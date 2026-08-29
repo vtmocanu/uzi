@@ -50,6 +50,18 @@ func (c *handoffClient) DispatchTaskRun(ctx context.Context, runID string) (apit
 
 // handoffEnv wires a fake client + a fake Git recorder into an Env.
 func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClient) {
+	// issue #403 F2: resolveHandoffRepo now always resolves origin + ListRepos (even with
+	// --repo), so seed a resolvable origin and a matching repo "p1" when the test didn't set
+	// them — a test that needs specific values sets rec.gitOut / fc.Repos before calling.
+	if rec.gitOut == nil {
+		rec.gitOut = map[string]string{}
+	}
+	if _, ok := rec.gitOut["remote get-url origin"]; !ok {
+		rec.gitOut["remote get-url origin"] = "https://github.com/acme/widgets.git"
+	}
+	if len(fc.Repos) == 0 {
+		fc.Repos = []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets"}}
+	}
 	hc := &handoffClient{FakeClient: fc, rec: rec}
 	env := fakeEnv(hc)
 	env.Git = rec.git
@@ -308,6 +320,106 @@ func TestHandoffRepoAutoDetect(t *testing.T) {
 				t.Errorf("resolved repo = %q, want %q", fc.LastCreateTaskRepoID, tc.wantRepoID)
 			}
 		})
+	}
+}
+
+// issue #403 F2: --repo whose repo path MATCHES origin proceeds and resolves to that id.
+func TestHandoffRepoFlagMatchesOrigin(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Repos:          []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets"}},
+		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
+		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
+	}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 for --repo matching origin", code)
+	}
+	if fc.LastCreateTaskRepoID != "p1" {
+		t.Errorf("resolved repo = %q, want p1", fc.LastCreateTaskRepoID)
+	}
+	wantPush := []string{"push", "origin", "HEAD:refs/heads/uzi/task/rf"}
+	if !hasGitCall(rec, wantPush) {
+		t.Errorf("matching --repo should push; git calls %v", rec.gitCalls)
+	}
+}
+
+// issue #403 F2: --repo whose repo path does NOT match origin is a usage error, and nothing
+// is created or pushed — pushing local HEAD to origin while the run points at a different
+// repo would silently drop the user's HEAD.
+func TestHandoffRepoFlagMismatchOrigin(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Repos:          []apitypes.RepoDTO{{ID: "pB", PathWithNamespace: "other/thing"}},
+		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
+		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
+	}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "pB", "-m", "x")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage) for --repo mismatching origin", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateTaskRepoID != "" {
+		t.Errorf("no run should be created on a repo/origin mismatch; repo = %q", fc.LastCreateTaskRepoID)
+	}
+	if len(rec.gitCalls) != 1 { // only the origin resolve; no push
+		t.Errorf("a mismatch must not push (only the origin get-url); git calls %v", rec.gitCalls)
+	}
+	for _, s := range rec.seq {
+		if s == "create" || s == "dispatch" {
+			t.Errorf("mismatch must not create/dispatch: %v", rec.seq)
+		}
+	}
+}
+
+// issue #403 F2: --repo naming an id that is not one of the caller's repos is a usage error,
+// and nothing is created or pushed.
+func TestHandoffRepoFlagUnknown(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Repos:          []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets"}},
+		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
+		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
+	}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "nope", "-m", "x")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage) for an unknown --repo", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateTaskRepoID != "" {
+		t.Errorf("no run should be created for an unknown --repo; repo = %q", fc.LastCreateTaskRepoID)
+	}
+	for _, s := range rec.seq {
+		if s == "create" || s == "dispatch" {
+			t.Errorf("unknown --repo must not create/dispatch: %v", rec.seq)
+		}
+	}
+}
+
+// issue #403 F2: when origin matches TWO of the caller's repos, --repo picks the right ID —
+// the ambiguity escape hatch still works because both candidates pass the path check.
+func TestHandoffRepoFlagDisambiguates(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Repos: []apitypes.RepoDTO{
+			{ID: "p1", PathWithNamespace: "acme/widgets"},
+			{ID: "p2", PathWithNamespace: "acme/widgets"},
+		},
+		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
+		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
+	}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p2", "-m", "x")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 for --repo disambiguating an ambiguous origin", code)
+	}
+	if fc.LastCreateTaskRepoID != "p2" {
+		t.Errorf("resolved repo = %q, want p2 (the disambiguated id)", fc.LastCreateTaskRepoID)
 	}
 }
 

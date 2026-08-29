@@ -158,28 +158,47 @@ func resolveHandoffContext(env Env, msg, file string) (string, error) {
 	return resolveMessage(env, ""), nil
 }
 
-// resolveHandoffRepo returns the repo id for the handoff. --repo takes precedence;
-// otherwise the origin remote URL is parsed to owner/namespace and matched against the
-// caller's repos by PathWithNamespace. Exactly one match resolves; zero or many is a
-// usage error naming --repo as the escape hatch.
+// resolveHandoffRepo returns the repo id for the handoff. Handoff ALWAYS resolves origin,
+// because the seed push targets the local `origin` remote (runHandoffCreate step 2). When
+// --repo is set it is validated to name the SAME forge repo origin points at; otherwise the
+// origin path is matched against the caller's repos by PathWithNamespace (exactly one match
+// resolves, zero or many is a usage error naming --repo as the escape hatch).
 func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag string) (string, error) {
-	if strings.TrimSpace(repoFlag) != "" {
-		return strings.TrimSpace(repoFlag), nil
-	}
+	// issue #403 F2: handoff pushes local HEAD to origin (git push origin …:refs/heads/<branch>),
+	// so the run's repo MUST be the same forge repo origin points at — else the worker clones a
+	// different repo, finds no seed branch, and silently seeds from that repo's default branch,
+	// dropping the user's HEAD. We therefore always resolve+parse origin and require --repo (when
+	// given) to match it; --repo remains only the disambiguator for an origin that matches several
+	// of the caller's repos, never a way to target a repo origin does NOT point at.
 	origin, err := env.Git(".", "remote", "get-url", "origin")
 	if err != nil {
 		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"not in a git repo with an 'origin' remote (%v); run from a checkout or pass --repo <id> (see 'uzi repo list')", err)
+			"not in a git repo with an 'origin' remote (%v); handoff pushes local HEAD to origin, so run it from a checkout", err)
 	}
 	path := parseRepoPath(origin)
 	if path == "" {
 		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"could not parse origin %q into an owner/repo path; pass --repo <id> (see 'uzi repo list')", origin)
+			"could not parse origin %q into an owner/repo path; handoff pushes local HEAD to origin, so it must be a resolvable remote", origin)
 	}
 	repos, err := c.ListRepos(ctx)
 	if err != nil {
 		return "", err
 	}
+
+	if repoFlag := strings.TrimSpace(repoFlag); repoFlag != "" {
+		for _, r := range repos {
+			if r.ID == repoFlag {
+				if r.PathWithNamespace != path {
+					return "", uzicli.Exitf(uzicli.ExitUsage,
+						"--repo %s (%s) does not match origin %s; handoff pushes local HEAD to origin, so they must be the same repo", repoFlag, r.PathWithNamespace, path)
+				}
+				return repoFlag, nil
+			}
+		}
+		return "", uzicli.Exitf(uzicli.ExitUsage,
+			"--repo %s is not one of your uzi repos (see 'uzi repo list')", repoFlag)
+	}
+
 	var matches []apitypes.RepoDTO
 	for _, r := range repos {
 		if r.PathWithNamespace == path {
