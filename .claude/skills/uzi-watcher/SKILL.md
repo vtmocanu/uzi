@@ -321,9 +321,12 @@ deliberate / mock-only** label, and a one-line recommendation. For each, the use
   nightly sweep silently never fires it (the sweep table is in `CLAUDE.local.md`; the failure
   mode and the fix are the `issue-triage` skill's whole subject). Three requirements:
   1. **A sweep selector label** — `Planned` for feature/change work, `bug` for a defect.
-  2. **The `uzi` eligibility label** — the single run-eligibility gate; no PRD link, no
-     PRD file, no waiver needed. A selector label alone does **not** fire an issue
-     missing `uzi`.
+  2. **Eligibility** — the `uzi` label, or the issue **assigned to the uzi-bot account**
+     (a third, label-less way to be eligible, PRD #767); no PRD link, no PRD file, no
+     waiver needed. A selector label alone does **not** fire an issue that is neither
+     `uzi`-labelled nor bot-assigned. For an issue you're filing fresh here, the `uzi`
+     label is simpler than assigning the bot account — assignment matters mainly for an
+     issue a human already assigned to the bot before you got to it.
   3. **A cold-readable body** — a swept worker reads ONLY the issue text (no chat, no memory
      of this session), so name the exact files and `file:line` anchors, the precise change,
      and acceptance criteria (a failing-first test where sensible). CodeRabbit's own finding

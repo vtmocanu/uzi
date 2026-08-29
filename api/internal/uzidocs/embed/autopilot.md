@@ -47,6 +47,16 @@ the repo connected under their own account. Closed issues are never
 autopilot candidates, even freshly relabeled — an autopilot-only guard the
 manual **Start run** button doesn't have.
 
+**Bot-assigned issues are candidates too.** An issue is eligible for a run
+whenever it carries the run-eligibility label above **or** is assigned to
+the uzi-bot account (see [Admin settings → Run
+eligibility](./admin-settings.md#run-eligibility)), so the poller also picks
+up an autopilot-labelled issue that's bot-assigned but never labelled.
+Consent and attribution still key on the **autopilot-label add event**, not
+the assignment: an assignment has no adder to resolve, so it never bypasses
+the who-added-it rule above — it only widens which issues become autopilot
+candidates once the autopilot label lands.
+
 ## What happens next
 
 - **Eligible**: the issue moves to In Progress, a run starts unattended

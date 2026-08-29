@@ -2,7 +2,7 @@
 
 **Issue**: #767
 **Priority**: Medium
-**Status**: Draft
+**Status**: Complete
 **Depends on**: #764 (the single eligibility gate this widens). **M1 is independent of #764 and may
 land first** (it only adds assignee data; nothing consumes it until M2). M2-M6 extend #764's seam
 and must be implemented against its **merged** form — see the rebase-seam call-outs below.
@@ -75,7 +75,7 @@ uzi's," and the same deliberate opt-ins gate unattended execution.
 
 ## Milestones
 
-- [ ] **M1 — Sync issue assignees end to end (independent of #764; may land first).** Add
+- [x] **M1 — Sync issue assignees end to end (independent of #764; may land first).** Add
   `Assignees []int64` (forge user ids) to `forge.Issue` and map it in each driver's `ListIssues`
   **and** `GetIssue` from the inline assignee field(s) — a set, normalizing GitHub's `*int64`
   (nil-guarded like the existing author guards) and GitLab/Forgejo's `int64`. Persist it in the
@@ -88,7 +88,7 @@ uzi's," and the same deliberate opt-ins gate unattended execution.
   back out through `GetIssueByIID`; an unassigned issue yields `[]`; net-new column + mappings fail
   against pre-change code.
 
-- [ ] **M2 — Eligibility: "OR assigned to bot" at the single gate (depends #764).** Widen #764's
+- [x] **M2 — Eligibility: "OR assigned to bot" at the single gate (depends #764).** Widen #764's
   Gate A predicate in `createRun` so an issue is eligible if it carries `uzi_label` **OR**
   `conn.bot_forge_user_id ∈ issue.assignee_ids`, reading the bot id from the repo's
   `forge_connections` row. **Rebase seam**: re-derive against #764's *merged* Gate A shape (today
@@ -101,7 +101,7 @@ uzi's," and the same deliberate opt-ins gate unattended execution.
   actually reaches the gate through `GetIssueByIID` (so M2 can't be green while the column is
   silently dropped).
 
-- [ ] **M3 — Autopilot poller recognizes assignment (depends #764; shares `autopilot.sql` with it).**
+- [x] **M3 — Autopilot poller recognizes assignment (depends #764; shares `autopilot.sql` with it).**
   Widen `ListAutopilotCandidateIssues`' eligibility half to include `assignee_ids @>
   to_jsonb(@bot_id::bigint)`. **Rebase seam + #764 gap**: #764 removes `prd_label` (its D7) but its
   plan never names `autopilot.sql:26` (`jsonb_exists(labels, @prd_label)`); this milestone must
@@ -119,7 +119,7 @@ uzi's," and the same deliberate opt-ins gate unattended execution.
   removed is detected-eligible but **held**, no run created. Live-DB (`run-store-it.sh`) for the new
   predicate.
 
-- [ ] **M4 — Sweeps recognize assignment + an assigned-queue catalog default (depends #764).**
+- [x] **M4 — Sweeps recognize assignment + an assigned-queue catalog default (depends #764).**
   "Assigned to the bot" is a **new selector kind, not another label** — the sweep selector is
   modeled today purely as a jsonb label array (`resolveSweepLabels`, `scheduler.go:707-729`, which
   defaults an empty selector to `[PRD]` and enforces non-empty; passed as `Labels: labelsJSON`,
@@ -135,7 +135,7 @@ uzi's," and the same deliberate opt-ins gate unattended execution.
   open issues on its schedule; a non-assigned candidate is a benign skip that advances the schedule;
   the numeric bot id actually matches (guards the jsonb trap).
 
-- [ ] **M5 — Web: mark assigned-to-bot as runnable, in the marker, filter, and Promote (depends
+- [x] **M5 — Web: mark assigned-to-bot as runnable, in the marker, filter, and Promote (depends
   M1).** Widen the **shared** `isEligibleCard` predicate to "carries `uzi` OR bot ∈ assignees" so
   the runnable marker, the `uzi`-only filter (now reads as "uzi's"), **and `canPromote`
   (`!isEligibleCard`)** all inherit — an assigned-but-unlabelled card is marked runnable and stops
@@ -145,7 +145,7 @@ uzi's," and the same deliberate opt-ins gate unattended execution.
   assertion that an assigned-unlabelled card is runnable and offers no Promote. *Success*: an issue
   assigned to the bot shows as runnable, passes the "uzi's" filter, and hides Promote, with no label.
 
-- [ ] **M6 — CLI check, docs, specs, close-out.** Confirm `api/cmd/uzi/` eligibility wording
+- [x] **M6 — CLI check, docs, specs, close-out.** Confirm `api/cmd/uzi/` eligibility wording
   reflects "label or assignment" (server-inherited; display only). Docs: `docs/scheduling.md` (the
   assigned-sweep default + the non-label selector kind), `docs/admin-settings.md`, the eligibility
   doc from #764 (assignment as a second signal + the D1 auto-run pin), the default-jobs docs (the

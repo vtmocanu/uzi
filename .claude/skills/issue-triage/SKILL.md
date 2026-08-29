@@ -26,12 +26,19 @@ If the user named an issue (number/URL), use it. Otherwise hunt in **priority or
 picking the lowest-numbered issue in the highest non-empty tier.
 
 **Why the tiers.** A sweep fires an issue only when it has BOTH halves: (a) a
-**selector** label (`Planned`, or `bug` for a bug) AND (b) the **`uzi` label** — the
-single run-eligibility gate; no PRD link and no admin waiver required, or relevant.
+**selector** label (`Planned`, or `bug` for a bug) AND (b) eligibility — the **`uzi`
+label**, or the issue **assigned to the uzi-bot account** (a third, label-less way
+to be eligible, PRD #767); no PRD link and no admin waiver required, or relevant.
 (Authoritative mechanics, which drift: `CLAUDE.local.md` → "uzi scheduled sweeps",
 plus `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`.) An issue missing
 **either** half looks queued but silently never runs, and nobody notices — so those are
 the highest-priority triage targets, ahead of the raw backlog.
+
+The gap query below only sees GitHub **labels** (`gh issue list --json ...,labels,...`),
+not assignees — so a Tier-1A hit here (selector, no `uzi`) can be a false positive if the
+issue is already bot-assigned and genuinely eligible. A quick check before applying labels:
+`gh issue view NNN --json assignees` for the account name; if it's already assigned to the
+bot, the issue is not actually a gap.
 
 - **Tier 1 — silently un-sweepable gaps** (not parked). Two shapes:
   - **1A selector, no `uzi`** — has `bug`/`Planned` but not `uzi`. The `bug` sweep

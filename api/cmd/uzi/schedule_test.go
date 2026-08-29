@@ -1241,7 +1241,7 @@ func TestScheduleGetLastFireCappedHint(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "newer issues not reached — raise --max-issues or add the uzi label") {
+	if !strings.Contains(out, "newer issues not reached — raise --max-issues, or add the uzi label / assign the issue to uzi") {
 		t.Errorf("capped fire missing the raise-the-cap hint\n%s", out)
 	}
 }
@@ -1329,7 +1329,7 @@ func TestScheduleRunNowBreakdown(t *testing.T) {
 		"Started 1 run(s) from sch_rn: run_c81a",
 		"#158 → run run_c81a  Fix the thing",
 		"Examined 3 candidate(s), skipped 2:",
-		"#96  not eligible   # add the uzi label, or raise --max-issues", // LABEL + hint
+		"#96  not eligible   # add the uzi label or assign the issue to uzi, or raise --max-issues", // LABEL + hint
 		"#97  already running",
 	} {
 		if !strings.Contains(out, want) {
@@ -1360,7 +1360,7 @@ func TestScheduleRunNowStartedNothing(t *testing.T) {
 	for _, want := range []string{
 		"Started 0 runs from sch_rn.",
 		"Examined 1 candidate(s), skipped 1:",
-		"#96  not eligible   # add the uzi label, or raise --max-issues",
+		"#96  not eligible   # add the uzi label or assign the issue to uzi, or raise --max-issues",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("started-nothing run-now missing %q\n%s", want, out)
