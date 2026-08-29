@@ -131,9 +131,12 @@ describe("AppShell build info wiring", () => {
     const badge = badges[0];
     const row = badge.closest("div.justify-between") as HTMLElement | null;
     expect(row).not.toBeNull();
+    // The credit is looked up WITHIN the badge's own footer row, so finding it
+    // proves the two share that one `justify-between` row (not merely that both
+    // exist somewhere in the tree). badge and credit are distinct elements.
     const credit = row!.querySelector('[data-testid="license-credit"]');
     expect(credit).not.toBeNull();
-    expect(row!.contains(badge)).toBe(true);
+    expect(credit).not.toBe(badge);
     expect(credit!.textContent).toBe("MIT © Vlad Mocanu");
   });
 });
