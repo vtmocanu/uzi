@@ -1066,3 +1066,137 @@ describe("worktreeStatus (issue #281 / CodeRabbit #655)", () => {
     assert.strictEqual(result, null);
   });
 });
+
+// Issue #781 — the worker must not seed a run off a STALE, DISJOINT remote ref, and a
+// remote branch deleted upstream must stop seeding stale bases (fetch --prune). Two
+// independent guards, both proven here against real local git.
+describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+  function refInBare(bare: string, ref: string): boolean {
+    try {
+      gitIn(bare, ["rev-parse", "--verify", "--quiet", ref]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("rejects a disjoint origin branch ref and seeds off the default tip instead", async () => {
+    // Build a DISJOINT branch at origin matching the seed branch name for issue 55 — an
+    // orphan root, so it shares no history (and no content) with main.
+    gitIn(fx.originPath, ["checkout", "--orphan", "agent/issue-55"]);
+    gitIn(fx.originPath, ["rm", "-rf", "."]);
+    fs.writeFileSync(path.join(fx.originPath, "ORPHAN.txt"), "x\n");
+    gitIn(fx.originPath, ["add", "."]);
+    gitIn(fx.originPath, [...IDENT, "commit", "-m", "orphan disjoint history"]);
+    gitIn(fx.originPath, ["checkout", "main"]);
+
+    // ensureClone fetches refs/remotes/origin/agent/issue-55 into the bare.
+    const bare = await git.ensureClone(fx.originPath);
+    assert.strictEqual(
+      refInBare(bare, "refs/remotes/origin/agent/issue-55"),
+      true,
+      "precondition: the disjoint ref is fetched into the bare",
+    );
+    // …and it genuinely shares NO history with default: plain merge-base prints nothing and
+    // exits non-zero (gitIn throws on non-zero, hence the try/catch).
+    let disjoint = false;
+    try {
+      disjoint = gitIn(bare, ["merge-base", "refs/remotes/origin/agent/issue-55", "refs/remotes/origin/main"]) === "";
+    } catch {
+      disjoint = true;
+    }
+    assert.strictEqual(disjoint, true, "precondition: the ref is genuinely disjoint from default");
+
+    const disjointTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/agent/issue-55"]);
+    const defaultTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+
+    const rc = await git.createOrAttachRunnerClone(bare, 55);
+    assert.strictEqual(rc.seededFrom, "default", "a disjoint origin ref is ignored; the seed falls back to default");
+    assert.strictEqual(rc.priorCommits, 0, "a default seed carries no prior commits");
+    assert.strictEqual(rc.baseCommit, defaultTip, "seeded off the fresh default tip");
+    assert.notStrictEqual(rc.baseCommit, disjointTip, "…explicitly NOT the disjoint ref tip");
+  });
+
+  it("keeps a far-ahead owned tracking ref that merely diverges from default (guard is not over-aggressive)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    // Seed a first runner clone off the initial default and build a tracking ref several
+    // commits ahead, owned by run-far. It forks off main's initial commit — so it merely
+    // DIVERGES from default; it is not disjoint.
+    const first = await git.createOrAttachRunnerClone(bare, 66, "run-far");
+    for (const f of ["F1.txt", "F2.txt", "F3.txt"]) {
+      fs.writeFileSync(path.join(first.path, f), `${f}\n`);
+      gitIn(first.path, ["add", f]);
+      gitIn(first.path, [...IDENT, "commit", "-m", `work ${f}`]);
+    }
+    const tip = gitIn(first.path, ["rev-parse", "HEAD"]);
+    await git.fetchAgentBranch(bare, first.path, "agent/issue-66", "run-far"); // tracking owned by run-far
+    await git.removeRunnerClone(first.path);
+
+    // Advance origin's main on its OWN line so the tracking ref genuinely diverges (their
+    // only common ancestor is the initial commit — neither descends the other).
+    fs.writeFileSync(path.join(fx.originPath, "MAIN.txt"), "m\n");
+    gitIn(fx.originPath, ["add", "MAIN.txt"]);
+    gitIn(fx.originPath, [...IDENT, "commit", "-m", "advance main on its own line"]);
+    await git.ensureClone(fx.originPath); // bare learns the fresh divergent main
+
+    // PRECONDITION: the tracking ref shares history with default (a common ancestor exists)
+    // but is NOT an ancestor of it — the exact case merge-base --is-ancestor would reject,
+    // and the reason sharesHistory uses plain merge-base rather than isAncestor.
+    assert.doesNotThrow(
+      () => gitIn(bare, ["merge-base", "refs/uzi-runner/agent/issue-66", "refs/remotes/origin/main"]),
+      "precondition: tracking ref shares history with default (plain merge-base succeeds)",
+    );
+    assert.throws(
+      () => gitIn(bare, ["merge-base", "--is-ancestor", "refs/uzi-runner/agent/issue-66", "refs/remotes/origin/main"]),
+      "precondition: the far-ahead tracking ref is NOT an ancestor of default (is-ancestor would reject it)",
+    );
+
+    // Reseed as the SAME run: the guard KEEPS the diverged tracking ref, so it seeds off it.
+    const rc = await git.createOrAttachRunnerClone(bare, 66, "run-far");
+    assert.strictEqual(rc.seededFrom, "tracking", "a merely-diverged owned tracking ref must be kept, not rejected");
+    assert.strictEqual(rc.baseCommit, tip, "…and seeded off the tracking tip");
+  });
+
+  it("prunes a deleted origin branch's tracking ref while leaving refs/uzi-runner/* and refs/uzi-checkpoints/* intact", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    // Create a throwaway branch at origin and fetch it into the bare.
+    gitIn(fx.originPath, ["branch", "throwaway-781", "main"]);
+    await git.ensureClone(fx.originPath);
+    assert.strictEqual(
+      refInBare(bare, "refs/remotes/origin/throwaway-781"),
+      true,
+      "precondition: the throwaway branch's tracking ref is fetched",
+    );
+
+    // Differential setup (catches a config-form regression): plant two custom refs whose
+    // origin counterparts do NOT exist. The config form (fetch.prune / remote.origin.prune)
+    // would sweep refs/uzi-checkpoints/* on the separate checkpoint mirror fetch; the
+    // --prune FLAG confines pruning to refs/remotes/origin/*, so both must survive.
+    const mainSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+    gitIn(bare, ["update-ref", "refs/uzi-runner/agent/issue-999", mainSha]);
+    gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-999", mainSha]);
+
+    // Delete the branch at origin, then refetch: --prune removes the now-dangling tracking ref.
+    gitIn(fx.originPath, ["branch", "-D", "throwaway-781"]);
+    await git.ensureClone(fx.originPath);
+
+    assert.strictEqual(
+      refInBare(bare, "refs/remotes/origin/throwaway-781"),
+      false,
+      "the deleted origin branch's tracking ref must be pruned (#781)",
+    );
+    // The differential assertion: custom refs with no origin counterpart SURVIVE the prune —
+    // the config form would drop refs/uzi-checkpoints/agent/issue-999 on the mirror fetch.
+    assert.strictEqual(
+      refInBare(bare, "refs/uzi-runner/agent/issue-999"),
+      true,
+      "refs/uzi-runner/* must survive the prune (#781)",
+    );
+    assert.strictEqual(
+      refInBare(bare, "refs/uzi-checkpoints/agent/issue-999"),
+      true,
+      "refs/uzi-checkpoints/* must survive the prune (#781)",
+    );
+  });
+});
