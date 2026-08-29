@@ -22017,8 +22017,10 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   admitted only when a CONSUMED `follow_up` input exists, as a third independent clause beside
   the `answer` gate — so a stale/duplicate pre-park `running` report cannot un-park an idle task
   and re-arm the wall clock. It is now keyed on a per-park identity (issue #552): `runs.open_followup_id`,
-  a watermark of the highest already-CONSUMED `follow_up` id, recomputed at each park by
-  `SetRunAwaitingFollowup`, so the wake requires a consumed `follow_up` NEWER than the watermark —
+  a watermark of the highest already-CONSUMED `follow_up` id, stamped at each park by
+  `SetRunAwaitingFollowup` (originally recomputed purely server-side; **as of issue #559 the value is
+  worker-provided then server-clamped/floored — see §585**), so the wake requires a consumed
+  `follow_up` NEWER than the watermark —
   a stale pre-park `running` report on a run that has already iterated (cycle ≥2) can no longer un-park
   an idle run. The worker completes the identity: the `awaiting_followup` report (which stamps the
   watermark) is emitted ONLY when the run is genuinely going idle — `RunRunner.awaitFollowUp` first
@@ -23044,3 +23046,48 @@ of the "looks queued, never runs" gap the `issue-triage` skill exists to hunt.
   section **supersedes** the design recorded in §119 (PRDLESS settings) and §308 (`PRD`+`PRDLESS`
   server-side assembly), and the run-eligibility narrative in §445; those remain as history of the
   now-removed model.
+
+## 585. issue #559 — close two #558-review residuals of the interactive wake-guard watermark: worker-PROVIDED (not server-derived) `open_followup_id`, and an ownership ACK on the park-SKIP path
+
+Context: two residuals surfaced by the #558 merge-gate review of the interactive-run mid-turn
+wake-guard watermark (issue #552 M1 / PRD #517). The watermark is `runs.open_followup_id`, which
+`SetRunRunning`'s Decision-7 guard compares (`id > COALESCE(open_followup_id, 0)`,
+`api/internal/store/queries/runtime.sql`) to admit `awaiting_followup → running`.
+
+- **Residual 1 — the watermark is now WORKER-PROVIDED, reversing #552 M1's server-derived design.**
+  `SetRunAwaitingFollowup` previously stamped `open_followup_id` from a server-derived
+  `MAX(consumed follow_up id)` subquery. That races a follow-up consumed by the poll loop DURING
+  the park report's DB round-trip: it folds a not-yet-applied follow-up into the watermark, so that
+  follow-up's own wake report fails `id > watermark` and strands the run at `awaiting_followup`
+  until the ~30m idle sweeper. Fix: the worker reports the highest follow_up id it has already
+  DELIVERED as `open_followup_id` on the `awaiting_followup` `StateRequest`
+  (`agent/src/protocol.ts`, `api/internal/workersvc/service.go` `StateRequest.OpenFollowupID
+  *int64`), and the server stamps `GREATEST(0, LEAST(COALESCE(@open_followup_id, <server
+  max-consumed>), <server max-consumed>))`. Worker-owned because only the worker knows what it
+  applied: buffering a follow-up during the round-trip does NOT advance the worker's last-delivered
+  id — `agent/src/steering.ts` `takeFollowUp` is the SINGLE shift+advance site (route→push only
+  buffers), and the follow-up waiter is armed only AFTER the report returns
+  (`agent/src/runner.ts`) — so the racing follow-up is excluded and its later wake succeeds.
+  The `LEAST(..., max-consumed)` ceiling and `GREATEST(0, ...)` floor bound a buggy worker value
+  (a huge value would strand forever; a negative value would fail-open `id > -1` and reopen #558)
+  to the range a correct worker could send — self-harm only, no cross-run reach. Absent field (old
+  worker / first park before anything delivered) → `int8Param(nil)` → NULL → COALESCE falls back to
+  the pre-#559 server-derived value, byte-identical and backward compatible (additive-optional, but
+  the JSON field MUST exist because `httpx.DecodeJSON` sets `DisallowUnknownFields`). This
+  **reverses** the SOURCE half of §566's #552 M1 decision (the `awaiting_followup`/wake-guard design
+  under PRD #517): its server-derived, no-worker-echo watermark is retired for the
+  worker-provided-then-clamped value. Only the source changes — the watermark is still stamped at
+  every park, there is still no clear-on-wake, and the guard predicate itself is UNCHANGED.
+- **Residual 2 — restore the ownership/terminality ACK on the park-SKIP path.** When a follow-up is
+  already buffered, the worker deliberately SKIPS the `awaiting_followup` park report (the #558 fix,
+  so it doesn't fold the not-yet-applied follow-up into the watermark) and services the buffered
+  outcome directly — but that skipped report's ACK doubled as the ownership check that throws
+  `REASON_FOLLOWUP_NOT_PARKED` when the run went terminal or was reclaimed by another worker.
+  Restored via a new read-only worker endpoint `GET /api/worker/runs/{id}/ownership`
+  (`WorkerRunOwnership` → `workersvc.RunOwnership`, reusing `GetRunOwnedByWorker` — no new SQL) that
+  the runner probes on the skip path. Only a DEFINITIVE answer throws early: a terminal status
+  (`completed`/`failed`/`cancelled`, `FOLLOWUP_TERMINAL_STATUSES`) or a definitive 404 (reclaimed).
+  A TRANSIENT error (network / 5xx) logs a warning and PROCEEDS — no new spurious-failure mode; the
+  `SetRunRunning` worker_id pin and the next ACK-checked park report remain the backstop.
+- Commits `aace2d0b`/`fc072247` (M1, server clamp+floor), `d8625495` (M2, worker threads the
+  last-delivered id through `SteeringChannel`), `ab774e05` (M3, park-skip ownership probe).
