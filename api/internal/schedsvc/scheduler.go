@@ -348,7 +348,24 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			return FireOutcome{}, fmt.Errorf("marshal catalog labels: %w", mErr)
 		}
 		sched.Labels = labelsJSON
-		sched.Guidance = pgtype.Text{String: job.Guidance, Valid: job.Guidance != ""}
+		// Owner-guidance overlay (issue #675): a default sweep's guidance column holds the
+		// owner OVERLAY (NULL today until one is set). The catalog value is the BAKED guidance.
+		// Compose baked + overlay into the single effective guidance so the one
+		// composeRunDescription call in createIssueRun emits exactly ONE guidance header. An
+		// empty overlay yields effective == baked, i.e. byte-for-byte the prior baked-only
+		// description. An over-long overlay is truncated (tail-first) by composeRunDescription,
+		// so the baked catalog text is preserved before the overlay.
+		overlay := guidanceOf(sched)
+		baked := job.Guidance
+		effective := baked
+		if strings.TrimSpace(overlay) != "" {
+			if strings.TrimSpace(baked) == "" {
+				effective = overlay
+			} else {
+				effective = baked + "\n\n" + overlay
+			}
+		}
+		sched.Guidance = pgtype.Text{String: effective, Valid: effective != ""}
 	}
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {

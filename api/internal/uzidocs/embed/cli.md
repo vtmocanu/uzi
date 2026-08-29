@@ -298,11 +298,12 @@ A few worth knowing:
   retime previously wiped the stored model. On a **default-origin** schedule only
   the catalog-editable fields (`--cron`, `--tz`, `--auto-approve`,
   `--wait-on-limit`, `--max-issues`, `--clear-max-issues`) may be edited, plus
-  `--guidance`/`--clear-guidance` on a **prompt-target default** (owner steering is
-  editable there — a partial edit restates the stored guidance so it is not wiped);
-  the catalog-owned fields
-  (`--prompt`, `--label`, `--repo`, timing, and `--guidance` on an issue/sweep
-  default) require `uzi schedule clone` first. Changing a sweep schedule's `--label`
+  `--guidance`/`--clear-guidance` on a **prompt-target or sweep-target default**
+  (owner steering is editable there — a partial edit restates the stored guidance
+  so it is not wiped; on a sweep default the guidance is an **overlay** composed
+  onto the read-only baked catalog guidance at fire time); the catalog-owned fields
+  (`--prompt`, `--label`, `--repo`, timing, and `--guidance` on an issue default)
+  require `uzi schedule clone` first. Changing a sweep schedule's `--label`
   selector runs the same advisory sweep-label guardrail as `create`/`catalog
   enable`: it `WARNING`s (to stderr) on any newly-set label missing on the
   schedule's repo, or creates it first with `--create-missing-labels`, and never
