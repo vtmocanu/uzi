@@ -22,12 +22,12 @@ from when the flag was raised, not from when the run started.
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
 
 One **waiting for worker** reason worth calling out is the Docker-worker
-allowlist. When a run's repo needs a Docker-capable worker and none currently
-eligible has that repo on the Docker worker allowlist, the run stays `queued`
-and the owner's reason names it specifically — "repo not Docker-allowlisted"
-(the repo isn't on the Docker worker allowlist) — distinct from "no worker
-online" or "all workers busy". The fix is to add the repo to the allowlist, not
-to start another worker.
+allowlist. When every online worker is a Docker worker and the run's repo
+isn't on the Docker-worker allowlist, no worker is eligible to claim it, so
+the run stays `queued` and the owner's reason names it specifically — _"this
+repo isn't on the Docker worker allowlist, so no Docker worker can run it"_ —
+distinct from "no worker online" or "all workers busy". The fix is to add the
+repo to the allowlist, not to start another worker.
 
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
