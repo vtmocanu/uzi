@@ -233,6 +233,14 @@ type ScheduleCloneRequest struct {
 	RepoID *string `json:"repo_id"`
 }
 
+// EnableCatalogRequest is the OPTIONAL body for POST /api/repos/{id}/schedule-catalog/{slug}
+// (issue #660). Timezone, when present and a valid IANA name, overrides the catalog's baked
+// zone so an enabled default fires in the caller's detected zone from the first fire; an
+// absent/empty body keeps the catalog zone (UTC) — CLI/headless and older clients send none.
+type EnableCatalogRequest struct {
+	Timezone string `json:"timezone"`
+}
+
 // AddScheduleRepoRequest is the body for POST /api/schedules/{id}/add-repo (PRD #636 M1,
 // Decision 5): the id of another repo the caller owns to replicate the source schedule's
 // current config onto as a new sibling in the source's group. RepoID is required and

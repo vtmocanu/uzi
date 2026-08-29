@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Default schedules gain model-parity with custom schedules ([#691](https://github.com/vtmocanu/uzi/issues/691)).**
+  An owner can now set "Apply model also to agents" (`override_subagent_model`) on a default (catalog) schedule in place — via the web modal, the API, and `uzi schedule edit --apply-model-to-agents` — instead of having to clone it first; Reset restores it to the catalog baseline (off) alongside the other editable fields. `uzi schedule edit` also gains a `--model <alias|id>` flag (empty clears back to the Worker-model default) for both custom and default schedules, closing the gap where the CLI could not change a schedule's model that the web UI and API already could.
+
 ### Changed
 
 - **Assigning an issue to the uzi-bot is now a run-eligibility signal too ([#767](https://github.com/vtmocanu/uzi/issues/767)).**

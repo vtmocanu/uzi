@@ -774,6 +774,7 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target or sweep-target default)")
 	edit.Flags().Bool("clear-max-issues", false, "clear the sweep cap back to unlimited (sweep target only)")
 	edit.Flags().Bool("apply-model-to-agents", false, "set whether the schedule's model also overrides every subagent's model pin")
+	edit.Flags().String("model", "", "change the model alias (opus/sonnet/haiku/fable) or custom model ID for runs this schedule fires; empty string clears it back to your Worker-model default (valid on every target)")
 	edit.Flags().String("repo", "", "repoint the schedule to another repo by id (sweep/prompt targets; an issue-target schedule cannot be repointed)")
 	edit.Flags().Bool("create-missing-labels", false, "for a sweep target: create any newly-set --label missing on the schedule's repo before saving the edit (default: warn only)")
 	return edit
@@ -920,6 +921,11 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 		req.MaxIssues = nil
 		changed = true
 	}
+	if f.Changed("model") {
+		v, _ := f.GetString("model")
+		req.Model = &v
+		changed = true
+	}
 	if f.Changed("apply-model-to-agents") {
 		v, _ := f.GetBool("apply-model-to-agents")
 		req.OverrideSubagentModel = &v
@@ -951,11 +957,12 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 // User-editable on a default: cron, timezone, auto_approve, wait_on_limit, and — for a
 // sweep — max_issues. For a sweep, max_issues is RESTATED from the fetched row because
 // patchDefaultScheduleConfig uses replace-semantics on it (an omitted value clears the cap
-// to unlimited). model and override_subagent_model are NOT user-editable on a default via
-// this command: there is no --model edit flag, and patchDefaultScheduleConfig never reads
-// req.OverrideSubagentModel (it keeps the seeded value), so --apply-model-to-agents is
-// refused client-side rather than reporting a false "updated". They are still restated from
-// the fetched row so a value is never dropped should the server later honor them.
+// to unlimited). model and override_subagent_model ARE now owner-editable on a default
+// (issue #691): --model sets the run model (empty string clears it back to the Worker-model
+// default) and --apply-model-to-agents sets override_subagent_model, since
+// patchDefaultScheduleConfig reads both req.Model and req.OverrideSubagentModel. Both are
+// restated from the fetched row (replace-semantics) so a partial edit does not drop them,
+// and an explicit flag overrides the restated value.
 //
 // Guidance is owner-editable on a PROMPT-target default (PRD #662 M1) and a SWEEP-target
 // default (issue #675, where it is an overlay composed onto the baked catalog guidance at
@@ -991,14 +998,6 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	if guidanceSet && clearGuidance {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--guidance and --clear-guidance are mutually exclusive")
 	}
-	// --apply-model-to-agents (override_subagent_model) is not editable on a default: the
-	// server keeps the seeded value and never reads it from the request, so accepting the
-	// flag would report a success that did not happen. Refuse it client-side.
-	if f.Changed("apply-model-to-agents") {
-		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
-			"--apply-model-to-agents cannot be edited on a default schedule; clone it first with `uzi schedule clone`")
-	}
-
 	maxIssuesSet := f.Changed("max-issues")
 	clearMaxIssues := f.Changed("clear-max-issues")
 	if (maxIssuesSet || clearMaxIssues) && s.Target != schedTargetSweep {
@@ -1009,7 +1008,8 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	}
 
 	// FRESH minimal request: only catalog-editable fields. Restate model/override from the
-	// fetched row (harmless; neither is user-editable here — see the doc comment). Leave
+	// fetched row so a partial edit keeps them; an explicit --model/--apply-model-to-agents
+	// overrides below (issue #691 — see the doc comment). Leave
 	// Target/Labels/Prompt/Guidance/IssueIID/Timing/RunAt/RepoID at zero so the guard passes.
 	req := apitypes.ScheduleRequest{
 		CronExpr:              s.CronExpr,
@@ -1083,9 +1083,24 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 		req.Guidance = &empty
 		changed = true
 	}
+	// --model is owner-editable on a default (issue #691): patchDefaultScheduleConfig reads
+	// req.Model. Restated from the fetched row above; an explicit flag overrides (empty clears).
+	if f.Changed("model") {
+		v, _ := f.GetString("model")
+		req.Model = &v
+		changed = true
+	}
+	// --apply-model-to-agents is owner-editable on a default (issue #691):
+	// patchDefaultScheduleConfig reads req.OverrideSubagentModel. Restated from the fetched
+	// row above; an explicit flag overrides.
+	if f.Changed("apply-model-to-agents") {
+		v, _ := f.GetBool("apply-model-to-agents")
+		req.OverrideSubagentModel = &v
+		changed = true
+	}
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
-			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --max-issues, --guidance)")
+			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --max-issues, --guidance, --model, --apply-model-to-agents)")
 	}
 	return req, nil
 }
