@@ -134,10 +134,11 @@ while [ "$i" -lt "$MAX" ]; do
   if [ "$mrw_active" -gt 0 ]; then echo "RESULT=mr_rework_active"; exit 4; fi
   if [ "$pend" -eq 0 ] && [ "$cancel" -eq 0 ] && [ "$reviewed_head" -eq 1 ]; then
     # Revalidate the head right before deciding (TOCTOU): a push during this iteration would
-    # otherwise let an exit 0 describe an unreviewed head.
+    # otherwise let an exit 0 describe an unreviewed head. Proceed to ready ONLY when the
+    # re-read succeeds AND matches; an empty (failed) re-read is unknown, not a match — defer.
     head2=$(gh pr view "$PR" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || true)
-    if [ -n "$head2" ] && [ "$head2" != "$head" ]; then
-      echo "try $i: head moved ${head:0:8} -> ${head2:0:8}, re-polling"
+    if [ -z "$head2" ] || [ "$head2" != "$head" ]; then
+      echo "try $i: head unconfirmed (${head:0:8} -> ${head2:0:8}), re-polling"
       sleep "$INTERVAL"; continue
     fi
     if [ "$live" -eq 0 ]; then echo "RESULT=ready"; exit 0; fi
