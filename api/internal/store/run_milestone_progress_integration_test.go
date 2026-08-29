@@ -523,11 +523,14 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 	t.Run("sweep excludes banked parked time on the global-timeout fallback", func(t *testing.T) {
 		base := time.Now().UTC()
 		// runTimeout=7200s (2h) global + 1h banked park = 3h deadline; NULL budget_wall_seconds.
-		// started 2h ago → 2h < 3h → NOT swept.
+		// Started 2h30m ago: 2.5h < 3h → NOT swept — but 2.5h > the bare 2h global, so WITHOUT
+		// the pause bank this run WOULD be swept. Sitting inside the pause-credit window is what
+		// makes this assertion actually require budget_paused_seconds (a boundary-exact 2h would
+		// pass even if the bank were dropped, since the deadline test is a strict `<`).
 		underGlobal := newRun("running")
 		mustExec(ctx, t, pool,
 			`UPDATE runs SET started_at = $2, budget_wall_seconds = NULL, budget_paused_seconds = 3600 WHERE id = $1`,
-			underGlobal, base.Add(-2*time.Hour))
+			underGlobal, base.Add(-150*time.Minute))
 		// Same shape but started 4h ago → 4h > 3h → swept.
 		overGlobal := newRun("running")
 		mustExec(ctx, t, pool,
@@ -547,7 +550,7 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 			got[r.ID] = true
 		}
 		if got[underGlobal] {
-			t.Fatalf("a NULL-budget run 2h into a 2h global + 1h banked park (3h deadline) must NOT be swept")
+			t.Fatalf("a NULL-budget run 2h30m into a 2h global + 1h banked park (3h deadline) must NOT be swept")
 		}
 		if !got[overGlobal] {
 			t.Fatalf("a NULL-budget run 4h into a 2h global + 1h banked park (3h deadline) MUST be swept")
