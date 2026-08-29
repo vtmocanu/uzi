@@ -501,19 +501,22 @@ new review object.
 **Two updates to signal (c) and the live-findings count, both measured 2026-08-29 driving a
 6-PR batch, both now fixed in `scripts/watch-pr.sh`:**
 
-- **CodeRabbit is migrating the walkthrough marker away from the `recent_review` range to a
-  `final_review_risk` block, so key on BOTH.** The new block reads `**Merge Risk:** _🟡
-  Moderate_ · up to` then the head short-sha in backticks (e.g. `up to 280ac`), sits between
-  `<!-- final_review_risk_start -->` / `<!-- final_review_risk_end -->`, and states a
-  merge-readiness verdict in prose ("no actionable merge-blocking risk remaining; it is
-  merge-ready" on a clean pass). On several PRs here the older `recent_review` "between BASE and
-  HEAD" range was **absent** while `final_review_risk` was present. `watch-pr.sh` now confirms
-  "reviewed this head" from EITHER the range's trailing SHA OR that `up to` short-sha marker; a poller you hand-roll must
-  do the same, or a clean re-review reads as never-landed and you time out on a merge-ready PR.
-  Parse each SHA only **inside its own marker block**, and only when **exactly one** walkthrough
-  comment exists (fail closed on 0 or >1) — otherwise an unrelated `up to` / `and <sha>` phrase
-  elsewhere in the body can forge a `reviewed_head=1` and, with zero live findings, a false
-  auto-merge. That is the "exactly one match, fail closed" contract above, now enforced in the script.
+- **The `recent_review` range is GONE; signal (c) now keys on the `final_review_risk` block.**
+  The long treatment above describes the `recent_review` "between BASE and HEAD" range as the
+  signal that "ALWAYS fires" — that format is **retired**: 0 occurrences across PRs #807 / #809 /
+  #812 on 2026-08-29, all of which carry a `final_review_risk` block instead. That block reads
+  `**Merge Risk:** _🟡 Moderate_ · up to` then the head short-sha in backticks (e.g. `up to
+  280ac`), sits between `<!-- final_review_risk_start -->` / `<!-- final_review_risk_end -->`,
+  and states a merge-readiness verdict in prose ("no actionable merge-blocking risk remaining;
+  it is merge-ready" on a clean pass). `watch-pr.sh` confirms "reviewed this head" from that `up
+  to` short-sha marker (**parsed only inside the `final_review_risk` block**, and only when
+  **exactly one** walkthrough comment exists — fail closed on 0 or >1), plus signal (a), a review
+  object whose `commit_id` is the head. It no longer parses `recent_review`: matching a retired
+  format over the whole body could false-match an unrelated "up to `<sha>`" phrase and, with zero
+  live findings, forge a merge — the "exactly one match, fail closed" contract above. A poller you
+  hand-roll must key on `final_review_risk` (block-scoped) + signal (a); if `recent_review` ever
+  returns, signal (a) still covers a real review, so the loss is fail-closed (a timeout, never a
+  false ready).
 - **An ADDRESSED finding keeps `line != null`; it is NOT outdated — do not count it as live.**
   The `line: null`/`original_line` "outdated" signal in (b) above is only ONE of the two ways a
   finding stops being live. When CodeRabbit judges a finding FIXED by a later commit it leaves
