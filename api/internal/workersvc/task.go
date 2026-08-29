@@ -99,28 +99,9 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		return store.Run{}, ErrTaskBranchUnsafe
 	}
 
-	// issue #785: a NON-interactive handoff persists a dedicated wall-clock budget
-	// (HANDOFF_RUN_TIMEOUT) and iteration cap (HANDOFF_RUN_MAX_ITERATIONS) so it is
-	// decoupled from the global RUN_TIMEOUT / RUN_MAX_ITERATIONS. Both stay NULL for an
-	// interactive handoff (idle-bounded by WorkerTaskIdleTimeout) and for a non-positive
-	// knob, so the claim/sweeper COALESCE falls back to the global default. The wall is
-	// LEAST-capped to budgetWallCeilingSeconds (the repo invariant that every budget
-	// writer caps the wall to the 8h ceiling — see runtime.sql SweepRunningTimeout); the
-	// CHECK constraint is `NULL OR > 0`. The guards check the COMPUTED integer seconds /
-	// iterations (not the raw duration), so a sub-second HANDOFF_RUN_TIMEOUT that truncates
-	// to 0 falls back to the global default instead of persisting a 0 that trips the CHECK.
-	// An iteration cap ABOVE int32 max is likewise treated as invalid and left NULL (global
-	// fallback), so an out-of-range HANDOFF_RUN_MAX_ITERATIONS cannot narrow to a negative or
-	// wrong-positive int32 that trips the CHECK / persists a bogus cap.
-	var budgetWall, budgetIters pgtype.Int4
-	if !interactive {
-		if secs := int(s.p.HandoffRunTimeout.Seconds()); secs > 0 {
-			budgetWall = pgtype.Int4{Int32: int32(min(secs, budgetWallCeilingSeconds)), Valid: true}
-		}
-		if s.p.HandoffRunMaxIterations > 0 && s.p.HandoffRunMaxIterations <= math.MaxInt32 {
-			budgetIters = pgtype.Int4{Int32: int32(s.p.HandoffRunMaxIterations), Valid: true}
-		}
-	}
+	// issue #785: a NON-interactive handoff persists the dedicated handoff budget so it is
+	// decoupled from the global RUN_TIMEOUT / RUN_MAX_ITERATIONS (see handoffBudget).
+	budgetWall, budgetIters := s.handoffBudget(interactive)
 
 	run, err := s.q.CreateTaskRun(ctx, store.CreateTaskRunParams{
 		RunID:               id,
@@ -145,6 +126,30 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 	// DispatchTaskRun stamps the gate (PRD #400 Decision 6).
 	s.notify(run.ID, "queued")
 	return run, nil
+}
+
+// handoffBudget computes the dedicated handoff run budget (issue #785) from config:
+// HANDOFF_RUN_TIMEOUT wall (LEAST-capped to budgetWallCeilingSeconds, the repo invariant
+// that every budget writer caps the wall to the 8h ceiling — see runtime.sql
+// SweepRunningTimeout) and HANDOFF_RUN_MAX_ITERATIONS. Both are NULL — so the claim/sweeper
+// COALESCE falls back to the global RUN_TIMEOUT / RUN_MAX_ITERATIONS — for an interactive
+// handoff (idle-bounded by WorkerTaskIdleTimeout instead) OR a non-positive/out-of-range
+// knob. The guards check the COMPUTED integer seconds/iterations (not the raw duration): a
+// sub-second HANDOFF_RUN_TIMEOUT truncating to 0, or an iteration cap above int32 max, is
+// invalid and left NULL rather than persisting a 0 / negative / wrapped value that trips the
+// `NULL OR > 0` CHECK. Shared by CreateTaskRun and CreateThenFixRun so a then-fix keeps the
+// same non-interactive budget as its original task rather than reverting to the global default.
+func (s *Service) handoffBudget(interactive bool) (budgetWall, budgetIters pgtype.Int4) {
+	if interactive {
+		return
+	}
+	if secs := int(s.p.HandoffRunTimeout.Seconds()); secs > 0 {
+		budgetWall = pgtype.Int4{Int32: int32(min(secs, budgetWallCeilingSeconds)), Valid: true}
+	}
+	if s.p.HandoffRunMaxIterations > 0 && s.p.HandoffRunMaxIterations <= math.MaxInt32 {
+		budgetIters = pgtype.Int4{Int32: int32(s.p.HandoffRunMaxIterations), Valid: true}
+	}
+	return
 }
 
 // DispatchTaskRun stamps the dispatch gate for a task run (PRD #400 Decision 6),
@@ -223,15 +228,21 @@ var ErrThenFixAlreadyActive = errors.New("a fix run is already active for this t
 // reason CreateTaskRun/CreateTaskReviewRun mint theirs.
 func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, originalRunID uuid.UUID, branch, baseBranch, description string) (store.Run, error) {
 	id := uuid.New()
+	// A then-fix is part of the same NON-interactive handoff flow as its original task
+	// (--interactive --then-fix is rejected at the CLI), so it carries the SAME dedicated
+	// handoff budget rather than reverting to the global default for its fix phase (issue #785).
+	budgetWall, budgetIters := s.handoffBudget(false)
 	run, err := s.q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
-		RunID:            id,
-		UserID:           userID,
-		RepoID:           repoID,
-		Branch:           pgText(branch),
-		BaseBranch:       pgTextTrimNarg(baseBranch),
-		ThenFixOfRunID:   pgUUID(originalRunID),
-		IssueTitle:       deriveThenFixTitle(branch),
-		IssueDescription: description,
+		RunID:               id,
+		UserID:              userID,
+		RepoID:              repoID,
+		Branch:              pgText(branch),
+		BaseBranch:          pgTextTrimNarg(baseBranch),
+		ThenFixOfRunID:      pgUUID(originalRunID),
+		IssueTitle:          deriveThenFixTitle(branch),
+		IssueDescription:    description,
+		BudgetWallSeconds:   budgetWall,
+		BudgetMaxIterations: budgetIters,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError

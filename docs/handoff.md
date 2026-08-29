@@ -110,10 +110,15 @@ uzi handoff -m "add input validation to the signup form" --interactive
   budgets.** It runs under a dedicated default of 4h (`HANDOFF_RUN_TIMEOUT`) and
   a dedicated implement ⇄ review cap of 10 (`HANDOFF_RUN_MAX_ITERATIONS`),
   separate from the global `RUN_TIMEOUT` / `RUN_MAX_ITERATIONS`, so a longer
-  handoff does not require moving every run's cap. An `--interactive` handoff is
-  exempt from both and falls back to the global caps (it is idle-bounded by
-  `WORKER_TASK_IDLE_TIMEOUT`). See the
-  [configuration reference](configuration.md#server-api) for the fallback rules.
+  handoff does not require moving every run's cap. A `--then-fix` fix run
+  inherits the same dedicated budget as its original task (it is part of the same
+  non-interactive handoff), so the fix phase of a long handoff is not silently
+  capped at the global default. An `--interactive` handoff persists neither
+  dedicated budget: its iteration count falls back to the global
+  `RUN_MAX_ITERATIONS`, and it is excluded from the wall-clock sweep entirely (no
+  `RUN_TIMEOUT` deadline applies), bounded instead by `WORKER_TASK_IDLE_TIMEOUT`.
+  See the [configuration reference](configuration.md#server-api) for the fallback
+  rules.
 - **`--review`/`--mr` compose at wind-down, not at every park.** The
   diff-review fires once — when the run finally reports `completed`, whether
   via `run stop` or the idle timeout — never on an intermediate park.

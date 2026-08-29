@@ -335,27 +335,31 @@ INSERT INTO runs (
     id, user_id, repo_id, kind, branch, base_branch,
     then_fix_of_run_id, review_target_run_id, dispatched_at,
     auto_approve, open_mr, review_requested, then_fix_requested,
-    issue_title, issue_description, required_capabilities
+    issue_title, issue_description, required_capabilities,
+    budget_wall_seconds, budget_max_iterations
 )
 VALUES (
     $1, $2, $3::uuid, 'task', $4, $5,
     $6, NULL, now(),
     true, false, false, false,
     $7, $8,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $3::uuid), '{}')
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $3::uuid), '{}'),
+    $9, $10
 )
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds
 `
 
 type CreateThenFixRunParams struct {
-	RunID            uuid.UUID   `json:"run_id"`
-	UserID           uuid.UUID   `json:"user_id"`
-	RepoID           uuid.UUID   `json:"repo_id"`
-	Branch           pgtype.Text `json:"branch"`
-	BaseBranch       pgtype.Text `json:"base_branch"`
-	ThenFixOfRunID   pgtype.UUID `json:"then_fix_of_run_id"`
-	IssueTitle       string      `json:"issue_title"`
-	IssueDescription string      `json:"issue_description"`
+	RunID               uuid.UUID   `json:"run_id"`
+	UserID              uuid.UUID   `json:"user_id"`
+	RepoID              uuid.UUID   `json:"repo_id"`
+	Branch              pgtype.Text `json:"branch"`
+	BaseBranch          pgtype.Text `json:"base_branch"`
+	ThenFixOfRunID      pgtype.UUID `json:"then_fix_of_run_id"`
+	IssueTitle          string      `json:"issue_title"`
+	IssueDescription    string      `json:"issue_description"`
+	BudgetWallSeconds   pgtype.Int4 `json:"budget_wall_seconds"`
+	BudgetMaxIterations pgtype.Int4 `json:"budget_max_iterations"`
 }
 
 // The dedicated insert for a FIX run (PRD #400 M5): a NORMAL task run that pushes fixes,
@@ -370,6 +374,12 @@ type CreateThenFixRunParams struct {
 // needs no CLI seed push. auto_approve true (no plan gate); open_mr false (a fix is still a
 // throwaway handoff); review_requested + then_fix_requested false (no recursion — a fix is
 // never itself reviewed or re-fixed). id is caller-supplied like CreateTaskReviewRun.
+// budget_wall_seconds / budget_max_iterations (issue #785): a then-fix is part of the same
+// non-interactive handoff flow as its original task, so it carries the SAME dedicated
+// HANDOFF_RUN_TIMEOUT / HANDOFF_RUN_MAX_ITERATIONS budget (8h-ceiling-capped by the caller)
+// rather than reverting to the global default — otherwise the fix phase of a long handoff
+// would silently cap at RUN_TIMEOUT / RUN_MAX_ITERATIONS, the exact regression #785 exists to
+// prevent. NULL (global fallback) only for a non-positive/out-of-range knob.
 func (q *Queries) CreateThenFixRun(ctx context.Context, arg CreateThenFixRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createThenFixRun,
 		arg.RunID,
@@ -380,6 +390,8 @@ func (q *Queries) CreateThenFixRun(ctx context.Context, arg CreateThenFixRunPara
 		arg.ThenFixOfRunID,
 		arg.IssueTitle,
 		arg.IssueDescription,
+		arg.BudgetWallSeconds,
+		arg.BudgetMaxIterations,
 	)
 	var i Run
 	err := row.Scan(

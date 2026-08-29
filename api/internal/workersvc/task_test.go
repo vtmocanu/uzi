@@ -212,6 +212,31 @@ func TestCreateTaskRunPersistsHandoffBudget(t *testing.T) {
 	})
 }
 
+// A then-fix run inherits the SAME dedicated handoff budget as its original task (issue
+// #785): the fix phase of a long non-interactive handoff must not silently revert to the
+// global RUN_TIMEOUT / RUN_MAX_ITERATIONS. CreateThenFixRun is always non-interactive
+// (--interactive --then-fix is rejected at the CLI), so it always persists the budget.
+func TestCreateThenFixRunPersistsHandoffBudget(t *testing.T) {
+	p := testParams()
+	p.HandoffRunTimeout = 4 * time.Hour
+	p.HandoffRunMaxIterations = 10
+	fs := &fakeStore{}
+	svc := New(fs, newBox(t), p)
+	if _, err := svc.CreateThenFixRun(context.Background(), uuid.New(), uuid.New(), uuid.New(), "uzi/task/abc", "main", "fix the findings"); err != nil {
+		t.Fatalf("CreateThenFixRun: %v", err)
+	}
+	got := fs.thenFixRunParams
+	if got == nil {
+		t.Fatal("insert did not run")
+	}
+	if !got.BudgetWallSeconds.Valid || got.BudgetWallSeconds.Int32 != 14400 {
+		t.Errorf("budget_wall_seconds = %v, want valid 14400 (same as the original task)", got.BudgetWallSeconds)
+	}
+	if !got.BudgetMaxIterations.Valid || got.BudgetMaxIterations.Int32 != 10 {
+		t.Errorf("budget_max_iterations = %v, want valid 10 (same as the original task)", got.BudgetMaxIterations)
+	}
+}
+
 // TestCreateTaskRunSanitizesAndCaps: NUL bytes are stripped from both context and
 // base_branch, an empty base_branch persists as NULL, and an over-cap context is
 // rejected with ErrDescriptionTooLarge before any insert.

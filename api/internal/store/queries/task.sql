@@ -40,18 +40,26 @@ RETURNING *;
 -- needs no CLI seed push. auto_approve true (no plan gate); open_mr false (a fix is still a
 -- throwaway handoff); review_requested + then_fix_requested false (no recursion — a fix is
 -- never itself reviewed or re-fixed). id is caller-supplied like CreateTaskReviewRun.
+-- budget_wall_seconds / budget_max_iterations (issue #785): a then-fix is part of the same
+-- non-interactive handoff flow as its original task, so it carries the SAME dedicated
+-- HANDOFF_RUN_TIMEOUT / HANDOFF_RUN_MAX_ITERATIONS budget (8h-ceiling-capped by the caller)
+-- rather than reverting to the global default — otherwise the fix phase of a long handoff
+-- would silently cap at RUN_TIMEOUT / RUN_MAX_ITERATIONS, the exact regression #785 exists to
+-- prevent. NULL (global fallback) only for a non-positive/out-of-range knob.
 INSERT INTO runs (
     id, user_id, repo_id, kind, branch, base_branch,
     then_fix_of_run_id, review_target_run_id, dispatched_at,
     auto_approve, open_mr, review_requested, then_fix_requested,
-    issue_title, issue_description, required_capabilities
+    issue_title, issue_description, required_capabilities,
+    budget_wall_seconds, budget_max_iterations
 )
 VALUES (
     @run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'),
     @then_fix_of_run_id, NULL, now(),
     true, false, false, false,
     @issue_title, @issue_description,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}')
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'),
+    sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations')
 )
 RETURNING *;
 
