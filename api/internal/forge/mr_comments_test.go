@@ -321,6 +321,69 @@ func TestGitHubReviewThreadPaginationSpansMultiplePages(t *testing.T) {
 	}
 }
 
+// TestGitHubReviewThreadInnerFanOutRespectsGlobalItemCap pins that a single
+// thread's comment fan-out cannot push the accumulated map past maxForgeItems: the
+// per-thread budget passed into reviewThreadCommentDBIDs trips the shared backstop
+// rather than letting the inner loop accumulate a fresh maxForgeItems on top of the
+// outer page. Without the budget, a hostile/buggy forge could amplify the ceiling by
+// the outer page size. Lowers maxForgeItems and restores it in a defer.
+func TestGitHubReviewThreadInnerFanOutRespectsGlobalItemCap(t *testing.T) {
+	defer func(o int) { maxForgeItems = o }(maxForgeItems)
+	maxForgeItems = 3
+
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			req := readGQL(t, r)
+			switch {
+			case strings.Contains(req.Query, "reviewThreads"):
+				// Single outer page: T1's page-1 comments exactly fill the budget
+				// (3), and it advertises more comments to fan out into.
+				writeGQLData(w, map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{
+							"reviewThreads": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+								"nodes": []map[string]any{
+									{"id": "T1", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": true, "endCursor": "CCUR1"},
+										"nodes": []map[string]any{
+											{"databaseId": 101}, {"databaseId": 102}, {"databaseId": 103},
+										},
+									}},
+								},
+							},
+						},
+					},
+				})
+			case strings.Contains(req.Query, "node("):
+				// Inner page: one more comment beyond the now-zero remaining budget.
+				writeGQLData(w, map[string]any{
+					"node": map[string]any{
+						"comments": map[string]any{
+							"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+							"nodes":    []map[string]any{{"databaseId": 104}},
+						},
+					},
+				})
+			default:
+				t.Fatalf("unexpected graphql request: query=%q vars=%+v", req.Query, req.Variables)
+			}
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	got, err := d.reviewThreadIDsByDatabaseID(context.Background(), repoSlug{owner: "acme", repo: "widgets"}, 13)
+	if err == nil {
+		t.Fatalf("expected an item-cap error from the inner fan-out, got nil (returned %d anchors)", len(got))
+	}
+	if got != nil {
+		t.Errorf("on backstop-exceed the driver must return a nil map, not a partial one (got %d)", len(got))
+	}
+	if !strings.Contains(err.Error(), "backstop") {
+		t.Errorf("error must name the backstop, got %q", err.Error())
+	}
+}
+
 // TestGitHubReplyMergeRequestComment pins the reply keyed on the REST databaseId
 // (the reply anchor): CreateCommentInReplyTo POSTs with in_reply_to set.
 func TestGitHubReplyMergeRequestComment(t *testing.T) {

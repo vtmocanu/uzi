@@ -983,20 +983,27 @@ func (g *github) reviewThreadIDsByDatabaseID(ctx context.Context, slug repoSlug,
 					m[cn.DatabaseID] = node.ID
 				}
 			}
+			// Enforce the item cap PER THREAD, not once per outer page: without this
+			// a single reviewThreads page of up to 100 threads could each fan out to
+			// reviewThreadCommentDBIDs and accumulate before the bound fired,
+			// amplifying the maxForgeItems ceiling by the page size.
+			if len(m) > maxForgeItems {
+				return nil, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
+			}
 			if node.Comments.PageInfo.HasNextPage {
-				rest, err := g.reviewThreadCommentDBIDs(ctx, node.ID, node.Comments.PageInfo.EndCursor)
+				// Bound the inner fan-out by the GLOBAL remaining budget so one
+				// thread's overflow cannot exceed maxForgeItems either.
+				rest, err := g.reviewThreadCommentDBIDs(ctx, node.ID, node.Comments.PageInfo.EndCursor, maxForgeItems-len(m))
 				if err != nil {
 					return nil, err
 				}
 				for _, dbID := range rest {
-					if dbID != 0 {
-						m[dbID] = node.ID
-					}
+					m[dbID] = node.ID
+				}
+				if len(m) > maxForgeItems {
+					return nil, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
 				}
 			}
-		}
-		if len(m) > maxForgeItems {
-			return nil, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
 		}
 		if !resp.Repository.PullRequest.ReviewThreads.PageInfo.HasNextPage || resp.Repository.PullRequest.ReviewThreads.PageInfo.EndCursor == "" {
 			break
@@ -1015,8 +1022,10 @@ func (g *github) reviewThreadIDsByDatabaseID(ctx context.Context, slug repoSlug,
 // cannot advance a nested connection cursor from the outer query, so it re-fetches
 // the thread node by id and walks its comments connection from afterCursor (the
 // outer page's comments.endCursor). It reuses graphqlDo and is backstopped by
-// maxForgePages exactly as the outer loop.
-func (g *github) reviewThreadCommentDBIDs(ctx context.Context, threadID, afterCursor string) ([]int64, error) {
+// maxForgePages exactly as the outer loop; budget is the caller's remaining global
+// item allowance, so one thread's comment fan-out cannot push the total past
+// maxForgeItems.
+func (g *github) reviewThreadCommentDBIDs(ctx context.Context, threadID, afterCursor string, budget int) ([]int64, error) {
 	const query = `query($threadId: ID!, $commentCursor: String) {
   node(id: $threadId) {
     ... on PullRequestReviewThread {
@@ -1050,9 +1059,11 @@ func (g *github) reviewThreadCommentDBIDs(ctx context.Context, threadID, afterCu
 			return nil, err
 		}
 		for _, cn := range resp.Node.Comments.Nodes {
-			out = append(out, cn.DatabaseID)
+			if cn.DatabaseID != 0 {
+				out = append(out, cn.DatabaseID)
+			}
 		}
-		if len(out) > maxForgeItems {
+		if len(out) > budget {
 			return nil, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
 		}
 		if !resp.Node.Comments.PageInfo.HasNextPage || resp.Node.Comments.PageInfo.EndCursor == "" {
