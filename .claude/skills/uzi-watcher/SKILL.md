@@ -271,7 +271,7 @@ by anything on the PR itself.
    reviewer**, and any **third-party review bot** — not just CodeRabbit, so gate the check
    on *any* finding, or a human/other-bot finding slips into the local-fix path while a
    rework is being queued and recreates the double-push collision:
-   ```
+   ```sh
    uzi run list --json | jq -r --arg repo REPO_ID --argjson pr PR \
      '.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr)|{id,status}'
    ```
@@ -285,17 +285,26 @@ by anything on the PR itself.
    The trigger needs a green pipeline + settled review, so the run may not have spawned yet
    even though it will; if the findings are uzi-fixable (below) and the owner is opted in,
    give it a beat and re-check rather than racing in.
-3. **Let it finish, then REVIEW its fix commit like any other diff** (`git show <sha>`).
-   uzi *acting* is not uzi being *right*: confirm the rework actually addressed the
-   finding, added no regression, and did not "fix" a deliberate behavior. A bad rework is a
-   `revise`/`follow-up` to that run or a local correction — never an automatic merge.
-   **A completed rework may push NO commit at all** — it can judge every finding invalid or
-   already handled and only reply/resolve threads, leaving the branch head unchanged. Then
-   there is nothing to `git show`: confirm the head SHA did not move (`git rev-parse
-   origin/<branch>` unchanged) and proceed on the re-review rather than hunting for a commit
-   that was never made.
-4. **Its push retriggers CodeRabbit.** Wait for the re-review on the **new head** (signal
-   (c), the walkthrough `recent_review` range covering the new SHA — see *Triaging* below),
+3. **Let it finish, then decide from whether the head ACTUALLY moved — and read the ref
+   authoritatively.** Record the branch head *before* the rework (`before=$(git rev-parse
+   origin/<branch>)`), and after the run reaches terminal **`git fetch origin <branch>`
+   FIRST** — a rework-worker push does not update your local remote-tracking ref, so a bare
+   `git rev-parse origin/<branch>` reads the stale pre-rework SHA and would call a real push
+   "no commit". Then compare:
+   - **Head advanced** → REVIEW the new commit like any other diff (`git show <sha>`). uzi
+     *acting* is not uzi being *right*: confirm it addressed the finding, added no
+     regression, and did not "fix" a deliberate behavior. A bad rework is a
+     `revise`/`follow-up` to that run or a local correction — never an automatic merge. Then
+     go to step 4 (its push retriggered CodeRabbit).
+   - **Head unchanged** → the rework pushed **no commit** (it judged every finding invalid
+     or already handled and only replied/resolved threads). There is no new head, so **no
+     re-review was triggered — do NOT wait for one** (step 4 does not apply). Instead read
+     the run's own outcome (its in-thread replies / `uzi run logs`) and confirm every
+     finding was *explicitly* skipped or resolved-without-code; if so, proceed to merge on
+     the existing green state, otherwise return it to triage or local handling.
+4. **When it pushed a commit, that push retriggers CodeRabbit.** Wait for the re-review on
+   the **new head** (signal (c), the walkthrough `recent_review` range covering the new SHA
+   — see *Triaging* below),
    confirm no active `mr_rework` remains and CI is green on that head, THEN merge.
 
 **When this session still fixes locally (mr_rework will not or cannot):**
