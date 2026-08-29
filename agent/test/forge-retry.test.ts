@@ -70,6 +70,30 @@ describe("classifyForgeError", () => {
     { name: "ForgeError(429)", err: new ForgeError(429, "rate limited"), want: "transient" },
     { name: "ForgeError(422)", err: new ForgeError(422, "validation failed"), want: "permanent" },
     { name: "ForgeError(403)", err: new ForgeError(403, "forbidden"), want: "permanent" },
+    // (vii) issue #775: the EXACT bare-clone connect-timeout from the real run ⇒ retry.
+    // Matches /failed to connect/i ("Failed to connect to ... after N ms") and the
+    // /could not connect to server/i trailer.
+    {
+      name: "bare-clone connect-timeout (issue #775)",
+      err: new Error(
+        "git clone --bare https://github.com/vtmocanu/uzi.git /data/repos/github.com+vtmocanu+uzi.git failed:\nCloning into bare repository '/data/repos/github.com+vtmocanu+uzi.git'...\nfatal: unable to access 'https://github.com/vtmocanu/uzi.git/': Failed to connect to github.com:443 after 129360 ms: Could not connect to server",
+      ),
+      want: "transient",
+    },
+    // (viii) negative control: an auth failure over the SAME URL ⇒ permanent (precedence).
+    {
+      name: "auth failure over the run URL",
+      err: new Error("fatal: Authentication failed for 'https://github.com/vtmocanu/uzi.git/'"),
+      want: "permanent",
+    },
+    // (ix) negative control: a 404 over the SAME URL ⇒ permanent (precedence).
+    {
+      name: "404 over the run URL",
+      err: new Error(
+        "fatal: unable to access 'https://github.com/vtmocanu/uzi.git/': The requested URL returned error: 404",
+      ),
+      want: "permanent",
+    },
   ];
 
   const exercised = new Set<string>();
