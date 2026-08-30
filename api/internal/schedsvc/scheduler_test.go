@@ -179,6 +179,9 @@ type runCall struct {
 	// overrideSubagentModel is the schedule's "apply model also to agents" opt-in (PRD
 	// #305), captured for a later assertion. false for the interactive CreateRun.
 	overrideSubagentModel bool
+	// force is the CreateRun bypass flag (issue #856); automated scheduler seams must NEVER
+	// force, so this is asserted false.
+	force bool
 }
 
 type promptCall struct {
@@ -221,13 +224,14 @@ func (f *fakeRuns) effErr(issueIID int64) error {
 	return f.err
 }
 
-func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, _ bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, _ *workersvc.SeededPlan) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
 	// nil model: the interactive CreateRun seam carries no per-schedule model (PRD #300).
 	// false overrideSubagentModel: no per-run opt-in on the interactive seam (PRD #305).
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, false, nil, false})
+	// force is captured so a test can prove the scheduler never sets it (issue #856).
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, false, nil, false, force})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan) (store.Run, error) {
@@ -238,7 +242,8 @@ func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUI
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel})
+	// false force: the scheduled seam never forces a run creation (issue #856).
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel, false})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
@@ -599,6 +604,11 @@ func TestTickNonAutoIssueScheduleUsesTheScheduledSeam(t *testing.T) {
 	}
 	if !h.runs.runs[0].scheduled {
 		t.Fatalf("non-auto issue must fire through CreateScheduledRun (waiver-free), not CreateRun (interactive, waiver-carrying)")
+	}
+	for i, rc := range h.runs.runs {
+		if rc.force {
+			t.Fatalf("scheduler must never force a run creation (issue #856): runs[%d].force = true", i)
+		}
 	}
 }
 

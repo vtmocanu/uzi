@@ -17,7 +17,7 @@ import (
 // (issue #856) against a REAL Postgres. createRun must refuse a fresh issue run when the
 // SAME issue already has a COMPLETED (terminal) run owning an OPEN merge request — the
 // active-run gate cannot see a terminal run, so this guard is the only thing that stops a
-// fresh run re-planning and re-reviewing onto an already-open MR. Four arms, each on its
+// fresh run re-planning and re-reviewing onto an already-open MR. Five arms, each on its
 // own repo+issue so they cannot cross-contaminate:
 //
 //  1. blocked   — a completed issue run with mr_iid + mr_state='opened' ⇒ a second
@@ -26,6 +26,10 @@ import (
 //  3. forced    — an open MR present but force=true ⇒ allowed (the guard is bypassed).
 //  4. kind scope — a completed SELF_IMPROVE run (kind != 'issue') owning an open MR for the
 //     same issue ⇒ allowed, because the guard is scoped to kind='issue'.
+//  5. watcher lag — a completed issue run with mr_iid set but mr_state STILL NULL (the
+//     watcher has not ticked yet) ⇒ a second CreateRun is still REFUSED with ErrOpenMRExists
+//     naming the MR. This proves the guard keys on the authoritative mr_iid and no longer
+//     depends on the watcher having recorded 'opened'; a NULL mr_state blocks conservatively.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (per the store
 // live-DB harness; migrations run in-test).
@@ -144,6 +148,30 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		}
 		if run.Kind != RunKindIssue {
 			t.Fatalf("run.Kind = %q, want %q", run.Kind, RunKindIssue)
+		}
+	})
+
+	t.Run("blocks during the watcher-lag window: mr_iid set but mr_state still NULL", func(t *testing.T) {
+		userID, repoID := seedRepoAndIssue(t, "lag")
+		const mrIID int64 = 4250
+		// A completed issue run whose mr_iid was written atomically at completion but whose
+		// mr_state is STILL NULL — the watcher has not yet ticked. This is the window a
+		// mr_state='opened'-only predicate missed; keying on mr_iid (releasing only on a
+		// terminal mr_state) must block here.
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, mr_iid, status)
+			 VALUES ($1, $2, $3, 'issue', $4, 'prior', 'd', $5, 'completed')`,
+			uuid.New(), userID, repoID, issueIID, mrIID); err != nil {
+			t.Fatalf("insert prior issue run with NULL mr_state: %v", err)
+		}
+
+		_, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil)
+		if !errors.Is(err, ErrOpenMRExists) {
+			t.Fatalf("CreateRun err = %v, want ErrOpenMRExists (NULL mr_state must block)", err)
+		}
+		// The refusal must still name the MR even before the watcher recorded a state.
+		if want := fmt.Sprintf("!%d", mrIID); !strings.Contains(err.Error(), want) {
+			t.Fatalf("CreateRun err %q does not mention the MR number %q", err.Error(), want)
 		}
 	})
 }

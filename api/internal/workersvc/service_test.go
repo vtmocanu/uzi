@@ -3589,6 +3589,62 @@ func TestCreateRunSnapshotsTitleAndRunsWithoutPRDLink(t *testing.T) {
 	}
 }
 
+// TestCreateRunOpenMRGuard exercises the create-time open-MR refusal (issue #856) at the
+// unit level against the fakeStore, complementing the live-DB acceptance test. The
+// fakeStore's GetOpenMRRunForIssue returns a staged open-MR iid, so createRun reaches the
+// guard: force=false must refuse with ErrOpenMRExists (naming the MR), force=true must
+// bypass it.
+func TestCreateRunOpenMRGuard(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	const mrIID int64 = 4260
+
+	// Blocked: an open MR is staged and the caller did not force → ErrOpenMRExists, with the
+	// MR number carried structurally on *OpenMRExistsError.
+	t.Run("blocks when an open MR exists and force is false", func(t *testing.T) {
+		fs := &fakeStore{
+			issueByID:         store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: false},
+			openMRRunForIssue: pgtype.Int8{Int64: mrIID, Valid: true},
+			createRunResult:   store.Run{ID: uuid.New()},
+		}
+		svc := New(fs, newBox(t), testParams())
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false /*force*/, nil)
+		if !errors.Is(err, ErrOpenMRExists) {
+			t.Fatalf("CreateRun err = %v, want ErrOpenMRExists", err)
+		}
+		var omr *OpenMRExistsError
+		if !errors.As(err, &omr) {
+			t.Fatalf("CreateRun err = %v, want *OpenMRExistsError", err)
+		}
+		if omr.MRIID != mrIID {
+			t.Fatalf("OpenMRExistsError.MRIID = %d, want %d", omr.MRIID, mrIID)
+		}
+		if fs.createRunParams != nil {
+			t.Fatal("a blocked run must be refused before CreateRun")
+		}
+	})
+
+	// Forced: the same open MR is staged but force=true bypasses the guard, so the run is
+	// created and no ErrOpenMRExists surfaces.
+	t.Run("force bypasses the open-MR guard", func(t *testing.T) {
+		fs := &fakeStore{
+			issueByID:         store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: false},
+			openMRRunForIssue: pgtype.Int8{Int64: mrIID, Valid: true},
+			createRunResult:   store.Run{ID: uuid.New()},
+		}
+		svc := New(fs, newBox(t), testParams())
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, true /*force*/, nil)
+		if errors.Is(err, ErrOpenMRExists) {
+			t.Fatalf("CreateRun with force=true err = %v, must NOT be ErrOpenMRExists (guard bypassed)", err)
+		}
+		if err != nil {
+			t.Fatalf("CreateRun with force=true err = %v, want success", err)
+		}
+		if fs.createRunParams == nil {
+			t.Fatal("a forced run must proceed to CreateRun")
+		}
+	})
+}
+
 func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 

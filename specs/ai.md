@@ -827,7 +827,9 @@ Serves human: Feature #4 job queue + worker registry + lossless live stream.
   - **Open-MR run-dedup guard** (issue #856) qualifies that re-run allowance: a
     create-time pre-check in the shared `createRun` refuses a fresh `kind='issue'`
     run when a prior **completed** run for the same `(repo_id, issue_iid)` still
-    owns an **open MR** (watcher-owned `runs.mr_state='opened'`, queried via
+    owns an **open MR** (keyed on the authoritative `runs.mr_iid`, written
+    atomically at completion by `SetRunCompleted`, releasing only once
+    `runs.mr_state` reaches a terminal `'merged'`/`'closed'`; queried via
     `GetOpenMRRunForIssue`), returning a distinct `ErrOpenMRExists` sentinel. It is
     deliberately a create-time guard, **not** a partial unique index: an index would
     be violated by the watcher's own `SetRunMRState` UPDATE once a forced second
@@ -837,10 +839,13 @@ Serves human: Feature #4 job queue + worker registry + lossless live stream.
     `open_mr_exists` skip (advances, no tick-storm), the autopilot poller
     records-and-swallows. An explicit `--force` (CLI `uzi run create --force`; the
     web board/issue Start flow offers a confirm that retries with force) bypasses
-    **only** this open-MR guard, never the active-run gate. Keyed on the
-    watcher-owned `mr_state`, so there is a brief false-negative window between
-    MR-open-at-finalize and the first watch tick (mirrors the mr_rework candidate
-    query; acceptable).
+    **only** this open-MR guard, never the active-run gate. Now independent of
+    watcher lag: keyed on the authoritative `mr_iid` (create-time authoritative,
+    written atomically with `status='completed'`) and released only on a terminal
+    `mr_state`, so a completed run whose MR the watcher has not yet observed
+    conservatively **blocks** — closing the false-negative window a prior
+    `mr_state='opened'`-only version had. This deliberately diverges from the
+    mr_rework candidate query, which still lives with that window.
 - **`run_messages`** — `bigserial id, run_id→runs ON DELETE CASCADE, seq int,
   kind, agent, payload jsonb, created_at, agent_instance text, agent_label text`,
   **UNIQUE(run_id, seq)**. The last two are PRD #99's per-instance attribution

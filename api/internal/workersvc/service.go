@@ -4988,10 +4988,12 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// active-run gate above cannot see it — yet a fresh start would re-plan and re-run the
 	// whole review wave onto that already-open MR (silent wasted spend). Refuse unless the
 	// caller forced it. Scoped to the issue kind by construction (createRun is the issue
-	// path). --force bypasses ONLY this guard, never the active-run gate above. The
-	// predicate is the watcher-owned mr_state='opened' (mirrors ListMRReworkCandidates); it
-	// leaves a brief false-negative window between MR-open-at-finalize and the first watch
-	// tick, the same limitation the mr_rework candidate query lives with.
+	// path). --force bypasses ONLY this guard, never the active-run gate above. The guard
+	// keys on the authoritative mr_iid (set atomically at completion by SetRunCompleted, so
+	// it is present the instant the run is completed) and releases only once the watcher has
+	// recorded a TERMINAL MR state ('merged'/'closed'); a NULL mr_state (watcher not yet
+	// ticked) still blocks. That closes the watcher-lag false-negative window a mr_state-only
+	// predicate had between MR-open-at-finalize and the first watch tick.
 	if !force {
 		mrIID, err := s.q.GetOpenMRRunForIssue(ctx, store.GetOpenMRRunForIssueParams{
 			RepoID:   repoID,
