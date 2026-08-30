@@ -2,7 +2,7 @@
 
 **Issue**: [#502](https://github.com/vtmocanu/uzi/issues/502)
 **Priority**: Low
-**Status**: Draft — ready for implementation
+**Status**: Complete. Both schema/description strings naming `plan_md` are live in `agent/src/signals.ts`; archived to `prds/done/`.
 
 > **Path convention**: every path is relative to the repo root. The change is confined to **one worker file plus its test** in the **agent** module (`agent/src/signals.ts`, `agent/test/signals.test.ts`). No api, no migration, no SQL, no web change. Load `.claude/rules/agent.md` before starting.
 >

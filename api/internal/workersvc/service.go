@@ -469,6 +469,11 @@ type Store interface {
 	ListPoolWaitRuns(ctx context.Context) ([]store.ListPoolWaitRunsRow, error)
 	PromotePoolWaitRun(ctx context.Context, arg store.PromotePoolWaitRunParams) (int64, error)
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
+	// GetActiveMRReworkRunForMR resolves the single non-terminal mr_rework run for a
+	// (repo, MR) — the mid-flight abort (issue #853) uses it to cancel a live rework
+	// when its MR leaves the opened state. :one is safe because the WHERE matches the
+	// uq_runs_one_active_mr_rework partial unique index (migration 00167).
+	GetActiveMRReworkRunForMR(ctx context.Context, arg store.GetActiveMRReworkRunForMRParams) (store.Run, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
 	// CancelRunByWorker is the LIVE-worker cancel transition (PRD #503 M1). SetState's
 	// failed arm routes here (instead of SetRunFailed) when the loaded run carries

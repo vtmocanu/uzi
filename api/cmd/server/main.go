@@ -495,6 +495,10 @@ func run() error {
 	// the owner. Nil-safe; wired here so the sync's reset-on-green path can reach it.
 	svc.SetNotifier(notifier)
 
+	// Wire the mid-flight mr_rework abort (#853): when the MR-close watcher observes a
+	// merge/close, cancel any in-flight rework for that MR through workersvc's cancel path.
+	svc.SetReworkCanceller(wsvc)
+
 	failNotifier := notifysvc.NewRunFailureNotifier(q, notifier, slog.Default())
 	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier, failNotifier})
 

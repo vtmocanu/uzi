@@ -1719,6 +1719,18 @@ UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancell
 WHERE id = @id AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: GetActiveMRReworkRunForMR :one
+-- Resolve the single non-terminal mr_rework run for a (repo, MR). Used by the
+-- mid-flight abort (issue #853): when the MR-close watcher sees the MR leave the
+-- opened state, the active rework is cancelled so a live worker stops spending.
+-- The WHERE is byte-identical to the partial unique index uq_runs_one_active_mr_rework
+-- (migration 00167) — that index is the ONLY reason this can be :one; widening it, or
+-- narrowing the status set here, would silently break the single-row guarantee.
+SELECT * FROM runs
+WHERE repo_id = @repo_id::uuid AND mr_iid = @mr_iid
+  AND kind = 'mr_rework'
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: CancelRunByWorker :execrows
 -- Live-worker cancel transition (PRD #503 M1). When a LIVE worker consumes a cancel
 -- verdict it reports `failed`; SetState's failed arm routes HERE off the run's already
