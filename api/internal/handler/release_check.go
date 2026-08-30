@@ -5,9 +5,14 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/releasecheck"
+	"github.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
@@ -73,6 +78,55 @@ func (h *Handler) PostReleaseCheck(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"release_check": dto})
 }
 
+// PostReleaseCheckSnooze snoozes the admin escalation banner (PRD #836 M6) for the
+// current upstream release. It reads the persisted latest_tag and, when non-empty,
+// upserts KeyReleaseBannerSnoozeTag = latest_tag through the existing generic
+// UpsertAppSetting (NO new SQL query), invalidates the settings cache, and returns the
+// refreshed DTO — banner_snoozed is then true. Keying the snooze to the release TAG is
+// what makes it auto-expire: a newer upstream release changes latest_tag, so the stored
+// snooze no longer matches and the banner returns with no admin action. When no
+// latest_tag has been fetched yet there is nothing to snooze, so it is a no-op that
+// returns the current DTO (banner_snoozed false). Cookie-only admin write; nil-safe.
+func (h *Handler) PostReleaseCheckSnooze(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	st, err := h.settings.ReleaseStatus(ctx)
+	if err != nil {
+		slog.Error("release-check: read status for snooze", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if st.LatestTag != "" {
+		if h.q == nil {
+			httpx.Error(w, http.StatusInternalServerError, "release check not configured")
+			return
+		}
+		// Attribute the snooze to the acting admin when present; UpdatedBy is nullable, so
+		// a missing actor stores NULL rather than failing.
+		var updatedBy pgtype.UUID
+		if actor, ok := mw.UserFromContext(ctx); ok {
+			updatedBy = pgUUID(actor.ID)
+		}
+		if _, err := h.q.UpsertAppSetting(ctx, store.UpsertAppSettingParams{
+			Key:       settings.KeyReleaseBannerSnoozeTag,
+			Value:     st.LatestTag,
+			UpdatedBy: updatedBy,
+		}); err != nil {
+			slog.Error("release-check: persist banner snooze", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		// Drop the read cache so the refreshed DTO below reflects the new snooze tag.
+		h.settings.Invalidate()
+	}
+	dto, derr := h.releaseCheckDTO(ctx)
+	if derr != nil {
+		slog.Error("release-check: build dto after snooze", "error", derr)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"release_check": dto})
+}
+
 // releaseCheckDTO assembles the admin release-check view from h.settings: the two
 // toggles + interval, the running version, the persisted remote facts (Body included —
 // admin-only), and the read-time derivations. Status distinguishes disabled / never
@@ -109,6 +163,9 @@ func (h *Handler) releaseCheckDTO(ctx context.Context) (apitypes.ReleaseCheckSta
 		UpdateAvailable: releasecheck.UpdateAvailable(h.version, st.LatestTag),
 		FarBehind:       releasecheck.FarBehind(h.version, st.LatestTag, st.PublishedAt, h.clock()),
 		Security:        releasecheck.Security(st.Body),
+		// Snoozed iff a snooze tag is set AND still matches the current latest_tag; a
+		// newer release changes latest_tag, so the snooze auto-expires (PRD #836 M6).
+		BannerSnoozed: st.BannerSnoozeTag != "" && st.BannerSnoozeTag == st.LatestTag,
 	}
 	switch {
 	case !enabled:

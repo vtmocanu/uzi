@@ -163,6 +163,7 @@ const releaseCheck = (
   update_available: true,
   far_behind: false,
   security: false,
+  banner_snoozed: false,
   status: "ok",
   ...over,
 });

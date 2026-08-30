@@ -67,7 +67,9 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 172 as of this commit (PRD #836 M3 added GET /api/admin/release-check and POST
+// 173 as of this commit (PRD #836 M6 added POST /api/admin/release-check/snooze — the
+// admin escalation-banner server-side snooze, keyed to the current release tag).
+// It was 172 until then (PRD #836 M3 added GET /api/admin/release-check and POST
 // /api/admin/release-check — the admin Updates-card read plus the "Check now" trigger).
 // It was 170 until then (issue #559 added GET /api/worker/runs/{id}/ownership —
 // the interactive park-skip ownership/terminality probe).
@@ -369,6 +371,10 @@ var wantRouteMounts = []routeMount{
 	// PRD #836 M3: "Check now" — cookie-only admin, a single bounded GitHub round trip,
 	// no per-user forge/model spend → noLimiter, like the agent-source update-check above.
 	{"POST", "/api/admin/release-check", noLimiter},
+	// PRD #836 M6: snooze the escalation banner — cookie-only admin, a single local
+	// app_settings upsert (no egress, no forge/model spend) → noLimiter, like the
+	// release-check "Check now" above.
+	{"POST", "/api/admin/release-check/snooze", noLimiter},
 	{"POST", "/api/agent-templates/", noLimiter},
 	{"POST", "/api/agent-templates/{id}/reset", noLimiter},
 	{"POST", "/api/auth/cli/approve", limAuth},

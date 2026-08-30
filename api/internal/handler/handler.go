@@ -1189,6 +1189,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// return the refreshed status. Cookie-only admin, off the read-only GET and
 				// the uza_ CLI token — the ONE new outbound-egress trigger this PRD adds.
 				r.Post("/release-check", h.PostReleaseCheck)
+				// PRD #836 M6: snooze the admin escalation banner for the current release.
+				// Cookie-only admin, no egress — upserts the snooze tag = latest_tag so a
+				// newer release auto-clears it. Off the read-only GET and the uza_ CLI token.
+				r.Post("/release-check/snooze", h.PostReleaseCheckSnooze)
 			})
 		})
 

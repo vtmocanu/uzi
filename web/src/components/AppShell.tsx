@@ -13,6 +13,7 @@ import { prefs } from "../lib/prefs";
 import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
+import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
@@ -1285,6 +1286,10 @@ export function AppShell({ children }: { children: ReactNode }) {
           {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
               any page. Self-gates — renders nothing while unlocked. */}
           <VaultLockedBanner />
+          {/* Update escalation banner (PRD #836 M6): app-wide, admin-only, self-gating —
+              renders nothing unless the server says the instance is far behind and the
+              banner is enabled and not snoozed for the current release. */}
+          <UpdateEscalationBanner />
           {/* Both halves of the one canonical to-triage number (PRD #98). The setter is
               how the Judge page keeps it fresh after a dispose; the value is how the judge
               notification in the inbox reads the SAME number the nav badge above is

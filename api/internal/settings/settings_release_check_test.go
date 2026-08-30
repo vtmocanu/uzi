@@ -201,10 +201,11 @@ func TestReleaseCheckAccessors(t *testing.T) {
 		t.Errorf("sub-minute interval = %v, want floored to 1m", got)
 	}
 
-	// ReleaseStatus reads persisted facts; absent → "".
+	// ReleaseStatus reads persisted facts (incl. the M6 banner-snooze tag); absent → "".
 	cFacts := New(&fakeStore{rows: []store.AppSetting{
 		row(KeyReleaseLatestTag, "v0.15.0"),
 		row(KeyReleaseNotesURL, "https://example.test/r"),
+		row(KeyReleaseBannerSnoozeTag, "v0.15.0"),
 	}}, time.Minute)
 	st, err := cFacts.ReleaseStatus(context.Background())
 	if err != nil {
@@ -213,7 +214,18 @@ func TestReleaseCheckAccessors(t *testing.T) {
 	if st.LatestTag != "v0.15.0" || st.NotesURL != "https://example.test/r" {
 		t.Errorf("ReleaseStatus = %+v, want tag/notes populated", st)
 	}
+	if st.BannerSnoozeTag != "v0.15.0" {
+		t.Errorf("ReleaseStatus.BannerSnoozeTag = %q, want v0.15.0", st.BannerSnoozeTag)
+	}
 	if st.LatestName != "" || st.Body != "" || st.PublishedAt != "" || st.CheckedAt != "" {
 		t.Errorf("ReleaseStatus absent keys should be empty, got %+v", st)
+	}
+
+	// Absent snooze tag reads as "" (never snoozed).
+	cNoSnooze := New(&fakeStore{rows: []store.AppSetting{row(KeyReleaseLatestTag, "v0.15.0")}}, time.Minute)
+	if st2, err := cNoSnooze.ReleaseStatus(context.Background()); err != nil {
+		t.Fatalf("ReleaseStatus: %v", err)
+	} else if st2.BannerSnoozeTag != "" {
+		t.Errorf("absent snooze tag = %q, want empty", st2.BannerSnoozeTag)
 	}
 }

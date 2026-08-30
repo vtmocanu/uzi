@@ -876,6 +876,13 @@ const releaseCheckFacts = {
   checked_at: daysAgo(0),
 };
 
+// Mock server-side banner snooze tag (PRD #836 M6): the release tag the escalation
+// banner was snoozed for, or null when never snoozed. `banner_snoozed` is DERIVED true
+// iff this equals the current latest_tag, so snoozeReleaseBanner setting it to the
+// latest_tag makes subsequent getReleaseCheck reads return banner_snoozed:true — and it
+// would auto-clear if the fixture's latest_tag advanced, mirroring the server.
+let releaseBannerSnoozeTag: string | null = null;
+
 // releaseCheckStatus builds the admin DTO from the persisted facts + the live
 // toggles. Master toggle off → status "disabled" and no derivation, mirroring the
 // server. With facts present and the toggle on it reports "ok"; the derivations are
@@ -893,6 +900,7 @@ function releaseCheckStatus(): ReleaseCheckStatus {
       update_available: false,
       far_behind: false,
       security: false,
+      banner_snoozed: false,
       status: "disabled",
     };
   }
@@ -909,8 +917,14 @@ function releaseCheckStatus(): ReleaseCheckStatus {
     published_at: releaseCheckFacts.published_at,
     checked_at: releaseCheckFacts.checked_at,
     update_available: true,
-    far_behind: false,
+    // Demo choice (PRD #836 M6): far_behind is forced true so mock mode exercises the
+    // escalation banner (surface 4). The real server derives this from the version gap +
+    // age heuristic (D4) — a 0.4.2 → v0.5.0 delta would NOT trip it — but the mock has no
+    // upstream to poll, so it hard-sets the state the banner needs to be demonstrable.
+    far_behind: true,
     security,
+    banner_snoozed:
+      releaseBannerSnoozeTag !== null && releaseBannerSnoozeTag === releaseCheckFacts.latest_tag,
     status: "ok",
   };
 }
@@ -2063,6 +2077,14 @@ export const mockApi = {
   checkReleaseNow: async () => {
     requireSession();
     releaseCheckFacts.checked_at = new Date().toISOString();
+    return delay({ release_check: releaseCheckStatus() });
+  },
+  // Snooze the escalation banner (RequireAdmin, PRD #836 M6): set the snooze tag to the
+  // current latest_tag so subsequent getReleaseCheck reads report banner_snoozed:true,
+  // then return the refreshed status — mirroring the server's tag-keyed upsert.
+  snoozeReleaseBanner: async () => {
+    requireSession();
+    releaseBannerSnoozeTag = releaseCheckFacts.latest_tag;
     return delay({ release_check: releaseCheckStatus() });
   },
 

@@ -38,6 +38,15 @@ type ReleaseCheckStatusDTO struct {
 	FarBehind       bool `json:"far_behind"`
 	Security        bool `json:"security"`
 
+	// BannerSnoozed reports whether the admin has snoozed the escalation banner for the
+	// CURRENT release (PRD #836 M6): true iff a snooze tag is set AND equals LatestTag.
+	// Because a newer upstream release changes LatestTag, the snooze auto-expires when a
+	// newer release arrives (the snooze tag no longer matches), with no admin action.
+	// Admin-only DTO, so a plain bool: the banner (surface 4) reads it to stay hidden
+	// after a dismiss. It does NOT live on the public BuildInfoDTO — the banner is
+	// admin-only.
+	BannerSnoozed bool `json:"banner_snoozed"`
+
 	// Status is "disabled" (master toggle off), "never" (enabled but no check has run),
 	// "ok" (facts present), or "error" (the last "Check now" failed). Message carries a
 	// token-scrubbed reason on an error status, empty otherwise.

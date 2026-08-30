@@ -219,6 +219,13 @@ const (
 	KeyReleaseNotesURL    = "release_notes_url"    // html_url of the latest release
 	KeyReleasePublishedAt = "release_published_at" // RFC3339 publish timestamp of the latest release
 	KeyReleaseCheckedAt   = "release_checked_at"   // RFC3339 timestamp of the last check
+	// KeyReleaseBannerSnoozeTag records the release tag an admin snoozed the escalation
+	// banner for (PRD #836 M6). Engine/admin-written via the snooze endpoint's
+	// UpsertAppSetting — kept OUT of Defaults (like the six remote-fact keys) and never
+	// secret. "banner_snoozed" is DERIVED at read time: true iff this equals the current
+	// latest_tag, so a newer upstream release changes latest_tag and the snooze
+	// auto-expires with no admin action.
+	KeyReleaseBannerSnoozeTag = "release_banner_snooze_tag"
 	// Instance branding keys (PRD #685 M1). All NON-SECRET public config → they live
 	// in Defaults (never SecretKeys), round-trip through PUT /admin/settings, and are
 	// served — allowlisted, never via All/AdminView — through the public GET
@@ -1120,6 +1127,10 @@ type ReleaseStatus struct {
 	NotesURL    string
 	PublishedAt string
 	CheckedAt   string
+	// BannerSnoozeTag is the release tag the escalation banner was snoozed for (PRD
+	// #836 M6), or "" when never snoozed. "banner_snoozed" is derived: it is true iff
+	// this equals LatestTag, so a newer release auto-clears the snooze.
+	BannerSnoozeTag string
 }
 
 // ReleaseStatus reads the six engine-managed release-fact keys in one snapshot pass
@@ -1131,12 +1142,13 @@ func (c *Cache) ReleaseStatus(ctx context.Context) (ReleaseStatus, error) {
 		return ReleaseStatus{}, err
 	}
 	return ReleaseStatus{
-		LatestTag:   c.effective(KeyReleaseLatestTag, m),
-		LatestName:  c.effective(KeyReleaseLatestName, m),
-		Body:        c.effective(KeyReleaseLatestBody, m),
-		NotesURL:    c.effective(KeyReleaseNotesURL, m),
-		PublishedAt: c.effective(KeyReleasePublishedAt, m),
-		CheckedAt:   c.effective(KeyReleaseCheckedAt, m),
+		LatestTag:       c.effective(KeyReleaseLatestTag, m),
+		LatestName:      c.effective(KeyReleaseLatestName, m),
+		Body:            c.effective(KeyReleaseLatestBody, m),
+		NotesURL:        c.effective(KeyReleaseNotesURL, m),
+		PublishedAt:     c.effective(KeyReleasePublishedAt, m),
+		CheckedAt:       c.effective(KeyReleaseCheckedAt, m),
+		BannerSnoozeTag: c.effective(KeyReleaseBannerSnoozeTag, m),
 	}, nil
 }
 

@@ -175,6 +175,50 @@ func TestPostReleaseCheckErrorScrubbed(t *testing.T) {
 	}
 }
 
+// TestReleaseCheckBannerSnoozedDerivation pins banner_snoozed as a pure read-time
+// derivation over the persisted snooze tag vs latest_tag (PRD #836 M6): false with no
+// snooze tag, true when the snooze tag equals the current latest_tag, and false again
+// once a NEWER latest_tag lands (the tag no longer matches → auto-expiry).
+func TestReleaseCheckBannerSnoozedDerivation(t *testing.T) {
+	base := []store.AppSetting{
+		{Key: settings.KeyReleaseCheckEnabled, Value: "true"},
+		{Key: settings.KeyReleaseLatestTag, Value: "v0.5.0"},
+		{Key: settings.KeyReleaseCheckedAt, Value: "2026-08-29T11:00:00Z"},
+	}
+	get := func(t *testing.T, h *Handler) apitypes.ReleaseCheckStatusDTO {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.GetReleaseCheck(rec, httptest.NewRequest(http.MethodGet, "/api/admin/release-check", nil))
+		return decodeReleaseCheck(t, rec)
+	}
+
+	t.Run("no snooze tag → false", func(t *testing.T) {
+		h := releaseCheckHandler("0.4.0", nil, base...)
+		if get(t, h).BannerSnoozed {
+			t.Error("banner_snoozed = true with no snooze tag, want false")
+		}
+	})
+	t.Run("snooze tag matches latest → true", func(t *testing.T) {
+		rows := append(append([]store.AppSetting{}, base...),
+			store.AppSetting{Key: settings.KeyReleaseBannerSnoozeTag, Value: "v0.5.0"})
+		if !get(t, releaseCheckHandler("0.4.0", nil, rows...)).BannerSnoozed {
+			t.Error("banner_snoozed = false when snooze tag == latest_tag, want true")
+		}
+	})
+	t.Run("stale snooze tag after a newer release → false", func(t *testing.T) {
+		// latest_tag advanced to v0.6.0 but the snooze is still pinned to v0.5.0.
+		rows := []store.AppSetting{
+			{Key: settings.KeyReleaseCheckEnabled, Value: "true"},
+			{Key: settings.KeyReleaseLatestTag, Value: "v0.6.0"},
+			{Key: settings.KeyReleaseCheckedAt, Value: "2026-08-29T11:00:00Z"},
+			{Key: settings.KeyReleaseBannerSnoozeTag, Value: "v0.5.0"},
+		}
+		if get(t, releaseCheckHandler("0.4.0", nil, rows...)).BannerSnoozed {
+			t.Error("banner_snoozed = true after a newer release, want false (auto-expiry)")
+		}
+	})
+}
+
 // TestReleaseCheckAdminGate: both endpoints are admin-gated by their route middleware —
 // a non-admin gets 403, an admin passes through. The routes mount GetReleaseCheck behind
 // RequireAdminRO and PostReleaseCheck behind RequireAdmin (see handler.Routes).
@@ -192,6 +236,10 @@ func TestReleaseCheckAdminGate(t *testing.T) {
 	}{
 		{"GET RequireAdminRO", mw.RequireAdminRO(http.HandlerFunc(h.GetReleaseCheck)), http.MethodGet},
 		{"POST RequireAdmin", mw.RequireAdmin(http.HandlerFunc(h.PostReleaseCheck)), http.MethodPost},
+		// PRD #836 M6: the snooze write is cookie-only RequireAdmin. With no latest_tag
+		// seeded the admin path is a no-op 200 (nothing to snooze, no store touch), which
+		// is exactly what proves the gate without needing a live DB.
+		{"POST snooze RequireAdmin", mw.RequireAdmin(http.HandlerFunc(h.PostReleaseCheckSnooze)), http.MethodPost},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name+" forbids a non-admin", func(t *testing.T) {

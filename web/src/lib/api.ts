@@ -1124,6 +1124,10 @@ export interface ReleaseCheckStatus {
   update_available: boolean;
   far_behind: boolean;
   security: boolean;
+  // banner_snoozed is true iff a snooze tag is set AND equals latest_tag (PRD #836 M6):
+  // the escalation banner (surface 4) stays hidden after a Dismiss. Because a newer
+  // release changes latest_tag, the snooze auto-expires when a newer release arrives.
+  banner_snoozed: boolean;
   // "disabled" (master toggle off) | "never" (enabled, no check yet) | "ok" (facts
   // present) | "error" (the last check failed). message carries a token-scrubbed
   // reason on error, empty otherwise.
@@ -3049,6 +3053,12 @@ const realApi = {
     request<{ release_check: ReleaseCheckStatus }>("GET", "/admin/release-check"),
   checkReleaseNow: () =>
     request<{ release_check: ReleaseCheckStatus }>("POST", "/admin/release-check"),
+  // Snooze the admin escalation banner (PRD #836 M6) for the current release: upserts
+  // the snooze tag = latest_tag server-side and returns the refreshed status (now with
+  // banner_snoozed:true). Keyed to the release tag, so a newer release auto-clears it.
+  // RequireAdmin (cookie-only), no egress. Called by UpdateEscalationBanner's Dismiss.
+  snoozeReleaseBanner: () =>
+    request<{ release_check: ReleaseCheckStatus }>("POST", "/admin/release-check/snooze"),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
