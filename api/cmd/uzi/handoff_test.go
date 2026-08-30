@@ -85,7 +85,9 @@ func TestHandoffHappyPath(t *testing.T) {
 		CreatedTaskRun: taskRun("r1", "uzi/task/r1"),
 		DispatchedRun:  taskRun("r1", "uzi/task/r1"),
 	}
-	rec := &handoffRecorder{}
+	// issue #403 F3: without --base the seed is local HEAD, so the CLI resolves HEAD's sha
+	// and records it as base_branch (the auto-review's diff base).
+	rec := &handoffRecorder{gitOut: map[string]string{"rev-parse HEAD": "c0ffee1234"}}
 	env, _ := handoffEnv(fc, rec)
 
 	out, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "do X")
@@ -100,8 +102,9 @@ func TestHandoffHappyPath(t *testing.T) {
 	if fc.LastCreateTaskContext != "do X" {
 		t.Errorf("create context = %q, want %q", fc.LastCreateTaskContext, "do X")
 	}
-	if fc.LastCreateTaskBaseBranch != "" {
-		t.Errorf("create base = %q, want empty", fc.LastCreateTaskBaseBranch)
+	// issue #403 F3: base_branch is HEAD's sha, so the review diffs only the worker's commits.
+	if fc.LastCreateTaskBaseBranch != "c0ffee1234" {
+		t.Errorf("create base = %q, want the seed commit sha c0ffee1234", fc.LastCreateTaskBaseBranch)
 	}
 	if fc.LastCreateTaskOpenMr {
 		t.Errorf("create open_mr = true, want false")
@@ -143,6 +146,34 @@ func TestHandoffBaseRef(t *testing.T) {
 	wantPush := []string{"push", "origin", "main:refs/heads/uzi/task/r2"}
 	if !hasGitCall(rec, wantPush) {
 		t.Errorf("push should use main as source; git calls %v", rec.gitCalls)
+	}
+}
+
+// issue #403 F3: if resolving HEAD's sha fails (rev-parse errors), a no---base handoff still
+// proceeds (create + push + dispatch) with base_branch empty — a graceful fallback to the
+// pre-F3 behavior rather than aborting the run.
+func TestHandoffSeedCommitFallbackOnRevParseError(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		CreatedTaskRun: taskRun("r2b", "uzi/task/r2b"),
+		DispatchedRun:  taskRun("r2b", "uzi/task/r2b"),
+	}
+	rec := &handoffRecorder{gitErr: map[string]error{"rev-parse HEAD": errPushRejected}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (rev-parse failure must fall back gracefully)", code)
+	}
+	if fc.LastCreateTaskBaseBranch != "" {
+		t.Errorf("create base = %q, want empty on rev-parse failure", fc.LastCreateTaskBaseBranch)
+	}
+	// The run still proceeds through push and dispatch.
+	wantPush := []string{"push", "origin", "HEAD:refs/heads/uzi/task/r2b"}
+	if !hasGitCall(rec, wantPush) {
+		t.Errorf("no push %v in git calls %v", wantPush, rec.gitCalls)
+	}
+	if fc.LastDispatchRunID != "r2b" {
+		t.Errorf("dispatch run id = %q, want r2b", fc.LastDispatchRunID)
 	}
 }
 

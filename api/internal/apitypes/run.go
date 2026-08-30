@@ -119,6 +119,10 @@ type RunDTO struct {
 	// when it inherited the caller's local HEAD, and on every non-task run); OpenMr is
 	// whether the worker opens an MR at the end (false by default and for every
 	// non-task run — a plain handoff produces commits on the branch, not an MR).
+	// For a handoff created without --base (issue #403 F3), BaseBranch is the resolved
+	// SEED COMMIT sha (the local HEAD the CLI pushed as the branch tip), which the
+	// auto-review uses as its diff base so it covers only the worker's commits, not the
+	// user's own seeded HEAD.
 	BaseBranch *string `json:"base_branch"`
 	OpenMr     bool    `json:"open_mr"`
 	// Interactive marks a long-lived, conversational task run (PRD #517 M1): the worker

@@ -112,8 +112,22 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 		return err
 	}
 
+	// issue #403 F3: the auto-review diffs against base_branch; when --base is omitted the seed is
+	// local HEAD, so record HEAD's commit SHA as the review base. Otherwise the review defaults to
+	// the repo's default branch and its diff would include the user's own seeded commits — findings
+	// against code the user wrote, and --then-fix would try to "fix" the seed. When --base IS given
+	// the seed already IS that ref, so its name stays the base (the push source is that ref too).
+	baseBranch := strings.TrimSpace(base)
+	if baseBranch == "" {
+		if head, herr := env.Git(".", "rev-parse", "HEAD"); herr == nil {
+			baseBranch = strings.TrimSpace(head)
+		}
+		// On rev-parse failure fall back to empty (today's behavior); the seed push below would
+		// fail anyway if HEAD is unresolvable, so nothing is silently created against a bad base.
+	}
+
 	// (1) Create — receive the id and the server-named uzi/task/<id> branch.
-	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, strings.TrimSpace(base), mr, reviewRequested, thenFix, interactive)
+	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, baseBranch, mr, reviewRequested, thenFix, interactive)
 	if err != nil {
 		return err
 	}

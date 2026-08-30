@@ -1133,11 +1133,15 @@ export class GitCache {
 
   /**
    * The unified diff of the reviewed `branch` against `base` (three-dot: the changes on
-   * `branch` since it diverged from `base`), for a PRD #400 M4b diff-review run. Both refs
-   * are resolved as the bare's remote-tracking refs (`refs/remotes/origin/<name>`, which
-   * every fetch updates — the same namespace `changedFiles` reads), so the caller must have
-   * fetched the bare (ensureClone) first; the reviewed task branch and its base are both
-   * pushed to origin (M2), so both exist there.
+   * `branch` since it diverged from `base`), for a PRD #400 M4b diff-review run. `branch` is
+   * resolved as the bare's remote-tracking ref (`refs/remotes/origin/<name>`, which every
+   * fetch updates — the same namespace `changedFiles` reads), so the caller must have
+   * fetched the bare (ensureClone) first; the reviewed task branch is pushed to origin (M2),
+   * so it exists there. `base` may be EITHER a branch name (resolved the same way, under
+   * `refs/remotes/origin/`) OR a commit-ish — the seed commit sha a handoff records as its
+   * base when created without --base (issue #403 F3), which does not exist under
+   * `refs/remotes/origin/` but is present in the mirror as an ancestor of the reviewed
+   * branch.
    *
    * The result is CAPPED at REVIEW_DIFF_MAX_BYTES with a truncation marker: a pathological
    * diff must not blow the reviewer model's context or the worker's memory. `--no-color`
@@ -1147,7 +1151,13 @@ export class GitCache {
    * `--name-only`; a real patch must disable it explicitly.
    */
   async reviewDiff(barePath: string, base: string, branch: string): Promise<string> {
-    const baseRef = `refs/remotes/origin/${base}`;
+    // issue #403 F3: `base` is usually a branch name (resolved under refs/remotes/origin/), but a
+    // handoff created without --base records the SEED COMMIT sha as its base so the review diffs
+    // only the worker's commits, not the user's seeded HEAD. A raw sha does not resolve under
+    // refs/remotes/origin/, so fall back to using `base` verbatim — the seed commit is present in
+    // the mirror as an ancestor of the reviewed branch.
+    const remoteBaseRef = `refs/remotes/origin/${base}`;
+    const baseRef = (await this.refExists(barePath, remoteBaseRef)) ? remoteBaseRef : base;
     const branchRef = `refs/remotes/origin/${branch}`;
     const out = await this.runGit(barePath, ["diff", "--no-color", "--no-ext-diff", `${baseRef}...${branchRef}`]);
     const buf = Buffer.from(out, "utf8");
