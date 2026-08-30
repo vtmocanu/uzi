@@ -18,6 +18,55 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.70.0] - 2026-08-30
+
+### Added
+
+- **Runs now record a `trigger_source`: what, how, and who started each run ([#860](https://github.com/vtmocanu/uzi/pull/860)).**
+  A first-class `trigger_source` column (NOT NULL, a 13-value enum covering manual, autopilot, schedule, self_improve, ci_fix, mr_rework, chat, task, task_review, then_fix, judge, judge_rerun and resume) is stamped on every run-insert path and backfilled for existing rows, a structured "run created" log line records it at creation, and it is surfaced in `uzi run get --json`/`--field`, `uzi admin runs`, and the web run DTO. New migration 00180.
+- **The UI surfaces when a newer uzi release is available ([#848](https://github.com/vtmocanu/uzi/pull/848)).**
+  A new server-side release-check service polls GitHub's latest release for this repo through a guarded HTTP client, persists the facts to app settings, and derives update-available, far-behind and security-update signals at read time behind a semver guard, which the web UI shows as an unobtrusive update cue. On by default; an admin master gate can turn it off so the api never calls github.com.
+- **Layered enable/disable for MR review rework ([#847](https://github.com/vtmocanu/uzi/pull/847)).**
+  MR review rework can now be turned on or off at four layers (per-run, per-schedule, CLI, and the admin/user default) with live inheritance: nullable `mr_rework_enabled` on runs and schedules resolves via COALESCE so an unset level inherits the one above it, exposed through `PUT /api/runs/{id}/mr-rework`, the run and schedule create paths, and `uzi schedule`. New migration 00179.
+- **`stop_reason` is surfaced in the run read path ([#525](https://github.com/vtmocanu/uzi/pull/525)).**
+  A run's `stop_reason` is now carried through the RunDTO, `uzi run get`, and the web run detail view, so why a run stopped is visible without digging into logs.
+
+### Changed
+
+- **The MIT © credit is now gated behind a build-time flag, hidden by default ([#835](https://github.com/vtmocanu/uzi/pull/835)).**
+  The license credit shown in the app chrome is gated by a `SHOW_LICENSE_CREDIT` build-time constant (`web/src/lib/flags.ts`), defaulting to off/hidden; flip the constant and rebuild to show it. This reverses the previously always-shown behavior.
+- **`uzi handoff` v1.1 hardening ([#403](https://github.com/vtmocanu/uzi/pull/403)).**
+  Seven follow-up findings from the handoff review are addressed: the review base now defaults to the seed commit rather than the repo default, `--repo` must match the origin remote it seeds, and rm-safety gains a branch-wide MR exemption plus a terminal and active-child guard, alongside related cleanups across the agent and worker paths.
+- **TUI context-meter refinements ([#571](https://github.com/vtmocanu/uzi/pull/571)).**
+  Web-parity and performance and cleanup follow-ups for the TUI context meter, tightening the `uzi` TUI context and detail views.
+
+### Fixed
+
+- **A completed issue run that owns an open MR now blocks a fresh re-run of the same issue ([#861](https://github.com/vtmocanu/uzi/pull/861)).**
+  A completed issue run is terminal, so the active-run gate could not see that it still owned an open merge request, and a fresh manual, board, Slack or sweep start would re-plan and re-run the whole review wave onto the already-open MR (silent wasted Anthropic spend; main is never touched). A create-time open-MR guard now hard-refuses such a start (HTTP 409 `issue_has_open_mr`, new scheduler skip reason `open_mr_exists`), releasing only on a terminal MR state, with a `uzi run create --force` override that bypasses only this guard.
+- **In-flight MR rework is now aborted when its MR is merged or closed mid-run ([#854](https://github.com/vtmocanu/uzi/pull/854)).**
+  When an MR merges or closes while an `mr_rework` run against it is still going, the MR-close watcher now cancels that run through the operator-cancel path (a live worker gets a stop verdict so it stops spending; a run with no live poller is flipped server-side), instead of letting it run on against a resolved MR.
+- **The awaiting-followup watermark no longer strands a genuinely idle run ([#846](https://github.com/vtmocanu/uzi/pull/846), [#817](https://github.com/vtmocanu/uzi/pull/817)).**
+  The `open_followup_id` watermark could be lowered to 0 by a worker re-claiming a requeued run, which then let the wake guard admit an already-consumed follow-up and spuriously un-park an idle run (a #559 regression); the watermark now has a current-value monotone floor.
+- **Concurrent admin settings PUTs are serialized to preserve the cross-key label invariant ([#844](https://github.com/vtmocanu/uzi/pull/844), [#831](https://github.com/vtmocanu/uzi/pull/831)).**
+  Two concurrent admin settings writes could both commit and leave `uzi_label` and `autopilot_label` equal (the FOR UPDATE cross-key check locked only pre-existing rows, and a fresh DB has no `uzi_label` row after the #764 rename); a `pg_advisory_xact_lock` now serializes all settings writes, fixing an intermittently red nightly compose E2E. New migration 00178.
+- **Worker lint-ratchet base clamp is now durable across a mid-run `git fetch` ([#843](https://github.com/vtmocanu/uzi/pull/843), [#363](https://github.com/vtmocanu/uzi/pull/363)).**
+  An agent-initiated `git fetch origin main` re-applied the clone's fetch refspec and forced the default-branch tracking ref back to the frozen mirror head, undoing the ratchet-base clamp and false-reddening the golangci-lint backlog; the runner clone's `remote.origin.fetch` refspec is now removed right after the clamp so a fetch touches no tracking ref.
+- **GitHub review-thread and comment fetch no longer truncates at 100 ([#761](https://github.com/vtmocanu/uzi/pull/761)).**
+  The GitHub forge driver now paginates review threads and comments via a GraphQL cursor instead of stopping at the first 100 nodes, so large MRs are read in full.
+- **Cross-kind branch guard in `mr_rework` create is hardened against a TOCTOU race ([#760](https://github.com/vtmocanu/uzi/pull/760)).**
+  The guard that prevents a second run of a different kind on the same branch is now an atomic count-plus-insert rather than a check-then-write, closing a time-of-check to time-of-use window.
+- **Dynamic navigation encodes server-derived path segments at every call site ([#644](https://github.com/vtmocanu/uzi/pull/644)).**
+  Every dynamic `navigate()` sink that builds a path from server-derived values now encodes the segment, hardening the web app against path injection per call site.
+- **Version build-info popover no longer spills past the expanded sidebar ([#852](https://github.com/vtmocanu/uzi/pull/852)).**
+  The build-info popover is now bounded to the sidebar width so it no longer overflows the sidebar's right edge when expanded.
+- **`PageHeader` description cap widened so subtitles fill the row ([#842](https://github.com/vtmocanu/uzi/pull/842)).**
+  The `PageHeader` description max-width is widened so page subtitles use the available row width instead of wrapping early.
+- **Sidebar dividers are bounded to their cluster ([#830](https://github.com/vtmocanu/uzi/pull/830), [#828](https://github.com/vtmocanu/uzi/pull/828)).**
+  Sidebar section dividers are now scoped to their own cluster rather than a sub-element, fixing a misdrawn divider.
+- **Schedules page no longer crashes to a black screen on a labelless sweep default ([#829](https://github.com/vtmocanu/uzi/pull/829)).**
+  A labelless `assigned-sweep` catalog entry hit `null.map` in the Default jobs view and crashed the Schedules page; the render now guards the null.
+
 ## [0.69.0] - 2026-08-29
 
 ### Added
@@ -3496,7 +3545,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.69.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.70.0...HEAD
+[0.70.0]: https://github.com/vtmocanu/uzi/compare/v0.69.0...v0.70.0
 [0.69.0]: https://github.com/vtmocanu/uzi/compare/v0.68.0...v0.69.0
 [0.68.0]: https://github.com/vtmocanu/uzi/compare/v0.67.0...v0.68.0
 [0.67.0]: https://github.com/vtmocanu/uzi/compare/v0.66.3...v0.67.0

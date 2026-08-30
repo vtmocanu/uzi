@@ -31,7 +31,7 @@
 # `task`'s own rc is 201 for any non-zero.
 set -eu
 
-PINNED_TAG="0.69.0"     # the concrete worker tag values.yaml must pin (kept in lockstep by scripts/worker-tag-autobump.sh)
+PINNED_TAG="0.70.0"     # the concrete worker tag values.yaml must pin (kept in lockstep by scripts/worker-tag-autobump.sh)
 SENTINEL_APPVERSION="9.9.9"  # a bogus appVersion the tag must IGNORE
 OVERRIDE_TAG="0.99.0"   # the deliberate-roll lever operators use (Part B)
 
