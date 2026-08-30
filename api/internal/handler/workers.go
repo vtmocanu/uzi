@@ -417,11 +417,15 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		// PRD #111 credential fields below: WaitOnLimit is set on every run from
 		// creation while the other four stay null/zero until a first park, so a run
 		// legitimately carries the opt-in with no park data. Never branch on the group.
-		WaitOnLimit:    r.WaitOnLimit,
-		LimitResetsAt:  timePtr(r.LimitResetsAt.Valid, r.LimitResetsAt.Time),
-		RetryNotBefore: timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
-		LimitWaitCount: r.LimitWaitCount,
-		RateLimitType:  textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
+		WaitOnLimit: r.WaitOnLimit,
+		// PRD #841 M1: the per-run MR-rework override, tri-state. boolPtrValue maps the
+		// nullable column to *bool so null (inherit) survives to the wire distinct from
+		// an explicit true/false.
+		MrReworkEnabled: boolPtrValue(r.MrReworkEnabled),
+		LimitResetsAt:   timePtr(r.LimitResetsAt.Valid, r.LimitResetsAt.Time),
+		RetryNotBefore:  timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
+		LimitWaitCount:  r.LimitWaitCount,
+		RateLimitType:   textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
 		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
 		// nil (NULL column) for every run that inherited the owner's per-user default.
 		Model: textPtrValue(r.Model.Valid, r.Model.String),
@@ -856,6 +860,12 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// against a start-run modal on 2026-07-27); the per-run toggle is
 		// PUT /api/runs/{id}/wait-on-limit.
 		WaitOnLimit *bool `json:"wait_on_limit"`
+		// PRD #841 M2: the per-run MR-rework override for CLI and API callers. A POINTER
+		// so "the caller said false" and "the caller said nothing" stay distinct — nil
+		// leaves the run inheriting the owner default live (D1), true/false stamp an
+		// explicit override. The web start button omits it; the per-run toggle is
+		// PUT /api/runs/{id}/mr-rework.
+		MrReworkEnabled *bool `json:"mr_rework_enabled"`
 		// PRD #209 seeded plan: an externally-authored plan and its optional agent
 		// roster. A POINTER so absence (an ordinary run planned from the issue) stays
 		// distinct from an empty string (a blank plan, which createRun rejects 422). The
@@ -922,7 +932,7 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
 	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
 	// start-run card.
-	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, seed)
+	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, seed)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return

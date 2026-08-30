@@ -212,10 +212,24 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
 	qtx := h.q.WithTx(tx)
 
-	// Authoritative cross-key check (Decision 8) against committed state: lock the
-	// settings rows FOR UPDATE, so a concurrent PUT blocks here and we read its
-	// committed values rather than a possibly-stale cache snapshot. Only non-secret
-	// updates merge into the label map (Effective already excludes secrets).
+	// Serialize all settings writes globally (issue #831). This MUST be the first
+	// statement of the transaction: it is a mutex that holds regardless of which
+	// rows exist, which the ListAppSettingsForUpdate FOR UPDATE below is not — a
+	// label key at its compiled-in default has no row for FOR UPDATE to lock, so two
+	// concurrent PUTs could each insert a NEW row invisible to the other's READ
+	// COMMITTED snapshot and both pass the cross-key check, committing equal labels.
+	// See store.SettingsMutationLockKey for the full reasoning.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", store.SettingsMutationLockKey); err != nil {
+		slog.Error("update settings: acquire lock", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	// Authoritative cross-key check (Decision 8) against committed state: read the
+	// settings rows FOR UPDATE. With the advisory lock held this no longer races (a
+	// concurrent PUT is blocked at the lock above), and reading the committed rows
+	// here still avoids a possibly-stale cache snapshot. Only non-secret updates
+	// merge into the label map (Effective already excludes secrets).
 	locked, err := qtx.ListAppSettingsForUpdate(ctx)
 	if err != nil {
 		slog.Error("update settings: lock rows", "error", err)

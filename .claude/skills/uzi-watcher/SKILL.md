@@ -292,6 +292,25 @@ by anything on the PR itself.
    The trigger needs a green pipeline + settled review, so the run may not have spawned yet
    even though it will; if the findings are uzi-fixable (below) and the owner is opted in,
    give it a beat and re-check rather than racing in.
+
+   **How long is "a beat"? Longer than the trigger wording implies — mr_rework firing LAGS
+   the settled review badly, and the measured lag is what to plan around.** The trigger
+   reads as "the next poll tick after the review settles," but on a busy instance the run
+   has been observed firing **30-40+ minutes** after CodeRabbit's review landed and CI went
+   green (measured 2026-08-30: findings on PRs #847/#848 settled ~14:10, the `mr_rework`
+   runs were created ~14:52-14:55, roughly 40 min later), while on a quiet instance it fired
+   in ~4 min (#843, same day). So a 20-minute "it hasn't fired, I'll just fix it myself"
+   conclusion is **premature**: you do the whole local fix and mr_rework then fires on top of
+   it, duplicating the work (not a data-loss collision if your pre-push re-check is clean,
+   but wasted effort and a confusing double set of fix commits). **Budget at least ~40 min
+   of polling for the run to APPEAR before falling back to a local fix, and poll for it
+   rather than eyeballing** — `scripts/wait-mrrework.sh OWNER/REPO PR` waits through the
+   fire→terminal lifecycle and exits when the run lands (or the budget elapses). Fall back to
+   a local fix only when that budget is genuinely spent, or when mr_rework structurally
+   cannot help (owner opted out, the admin kill-switch is on, or a `.github/workflows`
+   finding — the "when this session still fixes locally" list below). **Either way**, the
+   pre-push guard (re-list `kind=mr_rework` for this MR AND re-fetch the branch head, step 1)
+   stays mandatory right before any local push, because the run can fire during your edit.
 3. **Let it finish, then decide from whether the head ACTUALLY moved — and read the ref
    authoritatively at BOTH ends.** With `BR` the PR's `agent/issue-*` branch, **`git fetch
    origin "$BR"` before recording** the pre-rework head (`before=$(git rev-parse
@@ -530,6 +549,24 @@ new review object.
   findings by hand (e.g. via `pr-findings.sh`), a finding tagged `Addressed in commit` is done;
   verify against the body marker, not the line anchor.
 
+**A third fix, 2026-08-30 (#819): signal (d), the "equivalent head".** A merge commit whose only
+content is the merge-in of the PR base branch plus regenerated artifacts (e.g. resolving a
+`*.sql.go` sqlc conflict by re-running `sqlc generate`) carries **no branch-authored logic change**,
+so CodeRabbit posts no fresh review and moves its `final_review_risk` marker to no new SHA — signals
+(a) and (c) both stay silent and a genuinely merge-ready PR times out (exit 2). `watch-pr.sh` now
+recognizes this **fail-closed**: it treats the head as reviewed-equivalent to CodeRabbit's
+last-reviewed commit `A` only when every path that changed between `A` and HEAD is either absent from
+the PR's diff vs its base branch (so HEAD == base for that path — a pure merge-in the branch did not
+author) or a regenerated/mirror artifact (`api/internal/store/*.sql.go`, `api/internal/uzidocs/embed/*.md`
+— each scoped to the exact dir a generate/sync check covers, so a broader glob can't forgive an
+unchecked branch-added file). It is computed
+from two GitHub `compare` calls (no local git, so the script stays cwd-independent) and **refuses to
+judge** when either compare's `files` list reaches the API's 300-file cap, since a truncated list could
+hide an unreviewed path and forge equivalence. Any changed path that IS in the PR diff and is NOT such
+an artifact is unreviewed branch work, so the signal does not fire → timeout, never a false "ready". A
+poller you hand-roll should either key on (a)/(c) only (accepting the logic-free-merge timeout) or
+reproduce this exact fail-closed equivalence — never relax the head-match, which is what forges a merge.
+
 **The shared `main` worktree is a multi-writer tree — never assert it is clean.** Other
 sessions leave modified files in it and advance `main` mid-review (measured 2026-08-20:
 two reviewers found unrelated `tui_*` edits and `main` moving `6fc6c5eb`→`2007cbf4` under
@@ -665,7 +702,9 @@ die with its session. When you close, hand any still-in-flight run ids on the sa
 This skill and its `scripts/` (`watch-run.sh` for uzi runs, `watch-ci.sh` for post-merge
 GitHub Actions, `watch-pr.sh` for a PR's merge-readiness — CI + CodeRabbit-on-head +
 mr_rework coordination in one poll — `pr-findings.sh` to gather CodeRabbit findings across
-PRs, `backup-runs.sh` / `backup-loop.sh` to snapshot in-flight run work from worker PVCs)
+PRs, `wait-mrrework.sh OWNER/REPO PR` to DEFER to uzi's laggy mr_rework by polling its
+fire→terminal lifecycle before falling back to a local fix, `backup-runs.sh` /
+`backup-loop.sh` to snapshot in-flight run work from worker PVCs)
 are living documents — **update them in the same session you find them wanting.**
 When a run surprises you with a new failure mode, a plan trap this list does not name,
 changed merge/ruleset behaviour, a CLI verb that moved, or a poller needs a new

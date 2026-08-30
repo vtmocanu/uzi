@@ -141,6 +141,34 @@ func TestScheduleCreateSweepBody(t *testing.T) {
 	}
 }
 
+// TestScheduleCreateMrReworkTriState: the per-schedule MR-rework override (PRD #841 M3,
+// D5) is TRI-STATE and defaults to INHERIT (nil), unlike wait_on_limit which is always
+// sent. Omitting --mr-rework must leave MrReworkEnabled nil (fired jobs follow the owner's
+// global setting); --mr-rework sends &true; --mr-rework=false sends &false.
+func TestScheduleCreateMrReworkTriState(t *testing.T) {
+	create := func(t *testing.T, extra ...string) apitypes.ScheduleRequest {
+		t.Helper()
+		fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_m"}}
+		args := append([]string{"schedule", "create", "--repo", "r1", "--issue", "42", "--at", "2026-08-08T09:00:00Z"}, extra...)
+		_, errOut, code := runCLI(t, fakeEnv(fc), args...)
+		if code != uzicli.ExitOK {
+			t.Fatalf("schedule create %v exit = %d, want 0; stderr=%q", extra, code, errOut)
+		}
+		return fc.LastCreateSchedReq
+	}
+
+	// Absent → nil (inherit the account default), NOT the flag's false default (D5).
+	if got := create(t).MrReworkEnabled; got != nil {
+		t.Errorf("omitting --mr-rework sent %v, want nil — a schedule defaults to inherit, so its jobs follow the owner's global setting", *got)
+	}
+	if got := create(t, "--mr-rework").MrReworkEnabled; got == nil || !*got {
+		t.Errorf("--mr-rework sent %v, want a non-nil true", got)
+	}
+	if got := create(t, "--mr-rework=false").MrReworkEnabled; got == nil || *got {
+		t.Errorf("--mr-rework=false sent %v, want a non-nil false", got)
+	}
+}
+
 // TestScheduleCreateSweepMaxIssuesOverride: --max-issues overrides the default cap and is
 // sent as a non-nil pointer for the sweep target.
 func TestScheduleCreateSweepMaxIssuesOverride(t *testing.T) {
@@ -650,6 +678,64 @@ func TestScheduleEditFlagMapping(t *testing.T) {
 	}
 }
 
+// TestScheduleEditMrRework: --mr-rework=false lands in the patched request as an explicit
+// &false override (PRD #841 M3).
+func TestScheduleEditMrRework(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--mr-rework=false")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if got := fc.LastPatchSchedReq.MrReworkEnabled; got == nil || *got {
+		t.Errorf("mr_rework_enabled = %v, want a non-nil false", got)
+	}
+}
+
+// TestScheduleEditMrReworkPreservedOnUnrelatedEdit is the merge-correctness test: the
+// server's config PATCH uses REPLACE-semantics on mr_rework (an omitted value clears it to
+// inherit), so a partial edit that does NOT pass --mr-rework must RESTATE the stored value
+// from the fetched DTO, or an unrelated --cron edit would silently wipe a schedule's
+// explicit override. Here the stored schedule is mr_rework=on; a --cron-only edit must
+// re-send on, not nil.
+func TestScheduleEditMrReworkPreservedOnUnrelatedEdit(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	on := true
+	stored := fc.ScheduleByID["sch_e"]
+	stored.MrReworkEnabled = &on
+	fc.ScheduleByID["sch_e"] = stored
+
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--cron", "0 4 * * 2")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if got := fc.LastPatchSchedReq.MrReworkEnabled; got == nil || !*got {
+		t.Errorf("mr_rework_enabled = %v, want it RESTATED as on — a --cron-only edit must not clear the stored override under the server's replace-semantics", got)
+	}
+}
+
+// TestScheduleEditDefaultMrReworkPreservedOnUnrelatedEdit is the default-origin sibling of
+// the merge-correctness test above: buildDefaultScheduleEditRequest also RESTATES the stored
+// mr_rework value before any --mr-rework override, because the server's
+// patchDefaultScheduleConfig uses REPLACE-semantics on it (an omitted value clears the stored
+// override to inherit). Here a DEFAULT-origin schedule with an explicit mr_rework=on receives
+// a --cron-only edit (the flag NOT Changed); the outgoing request must re-send on, not nil, so
+// the unrelated edit does not silently wipe the override on the replace-semantics default path.
+func TestScheduleEditDefaultMrReworkPreservedOnUnrelatedEdit(t *testing.T) {
+	fc := editDefaultSweepFixture("sch_d")
+	on := true
+	stored := fc.ScheduleByID["sch_d"]
+	stored.MrReworkEnabled = &on
+	fc.ScheduleByID["sch_d"] = stored
+
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--cron", "0 4 * * 2")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if got := fc.LastPatchSchedReq.MrReworkEnabled; got == nil || !*got {
+		t.Errorf("mr_rework_enabled = %v, want it RESTATED as on — a --cron-only edit on a default schedule must not clear the stored override under the server's replace-semantics", got)
+	}
+}
+
 // TestScheduleEditAtSwitchesTiming: --at flips a recurring schedule to once, sets
 // run_at, and clears the cron.
 func TestScheduleEditAtSwitchesTiming(t *testing.T) {
@@ -826,6 +912,45 @@ func TestScheduleEditClearMaxIssues(t *testing.T) {
 	}
 }
 
+// TestScheduleEditClearMrRework: --clear-mr-rework nils a stored per-schedule override back
+// to inherit, OVERRIDING the restate a partial edit would otherwise re-send. The stored
+// schedule is mr_rework=on; --clear-mr-rework must send an explicit nil so the server's
+// replace-semantics clears it (the field is not omitempty, so nil is sent as JSON null).
+func TestScheduleEditClearMrRework(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	on := true
+	stored := fc.ScheduleByID["sch_e"]
+	stored.MrReworkEnabled = &on
+	fc.ScheduleByID["sch_e"] = stored
+
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--clear-mr-rework")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if got := fc.LastPatchSchedReq.MrReworkEnabled; got != nil {
+		t.Errorf("mr_rework_enabled = %v, want nil after --clear-mr-rework (override cleared to inherit)", *got)
+	}
+}
+
+// TestScheduleEditDefaultClearMrRework: the default-origin sibling — --clear-mr-rework nils a
+// stored override on a DEFAULT schedule through buildDefaultScheduleEditRequest's own clear
+// path (patchDefaultScheduleConfig replace-semantics).
+func TestScheduleEditDefaultClearMrRework(t *testing.T) {
+	fc := editDefaultSweepFixture("sch_d")
+	on := true
+	stored := fc.ScheduleByID["sch_d"]
+	stored.MrReworkEnabled = &on
+	fc.ScheduleByID["sch_d"] = stored
+
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--clear-mr-rework")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if got := fc.LastPatchSchedReq.MrReworkEnabled; got != nil {
+		t.Errorf("mr_rework_enabled = %v, want nil after --clear-mr-rework on a default schedule", *got)
+	}
+}
+
 // TestScheduleEditUsageErrors: conflicts, wrong-target scoping, and a no-op edit are all
 // usage errors (exit 2) with no PATCH sent.
 func TestScheduleEditUsageErrors(t *testing.T) {
@@ -843,6 +968,7 @@ func TestScheduleEditUsageErrors(t *testing.T) {
 	}{
 		{"guidance+clear-guidance", sweepSched, []string{"edit", "sch_e", "--guidance", "y", "--clear-guidance"}},
 		{"max-issues+clear-max-issues", sweepSched, []string{"edit", "sch_e", "--max-issues", "3", "--clear-max-issues"}},
+		{"mr-rework+clear-mr-rework", sweepSched, []string{"edit", "sch_e", "--mr-rework", "--clear-mr-rework"}},
 		{"cron+at", sweepSched, []string{"edit", "sch_e", "--cron", "0 4 * * 2", "--at", "2026-08-08T09:00:00Z"}},
 		{"no-op", sweepSched, []string{"edit", "sch_e"}},
 		{"label on prompt target", promptSched, []string{"edit", "sch_p", "--label", "bug"}},

@@ -121,3 +121,68 @@ describe("mockApi honours the mr_rework_enabled opt-in (PRD #700 M6)", () => {
     expect((await api.getMySettings()).settings.mr_rework_enabled).toBeNull();
   });
 });
+
+describe("mockApi.setRunMrRework — the per-run override (PRD #841)", () => {
+  it("round-trips the tri-state override on a run and returns the updated run", async () => {
+    installStorage();
+    const api = await reload();
+
+    // Explicit off, then on: each persists and is echoed back on the returned run.
+    const off = await api.setRunMrRework("run-done", false);
+    expect(off.run.mr_rework_enabled).toBe(false);
+    const on = await api.setRunMrRework("run-done", true);
+    expect(on.run.mr_rework_enabled).toBe(true);
+
+    // null clears back to inherit (never collapsed into false).
+    const cleared = await api.setRunMrRework("run-done", null);
+    expect(cleared.run.mr_rework_enabled).toBeNull();
+  });
+
+  it("has NO terminal-status guard (D2): a COMPLETED run is still togglable", async () => {
+    installStorage();
+    const api = await reload();
+    // run-done is a completed run; unlike setRunWaitOnLimit this must NOT 409.
+    const { run } = await api.setRunMrRework("run-done", false);
+    expect(run.status).toBe("completed");
+    expect(run.mr_rework_enabled).toBe(false);
+  });
+
+  it("404s an unknown run id (owner-scoped, like the server)", async () => {
+    installStorage();
+    const api = await reload();
+    await expect(api.setRunMrRework("run-nope", true)).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe("mockApi schedule handlers persist mr_rework_enabled (PRD #841)", () => {
+  it("round-trips the tri-state override through create, read, and update", async () => {
+    installStorage();
+    const api = await reload();
+
+    // A valid repo to hang the schedule off of (createSchedule 404s an unknown repo).
+    const { repos } = await api.listRepos();
+    const repoId = repos[0].id;
+
+    // Create with an explicit false: the create must stamp it rather than drop it, so a
+    // reopen (getSchedule) reads back the same explicit value, not a silently-lost null.
+    const created = await api.createSchedule(repoId, {
+      target: "issue",
+      issue_iid: 1,
+      timing: "recurring",
+      cron_expr: "0 9 * * *",
+      mr_rework_enabled: false,
+    });
+    expect(created.mr_rework_enabled).toBe(false);
+    expect((await api.getSchedule(created.id)).mr_rework_enabled).toBe(false);
+
+    // Update to an explicit true: replace-semantics applies the present value.
+    const on = await api.updateSchedule(created.id, { mr_rework_enabled: true });
+    expect(on.mr_rework_enabled).toBe(true);
+    expect((await api.getSchedule(created.id)).mr_rework_enabled).toBe(true);
+
+    // Update with null: clears back to inherit (never collapsed into false).
+    const cleared = await api.updateSchedule(created.id, { mr_rework_enabled: null });
+    expect(cleared.mr_rework_enabled).toBeNull();
+    expect((await api.getSchedule(created.id)).mr_rework_enabled).toBeNull();
+  });
+});

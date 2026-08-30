@@ -23139,6 +23139,21 @@ wake-guard watermark (issue #552 M1 / PRD #517). The watermark is `runs.open_fol
   `SetRunRunning` worker_id pin and the next ACK-checked park report remain the backstop.
 - Commits `aace2d0b`/`fc072247` (M1, server clamp+floor), `d8625495` (M2, worker threads the
   last-delivered id through `SteeringChannel`), `ab774e05` (M3, park-skip ownership probe).
+- **Issue #817 follow-up — the watermark could still REGRESS on an out-of-order / re-claim park,
+  reopening #558 for that run.** §586's "still monotone" claim held only for a worker whose
+  last-delivered id is monotone. A FRESH `SteeringChannel` re-claiming a requeued run reports a
+  **present 0** (`lastDeliveredFollowUpIdValue` inits to 0 and is NOT re-seeded from the durable
+  `open_followup_id` column, unlike `stop_pending`), and the pre-fix unconditional SET —
+  `GREATEST(0, LEAST(...))` — LOWERED the watermark to 0, so any already-consumed follow_up then
+  satisfied `id > 0` and woke the park (#558). `min(monotone value, value that resets to 0)` is not
+  monotone, so the ceiling/floor pair was never sufficient. Fixed by flooring the SET at the
+  current stored value: `open_followup_id = GREATEST(0, COALESCE(open_followup_id, 0), LEAST(...))`
+  (the RHS `open_followup_id` reads the pre-UPDATE row, the same self-referential SET-RHS pattern
+  as `milestones_completed`). Provably strand-free while `run_user_inputs` is append-only and
+  `consumed_at` is set-once: every operand is ≤ `MAX(consumed follow_up id)`, and the unconsumed
+  wake follow_up has id > that max, so `id > open_followup_id` always still holds. A future
+  retention/pruning job that hard-deletes consumed follow_up rows would break that premise and must
+  reckon with the wake guard.
 
 ## 587. PRD #767 — assignment to the uzi-bot is a second, equivalent expression of the single run-eligibility gate
 
@@ -23292,7 +23307,58 @@ surface and shown only by editing the constant and rebuilding — still not an a
 This supersedes PRD #685 D3's "durable / non-strippable" framing: the credit is no longer
 unconditionally present.
 
-## 591. PRD #836 — a server-side upstream update-available signal: poll GitHub releases, persist the facts, derive the flags at read time with zero client egress
+## 591. PRD #841 — layered enable/disable for `mr_rework`: per-run + per-schedule + CLI overrides, resolved LIVE (COALESCE), not snapshot
+
+Follow-on to PRD #700's MR review watcher (§580). §580 shipped `mr_rework` with exactly two
+control layers — a per-user default (`users.mr_rework_enabled`, nullable, default-ON via `IS
+NOT FALSE`) and an admin kill-switch. This adds the middle three the sibling `wait_on_limit`
+already had (per-run flag, CLI-at-start flag, per-schedule override), so a user can disable
+auto-rework for one run, start a run with it off, or scope it to scheduled jobs only. Terse
+contract here; PRD #841's Decision Log (D1–D5) is the richer rationale.
+
+- **Two new nullable tri-state columns, `runs.mr_rework_enabled` and
+  `run_schedules.mr_rework_enabled`** (`NULL` = inherit, `true`/`false` = explicit override).
+  Resolution order is run override → schedule override → per-user default.
+- **LIVE-INHERIT, not snapshot — the one deliberate divergence from `wait_on_limit` (D1).**
+  Eligibility is resolved at READ time in the candidate query: `COALESCE(run.mr_rework_enabled,
+  owner.mr_rework_enabled) IS NOT FALSE`. At creation the run's column is stamped by pure
+  pointer coalescing (`requestOverride ?? scheduleOverride`, either may stay NULL) — NO
+  owner-default snapshot. `wait_on_limit` is the opposite: `NOT NULL DEFAULT` columns that
+  snapshot the owner default at creation (`resolveWaitOnLimit`). Two reasons for the flip: a
+  global setting flip must reach un-overridden runs immediately, and the per-run toggle is
+  formed POST-completion while the user is looking at the MR, so a creation-time snapshot would
+  be stale by the time the opinion exists. Everything else mirrors the `wait_on_limit` plumbing.
+- **No terminal-status guard on the per-run write (D2).** `SetRunMrReworkEnabled` is
+  owner-scoped with NO status guard — the reverse of `SetRunWaitOnLimit`, which guards `status
+  NOT IN terminal` because that flag governs an in-flight run. The watcher acts AFTER the run
+  completes (during Human Review, MR still open), so the toggle must stay editable on a
+  completed run until its MR merges/closes. The write is inert once `mr_state != 'opened'` (the
+  candidate query already excludes non-open MRs), so no explicit terminal guard is needed; the
+  web hides the checkbox once the MR leaves the opened state.
+- **The per-run route is RequireUser, not `wait_on_limit`'s cookie-only (D3).** `PUT
+  /api/runs/{id}/mr-rework` (body `{"enabled": bool|null}`, null clears to inherit) is mounted
+  in the RequireUser group (cookie OR `uzc_` Bearer). `wait_on_limit`'s per-run route is
+  cookie-only because parking a run consumes resources (issue lock + worker disk), so consent
+  must be interactive. Toggling `mr_rework` is a pure preference with no resource-consent
+  dimension, and the CLI verb (`uzi run mr-rework <id>`) needs Bearer reach. Guarded by a
+  router-level auth test to pre-empt the cookie-only mis-mount plan-trap.
+- **Eligibility binds to the NEWEST issue run per branch.** `ListMRReworkCandidates`'s
+  `per_branch` CTE is `DISTINCT ON (r.branch) … ORDER BY r.branch, r.created_at DESC`, so the
+  per-run column is read from the newest `kind='issue'` run on the deterministic `agent/issue-N`
+  branch. A re-run reuses that branch; an older run's toggle does not move eligibility, which
+  matches the surfaced control (the web checkbox / CLI target the newest run).
+- **Schedule default is inherit (nil), not on (D5).** The schedule's `mr_rework_enabled`
+  defaults unset so default jobs follow the user's global setting; seeding an explicit `true`
+  would silently override a user who disabled `mr_rework` globally. The "only for scheduled
+  jobs" scenario is reached by explicitly setting the schedule to `true` with the global off.
+- **Scope.** New DTO fields `RunDTO.MrReworkEnabled *bool` and the schedule request/DTO
+  `*bool`; CLI `--mr-rework` tri-state on `run create` / `schedule create` / `schedule edit`,
+  the `uzi run mr-rework` verb, and `MR_REWORK` rows in `run get` / `schedule get`; web per-run
+  checkbox (gated by `canToggleMrRework`) and a schedule toggle. All other create paths
+  (autopilot label poller, `CreateAutoCIFixRun`, `CreateAutoMRReworkRun`, self-improve,
+  task/handoff) leave the column NULL → inherit, byte-identical to today.
+
+## 592. PRD #836 — a server-side upstream update-available signal: poll GitHub releases, persist the facts, derive the flags at read time with zero client egress
 
 Serves human: an operator should learn a newer uzi is out (and be nudged harder when far behind
 or a security release ships) without any surface hitting GitHub per browser/agent, and an air-gapped

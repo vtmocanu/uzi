@@ -116,7 +116,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (1) Human + bot ⇒ stored JSONB carries the human comment and NOT the bot one.
-	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", &waitFalse, nil)
+	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", &waitFalse, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 11: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (2) Only bot comments ⇒ stored NULL.
-	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil)
+	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 12: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (3) Human comment but the connection's bot id is 0 ⇒ D9 stores NULL.
-	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil)
+	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 13: %v", err)
 	}

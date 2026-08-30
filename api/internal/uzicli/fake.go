@@ -75,6 +75,10 @@ type FakeClient struct {
 	// passed" into "passed false", which is the exact distinction the flag exists to
 	// carry, and no test could then catch its loss.
 	LastCreateWaitOnLimit *bool
+	// LastCreateMrRework keeps the POINTER, for the SAME reason as LastCreateWaitOnLimit
+	// (PRD #841 M3): a test must tell nil (flag absent → inherit the account default) from
+	// &false and &true, which is exactly the tri-state `--mr-rework` carries.
+	LastCreateMrRework *bool
 	// LastCreateSeed captures PRD #209's optional seeded plan (nil when the run was
 	// created without --plan-file), so a test can assert the plan body and the roster
 	// the CLI forwarded — the assertion M3's flag parsing is proven against.
@@ -149,6 +153,16 @@ type FakeClient struct {
 	LastResumeRunID string
 	ResumedRun      apitypes.RunDTO
 	ResumeRunNowErr error
+
+	// SetRunMrRework capture (PRD #841 M3). LastMrReworkRunID is the run id `uzi run
+	// mr-rework` targeted; LastMrReworkEnabled keeps the POINTER so a test can tell the
+	// three wire states apart — &true, &false, and nil (--clear → clear to inherit).
+	// MrReworkRun is the canned success reply; SetRunMrReworkErr wins over the blanket Err
+	// so a test can model a 404 on the write while the capture still proves it was reached.
+	LastMrReworkRunID   string
+	LastMrReworkEnabled *bool
+	MrReworkRun         apitypes.RunDTO
+	SetRunMrReworkErr   error
 
 	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
 	// meters, each carrying the server-computed auto-selection status.
@@ -504,6 +518,22 @@ func (f *FakeClient) ResumeRunNow(_ context.Context, id string) (apitypes.RunDTO
 	return f.ResumedRun, nil
 }
 
+// SetRunMrRework records the run id and the tri-state pointer it was called with and
+// returns the canned run. It captures BEFORE the error branch (mirroring SetRunPriority)
+// so a test asserting a 404 still proves the write was reached; SetRunMrReworkErr wins
+// over the blanket Err.
+func (f *FakeClient) SetRunMrRework(_ context.Context, id string, enabled *bool) (apitypes.RunDTO, error) {
+	f.LastMrReworkRunID = id
+	f.LastMrReworkEnabled = enabled
+	if f.SetRunMrReworkErr != nil {
+		return apitypes.RunDTO{}, f.SetRunMrReworkErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.MrReworkRun, nil
+}
+
 func (f *FakeClient) SelfRateLimits(context.Context) ([]apitypes.TokenRateLimitDTO, error) {
 	if f.Err != nil {
 		return nil, f.Err
@@ -716,10 +746,11 @@ func (f *FakeClient) PollCLIAuth(context.Context, string, string) (CLIAuthPollRe
 	return res, nil
 }
 
-func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID
 	f.LastCreateWaitOnLimit = waitOnLimit
+	f.LastCreateMrRework = mrReworkEnabled
 	f.LastCreateSeed = seed
 	if f.Err != nil {
 		return apitypes.RunDTO{}, f.Err

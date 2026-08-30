@@ -474,6 +474,77 @@ func TestCLIReachesSettingsOverBearerLiveDB(t *testing.T) {
 	}
 }
 
+// TestCLIReachesMrReworkOverBearerLiveDB proves the PRD #841 M2 per-run mr-rework route
+// is mounted in the RequireUser group (a uzc_ Bearer reaches it, NOT 401) and is
+// owner-scoped, diverging deliberately from wait-on-limit's cookie-only mount (D3): this
+// is a pure preference toggle with no resource-consent dimension, and the M3 CLI verb
+// needs Bearer access. A fake-client unit test bypasses the router and cannot catch a
+// cookie-only mis-mount, so this drives the real mounted middleware chain. The route has
+// no status guard (D2), so a COMPLETED run is a valid target.
+func TestCLIReachesMrReworkOverBearerLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	other := cliSeedUser(t, pool, false)
+	ownerUzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+	otherUzc := cliMintToken(t, pool, other, clitoken.ScopeUser)
+
+	// A completed issue run owned by `owner` — the mr-rework toggle governs a run whose MR
+	// is under review AFTER completion, so a terminal run is exactly the intended target.
+	repoID := cliSeedOwnedRepo(t, pool, owner)
+	runID := uuid.New()
+	cliMustExec(t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+		 VALUES ($1, $2, $3, 8410, 'rework me', 'desc', 'completed', 'issue')`, runID, owner, repoID)
+
+	path := "/api/runs/" + runID.String() + "/mr-rework"
+	const body = `{"enabled":false}`
+
+	// A cross-user uzc_ is owner-scoped out: the write matches 0 rows and the re-read 404s.
+	// It must NOT touch the run's override column.
+	if rec := bearerReqBody(router, http.MethodPut, path, otherUzc, body); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-user uzc_ PUT %s = %d, want 404 (mr-rework is owner-scoped)\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+	var stillNull bool
+	if err := pool.QueryRow(context.Background(), `SELECT mr_rework_enabled IS NULL FROM runs WHERE id = $1`, runID).Scan(&stillNull); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if !stillNull {
+		t.Fatalf("a foreign uzc_ changed mr_rework_enabled; it must remain NULL (inherit)")
+	}
+
+	// The owner's uzc_ reaches the handler (not 401 — the mount is RequireUser) and sets
+	// the explicit false override on the completed run (no status guard, D2).
+	rec := bearerReqBody(router, http.MethodPut, path, ownerUzc, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner uzc_ PUT %s = %d, want 200 — RequireUser must let a CLI Bearer reach mr-rework\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+	var enabled *bool
+	if err := pool.QueryRow(context.Background(), `SELECT mr_rework_enabled FROM runs WHERE id = $1`, runID).Scan(&enabled); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if enabled == nil || *enabled {
+		t.Fatalf("mr_rework_enabled = %v after PUT enabled:false, want explicit false", enabled)
+	}
+
+	// A null/absent "enabled" clears the override back to inherit (D2): the column returns
+	// to NULL, proving the tri-state clear path over the Bearer route.
+	if rec := bearerReqBody(router, http.MethodPut, path, ownerUzc, `{"enabled":null}`); rec.Code != http.StatusOK {
+		t.Fatalf("owner uzc_ PUT %s (null) = %d, want 200\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT mr_rework_enabled IS NULL FROM runs WHERE id = $1`, runID).Scan(&stillNull); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if !stillNull {
+		t.Fatalf("a null enabled must clear mr_rework_enabled back to NULL (inherit)")
+	}
+
+	// No credential at all is still refused (401): proves the 200 above is the credential
+	// being honoured, not an unauthenticated route.
+	if rec := bearerReqBody(router, http.MethodPut, path, "", body); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no-credential PUT %s = %d, want 401 (mr-rework is authenticated)\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+}
+
 // -------------------------------------------------------------------------
 // (e) CSRF-bypass shape: a cookie request carrying a bogus Authorization header is
 // rejected on the bearer path and NEVER silently falls back to the cookie path;

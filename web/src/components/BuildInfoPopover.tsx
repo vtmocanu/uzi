@@ -419,14 +419,28 @@ export function BuildInfoPopover({
           // siblings. Raising it to compete with the mobile overlay would be
           // wrong — in the drawer it rides ABOVE that overlay already, and on
           // desktop the overlay is lg:hidden and cannot coexist.
-          "absolute bottom-full z-10 mb-2 w-[226px] rounded-lg border border-edge bg-raised p-3 shadow-2xl",
+          "absolute bottom-full z-10 mb-2 rounded-lg border border-edge bg-raised p-3 shadow-2xl",
           // Left-anchored in BOTH states, inset from the rail edge. Collapsed, the
           // rail is 56px (`w-14`, AppShell.tsx) against this panel's 226px, so it
           // overhangs the content by ~170px — deliberately, since there is nowhere
           // else for a 226px panel to go, and it is why the no-clipping note above
-          // matters. The 4px difference between the two insets is cosmetic and
-          // changes nothing about that overhang.
-          collapsed ? "left-1" : "left-2",
+          // matters.
+          //
+          // WIDTH and inset are BOTH state-dependent, and they trade against each
+          // other on the expanded rail. Expanded the rail is 240px (`w-60`,
+          // AppShell.tsx); the panel's left edge is host `px-3` (12px) + this inset,
+          // so a fixed 226px panel at `left-2` reached x=246 and spilled 6px past the
+          // rail onto <main>. Fitting it needs BOTH the wider room `left-1` buys and a
+          // bounded width: at `left-1` the left edge is 12 + 4 = 16, so width 222 →
+          // right 238, i.e. a 2px gap inside the 240 rail. 222 (not less) because the
+          // widest row — Built, a 21-glyph `29 Aug 2026 20:57 UTC` in mono — needs a
+          // ~132px value column, and the value column is width − 88 (p-3 24 + border 2
+          // + label-col 50 + gap-x-3 12); 222 − 88 = 134 clears it, 218 (130) wrapped
+          // `UTC` to a second line on Linux mono stacks (measured in a real browser;
+          // jsdom does no layout so the unit test can only assert the width is
+          // state-dependent). Collapsed keeps `left-1 w-[226px]` — a 56px rail cannot
+          // contain any reasonable width, so its overhang stays as documented above.
+          collapsed ? "left-1 w-[226px]" : "left-1 w-[222px]",
           "transition-opacity duration-150 motion-reduce:transition-none",
           open ? "opacity-100" : "pointer-events-none opacity-0",
         )}

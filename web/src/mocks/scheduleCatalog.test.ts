@@ -31,6 +31,10 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     expect(created.catalog_slug).toBe("bug-triage");
     expect(created.labels).toEqual(["bug"]);
     expect(created.enabled).toBe(true);
+    // PRD #841: a catalog default is inherit, and the field is PRESENT as an explicit null
+    // (the real ScheduleDTO's mr_rework_enabled is non-omitempty), never undefined/absent.
+    expect(created.mr_rework_enabled).toBeNull();
+    expect("mr_rework_enabled" in created).toBe(true);
 
     // Re-enabling the same (repo, slug) returns the existing row, not a duplicate.
     const again = await mockApi.enableCatalogSchedule("repo-payments", "bug-triage");

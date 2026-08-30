@@ -28,7 +28,7 @@ WHERE NOT EXISTS (
       AND pipeline_ref = $5
       AND status NOT IN ('completed', 'failed', 'cancelled')
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, lineage_epoch
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, lineage_epoch, mr_rework_enabled
 `
 
 type CreateAutoMRReworkRunParams struct {
@@ -183,6 +183,7 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 		&i.ReviewComments,
 		&i.BudgetPausedSeconds,
 		&i.LineageEpoch,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
@@ -244,7 +245,7 @@ const listMRReworkCandidates = `-- name: ListMRReworkCandidates :many
 
 WITH per_branch AS (
     SELECT DISTINCT ON (r.branch)
-           r.branch, r.mr_iid, r.user_id, r.id AS source_run_id
+           r.branch, r.mr_iid, r.user_id, r.id AS source_run_id, r.mr_rework_enabled
     FROM runs r
     WHERE r.repo_id = $1::uuid
       AND r.kind = 'issue'
@@ -270,7 +271,7 @@ JOIN users u ON u.id = per_branch.user_id
 LEFT JOIN pipeline_statuses ps
     ON ps.repo_id = $1::uuid AND ps.ref = per_branch.branch
 WHERE per_branch.branch <> rp.default_branch
-  AND u.mr_rework_enabled IS NOT FALSE
+  AND COALESCE(per_branch.mr_rework_enabled, u.mr_rework_enabled) IS NOT FALSE
   AND EXISTS (
       SELECT 1 FROM user_secrets s
       WHERE s.user_id = per_branch.user_id AND s.kind = 'anthropic_token'
@@ -304,9 +305,14 @@ type ListMRReworkCandidatesRow struct {
 //     'opened' (Decision 10 — gate on runs.mr_state, which SyncMRStates set FIRST
 //     this tick, NOT a fresh forge read; a just-merged/closed MR is excluded here so
 //     the watch halts without a double-fire against PRD #24's close edge).
-//  3. The run's owner has not opted out (users.mr_rework_enabled IS NOT FALSE —
-//     NULL/absent = ON, the default-ON semantics of 00165) AND has an Anthropic
-//     token on file. The token gate mirrors ListCIAutofixCandidateRefs: an mr_rework
+//  3. Eligibility has not been opted out ANYWHERE up the resolution chain (PRD #841 M1):
+//     COALESCE(per_branch.mr_rework_enabled, u.mr_rework_enabled) IS NOT FALSE. The
+//     per-run override (runs.mr_rework_enabled, nullable) coalesces OVER the owner
+//     default (users.mr_rework_enabled, nullable, default-ON per 00165): a non-NULL run
+//     column wins, and a NULL run column falls through to the owner default. Either
+//     layer explicitly false excludes the branch; NULL/absent at both = ON. The run
+//     column read is the newest issue run's per the DISTINCT ON below. The owner must
+//     ALSO have an Anthropic token on file. The token gate mirrors ListCIAutofixCandidateRefs: an mr_rework
 //     run executes on the OWNER's Anthropic token, so a token-less owner would only
 //     spawn a doomed run that burns the per-MR cap and posts a halt comment. It is an
 //     EXISTS over user_secrets (kind='anthropic_token'), not a users column. The admin

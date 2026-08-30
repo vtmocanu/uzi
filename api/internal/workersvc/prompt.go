@@ -36,7 +36,7 @@ var ErrActivePromptExists = errors.New("a prompt run is already active for this 
 // run-create paths. auto_approve and wait_on_limit ride straight from the schedule
 // the owner configured. A second active run for the schedule is rejected by the
 // partial unique index → ErrActivePromptExists.
-func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -55,6 +55,10 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 		IssueDescription: prompt,
 		AutoApprove:      autoApprove,
 		WaitOnLimit:      waitOnLimit,
+		// PRD #841 M1: the schedule's mr_rework override, stamped THROUGH live-inherit
+		// (D1) — nil ⇒ NULL ⇒ the run follows the owner default at read time. Threaded
+		// as *bool (not the schedule column yet) so M2 can pass sched.MrReworkEnabled.
+		MrReworkEnabled: pgBoolPtr(mrReworkEnabled),
 		// PRD #300: the schedule's per-schedule model override, frozen onto this run.
 		// nil → NULL → the run inherits the owner's per-user Worker default.
 		Model: pgTextPtr(model),

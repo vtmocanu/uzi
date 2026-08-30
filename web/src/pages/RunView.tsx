@@ -29,6 +29,7 @@ import {
 } from "../lib/api";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
+import { canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { stripUnsafeChars } from "../lib/safeText";
 import { effectiveWorkerCaps } from "../lib/workerCaps";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
@@ -588,6 +589,75 @@ export function LimitWaitPanel({
 }
 
 /**
+ * PRD #841: the per-run "auto-rework this MR's review comments" toggle. Mirrors the
+ * LimitWaitPanel checkbox block, with two deliberate divergences (D2/D3):
+ *
+ * - Visibility is gated by canToggleMrRework(run) — an `issue` run whose MR is null or
+ *   `opened` — NOT by a non-terminal status. The watcher acts AFTER the run completes,
+ *   so the toggle stays live on a completed run whose MR is still open and disappears
+ *   only once the MR merges/closes.
+ * - A non-owner (canSteer=false) sees NOTHING (returns null), not the inert
+ *   current-state text LimitWaitPanel shows: this is a post-completion preference with
+ *   no "when does it resume" fact a viewer needs, so there is nothing to render inert.
+ *
+ * The checkbox reflects the EFFECTIVE value (run override ?? owner default ?? on); a
+ * click sends the explicit boolean. The setting is tri-state (inherit/on/off), so when the
+ * run carries an EXPLICIT override (mr_rework_enabled is true or false, not null) a "Reset
+ * to default" button is shown that sends null, returning the run to live inheritance of the
+ * owner default (PRD #841) — so every state is reachable from the web, not only the CLI
+ * --clear. Exported like LimitWaitPanel so the gate + copy are testable without mounting
+ * the whole page.
+ */
+export function MrReworkPanel({
+  run,
+  busy,
+  canSteer = true,
+  userDefault,
+  onToggle,
+}: {
+  run: Run;
+  busy: boolean;
+  canSteer?: boolean;
+  // UserSettings.mr_rework_enabled: the owner's global default (null = never overrode
+  // the default-ON state). Only the run's own null-override falls through to it.
+  userDefault: boolean | null;
+  // null clears the run override back to inherit (the account default); true/false set it.
+  onToggle: (enabled: boolean | null) => void;
+}) {
+  // Hidden for a non-owner and once the MR is merged/closed (or a non-issue run).
+  if (!canSteer) return null;
+  if (!canToggleMrRework(run)) return null;
+  const effective = effectiveMrRework(run, userDefault);
+  // An explicit per-run override (true/false) is distinct from inherit (null/undefined);
+  // only then is there something to reset back to the account default.
+  const overridden = run.mr_rework_enabled != null;
+  return (
+    <div className="flex items-center gap-3 px-1">
+      <label className="flex items-center gap-2 text-xs">
+        <input
+          type="checkbox"
+          className="h-4 w-4 accent-brand"
+          checked={effective}
+          disabled={busy}
+          onChange={(e) => onToggle(e.target.checked)}
+        />
+        <span className="text-muted">Auto-rework this MR&apos;s review comments</span>
+      </label>
+      {overridden && (
+        <button
+          type="button"
+          className="text-xs font-medium text-muted transition-colors hover:text-fg disabled:opacity-50"
+          disabled={busy}
+          onClick={() => onToggle(null)}
+        >
+          Reset to default
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
  * Issue #754: the pool-empty hold panel + its Resume-now control — the analogue of
  * LimitWaitPanel for `pool_wait`.
  *
@@ -704,6 +774,11 @@ export function RunView() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // PRD #841: the owner's global MR-rework default, for the per-run checkbox's effective
+  // display when this run inherits (mr_rework_enabled null). Lives on UserSettings, not
+  // the session User, so it is fetched here. Best-effort — a failed read leaves null,
+  // which effectiveMrRework treats as the default-ON state.
+  const [mrReworkDefault, setMrReworkDefault] = useState<boolean | null>(null);
 
   // Resolve the repo's web URL (for the MR link); the run itself does not carry
   // it. Best-effort — the MR iid is shown as text if the repo is not resolvable.
@@ -730,6 +805,18 @@ export function RunView() {
       .then(({ workers }: { workers: Worker[] }) => setWorkers(workers))
       .catch(() => setWorkers([]));
   }, [run?.status]);
+
+  // PRD #841: load the owner's MR-rework default only when the per-run checkbox will
+  // actually show (owner viewing an issue run whose MR is still open) — the effective
+  // display needs it only in the inherit case. Best-effort; a failed read stays null.
+  const showMrRework = !!run && canSteer && canToggleMrRework(run);
+  useEffect(() => {
+    if (!showMrRework) return;
+    api
+      .getMySettings()
+      .then(({ settings }) => setMrReworkDefault(settings.mr_rework_enabled ?? null))
+      .catch(() => setMrReworkDefault(null));
+  }, [showMrRework]);
 
   const act = async (fn: () => Promise<unknown>) => {
     setActionErr("");
@@ -1050,6 +1137,24 @@ export function RunView() {
             // The flag is not a status change, so no WS frame announces it — without
             // this refetch the checkbox would snap back to the stale run on the next
             // render, which reads as the write having failed.
+            await refreshRun();
+          })
+        }
+      />
+
+      {/* PRD #841: the per-run MR-review-rework toggle. Self-hides for a non-owner and
+          once the MR is merged/closed; visible on a completed issue run whose MR is
+          still open, because the watcher acts after completion. */}
+      <MrReworkPanel
+        run={run}
+        busy={busy}
+        canSteer={canSteer}
+        userDefault={mrReworkDefault}
+        onToggle={(enabled) =>
+          act(async () => {
+            await api.setRunMrRework(run.id, enabled);
+            // Not a status change, so no WS frame announces it — refetch so the checkbox
+            // reflects the new run value instead of snapping back to the stale one.
             await refreshRun();
           })
         }

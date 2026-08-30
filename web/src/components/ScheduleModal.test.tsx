@@ -239,6 +239,85 @@ describe('the "apply model also to agents" toggle (PRD #305)', () => {
   });
 });
 
+describe("the per-schedule MR-rework tri-state control (PRD #841)", () => {
+  const LABEL = "Auto-rework MR review comments";
+
+  // Drive a fresh CREATE with the tri-state set to one of the three states, returning
+  // the ScheduleInput handed to createSchedule (the 2nd arg). "inherit" leaves the
+  // control at its default so the null path is exercised without touching it.
+  async function createWith(value: "inherit" | "on" | "off") {
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as Awaited<
+        ReturnType<typeof api.listRepos>
+      >["repos"],
+    });
+    mockApi.createSchedule.mockResolvedValue(schedFixture());
+    renderModal();
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Issue number"), { target: { value: "142" } });
+
+    const select = screen.getByLabelText(LABEL) as HTMLSelectElement;
+    // Default create leaves the control at Inherit.
+    expect(select.value).toBe("inherit");
+    if (value !== "inherit") {
+      fireEvent.change(select, { target: { value } });
+    }
+
+    const createBtn = screen.getByRole("button", { name: "Create schedule" });
+    await waitFor(() => expect(createBtn.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(createBtn);
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+    return mockApi.createSchedule.mock.calls[0]?.[1];
+  }
+
+  it("defaults to Inherit and sends mr_rework_enabled: null", async () => {
+    const input = await createWith("inherit");
+    expect(input?.mr_rework_enabled).toBeNull();
+  });
+
+  it("On sends mr_rework_enabled: true", async () => {
+    const input = await createWith("on");
+    expect(input?.mr_rework_enabled).toBe(true);
+  });
+
+  it("Off sends mr_rework_enabled: false (never collapsed from inherit)", async () => {
+    const input = await createWith("off");
+    expect(input?.mr_rework_enabled).toBe(false);
+  });
+
+  it("prefills the stored override when editing (false → 'off')", () => {
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ mr_rework_enabled: false })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect((screen.getByLabelText(LABEL) as HTMLSelectElement).value).toBe("off");
+  });
+
+  it("edit: changing to Inherit sends explicit null (clear-to-inherit)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ mr_rework_enabled: true })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    const select = screen.getByLabelText(LABEL) as HTMLSelectElement;
+    expect(select.value).toBe("on");
+    fireEvent.change(select, { target: { value: "inherit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.mr_rework_enabled).toBeNull();
+  });
+});
+
 describe("the create-only Enabled toggle (PRD #344 Feature B)", () => {
   it("renders the Enabled toggle in create mode", () => {
     renderModal();

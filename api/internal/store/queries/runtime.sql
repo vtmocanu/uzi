@@ -375,8 +375,8 @@ WHERE status = 'online'
 -- against the vocabulary at its write path, so no re-validation is needed here.
 -- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
 -- column default. Plan inference (M4) later union-merges via a separate UPDATE.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -1508,10 +1508,13 @@ UPDATE runs SET
     --
     -- CONSUMED-only (consumed_at IS NOT NULL) remains load-bearing on the server ceiling:
     -- the follow_up that wakes a park is UNCONSUMED until it wakes, so a consumed-only MAX
-    -- never advances past it. The watermark stays monotone across re-parks with NO claim
-    -- re-delivery and NO clear-on-wake — it simply names the last follow_up already spent
-    -- (or the worker's last-delivered id, whichever is lower), and anything newer is a
-    -- genuine new steer.
+    -- never advances past it. Monotonicity across re-parks is now ENFORCED by the
+    -- GREATEST(COALESCE(open_followup_id, 0), ...) current-value floor below — no longer
+    -- merely asserted from the protocol. Issue #817: the old "(or the worker's
+    -- last-delivered id, whichever is lower)" clause was exactly what broke it, because a
+    -- fresh re-claiming worker reports a present 0 (min of a monotone value and a value
+    -- that resets to 0 is not monotone). The watermark simply names the last follow_up
+    -- already spent, and anything newer is a genuine new steer.
     -- The GREATEST(0, ...) floor is the LOWER bound the LEAST ceiling does not give:
     -- LEAST only bounds a huge value from above, so a nonsensical NEGATIVE worker value
     -- (e.g. -1) would otherwise pass through and fail-open THIS run's own wake guard
@@ -1520,7 +1523,18 @@ UPDATE runs SET
     -- Flooring to 0 maps it to "nothing applied" (the first-park value), matching the
     -- stated "neutralize a buggy value" intent. GREATEST(0, ...) never affects a correct
     -- worker: its last-delivered id is always ≥ 0.
-    open_followup_id = GREATEST(0, LEAST(
+    -- Issue #817: floor the SET at the run's currently-stored value so the watermark
+    -- can never REGRESS. The RHS `open_followup_id` reads the PRE-UPDATE (old) row —
+    -- the same self-referential SET-RHS pattern this file already uses for
+    -- milestones_completed (see SetRunRunning and SetRunCompleted). Strand-free: every
+    -- GREATEST operand is ≤ the run's MAX(consumed follow_up id), which is monotone
+    -- non-decreasing, and the unconsumed wake follow_up has id > that max, so
+    -- `id > open_followup_id` always still holds. SAFETY DEPENDS on run_user_inputs
+    -- being append-only and consumed_at set-once: a retention/pruning job that
+    -- hard-deletes consumed follow_up rows would let MAX(consumed) drop below a prior
+    -- stamp, and this floor — unlike the pre-fix pure-LEAST clamp — would then hold the
+    -- watermark too high; such a change must reckon with the wake guard.
+    open_followup_id = GREATEST(0, COALESCE(open_followup_id, 0), LEAST(
         COALESCE(sqlc.narg('open_followup_id')::bigint,
                  (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
                   WHERE run_user_inputs.run_id = @id AND kind = 'follow_up' AND consumed_at IS NOT NULL)),
@@ -3188,6 +3202,24 @@ SELECT (EXISTS (
 UPDATE runs SET wait_on_limit = @wait_on_limit, updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: SetRunMrReworkEnabled :execrows
+-- Flip ONE run's MR-rework override after the fact (PRD #841 M1, Decision D2), the
+-- per-run surface for the MR review watcher. Owner-scoped exactly like SetRunWaitOnLimit:
+-- a foreign run returns 0 rows, which the handler maps to 404 (never 403, which would
+-- confirm the run exists). @mr_rework_enabled is a NULLABLE bool (the column is nullable,
+-- default-ON via COALESCE(run, owner) IS NOT FALSE): passing NULL clears the override
+-- back to inherit, and false/true set an explicit override.
+--
+-- 🔴 NO STATUS GUARD, and MUST NOT have one (D2). Unlike wait_on_limit — which governs
+-- an IN-FLIGHT run, so SetRunWaitOnLimit guards status NOT IN ('completed','failed',
+-- 'cancelled') — the MR-rework watcher acts AFTER the run completes, during Human Review
+-- while its MR still has open comments. A terminal-status guard would lock the toggle
+-- exactly when it matters. No explicit terminal guard for a merged/closed MR is needed
+-- either: the write is inert once the MR is no longer open, because ListMRReworkCandidates
+-- already excludes any run whose MR has left the opened state.
+UPDATE runs SET mr_rework_enabled = @mr_rework_enabled, updated_at = now()
+WHERE id = @id AND user_id = @user_id;
 
 -- name: SetRunPriority :execrows
 -- Expedite/undo one queued run's manual priority override (PRD #320 D6/D7). Owner-

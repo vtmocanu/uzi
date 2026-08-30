@@ -1309,6 +1309,10 @@ export interface Schedule {
   last_fire: LastFire | null;
   auto_approve: boolean;
   wait_on_limit: boolean;
+  /** PRD #841: per-schedule MR-review-rework override, tri-state. null = inherit (the
+   *  default), so runs this schedule fires follow the owner's global setting unless an
+   *  explicit true/false override is set. Mirrors the run-level nullable shape. */
+  mr_rework_enabled?: boolean | null;
   // Per-sweep upper bound on issues fanned out per fire, oldest-first; null =
   // unlimited. Sweep target only (null for issue/prompt).
   max_issues: number | null;
@@ -1417,6 +1421,10 @@ export interface ScheduleInput {
   timezone?: string;
   auto_approve?: boolean;
   wait_on_limit?: boolean;
+  /** PRD #841: per-schedule MR-review-rework override, tri-state. Present true/false is
+   *  applied, present null clears back to inherit, absent leaves it unchanged (PATCH
+   *  semantics). The modal always sends it on create (null = inherit the owner default). */
+  mr_rework_enabled?: boolean | null;
   // Sweep cap (oldest-first); explicit null clears to unlimited. Sweep target only.
   max_issues?: number | null;
   // Owner guidance for issue/sweep targets; explicit null/"" clears to none.
@@ -1768,6 +1776,13 @@ export interface Run {
    *  (opened|closed|merged|locked), null when never observed. Display-only hint
    *  (PRD #33); frozen per run, so a superseded run's value can be stale. */
   mr_state: string | null;
+  /** PRD #841: this run's per-run MR-review-rework override, tri-state and nullable.
+   *  `undefined`/absent (older api pod) and `null` both mean "inherit" — the watcher
+   *  resolves the effective value live as `run.mr_rework_enabled ?? owner default`, so
+   *  a null here follows the user's own Settings default. An explicit true/false is a
+   *  per-run override. Kept `boolean | null` (never `any`) to preserve the
+   *  omitted-vs-null-vs-value distinction, exactly like mr_state's nullability. */
+  mr_rework_enabled?: boolean | null;
   failure_reason: string | null;
   /** Server-stamped stop signal (PRD #33, widened by #108 M5): "cancelled" or
    *  "plan_rejected" (human), "auto_stopped" (server), null otherwise. isStoppedRun
@@ -3633,6 +3648,19 @@ const realApi = {
    */
   setRunWaitOnLimit: (id: string, enabled: boolean) =>
     request<{ run: Run }>("PUT", `/runs/${id}/wait-on-limit`, { enabled }),
+
+  /**
+   * PRD #841: set (or clear) THIS run's per-run MR-review-rework override. `true`/`false`
+   * is an explicit override; `null` clears back to inherit, so the watcher resolves the
+   * effective value from the owner's Settings default. Unlike setRunWaitOnLimit this route
+   * is RequireUser (cookie OR `uzc_` Bearer) and carries NO status guard — the watcher acts
+   * AFTER the run completes, so the toggle stays live on a completed run whose MR is still
+   * open. The write is inert once the MR merges/closes (the candidate query excludes a
+   * non-`opened` MR), so the web hides the control then rather than the server rejecting it.
+   * Returns the updated run.
+   */
+  setRunMrRework: (id: string, enabled: boolean | null) =>
+    request<{ run: Run }>("PUT", `/runs/${id}/mr-rework`, { enabled }),
 
   /**
    * Issue #754: resume an `auto`-lane run parked at `pool_wait` (the owner's

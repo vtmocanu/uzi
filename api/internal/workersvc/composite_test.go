@@ -234,7 +234,7 @@ func TestStartRunForUserForgeReadError(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetForges(fb)
 
-	_, err := svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 5, nil, nil)
+	_, err := svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 5, nil, nil, nil)
 	if !errors.Is(err, ErrForgeIssueRead) {
 		t.Fatalf("err = %v, want ErrForgeIssueRead", err)
 	}
@@ -251,7 +251,7 @@ func TestStartRunForUserRepoNotOwned(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetForges(fb)
 
-	_, err := svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 5, nil, nil)
+	_, err := svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 5, nil, nil, nil)
 	if !errors.Is(err, ErrRepoNotFound) {
 		t.Fatalf("err = %v, want ErrRepoNotFound", err)
 	}

@@ -676,6 +676,17 @@ func pgTextPtr(s *string) pgtype.Text {
 	return pgtype.Text{String: *s, Valid: true}
 }
 
+// pgBoolPtr maps a tri-state *bool to a nullable pgtype.Bool: nil ⇒ SQL NULL (inherit),
+// else the explicit value. Used to stamp runs.mr_rework_enabled / the schedule override
+// (PRD #841 M1) THROUGH the caller's pointer with no owner-default snapshot — the
+// live-inherit model (D1), unlike resolveWaitOnLimit which snapshots.
+func pgBoolPtr(b *bool) pgtype.Bool {
+	if b == nil {
+		return pgtype.Bool{}
+	}
+	return pgtype.Bool{Bool: *b, Valid: true}
+}
+
 // resolveWaitOnLimit answers "does THIS new run park on a usage limit" (PRD #35
 // Decision 7): the caller's explicit choice when it made one, else the owner's
 // users.wait_on_limit default.

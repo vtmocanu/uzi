@@ -712,6 +712,54 @@ func TestSetRunRunningAwaitingFollowupWatermarkDiscriminatesLiveDB(t *testing.T)
 	if got := f.status(ctx, t, run); got != "running" {
 		t.Fatalf("status = %q after new follow_up wake, want running", got)
 	}
+
+	// (6) Issue #817: the PRESENT-0 re-park (a fresh re-claiming worker). A worker that
+	//     just re-claimed a requeued run inits lastDeliveredFollowUpId to 0 and reports
+	//     that PRESENT 0 (Valid:true) at park — unlike an old worker that OMITS the param
+	//     (NULL) and falls back to the server max. The monotone floor must hold the
+	//     watermark at id2 rather than let the present 0 drop it.
+	park()
+	if w := watermark(); w != id2 {
+		t.Fatalf("watermark after normal re-park = %d, want id2=%d", w, id2)
+	}
+	prows, err := f.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
+		ID: run, WorkerID: pgU(wkr), OpenFollowupID: pgtype.Int8{Int64: 0, Valid: true},
+	})
+	if err != nil || prows != 1 {
+		t.Fatalf("present-0 SetRunAwaitingFollowup: rows=%d err=%v", prows, err)
+	}
+	if w := watermark(); w != id2 {
+		// On the UNPATCHED SQL (pure GREATEST(0, LEAST(...)) with no current-value floor)
+		// the present 0 would have dropped the watermark to 0 here — this assertion is the teeth.
+		t.Fatalf("watermark after present-0 re-park = %d, want id2=%d — the monotone floor did not hold", w, id2)
+	}
+
+	// (7) With id2 still the newest consumed follow_up, a stale/duplicate pre-park `running`
+	//     report must be REFUSED (the park holds). On unpatched SQL the watermark is 0 here
+	//     and this resume would return 1.
+	if rows := resume(); rows != 0 {
+		t.Fatalf("a stale pre-park report un-parked the run after a present-0 re-park (%d rows) — the "+
+			"open_followup_id floor did not survive the fresh-worker present 0", rows)
+	}
+	if got := f.status(ctx, t, run); got != "awaiting_followup" {
+		t.Fatalf("status = %q after the refused report, want awaiting_followup (the park must hold)", got)
+	}
+
+	// (8) A genuinely NEW follow_up (#3, id3 > id2) still wakes the floored park — proving the
+	//     floor at id2 is not too strict.
+	id3 := createFollowup()
+	if id3 <= id2 {
+		t.Fatalf("follow_up #3 id=%d not > #2 id=%d — run_user_inputs.id is not monotone as assumed", id3, id2)
+	}
+	if _, err := f.q.ConsumeRunInputs(ctx, run); err != nil {
+		t.Fatalf("ConsumeRunInputs #3: %v", err)
+	}
+	if rows := resume(); rows != 1 {
+		t.Fatalf("a genuinely new follow_up (#3) did not wake the floored park (%d rows) — the floor is too strict", rows)
+	}
+	if got := f.status(ctx, t, run); got != "running" {
+		t.Fatalf("status = %q after new follow_up wake, want running", got)
+	}
 }
 
 // The park WRITER itself (SetRunAwaitingFollowup): status write, the load-bearing health

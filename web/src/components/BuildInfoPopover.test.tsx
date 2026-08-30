@@ -680,3 +680,31 @@ describe("BuildInfoPopover — Changelog button + focus-within (PRD #415 M2)", (
     expect(bridge.className).not.toContain("pointer-events");
   });
 });
+
+describe("BuildInfoPopover — panel width is state-dependent so it fits the expanded rail", () => {
+  // jsdom does no layout, so getBoundingClientRect returns zeros and a test cannot
+  // measure real pixel overflow — the same reason the hover-bridge tests assert the
+  // mechanism. Here the mechanism is the width utility class: expanded the panel must
+  // carry the rail-bounded width (222px), collapsed it keeps the wider 226px whose
+  // overhang past the 56px rail is deliberate. Guarding that the two states differ is
+  // what locks out a regression back to a single fixed width spilling past the 240px
+  // expanded rail (see AppShell.tsx `w-60`).
+  it("expanded: carries the bounded width, not the wider collapsed width", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    const cls = popover().className;
+    expect(cls).toContain("w-[222px]");
+    expect(cls).not.toContain("w-[226px]");
+    // Fitting the rail took BOTH levers: 222px alone at the old `left-2` inset (left
+    // 20) still reaches right 242, a 2px spill. Pin the inset too, so a revert to
+    // `left-2` that keeps the width reintroduces the overflow and this test catches it.
+    expect(cls).toContain("left-1");
+    expect(cls).not.toContain("left-2");
+  });
+
+  it("collapsed: keeps the wider 226px width (its overhang is deliberate)", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} collapsed />);
+    const cls = popover().className;
+    expect(cls).toContain("w-[226px]");
+    expect(cls).not.toContain("w-[222px]");
+  });
+});
