@@ -4591,6 +4591,10 @@ export const mockApi = {
           (m.model ?? "") !== entry.model ||
           m.auto_approve !== entry.auto_approve ||
           m.wait_on_limit !== entry.wait_on_limit ||
+          // mr_rework_enabled (PRD #841): the catalog baseline is inherit (null), so ANY
+          // explicit override flips customized — mirroring the server's `if mrRework.Valid`
+          // in defaultEditableDiverges (api/internal/handler/schedules.go).
+          m.mr_rework_enabled != null ||
           (m.target === "sweep" && (m.max_issues ?? 0) !== entry.max_issues) ||
           // Owner guidance-overlay divergence for a prompt default (issue #662) or a sweep
           // default (issue #675): the OVERLAY (m.guidance) is null until the owner sets one,
