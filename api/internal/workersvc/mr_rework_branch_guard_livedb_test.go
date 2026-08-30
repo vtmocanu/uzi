@@ -149,6 +149,82 @@ func TestMRReworkBranchGuardForcedInterleaveLiveDB(t *testing.T) {
 	}
 }
 
+// TestCreateAutoMRReworkRunSameMRDuplicateIsActiveExistsLiveDB pins the restored contract
+// after the create-query predicate was narrowed to the CROSS-KIND case only: a repeated
+// create for the SAME merge request (same pipeline_ref = agent/issue-N, same mr_iid) must
+// fall through the WHERE NOT EXISTS guard and be rejected by the uq_runs_one_active_mr_rework
+// (repo_id, mr_iid) unique index → ErrActiveMRReworkExists, NOT the branch guard's
+// ErrBranchInUse.
+//
+// Before the fix the predicate matched kind IN ('ci_fix','mr_rework'), so the first
+// (committed) mr_rework made the second create see a same-kind sibling → zero rows →
+// pgx.ErrNoRows → ErrBranchInUse, wrongly shadowing the same-MR duplicate. This is the
+// sequential, committed-path counterpart to the concurrent-window test above; both calls
+// commit through the pool, so no goroutines or sleeps are needed.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (per the store
+// live-DB harness).
+func TestCreateAutoMRReworkRunSameMRDuplicateIsActiveExistsLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store live-DB harness for coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+	svc := New(q, nil, Params{})
+
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+
+	// The repo-ownership check (GetRepoForUser) needs users + forge_connections + repos.
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("dup-%s@e2e", userID))
+	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	      VALUES ($1, $2, 1, $3, 'https://forge.e2e/g/dup', 'main', true)`, repoID, connID, fmt.Sprintf("g/dup-%s", repoID))
+
+	// A completed source issue run with an opened MR on the branch, serving as target_run_id
+	// (runs_kind_shape requires an mr_rework to carry a non-null target_run_id).
+	const branch = "agent/issue-760"
+	const mrIID int64 = 7600
+	sourceRunID := uuid.New()
+	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, mr_iid, mr_state, status)
+	      VALUES ($1, $2, $3, 'issue', 760, 't', 'd', $4, $5, 'opened', 'completed')`,
+		sourceRunID, userID, repoID, branch, mrIID)
+
+	// First create SUCCEEDS: no active branch run, no active rework → the WHERE NOT EXISTS
+	// guard passes and the row inserts.
+	run, err := svc.CreateAutoMRReworkRun(ctx, userID, repoID, branch, mrIID, sourceRunID, "Rework MR review", "desc", nil)
+	if err != nil {
+		t.Fatalf("first CreateAutoMRReworkRun err = %v, want success", err)
+	}
+	if run.Kind != RunKindMRRework {
+		t.Fatalf("first run.Kind = %q, want %q", run.Kind, RunKindMRRework)
+	}
+
+	// Second create for the SAME branch + SAME mr_iid: the narrowed predicate no longer
+	// matches the committed mr_rework, so this proceeds past WHERE NOT EXISTS and is rejected
+	// by uq_runs_one_active_mr_rework (repo_id, mr_iid) → ErrActiveMRReworkExists (NOT
+	// ErrBranchInUse, which was the pre-fix behavior).
+	_, err = svc.CreateAutoMRReworkRun(ctx, userID, repoID, branch, mrIID, sourceRunID, "Rework MR review", "desc", nil)
+	if !errors.Is(err, ErrActiveMRReworkExists) {
+		t.Fatalf("same-MR duplicate create err = %v, want ErrActiveMRReworkExists", err)
+	}
+}
+
 // waitBlockedOnCreateMRRework proves, from a THIRD connection, that the racing
 // CreateAutoMRReworkRun is parked on a lock rather than merely slow. Returns false if it
 // cannot establish that within the bound; the caller must then invalidate the run rather

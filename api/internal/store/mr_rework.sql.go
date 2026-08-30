@@ -24,7 +24,7 @@ SELECT
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
-      AND kind IN ('ci_fix', 'mr_rework')
+      AND kind = 'ci_fix'
       AND pipeline_ref = $5
       AND status NOT IN ('completed', 'failed', 'cancelled')
 )
@@ -56,16 +56,19 @@ type CreateAutoMRReworkRunParams struct {
 // (23505 → ErrActiveMRReworkExists). wait_on_limit is the owner's default (PRD #35).
 //
 // The create-time CROSS-KIND branch guard (Decision 6, the most severe review finding)
-// is this query's own single atomic INSERT … WHERE NOT EXISTS: the WHERE NOT EXISTS
-// predicate is byte-identical to the removed CountActiveBranchRunsForRef count — an
-// active ci_fix OR mr_rework run whose pipeline_ref equals the branch (agent/issue-N)
-// means the branch is occupied. BOTH kinds write pipeline_ref AT INSERT, so — unlike
-// the old runs.branch count (NULL for a run's whole active life) — a freshly-created
-// sibling is seen. A committed sibling → zero rows inserted → pgx.ErrNoRows, which the
-// caller maps to ErrBranchInUse. A concurrent-window sibling not yet visible to this
+// is this query's own single atomic INSERT … WHERE NOT EXISTS. The WHERE NOT EXISTS
+// predicate is narrowed to the CROSS-KIND case only — an active ci_fix run whose
+// pipeline_ref equals the branch (agent/issue-N) means the branch is occupied by the
+// other kind. ci_fix writes pipeline_ref AT INSERT, so — unlike the old runs.branch
+// count (NULL for a run's whole active life) — a freshly-created cross-kind sibling is
+// seen. A committed ci_fix → zero rows inserted → pgx.ErrNoRows, which the caller maps
+// to ErrBranchInUse. A concurrent-window cross-kind race not yet visible to this
 // statement's snapshot slips past WHERE NOT EXISTS, and the durable spanning
 // uq_runs_one_active_branch_ref partial index arbitrates: the losing insert raises
-// 23505 on that constraint, which the caller likewise maps to ErrBranchInUse.
+// 23505 on that constraint, which the caller likewise maps to ErrBranchInUse. A same-MR
+// mr_rework DUPLICATE (same pipeline_ref) now proceeds PAST this predicate — it is no
+// longer swallowed as a false branch conflict — and is rejected by the
+// uq_runs_one_active_mr_rework (repo_id, mr_iid) index → 23505 → ErrActiveMRReworkExists.
 func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRReworkRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createAutoMRReworkRun,
 		arg.UserID,
