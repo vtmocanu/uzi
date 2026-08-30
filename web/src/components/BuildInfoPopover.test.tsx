@@ -694,10 +694,13 @@ describe("BuildInfoPopover — panel width is state-dependent so it fits the exp
     const cls = popover().className;
     expect(cls).toContain("w-[222px]");
     expect(cls).not.toContain("w-[226px]");
-    // Fitting the rail took BOTH levers: 222px alone at the old `left-2` inset (left
-    // 20) still reaches right 242, a 2px spill. Pin the inset too, so a revert to
-    // `left-2` that keeps the width reintroduces the overflow and this test catches it.
-    expect(cls).toContain("left-1");
+    // The expanded panel now CENTERS in the 240px rail via `-left-[3px]`: host `px-3`
+    // (12px) − 3px = 9px left edge, width 222 → right edge 231, i.e. equal 9px gaps.
+    // A revert to `left-1` or `left-2` re-pins it left and breaks the centering, so
+    // pin the inset too and these guards catch that. (The literal "-left-[3px]" does
+    // not contain the substrings "left-1" or "left-2", so both negatives stay valid.)
+    expect(cls).toContain("-left-[3px]");
+    expect(cls).not.toContain("left-1");
     expect(cls).not.toContain("left-2");
   });
 
@@ -706,5 +709,15 @@ describe("BuildInfoPopover — panel width is state-dependent so it fits the exp
     const cls = popover().className;
     expect(cls).toContain("w-[226px]");
     expect(cls).not.toContain("w-[222px]");
+  });
+
+  it("expanded: the version badge uses the aligned px-1.5 padding, not px-3", () => {
+    // The footer wrapper (AppShell.tsx) adds px-3 (12px); the badge's own px-1.5 (6px)
+    // sums to 18px, aligning the version text with the nav icon column. A revert to
+    // px-3 double-indents it and breaks that alignment, so guard the padding directly.
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    const badge = screen.getByRole("button", { name: "v0.4.2" });
+    expect(badge.className).toContain("px-1.5");
+    expect(badge.className).not.toContain("px-3");
   });
 });
