@@ -575,6 +575,11 @@ describe("BuildInfoPopover — panel width is state-dependent so it fits the exp
     const cls = popover().className;
     expect(cls).toContain("w-[222px]");
     expect(cls).not.toContain("w-[226px]");
+    // Fitting the rail took BOTH levers: 222px alone at the old `left-2` inset (left
+    // 20) still reaches right 242, a 2px spill. Pin the inset too, so a revert to
+    // `left-2` that keeps the width reintroduces the overflow and this test catches it.
+    expect(cls).toContain("left-1");
+    expect(cls).not.toContain("left-2");
   });
 
   it("collapsed: keeps the wider 226px width (its overhang is deliberate)", () => {
