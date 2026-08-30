@@ -2050,8 +2050,11 @@ export class RunRunner {
                     // Issue #631: a non-fast-forward rejection (an already-published branch — a resume, or
                     // the self_improve fixed branch — whose merge push cannot fast-forward) can't be cleared
                     // by the rebase fallback (it also can't force-push), so preserve the diff and fail typed
-                    // rather than escape to the generic catch (raw message, no preserved_patch). Mirrors the
-                    // overlay push catch (:2020) and pushAlignedOrPreserve (:1945-1946).
+                    // rather than escape to the generic catch (raw message, no preserved_patch). This
+                    // matches pushAlignedOrPreserve (:1945-1946), which likewise fails typed on non-ff.
+                    // (The overlay push catch at :2020 handles non-ff differently — it can still fall
+                    // back to merge/rebase — so this arm deliberately does NOT mirror it: once at the
+                    // merge, a rebase cannot clear a non-ff on an already-published branch.)
                     runLog.info(
                       "finalize base-align: merge push rejected non-fast-forward; preserving diff and failing typed",
                       { run_id: runId },
