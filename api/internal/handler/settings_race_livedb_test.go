@@ -80,9 +80,12 @@ func TestConcurrentCrossKeyLabelPutLiveDB(t *testing.T) {
 	for iter := 0; iter < raceIterations; iter++ {
 		// Reproduce the #831 starting state each iteration: no uzi_label row (so a write
 		// to it is an INSERT of a new row), autopilot_label back at its default. This is
-		// a shared DB, so reset explicitly rather than assuming a clean slate.
-		if _, err := pool.Exec(ctx, `DELETE FROM app_settings WHERE key IN ('uzi_label','prd_label')`); err != nil {
-			t.Fatalf("iter %d: reset uzi_label: %v", iter, err)
+		// a shared DB, so reset explicitly rather than assuming a clean slate. finding_label
+		// is cleared too: ValidateMerged also rejects uzi_label == finding_label, so a
+		// leftover finding_label == "SHARED" from prior state would 400 the uzi writer for
+		// an unrelated reason and make the assertion vacuous.
+		if _, err := pool.Exec(ctx, `DELETE FROM app_settings WHERE key IN ('uzi_label','prd_label','finding_label')`); err != nil {
+			t.Fatalf("iter %d: reset label rows: %v", iter, err)
 		}
 		if _, err := pool.Exec(ctx,
 			`INSERT INTO app_settings (key, value) VALUES ('autopilot_label','autopilot')

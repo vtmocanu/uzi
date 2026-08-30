@@ -90,6 +90,14 @@ const SecretMutationLockClass int32 = 0x757A736B // "uzsk"
 // one-bigint space is disjoint from the two-int space the *LockClass constants use,
 // so none can collide. XACT-scoped: released on commit or rollback, no unlock to
 // forget.
+//
+// Depends on the pool's default READ COMMITTED isolation (OpenPool sets none): the
+// loser acquires the lock only after the winner commits, and its NEXT statement then
+// takes a fresh snapshot that sees the winner's committed row. At REPEATABLE READ or
+// SERIALIZABLE the transaction snapshot would instead be fixed at this lock statement
+// — taken while the loser is still blocked, before the winner commits — so the loser
+// would miss the new row and the race would reopen. The sibling locks above make the
+// same assumption; do not add an isolation level to the DSN without revisiting this.
 const SettingsMutationLockKey int64 = 0x757A7365 // "uzse"
 
 // Migrate runs all pending goose migrations against the database at dsn. It

@@ -21,14 +21,20 @@
 INSERT INTO app_settings (key, value) VALUES ('uzi_label', 'uzi')
     ON CONFLICT (key) DO NOTHING;
 
-DELETE FROM app_settings WHERE key = 'prd_label';
+-- Remove ONLY the untouched 00036 seed row, never an admin-customised prd_label. The
+-- value guard spares a customisation to a non-default string even if its author was
+-- later deleted (updated_by is ON DELETE SET NULL, so it cannot alone mean "pristine");
+-- updated_by IS NULL additionally spares a deliberate 'PRD' set by an existing admin. A
+-- deliberate 'PRD' by a since-deleted admin is indistinguishable from the seed and is
+-- the one unavoidable case.
+DELETE FROM app_settings WHERE key = 'prd_label' AND value = 'PRD' AND updated_by IS NULL;
 
 -- +goose Down
 
--- Reverse the reconcile: restore the retired prd_label seed and drop the uzi_label
--- seed. Uses the 00036 default 'PRD' for prd_label; only removes a uzi_label row that
--- still carries the seeded default (an admin-customised value is left intact).
+-- Reverse the reconcile: restore the retired prd_label seed and drop the uzi_label seed.
+-- Symmetric with the Up delete: only a uzi_label row that still looks like the untouched
+-- seed is removed, so an admin-set uzi_label survives a rollback.
 INSERT INTO app_settings (key, value) VALUES ('prd_label', 'PRD')
     ON CONFLICT (key) DO NOTHING;
 
-DELETE FROM app_settings WHERE key = 'uzi_label' AND value = 'uzi';
+DELETE FROM app_settings WHERE key = 'uzi_label' AND value = 'uzi' AND updated_by IS NULL;
