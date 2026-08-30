@@ -45,6 +45,12 @@ const (
 	// normally and re-fires next cadence once a human merges or closes an outstanding MR, and
 	// the owner gets a selfimprove_skipped notification.
 	SkipSelfImproveMRCapReached SkipReason = "self_improve_mr_cap_reached"
+
+	// SkipOpenMRExists ← workersvc.ErrOpenMRExists (issue #856): a prior completed run for
+	// this issue still owns an OPEN merge request, so createRun refuses a fresh run. Benign:
+	// the sweep skips this candidate and advances, and the cadence re-fires once the MR is
+	// merged or closed.
+	SkipOpenMRExists SkipReason = "open_mr_exists"
 )
 
 // AllSkipReasons lists every SkipReason in the closed set. The cross-language contract
@@ -56,6 +62,7 @@ var AllSkipReasons = []SkipReason{
 	SkipFetchFailed,
 	SkipVaultLocked,
 	SkipSelfImproveMRCapReached,
+	SkipOpenMRExists,
 }
 
 // skipReasonForErr maps the benign run-creation seam sentinels to their SkipReason.
@@ -72,6 +79,8 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 		return SkipAlreadyRunning, true
 	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 		return SkipDescriptionTooLarge, true
+	case errors.Is(err, workersvc.ErrOpenMRExists):
+		return SkipOpenMRExists, true
 	default:
 		return "", false
 	}

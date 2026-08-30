@@ -221,7 +221,7 @@ func (f *fakeRuns) effErr(issueIID int64) error {
 	return f.err
 }
 
-func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, _ bool, _ *workersvc.SeededPlan) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
@@ -939,6 +939,7 @@ func TestSkipReasonForErr(t *testing.T) {
 		{workersvc.ErrNotPRDIssue, SkipNotEligible, true},
 		{workersvc.ErrActiveRunExists, SkipAlreadyRunning, true},
 		{workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge, true},
+		{workersvc.ErrOpenMRExists, SkipOpenMRExists, true},
 		{workersvc.ErrActivePromptExists, "", false},
 		{workersvc.ErrRepoNotFound, "", false},
 		{context.DeadlineExceeded, "", false},
@@ -950,9 +951,10 @@ func TestSkipReasonForErr(t *testing.T) {
 		}
 	}
 	// AllSkipReasons enumerates the full closed set (PRD #590 M1 added vault_locked;
-	// PRD #686 D10 added self_improve_mr_cap_reached; PRD #764 retired not_eligible).
-	if len(AllSkipReasons) != 6 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 6", len(AllSkipReasons))
+	// PRD #686 D10 added self_improve_mr_cap_reached; PRD #764 retired not_eligible;
+	// issue #856 added open_mr_exists).
+	if len(AllSkipReasons) != 7 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 7", len(AllSkipReasons))
 	}
 }
 

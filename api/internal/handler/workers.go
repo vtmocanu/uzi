@@ -882,6 +882,11 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// them.
 		PlannedCommit *string `json:"planned_commit"`
 		RequireBase   bool    `json:"require_base"`
+		// Force (issue #856): bypass ONLY the create-time open-MR dedup (a completed prior
+		// run still owning an OPEN MR for this issue). A plain bool — absence means "do not
+		// force" — and it never affects the active-run gate. The CLI `uzi run create --force`
+		// sets it (m2); the web board start button omits it.
+		Force bool `json:"force"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -932,7 +937,7 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
 	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
 	// start-run card.
-	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, seed)
+	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return
@@ -1084,6 +1089,10 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 		// internal invariant violation, never a caller error — 500, logged.
 		slog.Error("create task run: branch-safety assertion failed", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	case errors.Is(err, workersvc.ErrOpenMRExists):
+		// issue #856: distinct from the active-run 409. A machine-readable `code` lets the
+		// web offer a force-retry confirm; the message already names the MR.
+		httpx.JSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "code": "issue_has_open_mr"})
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
 	case errors.Is(err, workersvc.ErrBranchInUse):

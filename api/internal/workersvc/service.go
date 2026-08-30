@@ -131,7 +131,13 @@ var (
 	// both. This is the authoritative gate; the CLI mirrors it as a pre-flight usage error.
 	ErrInvalidPlannedCommit = errors.New("planned base commit is not a valid commit sha (hex, 7-64 chars)")
 	ErrActiveRunExists      = errors.New("a non-terminal run already exists for this issue")
-	ErrRunTerminal          = errors.New("run has already finished")
+	// ErrOpenMRExists refuses a fresh issue run when the issue already has a completed
+	// run owning an OPEN merge request (issue #856). Distinct from ErrActiveRunExists:
+	// the offending prior run is TERMINAL, so the active-run gate cannot see it. The
+	// create path wraps this with the issue and MR numbers; --force (workersvc create
+	// param) bypasses ONLY this guard, never the active-run gate.
+	ErrOpenMRExists = errors.New("issue already has an open MR")
+	ErrRunTerminal  = errors.New("run has already finished")
 	// ErrStopNotInteractive rejects a `stop` on a run that is not an interactive task
 	// (PRD #517 M4) → 409. A graceful stop is honored ONLY by the interactive-task park:
 	// no other run kind reads the stop flag, so a stop on a plan-gated / chat /
@@ -500,6 +506,10 @@ type Store interface {
 	// gave the manual/board/Slack path is restored here (this SELECT still counts
 	// pool_wait as active).
 	HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error)
+	// GetOpenMRRunForIssue returns the MR iid of a completed issue run that still owns an
+	// OPEN merge request for the issue (issue #856), or pgx.ErrNoRows when none does. It
+	// backs createRun's create-time open-MR refusal (the open-MR dedup that --force bypasses).
+	GetOpenMRRunForIssue(ctx context.Context, arg store.GetOpenMRRunForIssueParams) (pgtype.Int8, error)
 	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
@@ -4714,7 +4724,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // run is self-contained even if the issue cache is later evicted. A PRD link is no
 // longer required. The one-non-terminal-run-per-issue index rejects a duplicate
 // active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -4730,7 +4740,9 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// (PRD #300) — the per-schedule override applies only to runs a schedule fires.
 	// false overrideSubagentModel (PRD #305): an interactive run is not a schedule fire,
 	// so it stays in the default lane where subagent pins win.
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, mrReworkEnabled, nil, false, seed)
+	// force (issue #856): threaded straight through so the interactive/CLI caller can
+	// bypass the open-MR dedup with --force; it never affects the active-run gate.
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
@@ -4738,7 +4750,8 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 // It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
 // and, like every create path, no longer requires a PRD link.
 func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, seed)
+	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -4761,7 +4774,8 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// nil mrReworkEnabled (PRD #841 M1): label-poller autopilot has no human/schedule to
 	// express a per-run override, so the run's column stays NULL → inherit the owner
 	// default live, exactly today's behaviour.
-	return s.createRun(ctx, userID, repoID, issueIID, description, true, nil, nil, nil, false, nil)
+	// false force (issue #856): label-poller autopilot never bypasses the open-MR dedup.
+	return s.createRun(ctx, userID, repoID, issueIID, description, true, nil, nil, nil, false, false, nil)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -4774,7 +4788,8 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // scheduler seam cannot change label-driven autopilot. seed=nil for the same reason as
 // CreateAutopilotRun: autopilot never seeds its plan.
 func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, nil /*seed*/)
+	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
+	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -4803,7 +4818,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -4952,6 +4967,26 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	}
 	if active {
 		return store.Run{}, ErrActiveRunExists
+	}
+	// Open-MR dedup (issue #856): a COMPLETED run owning an OPEN MR is terminal, so the
+	// active-run gate above cannot see it — yet a fresh start would re-plan and re-run the
+	// whole review wave onto that already-open MR (silent wasted spend). Refuse unless the
+	// caller forced it. Scoped to the issue kind by construction (createRun is the issue
+	// path). --force bypasses ONLY this guard, never the active-run gate above. The
+	// predicate is the watcher-owned mr_state='opened' (mirrors ListMRReworkCandidates); it
+	// leaves a brief false-negative window between MR-open-at-finalize and the first watch
+	// tick, the same limitation the mr_rework candidate query lives with.
+	if !force {
+		mrIID, err := s.q.GetOpenMRRunForIssue(ctx, store.GetOpenMRRunForIssueParams{
+			RepoID:   repoID,
+			IssueIid: pgtype.Int8{Int64: issueIID, Valid: true},
+		})
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return store.Run{}, err
+		}
+		if err == nil && mrIID.Valid {
+			return store.Run{}, fmt.Errorf("%w: issue #%d already has open MR !%d — merge or close it, or leave review comments on the MR to iterate, before starting a new run (pass --force to re-run anyway)", ErrOpenMRExists, issueIID, mrIID.Int64)
+		}
 	}
 	// PRD #381: snapshot the issue's human comments alongside the description. One
 	// extra forge round-trip, centralized here so every issue-backed origin (manual,

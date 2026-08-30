@@ -100,3 +100,22 @@ SELECT EXISTS (
     WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid
       AND status NOT IN ('completed', 'failed', 'cancelled')
 ) AS active;
+
+-- name: GetOpenMRRunForIssue :one
+-- The MR iid of a completed issue run that still owns an OPEN merge request for this
+-- issue (issue #856). Backs createRun's create-time open-MR refusal: a fresh issue run
+-- is blocked while a prior run's MR is still open, so we do not re-plan + re-review onto
+-- an MR that is already open. Mirrors ListMRReworkCandidates' watcher-owned open-MR gate
+-- (kind='issue', completed, an mr_iid, watcher-owned mr_state='opened'). Returns the MR
+-- iid so the refusal can name it. LIMIT 1 / newest-first is arbitrary among multiple
+-- open-MR runs (there is normally at most one). pgx.ErrNoRows => no open MR (allow).
+SELECT r.mr_iid
+FROM runs r
+WHERE r.repo_id = @repo_id::uuid
+  AND r.issue_iid = @issue_iid
+  AND r.kind = 'issue'
+  AND r.status = 'completed'
+  AND r.mr_iid IS NOT NULL
+  AND r.mr_state = 'opened'
+ORDER BY r.created_at DESC
+LIMIT 1;
