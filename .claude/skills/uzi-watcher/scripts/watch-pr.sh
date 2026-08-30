@@ -165,8 +165,8 @@ while [ "$i" -lt "$MAX" ]; do
   # last-reviewed commit cr_a when EVERY path that changed between cr_a and HEAD is either
   #   - absent from the PR's diff vs its base branch (HEAD's version equals base's, so the
   #     change came in with the merge — the branch did not author it), or
-  #   - a regenerated/mirror artifact (*.sql.go, api/internal/uzidocs/embed/**) derived from
-  #     already-reviewed sources.
+  #   - a regenerated/mirror artifact (api/internal/store/*.sql.go,
+  #     api/internal/uzidocs/embed/*.md) derived from already-reviewed sources.
   # Any changed path that IS in the PR diff and is NOT such an artifact is real branch work
   # CodeRabbit has not seen — leave reviewed_head=0 (→ timeout, never a false "ready").
   # Two GitHub compare calls, no local git (keeps this script cwd-independent). Attempted only
@@ -191,9 +191,13 @@ while [ "$i" -lt "$MAX" ]; do
           # Absent from the PR's diff vs base ⇒ HEAD matches base for this path ⇒ a merge-in.
           if ! printf '%s\n' "$pr_diff" | grep -qxF "$f"; then continue; fi
           # In the PR diff but a regenerated/mirror artifact derived from reviewed sources.
+          # Scope each pattern to the exact dir a generator/sync check covers: validate:api
+          # regenerates only api/internal/store, and docs:sync mirrors only *.md into embed.
+          # A broader glob (*.sql.go anywhere, any file under embed/) would forgive a
+          # branch-added file no check regenerates — a fail-open hole in a fail-closed gate.
           case "$f" in
-            *.sql.go) continue ;;
-            api/internal/uzidocs/embed/*) continue ;;
+            api/internal/store/*.sql.go) continue ;;
+            api/internal/uzidocs/embed/*.md) continue ;;
           esac
           # Otherwise: branch-authored change CodeRabbit has not reviewed. Not equivalent.
           equiv=0

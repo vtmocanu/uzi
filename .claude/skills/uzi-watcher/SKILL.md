@@ -538,7 +538,9 @@ so CodeRabbit posts no fresh review and moves its `final_review_risk` marker to 
 recognizes this **fail-closed**: it treats the head as reviewed-equivalent to CodeRabbit's
 last-reviewed commit `A` only when every path that changed between `A` and HEAD is either absent from
 the PR's diff vs its base branch (so HEAD == base for that path — a pure merge-in the branch did not
-author) or a regenerated/mirror artifact (`*.sql.go`, `api/internal/uzidocs/embed/**`). It is computed
+author) or a regenerated/mirror artifact (`api/internal/store/*.sql.go`, `api/internal/uzidocs/embed/*.md`
+— each scoped to the exact dir a generate/sync check covers, so a broader glob can't forgive an
+unchecked branch-added file). It is computed
 from two GitHub `compare` calls (no local git, so the script stays cwd-independent) and **refuses to
 judge** when either compare's `files` list reaches the API's 300-file cap, since a truncated list could
 hide an unreviewed path and forge equivalence. Any changed path that IS in the PR diff and is NOT such
