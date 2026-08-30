@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -18,12 +19,16 @@ type fakeSettings struct {
 	enabled     bool
 	token       string
 	tokenErr    error
+	interval    time.Duration
 	invalidated atomic.Int64
 }
 
 func (f *fakeSettings) ReleaseCheckEnabled(context.Context) (bool, error) { return f.enabled, nil }
 func (f *fakeSettings) ReleaseCheckToken(context.Context) (string, error) {
 	return f.token, f.tokenErr
+}
+func (f *fakeSettings) ReleaseCheckInterval(context.Context) (time.Duration, error) {
+	return f.interval, nil
 }
 func (f *fakeSettings) Invalidate() { f.invalidated.Add(1) }
 

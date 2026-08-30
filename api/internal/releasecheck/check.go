@@ -25,10 +25,12 @@ type Store interface {
 }
 
 // SettingsReader is the typed release-check settings surface the check reads, plus
-// Invalidate so a persist is visible to the next read. *settings.Cache satisfies it.
+// Invalidate so a persist is visible to the next read, and ReleaseCheckInterval so the
+// interval Runner (PRD #836 M2) can read the poll cadence. *settings.Cache satisfies it.
 type SettingsReader interface {
 	ReleaseCheckEnabled(ctx context.Context) (bool, error)
 	ReleaseCheckToken(ctx context.Context) (string, error)
+	ReleaseCheckInterval(ctx context.Context) (time.Duration, error)
 	Invalidate()
 }
 

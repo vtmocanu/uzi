@@ -529,6 +529,82 @@ func TestLoadRegistrationPolicy(t *testing.T) {
 	})
 }
 
+// TestLoadReleaseCheck exercises the upstream-release-check seed knobs through Load()
+// (PRD #836 M2): the defaults (enabled + banner on, 6h interval, no token), explicit
+// overrides, and a malformed bool aborting boot the same way the registration
+// kill-switch does.
+func TestLoadReleaseCheck(t *testing.T) {
+	setBase := func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+		t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+		varied := make([]byte, secretbox.KeySize)
+		for i := range varied {
+			varied[i] = byte(i + 1)
+		}
+		t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+	}
+
+	t.Run("defaults: enabled + banner on, 6h, no token", func(t *testing.T) {
+		setBase(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.SeedReleaseCheckEnabled {
+			t.Error("SeedReleaseCheckEnabled should default to true")
+		}
+		if !cfg.SeedReleaseCheckBannerEnabled {
+			t.Error("SeedReleaseCheckBannerEnabled should default to true")
+		}
+		if cfg.SeedReleaseCheckInterval != 6*time.Hour {
+			t.Errorf("SeedReleaseCheckInterval = %v, want 6h", cfg.SeedReleaseCheckInterval)
+		}
+		if cfg.SeedReleaseCheckToken != "" {
+			t.Errorf("SeedReleaseCheckToken should default to empty, got %q", cfg.SeedReleaseCheckToken)
+		}
+	})
+
+	t.Run("explicit overrides", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_RELEASE_CHECK_ENABLED", "false")
+		t.Setenv("UZI_RELEASE_CHECK_BANNER_ENABLED", "0")
+		t.Setenv("UZI_RELEASE_CHECK_INTERVAL", "2h")
+		t.Setenv("UZI_RELEASE_CHECK_TOKEN", "ghp_seedtoken")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.SeedReleaseCheckEnabled {
+			t.Error("SeedReleaseCheckEnabled should be false")
+		}
+		if cfg.SeedReleaseCheckBannerEnabled {
+			t.Error("SeedReleaseCheckBannerEnabled should be false")
+		}
+		if cfg.SeedReleaseCheckInterval != 2*time.Hour {
+			t.Errorf("SeedReleaseCheckInterval = %v, want 2h", cfg.SeedReleaseCheckInterval)
+		}
+		if cfg.SeedReleaseCheckToken != "ghp_seedtoken" {
+			t.Errorf("SeedReleaseCheckToken = %q, want ghp_seedtoken", cfg.SeedReleaseCheckToken)
+		}
+	})
+
+	t.Run("malformed enabled aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_RELEASE_CHECK_ENABLED", "flase")
+		if _, err := Load(); err == nil {
+			t.Fatal("a malformed UZI_RELEASE_CHECK_ENABLED must abort boot")
+		}
+	})
+
+	t.Run("malformed banner aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_RELEASE_CHECK_BANNER_ENABLED", "nope")
+		if _, err := Load(); err == nil {
+			t.Fatal("a malformed UZI_RELEASE_CHECK_BANNER_ENABLED must abort boot")
+		}
+	})
+}
+
 // TestPrivilegeCheckInterval covers the sweep-cadence knob, including the
 // reviewer-flagged 0=disabled case that parseDuration would wrongly reject.
 func TestPrivilegeCheckInterval(t *testing.T) {

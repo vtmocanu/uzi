@@ -34,6 +34,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/oidc"
 	"github.com/vtmocanu/uzi/api/internal/poller"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/releasecheck"
 	"github.com/vtmocanu/uzi/api/internal/runlifecycle"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -421,6 +422,12 @@ func run() error {
 	if err := seed.SlackSettings(ctx, q, box, cfg); err != nil {
 		return err
 	}
+	// Upstream-release-check seed (PRD #836 M2): create-only, so an admin's later
+	// "off" flip is never re-enabled on reboot. DB or seal errors abort boot; the
+	// shared Invalidate below covers it so the cache's first read sees the seeded rows.
+	if err := seed.ReleaseCheckSettings(ctx, q, box, cfg); err != nil {
+		return err
+	}
 	settingsCache.Invalidate()
 
 	// Claim gating + claim-time token open share the same vault instance the HTTP
@@ -756,6 +763,20 @@ func run() error {
 	go func() {
 		defer bgWG.Done()
 		agentSourceRunner.Start(ctx)
+	}()
+
+	// Upstream-release-check interval Runner (PRD #836 M2), wired exactly like the
+	// agent-source Runner: a panic-recovered background goroutine that sleeps
+	// ReleaseCheckInterval per tick and calls CheckForUpdate. The master enable gate is
+	// read inside CheckForUpdate (short-circuits to "disabled" with no egress), and the
+	// first tick only fires after one interval, so this never delays boot or calls
+	// github.com when the feature is off.
+	releaseRec := releasecheck.NewReconciler(q, settingsCache, time.Now, slog.Default())
+	releaseRunner := releasecheck.NewRunner(releaseRec, settingsCache, slog.Default())
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		releaseRunner.Start(ctx)
 	}()
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
