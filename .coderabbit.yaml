@@ -4,6 +4,10 @@
 
 # Reduce review noise by focusing on actionable issues
 reviews:
+  # Only the most important findings inline; minor comments are collapsed into
+  # the summary. The structural counterpart to tone_instructions below.
+  profile: quiet
+
   # Two-step review: submit "Request changes" while issues are open, auto-switch
   # to "Approve" once they are resolved. (Not a severity filter; it can request
   # changes for lower-severity comments too.)
