@@ -102,7 +102,8 @@ export function UpdateEscalationBanner() {
               rel="noopener noreferrer"
               className="text-sm text-info hover:underline"
             >
-              Release notes &#8599;
+              Release notes <span aria-hidden="true">&#8599;</span>
+              <span className="sr-only">(opens in new tab)</span>
             </a>
           )}
           {/* Internal route → react-router Link (client-side nav), NOT a raw anchor
@@ -110,7 +111,13 @@ export function UpdateEscalationBanner() {
           <Link to="/admin/settings" className="text-sm text-info hover:underline">
             Update guide
           </Link>
-          <Button variant="secondary" size="sm" onClick={dismiss} disabled={snoozing}>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={dismiss}
+            disabled={snoozing}
+            aria-label={`Dismiss update banner for ${status.latest_tag}`}
+          >
             {snoozing ? "Dismissing…" : "Dismiss"}
           </Button>
         </div>

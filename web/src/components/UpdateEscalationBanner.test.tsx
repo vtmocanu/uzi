@@ -80,6 +80,14 @@ describe("UpdateEscalationBanner (PRD #836 M6)", () => {
     expect(notes.getAttribute("href")).toBe("https://github.com/vtmocanu/uzi/releases/tag/v0.5.0");
     expect(notes.getAttribute("target")).toBe("_blank");
     expect(notes.getAttribute("rel")).toBe("noopener noreferrer");
+    // The decorative ↗ glyph is hidden from screen readers, and a visually-hidden cue
+    // announces the new-tab behavior (so the accessible name carries it, not the glyph).
+    const arrow = notes.querySelector('[aria-hidden="true"]');
+    expect(arrow?.textContent).toBe("↗");
+    expect(notes.querySelector(".sr-only")?.textContent).toBe("(opens in new tab)");
+    // The Dismiss button's accessible name ties the action to the specific release.
+    const dismiss = screen.getByRole("button", { name: /Dismiss/ });
+    expect(dismiss.getAttribute("aria-label")).toBe("Dismiss update banner for v0.5.0");
   });
 
   it("renders nothing for a non-admin and makes NO api call", async () => {
@@ -114,7 +122,7 @@ describe("UpdateEscalationBanner (PRD #836 M6)", () => {
 
   it("Dismiss snoozes and hides the banner, and it stays hidden (snooze persists per tag)", async () => {
     renderBanner();
-    const dismiss = await screen.findByRole("button", { name: "Dismiss" });
+    const dismiss = await screen.findByRole("button", { name: /Dismiss/ });
     fireEvent.click(dismiss);
     await waitFor(() => expect(mockApi.snoozeReleaseBanner).toHaveBeenCalledTimes(1));
     // Banner is gone (optimistic hide) and the refreshed banner_snoozed:true keeps it so.
