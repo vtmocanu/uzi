@@ -1577,15 +1577,63 @@ export class GitCache {
     return (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])) === 0;
   }
 
-  /** issue #299: true when origin's brokered checkpoint ref for `branch` is present in
-   *  the worker bare — i.e. some attempt of this run published committed work to
-   *  `refs/uzi-checkpoints/<branch>`. `fetch()` mirrors those refs into the bare
-   *  best-effort on every fetch, so this catches a checkpoint any PRIOR/cross-worker
-   *  attempt landed; the runner pairs it with its own `lastPublishedTip` to also catch a
-   *  checkpoint THIS worker published mid-run (not yet mirrored locally). The report-only
-   *  completion guard uses the union to refuse orphaning a published checkpoint. */
-  async hasCheckpointRef(barePath: string, branch: string): Promise<boolean> {
-    return this.refExists(barePath, `refs/uzi-checkpoints/${branch}`);
+  /** issue #299 / PRD #759 — true when origin's brokered checkpoint ref for `branch`
+   *  holds COMMITTED work that a report-only completion would orphan. `fetch()` mirrors
+   *  `refs/uzi-checkpoints/<branch>` into the bare best-effort on every fetch, so this
+   *  catches a checkpoint any PRIOR/cross-worker attempt landed; the runner pairs it with
+   *  its own `lastPublishedTip` to also catch a checkpoint THIS worker published mid-run
+   *  (not yet mirrored locally). The report-only completion guard uses the union to refuse
+   *  orphaning a published checkpoint.
+   *
+   *  The marker-only exception (PRD #759): a usage-limit park publishes a throwaway
+   *  `wip(park):` marker commit (WIP_PARK_COMMIT_PREFIX) to the checkpoint ref, and nothing
+   *  deletes it on resume. A checkpoint whose tip is ONLY such a marker — with no committed
+   *  milestone below it — is NOT committed work: it is an abandoned WIP marker, so this
+   *  returns false for it and a legitimate report-only completion is no longer failed on
+   *  its mere existence. A genuine committed milestone (a non-marker tip, or a marker sitting
+   *  ON TOP OF a real commit that strictly descends the recovery floor) still returns true.
+   *
+   *  Only a SINGLE leading marker is ever stripped, and that is sufficient: the reseed's
+   *  `reset --soft` (see runnerClone, git.ts ~654-669) removes an adopted marker from the
+   *  branch history, so a resumed branch never carries a marker into the work the agent
+   *  builds on. Any subsequent park therefore plants its marker on a parent that is a real
+   *  commit or the base — never on another marker — so a one-marker strip cannot miss a
+   *  buried committed milestone. */
+  async hasCommittedCheckpoint(barePath: string, branch: string): Promise<boolean> {
+    const ref = `refs/uzi-checkpoints/${branch}`;
+    // 1) No checkpoint ref → nothing to orphan.
+    if (!(await this.refExists(barePath, ref))) return false;
+    // 2) Resolve the tip. A non-marker tip is a genuine committed checkpoint — return true,
+    //    byte-identical to the pre-PRD-759 existence check for every real checkpoint.
+    const tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+    if (!(await this.isWipParkMarker(barePath, tip))) return true;
+    // 3) The tip IS a `wip(park):` marker. The committed work (if any) is its parent and
+    //    below. A root-commit marker (no readable parent) has nothing committed below to
+    //    orphan → false (mirrors the root-marker handling in runnerClone, git.ts ~585-591).
+    const parent = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${tip}^^{commit}`])).trim();
+    if (parent === "") return false;
+    // Compute the recovery floor exactly the way the reseed does (git.ts ~535): origin's
+    // branch if pushed, else the default branch. The parent is a marker-only checkpoint iff
+    // it is at or below that floor; it is a genuine committed milestone iff it STRICTLY
+    // descends the floor (isAncestor is TRUE at equality, so require a different SHA too).
+    try {
+      const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
+        ? `refs/remotes/origin/${branch}`
+        : await this.defaultBranchRef(barePath);
+      const floorSha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${floorRef}^{commit}`])).trim();
+      if (floorSha === "") throw new Error(`cannot resolve floor SHA for ${floorRef}`);
+      return (await this.isAncestor(barePath, floorRef, parent)) && parent !== floorSha;
+    } catch (err) {
+      // Fail-safe: the floor could not be resolved. Preserve the guard rather than risk
+      // orphaning committed work below the marker.
+      this.log.warn("hasCommittedCheckpoint: could not resolve recovery floor — preserving guard", {
+        branch,
+        tip,
+        parent,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return true;
+    }
   }
 
   /** True when `ancestorRef` is an ancestor of (or equal to) `descendantRef` — i.e.

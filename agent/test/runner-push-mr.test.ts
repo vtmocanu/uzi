@@ -458,20 +458,20 @@ describe("RunRunner — worker-performed push + MR", () => {
 
   // issue #299: a report-only completion opens NO branch/MR, so if this run already
   // published committed work to a checkpoint ref on origin, completing report-only would
-  // orphan it. This pins the cross-worker leg of the union guard: hasCheckpointRef true
-  // (origin carries a checkpoint a prior attempt landed, mirrored into the bare) while
-  // this worker published nothing itself. It must FAIL with an actionable reason, opening
-  // NEITHER a push NOR an MR — mirroring the undeclared-empty-diff FAIL path.
+  // orphan it. This pins the cross-worker leg of the union guard: hasCommittedCheckpoint
+  // true (origin carries a COMMITTED checkpoint a prior attempt landed, mirrored into the
+  // bare) while this worker published nothing itself. It must FAIL with an actionable
+  // reason, opening NEITHER a push NOR an MR — mirroring the undeclared-empty-diff FAIL path.
   it("fails a report-only run that published a checkpoint (orphan guard), opening NO MR (issue #299)", async () => {
     const { gitlab, calls } = fakeGitlab();
     let pushed = false;
     git.pushBranch = (async () => {
       pushed = true;
     }) as typeof git.pushBranch;
-    // A checkpoint ref for this run's branch already exists on origin (mirrored into the
-    // bare) — this worker did not publish it, so lastPublishedTip stays undefined and the
-    // guard must key on hasCheckpointRef.
-    git.hasCheckpointRef = (async () => true) as typeof git.hasCheckpointRef;
+    // A committed checkpoint ref for this run's branch already exists on origin (mirrored
+    // into the bare) — this worker did not publish it, so lastPublishedTip stays undefined
+    // and the guard must key on hasCommittedCheckpoint.
+    git.hasCommittedCheckpoint = (async () => true) as typeof git.hasCommittedCheckpoint;
     const exec: Executor = {
       run: async (ctx) => ({
         branch: ctx.branch,
@@ -546,8 +546,8 @@ describe("RunRunner — worker-performed push + MR", () => {
   // guard as the declared report_only path. A zero-commit prompt run that ALREADY published
   // a checkpoint ref to origin must FAIL (not complete report-only, not open an MR) — else
   // completing report-only would orphan refs/uzi-checkpoints/<branch>. This mirrors the
-  // declared-path orphan test above, keyed on hasCheckpointRef (a prior/cross-worker landing
-  // mirrored into the bare) with lastPublishedTip staying undefined.
+  // declared-path orphan test above, keyed on hasCommittedCheckpoint (a prior/cross-worker
+  // committed landing mirrored into the bare) with lastPublishedTip staying undefined.
   it("fails a zero-commit prompt run that published a checkpoint (orphan guard), opening NO MR (issue #299)", async () => {
     const { gitlab, calls } = fakeGitlab();
     let pushed = false;
@@ -556,9 +556,9 @@ describe("RunRunner — worker-performed push + MR", () => {
     }) as typeof git.pushBranch;
     // Confirmed-empty diff ([], not null): the prompt run committed nothing at signal_done.
     git.changedFiles = (async () => []) as typeof git.changedFiles;
-    // ...but a checkpoint ref for this branch already exists on origin (mirrored into the
-    // bare). Completing report-only would orphan it, so the terminal must FAIL instead.
-    git.hasCheckpointRef = (async () => true) as typeof git.hasCheckpointRef;
+    // ...but a committed checkpoint ref for this branch already exists on origin (mirrored
+    // into the bare). Completing report-only would orphan it, so the terminal must FAIL instead.
+    git.hasCommittedCheckpoint = (async () => true) as typeof git.hasCommittedCheckpoint;
     const claim = gitlabClaim(27, { kind: "prompt" });
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 

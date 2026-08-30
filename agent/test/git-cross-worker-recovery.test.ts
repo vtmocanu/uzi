@@ -72,6 +72,15 @@ function worker(name: string): GitCache {
   return new GitCache(dataDir, nullLogger());
 }
 
+/** Build a commit object directly in the bare (no worktree) and return its sha. `parents`
+ *  empty makes a root commit. Used to construct precise checkpoint tip shapes (a wip(park)
+ *  marker with/without a committed parent) deterministically for the hasCommittedCheckpoint
+ *  unit tests — no timing, no working tree. */
+function mkCommit(bare: string, tree: string, parents: string[], subject: string): string {
+  const pargs = parents.flatMap((p) => ["-p", p]);
+  return gitIn(bare, [...IDENT, "commit-tree", tree, ...pargs, "-m", subject]);
+}
+
 /** Advance the fixture origin's `main` by one commit and return its new tip. Simulates
  *  `main` moving forward DURING a park, which is what diverges a set-aside checkpoint. */
 function advanceOriginMain(file: string, content: string): string {
@@ -480,5 +489,108 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     assert.strictEqual(rc.seededFrom, "default", "no checkpoint ⇒ a fresh start from the default branch");
     assert.strictEqual(rc.priorCommits, 0);
     assert.notStrictEqual(rc.checkpointSetAside, true);
+  });
+});
+
+describe("GitCache.hasCommittedCheckpoint (issue #771 / PRD #759)", () => {
+  // The report-only orphan guard must fire on a checkpoint that holds COMMITTED work but
+  // NOT on one whose tip is only an abandoned `wip(park):` marker (the usage-limit park
+  // planted it and nothing deletes it on resume). Each case constructs a real
+  // refs/uzi-checkpoints/<branch> in a fresh bare with plumbing (commit-tree + update-ref)
+  // and asserts the helper directly — deterministic, no timing/sleep.
+
+  it("returns FALSE for a marker-only checkpoint (tip is a wip(park) marker whose parent is the floor) — issue #771", async () => {
+    // THE failing-first case: a park with no committed work below the marker. The parent IS
+    // the recovery floor, so nothing would be orphaned. Under the old existence-only guard
+    // this returned TRUE (the bug — a legitimate report_only wrongly FAILED);
+    // hasCommittedCheckpoint now returns false.
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const branch = "agent/issue-771-marker-only";
+    const floor = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    const floorTree = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main^{tree}"]);
+    const marker = mkCommit(bareB, floorTree, [floor], `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved`);
+    gitIn(bareB, ["update-ref", `refs/uzi-checkpoints/${branch}`, marker]);
+    assert.strictEqual(
+      gitIn(bareB, ["log", "-1", "--format=%s", marker]).startsWith(WIP_PARK_COMMIT_PREFIX),
+      true,
+      "precondition: the checkpoint tip is a wip(park) marker",
+    );
+    assert.strictEqual(
+      gitIn(bareB, ["rev-parse", `${marker}^`]),
+      floor,
+      "precondition: the marker's parent is the floor (no committed work below it)",
+    );
+    assert.strictEqual(
+      await gitB.hasCommittedCheckpoint(bareB, branch),
+      false,
+      "a marker-only checkpoint holds no committed work to orphan",
+    );
+  });
+
+  it("returns TRUE for a real committed milestone tip (no marker)", async () => {
+    // Byte-identical to the pre-PRD-759 behaviour for every non-marker checkpoint tip.
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const branch = "agent/issue-771-real-tip";
+    const floor = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    const floorTree = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main^{tree}"]);
+    const milestone = mkCommit(bareB, floorTree, [floor], "real committed milestone");
+    gitIn(bareB, ["update-ref", `refs/uzi-checkpoints/${branch}`, milestone]);
+    assert.strictEqual(
+      await gitB.hasCommittedCheckpoint(bareB, branch),
+      true,
+      "a genuine committed checkpoint tip still blocks a report-only completion",
+    );
+  });
+
+  it("returns TRUE for a wip(park) marker sitting ON TOP OF a committed milestone (parent strictly descends the floor)", async () => {
+    // fork → m1(committed) → wip-marker: the marker's parent (m1) strictly descends the
+    // floor, so there IS committed work below the marker to orphan.
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const branch = "agent/issue-771-marker-over-milestone";
+    const floor = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    const floorTree = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main^{tree}"]);
+    const milestone = mkCommit(bareB, floorTree, [floor], "real committed milestone");
+    const marker = mkCommit(bareB, floorTree, [milestone], `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved`);
+    gitIn(bareB, ["update-ref", `refs/uzi-checkpoints/${branch}`, marker]);
+    assert.notStrictEqual(milestone, floor, "precondition: the milestone strictly descends the floor");
+    assert.strictEqual(
+      await gitB.hasCommittedCheckpoint(bareB, branch),
+      true,
+      "a committed milestone below the marker still blocks",
+    );
+  });
+
+  it("returns FALSE when no checkpoint ref exists", async () => {
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const branch = "agent/issue-771-no-ref";
+    assert.strictEqual(
+      refInBare(bareB, `refs/uzi-checkpoints/${branch}`),
+      false,
+      "precondition: no checkpoint ref for this branch",
+    );
+    assert.strictEqual(await gitB.hasCommittedCheckpoint(bareB, branch), false);
+  });
+
+  it("returns FALSE for a root-commit wip(park) marker (marker with no parent)", async () => {
+    // A marker planted on a repo with no commit below it — nothing committed to orphan.
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const branch = "agent/issue-771-root-marker";
+    const floorTree = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main^{tree}"]);
+    const rootMarker = mkCommit(bareB, floorTree, [], `${WIP_PARK_COMMIT_PREFIX} root-commit park`);
+    gitIn(bareB, ["update-ref", `refs/uzi-checkpoints/${branch}`, rootMarker]);
+    assert.throws(
+      () => gitIn(bareB, ["rev-parse", "--verify", `${rootMarker}^`]),
+      "precondition: the marker is a root commit (no parent)",
+    );
+    assert.strictEqual(
+      await gitB.hasCommittedCheckpoint(bareB, branch),
+      false,
+      "a root-commit marker has nothing committed below to orphan",
+    );
   });
 });
