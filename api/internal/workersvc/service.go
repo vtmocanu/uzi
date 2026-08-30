@@ -4714,7 +4714,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // run is self-contained even if the issue cache is later evicted. A PRD link is no
 // longer required. The one-non-terminal-run-per-issue index rejects a duplicate
 // active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, seed *SeededPlan) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -4730,15 +4730,15 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// (PRD #300) — the per-schedule override applies only to runs a schedule fires.
 	// false overrideSubagentModel (PRD #305): an interactive run is not a schedule fire,
 	// so it stays in the default lane where subagent pins win.
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, nil, false, seed)
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, mrReworkEnabled, nil, false, seed)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
 // or label-sweep schedule firing an issue with the plan gate still requiring a human).
 // It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
 // and, like every create path, no longer requires a PRD link.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, model, overrideSubagentModel, seed)
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, seed)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -4758,7 +4758,10 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// before (PRD #209 D3 keeps auto_approve and plan_source orthogonal).
 	// false overrideSubagentModel (PRD #305): label-poller autopilot is not a schedule
 	// fire and carries no per-run opt-in, so subagent pins win (default lane).
-	return s.createRun(ctx, userID, repoID, issueIID, description, true, nil, nil, false, nil)
+	// nil mrReworkEnabled (PRD #841 M1): label-poller autopilot has no human/schedule to
+	// express a per-run override, so the run's column stays NULL → inherit the owner
+	// default live, exactly today's behaviour.
+	return s.createRun(ctx, userID, repoID, issueIID, description, true, nil, nil, nil, false, nil)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -4770,8 +4773,8 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // seam (its interface, fake, and call site) stays byte-identical, so widening the
 // scheduler seam cannot change label-driven autopilot. seed=nil for the same reason as
 // CreateAutopilotRun: autopilot never seeds its plan.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, waitOnLimit, model, overrideSubagentModel, nil /*seed*/)
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, nil /*seed*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -4800,7 +4803,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -4978,6 +4981,13 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// keep the behaviour it was created with, so flipping the default later cannot
 		// retroactively change a run already in flight.
 		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, waitOnLimit),
+		// PRD #841 M1 Decision D1: mr_rework is LIVE-INHERIT, the deliberate opposite of
+		// wait_on_limit's snapshot. The pointer is stamped THROUGH with no resolver — nil
+		// ⇒ NULL ⇒ the run inherits the owner default live at read time (the candidate
+		// query COALESCEs run over owner), and an explicit true/false is a per-run override.
+		// Every M1 caller passes nil except a future request/schedule override (M2/M3), so
+		// behaviour is byte-identical to today.
+		MrReworkEnabled: pgBoolPtr(mrReworkEnabled),
 		// PRD #209 seeded-plan columns, listed explicitly (runtime.sql's 🔴 warning):
 		// all zero-valued to the not-seeded state above unless seed != nil. The M4
 		// staleness-guard pair (planned_base_commit, require_base_match) is here for the

@@ -460,6 +460,7 @@ type Run struct {
 	ReviewComments        []byte             `json:"review_comments"`
 	BudgetPausedSeconds   int32              `json:"budget_paused_seconds"`
 	LineageEpoch          int32              `json:"lineage_epoch"`
+	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
 }
 
 type RunMessage struct {
@@ -516,6 +517,7 @@ type RunSchedule struct {
 	CatalogSlug           pgtype.Text        `json:"catalog_slug"`
 	Customized            bool               `json:"customized"`
 	SiblingGroupID        pgtype.UUID        `json:"sibling_group_id"`
+	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
 }
 
 type RunUsage struct {

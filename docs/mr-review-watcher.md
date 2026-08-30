@@ -61,20 +61,62 @@ something that reads like an instruction to the agent. uzi treats it as
 
 ## Enablement
 
-Auto-rework ships **default ON**, at two levels, and both fail closed (a
-settings-read hiccup turns the feature off, never silently on):
+Auto-rework ships **default ON** and fails closed (a settings-read hiccup
+turns the feature off, never silently on). It's controlled at several
+layers, from the most specific to the most general, and each layer that's
+left unset just falls through to the next:
 
+- **Per run.** A single run can override auto-rework for its own MR. On
+  the run view, a checkbox reads "Auto-rework this MR's review comments"
+  and stays available on a **completed** run for as long as its MR is
+  still open (the watcher only acts after the run finishes, so this is
+  the whole window it matters). When the run carries an explicit override,
+  a **Reset to default** button next to the checkbox clears it back to
+  inherit. From the CLI, `uzi run mr-rework <run-id> --enabled=false`
+  turns it off for that run (`--enabled` turns it on, `--clear` returns it
+  to inherit). To start a run with it already off, pass `--mr-rework=false`
+  to `uzi run create` (or `--mr-rework` to force it on); omit the flag to
+  inherit your account default.
+- **Per schedule.** A schedule can force auto-rework on or off for every
+  run it fires, or leave it on Inherit. In the schedule modal, the
+  "Auto-rework MR review comments" control is a three-way Inherit/On/Off
+  choice; from the CLI, pass `--mr-rework` (or `--mr-rework=false`) to
+  `uzi schedule create` or `uzi schedule edit`, or `--clear-mr-rework` on
+  `uzi schedule edit` to return the schedule to Inherit. This is how you'd
+  turn auto-rework on only for scheduled jobs while leaving it off
+  everywhere else: switch your account default off, then set one
+  schedule's override to On.
 - **Your own opt-in.** Settings → **MR review rework** → "Auto-rework MR
-  review comments on my runs". Opting out stops the watcher from
-  auto-reworking *your* MRs; it doesn't touch anyone else's.
+  review comments on my runs". This is the account-wide default that
+  every run and schedule falls back to when it hasn't set its own
+  override. Opting out stops the watcher from auto-reworking *your* MRs;
+  it doesn't touch anyone else's.
 - **The instance-wide kill-switch.** A separate admin-only setting
   (`mr_rework_enabled`) that turns the feature off for every user on the
   instance at once, the same way the [run judge](./judge.md)'s kill-switch
   works. It's set through the settings API rather than a dedicated Admin
   Settings control today.
 
+The resolution order is: a run's own setting wins if it has one,
+otherwise its schedule's setting wins if it has one, otherwise your
+account default applies. A run started from a schedule inherits that
+schedule's setting as its own at creation time (unless you explicitly
+passed `--mr-rework` when the run started), so from then on the run's own
+setting is what governs it.
+
+That also means **Reset to default** on a scheduled run's MR doesn't fall
+back to the schedule — it clears the run's own copied-in value and goes
+straight to your account default. The schedule's setting was only ever a
+one-time snapshot taken when the run started; there's no live
+per-schedule re-evaluation afterward for reset to fall back to.
+
+One thing worth knowing: the per-run toggle (both the checkbox and the
+CLI verb) always targets a branch's newest issue run, so if a branch gets
+reused by a re-run, it's that newest run's setting that decides whether
+the branch's MR gets auto-reworked.
+
 Every rework run spends the **run owner's own** Anthropic token, exactly
-like any other run — including one triggered on an unattended nightly sweep
+like any other run, including one triggered on an unattended nightly sweep
 MR. If you'd rather review findings by hand before uzi acts on them, opt
 out in Settings.
 

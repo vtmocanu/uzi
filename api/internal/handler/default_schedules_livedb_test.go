@@ -365,6 +365,77 @@ func TestPatchDefaultOverrideSubagentModelLiveDB(t *testing.T) {
 	}
 }
 
+// TestPatchDefaultMrReworkLiveDB (PRD #841 M2, D5) is the mr_rework analog of the
+// override test above, but the catalog baseline is INHERIT (nil), not a non-nil false: a
+// default schedule's mr_rework_enabled ships nil, an explicit override flips it and marks
+// the row customized, an explicit clear (mr_rework_enabled: null) exact-restores to nil
+// and un-customizes, and Reset drops it back to nil.
+func TestPatchDefaultMrReworkLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	// Fresh default: mr_rework is at the catalog baseline (inherit = nil), not customized.
+	if dto.MrReworkEnabled != nil {
+		t.Fatalf("fresh default mr_rework = %v, want nil (inherit baseline, D5)", dto.MrReworkEnabled)
+	}
+	if dto.Customized {
+		t.Fatal("fresh default customized = true, want false")
+	}
+
+	// Setting an explicit false persists and flips customized (any explicit override diverges).
+	off := f.patchDefault(t, f.owner.ID, dto.ID, `{"mr_rework_enabled":false}`)
+	if off.MrReworkEnabled == nil || *off.MrReworkEnabled {
+		t.Fatalf("patched mr_rework = %v, want a non-nil false (persisted)", off.MrReworkEnabled)
+	}
+	if !off.Customized {
+		t.Fatal("mr_rework override divergence: customized = false, want true")
+	}
+
+	// It really persisted: re-read surfaces the explicit false.
+	got, gcode := f.getSchedule(t, f.owner.ID, dto.ID)
+	if gcode != http.StatusOK {
+		t.Fatalf("re-read status = %d, want 200", gcode)
+	}
+	if got.MrReworkEnabled == nil || *got.MrReworkEnabled {
+		t.Fatalf("re-read mr_rework = %v, want the persisted false", got.MrReworkEnabled)
+	}
+
+	// Clearing back to inherit (explicit null) is an exact-restore: nil AND customized cleared.
+	cleared := f.patchDefault(t, f.owner.ID, dto.ID, `{"mr_rework_enabled":null}`)
+	if cleared.MrReworkEnabled != nil {
+		t.Fatalf("cleared mr_rework = %v, want nil (inherit)", cleared.MrReworkEnabled)
+	}
+	if cleared.Customized {
+		t.Fatal("exact-restore: customized = true, want false (un-customizes)")
+	}
+
+	// Set again, then Reset drops it back to the nil baseline and un-customizes.
+	reon := f.patchDefault(t, f.owner.ID, dto.ID, `{"mr_rework_enabled":true}`)
+	if reon.MrReworkEnabled == nil || !*reon.MrReworkEnabled {
+		t.Fatalf("re-set mr_rework = %v, want a non-nil true", reon.MrReworkEnabled)
+	}
+	resetReq := userReq(http.MethodPost, "/api/schedules/"+dto.ID+"/reset", "", f.owner.ID, map[string]string{"id": dto.ID})
+	resetRec := httptest.NewRecorder()
+	f.h.ResetSchedule(resetRec, resetReq)
+	if resetRec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200 (body %s)", resetRec.Code, resetRec.Body.String())
+	}
+	var reset apitypes.ScheduleDTO
+	if err := json.Unmarshal(resetRec.Body.Bytes(), &reset); err != nil {
+		t.Fatalf("decode reset: %v", err)
+	}
+	if reset.MrReworkEnabled != nil {
+		t.Fatalf("reset mr_rework = %v, want the nil baseline restored", reset.MrReworkEnabled)
+	}
+	if reset.Customized {
+		t.Fatal("reset customized = true, want false")
+	}
+}
+
 // cloneSchedule POSTs to /api/schedules/{id}/clone with the given (possibly empty) body and
 // returns the decoded DTO plus the status code.
 func (f scheduleFixture) cloneSchedule(t *testing.T, user uuid.UUID, id, body string) (apitypes.ScheduleDTO, int) {

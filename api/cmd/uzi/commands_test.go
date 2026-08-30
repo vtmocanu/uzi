@@ -58,7 +58,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "follow-up", "answer", "inputs", "expedite", "resume-now"},
+		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework"},
 		// backlog is the PRD #98 M7 read; `file` (PRD #365 M2) files a recommendation
 		// as a forge issue from the CLI, mirroring `findings file`.
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats", "file"},
@@ -1572,6 +1572,102 @@ func TestRunCreateWaitOnLimitIsTriState(t *testing.T) {
 	fc := run(t, "--wait-on-limit")
 	if fc.LastCreateRepoID != "p1" || fc.LastCreateIssueIID != 42 {
 		t.Errorf("create sent repo=%q issue=%d, want p1/42", fc.LastCreateRepoID, fc.LastCreateIssueIID)
+	}
+}
+
+// TestRunCreateMrReworkIsTriState mirrors TestRunCreateWaitOnLimitIsTriState for the
+// per-run MR-rework override (PRD #841 M3): OMITTING --mr-rework must send NOTHING so the
+// server inherits the account default; --mr-rework sends explicit true; --mr-rework=false
+// sends explicit false. The fake keeps the POINTER so all three states are distinguishable
+// — a bool capture would collapse absent and explicit-false into one and pass against the
+// exact regression the Changed() guard exists to reject.
+func TestRunCreateMrReworkIsTriState(t *testing.T) {
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+
+	run := func(t *testing.T, extra ...string) *uzicli.FakeClient {
+		t.Helper()
+		fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "queued"}}
+		env := fakeEnv(fc)
+		env.Stdout = &bytes.Buffer{}
+		env.Stderr = &bytes.Buffer{}
+		args := append([]string{"run", "create", "--repo", "p1", "--issue", "42"}, extra...)
+		if code := Main(env, args); code != uzicli.ExitOK {
+			t.Fatalf("run create %v exit = %d, want 0", extra, code)
+		}
+		return fc
+	}
+
+	// Absent flag → nil (inherit the account default), NOT the flag's false default.
+	if got := run(t).LastCreateMrRework; got != nil {
+		t.Errorf("omitting --mr-rework sent %v, want nil — an absent flag must send NO key so the server inherits the account default; sending false here silently opts every CLI-created run out of auto-rework", *got)
+	}
+	if got := run(t, "--mr-rework").LastCreateMrRework; got == nil || !*got {
+		t.Errorf("--mr-rework sent %v, want an explicit true", got)
+	}
+	if got := run(t, "--mr-rework=false").LastCreateMrRework; got == nil || *got {
+		t.Errorf("--mr-rework=false sent %v, want an explicit false — it must override an account default of on, not fall back to it", got)
+	}
+}
+
+// TestRunMrReworkVerb covers `uzi run mr-rework <id>` (PRD #841 M3, acceptance #1). The
+// verb is tri-state: a bare invocation and --enabled send true, --enabled=false sends
+// false, and --clear sends nil (clear the override back to inherit). --clear together with
+// an explicit --enabled is a usage error.
+func TestRunMrReworkVerb(t *testing.T) {
+	run := func(t *testing.T, extra ...string) *uzicli.FakeClient {
+		t.Helper()
+		fc := &uzicli.FakeClient{MrReworkRun: apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "completed"}}
+		args := append([]string{"run", "mr-rework", "r1"}, extra...)
+		_, _, code := runCLI(t, fakeEnv(fc), args...)
+		if code != uzicli.ExitOK {
+			t.Fatalf("run mr-rework %v exit = %d, want 0", extra, code)
+		}
+		if fc.LastMrReworkRunID != "r1" {
+			t.Errorf("targeted run %q, want r1", fc.LastMrReworkRunID)
+		}
+		return fc
+	}
+
+	// PRD acceptance #1: `--enabled=false` must send an explicit false.
+	if got := run(t, "--enabled=false").LastMrReworkEnabled; got == nil || *got {
+		t.Errorf("--enabled=false sent %v, want an explicit false", got)
+	}
+	// A bare invocation and --enabled both mean ON (the flag defaults to true).
+	if got := run(t).LastMrReworkEnabled; got == nil || !*got {
+		t.Errorf("bare mr-rework sent %v, want an explicit true", got)
+	}
+	if got := run(t, "--enabled").LastMrReworkEnabled; got == nil || !*got {
+		t.Errorf("--enabled sent %v, want an explicit true", got)
+	}
+	// --clear sends nil so the server clears the override back to inherit.
+	if got := run(t, "--clear").LastMrReworkEnabled; got != nil {
+		t.Errorf("--clear sent %v, want nil (clear to inherit)", *got)
+	}
+}
+
+// --clear and --enabled express opposite intents; passing both is a loud usage error
+// rather than a silent precedence pick, and no write is made.
+func TestRunMrReworkClearAndEnabledConflict(t *testing.T) {
+	fc := &uzicli.FakeClient{MrReworkRun: apitypes.RunDTO{ID: "r1"}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "mr-rework", "r1", "--clear", "--enabled=false")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if fc.LastMrReworkRunID != "" {
+		t.Error("a usage error still reached the write; the command must refuse before calling the API")
+	}
+}
+
+// A foreign/absent run is a 404 → ExitNotFound (4); the CLI must propagate it.
+func TestRunMrReworkNotFound(t *testing.T) {
+	fc := &uzicli.FakeClient{SetRunMrReworkErr: uzicli.Exitf(uzicli.ExitNotFound, "run not found")}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "mr-rework", "r1", "--enabled=false")
+	if code != uzicli.ExitNotFound {
+		t.Fatalf("exit = %d, want %d (not found)", code, uzicli.ExitNotFound)
+	}
+	if fc.LastMrReworkRunID != "r1" {
+		t.Errorf("targeted run %q, want r1 — the write must still have been reached", fc.LastMrReworkRunID)
 	}
 }
 

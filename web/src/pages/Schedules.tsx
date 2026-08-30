@@ -604,7 +604,14 @@ function ScheduleRow({
         <div className="flex flex-wrap gap-1">
           {s.wait_on_limit && <OptionChip>wait-on-limit</OptionChip>}
           {showApprove && <OptionChip>auto-approve</OptionChip>}
-          {!s.wait_on_limit && !showApprove && <span className="text-[12px] text-faint">defaults</span>}
+          {/* PRD #841: only an EXPLICIT per-schedule override earns a chip; null/inherit
+              is the default and shows nothing (or "defaults" below). */}
+          {s.mr_rework_enabled != null && (
+            <OptionChip>mr-rework: {s.mr_rework_enabled ? "on" : "off"}</OptionChip>
+          )}
+          {!s.wait_on_limit && !showApprove && s.mr_rework_enabled == null && (
+            <span className="text-[12px] text-faint">defaults</span>
+          )}
         </div>
       </td>
 

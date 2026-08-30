@@ -1003,6 +1003,59 @@ func TestRenderRunDetailWaitOnLimitIsAlwaysPresent(t *testing.T) {
 	}
 }
 
+// TestRenderRunDetailMrReworkTriState — the per-run MR-rework override (PRD #841 M3)
+// rides EVERY run like WAIT_ON_LIMIT, but it is TRI-STATE: a nil pointer renders
+// "inherit" (follow the account default), &true renders "on", &false renders "off". An
+// always-present row keeps "inherit" distinguishable from an old CLI that never knew the
+// field, and "off"/"on" from "inherit" — the whole point of a *bool over a plain bool.
+func TestRenderRunDetailMrReworkTriState(t *testing.T) {
+	render := func(v *bool) string {
+		t.Helper()
+		var buf bytes.Buffer
+		p := uzicli.NewPrinter(&buf, false, false, true, false)
+		r := apitypes.RunDTO{ID: "run-1", Kind: "issue", Status: "completed", Health: "ok", MrReworkEnabled: v}
+		if err := renderRunDetail(p, r); err != nil {
+			t.Fatalf("renderRunDetail: %v", err)
+		}
+		return buf.String()
+	}
+	tr, fa := true, false
+	if out := render(nil); !strings.Contains(out, "MR_REWORK") || !strings.Contains(out, "inherit") {
+		t.Errorf("nil override: want MR_REWORK inherit, got:\n%s", out)
+	}
+	if out := render(&tr); !strings.Contains(out, "MR_REWORK") || !strings.Contains(out, "on") {
+		t.Errorf("&true override: want MR_REWORK on, got:\n%s", out)
+	}
+	if out := render(&fa); !strings.Contains(out, "MR_REWORK") || !strings.Contains(out, "off") {
+		t.Errorf("&false override: want MR_REWORK off, got:\n%s", out)
+	}
+}
+
+// TestRenderScheduleDetailMrReworkTriState — the per-schedule MR-rework override (PRD #841
+// M3) renders as inherit/on/off in `schedule get`, mirroring the run-detail row above.
+func TestRenderScheduleDetailMrReworkTriState(t *testing.T) {
+	render := func(v *bool) string {
+		t.Helper()
+		var buf bytes.Buffer
+		p := uzicli.NewPrinter(&buf, false, false, true, false)
+		s := apitypes.ScheduleDTO{ID: "sch-1", Target: "issue", Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", MrReworkEnabled: v}
+		if err := renderScheduleDetail(p, s); err != nil {
+			t.Fatalf("renderScheduleDetail: %v", err)
+		}
+		return buf.String()
+	}
+	tr, fa := true, false
+	if out := render(nil); !strings.Contains(out, "MR_REWORK") || !strings.Contains(out, "inherit") {
+		t.Errorf("nil override: want MR_REWORK inherit, got:\n%s", out)
+	}
+	if out := render(&tr); !strings.Contains(out, "MR_REWORK") || !strings.Contains(out, "on") {
+		t.Errorf("&true override: want MR_REWORK on, got:\n%s", out)
+	}
+	if out := render(&fa); !strings.Contains(out, "MR_REWORK") || !strings.Contains(out, "off") {
+		t.Errorf("&false override: want MR_REWORK off, got:\n%s", out)
+	}
+}
+
 // TestSteerStateOnAParkedRun. A park suspends the run, not the queue: nothing is
 // consuming follow-ups while parked, and everything queued drains when it resumes.
 func TestSteerStateOnAParkedRun(t *testing.T) {

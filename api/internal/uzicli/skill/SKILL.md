@@ -147,7 +147,7 @@ uzi run get <run-id> [--field <name>]...
 uzi run logs <run-id> [--follow] [--after <seq>]
 uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base]
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run reject <run-id> [--message <text>]
 uzi run revise <run-id> [--message <text>]
@@ -159,10 +159,11 @@ uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
 uzi run resume-now <run-id>
-uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit]
+uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
+uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]]
 uzi schedule list
 uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]] [--model <alias|id>] [--apply-model-to-agents[=false]]
+uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule run-now <schedule-id>
@@ -376,6 +377,11 @@ uzi version
   for this run only. A parked run holds its issue and its worker's disk until it
   resumes, so it is opt-in rather than the default.
 
+  `--mr-rework` is the same THREE-WAY shape for the MR review-rework watcher (PRD
+  #841): omit it and the run inherits your account default; pass `--mr-rework` to
+  auto-rework this run's MR review comments, or `--mr-rework=false` to force it off for
+  this run only. Change it later on a completed run with `uzi run mr-rework <id>`.
+
   `--plan-file <path>` seeds the run with a plan you have already written: the worker
   skips its own planning turn and the approval gate and implements the plan directly.
   Pass `-` to read the plan from stdin. `--agent-source own|repo` picks the subagent
@@ -484,6 +490,15 @@ uzi version
   is a 409 (exit 5), and a foreign/unknown run is a 404 (exit 4). No token is spent
   and nothing is written to the forge. Prints the updated run; `--json` emits the run
   object.
+- `uzi run mr-rework <run-id>` — set the per-run override for the MR review-rework
+  watcher (PRD #841): whether new review comments on this run's open MR are
+  auto-reworked. Tri-state and editable on a **completed** run for as long as its MR is
+  still open (the watcher acts after the run finishes): `--enabled` turns it **on**,
+  `--enabled=false` turns it **off**, and `--clear` resets the override back to
+  **inherit** (follow your account default). `--clear` with an explicit `--enabled` is a
+  usage error (exit 2); a foreign/unknown run is a 404 (exit 4). The write is inert once
+  the MR is merged or closed. Prints the updated run, whose `MR_REWORK` row reads
+  inherit/on/off.
 
 ### Schedules — time-driven runs
 
@@ -520,7 +535,9 @@ nothing a manual start cannot.
   - `--auto-approve` defaults **on** (the run proceeds past the plan gate unattended, the
     point of an off-hours schedule); pass `--auto-approve=false` to keep the gate.
     `--wait-on-limit` parks a fired run until the Anthropic usage window reopens instead
-    of failing it.
+    of failing it. `--mr-rework` sets whether fired runs' MR review comments are
+    auto-reworked (`--mr-rework=false` to force off); omit it to inherit the account
+    default, so scheduled jobs follow your global setting unless you set it explicitly.
   - `--enabled` defaults **on**; pass `--enabled=false` to create the schedule already
     paused (no separate `schedule pause` step, avoiding a brief window where a due schedule
     could fire).
@@ -565,12 +582,14 @@ nothing a manual start cannot.
   (enabled=false) schedule, which stays off until `resume`. Retime with `--cron` or `--at`
   (switching timing accordingly), adjust `--tz`, and — scoped to the target — `--prompt`,
   `--label`, `--guidance`/`--clear-guidance`, `--max-issues`/`--clear-max-issues`,
-  `--auto-approve`, `--wait-on-limit`, `--model <alias|id>` (change the run model in
+  `--auto-approve`, `--wait-on-limit`, `--mr-rework` (set whether fired runs' MR review
+  comments are auto-reworked; `--mr-rework=false` to force off), `--model <alias|id>`
+  (change the run model in
   place; an empty string clears it back to the Worker-model default; valid on every
   target and origin), `--apply-model-to-agents` (toggle the subagent model override). At
-  least one field is required. `edit` preserves the stored `--model` and
-  `--apply-model-to-agents` across any partial edit that does not pass those flags
-  (previously a plain retime silently wiped the stored model). Changing a
+  least one field is required. `edit` preserves the stored `--model`,
+  `--apply-model-to-agents` and `--mr-rework` across any partial edit that does not pass
+  those flags (previously a plain retime silently wiped the stored model). Changing a
   sweep schedule's `--label` selector runs the same advisory sweep-label guardrail as
   `create`/`catalog enable` (`WARNING` on a newly-set label missing on the repo, or
   `--create-missing-labels` to create it first); it never blocks the edit, and an edit that

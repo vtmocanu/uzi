@@ -9,12 +9,12 @@
 INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled, max_issues, guidance, model, override_subagent_model,
+    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, guidance, model, override_subagent_model,
     sibling_group_id
 ) VALUES (
     @user_id, @repo_id, @target, sqlc.narg('issue_iid'), sqlc.narg('labels'), sqlc.narg('prompt'),
     @timing, sqlc.narg('cron_expr'), sqlc.narg('run_at'), @timezone, sqlc.narg('next_fire_at'),
-    @auto_approve, @wait_on_limit, @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance'), sqlc.narg('model'), @override_subagent_model,
+    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance'), sqlc.narg('model'), @override_subagent_model,
     sqlc.narg('sibling_group_id')
 )
 RETURNING *;
@@ -36,12 +36,12 @@ INSERT INTO run_schedules (
     user_id, repo_id, target, catalog_slug, origin, customized,
     issue_iid, labels, prompt, guidance,
     timing, cron_expr, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled, max_issues, model
+    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, model
 ) VALUES (
     @user_id, @repo_id, @target, @catalog_slug, 'default', false,
     NULL, NULL, NULL, NULL,
     'recurring', @cron_expr, @timezone, @next_fire_at,
-    @auto_approve, @wait_on_limit, true, sqlc.narg('max_issues'), sqlc.narg('model')
+    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), true, sqlc.narg('max_issues'), sqlc.narg('model')
 )
 ON CONFLICT (user_id, repo_id, catalog_slug) WHERE origin = 'default' DO NOTHING
 RETURNING *;
@@ -71,6 +71,7 @@ SET cron_expr     = @cron_expr,
     model         = sqlc.narg('model'),
     auto_approve  = @auto_approve,
     wait_on_limit = @wait_on_limit,
+    mr_rework_enabled = sqlc.narg('mr_rework_enabled'),
     max_issues    = sqlc.narg('max_issues'),
     guidance      = NULL,
     override_subagent_model = false,
@@ -126,6 +127,7 @@ SET target        = @target,
     next_fire_at  = sqlc.narg('next_fire_at'),
     auto_approve  = @auto_approve,
     wait_on_limit = @wait_on_limit,
+    mr_rework_enabled = sqlc.narg('mr_rework_enabled'),
     max_issues    = sqlc.narg('max_issues'),
     guidance      = sqlc.narg('guidance'),
     model         = sqlc.narg('model'),
@@ -303,9 +305,9 @@ WHERE schedule_id = @schedule_id
 -- straight from the schedule (the owner set them there), so unlike the engine runs
 -- this path does not fall back to the owner's default.
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, model, override_subagent_model, required_capabilities
+    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, mr_rework_enabled, model, override_subagent_model, required_capabilities
 ) VALUES (
-    @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit, sqlc.narg('model'), @override_subagent_model,
+    @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('model'), @override_subagent_model,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}')
 )
 RETURNING *;

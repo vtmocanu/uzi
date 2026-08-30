@@ -346,6 +346,13 @@ type RunDTO struct {
 	// because it is meaningful BEFORE any park — it is what a "will retry on limit"
 	// affordance renders, and what a per-run toggle reads back.
 	WaitOnLimit bool `json:"wait_on_limit"`
+	// MrReworkEnabled is the run's per-run MR-rework override (PRD #841 M1), tri-state:
+	// null = inherit the owner default, true/false = explicit override. Unlike
+	// WaitOnLimit (a resolved bool snapshotted at creation), this is nullable and read
+	// LIVE — the candidate query resolves COALESCE(run, owner) IS NOT FALSE — so null on
+	// the wire means "no per-run opinion", which the web renders as the effective
+	// inherited value. It is what the per-run checkbox / `uzi run mr-rework` read back.
+	MrReworkEnabled *bool `json:"mr_rework_enabled"`
 	// LimitResetsAt is when the exhausted window reopens, as REPORTED by the worker
 	// off the SDK frame. RetryNotBefore is when the server will actually promote the
 	// run back to queued.

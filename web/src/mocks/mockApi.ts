@@ -1326,6 +1326,11 @@ function materializeDefault(
     last_fire: null,
     auto_approve: entry.auto_approve,
     wait_on_limit: entry.wait_on_limit,
+    // PRD #841: match the real ScheduleDTO shape — mr_rework_enabled is a non-omitempty
+    // *bool, so the API always emits it (null = inherit), never omits it. A catalog default
+    // is inherit until an override sets it, so seed the explicit null sentinel here rather
+    // than leaving the field undefined (which would diverge from the server response shape).
+    mr_rework_enabled: null,
     max_issues: entry.target === "sweep" ? entry.max_issues : null,
     // Owner OVERLAY (issue #675): null by default; a seed sets it via `...over`.
     guidance: null,
@@ -3699,6 +3704,18 @@ export const mockApi = {
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
+  // PRD #841: set (or clear) a run's per-run MR-review-rework override. Mirrors the
+  // server: owner-scoped (the demo caller owns every non-other-user run) and — unlike
+  // setRunWaitOnLimit — NO terminal-status guard (D2), because the watcher acts after
+  // the run completes, so the toggle stays live on a completed run whose MR is still
+  // open. `null` clears back to inherit.
+  setRunMrRework: async (id: string, enabled: boolean | null) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    patchRun(id, { mr_rework_enabled: enabled });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
   // Issue #754: resume an auto-lane run parked at `pool_wait` right now. Mirrors the
   // server: owner-scoped (the demo caller owns every non-other-user run) and
   // pool_wait-ONLY — a 409 ("run is not waiting for a pooled token") on any other
@@ -4449,6 +4466,8 @@ export const mockApi = {
       last_fire: null,
       auto_approve: input.auto_approve ?? true,
       wait_on_limit: input.wait_on_limit ?? true,
+      // PRD #841: a create stamps the explicit tri-state override, or leaves it null = inherit.
+      mr_rework_enabled: input.mr_rework_enabled ?? null,
       // Sweep-only; new sweeps default to 10 (mirrors the server), unlimited otherwise.
       max_issues: target === "sweep" ? (input.max_issues ?? 10) : null,
       // Guidance on issue/sweep only; null (none) for prompt (re-nulled per target).
@@ -4528,6 +4547,8 @@ export const mockApi = {
     if (input.timezone !== undefined) m.timezone = input.timezone;
     if (input.auto_approve !== undefined) m.auto_approve = input.auto_approve;
     if (input.wait_on_limit !== undefined) m.wait_on_limit = input.wait_on_limit;
+    // PRD #841: replace-semantics — apply when present (explicit null clears to inherit).
+    if (input.mr_rework_enabled !== undefined) m.mr_rework_enabled = input.mr_rework_enabled;
     // Replace-semantics: apply when the key is present (explicit null = unlimited).
     if (input.max_issues !== undefined) m.max_issues = input.max_issues;
     // Same replace-semantics for guidance (explicit null/"" clears to none).
@@ -4575,6 +4596,10 @@ export const mockApi = {
           (m.model ?? "") !== entry.model ||
           m.auto_approve !== entry.auto_approve ||
           m.wait_on_limit !== entry.wait_on_limit ||
+          // mr_rework_enabled (PRD #841): the catalog baseline is inherit (null), so ANY
+          // explicit override flips customized — mirroring the server's `if mrRework.Valid`
+          // in defaultEditableDiverges (api/internal/handler/schedules.go).
+          m.mr_rework_enabled != null ||
           (m.target === "sweep" && (m.max_issues ?? 0) !== entry.max_issues) ||
           // Owner guidance-overlay divergence for a prompt default (issue #662) or a sweep
           // default (issue #675): the OVERLAY (m.guidance) is null until the owner sets one,
