@@ -652,6 +652,16 @@ function SidebarContent({
     navigate("/login");
   };
 
+  // Whether the below-wordmark "powered by" row renders, mirroring PoweredBy's
+  // own gating for slot="below" (null when collapsed / no branding / mode
+  // "none"; resolves to "topright" only for logo+topright, else "below"). Used
+  // to trim the wordmark Link's bottom padding so the row tucks up close.
+  const belowPoweredByPresent =
+    !collapsed &&
+    !!branding &&
+    branding.brand_mode !== "none" &&
+    !(branding.brand_mode === "logo" && branding.brand_placement === "topright");
+
   return (
     <div className="flex h-full flex-col">
       {/* Header cluster: the app wordmark/logo Link and the below-wordmark "powered
@@ -663,8 +673,14 @@ function SidebarContent({
           onClick={onNavigate}
           title={collapsed ? (showName ? "uzi · uzinele întunecate" : "app logo") : undefined}
           className={cx(
-            "flex items-center py-4",
-            collapsed ? "justify-center px-2" : "gap-2.5 px-4",
+            "flex items-center",
+            // When the below-wordmark "powered by" row renders (its own gating,
+            // mirrored here), drop the Link's bottom padding so the row tucks
+            // ~4px under the tagline, matching AdminBranding's `mt-1` preview
+            // (issue #866). Otherwise keep the symmetric py-4.
+            collapsed
+              ? "justify-center px-2 py-4"
+              : cx("gap-2.5 px-4 pt-4", belowPoweredByPresent ? "pb-0" : "pb-4"),
           )}
         >
           <AppMark branding={branding} className="h-8 w-8 rounded-lg text-lg" />
