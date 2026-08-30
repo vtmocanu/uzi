@@ -196,7 +196,7 @@ Three states track how close the lead is to compaction:
 | State | Fill | Meaning |
 |---|---|---|
 | cool | `< 70%` | Plenty of room — a quiet steel bar, no glow. |
-| molten | `70–95%` | Filling toward the line — an orange glow. |
+| molten | `70 to <95%` | Filling toward the line — an orange glow. |
 | near-compaction | `≥ 95%` | Into the danger wash — a pulsing rose glow (steady, not pulsing, under reduced motion). |
 
 **100% is the compaction line**, not a 90% warning tick: the SDK's
