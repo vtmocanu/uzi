@@ -18,6 +18,17 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.71.1] - 2026-08-30
+
+### Fixed
+
+- **Sidebar build-info popover is centered and the version badge aligned ([#869](https://github.com/vtmocanu/uzi/pull/869), [#864](https://github.com/vtmocanu/uzi/pull/864)).**
+  The sidebar footer's version badge is aligned and its build-info popover is centered, instead of the badge sitting off-alignment and the popover drawing off-center.
+- **Sidebar tagline spacing tightened to the powered-by line ([#868](https://github.com/vtmocanu/uzi/pull/868), [#866](https://github.com/vtmocanu/uzi/pull/866)).**
+  The sidebar tagline and its powered-by line now sit at the intended spacing rather than drifting apart.
+- **Run-page option toggles now sit side by side ([#870](https://github.com/vtmocanu/uzi/pull/870), [#867](https://github.com/vtmocanu/uzi/pull/867)).**
+  The run page's option toggles are laid out side by side on wide screens and stack vertically on mobile, instead of always stacking.
+
 ## [0.71.0] - 2026-08-30
 
 ### Added
@@ -3552,7 +3563,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.71.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.71.1...HEAD
+[0.71.1]: https://github.com/vtmocanu/uzi/compare/v0.71.0...v0.71.1
 [0.71.0]: https://github.com/vtmocanu/uzi/compare/v0.70.0...v0.71.0
 [0.70.0]: https://github.com/vtmocanu/uzi/compare/v0.69.0...v0.70.0
 [0.69.0]: https://github.com/vtmocanu/uzi/compare/v0.68.0...v0.69.0
