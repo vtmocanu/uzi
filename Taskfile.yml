@@ -273,6 +273,9 @@ tasks:
       # so it belongs in gate:repo.
       - task: check:no-binary-text
       - task: scan:secrets
+      # Whole-tree Go+TS SAST scan (semgrep), BYO fail-open like lint:yaml. Ordered
+      # LAST because a whole-tree scan dominates, same as scan:secrets above (PRD #862 M2).
+      - task: sast:semgrep
 
   gate:api:
     desc: api - fmt-check, vet, build, lint, deadcode, test
@@ -865,6 +868,30 @@ tasks:
       # gitleaks does not honour `.gitignore`; findings in untracked files are
       # printed and do NOT gate.
       - ./scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt api/internal/config/gitleaks_canary_test.go
+
+  sast:semgrep:
+    desc: semgrep SAST over the tree, with a canary proving the scanner ran
+    cmds:
+      # 🔴 A `sast:` PREFIX AND NOT `lint:`, AND DELIBERATELY ABSENT FROM THE
+      # COMPOSED `lint` TARGET -- the same ruling `scan:secrets` above makes and for
+      # the same reason: this is not a lint (its findings are security invariants,
+      # not style opinions the tree can be edited to satisfy) and a whole-tree scan
+      # is tens of seconds where the composed lints are sub-second. `gate:repo` is
+      # what gates it; `task sast:semgrep` is how you run it alone.
+      #
+      # 🔴 BYO ON PATH, mirroring lint:yaml: semgrep is a Python/OCaml tool with no
+      # static binary, so it is not a pinned `go run`/curl+sha256 like gitleaks or
+      # golangci. The wrapper fail-open SKIPs when semgrep is absent on a laptop and
+      # is forced (UZI_SAST_REQUIRED) in the CI sast job (PRD #862 M5). Acquisition
+      # on a uzi worker is the baked toolchain (M0).
+      #
+      # BOTH ARGUMENTS ARE LOAD-BEARING AND HERE SO THIS FILE'S ECHO SHOWS THEM,
+      # the same reason lint:yaml carries its config path. The rules dir is where a
+      # reviewer sees which rules are in play; the canary path is the tracked file
+      # the wrapper asserts was DETECTED on every run, proving semgrep actually
+      # looked (guarding against a vacuous 0-findings pass). This ships the proof
+      # rule only -- the real uzi guardrail invariants are PRD #862 M3.
+      - ./scripts/semgrep-gate.sh semgrep scripts/semgrep-canary.txt
 
   # ------------------------------------------------------------- api (Go) -----
   fmt-check:api:
