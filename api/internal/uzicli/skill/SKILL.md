@@ -743,14 +743,31 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    ```
 
    A non-terminal match means uzi is on it: defer, let it finish, then review the
-   commit it pushed (uzi acting is not uzi being right) before merging.
+   commit it pushed (uzi acting is not uzi being right), and re-check this list
+   right before you merge. The check narrows the collision window, it does not lock
+   the branch, so the re-check just before merging is what actually keeps the two
+   pushes apart.
 
    **When no rework is running and the diff and any automated review are clean,**
    merge with the forge's own tool, picked by the repo's remote host: GitLab uses
    `glab mr merge` (on this host GitLab needs `env -u GITLAB_TOKEN glab`), GitHub
    uses `gh pr merge`, Forgejo or Gitea uses `tea pr merge`. uzi has no merge verb;
-   this is the local session merging. A blocked merge or a conflict stops here;
-   report it.
+   this is the local session merging. Two things to get right so you merge the
+   intended MR and know it actually landed:
+
+   - **Name the MR/PR and repo explicitly; do not rely on the current checkout.**
+     You have the `mr_web_url` from step 7, not necessarily that branch checked out,
+     so pass the number and the repository (e.g. `gh pr merge <number> --repo
+     <owner/repo>`, `glab mr merge <iid> --repo <group/project>`, `tea pr merge
+     <index>`). A bare merge command acts on whatever branch the shell is on, and
+     can merge the wrong MR or fail.
+   - **Confirm it actually merged before step 9.** `glab` and `gh` fall back to an
+     auto/deferred merge when a pipeline, a required check, or a merge queue is
+     still pending, which returns without merging now; step 9 would then watch the
+     wrong pipeline. Turn that fallback off, or poll the MR/PR until its state reads
+     `merged`, before starting the post-merge CI watch.
+
+   A blocked merge or a conflict stops here; report it.
 9. **Watch CI, fix failures locally.** Poll the post-merge pipeline with the forge
    CLI (`glab ci status`, `gh run watch`, or the `tea` equivalent) until it
    settles. On red, read each failed job's log and classify:
