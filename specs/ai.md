@@ -23334,7 +23334,7 @@ or privacy-sensitive install must be able to turn the check off entirely without
   distinct via `*bool` on the DTO: omitted (never checked / disabled), `false` (checked, current),
   `true` (behind) — the same "unknown beats wrong" rule the DTO's `*int` fields already use.
 - **`far_behind` is server-computed too, same principle as the pip.** v1 heuristic:
-  `update_available && (majorGap ≥ 1 OR minorGap ≥ 3 OR published_at ≥ 30 days ago)`, from
+  `update_available && (majorGap ≥ 1 OR minorGap ≥ 3 OR the release is at least 30 days old (now − published_at ≥ 30 days))`, from
   `semver.Major`/`semver.MajorMinor` on the re-prefixed strings; thresholds are tunable defaults. An
   exact "N releases behind" count (a releases-LIST call) is a future refinement, not v1.
 - **Security releases are auto-flagged from a `### Security` heading in the release body.** The
@@ -23352,7 +23352,8 @@ or privacy-sensitive install must be able to turn the check off entirely without
   (admin sees an "Update guide →" link, member sees "Ask your operator"); an admin Settings → Updates
   card (delta, notes excerpt, copyable helm/compose runbook, "Check now" → admin-only
   `POST /api/admin/release-check`, the two toggles, and the sole place the `error`/`disabled` status
-  is surfaced in words); and an admin-only escalation banner gated on `banner_enabled && far_behind`,
+  is surfaced in words); and an admin-only escalation banner gated on `banner_enabled && update_available && (far_behind || security)`
+  (the security arm is conjoined with update_available since a `### Security` heading alone does not imply a newer release),
   with a server-side snooze keyed to the release tag so it auto-clears when a newer release ships.
   Reading notes is always a link out to `notes_url`/`html_url` — no build-time upstream-feed bundle
   (it cannot hold entries newer than the instance's own build).

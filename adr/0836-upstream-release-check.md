@@ -7,7 +7,7 @@
 
 ## Decision (summary)
 
-A deployed instance now answers "is there a newer uzi release than the one I'm running?" without any client ever touching GitHub. The **api** — the sole outbound-egress holder — polls `GET https://api.github.com/repos/vtmocanu/uzi/releases/latest` on a schedule (default 6h), persists the remote facts to `app_settings`, and derives `update_available` / `far_behind` / `security` at **read time** with zero egress. `web` and the CLI render only from server booleans; neither hits GitHub (no CORS; nginx proxies only `/api/*`).
+A deployed instance now answers "is there a newer uzi release than the one I'm running?" without any client ever touching GitHub. The **api** — the only component that makes this release-check request (its own egress; the agent worker's outbound reach is the separate tiered egress of ADR-0285) — polls `GET https://api.github.com/repos/vtmocanu/uzi/releases/latest` on a schedule (default 6h), persists the remote facts to `app_settings`, and derives `update_available` / `far_behind` / `security` at **read time** with zero egress. `web` and the CLI render only from server booleans; neither hits GitHub (no CORS; nginx proxies only `/api/*`).
 
 This mirrors the agent-source update-check's **poll → persist → derive** core (`api/internal/agentsource/update.go`), but deliberately takes only that core: it schedules via a dedicated interval **Runner** (not a `poller.Engine` detector, not a `schedsvc` job) and seeds create-only from env (like `seed.SlackSettings`), because agent-source's own scheduling and admin-only-no-seed halves are the wrong precedent here. New code lives in `api/internal/releasecheck/` (`client.go` fetch, `check.go` poll/persist, `derive.go` read-time booleans, `runner.go` scheduler). The whole feature is gated by two admin-runtime toggles, default on.
 
@@ -17,7 +17,7 @@ A uzi instance already knows and serves its **own** version (`GET /api/version` 
 
 Two adjacent mechanisms existed and neither targeted upstream releases: CLI-vs-server skew (`api/internal/uzicli/versioncheck.go`, client-side) and the agent-source update check (`api/internal/agentsource/update.go`, which polls a configured template git source). The second is the structural template for this feature's core, not its schedule or seeding.
 
-The api is the only correct home: it holds the decrypted secrets and is the only component with open-web egress, and `web`/CLI cannot reach GitHub directly. That single fact drives most of what follows.
+The api is the only correct home: it holds the decrypted secrets and is the only component that reaches the open web for this check (the agent worker's outbound reach is governed separately by ADR-0285's egress tiers), and `web`/CLI cannot reach GitHub directly. That single fact drives most of what follows.
 
 ## The decisions
 
