@@ -305,10 +305,22 @@ by anything on the PR itself.
    but wasted effort and a confusing double set of fix commits). **Budget at least ~40 min
    of polling for the run to APPEAR before falling back to a local fix, and poll for it
    rather than eyeballing** — `scripts/wait-mrrework.sh OWNER/REPO PR` waits through the
-   fire→terminal lifecycle and exits when the run lands (or the budget elapses). Fall back to
-   a local fix only when that budget is genuinely spent, or when mr_rework structurally
-   cannot help (owner opted out, the admin kill-switch is on, or a `.github/workflows`
-   finding — the "when this session still fixes locally" list below). **Either way**, the
+   fire→terminal lifecycle and exits when the run lands (or the budget elapses).
+
+   **That ~40-min budget is measured from the NEWEST review comment, so it RESETS every time
+   a new one lands — it is not a fixed timer off the first finding.** mr_rework's quietPeriod
+   debounce runs from the latest review comment on the MR, so a later CodeRabbit incremental,
+   a human note, or another bot posting mid-wait pushes the fire window forward by another
+   full debounce. A fixed "~40 min from when I first saw findings" countdown can therefore
+   expire while the run is still legitimately pending against a newer comment. So restart the
+   budget whenever a new review comment arrives, and conclude "it will not fire" only once a
+   full quiet period has elapsed with NO new review comment AND no run has appeared (re-running
+   `wait-mrrework.sh` after any new comment does exactly this).
+
+   Fall back to a local fix only when that budget is genuinely spent, or when mr_rework
+   structurally cannot help (owner opted out, the admin kill-switch is on, or a
+   `.github/workflows` finding — the "when this session still fixes locally" list below).
+   **Either way**, the
    pre-push guard (re-list `kind=mr_rework` for this MR AND re-fetch the branch head, step 1)
    stays mandatory right before any local push, because the run can fire during your edit.
 3. **Let it finish, then decide from whether the head ACTUALLY moved — and read the ref
