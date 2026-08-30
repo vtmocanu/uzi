@@ -52,8 +52,12 @@ for i in $(seq 1 "$MAX"); do
     sleep "$INT"; continue
   fi
   ok_polls=$((ok_polls + 1)); last_poll_ok=1
+  # Anchor on the NEWEST mr_rework run for this MR, not an arbitrary first match: an MR can
+  # be reworked over several cycles (each a distinct run, up to the per-MR cap), so `first`
+  # could latch onto a stale TERMINAL earlier cycle and exit 0 while the current cycle is
+  # still running. `max_by(.created_at)` always tracks the latest cycle.
   row=$(printf '%s' "$raw" | jq -r --arg repo "$REPO_ID" --argjson pr "$PR" \
-    'first(.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr)) // {} | "\(.id // "")\t\(.status // "")"')
+    '([.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr)] | max_by(.created_at)) // {} | "\(.id // "")\t\(.status // "")"')
   id=$(printf '%s' "$row" | cut -f1)
   st=$(printf '%s' "$row" | cut -f2)
   if [ -z "$id" ]; then
