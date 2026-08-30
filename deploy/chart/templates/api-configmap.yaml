@@ -11,6 +11,15 @@ data:
   {{ $k }}: {{ $v | quote }}
   {{- end }}
   {{- /*
+    UZI_RELEASE_CHECK_TOKEN is an OPTIONAL SECRET and must NEVER be rendered into this
+    plaintext ConfigMap. Guarded here (OUTSIDE the releaseCheck block below) because the
+    api.config range above emits every key unconditionally, so the leak is independent of
+    whether releaseCheck is set. Supply the token via api.secretEnv (Infisical secretKeyRef).
+  */ -}}
+  {{- if hasKey .Values.api.config "UZI_RELEASE_CHECK_TOKEN" }}
+  {{- fail "Do not set UZI_RELEASE_CHECK_TOKEN in api.config: it is a secret and api.config renders into a plaintext ConfigMap. Supply it via api.secretEnv (Infisical secretKeyRef)." }}
+  {{- end }}
+  {{- /*
     FORGE_ALLOWED_BASE_URLS rendered EXPLICITLY from the first-class forge.allowedBaseURLs
     value (PRD #808), NOT left to the api.config freeform map — so the SSRF allowlist and
     the worker egress FQDNs (worker-fqdn-egress.yaml) derive from ONE source list and the
