@@ -502,6 +502,114 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     );
   });
 
+  // Issue #363 — the clamp (#262/#313) is UNDONE by a later `git fetch`. A plain `git clone`
+  // leaves a `remote.origin.fetch` refspec (`+refs/heads/*:refs/remotes/origin/*`) in the runner
+  // clone, so an agent that runs `git fetch origin main` / `git fetch origin` re-applies it and
+  // drags `refs/remotes/origin/main` back to the FROZEN bare mirror head — exactly the stale
+  // ancestor the clamp corrected — re-corrupting the ratchet base mid-run. The fix removes that
+  // refspec after clamping, so a fetch updates only FETCH_HEAD and moves no tracking ref. This
+  // test builds the SAME stale-ancestor topology as the #313 test, then fetches and re-asserts the
+  // clamp survives. RED without the git.ts refspec removal, GREEN with it.
+  const buildStaleAncestorClone = async (issue: number): Promise<{ rc: Awaited<ReturnType<GitCache["createOrAttachRunnerClone"]>>; frozen: string }> => {
+    const git = new GitCache(fx.dataDir, nullLogger());
+    const bare = await git.ensureClone(fx.originPath);
+    const initialHead = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+
+    // Advance the fixture ORIGIN's default branch so the branch's real base is FRESH.
+    fs.writeFileSync(path.join(fx.originPath, "ADVANCE.txt"), "moved on\n");
+    gitIn(fx.originPath, ["add", "ADVANCE.txt"]);
+    gitIn(fx.originPath, [...IDENT, "commit", "-m", "advance default"]);
+    const freshHead = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    assert.notStrictEqual(freshHead, initialHead, "precondition: fresh head differs from initial");
+
+    // Seed a first runner clone off the FRESH default, commit, push agent/issue-<issue> to origin.
+    await git.ensureClone(fx.originPath);
+    const first = await git.createOrAttachRunnerClone(bare, issue);
+    assert.strictEqual(first.baseCommit, freshHead, "precondition: first seed is off the fresh default");
+    fs.writeFileSync(path.join(first.path, "WORK.txt"), "w\n");
+    gitIn(first.path, ["add", "WORK.txt"]);
+    gitIn(first.path, [...IDENT, "commit", "-m", "branch work"]);
+    const branchTip = gitIn(first.path, ["rev-parse", "HEAD"]);
+    await git.fetchAgentBranch(bare, first.path, `agent/issue-${issue}`, "run-fixture");
+    await git.pushBranch(bare, `agent/issue-${issue}`, "", fx.originPath);
+    await git.removeRunnerClone(first.path);
+
+    // Stale the fresh default tracking refs so defaultBranchRef falls through to the frozen
+    // refs/heads/main rung (still the initial commit) — the exact #313 stale-ancestor topology.
+    await git.ensureClone(fx.originPath);
+    gitIn(bare, ["symbolic-ref", "-d", "refs/remotes/origin/HEAD"]);
+    gitIn(bare, ["update-ref", "-d", "refs/remotes/origin/main"]);
+    const frozen = gitIn(bare, ["rev-parse", "refs/heads/main"]);
+    assert.strictEqual(frozen, initialHead, "precondition: frozen mirror is the initial commit");
+
+    // Reseed: a resume whose defaultBranchCommit resolves through the frozen rung to the stale
+    // initial commit, so the clamp fires and pins origin/main to the fresh branch base.
+    const rc = await git.createOrAttachRunnerClone(bare, issue);
+    assert.strictEqual(rc.baseCommit, branchTip, "precondition: resume base is the fresh branch tip");
+    assert.notStrictEqual(rc.defaultBranchCommit, rc.baseCommit, "precondition: stale STRICT ancestor, not equal");
+    return { rc, frozen };
+  };
+
+  it("the clamp survives a later `git fetch origin main` / `git fetch origin` (no refspec re-applies it) (#363)", async () => {
+    const { rc } = await buildStaleAncestorClone(363);
+
+    // The clamp is applied: origin/main is the branch base, not the stale frozen ancestor.
+    assert.strictEqual(
+      gitIn(rc.path, ["rev-parse", "refs/remotes/origin/main"]),
+      rc.baseCommit,
+      "precondition: origin/main is clamped to the branch base before any fetch",
+    );
+
+    // An agent runs BOTH fetch shapes inside the runner clone. Without the refspec removal these
+    // drag origin/main back to the frozen mirror head; with it, they touch only FETCH_HEAD.
+    gitIn(rc.path, ["fetch", "origin", "main"]);
+    gitIn(rc.path, ["fetch", "origin"]);
+
+    // The clamp still holds — origin/main is the branch base, and merge-base(origin/main, HEAD)
+    // is the branch base, so the ratchet still gates only branch-introduced findings.
+    assert.strictEqual(
+      gitIn(rc.path, ["rev-parse", "refs/remotes/origin/main"]),
+      rc.baseCommit,
+      "origin/main must STILL be the branch base after fetch — a re-applied refspec would move it back",
+    );
+    assert.strictEqual(
+      gitIn(rc.path, ["merge-base", "refs/remotes/origin/main", "HEAD"]),
+      rc.baseCommit,
+      "merge-base(origin/main, HEAD) must still be the branch base after fetch (ratchet base intact)",
+    );
+  });
+
+  // Negative control: with the wildcard refspec RE-ADDED to the very same clone, the identical
+  // `git fetch origin main` DOES drag origin/main back to the frozen bare mirror head — proving the
+  // corruption is real and that the test above cannot pass vacuously. It is the ABSENCE of the
+  // refspec (the #363 fix) that protects the clamp, nothing else in the topology.
+  it("negative control: re-adding the wildcard refspec lets `git fetch` corrupt origin/main back to the frozen mirror (#363)", async () => {
+    const { rc, frozen } = await buildStaleAncestorClone(3631);
+
+    assert.strictEqual(
+      gitIn(rc.path, ["rev-parse", "refs/remotes/origin/main"]),
+      rc.baseCommit,
+      "precondition: origin/main is clamped to the branch base before the refspec is re-added",
+    );
+    assert.notStrictEqual(rc.baseCommit, frozen, "precondition: the branch base differs from the frozen mirror head");
+
+    // Re-add the exact refspec a plain clone carries, which the #363 fix removed.
+    gitIn(rc.path, ["config", "--add", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    gitIn(rc.path, ["fetch", "origin", "main"]);
+
+    // The refspec dragged origin/main back to the frozen mirror head — the clamp is undone.
+    assert.strictEqual(
+      gitIn(rc.path, ["rev-parse", "refs/remotes/origin/main"]),
+      frozen,
+      "with the refspec present, fetch moves origin/main to the frozen bare mirror head",
+    );
+    assert.notStrictEqual(
+      gitIn(rc.path, ["rev-parse", "refs/remotes/origin/main"]),
+      rc.baseCommit,
+      "with the refspec present, origin/main is no longer the branch base — the clamp is corrupted",
+    );
+  });
+
   // Issue #134 (the production half of #127). Any git that writes into a repo spawns a
   // DETACHED `git maintenance run --auto --detach` that outlives the awaited process and keeps
   // writing inside `.git`. removeRunnerClone() (runner.ts:454) `fs.rm`s the clone moments after

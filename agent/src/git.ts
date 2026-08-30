@@ -792,6 +792,10 @@ export class GitCache {
       // clone, exactly as #262. The no-resolvable-default-branch edge keeps today's skip (origin/main
       // keeps whatever the plain clone copied); it is governed by the Taskfile merge-base pre-flight,
       // out of scope here.
+      // Issue #363 — the clamp below is made DURABLE by removing the clone's `remote.origin.fetch`
+      // refspec right after it, so a later agent-initiated `git fetch origin main` / `git fetch
+      // origin` / `git pull` updates only FETCH_HEAD and cannot move `refs/remotes/origin/<default>`
+      // back to the frozen bare mirror head, which would undo the clamp and re-corrupt the ratchet base.
       // PRD #759 M2: clamp against effectiveBase — the real fork point after a wip(park)
       // reset --soft (== baseSha on every non-marker leg, so byte-identical there).
       const defaultBranch = await this.defaultBranchName(barePath);
@@ -810,6 +814,19 @@ export class GitCache {
           });
         }
       }
+      // Issue #363 — make the clamp above durable. `git clone` writes a
+      // `remote.origin.fetch` refspec (`+refs/heads/*:refs/remotes/origin/*`); a later
+      // agent-initiated `git fetch origin main` / `git fetch origin` / `git pull` would
+      // re-apply it and force `refs/remotes/origin/<default>` backward to the frozen bare
+      // mirror head, undoing the clamp and re-corrupting the ratchet base. With no
+      // configured refspec, a fetch updates only FETCH_HEAD and touches no tracking ref, so
+      // the clamp holds for the run's lifetime. `git config --unset-all` exits 5 when the key
+      // is absent (a plain clone always has it, so exit 5 is only a defensive edge); treat
+      // ONLY exit 5 as non-fatal and rethrow anything else.
+      await this.runGitAsRunner(clonePath, ["config", "--unset-all", "remote.origin.fetch"]).catch((err: unknown) => {
+        if ((err as { code?: unknown }).code === 5) return;
+        throw err;
+      });
       // PRD #759 M2: baseCommit is the REAL fork point — effectiveBase, which is the
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
@@ -1674,7 +1691,13 @@ export class GitCache {
       });
       return stdout;
     } catch (err) {
-      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
+      // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
+      // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const code = (err as { code?: unknown }).code;
+      if (typeof code === "number") (failure as { code?: number }).code = code;
+      throw failure;
     }
   }
 
