@@ -78,8 +78,9 @@ source constant edited by hand and picked up on the next rebuild) is not
 an admin or branding setting, so no combination of branding settings —
 including full white-label — can turn it on, off, or replace it. When the
 flag is on, the credit renders on the sidebar footer row (alongside the
-build/version badge) and on the signed-out footer, and collapsing the
-sidebar hides it the same as everything else in that row.
+build/version badge), on the signed-out footer, and in the Admin →
+Branding live preview, and collapsing the sidebar hides it the same as
+everything else in that row.
 
 ## Setting it up
 

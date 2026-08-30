@@ -85,6 +85,14 @@ const BUILD_INFO_FAILED: BuildInfoSnapshot = { status: "failed" };
 
 let buildInfoPromise: Promise<BuildInfoSnapshot> | null = null;
 
+// Test-only reset of the module-memoised build-info fetch, mirroring
+// __resetBrandingForTests below. Needed because the branding test file now drives
+// both a pending and a resolved build state within one file, so the memo must be
+// resettable between those tests.
+export function __resetBuildInfoForTests(): void {
+  buildInfoPromise = null;
+}
+
 function useBuildInfoSnapshot(): BuildInfoSnapshot | null {
   const [snapshot, setSnapshot] = useState<BuildInfoSnapshot | null>(null);
   useEffect(() => {
@@ -194,11 +202,11 @@ export function useAppVersion(): string | null {
 // default (app_logo_mode "default", keep_name true).
 let brandingPromise: Promise<Branding | null> | null = null;
 
-// Test-only reset of the module-memoised branding fetch. buildInfoPromise needs no
-// such seam because its tests resolve ONE value per file (vitest isolates per
-// file); the M3a chrome tests instead exercise DIFFERENT branding per test
-// (default / custom / white-label) within one file, so the memo must be cleared
-// between them or the first test's value would pin the whole file.
+// Test-only reset of the module-memoised branding fetch, paired with
+// __resetBuildInfoForTests above (both memos are cleared between tests). The M3a
+// chrome tests exercise DIFFERENT branding per test (default / custom / white-label)
+// within one file, so the memo must be cleared between them or the first test's
+// value would pin the whole file.
 export function __resetBrandingForTests(): void {
   brandingPromise = null;
 }

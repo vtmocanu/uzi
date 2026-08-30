@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { AppShell, __resetBrandingForTests } from "./AppShell";
+import { AppShell, __resetBrandingForTests, __resetBuildInfoForTests } from "./AppShell";
 import { api, type Branding } from "../lib/api";
 import { DEFAULT_TITLE } from "../lib/brandTitle";
 import { useAuth } from "../auth/AuthContext";
@@ -18,11 +18,11 @@ import { mockBuildInfo } from "../mocks/data";
 // <svg role="img">, so a role query would collide with it. Custom-mode tests read
 // img.getAttribute("src"); the default test asserts the SAME query returns nothing.
 //
-// The module-memoised branding fetch (`brandingPromise` in AppShell) is reset
-// between tests via the exported `__resetBrandingForTests` seam — unlike
-// buildInfoPromise, which its own test file leaves cold-per-file because it needs
-// only one value; here each test drives a DIFFERENT branding, so the memo must be
-// cleared or the first test's value would pin the whole file.
+// Both module-memoised fetches in AppShell (`brandingPromise` and
+// `buildInfoPromise`) are reset between tests via the exported
+// `__resetBrandingForTests` / `__resetBuildInfoForTests` seams: each test drives a
+// DIFFERENT branding and some drive a DIFFERENT build state (pending vs resolved),
+// so the memos must be cleared or the first test's value would pin the whole file.
 
 vi.mock("../lib/api", () => ({
   MOCK_MODE: false,
@@ -95,6 +95,7 @@ function signOut() {
 
 beforeEach(() => {
   __resetBrandingForTests();
+  __resetBuildInfoForTests();
   signIn();
   mockApi.version.mockResolvedValue(mockBuildInfo);
   mockApi.branding.mockResolvedValue(DEFAULT_BRANDING);
@@ -125,9 +126,9 @@ function renderShell(initial = "/dashboard") {
 const NAME_RE = /uzinele întunecate/;
 
 describe("AppShell branding — build-flag-gated credit", () => {
-  // FIRST in the file, deliberately: buildInfoPromise has no reset seam, so this is
-  // the only test guaranteed a cold build memo. It leaves version pending to prove
-  // the credit renders while BOTH branding and build are unresolved.
+  // Leaves both branding and version pending to prove the credit renders while BOTH
+  // fetches are unresolved. beforeEach resets buildInfoPromise, so this no longer
+  // depends on file ordering for a cold build memo.
   it("renders the license credit while branding and build are still in flight", () => {
     vi.mocked(licenseCreditEnabled).mockReturnValue(true);
     mockApi.branding.mockReturnValue(new Promise<Branding>(() => {}));
@@ -433,8 +434,14 @@ describe("AppShell branding — one-row footer", () => {
     const credit = await screen.findByTestId("license-credit");
     const row = credit.parentElement as HTMLElement;
     expect(row.className).toMatch(/justify-between/);
-    // The version badge (BuildInfoPopover) is the left-hand sibling in the same row.
+    // beforeEach resolves mockApi.version to mockBuildInfo (version "0.4.2"), and
+    // buildInfoPromise is reset, so the version badge actually renders here. Assert
+    // BOTH the credit and the badge live in the same justify-between row, so this
+    // test fails if the badge stops rendering.
+    const badge = await screen.findByText("v0.4.2");
+    expect(row.contains(badge)).toBe(true);
     expect(row.textContent).toContain("MIT © Vlad Mocanu");
+    expect(row.textContent).toContain("v0.4.2");
   });
 
   it("credit still renders (in the row) before the version resolves", async () => {
