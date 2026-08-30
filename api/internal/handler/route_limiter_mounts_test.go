@@ -575,6 +575,11 @@ var wantRouteMounts = []routeMount{
 	// /me/wait-on-limit: one owner-scoped boolean UPDATE, no spend, no forge write,
 	// and it cannot even change the run's status. Contrast /runs/{id}/rejudge above,
 	// which carries limJudge precisely because it MINTS a token-spending run.
+	// PRD #841 M2, the per-run MR-rework toggle. noLimiter for the same reason as
+	// wait-on-limit above: one owner-scoped nullable-boolean UPDATE, no spend, no forge
+	// write, and no status change. Unlike wait-on-limit it is mounted on RequireUser (D3),
+	// but the limiter dimension is the same.
+	{"PUT", "/api/runs/{id}/mr-rework", noLimiter},
 	{"PUT", "/api/runs/{id}/wait-on-limit", noLimiter},
 	{"PUT", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	{"PUT", "/api/skills/{id}", noLimiter},

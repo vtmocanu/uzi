@@ -193,7 +193,7 @@ func (s *Service) DismissProposalForUser(ctx context.Context, userID, runID, pro
 // composite no longer computes any PRD-link bypass. It returns the CreateRun
 // sentinels unchanged (ErrNotPRDIssue, ErrActiveRunExists, …) plus the forge
 // sentinels above.
-func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, waitOnLimit, mrReworkEnabled *bool, seed *SeededPlan) (store.Run, error) {
 	if s.forges == nil {
 		return store.Run{}, ErrForgesUnavailable
 	}
@@ -213,9 +213,10 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 		// err is already PAT-redacted by the driver.
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeIssueRead, err)
 	}
-	// nil mrReworkEnabled (PRD #841 M1): the create-run request field is not wired here
-	// until M2 — the run inherits the owner default live. Behaviour is byte-identical.
-	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, nil, seed)
+	// PRD #841 M2: the caller's per-run mr_rework override (CLI/API) threads straight
+	// through with no owner-default snapshot — the run inherits the owner default live
+	// when it is nil (D1).
+	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, mrReworkEnabled, seed)
 }
 
 // StartRunForUserByPath is StartRunForUser keyed by the human repo PATH the chat
@@ -231,5 +232,7 @@ func (s *Service) StartRunForUserByPath(ctx context.Context, userID uuid.UUID, r
 		}
 		return store.Run{}, err
 	}
-	return s.StartRunForUser(ctx, userID, repoID, issueIID, waitOnLimit, seed)
+	// nil mrReworkEnabled (PRD #841 M2): the chat/Slack start-run card carries no
+	// per-run mr_rework override, so the run inherits the owner default live.
+	return s.StartRunForUser(ctx, userID, repoID, issueIID, waitOnLimit, nil, seed)
 }

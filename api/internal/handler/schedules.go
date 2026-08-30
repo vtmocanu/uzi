@@ -233,6 +233,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		NextFireAt:            nextFire,
 		AutoApprove:           *m.AutoApprove,
 		WaitOnLimit:           *m.WaitOnLimit,
+		MrReworkEnabled:       optBoolToPgtype(m.MrReworkEnabled),
 		Enabled:               *m.Enabled,
 		MaxIssues:             maxIssuesColumn(m),
 		Guidance:              guidanceColumn(m),
@@ -359,6 +360,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			NextFireAt:            nextFire,
 			AutoApprove:           *m.AutoApprove,
 			WaitOnLimit:           *m.WaitOnLimit,
+			MrReworkEnabled:       optBoolToPgtype(m.MrReworkEnabled),
 			MaxIssues:             maxIssuesColumn(m),
 			Guidance:              guidanceColumn(m),
 			Model:                 modelColumn(m),
@@ -1105,6 +1107,15 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		waitOnLimit = *req.WaitOnLimit
 	}
 
+	// mr_rework (PRD #841 M2) takes replace-semantics from the request on a default patch:
+	// an explicit null clears the override back to inherit, a present pointer sets it,
+	// omitted keeps the stored value. The catalog/schedtmpl baseline is inherit (nil, D5),
+	// so any explicit override OR-s into customized via defaultEditableDiverges below.
+	mrRework := cur.MrReworkEnabled
+	if req.MrReworkEnabled != nil {
+		mrRework = optBoolToPgtype(req.MrReworkEnabled)
+	}
+
 	// max_issues is meaningful only for a sweep default; a prompt default keeps it NULL. For
 	// a sweep it takes replace-semantics from the request (the web sends the full editable
 	// config), same as the user path — an omitted value clears it to unlimited.
@@ -1154,7 +1165,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// OR-ed with a stale true — Reset and an exact-restore patch both un-customize).
 	customized := false
 	if job, ok := schedtmpl.BySlug(cur.CatalogSlug.String); ok {
-		customized = defaultEditableDiverges(job, cron, tz, model, autoApprove, waitOnLimit, maxIssues)
+		customized = defaultEditableDiverges(job, cron, tz, model, autoApprove, waitOnLimit, mrRework, maxIssues)
 	} else {
 		// Catalog entry gone: cannot compare, so preserve the stored flag rather than guess.
 		customized = cur.Customized
@@ -1186,6 +1197,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		NextFireAt:            pgtype.Timestamptz{Time: next, Valid: true},
 		AutoApprove:           autoApprove,
 		WaitOnLimit:           waitOnLimit,
+		MrReworkEnabled:       mrRework,
 		MaxIssues:             maxIssues,
 		Guidance:              guidance,
 		Model:                 model,
@@ -1257,7 +1269,7 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		req.RepoID == "" &&
 		req.IssueIID == nil && req.Labels == nil && req.Prompt == "" &&
 		req.CronExpr == "" && req.RunAt == nil && req.Timezone == "" &&
-		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MaxIssues == nil &&
+		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MrReworkEnabled == nil && req.MaxIssues == nil &&
 		req.Guidance == nil && req.Model == nil && req.OverrideSubagentModel == nil
 }
 
@@ -1345,6 +1357,12 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 	// the DB as NULL = inherit. A seed-and-keep would make an explicit clear indistinguishable
 	// from omitted.
 	m.Model = req.Model
+	// mr_rework (PRD #841 M2) takes the request value DIRECTLY, same replace-semantics as
+	// model/guidance/max_issues above: a config PATCH rewrites the whole row (enabled-only
+	// is short-circuited by onlyEnabled), so a `mr_rework_enabled: null` must reach the DB
+	// as NULL = inherit (D5). A seed-and-keep would make an explicit clear indistinguishable
+	// from omitted. It is the tri-state *bool, so nil ≠ false here (unlike wait_on_limit).
+	m.MrReworkEnabled = req.MrReworkEnabled
 	// override_subagent_model (PRD #305) takes the request value DIRECTLY, same
 	// replace-semantics as model/guidance/max_issues above: the config PATCH rewrites the
 	// whole row (enabled-only is short-circuited by onlyEnabled), so nil ≡ false (Decision 5)
@@ -1502,23 +1520,24 @@ func (h *Handler) repoPathFor(ctx context.Context, s store.RunSchedule) string {
 // a recurring schedule from the same cron logic the modal preview uses.
 func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.ScheduleDTO {
 	dto := apitypes.ScheduleDTO{
-		ID:          s.ID.String(),
-		RepoID:      s.RepoID.String(),
-		RepoPath:    repoPath,
-		Target:      s.Target,
-		Labels:      scheduleLabelsToSlice(s.Labels),
-		Prompt:      s.Prompt.String,
-		Timing:      s.Timing,
-		CronExpr:    s.CronExpr.String,
-		Timezone:    s.Timezone,
-		AutoApprove: s.AutoApprove,
-		WaitOnLimit: s.WaitOnLimit,
-		Enabled:     s.Enabled,
-		Status:      s.Status,
-		Origin:      s.Origin,
-		Customized:  s.Customized,
-		CreatedAt:   s.CreatedAt.Time,
-		UpdatedAt:   s.UpdatedAt.Time,
+		ID:              s.ID.String(),
+		RepoID:          s.RepoID.String(),
+		RepoPath:        repoPath,
+		Target:          s.Target,
+		Labels:          scheduleLabelsToSlice(s.Labels),
+		Prompt:          s.Prompt.String,
+		Timing:          s.Timing,
+		CronExpr:        s.CronExpr.String,
+		Timezone:        s.Timezone,
+		AutoApprove:     s.AutoApprove,
+		WaitOnLimit:     s.WaitOnLimit,
+		MrReworkEnabled: boolPtrValue(s.MrReworkEnabled),
+		Enabled:         s.Enabled,
+		Status:          s.Status,
+		Origin:          s.Origin,
+		Customized:      s.Customized,
+		CreatedAt:       s.CreatedAt.Time,
+		UpdatedAt:       s.UpdatedAt.Time,
 	}
 	if s.CatalogSlug.Valid && s.CatalogSlug.String != "" {
 		v := s.CatalogSlug.String
@@ -1672,11 +1691,11 @@ func catalogModel(j schedtmpl.DefaultJob) pgtype.Text {
 }
 
 // defaultEditableDiverges reports whether a default row's editable fields differ from the
-// catalog defaults (PRD #589 M2). It compares the six editable fields; the catalog-owned
+// catalog defaults (PRD #589 M2). It compares the editable run fields; the catalog-owned
 // prompt/labels/guidance are excluded (they are never stored on the row). A blank catalog
 // model and a NULL row model both mean "inherit", so they compare equal; a 0 catalog
 // max_issues and a NULL row max_issues both mean "unlimited".
-func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pgtype.Text, autoApprove, waitOnLimit bool, maxIssues pgtype.Int4) bool {
+func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pgtype.Text, autoApprove, waitOnLimit bool, mrRework pgtype.Bool, maxIssues pgtype.Int4) bool {
 	if cron != job.Cron {
 		return true
 	}
@@ -1695,6 +1714,12 @@ func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pg
 		return true
 	}
 	if autoApprove != schedtmpl.AutoApprove || waitOnLimit != schedtmpl.WaitOnLimit {
+		return true
+	}
+	// mr_rework_enabled (PRD #841 M2, D5): the schedtmpl/catalog baseline is inherit
+	// (nil), which for a nullable column is Valid=false. Nil-safe *bool comparison — an
+	// unset row column equals the nil default, and ANY explicit override (Valid) diverges.
+	if mrRework.Valid {
 		return true
 	}
 	jMax := int32(0)

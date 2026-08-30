@@ -144,6 +144,11 @@ type autopilotCall struct {
 	// value for CreateScheduledAutopilotRun (PRD #274 Decision 1a). A test proves the
 	// auto-approve scheduled path threads the schedule's wait_on_limit by reading it.
 	waitOnLimit *bool
+	// mrReworkEnabled is the schedule's per-schedule mr_rework override (PRD #841 M2),
+	// captured so a test can prove the auto-approve scheduled path threads
+	// sched.MrReworkEnabled onto the created run. nil for the poller-shaped
+	// CreateAutopilotRun (no per-schedule override).
+	mrReworkEnabled *bool
 	// model is the schedule's per-schedule model override (PRD #300), captured so a later
 	// milestone (M3) can assert the frozen model was threaded onto the created run. nil for
 	// the poller-shaped CreateAutopilotRun (no per-run model).
@@ -158,6 +163,10 @@ type runCall struct {
 	userID, repoID uuid.UUID
 	issueIID       int64
 	waitOnLimit    *bool
+	// mrReworkEnabled is the schedule's per-schedule mr_rework override (PRD #841 M2),
+	// captured to prove the non-auto scheduled path threads sched.MrReworkEnabled. nil for
+	// the interactive CreateRun (the handler's per-run field feeds that seam, not a schedule).
+	mrReworkEnabled *bool
 	// scheduled discriminates which seam the scheduler routed to: false = CreateRun
 	// (the interactive human seam, which carries PRD #196's PRD-link waiver), true =
 	// CreateScheduledRun (the non-interactive scheduled seam, no waiver). This pins the
@@ -176,6 +185,9 @@ type promptCall struct {
 	userID, repoID, scheduleID uuid.UUID
 	title, prompt              string
 	autoApprove, waitOnLimit   bool
+	// mrReworkEnabled is the schedule's per-schedule mr_rework override (PRD #841 M2),
+	// captured to prove the prompt path threads sched.MrReworkEnabled onto the run.
+	mrReworkEnabled *bool
 	// model is the schedule's per-schedule model override (PRD #300), captured for an M3
 	// assertion that the frozen model was threaded onto the prompt run.
 	model *string
@@ -209,16 +221,16 @@ func (f *fakeRuns) effErr(issueIID int64) error {
 	return f.err
 }
 
-func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, _ *bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, _ *workersvc.SeededPlan) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
 	// nil model: the interactive CreateRun seam carries no per-schedule model (PRD #300).
 	// false overrideSubagentModel: no per-run opt-in on the interactive seam (PRD #305).
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, false, nil, false})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, false, nil, false})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, _ *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan) (store.Run, error) {
 	// The non-auto-approve scheduled path: recorded in the same `runs` bucket as
 	// CreateRun so the existing wait-on-limit / path-selection count assertions still
 	// observe it, but tagged scheduled=true so a test can prove the scheduler routed
@@ -226,7 +238,7 @@ func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUI
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, true, model, overrideSubagentModel})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
@@ -236,25 +248,26 @@ func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUI
 	// nil waitOnLimit: the poller seam has no per-run choice (owner default). nil model:
 	// the poller seam has no per-run model (PRD #300). Kept so the interface stays
 	// satisfied even though the scheduler no longer calls it.
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, false})
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, _ *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
-	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops) and the
-	// schedule's model (PRD #300) so a test can prove both are threaded through.
+	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops), the
+	// schedule's mr_rework override (PRD #841 M2) and the schedule's model (PRD #300) so a
+	// test can prove all are threaded through.
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, model, overrideSubagentModel})
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, _ *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.prompts = append(f.prompts, promptCall{userID, repoID, scheduleID, title, prompt, autoApprove, waitOnLimit, model, overrideSubagentModel})
+	f.prompts = append(f.prompts, promptCall{userID, repoID, scheduleID, title, prompt, autoApprove, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
 }
 
@@ -494,6 +507,74 @@ func TestTickAutoApproveIssueThreadsWaitOnLimit(t *testing.T) {
 	if !*got {
 		t.Fatalf("auto-approve scheduled run threaded wait_on_limit = %v, want true (the schedule's persisted value)", *got)
 	}
+}
+
+// TestTickThreadsScheduleMrReworkEnabled pins PRD #841 M2: a scheduled run must stamp the
+// schedule's persisted mr_rework override onto the created run (scheduleMrRework reads it
+// off the nullable RunSchedule column). Covers all three scheduled seams: the auto-approve
+// issue path (CreateScheduledAutopilotRun), the non-auto issue path (CreateScheduledRun),
+// and the prompt path (CreatePromptRun). An explicit false must arrive as a non-nil *bool
+// false (not dropped to nil = inherit), which is the whole point of the override.
+func TestTickThreadsScheduleMrReworkEnabled(t *testing.T) {
+	t.Run("auto-approve issue", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule() // AutoApprove=true
+		s.MrReworkEnabled = pgtype.Bool{Bool: false, Valid: true}
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.autopilot) != 1 {
+			t.Fatalf("CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		}
+		got := h.runs.autopilot[0].mrReworkEnabled
+		if got == nil || *got {
+			t.Fatalf("auto-approve scheduled run threaded mr_rework = %v, want an explicit false", got)
+		}
+	})
+	t.Run("non-auto issue", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule()
+		s.AutoApprove = false
+		s.MrReworkEnabled = pgtype.Bool{Bool: true, Valid: true}
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.runs) != 1 {
+			t.Fatalf("CreateScheduledRun calls = %d, want 1", len(h.runs.runs))
+		}
+		got := h.runs.runs[0].mrReworkEnabled
+		if got == nil || !*got {
+			t.Fatalf("non-auto scheduled run threaded mr_rework = %v, want an explicit true", got)
+		}
+	})
+	t.Run("prompt", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule()
+		s.Target = "prompt"
+		s.IssueIid = pgtype.Int8{}
+		s.Prompt = pgtype.Text{String: "Do the weekly report", Valid: true}
+		s.AutoApprove = false
+		s.MrReworkEnabled = pgtype.Bool{Bool: false, Valid: true}
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.prompts) != 1 {
+			t.Fatalf("CreatePromptRun calls = %d, want 1", len(h.runs.prompts))
+		}
+		got := h.runs.prompts[0].mrReworkEnabled
+		if got == nil || *got {
+			t.Fatalf("prompt run threaded mr_rework = %v, want an explicit false", got)
+		}
+	})
+	t.Run("nil override inherits", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule() // AutoApprove=true, MrReworkEnabled zero-value = NULL
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.autopilot) != 1 {
+			t.Fatalf("CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		}
+		if got := h.runs.autopilot[0].mrReworkEnabled; got != nil {
+			t.Fatalf("a schedule with a NULL mr_rework column must thread nil (inherit), got %v", *got)
+		}
+	})
 }
 
 // TestTickNonAutoIssueScheduleUsesTheScheduledSeam pins the M4-review fix: a

@@ -383,6 +383,62 @@ func TestScheduleModelRoundTripLiveDB(t *testing.T) {
 	}
 }
 
+// TestScheduleMrReworkRoundTripLiveDB (PRD #841 M2) exercises the per-schedule mr_rework
+// override through the real nullable store column (pgtype.Bool): a user schedule created
+// with an explicit false persists it as a non-nil false, a config PATCH resending an
+// explicit true replaces it, and a config PATCH omitting the field CLEARS it back to nil
+// (inherit) — the tri-state replace-semantics (D5), where nil ≠ false. A fresh schedule
+// created with no mr_rework field is nil (inherit the owner default live, D1).
+func TestScheduleMrReworkRoundTripLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// Create with no mr_rework field → nil (inherit).
+	base, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"prompt","prompt":"do the thing","timing":"recurring","cron_expr":"0 9 * * 1"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", code)
+	}
+	if base.MrReworkEnabled != nil {
+		t.Fatalf("fresh schedule mr_rework = %v, want nil (inherit)", base.MrReworkEnabled)
+	}
+
+	// Create with an explicit false override → persisted as a non-nil false.
+	dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"prompt","prompt":"do the thing","timing":"recurring","cron_expr":"0 9 * * 1","mr_rework_enabled":false}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", code)
+	}
+	if dto.MrReworkEnabled == nil || *dto.MrReworkEnabled {
+		t.Fatalf("new schedule mr_rework = %v, want a non-nil false", dto.MrReworkEnabled)
+	}
+	id := dto.ID
+
+	patch := func(body string) (apitypes.ScheduleDTO, int) {
+		req := userReq(http.MethodPatch, "/api/schedules/"+id, body, f.owner.ID, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		f.h.PatchSchedule(rec, req)
+		var out apitypes.ScheduleDTO
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("decode patch: %v", err)
+			}
+		}
+		return out, rec.Code
+	}
+
+	// A config PATCH resending the full config with an explicit true replaces the override.
+	if got, gc := patch(`{"target":"prompt","prompt":"do the thing","timing":"recurring","cron_expr":"0 9 * * 1","mr_rework_enabled":true}`); gc != http.StatusOK || got.MrReworkEnabled == nil || !*got.MrReworkEnabled {
+		t.Fatalf("after set-true patch, code=%d mr_rework=%v, want 200 and non-nil true", gc, got.MrReworkEnabled)
+	}
+
+	// A config PATCH omitting mr_rework clears it to nil (inherit — replace-semantics, not
+	// the false a plain bool would collapse to).
+	if got, gc := patch(`{"target":"prompt","prompt":"do the thing","timing":"recurring","cron_expr":"0 9 * * 1"}`); gc != http.StatusOK || got.MrReworkEnabled != nil {
+		t.Fatalf("after omit patch, code=%d mr_rework=%v, want 200 and nil (cleared to inherit)", gc, got.MrReworkEnabled)
+	}
+}
+
 func TestScheduleOwnerIsolationLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newScheduleFixture(ctx, t)

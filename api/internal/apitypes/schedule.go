@@ -44,10 +44,15 @@ type ScheduleRequest struct {
 	Timezone    string     `json:"timezone"`
 	AutoApprove *bool      `json:"auto_approve"`
 	WaitOnLimit *bool      `json:"wait_on_limit"`
-	Enabled     *bool      `json:"enabled"`
-	MaxIssues   *int       `json:"max_issues"`
-	Guidance    *string    `json:"guidance"`
-	Model       *string    `json:"model"`
+	// MrReworkEnabled is the per-schedule MR-rework override (PRD #841 M2), tri-state:
+	// nil/absent = inherit the owner default (the schedule's default per D5), true/false
+	// = explicit override that a scheduled run stamps onto itself. On a config PATCH it
+	// takes replace-semantics (an explicit null clears back to inherit), like Model.
+	MrReworkEnabled *bool   `json:"mr_rework_enabled"`
+	Enabled         *bool   `json:"enabled"`
+	MaxIssues       *int    `json:"max_issues"`
+	Guidance        *string `json:"guidance"`
+	Model           *string `json:"model"`
 	// OverrideSubagentModel is the per-schedule "apply model also to agents" opt-in (PRD
 	// #305, all targets): when true, a fired run's resolved model overrides every
 	// subagent's own model pin too, not just the lead. Boolean, not tri-state (Decision 5):
@@ -84,7 +89,12 @@ type ScheduleDTO struct {
 	LastFiredAt *time.Time `json:"last_fired_at"`
 	AutoApprove bool       `json:"auto_approve"`
 	WaitOnLimit bool       `json:"wait_on_limit"`
-	Enabled     bool       `json:"enabled"`
+	// MrReworkEnabled is the per-schedule MR-rework override (PRD #841 M2): nil means
+	// inherit the owner default (NULL in the DB, the schedule default per D5), a value is
+	// an explicit override a scheduled run stamps onto itself. It is *bool (tri-state),
+	// NOT the plain bool WaitOnLimit uses, because mr_rework is inherit-capable.
+	MrReworkEnabled *bool `json:"mr_rework_enabled"`
+	Enabled         bool  `json:"enabled"`
 	// MaxIssues is the sweep fan-out cap (PRD #274 M2, sweep target only): nil means
 	// unlimited (NULL in the DB), a value is the oldest-first per-fire limit. New sweeps
 	// default to 10.
@@ -204,6 +214,11 @@ type CatalogEntryDTO struct {
 	MaxIssues    int      `json:"max_issues"`
 	AutoApprove  bool     `json:"auto_approve"`
 	WaitOnLimit  bool     `json:"wait_on_limit"`
+	// MrReworkEnabled is the per-schedule MR-rework override a default is seeded with (PRD
+	// #841 M2): nil = inherit the owner default (D5, the catalog default), so the
+	// enable-a-default UI reflects that a default job follows the user's global setting
+	// unless explicitly set. *bool (tri-state), unlike WaitOnLimit's plain bool.
+	MrReworkEnabled *bool `json:"mr_rework_enabled"`
 }
 
 // CatalogEnablementDTO records, for one (repo_id, slug) pair, that the owner already has a

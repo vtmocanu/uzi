@@ -1384,6 +1384,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (foreign run → 404) and POOL_WAIT-ONLY (non-held → 409); it only flips the
 				// hold to queued, so no token spend and no forge write.
 				r.Post("/{id}/resume-now", h.ResumeRunNow)
+				// Per-run MR-rework override (PRD #841 M2, Decision D3). RequireUser — NOT the
+				// cookie-only RequireAuth group where wait-on-limit sits — because this is a
+				// pure preference toggle with no resource-consent dimension (parking a run
+				// holds a lock + worker disk; toggling auto-rework spends nothing and holds
+				// nothing), and the M3 `uzi run mr-rework` CLI verb needs Bearer access.
+				// Owner-scoped in SQL (foreign run → 404); no status guard (D2). Guarded
+				// against a cookie-only mis-mount by a router-level auth test.
+				r.Put("/{id}/mr-rework", h.SetRunMrReworkEnabled)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))

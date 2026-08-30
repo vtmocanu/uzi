@@ -535,8 +535,9 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 		e.logger.Info("scheduler: prompt schedule has active run, skipping fire", "schedule", sched.ID.String())
 		return FireOutcome{Matched: 1, Skips: []Skip{{Title: title, Reason: SkipAlreadyRunning}}}, nil
 	}
-	// nil mrReworkEnabled (PRD #841 M1): threaded from sched.MrReworkEnabled in M2. Unchanged.
-	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, nil, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
+	// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run (nil ⇒
+	// inherit the owner default live).
+	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	switch {
 	case err == nil:
 		return FireOutcome{Matched: 1, Started: []Started{{RunID: run.ID, Title: title}}}, nil
@@ -588,9 +589,9 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// auto-approve run carries a persisted per-schedule wait_on_limit that must take
 		// effect (PRD #274 Decision 1a). Leaving the poller seam untouched is a structural
 		// guarantee that label-driven autopilot behaviour is unchanged.
-		// nil mrReworkEnabled (PRD #841 M1): the schedule's mr_rework override is not
-		// threaded until M2 — the run inherits the owner default live. Behaviour unchanged.
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, nil, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
+		// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run
+		// (nil ⇒ inherit the owner default live).
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	} else {
 		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
 		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
@@ -598,8 +599,9 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// with no PRD link runs here. The only thing separating this branch from the
 		// CreateScheduledAutopilotRun branch above is auto-approve (the plan gate still
 		// needs a human here), not eligibility.
-		// nil mrReworkEnabled (PRD #841 M1): threaded in M2. Behaviour unchanged.
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, nil, scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
+		// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run
+		// (nil ⇒ inherit the owner default live).
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
 	}
 
 	if err == nil {
@@ -863,6 +865,18 @@ func scheduleModel(s store.RunSchedule) *string {
 // behaviour). It is a plain bool (NOT NULL DEFAULT false column), not a tri-state.
 func scheduleOverrideSubagentModel(s store.RunSchedule) bool {
 	return s.OverrideSubagentModel
+}
+
+// scheduleMrRework returns the schedule's per-schedule mr_rework override (PRD #841 M2)
+// as a *bool for the run-insert seams: nil when the column is NULL, so a schedule with no
+// override freezes NULL onto the run and eligibility inherits the owner default live at
+// read time (D1); true/false stamp an explicit per-run override.
+func scheduleMrRework(s store.RunSchedule) *bool {
+	if !s.MrReworkEnabled.Valid {
+		return nil
+	}
+	v := s.MrReworkEnabled.Bool
+	return &v
 }
 
 // truncateUTF8 returns the longest prefix of s that is at most n bytes AND does not split
