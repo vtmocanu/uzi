@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, ApiError, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunListItem } from "../lib/api";
+import { api, ApiError, isHttpsUrl, isOpenMRConflict, openMRConflictMRIID, preferForgeUrl, type IssueDetail, type RunListItem } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
 import { activeRunInHistory, effectiveRunStatus, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
@@ -79,12 +79,40 @@ export function IssueView() {
     if (!issue) return;
     setError("");
     setStarting(true);
-    try {
-      const { run } = await api.createRun(repoId, issue.iid);
+    // createAndOpen runs the create then navigates; the force path reuses it so
+    // the retry does not duplicate the navigate.
+    const createAndOpen = async (force?: boolean) => {
+      const { run } = await api.createRun(repoId, issue.iid, force);
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
       navigate(`/runs/${encodeURIComponent(run.id)}`);
+    };
+    try {
+      await createAndOpen();
     } catch (err) {
+      // issue_has_open_mr (issue #856): a completed prior run still owns an open
+      // MR. Compose a web-specific confirm naming the MR (no --force jargon);
+      // confirm, then retry with force.
+      if (isOpenMRConflict(err) && err instanceof ApiError) {
+        const mr = openMRConflictMRIID(err);
+        const detail =
+          mr != null ? `an open merge request (!${mr})` : "an open merge request";
+        const proceed = window.confirm(
+          `This issue already has ${detail} from a completed run. Starting a new run will plan and review it again from scratch. Start a new run anyway?`,
+        );
+        if (proceed) {
+          try {
+            await createAndOpen(true);
+            return;
+          } catch (retryErr) {
+            setError(retryErr instanceof ApiError ? retryErr.message : "Could not start run");
+          }
+        }
+        // Declined (or forced retry failed): clear starting, no toast on decline.
+        setStarting(false);
+        load();
+        return;
+      }
       setError(err instanceof ApiError ? err.message : "Could not start run");
       setStarting(false);
       load();

@@ -13,6 +13,8 @@ import {
   api,
   ApiError,
   isHttpsUrl,
+  isOpenMRConflict,
+  openMRConflictMRIID,
   preferForgeUrl,
   type Board as BoardData,
   type Card as CardData,
@@ -584,12 +586,44 @@ export function Board() {
   const startRun = async (card: CardData) => {
     setError("");
     setStarting(card.iid);
-    try {
-      const { run } = await api.createRun(repoId, card.iid);
+    // createAndOpen runs the create then navigates; the force path reuses it so
+    // the retry does not duplicate the navigate.
+    const createAndOpen = async (force?: boolean) => {
+      const { run } = await api.createRun(repoId, card.iid, force);
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
       navigate(`/runs/${encodeURIComponent(run.id)}`);
+    };
+    try {
+      await createAndOpen();
     } catch (err) {
+      // issue_has_open_mr (issue #856): a completed prior run still owns an open
+      // MR. Compose a web-specific confirm naming the MR (no --force jargon);
+      // confirm, then retry with force.
+      if (isOpenMRConflict(err) && err instanceof ApiError) {
+        const mr = openMRConflictMRIID(err);
+        const detail =
+          mr != null ? `an open merge request (!${mr})` : "an open merge request";
+        const proceed = window.confirm(
+          `This issue already has ${detail} from a completed run. Starting a new run will plan and review it again from scratch. Start a new run anyway?`,
+        );
+        if (proceed) {
+          try {
+            await createAndOpen(true);
+            return;
+          } catch (retryErr) {
+            setError(
+              retryErr instanceof ApiError
+                ? retryErr.message
+                : "Could not start run",
+            );
+          }
+        }
+        // Declined (or forced retry failed): clear starting, no toast on decline.
+        setStarting(null);
+        loadPreconditions();
+        return;
+      }
       setError(err instanceof ApiError ? err.message : "Could not start run");
       setStarting(null);
       loadPreconditions();

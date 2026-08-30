@@ -100,7 +100,7 @@ type Store interface {
 // RunCreator is the shared run-creation seam the scheduler fires through — the SAME
 // seam autopilot and the manual board use. *workersvc.Service satisfies it.
 type RunCreator interface {
-	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, seed *workersvc.SeededPlan) (store.Run, error)
+	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *workersvc.SeededPlan) (store.Run, error)
 	// CreateScheduledRun is the non-auto-approve scheduled path: like CreateRun but the
 	// plan gate still requires a human (see workersvc.CreateScheduledRun). Eligibility is
 	// the single uzi_label gate (PRD #764 M1); a PRD link is no longer required.

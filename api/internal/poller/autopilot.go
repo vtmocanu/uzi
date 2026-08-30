@@ -225,6 +225,11 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		// A run appeared between the pre-check and here: swallow, same as an active run.
 		_ = a.record(ctx, r, iid, eventID)
+	case errors.Is(err, workersvc.ErrOpenMRExists):
+		// issue #856: the issue already has an open MR from a prior completed run. Record
+		// the event and swallow (no comment), same shape as the active-run case, so the
+		// detector does not re-evaluate and log-storm every tick.
+		_ = a.record(ctx, r, iid, eventID)
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
 		// The run gate says this issue is not uzi's: it carries neither the uzi_label
 		// nor a uzi-bot assignment (PRD #102 Decision 14; the gate is widened by PRD

@@ -667,7 +667,10 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"admin-rate-limits", func(c *HTTPClient) error { _, e := c.AdminRateLimits(context.Background()); return e }},
 		{"start-cli-auth", func(c *HTTPClient) error { _, e := c.StartCLIAuth(context.Background(), "ch", "desc"); return e }},
 		{"poll-cli-auth", func(c *HTTPClient) error { _, e := c.PollCLIAuth(context.Background(), "req", "ver"); return e }},
-		{"create-run", func(c *HTTPClient) error { _, e := c.CreateRun(context.Background(), "p1", 7, nil, nil, nil); return e }},
+		{"create-run", func(c *HTTPClient) error {
+			_, e := c.CreateRun(context.Background(), "p1", 7, nil, nil, false, nil)
+			return e
+		}},
 		{"submit-run-input", func(c *HTTPClient) error {
 			_, e := c.SubmitRunInput(context.Background(), "r1", "cancel", "", nil)
 			return e
@@ -818,7 +821,7 @@ func TestCreateRunWireBodyOmitsAbsentWaitOnLimit(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil, nil); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil, false, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if !strings.Contains(body, `"issue_iid":42`) {
@@ -866,13 +869,56 @@ func TestCreateRunWireBodyMrRework(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.in, nil); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.in, false, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if got := strings.Contains(body, "mr_rework_enabled"); got != tc.wantPresent {
 				t.Errorf("mr_rework_enabled present = %v, want %v; body = %s\n"+
 					"An absent flag must send NO key — the server stamps the run by inheriting the account "+
 					"default when the field is missing, and reads null or false as an explicit decision.",
+					got, tc.wantPresent, body)
+			}
+			if tc.wantJSON != "" && !strings.Contains(body, tc.wantJSON) {
+				t.Errorf("body = %s, want it to contain %s", body, tc.wantJSON)
+			}
+		})
+	}
+}
+
+// TestCreateRunWireBodyForce asserts the --force flag's wire mapping (issue #856). Unlike
+// wait_on_limit/mr_rework_enabled, force is NOT tri-state: it is a plain bool with omitempty,
+// so a false force (the default, and every non-forced create) must send NO `force` key —
+// keeping a plain create byte-identical to before — while `force:true` (set only by --force)
+// asks the server to bypass ONLY the open-MR guard. Asserted on raw bytes so an unwanted
+// `"force":false` a decode-into-struct would erase is caught.
+func TestCreateRunWireBodyForce(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		in          bool
+		wantPresent bool
+		wantJSON    string
+	}{
+		{"false omits the key entirely (byte-identical to a non-forced create)", false, false, ""},
+		{"true is SENT", true, true, `"force":true`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b := make([]byte, r.ContentLength)
+				_, _ = io.ReadFull(r.Body, b)
+				body = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"queued"}}`))
+			}))
+			defer srv.Close()
+
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, tc.in, nil); err != nil {
+				t.Fatalf("CreateRun: %v", err)
+			}
+			if got := strings.Contains(body, "force"); got != tc.wantPresent {
+				t.Errorf("force present = %v, want %v; body = %s\n"+
+					"A false force must send NO key (omitempty) so a plain create stays byte-identical; "+
+					"only --force sends force:true to bypass the open-MR guard.",
 					got, tc.wantPresent, body)
 			}
 			if tc.wantJSON != "" && !strings.Contains(body, tc.wantJSON) {
@@ -994,7 +1040,7 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, tc.seed); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, tc.seed); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			for _, want := range tc.wantContains {

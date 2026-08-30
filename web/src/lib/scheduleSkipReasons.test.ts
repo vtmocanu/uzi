@@ -25,6 +25,7 @@ const ALL_SCHEDULE_SKIP_REASONS: ScheduleSkipReason[] = [
   "fetch_failed",
   "vault_locked",
   "self_improve_mr_cap_reached",
+  "open_mr_exists",
 ];
 
 function reasonsFromGo(): string[] {

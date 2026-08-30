@@ -121,7 +121,7 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 	}
 
 	// ── Service-level: the four createRun-family entrypoints, DB-stamped. ──
-	r, err := svc.CreateRun(ctx, userID, repoID, 201, "desc", &waitFalse, nil, nil)
+	r, err := svc.CreateRun(ctx, userID, repoID, 201, "desc", &waitFalse, nil, false /*force*/, nil)
 	assert(t, "CreateRun", "manual", r, err)
 
 	r, err = svc.CreateScheduledRun(ctx, userID, repoID, 202, "desc", &waitFalse, nil, nil, false, nil)

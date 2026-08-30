@@ -30,6 +30,9 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   // The concurrent-open-MR cap (self_improve, PRD #686 D10) is benign and self-resolving:
   // the cycle re-fires next cadence once a human merges or closes an outstanding MR.
   self_improve_mr_cap_reached: "neutral",
+  // issue #856: a prior completed run's MR is still open, so a fresh run is refused. Benign
+  // and self-resolving like already_running — the cadence re-fires once the MR merges/closes.
+  open_mr_exists: "neutral",
 };
 
 // LastRunOutcome is the enriched "Last run" cell for a schedule that has a

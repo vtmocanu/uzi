@@ -79,6 +79,10 @@ type FakeClient struct {
 	// (PRD #841 M3): a test must tell nil (flag absent → inherit the account default) from
 	// &false and &true, which is exactly the tri-state `--mr-rework` carries.
 	LastCreateMrRework *bool
+	// LastCreateForce captures the --force flag (issue #856): a plain bool, since force
+	// is not tri-state — false means "respect the open-MR guard" (the default), true means
+	// "bypass ONLY that guard". A test asserts the CLI forwarded true iff --force was passed.
+	LastCreateForce bool
 	// LastCreateSeed captures PRD #209's optional seeded plan (nil when the run was
 	// created without --plan-file), so a test can assert the plan body and the roster
 	// the CLI forwarded — the assertion M3's flag parsing is proven against.
@@ -746,11 +750,12 @@ func (f *FakeClient) PollCLIAuth(context.Context, string, string) (CLIAuthPollRe
 	return res, nil
 }
 
-func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID
 	f.LastCreateWaitOnLimit = waitOnLimit
 	f.LastCreateMrRework = mrReworkEnabled
+	f.LastCreateForce = force
 	f.LastCreateSeed = seed
 	if f.Err != nil {
 		return apitypes.RunDTO{}, f.Err

@@ -84,6 +84,44 @@ func (q *Queries) GetAutopilotTrigger(ctx context.Context, arg GetAutopilotTrigg
 	return i, err
 }
 
+const getOpenMRRunForIssue = `-- name: GetOpenMRRunForIssue :one
+SELECT r.mr_iid
+FROM runs r
+WHERE r.repo_id = $1::uuid
+  AND r.issue_iid = $2
+  AND r.kind = 'issue'
+  AND r.status = 'completed'
+  AND r.mr_iid IS NOT NULL
+  AND r.mr_state IS DISTINCT FROM 'merged'
+  AND r.mr_state IS DISTINCT FROM 'closed'
+ORDER BY r.created_at DESC
+LIMIT 1
+`
+
+type GetOpenMRRunForIssueParams struct {
+	RepoID   uuid.UUID   `json:"repo_id"`
+	IssueIid pgtype.Int8 `json:"issue_iid"`
+}
+
+// The MR iid of a completed issue run that still owns an OPEN merge request for this
+// issue (issue #856). Backs createRun's create-time open-MR refusal: a fresh issue run
+// is blocked while a prior run's MR is still open, so we do not re-plan + re-review onto
+// an MR that is already open. The guard keys on the authoritative mr_iid, written
+// atomically at completion by SetRunCompleted (same statement as status='completed'), so
+// it is create-time authoritative and independent of watcher lag. It releases only once
+// the watcher has recorded a TERMINAL state ('merged'/'closed'); a NULL mr_state (watcher
+// not yet ticked) conservatively BLOCKS, closing the false-negative window a prior version
+// of this query had (it keyed on mr_state='opened' alone, which lags mr_iid). Uses
+// IS DISTINCT FROM so NULL/'opened'/'locked' all block and only terminal states release.
+// Returns the MR iid so the refusal can name it. LIMIT 1 / newest-first is arbitrary among
+// multiple open-MR runs (there is normally at most one). pgx.ErrNoRows => no open MR (allow).
+func (q *Queries) GetOpenMRRunForIssue(ctx context.Context, arg GetOpenMRRunForIssueParams) (pgtype.Int8, error) {
+	row := q.db.QueryRow(ctx, getOpenMRRunForIssue, arg.RepoID, arg.IssueIid)
+	var mr_iid pgtype.Int8
+	err := row.Scan(&mr_iid)
+	return mr_iid, err
+}
+
 const hasActiveRunForIssue = `-- name: HasActiveRunForIssue :one
 SELECT EXISTS (
     SELECT 1 FROM runs

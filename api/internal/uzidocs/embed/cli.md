@@ -86,7 +86,7 @@ uzi run list | get <id> [--field <name> ...] | logs <id> [--follow] [--after <se
 uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
-                [--planned-commit <sha>] [--require-base]
+                [--planned-commit <sha>] [--require-base] [--force]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run revise <id> [--message <text>]
@@ -169,6 +169,12 @@ A few worth knowing:
   `--require-base` (the base-commit staleness guard) are all optional and all
   require `--plan-file`; an empty or oversized plan is rejected at create
   time. A run created with no `--plan-file` is unchanged.
+- **`run create --force` re-runs an issue that already has an open MR.** By
+  default, creating a run for an issue whose last completed run still owns an
+  open MR is refused (a 409, exit 5) — re-running would spend budget building
+  onto a branch you have not merged yet. `--force` overrides that one refusal
+  so the new run is created anyway; it bypasses only the open-MR guard, and a
+  run already in progress for the issue is never bypassed.
 - **`run approve` picks the subagent roster explicitly.** By default a run
   uses its own default roster; `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in

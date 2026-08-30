@@ -1237,7 +1237,8 @@ export type ScheduleSkipReason =
   | "description_too_large"
   | "fetch_failed"
   | "vault_locked"
-  | "self_improve_mr_cap_reached";
+  | "self_improve_mr_cap_reached"
+  | "open_mr_exists";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {
@@ -2912,6 +2913,25 @@ export function isVaultLocked(err: unknown): boolean {
   );
 }
 
+// isOpenMRConflict reports whether an error is the 409 issue_has_open_mr signal
+// (issue #856): a completed prior run still owns an open MR, so a fresh run was
+// refused. The board/issue Start flow offers a force-retry on this specific code.
+export function isOpenMRConflict(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 409 &&
+    (err.body as { code?: string } | null)?.code === "issue_has_open_mr"
+  );
+}
+
+// openMRConflictMRIID returns the MR iid carried by a 409 issue_has_open_mr body
+// (issue #856), or null when absent — the web composes its own confirm copy from it.
+export function openMRConflictMRIID(err: unknown): number | null {
+  if (!(err instanceof ApiError)) return null;
+  const n = (err.body as { mr_iid?: unknown } | null)?.mr_iid;
+  return typeof n === "number" ? n : null;
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -3576,9 +3596,10 @@ const realApi = {
       docker,
     }),
 
-  createRun: (repoId: string, issueIid: number) =>
+  createRun: (repoId: string, issueIid: number, force?: boolean) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, {
       issue_iid: issueIid,
+      ...(force ? { force: true } : {}),
     }),
   /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
   createCIFixRun: (repoId: string, ref: string) =>

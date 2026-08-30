@@ -54,7 +54,7 @@ func runAllPaths(t *testing.T, wire func(*Service), labels []byte, hasPRDLink bo
 		out[name] = pathResult{err: err, reached: fs.createRunParams != nil}
 	}
 	invoke("CreateRun", func(svc *Service) error {
-		_, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, nil)
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil)
 		return err
 	})
 	invoke("CreateScheduledRun", func(svc *Service) error {

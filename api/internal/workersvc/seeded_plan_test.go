@@ -50,7 +50,7 @@ func TestCreateRunSeededPlanRejectsEmptyAndWhitespace(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := seededIssueStore()
 			svc := New(fs, newBox(t), testParams())
-			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: tc.plan})
+			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: tc.plan})
 			if err != ErrPlanEmpty {
 				t.Fatalf("err = %v, want ErrPlanEmpty", err)
 			}
@@ -67,7 +67,7 @@ func TestCreateRunSeededPlanTooLarge(t *testing.T) {
 	fs := seededIssueStore()
 	svc := New(fs, newBox(t), testParams())
 	oversize := strings.Repeat("x", MaxSeededPlanBytes+1)
-	_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: oversize})
+	_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: oversize})
 	if err != ErrPlanTooLarge {
 		t.Fatalf("err = %v, want ErrPlanTooLarge", err)
 	}
@@ -77,7 +77,7 @@ func TestCreateRunSeededPlanTooLarge(t *testing.T) {
 	// The boundary is exclusive: exactly MaxSeededPlanBytes is accepted.
 	fs2 := seededIssueStore()
 	svc2 := New(fs2, newBox(t), testParams())
-	if _, err := svc2.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: strings.Repeat("x", MaxSeededPlanBytes)}); err != nil {
+	if _, err := svc2.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: strings.Repeat("x", MaxSeededPlanBytes)}); err != nil {
 		t.Fatalf("a plan at exactly the cap must be accepted, got err = %v", err)
 	}
 }
@@ -99,7 +99,7 @@ func TestCreateRunSeededPlanRejectsUnsafeTarget(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := seededIssueStore()
 			svc := New(fs, newBox(t), testParams())
-			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: tc.plan})
+			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: tc.plan})
 			if !errors.Is(err, ErrPlanUnsafe) {
 				t.Fatalf("err = %v, want ErrPlanUnsafe", err)
 			}
@@ -118,7 +118,7 @@ func TestCreateRunSeededPlanRejectsUnsafeTarget(t *testing.T) {
 	t.Run("benign plan is accepted", func(t *testing.T) {
 		fs := seededIssueStore()
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: "Refactor the token store; add a test in queries_test.go"}); err != nil {
+		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: "Refactor the token store; add a test in queries_test.go"}); err != nil {
 			t.Fatalf("a benign seeded plan must be accepted, got err = %v", err)
 		}
 		if fs.createRunParams == nil {
@@ -148,7 +148,7 @@ func TestCreateRunSeededInvalidSelection(t *testing.T) {
 			fs := seededIssueStore()
 			svc := New(fs, newBox(t), testParams())
 			sel := tc.sel
-			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: "# Plan\nDo it.", Selection: &sel})
+			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: "# Plan\nDo it.", Selection: &sel})
 			if !errors.Is(err, ErrInvalidSelection) {
 				t.Fatalf("err = %v, want ErrInvalidSelection", err)
 			}
@@ -167,7 +167,7 @@ func TestCreateRunSeededPersistsPlanColumns(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 
 	sel := AgentSelection{Source: AgentSourceRepo, Exclusions: []string{"reviewer"}}
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: "# Plan\nImplement the thing.", Selection: &sel}); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: "# Plan\nImplement the thing.", Selection: &sel}); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	p := fs.createRunParams
@@ -211,7 +211,7 @@ func TestCreateRunSeededPlannedCommitValidation(t *testing.T) {
 		t.Run("reject: "+tc.name, func(t *testing.T) {
 			fs := seededIssueStore()
 			svc := New(fs, newBox(t), testParams())
-			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: "# Plan\nDo it.", PlannedCommit: tc.planned})
+			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: "# Plan\nDo it.", PlannedCommit: tc.planned})
 			if err != ErrInvalidPlannedCommit {
 				t.Fatalf("err = %v, want ErrInvalidPlannedCommit", err)
 			}
@@ -234,7 +234,7 @@ func TestCreateRunSeededPlannedCommitValidation(t *testing.T) {
 		t.Run("accept: "+tc.name, func(t *testing.T) {
 			fs := seededIssueStore()
 			svc := New(fs, newBox(t), testParams())
-			if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: "# Plan\nDo it.", PlannedCommit: tc.planned, RequireBase: true}); err != nil {
+			if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: "# Plan\nDo it.", PlannedCommit: tc.planned, RequireBase: true}); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			p := fs.createRunParams
@@ -259,7 +259,7 @@ func TestCreateRunSeededScrubsSecretsIntoPlanMd(t *testing.T) {
 	const token = "glpat-SCRUBTEST00000000000000" //gitleaks:allow synthetic non-credential fixture; asserts secretscrub matches the glpat- shape, never a real token
 	fs := seededIssueStore()
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, &SeededPlan{PlanMD: "# Plan\nuse " + token + " to auth"}); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, &SeededPlan{PlanMD: "# Plan\nuse " + token + " to auth"}); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	stored := fs.createRunParams.PlanMd.String
@@ -299,7 +299,7 @@ func TestCreateRunNonSeededIsByteIdenticalToPreFeature(t *testing.T) {
 	t.Run("manual CreateRun with nil seed", func(t *testing.T) {
 		fs := seededIssueStore()
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, nil); err != nil {
+		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
 		check(t, fs.createRunParams)

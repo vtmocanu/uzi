@@ -46,7 +46,7 @@ func TestTriggerSourceThreadedByCreateRunFamily(t *testing.T) {
 
 	t.Run("CreateRun stamps manual", func(t *testing.T) {
 		fs := newFS()
-		if _, err := New(fs, newBox(t), testParams()).CreateRun(ctx, user, repo, 1, "desc", nil, nil, nil); err != nil {
+		if _, err := New(fs, newBox(t), testParams()).CreateRun(ctx, user, repo, 1, "desc", nil, nil, false /*force*/, nil); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
 		assertStamp(t, fs, "manual")
