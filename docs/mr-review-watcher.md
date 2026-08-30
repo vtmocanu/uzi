@@ -104,6 +104,12 @@ schedule's setting as its own at creation time (unless you explicitly
 passed `--mr-rework` when the run started), so from then on the run's own
 setting is what governs it.
 
+That also means **Reset to default** on a scheduled run's MR doesn't fall
+back to the schedule — it clears the run's own copied-in value and goes
+straight to your account default. The schedule's setting was only ever a
+one-time snapshot taken when the run started; there's no live
+per-schedule re-evaluation afterward for reset to fall back to.
+
 One thing worth knowing: the per-run toggle (both the checkbox and the
 CLI verb) always targets a branch's newest issue run, so if a branch gets
 reused by a re-run, it's that newest run's setting that decides whether
