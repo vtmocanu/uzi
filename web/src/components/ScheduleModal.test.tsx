@@ -549,6 +549,61 @@ describe("the edit-mode repo selector (PRD #344 Feature A)", () => {
     // and provokes a server 422.
     expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.repo_id).toBeUndefined();
   });
+
+  it("shows a DEFAULT job's actual repo read-only, not repos[0] (issue #731)", async () => {
+    // listRepos deliberately omits the job's repo, so a <select> would fall back to
+    // its first option (an unrelated repo). A default renders read-only instead.
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-other", path_with_namespace: "vtmocanu/other" }] as unknown as Awaited<
+        ReturnType<typeof api.listRepos>
+      >["repos"],
+    });
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({
+            origin: "default",
+            catalog_slug: "prd-sweep",
+            repo_id: "repo-uzi",
+            repo_path: "vtmocanu/uzi",
+          })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    // The actual repo is shown from the DTO's repo_path, not the first listRepos result.
+    expect(screen.getByText("vtmocanu/uzi")).toBeTruthy();
+    // No editable Repo select at all for a default.
+    expect(screen.queryByLabelText("Repo")).toBeNull();
+    // The unrelated repo is never presented.
+    expect(screen.queryByText("vtmocanu/other")).toBeNull();
+  });
+
+  it("selects the actual repo even when listRepos omits it, for a non-default edit (issue #731)", async () => {
+    // The job's repo is missing from listRepos, so without a synthetic option the native
+    // select would render repo-other as its value. The synthetic leading option prevents it.
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-other", path_with_namespace: "vtmocanu/other" }] as unknown as Awaited<
+        ReturnType<typeof api.listRepos>
+      >["repos"],
+    });
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ repo_id: "repo-uzi", repo_path: "vtmocanu/uzi" })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    const select = screen.getByLabelText("Repo") as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe("repo-uzi"));
+  });
 });
 
 describe("the mock updateSchedule repoint branch (PRD #344 Feature A)", () => {
