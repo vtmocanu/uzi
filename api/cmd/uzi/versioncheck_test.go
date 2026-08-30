@@ -663,6 +663,12 @@ func TestVersionCommandOutputStaysValidUTF8(t *testing.T) {
 		t.Errorf("stdout is not valid UTF-8 — the byte-slice truncation cut a rune and "+
 			"nothing re-encoded the orphan:\n%.120q", out)
 	}
+	// utf8.ValidString is true for U+FFFD, so it alone cannot catch a regression to
+	// byte-slicing: cellText's strings.Map re-encodes an orphan byte as U+FFFD, which
+	// stays "valid". Reject the replacement rune so this test actually fails on that path.
+	if strings.ContainsRune(out, '�') {
+		t.Errorf("stdout contains U+FFFD — a rune was split and re-encoded downstream:\n%.120q", out)
+	}
 }
 
 // --json stays BYTE-EXACT, and the reason is the DESTINATION rather than the encoder:

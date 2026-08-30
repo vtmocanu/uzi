@@ -2077,8 +2077,15 @@ func compactText(s string) string {
 	s = sanitizeTTY(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, "\n", " ")
 	const max = 200
-	if utf8.RuneCountInString(s) > max {
-		return string([]rune(s)[:max]) + "…"
+	// Range yields each rune's start byte index, so we can slice at the 201st
+	// rune's boundary without allocating a []rune for the whole input — payloads
+	// forwarded through compactPayload can be up to the client's 32 MiB cap.
+	n := 0
+	for i := range s {
+		if n == max {
+			return s[:i] + "…"
+		}
+		n++
 	}
 	return s
 }
