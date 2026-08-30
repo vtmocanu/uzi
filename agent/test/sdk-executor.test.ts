@@ -4094,4 +4094,33 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
       "no subagent frame carries context",
     );
   });
+
+  it("finding 2 (gate): a turn with ONLY a subagent usage frame and NO lead usage frame reads NO context", async () => {
+    // This is the discriminating test for finding 2's `em.agent === "lead"` fire-guard.
+    // The implement turn has a SUBAGENT usage frame (which latches usage first) but NEVER
+    // a lead usage frame before the terminal result frame. With the gate (current, correct)
+    // the read `contextPromise = readLeadContext(...)` NEVER fires — it is guarded to fire
+    // only on a LEAD usage frame — so the terminal result frame carries NO context. Delete
+    // the `&& em.agent === "lead"` guard and the subagent usage frame WOULD fire the read
+    // (the fire-once `contextPromise === undefined` guard alone would let it), so the result
+    // frame would then carry context and `withContext(...).length` would be 1, failing this
+    // assertion. `getContextUsage` returns a valid reading here on purpose: the assertion
+    // proves the read is SUPPRESSED by the lead-gate, not merely absent.
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [subagentUsageFrame("subagent working", "reviewer"), signalDone(), resultSuccess()],
+      ],
+      async () => ({ totalTokens: 156000, rawMaxTokens: 200000, percentage: 78 }),
+    );
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the run still completes normally");
+
+    assert.strictEqual(
+      withContext(probe.emits).length,
+      0,
+      "the read never fired (no lead usage frame), so no frame carries context",
+    );
+  });
 });
