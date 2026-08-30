@@ -1306,6 +1306,24 @@ describe("ActivityFeed lead context-window meter", () => {
     expect(queryByTestId("lead-context-micrometer")).toBeNull();
   });
 
+  it("renders no meter when the parent passes leadContext={null} (sentinel suppresses the fallback derive)", () => {
+    // issue #553: a null prop means "the parent already derived; there is no reading" —
+    // the component MUST honor it and NOT fall back to deriving from `messages`, even
+    // though these messages DO carry a derivable lead context frame.
+    const { queryByTestId } = render(
+      <ActivityFeed
+        messages={[leadCtx(1, { used: 156_000, window: 200_000, pct: 78 })]}
+        run={runFixture({ status: "running", health: "ok" })}
+        runningLive
+        connected
+        terminal={false}
+        leadContext={null}
+      />,
+    );
+    expect(queryByTestId("lead-context-meter")).toBeNull();
+    expect(queryByTestId("lead-context-micrometer")).toBeNull();
+  });
+
   it("renders the lane meter on the LEAD lane with the true label", () => {
     const { getAllByTestId, container } = renderFeed([
       leadCtx(1, { used: 156_000, window: 200_000, pct: 78 }),

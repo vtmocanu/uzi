@@ -555,11 +555,15 @@ export function ActivityFeed({
   terminal: boolean;
   // PRD #40: per-result-frame token/cost deltas keyed by seq. Optional.
   phaseUsageBySeq?: Map<number, PhaseUsage>;
-  // PRD #516: the lead's live context-window fill. Optional — when the parent already
-  // derived RunUsage (RunView does, and threads phaseUsageBySeq from the same object),
-  // it passes leadContext too so this component does NOT re-run the full O(n) derive.
-  // Absent (standalone/tests) ⇒ fall back to deriving it from `messages` below.
-  leadContext?: LeadContext;
+  // PRD #516 / issue #553: the lead's live context-window fill. Three-state contract:
+  //   `undefined` ⇒ the parent did NOT derive (standalone/tests) — fall back to deriving
+  //                 it here from `messages` below.
+  //   `null`      ⇒ the parent derived but there is no reading (RunView threads
+  //                 `usage.leadContext ?? null`) — use undefined, do NOT re-derive.
+  //   an object   ⇒ the reading the parent already computed (RunView threads it from the
+  //                 same RunUsage object it built for phaseUsageBySeq, so the run view
+  //                 derives once, not twice), so this component skips the O(n) re-derive.
+  leadContext?: LeadContext | null;
 }) {
   const [showAll, setShowAll] = useState(false);
   // Opt-in Follow (Decision 3), default OFF — replaces the old whole-pane auto-jump.
@@ -588,7 +592,10 @@ export function ActivityFeed({
   // absent do we derive here, off `messages` (not `visible`) so the CAP that hides old
   // rows never drops a still-current reading. Feeds the lead-lane meter + crew micro-meter.
   const leadContext = useMemo(
-    () => leadContextProp ?? deriveRunUsage(messages).leadContext,
+    () =>
+      leadContextProp === undefined
+        ? deriveRunUsage(messages).leadContext
+        : (leadContextProp ?? undefined),
     [leadContextProp, messages],
   );
 
