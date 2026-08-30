@@ -1,9 +1,9 @@
 -- MR review watcher (PRD #700 M3) ---------------------------------------------
 -- The candidate enumeration + loop-guard ledger the poller detector
--- (poller/mr_review_watch.go) consumes, plus the create-time cross-kind branch
--- guard and the mr_rework create path. Detection lives in the poller, never in
--- forgesvc — forgesvc's sync methods are shared with the manual board Refresh and
--- must never spawn runs.
+-- (poller/mr_review_watch.go) consumes, plus the mr_rework create path whose
+-- single atomic INSERT … WHERE NOT EXISTS is itself the create-time cross-kind
+-- branch guard. Detection lives in the poller, never in forgesvc — forgesvc's
+-- sync methods are shared with the manual board Refresh and must never spawn runs.
 
 -- name: ListMRReworkCandidates :many
 -- The completed issue runs in a repo whose OPEN MR is eligible for an automatic
@@ -109,20 +109,6 @@ SET halt_notified = true,
 DELETE FROM mr_rework_ledger
 WHERE repo_id = @repo_id::uuid AND ref <> ALL(@keep_refs::text[]);
 
--- name: CountActiveBranchRunsForRef :one
--- The create-time CROSS-KIND branch guard (Decision 6, the most severe review
--- finding): count active ci_fix OR mr_rework runs whose pipeline_ref equals the
--- branch (agent/issue-N). BOTH kinds write pipeline_ref AT INSERT, so — unlike the
--- old CountActiveRunsWithBranch, which keys on runs.branch (NULL for a run's whole
--- active life) — this sees a freshly-created sibling. CreateAutoMRReworkRun calls it
--- BEFORE insert and returns ErrBranchInUse on > 0; the detector swallows and retries
--- next tick. The uq_runs_one_active_branch_ref partial index is the durable backstop.
-SELECT count(*) FROM runs
-WHERE repo_id = @repo_id::uuid
-  AND kind IN ('ci_fix', 'mr_rework')
-  AND pipeline_ref = @pipeline_ref
-  AND status NOT IN ('completed', 'failed', 'cancelled');
-
 -- name: CreateAutoMRReworkRun :one
 -- Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). issue_iid stays
 -- NULL (kind='mr_rework'); issue_title/issue_description carry the synthesized human
@@ -135,12 +121,34 @@ WHERE repo_id = @repo_id::uuid
 -- is true (Decision 1 — the run resolves its own plan gate). The
 -- uq_runs_one_active_mr_rework index rejects a second active rework for the same MR
 -- (23505 → ErrActiveMRReworkExists). wait_on_limit is the owner's default (PRD #35).
+--
+-- The create-time CROSS-KIND branch guard (Decision 6, the most severe review finding)
+-- is this query's own single atomic INSERT … WHERE NOT EXISTS. The WHERE NOT EXISTS
+-- predicate is narrowed to the CROSS-KIND case only — an active ci_fix run whose
+-- pipeline_ref equals the branch (agent/issue-N) means the branch is occupied by the
+-- other kind. ci_fix writes pipeline_ref AT INSERT, so — unlike the old runs.branch
+-- count (NULL for a run's whole active life) — a freshly-created cross-kind sibling is
+-- seen. A committed ci_fix → zero rows inserted → pgx.ErrNoRows, which the caller maps
+-- to ErrBranchInUse. A concurrent-window cross-kind race not yet visible to this
+-- statement's snapshot slips past WHERE NOT EXISTS, and the durable spanning
+-- uq_runs_one_active_branch_ref partial index arbitrates: the losing insert raises
+-- 23505 on that constraint, which the caller likewise maps to ErrBranchInUse. A same-MR
+-- mr_rework DUPLICATE (same pipeline_ref) now proceeds PAST this predicate — it is no
+-- longer swallowed as a false branch conflict — and is rejected by the
+-- uq_runs_one_active_mr_rework (repo_id, mr_iid) index → 23505 → ErrActiveMRReworkExists.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities
-) VALUES (
+)
+SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}')
+WHERE NOT EXISTS (
+    SELECT 1 FROM runs
+    WHERE repo_id = @repo_id::uuid
+      AND kind = 'ci_fix'
+      AND pipeline_ref = @pipeline_ref
+      AND status NOT IN ('completed', 'failed', 'cancelled')
 )
 RETURNING *;
