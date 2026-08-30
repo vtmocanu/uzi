@@ -239,6 +239,222 @@ func TestGitHubListMergeRequestComments(t *testing.T) {
 	}
 }
 
+// TestGitHubReviewThreadPaginationSpansMultiplePages pins that
+// reviewThreadIDsByDatabaseID pages BOTH GraphQL connections: the outer
+// reviewThreads cursor AND, for a thread whose first comment page is not the last,
+// the inner comments cursor via the node(id:) re-fetch helper. The cursor-aware
+// mock serves outer page 1 (thread T1 with more comments to come), outer page 2
+// (thread T2), and inner page 2 for T1. Against the pre-fix single-page code — which
+// sends no threadCursor and never issues the node() query — 201 (outer page 2) and
+// 102 (inner page 2 of T1) never enter the map, so this fails; after the fix all
+// three anchors are present.
+func TestGitHubReviewThreadPaginationSpansMultiplePages(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			req := readGQL(t, r)
+			threadCursor, _ := req.Variables["threadCursor"].(string)
+			switch {
+			case strings.Contains(req.Query, "reviewThreads") && threadCursor == "":
+				// Outer page 1: T1, whose comments have a next page.
+				writeGQLData(w, map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{
+							"reviewThreads": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": true, "endCursor": "TCUR1"},
+								"nodes": []map[string]any{
+									{"id": "T1", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": true, "endCursor": "CCUR1"},
+										"nodes":    []map[string]any{{"databaseId": 101}},
+									}},
+								},
+							},
+						},
+					},
+				})
+			case strings.Contains(req.Query, "reviewThreads") && threadCursor == "TCUR1":
+				// Outer page 2: T2, single comment page.
+				writeGQLData(w, map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{
+							"reviewThreads": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+								"nodes": []map[string]any{
+									{"id": "T2", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+										"nodes":    []map[string]any{{"databaseId": 201}},
+									}},
+								},
+							},
+						},
+					},
+				})
+			case strings.Contains(req.Query, "node(") &&
+				req.Variables["threadId"] == "T1" && req.Variables["commentCursor"] == "CCUR1":
+				// Inner page 2 for T1.
+				writeGQLData(w, map[string]any{
+					"node": map[string]any{
+						"comments": map[string]any{
+							"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+							"nodes":    []map[string]any{{"databaseId": 102}},
+						},
+					},
+				})
+			default:
+				t.Fatalf("unexpected graphql request: query=%q vars=%+v", req.Query, req.Variables)
+			}
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	got, err := d.reviewThreadIDsByDatabaseID(context.Background(), repoSlug{owner: "acme", repo: "widgets"}, 13)
+	if err != nil {
+		t.Fatalf("reviewThreadIDsByDatabaseID: %v", err)
+	}
+	if got[101] != "T1" {
+		t.Errorf("m[101] = %q, want T1 (outer page-1 comment)", got[101])
+	}
+	if got[201] != "T2" {
+		t.Errorf("m[201] = %q, want T2 (outer page-2 thread dropped without thread pagination)", got[201])
+	}
+	if got[102] != "T1" {
+		t.Errorf("m[102] = %q, want T1 (inner page-2 comment dropped without comment pagination)", got[102])
+	}
+}
+
+// TestGitHubReviewThreadInnerFanOutRespectsGlobalItemCap pins that a single
+// thread's comment fan-out cannot push the FETCHED item count past maxForgeItems:
+// the per-thread budget passed into reviewThreadCommentDBIDs trips the shared
+// backstop rather than letting the inner loop accumulate a fresh maxForgeItems on
+// top of the outer page. The inner page returns ids that DUPLICATE page-1 on
+// purpose: the distinct map stays at 3, so the outer per-thread `len(m) >
+// maxForgeItems` check does NOT fire — only the budget bound (which counts fetched
+// items) can catch this, which is exactly the mechanism this hardening adds. A
+// non-duplicate id here would also trip the distinct-map check and make the test
+// pass against the pre-hardening code (vacuous). Lowers maxForgeItems, restored in a
+// defer.
+func TestGitHubReviewThreadInnerFanOutRespectsGlobalItemCap(t *testing.T) {
+	defer func(o int) { maxForgeItems = o }(maxForgeItems)
+	maxForgeItems = 3
+
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			req := readGQL(t, r)
+			switch {
+			case strings.Contains(req.Query, "reviewThreads"):
+				// Single outer page: T1's page-1 comments exactly fill the budget
+				// (3), and it advertises more comments to fan out into.
+				writeGQLData(w, map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{
+							"reviewThreads": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+								"nodes": []map[string]any{
+									{"id": "T1", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": true, "endCursor": "CCUR1"},
+										"nodes": []map[string]any{
+											{"databaseId": 101}, {"databaseId": 102}, {"databaseId": 103},
+										},
+									}},
+								},
+							},
+						},
+					},
+				})
+			case strings.Contains(req.Query, "node("):
+				// Inner page: comments beyond the now-zero remaining budget, but
+				// DUPLICATING page-1 ids so the distinct map never grows — only the
+				// fetched-count budget bound can catch this.
+				writeGQLData(w, map[string]any{
+					"node": map[string]any{
+						"comments": map[string]any{
+							"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+							"nodes":    []map[string]any{{"databaseId": 101}, {"databaseId": 102}},
+						},
+					},
+				})
+			default:
+				t.Fatalf("unexpected graphql request: query=%q vars=%+v", req.Query, req.Variables)
+			}
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	got, err := d.reviewThreadIDsByDatabaseID(context.Background(), repoSlug{owner: "acme", repo: "widgets"}, 13)
+	if err == nil {
+		t.Fatalf("expected an item-cap error from the inner fan-out, got nil (returned %d anchors)", len(got))
+	}
+	if got != nil {
+		t.Errorf("on backstop-exceed the driver must return a nil map, not a partial one (got %d)", len(got))
+	}
+	if !strings.Contains(err.Error(), "backstop") {
+		t.Errorf("error must name the backstop, got %q", err.Error())
+	}
+}
+
+// TestGitHubReviewThreadOuterPageCountsFetchedNodes pins that the OUTER per-page
+// item cap keys off the number of comment NODES actually fetched, not the size of
+// the deduplicated map. A SINGLE outer reviewThreads page carries two threads whose
+// comments DUPLICATE ids across the threads (T1: 101,102; T2: 101,102) plus a
+// databaseId==0 node — 5 fetched nodes — while the distinct map holds only {101,102}
+// (2 entries). With maxForgeItems=3 the fetched count (5) exceeds the cap but the
+// distinct map (2) does not, so the pre-fix `len(m) > maxForgeItems` check never
+// fires and no error is returned (the test would be vacuous against that code).
+// Only counting fetched nodes catches it, which is exactly the fix. No inner
+// fan-out: every thread advertises hasNextPage:false so this stays focused on the
+// outer per-page fetched-node accounting. Lowers maxForgeItems, restored in a defer.
+func TestGitHubReviewThreadOuterPageCountsFetchedNodes(t *testing.T) {
+	defer func(o int) { maxForgeItems = o }(maxForgeItems)
+	maxForgeItems = 3
+
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			req := readGQL(t, r)
+			switch {
+			case strings.Contains(req.Query, "reviewThreads"):
+				// One outer page, two threads with DUPLICATE ids across them plus a
+				// zero-id node: 5 fetched nodes, distinct map only {101,102}.
+				writeGQLData(w, map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{
+							"reviewThreads": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+								"nodes": []map[string]any{
+									{"id": "T1", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+										"nodes": []map[string]any{
+											{"databaseId": 101}, {"databaseId": 102}, {"databaseId": 0},
+										},
+									}},
+									{"id": "T2", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+										"nodes": []map[string]any{
+											{"databaseId": 101}, {"databaseId": 102},
+										},
+									}},
+								},
+							},
+						},
+					},
+				})
+			default:
+				t.Fatalf("unexpected graphql request: query=%q vars=%+v", req.Query, req.Variables)
+			}
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	got, err := d.reviewThreadIDsByDatabaseID(context.Background(), repoSlug{owner: "acme", repo: "widgets"}, 13)
+	if err == nil {
+		t.Fatalf("expected an item-cap error from the outer per-page fetched-node count, got nil (returned %d anchors)", len(got))
+	}
+	if got != nil {
+		t.Errorf("on backstop-exceed the driver must return a nil map, not a partial one (got %d)", len(got))
+	}
+	if !strings.Contains(err.Error(), "backstop") {
+		t.Errorf("error must name the backstop, got %q", err.Error())
+	}
+}
+
 // TestGitHubReplyMergeRequestComment pins the reply keyed on the REST databaseId
 // (the reply anchor): CreateCommentInReplyTo POSTs with in_reply_to set.
 func TestGitHubReplyMergeRequestComment(t *testing.T) {
