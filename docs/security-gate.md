@@ -77,7 +77,10 @@ canary is an instrument failure (exit 2), never a clean run.
   `task_review.go`, excluding `worker_upgrade_summary.go`, which is a
   legitimately cookie-capable `RequireUser` route). A new worker handler
   added under a differently-named file escapes it until the glob is widened
-  — the route-mount test is the completeness backstop for that gap.
+  — code review is the backstop for that gap. (There is no route-enumeration
+  test asserting the cookie-free property today: `route_limiter_mounts_test.go`
+  enumerates routes but checks rate-limiter mounts, not the auth boundary. A
+  real route-auth-enumeration test is tracked as a follow-up.)
 - **`settings-sources-isolation.yml`** (invariant #6) — the agent SDK's
   `settingSources` must stay `[]` (the defense against a checked-out repo's
   `.claude/` widening the agent's own permissions). It matches an **explicit

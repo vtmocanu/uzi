@@ -195,8 +195,19 @@ linters:
         forge-sdk-isolation:
           # Invariant #7 (PRD #862): the forge SDK clients are used ONLY behind the
           # internal/forge interface. Deny the raw SDK imports everywhere except the
-          # driver package itself (the `files` glob excludes .../forge/...). Zero
+          # driver package itself (the `files` glob excludes the forge package). Zero
           # violations on the current tree.
+          #
+          # 🔴 THE EXCLUDE IS `!**/internal/forge/**`, NOT the broader `!**/forge/**`.
+          # `files:` DOES use glob semantics (unlike `pkg:` above), and a bare
+          # `**/forge/**` would exempt ANY directory named `forge` anywhere in the
+          # tree, so a raw SDK import under some unrelated `.../forge/` would silently
+          # bypass the rule. `internal/forge` is specific to the one real driver
+          # package (`api/internal/forge`) AND matches whether golangci feeds depguard
+          # module-relative paths (`internal/forge/gitlab.go`, under `dir: api`) or
+          # absolute ones (`.../api/internal/forge/...`) — narrowing further to
+          # `api/internal/forge` would miss the module-relative form and re-flag the
+          # driver files themselves. Verified: 0 violations (drivers still excluded).
           #
           # 🔴 `pkg:` MATCHES BY PREFIX, NOT GLOB — do not "wildcard" these paths.
           # depguard (v2, as bundled in golangci-lint 2.12.2) matches deny entries as
@@ -210,7 +221,7 @@ linters:
           list-mode: lax
           files:
             - "$all"
-            - "!**/forge/**"
+            - "!**/internal/forge/**"
           deny:
             - pkg: "github.com/google/go-github"
               desc: "forge SDKs only via the internal/forge interface (PRD #862 invariant #7)"

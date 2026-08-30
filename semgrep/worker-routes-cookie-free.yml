@@ -32,10 +32,16 @@
 #     RequireWorker (handler.go, the /me/workers group) -- a legitimately
 #     cookie-capable USER route. It is `paths.exclude`d below so a future, valid
 #     cookie read there is not falsely blocked.
-# semgrep here guards the syntactic shape in the known Bearer-only files; the
-# route-table / mount test remains the completeness backstop that a route is
-# actually behind RequireWorker/RequireController. Keep the include glob (and this
-# exclude) in sync when a worker handler file is added or re-authenticated.
+# semgrep here guards the syntactic shape in the known Bearer-only files; CODE
+# REVIEW is the backstop for the differently-named-handler gap. There is NO
+# route-enumeration test asserting the cookie-free property today:
+# route_limiter_mounts_test.go walks h.Routes but checks rate-limiter mounts, not
+# the auth boundary, and the per-handler auth tests cover specific handlers, not the
+# whole set. A real route-auth-enumeration test (walk h.Routes, assert every
+# worker/controller route's chain includes RequireWorker/RequireController and reads
+# no cookie) is the proper completeness backstop and is tracked as a follow-up. Keep
+# the include glob (and this exclude) in sync when a worker handler file is added or
+# re-authenticated.
 #
 # The pattern covers both the typed accessor (`r.Cookie(...)`) and the raw-header
 # spellings a handler could use to go around it -- `r.Header.Get("Cookie")` and
@@ -46,8 +52,8 @@
 # cookie by hand but silently allow reading the session CSRF token by hand -- an
 # asymmetric gap in a rule whose purpose is to block the session credential either
 # way. It does NOT chase a read hidden behind a helper in another file
-# (intraprocedural limit) -- that is what the mount-test backstop and code review
-# are for.
+# (intraprocedural limit) -- that is what code review (and the follow-up
+# route-auth-enumeration test) is for.
 #
 # POSITIVE CONTROL (verified before commit): temporarily adding
 # `_, _ = r.Cookie("x")` inside a handler in e.g. worker_findings.go fires;
