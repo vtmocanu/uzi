@@ -5352,10 +5352,13 @@ UPDATE runs SET
     --
     -- CONSUMED-only (consumed_at IS NOT NULL) remains load-bearing on the server ceiling:
     -- the follow_up that wakes a park is UNCONSUMED until it wakes, so a consumed-only MAX
-    -- never advances past it. The watermark stays monotone across re-parks with NO claim
-    -- re-delivery and NO clear-on-wake — it simply names the last follow_up already spent
-    -- (or the worker's last-delivered id, whichever is lower), and anything newer is a
-    -- genuine new steer.
+    -- never advances past it. Monotonicity across re-parks is now ENFORCED by the
+    -- GREATEST(COALESCE(open_followup_id, 0), ...) current-value floor below — no longer
+    -- merely asserted from the protocol. Issue #817: the old "(or the worker's
+    -- last-delivered id, whichever is lower)" clause was exactly what broke it, because a
+    -- fresh re-claiming worker reports a present 0 (min of a monotone value and a value
+    -- that resets to 0 is not monotone). The watermark simply names the last follow_up
+    -- already spent, and anything newer is a genuine new steer.
     -- The GREATEST(0, ...) floor is the LOWER bound the LEAST ceiling does not give:
     -- LEAST only bounds a huge value from above, so a nonsensical NEGATIVE worker value
     -- (e.g. -1) would otherwise pass through and fail-open THIS run's own wake guard
@@ -5364,7 +5367,18 @@ UPDATE runs SET
     -- Flooring to 0 maps it to "nothing applied" (the first-park value), matching the
     -- stated "neutralize a buggy value" intent. GREATEST(0, ...) never affects a correct
     -- worker: its last-delivered id is always ≥ 0.
-    open_followup_id = GREATEST(0, LEAST(
+    -- Issue #817: floor the SET at the run's currently-stored value so the watermark
+    -- can never REGRESS. The RHS ` + "`" + `open_followup_id` + "`" + ` reads the PRE-UPDATE (old) row —
+    -- the same self-referential SET-RHS pattern this file already uses for
+    -- milestones_completed (see SetRunRunning and SetRunCompleted). Strand-free: every
+    -- GREATEST operand is ≤ the run's MAX(consumed follow_up id), which is monotone
+    -- non-decreasing, and the unconsumed wake follow_up has id > that max, so
+    -- ` + "`" + `id > open_followup_id` + "`" + ` always still holds. SAFETY DEPENDS on run_user_inputs
+    -- being append-only and consumed_at set-once: a retention/pruning job that
+    -- hard-deletes consumed follow_up rows would let MAX(consumed) drop below a prior
+    -- stamp, and this floor — unlike the pre-fix pure-LEAST clamp — would then hold the
+    -- watermark too high; such a change must reckon with the wake guard.
+    open_followup_id = GREATEST(0, COALESCE(open_followup_id, 0), LEAST(
         COALESCE($2::bigint,
                  (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
                   WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND consumed_at IS NOT NULL)),
