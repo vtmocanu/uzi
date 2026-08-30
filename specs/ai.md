@@ -824,6 +824,23 @@ Serves human: Feature #4 job queue + worker registry + lossless live stream.
   `(repo_id, issue_iid) WHERE status NOT IN (completed,failed,cancelled)` — fixes
   bottega's check-then-insert TOCTOU race with a DB constraint. Terminal runs are
   excluded so an issue can be re-run once its prior run finishes.
+  - **Open-MR run-dedup guard** (issue #856) qualifies that re-run allowance: a
+    create-time pre-check in the shared `createRun` refuses a fresh `kind='issue'`
+    run when a prior **completed** run for the same `(repo_id, issue_iid)` still
+    owns an **open MR** (watcher-owned `runs.mr_state='opened'`, queried via
+    `GetOpenMRRunForIssue`), returning a distinct `ErrOpenMRExists` sentinel. It is
+    deliberately a create-time guard, **not** a partial unique index: an index would
+    be violated by the watcher's own `SetRunMRState` UPDATE once a forced second
+    run's MR opens. Applies to **all** issue create paths (manual/board/Slack,
+    scheduled sweep, autopilot) so the auto-approved sweep — where wasted spend is
+    silent — is covered; the scheduler maps the sentinel to a benign
+    `open_mr_exists` skip (advances, no tick-storm), the autopilot poller
+    records-and-swallows. An explicit `--force` (CLI `uzi run create --force`; the
+    web board/issue Start flow offers a confirm that retries with force) bypasses
+    **only** this open-MR guard, never the active-run gate. Keyed on the
+    watcher-owned `mr_state`, so there is a brief false-negative window between
+    MR-open-at-finalize and the first watch tick (mirrors the mr_rework candidate
+    query; acceptable).
 - **`run_messages`** — `bigserial id, run_id→runs ON DELETE CASCADE, seq int,
   kind, agent, payload jsonb, created_at, agent_instance text, agent_label text`,
   **UNIQUE(run_id, seq)**. The last two are PRD #99's per-instance attribution
