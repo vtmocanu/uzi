@@ -43,14 +43,19 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
    cross-issue blocker** (the target depends on another run's code landing first, or a
    sharp same-file overlap). Independent issues parallelize fine — do not gate on ordinary
    parallelism; a file conflict that slips through is resolved at merge.
-2. **Create gated** (no `--plan-file`):
+2. **Decide MR-rework, then create gated** (no `--plan-file`):
 
    ```
-   uzi run create --repo REPO_ID --issue ISSUE_NUM --json
+   uzi run create --repo REPO_ID --issue ISSUE_NUM --mr-rework=false --json
    ```
 
-   Gated, so the lead plans and the budget scales to its milestones. Seeded runs get the
-   global default budget, too small for a multi-milestone PRD.
+   Pass `--mr-rework` (v0.70.0) to control whether uzi auto-reworks this run's MR from
+   review comments — the decision, the three-way flag, and when to ask the user live in the
+   `uzi-cli` skill's *Send to uzi* step 3 (one source of truth). **Driving in Auto mode you
+   usually want `--mr-rework=false`** so THIS session owns the CodeRabbit/human/bot fixes and
+   merges; its operational consequence is folded into step 6. Gated, so the lead plans and the
+   budget scales to its milestones. Seeded runs get the global default budget, too small for
+   a multi-milestone PRD.
 3. **Watch to the gate** with the bundled poller (see *Watching*).
 4. **Review the plan, then approve / revise / reject.** Read it from the run log:
 
@@ -67,9 +72,12 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
    result → diagnose (see *When a run fails*) and stop.
 6. **Get the MR and review the diff.** `uzi run get RUN --field mr_web_url`, then review
    (see *Reviewing the diff* below), plus `gh pr diff`. Verify the diff against the
-   approved plan. **Once any review finding lands (CodeRabbit, a human reviewer, or another
-   review bot), uzi's own `mr_rework` usually fixes it itself** — defer to it and review its
-   fix before merging (see *uzi may fix the CodeRabbit findings ITSELF*).
+   approved plan. **If you created the run with `--mr-rework=false` (step 2), no rework fires
+   on it — fix the review findings locally and merge, and skip the defer-and-recheck
+   coordination below.** Otherwise (inherited or `--mr-rework`): **once any review finding
+   lands (CodeRabbit, a human reviewer, or another review bot), uzi's own `mr_rework` usually
+   fixes it itself** — defer to it and review its fix before merging (see *uzi may fix the
+   CodeRabbit findings ITSELF*).
 7. **Merge** (see *Merging past branch protection*).
 8. **Watch post-merge CI and fix** (see *Post-merge CI*).
 
