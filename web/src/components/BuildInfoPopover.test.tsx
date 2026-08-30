@@ -430,6 +430,114 @@ describe("BuildInfoPopover — open on hover AND focus AND tap", () => {
   });
 });
 
+describe("BuildInfoPopover — update signal: pip + popover row (PRD #836 M4)", () => {
+  // A stamped build the server says is behind. published_at is 3 calendar days
+  // before NOW (2026-07-28), so the age helper reused for the row reads "3 days ago".
+  const behind: BuildInfo = {
+    ...mockBuildInfo,
+    latest: {
+      version: "v0.5.0",
+      name: "Hosted worker drain controls",
+      published_at: "2026-07-25T00:00:00Z",
+      notes_url: "https://github.com/vtmocanu/uzi/releases/tag/v0.5.0",
+      security: false,
+    },
+    update_available: true,
+    far_behind: false,
+  };
+  const pip = () => document.querySelector("[data-update-pip]");
+  const updateRow = () => document.querySelector("[data-update-row]");
+
+  it("lights the pip on the badge when the server reports update_available === true", () => {
+    render(<BuildInfoPopover info={behind} now={NOW} />);
+    expect(pip()).not.toBeNull();
+    // Purely visual, so it must not leak into the trigger's accessible name.
+    expect(screen.getByRole("button", { name: "v0.4.2" })).toBeTruthy();
+  });
+
+  it("shows NO pip when update_available is explicitly false (checked, up to date)", () => {
+    // The distinct middle state: the check ran and the instance is current. The pip
+    // renders only from `=== true`, never a client-side compare.
+    render(
+      <BuildInfoPopover info={{ ...behind, update_available: false }} now={NOW} />,
+    );
+    expect(pip()).toBeNull();
+  });
+
+  it("shows NO pip when update_available is omitted (never checked / disabled)", () => {
+    // The unstamped dev fixture carries neither the flag nor a `latest` object — the
+    // unknown state, distinct from a checked `false`.
+    render(<BuildInfoPopover info={mockBuildInfoUnstamped} now={NOW} />);
+    expect(pip()).toBeNull();
+  });
+
+  it("hides the pip in the collapsed rail (no room), even when an update is available", () => {
+    render(<BuildInfoPopover info={behind} collapsed now={NOW} />);
+    expect(pip()).toBeNull();
+  });
+
+  it("renders the update row with the v-prefixed version and a `· N days ago` tail", () => {
+    render(<BuildInfoPopover info={behind} now={NOW} />);
+    const row = updateRow();
+    expect(row).not.toBeNull();
+    expect(row!.textContent).toContain("v0.5.0");
+    expect(row!.textContent).toContain("available");
+    expect(row!.textContent).toContain("3 days ago");
+    // The server-supplied tag is already v-prefixed and displayVersion is idempotent,
+    // so it must not double up to "vv0.5.0".
+    expect(row!.textContent).not.toContain("vv0.5.0");
+  });
+
+  it("omits the `· N days ago` tail gracefully when published_at is absent", () => {
+    render(
+      <BuildInfoPopover
+        info={{ ...behind, latest: { version: "v0.5.0" } }}
+        now={NOW}
+      />,
+    );
+    const row = updateRow();
+    expect(row).not.toBeNull();
+    expect(row!.textContent).toContain("v0.5.0");
+    expect(row!.textContent).toContain("available");
+    expect(row!.textContent).not.toContain("days ago");
+    expect(row!.textContent).not.toContain("null");
+  });
+
+  it("renders NOTHING when latest is omitted (unknown state), even if a flag leaks true", () => {
+    // `update_available` true but no `latest` object is not a shape our server sends,
+    // but the row must degrade to absent rather than throwing on latest.version.
+    render(
+      <BuildInfoPopover
+        info={{ ...mockBuildInfo, latest: undefined, update_available: true }}
+        now={NOW}
+      />,
+    );
+    expect(updateRow()).toBeNull();
+    // …and with both the flag and latest omitted (the true unknown state), nothing.
+    cleanup();
+    render(
+      <BuildInfoPopover
+        info={{ ...mockBuildInfo, latest: undefined, update_available: undefined }}
+        now={NOW}
+      />,
+    );
+    expect(updateRow()).toBeNull();
+  });
+
+  it("shows the admin `Update guide` affordance linking to admin settings", () => {
+    render(<BuildInfoPopover info={behind} isAdmin now={NOW} />);
+    const link = screen.getByRole("link", { name: /Update guide/ });
+    expect(link.getAttribute("href")).toBe("/admin/settings");
+    expect(updateRow()!.textContent).not.toContain("Ask your operator");
+  });
+
+  it("shows the member `Ask your operator` note with no link", () => {
+    render(<BuildInfoPopover info={behind} isAdmin={false} now={NOW} />);
+    expect(updateRow()!.textContent).toContain("Ask your operator");
+    expect(screen.queryByRole("link", { name: /Update guide/ })).toBeNull();
+  });
+});
+
 describe("BuildInfoPopover — PRDs row links to the repo prds/ directory (PRD #415 M2)", () => {
   // A directory is served under /tree/, not /blob/ (PRD #415 M3 review nit).
   const PRDS_URL = "https://github.com/vtmocanu/uzi/tree/main/prds";

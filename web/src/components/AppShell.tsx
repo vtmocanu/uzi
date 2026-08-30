@@ -927,6 +927,7 @@ function SidebarContent({
             <BuildInfoPopover
               info={build.info}
               collapsed={true}
+              isAdmin={!!user?.is_admin}
               fetchedAtMs={build.fetchedAtMs}
               onOpenChangelog={onOpenChangelog}
             />
@@ -937,6 +938,7 @@ function SidebarContent({
               <BuildInfoPopover
                 info={build.info}
                 collapsed={false}
+                isAdmin={!!user?.is_admin}
                 fetchedAtMs={build.fetchedAtMs}
                 onOpenChangelog={onOpenChangelog}
               />

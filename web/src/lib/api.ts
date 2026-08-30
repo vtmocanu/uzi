@@ -1058,6 +1058,27 @@ export interface BuildInfo {
   // legitimate uptime in a process's first second, so absent means UNKNOWN here and
   // must not be rendered as "up 0s".
   uptime_seconds?: number;
+  // Upstream-release check (PRD #836). These mirror the api DTO fields M3 added to
+  // apitypes.BuildInfoDTO and obey the same OMITTED-when-not-stamped, never
+  // zero-valued convention: the server omits all three (and the nested `latest`
+  // object) when the release check has not run or the feature is disabled. That
+  // keeps three distinct states — absent (unknown / disabled), false (checked, up
+  // to date) and true (behind) — which is why `update_available`/`far_behind` are
+  // optional booleans here rather than defaulting to false. The pip and popover row
+  // render ONLY from these server-derived values; the web never compares versions
+  // itself (the semver trap lives server-side, in one place).
+  latest?: {
+    // The `v`-prefixed release tag (e.g. "v0.66.0"), already prefixed by the
+    // server. displayVersion is idempotent for a leading-`v` string, so it is safe
+    // to pass through without producing "vv".
+    version: string;
+    name?: string;
+    published_at?: string;
+    notes_url?: string;
+    security?: boolean;
+  };
+  update_available?: boolean;
+  far_behind?: boolean;
 }
 
 // ── CLI tokens (PRD #64) ──────────────────────────────────────────────────
