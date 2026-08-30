@@ -243,6 +243,58 @@ func TestServerRowsPrdsBothOrNeither(t *testing.T) {
 	}
 }
 
+// TestServerRowsUpdateAvailable pins the update row (PRD #836 M7): it appears with
+// `<tag> available` ONLY when the server derived update_available=true AND carries a
+// latest tag, and is skipped when UpdateAvailable is nil (never checked / disabled)
+// or false (up to date) — the same unknown-beats-wrong discipline as the other rows.
+// The tag is already v-prefixed on the wire, so the row is not double-prefixed.
+func TestServerRowsUpdateAvailable(t *testing.T) {
+	rowValue := func(rows [][2]string, label string) (string, bool) {
+		for _, r := range rows {
+			if r[0] == label {
+				return r[1], true
+			}
+		}
+		return "", false
+	}
+	yes, no := true, false
+
+	// update_available=true + a latest tag: the row is emitted, v-prefix untouched.
+	b := apitypes.BuildInfoDTO{
+		Version:         "0.11.12",
+		UpdateAvailable: &yes,
+		Latest:          &apitypes.LatestReleaseDTO{Version: "v0.12.0"},
+	}
+	if v, ok := rowValue(serverRows(b), "update"); !ok || v != "v0.12.0 available" {
+		t.Errorf("update row = %q (present=%v), want %q", v, ok, "v0.12.0 available")
+	}
+
+	// Absent in every not-behind state.
+	for _, tc := range []struct {
+		name string
+		b    apitypes.BuildInfoDTO
+	}{
+		{"nil update_available (never checked / disabled)", apitypes.BuildInfoDTO{Version: "0.11.12"}},
+		{"update_available=false (up to date)", apitypes.BuildInfoDTO{
+			Version:         "0.11.12",
+			UpdateAvailable: &no,
+			Latest:          &apitypes.LatestReleaseDTO{Version: "v0.11.12"},
+		}},
+		{"true but no latest tag", apitypes.BuildInfoDTO{
+			Version:         "0.11.12",
+			UpdateAvailable: &yes,
+			Latest:          &apitypes.LatestReleaseDTO{Version: ""},
+		}},
+		{"true but latest nil", apitypes.BuildInfoDTO{Version: "0.11.12", UpdateAvailable: &yes}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if v, ok := rowValue(serverRows(tc.b), "update"); ok {
+				t.Errorf("update row present as %q, want it omitted", v)
+			}
+		})
+	}
+}
+
 // TestVersionJSONOmitsServerKeyWhenUnreachable: no server, no key. An explicit
 // null would make a consumer handle a third state for no benefit.
 func TestVersionJSONOmitsServerKeyWhenUnreachable(t *testing.T) {
