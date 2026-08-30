@@ -22,10 +22,13 @@
 #   3  findings — CodeRabbit reviewed the head but left live inline findings to triage.
 #   4  mr_rework active — an mr_rework run is on this MR; defer, let it finish, re-run.
 #
-# "CodeRabbit reviewed this head" is the union of two robust signals, because a
+# "CodeRabbit reviewed this head" is the union of three robust signals, because a
 # zero-actionable incremental review can post NO new review object AND re-anchor no
 # finding (SKILL.md signal (c)): (a) a CodeRabbit review whose commit_id == the head
-# SHA, or (c) the walkthrough comment's recent_review range ending at the head SHA.
+# SHA, (c) the walkthrough comment's final_review_risk marker naming the head SHA, or
+# (d) an "equivalent head" — CodeRabbit reviewed an earlier commit A and the delta
+# A..HEAD is only the merge-in of the PR base branch plus regenerated artifacts, so no
+# new branch-authored code exists for it to review (a logic-free merge commit; #819).
 # The script errs toward timeout (exit 2) rather than a false "ready".
 set -euo pipefail
 
@@ -98,11 +101,17 @@ while [ "$i" -lt "$MAX" ]; do
   # and `gh api --paginate` emits one array PER PAGE (so pages are slurped with `-s`/`.[][]`
   # before counting). The constant bot login is inlined into the filter.
   reviewed_head=0
+  cr_a=""
   if rev_raw=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null); then
     # shellcheck disable=SC2016  # $h is a jq var (--arg), must stay single-quoted
     rev_on_head=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
       '[.[][]|select(.user.login=="coderabbitai[bot]" and .commit_id==$h)]|length' 2>/dev/null || echo 0)
     [ "${rev_on_head:-0}" -gt 0 ] && reviewed_head=1
+    # cr_a: the commit CodeRabbit reviewed MOST RECENTLY (any head), for the equivalent-head
+    # signal (d) below. Reviews come back oldest-first, so the last coderabbit entry is its
+    # newest verdict. Empty when CodeRabbit has posted no review object yet.
+    cr_a=$(printf '%s' "$rev_raw" | jq -rs \
+      '[.[][]|select(.user.login=="coderabbitai[bot]")]|last|.commit_id // empty' 2>/dev/null || true)
   else
     unknown=1
   fi
@@ -148,7 +157,62 @@ while [ "$i" -lt "$MAX" ]; do
     unknown=1
   fi
 
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active reviewed_head=$reviewed_head live_findings=$live${unknown:+ unknown=$unknown}"
+  # Signal (d): "equivalent head" — a logic-free merge commit CodeRabbit did not re-review
+  # (issue #819). When the head is a merge that only brings in the PR base branch plus
+  # regenerated artifacts, CodeRabbit posts no fresh review (nothing to review), so signals
+  # (a)/(c) never fire and a genuinely merge-ready PR times out. Recognize ONLY the provably
+  # safe case, fail closed on everything else: HEAD is reviewed-equivalent to CodeRabbit's
+  # last-reviewed commit cr_a when EVERY path that changed between cr_a and HEAD is either
+  #   - absent from the PR's diff vs its base branch (HEAD's version equals base's, so the
+  #     change came in with the merge — the branch did not author it), or
+  #   - a regenerated/mirror artifact (api/internal/store/*.sql.go,
+  #     api/internal/uzidocs/embed/*.md) derived from already-reviewed sources.
+  # Any changed path that IS in the PR diff and is NOT such an artifact is real branch work
+  # CodeRabbit has not seen — leave reviewed_head=0 (→ timeout, never a false "ready").
+  # Two GitHub compare calls, no local git (keeps this script cwd-independent). Attempted only
+  # when we would otherwise be ready but for the missing review, to bound the cost. The compare
+  # API caps .files at 300; a truncated list could hide an unreviewed path and forge
+  # equivalence, so we refuse to judge at/above the cap.
+  equiv=0
+  if [ "$reviewed_head" -eq 0 ] && [ "$unknown" -eq 0 ] && [ "$fail" -eq 0 ] \
+     && [ "$pend" -eq 0 ] && [ "$cancel" -eq 0 ] && [ -n "$cr_a" ] && [ "$cr_a" != "$head" ]; then
+    base=$(gh pr view "$PR" --repo "$REPO" --json baseRefName -q .baseRefName 2>/dev/null || true)
+    if [ -n "$base" ] \
+       && cmp_ah=$(gh api "repos/$REPO/compare/$cr_a...$head" 2>/dev/null) \
+       && cmp_mh=$(gh api "repos/$REPO/compare/$base...$head" 2>/dev/null); then
+      n_ah=$(printf '%s' "$cmp_ah" | jq '.files|length' 2>/dev/null || echo 999)
+      n_mh=$(printf '%s' "$cmp_mh" | jq '.files|length' 2>/dev/null || echo 999)
+      changed_ah=$(printf '%s' "$cmp_ah" | jq -r '.files[]?.filename' 2>/dev/null || true)
+      pr_diff=$(printf '%s' "$cmp_mh" | jq -r '.files[]?.filename' 2>/dev/null || true)
+      if [ -n "$changed_ah" ] && [ "$n_ah" -lt 300 ] && [ "$n_mh" -lt 300 ]; then
+        equiv=1
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          # Absent from the PR's diff vs base ⇒ HEAD matches base for this path ⇒ a merge-in.
+          if ! printf '%s\n' "$pr_diff" | grep -qxF "$f"; then continue; fi
+          # In the PR diff but a regenerated/mirror artifact derived from reviewed sources.
+          # Scope each pattern to the exact dir a generator/sync check covers: validate:api
+          # regenerates only api/internal/store, and docs:sync mirrors only *.md into embed.
+          # A broader glob (*.sql.go anywhere, any file under embed/) would forgive a
+          # branch-added file no check regenerates — a fail-open hole in a fail-closed gate.
+          case "$f" in
+            api/internal/store/*.sql.go) continue ;;
+            api/internal/uzidocs/embed/*.md) continue ;;
+          esac
+          # Otherwise: branch-authored change CodeRabbit has not reviewed. Not equivalent.
+          equiv=0
+          break
+        done < <(printf '%s\n' "$changed_ah")
+      fi
+      [ "$equiv" -eq 1 ] && reviewed_head=1
+    else
+      unknown=1
+    fi
+  fi
+
+  eqnote=""
+  [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active reviewed_head=$reviewed_head${eqnote} live_findings=$live${unknown:+ unknown=$unknown}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
   if [ "$unknown" -ne 0 ]; then sleep "$INTERVAL"; continue; fi

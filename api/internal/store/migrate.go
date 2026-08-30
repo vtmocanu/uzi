@@ -68,6 +68,38 @@ const HostedProvisionLockClass int32 = 0x757A6877 // "uzhw"
 // rollback, no unlock to forget.
 const SecretMutationLockClass int32 = 0x757A736B // "uzsk"
 
+// SettingsMutationLockKey is the fixed key passed to pg_advisory_xact_lock as the
+// first statement of every app_settings write transaction (issue #831). It
+// serializes all settings PUTs globally so the cross-key label invariant
+// (uzi_label != autopilot_label != finding_label, ValidateMerged) can never be
+// broken by two concurrent PUTs.
+//
+// It exists because the transaction's own guard — ListAppSettingsForUpdate, a
+// `SELECT ... FOR UPDATE` — is INSUFFICIENT here for the SAME reason spelled out on
+// SecretMutationLockClass above: FOR UPDATE locks only rows that already exist, so
+// when a label key has no stored row yet (its value is the compiled-in default),
+// the loser of a race cannot see the winner's newly-INSERTED row under READ
+// COMMITTED and both PUTs pass the check. That was the live bug: a fresh DB has no
+// uzi_label row (00036 seeded the now-retired prd_label; PRD #764 renamed the key
+// without reseeding), so two concurrent PUTs could commit uzi_label == SHARED and
+// autopilot_label == SHARED. An advisory lock is a mutex regardless of which rows
+// exist, so the second transaction runs its check only after the first commits.
+//
+// Single-bigint space, like RegistrationLockKey (settings are global, not
+// per-user, so no objid). Its value differs from RegistrationLockKey's, and the
+// one-bigint space is disjoint from the two-int space the *LockClass constants use,
+// so none can collide. XACT-scoped: released on commit or rollback, no unlock to
+// forget.
+//
+// Depends on the pool's default READ COMMITTED isolation (OpenPool sets none): the
+// loser acquires the lock only after the winner commits, and its NEXT statement then
+// takes a fresh snapshot that sees the winner's committed row. At REPEATABLE READ or
+// SERIALIZABLE the transaction snapshot would instead be fixed at this lock statement
+// — taken while the loser is still blocked, before the winner commits — so the loser
+// would miss the new row and the race would reopen. The sibling locks above make the
+// same assumption; do not add an isolation level to the DSN without revisiting this.
+const SettingsMutationLockKey int64 = 0x757A7365 // "uzse"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

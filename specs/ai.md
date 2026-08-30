@@ -23139,6 +23139,21 @@ wake-guard watermark (issue #552 M1 / PRD #517). The watermark is `runs.open_fol
   `SetRunRunning` worker_id pin and the next ACK-checked park report remain the backstop.
 - Commits `aace2d0b`/`fc072247` (M1, server clamp+floor), `d8625495` (M2, worker threads the
   last-delivered id through `SteeringChannel`), `ab774e05` (M3, park-skip ownership probe).
+- **Issue #817 follow-up — the watermark could still REGRESS on an out-of-order / re-claim park,
+  reopening #558 for that run.** §586's "still monotone" claim held only for a worker whose
+  last-delivered id is monotone. A FRESH `SteeringChannel` re-claiming a requeued run reports a
+  **present 0** (`lastDeliveredFollowUpIdValue` inits to 0 and is NOT re-seeded from the durable
+  `open_followup_id` column, unlike `stop_pending`), and the pre-fix unconditional SET —
+  `GREATEST(0, LEAST(...))` — LOWERED the watermark to 0, so any already-consumed follow_up then
+  satisfied `id > 0` and woke the park (#558). `min(monotone value, value that resets to 0)` is not
+  monotone, so the ceiling/floor pair was never sufficient. Fixed by flooring the SET at the
+  current stored value: `open_followup_id = GREATEST(0, COALESCE(open_followup_id, 0), LEAST(...))`
+  (the RHS `open_followup_id` reads the pre-UPDATE row, the same self-referential SET-RHS pattern
+  as `milestones_completed`). Provably strand-free while `run_user_inputs` is append-only and
+  `consumed_at` is set-once: every operand is ≤ `MAX(consumed follow_up id)`, and the unconsumed
+  wake follow_up has id > that max, so `id > open_followup_id` always still holds. A future
+  retention/pruning job that hard-deletes consumed follow_up rows would break that premise and must
+  reckon with the wake guard.
 
 ## 587. PRD #767 — assignment to the uzi-bot is a second, equivalent expression of the single run-eligibility gate
 
