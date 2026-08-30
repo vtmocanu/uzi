@@ -89,12 +89,14 @@ export function DefaultJobs({
     await onEnable(entry, repoIds);
     // Auto-expand so the freshly-enabled repos are visible, and arm the sweep-warn.
     setExpanded((s) => new Set(s).add(entry.slug));
-    if (entry.target === "sweep" && entry.labels.length > 0) {
+    if (entry.target === "sweep" && entry.labels && entry.labels.length > 0) {
+      // Capture the narrowed non-null labels: TS drops the narrowing inside the map() closure.
+      const labels = entry.labels;
       setWarnTargets(
         repoIds.map((rid) => ({
           repoId: rid,
           repoPath: repos.find((r) => r.id === rid)?.path_with_namespace ?? "",
-          labels: entry.labels,
+          labels,
         })),
       );
     }
@@ -305,7 +307,7 @@ function CatalogRow({
       optionsCell={
         <div className="flex flex-wrap gap-1">
           {entry.model ? <Chip>model {entry.model}</Chip> : <Chip>inherit model</Chip>}
-          {entry.target === "sweep" && entry.labels.map((l) => <Chip key={l}>label {l}</Chip>)}
+          {entry.target === "sweep" && entry.labels?.map((l) => <Chip key={l}>label {l}</Chip>)}
           {entry.target === "sweep" && entry.max_issues > 0 && <Chip>max {entry.max_issues}</Chip>}
         </div>
       }

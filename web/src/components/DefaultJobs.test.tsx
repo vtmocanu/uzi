@@ -213,6 +213,20 @@ describe("DefaultJobs — catalog row", () => {
     expect(within(nextRunCell).getByText("1 repo")).toBeTruthy();
   });
 
+  it("renders a labelless assigned sweep without crashing", () => {
+    // Regression for the /schedules black-screen: the shipped assigned-sweep default carries
+    // labels: null, and the options cell read entry.labels.map() unguarded (DefaultJobs.tsx
+    // :308), so the tab threw on first render. Rendering the row must not throw, and with no
+    // labels no "label …" chip is emitted.
+    renderTab({
+      catalog: catalog([entry({ slug: "assigned-sweep", name: "Assigned sweep", labels: null })]),
+    });
+    // The row rendered (so the chip assertion below is discriminating, not vacuous).
+    expect(screen.getByText("Assigned sweep")).toBeTruthy();
+    // No selector-label chip is rendered for a labelless sweep.
+    expect(screen.queryByText(/^label /)).toBeNull();
+  });
+
   it("row Enable fans out only the actionable subset of the selection", async () => {
     // The job is already enabled on repo-uzi. Picking BOTH repos should enable only the
     // actionable one (repo-atlas), never re-enable the already-materialized repo-uzi.
