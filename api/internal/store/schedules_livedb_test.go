@@ -425,6 +425,7 @@ func TestRunModelFrozenLiveDB(t *testing.T) {
 		AutoApprove:      false,
 		WaitOnLimit:      false,
 		PlanSource:       "agent",
+		TriggerSource:    "manual",
 		RequireBaseMatch: false,
 		Model:            pgtype.Text{String: "haiku", Valid: true},
 	})
@@ -568,6 +569,7 @@ func TestRunOverrideSubagentModelFrozenLiveDB(t *testing.T) {
 		AutoApprove:           false,
 		WaitOnLimit:           false,
 		PlanSource:            "agent",
+		TriggerSource:         "manual",
 		RequireBaseMatch:      false,
 		OverrideSubagentModel: true,
 	})

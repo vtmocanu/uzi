@@ -93,7 +93,7 @@ func TestChatRunsLiveDB(t *testing.T) {
 	// ── claim lanes are disjoint: an issue run + the chat run above ──
 	issueRun, err := q.CreateRun(ctx, store.CreateRunParams{
 		UserID: userID, RepoID: repoID,
-		IssueIid: pgtype.Int8{Int64: 42, Valid: true}, IssueTitle: "iss", IssueDescription: "d", PlanSource: "agent",
+		IssueIid: pgtype.Int8{Int64: 42, Valid: true}, IssueTitle: "iss", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)

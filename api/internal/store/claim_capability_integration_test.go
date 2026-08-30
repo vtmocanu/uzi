@@ -272,7 +272,7 @@ func TestCreateRunCopiesRepoCapabilityHintLiveDB(t *testing.T) {
 		fx.repoID, []string{"docker"})
 	run, err := fx.q.CreateRun(fx.ctx, store.CreateRunParams{
 		UserID: fx.userID, RepoID: fx.repoID,
-		IssueIid: pgtype.Int8{Int64: fx.nextIID(), Valid: true}, IssueTitle: "hinted", IssueDescription: "d", PlanSource: "agent",
+		IssueIid: pgtype.Int8{Int64: fx.nextIID(), Valid: true}, IssueTitle: "hinted", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
@@ -286,7 +286,7 @@ func TestCreateRunCopiesRepoCapabilityHintLiveDB(t *testing.T) {
 	insertPlainRepo(fx, plainRepo)
 	run2, err := fx.q.CreateRun(fx.ctx, store.CreateRunParams{
 		UserID: fx.userID, RepoID: plainRepo,
-		IssueIid: pgtype.Int8{Int64: fx.nextIID(), Valid: true}, IssueTitle: "plain", IssueDescription: "d", PlanSource: "agent",
+		IssueIid: pgtype.Int8{Int64: fx.nextIID(), Valid: true}, IssueTitle: "plain", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
 		t.Fatalf("CreateRun(plain): %v", err)
