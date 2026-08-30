@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminSettings } from "./AdminSettings";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -218,6 +218,38 @@ describe("AdminSettings — Updates card (PRD #836 M5)", () => {
     });
     renderPage();
     await waitFor(() => expect(screen.getByText(/No release check has run yet/i)).toBeTruthy());
+  });
+
+  it("renders an error with a retry affordance when the initial load fails, and retry can succeed", async () => {
+    mockApi.getReleaseCheck
+      .mockRejectedValueOnce(new ApiError(503, "release check unreachable"))
+      .mockResolvedValueOnce({ release_check: releaseCheck({ latest_name: "Recovered on retry" }) });
+    renderPage();
+    // The dead-end skeleton is replaced by the error + a retry button; "Check now"
+    // (gated on a loaded status) is absent while the load has failed.
+    const retry = await screen.findByRole("button", { name: /retry/i });
+    expect(screen.getByText(/release check unreachable/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /check now/i })).toBeNull();
+    // Retry re-calls the API; the second (resolved) call loads the card body.
+    fireEvent.click(retry);
+    await screen.findByRole("button", { name: /check now/i });
+    expect(screen.getByText("Recovered on retry")).toBeTruthy();
+    expect(mockApi.getReleaseCheck).toHaveBeenCalledTimes(2);
+  });
+
+  it("strips markdown heading and bullet markers from the notes excerpt", async () => {
+    mockApi.getReleaseCheck.mockResolvedValue({
+      release_check: releaseCheck({
+        body: "### Added\n- Worker drain deadline controls (#812)\n* Per-run cost roll-up (#799)\n",
+      }),
+    });
+    renderPage();
+    const excerpt = await screen.findByText(/Worker drain deadline controls/);
+    // Plain text preserved, markers gone: "### Added" -> "Added", bullets dropped.
+    expect(excerpt.textContent).toContain("Added");
+    expect(excerpt.textContent).not.toContain("###");
+    expect(excerpt.textContent).not.toContain("- ");
+    expect(excerpt.textContent).not.toContain("* ");
   });
 
   it("shows the security badge on a security release", async () => {

@@ -707,13 +707,17 @@ const UPGRADE_RUNBOOK = [
 // releaseExcerpt renders a short PLAIN-TEXT preview of the raw release markdown
 // (never HTML — the body is admin-supplied markdown and must not be injected). It
 // collapses to the first few non-empty lines, capped at ~300 chars, with an ellipsis
-// when truncated.
+// when truncated. Each previewed line is tidied — a leading heading marker
+// (`#`..`######` + space) and a leading list bullet (`-`/`*`/`+` + space) are
+// stripped — so `### Added` shows as `Added` and `- Worker drain…` as `Worker
+// drain…`. This is a pure string transform on already-plain text: it strips the
+// markers, it does NOT render markdown.
 function releaseExcerpt(body: string | undefined, max = 300): string {
   if (!body) return "";
   const trimmed = body.trim();
   const lines = trimmed
     .split("\n")
-    .map((l) => l.trim())
+    .map((l) => l.trim().replace(/^#{1,6}\s+/, "").replace(/^[-*+]\s+/, ""))
     .filter((l) => l !== "")
     .slice(0, 6);
   const joined = lines.join("\n");
@@ -740,6 +744,8 @@ function UpdatesSettingsCard() {
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
     try {
       const { release_check } = await api.getReleaseCheck();
       setStatus(release_check);
@@ -827,8 +833,18 @@ function UpdatesSettingsCard() {
 
       {error && <Alert message={error} />}
 
-      {loading || !status ? (
+      {loading ? (
         <Skeleton className="h-24 w-full" />
+      ) : !status ? (
+        // Initial load failed (status never populated). Show the error (rendered
+        // above) plus a retry path instead of a permanent skeleton — the "Check
+        // now" button is gated on `status`, so this is the only way back.
+        <div className="space-y-3">
+          {!error && <Alert message="Failed to load release-check status." />}
+          <Button variant="secondary" size="sm" onClick={() => void load()} disabled={loading}>
+            Retry
+          </Button>
+        </div>
       ) : (
         <>
           {/* Security callout — the loudest thing this card does, per the mockup. */}
@@ -928,9 +944,14 @@ function UpdatesSettingsCard() {
             </div>
           )}
 
-          {status.checked_at && (
-            <p className="text-xs text-faint">Checked {formatAgo(status.checked_at)}.</p>
-          )}
+          {/* aria-live region: a "Check now" / toggle refresh mutates the text
+              inside this persistent container, so a screen reader is notified of
+              the async update. Single visible copy — no duplicate info. */}
+          <div aria-live="polite">
+            {status.checked_at && (
+              <p className="text-xs text-faint">Checked {formatAgo(status.checked_at)}.</p>
+            )}
+          </div>
 
           {/* The two runtime toggles — persisted through the settings string-space. */}
           <div className="space-y-3 border-t border-edge pt-4">
