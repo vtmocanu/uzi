@@ -1107,14 +1107,13 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		waitOnLimit = *req.WaitOnLimit
 	}
 
-	// mr_rework (PRD #841 M2) takes replace-semantics from the request on a default patch:
-	// an explicit null clears the override back to inherit, a present pointer sets it,
-	// omitted keeps the stored value. The catalog/schedtmpl baseline is inherit (nil, D5),
-	// so any explicit override OR-s into customized via defaultEditableDiverges below.
-	mrRework := cur.MrReworkEnabled
-	if req.MrReworkEnabled != nil {
-		mrRework = optBoolToPgtype(req.MrReworkEnabled)
-	}
+	// mr_rework (PRD #841) uses replace-semantics like mergeSchedule's mr_rework and
+	// max_issues/guidance/model: the config PATCH rewrites the whole row (enabled-only is
+	// short-circuited by onlyEnabled), so a null mr_rework_enabled must reach the DB as
+	// NULL = inherit (D5). It is the tri-state *bool, so nil clears to inherit (unlike
+	// wait_on_limit, a plain bool that keeps-on-nil). defaultEditableDiverges then
+	// recomputes customized = false when the override returns to the nil/inherit baseline.
+	mrRework := optBoolToPgtype(req.MrReworkEnabled)
 
 	// max_issues is meaningful only for a sweep default; a prompt default keeps it NULL. For
 	// a sweep it takes replace-semantics from the request (the web sends the full editable
