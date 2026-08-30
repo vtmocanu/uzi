@@ -1,0 +1,83 @@
+# GUARDRAIL INVARIANT #3 -- worker/controller routes are Bearer-only and must
+# never read the session cookie or a CSRF token (PRD #862 M3).
+#
+# WHAT THIS ENFORCES. Worker and controller routes authenticate via a Bearer join
+# token -- middleware/worker_auth.go RequireWorker (sha256 lookup against
+# workers.token_hash) and middleware/controller_auth.go RequireController -- NOT
+# the browser session-cookie + CSRF path (middleware/auth.go RequireAuth). The
+# credential is a bearer secret the worker holds, not an ambient cookie a browser
+# auto-sends, so these handlers have no reason to read a request cookie or to call
+# CSRF validation. A cookie/CSRF read in one of these files is a guardrail
+# regression: it means a worker/controller handler has started trusting the
+# session credential it must never see.
+#
+# THE PATTERN. `pattern-either` over the request-side read APIs -- `$R.Cookie(...)`
+# and `$R.Cookies(...)` (the *http.Request cookie readers) and
+# `auth.ValidateCSRF(...)` (the only exported CSRF read helper; the auth package's
+# other cookie funcs, SetAuthCookies/ClearAuthCookies, are WRITES and are
+# deliberately NOT matched -- this invariant is about READING the session
+# credential, not setting it on a response). Today the only cookie/CSRF reads in
+# the whole handler+middleware tree are middleware/auth.go (RequireAuth) and
+# handler/oidc.go (the OIDC state cookie) -- none in a worker/controller handler --
+# so on the clean tree this scoped rule reports ZERO findings.
+#
+# 🔴 RELIABILITY BOUNDARY. This rule is FILE-GLOB-SCOPED (the paths below), so it
+# guards only the KNOWN worker/controller handler files by name, and the glob is a
+# NAME proxy for the real "mounted under RequireWorker/RequireController" property.
+# Two consequences, in both directions:
+#   * UNDER-inclusion: a NEW worker handler added in a differently-named file
+#     ESCAPES it until the glob is widened.
+#   * OVER-inclusion: `worker_upgrade_summary.go` matches `worker_*.go` by name but
+#     its handler (WorkerUpgradeSummary) is mounted under RequireUser, not
+#     RequireWorker (handler.go, the /me/workers group) -- a legitimately
+#     cookie-capable USER route. It is `paths.exclude`d below so a future, valid
+#     cookie read there is not falsely blocked.
+# semgrep here guards the syntactic shape in the known Bearer-only files; the
+# route-table / mount test remains the completeness backstop that a route is
+# actually behind RequireWorker/RequireController. Keep the include glob (and this
+# exclude) in sync when a worker handler file is added or re-authenticated.
+#
+# The pattern also covers the raw-header spelling `r.Header.Get("Cookie")`, not
+# just the `r.Cookie(...)` helper, so a handler cannot read the session cookie by
+# going around the typed accessor. It does NOT chase a read hidden behind a helper
+# in another file (intraprocedural limit) -- that is what the mount-test backstop
+# and code review are for.
+#
+# POSITIVE CONTROL (verified before commit): temporarily adding
+# `_, _ = r.Cookie("x")` inside a handler in e.g. worker_findings.go fires;
+# reverting returns to zero.
+# NEGATIVE CONTROL: the committed tree reports zero findings, and the three
+# legitimate cookie/CSRF readers (middleware/auth.go, handler/oidc.go) are outside
+# this scope so they never fire.
+rules:
+  - id: worker-routes-no-cookie
+    languages: [go]
+    severity: ERROR
+    message: >-
+      Worker/controller routes are Bearer-only (guardrail invariant #3):
+      middleware/worker_auth.go RequireWorker / controller_auth.go
+      RequireController authenticate a Bearer join token, not the session
+      cookie + CSRF path. A request-cookie or CSRF read here is a guardrail
+      regression -- this handler must never trust the session credential.
+      Remove the r.Cookie/r.Cookies/auth.ValidateCSRF call.
+    paths:
+      # Root-anchored (leading `/`) to silence semgrep's Semgrepignore-v2
+      # deprecation warning about bare relative includes, mirroring canary.yml.
+      # The gate scans `.` from the repo root, so these resolve under
+      # api/internal/handler/. semgrep's defaults skip *_test.go, so this scopes
+      # to the production handler files.
+      include:
+        - /api/internal/handler/worker_*.go
+        - /api/internal/handler/controller_*.go
+        - /api/internal/handler/judge_worker.go
+        - /api/internal/handler/task_review.go
+      # worker_upgrade_summary.go matches worker_*.go by NAME but is a RequireUser
+      # (cookie-capable) route, not a Bearer worker route -- see the reliability
+      # boundary above. Excluded so a valid cookie read there never false-positives.
+      exclude:
+        - /api/internal/handler/worker_upgrade_summary.go
+    pattern-either:
+      - pattern: $R.Cookie(...)
+      - pattern: $R.Cookies(...)
+      - pattern: $R.Header.Get("Cookie")
+      - pattern: auth.ValidateCSRF(...)
