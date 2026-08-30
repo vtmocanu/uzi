@@ -301,7 +301,7 @@ export function BuildInfoPopover({
 
   return (
     <div
-      className="relative border-t border-edge"
+      className={cx("relative", collapsed && "border-t border-edge")}
       // Hover on the HOST, not the button, so the popover does not vanish the
       // instant the pointer crosses from the trigger onto the panel above it.
       onMouseEnter={() => setOpen(true)}
