@@ -201,6 +201,53 @@ describe("RunsList — the admin fleet list carries no format characters (#124)"
   });
 });
 
+// PRD #496 M2: the admin all-workers strip surfaces the cordon/drain state, not just a
+// bare online badge, for a worker whose draining_since is set.
+describe("RunsList — the admin fleet list surfaces the cordon badge (PRD #496)", () => {
+  const adminAuth = () =>
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+
+  const adminWorker = (over: Record<string, unknown>) => ({
+    id: "w1", name: "prodbox", status: "online", owner_email: "someone@else.test",
+    kind: "hosted", hosted_size: null, busy: false, active_runs: 0, max_concurrent_runs: null,
+    template_declared: null, template_reported: null, version: null, last_heartbeat_at: null,
+    created_at: "2026-01-01T00:00:00Z", draining_since: null,
+    ...over,
+  });
+
+  it("shows the cordoned pill for a drained worker holding no runs", async () => {
+    adminAuth();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({
+      workers: [adminWorker({ draining_since: "2026-01-02T00:00:00Z", active_runs: 0 })],
+    } as never);
+
+    renderRuns();
+    // Anchor on the owner email, which no mutation of the badge can move.
+    await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
+    expect(screen.getByText("cordoned")).toBeTruthy();
+    expect(screen.queryByText("draining")).toBeNull();
+  });
+
+  it("shows the draining pill for a cordoned worker still holding a run", async () => {
+    adminAuth();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({
+      workers: [adminWorker({ draining_since: "2026-01-02T00:00:00Z", active_runs: 1 })],
+    } as never);
+
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
+    expect(screen.getByText("draining")).toBeTruthy();
+    expect(screen.queryByText("cordoned")).toBeNull();
+  });
+});
+
 describe("RunsList — the run title carries no format characters (#124)", () => {
   it("strips bidi/zero-width characters out of the forge-supplied title", async () => {
     vi.mocked(useAuth).mockReturnValue({

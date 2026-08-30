@@ -471,3 +471,40 @@ describe("Dashboard milestone badge (PRD #122)", () => {
     expect(screen.queryByText(/^M\d+\/\d+$/)).toBeNull();
   });
 });
+
+describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () => {
+  const flush = async () => {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  };
+  // The Worker-load card only renders workers passing hasStats (stats_source and
+  // stats_mem_bytes both non-null — see WorkerStats.hasStats), so every fixture here
+  // sets those so the worker appears in the card at all.
+  const withStats = (over: Partial<Worker>): Worker =>
+    aWorker({ stats_source: "cgroup", stats_mem_bytes: 1_000_000, ...over });
+
+  it("shows the cordoned pill for a drained worker holding no runs", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [withStats({ draining_since: "2026-07-05T12:00:00Z", active_runs: 0 })],
+    });
+    renderDashboard();
+    await flush();
+    // Anchor on the card title so a mutation that drops the worker (not just the badge)
+    // still fails at the badge lookup below.
+    expect(screen.getByText("Worker load")).toBeTruthy();
+    expect(screen.getByText("cordoned")).toBeTruthy();
+    expect(screen.queryByText("draining")).toBeNull();
+  });
+
+  it("shows the draining pill for a cordoned worker still holding a run", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [withStats({ draining_since: "2026-07-05T12:00:00Z", active_runs: 1 })],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText("Worker load")).toBeTruthy();
+    expect(screen.getByText("draining")).toBeTruthy();
+    expect(screen.queryByText("cordoned")).toBeNull();
+  });
+});
