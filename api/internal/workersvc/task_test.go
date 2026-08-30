@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -306,6 +307,122 @@ func TestCreateThenFixRunCopiesOriginalBudget(t *testing.T) {
 	if !got.WaitOnLimit {
 		t.Error("wait_on_limit = false for an opted-in owner — the fix run fell to the column default instead of resolveWaitOnLimit (PRD #35)")
 	}
+}
+
+// TestCreateTaskRunThenFixImpliesReview: issue #403 F5. --then-fix implies --review is
+// enforced SERVER-SIDE, not only in the CLI, so a direct API caller that sets
+// then_fix_requested without review_requested still gets an auto-review (and thus a fix).
+func TestCreateTaskRunThenFixImpliesReview(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+
+	t.Run("then-fix without review forces review true", func(t *testing.T) {
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		svc := New(fs, newBox(t), testParams())
+		svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
+		// reviewRequested=false, thenFixRequested=true
+		if _, err := svc.CreateTaskRun(context.Background(), user, repo, "do it", "", false, false, true, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		if fs.taskRunParams == nil {
+			t.Fatal("insert did not run")
+		}
+		if !fs.taskRunParams.ReviewRequested {
+			t.Fatal("review_requested = false with then_fix_requested = true — the server-side " +
+				"then-fix-implies-review invariant (issue #403 F5) did not fire")
+		}
+		if !fs.taskRunParams.ThenFixRequested {
+			t.Fatal("then_fix_requested = false, want true when passed")
+		}
+	})
+
+	t.Run("neither review nor then-fix leaves review false", func(t *testing.T) {
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		svc := New(fs, newBox(t), testParams())
+		svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
+		if _, err := svc.CreateTaskRun(context.Background(), user, repo, "do it", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		if fs.taskRunParams == nil {
+			t.Fatal("insert did not run")
+		}
+		if fs.taskRunParams.ReviewRequested {
+			t.Fatal("review_requested = true with both flags false — the implication over-fired")
+		}
+	})
+}
+
+// TestCreateThenFixRunCapsDescription: issue #403 F4. The server-composed findings
+// description is capped to MaxIssueDescriptionBytes, kept valid UTF-8 and NUL-free, so
+// the fix prompt stays bounded (the every-other-creator invariant). A short description
+// passes through unchanged.
+func TestCreateThenFixRunCapsDescription(t *testing.T) {
+	owner := uuid.New()
+
+	t.Run("over-cap description is truncated to the cap", func(t *testing.T) {
+		fs := &fakeStore{userByID: store.User{ID: owner}}
+		svc := New(fs, newBox(t), testParams())
+		// Build an over-cap description of multi-byte runes so a naive byte-slice truncation
+		// would split a rune; the cap logic must still yield valid UTF-8.
+		big := strings.Repeat("é", MaxIssueDescriptionBytes) + "\x00tail" // é is 2 bytes → well over the cap, plus a NUL
+		if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", big,
+			pgtype.Int4{}, pgtype.Int4{}); err != nil {
+			t.Fatalf("CreateThenFixRun: %v", err)
+		}
+		got := fs.thenFixRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if len(got.IssueDescription) > MaxIssueDescriptionBytes {
+			t.Errorf("issue_description = %d bytes, want <= %d (the cap)", len(got.IssueDescription), MaxIssueDescriptionBytes)
+		}
+		if !utf8.ValidString(got.IssueDescription) {
+			t.Error("issue_description is not valid UTF-8 after truncation")
+		}
+		if strings.Contains(got.IssueDescription, "\x00") {
+			t.Error("issue_description still contains a NUL byte")
+		}
+	})
+
+	t.Run("under-cap description with embedded NUL is stripped, not truncated", func(t *testing.T) {
+		// The over-cap case above cannot prove stripNUL ran: its NUL sits past the cap, so
+		// truncation drops the byte even if stripNUL regressed. This case keeps the input
+		// UNDER the cap so no truncation occurs — the persisted description is NUL-free ONLY
+		// if stripNUL (which runs before the cap check) actually stripped it.
+		fs := &fakeStore{userByID: store.User{ID: owner}}
+		svc := New(fs, newBox(t), testParams())
+		const withNUL = "abc\x00def" // well under MaxIssueDescriptionBytes; the NUL must be removed, not preserved
+		if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", withNUL,
+			pgtype.Int4{}, pgtype.Int4{}); err != nil {
+			t.Fatalf("CreateThenFixRun: %v", err)
+		}
+		got := fs.thenFixRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if strings.Contains(got.IssueDescription, "\x00") {
+			t.Error("issue_description still contains a NUL byte; stripNUL did not run before persistence")
+		}
+		if got.IssueDescription != "abcdef" {
+			t.Errorf("issue_description = %q, want the NUL-stripped %q (no truncation for an under-cap value)", got.IssueDescription, "abcdef")
+		}
+	})
+
+	t.Run("short description passes through unchanged", func(t *testing.T) {
+		fs := &fakeStore{userByID: store.User{ID: owner}}
+		svc := New(fs, newBox(t), testParams())
+		const desc = "fix the two findings"
+		if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", desc,
+			pgtype.Int4{}, pgtype.Int4{}); err != nil {
+			t.Fatalf("CreateThenFixRun: %v", err)
+		}
+		got := fs.thenFixRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if got.IssueDescription != desc {
+			t.Errorf("issue_description = %q, want the unchanged %q", got.IssueDescription, desc)
+		}
+	})
 }
 
 // TestCreateTaskRunSanitizesAndCaps: NUL bytes are stripped from both context and

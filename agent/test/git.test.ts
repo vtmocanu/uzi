@@ -964,6 +964,40 @@ describe("reviewDiff (PRD #400 M4b diff-review)", () => {
     const diff = await git.reviewDiff(bare, "main", "uzi/task/same");
     assert.equal(diff.trim(), "");
   });
+
+  // issue #403 F3: a handoff created without --base records the SEED COMMIT sha (not a branch
+  // name) as its base, so the review diffs only the worker's commits on top of the seed, not
+  // the user's seeded HEAD. That raw sha never resolves under refs/remotes/origin/<sha>, so
+  // reviewDiff must fall back to using it verbatim as a commit-ish present in the mirror.
+  it("resolves a raw commit sha base (the handoff seed commit) — diffs only the post-seed commits", async () => {
+    // Build the branch: a SEED commit (the user's seeded HEAD), then two worker commits on top.
+    gitIn(fx.originPath, ["checkout", "-b", "uzi/task/sha", "main"]);
+    fs.writeFileSync(path.join(fx.originPath, "SEED.txt"), "seeded\n");
+    gitIn(fx.originPath, ["add", "SEED.txt"]);
+    gitIn(fx.originPath, ["commit", "-m", "seed commit"]);
+    const seedSha = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    // Worker commits ON TOP of the seed.
+    fs.writeFileSync(path.join(fx.originPath, "WORK1.txt"), "one\n");
+    gitIn(fx.originPath, ["add", "WORK1.txt"]);
+    gitIn(fx.originPath, ["commit", "-m", "worker commit 1"]);
+    fs.writeFileSync(path.join(fx.originPath, "WORK2.txt"), "two\n");
+    gitIn(fx.originPath, ["add", "WORK2.txt"]);
+    gitIn(fx.originPath, ["commit", "-m", "worker commit 2"]);
+    gitIn(fx.originPath, ["checkout", "main"]); // leave origin on main
+
+    const bare = await git.ensureClone(fx.originPath);
+    // Precondition: the seed sha is present in the mirror (as an ancestor of the reviewed
+    // branch) but NOT under refs/remotes/origin/<sha> — the exact shape the fallback handles.
+    assert.strictEqual(gitIn(bare, ["cat-file", "-t", seedSha]), "commit");
+    const diff = await git.reviewDiff(bare, seedSha, "uzi/task/sha");
+
+    // Only the worker's post-seed commits appear; the seed's own content is the base and absent.
+    assert.match(diff, /WORK1\.txt/);
+    assert.match(diff, /WORK2\.txt/);
+    assert.match(diff, /\+one/);
+    assert.match(diff, /\+two/);
+    assert.ok(!diff.includes("SEED.txt"), "the seed commit's own content is the base, absent from the diff");
+  });
 });
 
 describe("planChangedFiles (PRD #212)", () => {

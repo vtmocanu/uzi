@@ -112,8 +112,22 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 		return err
 	}
 
+	// issue #403 F3: the auto-review diffs against base_branch; when --base is omitted the seed is
+	// local HEAD, so record HEAD's commit SHA as the review base. Otherwise the review defaults to
+	// the repo's default branch and its diff would include the user's own seeded commits — findings
+	// against code the user wrote, and --then-fix would try to "fix" the seed. When --base IS given
+	// the seed already IS that ref, so its name stays the base (the push source is that ref too).
+	baseBranch := strings.TrimSpace(base)
+	if baseBranch == "" {
+		if head, herr := env.Git(".", "rev-parse", "HEAD"); herr == nil {
+			baseBranch = strings.TrimSpace(head)
+		}
+		// On rev-parse failure fall back to empty (today's behavior); the seed push below would
+		// fail anyway if HEAD is unresolvable, so nothing is silently created against a bad base.
+	}
+
 	// (1) Create — receive the id and the server-named uzi/task/<id> branch.
-	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, strings.TrimSpace(base), mr, reviewRequested, thenFix, interactive)
+	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, baseBranch, mr, reviewRequested, thenFix, interactive)
 	if err != nil {
 		return err
 	}
@@ -158,28 +172,47 @@ func resolveHandoffContext(env Env, msg, file string) (string, error) {
 	return resolveMessage(env, ""), nil
 }
 
-// resolveHandoffRepo returns the repo id for the handoff. --repo takes precedence;
-// otherwise the origin remote URL is parsed to owner/namespace and matched against the
-// caller's repos by PathWithNamespace. Exactly one match resolves; zero or many is a
-// usage error naming --repo as the escape hatch.
+// resolveHandoffRepo returns the repo id for the handoff. Handoff ALWAYS resolves origin,
+// because the seed push targets the local `origin` remote (runHandoffCreate step 2). When
+// --repo is set it is validated to name the SAME forge repo origin points at; otherwise the
+// origin path is matched against the caller's repos by PathWithNamespace (exactly one match
+// resolves, zero or many is a usage error naming --repo as the escape hatch).
 func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag string) (string, error) {
-	if strings.TrimSpace(repoFlag) != "" {
-		return strings.TrimSpace(repoFlag), nil
-	}
+	// issue #403 F2: handoff pushes local HEAD to origin (git push origin …:refs/heads/<branch>),
+	// so the run's repo MUST be the same forge repo origin points at — else the worker clones a
+	// different repo, finds no seed branch, and silently seeds from that repo's default branch,
+	// dropping the user's HEAD. We therefore always resolve+parse origin and require --repo (when
+	// given) to match it; --repo remains only the disambiguator for an origin that matches several
+	// of the caller's repos, never a way to target a repo origin does NOT point at.
 	origin, err := env.Git(".", "remote", "get-url", "origin")
 	if err != nil {
 		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"not in a git repo with an 'origin' remote (%v); run from a checkout or pass --repo <id> (see 'uzi repo list')", err)
+			"not in a git repo with an 'origin' remote (%v); handoff pushes local HEAD to origin, so run it from a checkout", err)
 	}
 	path := parseRepoPath(origin)
 	if path == "" {
 		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"could not parse origin %q into an owner/repo path; pass --repo <id> (see 'uzi repo list')", origin)
+			"could not parse origin %q into an owner/repo path; handoff pushes local HEAD to origin, so it must be a resolvable remote", origin)
 	}
 	repos, err := c.ListRepos(ctx)
 	if err != nil {
 		return "", err
 	}
+
+	if repoFlag := strings.TrimSpace(repoFlag); repoFlag != "" {
+		for _, r := range repos {
+			if r.ID == repoFlag {
+				if r.PathWithNamespace != path {
+					return "", uzicli.Exitf(uzicli.ExitUsage,
+						"--repo %s (%s) does not match origin %s; handoff pushes local HEAD to origin, so they must be the same repo", repoFlag, r.PathWithNamespace, path)
+				}
+				return repoFlag, nil
+			}
+		}
+		return "", uzicli.Exitf(uzicli.ExitUsage,
+			"--repo %s is not one of your uzi repos (see 'uzi repo list')", repoFlag)
+	}
+
 	var matches []apitypes.RepoDTO
 	for _, r := range repos {
 		if r.PathWithNamespace == path {
@@ -352,15 +385,26 @@ func runHandoffRm(env Env, gf *globalFlags, cmd *cobra.Command, id string) error
 	if run.Kind != "task" {
 		return uzicli.Exitf(uzicli.ExitUsage, "run %s is not a handoff task (kind=%s)", id, run.Kind)
 	}
-	// An open merge request needs its source branch, so a task that ACTUALLY opened one
-	// (MrWebURL set once the worker opens it) is exempt. Keying on MrWebURL, not the
-	// OpenMr *intent* flag: a --mr handoff that failed at push/dispatch before the worker
-	// ever opened an MR carries OpenMr=true but has no MR — its branch would otherwise be
-	// orphaned with no CLI path to delete it (and the create-time failure hints recommend
-	// exactly this command).
-	if run.MrWebURL != nil {
+	// issue #403 F1: an open merge request needs its source branch. The exemption is BRANCH-WIDE
+	// (branch_has_open_mr) because a handoff's original task, its auto-review and its --then-fix
+	// fix run all SHARE the uzi/task/<id> branch — running rm against a review/fix child (whose
+	// own row has no MR) must not delete the open MR's source branch. `|| MrWebURL != nil` keeps
+	// the per-run exemption working against a pre-feature api pod that omits the branch field.
+	if run.BranchHasOpenMr || run.MrWebURL != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric,
-			"task %s opened a merge request; its branch is exempt from rm — delete it via the merge request", id)
+			"task %s's branch has an open merge request; it is exempt from rm — delete it via the merge request", id)
+	}
+	// issue #403 F6: refuse rm while the branch is still in use. The run's own status catches a
+	// still-running original (and is robust to a pre-feature api pod that omits branch_has_active_run);
+	// branch_has_active_run catches an in-flight review/fix child pushing to the same branch after
+	// the original completed. Deleting under either races the worker's push.
+	if !isTerminalRunStatus(run.Status) {
+		return uzicli.Exitf(uzicli.ExitGeneric,
+			"task %s is not finished yet (status %s); wait for it to complete before rm", id, run.Status)
+	}
+	if run.BranchHasActiveRun {
+		return uzicli.Exitf(uzicli.ExitGeneric,
+			"task %s still has an active review or fix run on its branch; wait for it to finish before rm", id)
 	}
 	if run.Branch == nil || strings.TrimSpace(*run.Branch) == "" {
 		return uzicli.Exitf(uzicli.ExitGeneric, "task %s has no branch to delete", id)

@@ -168,3 +168,17 @@ UPDATE runs
 SET dispatched_at = now(), updated_at = now()
 WHERE id = @run_id AND user_id = @user_id AND kind = 'task' AND dispatched_at IS NULL
 RETURNING *;
+
+-- name: TaskBranchRmStats :one
+-- Branch-scoped safety stats for `uzi handoff rm` (issue #403 F1/F6). A handoff's original
+-- task, its auto-review and its --then-fix fix run are all kind='task' sharing the SAME
+-- uzi/task/<orig> branch, so "is this branch safe to delete?" is branch-scoped, not
+-- run-scoped: active_count > 0 means some run on the branch is still live (the original still
+-- running, or an in-flight review/fix child pushing to it); mr_count > 0 means the branch's
+-- owning task opened an MR (only an open_mr original ever sets mr_web_url), which exempts the
+-- branch from rm. Owner-scoped (@user_id) so it never reports on a foreign branch.
+SELECT
+    COUNT(*) FILTER (WHERE status NOT IN ('completed', 'failed', 'cancelled')) AS active_count,
+    COUNT(*) FILTER (WHERE mr_web_url IS NOT NULL) AS mr_count
+FROM runs
+WHERE user_id = @user_id AND kind = 'task' AND branch = @branch;

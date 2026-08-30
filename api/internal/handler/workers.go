@@ -1159,6 +1159,23 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Error("get run usage total", "run_id", run.ID, "error", err)
 	}
+	// issue #403 F1/F6: stamp the branch-wide `uzi handoff rm` preconditions for a task run so
+	// the CLI can refuse rm when the branch still has a live run (a running original or an
+	// in-flight review/fix child) or belongs to a task that opened an MR. Owner-scoped query.
+	// FAIL-CLOSED: on a lookup error leave BranchHasActiveRun=true so rm refuses rather than
+	// deletes a branch under uncertainty.
+	if run.Kind == "task" && run.Branch.Valid && run.Branch.String != "" {
+		if stats, err := h.q.TaskBranchRmStats(r.Context(), store.TaskBranchRmStatsParams{
+			UserID: run.UserID,
+			Branch: run.Branch,
+		}); err != nil {
+			slog.Error("task branch rm stats", "run_id", run.ID, "error", err)
+			dto.BranchHasActiveRun = true // fail closed
+		} else {
+			dto.BranchHasActiveRun = stats.ActiveCount > 0
+			dto.BranchHasOpenMr = stats.MrCount > 0
+		}
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"run": dto})
 }
 

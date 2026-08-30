@@ -87,8 +87,10 @@ type ClaimPayload struct {
 	// BaseBranch is the source ref a task run was branched from (PRD #400 M2),
 	// meaningful only for kind='task'. It is carried for context/review — the worker
 	// works the pre-seeded, server-named Branch (uzi/task/<run-id>), not this ref —
-	// so an MR/review can name what the task diverged from. Read from runs.base_branch
-	// (pgtype.Text); nil/omitted for every run that has none.
+	// so an MR/review can name what the task diverged from. For a no---base handoff
+	// (issue #403 F3) it may be the seed commit sha (the local HEAD the CLI pushed),
+	// not a branch name. Read from runs.base_branch (pgtype.Text); nil/omitted for
+	// every run that has none.
 	BaseBranch *string `json:"base_branch"`
 	// ReviewTargetRunID is the reviewed TASK run when THIS task run is a diff-review
 	// (PRD #400 M4a). Non-nil ⇒ the worker (M4b) routes this claim to a review executor:

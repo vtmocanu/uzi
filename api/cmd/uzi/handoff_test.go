@@ -50,6 +50,18 @@ func (c *handoffClient) DispatchTaskRun(ctx context.Context, runID string) (apit
 
 // handoffEnv wires a fake client + a fake Git recorder into an Env.
 func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClient) {
+	// issue #403 F2: resolveHandoffRepo now always resolves origin + ListRepos (even with
+	// --repo), so seed a resolvable origin and a matching repo "p1" when the test didn't set
+	// them — a test that needs specific values sets rec.gitOut / fc.Repos before calling.
+	if rec.gitOut == nil {
+		rec.gitOut = map[string]string{}
+	}
+	if _, ok := rec.gitOut["remote get-url origin"]; !ok {
+		rec.gitOut["remote get-url origin"] = "https://github.com/acme/widgets.git"
+	}
+	if len(fc.Repos) == 0 {
+		fc.Repos = []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets"}}
+	}
 	hc := &handoffClient{FakeClient: fc, rec: rec}
 	env := fakeEnv(hc)
 	env.Git = rec.git
@@ -59,7 +71,10 @@ func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClien
 // taskRun builds a created/dispatched task-run DTO with a server-named branch.
 func taskRun(id, branch string) apitypes.RunDTO {
 	b := branch
-	return apitypes.RunDTO{ID: id, Kind: "task", Branch: &b}
+	// Status defaults to "completed" — a finished handoff, the natural rm fixture. rm now
+	// refuses a non-terminal status (issue #403 F6), and this is harmless to the
+	// create/dispatch tests, which do not assert status.
+	return apitypes.RunDTO{ID: id, Kind: "task", Branch: &b, Status: "completed"}
 }
 
 // TestHandoffHappyPath is the Decision-6 core: a --repo handoff creates the run, pushes
@@ -70,7 +85,9 @@ func TestHandoffHappyPath(t *testing.T) {
 		CreatedTaskRun: taskRun("r1", "uzi/task/r1"),
 		DispatchedRun:  taskRun("r1", "uzi/task/r1"),
 	}
-	rec := &handoffRecorder{}
+	// issue #403 F3: without --base the seed is local HEAD, so the CLI resolves HEAD's sha
+	// and records it as base_branch (the auto-review's diff base).
+	rec := &handoffRecorder{gitOut: map[string]string{"rev-parse HEAD": "c0ffee1234"}}
 	env, _ := handoffEnv(fc, rec)
 
 	out, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "do X")
@@ -85,8 +102,9 @@ func TestHandoffHappyPath(t *testing.T) {
 	if fc.LastCreateTaskContext != "do X" {
 		t.Errorf("create context = %q, want %q", fc.LastCreateTaskContext, "do X")
 	}
-	if fc.LastCreateTaskBaseBranch != "" {
-		t.Errorf("create base = %q, want empty", fc.LastCreateTaskBaseBranch)
+	// issue #403 F3: base_branch is HEAD's sha, so the review diffs only the worker's commits.
+	if fc.LastCreateTaskBaseBranch != "c0ffee1234" {
+		t.Errorf("create base = %q, want the seed commit sha c0ffee1234", fc.LastCreateTaskBaseBranch)
 	}
 	if fc.LastCreateTaskOpenMr {
 		t.Errorf("create open_mr = true, want false")
@@ -128,6 +146,34 @@ func TestHandoffBaseRef(t *testing.T) {
 	wantPush := []string{"push", "origin", "main:refs/heads/uzi/task/r2"}
 	if !hasGitCall(rec, wantPush) {
 		t.Errorf("push should use main as source; git calls %v", rec.gitCalls)
+	}
+}
+
+// issue #403 F3: if resolving HEAD's sha fails (rev-parse errors), a no---base handoff still
+// proceeds (create + push + dispatch) with base_branch empty — a graceful fallback to the
+// pre-F3 behavior rather than aborting the run.
+func TestHandoffSeedCommitFallbackOnRevParseError(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		CreatedTaskRun: taskRun("r2b", "uzi/task/r2b"),
+		DispatchedRun:  taskRun("r2b", "uzi/task/r2b"),
+	}
+	rec := &handoffRecorder{gitErr: map[string]error{"rev-parse HEAD": errPushRejected}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (rev-parse failure must fall back gracefully)", code)
+	}
+	if fc.LastCreateTaskBaseBranch != "" {
+		t.Errorf("create base = %q, want empty on rev-parse failure", fc.LastCreateTaskBaseBranch)
+	}
+	// The run still proceeds through push and dispatch.
+	wantPush := []string{"push", "origin", "HEAD:refs/heads/uzi/task/r2b"}
+	if !hasGitCall(rec, wantPush) {
+		t.Errorf("no push %v in git calls %v", wantPush, rec.gitCalls)
+	}
+	if fc.LastDispatchRunID != "r2b" {
+		t.Errorf("dispatch run id = %q, want r2b", fc.LastDispatchRunID)
 	}
 }
 
@@ -308,6 +354,106 @@ func TestHandoffRepoAutoDetect(t *testing.T) {
 	}
 }
 
+// issue #403 F2: --repo whose repo path MATCHES origin proceeds and resolves to that id.
+func TestHandoffRepoFlagMatchesOrigin(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Repos:          []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets"}},
+		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
+		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
+	}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 for --repo matching origin", code)
+	}
+	if fc.LastCreateTaskRepoID != "p1" {
+		t.Errorf("resolved repo = %q, want p1", fc.LastCreateTaskRepoID)
+	}
+	wantPush := []string{"push", "origin", "HEAD:refs/heads/uzi/task/rf"}
+	if !hasGitCall(rec, wantPush) {
+		t.Errorf("matching --repo should push; git calls %v", rec.gitCalls)
+	}
+}
+
+// issue #403 F2: --repo whose repo path does NOT match origin is a usage error, and nothing
+// is created or pushed — pushing local HEAD to origin while the run points at a different
+// repo would silently drop the user's HEAD.
+func TestHandoffRepoFlagMismatchOrigin(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Repos:          []apitypes.RepoDTO{{ID: "pB", PathWithNamespace: "other/thing"}},
+		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
+		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
+	}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "pB", "-m", "x")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage) for --repo mismatching origin", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateTaskRepoID != "" {
+		t.Errorf("no run should be created on a repo/origin mismatch; repo = %q", fc.LastCreateTaskRepoID)
+	}
+	if len(rec.gitCalls) != 1 { // only the origin resolve; no push
+		t.Errorf("a mismatch must not push (only the origin get-url); git calls %v", rec.gitCalls)
+	}
+	for _, s := range rec.seq {
+		if s == "create" || s == "dispatch" {
+			t.Errorf("mismatch must not create/dispatch: %v", rec.seq)
+		}
+	}
+}
+
+// issue #403 F2: --repo naming an id that is not one of the caller's repos is a usage error,
+// and nothing is created or pushed.
+func TestHandoffRepoFlagUnknown(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Repos:          []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets"}},
+		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
+		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
+	}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "nope", "-m", "x")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage) for an unknown --repo", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateTaskRepoID != "" {
+		t.Errorf("no run should be created for an unknown --repo; repo = %q", fc.LastCreateTaskRepoID)
+	}
+	for _, s := range rec.seq {
+		if s == "create" || s == "dispatch" {
+			t.Errorf("unknown --repo must not create/dispatch: %v", rec.seq)
+		}
+	}
+}
+
+// issue #403 F2: when origin matches TWO of the caller's repos, --repo picks the right ID —
+// the ambiguity escape hatch still works because both candidates pass the path check.
+func TestHandoffRepoFlagDisambiguates(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Repos: []apitypes.RepoDTO{
+			{ID: "p1", PathWithNamespace: "acme/widgets"},
+			{ID: "p2", PathWithNamespace: "acme/widgets"},
+		},
+		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
+		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
+	}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p2", "-m", "x")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 for --repo disambiguating an ambiguous origin", code)
+	}
+	if fc.LastCreateTaskRepoID != "p2" {
+		t.Errorf("resolved repo = %q, want p2 (the disambiguated id)", fc.LastCreateTaskRepoID)
+	}
+}
+
 // A push failure must STOP before dispatch: the run is created but not dispatched, so no
 // worker claims it. Non-vacuous: it asserts DispatchTaskRun was never called.
 func TestHandoffPushFailureDoesNotDispatch(t *testing.T) {
@@ -432,6 +578,62 @@ func TestHandoffRmMRExempt(t *testing.T) {
 	}
 }
 
+// issue #403 F1: rm on a review/fix CHILD id (own row carries no MrWebURL) whose BRANCH's
+// owning task opened an MR is refused branch-wide — the open MR's source branch must not be
+// deleted through a child that shares it. Keys on BranchHasOpenMr with MrWebURL nil.
+func TestHandoffRmBranchMRExempt(t *testing.T) {
+	run := taskRun("r7c", "uzi/task/r7c")
+	run.BranchHasOpenMr = true // branch's owning task opened an MR; this row's MrWebURL is nil
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r7c": run}}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "rm", "r7c")
+	if code == uzicli.ExitOK {
+		t.Fatalf("rm of a branch whose owning task opened an MR must be refused, got exit 0")
+	}
+	if len(rec.gitCalls) != 0 {
+		t.Errorf("a branch-MR-exempt rm must not run git: %v", rec.gitCalls)
+	}
+}
+
+// issue #403 F6: rm on a run that is not yet finished (a still-running original) is refused
+// and runs no git — deleting under it would race the worker's push.
+func TestHandoffRmRefusesRunning(t *testing.T) {
+	run := taskRun("r7d", "uzi/task/r7d")
+	run.Status = "running"
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r7d": run}}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "rm", "r7d")
+	if code == uzicli.ExitOK {
+		t.Fatalf("rm of a non-terminal run must be refused, got exit 0")
+	}
+	if len(rec.gitCalls) != 0 {
+		t.Errorf("an unfinished-run rm must not run git: %v", rec.gitCalls)
+	}
+}
+
+// issue #403 F6: rm on a finished original whose BRANCH still has a live review/fix child
+// (BranchHasActiveRun) is refused and runs no git — the in-flight child is still pushing.
+func TestHandoffRmRefusesActiveChild(t *testing.T) {
+	run := taskRun("r7e", "uzi/task/r7e")
+	run.Status = "completed"
+	run.BranchHasActiveRun = true
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r7e": run}}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "rm", "r7e")
+	if code == uzicli.ExitOK {
+		t.Fatalf("rm while an active review/fix child runs on the branch must be refused, got exit 0")
+	}
+	if len(rec.gitCalls) != 0 {
+		t.Errorf("an active-child rm must not run git: %v", rec.gitCalls)
+	}
+}
+
 // A --base that starts with '-' is rejected (it would be misparsed by git push as an
 // option in the refspec argv element): usage error, and nothing is pushed or dispatched.
 func TestHandoffBaseLeadingDashRejected(t *testing.T) {
@@ -466,7 +668,10 @@ func TestHandoffBaseLeadingDashRejected(t *testing.T) {
 func TestHandoffRmRefusesNonNamespacedBranch(t *testing.T) {
 	rogue := "main"
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
-		"r8b": {ID: "r8b", Kind: "task", Branch: &rogue},
+		// Status completed + no active/MR so the F1/F6 checks pass and the refusal is the
+		// namespace guard specifically (issue #403: without a terminal status this would
+		// short-circuit at the F6 status check and no longer exercise the guard under test).
+		"r8b": {ID: "r8b", Kind: "task", Branch: &rogue, Status: "completed"},
 	}}
 	rec := &handoffRecorder{}
 	env, _ := handoffEnv(fc, rec)
