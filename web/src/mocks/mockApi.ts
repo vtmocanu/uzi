@@ -3590,7 +3590,7 @@ export const mockApi = {
   },
 
   // ── Runs ────────────────────────────────────────────────────────────────────
-  createRun: async (repoId: string, issueIid: number) => {
+  createRun: async (repoId: string, issueIid: number, force?: boolean) => {
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === issueIid);
     if (!b || !card) throw new ApiError(404, "issue not found");
@@ -3598,6 +3598,26 @@ export const mockApi = {
       (r) => r.repo_id === repoId && r.issue_iid === issueIid && !["completed", "failed", "cancelled"].includes(r.status),
     );
     if (active) throw new ApiError(409, "a run is already in progress for this issue");
+    // issue #856: a completed prior run that still owns an open MR refuses a fresh
+    // run (coded issue_has_open_mr), unless the caller passes force to override.
+    if (!force) {
+      const openMR = [...state.runs.values()].find(
+        (r) =>
+          r.repo_id === repoId &&
+          r.issue_iid === issueIid &&
+          r.kind === "issue" &&
+          r.status === "completed" &&
+          r.mr_iid != null &&
+          r.mr_state === "opened",
+      );
+      if (openMR) {
+        throw new ApiError(
+          409,
+          `issue #${issueIid} already has open MR !${openMR.mr_iid} — merge or close it, or leave review comments on the MR to iterate, before starting a new run`,
+          { code: "issue_has_open_mr" },
+        );
+      }
+    }
     const now = new Date().toISOString();
     const run: Run = {
       id: nextRunId(),

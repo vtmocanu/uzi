@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { IssueView } from "./IssueView";
-import { api, type Card, type IssueDetail, type SecretMeta, type Worker } from "../lib/api";
+import { api, ApiError, type Card, type IssueDetail, type Run, type SecretMeta, type Worker } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 // IssueView loads four endpoints and, for Promote (PRD #764), calls promoteIssue.
@@ -18,6 +18,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listWorkers: vi.fn(),
       listSecrets: vi.fn(),
       promoteIssue: vi.fn(),
+      createRun: vi.fn(),
     },
   };
 });
@@ -346,6 +347,74 @@ describe("IssueView Start gate (PRD #764)", () => {
     const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
     await screen.findByText("A small typo fix");
     await waitFor(() => expect(startBtn().disabled).toBe(false));
+  });
+
+  // Issue #856 M3: a completed prior run that still owns an open MR makes the
+  // server refuse a fresh run with a coded 409 (issue_has_open_mr). Start catches
+  // it, confirms (the message names the MR), and retries with force on confirm.
+  const openMRError = () =>
+    new ApiError(
+      409,
+      "issue #7 already has open MR !42 — merge or close it, or leave review comments on the MR to iterate, before starting a new run",
+      { code: "issue_has_open_mr" },
+    );
+
+  const renderWithRunRoute = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route path="/repos/:repoId/issues/:iid" element={<IssueView />} />
+          <Route path="/runs/:runId" element={<div>run page</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  const runnable = () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+  };
+
+  it("on the open-MR 409, confirms and retries Start with force, then navigates (#856)", async () => {
+    setAuth();
+    runnable();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    mockApi.createRun
+      .mockRejectedValueOnce(openMRError())
+      .mockResolvedValueOnce({ run: { id: "run-9" } as unknown as Run });
+    renderWithRunRoute();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    expect(confirmSpy.mock.calls[0][0]).toContain("open MR !42");
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
+    expect(mockApi.createRun.mock.calls[0]).toEqual(["repo-1", 7, undefined]);
+    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 7, true]);
+    await screen.findByText("run page");
+    confirmSpy.mockRestore();
+  });
+
+  it("on the open-MR 409, declining Start does not retry and shows no error (#856)", async () => {
+    setAuth();
+    runnable();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mockApi.createRun.mockRejectedValueOnce(openMRError());
+    renderIssueView();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    expect(mockApi.createRun).toHaveBeenCalledTimes(1);
+    // The coded-conflict message is not shown as an error alert on decline.
+    expect(screen.queryByText(/already has open MR/)).toBeNull();
+    confirmSpy.mockRestore();
   });
 });
 

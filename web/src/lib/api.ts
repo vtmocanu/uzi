@@ -2890,6 +2890,17 @@ export function isVaultLocked(err: unknown): boolean {
   );
 }
 
+// isOpenMRConflict reports whether an error is the 409 issue_has_open_mr signal
+// (issue #856): a completed prior run still owns an open MR, so a fresh run was
+// refused. The board/issue Start flow offers a force-retry on this specific code.
+export function isOpenMRConflict(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 409 &&
+    (err.body as { code?: string } | null)?.code === "issue_has_open_mr"
+  );
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -3554,9 +3565,10 @@ const realApi = {
       docker,
     }),
 
-  createRun: (repoId: string, issueIid: number) =>
+  createRun: (repoId: string, issueIid: number, force?: boolean) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, {
       issue_iid: issueIid,
+      ...(force ? { force: true } : {}),
     }),
   /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
   createCIFixRun: (repoId: string, ref: string) =>
