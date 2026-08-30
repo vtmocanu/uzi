@@ -1198,6 +1198,48 @@ describe("Repos — Board access (PRD #557 M4)", () => {
     expect(within(panel).getByRole("switch", { name: "Board visibility" }).getAttribute("aria-checked")).toBe("true");
   });
 
+  it("a visibility READ failure renders the mapped friendly copy, not the raw server message (#569 finding #3)", async () => {
+    // The lazy visibility GET fails with a 409 whose raw sentinel is the server's
+    // instance-flag message. The read path must map it through syncErrorMessage exactly
+    // like the toggle write does, so the same cause reads identically on read and write —
+    // not the raw sentinel.
+    mockApi.getProjectSyncVisibility.mockRejectedValue(
+      new ApiError(409, "github project sync is disabled instance-wide"),
+    );
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+
+    // Friendly mapped copy renders…
+    expect(
+      await within(panel).findByText(/turned off for this instance — ask an admin to enable it/i),
+    ).toBeTruthy();
+    // …and the raw server sentinel does NOT (proves the mapping, non-vacuously).
+    expect(within(panel).queryByText(/disabled instance-wide/i)).toBeNull();
+  });
+
+  it("a transient toggle failure keeps the known Private caption and shows the error separately (#569 finding #4)", async () => {
+    // Read succeeds (private). The toggle write then fails transiently. syncPublic stays a
+    // valid boolean, so the caption must keep showing "Private board" — never mask a known
+    // state as "Visibility unavailable" — while the error renders in its own alert below.
+    mockApi.setProjectSyncVisibility.mockRejectedValue(new Error("network blip"));
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+    // The fetched private-state caption is shown before the toggle attempt.
+    expect(await within(panel).findByText("Private board")).toBeTruthy();
+
+    fireEvent.click(within(panel).getByRole("switch", { name: "Board visibility" }));
+
+    // The error surfaces (its own alert)…
+    expect(await within(panel).findByText(/Something went wrong/i)).toBeTruthy();
+    // …and the known-state caption is NOT masked as unavailable.
+    expect(within(panel).getByText("Private board")).toBeTruthy();
+    expect(within(panel).queryByText("Visibility unavailable")).toBeNull();
+    // The controlled toggle stayed at its last-known position (private → off).
+    expect(
+      within(panel).getByRole("switch", { name: "Board visibility" }).getAttribute("aria-checked"),
+    ).toBe("false");
+  });
+
   it("Share calls the collaborators endpoint and shows a success confirmation", async () => {
     mockApi.shareProjectSync.mockResolvedValue(null);
     const panel = await openSyncPanel("vtmocanu/gh");
