@@ -150,6 +150,11 @@ var runDTOKeys = []string{
 	// clamped and pool-aware and is routinely EARLIER than the reported reset.
 	"wait_on_limit", "limit_resets_at", "retry_not_before", "limit_wait_count",
 	"rate_limit_type",
+	// PRD #841 M1: the per-run MR-rework override, tri-state *bool (null = inherit the
+	// owner default, resolved live). NOT omitempty — always on the wire, so the web can
+	// tell "no per-run opinion" (null) from an explicit true/false and render the
+	// effective inherited value.
+	"mr_rework_enabled",
 	// PRD #300: the per-schedule model a schedule froze onto the run at fire time (nil ⇒
 	// null ⇒ the run inherited the owner's per-user default). Always on the wire.
 	"model",

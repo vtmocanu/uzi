@@ -375,8 +375,8 @@ WHERE status = 'online'
 -- against the vocabulary at its write path, so no re-validation is needed here.
 -- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
 -- column default. Plan inference (M4) later union-merges via a separate UPDATE.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -3188,6 +3188,24 @@ SELECT (EXISTS (
 UPDATE runs SET wait_on_limit = @wait_on_limit, updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: SetRunMrReworkEnabled :execrows
+-- Flip ONE run's MR-rework override after the fact (PRD #841 M1, Decision D2), the
+-- per-run surface for the MR review watcher. Owner-scoped exactly like SetRunWaitOnLimit:
+-- a foreign run returns 0 rows, which the handler maps to 404 (never 403, which would
+-- confirm the run exists). @mr_rework_enabled is a NULLABLE bool (the column is nullable,
+-- default-ON via COALESCE(run, owner) IS NOT FALSE): passing NULL clears the override
+-- back to inherit, and false/true set an explicit override.
+--
+-- 🔴 NO STATUS GUARD, and MUST NOT have one (D2). Unlike wait_on_limit — which governs
+-- an IN-FLIGHT run, so SetRunWaitOnLimit guards status NOT IN ('completed','failed',
+-- 'cancelled') — the MR-rework watcher acts AFTER the run completes, during Human Review
+-- while its MR still has open comments. A terminal-status guard would lock the toggle
+-- exactly when it matters. No explicit terminal guard for a merged/closed MR is needed
+-- either: the write is inert once the MR is no longer open, because ListMRReworkCandidates
+-- already excludes any run whose MR has left the opened state.
+UPDATE runs SET mr_rework_enabled = @mr_rework_enabled, updated_at = now()
+WHERE id = @id AND user_id = @user_id;
 
 -- name: SetRunPriority :execrows
 -- Expedite/undo one queued run's manual priority override (PRD #320 D6/D7). Owner-

@@ -417,11 +417,15 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		// PRD #111 credential fields below: WaitOnLimit is set on every run from
 		// creation while the other four stay null/zero until a first park, so a run
 		// legitimately carries the opt-in with no park data. Never branch on the group.
-		WaitOnLimit:    r.WaitOnLimit,
-		LimitResetsAt:  timePtr(r.LimitResetsAt.Valid, r.LimitResetsAt.Time),
-		RetryNotBefore: timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
-		LimitWaitCount: r.LimitWaitCount,
-		RateLimitType:  textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
+		WaitOnLimit: r.WaitOnLimit,
+		// PRD #841 M1: the per-run MR-rework override, tri-state. boolPtrValue maps the
+		// nullable column to *bool so null (inherit) survives to the wire distinct from
+		// an explicit true/false.
+		MrReworkEnabled: boolPtrValue(r.MrReworkEnabled),
+		LimitResetsAt:   timePtr(r.LimitResetsAt.Valid, r.LimitResetsAt.Time),
+		RetryNotBefore:  timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
+		LimitWaitCount:  r.LimitWaitCount,
+		RateLimitType:   textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
 		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
 		// nil (NULL column) for every run that inherited the owner's per-user default.
 		Model: textPtrValue(r.Model.Valid, r.Model.String),

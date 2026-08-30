@@ -213,7 +213,9 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 		// err is already PAT-redacted by the driver.
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeIssueRead, err)
 	}
-	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, seed)
+	// nil mrReworkEnabled (PRD #841 M1): the create-run request field is not wired here
+	// until M2 — the run inherits the owner default live. Behaviour is byte-identical.
+	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, nil, seed)
 }
 
 // StartRunForUserByPath is StartRunForUser keyed by the human repo PATH the chat

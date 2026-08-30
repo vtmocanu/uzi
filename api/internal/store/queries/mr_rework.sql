@@ -15,9 +15,14 @@
 --      'opened' (Decision 10 — gate on runs.mr_state, which SyncMRStates set FIRST
 --      this tick, NOT a fresh forge read; a just-merged/closed MR is excluded here so
 --      the watch halts without a double-fire against PRD #24's close edge).
---   3. The run's owner has not opted out (users.mr_rework_enabled IS NOT FALSE —
---      NULL/absent = ON, the default-ON semantics of 00165) AND has an Anthropic
---      token on file. The token gate mirrors ListCIAutofixCandidateRefs: an mr_rework
+--   3. Eligibility has not been opted out ANYWHERE up the resolution chain (PRD #841 M1):
+--      COALESCE(per_branch.mr_rework_enabled, u.mr_rework_enabled) IS NOT FALSE. The
+--      per-run override (runs.mr_rework_enabled, nullable) coalesces OVER the owner
+--      default (users.mr_rework_enabled, nullable, default-ON per 00165): a non-NULL run
+--      column wins, and a NULL run column falls through to the owner default. Either
+--      layer explicitly false excludes the branch; NULL/absent at both = ON. The run
+--      column read is the newest issue run's per the DISTINCT ON below. The owner must
+--      ALSO have an Anthropic token on file. The token gate mirrors ListCIAutofixCandidateRefs: an mr_rework
 --      run executes on the OWNER's Anthropic token, so a token-less owner would only
 --      spawn a doomed run that burns the per-MR cap and posts a halt comment. It is an
 --      EXISTS over user_secrets (kind='anthropic_token'), not a users column. The admin
@@ -29,7 +34,7 @@
 -- not a filter that would hide a red pipeline from it.
 WITH per_branch AS (
     SELECT DISTINCT ON (r.branch)
-           r.branch, r.mr_iid, r.user_id, r.id AS source_run_id
+           r.branch, r.mr_iid, r.user_id, r.id AS source_run_id, r.mr_rework_enabled
     FROM runs r
     WHERE r.repo_id = @repo_id::uuid
       AND r.kind = 'issue'
@@ -55,7 +60,7 @@ JOIN users u ON u.id = per_branch.user_id
 LEFT JOIN pipeline_statuses ps
     ON ps.repo_id = @repo_id::uuid AND ps.ref = per_branch.branch
 WHERE per_branch.branch <> rp.default_branch
-  AND u.mr_rework_enabled IS NOT FALSE
+  AND COALESCE(per_branch.mr_rework_enabled, u.mr_rework_enabled) IS NOT FALSE
   AND EXISTS (
       SELECT 1 FROM user_secrets s
       WHERE s.user_id = per_branch.user_id AND s.kind = 'anthropic_token'

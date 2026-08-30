@@ -100,18 +100,18 @@ type Store interface {
 // RunCreator is the shared run-creation seam the scheduler fires through — the SAME
 // seam autopilot and the manual board use. *workersvc.Service satisfies it.
 type RunCreator interface {
-	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, seed *workersvc.SeededPlan) (store.Run, error)
+	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, seed *workersvc.SeededPlan) (store.Run, error)
 	// CreateScheduledRun is the non-auto-approve scheduled path: like CreateRun but the
 	// plan gate still requires a human (see workersvc.CreateScheduledRun). Eligibility is
 	// the single uzi_label gate (PRD #764 M1); a PRD link is no longer required.
-	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan) (store.Run, error)
+	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan) (store.Run, error)
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error)
 	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
 	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
 	// instead of the owner default. It is a distinct method so the poller's
 	// CreateAutopilotRun seam stays untouched (see workersvc.CreateScheduledAutopilotRun).
-	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error)
-	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string, overrideSubagentModel bool) (store.Run, error)
+	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error)
+	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error)
 	// CreateSelfImproveRun is the self-improvement fire path's insert (PRD #590 M1): a
 	// dedicated issue-shaped, auto_approve, kind='self_improve' run against the tracking
 	// issue, threading the schedule's per-schedule model override. The per-repo unique index
@@ -535,7 +535,8 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 		e.logger.Info("scheduler: prompt schedule has active run, skipping fire", "schedule", sched.ID.String())
 		return FireOutcome{Matched: 1, Skips: []Skip{{Title: title, Reason: SkipAlreadyRunning}}}, nil
 	}
-	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
+	// nil mrReworkEnabled (PRD #841 M1): threaded from sched.MrReworkEnabled in M2. Unchanged.
+	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, nil, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	switch {
 	case err == nil:
 		return FireOutcome{Matched: 1, Started: []Started{{RunID: run.ID, Title: title}}}, nil
@@ -587,7 +588,9 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// auto-approve run carries a persisted per-schedule wait_on_limit that must take
 		// effect (PRD #274 Decision 1a). Leaving the poller seam untouched is a structural
 		// guarantee that label-driven autopilot behaviour is unchanged.
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
+		// nil mrReworkEnabled (PRD #841 M1): the schedule's mr_rework override is not
+		// threaded until M2 — the run inherits the owner default live. Behaviour unchanged.
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, nil, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	} else {
 		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
 		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
@@ -595,7 +598,8 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// with no PRD link runs here. The only thing separating this branch from the
 		// CreateScheduledAutopilotRun branch above is auto-approve (the plan gate still
 		// needs a human here), not eligibility.
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
+		// nil mrReworkEnabled (PRD #841 M1): threaded in M2. Behaviour unchanged.
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, nil, scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
 	}
 
 	if err == nil {

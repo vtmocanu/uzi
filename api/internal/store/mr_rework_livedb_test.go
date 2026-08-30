@@ -193,3 +193,123 @@ func TestMRReworkLiveDB(t *testing.T) {
 		t.Fatal("expected the ledger row to be evicted")
 	}
 }
+
+// TestMRReworkCoalesceLiveDB proves the PRD #841 M1 live-inherit resolution: the candidate
+// query's eligibility filter is COALESCE(per_branch.mr_rework_enabled, u.mr_rework_enabled)
+// IS NOT FALSE, so the per-RUN override (runs.mr_rework_enabled, nullable) coalesces OVER
+// the owner default (users.mr_rework_enabled, nullable, default-ON per 00165), read LIVE.
+//
+// This can only be answered by a real Postgres — sqlc's type deduction is not Postgres's,
+// and a fold applied to the .sql only (not the generated const) is inert (.claude/rules/go.md).
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; it runs in CI's
+// store-it sweep. A package printing `ok` with PASS=0 is INVALID, not green.
+//
+// The four truth-table rows are chosen so a REGRESSION reverting the filter to the pre-841
+// `u.mr_rework_enabled IS NOT FALSE` (owner-only) would FAIL this test: rows 3 and 4 are the
+// per-run-override-wins cases in BOTH directions, and under the owner-only filter row 3
+// (owner true) would wrongly surface and row 4 (owner false) would wrongly vanish.
+func TestMRReworkCoalesceLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+	bp := func(b bool) *bool { return &b }
+
+	// Three owners spanning the owner-default tri-state (NULL = default-ON, false = opted
+	// out, true = opted in), each with an Anthropic token so the token gate never becomes
+	// the reason a row is excluded (that would make the COALESCE assertions vacuous). Each
+	// owns runs in ONE shared repo so ListMRReworkCandidates returns them together.
+	ownerNull, ownerFalse, ownerTrue := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, ownerNull, fmt.Sprintf("n-%s@e2e", ownerNull))
+	exec(`INSERT INTO users (id, email, password_hash, mr_rework_enabled) VALUES ($1, $2, 'x', false)`, ownerFalse, fmt.Sprintf("f-%s@e2e", ownerFalse))
+	exec(`INSERT INTO users (id, email, password_hash, mr_rework_enabled) VALUES ($1, $2, 'x', true)`, ownerTrue, fmt.Sprintf("t-%s@e2e", ownerTrue))
+	for _, u := range []uuid.UUID{ownerNull, ownerFalse, ownerTrue} {
+		exec(`INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
+		      VALUES ($1, 'anthropic_token', 'default', true, $2, 'master')`, u, []byte{0x9})
+	}
+	connID, repoID := uuid.New(), uuid.New()
+	// The repo's connection is owned by ownerNull; ownership does not gate the candidate
+	// query (it keys on the RUN's user_id via per_branch.user_id → users u), so runs owned
+	// by any of the three surface together.
+	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 888, $3)`, connID, ownerNull, []byte{0x1})
+	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	      VALUES ($1, $2, 42, 'g/m841', 'https://forge.e2e/g/m841', 'main', true)`, repoID, connID)
+
+	// seedRun inserts a completed issue run with an OPEN MR on the given branch, stamping
+	// mr_rework_enabled (nil ⇒ SQL NULL) and an explicit created_at offset so the newest
+	// run per branch is deterministic. Returns the run id.
+	seedRun := func(owner uuid.UUID, iid int64, branch string, mrRework *bool, ageSeconds int) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, mr_iid, mr_state, status, mr_rework_enabled, created_at)
+		      VALUES ($1, $2, $3, 'issue', $4, 't', 'd', $5, $6, 'opened', 'completed', $7, now() - make_interval(secs => $8))`,
+			id, owner, repoID, iid, branch, iid*10, mrRework, ageSeconds)
+		return id
+	}
+
+	// The truth table. Each row is on its OWN branch so DISTINCT ON isolates them.
+	// Row 1: run NULL + owner NULL     → COALESCE(NULL,NULL)=NULL  IS NOT FALSE → candidate.
+	row1 := seedRun(ownerNull, 101, "agent/issue-101", nil, 100)
+	// Row 2: run NULL + owner false    → COALESCE(NULL,false)=false           → excluded.
+	seedRun(ownerFalse, 102, "agent/issue-102", nil, 100)
+	// Row 3: run false + owner true    → COALESCE(false,true)=false           → excluded (per-run wins).
+	seedRun(ownerTrue, 103, "agent/issue-103", bp(false), 100)
+	// Row 4: run true + owner false    → COALESCE(true,false)=true            → candidate (per-run wins).
+	row4 := seedRun(ownerFalse, 104, "agent/issue-104", bp(true), 100)
+	// Row 5 (reused branch): two completed issue runs on the SAME branch. The OLDER carries
+	// mr_rework_enabled=true (would be a candidate if read), the NEWER carries false. Owner
+	// default is NULL. per_branch's DISTINCT ON (r.branch) ORDER BY r.branch, created_at DESC
+	// binds eligibility to the NEWEST run, so COALESCE(false,NULL)=false → excluded. Proves an
+	// older run's toggle does not move eligibility (the web checkbox/CLI target the newest run).
+	seedRun(ownerNull, 105, "agent/issue-105", bp(true), 200)  // older
+	seedRun(ownerNull, 106, "agent/issue-105", bp(false), 100) // newer, same branch
+
+	cands, err := q.ListMRReworkCandidates(ctx, repoID)
+	if err != nil {
+		t.Fatalf("ListMRReworkCandidates: %v", err)
+	}
+	got := map[string]uuid.UUID{}
+	for _, c := range cands {
+		got[c.Ref.String] = c.SourceRunID
+	}
+
+	// Exactly the two candidate rows (1 and 4) survive; the three excluded refs (rows 2, 3,
+	// and the reused-branch row 5) are absent. Asserting the exact set makes the negatives
+	// non-vacuous — a stray candidate or a missing one both fail.
+	if len(cands) != 2 {
+		t.Fatalf("expected exactly 2 candidates (rows 1 and 4), got %d: %+v", len(cands), cands)
+	}
+	if got["agent/issue-101"] != row1 {
+		t.Fatalf("row 1 (run NULL + owner NULL) must be a candidate via its own run, got %+v", got)
+	}
+	if got["agent/issue-104"] != row4 {
+		t.Fatalf("row 4 (run true + owner false) must be a candidate — per-run override wins over the owner default; got %+v", got)
+	}
+	if _, ok := got["agent/issue-102"]; ok {
+		t.Fatal("row 2 (run NULL + owner false) must be excluded — inherits the owner opt-out")
+	}
+	if _, ok := got["agent/issue-103"]; ok {
+		t.Fatal("row 3 (run false + owner true) must be excluded — per-run override wins over the owner opt-in")
+	}
+	if _, ok := got["agent/issue-105"]; ok {
+		t.Fatal("reused branch: the NEWEST run's mr_rework_enabled=false must exclude the branch, even though an older run on it is true")
+	}
+}

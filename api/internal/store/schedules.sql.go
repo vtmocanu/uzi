@@ -20,7 +20,7 @@ SET last_fired_at = $1,
     last_fire     = $4,
     updated_at    = now()
 WHERE id = $5
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled
 `
 
 type AdvanceScheduleParams struct {
@@ -80,12 +80,13 @@ func (q *Queries) AdvanceSchedule(ctx context.Context, arg AdvanceScheduleParams
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
 
 const claimDueSchedules = `-- name: ClaimDueSchedules :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id FROM run_schedules
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled FROM run_schedules
 WHERE enabled AND status = 'active'
   AND next_fire_at IS NOT NULL AND next_fire_at <= now()
 ORDER BY next_fire_at
@@ -137,6 +138,7 @@ func (q *Queries) ClaimDueSchedules(ctx context.Context) ([]RunSchedule, error) 
 			&i.CatalogSlug,
 			&i.Customized,
 			&i.SiblingGroupID,
+			&i.MrReworkEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -252,29 +254,30 @@ INSERT INTO run_schedules (
     user_id, repo_id, target, catalog_slug, origin, customized,
     issue_iid, labels, prompt, guidance,
     timing, cron_expr, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled, max_issues, model
+    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, model
 ) VALUES (
     $1, $2, $3, $4, 'default', false,
     NULL, NULL, NULL, NULL,
     'recurring', $5, $6, $7,
-    $8, $9, true, $10, $11
+    $8, $9, $10, true, $11, $12
 )
 ON CONFLICT (user_id, repo_id, catalog_slug) WHERE origin = 'default' DO NOTHING
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled
 `
 
 type CreateDefaultScheduleParams struct {
-	UserID      uuid.UUID          `json:"user_id"`
-	RepoID      uuid.UUID          `json:"repo_id"`
-	Target      string             `json:"target"`
-	CatalogSlug pgtype.Text        `json:"catalog_slug"`
-	CronExpr    pgtype.Text        `json:"cron_expr"`
-	Timezone    string             `json:"timezone"`
-	NextFireAt  pgtype.Timestamptz `json:"next_fire_at"`
-	AutoApprove bool               `json:"auto_approve"`
-	WaitOnLimit bool               `json:"wait_on_limit"`
-	MaxIssues   pgtype.Int4        `json:"max_issues"`
-	Model       pgtype.Text        `json:"model"`
+	UserID          uuid.UUID          `json:"user_id"`
+	RepoID          uuid.UUID          `json:"repo_id"`
+	Target          string             `json:"target"`
+	CatalogSlug     pgtype.Text        `json:"catalog_slug"`
+	CronExpr        pgtype.Text        `json:"cron_expr"`
+	Timezone        string             `json:"timezone"`
+	NextFireAt      pgtype.Timestamptz `json:"next_fire_at"`
+	AutoApprove     bool               `json:"auto_approve"`
+	WaitOnLimit     bool               `json:"wait_on_limit"`
+	MrReworkEnabled pgtype.Bool        `json:"mr_rework_enabled"`
+	MaxIssues       pgtype.Int4        `json:"max_issues"`
+	Model           pgtype.Text        `json:"model"`
 }
 
 // Enable a builtin default scheduled job (PRD #589 M2) on a repo for an owner. A
@@ -300,6 +303,7 @@ func (q *Queries) CreateDefaultSchedule(ctx context.Context, arg CreateDefaultSc
 		arg.NextFireAt,
 		arg.AutoApprove,
 		arg.WaitOnLimit,
+		arg.MrReworkEnabled,
 		arg.MaxIssues,
 		arg.Model,
 	)
@@ -333,18 +337,19 @@ func (q *Queries) CreateDefaultSchedule(ctx context.Context, arg CreateDefaultSc
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
 
 const createPromptRun = `-- name: CreatePromptRun :one
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, model, override_subagent_model, required_capabilities
+    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, mr_rework_enabled, model, override_subagent_model, required_capabilities
 ) VALUES (
-    $1, $2::uuid, 'prompt', $3, $4, $5::uuid, $6, $7, $8, $9,
+    $1, $2::uuid, 'prompt', $3, $4, $5::uuid, $6, $7, $8, $9, $10,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}')
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, lineage_epoch
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, lineage_epoch, mr_rework_enabled
 `
 
 type CreatePromptRunParams struct {
@@ -355,6 +360,7 @@ type CreatePromptRunParams struct {
 	ScheduleID            uuid.UUID   `json:"schedule_id"`
 	AutoApprove           bool        `json:"auto_approve"`
 	WaitOnLimit           bool        `json:"wait_on_limit"`
+	MrReworkEnabled       pgtype.Bool `json:"mr_rework_enabled"`
 	Model                 pgtype.Text `json:"model"`
 	OverrideSubagentModel bool        `json:"override_subagent_model"`
 }
@@ -375,6 +381,7 @@ func (q *Queries) CreatePromptRun(ctx context.Context, arg CreatePromptRunParams
 		arg.ScheduleID,
 		arg.AutoApprove,
 		arg.WaitOnLimit,
+		arg.MrReworkEnabled,
 		arg.Model,
 		arg.OverrideSubagentModel,
 	)
@@ -480,6 +487,7 @@ func (q *Queries) CreatePromptRun(ctx context.Context, arg CreatePromptRunParams
 		&i.ReviewComments,
 		&i.BudgetPausedSeconds,
 		&i.LineageEpoch,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
@@ -489,15 +497,15 @@ const createRunSchedule = `-- name: CreateRunSchedule :one
 INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled, max_issues, guidance, model, override_subagent_model,
+    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, guidance, model, override_subagent_model,
     sibling_group_id
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10, $11,
-    $12, $13, $14, $15, $16, $17, $18,
-    $19
+    $12, $13, $14, $15, $16, $17, $18, $19,
+    $20
 )
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled
 `
 
 type CreateRunScheduleParams struct {
@@ -514,6 +522,7 @@ type CreateRunScheduleParams struct {
 	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
 	AutoApprove           bool               `json:"auto_approve"`
 	WaitOnLimit           bool               `json:"wait_on_limit"`
+	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
 	Enabled               bool               `json:"enabled"`
 	MaxIssues             pgtype.Int4        `json:"max_issues"`
 	Guidance              pgtype.Text        `json:"guidance"`
@@ -543,6 +552,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		arg.NextFireAt,
 		arg.AutoApprove,
 		arg.WaitOnLimit,
+		arg.MrReworkEnabled,
 		arg.Enabled,
 		arg.MaxIssues,
 		arg.Guidance,
@@ -580,6 +590,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
@@ -603,7 +614,7 @@ func (q *Queries) DeleteRunSchedule(ctx context.Context, arg DeleteRunSchedulePa
 }
 
 const getDefaultScheduleForRepoSlug = `-- name: GetDefaultScheduleForRepoSlug :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id FROM run_schedules
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled FROM run_schedules
 WHERE user_id = $1 AND repo_id = $2 AND catalog_slug = $3
   AND origin = 'default'
 `
@@ -649,12 +660,13 @@ func (q *Queries) GetDefaultScheduleForRepoSlug(ctx context.Context, arg GetDefa
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
 
 const getRunSchedule = `-- name: GetRunSchedule :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id FROM run_schedules WHERE id = $1
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled FROM run_schedules WHERE id = $1
 `
 
 // Unscoped fetch by id (server-internal: the claimer/firing path already holds a
@@ -691,12 +703,13 @@ func (q *Queries) GetRunSchedule(ctx context.Context, id uuid.UUID) (RunSchedule
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
 
 const getRunScheduleForUser = `-- name: GetRunScheduleForUser :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id FROM run_schedules WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled FROM run_schedules WHERE id = $1 AND user_id = $2
 `
 
 type GetRunScheduleForUserParams struct {
@@ -738,6 +751,7 @@ func (q *Queries) GetRunScheduleForUser(ctx context.Context, arg GetRunScheduleF
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
@@ -801,7 +815,7 @@ func (q *Queries) ListEnabledDefaultsForUser(ctx context.Context, userID uuid.UU
 }
 
 const listRunSchedulesForUser = `-- name: ListRunSchedulesForUser :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
 `
 
 // The owner's schedules, newest first.
@@ -843,6 +857,7 @@ func (q *Queries) ListRunSchedulesForUser(ctx context.Context, userID uuid.UUID)
 			&i.CatalogSlug,
 			&i.Customized,
 			&i.SiblingGroupID,
+			&i.MrReworkEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -934,27 +949,29 @@ SET cron_expr     = $1,
     model         = $3,
     auto_approve  = $4,
     wait_on_limit = $5,
-    max_issues    = $6,
+    mr_rework_enabled = $6,
+    max_issues    = $7,
     guidance      = NULL,
     override_subagent_model = false,
-    next_fire_at  = $7,
+    next_fire_at  = $8,
     customized    = false,
     status        = 'active',
     updated_at    = now()
-WHERE id = $8 AND user_id = $9 AND origin = 'default'
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id
+WHERE id = $9 AND user_id = $10 AND origin = 'default'
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled
 `
 
 type ResetDefaultScheduleParams struct {
-	CronExpr    pgtype.Text        `json:"cron_expr"`
-	Timezone    string             `json:"timezone"`
-	Model       pgtype.Text        `json:"model"`
-	AutoApprove bool               `json:"auto_approve"`
-	WaitOnLimit bool               `json:"wait_on_limit"`
-	MaxIssues   pgtype.Int4        `json:"max_issues"`
-	NextFireAt  pgtype.Timestamptz `json:"next_fire_at"`
-	ID          uuid.UUID          `json:"id"`
-	UserID      uuid.UUID          `json:"user_id"`
+	CronExpr        pgtype.Text        `json:"cron_expr"`
+	Timezone        string             `json:"timezone"`
+	Model           pgtype.Text        `json:"model"`
+	AutoApprove     bool               `json:"auto_approve"`
+	WaitOnLimit     bool               `json:"wait_on_limit"`
+	MrReworkEnabled pgtype.Bool        `json:"mr_rework_enabled"`
+	MaxIssues       pgtype.Int4        `json:"max_issues"`
+	NextFireAt      pgtype.Timestamptz `json:"next_fire_at"`
+	ID              uuid.UUID          `json:"id"`
+	UserID          uuid.UUID          `json:"user_id"`
 }
 
 // Restore a default-origin schedule's editable fields to the catalog defaults and clear
@@ -974,6 +991,7 @@ func (q *Queries) ResetDefaultSchedule(ctx context.Context, arg ResetDefaultSche
 		arg.Model,
 		arg.AutoApprove,
 		arg.WaitOnLimit,
+		arg.MrReworkEnabled,
 		arg.MaxIssues,
 		arg.NextFireAt,
 		arg.ID,
@@ -1009,6 +1027,7 @@ func (q *Queries) ResetDefaultSchedule(ctx context.Context, arg ResetDefaultSche
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
@@ -1017,7 +1036,7 @@ const resumeRecurringSchedule = `-- name: ResumeRecurringSchedule :one
 UPDATE run_schedules
 SET enabled = $1, next_fire_at = $2, updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled
 `
 
 type ResumeRecurringScheduleParams struct {
@@ -1069,6 +1088,7 @@ func (q *Queries) ResumeRecurringSchedule(ctx context.Context, arg ResumeRecurri
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
@@ -1077,7 +1097,7 @@ const setRunScheduleEnabled = `-- name: SetRunScheduleEnabled :one
 UPDATE run_schedules
 SET enabled = $1, updated_at = now()
 WHERE id = $2 AND user_id = $3
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled
 `
 
 type SetRunScheduleEnabledParams struct {
@@ -1119,6 +1139,7 @@ func (q *Queries) SetRunScheduleEnabled(ctx context.Context, arg SetRunScheduleE
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
@@ -1127,7 +1148,7 @@ const setRunScheduleStatus = `-- name: SetRunScheduleStatus :one
 UPDATE run_schedules
 SET status = $1, updated_at = now()
 WHERE id = $2
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled
 `
 
 type SetRunScheduleStatusParams struct {
@@ -1169,6 +1190,7 @@ func (q *Queries) SetRunScheduleStatus(ctx context.Context, arg SetRunScheduleSt
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
@@ -1187,15 +1209,16 @@ SET target        = $1,
     next_fire_at  = $10,
     auto_approve  = $11,
     wait_on_limit = $12,
-    max_issues    = $13,
-    guidance      = $14,
-    model         = $15,
-    override_subagent_model = $16,
-    customized    = $17,
+    mr_rework_enabled = $13,
+    max_issues    = $14,
+    guidance      = $15,
+    model         = $16,
+    override_subagent_model = $17,
+    customized    = $18,
     status        = 'active',
     updated_at    = now()
-WHERE id = $18 AND user_id = $19
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id
+WHERE id = $19 AND user_id = $20
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled
 `
 
 type UpdateRunScheduleParams struct {
@@ -1211,6 +1234,7 @@ type UpdateRunScheduleParams struct {
 	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
 	AutoApprove           bool               `json:"auto_approve"`
 	WaitOnLimit           bool               `json:"wait_on_limit"`
+	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
 	MaxIssues             pgtype.Int4        `json:"max_issues"`
 	Guidance              pgtype.Text        `json:"guidance"`
 	Model                 pgtype.Text        `json:"model"`
@@ -1244,6 +1268,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		arg.NextFireAt,
 		arg.AutoApprove,
 		arg.WaitOnLimit,
+		arg.MrReworkEnabled,
 		arg.MaxIssues,
 		arg.Guidance,
 		arg.Model,
@@ -1282,6 +1307,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		&i.CatalogSlug,
 		&i.Customized,
 		&i.SiblingGroupID,
+		&i.MrReworkEnabled,
 	)
 	return i, err
 }
