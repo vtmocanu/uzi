@@ -906,12 +906,13 @@ function SidebarContent({
             different things. It renders nothing until the fetch resolves with a
             version, exactly as the old badge did.
 
-            The durable license/author credit (PRD #685 D3) is the RIGHT-HAND item of
-            this one-row footer. It is a build-time constant, NOT gated on the build
-            fetch, so it must render during the /api/version load and on its failure
-            alike — a rebrand or full white-label cannot strip it. When the rail is
-            collapsed there is no room for it: the footer falls back to just the
-            build popover's collapsed variant. */}
+            The license/author credit (issue #833) is the RIGHT-HAND item of this
+            one-row footer when shown. It is gated on the build-time SHOW_LICENSE_CREDIT
+            flag (default OFF, hidden) via LicenseCredit, and is NOT gated on the build
+            fetch, so when enabled it renders during the /api/version load and on its
+            failure alike; a rebrand or full white-label still cannot toggle it (not a
+            branding setting). When the rail is collapsed there is no room for it: the
+            footer falls back to just the build popover's collapsed variant. */}
         {collapsed ? (
           build?.status === "ok" &&
           build.info.version && (
@@ -975,8 +976,9 @@ function PublicShell({ children }: { children: ReactNode }) {
         </div>
       </header>
       <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-10">{children}</main>
-      {/* Durable credit (PRD #685 D3) on the signed-out shell, which has no version
-          row: a footer carries it here. Constant, independent of any fetch. */}
+      {/* License credit (issue #833) on the signed-out shell, which has no version
+          row: a footer carries it here. Gated on the build-time SHOW_LICENSE_CREDIT
+          flag (default OFF) via LicenseCredit, independent of any fetch. */}
       <footer className="border-t border-edge">
         <div className="mx-auto max-w-5xl px-4 py-4">
           <LicenseCredit />

@@ -278,7 +278,7 @@ export function AdminBranding() {
   };
 
   return (
-    <AdminShell description="Replace the app mark and add a POWERED BY brand. Fresh installs are unbranded; the license/author credit in the chrome is fixed and cannot be removed here.">
+    <AdminShell description="Replace the app mark and add a POWERED BY brand. Fresh installs are unbranded; the license/author credit is a build-time flag, not a branding setting, so it cannot be changed here.">
       {loading ? (
         <Card>
           <Skeleton className="h-40 w-full" />
