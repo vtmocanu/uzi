@@ -1125,40 +1125,85 @@ export function RunView() {
       {/* PRD #35: the usage-limit strip. High in the stack because on a parked run it
           carries the only thing the user came to find out — when it resumes — and low
           in weight otherwise, where it is just the per-run opt-in. Renders nothing at
-          all for a terminal run. */}
-      <LimitWaitPanel
-        run={run}
-        busy={busy}
-        canSteer={canSteer}
-        onStop={() => act(() => submit("cancel"))}
-        onToggle={(enabled) =>
-          act(async () => {
-            await api.setRunWaitOnLimit(run.id, enabled);
-            // The flag is not a status change, so no WS frame announces it — without
-            // this refetch the checkbox would snap back to the stale run on the next
-            // render, which reads as the write having failed.
-            await refreshRun();
-          })
-        }
-      />
-
-      {/* PRD #841: the per-run MR-review-rework toggle. Self-hides for a non-owner and
+          all for a terminal run.
+          PRD #841: the per-run MR-review-rework toggle. Self-hides for a non-owner and
           once the MR is merged/closed; visible on a completed issue run whose MR is
           still open, because the watcher acts after completion. */}
-      <MrReworkPanel
-        run={run}
-        busy={busy}
-        canSteer={canSteer}
-        userDefault={mrReworkDefault}
-        onToggle={(enabled) =>
-          act(async () => {
-            await api.setRunMrRework(run.id, enabled);
-            // Not a status change, so no WS frame announces it — refetch so the checkbox
-            // reflects the new run value instead of snapping back to the stale one.
-            await refreshRun();
-          })
-        }
-      />
+      {run.status === "limit_wait" ? (
+        // Parked: keep the full-width countdown card stacked exactly as today (no flex
+        // item → no shrinking). MrReworkPanel still self-hides / renders beneath it via
+        // the page-wide space-y-5 rhythm, unchanged.
+        <>
+          <LimitWaitPanel
+            run={run}
+            busy={busy}
+            canSteer={canSteer}
+            onStop={() => act(() => submit("cancel"))}
+            onToggle={(enabled) =>
+              act(async () => {
+                await api.setRunWaitOnLimit(run.id, enabled);
+                // The flag is not a status change, so no WS frame announces it — without
+                // this refetch the checkbox would snap back to the stale run on the next
+                // render, which reads as the write having failed.
+                await refreshRun();
+              })
+            }
+          />
+          <MrReworkPanel
+            run={run}
+            busy={busy}
+            canSteer={canSteer}
+            userDefault={mrReworkDefault}
+            onToggle={(enabled) =>
+              act(async () => {
+                await api.setRunMrRework(run.id, enabled);
+                // Not a status change, so no WS frame announces it — refetch so the checkbox
+                // reflects the new run value instead of snapping back to the stale one.
+                await refreshRun();
+              })
+            }
+          />
+        </>
+      ) : (
+        // Non-parked: the two simple inline toggles share one row from `sm` up, and stay
+        // cleanly stacked (two lines) on mobile — the two ~87-char labels would wrap
+        // raggedly if we relied on flex-wrap alone at narrow widths, so the breakpoint is
+        // explicit. Gated so no always-present empty <div> adds a stray space-y-5 margin
+        // on terminal runs where both panels render nothing.
+        (canToggleWaitOnLimit(run.status) || (canSteer && canToggleMrRework(run))) && (
+          <div className="flex flex-col gap-y-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-6">
+            <LimitWaitPanel
+              run={run}
+              busy={busy}
+              canSteer={canSteer}
+              onStop={() => act(() => submit("cancel"))}
+              onToggle={(enabled) =>
+                act(async () => {
+                  await api.setRunWaitOnLimit(run.id, enabled);
+                  // The flag is not a status change, so no WS frame announces it — without
+                  // this refetch the checkbox would snap back to the stale run on the next
+                  // render, which reads as the write having failed.
+                  await refreshRun();
+                })
+              }
+            />
+            <MrReworkPanel
+              run={run}
+              busy={busy}
+              canSteer={canSteer}
+              userDefault={mrReworkDefault}
+              onToggle={(enabled) =>
+                act(async () => {
+                  await api.setRunMrRework(run.id, enabled);
+                  // Not a status change, so no WS frame announces it — refetch so the checkbox
+                  // reflects the new run value instead of snapping back to the stale one.
+                  await refreshRun();
+                })
+              }
+            />
+          </div>
+        )
+      )}
 
       {/* PRD #362 M4: the plain-English run summary — intent, proposed/approved plan, and
           deltas from the original ask. Self-hides until a summary lands (the issue-title
