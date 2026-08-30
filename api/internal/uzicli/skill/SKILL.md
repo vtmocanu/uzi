@@ -716,11 +716,15 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    value — omit it to inherit the account default, `--mr-rework=false` to force it off for
    this run, `--mr-rework` to force it on. **Ask the user with one `AskUserQuestion`** unless
    they already stated a preference (or a Custom-mode answer already covered it). The choice
-   changes step 8/9: with `--mr-rework=false` no rework fires, so **you** fix the review
-   findings locally and merge — which is what an Auto-mode driver taking the helm usually
-   wants; leaving it on (or inherited) means uzi's own `mr_rework` may fix and push to the
-   branch on review comments, so defer to it and review its fix before merging, and watch for
-   the double-fix collision (never amend the same branch while a rework is in flight). Then:
+   changes step 8/9 by the run's **effective** rework value, which for an omitted flag is the
+   account default (which itself may be off), not "on": if rework is effectively **off**
+   (`--mr-rework=false`, or omitted while your account default is off) no rework fires, so
+   **you** fix the review findings locally and merge — which is what an Auto-mode driver
+   taking the helm usually wants; if it is effectively **on** (`--mr-rework`, or omitted while
+   the account default is on) uzi's own `mr_rework` may fix and push to the branch on review
+   comments, so defer to it and review its fix before merging, and watch for the double-fix
+   collision (never amend the same branch while a rework is in flight). When you omitted the
+   flag, resolve the account default before deciding — do not assume inherited means on. Then:
 
    ```
    uzi run create --repo <id> --issue <iid> --mr-rework=false --json   # or --mr-rework, or omit to inherit
