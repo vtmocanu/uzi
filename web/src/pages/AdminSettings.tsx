@@ -8,6 +8,7 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   api,
   ApiError,
+  isHttpsUrl,
   type AgentSourceStaged,
   type AgentSourceView,
   type AppSettings,
@@ -924,7 +925,7 @@ function UpdatesSettingsCard() {
                     <p className="whitespace-pre-wrap text-sm text-muted">{releaseExcerpt(status.body)}</p>
                   )}
 
-                  {status.notes_url && (
+                  {status.notes_url && isHttpsUrl(status.notes_url) && (
                     <a
                       href={status.notes_url}
                       target="_blank"

@@ -127,7 +127,9 @@ describe("UpdateEscalationBanner (PRD #836 M6)", () => {
     await waitFor(() => expect(mockApi.snoozeReleaseBanner).toHaveBeenCalledTimes(1));
     // Optimistic hide already took effect.
     expect(screen.queryByRole("alert")).toBeNull();
-    // Flush the snooze-response refresh (banner_snoozed:true) and re-assert it stays hidden.
+    // Flush the async snooze round-trip (the setStatus from its response) and re-assert
+    // the banner does not resurface. The refreshed status also carries banner_snoozed:true,
+    // so both the sticky local `dismissed` state and the server snooze keep it hidden here.
     await act(async () => { await Promise.resolve(); });
     expect(screen.queryByRole("alert")).toBeNull();
   });
