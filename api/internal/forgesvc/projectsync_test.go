@@ -24,8 +24,9 @@ import (
 type fakeProjectSyncer struct {
 	*fakeForge
 
-	scopes   []string
-	tokenErr error
+	scopes         []string
+	tokenErr       error
+	tokenInfoCalls int
 
 	slugOwner, slugRepo string
 	slugErr             error
@@ -125,6 +126,7 @@ type createFieldCall struct {
 }
 
 func (f *fakeProjectSyncer) TokenInfo(context.Context) (forge.TokenInfo, error) {
+	f.tokenInfoCalls++
 	if f.tokenErr != nil {
 		return forge.TokenInfo{}, f.tokenErr
 	}
@@ -1850,6 +1852,53 @@ func TestGetVisibilityReturnsForgeValue(t *testing.T) {
 	if !public {
 		t.Errorf("want public=true from the forge, got %v", public)
 	}
+}
+
+// GetVisibility is the lazy panel-open read: it must NOT run the scope preflight (issue
+// #569 finding #2). A scope-missing token (no "project" scope) that would trip the write
+// path's ErrProjectSyncMissingScope must instead read through — the read succeeds and
+// makes ZERO TokenInfo introspection round-trips. SetVisibility (the write path) with the
+// SAME token still rejects with ErrProjectSyncMissingScope AND does call TokenInfo, so the
+// preamble split changed only the read path's behavior.
+func TestGetVisibilitySkipsScopePreflight(t *testing.T) {
+	repoID := uuid.New()
+
+	t.Run("read reads through a scope-missing token without introspection", func(t *testing.T) {
+		syncer := boardAccessSyncer()
+		syncer.scopes = []string{"repo"} // no "project" scope
+		syncer.visibilityReturn = true
+		st := boardAccessStore(repoID, "PVT_1")
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+		public, err := svc.GetVisibility(context.Background(), repoID)
+		if err != nil {
+			t.Fatalf("GetVisibility must read through a scope-missing token, got %v", err)
+		}
+		if !public {
+			t.Errorf("want public=true from the forge, got %v", public)
+		}
+		if syncer.tokenInfoCalls != 0 {
+			t.Errorf("read path must make no TokenInfo introspection round-trip, got %d", syncer.tokenInfoCalls)
+		}
+	})
+
+	t.Run("write still enforces scope via TokenInfo", func(t *testing.T) {
+		syncer := boardAccessSyncer()
+		syncer.scopes = []string{"repo"} // no "project" scope
+		st := boardAccessStore(repoID, "PVT_1")
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+		err := svc.SetVisibility(context.Background(), repoID, true)
+		if !errors.Is(err, ErrProjectSyncMissingScope) {
+			t.Fatalf("write path must still reject a scope-missing token with ErrProjectSyncMissingScope, got %v", err)
+		}
+		if syncer.tokenInfoCalls == 0 {
+			t.Errorf("write path must run the scope preflight (TokenInfo), got 0 calls")
+		}
+		if len(syncer.setVisibilityCalls) != 0 {
+			t.Errorf("a scope-missing write must not reach the forge, got %v", syncer.setVisibilityCalls)
+		}
+	})
 }
 
 // SetVisibility(true) calls the syncer with the link's ProjectNodeID and public=true.
