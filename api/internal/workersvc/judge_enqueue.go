@@ -151,19 +151,22 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	}
 	// Enqueue. The judge run is owned by the SAME user (never cross-user) and targets
 	// this run. A concurrent duplicate trips the one-active-judge-per-target index.
-	if _, err := s.q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
+	judge, err := s.q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 		UserID:           run.UserID,
 		TargetRunID:      pgUUID(run.ID),
 		IssueTitle:       judgeRunTitle(run),
 		IssueDescription: "",
 		TriggerSource:    "judge",
-	}); err != nil {
+	})
+	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return // a judge run is already active for this target — expected, not an error
 		}
 		slog.Warn("judge enqueue: create judge run", "run", run.ID, "error", err)
+		return
 	}
+	logRunCreated(judge)
 }
 
 // maybeEnqueueTaskReview auto-creates a diff-review run for a just-completed task that was

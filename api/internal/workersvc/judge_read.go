@@ -256,5 +256,6 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 		}
 		return store.Run{}, err
 	}
+	logRunCreated(judge)
 	return judge, nil
 }

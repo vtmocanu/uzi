@@ -74,5 +74,6 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 	}
 	// queued keeps the live status broadcast consistent with other run kinds.
 	s.notify(run.ID, "queued")
+	logRunCreated(run)
 	return run, nil
 }
