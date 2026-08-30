@@ -100,9 +100,14 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 	seed := func(t *testing.T, issueIID, mrIID int64, issueState string, live bool) seeded {
 		t.Helper()
 		repoID := uuid.New()
+		// forge_project_id must be UNIQUE per repo under repos_connection_id_forge_project_id_key
+		// (one connection can't own two repos for the same forge project); mrIID is distinct per
+		// subtest so it serves. This is only the STORED row — SyncMRStates is still called with the
+		// const forgeProjectID below, which the fakeForge ignores, so the value here is inert beyond
+		// satisfying the constraint.
 		exec(t, `INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		         VALUES ($1, $2, $3, $4, 'https://forge.e2e/g/r', 'main', true)`,
-			repoID, connID, forgeProjectID, fmt.Sprintf("g/r-%s", repoID))
+			repoID, connID, mrIID, fmt.Sprintf("g/r-%s", repoID))
 
 		exec(t, `INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, forge_updated_at, synced_at)
 		         VALUES ($1, $2, 'seeded', $3, '["Human Review"]'::jsonb, 'https://x', now(), now())`,
@@ -167,6 +172,9 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 		if !stopKind.Valid || stopKind.String != "cancelled" {
 			t.Fatalf("rework run stop_kind = %+v, want 'cancelled'", stopKind)
 		}
+		if n := countCancelInputs(t, s.reworkRunID); n != 0 {
+			t.Fatalf("kind='cancel' run_user_inputs rows = %d, want 0 for a non-live worker (server-side cancel enqueues no verdict)", n)
+		}
 	})
 
 	t.Run("merged, live poller -> cancel verdict enqueued + stop_kind stamped", func(t *testing.T) {
@@ -227,6 +235,36 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 		status, stopKind := readRun(t, s.reworkRunID)
 		if status != "cancelled" {
 			t.Fatalf("rework run status = %q, want 'cancelled' — a closed MR must cancel the rework via the CLOSED arm", status)
+		}
+		if !stopKind.Valid || stopKind.String != "cancelled" {
+			t.Fatalf("rework run stop_kind = %+v, want 'cancelled'", stopKind)
+		}
+		if n := countCancelInputs(t, s.reworkRunID); n != 0 {
+			t.Fatalf("kind='cancel' run_user_inputs rows = %d, want 0 for a non-live worker (server-side cancel enqueues no verdict)", n)
+		}
+	})
+
+	t.Run("closed, forge move deferred -> cancels anyway (decoupled from board move)", func(t *testing.T) {
+		// Regression guard for #853 review finding: an OPEN issue whose card sits in
+		// Human Review is a Lane-A candidate, so guardedMRMove ATTEMPTS the move — but
+		// updateErr makes AutoMove fail, returning moveDeferred (not moveSkipped). The
+		// cancel must still fire: it is keyed on the MR, not gated behind the move, so a
+		// confirmed close cancels the in-flight rework even when the board move can't
+		// complete. mr_state is left unadvanced (the move retries next tick), which we do
+		// not assert here — the point is that the rework is cancelled regardless.
+		s := seed(t, 8535, 85350, "opened", false /* live */)
+		f := &fakeForge{
+			mrByIID:   map[int64]forge.MergeRequest{s.mrIID: forgeMR(s.mrIID, "closed")},
+			updateErr: fmt.Errorf("forge unreachable"),
+		}
+
+		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f); err != nil {
+			t.Fatalf("SyncMRStates: %v", err)
+		}
+
+		status, stopKind := readRun(t, s.reworkRunID)
+		if status != "cancelled" {
+			t.Fatalf("rework run status = %q, want 'cancelled' — a confirmed-closed MR must cancel the rework even when the board move defers", status)
 		}
 		if !stopKind.Valid || stopKind.String != "cancelled" {
 			t.Fatalf("rework run stop_kind = %+v, want 'cancelled'", stopKind)

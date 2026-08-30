@@ -94,12 +94,23 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 	case stored == forge.MRStateOpened && observed == forge.MRStateClosed:
 		// close-edge: reviewer rejected the MR → rework needed → In Progress,
 		// guarded from Human Review (where the completed run parked the card).
-		if s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, f, board.ColumnHumanReview, board.ColumnInProgress) == moveDeferred {
-			return // forge failure / vanished card: leave the edge for next-tick retry
+		//
+		// A confirmed close means any in-flight rework can never land — abort it
+		// INDEPENDENTLY of the board move (#853 review finding). Cancellation is
+		// idempotent (no active rework / no canceller → no-op nil) and keyed on the
+		// MR, not the card, so it must NOT be gated behind a move that can defer:
+		// a forge move error, or an evicted card that stops being a candidate next
+		// tick, would otherwise leave the rework spending forever. Attempt it every
+		// tick, ahead of the move.
+		cancelErr := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64)
+		if cancelErr != nil {
+			slog.Warn("forgesvc: cancel rework on MR close failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", cancelErr)
 		}
-		if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
-			slog.Warn("forgesvc: cancel rework on MR close failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", err)
-			return // leave mr_state unadvanced so the next tick retries; don't consume the edge
+		moved := s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, f, board.ColumnHumanReview, board.ColumnInProgress)
+		if moved == moveDeferred || cancelErr != nil {
+			// forge failure / vanished card, or a cancel that must be retried: leave
+			// mr_state unadvanced so the next tick re-observes the edge and retries.
+			return
 		}
 		s.recordMRState(ctx, c.ID, observed)
 	case stored == forge.MRStateClosed && observed == forge.MRStateOpened:
