@@ -1136,6 +1136,7 @@ export function RunView() {
                 Run {stopped ? "stopped" : "failed"}
               </p>
               <RunFailureReason run={run} stopped={stopped} />
+              <RunStopReason run={run} />
               {duration && <p className="mt-0.5 text-xs text-muted">Ran for {duration}.</p>}
             </div>
             {/* The MR link is the run's whole output; surface it even on a failed or
@@ -1874,6 +1875,21 @@ export function RunFailureReason({ run, stopped }: { run: Run; stopped?: boolean
   return (
     <p className={cx("mt-0.5 text-xs", stopped ? "text-muted" : "text-danger/80")}>
       {stripUnsafeChars(run.failure_reason)}
+    </p>
+  );
+}
+
+/**
+ * The operator's free-text cancel reason (issue #525), shown in the stopped/failed hero
+ * beside the failure_reason line. On the live-poller cancel path failure_reason is the
+ * generic "run cancelled", so this is the line that actually says WHY. Untrusted free
+ * text, same channel as failure_reason — through stripUnsafeChars. Renders nothing when unset.
+ */
+export function RunStopReason({ run }: { run: Run }) {
+  if (!run.stop_reason) return null;
+  return (
+    <p className="mt-0.5 text-xs text-muted">
+      Reason: {stripUnsafeChars(run.stop_reason)}
     </p>
   );
 }

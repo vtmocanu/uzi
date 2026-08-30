@@ -205,6 +205,7 @@ const CARD_MIRRORED_FIELDS = [
   "mr_state",
   "failure_reason",
   "stop_kind",
+  "stop_reason",
   "health",
   "health_reason",
   "health_since",

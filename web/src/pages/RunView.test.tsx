@@ -20,6 +20,7 @@ import {
   RunHeading,
   RunCompletedLine,
   RunFailureReason,
+  RunStopReason,
   HealthFlag,
   LimitWaitPanel,
   RunView,
@@ -113,6 +114,7 @@ function run(over: Partial<Run>): Run {
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    stop_reason: null,
     health: "ok",
     health_reason: null,
     health_since: null,
@@ -784,6 +786,65 @@ describe("RunFailureReason — the worker-supplied failure reason (#124, text ch
       <RunFailureReason run={run({ failure_reason: null })} />,
     );
     expect(container.textContent).toBe("");
+  });
+});
+
+// Issue #525: the operator's free-text cancel reason. It rides the owner-scoped run DTO
+// and is rendered in the stopped/failed hero beside failure_reason — the live-poller cancel
+// path leaves failure_reason the generic "run cancelled", so this is the line that says WHY.
+// Untrusted free text, same channel as failure_reason, so it must go through stripUnsafeChars.
+describe("RunStopReason — the operator's cancel reason (#525, text channel)", () => {
+  it("renders the reason (bidi/zero-width stripped) for a stopped run that carries one", () => {
+    const { container } = render(
+      <RunStopReason
+        run={run({
+          status: "cancelled",
+          stop_kind: "cancelled",
+          stop_reason: "wrong \u202Ebranch\u200B, restarting",
+        })}
+      />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(container.textContent).toBe("Reason: wrong branch, restarting");
+  });
+
+  it("renders nothing when there is no stop reason", () => {
+    const { container } = render(
+      <RunStopReason run={run({ status: "cancelled", stop_kind: "cancelled", stop_reason: null })} />,
+    );
+    expect(container.textContent).toBe("");
+  });
+
+  // The page-level wiring: <RunStopReason run={run} /> lives in the stopped/failed hero
+  // panel (RunView.tsx, gated on terminal && status !== "completed"), which the direct
+  // component tests above never reach — removing that page render would keep them green.
+  // This renders the WHOLE RunView page for a cancelled run carrying bidi/zero-width runes
+  // and asserts the sanitized "Reason: ..." line surfaces there, with the same Cf check.
+  it("surfaces the sanitized cancel reason on the full RunView page for a cancelled run", async () => {
+    mockUseRunStream.mockReturnValue({
+      run: run({
+        status: "cancelled",
+        stop_kind: "cancelled",
+        stop_reason: "wrong \u202Ebranch\u200B, restarting",
+      }),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const { container } = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    // Settle the page (the issue title renders in the heading).
+    await screen.findByText("Add rate limiting");
+    expect(container.textContent ?? "").toContain("Reason: wrong branch, restarting");
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
   });
 });
 

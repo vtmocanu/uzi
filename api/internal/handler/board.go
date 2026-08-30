@@ -122,6 +122,11 @@ type latestRunDTO struct {
 	// or "plan_rejected", null otherwise. The board badge reads it (not the
 	// failure_reason text) to render a deliberate stop as calm "stopped".
 	StopKind *string `json:"stop_kind"`
+	// StopReason is the operator's OPTIONAL free-text cancel reason (issue #525). Unlike
+	// the non-sensitive StopKind enum above, it is owner-gated below (assigned only when
+	// IsMine) exactly like FailureReason — a shared board must not leak another user's
+	// typed text (PRD #33 Decision 5). Null for a non-owner viewer and when no reason was given.
+	StopReason *string `json:"stop_reason"`
 	// Health is the run-health flag (PRD #47): ok|stalled|looping|slow|
 	// waiting_worker|approval_idle. Non-sensitive (like StopKind), so it rides the
 	// shared board card unconditionally — runBadge renders the warn variant only for
@@ -160,7 +165,7 @@ type latestRunDTO struct {
 // the email (PRD #33 Decision 5): a shared board must not leak another user's email
 // on a card, and the web already renders a no-owner badge for empty. The query no
 // longer even selects the email, so there is nothing to fall back to here.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind, stopReason pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
 	dto := &latestRunDTO{
 		ID:          runID.String(),
 		Status:      status,
@@ -183,6 +188,7 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 	// the elapsed for the badge.
 	if dto.IsMine {
 		dto.FailureReason = textPtrValue(failureReason.Valid, failureReason.String)
+		dto.StopReason = textPtrValue(stopReason.Valid, stopReason.String)
 		dto.HealthReason = textPtrValue(healthReason.Valid, healthReason.String)
 	}
 	if mrIID.Valid {
@@ -565,7 +571,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		dto := mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
-			rr.MrState, rr.FailureReason, rr.StopKind, rr.Health, rr.HealthReason, rr.HealthSince,
+			rr.MrState, rr.FailureReason, rr.StopKind, rr.StopReason, rr.Health, rr.HealthReason, rr.HealthSince,
 			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 		dto.IsRevising = revising[rr.ID] // nil map ⇒ false (issue #750)
 		latestByIID[rr.IssueIid.Int64] = dto
@@ -919,7 +925,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
-			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -1023,7 +1029,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	card := issueToCard(updated, position, repo.ForgeType)
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
-			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {

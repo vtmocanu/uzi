@@ -77,6 +77,7 @@ function runFixture(over: Partial<Run> = {}): Run {
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    stop_reason: null,
     health: "ok",
     health_reason: null,
     health_since: null,

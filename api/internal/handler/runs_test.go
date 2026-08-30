@@ -238,6 +238,28 @@ func TestRunToDTOStopKind(t *testing.T) {
 	}
 }
 
+// TestRunToDTOStopReason pins that the operator's free-text cancel reason (issue #525)
+// reaches the RunDTO runToDTO builds, mirroring the StopKind mapping above. Both
+// directions: a stamped reason surfaces, and a NULL column becomes nil rather than "".
+func TestRunToDTOStopReason(t *testing.T) {
+	stamped := runToDTO(store.Run{
+		Status:     "cancelled",
+		StopReason: pgtype.Text{String: "wrong approach, restarting", Valid: true},
+	}, "normal")
+	if stamped.StopReason == nil {
+		t.Fatal("a stamped stop_reason must reach the RunDTO, got nil")
+	}
+	if *stamped.StopReason != "wrong approach, restarting" {
+		t.Errorf("stop_reason = %q, want %q", *stamped.StopReason, "wrong approach, restarting")
+	}
+
+	// NULL column ⇒ nil pointer (omitted from JSON), never "".
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal")
+	if unstamped.StopReason != nil {
+		t.Errorf("an unstamped stop_reason must map to nil, got %q", *unstamped.StopReason)
+	}
+}
+
 // TestRunToDTORequirementSet pins that PRD #84's inferred/hinted requirement set reaches the
 // RunDTO runToDTO builds: required_capabilities and required_tools surface their values and
 // are normalized to a non-nil empty slice ([] over null) when the column is empty, and
