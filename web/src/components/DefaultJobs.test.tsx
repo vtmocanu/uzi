@@ -215,9 +215,9 @@ describe("DefaultJobs — catalog row", () => {
 
   it("renders a labelless assigned sweep without crashing", () => {
     // Regression for the /schedules black-screen: the shipped assigned-sweep default carries
-    // labels: null, and the options cell read entry.labels.map() unguarded (DefaultJobs.tsx
-    // :308), so the tab threw on first render. Rendering the row must not throw, and with no
-    // labels no "label …" chip is emitted.
+    // labels: null, and the options cell read entry.labels.map() unguarded, so the tab threw
+    // on first render. Rendering the row must not throw, and with no labels no "label …" chip
+    // is emitted.
     renderTab({
       catalog: catalog([entry({ slug: "assigned-sweep", name: "Assigned sweep", labels: null })]),
     });
