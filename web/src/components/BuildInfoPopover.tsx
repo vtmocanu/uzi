@@ -383,7 +383,7 @@ export function BuildInfoPopover({
         className={cx(
           "block w-full truncate text-left font-mono text-faint transition-colors",
           "hover:bg-raised hover:text-fg focus-visible:text-fg",
-          collapsed ? "px-1 py-1.5 text-center text-[9px]" : "px-3 py-1.5 text-[10px]",
+          collapsed ? "px-1 py-1.5 text-center text-[9px]" : "px-1.5 py-1.5 text-[10px]",
         )}
       >
         {label}
@@ -426,21 +426,21 @@ export function BuildInfoPopover({
           // else for a 226px panel to go, and it is why the no-clipping note above
           // matters.
           //
-          // WIDTH and inset are BOTH state-dependent, and they trade against each
-          // other on the expanded rail. Expanded the rail is 240px (`w-60`,
-          // AppShell.tsx); the panel's left edge is host `px-3` (12px) + this inset,
-          // so a fixed 226px panel at `left-2` reached x=246 and spilled 6px past the
-          // rail onto <main>. Fitting it needs BOTH the wider room `left-1` buys and a
-          // bounded width: at `left-1` the left edge is 12 + 4 = 16, so width 222 →
-          // right 238, i.e. a 2px gap inside the 240 rail. 222 (not less) because the
-          // widest row — Built, a 21-glyph `29 Aug 2026 20:57 UTC` in mono — needs a
-          // ~132px value column, and the value column is width − 88 (p-3 24 + border 2
-          // + label-col 50 + gap-x-3 12); 222 − 88 = 134 clears it, 218 (130) wrapped
-          // `UTC` to a second line on Linux mono stacks (measured in a real browser;
-          // jsdom does no layout so the unit test can only assert the width is
-          // state-dependent). Collapsed keeps `left-1 w-[226px]` — a 56px rail cannot
-          // contain any reasonable width, so its overhang stays as documented above.
-          collapsed ? "left-1 w-[226px]" : "left-1 w-[222px]",
+          // WIDTH and inset are BOTH state-dependent. Expanded the panel is CENTERED
+          // in the rail. The rail is 240px (`w-60`, AppShell.tsx); the panel's left
+          // edge is host `px-3` (12px) + this inset, so `-left-[3px]` puts it at
+          // 12 − 3 = 9px, and width 222 → right edge 231. That leaves a 9px gap on the
+          // left and 240 − 231 = 9px on the right — equal gaps, i.e. the panel sits
+          // centered in the rail rather than pinned to one side. 222 (not less)
+          // because the widest row — Built, a 21-glyph `29 Aug 2026 20:57 UTC` in
+          // mono — needs a ~132px value column, and the value column is width − 88
+          // (p-3 24 + border 2 + label-col 50 + gap-x-3 12); 222 − 88 = 134 clears it,
+          // 218 (130) wrapped `UTC` to a second line on Linux mono stacks (measured in
+          // a real browser; jsdom does no layout so the unit test can only assert the
+          // inset and width are state-dependent). Collapsed keeps `left-1 w-[226px]` —
+          // a 56px rail cannot contain any reasonable width, so its overhang stays as
+          // documented above.
+          collapsed ? "left-1 w-[226px]" : "-left-[3px] w-[222px]",
           "transition-opacity duration-150 motion-reduce:transition-none",
           open ? "opacity-100" : "pointer-events-none opacity-0",
         )}
