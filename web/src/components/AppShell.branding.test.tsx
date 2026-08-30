@@ -6,11 +6,12 @@ import { AppShell, __resetBrandingForTests } from "./AppShell";
 import { api, type Branding } from "../lib/api";
 import { DEFAULT_TITLE } from "../lib/brandTitle";
 import { useAuth } from "../auth/AuthContext";
+import { licenseCreditEnabled } from "../lib/flags";
 import { mockBuildInfo } from "../mocks/data";
 
 // Instance-branding chrome (PRD #685 M3a): the custom app mark across all four
 // surfaces (desktop aside, mobile drawer, signed-out PublicShell, mobile signed-in
-// top bar) and the durable MIT © Vlad Mocanu credit.
+// top bar) and the build-flag-gated MIT © Vlad Mocanu credit (default hidden).
 //
 // The app mark is asserted on the HTML <img> handle (data-testid="app-logo-img" /
 // alt="app logo"), NEVER role="img": the inline FactoryIcon renders through an
@@ -48,6 +49,9 @@ vi.mock("../lib/api", () => ({
   },
 }));
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+// Auto-mocked: licenseCreditEnabled becomes a vi.fn(). beforeEach defaults it to
+// false (credit hidden); tests that need the credit shown flip it to true.
+vi.mock("../lib/flags");
 
 const mockApi = vi.mocked(api);
 
@@ -94,6 +98,10 @@ beforeEach(() => {
   signIn();
   mockApi.version.mockResolvedValue(mockBuildInfo);
   mockApi.branding.mockResolvedValue(DEFAULT_BRANDING);
+  // Default the build-time credit flag OFF (hidden); tests that assert the credit
+  // renders flip it to true explicitly. Reset so no test leaks its return value.
+  vi.mocked(licenseCreditEnabled).mockReset();
+  vi.mocked(licenseCreditEnabled).mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -116,11 +124,12 @@ function renderShell(initial = "/dashboard") {
 // substring regex because PublicShell/mobile render it as "· uzinele întunecate".
 const NAME_RE = /uzinele întunecate/;
 
-describe("AppShell branding — durable credit (D3)", () => {
+describe("AppShell branding — build-flag-gated credit", () => {
   // FIRST in the file, deliberately: buildInfoPromise has no reset seam, so this is
   // the only test guaranteed a cold build memo. It leaves version pending to prove
   // the credit renders while BOTH branding and build are unresolved.
   it("renders the license credit while branding and build are still in flight", () => {
+    vi.mocked(licenseCreditEnabled).mockReturnValue(true);
     mockApi.branding.mockReturnValue(new Promise<Branding>(() => {}));
     mockApi.version.mockReturnValue(new Promise(() => {}));
     renderShell();
@@ -129,6 +138,7 @@ describe("AppShell branding — durable credit (D3)", () => {
   });
 
   it("still renders the credit under full white-label settings (signed-in)", async () => {
+    vi.mocked(licenseCreditEnabled).mockReturnValue(true);
     mockApi.branding.mockResolvedValue(
       brandingWith({ app_logo_mode: "custom", app_logo_present: true, app_logo_keep_name: false }),
     );
@@ -138,14 +148,32 @@ describe("AppShell branding — durable credit (D3)", () => {
   });
 
   it("renders the credit on the signed-out shell too", async () => {
+    vi.mocked(licenseCreditEnabled).mockReturnValue(true);
     signOut();
     renderShell("/");
     expect((await screen.findByTestId("license-credit")).textContent).toBe("MIT © Vlad Mocanu");
   });
 
   it("hides the credit when the sidebar is collapsed", () => {
+    // Flag ON so absence proves the collapse behavior, not the flag default.
+    vi.mocked(licenseCreditEnabled).mockReturnValue(true);
     window.localStorage.setItem("uzi.sidebar.collapsed", "true");
     renderShell();
+    expect(screen.queryAllByTestId("license-credit")).toHaveLength(0);
+  });
+
+  // Default-OFF coverage: with the build flag off (the shipped default) the credit
+  // is absent on every surface, whether or not the sidebar is collapsed.
+  it("flag OFF (default): no credit on the signed-in shell", async () => {
+    renderShell();
+    await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
+    expect(screen.queryAllByTestId("license-credit")).toHaveLength(0);
+  });
+
+  it("flag OFF (default): no credit on the signed-out shell", async () => {
+    signOut();
+    renderShell("/");
+    await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
     expect(screen.queryAllByTestId("license-credit")).toHaveLength(0);
   });
 });
@@ -393,11 +421,14 @@ describe("AppShell branding — POWERED BY block", () => {
   });
 });
 
-// The M4 one-row footer (D-follow-up): the version badge (left) and the durable
-// license credit (right) share a single `justify-between` row when expanded, and the
-// credit is ungated — it renders during the /api/version load and on its failure.
+// The M4 one-row footer (D-follow-up): the version badge (left) and the license
+// credit (right) share a single `justify-between` row when expanded. The credit is
+// the DOM anchor for these layout assertions, so each test flips the build flag ON
+// (otherwise the credit is absent and findByTestId times out); when the flag is on
+// the credit renders during the /api/version load and on its failure.
 describe("AppShell branding — one-row footer", () => {
   it("expanded: the license credit sits in a justify-between row with the version badge", async () => {
+    vi.mocked(licenseCreditEnabled).mockReturnValue(true);
     renderShell();
     const credit = await screen.findByTestId("license-credit");
     const row = credit.parentElement as HTMLElement;
@@ -407,6 +438,7 @@ describe("AppShell branding — one-row footer", () => {
   });
 
   it("credit still renders (in the row) before the version resolves", async () => {
+    vi.mocked(licenseCreditEnabled).mockReturnValue(true);
     mockApi.version.mockReturnValue(new Promise(() => {}));
     renderShell();
     const credit = await screen.findByTestId("license-credit");
@@ -418,6 +450,7 @@ describe("AppShell branding — one-row footer", () => {
   // half-width BuildInfoPopover host inside it. Pair the POSITIVE (border-t now on
   // the row) with the retained justify-between so neither assertion goes vacuous.
   it("expanded: the footer row carries the full-width border-t divider", async () => {
+    vi.mocked(licenseCreditEnabled).mockReturnValue(true);
     renderShell();
     const credit = await screen.findByTestId("license-credit");
     const row = credit.parentElement as HTMLElement;

@@ -70,13 +70,16 @@ its own tile.
 on `uzi` and POWERED BY starts off, so nobody sees a preset or a
 co-brand unless an admin deliberately turns branding on.
 
-## The license credit is fixed
+## The license credit
 
-`MIT © Vlad Mocanu` is shown on the sidebar footer row (alongside the
-build/version badge) and on the signed-out footer. It is not part of
-branding and can't be turned off, replaced, or hidden by any combination
-of branding settings — including full white-label. Only collapsing the
-sidebar hides it, the same as everything else in that row.
+`MIT © Vlad Mocanu` is **hidden by default** and shown only when a
+build-time code flag is turned on. That flag (`SHOW_LICENSE_CREDIT`, a
+source constant edited by hand and picked up on the next rebuild) is not
+an admin or branding setting, so no combination of branding settings —
+including full white-label — can turn it on, off, or replace it. When the
+flag is on, the credit renders on the sidebar footer row (alongside the
+build/version badge) and on the signed-out footer, and collapsing the
+sidebar hides it the same as everything else in that row.
 
 ## Setting it up
 

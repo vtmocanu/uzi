@@ -17,6 +17,7 @@ import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
 import { brandTabTitle } from "../lib/brandTitle";
+import { licenseCreditEnabled } from "../lib/flags";
 import { JudgeTodoContext, JudgeTodoValueContext } from "./JudgeTodoContext";
 import { BuildInfoPopover } from "./BuildInfoPopover";
 import { ChangelogDrawer } from "./ChangelogDrawer";
@@ -292,14 +293,16 @@ function AppMark({ branding, className }: { branding: Branding | null; className
   );
 }
 
-// The durable license/author credit (PRD #685 Decision D3). A build-time CONSTANT,
-// never a setting — a rebrand or full white-label cannot strip it. Rendered
-// independently of the build-info fetch so it shows during load and on fetch
-// failure, on both the signed-in sidebar footer and the signed-out shell. `©`
-// (U+00A9), not `·`.
+// The license/author credit, gated on the build-time source constant
+// SHOW_LICENSE_CREDIT (see lib/flags.ts), default OFF (hidden). Still never a
+// setting — a rebrand or full white-label cannot show or strip it; only editing
+// the source flag and rebuilding does. When enabled it renders independently of
+// the build-info fetch (so it shows during load and on fetch failure) on both
+// the signed-in sidebar footer and the signed-out shell. `©` (U+00A9), not `·`.
 const LICENSE_CREDIT = "MIT © Vlad Mocanu";
 
 function LicenseCredit({ className }: { className?: string }) {
+  if (!licenseCreditEnabled()) return null;
   return (
     <span data-testid="license-credit" className={cx("font-mono text-[10px] text-faint", className)}>
       {LICENSE_CREDIT}
