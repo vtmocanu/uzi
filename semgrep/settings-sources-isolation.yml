@@ -1,0 +1,61 @@
+# GUARDRAIL INVARIANT #6 -- the agent SDK is configured with `settingSources: []`
+# and that isolation must never be widened (PRD #862 M3).
+#
+# WHAT THIS ENFORCES. Every place the agent worker constructs an SDK query passes
+# `settingSources: []`, a repo-borne prompt-injection defense: with no setting
+# sources the SDK never loads a checked-out repo's `.claude/` (settings, agents,
+# skills, instructions) as configuration, so a hostile repo cannot widen the
+# agent's own permissions from inside its own tree. See ARCHITECTURE.md's
+# guardrails section and agent/src/sdk-executor.ts (the lead executor, the widest
+# blast radius of the five sites). There are exactly five real assignments today
+# -- judge-runner.ts, sdk-executor.ts, chat-executor.ts, summary-runner.ts,
+# review-runner.ts -- and ALL are `settingSources: []`. This rule forbids any
+# other value.
+#
+# THE PATTERN. `settingSources: $X` matches every assignment; `pattern-not:
+# settingSources: []` subtracts the exact empty-array literal. So the clean tree
+# (all five sites `[]`) yields ZERO findings, while any EXPLICIT non-empty VALUE
+# fires: an array with elements (`settingSources: ["project"]`), a variable
+# (`settingSources: someVar`), or any other expression in the value position.
+# semgrep parses TypeScript, so the many `settingSources: []` mentions in COMMENTS
+# across agent/src never match -- only real syntax does.
+#
+# 🔴 RELIABILITY BOUNDARY -- THIS RULE CATCHES A WIDENED VALUE, NOT A DROPPED KEY.
+# The SDK default is FAIL-OPEN: the type doc says an OMITTED `settingSources` loads
+# ALL sources (the checked-out repo's `.claude/`), which is the exact vector this
+# invariant blocks. This rule matches on the KEY being present with a non-empty
+# value, so it does NOT fire when the key is deleted from an existing site or a new
+# `query(...)` site omits it entirely. Catching omission cannot be done cleanly
+# here: the options are assembled once as `baseOptions` (with `settingSources: []`)
+# and spread into the query as `{ ...baseOptions, ... }` (sdk-executor.ts:1430,
+# :2226; chat-executor.ts:436), so a "the query object must contain
+# settingSources: []" rule would false-positive on every legitimate spread site.
+# That is the same intraprocedural/structural limit that sends invariants #1/#4/#2
+# to CodeQL; the property "every SDK query site sets []" is a review + test concern,
+# and this rule guards the narrower, cleanly-expressible half (no explicit widening).
+#
+# POSITIVE CONTROL (verified before commit): temporarily changing any site to
+# `settingSources: ["project"]` fires; a variable form `settingSources: someVar`
+# fires; reverting to `[]` returns to zero.
+# NEGATIVE CONTROL: the committed tree reports zero findings. (Dropping the key
+# entirely is the boundary above -- it does NOT fire, by design.)
+rules:
+  - id: settingsources-must-be-empty
+    languages: [typescript]
+    severity: ERROR
+    message: >-
+      settingSources must stay `[]`. This is guardrail invariant #6, the
+      repo-borne prompt-injection defense that stops the SDK loading a
+      checked-out repo's .claude/ as configuration. A non-empty settingSources
+      (an array with elements, or a variable) lets a hostile repo widen the
+      agent's own permissions from inside its tree. See ARCHITECTURE.md's
+      guardrails section and agent/src/sdk-executor.ts; keep it `[]`.
+    paths:
+      # Root-anchored (leading `/`) to silence semgrep's Semgrepignore-v2
+      # deprecation warning about bare relative includes, mirroring canary.yml.
+      # The gate scans `.` from the repo root, so this resolves to agent/src/.
+      include:
+        - /agent/src
+    patterns:
+      - pattern: "settingSources: $X"
+      - pattern-not: "settingSources: []"

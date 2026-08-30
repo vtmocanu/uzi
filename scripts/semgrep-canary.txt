@@ -1,0 +1,35 @@
+SEMGREP CANARY -- DO NOT DELETE, DO NOT "FIX", DO NOT ANNOTATE (PRD #862 M2)
+================================================================================
+
+The token on the last line of this file is a FAKE, INERT marker. It matches
+nothing real and means nothing anywhere. It exists so that
+`scripts/semgrep-gate.sh` can assert, on every run, that the semgrep it just
+invoked was actually looking BEFORE it believes semgrep's "0 findings" verdict.
+
+WHY A PLANTED MATCH IS THE CHEAPEST HONEST CHECK
+--------------------------------------------------------------------------------
+A SAST gate whose healthy state is silence cannot tell "the tree is clean" from
+"the scanner never ran" -- a broken config, an unreadable rules dir, or a
+semgrep that aborted before scanning all produce the same empty report and the
+same green. So the wrapper runs the proof rule (`semgrep/canary.yml`) against
+THIS file first and requires it to FIRE. If the canary is not detected, the
+scanner was blind and the wrapper exits 2 (instrument broken), never 0. A clean
+gate run is thus a positive observation that semgrep looked, not an absence of
+complaint -- the same discipline as `scripts/gitleaks-canary.txt`.
+
+The proof rule is `paths`-scoped to this exact file, so it can ONLY ever match
+here and never fires on real code. The gate run separately EXCLUDES this file so
+the canary contributes nothing to the gate's own verdict.
+
+WHAT BREAKS IF YOU TOUCH THIS FILE
+--------------------------------------------------------------------------------
+* Delete it, move it, or rename it        -> `task sast:semgrep` exits 2.
+* `git rm --cached` it (untrack it)       -> exits 2 (a canary out of the index
+  attests liveness over a population the gate does not gate on).
+* Change the token so it no longer matches `semgrep/canary.yml` -> exits 2.
+
+Exit 2 is this repo's "the instrument is broken", never "there are findings".
+The wrapper's message names this file and this paragraph.
+
+--------------------------------------------------------------------------------
+SEMGREP_GATE_CANARY_DO_NOT_REMOVE

@@ -57,6 +57,12 @@ linters:
     #   `--report-unused-disable-directives-severity=error` (see `lint:web`'s
     #   comment in Taskfile.yml for why). The Go half had no such guard.
     - nolintlint
+    # gosec — security linter for Go; rides the ratchet, so only branch-introduced
+    #   findings gate (PRD #862 M1). No settings.gosec exclusions yet.
+    - gosec
+    # depguard — enforces invariant #7: forge SDKs only via internal/forge. Rule in
+    #   settings.depguard below; zero violations on the current tree (PRD #862 M1).
+    - depguard
 
   # EVERY DISABLED LINTER OWES A ONE-LINE JUSTIFICATION (git-manager's convention,
   # adopted by PRD #103 M3). Two are disabled deliberately and both would otherwise
@@ -183,6 +189,46 @@ linters:
       allow-unused: false
       require-explanation: true
       require-specific: true
+
+    depguard:
+      rules:
+        forge-sdk-isolation:
+          # Invariant #7 (PRD #862): the forge SDK clients are used ONLY behind the
+          # internal/forge interface. Deny the raw SDK imports everywhere except the
+          # driver package itself (the `files` glob excludes the forge package). Zero
+          # violations on the current tree.
+          #
+          # 🔴 THE EXCLUDE IS `!**/internal/forge/**`, NOT the broader `!**/forge/**`.
+          # `files:` DOES use glob semantics (unlike `pkg:` above), and a bare
+          # `**/forge/**` would exempt ANY directory named `forge` anywhere in the
+          # tree, so a raw SDK import under some unrelated `.../forge/` would silently
+          # bypass the rule. `internal/forge` is specific to the one real driver
+          # package (`api/internal/forge`) AND matches whether golangci feeds depguard
+          # module-relative paths (`internal/forge/gitlab.go`, under `dir: api`) or
+          # absolute ones (`.../api/internal/forge/...`) — narrowing further to
+          # `api/internal/forge` would miss the module-relative form and re-flag the
+          # driver files themselves. Verified: 0 violations (drivers still excluded).
+          #
+          # 🔴 `pkg:` MATCHES BY PREFIX, NOT GLOB — do not "wildcard" these paths.
+          # depguard (v2, as bundled in golangci-lint 2.12.2) matches deny entries as
+          # package-tree PREFIXES; a `**`/`*` in `pkg:` is taken LITERALLY and matches
+          # nothing, so a glob'd rule reports a SILENT FALSE ZERO (measured 2026-08-30:
+          # `github.com/google/go-github/**` flagged neither a probe import in
+          # internal/handler nor the real driver imports). The bare module-path prefix
+          # is what a renovate major bump can't escape: `github.com/google/go-github`
+          # already covers `.../v90/github` and a future `.../v91/...`, and
+          # `gitlab.com/gitlab-org/api/client-go` already covers its `/v2` suffix.
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/forge/**"
+          deny:
+            - pkg: "github.com/google/go-github"
+              desc: "forge SDKs only via the internal/forge interface (PRD #862 invariant #7)"
+            - pkg: "code.gitea.io/sdk/gitea"
+              desc: "forge SDKs only via the internal/forge interface (PRD #862 invariant #7)"
+            - pkg: "gitlab.com/gitlab-org/api/client-go"
+              desc: "forge SDKs only via the internal/forge interface (PRD #862 invariant #7)"
 
   exclusions:
     rules:

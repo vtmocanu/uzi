@@ -1,0 +1,29 @@
+# POSITIVE CONTROL for the semgrep gate (PRD #862 M2).
+#
+# DO NOT DELETE, DO NOT DISABLE, DO NOT ANNOTATE. This single rule is what proves
+# `scripts/semgrep-gate.sh` actually invoked a working semgrep before it believes
+# a "0 findings" verdict on the real tree. The wrapper runs this rule against
+# scripts/semgrep-canary.txt and REQUIRES it to fire; if it does not, the scanner
+# was blind and the gate exits 2 (instrument broken), never a vacuous green.
+#
+# It is `paths`-scoped to the canary file alone, so it can only ever match there
+# and never fires on real code. The gate run excludes the canary file, so this
+# rule contributes nothing to the gate's own verdict. Mirror of
+# scripts/gitleaks-canary.txt's role for the secret scanner.
+#
+# This is NOT an invariant rule -- the real uzi guardrail rules are PRD #862 M3.
+rules:
+  - id: semgrep-canary
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      semgrep canary fired: the SAST scanner is live. This match is expected and
+      proves scripts/semgrep-gate.sh actually ran semgrep. It is never a real
+      finding.
+    paths:
+      # Root-anchored (leading `/`) so it matches ONLY this file at the repo root
+      # and never fires elsewhere. The anchored form also silences semgrep's
+      # Semgrepignore-v2 deprecation warning about bare relative includes.
+      include:
+        - /scripts/semgrep-canary.txt
+    pattern-regex: SEMGREP_GATE_CANARY_DO_NOT_REMOVE

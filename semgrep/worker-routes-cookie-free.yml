@@ -1,0 +1,104 @@
+# GUARDRAIL INVARIANT #3 -- worker/controller routes are Bearer-only and must
+# never read the session cookie or a CSRF token (PRD #862 M3).
+#
+# WHAT THIS ENFORCES. Worker and controller routes authenticate via a Bearer join
+# token -- middleware/worker_auth.go RequireWorker (sha256 lookup against
+# workers.token_hash) and middleware/controller_auth.go RequireController -- NOT
+# the browser session-cookie + CSRF path (middleware/auth.go RequireAuth). The
+# credential is a bearer secret the worker holds, not an ambient cookie a browser
+# auto-sends, so these handlers have no reason to read a request cookie or to call
+# CSRF validation. A cookie/CSRF read in one of these files is a guardrail
+# regression: it means a worker/controller handler has started trusting the
+# session credential it must never see.
+#
+# THE PATTERN. `pattern-either` over the request-side read APIs -- `$R.Cookie(...)`
+# and `$R.Cookies(...)` (the *http.Request cookie readers) and
+# `auth.ValidateCSRF(...)` (the only exported CSRF read helper; the auth package's
+# other cookie funcs, SetAuthCookies/ClearAuthCookies, are WRITES and are
+# deliberately NOT matched -- this invariant is about READING the session
+# credential, not setting it on a response). Today the only cookie/CSRF reads in
+# the whole handler+middleware tree are middleware/auth.go (RequireAuth) and
+# handler/oidc.go (the OIDC state cookie) -- none in a worker/controller handler --
+# so on the clean tree this scoped rule reports ZERO findings.
+#
+# 🔴 RELIABILITY BOUNDARY. This rule is FILE-GLOB-SCOPED (the paths below), so it
+# guards only the KNOWN worker/controller handler files by name, and the glob is a
+# NAME proxy for the real "mounted under RequireWorker/RequireController" property.
+# Two consequences, in both directions:
+#   * UNDER-inclusion: a NEW worker handler added in a differently-named file
+#     ESCAPES it until the glob is widened.
+#   * OVER-inclusion: `worker_upgrade_summary.go` matches `worker_*.go` by name but
+#     its handler (WorkerUpgradeSummary) is mounted under RequireUser, not
+#     RequireWorker (handler.go, the /me/workers group) -- a legitimately
+#     cookie-capable USER route. It is `paths.exclude`d below so a future, valid
+#     cookie read there is not falsely blocked.
+# semgrep here guards the syntactic shape in the known Bearer-only files; CODE
+# REVIEW is the backstop for the differently-named-handler gap. There is NO
+# route-enumeration test asserting the cookie-free property today:
+# route_limiter_mounts_test.go walks h.Routes but checks rate-limiter mounts, not
+# the auth boundary, and the per-handler auth tests cover specific handlers, not the
+# whole set. A real route-auth-enumeration test (walk h.Routes, assert every
+# worker/controller route's chain includes RequireWorker/RequireController and reads
+# no cookie) is the proper completeness backstop and is tracked as a follow-up. Keep
+# the include glob (and this exclude) in sync when a worker handler file is added or
+# re-authenticated.
+#
+# The pattern covers both the typed accessor (`r.Cookie(...)`) and the raw-header
+# spellings a handler could use to go around it -- `r.Header.Get("Cookie")` and
+# `r.Header["Cookie"]` -- and it is SYMMETRIC on CSRF: the exported
+# `auth.ValidateCSRF(...)` helper plus a raw read of the CSRF header, literal
+# `r.Header.Get("X-CSRF-Token")` or via the `auth.CSRFHeaderName` constant, and the
+# map-index form. Without the raw CSRF spellings the rule would block reading the
+# cookie by hand but silently allow reading the session CSRF token by hand -- an
+# asymmetric gap in a rule whose purpose is to block the session credential either
+# way. It does NOT chase a read hidden behind a helper in another file
+# (intraprocedural limit) -- that is what code review (and the follow-up
+# route-auth-enumeration test) is for.
+#
+# POSITIVE CONTROL (verified before commit): temporarily adding
+# `_, _ = r.Cookie("x")` inside a handler in e.g. worker_findings.go fires;
+# reverting returns to zero.
+# NEGATIVE CONTROL: the committed tree reports zero findings, and the three
+# legitimate cookie/CSRF readers (middleware/auth.go, handler/oidc.go) are outside
+# this scope so they never fire.
+rules:
+  - id: worker-routes-no-cookie
+    languages: [go]
+    severity: ERROR
+    message: >-
+      Worker/controller routes are Bearer-only (guardrail invariant #3):
+      middleware/worker_auth.go RequireWorker / controller_auth.go
+      RequireController authenticate a Bearer join token, not the session
+      cookie + CSRF path. A request-cookie or CSRF read here is a guardrail
+      regression -- this handler must never trust the session credential.
+      Remove the r.Cookie/r.Cookies/auth.ValidateCSRF call.
+    paths:
+      # Root-anchored (leading `/`) to silence semgrep's Semgrepignore-v2
+      # deprecation warning about bare relative includes, mirroring canary.yml.
+      # The gate scans `.` from the repo root, so these resolve under
+      # api/internal/handler/. semgrep's defaults skip *_test.go, so this scopes
+      # to the production handler files.
+      include:
+        - /api/internal/handler/worker_*.go
+        - /api/internal/handler/controller_*.go
+        - /api/internal/handler/judge_worker.go
+        - /api/internal/handler/task_review.go
+      # worker_upgrade_summary.go matches worker_*.go by NAME but is a RequireUser
+      # (cookie-capable) route, not a Bearer worker route -- see the reliability
+      # boundary above. Excluded so a valid cookie read there never false-positives.
+      exclude:
+        - /api/internal/handler/worker_upgrade_summary.go
+    pattern-either:
+      - pattern: $R.Cookie(...)
+      - pattern: $R.Cookies(...)
+      # Raw-header reads of the session cookie, both spellings a handler could use
+      # to go around r.Cookie: Header.Get and direct map indexing.
+      - pattern: $R.Header.Get("Cookie")
+      - pattern: $R.Header["Cookie"]
+      # CSRF read, symmetric with the cookie coverage above: the exported helper AND
+      # a raw read of the CSRF header (literal or via auth.CSRFHeaderName), so a
+      # handler cannot read the session CSRF token by bypassing auth.ValidateCSRF.
+      - pattern: auth.ValidateCSRF(...)
+      - pattern: $R.Header.Get("X-CSRF-Token")
+      - pattern: $R.Header.Get(auth.CSRFHeaderName)
+      - pattern: $R.Header["X-CSRF-Token"]
