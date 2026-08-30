@@ -14,6 +14,8 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     expect(entries.map((e) => e.slug).sort()).toEqual(
       ["assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "self-improve", "test-improvement"].sort(),
     );
+    // The assigned sweep selects by assignee, not by label, so its catalog labels stay null.
+    expect(entries.find((e) => e.slug === "assigned-sweep")?.labels).toBeNull();
     // bug-triage is enabled on TWO repos (Layout A), one of them paused.
     const bt = enablements.filter((e) => e.slug === "bug-triage");
     expect(bt.map((e) => e.repo_id).sort()).toEqual(["repo-atlas", "repo-uzi"]);
