@@ -11,9 +11,18 @@
 #
 # Exit codes:
 #   0  an mr_rework run reached terminal; prints MRREWORK_ID / MRREWORK_STATUS
-#   2  budget elapsed with NO mr_rework run ever seen (fall back to a local fix)
+#   2  budget elapsed with NO mr_rework run seen AND the poll that ended the budget
+#      SUCCEEDED (a confirmed empty result) — safe to fall back to a local fix
 #   3  budget elapsed while a run was still non-terminal (still reworking; re-run me)
 #   4  the OWNER/REPO could not be resolved to a uzi repo id
+#   5  budget elapsed but the polls were UNRELIABLE (every poll, or the final one,
+#      failed — `uzi run list` errored or returned non-JSON), so "never fired" is NOT
+#      established: do NOT fall back to a local fix on this; re-run or investigate.
+#
+# The exit-2-vs-5 split is load-bearing: a failed listing must never masquerade as a
+# confirmed-empty "no run", or a transient `uzi`/network blip would greenlight a local
+# fix while mr_rework is in fact mid-flight — recreating the double-push collision this
+# poller exists to prevent.
 set -uo pipefail
 
 REPO_SLUG=${1:?usage: wait-mrrework.sh OWNER/REPO PR [max_ticks] [interval_s]}
@@ -30,9 +39,20 @@ fi
 
 seen_id=""
 last_status=""
+ok_polls=0        # count of polls where `uzi run list` returned valid JSON
+last_poll_ok=0    # was the MOST RECENT poll a successful (valid-JSON) listing?
 for i in $(seq 1 "$MAX"); do
-  row=$(uzi run list --json 2>/dev/null | jq -r \
-    --arg repo "$REPO_ID" --argjson pr "$PR" \
+  # Separate a command/parse FAILURE from a successful-but-empty listing: pipefail alone
+  # can't, because the jq at the tail masks `uzi run list`'s exit status. Capture raw
+  # output + rc, then validate it is JSON before trusting an "empty" result.
+  raw=$(uzi run list --json 2>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$raw" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    last_poll_ok=0
+    echo "$(date +%H:%M:%S) tick $i/$MAX: poll FAILED (uzi run list rc=$rc or non-array JSON) — NOT counted as 'no run'"
+    sleep "$INT"; continue
+  fi
+  ok_polls=$((ok_polls + 1)); last_poll_ok=1
+  row=$(printf '%s' "$raw" | jq -r --arg repo "$REPO_ID" --argjson pr "$PR" \
     'first(.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr)) // {} | "\(.id // "")\t\(.status // "")"')
   id=$(printf '%s' "$row" | cut -f1)
   st=$(printf '%s' "$row" | cut -f2)
@@ -55,5 +75,11 @@ if [ -n "$seen_id" ]; then
   echo "BUDGET_ELAPSED: mr_rework $seen_id still $last_status (re-run to keep waiting)"
   exit 3
 fi
-echo "BUDGET_ELAPSED: no mr_rework run appeared for $REPO_SLUG#$PR — fall back to a local fix"
+# No run ever seen. Only call it "never fired" if the LAST poll was a confirmed empty
+# listing; if polls were failing (esp. at the end), "never fired" is not established.
+if [ "$ok_polls" -eq 0 ] || [ "$last_poll_ok" -ne 1 ]; then
+  echo "BUDGET_ELAPSED: polls UNRELIABLE ($ok_polls ok, last_poll_ok=$last_poll_ok) — 'never fired' NOT established; do NOT fall back to a local fix on this"
+  exit 5
+fi
+echo "BUDGET_ELAPSED: no mr_rework run appeared for $REPO_SLUG#$PR across $ok_polls confirmed polls — fall back to a local fix"
 exit 2
