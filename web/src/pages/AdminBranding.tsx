@@ -37,6 +37,7 @@ import {
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { FactoryIcon, PlusIcon } from "../components/icons";
+import { licenseCreditEnabled } from "../lib/flags";
 import {
   BRAND_PRESETS,
   presetAssetForSlug,
@@ -277,7 +278,7 @@ export function AdminBranding() {
   };
 
   return (
-    <AdminShell description="Replace the app mark and add a POWERED BY brand. Fresh installs are unbranded; the license/author credit in the chrome is fixed and cannot be removed here.">
+    <AdminShell description="Replace the app mark and add a POWERED BY brand. Fresh installs are unbranded; the license/author credit is controlled by a build-time flag, not a branding setting, so it cannot be changed here.">
       {loading ? (
         <Card>
           <Skeleton className="h-40 w-full" />
@@ -602,8 +603,11 @@ function BrandingPreview({
         </div>
       )}
 
-      {/* The durable, non-editable license/author credit (Decision D3). */}
-      <div className="mt-3 font-mono text-[10px] text-faint">MIT © Vlad Mocanu</div>
+      {/* The license/author credit, gated on the build-time source flag
+          SHOW_LICENSE_CREDIT (lib/flags.ts), default OFF/hidden — not admin-editable. */}
+      {licenseCreditEnabled() && (
+        <div className="mt-3 font-mono text-[10px] text-faint">MIT © Vlad Mocanu</div>
+      )}
     </div>
   );
 }

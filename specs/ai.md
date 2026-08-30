@@ -23281,3 +23281,13 @@ cannot provision tools (it worked on the live cluster only via an interim per-cl
   and credential exfil is already handled by the scrubbed provisioning env. No follow-up issue was filed.
   **Revisit only if egress-tightening becomes a hard requirement** (e.g. a compliance mandate to drop all
   GitHub/devbox hosts from worker egress).
+
+## 590. issue #833 — the license credit is a build-time source flag, default OFF (hidden)
+
+Serves human: instance branding / white-label. The `MIT © Vlad Mocanu` credit is gated on a
+build-time source constant `SHOW_LICENSE_CREDIT` in `web/src/lib/flags.ts` (default `false`), read
+through `licenseCreditEnabled()`. `AppShell`'s `LicenseCredit` component and the hardcoded credit in
+`AdminBranding` both early-return/skip when it is off, so the credit is hidden by default on every
+surface and shown only by editing the constant and rebuilding — still not an admin/branding setting.
+This supersedes PRD #685 D3's "durable / non-strippable" framing: the credit is no longer
+unconditionally present.
