@@ -373,7 +373,7 @@
   // (contrast openssl.bin/file.out/shellcheck.bin, whose CLI-bearing output is not `out`). No
   // meta.mainProgram is set, but bin/semgrep lands regardless. This rev carries semgrep 1.164.0;
   // its out-output narinfo (4dhfl2628wgqj25rm9m0mn28cp5x3lhq) is HTTP 200 on cache.nixos.org for
-  // x86_64-linux, so CI's amd64-only kaniko build SUBSTITUTES it rather than compiling
+  // x86_64-linux, so CI's amd64-only image build SUBSTITUTES it rather than compiling
   // semgrep-core from source — the non-negotiable condition for baking a tool in. Guard row is
   // `semgrep  semgrep  semgrep --version`. Added by hand-editing this file + the sibling
   // devbox.lock entry (never `devbox add`); locks as `source: "nixpkg"` at 20535e48….
