@@ -355,8 +355,8 @@ describe("IssueView Start gate (PRD #764)", () => {
   const openMRError = () =>
     new ApiError(
       409,
-      "issue #7 already has open MR !42 — merge or close it, or leave review comments on the MR to iterate, before starting a new run",
-      { code: "issue_has_open_mr" },
+      "issue #7 already has open MR !42 — merge or close it, or leave review comments on the MR to iterate, before starting a new run (pass --force to re-run anyway)",
+      { code: "issue_has_open_mr", mr_iid: 42 },
     );
 
   const renderWithRunRoute = () =>
@@ -389,8 +389,12 @@ describe("IssueView Start gate (PRD #764)", () => {
     await waitFor(() => expect(startBtn().disabled).toBe(false));
     fireEvent.click(startBtn());
 
+    // The confirm is web-composed: names the MR, states the action, no --force jargon.
     await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
-    expect(confirmSpy.mock.calls[0][0]).toContain("open MR !42");
+    const confirmMsg = confirmSpy.mock.calls[0][0] as string;
+    expect(confirmMsg).toContain("!42");
+    expect(confirmMsg).toContain("Start a new run anyway?");
+    expect(confirmMsg).not.toContain("--force");
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
     expect(mockApi.createRun.mock.calls[0]).toEqual(["repo-1", 7, undefined]);
     expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 7, true]);
@@ -414,6 +418,37 @@ describe("IssueView Start gate (PRD #764)", () => {
     expect(mockApi.createRun).toHaveBeenCalledTimes(1);
     // The coded-conflict message is not shown as an error alert on decline.
     expect(screen.queryByText(/already has open MR/)).toBeNull();
+    // The Start control is re-enabled after decline (starting state cleared): a
+    // stuck-in-"Starting…" regression would leave it disabled and fail here.
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    expect(screen.queryByText("Starting…")).toBeNull();
+    confirmSpy.mockRestore();
+  });
+
+  it("on the open-MR 409, a confirmed forced retry that fails clears starting (#856)", async () => {
+    setAuth();
+    runnable();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    mockApi.createRun
+      .mockRejectedValueOnce(openMRError())
+      .mockRejectedValueOnce(new ApiError(500, "boom while forcing"));
+    renderIssueView();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    fireEvent.click(startBtn());
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    // Retried with force === true; that retry failed, and the starting state is
+    // cleared (button re-enabled). NOTE: unlike Board, IssueView's forced-retry
+    // failure toast does NOT persist — startRun's catch calls load(), whose first
+    // line is setError(""), which wipes the just-set message. This is existing
+    // control flow (the spec said keep it as-is), so this test asserts the real
+    // behavior; the Board/IssueView divergence is flagged back to the lead.
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
+    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 7, true]);
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
     confirmSpy.mockRestore();
   });
 });

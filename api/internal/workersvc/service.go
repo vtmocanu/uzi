@@ -245,6 +245,22 @@ var (
 	ErrGuardrailBlocked = errors.New("run refused by the default-branch guardrail")
 )
 
+// OpenMRExistsError carries the issue and MR numbers of an open-MR refusal (issue
+// #856) so a caller (the web 409 body) can name the MR structurally rather than
+// parse the message. Its Error() keeps the --force hint for the CLI/API `error`
+// field; Is() ties it to ErrOpenMRExists so errors.Is, the scheduler skip mapping
+// and the poller swallow all keep working.
+type OpenMRExistsError struct {
+	IssueIID int64
+	MRIID    int64
+}
+
+func (e *OpenMRExistsError) Error() string {
+	return fmt.Sprintf("issue #%d already has open MR !%d — merge or close it, or leave review comments on the MR to iterate, before starting a new run (pass --force to re-run anyway)", e.IssueIID, e.MRIID)
+}
+
+func (e *OpenMRExistsError) Is(target error) bool { return target == ErrOpenMRExists }
+
 // GuardrailBlockedError is returned by the run-create paths when the #66 default-
 // branch guardrail refuses (D1 layer 2). Findings carries the block-finding
 // messages for the 422 body. It wraps ErrGuardrailBlocked so callers can errors.Is
@@ -4985,7 +5001,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			return store.Run{}, err
 		}
 		if err == nil && mrIID.Valid {
-			return store.Run{}, fmt.Errorf("%w: issue #%d already has open MR !%d — merge or close it, or leave review comments on the MR to iterate, before starting a new run (pass --force to re-run anyway)", ErrOpenMRExists, issueIID, mrIID.Int64)
+			return store.Run{}, &OpenMRExistsError{IssueIID: issueIID, MRIID: mrIID.Int64}
 		}
 	}
 	// PRD #381: snapshot the issue's human comments alongside the description. One

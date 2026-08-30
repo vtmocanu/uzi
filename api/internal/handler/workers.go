@@ -1090,9 +1090,15 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 		slog.Error("create task run: branch-safety assertion failed", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	case errors.Is(err, workersvc.ErrOpenMRExists):
-		// issue #856: distinct from the active-run 409. A machine-readable `code` lets the
-		// web offer a force-retry confirm; the message already names the MR.
-		httpx.JSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "code": "issue_has_open_mr"})
+		// issue #856: distinct from the active-run 409. A machine-readable `code` +
+		// structured `mr_iid` let the web compose its own confirm; `error` keeps the
+		// full message (incl. the --force hint the CLI surfaces).
+		body := map[string]any{"error": err.Error(), "code": "issue_has_open_mr"}
+		var omErr *workersvc.OpenMRExistsError
+		if errors.As(err, &omErr) {
+			body["mr_iid"] = omErr.MRIID
+		}
+		httpx.JSON(w, http.StatusConflict, body)
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
 	case errors.Is(err, workersvc.ErrBranchInUse):

@@ -14,6 +14,7 @@ import {
   ApiError,
   isHttpsUrl,
   isOpenMRConflict,
+  openMRConflictMRIID,
   preferForgeUrl,
   type Board as BoardData,
   type Card as CardData,
@@ -597,9 +598,16 @@ export function Board() {
       await createAndOpen();
     } catch (err) {
       // issue_has_open_mr (issue #856): a completed prior run still owns an open
-      // MR. The message already names the MR; confirm, then retry with force.
+      // MR. Compose a web-specific confirm naming the MR (no --force jargon);
+      // confirm, then retry with force.
       if (isOpenMRConflict(err) && err instanceof ApiError) {
-        if (window.confirm(err.message)) {
+        const mr = openMRConflictMRIID(err);
+        const detail =
+          mr != null ? `an open merge request (!${mr})` : "an open merge request";
+        const proceed = window.confirm(
+          `This issue already has ${detail} from a completed run. Starting a new run will plan and review it again from scratch. Start a new run anyway?`,
+        );
+        if (proceed) {
           try {
             await createAndOpen(true);
             return;

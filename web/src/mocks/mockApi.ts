@@ -3614,7 +3614,7 @@ export const mockApi = {
         throw new ApiError(
           409,
           `issue #${issueIid} already has open MR !${openMR.mr_iid} — merge or close it, or leave review comments on the MR to iterate, before starting a new run`,
-          { code: "issue_has_open_mr" },
+          { code: "issue_has_open_mr", mr_iid: openMR.mr_iid },
         );
       }
     }

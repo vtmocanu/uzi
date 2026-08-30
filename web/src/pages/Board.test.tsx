@@ -1402,8 +1402,8 @@ describe("Board — non-uzi issues (PRD #764)", () => {
   const openMRError = () =>
     new ApiError(
       409,
-      "issue #1 already has open MR !42 — merge or close it, or leave review comments on the MR to iterate, before starting a new run",
-      { code: "issue_has_open_mr" },
+      "issue #1 already has open MR !42 — merge or close it, or leave review comments on the MR to iterate, before starting a new run (pass --force to re-run anyway)",
+      { code: "issue_has_open_mr", mr_iid: 42 },
     );
 
   const renderBoardWithRunRoute = () =>
@@ -1428,9 +1428,13 @@ describe("Board — non-uzi issues (PRD #764)", () => {
     await waitFor(() => expect(start.disabled).toBe(false));
     fireEvent.click(start);
 
-    // The confirm used the server message verbatim (it already names MR !42).
+    // The confirm is web-composed: it names the MR, states the action, and carries
+    // no CLI --force jargon (issue #856).
     await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
-    expect(confirmSpy.mock.calls[0][0]).toContain("open MR !42");
+    const confirmMsg = confirmSpy.mock.calls[0][0] as string;
+    expect(confirmMsg).toContain("!42");
+    expect(confirmMsg).toContain("Start a new run anyway?");
+    expect(confirmMsg).not.toContain("--force");
     // Retried with force === true, and the run page opened.
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
     expect(mockApi.createRun.mock.calls[0]).toEqual(["repo-1", 1, undefined]);
@@ -1453,6 +1457,42 @@ describe("Board — non-uzi issues (PRD #764)", () => {
     // No retry, and the coded-conflict message is NOT shown as an error toast.
     expect(mockApi.createRun).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(/already has open MR/)).toBeNull();
+    // The Start control is re-enabled after decline (starting state cleared): a
+    // stuck-in-"Starting…" regression would leave it disabled and fail here.
+    await waitFor(() => {
+      const start2 = within(cardOf("issue one")).getByRole("button", {
+        name: /Start run/,
+      }) as HTMLButtonElement;
+      expect(start2.disabled).toBe(false);
+    });
+    expect(within(cardOf("issue one")).queryByText("Starting…")).toBeNull();
+    confirmSpy.mockRestore();
+  });
+
+  it("on the open-MR 409, a confirmed forced retry that fails shows the toast and clears starting (#856)", async () => {
+    withWorkerAndToken();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    mockApi.createRun
+      .mockRejectedValueOnce(openMRError())
+      .mockRejectedValueOnce(new ApiError(500, "boom while forcing"));
+    renderBoard();
+    await screen.findByText("Backlog");
+    const start = within(cardOf("issue one")).getByRole("button", { name: /Start run/ }) as HTMLButtonElement;
+    await waitFor(() => expect(start.disabled).toBe(false));
+    fireEvent.click(start);
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    // Retried with force === true, that retry failed, so the toast shows the retry
+    // error and the starting state is cleared (button re-enabled).
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
+    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 1, true]);
+    await screen.findByText("boom while forcing");
+    await waitFor(() => {
+      const start2 = within(cardOf("issue one")).getByRole("button", {
+        name: /Start run/,
+      }) as HTMLButtonElement;
+      expect(start2.disabled).toBe(false);
+    });
     confirmSpy.mockRestore();
   });
 

@@ -2901,6 +2901,14 @@ export function isOpenMRConflict(err: unknown): boolean {
   );
 }
 
+// openMRConflictMRIID returns the MR iid carried by a 409 issue_has_open_mr body
+// (issue #856), or null when absent — the web composes its own confirm copy from it.
+export function openMRConflictMRIID(err: unknown): number | null {
+  if (!(err instanceof ApiError)) return null;
+  const n = (err.body as { mr_iid?: unknown } | null)?.mr_iid;
+  return typeof n === "number" ? n : null;
+}
+
 async function request<T>(
   method: string,
   path: string,
