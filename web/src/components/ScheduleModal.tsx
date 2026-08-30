@@ -207,6 +207,13 @@ export function ScheduleModal({
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const [waitOnLimit, setWaitOnLimit] = useState<boolean>(editing?.wait_on_limit ?? true);
+  // PRD #841: per-schedule MR-review-rework override, TRI-STATE (inherit/on/off). Unlike
+  // waitOnLimit (a plain on/off), inherit is a first-class value AND the default (D5), so
+  // a plain Toggle cannot express it — this is a 3-way <Select>. null = inherit (runs
+  // this schedule fires follow the owner's global setting), true/false = explicit
+  // override. Sent as an explicit `mr_rework_enabled` on both create and update so
+  // inherit stays a real null and never collapses into false.
+  const [mrRework, setMrRework] = useState<boolean | null>(editing?.mr_rework_enabled ?? null);
   const [autoApprove, setAutoApprove] = useState<boolean>(editing?.auto_approve ?? true);
   // Create-only enabled/disabled toggle (PRD #344 Feature B): lets a schedule be created
   // already paused. Edit-mode enable/disable stays the job of pause/resume, so this state
@@ -431,6 +438,9 @@ export function ScheduleModal({
     // every path), so omit it here rather than send a client-chosen value the server ignores.
     auto_approve: target === "self_improve" ? undefined : autoApprove,
     wait_on_limit: waitOnLimit,
+    // PRD #841: tri-state; null (inherit) is sent explicitly, never omitted, so a reset
+    // to inherit clears any stored override (replace-semantics).
+    mr_rework_enabled: mrRework,
     max_issues: target === "sweep" ? maxIssues : undefined,
     model: model.trim() === "" ? null : model,
     // PRD #305: apply the run model to every subagent. Editable on a default too
@@ -468,6 +478,9 @@ export function ScheduleModal({
     // every path), so omit it here rather than send a client-chosen value the server ignores.
     auto_approve: target === "self_improve" ? undefined : autoApprove,
     wait_on_limit: waitOnLimit,
+    // PRD #841: tri-state MR-rework override; null (inherit) is sent explicitly so it is
+    // never collapsed into false — inherit means "follow the owner's global setting".
+    mr_rework_enabled: mrRework,
     // Model override on EVERY target (all-targets field, unlike guidance); an empty
     // control sends explicit null to clear-to-inherit (replace-semantics).
     model: model.trim() === "" ? null : model,
@@ -979,6 +992,27 @@ export function ScheduleModal({
                 </span>
               </span>
             </div>
+            {/* PRD #841: MR-review-rework is TRI-STATE (inherit/on/off), so a 3-way
+                <Select> rather than a plain Toggle. Inherit (the default, D5) means runs
+                this schedule fires follow the owner's global Settings default. */}
+            <Field label="Auto-rework MR review comments" htmlFor="sched-mr-rework">
+              <Select
+                id="sched-mr-rework"
+                value={mrRework === null ? "inherit" : mrRework ? "on" : "off"}
+                onChange={(e) =>
+                  setMrRework(
+                    e.target.value === "inherit" ? null : e.target.value === "on",
+                  )
+                }
+              >
+                <option value="inherit">Inherit (use my default)</option>
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </Select>
+              <p className="mt-1 text-[11px] text-faint">
+                Auto-rework this schedule's MRs when reviewers leave comments. Inherit follows your account default.
+              </p>
+            </Field>
             {/* A self_improve run is always auto-approved (the server forces auto_approve=true),
                 so hide the toggle rather than misrepresent a fixed value as a user choice. */}
             {target !== "self_improve" && (

@@ -23,6 +23,7 @@ import {
   RunStopReason,
   HealthFlag,
   LimitWaitPanel,
+  MrReworkPanel,
   RunView,
   RunSummary,
   derivePlanRevision,
@@ -67,6 +68,12 @@ vi.mock("../lib/api", async (importOriginal) => {
       // PRD #320 M6: the Expedite/undo mutation. Defaulted to resolve so a click +
       // refreshRun settles; the priority cases assert the call args.
       expediteRun: vi.fn().mockResolvedValue({ run: null }),
+      // PRD #841: the per-run MR-rework toggle reads the owner's default from
+      // getMySettings and writes via setRunMrRework. Defaulted so a full-page render of
+      // an owner's issue+open-MR run settles (getMySettings resolves the default-ON
+      // null; setRunMrRework echoes an updated run).
+      getMySettings: vi.fn().mockResolvedValue({ settings: { mr_rework_enabled: null } }),
+      setRunMrRework: vi.fn().mockResolvedValue({ run: null }),
     },
   };
 });
@@ -1145,6 +1152,171 @@ describe("RunView — queue priority pill + Expedite action (PRD #320 M6)", () =
     expect(screen.queryByText("Expedited")).toBeNull();
     expect(screen.queryByRole("button", { name: "Expedite" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Undo expedite" })).toBeNull();
+  });
+});
+
+// PRD #841: the per-run "Auto-rework this MR's review comments" checkbox. Its gate is
+// DELIBERATELY unlike wait-on-limit's (D2): visible for an issue run whose MR is null or
+// `opened` — including a COMPLETED run, because the watcher acts after completion — and
+// hidden once the MR merges/closes or for a non-owner. Every negative below queries with
+// the SAME label matcher the positive uses, so an absent checkbox is a meaningful miss,
+// not a vacuous one (.claude/rules/web.md).
+describe("MrReworkPanel — per-run MR-rework checkbox (PRD #841)", () => {
+  const LABEL = /auto-rework/i;
+
+  it("SHOWS the checkbox for an owner on an issue run with an OPEN MR (completed)", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", status: "completed", mr_iid: 42, mr_state: "opened" })}
+        busy={false}
+        canSteer
+        userDefault={null}
+        onToggle={vi.fn()}
+      />,
+    );
+    const cb = screen.getByLabelText(LABEL) as HTMLInputElement;
+    expect(cb).toBeTruthy();
+    // Inherit (run null) + user default null → the default-ON state → checked.
+    expect(cb.checked).toBe(true);
+  });
+
+  it("SHOWS the checkbox when mr_state is null (MR not yet observed)", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", mr_state: null })}
+        busy={false}
+        canSteer
+        userDefault={null}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText(LABEL)).toBeTruthy();
+  });
+
+  it("HIDES the checkbox once the MR is MERGED", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", status: "completed", mr_iid: 42, mr_state: "merged" })}
+        busy={false}
+        canSteer
+        userDefault={null}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText(LABEL)).toBeNull();
+  });
+
+  it("HIDES the checkbox once the MR is CLOSED", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", status: "completed", mr_iid: 42, mr_state: "closed" })}
+        busy={false}
+        canSteer
+        userDefault={null}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText(LABEL)).toBeNull();
+  });
+
+  it("HIDES the checkbox for a NON-OWNER (canSteer=false), even on an open MR", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", status: "completed", mr_iid: 42, mr_state: "opened" })}
+        busy={false}
+        canSteer={false}
+        userDefault={null}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText(LABEL)).toBeNull();
+  });
+
+  it("HIDES the checkbox for a non-issue run (e.g. ci_fix)", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "ci_fix", mr_state: "opened" })}
+        busy={false}
+        canSteer
+        userDefault={null}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText(LABEL)).toBeNull();
+  });
+
+  it("effective value: a run override WINS over the user default", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", mr_state: "opened", mr_rework_enabled: false })}
+        busy={false}
+        canSteer
+        userDefault={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect((screen.getByLabelText(LABEL) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("effective value: inherit (run null) shows the USER DEFAULT (off)", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", mr_state: "opened", mr_rework_enabled: null })}
+        busy={false}
+        canSteer
+        userDefault={false}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect((screen.getByLabelText(LABEL) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("toggling calls onToggle with the FLIPPED effective value", () => {
+    const onToggle = vi.fn();
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", mr_state: "opened", mr_rework_enabled: true })}
+        busy={false}
+        canSteer
+        userDefault={null}
+        onToggle={onToggle}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText(LABEL)); // checked true → onToggle(false)
+    expect(onToggle).toHaveBeenCalledWith(false);
+  });
+
+  it("(page wiring) clicking the checkbox calls api.setRunMrRework(id, next) then refreshRun", async () => {
+    const refreshRun = vi.fn();
+    mockUseRunStream.mockReturnValue({
+      run: run({ kind: "issue", status: "completed", mr_iid: 42, mr_state: "opened" }),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun,
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    // getMySettings keeps its factory default (settings.mr_rework_enabled: null), so the
+    // effective value falls through to the default-ON state and the checkbox is checked.
+    mockApi.setRunMrRework.mockResolvedValue({
+      run: run({ kind: "issue", status: "completed", mr_iid: 42, mr_state: "opened", mr_rework_enabled: false }),
+    });
+    render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Add rate limiting");
+    // Effective default-ON → checked; a click sends the flipped value false.
+    const cb = await screen.findByLabelText(LABEL);
+    await act(async () => {
+      fireEvent.click(cb);
+    });
+    await waitFor(() => expect(mockApi.setRunMrRework).toHaveBeenCalledWith("r1", false));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
   });
 });
 

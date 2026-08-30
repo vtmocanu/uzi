@@ -3699,6 +3699,18 @@ export const mockApi = {
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
+  // PRD #841: set (or clear) a run's per-run MR-review-rework override. Mirrors the
+  // server: owner-scoped (the demo caller owns every non-other-user run) and — unlike
+  // setRunWaitOnLimit — NO terminal-status guard (D2), because the watcher acts after
+  // the run completes, so the toggle stays live on a completed run whose MR is still
+  // open. `null` clears back to inherit.
+  setRunMrRework: async (id: string, enabled: boolean | null) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    patchRun(id, { mr_rework_enabled: enabled });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
   // Issue #754: resume an auto-lane run parked at `pool_wait` right now. Mirrors the
   // server: owner-scoped (the demo caller owns every non-other-user run) and
   // pool_wait-ONLY — a 409 ("run is not waiting for a pooled token") on any other

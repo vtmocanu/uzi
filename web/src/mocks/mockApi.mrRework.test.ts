@@ -121,3 +121,35 @@ describe("mockApi honours the mr_rework_enabled opt-in (PRD #700 M6)", () => {
     expect((await api.getMySettings()).settings.mr_rework_enabled).toBeNull();
   });
 });
+
+describe("mockApi.setRunMrRework — the per-run override (PRD #841)", () => {
+  it("round-trips the tri-state override on a run and returns the updated run", async () => {
+    installStorage();
+    const api = await reload();
+
+    // Explicit off, then on: each persists and is echoed back on the returned run.
+    const off = await api.setRunMrRework("run-done", false);
+    expect(off.run.mr_rework_enabled).toBe(false);
+    const on = await api.setRunMrRework("run-done", true);
+    expect(on.run.mr_rework_enabled).toBe(true);
+
+    // null clears back to inherit (never collapsed into false).
+    const cleared = await api.setRunMrRework("run-done", null);
+    expect(cleared.run.mr_rework_enabled).toBeNull();
+  });
+
+  it("has NO terminal-status guard (D2): a COMPLETED run is still togglable", async () => {
+    installStorage();
+    const api = await reload();
+    // run-done is a completed run; unlike setRunWaitOnLimit this must NOT 409.
+    const { run } = await api.setRunMrRework("run-done", false);
+    expect(run.status).toBe("completed");
+    expect(run.mr_rework_enabled).toBe(false);
+  });
+
+  it("404s an unknown run id (owner-scoped, like the server)", async () => {
+    installStorage();
+    const api = await reload();
+    await expect(api.setRunMrRework("run-nope", true)).rejects.toMatchObject({ status: 404 });
+  });
+});
