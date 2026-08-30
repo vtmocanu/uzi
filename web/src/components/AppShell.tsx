@@ -642,45 +642,50 @@ function SidebarContent({
 
   return (
     <div className="flex h-full flex-col">
-      <Link
-        to="/dashboard"
-        onClick={onNavigate}
-        title={collapsed ? (showName ? "uzi · uzinele întunecate" : "app logo") : undefined}
-        className={cx(
-          "flex items-center border-b border-edge py-4",
-          collapsed ? "justify-center px-2" : "gap-2.5 px-4",
-        )}
-      >
-        <AppMark branding={branding} className="h-8 w-8 rounded-lg text-lg" />
-        {!collapsed && (
-          <>
-            {showName && (
-              <span className="min-w-0">
-                <span className="block text-sm font-semibold leading-tight tracking-tight">uzi</span>
-                <span className="block truncate text-[11px] leading-tight text-faint">
-                  uzinele întunecate
+      {/* Header cluster: the app wordmark/logo Link and the below-wordmark "powered
+          by" row share ONE bottom divider, so the border bounds the whole cluster
+          rather than only the Link (issue #828). */}
+      <div className="border-b border-edge">
+        <Link
+          to="/dashboard"
+          onClick={onNavigate}
+          title={collapsed ? (showName ? "uzi · uzinele întunecate" : "app logo") : undefined}
+          className={cx(
+            "flex items-center py-4",
+            collapsed ? "justify-center px-2" : "gap-2.5 px-4",
+          )}
+        >
+          <AppMark branding={branding} className="h-8 w-8 rounded-lg text-lg" />
+          {!collapsed && (
+            <>
+              {showName && (
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold leading-tight tracking-tight">uzi</span>
+                  <span className="block truncate text-[11px] leading-tight text-faint">
+                    uzinele întunecate
+                  </span>
                 </span>
-              </span>
-            )}
-            {MOCK_MODE && (
-              <span
-                title="This build runs entirely in your browser on demo data — no backend."
-                className="ml-auto rounded-md border border-brand/40 bg-brand/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-brand"
-              >
-                demo
-              </span>
-            )}
-          </>
-        )}
-        {/* POWERED BY, top-right placement (PRD #685 M3b): logo-only, no label,
-            sharing the header row. Self-gates on placement/mode/collapsed. */}
-        <PoweredBy branding={branding} collapsed={collapsed} slot="topright" />
-      </Link>
+              )}
+              {MOCK_MODE && (
+                <span
+                  title="This build runs entirely in your browser on demo data — no backend."
+                  className="ml-auto rounded-md border border-brand/40 bg-brand/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-brand"
+                >
+                  demo
+                </span>
+              )}
+            </>
+          )}
+          {/* POWERED BY, top-right placement (PRD #685 M3b): logo-only, no label,
+              sharing the header row. Self-gates on placement/mode/collapsed. */}
+          <PoweredBy branding={branding} collapsed={collapsed} slot="topright" />
+        </Link>
 
-      {/* POWERED BY, below-wordmark placement (PRD #685 M3b, the default): a row
-          under the header carrying the faint uppercase label + text or logo.
-          Self-gates on placement/mode/collapsed. */}
-      <PoweredBy branding={branding} collapsed={collapsed} slot="below" />
+        {/* POWERED BY, below-wordmark placement (PRD #685 M3b, the default): a row
+            under the header carrying the faint uppercase label + text or logo.
+            Self-gates on placement/mode/collapsed. */}
+        <PoweredBy branding={branding} collapsed={collapsed} slot="below" />
+      </div>
 
       <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4 lg:space-y-0.5 lg:pb-2">
         <div className="space-y-0.5 pt-3 lg:pt-2">
@@ -915,7 +920,7 @@ function SidebarContent({
             />
           )
         ) : (
-          <div className="flex items-center justify-between gap-2 px-3 pb-2 pt-1">
+          <div className="flex items-center justify-between gap-2 border-t border-edge px-3 pb-2 pt-1">
             {build?.status === "ok" && build.info.version ? (
               <BuildInfoPopover
                 info={build.info}

@@ -377,6 +377,20 @@ describe("AppShell branding — POWERED BY block", () => {
     expect(row.className).not.toMatch(/border-b/);
     expect(row.className).toMatch(/justify-end|text-right/);
   });
+
+  // Issue #828: the header divider belongs on the OUTER wrapper that bounds the
+  // wordmark Link AND the below "powered by" row, so both share one bottom border —
+  // NOT on the inner PoweredBy row. Assert the wrapper (row.parentElement) has
+  // border-b while the inner row still does not.
+  it("text-mode below block: the outer header wrapper carries the single border-b, not the row", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "text", brand_company: "Acme, Inc." }));
+    renderShell();
+    const label = (await screen.findAllByText(POWERED_BY_RE))[0];
+    const row = label.parentElement as HTMLElement;
+    const outer = row.parentElement as HTMLElement;
+    expect(row.className).not.toMatch(/border-b/);
+    expect(outer.className).toMatch(/border-b/);
+  });
 });
 
 // The M4 one-row footer (D-follow-up): the version badge (left) and the durable
@@ -397,6 +411,17 @@ describe("AppShell branding — one-row footer", () => {
     renderShell();
     const credit = await screen.findByTestId("license-credit");
     const row = credit.parentElement as HTMLElement;
+    expect(row.className).toMatch(/justify-between/);
+  });
+
+  // Issue #828: the top divider belongs on the full-width footer ROW, not on the
+  // half-width BuildInfoPopover host inside it. Pair the POSITIVE (border-t now on
+  // the row) with the retained justify-between so neither assertion goes vacuous.
+  it("expanded: the footer row carries the full-width border-t divider", async () => {
+    renderShell();
+    const credit = await screen.findByTestId("license-credit");
+    const row = credit.parentElement as HTMLElement;
+    expect(row.className).toMatch(/border-t/);
     expect(row.className).toMatch(/justify-between/);
   });
 });

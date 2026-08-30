@@ -122,6 +122,33 @@ describe("AppShell build info wiring", () => {
   });
 });
 
+// Issue #828 footer divider. This file (not AppShell.branding.test.tsx) is the home
+// for the COLLAPSED case: there the module-scope version promise is pinned PENDING by
+// that file's first test, so the popover never renders; here it resolves, so the
+// collapsed BuildInfoPopover mounts standalone and its host div can be asserted.
+describe("AppShell build info — footer divider (issue #828)", () => {
+  afterEach(() => window.localStorage.clear());
+
+  it("collapsed: the standalone BuildInfoPopover host keeps its own border-t", async () => {
+    // Collapsing the rail drops the full-width footer ROW; the popover renders as the
+    // whole footer, so the top divider must live on ITS host (the cx() collapsed arm).
+    window.localStorage.setItem("uzi.sidebar.collapsed", "true");
+    renderShell();
+    const trigger = await screen.findByRole("button", { name: "v0.4.2" });
+    const host = trigger.parentElement as HTMLElement;
+    expect(host.className).toMatch(/border-t/);
+  });
+
+  it("expanded: the popover host does NOT carry the border-t (the footer row does)", async () => {
+    // Counterpart: expanded, the divider moved up to the full-width footer row, so the
+    // popover's own host must NOT re-draw it (that was the half-width bug).
+    renderShell();
+    const trigger = await screen.findByRole("button", { name: "v0.4.2" });
+    const host = trigger.parentElement as HTMLElement;
+    expect(host.className).not.toMatch(/border-t/);
+  });
+});
+
 // The failure case lives in AppShell.buildinfo.failure.test.tsx, NOT here — and it
 // was written here first, which is how the hazard proved itself: the module-scope
 // promise is already resolved by the tests above, so a mockRejectedValue in a
