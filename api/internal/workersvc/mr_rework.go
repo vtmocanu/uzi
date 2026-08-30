@@ -105,7 +105,14 @@ func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid
 			return store.Run{}, ErrBranchInUse
 		}
 		if isUniqueViolation(err) {
-			// uq_runs_one_active_mr_rework: a second active rework on the same MR.
+			// uq_runs_one_active_mr_rework: a second active rework on the same MR. A same-MR
+			// duplicate actually trips BOTH partial indexes at once (same MR ⇒ same
+			// pipeline_ref), so this branch is reached only because Postgres reports the
+			// violation on uq_runs_one_active_mr_rework FIRST — it is created before
+			// uq_runs_one_active_branch_ref in migration 00167 (lower OID), so the
+			// uq_runs_one_active_branch_ref check above does not match. That ordering is
+			// pinned by TestCreateAutoMRReworkRunSameMRDuplicateIsActiveExistsLiveDB; a
+			// migration that recreated the two indexes in reverse order would regress this.
 			return store.Run{}, ErrActiveMRReworkExists
 		}
 		return store.Run{}, err
