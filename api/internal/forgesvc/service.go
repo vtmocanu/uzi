@@ -156,6 +156,18 @@ type Service struct {
 	// (PRD #71 M6). Optional (nil-safe): set via SetNotifier, unset means the landed
 	// notification is skipped — every other pipeline-sync behaviour is unaffected.
 	notifier LandedNotifier
+
+	// reworkCanceller aborts an in-flight mr_rework run when its MR leaves the opened
+	// state (issue #853). Optional (nil-safe): set via SetReworkCanceller, unset means
+	// the mid-flight abort is skipped — every other MR-sync behaviour is unaffected.
+	reworkCanceller ReworkCanceller
+}
+
+// ReworkCanceller aborts an active mr_rework run when its MR leaves the opened
+// state (issue #853). *workersvc.Service satisfies it. Optional (nil-safe): unset
+// means the mid-flight abort is skipped and every other sync behaviour is unchanged.
+type ReworkCanceller interface {
+	CancelReworkForMR(ctx context.Context, repoID uuid.UUID, mrIID int64, reason string) error
 }
 
 // LandedNotifier lands an inbox notification when a ci_fix run's fix pipeline goes
@@ -177,6 +189,11 @@ func New(q IssueStore, box *secretbox.Box, timeout time.Duration, labels LabelCo
 // startup, before the poller runs. A nil notifier (the default) disables the landed
 // inbox row; the rest of the sync is unchanged.
 func (s *Service) SetNotifier(n LandedNotifier) { s.notifier = n }
+
+// SetReworkCanceller wires the mid-flight mr_rework abort collaborator (issue #853).
+// Call once at startup, before the poller runs. A nil canceller (the default) disables
+// the abort; the rest of the sync is unchanged.
+func (s *Service) SetReworkCanceller(c ReworkCanceller) { s.reworkCanceller = c }
 
 // uziLabel resolves the configured uzi run-eligibility label for the sync filters,
 // falling back to the compiled-in default when unconfigured or on a settings read
