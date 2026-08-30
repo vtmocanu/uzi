@@ -192,6 +192,33 @@ const (
 	KeyAgentSourceLatestRef       = "agent_source_latest_ref"        // newest IsValid semver tag advertised by the source ("" if none)
 	KeyAgentSourceRemoteTipSHA    = "agent_source_remote_tip_sha"    // advertised tip SHA of the configured ref (or HEAD)
 	KeyAgentSourceUpdateCheckedAt = "agent_source_update_checked_at" // RFC3339 timestamp of the last update check
+	// Upstream-release-check settings (PRD #836 M1). A server-side periodic check
+	// against the GitHub Releases API for vtmocanu/uzi persists the remote facts, and
+	// "update available" / "far behind" / "security" are DERIVED at read time with
+	// zero egress — the SAME poll→persist→derive core as the agent-source keys above,
+	// a different target. Two independent CONFIG toggles plus an interval (in
+	// Defaults); the optional token is the only secret; the six remote-fact keys are
+	// ENGINE-written (absent from Defaults, never secret — the release-check Runner
+	// sets them via UpsertAppSetting, then Cache.Invalidate()).
+	KeyReleaseCheckEnabled       = "release_check_enabled"        // master gate: off → the api never calls github.com
+	KeyReleaseCheckBannerEnabled = "release_check_banner_enabled" // governs only the escalation banner (cosmetic)
+	KeyReleaseCheckInterval      = "release_check_interval"       // poll cadence, a Go duration with a 1m floor
+	// KeyReleaseCheckToken is the OPTIONAL GitHub token (raises the unauth 60 req/hr
+	// ceiling to 5,000). A SecretKeys member, sealed like the Slack tokens and kept
+	// OUT of Defaults so it never leaks through a value read.
+	KeyReleaseCheckToken = "release_check_token"
+	// Engine-managed remote-fact keys (PRD #836 M1). Persisted by the release-check
+	// Runner from the releases/latest payload; kept out of Defaults (engine pattern,
+	// like the agent-source remote-fact keys) so a generic PUT can never write them.
+	// "Update available"/"far behind"/"security" are DERIVED from these plus the
+	// running version, never stored — see releasecheck.UpdateAvailable / FarBehind /
+	// Security.
+	KeyReleaseLatestTag   = "release_latest_tag"   // v-prefixed tag_name of the latest upstream release
+	KeyReleaseLatestName  = "release_latest_name"  // release name
+	KeyReleaseLatestBody  = "release_latest_body"  // markdown release notes (the ### Security scan + notes excerpt)
+	KeyReleaseNotesURL    = "release_notes_url"    // html_url of the latest release
+	KeyReleasePublishedAt = "release_published_at" // RFC3339 publish timestamp of the latest release
+	KeyReleaseCheckedAt   = "release_checked_at"   // RFC3339 timestamp of the last check
 	// Instance branding keys (PRD #685 M1). All NON-SECRET public config → they live
 	// in Defaults (never SecretKeys), round-trip through PUT /admin/settings, and are
 	// served — allowlisted, never via All/AdminView — through the public GET
@@ -304,6 +331,14 @@ const (
 	// sourceAgentsDir (".claude/agents"), so an install with no folder set reads
 	// role files from exactly the same subtree as before.
 	DefaultAgentSourceFolder = ".claude/agents"
+	// PRD #836 M1 upstream-release-check. The check ships ON — both the master gate
+	// and the banner — unlike agent-source's default-off: it makes a single
+	// server-side poll to a compile-time-constant public URL and surfacing that a
+	// newer release exists is the whole point of the feature. The cadence defaults to
+	// 6h (trivially within GitHub's 60 req/hr unauthenticated budget).
+	DefaultReleaseCheckEnabled       = "true"
+	DefaultReleaseCheckBannerEnabled = "true"
+	DefaultReleaseCheckInterval      = "6h"
 	// PRD #685 M1 instance-branding defaults. A fresh install is UNBRANDED (Decision
 	// D4): the app mark stays the uzi FactoryIcon + literals (app_logo_mode=default,
 	// keep-name on) and there is no POWERED BY brand (brand_mode=none). brand_company
@@ -440,6 +475,15 @@ var Defaults = map[string]string{
 	// synthesizes to DefaultAgentSourceFolder, so Known()/admin-writable with no
 	// migration and existing installs read the historical ".claude/agents" subtree.
 	KeyAgentSourceFolder: DefaultAgentSourceFolder,
+	// PRD #836 M1 release-check config toggles/interval. Same no-seeded-row pattern:
+	// an absent row synthesizes to these defaults (master + banner ON, 6h cadence), so
+	// All/AdminView surface them on every instance and no migration seeds them. The
+	// token (release_check_token) is a SecretKeys member, deliberately NOT here; the
+	// six engine-written remote-fact keys are likewise absent (only the release-check
+	// Runner writes them).
+	KeyReleaseCheckEnabled:       DefaultReleaseCheckEnabled,
+	KeyReleaseCheckBannerEnabled: DefaultReleaseCheckBannerEnabled,
+	KeyReleaseCheckInterval:      DefaultReleaseCheckInterval,
 	// PRD #685 M1 instance-branding config keys. Same no-seeded-row pattern: an absent
 	// row synthesizes to these defaults, so a fresh install renders unbranded and the
 	// public GET /api/branding reports the default shape. NON-SECRET (here, not in
@@ -471,6 +515,9 @@ var SecretKeys = map[string]struct{}{
 	KeySlackAppToken: {},
 	// PRD #602 M2: the private-repo clone credential, sealed like the Slack tokens.
 	KeyAgentSourceCredential: {},
+	// PRD #836 M1: the optional upstream-release-check GitHub token, sealed like the
+	// Slack tokens and kept out of Defaults so it never leaks through a value read.
+	KeyReleaseCheckToken: {},
 }
 
 // IsSecret reports whether key is a secret setting (sealed at rest, never read
@@ -1004,6 +1051,95 @@ func (c *Cache) AgentSourceStatus(ctx context.Context) (AgentSourceStatus, error
 	}, nil
 }
 
+// ReleaseCheckEnabled reports whether the upstream-release check is enabled (PRD
+// #836 M1): the master gate — when off the api never calls github.com. Stored as
+// "true"/"false"; any other value falls back to the compiled-in default (true), the
+// same junk-tolerance as SlackEnabled but defaulting ON, so a malformed value never
+// silently disables the check.
+func (c *Cache) ReleaseCheckEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyReleaseCheckEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultReleaseCheckEnabled == "true", err
+	}
+}
+
+// ReleaseCheckBannerEnabled reports whether the intrusive escalation banner is
+// enabled (PRD #836 M1). Independent of the master gate: it governs only the banner
+// (the pip and admin card do not depend on it). Same junk-tolerant defaulting ON.
+func (c *Cache) ReleaseCheckBannerEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyReleaseCheckBannerEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultReleaseCheckBannerEnabled == "true", err
+	}
+}
+
+// ReleaseCheckInterval returns the release-check poll cadence (PRD #836 M1). Stored
+// as a Go duration string ("6h"); a missing or unparseable value falls back to the
+// compiled-in default, and a sub-minute value is floored at releaseCheckIntervalMin
+// so a bad row can never make the loop hammer github.com (the same floor
+// validateReleaseCheckInterval enforces at write time).
+func (c *Cache) ReleaseCheckInterval(ctx context.Context) (time.Duration, error) {
+	v, err := c.get(ctx, KeyReleaseCheckInterval)
+	d, perr := time.ParseDuration(v)
+	if perr != nil || d <= 0 {
+		d, _ = time.ParseDuration(DefaultReleaseCheckInterval)
+	}
+	if d < releaseCheckIntervalMin {
+		d = releaseCheckIntervalMin
+	}
+	return d, err
+}
+
+// ReleaseCheckToken returns the OPTIONAL upstream-check GitHub token in plaintext
+// (PRD #836 M1), or "" when unconfigured (the unauthenticated path). Same secret
+// precedence as SlackBotToken: an ENV overlay wins, else the sealed DB row is opened
+// with the box. Errors carry no plaintext.
+func (c *Cache) ReleaseCheckToken(ctx context.Context) (string, error) {
+	return c.secret(ctx, KeyReleaseCheckToken)
+}
+
+// ReleaseStatus is the engine-managed remote-release facts the release-check Runner
+// persists (PRD #836 M1) and the derivation + admin panel read. Every field is
+// stored as an app_setting by the Runner; an absent key reads as "". "Update
+// available"/"far behind"/"security" are DERIVED from these plus the running version,
+// never stored — see releasecheck.UpdateAvailable / FarBehind / Security.
+type ReleaseStatus struct {
+	LatestTag   string
+	LatestName  string
+	Body        string
+	NotesURL    string
+	PublishedAt string
+	CheckedAt   string
+}
+
+// ReleaseStatus reads the six engine-managed release-fact keys in one snapshot pass
+// (PRD #836 M1). Best-effort: a snapshot error returns the zero status alongside the
+// error so a best-effort caller can still render an empty panel.
+func (c *Cache) ReleaseStatus(ctx context.Context) (ReleaseStatus, error) {
+	m, err := c.snapshot(ctx)
+	if err != nil {
+		return ReleaseStatus{}, err
+	}
+	return ReleaseStatus{
+		LatestTag:   c.effective(KeyReleaseLatestTag, m),
+		LatestName:  c.effective(KeyReleaseLatestName, m),
+		Body:        c.effective(KeyReleaseLatestBody, m),
+		NotesURL:    c.effective(KeyReleaseNotesURL, m),
+		PublishedAt: c.effective(KeyReleasePublishedAt, m),
+		CheckedAt:   c.effective(KeyReleaseCheckedAt, m),
+	}, nil
+}
+
 // HealthEnabled reports whether the run-health detector is enabled instance-wide
 // (PRD #47). Stored as "true"/"false"; any other value falls back to the
 // compiled-in default (true), the same junk-tolerance as SlackEnabled but
@@ -1289,6 +1425,7 @@ func Validate(key, value string) error {
 	case KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
 		KeyCapabilityAwareScheduling, KeyGithubProjectSyncEnabled,
 		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled,
+		KeyReleaseCheckEnabled, KeyReleaseCheckBannerEnabled,
 		KeyAppLogoKeepName, KeyBrandPlaque:
 		return validateBool(value)
 	case KeyMrReworkCap:
@@ -1338,6 +1475,10 @@ func Validate(key, value string) error {
 		return validateSlackToken(value, "xapp-", "app-level")
 	case KeyAgentSourceCredential:
 		return validateAgentSourceCredential(value)
+	case KeyReleaseCheckInterval:
+		return validateReleaseCheckInterval(value)
+	case KeyReleaseCheckToken:
+		return validateReleaseCheckToken(value)
 	default:
 		// The label keys (uzi_label, autopilot_label, finding_label) all use the
 		// Decision 8 label rules; cross-key distinctness is ValidateMerged's job.
@@ -1418,6 +1559,51 @@ func validateAgentSourceInterval(value string) error {
 	}
 	if d < agentSourceIntervalMin {
 		return errors.New("must be at least 1m")
+	}
+	return nil
+}
+
+// releaseCheckIntervalMin is the upstream-release-check cadence floor (PRD #836 M1):
+// a sub-minute poll is a fat-finger, and GitHub's unauthenticated 60 req/hr budget
+// makes hammering the endpoint pointless as well as rude.
+const releaseCheckIntervalMin = time.Minute
+
+// validateReleaseCheckInterval is the write-time gate for the release-check cadence
+// (PRD #836 M1), mirroring validateAgentSourceInterval: a valid Go duration string
+// ("6h", "1h") that parses to at least releaseCheckIntervalMin. The floor stops a
+// bad value from making the poll loop hammer github.com.
+func validateReleaseCheckInterval(value string) error {
+	d, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New(`must be a duration like "6h"`)
+	}
+	if d < releaseCheckIntervalMin {
+		return errors.New("must be at least 1m")
+	}
+	return nil
+}
+
+// maxReleaseCheckTokenLen caps the sealed release-check token (PRD #836 M1). Like
+// the agent-source credential it is generous: a GitHub fine-grained PAT
+// (github_pat_...) is ~93 chars, well over the 64-char label cap the ValidateLabel
+// default branch would otherwise impose.
+const maxReleaseCheckTokenLen = 1024
+
+// validateReleaseCheckToken is the write-time gate for the OPTIONAL upstream-check
+// GitHub token (PRD #836 M1), the same shape as validateAgentSourceCredential: a
+// single opaque token, non-empty, no whitespace/control characters, generously
+// capped. The error never echoes the value (a token must not appear in a message).
+func validateReleaseCheckToken(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("token must not be empty")
+	}
+	if utf8.RuneCountInString(value) > maxReleaseCheckTokenLen {
+		return fmt.Errorf("token must be at most %d characters", maxReleaseCheckTokenLen)
+	}
+	for _, r := range value {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return errors.New("token must not contain whitespace or control characters")
+		}
 	}
 	return nil
 }
