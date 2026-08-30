@@ -305,9 +305,9 @@ WHERE schedule_id = @schedule_id
 -- straight from the schedule (the owner set them there), so unlike the engine runs
 -- this path does not fall back to the owner's default.
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, mr_rework_enabled, model, override_subagent_model, required_capabilities
+    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, mr_rework_enabled, model, override_subagent_model, required_capabilities, trigger_source
 ) VALUES (
     @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('model'), @override_subagent_model,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}')
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'schedule'
 )
 RETURNING *;

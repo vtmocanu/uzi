@@ -461,6 +461,7 @@ type Run struct {
 	BudgetPausedSeconds   int32              `json:"budget_paused_seconds"`
 	LineageEpoch          int32              `json:"lineage_epoch"`
 	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
+	TriggerSource         string             `json:"trigger_source"`
 }
 
 type RunMessage struct {

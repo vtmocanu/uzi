@@ -5016,6 +5016,10 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// The mr_rework create path (M3's CreateAutoMRReworkRun) fetches the MR review
 		// snapshot via fetchReviewCommentsSnapshot and populates this itself.
 		ReviewComments: nil,
+		// issue #857 M1 placeholder: createRun does not yet take a triggerSource param
+		// (M2 threads the real value from each entrypoint). "manual" keeps the column
+		// non-empty and the build green until then.
+		TriggerSource: "manual",
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

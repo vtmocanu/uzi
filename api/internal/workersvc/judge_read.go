@@ -247,6 +247,7 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 		TargetRunID:      pgUUID(target.ID),
 		IssueTitle:       judgeRunTitle(target),
 		IssueDescription: "",
+		TriggerSource:    "judge_rerun",
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError

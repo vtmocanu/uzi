@@ -156,6 +156,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		TargetRunID:      pgUUID(run.ID),
 		IssueTitle:       judgeRunTitle(run),
 		IssueDescription: "",
+		TriggerSource:    "judge",
 	}); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
