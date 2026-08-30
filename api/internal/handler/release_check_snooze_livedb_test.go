@@ -101,13 +101,18 @@ func TestReleaseCheckSnoozeLiveDB(t *testing.T) {
 		}
 	}
 
-	// The snooze tag was actually persisted to the current latest_tag.
+	// The snooze tag was actually persisted to the current latest_tag, attributed to the
+	// acting admin via updated_by.
 	var persisted string
-	if err := pool.QueryRow(ctx, `SELECT value FROM app_settings WHERE key = $1`, settings.KeyReleaseBannerSnoozeTag).Scan(&persisted); err != nil {
+	var updatedBy uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT value, updated_by FROM app_settings WHERE key = $1`, settings.KeyReleaseBannerSnoozeTag).Scan(&persisted, &updatedBy); err != nil {
 		t.Fatalf("read persisted snooze tag: %v", err)
 	}
 	if persisted != "v0.5.0" {
 		t.Fatalf("persisted snooze tag = %q, want v0.5.0", persisted)
+	}
+	if updatedBy != admin {
+		t.Fatalf("persisted updated_by = %q, want acting admin %q", updatedBy, admin)
 	}
 
 	// A NEWER release lands: latest_tag advances to v0.6.0, the snooze (still v0.5.0) no

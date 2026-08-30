@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -256,8 +257,40 @@ func TestCheckForUpdateErrorPreservesLastGood(t *testing.T) {
 	}
 }
 
+// TestScrubToken covers scrubToken directly: a token embedded in a non-nil error is
+// replaced with REDACTED, a nil error stays nil, and an empty token returns the error
+// unchanged.
+func TestScrubToken(t *testing.T) {
+	const token = "ghp_secret_token_xyz789"
+
+	// (a) A non-nil error whose message contains the token has it redacted.
+	in := fmt.Errorf("dial failed for %s: connection refused", token)
+	out := scrubToken(in, token)
+	if out == nil {
+		t.Fatalf("scrubToken returned nil for a non-nil error")
+	}
+	if strings.Contains(out.Error(), token) {
+		t.Errorf("scrubbed error still contains the token: %q", out.Error())
+	}
+	if !strings.Contains(out.Error(), "REDACTED") {
+		t.Errorf("scrubbed error missing REDACTED marker: %q", out.Error())
+	}
+
+	// (b) A nil error in yields nil out.
+	if got := scrubToken(nil, token); got != nil {
+		t.Errorf("scrubToken(nil, token) = %v, want nil", got)
+	}
+
+	// (c) An empty token returns the original error value unchanged.
+	orig := fmt.Errorf("dial failed for %s: connection refused", token)
+	if got := scrubToken(orig, ""); got != orig {
+		t.Errorf("scrubToken(err, \"\") = %v, want the original error value unchanged", got)
+	}
+}
+
 // TestCheckForUpdateSendsBearerToken: a configured token → Authorization: Bearer
-// <token> is sent, and the token is scrubbed from an error.
+// <token> is sent (verifies the Authorization Bearer header only; token scrubbing is
+// covered by TestScrubToken).
 func TestCheckForUpdateSendsBearerToken(t *testing.T) {
 	const token = "ghp_release_check_token_abc123"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
