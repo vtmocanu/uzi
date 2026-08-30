@@ -1775,6 +1775,133 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 	return items, nil
 }
 
+const getActiveMRReworkRunForMR = `-- name: GetActiveMRReworkRunForMR :one
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, lineage_epoch, mr_rework_enabled FROM runs
+WHERE repo_id = $1::uuid AND mr_iid = $2
+  AND kind = 'mr_rework'
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+type GetActiveMRReworkRunForMRParams struct {
+	RepoID uuid.UUID   `json:"repo_id"`
+	MrIid  pgtype.Int8 `json:"mr_iid"`
+}
+
+// Resolve the single non-terminal mr_rework run for a (repo, MR). Used by the
+// mid-flight abort (issue #853): when the MR-close watcher sees the MR leave the
+// opened state, the active rework is cancelled so a live worker stops spending.
+// The WHERE is byte-identical to the partial unique index uq_runs_one_active_mr_rework
+// (migration 00167) — that index is the ONLY reason this can be :one; widening it, or
+// narrowing the status set here, would silently break the single-row guarantee.
+func (q *Queries) GetActiveMRReworkRunForMR(ctx context.Context, arg GetActiveMRReworkRunForMRParams) (Run, error) {
+	row := q.db.QueryRow(ctx, getActiveMRReworkRunForMR, arg.RepoID, arg.MrIid)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+		&i.PreservedPatch,
+		&i.RequiredCapabilities,
+		&i.StopReason,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.Interactive,
+		&i.OpenFollowupID,
+		&i.PlanChangedFiles,
+		&i.ScopeCeiling,
+		&i.StatusSince,
+		&i.ReviewComments,
+		&i.BudgetPausedSeconds,
+		&i.LineageEpoch,
+		&i.MrReworkEnabled,
+	)
+	return i, err
+}
+
 const getForgeTypeForRepo = `-- name: GetForgeTypeForRepo :one
 SELECT c.forge_type
 FROM repos r
