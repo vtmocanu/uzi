@@ -45,6 +45,11 @@ type detailState struct {
 
 	lanes   []agentLane
 	laneIdx int
+	// leadCtx is the lead context-window meter reading, memoized on rebuild so a
+	// render does not re-scan+unmarshal lead frames each View() (mirrors web's
+	// leadContext memoization in deriveRunUsage).
+	leadCtx   contextFill
+	leadCtxOK bool
 	// scroll is the transcript window's TOP line index (M5, bottom-anchored). When follow
 	// is true the window is pinned to the bottom (auto-tail) and scroll is recomputed on
 	// render; when paused, scroll is the fixed top so the view does not jump as frames
@@ -187,6 +192,9 @@ func (d *detailState) rebuild() {
 	if d.laneIdx < 0 {
 		d.laneIdx = 0
 	}
+	// Memoize the lead context-window meter reading now that d.lanes is final, so each
+	// render reads the cached value instead of re-scanning+unmarshalling lead frames.
+	d.leadCtx, d.leadCtxOK = leadContextFill(d.lanes)
 }
 
 func (d *detailState) selectedLane() (agentLane, bool) {
@@ -677,9 +685,10 @@ func (m tuiModel) renderLaneRail() string {
 		}
 		return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
 	}
-	// The lead's context-window meter (#565): latest-wins across LEAD frames only, computed once
-	// and shown ONLY on the lead lane. A subagent lane and the synthetic ALL lane never get it.
-	fill, hasCtx := leadContextFill(d.lanes)
+	// The lead's context-window meter (#565): latest-wins across LEAD frames only, memoized in
+	// rebuild() (d.leadCtx) so a render does not re-scan+unmarshal lead frames, and shown ONLY on
+	// the lead lane. A subagent lane and the synthetic ALL lane never get it.
+	fill, hasCtx := d.leadCtx, d.leadCtxOK
 	if d.railCollapsed {
 		// Just the selected lane, so the reader still knows whose transcript is on screen while
 		// the milestones get the rest of the column.
