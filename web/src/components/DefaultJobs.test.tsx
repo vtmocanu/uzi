@@ -213,6 +213,46 @@ describe("DefaultJobs — catalog row", () => {
     expect(within(nextRunCell).getByText("1 repo")).toBeTruthy();
   });
 
+  it("renders a labelless assigned sweep without crashing", () => {
+    // Regression for the /schedules black-screen: the shipped assigned-sweep default carries
+    // labels: null, and the options cell read entry.labels.map() unguarded, so the tab threw
+    // on first render. Rendering the row must not throw, and with no labels no "label …" chip
+    // is emitted.
+    renderTab({
+      catalog: catalog([entry({ slug: "assigned-sweep", name: "Assigned sweep", labels: null })]),
+    });
+    // The row rendered (so the chip assertion below is discriminating, not vacuous).
+    expect(screen.getByText("Assigned sweep")).toBeTruthy();
+    // No selector-label chip is rendered for a labelless sweep.
+    expect(screen.queryByText(/^label /)).toBeNull();
+  });
+
+  it("Enable on a labelless assigned sweep runs the null-guarded enable handler without throwing", async () => {
+    // Covers the onEnable null guard (`entry.labels && entry.labels.length > 0`) that the
+    // sibling render-only test above never reaches: it exercises the Enable flow for a
+    // labelless entry, so a regression to an unguarded `entry.labels.length` would throw here.
+    const onEnable = vi.fn(async () => {});
+    renderTab({
+      catalog: catalog([entry({ slug: "assigned-sweep", name: "Assigned sweep", labels: null })]),
+      onEnable,
+    });
+
+    // Pick a repo so the row Enable button appears (it only renders for an actionable repo).
+    fireEvent.click(screen.getByLabelText("vtmocanu/uzi"));
+    fireEvent.click(await screen.findByRole("button", { name: /Enable/ }));
+
+    // The handler is called with the labelless entry and the selected repo id (the guard did
+    // not throw on entry.labels being null).
+    await waitFor(() =>
+      expect(onEnable).toHaveBeenCalledWith(
+        expect.objectContaining({ slug: "assigned-sweep", labels: null }),
+        ["repo-uzi"],
+      ),
+    );
+    // The row is still rendered after enabling — the null guard did not throw mid-render.
+    expect(screen.getByText("Assigned sweep")).toBeTruthy();
+  });
+
   it("row Enable fans out only the actionable subset of the selection", async () => {
     // The job is already enabled on repo-uzi. Picking BOTH repos should enable only the
     // actionable one (repo-atlas), never re-enable the already-materialized repo-uzi.

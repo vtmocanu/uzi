@@ -1300,8 +1300,8 @@ export interface CatalogEntry {
   model: string;
   // Baked prompt for a prompt entry; "" for a sweep entry.
   prompt: string;
-  // Sweep selector labels; [] for a prompt entry.
-  labels: string[];
+  // Sweep selector labels; null for an assigned sweep (selects by assignee), [] for a prompt entry.
+  labels: string[] | null;
   // Baked per-issue guidance for a sweep entry; "" for a prompt entry.
   guidance: string;
   // Sweep fan-out cap; 0 for a prompt entry.

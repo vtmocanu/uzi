@@ -1277,6 +1277,15 @@ const scheduleCatalog: CatalogEntry[] = [
       "Implement the sweep's planned-work issue. Treat the issue description (and any linked spec) as the specification, deliver the change end to end with tests, and run the project's gate before finishing. Keep the work scoped to what the issue asks for and stop to report if it turns out to depend on something not yet in place.",
   },
   {
+    slug: "assigned-sweep",
+    name: "Assigned-work sweep",
+    description: "Daily sweep over open issues assigned to the uzi bot account, starting a run for the oldest few.",
+    target: "sweep", cron: "0 2 * * *", timezone: "UTC", model: "",
+    prompt: "", labels: null, max_issues: 3, auto_approve: true, wait_on_limit: true,
+    guidance:
+      "Implement the sweep's assigned issue. This sweep selects by assignee rather than a label, so there is no selector label to match. Treat the issue description (and any linked spec) as the specification, deliver the change end to end with tests, and run the project's gate before finishing. Keep the work scoped to what the issue asks for and stop to report if it turns out to depend on something not yet in place.",
+  },
+  {
     // A self_improve entry (PRD #590) carries neither a prompt nor labels/guidance: the
     // orchestration lead resolves its own tracking issue at fire time. So it edits like a
     // prompt default (cadence/model only) but has no baked text to show.
@@ -1306,7 +1315,7 @@ function materializeDefault(
     repo_path: repo?.path_with_namespace ?? "",
     target: entry.target,
     issue_iid: null,
-    labels: entry.target === "sweep" ? [...entry.labels] : null,
+    labels: entry.target === "sweep" && entry.labels ? [...entry.labels] : null,
     prompt: entry.target === "prompt" ? entry.prompt : "",
     timing: "recurring",
     cron_expr: entry.cron,
@@ -4631,7 +4640,7 @@ export const mockApi = {
         schedule_id: s.id,
         enabled: s.enabled,
       }));
-    return delay({ entries: scheduleCatalog.map((e) => ({ ...e, labels: [...e.labels] })), enablements });
+    return delay({ entries: scheduleCatalog.map((e) => ({ ...e, labels: e.labels ? [...e.labels] : null })), enablements });
   },
   enableCatalogSchedule: async (repoId: string, slug: string, timezone?: string) => {
     requireSession();
