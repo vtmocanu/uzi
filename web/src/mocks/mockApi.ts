@@ -49,6 +49,7 @@ import {
   type ProjectSyncOwnerKind,
   type ProjectSyncStatus,
   type RecommendationCategory,
+  type ReleaseCheckStatus,
   type Run,
   type RunPriority,
   type CatalogEntry,
@@ -92,6 +93,7 @@ import {
   mockAdminWorkers,
   mockAllocations,
   mockBuildInfo,
+  daysAgo,
   mockCliAuthRequest,
   mockCliTokens,
   mockMemories,
@@ -173,6 +175,11 @@ const SEED_APP_SETTINGS: AppSettings = {
   judge_daily_budget: "0",
   // PRD #529 / #649 M1: ephemeral worker auto-provisioning instance kill-switch, default OFF.
   ephemeral_workers_enabled: "false",
+  // PRD #836: upstream release-check toggles, both default ON (the master air-gap
+  // switch and the escalation-banner switch). The Updates card reads the live values
+  // off getReleaseCheck and writes them back here through updateSettings.
+  release_check_enabled: "true",
+  release_check_banner_enabled: "true",
   // PRD #362 Decision 8: the run-summary generator model, haiku by default.
   summary_model: "haiku",
   health_enabled: "true",
@@ -845,6 +852,68 @@ let agentSource: AgentSourceView = structuredClone(mockAgentSource);
 // read time — so a pin bump or apply self-clears the badge with no new egress. Null
 // until a check has run, so a fresh install shows no badge.
 let agentSourceRemote: { latestRef: string; tipSha: string; checkedAt: string } | null = null;
+
+// ── Upstream release check (PRD #836) ────────────────────────────────────────
+// Persisted remote facts from the last release poll, consistent with mockBuildInfo
+// (running 0.4.2, latest v0.5.0, update_available). The body carries a couple of
+// markdown bullets so the Updates card's plain-text notes excerpt renders, and NO
+// `### Security` heading — the `security` derivation is therefore false, matching
+// mockBuildInfo.latest.security. checkReleaseNow refreshes checked_at to simulate a
+// successful re-check. The two toggles live in appSettings (release_check_*), so the
+// derived status/enabled fields are read from there at build time — flipping a toggle
+// in the card and re-reading getReleaseCheck stays coherent.
+const releaseCheckFacts = {
+  latest_tag: "v0.5.0",
+  latest_name: "Hosted worker drain controls",
+  body:
+    "### Added\n" +
+    "- Worker drain deadline controls on the fleet page (#812)\n" +
+    "- Per-run cost roll-up in the board column footer (#799)\n\n" +
+    "### Fixed\n" +
+    "- Changelog drawer marker fixed on pre-release builds (#821)\n",
+  notes_url: "https://github.com/vtmocanu/uzi/releases/tag/v0.5.0",
+  published_at: daysAgo(3),
+  checked_at: daysAgo(0),
+};
+
+// releaseCheckStatus builds the admin DTO from the persisted facts + the live
+// toggles. Master toggle off → status "disabled" and no derivation, mirroring the
+// server. With facts present and the toggle on it reports "ok"; the derivations are
+// consistent with mockBuildInfo (update available, not far-behind, not security).
+function releaseCheckStatus(): ReleaseCheckStatus {
+  const enabled = appSettings.release_check_enabled === "true";
+  const bannerEnabled = appSettings.release_check_banner_enabled === "true";
+  const running = mockBuildInfo.version; // "0.4.2", bare
+  if (!enabled) {
+    return {
+      release_check_enabled: false,
+      release_check_banner_enabled: bannerEnabled,
+      interval: "6h",
+      running_version: running,
+      update_available: false,
+      far_behind: false,
+      security: false,
+      status: "disabled",
+    };
+  }
+  const security = /(^|\n)###\s+Security\b/i.test(releaseCheckFacts.body);
+  return {
+    release_check_enabled: true,
+    release_check_banner_enabled: bannerEnabled,
+    interval: "6h",
+    running_version: running,
+    latest_tag: releaseCheckFacts.latest_tag,
+    latest_name: releaseCheckFacts.latest_name,
+    body: releaseCheckFacts.body,
+    notes_url: releaseCheckFacts.notes_url,
+    published_at: releaseCheckFacts.published_at,
+    checked_at: releaseCheckFacts.checked_at,
+    update_available: true,
+    far_behind: false,
+    security,
+    status: "ok",
+  };
+}
 
 // parseAgentSourceSemver mirrors the server's re-prefix + IsValid guard (Decision 4):
 // a non-`v`-prefixed or malformed ref is not a comparable semver (null), never treated
@@ -1982,6 +2051,21 @@ export const mockApi = {
     return delay({ agent_source: agentSourceView() });
   },
 
+  // ── Upstream release check (PRD #836 M5) ─────────────────────────────────────
+  // Admin read (RequireAdminRO): the full release-check status backing the Updates
+  // card, derived from the persisted facts + the live toggles.
+  getReleaseCheck: async () => {
+    requireSession();
+    return delay({ release_check: releaseCheckStatus() });
+  },
+  // "Check now" (RequireAdmin): simulate a successful re-check by refreshing the
+  // checked-at stamp, then return the refreshed status.
+  checkReleaseNow: async () => {
+    requireSession();
+    releaseCheckFacts.checked_at = new Date().toISOString();
+    return delay({ release_check: releaseCheckStatus() });
+  },
+
   updateSettings: async (updates: UpdateSettingsPayload) => {
     // Secret tokens are write-only: validated + recorded as configured, never
     // merged into the readable settings (mirrors the real structural exclusion).
@@ -2074,7 +2158,9 @@ export const mockApi = {
         key === "slack_enabled" ||
         key === "judge_enabled" ||
         key === "judge_enforce_all" ||
-        key === "ephemeral_workers_enabled"
+        key === "ephemeral_workers_enabled" ||
+        key === "release_check_enabled" ||
+        key === "release_check_banner_enabled"
       ) {
         if (value !== "true" && value !== "false") {
           throw new ApiError(400, `${key}: must be "true" or "false"`);

@@ -733,6 +733,15 @@ export interface AppSettings {
   // users can still individually opt in on the Workers page. Web-only surfacing — the
   // key already round-trips through GET/PUT /admin/settings.
   ephemeral_workers_enabled: string;
+  // Upstream release-check toggles (PRD #836). Both the text "true"/"false" (default
+  // "true"), round-tripping through GET/PUT /admin/settings like every other setting.
+  // release_check_enabled is the master air-gap switch: when off, the api never calls
+  // github.com. release_check_banner_enabled governs only the intrusive escalation
+  // banner (M6); the pip and the admin Updates card do not depend on it. The Updates
+  // card reads the LIVE values off the ReleaseCheckStatus DTO and writes them back
+  // here through updateSettings (string-space), the same shape as the toggles above.
+  release_check_enabled: string;
+  release_check_banner_enabled: string;
   // Run-summary model (PRD #362 Decision 8): the model alias the inline run-summary
   // generator runs on (haiku by default), served as a raw string like every other
   // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
@@ -1079,6 +1088,47 @@ export interface BuildInfo {
   };
   update_available?: boolean;
   far_behind?: boolean;
+}
+
+// ReleaseCheckStatus is the ADMIN release-check surface (PRD #836 M5): the response
+// of both admin release-check endpoints (`GET`/`POST /admin/release-check`) and the
+// data source for the admin Updates card. It mirrors `apitypes.ReleaseCheckStatusDTO`
+// byte-for-byte (snake_case JSON tags). Unlike the world-readable BuildInfo.latest,
+// this is served ONLY to a cookie-authenticated admin, so it carries the full
+// persisted release `body` — the RAW release markdown the card excerpts (rendered as
+// PLAIN TEXT, never HTML) and scans for the `### Security` heading. That field is
+// admin-only and must never migrate onto an unauthenticated response.
+//
+// The three derived booleans are plain (never omitted) because `status`
+// ("disabled" | "never" | "ok" | "error") already carries the "has a check run?"
+// distinction — this endpoint always returns the complete picture. The omitempty
+// facts are optional here; the required config/version/status fields are always
+// present. No token is ever serialized.
+export interface ReleaseCheckStatus {
+  // The two runtime toggles + poll cadence, read live from settings.
+  release_check_enabled: boolean;
+  release_check_banner_enabled: boolean;
+  interval: string;
+  // This instance's own served version (bare, "dev" on an un-stamped build) — the
+  // left-hand side of the update delta the card renders.
+  running_version: string;
+  // The persisted remote facts, omitted until a check has run. `body` is the RAW
+  // release markdown (admin-only).
+  latest_tag?: string;
+  latest_name?: string;
+  body?: string;
+  notes_url?: string;
+  published_at?: string;
+  checked_at?: string;
+  // Read-time derivations over the facts + running_version (PRD #836 M1).
+  update_available: boolean;
+  far_behind: boolean;
+  security: boolean;
+  // "disabled" (master toggle off) | "never" (enabled, no check yet) | "ok" (facts
+  // present) | "error" (the last check failed). message carries a token-scrubbed
+  // reason on error, empty otherwise.
+  status: string;
+  message?: string;
 }
 
 // ── CLI tokens (PRD #64) ──────────────────────────────────────────────────
@@ -2989,6 +3039,16 @@ const realApi = {
   // `latest_ref` is empty when the source publishes no semver tag yet.
   resolveAgentSourceLatest: (url: string) =>
     request<{ latest_ref: string }>("POST", "/admin/agent-source/resolve-latest", { url }),
+  // Upstream release-check admin surface (PRD #836 M3/M5). getReleaseCheck is the read
+  // (RequireAdminRO) that backs the admin Updates card — the full status incl. the raw
+  // admin-only `body`. checkReleaseNow is the "Check now" write (RequireAdmin): it
+  // triggers one poll against the GitHub Releases API and returns the refreshed status.
+  // The two runtime toggles are edited through updateSettings (the release_check_*
+  // keys above), never here. Both return the same envelope shape.
+  getReleaseCheck: () =>
+    request<{ release_check: ReleaseCheckStatus }>("GET", "/admin/release-check"),
+  checkReleaseNow: () =>
+    request<{ release_check: ReleaseCheckStatus }>("POST", "/admin/release-check"),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
