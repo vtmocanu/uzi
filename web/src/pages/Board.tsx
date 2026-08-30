@@ -586,7 +586,9 @@ export function Board() {
     setStarting(card.iid);
     try {
       const { run } = await api.createRun(repoId, card.iid);
-      navigate(`/runs/${run.id}`);
+      // encodeURIComponent the id: per-call-site open-redirect hardening (see
+      // safeNextPath in Login.tsx). A no-op for today's UUID ids.
+      navigate(`/runs/${encodeURIComponent(run.id)}`);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not start run");
       setStarting(null);
@@ -603,7 +605,8 @@ export function Board() {
     setFixingRef(ref);
     try {
       const { run } = await api.createCIFixRun(repoId, ref);
-      navigate(`/runs/${run.id}`);
+      // encodeURIComponent the id (see safeNextPath in Login.tsx).
+      navigate(`/runs/${encodeURIComponent(run.id)}`);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not start CI fix");
       setFixingRef(null);

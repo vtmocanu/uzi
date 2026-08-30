@@ -98,7 +98,9 @@ export function ChatList() {
       // create returns a full runDTO under `run`; navigate to the new conversation,
       // seeding its meta optimistically so the header renders before the list loads.
       const { run } = await api.createChat(p);
-      navigate(`/chat/${run.id}`, { state: { seed: chatFromRun(run) } });
+      // encodeURIComponent the id: per-call-site open-redirect hardening (see
+      // safeNextPath in Login.tsx). A no-op for today's UUID ids.
+      navigate(`/chat/${encodeURIComponent(run.id)}`, { state: { seed: chatFromRun(run) } });
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to start the chat");
       setStarting(false);
@@ -149,7 +151,10 @@ export function ChatList() {
               <ConversationRow
                 key={c.id}
                 chat={c}
-                onContinued={(run) => navigate(`/chat/${run.id}`, { state: { seed: chatFromRun(run) } })}
+                onContinued={(run) =>
+                  // encodeURIComponent the id (see safeNextPath in Login.tsx).
+                  navigate(`/chat/${encodeURIComponent(run.id)}`, { state: { seed: chatFromRun(run) } })
+                }
                 onError={setError}
               />
             ))}
@@ -287,7 +292,8 @@ export function ChatConversation() {
   const continueChat = () =>
     act(async () => {
       const { run: next } = await api.continueChat(id);
-      navigate(`/chat/${next.id}`, { state: { seed: chatFromRun(next) } });
+      // encodeURIComponent the id (see safeNextPath in Login.tsx).
+      navigate(`/chat/${encodeURIComponent(next.id)}`, { state: { seed: chatFromRun(next) } });
     });
 
   if (!run && !meta) {

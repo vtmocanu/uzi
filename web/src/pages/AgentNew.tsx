@@ -26,7 +26,9 @@ export function AgentNew() {
     setBusy(true);
     try {
       const { template } = await api.createAgentTemplate(input);
-      navigate(`/agents/${template.id}`);
+      // encodeURIComponent the id: per-call-site open-redirect hardening (see
+      // safeNextPath in Login.tsx). A no-op for today's UUID ids.
+      navigate(`/agents/${encodeURIComponent(template.id)}`);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to create template");
       setBusy(false);
