@@ -23429,7 +23429,7 @@ or privacy-sensitive install must be able to turn the check off entirely without
 ## 593. Issue #857 — `runs.trigger_source`: a first-class, queryable column for what/how/who started a run
 
 A bounded observability enhancement (no PRD). Previously the trigger had to be *derived* by
-combining `user_id` / `auto_approve` / `schedule_id` / `resume_of_run_id` / `origin_column` / `kind`;
+combining `user_id` / `auto_approve` / `schedule_id` / `resume_of_run_id` / `kind`;
 `trigger_source` records it directly so runs can be filtered and reported on by entrypoint.
 
 - **Closed enum, exactly 13 values — the one real design decision.** One value per create-entrypoint
@@ -23440,7 +23440,7 @@ combining `user_id` / `auto_approve` / `schedule_id` / `resume_of_run_id` / `ori
   via `createRun` for the manual/schedule/autopilot paths and via the judge query param for
   `judge`/`judge_rerun`. A structured `slog.Info("workersvc: run created", ...)` line is emitted at
   creation carrying run_id/repo_id/issue_iid/kind/trigger_source/user_id/auto_approve/schedule_id.
-- **Backfill is best-effort inference from the same columns the trigger used to be derived from.** Two
+- **Backfill is best-effort inference keyed on `kind` plus `auto_approve` / `schedule_id` / `resume_of_run_id` and the task lineage pointers (`review_target_run_id` / `then_fix_of_run_id`); it does not read `origin_column` (which records board position at creation, not the trigger).** Two
   values are historically indistinguishable and documented as such: `judge_rerun` is not separable from
   `judge` (backfill reads `judge`), and an issue run whose schedule was since deleted falls to
   `manual`/`autopilot`.
