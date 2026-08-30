@@ -383,6 +383,30 @@ func TestCreateThenFixRunCapsDescription(t *testing.T) {
 		}
 	})
 
+	t.Run("under-cap description with embedded NUL is stripped, not truncated", func(t *testing.T) {
+		// The over-cap case above cannot prove stripNUL ran: its NUL sits past the cap, so
+		// truncation drops the byte even if stripNUL regressed. This case keeps the input
+		// UNDER the cap so no truncation occurs — the persisted description is NUL-free ONLY
+		// if stripNUL (which runs before the cap check) actually stripped it.
+		fs := &fakeStore{userByID: store.User{ID: owner}}
+		svc := New(fs, newBox(t), testParams())
+		const withNUL = "abc\x00def" // well under MaxIssueDescriptionBytes; the NUL must be removed, not preserved
+		if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", withNUL,
+			pgtype.Int4{}, pgtype.Int4{}); err != nil {
+			t.Fatalf("CreateThenFixRun: %v", err)
+		}
+		got := fs.thenFixRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if strings.Contains(got.IssueDescription, "\x00") {
+			t.Error("issue_description still contains a NUL byte; stripNUL did not run before persistence")
+		}
+		if got.IssueDescription != "abcdef" {
+			t.Errorf("issue_description = %q, want the NUL-stripped %q (no truncation for an under-cap value)", got.IssueDescription, "abcdef")
+		}
+	})
+
 	t.Run("short description passes through unchanged", func(t *testing.T) {
 		fs := &fakeStore{userByID: store.User{ID: owner}}
 		svc := New(fs, newBox(t), testParams())
