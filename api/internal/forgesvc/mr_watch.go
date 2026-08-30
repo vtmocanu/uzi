@@ -97,11 +97,15 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		//
 		// A confirmed close means any in-flight rework can never land — abort it
 		// INDEPENDENTLY of the board move (#853 review finding). Cancellation is
-		// idempotent (no active rework / no canceller → no-op nil) and keyed on the
-		// MR, not the card, so it must NOT be gated behind a move that can defer:
-		// a forge move error, or an evicted card that stops being a candidate next
-		// tick, would otherwise leave the rework spending forever. Attempt it every
-		// tick, ahead of the move.
+		// keyed on the MR, not the card, so it must NOT be gated behind a move that
+		// can defer: a forge move error, or an evicted card that stops being a
+		// candidate next tick, would otherwise leave the rework spending forever.
+		// Attempt it every tick, ahead of the move. Re-attempts converge: once the
+		// run is terminal (server-side path) GetActiveMRReworkRunForMR returns no
+		// rows → no-op nil; while a live worker's run is still non-terminal a
+		// re-entry re-stamps stop_kind and re-enqueues a cancel verdict, which is
+		// harmless (the worker cancels on the first it consumes) and only occurs in
+		// the narrow window where the move keeps deferring before the worker acks.
 		cancelErr := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64)
 		if cancelErr != nil {
 			slog.Warn("forgesvc: cancel rework on MR close failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", cancelErr)

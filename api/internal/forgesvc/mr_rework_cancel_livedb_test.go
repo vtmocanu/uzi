@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -25,17 +26,22 @@ import (
 // re-assert the wiring the unit tests already pin (mr_watch_test.go); the point here is
 // that the two services agree over the SAME rows through the SAME SQL the server runs.
 //
-// The four subtests each seed their OWN repo + issue + mr_iid so they are independent, and
+// The five subtests each seed their OWN repo + issue + mr_iid so they are independent, and
 // assert on the LIVE DB (runs.status / runs.stop_kind / a run_user_inputs cancel row):
 //
-//  1. Merged, NO live poller  -> the rework run flips to status='cancelled' (CancelRunServerSide).
+//  1. Merged, NO live poller  -> the rework run flips to status='cancelled' (CancelRunServerSide);
+//     no cancel verdict is enqueued (countCancelInputs==0).
 //  2. Merged, LIVE poller     -> stop_kind='cancelled' stamped AND a kind='cancel' run_user_inputs
 //     row is enqueued (CreateStopVerdictInput); the run stays non-terminal because no real worker
 //     acks — the enqueue+stamp IS the observable, not a terminal status.
 //  3. Locked (no-op)          -> the rework run is untouched: status unchanged, stop_kind NULL, no
 //     cancel input. Locked is transient mid-merge and must NOT trigger a cancel.
 //  4. Closed, cancels too     -> the CLOSED arm reaches the cancel (guardedMRMove returns moveSkipped
-//     on a closed issue, not moveDeferred), so the rework run flips to status='cancelled'.
+//     on a closed issue, not moveDeferred), so the rework run flips to status='cancelled'; no
+//     cancel verdict is enqueued (countCancelInputs==0).
+//  5. Closed + move DEFERRED  -> an OPEN issue with seeded board columns whose move fails (updateErr)
+//     makes guardedMRMove return moveDeferred; the cancel is DECOUPLED from the move and still fires
+//     (status='cancelled'), while mr_state is left 'opened' so the move retries next tick.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; e2e/run-store-it.sh
 // (and task gate:api in CI) provide one. `go test ./...` without it SKIPs.
@@ -245,14 +251,21 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 	})
 
 	t.Run("closed, forge move deferred -> cancels anyway (decoupled from board move)", func(t *testing.T) {
-		// Regression guard for #853 review finding: an OPEN issue whose card sits in
-		// Human Review is a Lane-A candidate, so guardedMRMove ATTEMPTS the move — but
-		// updateErr makes AutoMove fail, returning moveDeferred (not moveSkipped). The
-		// cancel must still fire: it is keyed on the MR, not gated behind the move, so a
-		// confirmed close cancels the in-flight rework even when the board move can't
-		// complete. mr_state is left unadvanced (the move retries next tick), which we do
-		// not assert here — the point is that the rework is cancelled regardless.
+		// Regression guard for #853 review finding: the close-edge cancel must fire even
+		// when the board move genuinely DEFERS (a forge-side move error). To reach that
+		// path the guarded move must ATTEMPT AutoMove rather than short-circuit, so this
+		// subtest — unlike #4, whose closed ISSUE skips the move — uses an OPEN issue AND
+		// seeds board_columns so ResolveColumn(["Human Review"]) == wantSource. Then
+		// updateErr makes AutoMove's UpdateIssueLabels fail → guardedMRMove returns
+		// moveDeferred. Pre-fix, that early-returned before the cancel; post-fix, the
+		// cancel is decoupled and still runs. mr_state is left unadvanced so the move
+		// retries next tick — asserted below.
 		s := seed(t, 8535, 85350, "opened", false /* live */)
+		// A card only resolves to a column when that label is a real board column; with
+		// no board_columns row ResolveColumn returns "" and the source guard yields
+		// moveSkipped, never reaching AutoMove. Seed the two columns the move spans.
+		exec(t, `INSERT INTO board_columns (repo_id, label_name, position) VALUES ($1, $2, 0), ($1, $3, 1)`,
+			s.repoID, board.ColumnInProgress, board.ColumnHumanReview)
 		f := &fakeForge{
 			mrByIID:   map[int64]forge.MergeRequest{s.mrIID: forgeMR(s.mrIID, "closed")},
 			updateErr: fmt.Errorf("forge unreachable"),
@@ -268,6 +281,17 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 		}
 		if !stopKind.Valid || stopKind.String != "cancelled" {
 			t.Fatalf("rework run stop_kind = %+v, want 'cancelled'", stopKind)
+		}
+		// A deferred move must NOT consume the edge: the issue run's mr_state stays
+		// 'opened' so the next poller tick re-observes the close and retries the move.
+		var mrState pgtype.Text
+		if err := pool.QueryRow(ctx,
+			`SELECT mr_state FROM runs WHERE repo_id = $1 AND kind = 'issue'`, s.repoID).
+			Scan(&mrState); err != nil {
+			t.Fatalf("read issue-run mr_state: %v", err)
+		}
+		if !mrState.Valid || mrState.String != "opened" {
+			t.Fatalf("issue-run mr_state = %+v, want 'opened' — a deferred move must leave the edge unadvanced for retry", mrState)
 		}
 	})
 }
