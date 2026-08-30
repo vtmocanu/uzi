@@ -1,4 +1,4 @@
-{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs (include "uzi.apiHostingEnabled" .)) }}
+{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs .Values.releaseCheck (include "uzi.apiHostingEnabled" .)) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -9,6 +9,15 @@ metadata:
 data:
   {{- range $k, $v := .Values.api.config }}
   {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- /*
+    UZI_RELEASE_CHECK_TOKEN is an OPTIONAL SECRET and must NEVER be rendered into this
+    plaintext ConfigMap. Guarded here (OUTSIDE the releaseCheck block below) because the
+    api.config range above emits every key unconditionally, so the leak is independent of
+    whether releaseCheck is set. Supply the token via api.secretEnv (Infisical secretKeyRef).
+  */ -}}
+  {{- if hasKey .Values.api.config "UZI_RELEASE_CHECK_TOKEN" }}
+  {{- fail "Do not set UZI_RELEASE_CHECK_TOKEN in api.config: it is a secret and api.config renders into a plaintext ConfigMap. Supply it via api.secretEnv (Infisical secretKeyRef)." }}
   {{- end }}
   {{- /*
     FORGE_ALLOWED_BASE_URLS rendered EXPLICITLY from the first-class forge.allowedBaseURLs
@@ -26,6 +35,36 @@ data:
   {{- fail "Set the forge allowlist in EITHER forge.allowedBaseURLs OR api.config.FORGE_ALLOWED_BASE_URLS, not both: both set would emit a duplicate FORGE_ALLOWED_BASE_URLS ConfigMap key. Prefer forge.allowedBaseURLs (it also drives the worker egress FQDN list)." }}
   {{- end }}
   FORGE_ALLOWED_BASE_URLS: {{ join "," .Values.forge.allowedBaseURLs | quote }}
+  {{- end }}
+  {{- /*
+    UZI_RELEASE_CHECK_* rendered EXPLICITLY from the first-class releaseCheck values
+    (PRD #836), NOT left to the api.config freeform map — so the chart's seed defaults
+    track the api's own config.go defaults and the create-only seeder is not fought.
+    Rendered like WORKER_HOSTING_ENABLED below, for the same anti-drift reason.
+
+    Setting the SAME UZI_RELEASE_CHECK_* key in api.config AND here would emit a
+    DUPLICATE ConfigMap key (the range above already emitted the api.config one), so
+    each combination is a hard render failure rather than a last-wins silent pick —
+    the same convention as FORGE_ALLOWED_BASE_URLS. Set these in releaseCheck, not
+    api.config.
+
+    UZI_RELEASE_CHECK_TOKEN is an OPTIONAL SECRET (raises the GitHub rate limit) and is
+    deliberately NOT rendered here — supply it via api.secretEnv (Infisical secretKeyRef),
+    never as a plaintext ConfigMap value.
+  */ -}}
+  {{- if .Values.releaseCheck }}
+  {{- if hasKey .Values.api.config "UZI_RELEASE_CHECK_ENABLED" }}
+  {{- fail "Set the release-check master toggle in releaseCheck.enabled, not api.config.UZI_RELEASE_CHECK_ENABLED: both set would emit a duplicate UZI_RELEASE_CHECK_ENABLED ConfigMap key." }}
+  {{- end }}
+  {{- if hasKey .Values.api.config "UZI_RELEASE_CHECK_BANNER_ENABLED" }}
+  {{- fail "Set the release-check banner toggle in releaseCheck.bannerEnabled, not api.config.UZI_RELEASE_CHECK_BANNER_ENABLED: both set would emit a duplicate UZI_RELEASE_CHECK_BANNER_ENABLED ConfigMap key." }}
+  {{- end }}
+  {{- if hasKey .Values.api.config "UZI_RELEASE_CHECK_INTERVAL" }}
+  {{- fail "Set the release-check interval in releaseCheck.interval, not api.config.UZI_RELEASE_CHECK_INTERVAL: both set would emit a duplicate UZI_RELEASE_CHECK_INTERVAL ConfigMap key." }}
+  {{- end }}
+  UZI_RELEASE_CHECK_ENABLED: {{ .Values.releaseCheck.enabled | quote }}
+  UZI_RELEASE_CHECK_BANNER_ENABLED: {{ .Values.releaseCheck.bannerEnabled | quote }}
+  UZI_RELEASE_CHECK_INTERVAL: {{ .Values.releaseCheck.interval | quote }}
   {{- end }}
   {{- if include "uzi.apiHostingEnabled" . }}
   # Hosted workers (PRD #58 Decision 12). Rendered from the chart rather than left to

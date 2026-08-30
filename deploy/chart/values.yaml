@@ -83,6 +83,33 @@ imageVerification:
 forge:
   allowedBaseURLs: []
 
+# --- releaseCheck: the periodic GitHub release-availability check (PRD #836) -------
+#
+# The api periodically polls GitHub's releases API for vtmocanu/uzi and surfaces an
+# "update available" banner to admins. These values SEED the check at first boot
+# (create-only), after which it is admin-runtime-authoritative (changed from the
+# admin Settings UI). So keep these defaults matching the api's own config.go
+# defaults, or the create-only seeder fights the chart on a fresh install.
+#
+# Rendered EXPLICITLY into the api ConfigMap (api-configmap.yaml), like
+# WORKER_HOSTING_ENABLED — NOT via the api.config freeform map. Set these toggles
+# HERE, never as UZI_RELEASE_CHECK_* keys in api.config: doing both would emit a
+# duplicate ConfigMap key, which the template turns into a hard render failure.
+releaseCheck:
+  # Master / air-gap toggle. false => the api NEVER calls github.com for this check.
+  enabled: true
+  # Whether the "update available" banner is shown to admins. The check can still run
+  # with the banner suppressed (bannerEnabled:false, enabled:true).
+  bannerEnabled: true
+  # How often the api polls the GitHub releases API. An ordinary Go duration.
+  interval: "6h"
+  # UZI_RELEASE_CHECK_TOKEN is an OPTIONAL SECRET that raises GitHub's rate limit. It
+  # is deliberately NOT set here — plaintext values are never secret. Supply it via
+  # api.secretEnv (the Infisical secretKeyRef path, like the other secrets) ONLY when
+  # a higher GitHub rate limit is needed:
+  #   api.secretEnv:
+  #     UZI_RELEASE_CHECK_TOKEN: UZI_RELEASE_CHECK_TOKEN
+
 # --- api: the Go backend (sole holder of secrets/keys, the DB client) -----------
 api:
   enabled: true

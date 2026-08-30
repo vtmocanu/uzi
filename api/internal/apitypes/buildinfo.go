@@ -73,4 +73,41 @@ type BuildInfoDTO struct {
 	// internal/handler/handler.go), leaving startedAt the zero time, where a naive
 	// subtraction renders roughly two millennia.
 	UptimeSeconds *int64 `json:"uptime_seconds,omitempty"`
+	// Latest is the newest upstream uzi release the server knows about (PRD #836 M3),
+	// derived at read time from the persisted release-check facts. Omitted entirely
+	// until a check has actually run and the feature is enabled — a nil Latest is
+	// "never checked / disabled", distinct from any populated value. Its inner fields
+	// are public-by-construction (the release is on github.com) and NOT separately
+	// audited by TestVersionEndpointCarriesNothingPrivate, which does not recurse into
+	// this named object. Body is deliberately absent here — the raw release notes are
+	// admin-only and served by the admin release-check endpoint, never this
+	// world-readable one.
+	Latest *LatestReleaseDTO `json:"latest,omitempty"`
+	// UpdateAvailable / FarBehind are the read-time derivations over Latest + the
+	// running Version (PRD #836 M3). *bool, NOT a bare bool: a bare bool with omitempty
+	// collapses false ("checked, up to date") into "never checked", exactly the
+	// unknown-beats-wrong hazard the *int/*int64 fields above avoid. The pointer keeps
+	// nil (unknown), false (up to date) and true (behind) three distinct states. Both
+	// are nil whenever Latest is nil (no check has run, or the feature is disabled).
+	UpdateAvailable *bool `json:"update_available,omitempty"`
+	FarBehind       *bool `json:"far_behind,omitempty"`
+}
+
+// LatestReleaseDTO is the newest upstream release's public coordinates, nested under
+// BuildInfoDTO.Latest (PRD #836 M3). Every field here is public-by-construction: the
+// release is published on github.com/vtmocanu/uzi. The markdown release body is
+// deliberately NOT on this struct — it is admin-only and served by the admin
+// release-check endpoint, so it never rides this unauthenticated response.
+type LatestReleaseDTO struct {
+	// Version is the upstream release tag as stored (v-prefixed on the wire, e.g.
+	// "v0.66.0"); the SPA re-derives display. Always present when Latest is non-nil.
+	Version string `json:"version"`
+	// Name is the release's title; PublishedAt is its RFC3339 publish time; NotesURL is
+	// the html_url to the full release notes. Omitted when unknown.
+	Name        string `json:"name,omitempty"`
+	PublishedAt string `json:"published_at,omitempty"`
+	NotesURL    string `json:"notes_url,omitempty"`
+	// Security is true when the release body advertises a security fix (a "### Security"
+	// heading, PRD #836 D5). Omitted when false — a routine release carries no flag.
+	Security bool `json:"security,omitempty"`
 }

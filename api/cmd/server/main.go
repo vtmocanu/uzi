@@ -34,6 +34,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/oidc"
 	"github.com/vtmocanu/uzi/api/internal/poller"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/releasecheck"
 	"github.com/vtmocanu/uzi/api/internal/runlifecycle"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -421,6 +422,12 @@ func run() error {
 	if err := seed.SlackSettings(ctx, q, box, cfg); err != nil {
 		return err
 	}
+	// Upstream-release-check seed (PRD #836 M2): create-only, so an admin's later
+	// "off" flip is never re-enabled on reboot. DB or seal errors abort boot; the
+	// shared Invalidate below covers it so the cache's first read sees the seeded rows.
+	if err := seed.ReleaseCheckSettings(ctx, q, box, cfg); err != nil {
+		return err
+	}
 	settingsCache.Invalidate()
 
 	// Claim gating + claim-time token open share the same vault instance the HTTP
@@ -758,6 +765,20 @@ func run() error {
 		agentSourceRunner.Start(ctx)
 	}()
 
+	// Upstream-release-check interval Runner (PRD #836 M2), wired exactly like the
+	// agent-source Runner: a panic-recovered background goroutine that sleeps
+	// ReleaseCheckInterval per tick and calls CheckForUpdate. The master enable gate is
+	// read inside CheckForUpdate (short-circuits to "disabled" with no egress), and the
+	// first tick only fires after one interval, so this never delays boot or calls
+	// github.com when the feature is off.
+	releaseRec := releasecheck.NewReconciler(q, settingsCache, time.Now, slog.Default())
+	releaseRunner := releasecheck.NewRunner(releaseRec, settingsCache, slog.Default())
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		releaseRunner.Start(ctx)
+	}()
+
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
 	// Dedicated tighter budget for the two Slack-DM-triggering /me/slack endpoints
@@ -796,6 +817,9 @@ func run() error {
 	// The admin agent-source endpoints (PRD #602 M4) drive the SAME reconciler the
 	// interval loop uses: "Sync now" calls Reconcile, approve-and-apply calls Apply.
 	h.SetAgentSourceReconciler(agentSourceRec)
+	// The admin release-check "Check now" endpoint (PRD #836 M3) drives the SAME
+	// reconciler the interval Runner uses (releaseRec, built above): CheckForUpdate.
+	h.SetReleaseCheckReconciler(releaseRec)
 	// Share the vault with the HTTP handlers: unlock at login, DEK-seal on secret
 	// save, the /api/vault endpoints, and vault status on /api/me (PRD #32). M3 adds
 	// the same instance to workersvc for claim-time gating + open.

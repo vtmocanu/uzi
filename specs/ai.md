@@ -23357,3 +23357,71 @@ contract here; PRD #841's Decision Log (D1–D5) is the richer rationale.
   checkbox (gated by `canToggleMrRework`) and a schedule toggle. All other create paths
   (autopilot label poller, `CreateAutoCIFixRun`, `CreateAutoMRReworkRun`, self-improve,
   task/handoff) leave the column NULL → inherit, byte-identical to today.
+
+## 592. PRD #836 — a server-side upstream update-available signal: poll GitHub releases, persist the facts, derive the flags at read time with zero client egress
+
+Serves human: an operator should learn a newer uzi is out (and be nudged harder when far behind
+or a security release ships) without any surface hitting GitHub per browser/agent, and an air-gapped
+or privacy-sensitive install must be able to turn the check off entirely without redeploying.
+
+- **The api owns the check; clients render server booleans, never a client-side version compare.**
+  A dedicated `releasecheck` package (mirroring `agentsource`'s file shape) fetches
+  `releases/latest` for `vtmocanu/uzi` on a cadence, persists the remote facts to `app_settings`,
+  and derives `update_available` / `far_behind` / `security` at READ time in one server-side place.
+  The SPA/CLI consume those flags off the extended `/api/version` DTO and do zero egress and zero
+  version math — the semver trap lives server-side, in one place, on purpose.
+- **Mirrors agent-source's POLL→PERSIST→DERIVE core, but not its scheduling or seeding (two
+  deliberate precedents).** The guarded client, the disabled/error status shape, the read-time
+  derivation, and the semver guard come straight from `api/internal/agentsource/update.go`. But it
+  schedules via a dedicated interval Runner (`agentsource.NewRunner`/`Start` shape in `reconcile.go`,
+  wired beside `agentSourceRunner.Start` in `main.go`) — a panic-recovered goroutine sleeping the
+  interval per tick, NOT a `poller.Engine` detector (those are post-forge-sync hooks) and NOT a
+  `schedsvc` job. And because it IS env-seeded (agent-source is admin-only, never seeded), the
+  seeding half follows `seed.SlackSettings`: create-only.
+- **Two admin runtime toggles, default on.** `release_check_enabled` is the master air-gap/privacy
+  gate — off → the api never contacts github.com (no poll, no logged poll errors on an offline
+  install). `release_check_banner_enabled` gates only the intrusive escalation banner; the pip and
+  the admin card do not depend on it. Both live in `app_settings` (admin-editable at runtime),
+  because helm gates only the k8s path and uzi also ships docker-compose, and the admin who sees the
+  banner is exactly who wants to silence it without a redeploy. The master gate fails CLOSED on a
+  settings-read error (a read failure must not turn egress on).
+- **Env/helm seeding is create-only, so a runtime "off" survives redeploy.** `seed.ReleaseCheckSettings`
+  writes only absent keys; `UZI_RELEASE_CHECK_ENABLED`/`_BANNER_ENABLED`/`_INTERVAL` (default `6h`,
+  parsed by `config.go`'s existing helpers — a typo aborts boot) supply the INITIAL default only, and
+  the admin setting is authoritative thereafter. Optional `UZI_RELEASE_CHECK_TOKEN` is sealed via
+  `settings.ValueForStorage` like `KeySlackBotToken` and raises the unauth 60-req/hr-per-IP ceiling,
+  unneeded at this cadence.
+- **The semver comparison is guarded (re-prefix + `IsValid` both operands).** The server serves the
+  version bare (`0.14.0`, Model B: served == image tag == chart appVersion) while GitHub `tag_name`
+  is `v`-prefixed, and `x/mod/semver` treats every invalid version as equal — so a naive
+  `Compare(server, tag)` fails silently OPEN ("up to date" for a genuinely-behind pair). It mirrors
+  `agentsource.semverNewer`: re-prefix AND `IsValid`-guard both operands before comparing, proven by a
+  genuinely-behind fixture (the all-current fixture is a false control). Three states are kept
+  distinct via `*bool` on the DTO: omitted (never checked / disabled), `false` (checked, current),
+  `true` (behind) — the same "unknown beats wrong" rule the DTO's `*int` fields already use.
+- **`far_behind` is server-computed too, same principle as the pip.** v1 heuristic:
+  `update_available && (majorGap ≥ 1 OR minorGap ≥ 3 OR the release is at least 30 days old (now − published_at ≥ 30 days))`, from
+  `semver.Major`/`semver.MajorMinor` on the re-prefixed strings; thresholds are tunable defaults. An
+  exact "N releases behind" count (a releases-LIST call) is a future refinement, not v1.
+- **Security releases are auto-flagged from a `### Security` heading in the release body.** The
+  `releases/latest` payload has no severity field, but `release.yml` emits each Release body from the
+  matching `CHANGELOG.md` section verbatim, and the CHANGELOG uses Keep-a-Changelog `### Security`
+  subsections — so `security=true` is derivable offline by scanning the persisted body, zero new API
+  surface. A CHANGELOG-discipline heuristic: a security fix shipped without the heading reads as
+  routine (acceptable for a nudge, documented in the ADR).
+- **The check bypasses the SSRF allowlists deliberately.** `FORGE_ALLOWED_BASE_URLS` and
+  `AGENT_SOURCE_ALLOWED_BASE_URLS` guard USER-supplied base URLs; this check hits a
+  compile-time-constant URL (`api.github.com/repos/vtmocanu/uzi/...`) and carries no PAT on the
+  unauthenticated path, so the user-URL SSRF threat does not apply (and `api.github.com` would not
+  match the default `https://github.com` entry anyway).
+- **Three surfaces.** A brand-colored version-badge pip + a `BuildInfoPopover` row for all users
+  (admin sees an "Update guide →" link, member sees "Ask your operator"); an admin Settings → Updates
+  card (delta, notes excerpt, copyable helm/compose runbook, "Check now" → admin-only
+  `POST /api/admin/release-check`, the two toggles, and the sole place the `error`/`disabled` status
+  is surfaced in words); and an admin-only escalation banner gated on `banner_enabled && update_available && (far_behind || security)`
+  (the security arm is conjoined with update_available since a `### Security` heading alone does not imply a newer release),
+  with a server-side snooze keyed to the release tag so it auto-clears when a newer release ships.
+  Reading notes is always a link out to `notes_url`/`html_url` — no build-time upstream-feed bundle
+  (it cannot hold entries newer than the instance's own build).
+- Full rationale and Decision Log D1–D8: `prds/done/836-update-available-signal.md`; the outbound-egress
+  path and the SSRF-bypass argument are recorded in `adr/0836-upstream-release-check.md`.

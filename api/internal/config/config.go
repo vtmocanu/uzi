@@ -296,6 +296,22 @@ type Config struct {
 	SeedSlackAppToken string
 	SeedPublicBaseURL string
 
+	// SeedReleaseCheck* carry the initial defaults for the upstream-release check
+	// (PRD #836 M2), seeded create-only into app_settings at boot by
+	// seed.ReleaseCheckSettings. They are the *initial* values only — the admin
+	// runtime settings are authoritative after first seed (D8), so redeploying with
+	// an env var still set never re-enables a feature an admin turned off.
+	//
+	// The two bools come from UZI_RELEASE_CHECK_ENABLED / UZI_RELEASE_CHECK_BANNER_ENABLED
+	// (default true), and a typo in either aborts boot via parseBool. The interval is
+	// UZI_RELEASE_CHECK_INTERVAL (default 6h). SeedReleaseCheckToken is the OPTIONAL
+	// GitHub token (UZI_RELEASE_CHECK_TOKEN, default ""); it is a settings-level secret
+	// sealed with the settings secretbox before storage and never logged.
+	SeedReleaseCheckEnabled       bool
+	SeedReleaseCheckBannerEnabled bool
+	SeedReleaseCheckInterval      time.Duration
+	SeedReleaseCheckToken         string
+
 	// Agent-runtime (PRD #4) knobs. All have safe defaults; none is a boot guard
 	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
@@ -901,6 +917,11 @@ func Load() (Config, error) {
 	if err := loadSeedSlack(&cfg); err != nil {
 		return Config{}, err
 	}
+	// PRD #836 M2. A typo in either release-check bool aborts boot (parseBool),
+	// mirroring UZI_AUTOSTOP_ENABLED — these seed the initial app_settings defaults.
+	if err := loadReleaseCheck(&cfg); err != nil {
+		return Config{}, err
+	}
 	// Must run after FrontendOrigin is set (the redirect URL is derived from it).
 	if err := loadOIDC(&cfg); err != nil {
 		return Config{}, err
@@ -1345,6 +1366,31 @@ func loadSeedSlack(cfg *Config) error {
 	cfg.SeedSlackBotToken = bot
 	cfg.SeedSlackAppToken = app
 	cfg.SeedPublicBaseURL = pub
+	return nil
+}
+
+// loadReleaseCheck reads the upstream-release-check env seeds (PRD #836 M2) into the
+// SeedReleaseCheck* config fields, which seed.ReleaseCheckSettings later writes
+// create-only into app_settings. The two toggles use parseBool so a typo (e.g.
+// UZI_RELEASE_CHECK_ENABLED=flase) aborts boot loudly instead of silently defaulting —
+// the same convention as UZI_AUTOSTOP_ENABLED, and for the same reason (an operator who
+// believes they disabled the github.com poll must not be silently left with it on).
+// The interval uses parseDuration (default 6h; a malformed value falls back). The
+// OPTIONAL token is read verbatim (default ""); it is a settings-level secret, sealed
+// at seed time and never logged.
+func loadReleaseCheck(cfg *Config) error {
+	enabled, err := parseBool("UZI_RELEASE_CHECK_ENABLED", true)
+	if err != nil {
+		return err
+	}
+	banner, err := parseBool("UZI_RELEASE_CHECK_BANNER_ENABLED", true)
+	if err != nil {
+		return err
+	}
+	cfg.SeedReleaseCheckEnabled = enabled
+	cfg.SeedReleaseCheckBannerEnabled = banner
+	cfg.SeedReleaseCheckInterval = parseDuration("UZI_RELEASE_CHECK_INTERVAL", 6*time.Hour)
+	cfg.SeedReleaseCheckToken = getenv("UZI_RELEASE_CHECK_TOKEN", "")
 	return nil
 }
 

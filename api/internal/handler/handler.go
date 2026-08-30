@@ -28,6 +28,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/releasecheck"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
@@ -161,6 +162,19 @@ type Handler struct {
 	// from a sync. Wired via SetAgentSourceReconciler in main; nil-guarded in the
 	// handlers so a struct-literal test handler returns a clean error, not a panic.
 	agentSource AgentSourceReconciler
+	// releaseCheck is the upstream-release-check reconciler (PRD #836 M3). The admin
+	// "Check now" endpoint drives it — the SAME CheckForUpdate the interval Runner
+	// calls. Wired via SetReleaseCheckReconciler in main; nil-guarded in the handler so
+	// a struct-literal test handler returns a clean error, not a panic.
+	releaseCheck ReleaseCheckReconciler
+}
+
+// ReleaseCheckReconciler is the slice of *releasecheck.Reconciler the admin
+// release-check "Check now" handler drives (PRD #836 M3). Kept as an interface so a
+// handler test can inject a fake without the HTTP-client machinery, and so the handler
+// package does not hard-depend on the concrete reconciler.
+type ReleaseCheckReconciler interface {
+	CheckForUpdate(ctx context.Context) (releasecheck.Result, error)
 }
 
 // AgentSourceReconciler is the slice of *agentsource.Reconciler the admin
@@ -229,6 +243,11 @@ func (h *Handler) SetProjectSync(p ProjectSyncer) { h.projectSync = p }
 // construction. Safe to leave unset — the admin agent-source endpoints then return a
 // clean 500 rather than panic (struct-literal test handlers that don't exercise them).
 func (h *Handler) SetAgentSourceReconciler(r AgentSourceReconciler) { h.agentSource = r }
+
+// SetReleaseCheckReconciler wires the upstream-release-check reconciler (PRD #836 M3)
+// after construction. Safe to leave unset — the admin "Check now" endpoint then returns
+// a clean 500 rather than panic (struct-literal test handlers that don't exercise it).
+func (h *Handler) SetReleaseCheckReconciler(r ReleaseCheckReconciler) { h.releaseCheck = r }
 
 // clock reads the classification clock seam, nil-safe.
 //
@@ -563,7 +582,47 @@ func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
 		}
 		info.UptimeSeconds = &secs
 	}
+	h.attachReleaseInfo(r.Context(), &info)
 	httpx.JSON(w, http.StatusOK, info)
+}
+
+// attachReleaseInfo populates the optional upstream-release fields (PRD #836 M3) on
+// the version DTO, DERIVED at read time from the persisted release-check facts read
+// through h.settings (the read-through cache, no per-request DB hit — the token key is
+// never serialized here). It leaves all three fields nil (omitted) unless a check has
+// actually run (a non-empty CheckedAt) AND the feature is enabled — so a nil Latest is
+// "never checked / disabled", and false vs true stay distinct via the *bool. The DTO's
+// public `latest` carries no body: the raw notes are admin-only (see the admin
+// release-check endpoint). Any read error leaves the fields nil (unknown), never
+// erroring the endpoint.
+func (h *Handler) attachReleaseInfo(ctx context.Context, info *apitypes.BuildInfoDTO) {
+	if h.settings == nil {
+		return
+	}
+	enabled, err := h.settings.ReleaseCheckEnabled(ctx)
+	if err != nil || !enabled {
+		return
+	}
+	st, err := h.settings.ReleaseStatus(ctx)
+	if err != nil {
+		return
+	}
+	// "Has a check run?" is signalled by a stamped CheckedAt — the Runner writes it on
+	// every successful pass, so an empty CheckedAt means no facts have been persisted.
+	if st.CheckedAt == "" {
+		return
+	}
+	info.Latest = &apitypes.LatestReleaseDTO{
+		Version:     st.LatestTag,
+		Name:        st.LatestName,
+		PublishedAt: st.PublishedAt,
+		NotesURL:    st.NotesURL,
+		Security:    releasecheck.Security(st.Body),
+	}
+	ua := releasecheck.UpdateAvailable(h.version, st.LatestTag)
+	info.UpdateAvailable = &ua
+	fb := releasecheck.FarBehind(h.version, st.LatestTag, st.PublishedAt, h.clock())
+	info.FarBehind = &fb
 }
 
 // ChatCreateRoutePattern is the chi route pattern of POST /chats (create a chat).
@@ -1058,6 +1117,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// are cookie-only writes in the group below. The staged roles' body is
 				// display-sanitized in the DTO (the approval surface must not be spoofable).
 				r.Get("/agent-source", h.GetAgentSource)
+				// Upstream-release-check config + persisted facts + derived signals for
+				// the admin Updates card (PRD #836 M3). Read-only: the "Check now" trigger
+				// is a cookie-only write in the group below. Admin-only route, so the DTO
+				// carries the raw release body the card previews.
+				r.Get("/release-check", h.GetReleaseCheck)
 				// Factory-wide standing-credential inventory: every CLI token with its
 				// owner. Closes the gap that `workers` has not had since PRD #42 — a CLI
 				// token was visible to its owner and to NOBODY else, and a user-scope token
@@ -1120,6 +1184,15 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// facts with zero egress. Cookie-only admin, off the read-only GET and the
 				// uza_ CLI token.
 				r.Post("/agent-source/update-check", h.PostAgentSourceUpdateCheck)
+				// PRD #836 M3: "Check now" — trigger one upstream-release check (the SAME
+				// CheckForUpdate the interval Runner calls), persist the remote facts, and
+				// return the refreshed status. Cookie-only admin, off the read-only GET and
+				// the uza_ CLI token — the ONE new outbound-egress trigger this PRD adds.
+				r.Post("/release-check", h.PostReleaseCheck)
+				// PRD #836 M6: snooze the admin escalation banner for the current release.
+				// Cookie-only admin, no egress — upserts the snooze tag = latest_tag so a
+				// newer release auto-clears it. Off the read-only GET and the uza_ CLI token.
+				r.Post("/release-check/snooze", h.PostReleaseCheckSnooze)
 			})
 		})
 

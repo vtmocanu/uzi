@@ -155,6 +155,16 @@ func serverBuildInfo(ctx context.Context, env Env, gf *globalFlags) *apitypes.Bu
 // after it would assert exactly the false knowledge the server refuses to serve.
 func serverRows(b apitypes.BuildInfoDTO) [][2]string {
 	rows := [][2]string{{"version", b.Version}}
+	// Surface an available upstream update right next to the running version (PRD
+	// #836 M7), mirroring the omit-never-zero discipline: shown ONLY when the server
+	// derived update_available=true AND carries a latest tag. Nil UpdateAvailable
+	// (never checked / feature disabled) and false (up to date) skip the row, the same
+	// unknown-beats-wrong rule the *bool field was chosen to preserve. The tag is
+	// already v-prefixed on the wire, so it is not re-prefixed here. far_behind and
+	// security are deliberately not surfaced in the v1 CLI scope.
+	if b.UpdateAvailable != nil && *b.UpdateAvailable && b.Latest != nil && b.Latest.Version != "" {
+		rows = append(rows, [2]string{"update", fmt.Sprintf("%s available", b.Latest.Version)})
+	}
 	if b.Commit != "" {
 		rows = append(rows, [2]string{"commit", b.Commit})
 	}

@@ -733,6 +733,15 @@ export interface AppSettings {
   // users can still individually opt in on the Workers page. Web-only surfacing — the
   // key already round-trips through GET/PUT /admin/settings.
   ephemeral_workers_enabled: string;
+  // Upstream release-check toggles (PRD #836). Both the text "true"/"false" (default
+  // "true"), round-tripping through GET/PUT /admin/settings like every other setting.
+  // release_check_enabled is the master air-gap switch: when off, the api never calls
+  // github.com. release_check_banner_enabled governs only the intrusive escalation
+  // banner (M6); the pip and the admin Updates card do not depend on it. The Updates
+  // card reads the LIVE values off the ReleaseCheckStatus DTO and writes them back
+  // here through updateSettings (string-space), the same shape as the toggles above.
+  release_check_enabled: string;
+  release_check_banner_enabled: string;
   // Run-summary model (PRD #362 Decision 8): the model alias the inline run-summary
   // generator runs on (haiku by default), served as a raw string like every other
   // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
@@ -1058,6 +1067,72 @@ export interface BuildInfo {
   // legitimate uptime in a process's first second, so absent means UNKNOWN here and
   // must not be rendered as "up 0s".
   uptime_seconds?: number;
+  // Upstream-release check (PRD #836). These mirror the api DTO fields M3 added to
+  // apitypes.BuildInfoDTO and obey the same OMITTED-when-not-stamped, never
+  // zero-valued convention: the server omits all three (and the nested `latest`
+  // object) when the release check has not run or the feature is disabled. That
+  // keeps three distinct states — absent (unknown / disabled), false (checked, up
+  // to date) and true (behind) — which is why `update_available`/`far_behind` are
+  // optional booleans here rather than defaulting to false. The pip and popover row
+  // render ONLY from these server-derived values; the web never compares versions
+  // itself (the semver trap lives server-side, in one place).
+  latest?: {
+    // The `v`-prefixed release tag (e.g. "v0.66.0"), already prefixed by the
+    // server. displayVersion is idempotent for a leading-`v` string, so it is safe
+    // to pass through without producing "vv".
+    version: string;
+    name?: string;
+    published_at?: string;
+    notes_url?: string;
+    security?: boolean;
+  };
+  update_available?: boolean;
+  far_behind?: boolean;
+}
+
+// ReleaseCheckStatus is the ADMIN release-check surface (PRD #836 M5): the response
+// of both admin release-check endpoints (`GET`/`POST /admin/release-check`) and the
+// data source for the admin Updates card. It mirrors `apitypes.ReleaseCheckStatusDTO`
+// byte-for-byte (snake_case JSON tags). Unlike the world-readable BuildInfo.latest,
+// this is served ONLY to a cookie-authenticated admin, so it carries the full
+// persisted release `body` — the RAW release markdown the card excerpts (rendered as
+// PLAIN TEXT, never HTML) and scans for the `### Security` heading. That field is
+// admin-only and must never migrate onto an unauthenticated response.
+//
+// The three derived booleans are plain (never omitted) because `status`
+// ("disabled" | "never" | "ok" | "error") already carries the "has a check run?"
+// distinction — this endpoint always returns the complete picture. The omitempty
+// facts are optional here; the required config/version/status fields are always
+// present. No token is ever serialized.
+export interface ReleaseCheckStatus {
+  // The two runtime toggles + poll cadence, read live from settings.
+  release_check_enabled: boolean;
+  release_check_banner_enabled: boolean;
+  interval: string;
+  // This instance's own served version (bare, "dev" on an un-stamped build) — the
+  // left-hand side of the update delta the card renders.
+  running_version: string;
+  // The persisted remote facts, omitted until a check has run. `body` is the RAW
+  // release markdown (admin-only).
+  latest_tag?: string;
+  latest_name?: string;
+  body?: string;
+  notes_url?: string;
+  published_at?: string;
+  checked_at?: string;
+  // Read-time derivations over the facts + running_version (PRD #836 M1).
+  update_available: boolean;
+  far_behind: boolean;
+  security: boolean;
+  // banner_snoozed is true iff a snooze tag is set AND equals latest_tag (PRD #836 M6):
+  // the escalation banner (surface 4) stays hidden after a Dismiss. Because a newer
+  // release changes latest_tag, the snooze auto-expires when a newer release arrives.
+  banner_snoozed: boolean;
+  // "disabled" (master toggle off) | "never" (enabled, no check yet) | "ok" (facts
+  // present) | "error" (the last check failed). message carries a token-scrubbed
+  // reason on error, empty otherwise.
+  status: string;
+  message?: string;
 }
 
 // ── CLI tokens (PRD #64) ──────────────────────────────────────────────────
@@ -2983,6 +3058,22 @@ const realApi = {
   // `latest_ref` is empty when the source publishes no semver tag yet.
   resolveAgentSourceLatest: (url: string) =>
     request<{ latest_ref: string }>("POST", "/admin/agent-source/resolve-latest", { url }),
+  // Upstream release-check admin surface (PRD #836 M3/M5). getReleaseCheck is the read
+  // (RequireAdminRO) that backs the admin Updates card — the full status incl. the raw
+  // admin-only `body`. checkReleaseNow is the "Check now" write (RequireAdmin): it
+  // triggers one poll against the GitHub Releases API and returns the refreshed status.
+  // The two runtime toggles are edited through updateSettings (the release_check_*
+  // keys above), never here. Both return the same envelope shape.
+  getReleaseCheck: () =>
+    request<{ release_check: ReleaseCheckStatus }>("GET", "/admin/release-check"),
+  checkReleaseNow: () =>
+    request<{ release_check: ReleaseCheckStatus }>("POST", "/admin/release-check"),
+  // Snooze the admin escalation banner (PRD #836 M6) for the current release: upserts
+  // the snooze tag = latest_tag server-side and returns the refreshed status (now with
+  // banner_snoozed:true). Keyed to the release tag, so a newer release auto-clears it.
+  // RequireAdmin (cookie-only), no egress. Called by UpdateEscalationBanner's Dismiss.
+  snoozeReleaseBanner: () =>
+    request<{ release_check: ReleaseCheckStatus }>("POST", "/admin/release-check/snooze"),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),

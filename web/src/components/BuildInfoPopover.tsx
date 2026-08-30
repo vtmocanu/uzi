@@ -17,6 +17,7 @@
 
 import { useEffect, useId, useState } from "react";
 import type { ReactNode } from "react";
+import { Link } from "react-router-dom";
 import type { BuildInfo } from "../lib/api";
 import { Button, cx } from "./ui";
 
@@ -212,6 +213,11 @@ export function BuildInfoPopover({
   // this is absent. AppShell threads ONE callback down to both SidebarContent mounts
   // so the two triggers open a single drawer instance.
   onOpenChangelog,
+  // Whether the viewing user is an admin (PRD #836 M4). AppShell reads
+  // `user?.is_admin` via useAuth() and threads it here so the update row can show
+  // the operator "Update guide" affordance to admins and a static "ask your
+  // operator" note to members. Defaults false: a member sees no runbook link.
+  isAdmin = false,
   // Injected only by tests, so the age/uptime assertions are not hostage to the
   // wall clock. Production always reads the real clock.
   now,
@@ -220,6 +226,7 @@ export function BuildInfoPopover({
   info: BuildInfo;
   collapsed?: boolean;
   onOpenChangelog?: () => void;
+  isAdmin?: boolean;
   now?: number;
   fetchedAtMs?: number;
 }) {
@@ -290,6 +297,27 @@ export function BuildInfoPopover({
             : liveUptimeSeconds(uptimeSeconds, fetchedAtMs, now),
         );
 
+  // Upstream-release signal (PRD #836 M4). The pip and the popover's update row
+  // render ONLY from the server's `update_available` boolean plus the `latest`
+  // object — never a client-side version compare, which is the semver trap the
+  // server owns in one place. `=== true` collapses the two non-signalling states
+  // (undefined = unknown/disabled, false = checked-and-current) into "no pip".
+  const updateAvailable = info.update_available === true;
+  const latest = updateAvailable ? info.latest : undefined;
+  // "N days ago" for the latest release, reusing ageInDays — the same day-granular
+  // relative-time helper the subtitle age uses — against latest.published_at. Null
+  // when published_at is absent or unparseable, in which case the "· N days ago"
+  // tail is dropped gracefully rather than rendering "· null days ago".
+  const latestDays = latest ? ageInDays(latest.published_at, now) : null;
+  const latestAgo =
+    latestDays === null
+      ? null
+      : latestDays === 0
+        ? "today"
+        : latestDays === 1
+          ? "1 day ago"
+          : `${latestDays} days ago`;
+
   // The subtitle line: age, then the commit count when the build carries one. M3
   // is independently droppable, so "24 days old" alone is a supported final state,
   // not a loading intermediate.
@@ -359,6 +387,19 @@ export function BuildInfoPopover({
         )}
       >
         {label}
+        {/* The update lamp (PRD #836 M4, mockup Station 01): a small brand pip beside
+            the version, lit ONLY from the server's update_available — never a
+            client-side compare. Purely visual, so it carries no text and is
+            aria-hidden; the popover's update row is the announced form. The COLLAPSED
+            rail has no room for it (56px), so it is dropped there, consistent with the
+            license credit the collapsed footer already drops. */}
+        {updateAvailable && !collapsed && (
+          <span
+            aria-hidden="true"
+            data-update-pip
+            className="ml-1.5 inline-block h-1.5 w-1.5 flex-none rounded-full bg-brand align-middle"
+          />
+        )}
       </button>
       <div
         id={popId}
@@ -466,6 +507,38 @@ export function BuildInfoPopover({
               coordinates and the PRD counts. */}
           {uptime && <Row label="Uptime" value={uptime} />}
         </dl>
+        {/* Update row (PRD #836 M4, mockup Station 01). Shown ONLY when the server
+            says an update is available AND carries the `latest` object — the omitted
+            `latest` (unknown) state renders nothing, matching the panel's
+            "unknown beats wrong" rule. `latest.version` is already `v`-prefixed from
+            the server and displayVersion is idempotent for a leading-`v` string, so
+            it passes through without producing "vv". Admins get an "Update guide"
+            link into the admin Updates location (Settings, where M5's card lands);
+            members get a static note, since they cannot run the upgrade. */}
+        {latest && (
+          <div className="mt-2 border-t border-edge pt-2 text-[11px]" data-update-row>
+            <div className="flex items-center gap-1.5 font-mono">
+              <span
+                aria-hidden="true"
+                className="inline-block h-1.5 w-1.5 flex-none rounded-full bg-brand"
+              />
+              <span className="font-semibold text-fg">{displayVersion(latest.version)}</span>
+              <span className="text-faint">
+                available{latestAgo ? ` · ${latestAgo}` : ""}
+              </span>
+            </div>
+            {isAdmin ? (
+              <Link
+                to="/admin/settings"
+                className="mt-1 inline-block text-brand hover:text-brand-hover hover:underline"
+              >
+                Update guide →
+              </Link>
+            ) : (
+              <div className="mt-1 text-faint">Ask your operator to update.</div>
+            )}
+          </div>
+        )}
         {/* Changelog opener (PRD #415 M2). An interactive control INSIDE the panel,
             which is why the close logic moved to focus-within on the host — see that
             note. Rendered only when a handler is wired (AppShell provides one; bare

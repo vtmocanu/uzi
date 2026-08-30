@@ -21,6 +21,8 @@ vi.mock("../lib/api", async (importActual) => {
       applyAgentSource: vi.fn(),
       resolveAgentSourceLatest: vi.fn(),
       updateCheckAgentSource: vi.fn(),
+      getReleaseCheck: vi.fn(),
+      checkReleaseNow: vi.fn(),
     },
   };
 });
@@ -42,6 +44,8 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
   ephemeral_workers_enabled: "false",
+  release_check_enabled: "true",
+  release_check_banner_enabled: "true",
   summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
@@ -140,8 +144,34 @@ const pendingAgentSource = (): import("../lib/api").AgentSourceView => ({
   },
 });
 
+// A release-check status fixture (PRD #836 M5). The default is the "behind" happy
+// path: a check has run, a newer release exists, both toggles on. Tests override the
+// fields they exercise.
+const releaseCheck = (
+  over: Partial<import("../lib/api").ReleaseCheckStatus> = {},
+): import("../lib/api").ReleaseCheckStatus => ({
+  release_check_enabled: true,
+  release_check_banner_enabled: true,
+  interval: "6h",
+  running_version: "0.4.2",
+  latest_tag: "v0.5.0",
+  latest_name: "Hosted worker drain controls",
+  body: "### Added\n- Worker drain deadline controls (#812)\n- Per-run cost roll-up (#799)\n",
+  notes_url: "https://github.com/vtmocanu/uzi/releases/tag/v0.5.0",
+  published_at: "2026-08-27T00:00:00Z",
+  checked_at: "2026-08-30T00:00:00Z",
+  update_available: true,
+  far_behind: false,
+  security: false,
+  banner_snoozed: false,
+  status: "ok",
+  ...over,
+});
+
 beforeEach(() => {
   mockApi.getSettings.mockResolvedValue(response());
+  mockApi.getReleaseCheck.mockResolvedValue({ release_check: releaseCheck() });
+  mockApi.checkReleaseNow.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
   mockApi.listRepos.mockResolvedValue({
     repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as import("../lib/api").Repo[],

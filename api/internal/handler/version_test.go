@@ -579,6 +579,14 @@ func TestVersionEndpointCarriesNothingPrivate(t *testing.T) {
 		"uptime_seconds": "DISCLOSURE, not already-public: a runtime fact about this process. " +
 			"See the Version handler for the decision and for what would require re-deciding " +
 			"it (an /about page, a signed-out footer — any new surface widens the audience).",
+		// PRD #836 M3. The tag walk records the named `latest` object as the single key
+		// "latest" and does NOT recurse into its inner fields (version/name/… are
+		// public-by-construction and unaudited here — see buildInfoJSONKeys). Exactly
+		// these three top-level keys are added; the body/notes are admin-only and never
+		// ride this endpoint.
+		"latest":           "already public: the newest upstream release, published on github.com/vtmocanu/uzi",
+		"update_available": "already public: a boolean derived from the public latest tag vs the public running version",
+		"far_behind":       "already public: a boolean derived from the same public version delta (D4 heuristic)",
 	}
 
 	got := buildInfoJSONKeys(t, reflect.TypeOf(apitypes.BuildInfoDTO{}))

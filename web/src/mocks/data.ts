@@ -5392,6 +5392,20 @@ export const mockBuildInfo: BuildInfo = {
   uptime_seconds: 3 * 86_400 + 4 * 3_600 + 12 * 60, // 3d 4h 12m
   prds_done: 80,
   prds_open: 32,
+  // Upstream-release signal (PRD #836 M4) so mock-mode + demos exercise the pip and
+  // the popover's update row: a newer release than the running 0.4.2, checked a few
+  // days ago. `latest.version` is `v`-prefixed exactly as the server serves it.
+  // Only the stamped release fixture carries this; the two `dev` fixtures below are
+  // left WITHOUT it, representing the unknown (never-checked) state.
+  latest: {
+    version: "v0.5.0",
+    name: "Hosted worker drain controls",
+    published_at: daysAgo(3),
+    notes_url: "https://github.com/vtmocanu/uzi/releases/tag/v0.5.0",
+    security: false,
+  },
+  update_available: true,
+  far_behind: false,
 };
 
 // THE LAPTOP SHAPE, and the one a developer actually hits: `docker-compose.yml`
