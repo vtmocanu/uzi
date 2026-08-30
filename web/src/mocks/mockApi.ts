@@ -1326,6 +1326,11 @@ function materializeDefault(
     last_fire: null,
     auto_approve: entry.auto_approve,
     wait_on_limit: entry.wait_on_limit,
+    // PRD #841: match the real ScheduleDTO shape — mr_rework_enabled is a non-omitempty
+    // *bool, so the API always emits it (null = inherit), never omits it. A catalog default
+    // is inherit until an override sets it, so seed the explicit null sentinel here rather
+    // than leaving the field undefined (which would diverge from the server response shape).
+    mr_rework_enabled: null,
     max_issues: entry.target === "sweep" ? entry.max_issues : null,
     // Owner OVERLAY (issue #675): null by default; a seed sets it via `...over`.
     guidance: null,
