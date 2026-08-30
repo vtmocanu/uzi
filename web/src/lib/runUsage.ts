@@ -620,6 +620,15 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
     }
 
     if (isResultFrame(m)) {
+      // PRD #516 / issue #553: the lead's context-window fill now ALSO rides the turn's
+      // terminal result frame (moved off the usage frame to keep the worker's read off
+      // the hot loop — see sdk-executor.ts). Result frames are always the lead lane, so
+      // read latest-wins here, ABOVE the modelUsage early-out below, because an
+      // error/modelUsage-less result frame must still yield its context reading.
+      if ((m.agent ?? "lead") === "lead") {
+        const rctx = readContext(payload?.["context"]);
+        if (rctx) leadContext = rctx;
+      }
       // A result frame NEVER falls through to the per-agent branch below, whether or
       // not it folded: its usage is the run's cumulative total, not one call's.
       const mu = readModelUsage(payload?.["modelUsage"]);
@@ -673,10 +682,16 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
       const u = readUsage(payload["usage"]);
       if (u) {
         const agent = m.agent ?? "lead";
-        // PRD #516: the lead's context-window fill co-rides this same usage-latched lead
-        // frame as `payload.context`. Read it ONLY on the lead lane (keyed exactly like
-        // the usage sum above) and keep the latest — a subagent frame carrying a
-        // synthetic `context` is deliberately ignored (lead-only SDK constraint).
+        // PRD #516 / issue #553: the lead's context-window fill may ride EITHER a lead
+        // usage frame (M1, this read) OR the lead terminal result frame (M2, read in the
+        // isResultFrame branch above) — latest-wins across both carriers. This usage-frame
+        // read is KEPT deliberately: already-persisted M1 runs carry context on lead usage
+        // frames and the reader replays them, so removing it would blank every historical
+        // run's meter, and it also covers resume-across-upgrade (old worker writes
+        // usage-frame context, new worker writes result-frame context; latest-wins across
+        // the seq boundary picks the newer). Read it ONLY on the lead lane (keyed exactly
+        // like the usage sum above) — a subagent frame carrying a synthetic `context` is
+        // deliberately ignored (lead-only SDK constraint).
         if (agent === "lead") {
           const ctx = readContext(payload["context"]);
           if (ctx) leadContext = ctx;

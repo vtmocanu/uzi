@@ -971,4 +971,69 @@ describe("deriveRunUsage.leadContext", () => {
     ]);
     expect(d.leadContext).toBeUndefined();
   });
+
+  it("populates leadContext from a lead RESULT frame — including a modelUsage-less/error one (read sits ABOVE the modelUsage early-out)", () => {
+    const reading = { used: 156_000, window: 200_000, pct: 78 };
+
+    // A success result frame WITH modelUsage still yields its context reading.
+    const withMu = deriveRunUsage([
+      msg("status", "lead", {
+        event: "result",
+        subtype: "success",
+        num_turns: 1,
+        duration_ms: 100,
+        modelUsage: {
+          "claude-sonnet-5": {
+            inputTokens: 100,
+            outputTokens: 10,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            costUSD: 0.01,
+          },
+        },
+        context: reading,
+      }),
+    ]);
+    expect(withMu.leadContext).toEqual(reading);
+
+    // The load-bearing case: an ERROR result frame with NO modelUsage. The old code's
+    // `if (!mu) continue` sat above the context read; the new placement reads context
+    // FIRST, so this modelUsage-less frame still delivers the meter.
+    const noMu = deriveRunUsage([
+      msg("error", "lead", {
+        event: "result",
+        subtype: "error_max_turns",
+        errors: [],
+        context: reading,
+      }),
+    ]);
+    expect(noMu.leadContext).toEqual(reading);
+  });
+
+  it("latest-wins across BOTH carriers: a later lead RESULT frame overrides an earlier lead usage frame", () => {
+    const d = deriveRunUsage([
+      // Earlier: M1-style lead usage frame carrying one reading.
+      assistantUsageCtx("lead", { input: 100, output: 10 }, { used: 40_000, window: 200_000, pct: 20 }),
+      // Later: M2-style lead terminal result frame carrying a DIFFERENT reading.
+      msg("status", "lead", {
+        event: "result",
+        subtype: "success",
+        num_turns: 1,
+        duration_ms: 100,
+        modelUsage: {
+          "claude-sonnet-5": {
+            inputTokens: 200,
+            outputTokens: 20,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            costUSD: 0.02,
+          },
+        },
+        context: { used: 156_000, window: 200_000, pct: 78 },
+      }),
+    ]);
+    // The result-frame (later in stream order) value wins. A broken result-frame read
+    // would leave the earlier usage-frame value (pct 20) winning.
+    expect(d.leadContext).toEqual({ used: 156_000, window: 200_000, pct: 78 });
+  });
 });

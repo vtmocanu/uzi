@@ -3948,7 +3948,7 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
     return emits.filter((m) => m.payload["context"] !== undefined);
   }
 
-  it("attaches payload.context (mapped {used,window,pct}) to the SAME lead frame that carries usage", async () => {
+  it("attaches payload.context (mapped {used,window,pct}) to the terminal RESULT frame, not the usage frame", async () => {
     const { queryFn } = fakeTurnsWithContext(
       [
         [submitPlan("plan"), resultSuccess()],
@@ -3960,16 +3960,23 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
     const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.strictEqual(result.branch, "agent/issue-5");
 
+    // issue #553 M2: context rides the turn's terminal result frame now (fired off the
+    // hot loop, awaited at the result frame), NOT the assistant usage frame.
     const carriers = withContext(probe.emits);
-    assert.strictEqual(carriers.length, 1, "context attaches exactly once, on the lead usage frame");
+    assert.strictEqual(carriers.length, 1, "context attaches exactly once, on the result frame");
     assert.deepStrictEqual(carriers[0]!.payload["context"], {
       used: 156000,
       window: 200000,
       pct: 78,
     });
-    // Co-attached: the context rides the very frame that carries usage (the seam the
-    // web consumer reads inside its `"usage" in payload` branch).
-    assert.deepStrictEqual(carriers[0]!.payload["usage"], USAGE);
+    assert.strictEqual(carriers[0]!.payload["event"], "result", "the carrier is a terminal result frame");
+    assert.strictEqual(carriers[0]!.kind, "status", "the success result frame is a status message");
+    assert.strictEqual(carriers[0]!.payload["usage"], undefined, "the result frame carries no per-call USAGE (its usage is cumulative)");
+
+    // The assistant usage frame still carries usage, but no longer carries context.
+    const usageFrame = probe.emits.find((m) => m.payload["usage"] === USAGE);
+    assert.ok(usageFrame, "the assistant usage frame still carries the per-call usage");
+    assert.strictEqual(usageFrame!.payload["context"], undefined, "the usage frame carries no context");
   });
 
   it("preserves an unclamped pct > 100 (near/over-compaction) verbatim", async () => {
@@ -4035,5 +4042,56 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
     assert.strictEqual(result.branch, "agent/issue-5");
     assert.strictEqual(withContext(probe.emits).length, 0, "an absent control method attaches no context");
     assert.ok(probe.emits.some((m) => m.payload["usage"] !== undefined), "usage still attaches");
+  });
+
+  /** A SUBAGENT assistant frame carrying per-call usage — hits the usage latch first
+   *  when emitted before the lead's frame in a turn (issue #553 finding 2). */
+  function subagentUsageFrame(text: string, subagentType = "coder"): SDKMessage {
+    return {
+      type: "assistant",
+      session_id: "sess-1",
+      subagent_type: subagentType,
+      parent_tool_use_id: "p1",
+      message: { usage: USAGE, content: [{ type: "text", text }] },
+    } as unknown as SDKMessage;
+  }
+
+  it("finding 2: a subagent usage frame BEFORE the lead's does not capture or block the lead context read", async () => {
+    // The subagent frame latches usage first this turn. Under the old design the inline
+    // co-attach fired on that first-usage frame with no lead guard, so context misattached
+    // to the subagent frame (dropped by the lead-only reader) AND blocked the lead's own
+    // later frame. Now the read fires only on the LEAD usage frame and is delivered on the
+    // terminal result frame.
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [
+          subagentUsageFrame("subagent working"),
+          leadUsageFrame("lead working"),
+          signalDone(),
+          resultSuccess(),
+        ],
+      ],
+      async () => ({ totalTokens: 156000, rawMaxTokens: 200000, percentage: 78 }),
+    );
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+
+    const carriers = withContext(probe.emits);
+    assert.strictEqual(carriers.length, 1, "context attaches exactly once");
+    // It is the terminal lead result frame, NOT a subagent frame.
+    assert.strictEqual(carriers[0]!.payload["event"], "result");
+    assert.strictEqual(carriers[0]!.agent, "lead");
+    assert.deepStrictEqual(carriers[0]!.payload["context"], {
+      used: 156000,
+      window: 200000,
+      pct: 78,
+    });
+    // No subagent frame carries context.
+    assert.ok(
+      !probe.emits.some((m) => m.agent === "coder" && m.payload["context"] !== undefined),
+      "no subagent frame carries context",
+    );
   });
 });
