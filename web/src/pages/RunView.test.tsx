@@ -1286,6 +1286,54 @@ describe("MrReworkPanel — per-run MR-rework checkbox (PRD #841)", () => {
     expect(onToggle).toHaveBeenCalledWith(false);
   });
 
+  // PRD #841: the tri-state is inherit/on/off. "Reset to default" is the web affordance for
+  // the third state (null → inherit) and appears ONLY when an explicit override is set, so
+  // both the shown and hidden cases are asserted positively (not a vacuous negative).
+  const RESET = /reset to default/i;
+
+  it("SHOWS 'Reset to default' only when an explicit run override (true/false) is set", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", mr_state: "opened", mr_rework_enabled: false })}
+        busy={false}
+        canSteer
+        userDefault={null}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: RESET })).toBeTruthy();
+  });
+
+  it("HIDES 'Reset to default' when the run inherits (mr_rework_enabled null)", () => {
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", mr_state: "opened", mr_rework_enabled: null })}
+        busy={false}
+        canSteer
+        userDefault={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    // The checkbox is still present (the panel renders); only the reset affordance is gone.
+    expect(screen.getByLabelText(LABEL)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: RESET })).toBeNull();
+  });
+
+  it("clicking 'Reset to default' calls onToggle(null) to clear the override to inherit", () => {
+    const onToggle = vi.fn();
+    render(
+      <MrReworkPanel
+        run={run({ kind: "issue", mr_state: "opened", mr_rework_enabled: true })}
+        busy={false}
+        canSteer
+        userDefault={null}
+        onToggle={onToggle}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: RESET }));
+    expect(onToggle).toHaveBeenCalledWith(null);
+  });
+
   it("(page wiring) clicking the checkbox calls api.setRunMrRework(id, next) then refreshRun", async () => {
     const refreshRun = vi.fn();
     mockUseRunStream.mockReturnValue({

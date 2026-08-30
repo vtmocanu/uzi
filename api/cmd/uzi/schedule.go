@@ -781,6 +781,7 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().Int("max-issues", 10, "change the per-fire sweep cap, oldest-first (sweep target only)")
 	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target or sweep-target default)")
 	edit.Flags().Bool("clear-max-issues", false, "clear the sweep cap back to unlimited (sweep target only)")
+	edit.Flags().Bool("clear-mr-rework", false, "clear the stored MR-rework override back to inherit (the account default)")
 	edit.Flags().Bool("apply-model-to-agents", false, "set whether the schedule's model also overrides every subagent's model pin")
 	edit.Flags().String("model", "", "change the model alias (opus/sonnet/haiku/fable) or custom model ID for runs this schedule fires; empty string clears it back to your Worker-model default (valid on every target)")
 	edit.Flags().String("repo", "", "repoint the schedule to another repo by id (sweep/prompt targets; an issue-target schedule cannot be repointed)")
@@ -846,6 +847,7 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 	maxIssuesSet := f.Changed("max-issues")
 	clearGuidance := f.Changed("clear-guidance")
 	clearMaxIssues := f.Changed("clear-max-issues")
+	clearMrRework := f.Changed("clear-mr-rework")
 	repoSet := f.Changed("repo")
 
 	// --cron and --at both restate TIMING; at most one may win.
@@ -872,6 +874,9 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 	}
 	if maxIssuesSet && clearMaxIssues {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--max-issues and --clear-max-issues are mutually exclusive")
+	}
+	if f.Changed("mr-rework") && clearMrRework {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--mr-rework and --clear-mr-rework are mutually exclusive")
 	}
 
 	changed := false
@@ -919,6 +924,13 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 	if f.Changed("mr-rework") {
 		v, _ := f.GetBool("mr-rework")
 		req.MrReworkEnabled = &v
+		changed = true
+	}
+	if clearMrRework {
+		// Explicit nil reaches the server as `mr_rework_enabled: null` (the field is not
+		// omitempty) and mergeSchedule's replace-semantics clears the stored override back
+		// to inherit. Restated auto_approve/wait_on_limit keep this off the onlyEnabled path.
+		req.MrReworkEnabled = nil
 		changed = true
 	}
 	if guidanceSet {
@@ -1018,11 +1030,15 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	}
 	maxIssuesSet := f.Changed("max-issues")
 	clearMaxIssues := f.Changed("clear-max-issues")
+	clearMrRework := f.Changed("clear-mr-rework")
 	if (maxIssuesSet || clearMaxIssues) && s.Target != schedTargetSweep {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--max-issues/--clear-max-issues are only valid on a sweep target")
 	}
 	if maxIssuesSet && clearMaxIssues {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--max-issues and --clear-max-issues are mutually exclusive")
+	}
+	if f.Changed("mr-rework") && clearMrRework {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--mr-rework and --clear-mr-rework are mutually exclusive")
 	}
 
 	// FRESH minimal request: only catalog-editable fields. Restate model/override from the
@@ -1085,6 +1101,12 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	if f.Changed("mr-rework") {
 		v, _ := f.GetBool("mr-rework")
 		req.MrReworkEnabled = &v
+		changed = true
+	}
+	if clearMrRework {
+		// nil reaches patchDefaultScheduleConfig's replace-semantics as a cleared override
+		// (inherit); see the user-schedule builder for the wire-shape rationale.
+		req.MrReworkEnabled = nil
 		changed = true
 	}
 	if maxIssuesSet {

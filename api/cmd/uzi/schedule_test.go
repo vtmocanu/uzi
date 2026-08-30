@@ -912,6 +912,45 @@ func TestScheduleEditClearMaxIssues(t *testing.T) {
 	}
 }
 
+// TestScheduleEditClearMrRework: --clear-mr-rework nils a stored per-schedule override back
+// to inherit, OVERRIDING the restate a partial edit would otherwise re-send. The stored
+// schedule is mr_rework=on; --clear-mr-rework must send an explicit nil so the server's
+// replace-semantics clears it (the field is not omitempty, so nil is sent as JSON null).
+func TestScheduleEditClearMrRework(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	on := true
+	stored := fc.ScheduleByID["sch_e"]
+	stored.MrReworkEnabled = &on
+	fc.ScheduleByID["sch_e"] = stored
+
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--clear-mr-rework")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if got := fc.LastPatchSchedReq.MrReworkEnabled; got != nil {
+		t.Errorf("mr_rework_enabled = %v, want nil after --clear-mr-rework (override cleared to inherit)", *got)
+	}
+}
+
+// TestScheduleEditDefaultClearMrRework: the default-origin sibling — --clear-mr-rework nils a
+// stored override on a DEFAULT schedule through buildDefaultScheduleEditRequest's own clear
+// path (patchDefaultScheduleConfig replace-semantics).
+func TestScheduleEditDefaultClearMrRework(t *testing.T) {
+	fc := editDefaultSweepFixture("sch_d")
+	on := true
+	stored := fc.ScheduleByID["sch_d"]
+	stored.MrReworkEnabled = &on
+	fc.ScheduleByID["sch_d"] = stored
+
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--clear-mr-rework")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if got := fc.LastPatchSchedReq.MrReworkEnabled; got != nil {
+		t.Errorf("mr_rework_enabled = %v, want nil after --clear-mr-rework on a default schedule", *got)
+	}
+}
+
 // TestScheduleEditUsageErrors: conflicts, wrong-target scoping, and a no-op edit are all
 // usage errors (exit 2) with no PATCH sent.
 func TestScheduleEditUsageErrors(t *testing.T) {
@@ -929,6 +968,7 @@ func TestScheduleEditUsageErrors(t *testing.T) {
 	}{
 		{"guidance+clear-guidance", sweepSched, []string{"edit", "sch_e", "--guidance", "y", "--clear-guidance"}},
 		{"max-issues+clear-max-issues", sweepSched, []string{"edit", "sch_e", "--max-issues", "3", "--clear-max-issues"}},
+		{"mr-rework+clear-mr-rework", sweepSched, []string{"edit", "sch_e", "--mr-rework", "--clear-mr-rework"}},
 		{"cron+at", sweepSched, []string{"edit", "sch_e", "--cron", "0 4 * * 2", "--at", "2026-08-08T09:00:00Z"}},
 		{"no-op", sweepSched, []string{"edit", "sch_e"}},
 		{"label on prompt target", promptSched, []string{"edit", "sch_p", "--label", "bug"}},

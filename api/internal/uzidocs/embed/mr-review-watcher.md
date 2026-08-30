@@ -70,19 +70,22 @@ left unset just falls through to the next:
   the run view, a checkbox reads "Auto-rework this MR's review comments"
   and stays available on a **completed** run for as long as its MR is
   still open (the watcher only acts after the run finishes, so this is
-  the whole window it matters). From the CLI, `uzi run mr-rework <run-id>
-  --enabled=false` turns it off for that run (`--enabled` turns it on,
-  `--clear` returns it to inherit). To start a run with it already off,
-  pass `--mr-rework=false` to `uzi run create` (or `--mr-rework` to force
-  it on); omit the flag to inherit your account default.
+  the whole window it matters). When the run carries an explicit override,
+  a **Reset to default** button next to the checkbox clears it back to
+  inherit. From the CLI, `uzi run mr-rework <run-id> --enabled=false`
+  turns it off for that run (`--enabled` turns it on, `--clear` returns it
+  to inherit). To start a run with it already off, pass `--mr-rework=false`
+  to `uzi run create` (or `--mr-rework` to force it on); omit the flag to
+  inherit your account default.
 - **Per schedule.** A schedule can force auto-rework on or off for every
   run it fires, or leave it on Inherit. In the schedule modal, the
   "Auto-rework MR review comments" control is a three-way Inherit/On/Off
   choice; from the CLI, pass `--mr-rework` (or `--mr-rework=false`) to
-  `uzi schedule create` or `uzi schedule edit`. This is how you'd turn
-  auto-rework on only for scheduled jobs while leaving it off everywhere
-  else: switch your account default off, then set one schedule's override
-  to On.
+  `uzi schedule create` or `uzi schedule edit`, or `--clear-mr-rework` on
+  `uzi schedule edit` to return the schedule to Inherit. This is how you'd
+  turn auto-rework on only for scheduled jobs while leaving it off
+  everywhere else: switch your account default off, then set one
+  schedule's override to On.
 - **Your own opt-in.** Settings → **MR review rework** → "Auto-rework MR
   review comments on my runs". This is the account-wide default that
   every run and schedule falls back to when it hasn't set its own

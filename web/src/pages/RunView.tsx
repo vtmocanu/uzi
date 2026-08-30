@@ -601,9 +601,12 @@ export function LimitWaitPanel({
  *   no "when does it resume" fact a viewer needs, so there is nothing to render inert.
  *
  * The checkbox reflects the EFFECTIVE value (run override ?? owner default ?? on); a
- * click sends the explicit boolean, never null (clearing back to inherit is a CLI-only
- * affordance). Exported like LimitWaitPanel so the gate + copy are testable without
- * mounting the whole page.
+ * click sends the explicit boolean. The setting is tri-state (inherit/on/off), so when the
+ * run carries an EXPLICIT override (mr_rework_enabled is true or false, not null) a "Reset
+ * to default" button is shown that sends null, returning the run to live inheritance of the
+ * owner default (PRD #841) — so every state is reachable from the web, not only the CLI
+ * --clear. Exported like LimitWaitPanel so the gate + copy are testable without mounting
+ * the whole page.
  */
 export function MrReworkPanel({
   run,
@@ -618,14 +621,18 @@ export function MrReworkPanel({
   // UserSettings.mr_rework_enabled: the owner's global default (null = never overrode
   // the default-ON state). Only the run's own null-override falls through to it.
   userDefault: boolean | null;
-  onToggle: (enabled: boolean) => void;
+  // null clears the run override back to inherit (the account default); true/false set it.
+  onToggle: (enabled: boolean | null) => void;
 }) {
   // Hidden for a non-owner and once the MR is merged/closed (or a non-issue run).
   if (!canSteer) return null;
   if (!canToggleMrRework(run)) return null;
   const effective = effectiveMrRework(run, userDefault);
+  // An explicit per-run override (true/false) is distinct from inherit (null/undefined);
+  // only then is there something to reset back to the account default.
+  const overridden = run.mr_rework_enabled != null;
   return (
-    <div className="px-1">
+    <div className="flex items-center gap-3 px-1">
       <label className="flex items-center gap-2 text-xs">
         <input
           type="checkbox"
@@ -636,6 +643,16 @@ export function MrReworkPanel({
         />
         <span className="text-muted">Auto-rework this MR&apos;s review comments</span>
       </label>
+      {overridden && (
+        <button
+          type="button"
+          className="text-xs font-medium text-muted transition-colors hover:text-fg disabled:opacity-50"
+          disabled={busy}
+          onClick={() => onToggle(null)}
+        >
+          Reset to default
+        </button>
+      )}
     </div>
   );
 }

@@ -163,7 +163,7 @@ uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]]
 uzi schedule list
 uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false]] [--model <alias|id>] [--apply-model-to-agents[=false]]
+uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule run-now <schedule-id>
