@@ -1734,11 +1734,14 @@ export class RunRunner {
       // that preserves the agent's diff for a human to land — instead of face-planting into
       // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
       // Serves every forge-pushing kind (the failed path is not issue-gated).
+      // #377 / issue #631: computed once here, reused by the base-align overlay gate below
+      // (both read changedFiles(barePath, trackingRef)); recomputed there only if this failed open.
+      let changedForWf: string[] | null = null;
       if (claim.repo.forge_type === "github") {
         // Capture the narrowed bare path in a const the SAME way the push block does
         // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
         const wfBarePath = barePath;
-        const changedForWf = await this.git.changedFiles(wfBarePath, trackingRef);
+        changedForWf = await this.git.changedFiles(wfBarePath, trackingRef);
         // D6: a null diff (diff-computation failure) fails OPEN to the normal push — do not
         // fail a possibly-legitimate non-workflow run on an inability to compute the diff.
         const wfHits =
@@ -1857,19 +1860,21 @@ export class RunRunner {
           } else {
             // The conflict-failure path (M2). The abort already ran inside
             // alignBranchWithDefault; here we preserve the diff via #377's preserved_patch and
-            // fail typed. When a strategy conflicts BEFORE any fetchAndPush (the common case),
-            // `trackingRef` still points at the agent's pre-align committed work, so
-            // workflowScopeDiff captures exactly the human-landable diff. Note a subtle
-            // exception (issue #627): a strategy that ALIGNED and then had its push rejected
-            // (the overlay's arm (c), or a merge whose push was workflow-scope-rejected) already
-            // re-fetched the ALIGNED tip into `trackingRef`; if a LATER strategy then conflicts
-            // and lands here, the preserved patch is a SUPERSET — it still contains every agent
-            // commit (the aligned tip is a fast-forward/replay of the agent work, so nothing is
-            // lost), plus the aligning strategy's own workflow-subtree/merge changes. That is a
-            // rare double-fault (a push rejection followed by a conflict) and never drops work.
+            // fail typed. We diff the pre-align agent tip (`originalAgentTip`, declared at :1848,
+            // non-null under the :1852 guard) — NOT `trackingRef` — so the preserved patch is
+            // exactly the agent's human-landable work. Issue #631: when a strategy ALIGNED and
+            // then had its push rejected (the overlay's arm (c), or a merge/rebase whose push was
+            // rejected) `fetchAndPush` re-fetched the ALIGNED tip into `trackingRef`, so diffing
+            // `trackingRef` yielded a SUPERSET (agent work PLUS the aligning strategy's own
+            // workflow-subtree/merge changes) if a LATER strategy then conflicted and landed here.
+            // Diffing `originalAgentTip` eliminates that superset: its objects were fetched into
+            // the worker bare by the finalize `fetchAgentBranch` before any align, so
+            // workflowScopeDiff resolves it. In the non-push conflict paths originalAgentTip ==
+            // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
+            // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
             const defTip = defaultTip;
             const failBaseAlignConflict = async () => {
-              const rawPatch = await this.git.workflowScopeDiff(alignBarePath, trackingRef);
+              const rawPatch = await this.git.workflowScopeDiff(alignBarePath, originalAgentTip);
               const patch = rawPatch === null ? undefined : redactText(rawPatch);
               batcher.emit({
                 kind: "status",
@@ -1967,7 +1972,12 @@ export class RunRunner {
             // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
             // file. Any other case (null diff, or a real workflow edit) falls straight into the
             // EXISTING merge → rebase → preserve chain, unchanged.
-            const alignChanged = await this.git.changedFiles(alignBarePath, trackingRef);
+            // Issue #631: reuse the #377 guard's changedFiles result (identical barePath+trackingRef);
+            // recompute only when #377 failed open (null diff), so a transient diff failure gets a retry.
+            const alignChanged =
+              changedForWf === null
+                ? await this.git.changedFiles(alignBarePath, trackingRef)
+                : changedForWf;
             const alignWfHits =
               alignChanged === null
                 ? null
@@ -2036,6 +2046,19 @@ export class RunRunner {
                 try {
                   await fetchAndPush();
                 } catch (e) {
+                  if (isNonFastForwardRejection(e)) {
+                    // Issue #631: a non-fast-forward rejection (an already-published branch — a resume, or
+                    // the self_improve fixed branch — whose merge push cannot fast-forward) can't be cleared
+                    // by the rebase fallback (it also can't force-push), so preserve the diff and fail typed
+                    // rather than escape to the generic catch (raw message, no preserved_patch). Mirrors the
+                    // overlay push catch (:2020) and pushAlignedOrPreserve (:1945-1946).
+                    runLog.info(
+                      "finalize base-align: merge push rejected non-fast-forward; preserving diff and failing typed",
+                      { run_id: runId },
+                    );
+                    await failBaseAlignConflict();
+                    return;
+                  }
                   if (!isWorkflowScopeRejection(e)) throw e;
                   // The merge did NOT clear GitHub's workflow-scope rejection → the proven
                   // rebase fallback (#422). alignBranchWithDefault rewinds to originalAgentTip
