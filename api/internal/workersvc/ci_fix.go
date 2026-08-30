@@ -205,5 +205,6 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 	// queued drives no column move for a ci_fix run (notifyOnce skips NULL issue_iid),
 	// but firing the hook keeps the live status broadcast consistent with issue runs.
 	s.notify(run.ID, "queued")
+	logRunCreated(run)
 	return run, nil
 }

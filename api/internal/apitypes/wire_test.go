@@ -79,7 +79,11 @@ var runDTOKeys = []string{
 	"is_planning",
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
-	"auto_approve", "milestones",
+	"auto_approve",
+	// issue #857: the run's trigger provenance (what/how/who started it), NOT NULL
+	// (DEFAULT 'manual') so always on the wire.
+	"trigger_source",
+	"milestones",
 	// PRD #122 M3: the PRE-APPROVAL candidate list (nil ⇒ null), always on the wire; the
 	// web renders it only at the plan gate so the human approves the proposed breakdown.
 	"milestones_candidate",

@@ -69,6 +69,11 @@ type RunDTO struct {
 	// status value. A pre-feature api pod omits it; absent reads as not-planning.
 	IsPlanning  bool `json:"is_planning"`
 	AutoApprove bool `json:"auto_approve"`
+	// TriggerSource records what/how/who started the run (issue #857): one of
+	// manual, autopilot, schedule, self_improve, ci_fix, mr_rework, chat, task,
+	// task_review, then_fix, judge, judge_rerun, resume. Always set (NOT NULL column,
+	// DEFAULT 'manual'); historical rows carry a best-effort backfilled value.
+	TriggerSource string `json:"trigger_source"`
 	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
 	// decoded from runs.milestones_frozen. A nil slice marshals to JSON null, which is
 	// the back-compat contract: a run with no milestones (every pre-feature run, and

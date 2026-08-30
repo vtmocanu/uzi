@@ -121,5 +121,6 @@ func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid
 	// notifyOnce skips it), but firing the hook keeps the live status broadcast
 	// consistent with issue runs.
 	s.notify(run.ID, "queued")
+	logRunCreated(run)
 	return run, nil
 }

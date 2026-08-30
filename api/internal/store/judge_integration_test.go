@@ -78,7 +78,7 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 	// ── CreateJudgeRun: repo/issue-less, kind='judge', points at the target ──
 	judge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 		UserID: userID, TargetRunID: pgtype.UUID{Bytes: targetID, Valid: true},
-		IssueTitle: "Judge: Do X", IssueDescription: "",
+		IssueTitle: "Judge: Do X", IssueDescription: "", TriggerSource: "judge",
 	})
 	if err != nil {
 		t.Fatalf("CreateJudgeRun: %v", err)
@@ -89,7 +89,7 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 
 	// ── one-active-judge-per-target: a second non-terminal judge → 23505 ──
 	if _, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
-		UserID: userID, TargetRunID: pgtype.UUID{Bytes: targetID, Valid: true}, IssueTitle: "dup",
+		UserID: userID, TargetRunID: pgtype.UUID{Bytes: targetID, Valid: true}, IssueTitle: "dup", TriggerSource: "judge",
 	}); !isUniqueViolation(err) {
 		t.Fatalf("a second active judge for the same target must 23505, got %v", err)
 	}
@@ -225,7 +225,7 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 		// is itself the index's rule (a re-judge is legal once the prior judge settles).
 		pending, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 			UserID: userID, TargetRunID: pgtype.UUID{Bytes: targetID, Valid: true},
-			IssueTitle: "Judge: Do X (again)", IssueDescription: "",
+			IssueTitle: "Judge: Do X (again)", IssueDescription: "", TriggerSource: "judge",
 		})
 		if err != nil {
 			t.Fatalf("CreateJudgeRun (pending): %v", err)
@@ -238,7 +238,7 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 			 VALUES ($1, $2, $3, 43, 'Do Y', 'desc', 'completed', 'issue')`, otherTargetID, userID, repoID)
 		otherJudge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 			UserID: userID, TargetRunID: pgtype.UUID{Bytes: otherTargetID, Valid: true},
-			IssueTitle: "Judge: Do Y", IssueDescription: "",
+			IssueTitle: "Judge: Do Y", IssueDescription: "", TriggerSource: "judge",
 		})
 		if err != nil {
 			t.Fatalf("CreateJudgeRun (other target): %v", err)

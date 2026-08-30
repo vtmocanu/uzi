@@ -19,8 +19,8 @@ WITH seed AS (
     INSERT INTO run_user_inputs (run_id, kind, body)
     VALUES (@run_id, 'follow_up', @issue_description)
 )
-INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title)
-VALUES (@run_id, @user_id, 'chat', @issue_title, @issue_description, @title)
+INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title, trigger_source)
+VALUES (@run_id, @user_id, 'chat', @issue_title, @issue_description, @title, 'chat')
 RETURNING *;
 
 -- name: CreateChatContinueRun :one
@@ -29,8 +29,8 @@ RETURNING *;
 -- for resume affinity (the claim's affinity ordering prefers the worker whose disk
 -- still holds the SDK session). issue_description is empty — a Continue seeds no new
 -- prompt; the worker resumes the prior session and parks awaiting the next message.
-INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id)
-VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, @worker_id)
+INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id, trigger_source)
+VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, @worker_id, 'resume')
 RETURNING *;
 
 -- name: ListChatRunsForUser :many

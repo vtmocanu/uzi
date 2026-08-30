@@ -137,6 +137,7 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 	// broadcast stays consistent with other kinds, but the worker cannot claim it until
 	// DispatchTaskRun stamps the gate (PRD #400 Decision 6).
 	s.notify(run.ID, "queued")
+	logRunCreated(run)
 	return run, nil
 }
 
@@ -222,6 +223,7 @@ func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targe
 	// The review run is already claimable (dispatched_at stamped in SQL); broadcast queued
 	// so any live view re-reads it, exactly like DispatchTaskRun does for a plain handoff.
 	s.notify(run.ID, "queued")
+	logRunCreated(run)
 	return run, nil
 }
 
@@ -289,6 +291,7 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 	// The fix run is already claimable (dispatched_at stamped in SQL); broadcast queued so
 	// any live view re-reads it, exactly like CreateTaskReviewRun / DispatchTaskRun.
 	s.notify(run.ID, "queued")
+	logRunCreated(run)
 	return run, nil
 }
 

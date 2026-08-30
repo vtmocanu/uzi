@@ -64,9 +64,9 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(rs))
 			for _, r := range rs {
-				rows = append(rows, []string{r.ID, strOr(r.OwnerEmail, "-"), r.Kind, effectiveRunStatus(r.Status, r.IsPlanning, r.IsRevising), runTitle(r.RunDTO)})
+				rows = append(rows, []string{r.ID, strOr(r.OwnerEmail, "-"), r.Kind, r.TriggerSource, effectiveRunStatus(r.Status, r.IsPlanning, r.IsRevising), runTitle(r.RunDTO)})
 			}
-			return p.Table([]string{"ID", "OWNER", "KIND", "STATUS", "TITLE"}, rows)
+			return p.Table([]string{"ID", "OWNER", "KIND", "TRIGGER", "STATUS", "TITLE"}, rows)
 		},
 	}
 

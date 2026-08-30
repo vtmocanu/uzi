@@ -143,12 +143,12 @@ WHERE repo_id = @repo_id::uuid AND ref <> ALL(@keep_refs::text[]);
 -- uq_runs_one_active_mr_rework (repo_id, mr_iid) index → 23505 → ErrActiveMRReworkExists.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
-    pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities
+    pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source
 )
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}')
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'mr_rework'
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid

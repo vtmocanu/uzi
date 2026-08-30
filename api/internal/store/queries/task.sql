@@ -27,8 +27,8 @@
 -- service layer (resolveWaitOnLimit): a handoff has no per-request override today, so
 -- nil -> the owner's users.wait_on_limit is the whole behavior. Omitting it (as this
 -- query originally did) silently opts every task run OUT via the column DEFAULT false.
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities, budget_wall_seconds, budget_max_iterations)
-VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'))
+INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities, budget_wall_seconds, budget_max_iterations, trigger_source)
+VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'task')
 RETURNING *;
 
 -- name: CreateThenFixRun :one
@@ -59,7 +59,7 @@ INSERT INTO runs (
     then_fix_of_run_id, review_target_run_id, dispatched_at,
     auto_approve, open_mr, review_requested, then_fix_requested, wait_on_limit,
     issue_title, issue_description, required_capabilities,
-    budget_wall_seconds, budget_max_iterations
+    budget_wall_seconds, budget_max_iterations, trigger_source
 )
 VALUES (
     @run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'),
@@ -67,7 +67,7 @@ VALUES (
     true, false, false, false, @wait_on_limit,
     @issue_title, @issue_description,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'),
-    sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations')
+    sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'then_fix'
 )
 RETURNING *;
 
@@ -86,13 +86,13 @@ RETURNING *;
 INSERT INTO runs (
     id, user_id, repo_id, kind, branch, base_branch,
     review_target_run_id, dispatched_at, auto_approve, open_mr, review_requested,
-    issue_title, issue_description, required_capabilities
+    issue_title, issue_description, required_capabilities, trigger_source
 )
 VALUES (
     @run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'),
     @target_run_id, now(), true, false, false,
     @issue_title, '',
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}')
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'task_review'
 )
 RETURNING *;
 

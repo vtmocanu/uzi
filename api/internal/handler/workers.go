@@ -376,11 +376,12 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		IterationCount: r.IterationCount,
 		IsPlanning: isPlanningPhase(r.Kind, r.Status, r.IterationCount,
 			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
-		AutoApprove: r.AutoApprove,
-		Branch:      textPtrValue(r.Branch.Valid, r.Branch.String),
-		BaseBranch:  textPtrValue(r.BaseBranch.Valid, r.BaseBranch.String),
-		OpenMr:      r.OpenMr,
-		Interactive: r.Interactive,
+		AutoApprove:   r.AutoApprove,
+		TriggerSource: r.TriggerSource,
+		Branch:        textPtrValue(r.Branch.Valid, r.Branch.String),
+		BaseBranch:    textPtrValue(r.BaseBranch.Valid, r.BaseBranch.String),
+		OpenMr:        r.OpenMr,
+		Interactive:   r.Interactive,
 		// PRD #400 Decision 6: when the task run's dispatch gate was stamped (null until
 		// then, and on every non-task run). Mapped like ClaimedAt.
 		DispatchedAt:  timePtr(r.DispatchedAt.Valid, r.DispatchedAt.Time),

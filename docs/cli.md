@@ -1150,6 +1150,14 @@ schedule pinned none) and `uzi run get <id> --field override_subagent_model`
 (the boolean literal `true`/`false` — whether that model was also applied to
 every subagent).
 
+A run's trigger provenance — what/how/who started it — is readable this way:
+`uzi run get <id> --field trigger_source`. It is a NOT NULL server enum
+(DEFAULT `manual`, so always set; historical rows carry a best-effort
+backfilled value), one of: `manual`, `autopilot`, `schedule`, `self_improve`,
+`ci_fix`, `mr_rework`, `chat`, `task`, `task_review`, `then_fix`, `judge`,
+`judge_rerun`, `resume`. The human `run get` view prints it as a `TRIGGER` row,
+and `uzi admin runs` shows it as a `TRIGGER` column.
+
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run
 declared it moved a completed PRD to, e.g. `prds/done/72-x.md`) and <!-- check-docs:ignore-path: didactic example path, not a real PRD -->

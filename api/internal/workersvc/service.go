@@ -4735,7 +4735,7 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// (PRD #300) — the per-schedule override applies only to runs a schedule fires.
 	// false overrideSubagentModel (PRD #305): an interactive run is not a schedule fire,
 	// so it stays in the default lane where subagent pins win.
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, mrReworkEnabled, nil, false, seed)
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, seed)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
@@ -4743,7 +4743,7 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 // It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
 // and, like every create path, no longer requires a PRD link.
 func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, seed)
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, seed)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -4766,7 +4766,7 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// nil mrReworkEnabled (PRD #841 M1): label-poller autopilot has no human/schedule to
 	// express a per-run override, so the run's column stays NULL → inherit the owner
 	// default live, exactly today's behaviour.
-	return s.createRun(ctx, userID, repoID, issueIID, description, true, nil, nil, nil, false, nil)
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, nil)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -4779,7 +4779,7 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // scheduler seam cannot change label-driven autopilot. seed=nil for the same reason as
 // CreateAutopilotRun: autopilot never seeds its plan.
 func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, nil /*seed*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, nil /*seed*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -4808,7 +4808,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -5021,6 +5021,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// The mr_rework create path (M3's CreateAutoMRReworkRun) fetches the MR review
 		// snapshot via fetchReviewCommentsSnapshot and populates this itself.
 		ReviewComments: nil,
+		// issue #857 M2: the provenance stamp threaded from each public entrypoint
+		// ("manual"/"schedule"/"autopilot"), so a run records why it fired.
+		TriggerSource: triggerSource,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -5031,6 +5034,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// queued is the start intent → In Progress. The move marker is already stamped
 	// in the CreateRun statement; Notify performs the move.
 	s.notify(run.ID, "queued")
+	logRunCreated(run)
 	return run, nil
 }
 

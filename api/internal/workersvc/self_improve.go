@@ -65,5 +65,6 @@ func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.
 	// effect, review N1) and keeps the live status broadcast consistent with other
 	// issue-shaped runs.
 	s.notify(run.ID, "queued")
+	logRunCreated(run)
 	return run, nil
 }
