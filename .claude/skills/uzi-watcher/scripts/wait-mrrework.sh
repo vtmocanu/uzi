@@ -6,13 +6,17 @@
 # DEFER to it deterministically instead of eyeballing a too-short wait and then doing a
 # redundant local fix. Poll for the run to APPEAR, then to reach terminal.
 #
-# Usage: wait-mrrework.sh OWNER/REPO PR [max_ticks] [interval_s]
+# Usage: wait-mrrework.sh OWNER/REPO PR [max_ticks] [interval_s] [since_utc]
 #   default budget: 45 ticks x 60s = 45 min (covers the observed ~40 min fire lag).
+#   since_utc: an RFC3339-UTC instant (`date -u +%Y-%m-%dT%H:%M:%SZ`) captured BEFORE this
+#     wait began. When set, only mr_rework runs created AFTER it count as "the current
+#     cycle" — see the cycle-anchoring note below. Omit it and the wait is legacy (newest
+#     run of ANY cycle), which can report a STALE prior cycle's terminal run as done.
 #
 # Exit codes:
-#   0  an mr_rework run reached terminal; prints MRREWORK_ID / MRREWORK_STATUS
-#   2  budget elapsed with NO mr_rework run seen AND the poll that ended the budget
-#      SUCCEEDED (a confirmed empty result) — safe to fall back to a local fix
+#   0  a CURRENT-cycle mr_rework run reached terminal; prints MRREWORK_ID / MRREWORK_STATUS
+#   2  budget elapsed with NO current-cycle mr_rework run seen AND the poll that ended the
+#      budget SUCCEEDED (a confirmed empty result) — the ONLY exit that authorizes a local fix
 #   3  budget elapsed while a run was still non-terminal (still reworking; re-run me)
 #   4  the OWNER/REPO could not be resolved to a uzi repo id
 #   5  budget elapsed but the polls were UNRELIABLE (every poll, or the final one,
@@ -22,13 +26,15 @@
 # The exit-2-vs-5 split is load-bearing: a failed listing must never masquerade as a
 # confirmed-empty "no run", or a transient `uzi`/network blip would greenlight a local
 # fix while mr_rework is in fact mid-flight — recreating the double-push collision this
-# poller exists to prevent.
+# poller exists to prevent. Callers must treat ONLY exit 2 as "no rework, fix locally";
+# 3/4/5 all mean "do NOT fix locally yet".
 set -uo pipefail
 
-REPO_SLUG=${1:?usage: wait-mrrework.sh OWNER/REPO PR [max_ticks] [interval_s]}
-PR=${2:?usage: wait-mrrework.sh OWNER/REPO PR [max_ticks] [interval_s]}
+REPO_SLUG=${1:?usage: wait-mrrework.sh OWNER/REPO PR [max_ticks] [interval_s] [since_utc]}
+PR=${2:?usage: wait-mrrework.sh OWNER/REPO PR [max_ticks] [interval_s] [since_utc]}
 MAX=${3:-45}
 INT=${4:-60}
+SINCE=${5:-}   # RFC3339-UTC baseline; empty = legacy (no cycle anchoring)
 
 REPO_ID=$(uzi repo list --json 2>/dev/null \
   | jq -r --arg s "$REPO_SLUG" 'first(.[]|select(.path_with_namespace==$s)|.id) // empty')
@@ -55,9 +61,17 @@ for i in $(seq 1 "$MAX"); do
   # Anchor on the NEWEST mr_rework run for this MR, not an arbitrary first match: an MR can
   # be reworked over several cycles (each a distinct run, up to the per-MR cap), so `first`
   # could latch onto a stale TERMINAL earlier cycle and exit 0 while the current cycle is
-  # still running. `max_by(.created_at)` always tracks the latest cycle.
-  row=$(printf '%s' "$raw" | jq -r --arg repo "$REPO_ID" --argjson pr "$PR" \
-    '([.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr)] | max_by(.created_at)) // {} | "\(.id // "")\t\(.status // "")"')
+  # still running. `max_by(.created_at)` tracks the latest cycle — but "latest that EXISTS
+  # right now" is still a PRIOR cycle's terminal run until the current one is queued, so a
+  # bare max_by can report an old completed run as done before this cycle fires. SINCE fixes
+  # that: when set, only runs created after it are considered, so a prior cycle's run is
+  # excluded and the wait holds for the run this review actually triggers. Fractional seconds
+  # are stripped so a plain `YYYY-MM-DDTHH:MM:SSZ` baseline compares lexicographically (same
+  # format + UTC 'Z' => string order == time order).
+  row=$(printf '%s' "$raw" | jq -r --arg repo "$REPO_ID" --argjson pr "$PR" --arg since "$SINCE" \
+    '([.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr
+        and ($since=="" or ((.created_at|sub("\\.[0-9]+";"")) > $since)))]
+      | max_by(.created_at)) // {} | "\(.id // "")\t\(.status // "")"')
   id=$(printf '%s' "$row" | cut -f1)
   st=$(printf '%s' "$row" | cut -f2)
   if [ -z "$id" ]; then
