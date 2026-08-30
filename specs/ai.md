@@ -23447,3 +23447,24 @@ or privacy-sensitive install must be able to turn the check off entirely without
   (it cannot hold entries newer than the instance's own build).
 - Full rationale and Decision Log D1–D8: `prds/done/836-update-available-signal.md`; the outbound-egress
   path and the SSRF-bypass argument are recorded in `adr/0836-upstream-release-check.md`.
+
+## 593. Issue #857 — `runs.trigger_source`: a first-class, queryable column for what/how/who started a run
+
+A bounded observability enhancement (no PRD). Previously the trigger had to be *derived* by
+combining `user_id` / `auto_approve` / `schedule_id` / `resume_of_run_id` / `kind`;
+`trigger_source` records it directly so runs can be filtered and reported on by entrypoint.
+
+- **Closed enum, exactly 13 values — the one real design decision.** One value per create-entrypoint
+  family: `manual`, `autopilot`, `schedule`, `self_improve`, `ci_fix`, `mr_rework`, `chat`, `task`,
+  `task_review`, `then_fix`, `judge`, `judge_rerun`, `resume`. It captures *what/how* only; *who* stays
+  the existing `user_id` (the column is orthogonal to identity, not a replacement for it).
+- **Stamped once at each create entrypoint.** Set as a literal in the sqlc insert query, or threaded
+  via `createRun` for the manual/schedule/autopilot paths and via the judge query param for
+  `judge`/`judge_rerun`. A structured `slog.Info("workersvc: run created", ...)` line is emitted at
+  creation carrying run_id/repo_id/issue_iid/kind/trigger_source/user_id/auto_approve/schedule_id.
+- **Backfill is best-effort inference keyed on `kind` plus `auto_approve` / `schedule_id` / `resume_of_run_id` and the task lineage pointers (`review_target_run_id` / `then_fix_of_run_id`); it does not read `origin_column` (which records board position at creation, not the trigger).** Two
+  values are historically indistinguishable and documented as such: `judge_rerun` is not separable from
+  `judge` (backfill reads `judge`), and an issue run whose schedule was since deleted falls to
+  `manual`/`autopilot`.
+- **Surfaced end to end.** RunDTO (`trigger_source`), `uzi run get --json` / `--field`, the
+  `uzi admin runs` table, and the web `interface Run` mirror.

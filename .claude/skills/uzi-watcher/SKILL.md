@@ -304,11 +304,33 @@ by anything on the PR itself.
    it, duplicating the work (not a data-loss collision if your pre-push re-check is clean,
    but wasted effort and a confusing double set of fix commits). **Budget at least ~40 min
    of polling for the run to APPEAR before falling back to a local fix, and poll for it
-   rather than eyeballing** — `scripts/wait-mrrework.sh OWNER/REPO PR` waits through the
-   fire→terminal lifecycle and exits when the run lands (or the budget elapses). Fall back to
-   a local fix only when that budget is genuinely spent, or when mr_rework structurally
-   cannot help (owner opted out, the admin kill-switch is on, or a `.github/workflows`
-   finding — the "when this session still fixes locally" list below). **Either way**, the
+   rather than eyeballing** — `scripts/wait-mrrework.sh OWNER/REPO PR [max] [int] [since_utc]`
+   waits through the fire→terminal lifecycle and exits when the run lands (or the budget
+   elapses). **Capture `since_utc` BEFORE the wait and pass it**, so the poller anchors to the
+   CURRENT rework cycle and cannot report a PRIOR cycle's already-terminal run as "done" (the
+   exact failure it exists to prevent, one cycle down): `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)`
+   the moment you first see the findings, then `wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`.
+   Reuse the SAME `$SINCE` on every re-run — a run for any later comment is still created after
+   it, so one baseline catches every cycle for these findings.
+
+   **That ~40-min budget is measured from the NEWEST review comment, so it RESETS every time
+   a new one lands — it is not a fixed timer off the first finding.** mr_rework's quietPeriod
+   debounce runs from the latest review comment on the MR, so a later CodeRabbit incremental,
+   a human note, or another bot posting mid-wait pushes the fire window forward by another
+   full debounce. A fixed "~40 min from when I first saw findings" countdown can therefore
+   expire while the run is still legitimately pending against a newer comment. So restart the
+   budget whenever a new review comment arrives, and conclude "it will not fire" only once a
+   full quiet period has elapsed with NO new review comment AND no run has appeared (re-running
+   `wait-mrrework.sh` after any new comment does exactly this).
+
+   Fall back to a local fix **only on `wait-mrrework.sh` exit 2** — a CONFIRMED empty result
+   (no current-cycle run appeared across reliable polls) — or when mr_rework structurally
+   cannot help (owner opted out, the admin kill-switch is on, or a `.github/workflows` finding
+   — the "when this session still fixes locally" list below). **Its other exits do NOT
+   authorize a local fix:** exit 3 means a run is STILL reworking (re-run to keep waiting),
+   exit 5 means the polls were unreliable so "never fired" is unproven, and exit 4 means the
+   repo did not resolve — treating any of these as "budget spent, fix locally" re-opens the
+   double-push collision. **Either way**, the
    pre-push guard (re-list `kind=mr_rework` for this MR AND re-fetch the branch head, step 1)
    stays mandatory right before any local push, because the run can fire during your edit.
 3. **Let it finish, then decide from whether the head ACTUALLY moved — and read the ref

@@ -259,13 +259,18 @@ func (s *Service) CreateChatRun(ctx context.Context, userID uuid.UUID, message s
 		return store.Run{}, err
 	}
 	title := deriveChatTitle(message)
-	return s.q.CreateChatRun(ctx, store.CreateChatRunParams{
+	run, err := s.q.CreateChatRun(ctx, store.CreateChatRunParams{
 		RunID:            uuid.New(),
 		UserID:           userID,
 		IssueTitle:       title,
 		IssueDescription: message,
 		Title:            pgText(title),
 	})
+	if err != nil {
+		return store.Run{}, err
+	}
+	logRunCreated(run)
+	return run, nil
 }
 
 // ListChatRuns returns the user's chat conversations for the Chat page's list,
@@ -380,13 +385,18 @@ func (s *Service) ContinueChat(ctx context.Context, userID, runID uuid.UUID) (st
 	if !title.Valid {
 		title = pgText(src.IssueTitle)
 	}
-	return s.q.CreateChatContinueRun(ctx, store.CreateChatContinueRunParams{
+	run, err := s.q.CreateChatContinueRun(ctx, store.CreateChatContinueRunParams{
 		UserID:        userID,
 		IssueTitle:    src.IssueTitle,
 		Title:         title,
 		ResumeOfRunID: pgUUID(src.ID),
 		WorkerID:      src.WorkerID, // affinity to the worker whose disk holds the session (may be NULL)
 	})
+	if err != nil {
+		return store.Run{}, err
+	}
+	logRunCreated(run)
+	return run, nil
 }
 
 // -------------------------------------------------------------------------

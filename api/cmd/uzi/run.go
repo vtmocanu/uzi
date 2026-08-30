@@ -1445,6 +1445,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	rows := [][]string{
 		{"ID", r.ID},
 		{"KIND", r.Kind},
+		// issue #857: what/how/who started the run. A NOT NULL server enum (DEFAULT
+		// 'manual'), so it is always set and printed unconditionally like KIND above.
+		{"TRIGGER", r.TriggerSource},
 		// RunDTO carries no is_revising (issue #750): the detail page keeps its own
 		// derivePlanRevision panel, so revising is never surfaced through this helper here.
 		{"STATUS", effectiveRunStatus(r.Status, r.IsPlanning, false)},

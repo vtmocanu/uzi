@@ -71,14 +71,14 @@ func TestClaimRunDockerRepoAllowlistLiveDB(t *testing.T) {
 	// A queued issue run per repo.
 	allowedRun, err := q.CreateRun(ctx, store.CreateRunParams{
 		UserID: userID, RepoID: allowedRepo,
-		IssueIid: pgtype.Int8{Int64: 1, Valid: true}, IssueTitle: "allowed", IssueDescription: "d", PlanSource: "agent",
+		IssueIid: pgtype.Int8{Int64: 1, Valid: true}, IssueTitle: "allowed", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
 		t.Fatalf("CreateRun(allowed): %v", err)
 	}
 	deniedRun, err := q.CreateRun(ctx, store.CreateRunParams{
 		UserID: userID, RepoID: deniedRepo,
-		IssueIid: pgtype.Int8{Int64: 2, Valid: true}, IssueTitle: "denied", IssueDescription: "d", PlanSource: "agent",
+		IssueIid: pgtype.Int8{Int64: 2, Valid: true}, IssueTitle: "denied", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
 		t.Fatalf("CreateRun(denied): %v", err)
@@ -88,7 +88,7 @@ func TestClaimRunDockerRepoAllowlistLiveDB(t *testing.T) {
 	// exemption a docker worker keeps even under an empty allowlist).
 	target, err := q.CreateRun(ctx, store.CreateRunParams{
 		UserID: userID, RepoID: allowedRepo,
-		IssueIid: pgtype.Int8{Int64: 3, Valid: true}, IssueTitle: "target", IssueDescription: "d", PlanSource: "agent",
+		IssueIid: pgtype.Int8{Int64: 3, Valid: true}, IssueTitle: "target", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
 		t.Fatalf("CreateRun(target): %v", err)
@@ -96,7 +96,7 @@ func TestClaimRunDockerRepoAllowlistLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, target.ID)
 	judge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 		UserID: userID, TargetRunID: pgtype.UUID{Bytes: target.ID, Valid: true},
-		IssueTitle: "Judge: review target", IssueDescription: "",
+		IssueTitle: "Judge: review target", IssueDescription: "", TriggerSource: "judge",
 	})
 	if err != nil {
 		t.Fatalf("CreateJudgeRun: %v", err)

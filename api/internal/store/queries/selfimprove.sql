@@ -36,7 +36,7 @@
 -- (@override_subagent_model, a plain bool). The bespoke engine passes nil/false, freezing
 -- NULL/false onto its run exactly as before this column pair was threaded through.
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, override_subagent_model, required_capabilities
+    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, override_subagent_model, required_capabilities, trigger_source
 ) VALUES (
     @user_id, @repo_id::uuid, 'self_improve', @issue_iid, @issue_title, @issue_description, true, @wait_on_limit, sqlc.narg('model'), @override_subagent_model,
     -- required_capabilities (PRD #84 M2, issue #512 M1): a self_improve run is REPO-BEARING
@@ -44,7 +44,7 @@ INSERT INTO runs (
     -- inherit the repo's capability hint like every other repo-bearing path — else with
     -- capability_aware ON a base worker claims it and fails mid-run. Inherit atomically via
     -- subquery reusing @repo_id, so no new Go struct field. Same expression CreateRun uses.
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}')
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'self_improve'
 )
 RETURNING *;
 

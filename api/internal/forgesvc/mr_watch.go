@@ -94,8 +94,27 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 	case stored == forge.MRStateOpened && observed == forge.MRStateClosed:
 		// close-edge: reviewer rejected the MR → rework needed → In Progress,
 		// guarded from Human Review (where the completed run parked the card).
-		if s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, f, board.ColumnHumanReview, board.ColumnInProgress) == moveDeferred {
-			return // forge failure / vanished card: leave the edge for next-tick retry
+		//
+		// A confirmed close means any in-flight rework can never land — abort it
+		// INDEPENDENTLY of the board move (#853 review finding). Cancellation is
+		// keyed on the MR, not the card, so it must NOT be gated behind a move that
+		// can defer: a forge move error, or an evicted card that stops being a
+		// candidate next tick, would otherwise leave the rework spending forever.
+		// Attempt it every tick, ahead of the move. Re-attempts converge: once the
+		// run is terminal (server-side path) GetActiveMRReworkRunForMR returns no
+		// rows → no-op nil; while a live worker's run is still non-terminal a
+		// re-entry re-stamps stop_kind and re-enqueues a cancel verdict, which is
+		// harmless (the worker cancels on the first it consumes) and only occurs in
+		// the narrow window where the move keeps deferring before the worker acks.
+		cancelErr := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64)
+		if cancelErr != nil {
+			slog.Warn("forgesvc: cancel rework on MR close failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", cancelErr)
+		}
+		moved := s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, f, board.ColumnHumanReview, board.ColumnInProgress)
+		if moved == moveDeferred || cancelErr != nil {
+			// forge failure / vanished card, or a cancel that must be retried: leave
+			// mr_state unadvanced so the next tick re-observes the edge and retries.
+			return
 		}
 		s.recordMRState(ctx, c.ID, observed)
 	case stored == forge.MRStateClosed && observed == forge.MRStateOpened:
@@ -110,8 +129,29 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		// Unknown states never reach here — they are ignored before the bootstrap
 		// check above. A merge closes the issue via `Closes #N`, which the existing
 		// issue-close sync owns; locked is transient during merge processing.
+		//
+		// A merge additionally means the branch is gone and any in-flight rework can
+		// never land — abort it (#853). Locked is transient during merge processing
+		// and must NOT trigger a cancel.
+		if observed == forge.MRStateMerged {
+			if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
+				slog.Warn("forgesvc: cancel rework on MR merge failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", err)
+				return // leave mr_state unadvanced so the next tick retries
+			}
+		}
 		s.recordMRState(ctx, c.ID, observed)
 	}
+}
+
+// cancelReworkOnClosedMR aborts an in-flight mr_rework when its MR has merged/closed
+// (issue #853). Returns nil when no canceller is wired or no active rework exists.
+// A non-nil error means the caller must LEAVE mr_state unadvanced (don't consume the
+// edge) so the next poller tick retries — same contract as a forge-side failure.
+func (s *Service) cancelReworkOnClosedMR(ctx context.Context, repoID uuid.UUID, mrIID int64) error {
+	if s.reworkCanceller == nil {
+		return nil
+	}
+	return s.reworkCanceller.CancelReworkForMR(ctx, repoID, mrIID, "MR merged/closed during rework")
 }
 
 // moveOutcome is the result of a guarded MR-state move, distinguishing the two

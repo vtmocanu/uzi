@@ -375,8 +375,8 @@ WHERE status = 'online'
 -- against the vocabulary at its write path, so no re-validation is needed here.
 -- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
 -- column default. Plan inference (M4) later union-merges via a separate UPDATE.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -1717,6 +1717,18 @@ UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancell
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: GetActiveMRReworkRunForMR :one
+-- Resolve the single non-terminal mr_rework run for a (repo, MR). Used by the
+-- mid-flight abort (issue #853): when the MR-close watcher sees the MR leave the
+-- opened state, the active rework is cancelled so a live worker stops spending.
+-- The WHERE is byte-identical to the partial unique index uq_runs_one_active_mr_rework
+-- (migration 00167) — that index is the ONLY reason this can be :one; widening it, or
+-- narrowing the status set here, would silently break the single-row guarantee.
+SELECT * FROM runs
+WHERE repo_id = @repo_id::uuid AND mr_iid = @mr_iid
+  AND kind = 'mr_rework'
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: CancelRunByWorker :execrows

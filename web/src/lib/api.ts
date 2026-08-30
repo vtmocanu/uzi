@@ -1719,6 +1719,23 @@ export interface Milestone {
   title: string;
 }
 
+/** The create-entrypoint family that started a run (server column `trigger_source`,
+ *  a closed 13-value enum). Mirrors the Go CHECK constraint / RunDTO. */
+export type RunTriggerSource =
+  | "manual"
+  | "autopilot"
+  | "schedule"
+  | "self_improve"
+  | "ci_fix"
+  | "mr_rework"
+  | "chat"
+  | "task"
+  | "task_review"
+  | "then_fix"
+  | "judge"
+  | "judge_rerun"
+  | "resume";
+
 export interface Run {
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
@@ -1752,6 +1769,12 @@ export interface Run {
   /** PRD #19: an autopilot run (poller-started, plan auto-approved). Drives the
    *  "autopilot" badge; a manually-started run is false. */
   auto_approve: boolean;
+  /** issue #857: what/how/who started the run (manual, autopilot, schedule,
+   *  self_improve, ci_fix, mr_rework, chat, task, task_review, then_fix, judge,
+   *  judge_rerun, resume). A NOT NULL server column (DEFAULT 'manual'), so it is
+   *  always present on a live read; OPTIONAL here only to avoid forcing mock-object
+   *  updates. RunListItem extends Run, so list rows inherit it. */
+  trigger_source?: RunTriggerSource;
   worker_id: string | null;
   branch: string | null;
   /** PRD #300: the per-schedule model a schedule froze onto this run at fire time;
