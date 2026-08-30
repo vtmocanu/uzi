@@ -1185,7 +1185,7 @@ func readPlanFile(env Env, path string) (string, error) {
 		}
 		return string(b), nil
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: path is the operator's own --plan-file argument to their local CLI; reading the file they named is the intended behaviour, not untrusted inclusion.
 	if err != nil {
 		return "", uzicli.Exitf(uzicli.ExitUsage, "cannot read plan file: %v", err)
 	}
@@ -2047,11 +2047,8 @@ func shortInstanceID(id string) string {
 
 // capCell truncates a table cell to max RUNES, appending an ellipsis. Rune-based
 // per the house idiom (workersvc.deriveChatTitle): byte-slicing splits a multibyte
-// codepoint into invalid UTF-8. Note the neighbouring compactText still byte-slices
-// at its 200-char cap — milder there, since a mangled rune reaches a terminal rather
-// than an INSERT, but the two are inconsistent and compactText is the one that is
-// wrong. Left alone here: it is shared with the payload and steer-body columns, so
-// changing it changes output this milestone does not own.
+// codepoint into invalid UTF-8. The neighbouring compactText caps on runes for the
+// same reason (issue #554); the two are now consistent.
 func capCell(s string, max int) string {
 	if utf8.RuneCountInString(s) <= max {
 		return s
@@ -2068,14 +2065,20 @@ func compactPayload(raw json.RawMessage) string {
 
 // compactText sanitizes untrusted free text and folds it to a single truncated
 // line for a human table cell (Risk 13): C0/C1 controls stripped, newlines
-// collapsed to spaces, capped at 200 chars. Shared by compactPayload (message
+// collapsed to spaces, capped at 200 RUNES. Shared by compactPayload (message
 // payloads) and the steer-queue body column.
+//
+// The cap is rune-based (issue #554): a byte slice at 200 bytes could split a
+// multibyte rune straddling the boundary, emitting an orphan continuation byte —
+// invalid UTF-8 to a terminal on the direct callers, and a U+FFFD mojibake glyph
+// on the paths that re-encode downstream (cellText's strings.Map). capCell above
+// caps on runes for the same reason.
 func compactText(s string) string {
 	s = sanitizeTTY(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, "\n", " ")
 	const max = 200
-	if len(s) > max {
-		return s[:max] + "…"
+	if utf8.RuneCountInString(s) > max {
+		return string([]rune(s)[:max]) + "…"
 	}
 	return s
 }
