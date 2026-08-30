@@ -713,6 +713,29 @@ func TestScheduleEditMrReworkPreservedOnUnrelatedEdit(t *testing.T) {
 	}
 }
 
+// TestScheduleEditDefaultMrReworkPreservedOnUnrelatedEdit is the default-origin sibling of
+// the merge-correctness test above: buildDefaultScheduleEditRequest also RESTATES the stored
+// mr_rework value before any --mr-rework override, because the server's
+// patchDefaultScheduleConfig uses REPLACE-semantics on it (an omitted value clears the stored
+// override to inherit). Here a DEFAULT-origin schedule with an explicit mr_rework=on receives
+// a --cron-only edit (the flag NOT Changed); the outgoing request must re-send on, not nil, so
+// the unrelated edit does not silently wipe the override on the replace-semantics default path.
+func TestScheduleEditDefaultMrReworkPreservedOnUnrelatedEdit(t *testing.T) {
+	fc := editDefaultSweepFixture("sch_d")
+	on := true
+	stored := fc.ScheduleByID["sch_d"]
+	stored.MrReworkEnabled = &on
+	fc.ScheduleByID["sch_d"] = stored
+
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--cron", "0 4 * * 2")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if got := fc.LastPatchSchedReq.MrReworkEnabled; got == nil || !*got {
+		t.Errorf("mr_rework_enabled = %v, want it RESTATED as on — a --cron-only edit on a default schedule must not clear the stored override under the server's replace-semantics", got)
+	}
+}
+
 // TestScheduleEditAtSwitchesTiming: --at flips a recurring schedule to once, sets
 // run_at, and clears the cron.
 func TestScheduleEditAtSwitchesTiming(t *testing.T) {
