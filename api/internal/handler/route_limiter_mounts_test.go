@@ -67,7 +67,9 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 170 as of this commit (issue #559 added GET /api/worker/runs/{id}/ownership —
+// 172 as of this commit (PRD #836 M3 added GET /api/admin/release-check and POST
+// /api/admin/release-check — the admin Updates-card read plus the "Check now" trigger).
+// It was 170 until then (issue #559 added GET /api/worker/runs/{id}/ownership —
 // the interactive park-skip ownership/terminality probe).
 // It was 169 until then (PRD #685 M1 added GET /api/branding, GET
 // /api/branding/logo/{slot}, PUT /api/admin/branding/logo/{slot} and DELETE
@@ -222,6 +224,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/admin/rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
 	{"GET", "/api/admin/agent-source", noLimiter},
+	// PRD #836 M3: the admin Updates-card data source — a cache-backed read, no forge
+	// call → noLimiter, like the agent-source GET beside it.
+	{"GET", "/api/admin/release-check", noLimiter},
 	{"GET", "/api/admin/settings", noLimiter},
 	{"GET", "/api/admin/slack/status", noLimiter},
 	{"GET", "/api/admin/usage", noLimiter},
@@ -361,6 +366,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #702 M4: ls-remote the configured source and persist remote facts — cookie-only
 	// admin, single bounded ls-remote round trip, no per-user forge/model spend → noLimiter.
 	{"POST", "/api/admin/agent-source/update-check", noLimiter},
+	// PRD #836 M3: "Check now" — cookie-only admin, a single bounded GitHub round trip,
+	// no per-user forge/model spend → noLimiter, like the agent-source update-check above.
+	{"POST", "/api/admin/release-check", noLimiter},
 	{"POST", "/api/agent-templates/", noLimiter},
 	{"POST", "/api/agent-templates/{id}/reset", noLimiter},
 	{"POST", "/api/auth/cli/approve", limAuth},

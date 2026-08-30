@@ -35,8 +35,10 @@ func TestReleaseCheckSettingsSeedsWhenAbsent(t *testing.T) {
 	if got := st.upserted[settings.KeyReleaseCheckBannerEnabled]; got != "false" {
 		t.Errorf("release_check_banner_enabled = %q, want false", got)
 	}
-	if got := st.upserted[settings.KeyReleaseCheckInterval]; got != (6 * time.Hour).String() {
-		t.Errorf("release_check_interval = %q, want %q", got, (6 * time.Hour).String())
+	// The default 6h interval is stored in the tidy canonical spelling ("6h"), matching
+	// settings.DefaultReleaseCheckInterval, not time.Duration.String()'s "6h0m0s".
+	if got := st.upserted[settings.KeyReleaseCheckInterval]; got != settings.DefaultReleaseCheckInterval {
+		t.Errorf("release_check_interval = %q, want %q", got, settings.DefaultReleaseCheckInterval)
 	}
 
 	// The token is a secret: sealed at rest, never stored in the clear.

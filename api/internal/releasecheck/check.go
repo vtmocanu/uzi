@@ -98,7 +98,13 @@ func NewReconciler(st Store, set SettingsReader, now func() time.Time, logger *s
 func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 	enabled, err := r.settings.ReleaseCheckEnabled(ctx)
 	if err != nil {
+		// Fail CLOSED. The master toggle is the AIR-GAP / privacy gate (PRD #836 D2:
+		// off → the api never calls github.com), so a transient cache-read error must
+		// NOT cause egress: treat an errored read as disabled — no HTTP call, nothing
+		// persisted. The accessor defaults to true on a read error, so we cannot proceed
+		// on the returned bool. Keep logging the error.
 		r.logger.Error("releasecheck: read enabled", "error", err)
+		return Result{Status: statusDisabled, Message: "release check enable read failed; treating as disabled"}, nil
 	}
 	if !enabled {
 		return Result{Status: statusDisabled, Message: "release check is disabled"}, nil

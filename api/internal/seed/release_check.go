@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -38,7 +39,7 @@ func ReleaseCheckSettings(ctx context.Context, q SettingsStore, box *secretbox.B
 	desired := map[string]string{
 		settings.KeyReleaseCheckEnabled:       boolStr(cfg.SeedReleaseCheckEnabled),
 		settings.KeyReleaseCheckBannerEnabled: boolStr(cfg.SeedReleaseCheckBannerEnabled),
-		settings.KeyReleaseCheckInterval:      cfg.SeedReleaseCheckInterval.String(),
+		settings.KeyReleaseCheckInterval:      seededIntervalStr(cfg.SeedReleaseCheckInterval),
 	}
 	// The token is OPTIONAL: seed it only when configured, so an empty env var never
 	// creates an empty sealed row that would mask a later admin-set token.
@@ -74,6 +75,19 @@ func ReleaseCheckSettings(ctx context.Context, q SettingsStore, box *secretbox.B
 
 	slog.Info("seeded release-check settings", "seeded", seeded, "existing_untouched", skipped)
 	return nil
+}
+
+// seededIntervalStr renders the seed interval for storage. time.Duration.String()
+// spells 6h as "6h0m0s"; when the configured interval equals the compiled-in default
+// this returns the tidier canonical settings.DefaultReleaseCheckInterval ("6h")
+// instead, so the default seeded row matches Defaults byte-for-byte. A non-default
+// interval keeps its String() form; both spellings parse identically. The create-only
+// contract is unchanged — the interval row is still always written when absent.
+func seededIntervalStr(d time.Duration) string {
+	if def, err := time.ParseDuration(settings.DefaultReleaseCheckInterval); err == nil && d == def {
+		return settings.DefaultReleaseCheckInterval
+	}
+	return d.String()
 }
 
 // boolStr renders a config bool as the "true"/"false" string app_settings stores.

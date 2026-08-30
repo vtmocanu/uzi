@@ -17,13 +17,18 @@ import (
 // counting Invalidate calls so a persist is observable.
 type fakeSettings struct {
 	enabled     bool
+	enabledErr  error
 	token       string
 	tokenErr    error
 	interval    time.Duration
 	invalidated atomic.Int64
 }
 
-func (f *fakeSettings) ReleaseCheckEnabled(context.Context) (bool, error) { return f.enabled, nil }
+func (f *fakeSettings) ReleaseCheckEnabled(context.Context) (bool, error) {
+	// Mirror the real accessor's default-ON-on-error behavior so the fail-closed test
+	// exercises the same trap: enabled=true is returned ALONGSIDE the error.
+	return f.enabled, f.enabledErr
+}
 func (f *fakeSettings) ReleaseCheckToken(context.Context) (string, error) {
 	return f.token, f.tokenErr
 }
@@ -175,6 +180,44 @@ func TestCheckForUpdateDisabled(t *testing.T) {
 	}
 	if set.invalidated.Load() != 0 {
 		t.Errorf("disabled check invalidated the cache %d times, want 0", set.invalidated.Load())
+	}
+}
+
+// TestCheckForUpdateEnableReadErrorFailsClosed: an error reading the master toggle →
+// Status "disabled", the server sees ZERO requests, nothing persisted, cache not
+// invalidated. The master gate is the air-gap/privacy gate (PRD #836 D2), so a
+// transient cache-read error must never cause egress — even though the accessor
+// defaults to enabled=true on that error.
+func TestCheckForUpdateEnableReadErrorFailsClosed(t *testing.T) {
+	var reqCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reqCount.Add(1)
+		_, _ = w.Write([]byte(releaseJSON("v9.9.9", "x", "", "2026-08-20T10:00:00Z", "https://x")))
+	}))
+	defer srv.Close()
+	withBaseURL(t, srv.URL)
+
+	st := newFakeStore(nil)
+	// enabled=true PLUS a read error: the accessor's default-ON behavior must NOT let
+	// the check proceed to egress.
+	set := &fakeSettings{enabled: true, enabledErr: fmt.Errorf("cache read failed")}
+	rec := NewReconciler(st, set, nil, nil)
+
+	res, err := rec.CheckForUpdate(context.Background())
+	if err != nil {
+		t.Fatalf("CheckForUpdate err = %v", err)
+	}
+	if res.Status != statusDisabled {
+		t.Fatalf("Status = %q, want %q (an errored enable read must fail closed)", res.Status, statusDisabled)
+	}
+	if reqCount.Load() != 0 {
+		t.Errorf("enable-read-error check made %d http requests, want 0", reqCount.Load())
+	}
+	if st.writes != 0 || len(st.values) != 0 {
+		t.Errorf("enable-read-error check persisted %d writes, want 0", st.writes)
+	}
+	if set.invalidated.Load() != 0 {
+		t.Errorf("enable-read-error check invalidated the cache %d times, want 0", set.invalidated.Load())
 	}
 }
 

@@ -817,6 +817,9 @@ func run() error {
 	// The admin agent-source endpoints (PRD #602 M4) drive the SAME reconciler the
 	// interval loop uses: "Sync now" calls Reconcile, approve-and-apply calls Apply.
 	h.SetAgentSourceReconciler(agentSourceRec)
+	// The admin release-check "Check now" endpoint (PRD #836 M3) drives the SAME
+	// reconciler the interval Runner uses (releaseRec, built above): CheckForUpdate.
+	h.SetReleaseCheckReconciler(releaseRec)
 	// Share the vault with the HTTP handlers: unlock at login, DEK-seal on secret
 	// save, the /api/vault endpoints, and vault status on /api/me (PRD #32). M3 adds
 	// the same instance to workersvc for claim-time gating + open.
