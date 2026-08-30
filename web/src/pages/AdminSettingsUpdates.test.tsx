@@ -194,6 +194,9 @@ describe("AdminSettings — Updates card (PRD #836 M5)", () => {
     await waitFor(() => expect(screen.getByText(/Update checks are turned off/i)).toBeTruthy());
     const master = screen.getByLabelText(/enable update checks/i) as HTMLInputElement;
     expect(master.checked).toBe(false);
+    // Air-gap guarantee: with checks off, "Check now" cannot fire a network call.
+    const check = screen.getByRole("button", { name: /check now/i }) as HTMLButtonElement;
+    expect(check.disabled).toBe(true);
   });
 
   it("states the error status with the scrubbed message", async () => {

@@ -738,7 +738,9 @@ function UpdatesSettingsCard() {
   const [status, setStatus] = useState<ReleaseCheckStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
-  // Which toggle is mid-save (so only that row disables). null when idle.
+  // Which toggle is mid-save; null when idle. A save disables BOTH toggle inputs
+  // (deliberate concurrent-write protection — see the `disabled` guards below), while
+  // this value still records which of the two rows is the one being saved.
   const [savingToggle, setSavingToggle] = useState<"enabled" | "banner" | null>(null);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
@@ -782,6 +784,15 @@ function UpdatesSettingsCard() {
     try {
       const key = which === "enabled" ? "release_check_enabled" : "release_check_banner_enabled";
       await api.updateSettings({ [key]: String(next) });
+      // The write succeeded — reflect it immediately so a failed re-read below does not
+      // leave the controlled checkbox showing the pre-save value.
+      setStatus((prev) =>
+        prev === null
+          ? prev
+          : which === "enabled"
+            ? { ...prev, release_check_enabled: next }
+            : { ...prev, release_check_banner_enabled: next },
+      );
       const { release_check } = await api.getReleaseCheck();
       setStatus(release_check);
     } catch (err) {

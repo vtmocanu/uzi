@@ -11,7 +11,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, type ReleaseCheckStatus } from "../lib/api";
+import { api, isHttpsUrl, type ReleaseCheckStatus } from "../lib/api";
 import { displayVersion } from "./BuildInfoPopover";
 import { Button, cx } from "./ui";
 
@@ -46,13 +46,20 @@ export function UpdateEscalationBanner() {
   if (!isAdmin) return null;
   if (dismissed || !status) return null;
 
-  // Self-gate: the banner toggle on AND server-derived far_behind AND not already
-  // snoozed for this release AND a known latest_tag. Anything else renders nothing.
+  // Self-gate: the banner toggle on AND not already snoozed for this release AND a
+  // known latest_tag AND a newer release genuinely exists (update_available) AND the
+  // escalation condition holds — far_behind OR a security release. The update_available
+  // requirement is what guards the security arm: `security` is derived purely from the
+  // release body and does NOT imply a newer release exists, so without it the banner
+  // could claim a security release "is available" for the version already running.
+  // far_behind already implies update_available server-side, so this only tightens the
+  // new security arm.
   const show =
     status.release_check_banner_enabled === true &&
-    status.far_behind === true &&
     status.banner_snoozed === false &&
-    !!status.latest_tag;
+    !!status.latest_tag &&
+    status.update_available === true &&
+    (status.far_behind === true || status.security === true);
   if (!show) return null;
 
   const version = displayVersion(status.latest_tag ?? "");
@@ -95,7 +102,7 @@ export function UpdateEscalationBanner() {
           </p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-3">
-          {status.notes_url && (
+          {status.notes_url && isHttpsUrl(status.notes_url) && (
             <a
               href={status.notes_url}
               target="_blank"

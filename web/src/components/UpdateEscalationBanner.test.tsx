@@ -4,7 +4,7 @@
 // a server-side snooze. Only `api` and `useAuth` are swapped; the Link needs a router,
 // so renders are wrapped in a MemoryRouter.
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { api } from "../lib/api";
@@ -125,8 +125,11 @@ describe("UpdateEscalationBanner (PRD #836 M6)", () => {
     const dismiss = await screen.findByRole("button", { name: /Dismiss/ });
     fireEvent.click(dismiss);
     await waitFor(() => expect(mockApi.snoozeReleaseBanner).toHaveBeenCalledTimes(1));
-    // Banner is gone (optimistic hide) and the refreshed banner_snoozed:true keeps it so.
-    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    // Optimistic hide already took effect.
+    expect(screen.queryByRole("alert")).toBeNull();
+    // Flush the snooze-response refresh (banner_snoozed:true) and re-assert it stays hidden.
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("emphasizes a security release", async () => {
@@ -135,5 +138,33 @@ describe("UpdateEscalationBanner (PRD #836 M6)", () => {
     const banner = await screen.findByRole("alert");
     expect(banner.textContent).toContain("Security release v0.5.0 is available");
     expect(banner.textContent).toMatch(/security release/i);
+  });
+
+  it("shows for a security release even when NOT far behind (security arm)", async () => {
+    mockApi.getReleaseCheck.mockResolvedValue({
+      release_check: releaseCheck({ security: true, far_behind: false, update_available: true }),
+    });
+    renderBanner();
+    const banner = await screen.findByRole("alert");
+    expect(banner.textContent).toContain("Security release v0.5.0 is available");
+  });
+
+  it("renders nothing for a security flag when no update is available (security ⇏ newer release)", async () => {
+    mockApi.getReleaseCheck.mockResolvedValue({
+      release_check: releaseCheck({ security: true, far_behind: false, update_available: false }),
+    });
+    renderBanner();
+    await waitFor(() => expect(mockApi.getReleaseCheck).toHaveBeenCalled());
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("renders no Release notes link when notes_url is not HTTPS", async () => {
+    mockApi.getReleaseCheck.mockResolvedValue({
+      release_check: releaseCheck({ notes_url: "javascript:alert(1)" }),
+    });
+    renderBanner();
+    // The banner still renders; only the non-HTTPS notes link is suppressed.
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("link", { name: /Release notes/ })).toBeNull();
   });
 });
