@@ -85,6 +85,7 @@ Prerequisite for M2-M4 reaching a uzi worker. Not implemented by the worker.
 
 ### M2 — semgrep harness wired into the gate (uzi-swippable; requires the M0 roll on a worker)
 - [ ] Write `scripts/semgrep-gate.sh` as a BYO-on-PATH wrapper mirroring `scripts/lint-yaml.sh` (`command -v semgrep` + install hint on miss). Acquisition is resolved (M0 / Scope notes) — no pinned-download mechanism to build.
+- [ ] 🔴 **The wrapper MUST point semgrep at a writable settings path + disable metrics.** Verified on a live 0.71.0 worker (2026-08-30): the baked binary resolves (`/opt/uzi-toolchain/bin/semgrep` → nixstore `python3.14-semgrep-1.164.0`) and prints `1.164.0`, but on first run it writes `$HOME/.semgrep/settings.yml`, which **aborts** if that path isn't writable (an ad-hoc `exec` hit `Permission denied`; a writable `HOME` fixed it). So export `SEMGREP_SETTINGS_FILE=<writable, e.g. a mktemp/repo-tmp path>` and pass `--metrics=off --disable-version-check` in the wrapper, so the gate never depends on `$HOME/.semgrep` being writable in the run env.
 - [ ] Add a `sast:semgrep` Task target and wire it into `task gate` (via `gate:repo` or a new `gate:sast`) so it blocks locally.
 - [ ] Ship **one trivial proof rule** with a positive control (a canary that fires) proving the harness runs, using the repo's canary convention (`scripts/*-canary.*`, e.g. `scripts/gitleaks-canary.txt`) — not a new `probes/` dir.
 
