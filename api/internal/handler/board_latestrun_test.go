@@ -197,9 +197,9 @@ func TestAssembleCards(t *testing.T) {
 	// issue_iid, so a positional/cross-keying bug would surface here.
 	runRows := []store.ListLatestRunsForRepoRow{
 		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", Kind: "issue", IterationCount: 4, HasPlanMd: pgtype.Bool{Bool: true, Valid: true}, MrIid: i8(5), MrWebUrl: txt("https://forge.example/grp/repo/pulls/5"), MrState: txt("closed"),
-			FailureReason: txt("raw agent internals"), OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+			FailureReason: txt("raw agent internals"), StopReason: txt("wrong branch, my mistake"), OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 		{IssueIid: i8(10), ID: run10, UserID: viewer, Status: "running", Kind: "issue", IterationCount: 0, HasPlanMd: pgtype.Bool{Bool: false, Valid: true},
-			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), RunCount: 1, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+			StopReason: txt("wrong branch, my mistake"), OwnerName: txt("Vlad"), WorkerName: txt("laptop"), RunCount: 1, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 	}
 	position := map[string]int{"In Progress": 0}
 
@@ -254,6 +254,14 @@ func TestAssembleCards(t *testing.T) {
 	// Decision 5: another owner's failure_reason is withheld from this viewer.
 	if byIID[20].LatestRun.FailureReason != nil {
 		t.Fatalf("issue 20: failure_reason must be withheld from a non-owner viewer, got %q", *byIID[20].LatestRun.FailureReason)
+	}
+	// issue #525: stop_reason is owner-gated free text, threaded through the assembly.
+	// The owner (issue 10) sees it; a non-owner viewer (issue 20) has it withheld.
+	if byIID[10].LatestRun.StopReason == nil || *byIID[10].LatestRun.StopReason != "wrong branch, my mistake" {
+		t.Fatalf("issue 10: owner must see its stop_reason, got %v", byIID[10].LatestRun.StopReason)
+	}
+	if byIID[20].LatestRun.StopReason != nil {
+		t.Fatalf("issue 20: stop_reason must be withheld from a non-owner viewer, got %q", *byIID[20].LatestRun.StopReason)
 	}
 	// (4) run_count keys onto the right issue (drives the "×N" retry hint).
 	if byIID[20].LatestRun.RunCount != 2 {

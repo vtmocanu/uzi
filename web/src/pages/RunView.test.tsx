@@ -814,6 +814,38 @@ describe("RunStopReason — the operator's cancel reason (#525, text channel)", 
     );
     expect(container.textContent).toBe("");
   });
+
+  // The page-level wiring: <RunStopReason run={run} /> lives in the stopped/failed hero
+  // panel (RunView.tsx, gated on terminal && status !== "completed"), which the direct
+  // component tests above never reach — removing that page render would keep them green.
+  // This renders the WHOLE RunView page for a cancelled run carrying bidi/zero-width runes
+  // and asserts the sanitized "Reason: ..." line surfaces there, with the same Cf check.
+  it("surfaces the sanitized cancel reason on the full RunView page for a cancelled run", async () => {
+    mockUseRunStream.mockReturnValue({
+      run: run({
+        status: "cancelled",
+        stop_kind: "cancelled",
+        stop_reason: "wrong \u202Ebranch\u200B, restarting",
+      }),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const { container } = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    // Settle the page (the issue title renders in the heading).
+    await screen.findByText("Add rate limiting");
+    expect(container.textContent ?? "").toContain("Reason: wrong branch, restarting");
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+  });
 });
 
 describe("HealthFlag — the health reason (#124, text channel)", () => {

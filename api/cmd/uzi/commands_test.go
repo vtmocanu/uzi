@@ -199,7 +199,7 @@ func TestRunGetSurfacesStopKind(t *testing.T) {
 	// The operator's OPTIONAL free-text cancel reason (issue #525): stamped on the user
 	// cancel, absent on the auto-stop (uzi stops carry no operator note) and on the plain
 	// failure. It rides beside stop_kind and must surface on its own STOP_REASON row.
-	cancelNote := "wrong branch, my mistake"
+	cancelNote := "wrong \u202Ebranch\u200B, my mistake"
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
 		"auto":  {ID: "auto", Status: "failed", FailureReason: &reason, StopKind: &autoStop},
 		"user":  {ID: "user", Status: "failed", FailureReason: &reason, StopKind: &cancelled, StopReason: &cancelNote},
@@ -217,10 +217,15 @@ func TestRunGetSurfacesStopKind(t *testing.T) {
 	if !strings.Contains(userOut, "cancelled") {
 		t.Errorf("a user-cancelled run lost its stop kind:\n%s", userOut)
 	}
-	// issue #525: the operator's cancel reason surfaces on its own STOP_REASON row, so
-	// `uzi run get` shows WHY the run was cancelled, not just that it was.
-	if !strings.Contains(userOut, "STOP_REASON") || !strings.Contains(userOut, cancelNote) {
-		t.Errorf("a user-cancelled run with a reason did not surface its STOP_REASON:\n%s", userOut)
+	// issue #525: the operator's cancel reason surfaces on its own STOP_REASON row, and
+	// like FAILURE_REASON it is untrusted free text run through sanitizeTTY — so the bidi
+	// (U+202E) and zero-width (U+200B) runes above must be stripped from the rendered row.
+	const cancelNoteScrubbed = "wrong branch, my mistake"
+	if !strings.Contains(userOut, "STOP_REASON") || !strings.Contains(userOut, cancelNoteScrubbed) {
+		t.Errorf("a user-cancelled run with a reason did not surface its sanitized STOP_REASON:\n%s", userOut)
+	}
+	if strings.ContainsRune(userOut, '\u202E') || strings.ContainsRune(userOut, '\u200B') {
+		t.Errorf("STOP_REASON row leaked an unsanitized control rune:\n%s", userOut)
 	}
 	// The whole claim, stated as a comparison rather than as two substring checks:
 	// the two outputs must actually DIFFER. Without this the assertions above would
@@ -230,7 +235,10 @@ func TestRunGetSurfacesStopKind(t *testing.T) {
 	}
 	// And a run that stopped for neither reason carries no row at all, rather than an
 	// empty one — same shape as HEALTH_REASON and FAILURE_REASON above it.
-	plainOut, _, _ := runCLI(t, fakeEnv(fc), "run", "get", "plain")
+	plainOut, plainErr, plainCode := runCLI(t, fakeEnv(fc), "run", "get", "plain")
+	if plainCode != uzicli.ExitOK {
+		t.Fatalf("plain run get failed: code = %d\n%s", plainCode, plainErr)
+	}
 	if strings.Contains(plainOut, "STOP_KIND") {
 		t.Errorf("a genuine failure (no stop_kind) printed an empty STOP_KIND row:\n%s", plainOut)
 	}
