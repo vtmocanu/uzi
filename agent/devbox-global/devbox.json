@@ -357,6 +357,26 @@
   // `file` regression. Written BARE of any version/`@latest` suffix and added by hand-editing this
   // file + the sibling devbox.lock entry (never `devbox add`, which pins its own rev and writes a
   // fat `systems:` block); locks as `source: "nixpkg"` at 20535e48….
+  //
+  // `semgrep` (2026-08-30, PRD #862 M0) bakes the SAST engine the security gate needs so a
+  // uzi worker can run and validate `task gate`'s semgrep step (invariant rules). Same "every
+  // worker should have it, restores fidelity of uzi's OWN gate" class as `yamllint`/`shellcheck`
+  // above, NOT a repo-specific tier-2 extra: without it a worker's `command -v semgrep` fails and
+  // `scripts/semgrep-gate.sh` (M2, modelled on `lint:yaml`) FAILS OPEN / prints SKIPPED — a
+  // skipped and a passing gate must never look alike, the same trap yamllint/shellcheck resolve.
+  // semgrep is Python/OCaml with no static binary, so BYO-on-PATH via this baked toolchain is the
+  // delivery (devs install locally, CI installs it) rather than a pinned-download wrapper.
+  //
+  // Multi-output at this rev — MEASURED not assumed (outputs [out dist], meta.outputsToInstall
+  // [out]) — but the CLI is in the DEFAULT `out` output (store ls of out/bin → `semgrep` present),
+  // so a BARE `semgrep` carries the CLI and NO `.bin`/`.out` selector is needed or correct
+  // (contrast openssl.bin/file.out/shellcheck.bin, whose CLI-bearing output is not `out`). No
+  // meta.mainProgram is set, but bin/semgrep lands regardless. This rev carries semgrep 1.164.0;
+  // its out-output narinfo (4dhfl2628wgqj25rm9m0mn28cp5x3lhq) is HTTP 200 on cache.nixos.org for
+  // x86_64-linux, so CI's amd64-only kaniko build SUBSTITUTES it rather than compiling
+  // semgrep-core from source — the non-negotiable condition for baking a tool in. Guard row is
+  // `semgrep  semgrep  semgrep --version`. Added by hand-editing this file + the sibling
+  // devbox.lock entry (never `devbox add`); locks as `source: "nixpkg"` at 20535e48….
   "packages": [
     "go",
     "gcc",
@@ -379,6 +399,7 @@
     "gnumake",
     "ripgrep",
     "opentofu",
-    "yamllint"
+    "yamllint",
+    "semgrep"
   ]
 }
