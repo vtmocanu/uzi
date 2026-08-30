@@ -471,12 +471,27 @@ jobs:
           # maintain (pip verifies from PyPI), so Renovate bumps this fully automatically.
           # renovate: datasource=pypi depName=zizmor versioning=pep440
           pipx install zizmor==1.29.0
-      - name: gate:repo (shell + yaml + formula + actions + secrets)
+      - name: Install semgrep (pinned; matches the baked worker toolchain)
+        # semgrep is a PyPI-packaged tool, so pipx mirrors the yamllint/zizmor
+        # installs above. Pinned to the SAME version baked into the worker toolchain
+        # (agent/devbox-global/devbox.json ships nixpkgs `semgrep` at the pinned rev,
+        # which is 1.164.0), so CI and a uzi worker enforce the SAST rules with the
+        # identical engine -- a version split there would let a rule pass on one and
+        # fail on the other. A newer semgrep can change rule/pattern semantics, the
+        # same drift the pinned zizmor/shellcheck above guard against.
+        # renovate: datasource=pypi depName=semgrep versioning=pep440
+        run: pipx install semgrep==1.164.0
+      - name: gate:repo (shell + yaml + formula + actions + secrets + sast)
         env:
           UZI_LINT_SHELL_REQUIRED: "1"
           UZI_LINT_YAML_REQUIRED: "1"
           UZI_LINT_FORMULA_REQUIRED: "1"
           UZI_LINT_ACTIONS_REQUIRED: "1"
+          # PRD #862 M5: now that semgrep is installed above, force the sast:semgrep
+          # step in gate:repo to REQUIRED (scripts/semgrep-gate.sh keys on this, not
+          # on bare CI -- see that script). This is the milestone that turns the
+          # semgrep gate on IN CI; before it, CI skipped semgrep gracefully.
+          UZI_SAST_REQUIRED: "1"
         run: task gate:repo
 
   # ------------------------------------------------------------- Helm chart ----
