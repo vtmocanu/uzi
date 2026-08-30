@@ -472,7 +472,8 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), seed)
+			force, _ := cmd.Flags().GetBool("force")
+			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), force, seed)
 			if err != nil {
 				return err
 			}
@@ -487,6 +488,9 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Bool("mr-rework", false,
 		"enable or disable auto-rework of this run's MR review comments; "+
 			"omit to inherit the account default, or pass --mr-rework=false to force off")
+	create.Flags().Bool("force", false,
+		"re-run even if the issue already has an open MR from a completed run "+
+			"(bypasses only the open-MR guard; a run already in progress is never bypassed)")
 	// PRD #209 seeded plan. --agent-source/--exclude-agents reuse the plan gate's flag
 	// names and validation (approveSelection); both are meaningful only alongside a plan.
 	create.Flags().String("plan-file", "",

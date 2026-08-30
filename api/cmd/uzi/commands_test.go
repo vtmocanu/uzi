@@ -1610,6 +1610,35 @@ func TestRunCreateMrReworkIsTriState(t *testing.T) {
 	}
 }
 
+// TestRunCreateForceThreadsThrough covers the --force flag (issue #856). Unlike the
+// tri-state flags, force is a plain bool: omitting it forwards false (respect the open-MR
+// guard, the default), and --force forwards true (bypass ONLY the open-MR guard). It proves
+// the CLI resolves the flag to the value the client's wire test then maps onto the body.
+func TestRunCreateForceThreadsThrough(t *testing.T) {
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+
+	run := func(t *testing.T, extra ...string) *uzicli.FakeClient {
+		t.Helper()
+		fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "queued"}}
+		env := fakeEnv(fc)
+		env.Stdout = &bytes.Buffer{}
+		env.Stderr = &bytes.Buffer{}
+		args := append([]string{"run", "create", "--repo", "p1", "--issue", "42"}, extra...)
+		if code := Main(env, args); code != uzicli.ExitOK {
+			t.Fatalf("run create %v exit = %d, want 0", extra, code)
+		}
+		return fc
+	}
+
+	if got := run(t).LastCreateForce; got {
+		t.Errorf("omitting --force forwarded true, want false — a plain create must respect the open-MR guard")
+	}
+	if got := run(t, "--force").LastCreateForce; !got {
+		t.Errorf("--force forwarded false, want true — it must ask the server to bypass the open-MR guard")
+	}
+}
+
 // TestRunMrReworkVerb covers `uzi run mr-rework <id>` (PRD #841 M3, acceptance #1). The
 // verb is tri-state: a bare invocation and --enabled send true, --enabled=false sends
 // false, and --clear sends nil (clear the override back to inherit). --clear together with

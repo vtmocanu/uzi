@@ -180,7 +180,7 @@ type Client interface {
 	// before), and a non-nil seed always carries a plan (the server rejects a
 	// selection with no plan). The plan's size cap and empty-plan rejection are the
 	// SERVER's (422) — the client forwards the bytes so those rules live in one place.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
 	// CreateTaskRun queues an issue-less handoff/task run on a repo (PRD #400 M3):
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
 	// names the branch (uzi/task/<run-id>) and the created-run response carries it in
@@ -1304,7 +1304,7 @@ type CreateRunSeed struct {
 	RequireBase bool
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
@@ -1329,15 +1329,21 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 	// `*bool` with `omitempty`, so a nil pointer omits the key (the server inherits the
 	// account default) while a non-nil &false still marshals `"mr_rework_enabled": false`
 	// (explicit opt-out for this run). A bare create sends neither, byte-identical to before.
+	//
+	// force (issue #856) is a plain `omitempty` bool: a false force sends NO `force` key, so
+	// a plain create stays byte-identical to before, while `force:true` (only ever set on
+	// --force) asks the server to bypass ONLY the open-MR guard — a run already in progress
+	// is never bypassed. false is the common, correct value, so omitempty is the whole point.
 	reqBody := struct {
 		IssueIID        int64                    `json:"issue_iid"`
 		WaitOnLimit     *bool                    `json:"wait_on_limit,omitempty"`
 		MrReworkEnabled *bool                    `json:"mr_rework_enabled,omitempty"`
+		Force           bool                     `json:"force,omitempty"`
 		PlanMD          *string                  `json:"plan_md,omitempty"`
 		Selection       *apitypes.AgentSelection `json:"agent_selection,omitempty"`
 		PlannedCommit   *string                  `json:"planned_commit,omitempty"`
 		RequireBase     bool                     `json:"require_base,omitempty"`
-	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled}
+	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled, Force: force}
 	if seed != nil {
 		reqBody.PlanMD = &seed.PlanMD
 		reqBody.Selection = seed.Selection
