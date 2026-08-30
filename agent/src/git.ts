@@ -1590,8 +1590,11 @@ export class GitCache {
    *  deletes it on resume. A checkpoint whose tip is ONLY such a marker — with no committed
    *  milestone below it — is NOT committed work: it is an abandoned WIP marker, so this
    *  returns false for it and a legitimate report-only completion is no longer failed on
-   *  its mere existence. A genuine committed milestone (a non-marker tip, or a marker sitting
-   *  ON TOP OF a real commit that strictly descends the recovery floor) still returns true.
+   *  its mere existence. The discriminator is ancestry, not descent: a marker-only checkpoint
+   *  is one whose parent is an ancestor-or-equal of the recovery floor; anything else (a
+   *  non-marker tip, or a marker whose parent STRICTLY DESCENDS the floor OR has DIVERGED from
+   *  it — the "main advanced during a park" shape) is a genuine committed milestone and still
+   *  returns true.
    *
    *  Only a SINGLE leading marker is ever stripped, and that is sufficient: the reseed's
    *  `reset --soft` (see runnerClone, git.ts ~654-669) removes an adopted marker from the
@@ -1612,17 +1615,33 @@ export class GitCache {
     //    orphan → false (mirrors the root-marker handling in runnerClone, git.ts ~585-591).
     const parent = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${tip}^^{commit}`])).trim();
     if (parent === "") return false;
-    // Compute the recovery floor exactly the way the reseed does (git.ts ~535): origin's
-    // branch if pushed, else the default branch. The parent is a marker-only checkpoint iff
-    // it is at or below that floor; it is a genuine committed milestone iff it STRICTLY
-    // descends the floor (isAncestor is TRUE at equality, so require a different SHA too).
+    // Compute the recovery floor similar to the way the reseed does (git.ts ~535): origin's
+    // branch if pushed, else the default branch. (Only "similar to": the reseed excludes a
+    // DISJOINT origin ref via originExists = raw existence AND non-disjoint, git.ts:475/484,
+    // whereas this helper uses raw refExists. That is acceptable here because a disjoint
+    // origin floor only pushes toward BLOCK — the safe direction: a disjoint parent is not an
+    // ancestor of it, so the committed-work test below returns true.)
+    //
+    // The parent is a marker-only checkpoint iff it is an ancestor-or-equal of the floor;
+    // anything else — the parent STRICTLY descends the floor, OR it DIVERGED from the floor
+    // (shared ancestor, neither contains the other; the "main advanced during a park" shape) —
+    // is committed work that a report-only completion would orphan, so it still blocks. This
+    // mirrors the reseed's diverged-WIP leg (git.ts:713), which uses the same
+    // isAncestor(markerParent, floor) discriminator to decide "no committed milestones live
+    // below the marker". isAncestor is TRUE at equality, so the parent == floor case is a
+    // marker-only checkpoint (allow); it also returns false on a missing/broken ref, which
+    // fails safe toward BLOCK here.
     try {
       const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
         ? `refs/remotes/origin/${branch}`
         : await this.defaultBranchRef(barePath);
-      const floorSha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${floorRef}^{commit}`])).trim();
-      if (floorSha === "") throw new Error(`cannot resolve floor SHA for ${floorRef}`);
-      return (await this.isAncestor(barePath, floorRef, parent)) && parent !== floorSha;
+      // Committed work exists below the marker iff the marker's parent is NOT an
+      // ancestor-or-equal of the recovery floor:
+      //   parent strictly descends floor → isAncestor(parent,floor) false → block ✓
+      //   parent == floor                → isAncestor true (true at equality) → allow ✓
+      //   parent is an ancestor of floor → isAncestor true                    → allow ✓
+      //   parent and floor DIVERGED      → isAncestor(parent,floor) false → block ✓
+      return !(await this.isAncestor(barePath, parent, floorRef));
     } catch (err) {
       // Fail-safe: the floor could not be resolved. Preserve the guard rather than risk
       // orphaning committed work below the marker.

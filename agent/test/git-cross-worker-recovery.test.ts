@@ -575,6 +575,44 @@ describe("GitCache.hasCommittedCheckpoint (issue #771 / PRD #759)", () => {
     assert.strictEqual(await gitB.hasCommittedCheckpoint(bareB, branch), false);
   });
 
+  it("returns TRUE for a wip(park) marker over a DIVERGED committed milestone (parent diverges from the floor — main advanced during the park)", async () => {
+    // Case 4, the direction the old `isAncestor(floor, parent) && parent !== floor` return
+    // MISSED: the milestone M and the floor F share a common ancestor but neither contains
+    // the other (the "main advanced during a park" shape). M is a genuine committed milestone
+    // a report-only completion would orphan, so the helper must BLOCK (true). The old return
+    // yielded FALSE here (isAncestor(floor, M) is false for a diverged M), the dangerous
+    // under-block; the fix's `!isAncestor(parent, floor)` yields true, mirroring the reseed's
+    // diverged-WIP leg (git.ts:713).
+    const gitB = worker("workerB");
+    // Build the floor A→B: advance origin/main once so its tip B has a parent A, THEN clone
+    // worker B's bare so its refs/remotes/origin/main resolves to B.
+    const floorB = advanceOriginMain("floor-advance.txt", "second floor commit\n");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const branch = "agent/issue-771-diverged-milestone";
+    const floor = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    assert.strictEqual(floor, floorB, "precondition: worker B's floor is the advanced tip B");
+    const forkA = gitIn(bareB, ["rev-parse", `${floor}^`]); // A = parent of the floor tip B
+    const forkTree = gitIn(bareB, ["rev-parse", `${forkA}^{tree}`]);
+    // M: a committed milestone whose parent is A (NOT B), so M and B diverge — neither is an
+    // ancestor of the other.
+    const milestone = mkCommit(bareB, forkTree, [forkA], "diverged committed milestone");
+    const marker = mkCommit(bareB, forkTree, [milestone], `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved`);
+    gitIn(bareB, ["update-ref", `refs/uzi-checkpoints/${branch}`, marker]);
+    assert.throws(
+      () => gitIn(bareB, ["merge-base", "--is-ancestor", milestone, floor]),
+      "precondition: the milestone is NOT an ancestor of the floor (diverged)",
+    );
+    assert.throws(
+      () => gitIn(bareB, ["merge-base", "--is-ancestor", floor, milestone]),
+      "precondition: the floor is NOT an ancestor of the milestone (diverged, not merely behind)",
+    );
+    assert.strictEqual(
+      await gitB.hasCommittedCheckpoint(bareB, branch),
+      true,
+      "a diverged committed milestone below the marker still blocks a report-only completion",
+    );
+  });
+
   it("returns FALSE for a root-commit wip(park) marker (marker with no parent)", async () => {
     // A marker planted on a repo with no commit below it — nothing committed to orphan.
     const gitB = worker("workerB");
