@@ -530,6 +530,22 @@ new review object.
   findings by hand (e.g. via `pr-findings.sh`), a finding tagged `Addressed in commit` is done;
   verify against the body marker, not the line anchor.
 
+**A third fix, 2026-08-30 (#819): signal (d), the "equivalent head".** A merge commit whose only
+content is the merge-in of the PR base branch plus regenerated artifacts (e.g. resolving a
+`*.sql.go` sqlc conflict by re-running `sqlc generate`) carries **no branch-authored logic change**,
+so CodeRabbit posts no fresh review and moves its `final_review_risk` marker to no new SHA — signals
+(a) and (c) both stay silent and a genuinely merge-ready PR times out (exit 2). `watch-pr.sh` now
+recognizes this **fail-closed**: it treats the head as reviewed-equivalent to CodeRabbit's
+last-reviewed commit `A` only when every path that changed between `A` and HEAD is either absent from
+the PR's diff vs its base branch (so HEAD == base for that path — a pure merge-in the branch did not
+author) or a regenerated/mirror artifact (`*.sql.go`, `api/internal/uzidocs/embed/**`). It is computed
+from two GitHub `compare` calls (no local git, so the script stays cwd-independent) and **refuses to
+judge** when either compare's `files` list reaches the API's 300-file cap, since a truncated list could
+hide an unreviewed path and forge equivalence. Any changed path that IS in the PR diff and is NOT such
+an artifact is unreviewed branch work, so the signal does not fire → timeout, never a false "ready". A
+poller you hand-roll should either key on (a)/(c) only (accepting the logic-free-merge timeout) or
+reproduce this exact fail-closed equivalence — never relax the head-match, which is what forges a merge.
+
 **The shared `main` worktree is a multi-writer tree — never assert it is clean.** Other
 sessions leave modified files in it and advance `main` mid-review (measured 2026-08-20:
 two reviewers found unrelated `tui_*` edits and `main` moving `6fc6c5eb`→`2007cbf4` under
