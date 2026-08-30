@@ -37,11 +37,17 @@
 # actually behind RequireWorker/RequireController. Keep the include glob (and this
 # exclude) in sync when a worker handler file is added or re-authenticated.
 #
-# The pattern also covers the raw-header spelling `r.Header.Get("Cookie")`, not
-# just the `r.Cookie(...)` helper, so a handler cannot read the session cookie by
-# going around the typed accessor. It does NOT chase a read hidden behind a helper
-# in another file (intraprocedural limit) -- that is what the mount-test backstop
-# and code review are for.
+# The pattern covers both the typed accessor (`r.Cookie(...)`) and the raw-header
+# spellings a handler could use to go around it -- `r.Header.Get("Cookie")` and
+# `r.Header["Cookie"]` -- and it is SYMMETRIC on CSRF: the exported
+# `auth.ValidateCSRF(...)` helper plus a raw read of the CSRF header, literal
+# `r.Header.Get("X-CSRF-Token")` or via the `auth.CSRFHeaderName` constant, and the
+# map-index form. Without the raw CSRF spellings the rule would block reading the
+# cookie by hand but silently allow reading the session CSRF token by hand -- an
+# asymmetric gap in a rule whose purpose is to block the session credential either
+# way. It does NOT chase a read hidden behind a helper in another file
+# (intraprocedural limit) -- that is what the mount-test backstop and code review
+# are for.
 #
 # POSITIVE CONTROL (verified before commit): temporarily adding
 # `_, _ = r.Cookie("x")` inside a handler in e.g. worker_findings.go fires;
@@ -79,5 +85,14 @@ rules:
     pattern-either:
       - pattern: $R.Cookie(...)
       - pattern: $R.Cookies(...)
+      # Raw-header reads of the session cookie, both spellings a handler could use
+      # to go around r.Cookie: Header.Get and direct map indexing.
       - pattern: $R.Header.Get("Cookie")
+      - pattern: $R.Header["Cookie"]
+      # CSRF read, symmetric with the cookie coverage above: the exported helper AND
+      # a raw read of the CSRF header (literal or via auth.CSRFHeaderName), so a
+      # handler cannot read the session CSRF token by bypassing auth.ValidateCSRF.
       - pattern: auth.ValidateCSRF(...)
+      - pattern: $R.Header.Get("X-CSRF-Token")
+      - pattern: $R.Header.Get(auth.CSRFHeaderName)
+      - pattern: $R.Header["X-CSRF-Token"]

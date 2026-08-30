@@ -8,8 +8,8 @@
 # A BYO-ON-PATH WRAPPER mirroring scripts/lint-yaml.sh: semgrep is a Python/OCaml
 # tool with no static binary, so unlike gitleaks/golangci it is not fetched via a
 # pinned `go run`/curl+sha256. It follows the repo's existing pattern for non-Go
-# gate tools (yamllint, shellcheck) -- `command -v` + a loud fail-open SKIP
-# locally, forced-required in CI. Acquisition on a uzi worker is the baked
+# gate tools (yamllint, shellcheck) -- `command -v` + a loud fail-open SKIP when
+# absent, required only when UZI_SAST_REQUIRED is set. Acquisition on a uzi worker is the baked
 # toolchain (PRD #862 M0); a dev installs it (`pipx install semgrep`, or nixpkgs
 # `semgrep`).
 #
@@ -71,8 +71,15 @@ truthy() {
   esac
 }
 required() {
+  # Keyed ONLY on UZI_SAST_REQUIRED, NOT on a bare CI=true. GitHub Actions always
+  # sets CI=true, but the lint-repo job (which runs `task gate:repo`) does not
+  # install semgrep until M5 wires it (a .github/workflows edit the uzi worker PAT
+  # cannot push). Requiring on bare CI therefore reddened main the moment M2 landed
+  # semgrep into gate:repo ahead of the tool being present. So CI enforcement is
+  # opt-in via UZI_SAST_REQUIRED, set by M5 in the same job that installs semgrep --
+  # the exact UZI_LINT_YAML_REQUIRED precedent. Until then CI skips gracefully, while
+  # a uzi worker (semgrep baked, M0) still enforces because command -v succeeds there.
   truthy "${UZI_SAST_REQUIRED:-}" && return 0
-  truthy "${CI:-}" && return 0
   return 1
 }
 
@@ -80,13 +87,13 @@ required() {
 # inside `task gate`, so a hard failure on a missing tool would stop gate:api,
 # gate:web and every other component gate from running at all (PRD #103 Decision 2
 # -- a gate people cannot run is a gate that stops being run). So absent -> loud
-# fail-open SKIP; required (CI, or UZI_SAST_REQUIRED) -> exit 2.
+# fail-open SKIP; required (UZI_SAST_REQUIRED) -> exit 2.
 if ! command -v semgrep >/dev/null 2>&1; then
   if required; then
     echo "semgrep-gate: no semgrep on PATH, and this run is REQUIRED" >&2
-    echo "  (UZI_SAST_REQUIRED and/or CI is set)." >&2
-    echo "  In CI this means the job image no longer installs it; on a uzi worker it" >&2
-    echo "  means the baked toolchain (PRD #862 M0) has not rolled to the fleet." >&2
+    echo "  (UZI_SAST_REQUIRED is set)." >&2
+    echo "  In a CI job that set it, the job image no longer installs semgrep; on a" >&2
+    echo "  uzi worker it means the baked toolchain (PRD #862 M0) has not rolled." >&2
     exit 2
   fi
   echo "semgrep-gate: ================================================================"
@@ -96,8 +103,10 @@ if ! command -v semgrep >/dev/null 2>&1; then
   echo "semgrep-gate:"
   echo "semgrep-gate: This is FAIL-OPEN and deliberate. gate:repo runs FIRST inside"
   echo "semgrep-gate: \`task gate\`, so failing here would stop gate:api, gate:web and"
-  echo "semgrep-gate: every other component gate from running at all. CI sets"
-  echo "semgrep-gate: UZI_SAST_REQUIRED, so the SAST rules ARE enforced on every MR."
+  echo "semgrep-gate: every other component gate from running at all. A uzi worker has"
+  echo "semgrep-gate: semgrep baked in (PRD #862 M0), so the gate enforces there; CI"
+  echo "semgrep-gate: enforcement is wired by M5, which installs semgrep and sets"
+  echo "semgrep-gate: UZI_SAST_REQUIRED in the lint-repo job."
   echo "semgrep-gate:"
   echo "semgrep-gate: To run it here: \`pipx install semgrep\` (or nixpkgs semgrep)."
   echo "semgrep-gate: ================================================================"
@@ -162,11 +171,17 @@ CANARY_BASE="${CANARY##*/}"
 
 # 🔴 LIVENESS RUN. Scan ONLY the canary file with the proof rule; it MUST fire.
 # With `--error`, semgrep exits 1 on findings, 0 when clean, >=2 on an instrument
-# error. An exit 0 here means the canary is DEAD -- semgrep did not actually scan,
+# error. `--strict` (on every scan below) makes a rule-LOAD error -- a rule file
+# that is valid YAML but has an unsupported/invalid pattern -- FATAL (>=2) instead
+# of a logged warning semgrep skips past. Without it a broken invariant rule would
+# be silently dropped while the distinct canary rule still fired, so the gate would
+# report 0 findings and read green while enforcing fewer invariants than it claims
+# -- the exact vacuous pass the canary exists to prevent, arriving through a
+# different door (rule-load rather than scanner-blind). An exit 0 here means the canary is DEAD -- semgrep did not actually scan,
 # or the proof rule is broken -- which is the vacuous 0-findings pass this canary
 # exists to prevent, so it is an instrument failure (2), not a clean gate.
 rc=0
-semgrep scan --config "$RULES_DIR" --error --metrics=off --disable-version-check \
+semgrep scan --config "$RULES_DIR" --error --strict --metrics=off --disable-version-check \
   "$CANARY" >/dev/null 2>&1 || rc=$?
 case "$rc" in
   1) : ;;  # canary fired -- the scanner is live, as required
@@ -194,7 +209,7 @@ esac
 # (measured PRD #862 M2). `--error` makes the exit code parser-free: 0 clean,
 # 1 findings, >=2 instrument error.
 rc=0
-semgrep scan --config "$RULES_DIR" --error --metrics=off --disable-version-check \
+semgrep scan --config "$RULES_DIR" --error --strict --metrics=off --disable-version-check \
   --exclude "$CANARY_BASE" . >/dev/null 2>&1 || rc=$?
 
 case "$rc" in
@@ -209,7 +224,7 @@ case "$rc" in
     # Re-run WITHOUT suppressing output so the findings are shown. Its own exit is
     # ignored (`|| true`): the verdict was already decided by the quiet run above,
     # and set -eu would otherwise abort on this expected non-zero.
-    semgrep scan --config "$RULES_DIR" --error --metrics=off --disable-version-check \
+    semgrep scan --config "$RULES_DIR" --error --strict --metrics=off --disable-version-check \
       --exclude "$CANARY_BASE" . >&2 || true
     exit 1
     ;;
