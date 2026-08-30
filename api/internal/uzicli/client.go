@@ -94,6 +94,13 @@ type Client interface {
 	// /api/runs/{id}/resume-now, RequireUser so a CLI token can reach it. A non-held run
 	// is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4. No request body.
 	ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error)
+	// SetRunMrRework sets the per-run MR review-rework override (PRD #841 M3): PUT
+	// /api/runs/{id}/mr-rework {enabled: bool|null}, RequireUser so a CLI `uzc_` token can
+	// reach it. enabled is tri-state — &true opts the run's MR into auto-rework, &false out,
+	// and NIL clears the override back to inherit the account default (sent as `enabled:
+	// null`). No status guard: editable on a completed run for as long as its MR is open. A
+	// foreign/absent run is 404 → 4.
+	SetRunMrRework(ctx context.Context, id string, enabled *bool) (apitypes.RunDTO, error)
 	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
 	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
 	//
@@ -173,7 +180,7 @@ type Client interface {
 	// before), and a non-nil seed always carries a plan (the server rejects a
 	// selection with no plan). The plan's size cap and empty-plan rejection are the
 	// SERVER's (422) — the client forwards the bytes so those rules live in one place.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
 	// CreateTaskRun queues an issue-less handoff/task run on a repo (PRD #400 M3):
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
 	// names the branch (uzi/task/<run-id>) and the created-run response carries it in
@@ -916,6 +923,24 @@ func (c *HTTPClient) ResumeRunNow(ctx context.Context, id string) (apitypes.RunD
 	return env.Run, nil
 }
 
+func (c *HTTPClient) SetRunMrRework(ctx context.Context, id string, enabled *bool) (apitypes.RunDTO, error) {
+	// `enabled` is a *bool with NO omitempty, deliberately: this endpoint's null is
+	// meaningful — a nil pointer marshals `"enabled": null`, which the server reads as
+	// "clear the override back to inherit". &false must marshal `"enabled": false` (explicit
+	// opt-out), and omitempty on a pointer drops only nil, so both cases survive. This is the
+	// inverse of CreateRun's mr_rework_enabled, where absence (not null) means inherit.
+	body := struct {
+		Enabled *bool `json:"enabled"`
+	}{Enabled: enabled}
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.put(ctx, "/api/runs/"+url.PathEscape(id)+"/mr-rework", body, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
 func (c *HTTPClient) SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error) {
 	var env struct {
 		Tokens []apitypes.TokenRateLimitDTO `json:"tokens"`
@@ -1279,7 +1304,7 @@ type CreateRunSeed struct {
 	RequireBase bool
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
@@ -1299,14 +1324,20 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 	// AND a seed that set neither, sends neither key, so the byte-identical guarantee
 	// holds for a plain --plan-file create too. planned_commit rides only when non-empty
 	// (a *string so omitempty drops it); require_base only when true.
+	//
+	// mr_rework_enabled (PRD #841 M3) rides the SAME tri-state contract as wait_on_limit: a
+	// `*bool` with `omitempty`, so a nil pointer omits the key (the server inherits the
+	// account default) while a non-nil &false still marshals `"mr_rework_enabled": false`
+	// (explicit opt-out for this run). A bare create sends neither, byte-identical to before.
 	reqBody := struct {
-		IssueIID      int64                    `json:"issue_iid"`
-		WaitOnLimit   *bool                    `json:"wait_on_limit,omitempty"`
-		PlanMD        *string                  `json:"plan_md,omitempty"`
-		Selection     *apitypes.AgentSelection `json:"agent_selection,omitempty"`
-		PlannedCommit *string                  `json:"planned_commit,omitempty"`
-		RequireBase   bool                     `json:"require_base,omitempty"`
-	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit}
+		IssueIID        int64                    `json:"issue_iid"`
+		WaitOnLimit     *bool                    `json:"wait_on_limit,omitempty"`
+		MrReworkEnabled *bool                    `json:"mr_rework_enabled,omitempty"`
+		PlanMD          *string                  `json:"plan_md,omitempty"`
+		Selection       *apitypes.AgentSelection `json:"agent_selection,omitempty"`
+		PlannedCommit   *string                  `json:"planned_commit,omitempty"`
+		RequireBase     bool                     `json:"require_base,omitempty"`
+	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled}
 	if seed != nil {
 		reqBody.PlanMD = &seed.PlanMD
 		reqBody.Selection = seed.Selection

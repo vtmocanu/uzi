@@ -472,7 +472,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), seed)
+			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), seed)
 			if err != nil {
 				return err
 			}
@@ -484,6 +484,9 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Bool("wait-on-limit", false,
 		"park this run until the Anthropic usage window reopens instead of failing it; "+
 			"omit to inherit your Settings default, or pass --wait-on-limit=false to force off")
+	create.Flags().Bool("mr-rework", false,
+		"enable or disable auto-rework of this run's MR review comments; "+
+			"omit to inherit the account default, or pass --mr-rework=false to force off")
 	// PRD #209 seeded plan. --agent-source/--exclude-agents reuse the plan gate's flag
 	// names and validation (approveSelection); both are meaningful only alongside a plan.
 	create.Flags().String("plan-file", "",
@@ -838,7 +841,52 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, stop, scope, followUp, answer, inputs, expedite, resumeNow)
+	mrRework := &cobra.Command{
+		Use:   "mr-rework <run-id>",
+		Short: "Set whether this run's MR review comments are auto-reworked (--enabled[=false], or --clear to inherit)",
+		Long: "Set the per-run override for the MR review-rework watcher (PRD #841): whether new review " +
+			"comments on this run's open MR are auto-reworked. Tri-state, editable on a COMPLETED run for as " +
+			"long as its MR is still open (the watcher acts after the run finishes):\n\n" +
+			"  --enabled            turn auto-rework ON for this run\n" +
+			"  --enabled=false      turn it OFF (its MR is never auto-reworked)\n" +
+			"  --clear              clear the override back to inherit (follow the account default)\n\n" +
+			"A foreign or unknown run is a 404 (exit 4). The write is inert once the MR is merged or closed. " +
+			"Prints the run's resulting MR_REWORK state (inherit/on/off).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			// Three-way: --clear sends null (inherit); otherwise --enabled's value (default
+			// true for a bare `mr-rework <id>`) is sent explicitly. --clear and --enabled
+			// together is a usage error — they express opposite intents.
+			clear, _ := cmd.Flags().GetBool("clear")
+			var enabled *bool
+			if clear {
+				if cmd.Flags().Changed("enabled") {
+					return uzicli.Exitf(uzicli.ExitUsage, "--clear and --enabled are mutually exclusive")
+				}
+				enabled = nil
+			} else {
+				v, _ := cmd.Flags().GetBool("enabled")
+				enabled = &v
+			}
+			run, err := c.SetRunMrRework(cmd.Context(), args[0], enabled)
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(run)
+			}
+			return renderRunDetail(p, run)
+		},
+	}
+	mrRework.Flags().Bool("enabled", true, "whether this run's MR review comments are auto-reworked; pass --enabled=false to turn it off")
+	mrRework.Flags().Bool("clear", false, "clear the per-run override back to inherit (follow the account default)")
+
+	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, stop, scope, followUp, answer, inputs, expedite, resumeNow, mrRework)
 	return cmd
 }
 
@@ -1509,6 +1557,10 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
 	}
 	rows = append(rows, limitWaitRows(r, time.Now())...)
+	// MR_REWORK rides every run like WAIT_ON_LIMIT above, and is tri-state (PRD #841):
+	// "inherit" (nil → follow the owner's account default), "on" or "off". An always-present
+	// row keeps "inherit" distinguishable from an old CLI that does not know the field.
+	rows = append(rows, []string{"MR_REWORK", triStateStr(r.MrReworkEnabled)})
 	if err := p.Table(nil, rows); err != nil {
 		return err
 	}
@@ -2189,6 +2241,30 @@ func waitOnLimitFlag(cmd *cobra.Command) *bool {
 		return nil
 	}
 	v, err := cmd.Flags().GetBool("wait-on-limit")
+	if err != nil {
+		return nil
+	}
+	return &v
+}
+
+// mrReworkFlag resolves `--mr-rework` into the same TRI-STATE the create endpoint takes
+// for the per-run MR-rework override (PRD #841 M3): nil omits the key so the server
+// stamps the run by inheriting the owner default, &true opts this run's MR into
+// auto-rework, &false opts it explicitly out.
+//
+// It mirrors waitOnLimitFlag exactly, and for the same reason: `Bool("mr-rework", false,
+// …)` makes GetBool return false when the flag is absent, indistinguishable from
+// `--mr-rework=false`. Passing that straight through would send `"mr_rework_enabled":
+// false` on EVERY CLI-created run and silently override the owner's default. Changed() is
+// what separates "the user said false" from "the user said nothing" — pflag sets it for
+// `--mr-rework` and `--mr-rework=false` alike and leaves it false when the flag is absent.
+// (`--mr-rework false` with a SPACE reads false as a positional, a loud usage error under
+// create's cobra.NoArgs, so it needs no guard of its own — same as wait-on-limit.)
+func mrReworkFlag(cmd *cobra.Command) *bool {
+	if !cmd.Flags().Changed("mr-rework") {
+		return nil
+	}
+	v, err := cmd.Flags().GetBool("mr-rework")
 	if err != nil {
 		return nil
 	}

@@ -35,6 +35,20 @@ func int64Or(p *int64, fallback string) string {
 // boolStr renders a bool as "true"/"false" for a table cell.
 func boolStr(b bool) string { return fmt.Sprintf("%t", b) }
 
+// triStateStr renders a tri-state *bool (PRD #841): nil → "inherit", true → "on",
+// false → "off". Used by the MR_REWORK rows in `run get` / `schedule get`, where a nil
+// pointer means "inherit the owner default" rather than a concrete on/off — unlike
+// boolStr, which cannot express the inherit case.
+func triStateStr(b *bool) string {
+	if b == nil {
+		return "inherit"
+	}
+	if *b {
+		return "on"
+	}
+	return "off"
+}
+
 // mrAbbrev is the compact per-run label for the merge/pull request, forge-aware:
 // GitLab "MR", Forgejo AND GitHub "PR" (PRD #65 D2, #238 D2). It is the CLI's twin of
 // the web's mrAbbrev (web/src/lib/forgeNoun.ts) and slacksvc's forgeMrAbbrev — same

@@ -497,6 +497,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().String("tz", "UTC", "IANA timezone the --cron expression is interpreted in")
 	create.Flags().Bool("auto-approve", true, "proceed past the plan gate unattended; pass --auto-approve=false to keep the gate")
 	create.Flags().Bool("wait-on-limit", true, "park a fired run until the Anthropic usage window reopens instead of failing it; pass --wait-on-limit=false to fail on limit")
+	create.Flags().Bool("mr-rework", false, "enable or disable auto-rework of fired runs' MR review comments; omit to inherit the account default, or pass --mr-rework=false to force off")
 	create.Flags().Bool("enabled", true, "create the schedule enabled; pass --enabled=false to create it paused")
 	create.Flags().Bool("create-missing-labels", false, "for a --sweep target: create any --label missing on a target repo before creating the schedule (default: warn only)")
 	return create
@@ -621,6 +622,12 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, []strin
 	waitOnLimit, _ := cmd.Flags().GetBool("wait-on-limit")
 	req.AutoApprove = &autoApprove
 	req.WaitOnLimit = &waitOnLimit
+
+	// mr_rework is tri-state and its schedule default is INHERIT (nil), not on (PRD #841
+	// D5) — so it is Changed()-gated via mrReworkFlag rather than always-sent like
+	// wait_on_limit above: an omitted flag stays nil so the fired jobs follow the owner's
+	// global setting, and only an explicit --mr-rework[=false] stamps the schedule.
+	req.MrReworkEnabled = mrReworkFlag(cmd)
 
 	// --enabled is only sent when the caller passed it, so an omitted flag stays nil and
 	// the server's create default (enabled=true) applies. Use Changed() rather than the
@@ -769,6 +776,7 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().StringArray("label", nil, "replace the sweep label selector (repeatable; sweep-target schedules only)")
 	edit.Flags().Bool("auto-approve", true, "set whether a fired run proceeds past the plan gate unattended")
 	edit.Flags().Bool("wait-on-limit", true, "set whether a fired run parks on the usage limit instead of failing")
+	edit.Flags().Bool("mr-rework", false, "set whether fired runs' MR review comments are auto-reworked; pass --mr-rework=false to force off (an unset flag leaves the stored value unchanged)")
 	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target or sweep-target default)")
 	edit.Flags().Int("max-issues", 10, "change the per-fire sweep cap, oldest-first (sweep target only)")
 	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target or sweep-target default)")
@@ -820,6 +828,11 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 	waitOnLimit := s.WaitOnLimit
 	req.AutoApprove = &autoApprove
 	req.WaitOnLimit = &waitOnLimit
+	// mr_rework is a tri-state *bool (PRD #841): RESTATE the fetched value so a partial edit
+	// (e.g. --cron only) does not wipe the stored override under the server's replace-semantics
+	// — mirroring model/wait_on_limit. Its inherit state is nil, and restating nil re-sends
+	// nil, so an inherit schedule stays inherit. An explicit --mr-rework overrides below.
+	req.MrReworkEnabled = s.MrReworkEnabled
 
 	f := cmd.Flags()
 	cronSet := f.Changed("cron")
@@ -901,6 +914,11 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 	if waitSet {
 		v, _ := f.GetBool("wait-on-limit")
 		req.WaitOnLimit = &v
+		changed = true
+	}
+	if f.Changed("mr-rework") {
+		v, _ := f.GetBool("mr-rework")
+		req.MrReworkEnabled = &v
 		changed = true
 	}
 	if guidanceSet {
@@ -1021,6 +1039,10 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	waitOnLimit := s.WaitOnLimit
 	req.AutoApprove = &autoApprove
 	req.WaitOnLimit = &waitOnLimit
+	// mr_rework (PRD #841): patchDefaultScheduleConfig uses replace-semantics on it, so RESTATE
+	// the fetched tri-state value or a partial edit (e.g. --cron alone) sends nil and wipes the
+	// stored override to inherit. Restating nil re-sends inherit; an explicit --mr-rework overrides.
+	req.MrReworkEnabled = s.MrReworkEnabled
 	// max_issues is meaningful only for a sweep default; restate it so a partial edit keeps
 	// the stored cap (the server clears it to unlimited on an omitted value).
 	if s.Target == schedTargetSweep {
@@ -1058,6 +1080,11 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	if f.Changed("wait-on-limit") {
 		v, _ := f.GetBool("wait-on-limit")
 		req.WaitOnLimit = &v
+		changed = true
+	}
+	if f.Changed("mr-rework") {
+		v, _ := f.GetBool("mr-rework")
+		req.MrReworkEnabled = &v
 		changed = true
 	}
 	if maxIssuesSet {
@@ -1100,7 +1127,7 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	}
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
-			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --max-issues, --guidance, --model, --apply-model-to-agents)")
+			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --apply-model-to-agents)")
 	}
 	return req, nil
 }
@@ -1329,6 +1356,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 		[]string{"APPLY_MODEL_TO_AGENTS", boolStr(s.OverrideSubagentModel != nil && *s.OverrideSubagentModel)},
 		[]string{"AUTO_APPROVE", boolStr(s.AutoApprove)},
 		[]string{"WAIT_ON_LIMIT", boolStr(s.WaitOnLimit)},
+		[]string{"MR_REWORK", triStateStr(s.MrReworkEnabled)},
 		[]string{"ENABLED", boolStr(s.Enabled)},
 		[]string{"STATUS", s.Status},
 	)

@@ -667,7 +667,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"admin-rate-limits", func(c *HTTPClient) error { _, e := c.AdminRateLimits(context.Background()); return e }},
 		{"start-cli-auth", func(c *HTTPClient) error { _, e := c.StartCLIAuth(context.Background(), "ch", "desc"); return e }},
 		{"poll-cli-auth", func(c *HTTPClient) error { _, e := c.PollCLIAuth(context.Background(), "req", "ver"); return e }},
-		{"create-run", func(c *HTTPClient) error { _, e := c.CreateRun(context.Background(), "p1", 7, nil, nil); return e }},
+		{"create-run", func(c *HTTPClient) error { _, e := c.CreateRun(context.Background(), "p1", 7, nil, nil, nil); return e }},
 		{"submit-run-input", func(c *HTTPClient) error {
 			_, e := c.SubmitRunInput(context.Background(), "r1", "cancel", "", nil)
 			return e
@@ -818,7 +818,7 @@ func TestCreateRunWireBodyOmitsAbsentWaitOnLimit(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if !strings.Contains(body, `"issue_iid":42`) {
@@ -832,6 +832,97 @@ func TestCreateRunWireBodyOmitsAbsentWaitOnLimit(t *testing.T) {
 			}
 			if tc.wantJSON != "" && !strings.Contains(body, tc.wantJSON) {
 				t.Errorf("body = %s, want it to contain %s", body, tc.wantJSON)
+			}
+		})
+	}
+}
+
+// TestCreateRunWireBodyMrRework mirrors the wait_on_limit wire test for the per-run
+// MR-rework override (PRD #841 M3): the tri-state `mr_rework_enabled` field must OMIT its
+// key when nil (server inherits the account default), and SEND an explicit true/false
+// otherwise — the same omitempty-on-a-pointer contract, asserted on raw bytes so an
+// explicit `null` (which decoding would collapse into nil) is caught.
+func TestCreateRunWireBodyMrRework(t *testing.T) {
+	tr := true
+	fa := false
+	for _, tc := range []struct {
+		name        string
+		in          *bool
+		wantPresent bool
+		wantJSON    string
+	}{
+		{"absent omits the key entirely", nil, false, ""},
+		{"explicit true", &tr, true, `"mr_rework_enabled":true`},
+		{"explicit false is SENT, not omitted", &fa, true, `"mr_rework_enabled":false`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b := make([]byte, r.ContentLength)
+				_, _ = io.ReadFull(r.Body, b)
+				body = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"queued"}}`))
+			}))
+			defer srv.Close()
+
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.in, nil); err != nil {
+				t.Fatalf("CreateRun: %v", err)
+			}
+			if got := strings.Contains(body, "mr_rework_enabled"); got != tc.wantPresent {
+				t.Errorf("mr_rework_enabled present = %v, want %v; body = %s\n"+
+					"An absent flag must send NO key — the server stamps the run by inheriting the account "+
+					"default when the field is missing, and reads null or false as an explicit decision.",
+					got, tc.wantPresent, body)
+			}
+			if tc.wantJSON != "" && !strings.Contains(body, tc.wantJSON) {
+				t.Errorf("body = %s, want it to contain %s", body, tc.wantJSON)
+			}
+		})
+	}
+}
+
+// TestSetRunMrReworkWire asserts `SetRunMrRework` PUTs to /api/runs/{id}/mr-rework with an
+// `enabled` field that carries the tri-state faithfully (PRD #841 M3). Unlike CreateRun's
+// omit-when-nil, this endpoint's `enabled: null` is MEANINGFUL — it clears the override
+// back to inherit — so the field has NO omitempty and nil must marshal as `"enabled":null`.
+// Asserted on raw bytes so the null case is not collapsed by decoding.
+func TestSetRunMrReworkWire(t *testing.T) {
+	tr := true
+	fa := false
+	for _, tc := range []struct {
+		name     string
+		in       *bool
+		wantJSON string
+	}{
+		{"explicit true", &tr, `"enabled":true`},
+		{"explicit false", &fa, `"enabled":false`},
+		{"nil clears to inherit (null, NOT omitted)", nil, `"enabled":null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath, body string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod, gotPath = r.Method, r.URL.Path
+				b := make([]byte, r.ContentLength)
+				_, _ = io.ReadFull(r.Body, b)
+				body = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"completed"}}`))
+			}))
+			defer srv.Close()
+
+			run, err := newTestClient(srv).SetRunMrRework(context.Background(), "r1", tc.in)
+			if err != nil {
+				t.Fatalf("SetRunMrRework: %v", err)
+			}
+			if gotMethod != http.MethodPut || gotPath != "/api/runs/r1/mr-rework" {
+				t.Errorf("request = %s %s, want PUT /api/runs/r1/mr-rework", gotMethod, gotPath)
+			}
+			if !strings.Contains(body, tc.wantJSON) {
+				t.Errorf("body = %s, want it to contain %s", body, tc.wantJSON)
+			}
+			if run.ID != "r1" {
+				t.Errorf("decoded run id = %q, want r1", run.ID)
 			}
 		})
 	}
@@ -903,7 +994,7 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.seed); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, tc.seed); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			for _, want := range tc.wantContains {
