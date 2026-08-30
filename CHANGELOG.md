@@ -18,6 +18,13 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.71.0] - 2026-08-30
+
+### Added
+
+- **semgrep is baked into the worker toolchain ([#863](https://github.com/vtmocanu/uzi/pull/863)).**
+  uzi workers now carry semgrep (nixpkgs v1.164.0, pinned) in the baked devbox toolchain, so the SAST engine the security gate needs is present on every worker, the same "every worker should have it" class as yamllint and shellcheck. Delivered BYO-on-PATH via the toolchain (semgrep ships no static binary), with a fail-closed `toolchain-guard.tsv` row and the go:embed'd toolseed copy kept byte-identical. Prerequisite for the semgrep security-gate milestones (PRD #862).
+
 ## [0.70.0] - 2026-08-30
 
 ### Added
@@ -3545,7 +3552,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.70.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.71.0...HEAD
+[0.71.0]: https://github.com/vtmocanu/uzi/compare/v0.70.0...v0.71.0
 [0.70.0]: https://github.com/vtmocanu/uzi/compare/v0.69.0...v0.70.0
 [0.69.0]: https://github.com/vtmocanu/uzi/compare/v0.68.0...v0.69.0
 [0.68.0]: https://github.com/vtmocanu/uzi/compare/v0.67.0...v0.68.0
