@@ -47,3 +47,4 @@ gnumake	make	make --version
 ripgrep	rg	rg --version
 opentofu	tofu	tofu version
 yamllint	yamllint	yamllint --version
+semgrep	semgrep	semgrep --version
