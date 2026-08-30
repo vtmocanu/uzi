@@ -112,8 +112,18 @@ func TestRunnerRecoversPanickingCheck(t *testing.T) {
 }
 
 func TestRunnerFloorsNonPositiveInterval(t *testing.T) {
-	// A zero interval read must be floored (not busy-loop with a 0-length timer). We
-	// only assert the floor constant is applied deterministically, not timing.
+	// Exercise the flooring BRANCH itself (not just the constant's sign): a zero or
+	// negative configured interval must clamp UP to the floor so Start never arms a
+	// 0-length timer and busy-loops; a positive value at/above the floor passes through.
+	if got := flooredInterval(0); got != releaseCheckRunnerFloor {
+		t.Errorf("flooredInterval(0) = %v, want the floor %v", got, releaseCheckRunnerFloor)
+	}
+	if got := flooredInterval(-time.Second); got != releaseCheckRunnerFloor {
+		t.Errorf("flooredInterval(-1s) = %v, want the floor %v", got, releaseCheckRunnerFloor)
+	}
+	if got := flooredInterval(3 * time.Hour); got != 3*time.Hour {
+		t.Errorf("flooredInterval(3h) = %v, want 3h unclamped", got)
+	}
 	if releaseCheckRunnerFloor <= 0 {
 		t.Fatalf("releaseCheckRunnerFloor must be positive, got %v", releaseCheckRunnerFloor)
 	}

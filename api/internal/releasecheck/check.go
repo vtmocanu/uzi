@@ -135,8 +135,11 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 		CheckedAt:   r.now().UTC().Format(time.RFC3339),
 	}
 
-	// Persist the six remote facts through the existing generic query. Best-effort: a
-	// write failure is logged, never fatal (worst case is a stale panel).
+	// Persist the six remote facts through the existing generic query. Never fatal, but a
+	// write failure must NOT surface as success: the six keys are read back independently
+	// (KeyReleaseCheckedAt, written last, is what handler.attachReleaseInfo treats as
+	// "facts exist"), so a partial write would let the panel derive signals from a mix of
+	// new and stale keys, and the admin "Check now" would report ok while nothing landed.
 	writes := []store.UpsertAppSettingParams{
 		{Key: settings.KeyReleaseLatestTag, Value: facts.LatestTag},
 		{Key: settings.KeyReleaseLatestName, Value: facts.LatestName},
@@ -145,10 +148,18 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 		{Key: settings.KeyReleasePublishedAt, Value: facts.PublishedAt},
 		{Key: settings.KeyReleaseCheckedAt, Value: facts.CheckedAt},
 	}
+	var persistErr error
 	for _, w := range writes {
 		if _, err := r.store.UpsertAppSetting(ctx, w); err != nil {
 			r.logger.Error("releasecheck: persist remote facts", "key", w.Key, "error", err)
+			persistErr = err
 		}
+	}
+	if persistErr != nil {
+		// Report the failure truthfully and leave the cache un-invalidated so it keeps
+		// serving the last COMPLETE snapshot rather than the partial one just written; the
+		// condition self-corrects on the next fully-successful pass.
+		return Result{Status: statusError, Facts: facts, Message: "persist remote facts failed: " + persistErr.Error()}, nil
 	}
 	r.settings.Invalidate()
 

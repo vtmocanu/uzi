@@ -12,6 +12,17 @@ import (
 // the stored value at 1m; this is the Runner's own belt-and-braces default.)
 const releaseCheckRunnerFloor = time.Hour
 
+// flooredInterval clamps a configured interval UP to releaseCheckRunnerFloor, so a zero or
+// negative reading can never make Start busy-loop on a 0-length timer. A positive value at
+// or above the floor passes through unchanged. Extracted from Start so the flooring branch
+// is exercised directly by a unit test rather than only through a live loop.
+func flooredInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return releaseCheckRunnerFloor
+	}
+	return d
+}
+
 // updateChecker is the check seam the Runner drives, satisfied by *Reconciler. It is
 // an interface so a unit test can inject a counting or panicking fake without a live
 // HTTP endpoint.
@@ -46,11 +57,8 @@ func NewRunner(rec *Reconciler, set SettingsReader, logger *slog.Logger) *Runner
 // cancellation it stops the timer and returns.
 func (rn *Runner) Start(ctx context.Context) {
 	for {
-		interval, _ := rn.settings.ReleaseCheckInterval(ctx)
-		if interval <= 0 {
-			interval = releaseCheckRunnerFloor
-		}
-		timer := time.NewTimer(interval)
+		configured, _ := rn.settings.ReleaseCheckInterval(ctx)
+		timer := time.NewTimer(flooredInterval(configured))
 		select {
 		case <-ctx.Done():
 			timer.Stop()

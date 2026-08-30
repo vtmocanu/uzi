@@ -41,8 +41,9 @@ func (f *fakeSettings) Invalidate() { f.invalidated.Add(1) }
 // fakeStore is an in-memory Store recording every UpsertAppSetting, seeded with any
 // prior facts so a test can assert last-good survives an error pass.
 type fakeStore struct {
-	values map[string]string
-	writes int
+	values  map[string]string
+	writes  int
+	failKey string // when non-empty, UpsertAppSetting errors on this key (persist-failure path)
 }
 
 func newFakeStore(seed map[string]string) *fakeStore {
@@ -55,6 +56,9 @@ func newFakeStore(seed map[string]string) *fakeStore {
 
 func (s *fakeStore) UpsertAppSetting(_ context.Context, arg store.UpsertAppSettingParams) (store.AppSetting, error) {
 	s.writes++
+	if s.failKey != "" && arg.Key == s.failKey {
+		return store.AppSetting{}, fmt.Errorf("simulated write failure for %s", arg.Key)
+	}
 	s.values[arg.Key] = arg.Value
 	return store.AppSetting{Key: arg.Key, Value: arg.Value}, nil
 }
@@ -128,6 +132,35 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 	}
 	if set.invalidated.Load() != 1 {
 		t.Errorf("Invalidate called %d times, want 1", set.invalidated.Load())
+	}
+}
+
+// TestCheckForUpdatePersistFailureReportsError: a failed fact write must surface as status
+// "error", not "ok" — the admin "Check now" would otherwise report success while a mix of
+// new and stale keys is left behind — and must NOT invalidate the cache, so the last
+// COMPLETE snapshot keeps serving until a fully-successful pass.
+func TestCheckForUpdatePersistFailureReportsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(releaseJSON("v0.15.0", "v0.15.0", "notes",
+			"2026-08-20T10:00:00Z", "https://github.com/vtmocanu/uzi/releases/tag/v0.15.0")))
+	}))
+	defer srv.Close()
+	withBaseURL(t, srv.URL)
+
+	st := newFakeStore(nil)
+	st.failKey = settings.KeyReleaseLatestBody // one of the six writes fails mid-loop
+	set := &fakeSettings{enabled: true}
+	rec := NewReconciler(st, set, nil, nil)
+
+	res, err := rec.CheckForUpdate(context.Background())
+	if err != nil {
+		t.Fatalf("CheckForUpdate err = %v", err)
+	}
+	if res.Status != statusError {
+		t.Fatalf("Status = %q, want %q on a persist failure", res.Status, statusError)
+	}
+	if set.invalidated.Load() != 0 {
+		t.Errorf("Invalidate called %d times, want 0 — a partial write must keep the last-good cache", set.invalidated.Load())
 	}
 }
 
