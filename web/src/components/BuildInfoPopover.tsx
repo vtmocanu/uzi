@@ -17,6 +17,7 @@
 
 import { useEffect, useId, useState } from "react";
 import type { ReactNode } from "react";
+import { Link } from "react-router-dom";
 import type { BuildInfo } from "../lib/api";
 import { Button, cx } from "./ui";
 
@@ -513,12 +514,12 @@ export function BuildInfoPopover({
               </span>
             </div>
             {isAdmin ? (
-              <a
-                href="/admin/settings"
+              <Link
+                to="/admin/settings"
                 className="mt-1 inline-block text-brand hover:text-brand-hover hover:underline"
               >
                 Update guide →
-              </a>
+              </Link>
             ) : (
               <div className="mt-1 text-faint">Ask your operator to update.</div>
             )}

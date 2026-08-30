@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import {
   BuildInfoPopover,
   ageInDays,
@@ -451,7 +452,11 @@ describe("BuildInfoPopover — update signal: pip + popover row (PRD #836 M4)", 
   it("lights the pip on the badge when the server reports update_available === true", () => {
     render(<BuildInfoPopover info={behind} now={NOW} />);
     expect(pip()).not.toBeNull();
-    // Purely visual, so it must not leak into the trigger's accessible name.
+    // Purely visual, so it must not leak into the trigger's accessible name. The
+    // accessible-name check below passes regardless (the pip span has no text), so
+    // guard the pip's decorative nature directly: removing aria-hidden from
+    // production must fail this test.
+    expect(pip()!.getAttribute("aria-hidden")).toBe("true");
     expect(screen.getByRole("button", { name: "v0.4.2" })).toBeTruthy();
   });
 
@@ -525,7 +530,13 @@ describe("BuildInfoPopover — update signal: pip + popover row (PRD #836 M4)", 
   });
 
   it("shows the admin `Update guide` affordance linking to admin settings", () => {
-    render(<BuildInfoPopover info={behind} isAdmin now={NOW} />);
+    // The affordance is a react-router <Link>, so it needs a Router context; a bare
+    // render would throw "useHref may be used only in the context of a Router".
+    render(
+      <MemoryRouter>
+        <BuildInfoPopover info={behind} isAdmin now={NOW} />
+      </MemoryRouter>,
+    );
     const link = screen.getByRole("link", { name: /Update guide/ });
     expect(link.getAttribute("href")).toBe("/admin/settings");
     expect(updateRow()!.textContent).not.toContain("Ask your operator");
