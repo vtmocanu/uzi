@@ -4,7 +4,9 @@
 
 # Reduce review noise by focusing on actionable issues
 reviews:
-  # Request changes only for critical/major issues
+  # Two-step review: submit "Request changes" while issues are open, auto-switch
+  # to "Approve" once they are resolved. (Not a severity filter; it can request
+  # changes for lower-severity comments too.)
   request_changes_workflow: true
 
   # Reduce comment verbosity
@@ -65,9 +67,6 @@ reviews:
       - "fix(deps)"
       - "build(deps)"
 
-  # Reduce nitpick comments
-  tone_instructions: "Focus only on critical bugs, security issues, and architectural concerns. Skip style nitpicks and minor improvements unless they significantly impact code quality or maintainability."
-
   # Path-specific instructions
   path_instructions:
     # Tests: correctness/coverage only, and specifically hunt the vacuous-assertion
@@ -109,6 +108,10 @@ reviews:
 # Limit review scope
 language: "en-US"
 early_access: false
+
+# Reduce nitpick comments (root-level per the CodeRabbit schema; it is ignored
+# when nested under reviews:).
+tone_instructions: "Focus only on critical bugs, security issues, and architectural concerns. Skip style nitpicks and minor improvements unless they significantly impact code quality or maintainability."
 
 # Custom review instructions
 chat:
