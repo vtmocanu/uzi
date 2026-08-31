@@ -2145,7 +2145,7 @@ through `[0.52.0]`.)
   behavior, set `run_eligible_labels` to just the primary label, or turn
   `eligible_label_waives_prd_link` off, from Admin → Instance settings. See
   [docs/board.md](docs/board.md#which-issues-show-up) and
-  [docs/admin-settings.md](docs/admin-settings.md#run-eligibility-and-board-membership).
+  [docs/admin-settings.md](docs/admin-settings.md#run-eligibility).
 
 - **Per-label counts on the Judge filter chips ([#244](https://github.com/vtmocanu/uzi/pull/244)).** Each chip now shows how
   many recommendation groups are in that category across your whole backlog, every

@@ -543,7 +543,7 @@ secrets from the kubelet — including the api pod's `UZI_SECRET_KEY`, the maste
 key that decrypts every user's forge PAT and Anthropic token. This is an
 owner-accepted risk on the mitigation terms below, for dev-cluster specifically —
 not a claim that non-rootless is safe by default. See
-`prds/89-optional-nonrootless-dind.md` (Security framing, Decision Log) for the
+`prds/done/89-optional-nonrootless-dind.md` (Security framing, Decision Log) for the
 full reasoning.
 
 **The mitigations (required together, not a menu):**
