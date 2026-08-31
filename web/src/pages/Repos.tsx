@@ -175,9 +175,10 @@ export function Repos() {
         setSyncPublic(vis.public);
       } catch (visErr) {
         setSyncPublic(null);
-        setSyncVisibilityError(
-          visErr instanceof ApiError ? visErr.message : "Couldn't read the board's visibility.",
-        );
+        // Route the read failure through the SAME mapper as the toggle write
+        // (syncErrorMessage), so the same 409/422 cause renders identical friendly
+        // copy whether it surfaced on read or on write (#569 finding #3).
+        setSyncVisibilityError(syncErrorMessage(visErr));
       }
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) {
@@ -1516,13 +1517,18 @@ export function Repos() {
                             onChange={(next) => toggleVisibility(syncRepo.id, next)}
                           />
                           <span className="text-sm text-fg">
-                            {syncVisibilityError
-                              ? "Visibility unavailable"
-                              : syncPublic === null
-                                ? "Loading visibility…"
-                                : syncPublic === true
-                                  ? "Public board"
-                                  : "Private board"}
+                            {/* Key off syncPublic first: a transient toggle failure
+                                leaves syncPublic a valid boolean, so keep the known
+                                Public/Private caption and let the separate alert below
+                                carry the error. Only a truly-unknown state (null)
+                                reads as unavailable/loading (#569 finding #4). */}
+                            {syncPublic === null
+                              ? syncVisibilityError
+                                ? "Visibility unavailable"
+                                : "Loading visibility…"
+                              : syncPublic === true
+                                ? "Public board"
+                                : "Private board"}
                           </span>
                         </div>
                         {syncPublic === true && (

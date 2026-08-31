@@ -44,6 +44,40 @@ func parseOwnerKind(s string) (forge.ProjectV2OwnerKind, bool) {
 	}
 }
 
+// ownerOrAdminRepoID resolves the path :id as a uuid and enforces the owner-or-admin
+// authorization every github-project-sync handler shares: an authenticated user is
+// required (401 if none), the id must parse (400), and a non-admin must own the repo —
+// a GetRepoForUser miss maps to 404 (foreign/unknown id) and any other store error to
+// 500. On the not-ok path it writes the response and returns ok=false; the caller then
+// simply `return`s. Extracting it collapses the ~20-line block that was copy-pasted
+// verbatim across all the handlers below into one edit-once authorization boundary
+// (issue #569 finding #1). No handler uses the auth user after the preflight, so a
+// (uuid.UUID, bool) return is sufficient.
+func (h *Handler) ownerOrAdminRepoID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return uuid.Nil, false
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return uuid.Nil, false
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return uuid.Nil, false
+		}
+	}
+	return id, true
+}
+
 // AdoptGithubProjectSync is the adopt/link write (PRD #364 M3, relocated to
 // owner-or-admin by issue #534 D4): link an EXISTING GitHub Projects v2 board to this
 // repo's label board and seed it. Mounted under the per-repo RequireAuth group, so it
@@ -52,26 +86,9 @@ func parseOwnerKind(s string) (forge.ProjectV2OwnerKind, bool) {
 // the preflight. The repo target comes from the path; the body carries only the
 // project coordinates.
 func (h *Handler) AdoptGithubProjectSync(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	var req adoptGithubProjectSyncRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
@@ -107,26 +124,9 @@ func (h *Handler) AdoptGithubProjectSync(w http.ResponseWriter, r *http.Request)
 // stored link). A repo with no link row maps to 404 ("not linked") via the not-linked
 // sentinel. Success is 200 {"status":"resynced"}.
 func (h *Handler) ResyncGithubProjectSync(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	if h.projectSync == nil {
 		slog.Error("github project sync resync: service not wired")
@@ -148,26 +148,9 @@ func (h *Handler) ResyncGithubProjectSync(w http.ResponseWriter, r *http.Request
 // (the coordinates come from the stored link). A repo with no link row maps to 404 ("not
 // linked") via the not-linked sentinel. Success is 200 {"status":"columns_created"}.
 func (h *Handler) AutoCreateGithubProjectColumns(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	if h.projectSync == nil {
 		slog.Error("github project sync autocreate-columns: service not wired")
@@ -198,26 +181,9 @@ type provisionGithubProjectSyncRequest struct {
 // error mapping; it persists owned_by_uzi=true. Success is 201 Created (a new board
 // was made).
 func (h *Handler) ProvisionGithubProjectSync(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	var req provisionGithubProjectSyncRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
@@ -246,26 +212,9 @@ func (h *Handler) ProvisionGithubProjectSync(w http.ResponseWriter, r *http.Requ
 // path-scoped shape as the adopt route. It does not touch the project board itself
 // (M7 refines that).
 func (h *Handler) DisableGithubProjectSync(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	if h.projectSync == nil {
 		slog.Error("github project sync disable: service not wired")
@@ -306,26 +255,9 @@ type getGithubProjectSyncStatusResponse struct {
 // (GetRepoForUser preflight, 404 for a foreign/unknown id), while an admin skips it.
 // A repo with no link row is a (different) 404: "no link = not sync-enabled".
 func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	if h.projectSync == nil {
 		slog.Error("github project sync status: service not wired")
@@ -373,26 +305,9 @@ func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Requ
 // sibling routes: a non-admin must own the repo (GetRepoForUser preflight, 404 for a
 // foreign/unknown id), an admin skips it; the preflight runs BEFORE the nil-guard.
 func (h *Handler) GetGithubProjectOwnerType(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	if h.projectSync == nil {
 		slog.Error("github project sync owner-type: service not wired")
@@ -429,26 +344,9 @@ type collaboratorRequest struct {
 // (GetRepoForUser preflight, 404 for a foreign/unknown id), an admin skips it. The
 // preflight runs BEFORE the nil-guard so a non-owner is 404'd regardless.
 func (h *Handler) GetGithubProjectVisibility(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	if h.projectSync == nil {
 		slog.Error("github project sync visibility: service not wired")
@@ -469,26 +367,9 @@ func (h *Handler) GetGithubProjectVisibility(w http.ResponseWriter, r *http.Requ
 // owner-or-admin preflight runs BEFORE the body decode and BEFORE the nil-guard, so a
 // non-owner is 404'd even with an empty/absent body.
 func (h *Handler) SetGithubProjectVisibility(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	var req setVisibilityRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
@@ -515,26 +396,9 @@ func (h *Handler) SetGithubProjectVisibility(w http.ResponseWriter, r *http.Requ
 // ErrProjectSyncUserNotFound → 422 (not a 500). Same owner-or-admin, path-scoped shape
 // as the status route; the preflight runs BEFORE body decode and the nil-guard.
 func (h *Handler) ShareGithubProjectSync(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	var req collaboratorRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
@@ -563,26 +427,9 @@ func (h *Handler) ShareGithubProjectSync(w http.ResponseWriter, r *http.Request)
 // reads it fine). Same owner-or-admin, path-scoped shape; the preflight runs BEFORE
 // body decode and the nil-guard.
 func (h *Handler) UnshareGithubProjectSync(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	id, ok := h.ownerOrAdminRepoID(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
-	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
-	if !user.IsAdmin {
-		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				httpx.Error(w, http.StatusNotFound, "repo not found")
-				return
-			}
-			slog.Error("github project sync: owner preflight", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	var req collaboratorRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {

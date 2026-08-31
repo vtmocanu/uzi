@@ -251,37 +251,57 @@ func (s *ProjectSyncService) Adopt(ctx context.Context, repoID uuid.UUID, projec
 	return nil
 }
 
-// projectSyncPreamble runs the preconditions Adopt and Provision share and returns
-// the resolved repo row + the type-asserted ProjectBoardSyncer. The check order and
-// the CLEAR sentinels it returns (ErrProjectSyncDisabled / NotGitHub / Unsupported /
-// MissingScope, and a bare pgx.ErrNoRows for an unknown repo id) are exactly what the
-// admin handler maps to a 4xx — extracting it keeps the two entry points DRY without
-// changing either's observable behavior.
-func (s *ProjectSyncService) projectSyncPreamble(ctx context.Context, repoID uuid.UUID) (store.GetRepoByIDRow, forge.ProjectBoardSyncer, error) {
+// projectSyncResolve runs the preconditions that need NO live forge round-trip: the
+// instance kill-switch, repo lookup (unknown id → a bare pgx.ErrNoRows the handler maps
+// to 404), the GitHub-only check, the forge build, and the ProjectBoardSyncer capability
+// assertion. It returns the resolved repo row, the type-asserted syncer, and the
+// underlying forge.Forge (so a caller that still wants the scope preflight can run it).
+// The CLEAR sentinels it returns (ErrProjectSyncDisabled / NotGitHub / Unsupported, plus
+// the bare pgx.ErrNoRows) are exactly what the admin handler maps to a 4xx.
+//
+// projectSyncPreamble layers the live scope preflight (ensureProjectScope → TokenInfo)
+// on top; the pure read path (GetVisibility) calls projectSyncResolve directly to skip
+// that extra introspection round-trip on the common panel-open path (issue #569 finding
+// #2) — a scope-missing token fails the visibility read itself.
+func (s *ProjectSyncService) projectSyncResolve(ctx context.Context, repoID uuid.UUID) (store.GetRepoByIDRow, forge.ProjectBoardSyncer, forge.Forge, error) {
 	enabled, err := s.settings.GithubProjectSyncEnabled(ctx)
 	if err != nil {
-		return store.GetRepoByIDRow{}, nil, fmt.Errorf("project sync: read kill-switch: %w", err)
+		return store.GetRepoByIDRow{}, nil, nil, fmt.Errorf("project sync: read kill-switch: %w", err)
 	}
 	if !enabled {
-		return store.GetRepoByIDRow{}, nil, ErrProjectSyncDisabled
+		return store.GetRepoByIDRow{}, nil, nil, ErrProjectSyncDisabled
 	}
 
 	repo, err := s.store.GetRepoByID(ctx, repoID)
 	if err != nil {
 		// pgx.ErrNoRows for an unknown id — the handler maps it to 404.
-		return store.GetRepoByIDRow{}, nil, err
+		return store.GetRepoByIDRow{}, nil, nil, err
 	}
 	if repo.ForgeType != string(forge.TypeGitHub) {
-		return store.GetRepoByIDRow{}, nil, ErrProjectSyncNotGitHub
+		return store.GetRepoByIDRow{}, nil, nil, ErrProjectSyncNotGitHub
 	}
 
 	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
-		return store.GetRepoByIDRow{}, nil, fmt.Errorf("project sync: build forge: %w", err)
+		return store.GetRepoByIDRow{}, nil, nil, fmt.Errorf("project sync: build forge: %w", err)
 	}
 	syncer, ok := f.(forge.ProjectBoardSyncer)
 	if !ok {
-		return store.GetRepoByIDRow{}, nil, ErrProjectSyncUnsupported
+		return store.GetRepoByIDRow{}, nil, nil, ErrProjectSyncUnsupported
+	}
+	return repo, syncer, f, nil
+}
+
+// projectSyncPreamble runs the preconditions the write paths (Adopt, Provision,
+// SetVisibility, ShareWithUser, Unshare) and the RepoOwnerType read share: everything
+// projectSyncResolve checks, plus the live scope preflight (ensureProjectScope, which
+// adds MissingScope to the sentinel set). The check order is exactly what the admin
+// handler maps to a 4xx — keeping the entry points DRY without changing any observable
+// behavior.
+func (s *ProjectSyncService) projectSyncPreamble(ctx context.Context, repoID uuid.UUID) (store.GetRepoByIDRow, forge.ProjectBoardSyncer, error) {
+	repo, syncer, f, err := s.projectSyncResolve(ctx, repoID)
+	if err != nil {
+		return store.GetRepoByIDRow{}, nil, err
 	}
 	if err := ensureProjectScope(ctx, f); err != nil {
 		return store.GetRepoByIDRow{}, nil, err
@@ -1086,10 +1106,14 @@ func (s *ProjectSyncService) Disable(ctx context.Context, repoID uuid.UUID) erro
 }
 
 // GetVisibility reads the linked board's current `public` flag from GitHub (PRD
-// #557 M2). It runs the shared projectSyncPreamble (instance-flag gate, GitHub-only,
-// forge build, ProjectBoardSyncer assertion, scope preflight), then reads the link
-// row for the board's node id and issues a single `node(...ProjectV2{public})`
-// query. A repo with no link row surfaces pgx.ErrNoRows verbatim (handler → 404).
+// #557 M2). Unlike the write paths it runs projectSyncResolve (instance-flag gate,
+// GitHub-only, forge build, ProjectBoardSyncer assertion) but NOT the scope preflight:
+// this is the lazy read issued on every Board-access panel open (D4), and the extra
+// f.TokenInfo introspection round-trip only buys a cleaner 422 — a scope-missing token
+// fails the visibility query itself, so the preflight is dropped from this hot path
+// (issue #569 finding #2). It then reads the link row for the board's node id and issues
+// a single `node(...ProjectV2{public})` query. A repo with no link row surfaces
+// pgx.ErrNoRows verbatim (handler → 404).
 //
 // A stale/deleted board node id makes graphqlDo wrap GitHub's NOT_FOUND with
 // forge.ErrGitHubUserNotFound (that wrap is applied to EVERY NOT_FOUND, not just a
@@ -1097,7 +1121,7 @@ func (s *ProjectSyncService) Disable(ctx context.Context, repoID uuid.UUID) erro
 // ShareWithUser/Unshare maps to ErrProjectSyncUserNotFound (422). So a stale board
 // propagates as a generic error → the handler's default 500, exactly as intended.
 func (s *ProjectSyncService) GetVisibility(ctx context.Context, repoID uuid.UUID) (bool, error) {
-	_, syncer, err := s.projectSyncPreamble(ctx, repoID)
+	_, syncer, _, err := s.projectSyncResolve(ctx, repoID)
 	if err != nil {
 		return false, err
 	}
@@ -1131,8 +1155,11 @@ func (s *ProjectSyncService) RepoOwnerType(ctx context.Context, repoID uuid.UUID
 }
 
 // SetVisibility writes the linked board's `public` flag on GitHub (PRD #557 M2) via
-// `updateProjectV2`. Same preamble + link-row read as GetVisibility. As with
-// GetVisibility, a stale board node id propagates as a generic error (→ 500), not
+// `updateProjectV2`. As a WRITE it runs the full projectSyncPreamble (including the
+// scope preflight), unlike GetVisibility which drops the preflight (issue #569 finding
+// #2) — so a scope-missing token is rejected here with ErrProjectSyncMissingScope but
+// reads through on GetVisibility. The link-row read is the same. As with GetVisibility,
+// a stale board node id propagates as a generic error (→ 500), not
 // ErrProjectSyncUserNotFound — the not-found translation is scoped to the username
 // resolve step in ShareWithUser/Unshare, never the visibility path.
 func (s *ProjectSyncService) SetVisibility(ctx context.Context, repoID uuid.UUID, public bool) error {
