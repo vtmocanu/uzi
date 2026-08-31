@@ -9,13 +9,44 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const claimVaultLockNotice = `-- name: ClaimVaultLockNotice :one
+UPDATE user_vaults SET lock_notified_at = now()
+WHERE user_id = $1 AND lock_notified_at IS NULL
+RETURNING user_id
+`
+
+// PRD #890 M1: atomically claim the notify slot for one user. Only the row that
+// comes back has been claimed by THIS caller, so N api pods booting together send
+// exactly ONE DM per user — the mark is set before Notify runs (at-most-once dedup).
+// A user already marked returns no row (pgx.ErrNoRows) and is not re-sent.
+func (q *Queries) ClaimVaultLockNotice(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, claimVaultLockNotice, userID)
+	var user_id uuid.UUID
+	err := row.Scan(&user_id)
+	return user_id, err
+}
+
+const clearVaultLockNotice = `-- name: ClearVaultLockNotice :exec
+UPDATE user_vaults SET lock_notified_at = NULL
+WHERE user_id = $1 AND lock_notified_at IS NOT NULL
+`
+
+// PRD #890 M1: re-arm the notice on a successful unlock, ending the lock-episode so a
+// later deploy that locks the user again can notify afresh. The AND lock_notified_at
+// IS NOT NULL guard makes this a no-op write on the hot login path when already clear.
+func (q *Queries) ClearVaultLockNotice(ctx context.Context, userID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, clearVaultLockNotice, userID)
+	return err
+}
 
 const createUserVaultIfAbsent = `-- name: CreateUserVaultIfAbsent :one
 INSERT INTO user_vaults (user_id, kek_salt, wrapped_dek)
 VALUES ($1, $2, $3)
 ON CONFLICT (user_id) DO NOTHING
-RETURNING user_id, kek_salt, wrapped_dek, created_at, updated_at
+RETURNING user_id, kek_salt, wrapped_dek, created_at, updated_at, lock_notified_at
 `
 
 type CreateUserVaultIfAbsentParams struct {
@@ -42,6 +73,7 @@ func (q *Queries) CreateUserVaultIfAbsent(ctx context.Context, arg CreateUserVau
 		&i.WrappedDek,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LockNotifiedAt,
 	)
 	return i, err
 }
@@ -66,7 +98,7 @@ func (q *Queries) DeleteUserVault(ctx context.Context, userID uuid.UUID) (int64,
 }
 
 const getUserVault = `-- name: GetUserVault :one
-SELECT user_id, kek_salt, wrapped_dek, created_at, updated_at FROM user_vaults WHERE user_id = $1
+SELECT user_id, kek_salt, wrapped_dek, created_at, updated_at, lock_notified_at FROM user_vaults WHERE user_id = $1
 `
 
 // The user's KEK salt + wrapped DEK. The plaintext DEK is never selected (it is
@@ -81,6 +113,86 @@ func (q *Queries) GetUserVault(ctx context.Context, userID uuid.UUID) (UserVault
 		&i.WrappedDek,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LockNotifiedAt,
 	)
 	return i, err
+}
+
+const listUsersNeedingVaultLockNotice = `-- name: ListUsersNeedingVaultLockNotice :many
+SELECT
+    u.id,
+    u.slack_resolved_id,
+    (SELECT count(*) FROM runs r
+        WHERE r.user_id = u.id
+          AND r.status IN ('queued', 'awaiting_approval', 'awaiting_input'))::bigint AS pending_runs,
+    (SELECT count(*) FROM run_schedules s
+        WHERE s.user_id = u.id
+          AND s.enabled AND s.status = 'active' AND s.next_fire_at IS NOT NULL)::bigint AS pending_schedules
+FROM user_vaults v
+JOIN users u ON u.id = v.user_id
+WHERE v.lock_notified_at IS NULL
+  AND u.slack_notify = true
+  AND u.slack_link_confirmed_at IS NOT NULL
+  AND u.slack_resolved_id IS NOT NULL
+  AND (
+        EXISTS (
+            SELECT 1 FROM runs r
+            WHERE r.user_id = u.id
+              AND r.status IN ('queued', 'awaiting_approval', 'awaiting_input')
+        )
+     OR EXISTS (
+            SELECT 1 FROM run_schedules s
+            WHERE s.user_id = u.id
+              AND s.enabled AND s.status = 'active' AND s.next_fire_at IS NOT NULL
+        )
+      )
+ORDER BY u.id
+`
+
+type ListUsersNeedingVaultLockNoticeRow struct {
+	ID               uuid.UUID   `json:"id"`
+	SlackResolvedID  pgtype.Text `json:"slack_resolved_id"`
+	PendingRuns      int64       `json:"pending_runs"`
+	PendingSchedules int64       `json:"pending_schedules"`
+}
+
+// PRD #890 M1: the users the boot reconciler should DM about their locked vault.
+// A user qualifies when ALL hold:
+//   - they have a user_vaults row (they actually use personal secrets);
+//   - they are Slack-deliverable — the same gate GetSlackDeliveryForUser uses:
+//     slack_notify = true AND slack_link_confirmed_at IS NOT NULL AND
+//     slack_resolved_id IS NOT NULL;
+//   - they have NOT already been notified for this lock-episode
+//     (user_vaults.lock_notified_at IS NULL — the dedup key);
+//   - they have work the lock actually blocks — mirroring what the claim gates
+//     withhold, NOT "any non-terminal work": ≥1 run in queued/awaiting_approval/
+//     awaiting_input (ClaimRun claims only status='queued'; the other two return to
+//     queued on resume), OR ≥1 schedule that will really fire (enabled AND
+//     status='active' AND next_fire_at IS NOT NULL, mirroring ClaimDueSchedules).
+//
+// The WHERE stays fast via the EXISTS pair; the two scalar COUNT subqueries then
+// carry the pending-work totals for the notification's Facts line (closed ints).
+func (q *Queries) ListUsersNeedingVaultLockNotice(ctx context.Context) ([]ListUsersNeedingVaultLockNoticeRow, error) {
+	rows, err := q.db.Query(ctx, listUsersNeedingVaultLockNotice)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUsersNeedingVaultLockNoticeRow{}
+	for rows.Next() {
+		var i ListUsersNeedingVaultLockNoticeRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.SlackResolvedID,
+			&i.PendingRuns,
+			&i.PendingSchedules,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

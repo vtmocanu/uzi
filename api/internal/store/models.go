@@ -658,11 +658,12 @@ type UserSecret struct {
 }
 
 type UserVault struct {
-	UserID     uuid.UUID          `json:"user_id"`
-	KekSalt    []byte             `json:"kek_salt"`
-	WrappedDek []byte             `json:"wrapped_dek"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+	UserID         uuid.UUID          `json:"user_id"`
+	KekSalt        []byte             `json:"kek_salt"`
+	WrappedDek     []byte             `json:"wrapped_dek"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	LockNotifiedAt pgtype.Timestamptz `json:"lock_notified_at"`
 }
 
 type Worker struct {

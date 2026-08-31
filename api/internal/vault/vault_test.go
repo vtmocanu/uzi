@@ -33,6 +33,12 @@ type fakeVaultStore struct {
 	mu      sync.Mutex
 	vaults  map[uuid.UUID]store.UserVault
 	secrets []*fakeSecret
+
+	// clearNoticeCalls records every ClearVaultLockNotice(userID) the unlock hook
+	// fires (PRD #890 M1), so the unlock-hook test can assert it ran. clearNoticeErr,
+	// when set, forces the clear to fail — proving the unlock still succeeds anyway.
+	clearNoticeCalls []uuid.UUID
+	clearNoticeErr   error
 }
 
 func newFakeVaultStore() *fakeVaultStore {
@@ -123,6 +129,13 @@ func (f *fakeVaultStore) RewrapUserSecret(_ context.Context, arg store.RewrapUse
 		n++
 	}
 	return n, nil
+}
+
+func (f *fakeVaultStore) ClearVaultLockNotice(_ context.Context, userID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clearNoticeCalls = append(f.clearNoticeCalls, userID)
+	return f.clearNoticeErr
 }
 
 func newTestVault(t *testing.T) (*Vault, *secretbox.Box) {

@@ -69,6 +69,55 @@ type fakeStore struct {
 	markedIDs              []uuid.UUID
 	markedByRun            uuid.UUID
 	markErr                error
+
+	// Vault-lock notice reconciler (PRD #890 M1/M2). vaultNoticeUsers is what the
+	// eligibility list returns; vaultNoticeUsersErr forces an error on it.
+	// vaultClaimed is the set of user ids ClaimVaultLockNotice has already burned —
+	// the first claim of a user returns its id, a second returns pgx.ErrNoRows,
+	// modeling the atomic RETURNING dedup. vaultClaimErr / vaultClearErr force errors.
+	// vaultClaimedOrder / vaultClearedUsers record calls so M2 tests can assert them.
+	vaultNoticeUsers    []store.ListUsersNeedingVaultLockNoticeRow
+	vaultNoticeUsersErr error
+	vaultClaimed        map[uuid.UUID]bool
+	vaultClaimedOrder   []uuid.UUID
+	vaultClaimErr       error
+	vaultClearedUsers   []uuid.UUID
+	vaultClearErr       error
+}
+
+func (f *fakeStore) ListUsersNeedingVaultLockNotice(context.Context) ([]store.ListUsersNeedingVaultLockNoticeRow, error) {
+	if f.vaultNoticeUsersErr != nil {
+		return nil, f.vaultNoticeUsersErr
+	}
+	return f.vaultNoticeUsers, nil
+}
+
+func (f *fakeStore) ClaimVaultLockNotice(_ context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	if f.vaultClaimErr != nil {
+		return uuid.Nil, f.vaultClaimErr
+	}
+	f.vaultClaimedOrder = append(f.vaultClaimedOrder, userID)
+	if f.vaultClaimed == nil {
+		f.vaultClaimed = make(map[uuid.UUID]bool)
+	}
+	if f.vaultClaimed[userID] {
+		// Already notified for this episode: the atomic UPDATE ... WHERE
+		// lock_notified_at IS NULL matches no row, so the caller gets no row back.
+		return uuid.Nil, pgx.ErrNoRows
+	}
+	f.vaultClaimed[userID] = true
+	return userID, nil
+}
+
+func (f *fakeStore) ClearVaultLockNotice(_ context.Context, userID uuid.UUID) error {
+	if f.vaultClearErr != nil {
+		return f.vaultClearErr
+	}
+	f.vaultClearedUsers = append(f.vaultClearedUsers, userID)
+	if f.vaultClaimed != nil {
+		delete(f.vaultClaimed, userID)
+	}
+	return nil
 }
 
 func (f *fakeStore) ClaimDueSchedules(context.Context) ([]store.RunSchedule, error) {

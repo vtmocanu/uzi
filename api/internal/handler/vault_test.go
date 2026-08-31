@@ -55,6 +55,7 @@ func (m *memVaultQ) ListMasterSealedSecrets(context.Context, uuid.UUID) ([]store
 func (m *memVaultQ) RewrapUserSecret(context.Context, store.RewrapUserSecretParams) (int64, error) {
 	return 0, nil
 }
+func (m *memVaultQ) ClearVaultLockNotice(context.Context, uuid.UUID) error { return nil }
 
 func testVault(t *testing.T) *vault.Vault {
 	t.Helper()
@@ -309,7 +310,7 @@ func TestPutAnthropicTokenLockedReturns409(t *testing.T) {
 	}
 	v.Lock(uid)
 
-	body, _ := json.Marshal(map[string]string{"token": "sk-ant-oat01-LOCKEDTEST-abcdef1234567890"})
+	body, _ := json.Marshal(map[string]string{"token": "sk-ant-oat01-LOCKEDTEST-abcdef1234567890"}) //nolint:gosec // synthetic fake token for a test fixture, not a real credential
 	rec := httptest.NewRecorder()
 	h.PutAnthropicToken(rec, authedAs(http.MethodPut, "/api/me/secrets/anthropic_token", body, uid))
 

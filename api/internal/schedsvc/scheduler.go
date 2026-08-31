@@ -95,6 +95,13 @@ type Store interface {
 	RecentSelfImproveMRRunsForRepo(ctx context.Context, arg store.RecentSelfImproveMRRunsForRepoParams) ([]store.RecentSelfImproveMRRunsForRepoRow, error)
 	ListOpenImproveUziRecommendationsForUser(ctx context.Context, arg store.ListOpenImproveUziRecommendationsForUserParams) ([]store.ListOpenImproveUziRecommendationsForUserRow, error)
 	MarkImproveUziRecommendationsAddressed(ctx context.Context, arg store.MarkImproveUziRecommendationsAddressedParams) (int64, error)
+	// Vault-lock notice reconciler (PRD #890 M1/M2): the eligibility list, the atomic
+	// per-user claim (only the returned row is DM'd, so N booting pods send one DM), and
+	// the unlock re-arm are wired here so the M2 reconciler reached from schedsvc can use
+	// the narrow Store it already holds instead of raw *store.Queries.
+	ListUsersNeedingVaultLockNotice(ctx context.Context) ([]store.ListUsersNeedingVaultLockNoticeRow, error)
+	ClaimVaultLockNotice(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
+	ClearVaultLockNotice(ctx context.Context, userID uuid.UUID) error
 }
 
 // RunCreator is the shared run-creation seam the scheduler fires through — the SAME
