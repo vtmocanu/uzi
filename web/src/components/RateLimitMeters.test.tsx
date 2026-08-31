@@ -203,6 +203,30 @@ describe("SidebarRateLimits", () => {
     expect(screen.queryByLabelText("Claude rate limits")).toBeNull();
   });
 
+  // The forecast rows must carry the "resets in …" countdown, folded into
+  // MicroRow's valueText so it flows into RateLimitForecast's tooltip text. A 5h
+  // window at 90% with a near reset (elapsed ≈ 13000s on the 18000s window ⇒
+  // projected ≈ 125 ⇒ "over"): the wrapper's title is `${valueText} — projected …`,
+  // so after the fix it contains BOTH "resets in" (from valueText) and "projected".
+  it("carries the resets-in countdown into a forecast row's title", async () => {
+    const forecastReading: MyRateLimits = {
+      status: "ok",
+      five_hour: { pct: 90, resets_at: nowSecs + 5000 },
+      seven_day: { pct: 20, resets_at: nowSecs + 200_000 },
+      source: "usage_endpoint",
+      synced_at: new Date().toISOString(),
+      stale: false,
+    };
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(forecastReading));
+    render(<SidebarRateLimits />);
+    await screen.findByLabelText("Claude rate limits");
+    const bar5h = screen.getByRole("progressbar", { name: "5h window" });
+    const titled = bar5h.closest("[title]") as HTMLElement;
+    const title = titled.getAttribute("title") ?? "";
+    expect(title).toMatch(/resets in/);
+    expect(title).toMatch(/projected/);
+  });
+
   it("dims both micro-bars on a stale reading", async () => {
     mockApi.getMyRateLimits.mockResolvedValue(tokens(staleReading));
     render(<SidebarRateLimits />);

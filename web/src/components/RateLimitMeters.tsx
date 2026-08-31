@@ -304,12 +304,15 @@ function MicroRow({
   win,
   dim,
   forecast,
+  now,
 }: {
   label: string;
   win: RateLimitWindow;
   dim: boolean;
   forecast: PaceForecast;
+  now: number;
 }) {
+  const countdown = formatCountdown(win.resets_at, now);
   return (
     <div className="grid grid-cols-[1.4rem_1fr_2.6rem] items-center gap-2 text-[11px]">
       <span className="font-mono text-faint">{label}</span>
@@ -317,7 +320,7 @@ function MicroRow({
         className="h-[5px]"
         label={`${label} window`}
         pct={win.pct}
-        valueText={`${win.pct}%`}
+        valueText={`${win.pct}%${countdown ? `, resets in ${countdown}` : ""}`}
         forecast={forecast}
         dim={dim}
       />
@@ -360,12 +363,14 @@ function TokenMicroMeters({
         win={limits.five_hour}
         dim={limits.stale}
         forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
+        now={now}
       />
       <MicroRow
         label="7d"
         win={limits.seven_day}
         dim={limits.stale}
         forecast={rowForecast(limits.stale, limits.seven_day.pct, limits.seven_day.resets_at, WINDOW_DURATION["7d"], now, limits.source)}
+        now={now}
       />
     </div>
   );
