@@ -21,8 +21,28 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$ROOT/.env"
 EXAMPLE="$ROOT/.env.example"
 
+# The three vars docker-compose.yml requires with no default (${VAR:?} / bare).
+REQUIRED="JWT_SECRET UZI_SECRET_KEY POSTGRES_PASSWORD"
+
+# has_value FILE VAR — true iff FILE carries a non-empty `VAR=<something>` line.
+has_value() { grep -q "^$2=." "$1"; }
+
+# Never clobber an existing .env (that is what "persist" means). But an existing
+# file with an unfilled required var is NOT done: report it plainly and fail,
+# rather than printing "secrets persist" over a .env that will bounce off the
+# compose ${VAR:?} guards. Common trigger: a prior manual `cp .env.example .env`
+# with the values left blank.
 if [ -e "$ENV_FILE" ]; then
-  echo "init-env: .env already exists; leaving it untouched (secrets persist)."
+  missing=""
+  for v in $REQUIRED; do
+    has_value "$ENV_FILE" "$v" || missing="$missing $v"
+  done
+  if [ -n "$missing" ]; then
+    echo "init-env: .env exists but has no value for:${missing}" >&2
+    echo "init-env: fill those in, or 'rm .env' and re-run to generate a fresh one. Leaving .env untouched." >&2
+    exit 1
+  fi
+  echo "init-env: .env already exists with all required secrets set; leaving it untouched."
   exit 0
 fi
 
@@ -40,6 +60,12 @@ pw="$(openssl rand -hex 24)"
 
 umask 077  # .env holds secrets: create it 0600.
 
+# Write to a temp file on the same filesystem, then rename into place. An
+# interrupted or failed write can never leave a truncated .env that the
+# existence guard above would then lock in.
+tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
 if [ -f "$EXAMPLE" ]; then
   # Start from the fully-documented example so the user keeps every option
   # (OIDC, Slack, seeds, tuning knobs) at hand, and fill only the three empty
@@ -50,14 +76,32 @@ if [ -f "$EXAMPLE" ]; then
     $0 == "UZI_SECRET_KEY="    { print "UZI_SECRET_KEY=" key; next }
     $0 == "POSTGRES_PASSWORD=" { print "POSTGRES_PASSWORD=" pw; next }
     { print }
-  ' "$EXAMPLE" >"$ENV_FILE"
+  ' "$EXAMPLE" >"$tmp"
 else
   # No example on disk (unusual): write a minimal but complete .env.
-  cat >"$ENV_FILE" <<EOF
+  cat >"$tmp" <<EOF
 JWT_SECRET=$jwt
 UZI_SECRET_KEY=$key
 POSTGRES_PASSWORD=$pw
 EOF
 fi
+
+# Confirm each required secret landed as the value we just generated, before
+# committing the file. This catches a drifted .env.example whose `VAR=` lines no
+# longer match the awk guards above (rename, a non-empty placeholder like
+# REPLACE_ME, trailing whitespace): in every such case the value read back would
+# not equal what we generated, which a bare non-empty check would miss.
+# value_of prints the text after the FIRST '=' on VAR's line (so a '=' inside a
+# base64 value survives).
+value_of() { awk -F= -v k="$2" '$1==k { sub(/^[^=]*=/, ""); print; exit }' "$1"; }
+if [ "$(value_of "$tmp" JWT_SECRET)" != "$jwt" ] ||
+   [ "$(value_of "$tmp" UZI_SECRET_KEY)" != "$key" ] ||
+   [ "$(value_of "$tmp" POSTGRES_PASSWORD)" != "$pw" ]; then
+  echo "init-env: generated secrets did not apply cleanly (is .env.example intact?); .env not written" >&2
+  exit 1
+fi
+
+mv "$tmp" "$ENV_FILE"
+trap - EXIT
 
 echo "init-env: wrote $ENV_FILE with freshly generated secrets. Run: docker compose up"
