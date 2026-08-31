@@ -1402,14 +1402,17 @@ export class RunRunner {
         // two signals, each covering a gap the other has:
         //   - lastPublishedTip: a checkpoint THIS worker confirmed-landed mid-run (set only
         //     on a landed publish), which may not yet be mirrored into the bare's local ref.
-        //   - hasCheckpointRef: origin's checkpoint ref, mirrored into the bare at
+        //   - hasCommittedCheckpoint: origin's checkpoint ref, mirrored into the bare at
         //     clone/fetch time — catches a checkpoint a PRIOR/cross-worker attempt landed.
+        //     Per PRD #759 it IGNORES a marker-only `wip(park):` checkpoint (an abandoned
+        //     usage-limit-park WIP marker with no committed milestone below it), while a
+        //     real committed milestone still blocks.
         // A genuine zero-code run trips NEITHER (nothing committed ⇒ no pack ⇒ no publish),
         // so it still completes report-only below. Refuse loudly, mirroring the
         // undeclared-empty-diff FAIL path, rather than opening a delete-ref capability.
         const publishedCheckpoint =
           lastPublishedTip !== undefined ||
-          (await this.git.hasCheckpointRef(barePath, runnerClone.branch));
+          (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
         if (publishedCheckpoint) {
           batcher.emit({
             kind: "status",
@@ -1480,11 +1483,13 @@ export class RunRunner {
           // orphaning: if this run DID publish a checkpoint to origin (a mid-run milestone
           // landed there), there IS committed work to land, so fall through to the push+MR
           // path. Only the genuinely-empty case completes report-only with no MR. Detection
-          // reuses the SAME publishedCheckpoint union the declared-report_only path uses.
+          // reuses the SAME publishedCheckpoint union the declared-report_only path uses,
+          // which (PRD #759) ignores a marker-only `wip(park):` checkpoint while a real
+          // committed milestone still blocks.
           if (result.scopeCapped) {
             const publishedCheckpoint =
               lastPublishedTip !== undefined ||
-              (await this.git.hasCheckpointRef(barePath, runnerClone.branch));
+              (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
             if (!publishedCheckpoint) {
               batcher.emit({
                 kind: "status",
@@ -1552,12 +1557,14 @@ export class RunRunner {
           // (refs/uzi-checkpoints/<branch>), completing report-only would orphan that ref.
           // This mirrors the declared report_only terminal above: detect via the UNION of
           // lastPublishedTip (a checkpoint THIS worker confirmed-landed mid-run) and
-          // hasCheckpointRef (origin's checkpoint ref, mirrored into the bare at
-          // clone/fetch time — catches a prior/cross-worker landing). A genuine zero-code
-          // prompt run trips NEITHER and still completes report-only below.
+          // hasCommittedCheckpoint (origin's checkpoint ref, mirrored into the bare at
+          // clone/fetch time — catches a prior/cross-worker landing; per PRD #759 it ignores
+          // a marker-only `wip(park):` checkpoint while a real committed milestone still
+          // blocks). A genuine zero-code prompt run trips NEITHER and still completes
+          // report-only below.
           const publishedCheckpoint =
             lastPublishedTip !== undefined ||
-            (await this.git.hasCheckpointRef(barePath, runnerClone.branch));
+            (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
           if (publishedCheckpoint) {
             batcher.emit({
               kind: "status",
