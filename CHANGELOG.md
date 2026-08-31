@@ -18,6 +18,33 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.71.2] - 2026-08-31
+
+### Added
+
+- **Cordon/drain state now shows on the admin fleet lists ([#879](https://github.com/vtmocanu/uzi/pull/879)).**
+  A worker that is draining before a roll shows a cordon badge on the Dashboard and admin all-workers strip, instead of a bare online badge that hid the drain.
+
+### Changed
+
+- **SAST is now enforced in the quality gate ([#872](https://github.com/vtmocanu/uzi/pull/872), [#874](https://github.com/vtmocanu/uzi/pull/874)).**
+  gosec runs inside golangci-lint and semgrep runs in lint-repo, checking uzi's own guardrail invariants, so a security regression reddens the gate rather than shipping.
+- **GitHub Projects sync reads skip the extra scope preflight ([#877](https://github.com/vtmocanu/uzi/pull/877)).**
+  The board-access panel's visibility read no longer makes an extra token-introspection round-trip on every open, while writes still enforce the project scope, and a read or toggle failure now renders the same friendly copy instead of a raw server message.
+
+### Fixed
+
+- **Schedule edit modal shows a default job's actual repo ([#875](https://github.com/vtmocanu/uzi/pull/875)).**
+  A default schedule now renders its real repo read-only, and a non-default edit selects the job's actual repo even when the repo list omits it, instead of silently falling back to the first repo in the list.
+- **CLI table truncation is rune-safe ([#879](https://github.com/vtmocanu/uzi/pull/879)).**
+  compactText caps on runes rather than bytes, so a multibyte character straddling the cap is no longer split into invalid UTF-8, and the read stays bounded for large payloads.
+- **Report-only completion no longer fails on a leftover park marker ([#878](https://github.com/vtmocanu/uzi/pull/878)).**
+  A run that parked with a wip(park) marker and then legitimately finished report-only is no longer blocked by that abandoned marker, while a checkpoint holding real committed work still blocks to avoid orphaning it.
+- **Base-align diff preservation is tightened ([#876](https://github.com/vtmocanu/uzi/pull/876)).**
+  A double-fault (aligned push rejected, then a fallback conflict) preserves exactly the agent's work rather than a superset that carried the aligning strategy's own changes, a non-fast-forward merge-push failure preserves the diff and fails typed, and the workflow-scope diff is computed once and reused.
+- **Lead context-window meter is more robust ([#880](https://github.com/vtmocanu/uzi/pull/880)).**
+  The worker's context read is keyed to the lead lane and moved off the hot message loop so a slow read no longer delays a turn's frames, and the web reader accepts the reading from either carrier so historical and resumed runs keep a live meter.
+
 ## [0.71.1] - 2026-08-30
 
 ### Fixed
@@ -3563,7 +3590,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.71.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.71.2...HEAD
+[0.71.2]: https://github.com/vtmocanu/uzi/compare/v0.71.1...v0.71.2
 [0.71.1]: https://github.com/vtmocanu/uzi/compare/v0.71.0...v0.71.1
 [0.71.0]: https://github.com/vtmocanu/uzi/compare/v0.70.0...v0.71.0
 [0.70.0]: https://github.com/vtmocanu/uzi/compare/v0.69.0...v0.70.0
