@@ -18,8 +18,8 @@ user is affected.
 1. Go to **Settings** and find the **Demo mode** card, kept visually
    separate from the theme picker above it — theme is a server setting that
    follows you across browsers, demo mode is not.
-2. Or use the quick toggle in the sidebar's user/avatar menu, which also
-   shows "Demo mode: On/Off" as a state cue.
+2. Or use the quick toggle in the sidebar, in the user area next to your
+   name, which also shows "Demo mode: On/Off" as a state cue.
 
 Either toggle updates the UI live (no reload needed), persists on this
 device (`localStorage`), and syncs across every tab open in the same
