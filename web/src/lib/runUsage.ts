@@ -622,10 +622,14 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
     if (isResultFrame(m)) {
       // PRD #516 / issue #553: the lead's context-window fill now ALSO rides the turn's
       // terminal result frame (moved off the usage frame to keep the worker's read off
-      // the hot loop — see sdk-executor.ts). Result frames are always the lead lane, so
-      // read latest-wins here, ABOVE the modelUsage early-out below, because an
+      // the hot loop — see sdk-executor.ts). A result frame's context is read only when
+      // it is actually the lead lane — keyed on `agent_instance` absence (null instance)
+      // AND the lead role, exactly like ActivityFeed's lane key and the comment near
+      // lines 208–212, so a subagent-lane result frame (distinct non-null agent_instance)
+      // whose agent is null/"lead" cannot overwrite the real lead reading. Read
+      // latest-wins here, ABOVE the modelUsage early-out below, because an
       // error/modelUsage-less result frame must still yield its context reading.
-      if ((m.agent ?? "lead") === "lead") {
+      if (!m.agent_instance && (m.agent ?? "lead") === "lead") {
         const rctx = readContext(payload?.["context"]);
         if (rctx) leadContext = rctx;
       }
@@ -689,10 +693,12 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
         // frames and the reader replays them, so removing it would blank every historical
         // run's meter, and it also covers resume-across-upgrade (old worker writes
         // usage-frame context, new worker writes result-frame context; latest-wins across
-        // the seq boundary picks the newer). Read it ONLY on the lead lane (keyed exactly
-        // like the usage sum above) — a subagent frame carrying a synthetic `context` is
-        // deliberately ignored (lead-only SDK constraint).
-        if (agent === "lead") {
+        // the seq boundary picks the newer). Read it ONLY on the lead lane — gated on
+        // `agent_instance` absence (null instance) AND the lead role, consistent with the
+        // usage-sum keying above and the comment near lines 208–212 — so a subagent frame
+        // (distinct non-null agent_instance) carrying a synthetic `context`, even one whose
+        // agent is null/"lead", is deliberately ignored (lead-only SDK constraint).
+        if (!m.agent_instance && agent === "lead") {
           const ctx = readContext(payload["context"]);
           if (ctx) leadContext = ctx;
         }

@@ -1036,4 +1036,46 @@ describe("deriveRunUsage.leadContext", () => {
     // would leave the earlier usage-frame value (pct 20) winning.
     expect(d.leadContext).toEqual({ used: 156_000, window: 200_000, pct: 78 });
   });
+
+  it("IGNORES a USAGE frame whose agent is 'lead' but agent_instance is non-null (subagent lane)", () => {
+    // The lead lane is agent_instance ABSENT (null) AND the lead role — matching
+    // ActivityFeed's lane key and the comment near lines 208–212. A subagent-lane frame
+    // carrying a non-null agent_instance must never populate leadContext even when its
+    // agent field reads "lead". Covers the usage-frame predicate.
+    const d = deriveRunUsage([
+      {
+        ...assistantUsageCtx("lead", { input: 500, output: 50 }, { used: 190_000, window: 200_000, pct: 95 }),
+        agent_instance: "sub-123",
+      },
+    ]);
+    expect(d.leadContext).toBeUndefined();
+  });
+
+  it("IGNORES a RESULT frame whose agent is 'lead' but agent_instance is non-null (subagent lane)", () => {
+    // Same lead-lane guard on the result-frame carrier: a distinct non-null agent_instance
+    // is a subagent lane, so its context must not overwrite the real lead reading.
+    const reading = { used: 190_000, window: 200_000, pct: 95 };
+    const d = deriveRunUsage([
+      {
+        ...msg("status", "lead", {
+          event: "result",
+          subtype: "success",
+          num_turns: 1,
+          duration_ms: 100,
+          modelUsage: {
+            "claude-sonnet-5": {
+              inputTokens: 100,
+              outputTokens: 10,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+              costUSD: 0.01,
+            },
+          },
+          context: reading,
+        }),
+        agent_instance: "sub-123",
+      },
+    ]);
+    expect(d.leadContext).toBeUndefined();
+  });
 });
