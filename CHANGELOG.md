@@ -20,6 +20,8 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **A demo docs page and helper landed to exercise a full uzi run ([#897](https://github.com/vtmocanu/uzi/issues/897)).**
+  Adds `docs/demo.md` and an `api/internal/demo` helper with a unit test; the change is additive, carries no product behaviour, and exists only to drive a uzi run end to end.
 - **Slack DM when a locked vault is blocking your work ([#890](https://github.com/vtmocanu/uzi/issues/890)).**
   A boot reconciler now DMs each Slack-linked user whose locked vault is blocking a queued run or a due schedule, once per lock-episode, so they unlock before the work silently stalls; the copy is cause-neutral (it never asserts a restart as the cause) and reuses the existing Slack notification gate.
 - **`scripts/init-env.sh` generates the local secrets so a fresh `docker compose up` just works ([#894](https://github.com/vtmocanu/uzi/issues/894)).**
