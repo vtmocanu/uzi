@@ -18,12 +18,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useOutletContext, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
+import { api, ApiError, isTerminalRun, preferForgeUrl, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
 import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill, cx } from "../components/ui";
 import { ActivityIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
+import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { effectiveRunStatus, isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatTokens, formatCost } from "../lib/formatTokens";
@@ -241,6 +242,17 @@ function RunRow({
   // MR chip state (PRD #33): open renders exactly as before; merged/closed get a
   // label and closed is muted + struck. This is a per-run frozen hint.
   const mrState = mrChipState(run.mr_state);
+  // Issue #803: make the MR/PR chip a real deep-link. Prefer the persisted forge URL
+  // (mr_web_url); fall back to reconstructing it from the run's own issue URL, which
+  // only works for GitLab's /-/issues/ shape (projectWebUrlFromIssue), exactly as
+  // IssueView does. preferForgeUrl/mergeRequestUrl guard non-https/empty inputs and
+  // return null, so a malformed value degrades to the inert <span> chip.
+  const mrHref = preferForgeUrl(
+    run.mr_web_url,
+    run.mr_iid != null && run.issue_web_url
+      ? mergeRequestUrl(projectWebUrlFromIssue(run.issue_web_url), run.mr_iid)
+      : null,
+  );
   // PRD #122: compact milestone progress for the row; null on a non-milestone run,
   // which then renders no new badge (the row had none before this feature).
   const ms = milestoneBadge(run);
@@ -330,10 +342,12 @@ function RunRow({
                 forgeType={run.forge_type}
                 mrIid={run.mr_iid}
                 mrState={mrState}
-                href={null}
+                href={mrHref}
                 // Issue #485 review FIX 1: raised above the card's stretched-link overlay
-                // (relative z-10) so its native `title` (MR state) fires on hover; the
-                // href-less chip is not click-to-navigate, which is fine for a status chip.
+                // (relative z-10) so its native `title` fires on hover AND so the chip is
+                // independently clickable — clicking it opens the PR/MR on the forge in a
+                // new tab (`target="_blank"`), while clicking elsewhere on the card follows
+                // the stretched link to the run detail view (issue #803).
                 className="relative z-10 font-medium"
               />
             )}

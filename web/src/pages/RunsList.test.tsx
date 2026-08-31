@@ -416,6 +416,67 @@ describe("RunsList — usage meta line (PRD #40)", () => {
   });
 })
 
+// Issue #803: the MR/PR chip on a run row is a real deep-link to the forge request,
+// mirroring IssueView/Board — preferring the persisted mr_web_url and otherwise
+// reconstructing it from the run's own issue URL (GitLab /-/issues/ shape).
+describe("RunsList — MR/PR chip deep-links (issue #803)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  it("the runs list MR chip deep-links to the persisted forge URL", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "run-1",
+          issue_title: "Linked run",
+          status: "running",
+          mr_iid: 799,
+          mr_state: "opened",
+          mr_web_url: "https://gitlab.example.com/g/p/-/merge_requests/799",
+        }),
+      ],
+    });
+
+    const { container } = renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Linked run")).toBeTruthy());
+    const chip = container.querySelector('a[href*="merge_requests"]') as HTMLAnchorElement | null;
+    expect(chip).not.toBeNull();
+    expect(chip?.getAttribute("href")).toBe("https://gitlab.example.com/g/p/-/merge_requests/799");
+    expect(chip?.getAttribute("target")).toBe("_blank");
+    // The row's own run-detail link still stands (click-separation intent): the chip is
+    // independently clickable, the rest of the card follows the stretched link.
+    expect(container.querySelector('a[href="/runs/run-1"]')).not.toBeNull();
+  });
+
+  it("the runs list MR chip falls back to the issue-derived forge URL when mr_web_url is null", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "run-1",
+          issue_title: "Derived-link run",
+          status: "running",
+          mr_iid: 799,
+          mr_state: "opened",
+          mr_web_url: null,
+          issue_web_url: "https://gitlab.example.com/g/p/-/issues/42",
+        }),
+      ],
+    });
+
+    const { container } = renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Derived-link run")).toBeTruthy());
+    const chip = container.querySelector('a[href*="merge_requests"]') as HTMLAnchorElement | null;
+    expect(chip).not.toBeNull();
+    expect(chip?.getAttribute("href")).toBe("https://gitlab.example.com/g/p/-/merge_requests/799");
+  });
+});
+
 describe("RunsList — global judge-triage strip removed (PRD #98 Decision 7)", () => {
   it("no longer renders the aggregate strip (its home is now the Judge page header)", async () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ issue_title: "A run" })] });
