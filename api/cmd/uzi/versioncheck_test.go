@@ -634,22 +634,19 @@ func TestVersionCommandSanitizesServerBuildInfo(t *testing.T) {
 	}
 }
 
-// 🔴 PINS A SAFETY PROPERTY THAT IS EMERGENT FROM STATEMENT ORDERING, WITH NOTHING
-// ELSE HOLDING IT.
+// PINS that the version render path emits valid UTF-8 when the server string ends in a
+// multibyte rune at the truncation boundary.
 //
-// compactText truncates with `s[:200]` — 200 BYTES, not runes — so a multi-byte rune
-// straddling that boundary is cut in half and the tail is an orphan continuation
-// byte. The output is nevertheless valid UTF-8, but ONLY because cellText runs its
-// outer strings.Map AFTER that slice, and Map re-encodes the orphan as U+FFFD.
-//
-// Swap those two steps, or call compactText alone on this path, and uzi emits
-// invalid UTF-8 derived from attacker-chosen input — with every existing assertion
-// still green, because the bytes carry no control character and sit on one line.
-// That is what this test exists for; it is not a duplicate of the control-character
-// tests above.
+// compactText now caps on RUNES (issue #554), so it never splits a rune and the render
+// path is valid UTF-8 with no U+FFFD at the cut. Before that fix compactText byte-sliced
+// at 200 bytes: a rune straddling the boundary was cut in half, and the output stayed
+// valid here ONLY because cellText's outer strings.Map re-encoded the orphan byte as
+// U+FFFD downstream — the direct compactText callers (compactPayload, the steer body
+// column) had no such re-encode and emitted invalid UTF-8. This test guards the whole
+// render path; the direct-caller property is pinned by TestCompactTextRuneSafe.
 //
 // The payload puts the boundary inside a 3-byte rune deliberately: 199 ASCII bytes
-// then U+20AC, so the slice keeps one byte of it.
+// then U+20AC, so a byte slice would have kept one byte of it.
 func TestVersionCommandOutputStaysValidUTF8(t *testing.T) {
 	withVersion(t, "v1.2.3")
 	payload := strings.Repeat("A", 199) + strings.Repeat("€", 4)
@@ -665,6 +662,12 @@ func TestVersionCommandOutputStaysValidUTF8(t *testing.T) {
 	if !utf8.ValidString(out) {
 		t.Errorf("stdout is not valid UTF-8 — the byte-slice truncation cut a rune and "+
 			"nothing re-encoded the orphan:\n%.120q", out)
+	}
+	// utf8.ValidString is true for U+FFFD, so it alone cannot catch a regression to
+	// byte-slicing: cellText's strings.Map re-encodes an orphan byte as U+FFFD, which
+	// stays "valid". Reject the replacement rune so this test actually fails on that path.
+	if strings.ContainsRune(out, '�') {
+		t.Errorf("stdout contains U+FFFD — a rune was split and re-encoded downstream:\n%.120q", out)
 	}
 }
 

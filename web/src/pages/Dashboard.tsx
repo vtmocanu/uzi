@@ -16,6 +16,7 @@ import { mrAbbrev } from "../lib/forgeNoun";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { WorkerStatLine, hasStats } from "../components/WorkerStats";
+import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
@@ -254,6 +255,7 @@ export function Dashboard() {
                     <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                       {w.status}
                     </Badge>
+                    <WorkerCordonBadge worker={w} />
                     <span className="truncate text-sm font-medium text-fg">{w.name}</span>
                   </div>
                   <WorkerStatLine worker={w} />

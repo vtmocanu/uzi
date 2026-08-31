@@ -610,6 +610,9 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
       });
       // No session_id ⇒ a fresh run.
       await runnerWith(factory, gitlab).execute(gitlabClaim(iid, {}));
+      // Guard against a vacuous pass: the executor must actually have run, else
+      // `seen[0]?.resumed !== true` is trivially true on an undefined seen[0].
+      assert.strictEqual(seen.length, 1, "the executor must have been invoked exactly once");
       assert.ok(
         seen[0]?.resumed !== true,
         `a fresh claim must not be flagged resumed, got ${String(seen[0]?.resumed)}`,

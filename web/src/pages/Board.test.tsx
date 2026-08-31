@@ -1909,6 +1909,71 @@ describe("Board — search + per-lane paging (PRD #304)", () => {
     );
   });
 
+  // Same route-swap trap for sortMode: the [repoId] effect at Board.tsx re-reads the
+  // persisted mode when :id changes without a remount. repo-1 has no saved mode (default
+  // "manual"); repo-2 saved "title". Delete the sortMode re-read effect and the combobox
+  // stays "manual" after the swap → this fails.
+  it("re-reads the persisted sortMode when the route repo id changes without a remount", async () => {
+    store.set("uzi.board.repo-2.sortMode", '"title"');
+    const NavProbe = () => {
+      const nav = useNavigate();
+      return <button onClick={() => nav("/repos/repo-2/board")}>go repo2</button>;
+    };
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+        <NavProbe />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Backlog");
+    // repo-1 has no saved mode → the default "manual".
+    expect((screen.getByRole("combobox", { name: "Sort" }) as HTMLSelectElement).value).toBe("manual");
+
+    fireEvent.click(screen.getByRole("button", { name: "go repo2" }));
+    await waitFor(() =>
+      expect((screen.getByRole("combobox", { name: "Sort" }) as HTMLSelectElement).value).toBe("title"),
+    );
+  });
+
+  // Same route-swap trap for sortDir: the [repoId] effect re-reads the persisted direction
+  // for the new repo. repo-2 saved mode "updated" (DEFAULT_SORT_DIR desc) with sortDir
+  // "asc" — the OPPOSITE of the mode default, which is what makes the direction assertion
+  // non-vacuous: only the re-read effect can produce ascending. Delete the sortDir re-read
+  // effect and the toggle stays at repo-1's manual/descending after the swap → this fails.
+  it("re-reads the persisted sortDir when the route repo id changes without a remount", async () => {
+    store.set("uzi.board.repo-2.sortMode", '"updated"');
+    store.set("uzi.board.repo-2.sortDir", '"asc"');
+    const NavProbe = () => {
+      const nav = useNavigate();
+      return <button onClick={() => nav("/repos/repo-2/board")}>go repo2</button>;
+    };
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+        <NavProbe />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Backlog");
+    // repo-1 has no saved mode → Manual, so the direction toggle is present but disabled.
+    expect((screen.getByRole("combobox", { name: "Sort" }) as HTMLSelectElement).value).toBe("manual");
+    expect((screen.getByRole("button", { name: /Sort direction/ }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "go repo2" }));
+    // repo-2's persisted mode "updated" adopts, and its persisted "asc" (opposite of the
+    // updated=desc default) adopts too — so the toggle reads ascending and is enabled.
+    await waitFor(() =>
+      expect((screen.getByRole("combobox", { name: "Sort" }) as HTMLSelectElement).value).toBe("updated"),
+    );
+    const dir = screen.getByRole("button", { name: /Sort direction/ }) as HTMLButtonElement;
+    expect(dir.disabled).toBe(false);
+    expect(dir.textContent).toBe("↑ Ascending");
+    expect(dir.getAttribute("aria-pressed")).toBe("false");
+  });
+
   // --- M6: THE freeze guard. Cap and/or search hide cards from the render set; the
   // reorder freeze must still submit the UNFILTERED payload order (Decision 2). ---
   it("freezes hidden-by-cap cards: reorder submits iids beyond the visible cap", async () => {

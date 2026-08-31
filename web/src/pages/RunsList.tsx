@@ -31,6 +31,7 @@ import { runDurationLabel } from "../lib/runDuration";
 import { useNow } from "../lib/rateLimits";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
+import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { JudgeRunBadge } from "../components/JudgeRunBadge";
 import { RunCredential } from "../components/RunCredential";
@@ -629,6 +630,7 @@ export function RunsList() {
                       <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                         {w.status}
                       </Badge>
+                      <WorkerCordonBadge worker={w} />
                       <WorkerRunBadge worker={w} />
                     </div>
                   </li>
