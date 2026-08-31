@@ -1,7 +1,7 @@
 # PRD #886 — Demo mode: client-side masking of identifying values
 
 **Issue**: [#886](https://github.com/vtmocanu/uzi/issues/886)
-**Status**: Draft
+**Status**: Complete
 **Priority**: Low
 **Owner**: maintainer
 **Scope**: `web/` only. No API, DB, migration, admin, or CLI changes.
@@ -220,7 +220,7 @@ CSV/JSON export path exists (verified — nothing to mask there).
 
 ## Milestones
 
-- [ ] **M1 — Demo-mode state + masking library.** `demoMode.ts`
+- [x] **M1 — Demo-mode state + masking library.** `demoMode.ts`
   (localStorage/try-catch, same-tab local notify + cross-tab `storage` sync,
   `useDemoMode` via `useSyncExternalStore` returning a stable boolean) and
   `demoMask.ts` (all pure helpers per the registry), each deterministic and
@@ -231,24 +231,24 @@ CSV/JSON export path exists (verified — nothing to mask there).
   `demoMode.ts` export too, not only the maskers — because `web/knip.jsonc` gates
   unused `exports`/`types` at **error**, so an export with no importer reddens
   `task gate:web`.
-- [ ] **M2 — Toggle UI.** Settings toggle (visually separated from the server-backed
+- [x] **M2 — Toggle UI.** Settings toggle (visually separated from the server-backed
   theme control) + user-menu quick toggle with an "on" state cue. Toggling updates
   the UI **live in the same tab** (no reload), persists to localStorage, syncs to
   other tabs, and survives a refresh.
-- [ ] **M3 — Mask user identity everywhere, grep-verified.** Mask all
+- [x] **M3 — Mask user identity everywhere, grep-verified.** Mask all
   email/`display_name`/`owner_email`/`author`/`owner_name` sites INCLUDING the
   AppShell `title` tooltip and initials-from-masked-name. **Required step:**
   `git grep -nE 'owner_email|display_name|owner_name|\.email\b|\.author\b' -- 'web/src/**/*.tsx'`
   and confirm every pure-display hit routes through a masker (input/key/href sites
   stay raw). List the grep output in the MR.
-- [ ] **M4 — Mask infra/forge fields, grep-verified.**
+- [x] **M4 — Mask infra/forge fields, grep-verified.**
   `repo_path`/`path_with_namespace`/`repo_name`/`path`, forge `base_url`,
   `human_username`/`bot_username` (display rows), `last_used_ip`,
   `allowed_email_domains`. **Required step:**
   `git grep -nE 'path_with_namespace|repo_path|repo_name|\.path\b|base_url|human_username|bot_username|last_used_ip|allowed_email_domains' -- 'web/src/**/*.tsx'`
   and confirm every pure-display hit is masked and every input/select/href hit is
   left raw. List the grep output in the MR.
-- [ ] **M5 — Tests green, attribute-aware.** Component tests proving a
+- [x] **M5 — Tests green, attribute-aware.** Component tests proving a
   representative site in each channel — AppShell header **text**, the AppShell email
   **`title` tooltip**, a `repo_path` **`aria-label`**, ForgeSettings — shows the
   **real** value with demo off and the **masked** value with it on. Assertions MUST
@@ -259,7 +259,7 @@ CSV/JSON export path exists (verified — nothing to mask there).
   merely that the mask is present — `maskEmail` and `maskName` both yield `Vlad`, so
   "Vlad present" doesn't prove which field masked). `task gate:web` passes. (Helper
   unit tests belong to M1; M5 owns component tests + gate.)
-- [ ] **M6 — Docs.** A user-facing docs page (`docs/`, `audience: user`, valid
+- [x] **M6 — Docs.** A user-facing docs page (`docs/`, `audience: user`, valid
   frontmatter per `docs/README.md`) describing demo mode: what it masks, that it's
   per-device and screenshot-only, that **search/filter still use real values**, and
   the URL-bar / href-hover caveats.
