@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/init-env.sh` generates the local secrets so a fresh `docker compose up` just works ([#894](https://github.com/vtmocanu/uzi/issues/894)).**
+  A new `./scripts/init-env.sh` (also `task init`) writes `.env` with freshly generated `JWT_SECRET`, `UZI_SECRET_KEY` and `POSTGRES_PASSWORD`, starting from `.env.example` so every other option stays documented; it is generate-once (writes only when `.env` is absent and never regenerates, keeping the encryption key and Postgres password stable), the `${VAR:?}` compose guards are unchanged so a non-local misconfig still fails loudly, and the Kubernetes/Helm deploy still uses explicit secrets.
+
 ## [0.72.1] - 2026-08-31
 
 ### Changed

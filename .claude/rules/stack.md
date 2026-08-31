@@ -14,7 +14,7 @@ chart. The repo-wide map is the root `CLAUDE.md`.
 ### Full stack
 
 ```sh
-cp .env.example .env                 # set JWT_SECRET, UZI_SECRET_KEY, POSTGRES_PASSWORD
+./scripts/init-env.sh                # generate JWT_SECRET, UZI_SECRET_KEY, POSTGRES_PASSWORD into .env (once; no-op if .env exists)
 docker compose up                    # web on http://127.0.0.1:8080
 docker compose --profile agent up    # additionally start a worker (needs join token)
 ```
