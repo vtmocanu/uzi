@@ -137,7 +137,7 @@ with the bot, so the sender is already `uzi`. Glyph legend:
 | 🧩 N/M milestones | 🔗 Open in uzi | 💬 Chat |
 | 🔎 Judge review (verdict ✅ ideal/ok · ⚠️ issues) | 🔧 Self-improvement | 📝 Issue proposal |
 | 💤 Stalled | 🔁 Looping | 🐢 Slow |
-| ⏳ Waiting for a worker | ⏸️ Awaiting approval | |
+| ⏳ Waiting for a worker | ⏸️ Awaiting approval | 🔒 Vault locked |
 
 - **Plan gate**: the `awaiting_approval` DM carries **Approve** /
   **Request changes** / **Reject** / **Open in uzi**, and the plan body
@@ -240,8 +240,9 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   When the run recovers, the `⚠️ <flag>` context element drops off on its own
   and nudging stops — no action needed.
 - **Vault-locked nudge**: if your vault is locked (e.g. after a deploy
-  restarts the api) and it's blocking a queued run or a due schedule, you get
-  a one-time DM telling you to unlock so that work can proceed — it fires for
+  restarts the api) and it's blocking work that needs the vault — a run that is
+  queued, awaiting your approval, or awaiting your input, or a due schedule — you
+  get a one-time DM telling you to unlock so that work can proceed — it fires for
   any locked vault with blocked work, not only after a deploy, and clears once
   you unlock. Unlock the same way you always do: the in-app banner or password
   prompt, not from Slack.

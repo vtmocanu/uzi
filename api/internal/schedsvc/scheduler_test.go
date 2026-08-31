@@ -94,6 +94,11 @@ func (f *fakeStore) ListUsersNeedingVaultLockNotice(context.Context) ([]store.Li
 
 func (f *fakeStore) ClaimVaultLockNotice(_ context.Context, userID uuid.UUID) (uuid.UUID, error) {
 	if f.vaultClaimErr != nil {
+		// Record the ATTEMPT even on the error path: a test asserting the loop
+		// continues past a failed claim must be able to observe that the next
+		// user was still reached (distinguishing continue from return at
+		// vault_lock_notice.go's claim-error branch).
+		f.vaultClaimedOrder = append(f.vaultClaimedOrder, userID)
 		return uuid.Nil, f.vaultClaimErr
 	}
 	f.vaultClaimedOrder = append(f.vaultClaimedOrder, userID)

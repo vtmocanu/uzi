@@ -1,7 +1,8 @@
 // This file is the vault-lock Slack notice reconciler (PRD #890 M2). It notifies
 // each user whose vault is locked while they have work the lock actually blocks —
-// a queued run or a schedule that will fire — so they unlock before their queued
-// or scheduled work silently stalls after a deploy.
+// a run that is queued, awaiting_approval, or awaiting_input (all of which need
+// an unlocked vault to proceed), or a schedule that will fire — so they unlock
+// before their queued or scheduled work silently stalls after a deploy.
 //
 // It is a STANDALONE type, deliberately NOT a method on *Scheduler (Decision D1):
 // the scheduler goroutine is gated on cfg.SchedulerCheckInterval > 0 and runs an

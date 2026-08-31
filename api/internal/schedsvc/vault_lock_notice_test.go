@@ -159,10 +159,13 @@ func TestVaultLockReconcileListErrorNoOp(t *testing.T) {
 // TestVaultLockReconcileClaimErrorContinues: a non-ErrNoRows claim error on one user is
 // logged and skipped without aborting the loop — the next user still proceeds.
 func TestVaultLockReconcileClaimErrorContinues(t *testing.T) {
-	u1 := uuid.New()
+	u1, u2 := uuid.New(), uuid.New()
 	st := &fakeStore{
-		vaultNoticeUsers: []store.ListUsersNeedingVaultLockNoticeRow{{ID: u1, PendingRuns: 1}},
-		vaultClaimErr:    context.DeadlineExceeded,
+		vaultNoticeUsers: []store.ListUsersNeedingVaultLockNoticeRow{
+			{ID: u1, PendingRuns: 1},
+			{ID: u2, PendingRuns: 1},
+		},
+		vaultClaimErr: context.DeadlineExceeded,
 	}
 	notif := &fakeNotifier{}
 	r := newVaultLockReconciler(st, notif, &fakeSettings{}, nil)
@@ -171,6 +174,12 @@ func TestVaultLockReconcileClaimErrorContinues(t *testing.T) {
 
 	if len(notif.notifications) != 0 {
 		t.Errorf("Notify called %d times, want 0 when the claim errors", len(notif.notifications))
+	}
+	// Both users' claims must have been ATTEMPTED: the first user's claim error
+	// is logged and skipped with continue (not return), so the loop reaches the
+	// second user. A return in place of continue would leave this at 1.
+	if len(st.vaultClaimedOrder) != 2 {
+		t.Errorf("claim attempts = %d, want 2 (the loop must continue past a failed claim)", len(st.vaultClaimedOrder))
 	}
 }
 

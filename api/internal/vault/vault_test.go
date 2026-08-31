@@ -531,4 +531,10 @@ func TestUnlockClearNoticeErrorNonFatal(t *testing.T) {
 	if !v.Unlocked(uid) {
 		t.Fatal("vault should be unlocked after a successful unlock, even when the clear hook errored")
 	}
+	// The clear hook must still have been ATTEMPTED — this is what proves the
+	// error path is exercised (and non-fatal). Without it the test would pass
+	// even if Unlock stopped calling ClearVaultLockNotice entirely.
+	if len(st.clearNoticeCalls) != 1 || st.clearNoticeCalls[0] != uid {
+		t.Fatalf("clearNoticeCalls = %v, want exactly [%v] (the failing clear hook must still have fired)", st.clearNoticeCalls, uid)
+	}
 }
