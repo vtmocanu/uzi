@@ -30,7 +30,10 @@ browser. It does not follow you to another browser or device.
 - **Email and display name** → a first name (e.g. `ada.lovelace@example.com`
   or `Ada Lovelace` → `Ada`). A handle-style email with no separator can't be
   told apart from a bare first name, so it collapses to the neutral `User`
-  instead (e.g. `alovelace@example.com` → `User`)
+  instead (e.g. `alovelace@example.com` → `User`). A display name keeps only
+  its first token, so a surname is dropped; a single-token name (e.g. `Ada`)
+  shows unchanged, since it is already a first name. Demo mode shows the first
+  name for a clean screenshot, so this is not full anonymization.
 - **Repo owner/namespace** → `demo/<repo>` (e.g. `vtmocanu/uzi` →
   `demo/uzi`)
 - **Forge host / base URL** → `https://forge.example.com`
