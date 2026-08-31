@@ -18,6 +18,13 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-08-31
+
+### Added
+
+- **Demo mode masks identifying values in the web UI for screenshots ([#889](https://github.com/vtmocanu/uzi/pull/889)).**
+  A device-local Demo mode toggle in Settings and the sidebar user area masks names, emails, repository paths, hosts, usernames, IP addresses and domains at their display sites across the app, so a screenshot can be shared without leaking identifying data; masking is display-only (underlying data, API responses, links, forms and navigation are unchanged), persists in local storage, and stays in sync across browser tabs.
+
 ## [0.71.2] - 2026-08-31
 
 ### Added
@@ -3590,7 +3597,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.71.2...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.72.0...HEAD
+[0.72.0]: https://github.com/vtmocanu/uzi/compare/v0.71.2...v0.72.0
 [0.71.2]: https://github.com/vtmocanu/uzi/compare/v0.71.1...v0.71.2
 [0.71.1]: https://github.com/vtmocanu/uzi/compare/v0.71.0...v0.71.1
 [0.71.0]: https://github.com/vtmocanu/uzi/compare/v0.70.0...v0.71.0
