@@ -143,8 +143,18 @@ function runnerTrackingRef(branch: string): string {
 // ONLY when the stamp matches the claiming run. This is a worker-owned `config --local`
 // write, the same posture as disableAutoMaintenance — no new trust boundary. The key is
 // dot/slash-free so the dotted git-config name parses (`git config uzi-trackowner.<x>`).
+//
+// issue #887 — the branch is carried in a git-config SUBSECTION, not flattened into the
+// variable name. git parses `section.subsection.variable` by the FIRST and LAST dot, so
+// the middle keeps the branch VERBATIM (slashes and dots included) and the variable is the
+// fixed `owner`. The earlier form flattened `/`->`-` into the variable name, which collided:
+// `uzi/self-improve` and a literal `uzi-self-improve` mapped to the same key, so clearing
+// one branch's owner stamp (clearConflictingAncestorTrackingRefs) could wipe the other's
+// and cost a later resume its unpushed recovery state. The subsection encoding is reversible
+// and collision-free — distinct branches always land in distinct `[uzi-trackowner "<branch>"]`
+// blocks. (Legacy two-part stamps on a persistent bare become dead config no read touches.)
 function runnerTrackingOwnerKey(branch: string): string {
-  return `uzi-trackowner.${branch.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  return `uzi-trackowner.${branch}.owner`;
 }
 
 export interface RunnerClone {
