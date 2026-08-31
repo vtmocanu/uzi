@@ -529,6 +529,72 @@ func TestLoadRegistrationPolicy(t *testing.T) {
 	})
 }
 
+// TestLoadVaultLockNotice exercises the vault-lock Slack notice knobs through Load()
+// (PRD #890 M3): the defaults (enabled, 15m interval, 30s grace), the explicit
+// disable, a malformed kill-switch aborting boot like the registration switch, and
+// the non-positive-interval clamp that keeps the interval from becoming a hidden
+// second off-switch (Decision D1).
+func TestLoadVaultLockNotice(t *testing.T) {
+	setBase := func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+		t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+		varied := make([]byte, secretbox.KeySize)
+		for i := range varied {
+			varied[i] = byte(i + 1)
+		}
+		t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+	}
+
+	t.Run("defaults: enabled, 15m interval, 30s grace", func(t *testing.T) {
+		setBase(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.VaultLockNoticeEnabled {
+			t.Error("VaultLockNoticeEnabled should default to true")
+		}
+		if cfg.VaultLockNoticeInterval != 15*time.Minute {
+			t.Errorf("VaultLockNoticeInterval = %v, want 15m", cfg.VaultLockNoticeInterval)
+		}
+		if cfg.VaultLockNoticeGraceDelay != 30*time.Second {
+			t.Errorf("VaultLockNoticeGraceDelay = %v, want 30s", cfg.VaultLockNoticeGraceDelay)
+		}
+	})
+
+	t.Run("explicit disable", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_VAULT_LOCK_NOTICE_ENABLED", "false")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.VaultLockNoticeEnabled {
+			t.Error("VaultLockNoticeEnabled should be false")
+		}
+	})
+
+	t.Run("malformed kill-switch aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_VAULT_LOCK_NOTICE_ENABLED", "notabool")
+		if _, err := Load(); err == nil {
+			t.Fatal("a malformed UZI_VAULT_LOCK_NOTICE_ENABLED must abort boot")
+		}
+	})
+
+	t.Run("non-positive interval is clamped to the default (not a hidden off-switch)", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_VAULT_LOCK_NOTICE_INTERVAL", "0")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.VaultLockNoticeInterval != 15*time.Minute {
+			t.Errorf("VaultLockNoticeInterval = %v, want clamp to 15m", cfg.VaultLockNoticeInterval)
+		}
+	})
+}
+
 // TestLoadReleaseCheck exercises the upstream-release-check seed knobs through Load()
 // (PRD #836 M2): the defaults (enabled + banner on, 6h interval, no token), explicit
 // overrides, and a malformed bool aborting boot the same way the registration

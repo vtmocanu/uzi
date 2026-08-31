@@ -124,7 +124,7 @@ func healthcheck() int {
 		addr = ":8080"
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("http://127.0.0.1" + addr + "/api/health")
+	resp, err := client.Get("http://127.0.0.1" + addr + "/api/health") //nolint:gosec // G704: the host is the fixed literal 127.0.0.1 loopback; only the port comes from the operator's own API_ADDR env, so this is the intended local health probe, not untrusted-URL SSRF.
 	if err != nil {
 		return 1
 	}
@@ -727,6 +727,47 @@ func run() error {
 		}()
 	} else {
 		slog.Info("run scheduler disabled (UZI_SCHEDULER_CHECK_INTERVAL=0)")
+	}
+
+	// Vault-lock Slack notice (PRD #890): after a restart the in-memory DEK cache is
+	// empty, so every vault is locked and a locked owner's queued/scheduled work
+	// silently stalls. This reconciler DMs each affected, Slack-linked user once per
+	// lock-episode. Wired INDEPENDENTLY of the scheduler gate (Decision D1): its only
+	// off-switches are UZI_VAULT_LOCK_NOTICE_ENABLED and the per-user slack_notify gate,
+	// so disabling scheduled runs (UZI_SCHEDULER_CHECK_INTERVAL=0) does NOT disable it.
+	// A grace-delayed boot one-shot lets the boot sequence settle, then it re-checks on
+	// its own ticker (not the scheduler's tick) so a vault locked at any later point
+	// (a manual lock, a cross-pod state) is still noticed.
+	if cfg.VaultLockNoticeEnabled {
+		vaultLockRec := schedsvc.NewVaultLockReconciler(q, vlt, notifier, settingsCache, slog.Default())
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			// grace-delayed boot one-shot (honour ctx cancellation during the wait)
+			if cfg.VaultLockNoticeGraceDelay > 0 {
+				t := time.NewTimer(cfg.VaultLockNoticeGraceDelay)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return
+				case <-t.C:
+				}
+			}
+			vaultLockRec.Reconcile(ctx)
+			// periodic re-check on our OWN ticker, independent of the scheduler goroutine
+			tick := time.NewTicker(cfg.VaultLockNoticeInterval)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					vaultLockRec.Reconcile(ctx)
+				}
+			}
+		}()
+	} else {
+		slog.Info("vault-lock notice disabled (UZI_VAULT_LOCK_NOTICE_ENABLED=false)")
 	}
 
 	// Per-user Claude rate-limit poller (PRD #53): each tick it polls every
