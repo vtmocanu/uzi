@@ -8929,7 +8929,7 @@ viewer" — the first path that writes judge text to a forge issue.
 A scoped fallback on PRD #83's rootless docker-worker tier (§297–305), added because the live
 dev-cluster nodes ship unprivileged user namespaces DISABLED, so
 rootless dockerd crash-loops there and #83's k8s definition of done is unreachable on this cluster.
-Owner decisions are recorded in `prds/89-optional-nonrootless-dind.md`'s Decision Log and are NOT
+Owner decisions are recorded in `prds/done/89-optional-nonrootless-dind.md`'s Decision Log and are NOT
 duplicated into `specs/human.md` (they are #83 owner overrides, not new user-binding requirements);
 what follows is the AI/implementation record for rebuild-from-specs. The owner-stated frame (reference
 only): docker workers run on dev-cluster; the owner accepts the node-root residual on the mitigation
