@@ -7,11 +7,12 @@ audience: user
 # Automatic CI fixes
 
 With automatic CI fixes on, uzi reacts to a failed pipeline on one of your
-own agent merge-request branches by itself: no clicking **Fix CI**, spending
-your own Anthropic token. It's the unattended sibling of the manual **Fix
-CI** button described in [Configuration](./configuration.md#ci-status-integration-prd-6)
-— same `ci_fix` run type, same verification, just started for you. Off by
-default, and opt-in per user.
+own agent merge-request branches by itself: no clicking **Fix CI**. Like the
+manual button, it spends your own Anthropic token, not the instance's. It's
+the unattended sibling of the manual **Fix CI** button described in
+[Configuration](./configuration.md#ci-status-integration-prd-6) — same
+`ci_fix` run type, same verification, just started for you. Off by default,
+and opt-in per user.
 
 ## 1. Opt in
 

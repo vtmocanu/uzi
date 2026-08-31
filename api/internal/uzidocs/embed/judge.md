@@ -87,7 +87,7 @@ mode](#judge-mode-off-optional-enforced) above).
 ## What you get
 
 When a judged run finishes (completed or failed — a cancelled run is never
-judged), a review lands in five places:
+judged), a review lands in six places:
 
 - **The run page**: a verdict chip (Ideal / OK / Issues found) plus a list of
   recommendations, each with a category, a target (the tool/agent/repo it's

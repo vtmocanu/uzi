@@ -115,7 +115,9 @@ accepted and bounded rather than closed:
    controller delivers it as a file-mounted k8s Secret (never an env var —
    the same `/proc/<pid>/environ` leak class [proc-hardening.md](proc-hardening.md)
    closes for the worker's own credentials), and a k8s Secret is
-   base64-encoded, not encrypted, at that layer. Anyone who can read it can
+   base64-encoded, not encrypted, at that layer by default — unless the
+   cluster operator has enabled etcd encryption-at-rest (an
+   `EncryptionConfiguration`). Anyone who can read it can
    impersonate that worker: claim its owner's runs, and receive their
    decrypted forge PAT and Anthropic token in the claim response. Bounded by
    the worker namespace holding nothing else and the controller's own RBAC

@@ -16,15 +16,16 @@ manage workers and repos, and (read-only) admin state. Built for humans
 
 ```sh
 brew tap vtmocanu/tap
-brew trust vtmocanu/tap   # one-time: Homebrew 6+ requires trusting third-party taps
+brew trust --formula vtmocanu/tap/uzi-cli   # one-time: Homebrew 6+ requires trusting third-party formulae
 brew install vtmocanu/tap/uzi-cli
 uzi version
 ```
 
 `vtmocanu/tap` resolves to `github.com/vtmocanu/homebrew-tap` on its own (Homebrew maps
 a bare `user/repo` tap name to `github.com/user/homebrew-repo`), so no explicit remote
-is needed. `brew trust` is a one-time step: Homebrew 6+ refuses to load formulae from a
-third-party tap until it is trusted.
+is needed. `brew trust` is a one-time step: Homebrew 6+ refuses to load a third-party
+formula until it is trusted, so trust just the `uzi-cli` formula rather than the whole
+tap.
 
 The formula builds `uzi` from source: `brew install` downloads the release source
 tarball and runs `go build` (Homebrew installs Go as a build dependency). No access to
@@ -1328,8 +1329,9 @@ uzi docs search "connect a forge"   # find pages by a substring of the title or 
   It defaults to `--audience user` (the onboarding-facing pages) and takes
   `--audience user|operator|design|contributor|all`. `--json` returns an array.
 - **`show <slug>`** prints one page's raw markdown body (the slug is the
-  filename without `.md`, e.g. `worker-setup`). An unknown slug exits 4 with a
-  "did you mean" suggestion; `--json` returns `{slug, meta, body}`.
+  filename without `.md`, e.g. `worker-setup`). An unknown slug exits 4 — with a
+  "did you mean" suggestion when a similar slug exists; `--json` returns
+  `{slug, meta, body}`.
 - **`search <query>`** does a whole-query, case-insensitive substring match over
   every page's title and body (title matches rank first) and prints
   `slug · title · snippet`. It takes the same `--audience` filter and `--json`.

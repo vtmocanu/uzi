@@ -15,7 +15,7 @@ from when the flag was raised, not from when the run started.
 
 | Flag | Shows up when | What to do |
 |---|---|---|
-| ⚠ looping | The agent has repeated the exact same tool call 4+ times recently. | Open the run view and check what it's stuck repeating; it may need a nudge or a cancel. |
+| ⚠ looping | The agent has repeated the exact same tool call 4+ times recently — or its updates can't be saved, so it keeps resending them. | Open the run view and check what it's stuck repeating (or whether it's stuck retrying a save); it may need a nudge or a cancel. |
 | ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
 | ⚠ slow | Running much longer than typical, wall clock. | Usually fine for a big task; worth a look if unexpected. |
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it. | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |

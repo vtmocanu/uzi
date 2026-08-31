@@ -6,7 +6,7 @@ audience: operator
 
 # Configuration
 
-All configuration is via environment variables, set in `.env` (copied from `.env.example`) and passed into the `api` container by `docker-compose.yml`. `POSTGRES_*` also configures the `db` service directly.
+All **deployment** configuration is via environment variables, set in `.env` (copied from `.env.example`) and passed into the `api` container by `docker-compose.yml`. `POSTGRES_*` also configures the `db` service directly. Per-user and admin settings live in the database and are set through the UI, not through environment variables.
 
 | Var | Default | Notes |
 |---|---|---|

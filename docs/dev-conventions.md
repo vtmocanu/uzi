@@ -222,13 +222,16 @@ its own, so read their output rather than their exit code.
 There is still no coverage signal. That is PRD #103's M6, and a target for it
 arrives with the check itself rather than as an empty stub.
 
-There are also three repo-wide checks with no component, as of PRD #103 M5:
-`task lint:shell` (shellcheck), `task lint:yaml` (yamllint `--strict`) and
+There are also four repo-wide checks with no component, as of PRD #103 M5:
+`task lint:shell` (shellcheck), `task lint:yaml` (yamllint `--strict`),
 `task lint:formula` (`ruby -c` on `Formula/uzi-cli.rb`, which release CI copies
-verbatim into the shared Homebrew tap on every tag). `task gate:repo` composes
-the three and runs **first** inside `task gate`, cheap-first, ahead of any Go
-module's `-race` compile or npm step — none of the three needs a build or a
-warm toolchain. Like the other repo-wide slots, their scope comes from the git
+verbatim into the shared Homebrew tap on every tag) and `task scan:secrets`
+(gitleaks, a secret scan over tracked files). `task gate:repo` runs these —
+among the further repo-wide checks it has gained since (`lint:actions`, the
+`check:migration-*` and `check:spec-numbering` guards, `sast:semgrep`) — and it
+runs **first** inside `task gate`, cheap-first, ahead of any Go module's `-race`
+compile or npm step — none of the three lint checks needs a build or a warm
+toolchain. Like the other repo-wide slots, their scope comes from the git
 index rather than a hand-maintained list: shellcheck's is `git ls-files
 '*.sh'` **unioned with a shebang scan**, because the extension alone missed
 `agent/bin/agent-browser` — a `#!/bin/sh` shim with no `.sh` suffix, COPYd into

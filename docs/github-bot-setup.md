@@ -22,8 +22,9 @@ revocable, individually-scoped identity instead of one shared credential. See
 
 ## 1. Protect `main`
 
-Repository → **Settings → Rules → Rulesets**, add a ruleset targeting `main` that
-requires a pull request before merging and blocks force pushes. A ruleset is
+Repository → **Settings → Rules → Rulesets**, add a ruleset targeting your
+repository's default branch (`main` in most repos) that requires a pull
+request before merging and blocks force pushes. A ruleset is
 preferred over the legacy **Settings → Branches** protection rule because uzi can
 read it at write role; classic protection is invisible to the bot beyond a bare
 "protected" flag.
@@ -37,10 +38,13 @@ Register a second GitHub account for the bot yourself (e.g. `uzi-bot-<yourname>`
 From the bot account's **Settings → Developer settings → Personal access tokens
 → Tokens (classic)**:
 
-- **Scope: exactly `repo`**, nothing more. `repo` is the single scope that grants
+- **Scope: `repo` is required.** `repo` is the single scope that grants
   private-repo contents write (git push), issues, pull requests, and read of
   Actions runs/jobs/logs on that repo — the coarsest and only classic scope that
-  covers everything uzi needs. Anything broader (`workflow`, `delete_repo`,
+  covers everything uzi needs by default. **If you want [GitHub Projects v2
+  sync](./github-project-sync.md), also add `project`** (or the read-only
+  `read:project`) — uzi accepts exactly `{repo}`, `{repo, project}`, or
+  `{repo, read:project}`. Anything broader (`workflow`, `delete_repo`,
   `admin:org`, …) is over-privilege and uzi refuses it at connect (see
   [Least privilege](#least-privilege-what-uzi-verifies)).
 - **Only a classic token (`ghp_…`) is supported.** A fine-grained token

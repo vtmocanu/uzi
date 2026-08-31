@@ -60,14 +60,26 @@ rather than guessing at a cause it cannot observe. There is no restart button.
 restart count or exit code because nothing was ever started: Kubernetes refused to create the
 pod (a missing ServiceAccount, an exceeded quota, an admission policy). **The copyable command
 below cannot help here** — `describe pod` matches nothing and prints `No resources found`, which
-reads as the worker having gone. Use `describe deploy -l uzi.dev/hosted-worker-id=<id>` instead;
-its `Conditions` and `Events` carry the refusal in full.
+reads as the worker having gone. Use the `describe deploy` variant instead; its `Conditions` and
+`Events` carry the refusal in full.
 
-The copyable **kubectl command** is read-only (`describe pod`). Replace `<worker-namespace>`
-with the namespace that worker runs in — docker-capable workers live in a separate one. Pasted
-unsubstituted it never reaches kubectl: `<` and `>` are redirections, so the shell errors on a
-file named `worker-namespace`. Confusing, but a reliable reminder. The quiet failure is the
-*wrong* namespace, which prints `No resources found` and reads as the worker having gone.
+The copyable **kubectl command** is read-only (`describe pod`):
+
+```sh
+kubectl -n <worker-namespace> describe pod -l uzi.dev/hosted-worker-id=<id>
+```
+
+and for the `FailedCreate` case above:
+
+```sh
+kubectl -n <worker-namespace> describe deploy -l uzi.dev/hosted-worker-id=<id>
+```
+
+Replace `<worker-namespace>` with the namespace that worker runs in — docker-capable workers
+live in a separate one. Pasted unsubstituted it never reaches kubectl: `<` and `>` are
+redirections, so the shell errors on a file named `worker-namespace`. Confusing, but a reliable
+reminder. The quiet failure is the *wrong* namespace, which prints `No resources found` and
+reads as the worker having gone.
 
 **`Start Time` in that output** is when the pod started, not when it went wrong, and a pod that
 never scheduled has no `Start Time` line at all. Nothing records when a worker started failing,
