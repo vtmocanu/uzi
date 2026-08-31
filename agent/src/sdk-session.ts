@@ -88,15 +88,19 @@
 // the one residual false-absent path in the glob, and dropping it makes "the glob's only
 // error is a false present" exactly true rather than nearly true.
 //
-// VERSION-COUPLED to @anthropic-ai/claude-agent-sdk 0.3.201: the transcript LAYOUT
-// (`$HOME/.claude/projects/<dir>/<session-id>.jsonl`) is the CLI's private on-disk
+// VERSION-COUPLED to the bundled Claude Code CLI's transcript LAYOUT
+// (`$HOME/.claude/projects/<dir>/<session-id>.jsonl`), the CLI's private on-disk
 // format, not a documented contract. The glob depends only on the `.jsonl`-named-by-
 // session-id leaf and the two-level projects/<dir> nesting — NOT on the encoding rule,
 // which is exactly why globbing survives an encoding change. A layout change would make
 // this find nothing and fail OPEN (degrade toward today's loud failure), never toward a
 // silent fresh start — but nothing in CI would notice it had stopped firing, so an SDK
-// bump needs this re-verified. The layout, the local pre-network resolution, and the
-// realpath-before-encode behaviour were each established independently by researcher-105
+// bump needs this re-verified. The pinned SDK version lives in agent/package.json and is
+// deliberately NOT restated as a number here — a hardcoded version is exactly what went
+// stale (issue #723). The `0.3.201` figures elsewhere in this header are the ORIGINAL
+// measurement provenance (issue #105), not a currentness claim; the layout was re-checked
+// unchanged against the then-pinned SDK for #723. The layout, the local pre-network
+// resolution, and the realpath-before-encode behaviour were each established independently by researcher-105
 // (shipped bundle + live harness) and by this author (direct CLI runs), so the claims
 // above are corroborated, not single-sourced.
 
