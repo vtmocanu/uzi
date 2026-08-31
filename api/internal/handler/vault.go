@@ -145,8 +145,8 @@ func (h *Handler) VaultLock(w http.ResponseWriter, r *http.Request) {
 		// already aware, so mark lock_notified_at = now() to keep the vault-lock reconciler
 		// from later DMing them to unlock. Best-effort — the returned row and any error are
 		// ignored/logged; a DB hiccup here must not fail the lock.
-		if h.q != nil {
-			if _, err := h.q.ClaimVaultLockNotice(r.Context(), user.ID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if claimer := h.vaultLockNoticeStore(); claimer != nil {
+			if _, err := claimer.ClaimVaultLockNotice(r.Context(), user.ID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 				slog.Error("vault lock: pre-ack lock-notice", "user", user.ID, "error", err)
 			}
 		}

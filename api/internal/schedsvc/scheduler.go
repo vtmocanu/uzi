@@ -136,6 +136,11 @@ type ForgeBuilder interface {
 // empty sweep selector to the configured uzi label. *settings.Cache satisfies it.
 type SettingsReader interface {
 	UziLabel(ctx context.Context) (string, error)
+	// PublicBaseURL is the operator-set app base URL the vault-lock notice reconciler
+	// builds its deep link from (PRD #890 M2). *settings.Cache satisfies it. An empty
+	// value (unset, or the lookup failed) makes the notice omit the link and still send,
+	// matching the other notifiers' empty-base behavior.
+	PublicBaseURL(ctx context.Context) (string, error)
 }
 
 // Notifier is the notifysvc write seam (persist-first, best-effort Slack).

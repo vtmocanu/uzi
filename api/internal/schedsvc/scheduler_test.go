@@ -411,9 +411,13 @@ func (b *fakeBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, e
 
 type fakeSettings struct {
 	uziLabel string
+	// publicBaseURL backs SettingsReader.PublicBaseURL for the vault-lock notice deep
+	// link (PRD #890 M2); "" exercises the link-omission path.
+	publicBaseURL string
 }
 
-func (s *fakeSettings) UziLabel(context.Context) (string, error) { return s.uziLabel, nil }
+func (s *fakeSettings) UziLabel(context.Context) (string, error)      { return s.uziLabel, nil }
+func (s *fakeSettings) PublicBaseURL(context.Context) (string, error) { return s.publicBaseURL, nil }
 
 type fakeNotifier struct{ notifications []notifysvc.Notification }
 
@@ -422,10 +426,21 @@ func (n *fakeNotifier) Notify(_ context.Context, notif notifysvc.Notification) (
 	return store.Notification{}, nil
 }
 
-// fakeVault satisfies VaultGate (PRD #590 M1): unlocked controls the self_improve vault gate.
-type fakeVault struct{ unlocked bool }
+// fakeVault satisfies VaultGate (PRD #590 M1): unlocked controls the self_improve vault
+// gate. For the PRD #890 M2 vault-lock reconciler, unlockedSet (when non-nil) overrides the
+// bool per user so a test can mark one user unlocked (the seed-admin skip) and others locked;
+// a nil unlockedSet preserves the original "same for everyone" behavior self_improve relies on.
+type fakeVault struct {
+	unlocked    bool
+	unlockedSet map[uuid.UUID]bool
+}
 
-func (v *fakeVault) Unlocked(uuid.UUID) bool { return v.unlocked }
+func (v *fakeVault) Unlocked(id uuid.UUID) bool {
+	if v.unlockedSet != nil {
+		return v.unlockedSet[id]
+	}
+	return v.unlocked
+}
 
 // ── Harness ──────────────────────────────────────────────────────────────────
 

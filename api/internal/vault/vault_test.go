@@ -3,6 +3,7 @@ package vault
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -498,5 +499,36 @@ func TestConcurrentFirstUnlockConsistent(t *testing.T) {
 	}
 	if !bytes.Equal(opened, secret) {
 		t.Fatalf("mismatch after race: got %q want %q", opened, secret)
+	}
+}
+
+// TestUnlockFiresClearNotice: a successful Unlock re-arms the vault-lock Slack notice
+// (PRD #890 M1) — the ClearVaultLockNotice hook fires for the unlocked user, ending the
+// current lock-episode so a later deploy that locks them again notifies afresh.
+func TestUnlockFiresClearNotice(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+
+	if err := v.Unlock(context.Background(), uid, "clear-notice-pw"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	if len(st.clearNoticeCalls) != 1 || st.clearNoticeCalls[0] != uid {
+		t.Fatalf("clearNoticeCalls = %v, want exactly [%v]", st.clearNoticeCalls, uid)
+	}
+}
+
+// TestUnlockClearNoticeErrorNonFatal: a ClearVaultLockNotice failure must NOT fail an
+// otherwise-valid unlock (PRD #890 M1) — the re-arm is best-effort and logged, mirroring
+// rewrapMasterSecrets. The vault ends unlocked despite the clear error.
+func TestUnlockClearNoticeErrorNonFatal(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	st.clearNoticeErr = errors.New("db hiccup on clear")
+	uid := uuid.New()
+
+	if err := v.Unlock(context.Background(), uid, "clear-err-pw"); err != nil {
+		t.Fatalf("Unlock must succeed despite a clear-notice error, got %v", err)
+	}
+	if !v.Unlocked(uid) {
+		t.Fatal("vault should be unlocked after a successful unlock, even when the clear hook errored")
 	}
 }
