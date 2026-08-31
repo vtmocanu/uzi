@@ -95,10 +95,11 @@ describe("maskHost", () => {
     expect(maskHost("http://gitlab.metaminds.com", true)).toBe("http://forge.example.com");
   });
 
-  it("preserves a path/search and masks a port", () => {
-    expect(maskHost("https://gitlab.metaminds.com:8443/foo", true)).toBe(
-      "https://forge.example.com/foo",
+  it("drops path/search/port so no subpath leaks", () => {
+    expect(maskHost("https://gitlab.metaminds.com:8443/foo?x=1", true)).toBe(
+      "https://forge.example.com",
     );
+    expect(maskHost("https://git.co.com/team", true)).toBe("https://forge.example.com");
   });
 
   it("falls back to a bare fake host for a value with no scheme", () => {

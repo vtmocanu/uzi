@@ -52,16 +52,17 @@ export function maskRepoPath(value: string | null | undefined, enabled: boolean)
   return `demo/${repo}`;
 }
 
-// maskHost replaces the host (and port) with `forge.example.com`, KEEPING the scheme.
-// `https://gitlab.metaminds.com → https://forge.example.com`. A path/search is preserved
-// (`https://gitlab.x.com/foo → https://forge.example.com/foo`). Unparseable input or a
-// bare host with no scheme falls back to the bare fake host `forge.example.com`.
+// maskHost replaces the host, port, path, and query with a single fake host —
+// `forge.example.com` — KEEPING only the scheme, per the registry ("replace host with
+// forge.example.com, keep scheme"). `https://gitlab.metaminds.com/team → https://forge.example.com`.
+// Dropping the path/query is deliberate: a self-hosted forge under a subpath would otherwise
+// leak that segment, which is the exact class of identity leak demo mode exists to hide.
+// Unparseable input or a bare host with no scheme falls back to the bare fake host.
 export function maskHost(value: string | null | undefined, enabled: boolean): string {
   if (!enabled || !value) return value ?? "";
   try {
     const u = new URL(value);
-    const path = u.pathname === "/" ? "" : u.pathname;
-    return `${u.protocol}//forge.example.com${path}${u.search}`;
+    return `${u.protocol}//forge.example.com`;
   } catch {
     return "forge.example.com";
   }
