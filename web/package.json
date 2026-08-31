@@ -37,7 +37,7 @@
     "@vitest/coverage-v8": "4.1.11",
     "jsdom": "^30.0.0",
     "knip": "6.32.2",
-    "oxlint": "1.79.0",
+    "oxlint": "1.80.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^4",
     "typescript": "^7.0.0",
