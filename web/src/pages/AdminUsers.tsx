@@ -3,8 +3,11 @@ import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type User } from "../lib/api";
 import { Alert, Badge, Button, Card, ListSkeleton } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
+import { useDemoMode } from "../lib/demoMode";
+import { maskEmail, maskName } from "../lib/demoMask";
 
 export function AdminUsers() {
+  const demo = useDemoMode();
   const { user: me } = useAuth();
   const [users, setUsers] = useState<User[]>([]);
   const [error, setError] = useState("");
@@ -117,10 +120,10 @@ export function AdminUsers() {
               <tbody className="divide-y divide-edge">
                 {users.map((u) => (
                   <tr key={u.id} className="transition-colors hover:bg-raised/30">
-                    <td className="px-4 py-3 text-fg">{u.email}</td>
+                    <td className="px-4 py-3 text-fg">{maskEmail(u.email, demo)}</td>
                     {/* ?? only catches null/undefined; an empty-string name would
                         render blank, so fall back on a trimmed-empty name too. */}
-                    <td className="px-4 py-3 text-muted">{u.display_name?.trim() || "—"}</td>
+                    <td className="px-4 py-3 text-muted">{maskName(u.display_name?.trim(), demo) || "—"}</td>
                     <td className="px-4 py-3">
                       {u.is_admin ? <Badge tone="brand">Admin</Badge> : <Badge>User</Badge>}
                     </td>

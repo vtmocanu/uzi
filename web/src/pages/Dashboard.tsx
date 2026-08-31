@@ -21,6 +21,8 @@ import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskName, maskRepoPath } from "../lib/demoMask";
 
 interface Overview {
   runs: RunListItem[];
@@ -83,6 +85,7 @@ function Step({
 }
 
 export function Dashboard() {
+  const demo = useDemoMode();
   const { user } = useAuth();
   const [data, setData] = useState<Overview | null>(null);
 
@@ -206,7 +209,7 @@ export function Dashboard() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={`Welcome${user.display_name ? `, ${user.display_name}` : ""}`}
+        title={`Welcome${user.display_name ? `, ${maskName(user.display_name, demo)}` : ""}`}
         description="The factory floor at a glance."
       />
 
@@ -370,7 +373,7 @@ export function Dashboard() {
                     {/* Issue #124: forge-supplied issue title, untrusted (see RunsList). */}
                     <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(r.issue_title)}</p>
                     <p className="flex flex-wrap items-center gap-x-1 text-xs text-faint">
-                      {r.repo_path}{" "}
+                      {maskRepoPath(r.repo_path, demo)}{" "}
                       <RunIssueRef
                         issueIid={r.issue_iid}
                         issueWebUrl={r.issue_web_url}

@@ -16,6 +16,8 @@ import { ClockIcon } from "../components/icons";
 import { ScheduleModal } from "../components/ScheduleModal";
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskUsername } from "../lib/demoMask";
 
 // columnLabel names the column the issue sits in, for the header chip. "Backlog"
 // is the display name of the implicit column (PRD #102 M1) — the stored column is
@@ -35,6 +37,7 @@ function runDuration(run: RunListItem): string | null {
 }
 
 export function IssueView() {
+  const demo = useDemoMode();
   const { repoId = "", iid = "" } = useParams();
   const iidNum = Number(iid);
   const navigate = useNavigate();
@@ -256,7 +259,7 @@ export function IssueView() {
                       assigned
                     </Badge>
                   ))}
-                {issue.author && <span className="text-xs text-faint">{issue.author}</span>}
+                {issue.author && <span className="text-xs text-faint">{maskUsername(issue.author, "human", demo)}</span>}
                 {/* Neutral PRD-presence marker (PRD #764): a linked prds/*.md is optional
                     but still detected, so an issue that has one shows a quiet "PRD" badge. */}
                 {issue.has_prd_link && (

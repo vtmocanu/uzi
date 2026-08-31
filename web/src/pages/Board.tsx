@@ -67,6 +67,8 @@ import { forgePlatform } from "../lib/forgeNoun";
 import { ExternalLinkIcon, GripVerticalIcon, PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskName, maskRepoPath, maskUsername } from "../lib/demoMask";
 
 const OPEN_KEY = "";
 const CLOSED_KEY = "__closed__";
@@ -101,6 +103,7 @@ export function Board() {
   const { id: repoId = "" } = useParams();
   const navigate = useNavigate();
   const { uziLabel, autopilotLabel } = useAuth();
+  const demo = useDemoMode();
   const [board, setBoard] = useState<BoardData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -1040,7 +1043,7 @@ export function Board() {
         backLabel="Boards"
         titleNode={
           <div className="flex flex-wrap items-center gap-2">
-            <h1 className="text-xl font-semibold tracking-tight">{board?.path_with_namespace ?? "Board"}</h1>
+            <h1 className="text-xl font-semibold tracking-tight">{board?.path_with_namespace ? maskRepoPath(board.path_with_namespace, demo) : "Board"}</h1>
             {board?.pipeline && <PipelineBadge pipeline={board.pipeline} />}
             {board?.pipeline && (
               <FixCiButton
@@ -1681,6 +1684,7 @@ export function IssueCard({
   // Chips are bounded (PRD #102 M4): a lane is a fixed w-72, so an issue wearing a
   // dozen labels would push the card several rows taller than its neighbours and
   // bury the run badges. The remainder is not dropped — it rides the "+N" title.
+  const demo = useDemoMode();
   const { shown: shownChips, overflow: chipOverflow, hidden: hiddenChips } = boundedChips(chips, maxChips);
   // Closed cards are not movable (move-to-Closed is unsupported; close/reopen
   // stays on the forge), so they are not draggable.
@@ -1985,7 +1989,7 @@ export function IssueCard({
       {(run || card.author) && (
         <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-faint">
           {run?.status === "running" && run.worker_name && <span>{run.worker_name}</span>}
-          {run && !run.is_mine && run.owner_name && <span>started by {run.owner_name}</span>}
+          {run && !run.is_mine && run.owner_name && <span>started by {maskName(run.owner_name, demo)}</span>}
           {run && canOpenRunView(run) && (
             <Link
               to={`/runs/${run.id}`}
@@ -1995,7 +1999,7 @@ export function IssueCard({
               view run
             </Link>
           )}
-          {card.author && <span>{card.author}</span>}
+          {card.author && <span>{maskUsername(card.author, "human", demo)}</span>}
         </div>
       )}
       {/* D15: Promote stands IN PLACE OF Start run, never beside it. A non-`uzi` card

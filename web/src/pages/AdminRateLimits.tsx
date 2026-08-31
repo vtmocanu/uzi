@@ -22,6 +22,8 @@ import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
 import { DOC_RATE_LIMITS } from "../lib/doclinks";
 import { RateLimitForecastMeter } from "../components/RateLimitForecast";
+import { useDemoMode } from "../lib/demoMode";
+import { maskEmail, maskName } from "../lib/demoMask";
 
 // One stacked meter row inside the Utilization cell: a mono window chip (5h/7d),
 // the RateLimitForecastMeter (the shared MeterTrack plus the PRD #309/#310 anchored
@@ -115,13 +117,14 @@ function UserCell({
   rowSpan: number;
   showIdentity: boolean;
 }) {
+  const demo = useDemoMode();
   if (!showIdentity) return null;
   return (
     <td className="px-4 py-3 align-top" rowSpan={rowSpan}>
       <div className="font-medium text-fg">
-        {user.name || <span className="italic text-faint">no name</span>}
+        {maskName(user.name, demo) || <span className="italic text-faint">no name</span>}
       </div>
-      <div className="text-xs text-faint">{user.email}</div>
+      <div className="text-xs text-faint">{maskEmail(user.email, demo)}</div>
     </td>
   );
 }

@@ -15,12 +15,15 @@ import { DocLink } from "../components/DocLink";
 import { DOC_GITHUB_PROJECT_SYNC, DOC_REPO_AGENTS } from "../lib/doclinks";
 import { selectedForge } from "../lib/prefs";
 import { CAPABILITY_VOCABULARY } from "../lib/capabilityVocabulary";
+import { useDemoMode } from "../lib/demoMode";
+import { maskEmail, maskHost, maskRepoPath, maskUsername } from "../lib/demoMask";
 
 export function Repos() {
   // The guardrail override write is admin-only (PRD #66 D8): a member sees the block
   // and a pointer to ask an admin, never an Allow/Revoke control.
   const { user } = useAuth();
   const isAdmin = user?.is_admin ?? false;
+  const demo = useDemoMode();
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
   const [connectionId, setConnectionId] = useState("");
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -769,7 +772,7 @@ export function Repos() {
               >
                 {connections.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.bot_username} — {c.base_url}
+                    {maskUsername(c.bot_username, "bot", demo)} — {maskHost(c.base_url, demo)}
                   </option>
                 ))}
               </Select>
@@ -813,10 +816,10 @@ export function Repos() {
                               rel="noreferrer"
                               className="font-medium text-fg hover:text-brand-hover"
                             >
-                              {r.path_with_namespace}
+                              {maskRepoPath(r.path_with_namespace, demo)}
                             </a>
                           ) : (
-                            <span className="font-medium text-fg">{r.path_with_namespace}</span>
+                            <span className="font-medium text-fg">{maskRepoPath(r.path_with_namespace, demo)}</span>
                           )}
                         </td>
                         <td className="px-4 py-3 font-mono text-xs text-muted">
@@ -879,7 +882,7 @@ export function Repos() {
                                     <Badge
                                       tone="warning"
                                       dot
-                                      title={`Allowed by ${ov.by} on ${new Date(ov.at).toLocaleString()}\nReason: ${ov.reason}`}
+                                      title={`Allowed by ${maskEmail(ov.by, demo)} on ${new Date(ov.at).toLocaleString()}\nReason: ${ov.reason}`}
                                     >
                                       allowed by admin
                                     </Badge>
@@ -928,7 +931,7 @@ export function Repos() {
                                 variant="secondary"
                                 size="sm"
                                 aria-expanded={trustRepoId === r.id}
-                                aria-label={`Trusted repo settings for ${r.path_with_namespace}`}
+                                aria-label={`Trusted repo settings for ${maskRepoPath(r.path_with_namespace, demo)}`}
                                 onClick={(e) => {
                                   trustTriggerRef.current = e.currentTarget;
                                   setConfirmTrustId(null);
@@ -998,7 +1001,7 @@ export function Repos() {
                                 variant="secondary"
                                 size="sm"
                                 aria-expanded={syncRepoId === r.id}
-                                aria-label={`Project sync settings for ${r.path_with_namespace}`}
+                                aria-label={`Project sync settings for ${maskRepoPath(r.path_with_namespace, demo)}`}
                                 onClick={(e) => {
                                   syncTriggerRef.current = e.currentTarget;
                                   setSyncRepoId((id) => (id === r.id ? null : r.id));
@@ -1017,11 +1020,11 @@ export function Repos() {
                             <div
                               ref={confirmRemoveRef}
                               role="group"
-                              aria-label={`Confirm removing ${r.path_with_namespace}`}
+                              aria-label={`Confirm removing ${maskRepoPath(r.path_with_namespace, demo)}`}
                               className="ml-auto max-w-xs space-y-2 rounded-md border border-danger/40 bg-danger/5 p-3 text-left"
                             >
                               <p className="text-xs text-fg">
-                                <span className="font-medium">Remove {r.path_with_namespace}?</span> This is
+                                <span className="font-medium">Remove {maskRepoPath(r.path_with_namespace, demo)}?</span> This is
                                 permanent and deletes its board and run history. If the bot still has access to
                                 the project, a refresh re-adds it as a disabled repo.
                               </p>
@@ -1091,7 +1094,7 @@ export function Repos() {
               <div
                 ref={trustPanelRef}
                 role="group"
-                aria-label={`Trusted repo for ${trustRepo.path_with_namespace}`}
+                aria-label={`Trusted repo for ${maskRepoPath(trustRepo.path_with_namespace, demo)}`}
                 className="space-y-4 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 {/* Header: what "trusted" means, plus the master switch. */}
@@ -1104,7 +1107,7 @@ export function Repos() {
                       </Badge>
                     </h3>
                     <p className="max-w-2xl text-sm text-muted">
-                      You vouch that every committer to {trustRepo.path_with_namespace} is trusted. This
+                      You vouch that every committer to {maskRepoPath(trustRepo.path_with_namespace, demo)} is trusted. This
                       unlocks repo-authored context below, applied to new runs immediately. It grants{" "}
                       <span className="font-medium text-fg">context, not permissions</span>: the guardrails do
                       not change.
@@ -1123,11 +1126,11 @@ export function Repos() {
                   <div
                     ref={confirmTrustRef}
                     role="group"
-                    aria-label={`Confirm trusting ${trustRepo.path_with_namespace}`}
+                    aria-label={`Confirm trusting ${maskRepoPath(trustRepo.path_with_namespace, demo)}`}
                     className="space-y-3 rounded-md border border-warn/40 bg-warn/5 p-3"
                   >
                     <p className="text-sm text-fg">
-                      <span className="font-medium">Mark {trustRepo.path_with_namespace} as trusted?</span>{" "}
+                      <span className="font-medium">Mark {maskRepoPath(trustRepo.path_with_namespace, demo)} as trusted?</span>{" "}
                       This turns on both capabilities: it loads skills from the repo&rsquo;s own{" "}
                       <code className="rounded bg-raised px-1 py-0.5 font-mono text-xs">.claude/skills/</code>, and
                       lets the lead read the repo&rsquo;s root{" "}
@@ -1245,11 +1248,11 @@ export function Repos() {
             {toolsRepo && (
               <div
                 role="group"
-                aria-label={`Tool profile for ${toolsRepo.path_with_namespace}`}
+                aria-label={`Tool profile for ${maskRepoPath(toolsRepo.path_with_namespace, demo)}`}
                 className="space-y-3 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 <p className="text-sm text-fg">
-                  <span className="font-medium">Tools for {toolsRepo.path_with_namespace}</span> — the worker installs
+                  <span className="font-medium">Tools for {maskRepoPath(toolsRepo.path_with_namespace, demo)}</span> — the worker installs
                   these with devbox before every run on this repo. The list is what an admin has allowed.
                 </p>
                 {allowlist && allowlist.length === 0 ? (
@@ -1373,7 +1376,7 @@ export function Repos() {
               <div
                 ref={syncPanelRef}
                 role="group"
-                aria-label={`Project sync for ${syncRepo.path_with_namespace}`}
+                aria-label={`Project sync for ${maskRepoPath(syncRepo.path_with_namespace, demo)}`}
                 className="space-y-4 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 <div className="min-w-0 space-y-1">
@@ -1384,7 +1387,7 @@ export function Repos() {
                     </Badge>
                   </h3>
                   <p className="max-w-2xl text-sm text-muted">
-                    Mirror {syncRepo.path_with_namespace}&rsquo;s board onto a GitHub Projects v2
+                    Mirror {maskRepoPath(syncRepo.path_with_namespace, demo)}&rsquo;s board onto a GitHub Projects v2
                     board. See the{" "}
                     <DocLink slug={DOC_GITHUB_PROJECT_SYNC}>GitHub Projects v2 sync</DocLink> guide.
                   </p>
@@ -1724,7 +1727,7 @@ export function Repos() {
           requires a non-empty reason before it will POST the override. */}
       {allowRepo && (
         <Modal
-          label={`Allow runs on ${allowRepo.path_with_namespace}`}
+          label={`Allow runs on ${maskRepoPath(allowRepo.path_with_namespace, demo)}`}
           onClose={closeAllow}
           closeOnBackdrop={!allowBusy}
         >
@@ -1732,7 +1735,7 @@ export function Repos() {
             <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-4">
               <div>
                 <h2 className="text-base font-semibold">Allow runs on this repo?</h2>
-                <p className="mt-0.5 text-xs text-muted">{allowRepo.path_with_namespace}</p>
+                <p className="mt-0.5 text-xs text-muted">{maskRepoPath(allowRepo.path_with_namespace, demo)}</p>
               </div>
               <button
                 type="button"

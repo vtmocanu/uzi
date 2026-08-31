@@ -9,6 +9,8 @@
 import type { Repo } from "../lib/api";
 import { cx } from "./ui";
 import { XIcon } from "./icons";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 
 export function RepoMultiSelect({
   repos,
@@ -29,6 +31,7 @@ export function RepoMultiSelect({
   label?: string;
   id?: string;
 }) {
+  const demo = useDemoMode();
   const toggle = (repoId: string) => {
     onChange(
       selected.includes(repoId) ? selected.filter((r) => r !== repoId) : [...selected, repoId],
@@ -74,11 +77,11 @@ export function RepoMultiSelect({
                         checked={checked}
                         disabled={isDisabled}
                         onChange={() => toggle(r.id)}
-                        aria-label={r.path_with_namespace}
+                        aria-label={maskRepoPath(r.path_with_namespace, demo)}
                         className="h-4 w-4 shrink-0 accent-brand"
                       />
                       <span className="truncate font-mono text-[12.5px] text-fg">
-                        {r.path_with_namespace}
+                        {maskRepoPath(r.path_with_namespace, demo)}
                       </span>
                       {isDisabled && disabledReason && (
                         <span className="ml-auto shrink-0 text-[11px] text-faint">{disabledReason}</span>
@@ -99,10 +102,10 @@ export function RepoMultiSelect({
               key={r.id}
               className="inline-flex items-center gap-1 rounded-md border border-brand/40 bg-brand/10 px-2 py-0.5 font-mono text-[11px] text-brand"
             >
-              {r.path_with_namespace}
+              {maskRepoPath(r.path_with_namespace, demo)}
               <button
                 type="button"
-                aria-label={`Remove ${r.path_with_namespace}`}
+                aria-label={`Remove ${maskRepoPath(r.path_with_namespace, demo)}`}
                 onClick={() => toggle(r.id)}
                 className="text-brand/70 hover:text-brand"
               >

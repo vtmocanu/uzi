@@ -10,9 +10,10 @@
 // flex-wrap container ahead of the description so the pill never dangles under it. The
 // lock marker is retained (it encodes a baked/read-only prompt).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { DefaultJobs } from "./DefaultJobs";
+import { setDemoMode } from "../lib/demoMode";
 import { api, type CatalogEntry, type LastFire, type Repo, type Schedule, type ScheduleCatalog } from "../lib/api";
 
 // An expanded LastFireDetail sub-row reads useAuth().uziLabel (PRD #764 follow-up); this
@@ -38,6 +39,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // Leave demo mode off so a test that toggles it never leaks a masked state into the next.
+  setDemoMode(false);
 });
 
 const REPOS: Repo[] = [
@@ -380,5 +383,27 @@ describe("DefaultJobs — sweep-warn after enabling", () => {
     await waitFor(() =>
       expect(mockApi.ensureRepoLabels).toHaveBeenCalledWith("repo-atlas", ["bug"]),
     );
+  });
+
+  it("re-masks the armed warn row live when demo mode toggles ON after enabling (PRD #886)", async () => {
+    // The warn row stores the RAW path and masks at the render site, so a demo-mode toggle
+    // taken AFTER the row is armed must live-update the displayed path. Regression against
+    // baking maskRepoPath into state at enable-time, which froze the mask.
+    mockApi.checkRepoLabels.mockResolvedValue({ missing: ["bug"] });
+    const onEnable = vi.fn(async () => {});
+    renderTab({ onEnable });
+
+    // Arm the warn with demo OFF: enable the sweep on a repo missing the "bug" label.
+    fireEvent.click(screen.getByLabelText("vtmocanu/atlas-api"));
+    fireEvent.click(screen.getByRole("button", { name: /Enable/ }));
+    await waitFor(() => expect(onEnable).toHaveBeenCalled());
+
+    // Demo OFF: the warn names the real repo path.
+    expect(await screen.findByText(/exist on vtmocanu\/atlas-api/)).toBeTruthy();
+
+    // Toggle demo ON — the already-armed warn row must re-render with the masked path.
+    act(() => setDemoMode(true));
+    expect(await screen.findByText(/exist on demo\/atlas-api/)).toBeTruthy();
+    expect(screen.queryByText(/exist on vtmocanu\/atlas-api/)).toBeNull();
   });
 });

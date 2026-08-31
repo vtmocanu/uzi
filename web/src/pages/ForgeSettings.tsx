@@ -9,6 +9,8 @@ import { privilegeBadge } from "../lib/privilege";
 import { forgePlatform } from "../lib/forgeNoun";
 import { inferForgeType, defaultUrlForType } from "../lib/forgeInfer";
 import { DOC_BOT_SETUP_FORGEJO, DOC_BOT_SETUP_GITHUB, DOC_BOT_SETUP_GITLAB } from "../lib/doclinks";
+import { useDemoMode } from "../lib/demoMode";
+import { maskHost, maskRepoPath, maskUsername } from "../lib/demoMask";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, PasswordInput, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
 import { DocLink } from "../components/DocLink";
@@ -77,6 +79,7 @@ function connectHints(forgeType: string): ConnectHints {
 }
 
 export function ForgeSettings() {
+  const demo = useDemoMode();
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
   const [allowedUrls, setAllowedUrls] = useState<string[]>([]);
   const [baseUrl, setBaseUrl] = useState("");
@@ -146,7 +149,7 @@ export function ForgeSettings() {
     try {
       const { connection } = await api.createConnection(baseUrl, token, forgeType);
       setToken("");
-      setNotice(`Connected as ${connection.bot_username}.`);
+      setNotice(`Connected as ${maskUsername(connection.bot_username, "bot", demo)}.`);
       await load();
     } catch (err) {
       if (err instanceof ApiError && err.status === 422) {
@@ -166,7 +169,7 @@ export function ForgeSettings() {
     setBusyId(id);
     try {
       const { connection } = await api.verifyConnection(id);
-      setNotice(`Verified ${connection.bot_username}.`);
+      setNotice(`Verified ${maskUsername(connection.bot_username, "bot", demo)}.`);
       await load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Verify failed");
@@ -222,7 +225,7 @@ export function ForgeSettings() {
       } else {
         setNotice(
           connection.human_username
-            ? `Saved your forge username: ${connection.human_username}.`
+            ? `Saved your forge username: ${maskUsername(connection.human_username, "human", demo)}.`
             : "Forge username cleared.",
         );
       }
@@ -385,10 +388,10 @@ export function ForgeSettings() {
                     <Fragment key={c.id}>
                       <tr>
                         <td className="px-4 py-3">
-                          <span className="font-medium text-fg">{c.bot_username}</span>{" "}
+                          <span className="font-medium text-fg">{maskUsername(c.bot_username, "bot", demo)}</span>{" "}
                           <Badge>{c.forge_type}</Badge>
                         </td>
-                        <td className="px-4 py-3 text-muted">{c.base_url}</td>
+                        <td className="px-4 py-3 text-muted">{maskHost(c.base_url, demo)}</td>
                         <td className="px-4 py-3">
                           <div className="flex flex-col items-start gap-0.5">
                             {expandable ? (
@@ -477,7 +480,7 @@ export function ForgeSettings() {
           <div className="mt-4 space-y-5">
             {connections.map((c) => (
               <div key={c.id} className="space-y-3">
-                <Field label={`Your username on ${c.base_url}`}>
+                <Field label={`Your username on ${maskHost(c.base_url, demo)}`}>
                   <Input
                     autoComplete="off"
                     placeholder="your-forge-username"
@@ -509,6 +512,7 @@ export function ForgeSettings() {
 // PrivilegeFindings renders the token + per-repo findings of one report. A clean
 // report says so explicitly rather than showing an empty panel.
 function PrivilegeFindings({ report }: { report: PrivilegeReport }) {
+  const demo = useDemoMode();
   const clean =
     report.token.violations.length === 0 &&
     report.token.warnings.length === 0 &&
@@ -530,7 +534,7 @@ function PrivilegeFindings({ report }: { report: PrivilegeReport }) {
         const warnings = r.findings.filter((f) => f.severity === "warn").map((f) => f.message);
         return (
           <div key={r.repo_id}>
-            <p className="font-medium text-fg">{r.path}</p>
+            <p className="font-medium text-fg">{maskRepoPath(r.path, demo)}</p>
             {r.findings.length === 0 ? (
               <p className="text-xs text-muted">Developer on a protected default branch.</p>
             ) : (

@@ -11,7 +11,9 @@ import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type Branding, type BuildInfo, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
 import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
-import { cx } from "./ui";
+import { cx, Toggle } from "./ui";
+import { useDemoMode, setDemoMode } from "../lib/demoMode";
+import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
@@ -608,6 +610,12 @@ function SidebarContent({
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const demoMode = useDemoMode();
+  // Single masked identity label (PRD #886 M3). Preserve the raw display_name ?? email
+  // fallback precedence, masking whichever branch is chosen, and derive the initial from
+  // the masked label so it matches the shown name (decision 7: Vlad → V, not the raw one).
+  const identityLabel = user ? (user.display_name ? maskName(user.display_name, demoMode) : maskEmail(user.email, demoMode)) : "";
+  const identityInitial = identityLabel[0]?.toUpperCase() ?? "?";
   const build = useBuildInfoSnapshot();
   const branding = useBranding();
   const showName = appMarkShowName(branding);
@@ -739,7 +747,7 @@ function SidebarContent({
                 key={r.id}
                 to={`/repos/${r.id}/board`}
                 icon={forgeIcon(forgeTypeById[r.connection_id])}
-                label={r.path_with_namespace}
+                label={maskRepoPath(r.path_with_namespace, demoMode)}
                 indent
                 onNavigate={onNavigate}
               />
@@ -846,10 +854,10 @@ function SidebarContent({
                   Settings and the app-wide banner. */}
               <VaultBadge compact />
               <span
-                title={`${user.display_name ?? user.email} · ${user.is_admin ? "Administrator" : "User"}`}
+                title={`${identityLabel} · ${user.is_admin ? "Administrator" : "User"}`}
                 className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-raised text-xs font-semibold text-muted"
               >
-                {(user.display_name?.[0] ?? user.email[0] ?? "?").toUpperCase()}
+                {identityInitial}
               </span>
               <button
                 onClick={handleLogout}
@@ -882,11 +890,11 @@ function SidebarContent({
               </div>
               <div className="flex items-center gap-2">
                 <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-raised text-xs font-semibold text-muted">
-                  {(user.display_name?.[0] ?? user.email[0] ?? "?").toUpperCase()}
+                  {identityInitial}
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-xs font-medium text-fg">
-                    {user.display_name ?? user.email}
+                    {identityLabel}
                   </span>
                   <span className="block truncate text-[11px] text-faint">
                     {user.is_admin ? "Administrator" : "User"}
@@ -917,6 +925,23 @@ function SidebarContent({
                     </button>
                   </>
                 )}
+              </div>
+              {/* Demo-mode quick toggle (PRD #886 M2). A menu-style row inside the
+                  sidebar chrome — NOT a floating/overlay badge, which would land in
+                  the screenshot. Shows the state ("Demo mode: On/Off") as the cue and
+                  is wired to the same per-device store as the Settings toggle, so both
+                  and the whole UI update live in this tab. Rendered only in the
+                  expanded cluster (the home for it); the collapsed rail is left
+                  uncluttered — demo mode is toggled from the expanded rail or Settings. */}
+              <div className="mt-1 flex items-center justify-between gap-2 rounded-md px-1 py-1.5">
+                <span className="truncate text-xs font-medium text-fg">
+                  Demo mode: {demoMode ? "On" : "Off"}
+                </span>
+                <Toggle
+                  checked={demoMode}
+                  onChange={setDemoMode}
+                  label="Demo mode"
+                />
               </div>
               {/* Claude rate-limit micro-meters (PRD #53): two 5px bars under the
                   user block. Self-gates — renders nothing without a live reading. */}

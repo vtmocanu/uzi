@@ -7,6 +7,8 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type CliToken, type CliTokenScope } from "../lib/api";
 import { CLI_TOKEN_STALE_DAYS, isCliTokenStale } from "../lib/cliTokens";
+import { useDemoMode } from "../lib/demoMode";
+import { maskIp } from "../lib/demoMask";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle } from "./ui";
 import { ScopePicker } from "./ScopePicker";
 import { KeyIcon } from "./icons";
@@ -264,6 +266,7 @@ function Skeletons() {
 }
 
 function TokenRow({ token, onRevoke }: { token: CliToken; onRevoke: () => void }) {
+  const demo = useDemoMode();
   const stale = isCliTokenStale(token);
   return (
     <li
@@ -301,7 +304,7 @@ function TokenRow({ token, onRevoke }: { token: CliToken; onRevoke: () => void }
                 ? `last used ${new Date(token.last_used_at).toLocaleString()}`
                 : "never used"}
             </span>
-            <span>· {token.last_used_ip ? `from ${token.last_used_ip}` : "no IP recorded"}</span>
+            <span>· {token.last_used_ip ? `from ${maskIp(token.last_used_ip, demo)}` : "no IP recorded"}</span>
             {token.expires_at && <span>· expires {new Date(token.expires_at).toLocaleDateString()}</span>}
           </div>
         </div>

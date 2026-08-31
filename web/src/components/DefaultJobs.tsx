@@ -17,6 +17,8 @@
 
 import { useState } from "react";
 import type { CatalogEntry, Repo, Schedule, ScheduleCatalog } from "../lib/api";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 import { humanizeCron } from "../lib/schedulePresets";
 import { RepoMultiSelect } from "./RepoMultiSelect";
 import { ScheduleGroupRow, ScheduleSubRow } from "./ScheduleGroupRow";
@@ -66,6 +68,7 @@ export function DefaultJobs({
   notice: string;
   error: string;
 }) {
+  const demo = useDemoMode();
   // The shared repo selection driving every entry's Enable button (guardrail: a row's
   // Enable renders only when at least one selected repo is not already enabled on it).
   const [selectedRepos, setSelectedRepos] = useState<string[]>([]);
@@ -95,6 +98,9 @@ export function DefaultJobs({
       setWarnTargets(
         repoIds.map((rid) => ({
           repoId: rid,
+          // Store the RAW path, not a masked snapshot: masking here would freeze the
+          // demo-mode state at enable-time, so a later toggle would not live-update the
+          // armed warn rows. maskRepoPath is applied live at the render site below.
           repoPath: repos.find((r) => r.id === rid)?.path_with_namespace ?? "",
           labels,
         })),
@@ -138,7 +144,7 @@ export function DefaultJobs({
             <SweepLabelWarn
               key={`${w.repoId}-${w.labels.join(",")}`}
               repoId={w.repoId}
-              repoPath={w.repoPath}
+              repoPath={maskRepoPath(w.repoPath, demo)}
               labels={w.labels}
             />
           ))}
@@ -372,12 +378,14 @@ function SubRow({
   onRemove: () => void;
   onEdit: () => void;
 }) {
+  const demo = useDemoMode();
+  const repoPath = maskRepoPath(s.repo_path, demo);
   const nextFire = s.next_fires[0] ?? s.next_fire_at;
   const [expanded, setExpanded] = useState(false);
   const panelId = `last-fire-${s.id}`;
   return (
     <ScheduleSubRow
-      repoLabel={s.repo_path || s.repo_id}
+      repoLabel={s.repo_path ? repoPath : s.repo_id}
       enabled={s.enabled}
       cronExpr={s.cron_expr}
       nextFire={nextFire}
@@ -411,21 +419,21 @@ function SubRow({
       }
       actions={
         <>
-          <Button variant="ghost" size="sm" title="Run now" aria-label={`Run now on ${s.repo_path}`} disabled={busy} onClick={onRunNow}>
+          <Button variant="ghost" size="sm" title="Run now" aria-label={`Run now on ${repoPath}`} disabled={busy} onClick={onRunNow}>
             <PlayIcon />
           </Button>
-          <Button variant="ghost" size="sm" title="Edit settings" aria-label={`Edit ${entry.name} on ${s.repo_path}`} onClick={onEdit}>
+          <Button variant="ghost" size="sm" title="Edit settings" aria-label={`Edit ${entry.name} on ${repoPath}`} onClick={onEdit}>
             <PencilIcon />
           </Button>
-          <Button variant="ghost" size="sm" title="Clone to an editable copy" aria-label={`Clone ${entry.name} on ${s.repo_path}`} disabled={busy} onClick={onClone}>
+          <Button variant="ghost" size="sm" title="Clone to an editable copy" aria-label={`Clone ${entry.name} on ${repoPath}`} disabled={busy} onClick={onClone}>
             <CopyIcon />
           </Button>
           {!s.customized && (
-            <Button variant="ghost" size="sm" title="Reset to the catalog default" aria-label={`Reset ${entry.name} on ${s.repo_path}`} disabled={busy} onClick={onReset}>
+            <Button variant="ghost" size="sm" title="Reset to the catalog default" aria-label={`Reset ${entry.name} on ${repoPath}`} disabled={busy} onClick={onReset}>
               <RotateCcwIcon />
             </Button>
           )}
-          <Button variant="ghost" size="sm" title="Remove" aria-label={`Remove ${entry.name} on ${s.repo_path}`} disabled={busy} onClick={onRemove}>
+          <Button variant="ghost" size="sm" title="Remove" aria-label={`Remove ${entry.name} on ${repoPath}`} disabled={busy} onClick={onRemove}>
             <TrashIcon />
           </Button>
           {/* Already materialized: the resume/pause toggle is the affordance, not enable. */}
@@ -433,7 +441,7 @@ function SubRow({
             checked={s.enabled}
             onChange={onTogglePause}
             disabled={busy}
-            label={s.enabled ? `Pause on ${s.repo_path}` : `Resume on ${s.repo_path}`}
+            label={s.enabled ? `Pause on ${repoPath}` : `Resume on ${repoPath}`}
           />
         </>
       }
@@ -456,6 +464,7 @@ function EnableAnotherRepo({
   busy: boolean;
   onEnableRepo: (repoId: string) => void;
 }) {
+  const demo = useDemoMode();
   const available = repos.filter((r) => !materialized.has(r.id));
   const [repoId, setRepoId] = useState("");
   if (available.length === 0) {
@@ -475,7 +484,7 @@ function EnableAnotherRepo({
         <option value="">Choose a repo…</option>
         {available.map((r) => (
           <option key={r.id} value={r.id}>
-            {r.path_with_namespace}
+            {maskRepoPath(r.path_with_namespace, demo)}
           </option>
         ))}
       </select>

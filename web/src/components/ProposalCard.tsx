@@ -3,6 +3,8 @@ import { api, ApiError, isHttpsUrl, type CreatedIssue, type IssueProposal, type 
 import { Badge, Button } from "./ui";
 import { ExternalLinkIcon, FileTextIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 
 // ProposalCard renders a chat agent's issue draft (PRD #39 Decision 8) as a
 // human-gated card. The load-bearing rule: title/description/labels come from the
@@ -13,6 +15,7 @@ import { stripUnsafeChars } from "../lib/safeText";
 // on the human's Create click, and the resulting issue link comes from the confirm
 // response (CreatedIssue), not from any model text.
 export function ProposalCard({ chatId, proposal }: { chatId: string; proposal: IssueProposal }) {
+  const demo = useDemoMode();
   // The payload's status is the initial state; Create/Dismiss resolve it locally
   // (the run-message payload itself is immutable, and dismiss returns 204 no body).
   const [status, setStatus] = useState<ProposalStatus>(proposal.status);
@@ -67,7 +70,7 @@ export function ProposalCard({ chatId, proposal }: { chatId: string; proposal: I
             never these strings, so the raw values still round-trip. */}
         <div className="space-y-1">
           {proposal.repo_path && (
-            <p className="font-mono text-[11px] text-faint">{stripUnsafeChars(proposal.repo_path)}</p>
+            <p className="font-mono text-[11px] text-faint">{stripUnsafeChars(maskRepoPath(proposal.repo_path, demo))}</p>
           )}
           <p className="text-sm font-semibold text-fg">{stripUnsafeChars(proposal.title)}</p>
         </div>

@@ -21,6 +21,8 @@ import {
 } from "../lib/notifications";
 import { useJudgeTodo } from "../components/JudgeTodoContext";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
 
 // PAGE_SIZE matches the API's default page; Load-more fetches the next page.
 const PAGE_SIZE = 30;
@@ -36,6 +38,7 @@ function NotificationRow({
   canMarkRead: boolean;
   onMarkRead: (id: string) => void;
 }) {
+  const demo = useDemoMode();
   const unread = !n.read_at;
   const link = notificationLink(n.kind, n.run_id);
   return (
@@ -59,7 +62,13 @@ function NotificationRow({
             <p className="mt-0.5 text-sm text-muted">{notificationBody(n.payload)}</p>
           )}
           <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-faint">
-            {n.owner && <span>{n.owner.display_name ?? n.owner.email}</span>}
+            {n.owner && (
+              <span>
+                {n.owner.display_name
+                  ? maskName(n.owner.display_name, demo)
+                  : maskEmail(n.owner.email, demo)}
+              </span>
+            )}
             <span>{new Date(n.created_at).toLocaleString()}</span>
             {/* Kind-conditional (PRD #98 M5, Decision 4) — see notificationLink for why
                 this is a guard and not a URL edit. A judge ping opens the cross-run
@@ -102,6 +111,7 @@ function FindingNotificationRow({
   canMarkRead: boolean;
   onMarkRead: (id: string) => void;
 }) {
+  const demo = useDemoMode();
   const unread = !n.read_at;
   const rawCount = n.payload.count;
   const count = typeof rawCount === "number" && Number.isFinite(rawCount) ? rawCount : 0;
@@ -125,10 +135,16 @@ function FindingNotificationRow({
             </p>
           </div>
           {repoPath && (
-            <p className="mt-0.5 font-mono text-xs text-muted">{stripUnsafeChars(repoPath)}</p>
+            <p className="mt-0.5 font-mono text-xs text-muted">{stripUnsafeChars(maskRepoPath(repoPath, demo))}</p>
           )}
           <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-faint">
-            {n.owner && <span>{n.owner.display_name ?? n.owner.email}</span>}
+            {n.owner && (
+              <span>
+                {n.owner.display_name
+                  ? maskName(n.owner.display_name, demo)
+                  : maskEmail(n.owner.email, demo)}
+              </span>
+            )}
             <span>{new Date(n.created_at).toLocaleString()}</span>
             {link && (
               <Link to={link} className="font-medium text-brand hover:text-brand-hover">

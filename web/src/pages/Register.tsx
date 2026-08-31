@@ -3,6 +3,8 @@ import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type AuthConfig } from "../lib/api";
 import { emailDomainAllowed } from "../lib/emailDomain";
+import { useDemoMode } from "../lib/demoMode";
+import { maskDomains } from "../lib/demoMask";
 import { scorePassword } from "../lib/passwordStrength";
 import { Alert, Button, Card, Field, Input, Skeleton } from "../components/ui";
 
@@ -10,6 +12,7 @@ const MIN_PASSWORD = 12;
 
 export function Register() {
   const { register } = useAuth();
+  const demo = useDemoMode();
   const navigate = useNavigate();
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -48,7 +51,7 @@ export function Register() {
     // Client-side pre-validation of the domain allowlist. The server enforces the
     // same rule authoritatively; this just avoids a round-trip and a late 403.
     if (domainRestricted && !emailDomainAllowed(email, domains)) {
-      setError(`Registration is restricted to: ${domains.join(", ")}`);
+      setError(`Registration is restricted to: ${maskDomains(domains.join(", "), demo)}`);
       return;
     }
     setSubmitting(true);
@@ -139,7 +142,7 @@ export function Register() {
             />
             {domainRestricted && (
               <p className="mt-1 text-xs text-muted">
-                Only {domains.join(", ")} addresses may register.
+                Only {maskDomains(domains.join(", "), demo)} addresses may register.
               </p>
             )}
           </Field>
