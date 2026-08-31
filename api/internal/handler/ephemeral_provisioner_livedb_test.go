@@ -14,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // The end-to-end live-DB proof of PRD #529 M2's provisioner: the real
@@ -518,4 +519,79 @@ func TestEphemeralProvisionPassSaturationPlainRunLiveDB(t *testing.T) {
 	if rows[0].template != "base" {
 		t.Errorf("template = %q, want base (plain run)", rows[0].template)
 	}
+}
+
+// TestEphemeralProvisionBindModeLiveDB pins issue #804 in the REAL provisioner path
+// (ProvisionPass → provisionOne against real Postgres): an auto-provisioned burst worker
+// defaults to anthropic_bind_mode 'auto' ONLY when its owner has a non-empty auto-select
+// pool (≥1 auto_eligible anthropic_token), and 'default' otherwise — so an auto worker
+// never parks its run in pool_wait on an empty pool. This is the CI-gating home for the
+// decision (run-store-it.sh sweeps `-run 'LiveDB$'` over the handler package); the
+// store-package LiveDB tests separately pin the UserHasAutoEligibleAnthropicToken read and
+// the CreateEphemeralHostedWorker persistence it composes.
+func TestEphemeralProvisionBindModeLiveDB(t *testing.T) {
+	insertToken := func(fx *ephemeralFixture, label string, first bool) uuid.UUID {
+		fx.t.Helper()
+		row, err := fx.q.InsertUserSecret(fx.ctx, store.InsertUserSecretParams{
+			UserID: fx.userID, Kind: store.KindAnthropicToken, Label: label, WantDefault: first,
+			Ciphertext: []byte("ct-" + label), SealedWith: store.SealedWithMaster,
+		})
+		if err != nil {
+			fx.t.Fatalf("insert token %s: %v", label, err)
+		}
+		return row.ID
+	}
+	// provisionAndReadMode drives a capability-gap provision for the fixture user (a docker
+	// run its base-only fleet cannot serve) and returns the created worker's persisted
+	// anthropic_bind_mode.
+	provisionAndReadMode := func(fx *ephemeralFixture) string {
+		fx.t.Helper()
+		fx.onlineWorker("base-only", false) // base fleet cannot satisfy docker
+		runID := fx.queuedRun([]string{"docker"})
+		if _, err := fx.provisioner(true, 2).ProvisionPass(fx.ctx); err != nil {
+			fx.t.Fatalf("ProvisionPass: %v", err)
+		}
+		var mode string
+		if err := fx.pool.QueryRow(fx.ctx,
+			`SELECT anthropic_bind_mode FROM workers WHERE ephemeral_run_id = $1 AND ephemeral`, runID).Scan(&mode); err != nil {
+			fx.t.Fatalf("read bind mode: %v", err)
+		}
+		return mode
+	}
+
+	// An owner with ≥1 auto_eligible token (here: a born-eligible first token plus a second
+	// opted-out token) → the pool is non-empty → auto.
+	t.Run("eligible_token_owner_auto", func(t *testing.T) {
+		fx := newEphemeralFixture(t, true)
+		insertToken(fx, "default", true)      // first token, born auto_eligible (issue #804)
+		insertToken(fx, "console-key", false) // a second, non-eligible token; pool still non-empty
+		if got := provisionAndReadMode(fx); got != workersvc.BindModeAuto {
+			t.Errorf("anthropic_bind_mode = %q, want %q (owner has ≥1 auto_eligible token)", got, workersvc.BindModeAuto)
+		}
+	})
+
+	// An owner whose ONLY token is not eligible (born eligible, then opted out) → empty pool
+	// → default, so the run is never parked in pool_wait.
+	t.Run("opted_out_only_owner_default", func(t *testing.T) {
+		fx := newEphemeralFixture(t, true)
+		tok := insertToken(fx, "default", true)
+		if _, err := fx.q.SetUserSecretAutoEligible(fx.ctx, store.SetUserSecretAutoEligibleParams{
+			ID: tok, UserID: fx.userID, Kind: store.KindAnthropicToken, AutoEligible: false,
+		}); err != nil {
+			t.Fatalf("opt token out: %v", err)
+		}
+		if got := provisionAndReadMode(fx); got != workersvc.BindModeDefault {
+			t.Errorf("anthropic_bind_mode = %q, want %q (empty auto-select pool must not select auto)", got, workersvc.BindModeDefault)
+		}
+	})
+
+	// A single-token owner, eligible purely via the born-eligible first-token insert (no
+	// toggle) → auto. This is the headline #804 case: single-token users get auto for free.
+	t.Run("single_token_owner_auto", func(t *testing.T) {
+		fx := newEphemeralFixture(t, true)
+		insertToken(fx, "default", true) // sole token, born auto_eligible via insert
+		if got := provisionAndReadMode(fx); got != workersvc.BindModeAuto {
+			t.Errorf("anthropic_bind_mode = %q, want %q (single born-eligible token)", got, workersvc.BindModeAuto)
+		}
+	})
 }

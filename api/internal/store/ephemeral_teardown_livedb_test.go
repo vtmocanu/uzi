@@ -22,13 +22,14 @@ import (
 func seedEphemeralWorkerBound(fx *fleetFixture, runID uuid.UUID) uuid.UUID {
 	fx.t.Helper()
 	w, err := fx.q.CreateEphemeralHostedWorker(fx.ctx, store.CreateEphemeralHostedWorkerParams{
-		UserID:           fx.userID,
-		Name:             "ephemeral-" + runID.String(),
-		TokenHash:        tokenHash(),
-		TemplateDeclared: pgtype.Text{String: "base", Valid: true},
-		HostedSize:       pgtype.Text{String: "m", Valid: true},
-		DockerEnabled:    pgtype.Bool{Bool: true, Valid: true},
-		EphemeralRunID:   runID,
+		UserID:            fx.userID,
+		Name:              "ephemeral-" + runID.String(),
+		TokenHash:         tokenHash(),
+		TemplateDeclared:  pgtype.Text{String: "base", Valid: true},
+		HostedSize:        pgtype.Text{String: "m", Valid: true},
+		DockerEnabled:     pgtype.Bool{Bool: true, Valid: true},
+		EphemeralRunID:    runID,
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		fx.t.Fatalf("CreateEphemeralHostedWorker: %v", err)

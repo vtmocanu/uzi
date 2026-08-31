@@ -102,19 +102,20 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 }
 
 const createEphemeralHostedWorker = `-- name: CreateEphemeralHostedWorker :one
-INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id)
-VALUES ($1, $2, $3, $4, 'hosted', $5, $6, true, $7::uuid)
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode)
+VALUES ($1, $2, $3, $4, 'hosted', $5, $6, true, $7::uuid, $8)
 RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id
 `
 
 type CreateEphemeralHostedWorkerParams struct {
-	UserID           uuid.UUID   `json:"user_id"`
-	Name             string      `json:"name"`
-	TokenHash        []byte      `json:"token_hash"`
-	TemplateDeclared pgtype.Text `json:"template_declared"`
-	HostedSize       pgtype.Text `json:"hosted_size"`
-	DockerEnabled    pgtype.Bool `json:"docker_enabled"`
-	EphemeralRunID   uuid.UUID   `json:"ephemeral_run_id"`
+	UserID            uuid.UUID   `json:"user_id"`
+	Name              string      `json:"name"`
+	TokenHash         []byte      `json:"token_hash"`
+	TemplateDeclared  pgtype.Text `json:"template_declared"`
+	HostedSize        pgtype.Text `json:"hosted_size"`
+	DockerEnabled     pgtype.Bool `json:"docker_enabled"`
+	EphemeralRunID    uuid.UUID   `json:"ephemeral_run_id"`
+	AnthropicBindMode string      `json:"anthropic_bind_mode"`
 }
 
 // Insert a run-bound EPHEMERAL hosted worker (PRD #529 M2). It is CreateHostedWorker
@@ -132,6 +133,10 @@ type CreateEphemeralHostedWorkerParams struct {
 // requires template_declared/hosted_size NOT NULL on a hosted row, docker_enabled an
 // explicit true/false). ephemeral_run_id is cast to a non-null uuid so the param is a
 // plain uuid.UUID: the provisioner always has a concrete run to bind to.
+//
+// anthropic_bind_mode is now caller-supplied (issue #804): the provisioner passes `auto`
+// when the owner has ≥1 auto_eligible anthropic_token (a non-empty auto-select pool) and
+// `default` otherwise, so an auto worker never parks a run in pool_wait on an empty pool.
 func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEphemeralHostedWorkerParams) (Worker, error) {
 	row := q.db.QueryRow(ctx, createEphemeralHostedWorker,
 		arg.UserID,
@@ -141,6 +146,7 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 		arg.HostedSize,
 		arg.DockerEnabled,
 		arg.EphemeralRunID,
+		arg.AnthropicBindMode,
 	)
 	var i Worker
 	err := row.Scan(
