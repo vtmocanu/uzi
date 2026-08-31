@@ -11,7 +11,8 @@ import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type Branding, type BuildInfo, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
 import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
-import { cx } from "./ui";
+import { cx, Toggle } from "./ui";
+import { useDemoMode, setDemoMode } from "../lib/demoMode";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
@@ -608,6 +609,7 @@ function SidebarContent({
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const demoMode = useDemoMode();
   const build = useBuildInfoSnapshot();
   const branding = useBranding();
   const showName = appMarkShowName(branding);
@@ -917,6 +919,23 @@ function SidebarContent({
                     </button>
                   </>
                 )}
+              </div>
+              {/* Demo-mode quick toggle (PRD #886 M2). A menu-style row inside the
+                  sidebar chrome — NOT a floating/overlay badge, which would land in
+                  the screenshot. Shows the state ("Demo mode: On/Off") as the cue and
+                  is wired to the same per-device store as the Settings toggle, so both
+                  and the whole UI update live in this tab. Rendered only in the
+                  expanded cluster (the home for it); the collapsed rail is left
+                  uncluttered — demo mode is toggled from the expanded rail or Settings. */}
+              <div className="mt-1 flex items-center justify-between gap-2 rounded-md px-1 py-1.5">
+                <span className="truncate text-xs font-medium text-fg">
+                  Demo mode: {demoMode ? "On" : "Off"}
+                </span>
+                <Toggle
+                  checked={demoMode}
+                  onChange={setDemoMode}
+                  label="Demo mode"
+                />
               </div>
               {/* Claude rate-limit micro-meters (PRD #53): two 5px bars under the
                   user block. Self-gates — renders nothing without a live reading. */}

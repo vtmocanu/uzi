@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type SecretMeta } from "../lib/api";
-import { Alert, Button, Card, Field, SectionTitle, Select } from "../components/ui";
+import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "../components/ui";
 import { AnthropicTokens } from "../components/AnthropicTokens";
 import { SettingsShell } from "../components/SettingsShell";
 import { RateLimitCard } from "../components/RateLimitMeters";
@@ -19,6 +19,7 @@ import { SlackNotifications } from "../components/SlackNotifications";
 import { prefs } from "../lib/prefs";
 import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
 import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/theme";
+import { useDemoMode, setDemoMode } from "../lib/demoMode";
 
 // One-time dismissal (per browser) of the rotate-your-legacy-token reminder.
 const ROTATE_NOTICE_KEY = "uzi.vault.rotateNoticeDismissed";
@@ -89,6 +90,11 @@ export function Settings() {
   // from the server, reverting the optimistic stamp.
   const [themeBusy, setThemeBusy] = useState(false);
   const [themeError, setThemeError] = useState("");
+
+  // Demo mode: per-device localStorage flag (NOT the server-backed theme above),
+  // so it deliberately gets its own card below Appearance rather than sitting
+  // beside the "follows you across browsers" control. Live via useDemoMode().
+  const demoMode = useDemoMode();
 
   const changeTheme = async (value: string) => {
     setThemeError("");
@@ -203,6 +209,32 @@ export function Settings() {
               ))}
             </Select>
           </Field>
+        </div>
+      </Card>
+
+      {/* Demo mode (PRD #886). Deliberately its OWN card below Appearance so it is
+          not confused with the server-backed theme control that "follows you across
+          browsers" — this one is per-device (localStorage) and screenshot-only. */}
+      <Card className="space-y-5">
+        <div>
+          <SectionTitle>Demo mode</SectionTitle>
+          <p id="demo-mode-desc" className="mt-2 text-sm text-muted">
+            This device only. Masks emails, repo names, forge host, and other
+            identifying info in what you see — for screenshots. Doesn&apos;t change
+            your data or affect anyone else.
+          </p>
+        </div>
+
+        <div className="flex items-center justify-between rounded-lg border border-edge bg-raised/60 px-4 py-3">
+          <span className="text-sm font-medium text-fg">
+            Demo mode: {demoMode ? "On" : "Off"}
+          </span>
+          <Toggle
+            checked={demoMode}
+            onChange={setDemoMode}
+            label="Demo mode"
+            aria-describedby="demo-mode-desc"
+          />
         </div>
       </Card>
 
