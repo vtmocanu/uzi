@@ -778,10 +778,14 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    do NOT flip their formal verdict back to *approved*: they re-review as a plain
    *comment*, or on a clean pass post nothing at all, so the forge's computed
    review-decision / merge-state can stay *changes-requested* / *blocked* long after
-   every finding is addressed. Do not read that stale verdict as an open finding. The
-   reliable "satisfied" signals on the current head are the bot's own **check-run
-   conclusion** (green) and **zero unresolved, non-outdated review threads**. Once
-   those hold and CI is green, an admin merge past the stale bot verdict is
+   every finding is addressed. Do not read that stale verdict as an open finding — but
+   do not merge on a green reviewer check ALONE either: a bot's check-run can read
+   green for an EARLIER commit, so a green check is not proof it reviewed what you are
+   about to merge. First confirm the bot actually reviewed your **current head SHA**
+   (its latest review or walkthrough names a commit range ending at that SHA), and
+   only THEN take its **check-run conclusion** (green) plus **zero unresolved,
+   non-outdated review threads** as the "satisfied" signal. Once those hold on the
+   current head and CI is green, an admin merge past the stale bot verdict is
    legitimate — distinguish it from a genuine block (a failing required check, or a
    live unresolved thread), which still stops you.
 
