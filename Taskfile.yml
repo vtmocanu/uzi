@@ -184,6 +184,16 @@ tasks:
     cmds:
       - task --list
 
+  # NOT a gate target and NOT under gate: it WRITES the tree (a .env with fresh
+  # secrets) and is a convenience entry point for the laptop dev loop, not a check.
+  # The script is the source of truth (docs point at it directly for the no-`task`
+  # new-user path); this just gives `task init` the same one-liner. Generate-once:
+  # re-running is a no-op when .env exists (issue #894).
+  init:
+    desc: generate the local docker-compose secrets into .env once (no-op if .env exists)
+    cmds:
+      - ./scripts/init-env.sh
+
   gate:
     desc: The whole gate, repo-wide checks then every component, serially
     cmds:

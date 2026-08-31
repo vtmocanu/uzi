@@ -5,13 +5,14 @@ AI dark factory. Local laptop demo: Go API + React SPA + PostgreSQL, run via doc
 ## Quick Start
 
 ```sh
-cp .env.example .env
-# set JWT_SECRET, UZI_SECRET_KEY and POSTGRES_PASSWORD in .env, e.g.:
-#   openssl rand -hex 64      -> JWT_SECRET
-#   openssl rand -base64 32   -> UZI_SECRET_KEY
-#   openssl rand -hex 24      -> POSTGRES_PASSWORD
+./scripts/init-env.sh   # generate JWT_SECRET, UZI_SECRET_KEY, POSTGRES_PASSWORD into .env (once)
 docker compose up
 ```
+
+`init-env.sh` writes `.env` only if it is absent and never regenerates, so the
+encryption key and Postgres password stay stable across restarts. Prefer to set
+them by hand? `cp .env.example .env` and fill the three values in (`openssl rand
+-hex 64` / `-base64 32` / `-hex 24` respectively).
 
 Open <http://127.0.0.1:8080> and register. The first registered account becomes admin — or set `UZI_SEED_EMAIL`/`UZI_SEED_PASSWORD` in `.env` to provision an admin automatically at startup (see [configuration.md](docs/configuration.md)). Admins can define agent templates under **Agents**; any user can connect their own Anthropic token under **Settings** (see [docs/anthropic-token.md](docs/anthropic-token.md)).
 

@@ -23,15 +23,25 @@ cd uzi
 ## Configure
 
 ```sh
-cp .env.example .env
+./scripts/init-env.sh
 ```
 
-Fill in the two required values (both refused at boot / by compose if left empty):
+This generates the three required secrets and writes them to `.env` (starting from
+`.env.example`, so every other option stays documented and editable):
 
-- `JWT_SECRET` — `openssl rand -hex 64`
-- `POSTGRES_PASSWORD` — `openssl rand -hex 24`
+- `JWT_SECRET`: session signing key (`openssl rand -hex 64`)
+- `UZI_SECRET_KEY`: base64 master key that encrypts secrets at rest (`openssl rand -base64 32`)
+- `POSTGRES_PASSWORD`: bundled Postgres password (`openssl rand -hex 24`)
 
-The rest have sane defaults for local use. See [configuration.md](configuration.md) for the full list.
+All three are refused at boot / by compose if left empty. The script is
+**generate-once**: it writes `.env` only if it is absent and never regenerates,
+because `UZI_SECRET_KEY` (rotating it makes stored tokens undecryptable) and
+`POSTGRES_PASSWORD` (only used to init the `pgdata` volume on first run) must stay
+stable. The rest have sane defaults for local use; see
+[configuration.md](configuration.md) for the full list.
+
+Prefer to do it by hand? `cp .env.example .env` and fill those three values in.
+With `task` installed, `task init` runs the same script.
 
 ## Run
 
