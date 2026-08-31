@@ -27,10 +27,10 @@ browser. It does not follow you to another browser or device.
 
 ## What it masks
 
-- **Email and display name** → a first name (e.g. `vlad.mocanu@company.com`
-  or `Vlad Mocanu` → `Vlad`). A handle-style email with no separator can't be
+- **Email and display name** → a first name (e.g. `ada.lovelace@example.com`
+  or `Ada Lovelace` → `Ada`). A handle-style email with no separator can't be
   told apart from a bare first name, so it collapses to the neutral `User`
-  instead (e.g. `vtmocanu@gmail.com` → `User`)
+  instead (e.g. `alovelace@example.com` → `User`)
 - **Repo owner/namespace** → `demo/<repo>` (e.g. `vtmocanu/uzi` →
   `demo/uzi`)
 - **Forge host / base URL** → `https://forge.example.com`

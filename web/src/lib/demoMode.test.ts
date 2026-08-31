@@ -60,14 +60,20 @@ describe("isDemoMode / setDemoMode", () => {
     expect(isDemoMode()).toBe(false);
   });
 
-  it("swallows a throwing setItem instead of raising", () => {
+  it("swallows a throwing setItem and leaves both the store and the hook off", () => {
     vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
       throw new Error("quota exceeded");
     });
-    expect(() => setDemoMode(true)).not.toThrow();
+    const { result } = renderHook(() => useDemoMode());
+    expect(result.current).toBe(false);
+    expect(() => act(() => setDemoMode(true))).not.toThrow();
     // The write failed, so the persisted flag never changed: demo mode stays off rather
-    // than silently reporting on.
+    // than silently reporting on. Assert via BOTH channels — the direct read AND the hook
+    // value. The hook returns the cached snapshot, which setDemoMode must recompute from
+    // the store after the throw (not blindly trust `on`); isDemoMode() alone re-reads the
+    // store and so would pass even if the cache went stale-true.
     expect(isDemoMode()).toBe(false);
+    expect(result.current).toBe(false);
   });
 });
 
