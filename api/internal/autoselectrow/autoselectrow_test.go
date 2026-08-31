@@ -203,14 +203,17 @@ func TestFromCandidateRow_CarriesInFlightAndDelegates(t *testing.T) {
 func TestFromAdminRateLimitRow_UnwrapsNullables(t *testing.T) {
 	sid := uuid.New()
 	synced := time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC)
+	fiveReset := time.Date(2026, 8, 3, 14, 0, 0, 0, time.UTC)
 
 	got := FromAdminRateLimitRow(store.ListRateLimitsRow{
-		UserSecretID: pgtype.UUID{Bytes: [16]byte(sid), Valid: true},
-		Label:        pgtype.Text{String: "admin-token", Valid: true},
-		AutoEligible: pgtype.Bool{Bool: true, Valid: true},
-		FiveHourPct:  pgtype.Int2{Int16: 72, Valid: true},
-		SevenDayPct:  pgtype.Int2{Valid: false},
-		SyncedAt:     pgtype.Timestamptz{Time: synced, Valid: true},
+		UserSecretID:     pgtype.UUID{Bytes: [16]byte(sid), Valid: true},
+		Label:            pgtype.Text{String: "admin-token", Valid: true},
+		AutoEligible:     pgtype.Bool{Bool: true, Valid: true},
+		FiveHourPct:      pgtype.Int2{Int16: 72, Valid: true},
+		FiveHourResetsAt: pgtype.Timestamptz{Time: fiveReset, Valid: true},
+		SevenDayPct:      pgtype.Int2{Valid: false},
+		SevenDayResetsAt: pgtype.Timestamptz{Valid: false},
+		SyncedAt:         pgtype.Timestamptz{Time: synced, Valid: true},
 	})
 
 	if got.SecretID != sid {
@@ -228,7 +231,13 @@ func TestFromAdminRateLimitRow_UnwrapsNullables(t *testing.T) {
 	if got.FiveHourPct == nil || *got.FiveHourPct != 72 {
 		t.Errorf("FiveHourPct = %v, want *72", got.FiveHourPct)
 	}
+	if got.FiveResetsAt == nil || !got.FiveResetsAt.Equal(fiveReset) {
+		t.Errorf("FiveResetsAt = %v, want *%v (delegated through the admin twin)", got.FiveResetsAt, fiveReset)
+	}
 	if got.SevenDayPct != nil {
 		t.Errorf("SevenDayPct = %v, want nil (invalid column)", got.SevenDayPct)
+	}
+	if got.SevenResetsAt != nil {
+		t.Errorf("SevenResetsAt = %v, want nil (invalid column)", got.SevenResetsAt)
 	}
 }
