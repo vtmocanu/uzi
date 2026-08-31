@@ -28,11 +28,14 @@ browser. It does not follow you to another browser or device.
 ## What it masks
 
 - **Email and display name** → a first name (e.g. `vlad.mocanu@company.com`
-  → `Vlad`)
+  or `Vlad Mocanu` → `Vlad`). A handle-style email with no separator can't be
+  told apart from a bare first name, so it collapses to the neutral `User`
+  instead (e.g. `vtmocanu@gmail.com` → `User`)
 - **Repo owner/namespace** → `demo/<repo>` (e.g. `vtmocanu/uzi` →
   `demo/uzi`)
 - **Forge host / base URL** → `https://forge.example.com`
-- **Forge usernames** → `demo-user` (human) / `demo-bot` (bot)
+- **Forge usernames** (including issue and board authors) → `demo-user`
+  (human) / `demo-bot` (bot)
 - **CLI token last-used IP** → `203.0.113.7`
 - **Registration email-domain allowlist** → `example.com`
 

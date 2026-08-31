@@ -98,7 +98,10 @@ export function DefaultJobs({
       setWarnTargets(
         repoIds.map((rid) => ({
           repoId: rid,
-          repoPath: maskRepoPath(repos.find((r) => r.id === rid)?.path_with_namespace ?? "", demo),
+          // Store the RAW path, not a masked snapshot: masking here would freeze the
+          // demo-mode state at enable-time, so a later toggle would not live-update the
+          // armed warn rows. maskRepoPath is applied live at the render site below.
+          repoPath: repos.find((r) => r.id === rid)?.path_with_namespace ?? "",
           labels,
         })),
       );
@@ -141,7 +144,7 @@ export function DefaultJobs({
             <SweepLabelWarn
               key={`${w.repoId}-${w.labels.join(",")}`}
               repoId={w.repoId}
-              repoPath={w.repoPath}
+              repoPath={maskRepoPath(w.repoPath, demo)}
               labels={w.labels}
             />
           ))}

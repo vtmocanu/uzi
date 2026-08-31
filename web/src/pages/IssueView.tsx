@@ -17,7 +17,7 @@ import { ScheduleModal } from "../components/ScheduleModal";
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
-import { maskName } from "../lib/demoMask";
+import { maskUsername } from "../lib/demoMask";
 
 // columnLabel names the column the issue sits in, for the header chip. "Backlog"
 // is the display name of the implicit column (PRD #102 M1) — the stored column is
@@ -259,7 +259,7 @@ export function IssueView() {
                       assigned
                     </Badge>
                   ))}
-                {issue.author && <span className="text-xs text-faint">{maskName(issue.author, demo)}</span>}
+                {issue.author && <span className="text-xs text-faint">{maskUsername(issue.author, "human", demo)}</span>}
                 {/* Neutral PRD-presence marker (PRD #764): a linked prds/*.md is optional
                     but still detected, so an issue that has one shows a quiet "PRD" badge. */}
                 {issue.has_prd_link && (

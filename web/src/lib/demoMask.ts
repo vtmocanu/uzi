@@ -18,14 +18,21 @@ function capitalize(token: string): string {
   return token.charAt(0).toUpperCase() + token.slice(1).toLowerCase();
 }
 
-// maskEmail derives a first name from an email's local-part: the text before "@" (or the
-// whole string if there is no "@"), split on the first of ./_/+/-, first token
-// capitalized. A local-part with no separator uses the whole local-part capitalized.
-// `vlad.mocanu@metaminds.com` → `Vlad`; `vlad@x.com` → `Vlad`; `vlad` → `Vlad`.
+// maskEmail derives a display alias from an email's local-part: the text before "@" (or
+// the whole string if there is no "@"). HYBRID by design, because a bare local-part is
+// ambiguous — `vlad` could be a first name or an opaque handle, and we cannot tell them
+// apart. So we only trust the local-part as a name when it carries a separator
+// (`.`/`_`/`+`/`-`), which conventionally joins name tokens: then we keep the first token,
+// capitalized (`vlad.mocanu@metaminds.com` → `Vlad`; `vlad_mocanu@x.com` → `Vlad`). A
+// separator-less local-part is treated as a handle and aliased to the neutral `User`
+// rather than surfaced, so `vtmocanu@gmail.com` → `User` (never `Vtmocanu`, which would
+// leak the handle). The tradeoff: a genuine bare first name (`vlad@x.com`) also aliases to
+// `User` — the safe direction when the two are indistinguishable.
 export function maskEmail(value: string | null | undefined, enabled: boolean): string {
   if (!enabled || !value) return value ?? "";
   const atIndex = value.indexOf("@");
   const local = atIndex === -1 ? value : value.slice(0, atIndex);
+  if (!/[._+-]/.test(local)) return "User";
   const firstToken = local.split(/[._+-]/)[0];
   return capitalize(firstToken);
 }

@@ -30,6 +30,13 @@ export function isDemoMode(): boolean {
   }
 }
 
+// Cached snapshot for useSyncExternalStore's getSnapshot. getSnapshot runs once per render
+// across every subscribed component (~25), so reading localStorage there is wasted I/O:
+// the flag only changes on setDemoMode (this tab) or a cross-tab `storage` event, and both
+// refresh this cache. Initialized once at module load from the persisted value; getSnapshot
+// then returns a stable primitive with no per-render I/O.
+let cachedSnapshot = isDemoMode();
+
 // Local in-tab subscribers. The browser `storage` event does NOT fire in the tab that
 // made the change, so the toggling tab needs an explicit notify to re-render live; other
 // tabs are covered by the `storage` listener attached in subscribeDemoMode.
@@ -44,7 +51,12 @@ function notifyLocal(): void {
 // The event fires only in OTHER tabs; we react solely to our own key (or key === null,
 // which fires on storage.clear()).
 function onStorage(e: StorageEvent): void {
-  if (e.key === KEY || e.key === null) notifyLocal();
+  if (e.key === KEY || e.key === null) {
+    // A cross-tab write already updated the shared localStorage before this event fired,
+    // so recompute the cache from the store, then notify subscribers.
+    cachedSnapshot = isDemoMode();
+    notifyLocal();
+  }
 }
 
 // setDemoMode persists the flag (try/catch — private mode / quota) and then notifies
@@ -59,6 +71,9 @@ export function setDemoMode(on: boolean): void {
       // surface them. The in-tab notify below still fires so live components update.
     }
   }
+  // Recompute from the store (not from `on`) so the cache reflects what actually persisted
+  // — a throwing setItem leaves the flag unchanged, and the snapshot must agree.
+  cachedSnapshot = isDemoMode();
   notifyLocal();
 }
 
@@ -66,6 +81,12 @@ export function setDemoMode(on: boolean): void {
 // `storage` listener so OTHER tabs re-render on change. Returns an unsubscribe that
 // removes the subscriber and detaches the listener when the last one leaves.
 export function subscribeDemoMode(cb: () => void): () => void {
+  // Re-sync the cache from the store as a subscriber attaches (a mount). getSnapshot does
+  // no per-render I/O, so this once-per-mount read is where the cache reconciles with any
+  // value written to the store without going through setDemoMode (e.g. a pre-mount write).
+  // useSyncExternalStore re-reads getSnapshot right after subscribe, so a fresh value here
+  // is picked up on the initial render with no extra toggle.
+  cachedSnapshot = isDemoMode();
   subscribers.add(cb);
   if (!storageListenerAttached && typeof window !== "undefined") {
     window.addEventListener("storage", onStorage);
@@ -80,9 +101,18 @@ export function subscribeDemoMode(cb: () => void): () => void {
   };
 }
 
-// useDemoMode is the React hook. getSnapshot returns the plain boolean primitive so it
-// is referentially stable (no tearing / render loops); getServerSnapshot is isDemoMode
-// too, which already returns false when there is no window (SSR).
+// getSnapshot returns the cached boolean primitive so it is referentially stable (no
+// tearing / render loops) and does no localStorage I/O per render.
+function getSnapshot(): boolean {
+  return cachedSnapshot;
+}
+
+// getServerSnapshot: with no window (SSR / non-DOM test setup) demo mode is off.
+function getServerSnapshot(): boolean {
+  return false;
+}
+
+// useDemoMode is the React hook.
 export function useDemoMode(): boolean {
-  return useSyncExternalStore(subscribeDemoMode, isDemoMode, isDemoMode);
+  return useSyncExternalStore(subscribeDemoMode, getSnapshot, getServerSnapshot);
 }

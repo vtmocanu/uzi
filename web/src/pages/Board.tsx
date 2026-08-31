@@ -68,7 +68,7 @@ import { ExternalLinkIcon, GripVerticalIcon, PlusIcon, XIcon } from "../componen
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
-import { maskName, maskRepoPath } from "../lib/demoMask";
+import { maskName, maskRepoPath, maskUsername } from "../lib/demoMask";
 
 const OPEN_KEY = "";
 const CLOSED_KEY = "__closed__";
@@ -1999,7 +1999,7 @@ export function IssueCard({
               view run
             </Link>
           )}
-          {card.author && <span>{maskName(card.author, demo)}</span>}
+          {card.author && <span>{maskUsername(card.author, "human", demo)}</span>}
         </div>
       )}
       {/* D15: Promote stands IN PLACE OF Start run, never beside it. A non-`uzi` card

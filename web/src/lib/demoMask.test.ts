@@ -14,19 +14,23 @@ describe("maskEmail", () => {
     expect(maskEmail("vlad.mocanu@metaminds.com", false)).toBe("vlad.mocanu@metaminds.com");
   });
 
-  it("derives a capitalized first name from the local-part when enabled", () => {
+  it("derives a capitalized first token from a local-part with a separator", () => {
     expect(maskEmail("vlad.mocanu@metaminds.com", true)).toBe("Vlad");
     expect(maskEmail("vlad_mocanu@x.com", true)).toBe("Vlad");
     expect(maskEmail("vlad+tag@x.com", true)).toBe("Vlad");
     expect(maskEmail("vlad-m@x.com", true)).toBe("Vlad");
   });
 
-  it("uses the whole local-part when it has no separator", () => {
-    expect(maskEmail("vlad@x.com", true)).toBe("Vlad");
+  it("aliases a separator-less local-part to the neutral User (a handle is indistinguishable from a name)", () => {
+    expect(maskEmail("vtmocanu@gmail.com", true)).toBe("User");
+    expect(maskEmail("john@x.com", true)).toBe("User");
+    // A genuine bare first name aliases the same way — the safe direction when ambiguous.
+    expect(maskEmail("vlad@x.com", true)).toBe("User");
   });
 
-  it("treats a value with no @ as the local-part", () => {
-    expect(maskEmail("vlad", true)).toBe("Vlad");
+  it("treats a value with no @ as the local-part (same hybrid rule)", () => {
+    expect(maskEmail("vlad.mocanu", true)).toBe("Vlad");
+    expect(maskEmail("vtmocanu", true)).toBe("User");
   });
 
   it("passes empty/undefined/null through", () => {

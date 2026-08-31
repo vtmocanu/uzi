@@ -65,6 +65,9 @@ describe("isDemoMode / setDemoMode", () => {
       throw new Error("quota exceeded");
     });
     expect(() => setDemoMode(true)).not.toThrow();
+    // The write failed, so the persisted flag never changed: demo mode stays off rather
+    // than silently reporting on.
+    expect(isDemoMode()).toBe(false);
   });
 });
 
