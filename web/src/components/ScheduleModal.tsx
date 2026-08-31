@@ -665,27 +665,43 @@ export function ScheduleModal({
               is a multi-repo picker (PRD #636 Decision 6): N repos → N independent schedules. */}
           {!pinned &&
             (isEdit ? (
-              <Field label="Repo" htmlFor="sched-repo">
-                <Select
-                  id="sched-repo"
-                  value={repoId}
-                  onChange={(e) => setRepoId(e.target.value)}
-                  disabled={isDefault || target === "issue"}
-                >
-                  {repos.length === 0 && <option value="">No repos available</option>}
-                  {repos.map((r) => (
-                    <option key={r.id} value={r.id}>
-                      {r.path_with_namespace}
-                    </option>
-                  ))}
-                </Select>
-                {target === "issue" && (
-                  <p className="mt-1 text-[11px] text-faint">
-                    An issue-target schedule can't be repointed — its issue number is
-                    repo-specific. Delete and recreate it on the new repo.
-                  </p>
-                )}
-              </Field>
+              isDefault ? (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-muted">Repo</span>
+                  <span className="inline-flex items-center gap-1 text-[13px] font-semibold text-fg">
+                    <span aria-hidden="true" className="text-muted">
+                      <LockIcon />
+                    </span>
+                    {editing?.repo_path || editing?.repo_id}
+                    <span className="text-[11px] font-normal text-faint">· fixed for this default</span>
+                  </span>
+                </div>
+              ) : (
+                <Field label="Repo" htmlFor="sched-repo">
+                  <Select
+                    id="sched-repo"
+                    value={repoId}
+                    onChange={(e) => setRepoId(e.target.value)}
+                    disabled={target === "issue"}
+                  >
+                    {repos.length === 0 && !repoId && <option value="">No repos available</option>}
+                    {repoId && !repos.some((r) => r.id === repoId) && (
+                      <option value={repoId}>{editing?.repo_path || repoId}</option>
+                    )}
+                    {repos.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {r.path_with_namespace}
+                      </option>
+                    ))}
+                  </Select>
+                  {target === "issue" && (
+                    <p className="mt-1 text-[11px] text-faint">
+                      An issue-target schedule can't be repointed — its issue number is
+                      repo-specific. Delete and recreate it on the new repo.
+                    </p>
+                  )}
+                </Field>
+              )
             ) : (
               <div className="space-y-1.5">
                 <RepoMultiSelect
