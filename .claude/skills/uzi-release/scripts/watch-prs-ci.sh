@@ -49,7 +49,18 @@
 #    exiting, because a freshly-started run can briefly report a stale non-success
 #    conclusion on a job that is actually still in_progress (skill step 4's
 #    stale-first-tick caveat).
+#  - The `classify` function is the shared lib/pr-checks-classify.sh (also sourced by
+#    watch-pr-ci.sh), so the two watchers cannot drift in what they count.
+#  - A genuine `gh` failure (bad PR number, auth, no network) is not swallowed: it
+#    surfaces as ERROR and exits 3 (the documented usage/gh-error code), rather than
+#    masquerading as an empty read that retries to the timeout code 2.
 set -uo pipefail
+
+# Shared `gh pr checks` classifier — sourced (not copied) so a state-policy edit
+# lands for every watcher at once. Resolved relative to this script, cwd-independent.
+_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/pr-checks-classify.sh
+. "$_LIB_DIR/lib/pr-checks-classify.sh"
 
 PRS=(); INTERVAL=120; MAX_TICKS=40; WAIT_CR=0
 while [ $# -gt 0 ]; do
@@ -64,33 +75,33 @@ while [ $# -gt 0 ]; do
 done
 [ "${#PRS[@]}" -gt 0 ] || { echo "usage: watch-prs-ci.sh <PR> [<PR>...] [--interval S] [--max-ticks N] [--wait-cr]" >&2; exit 3; }
 
-# Classify one `gh pr checks` dump. Prints one of: FAIL / PENDING / GREEN, followed
-# by the failing rows (name<TAB>url) when FAIL. Reads the dump on stdin. Identical
-# to watch-pr-ci.sh's classify so the two scripts cannot drift in what they count.
-classify() {
-  awk -F'\t' -v wait_cr="$WAIT_CR" '
-    function isfail(s){ return s=="fail"||s=="failure"||s=="cancelled"||s=="timed_out"||s=="action_required" }
-    function ispend(s){ return s=="pending"||s=="in_progress"||s=="queued"||s=="waiting" }
-    {
-      name=$1; state=$2; url=$4
-      if (name=="CodeRabbit" && !wait_cr) next   # CR assessed separately unless --wait-cr
-      if (isfail(state)) { fails[nf++]=name "\t" url }
-      else if (ispend(state)) pend++
-    }
-    END {
-      if (nf>0){ print "FAIL"; for(i=0;i<nf;i++) print fails[i] }
-      else if (pend>0) print "PENDING"
-      else print "GREEN"
-    }'
-}
-
-# Verdict for one PR ("FAIL" | "PENDING" | "GREEN" | "EMPTY"), printed on line 1,
-# any failing rows following. EMPTY = gh returned nothing (transient), treated as
-# non-terminal for aggregation so a blip does not end the watch.
+# Verdict for one PR, printed on line 1 ("FAIL" | "PENDING" | "GREEN" | "EMPTY" |
+# "ERROR"), any failing rows following on a FAIL. `classify` comes from the sourced
+# lib. The exit status of `gh pr checks` is inspected, NOT swallowed:
+#   - non-empty stdout  → classify it (rows carry the state; rc is not needed).
+#   - empty stdout, rc 0 or 8 → EMPTY: a no-checks PR or a transient blank read;
+#     non-terminal for aggregation, so the loop retries rather than ending.
+#   - empty stdout, any other rc → ERROR: a genuine gh failure (bad PR, auth, no
+#     network). stderr is preserved and the loop maps a confirmed ERROR to exit 3.
+# (gh pr checks exits 0 when all pass, 8 when some are pending, and non-zero/non-8
+#  on a command error; a FAILING check yields rows on stdout, so it lands in classify.)
 pr_verdict() {
-  local out; out="$(gh pr checks "$1" 2>/dev/null)"
-  if [ -z "$out" ]; then echo "EMPTY"; return; fi
-  printf '%s\n' "$out" | classify
+  local out rc errf
+  errf="$(mktemp)"
+  out="$(gh pr checks "$1" 2>"$errf")"; rc=$?
+  if [ -n "$out" ]; then
+    rm -f "$errf"
+    printf '%s\n' "$out" | classify "$WAIT_CR"
+    return
+  fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 8 ]; then
+    echo "ERROR"
+    sed 's/^/    gh: /' "$errf" >&2
+    rm -f "$errf"
+    return
+  fi
+  rm -f "$errf"
+  echo "EMPTY"
 }
 
 tick=0
@@ -110,6 +121,16 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
         fi
         echo "[tick $tick] #$pr: a fail cleared on re-query (stale read); continuing"
         all_green=0; line="$line #$pr:pending(re-query)"
+        ;;
+      ERROR)
+        # A hard gh failure (its stderr was printed by pr_verdict). Confirm once so a
+        # transient blip does not abort the whole batch watch, then exit 3.
+        if [ "$(pr_verdict "$pr" | head -1)" = "ERROR" ]; then
+          echo "=== #$pr: gh error querying checks (stderr above) after ~$((tick*INTERVAL))s — exiting 3 ==="
+          exit 3
+        fi
+        echo "[tick $tick] #$pr: a gh error cleared on re-query (transient); continuing"
+        all_green=0; line="$line #$pr:error(re-query)"
         ;;
       GREEN)   line="$line #$pr:green" ;;
       PENDING) all_green=0; line="$line #$pr:pending" ;;
