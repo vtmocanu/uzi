@@ -163,3 +163,30 @@ user until their first post-deploy login (which unlocks the vault and lazily
 rewraps their token). Communicate this before deploying. The seed admin is
 unaffected (boot-unlocked). Migration progress is visible to admins under
 Settings → Instance settings as a count of still-master-sealed secrets.
+
+## Vault-lock Slack notice (PRD #890)
+
+Every restart is also an every-vault-lock event (the DEK cache is dropped, see
+residual #7), which is precisely the stall this section describes — not just
+the one-time first-vault-rollout, but any later restart too. A boot
+reconciler now closes the "nothing tells the user" gap directly: for each
+vault-having, Slack-linked user whose locked vault is blocking `queued`/
+`awaiting_approval`/`awaiting_input` work or a due schedule, it DMs them to
+unlock, once per lock-episode — deduped on `user_vaults.lock_notified_at`
+(atomic across replicas) and cleared on their next successful unlock. It is
+gated by `UZI_VAULT_LOCK_NOTICE_ENABLED` (default on) and the same per-user
+`slack_notify` gate every other DM uses.
+
+**Nothing new is leaked.** The DM goes only to the owner's own confirmed
+Slack DM, and the owner already sees their own lock state in-app (the
+`VaultLockedBanner` and `GET /api/vault/status` / `/api/me`) — lock/unlock
+state is not a protected secret; the indistinguishability requirement above
+is about an unauthenticated or other-user probe, not about telling the
+authenticated owner their own state. The DM body is a fixed, cause-neutral
+title and text plus an in-app deep link — never the password, KEK, or DEK.
+
+**Residual #7 interaction.** Because "locked" is per-process, an unlock on
+one pod re-arms the marker, so a sibling pod still locked in its own process
+can re-notify on its next tick. This is bounded — **at most one redundant DM
+per cross-pod unlock event**, never N — and single-replica deployments (the
+norm today) never hit it at all.

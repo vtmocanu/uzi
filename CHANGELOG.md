@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Slack DM when a locked vault is blocking your work ([#890](https://github.com/vtmocanu/uzi/issues/890)).**
+  A boot reconciler now DMs each Slack-linked user whose locked vault is blocking a queued run or a due schedule, once per lock-episode, so they unlock before the work silently stalls; the copy is cause-neutral (it never asserts a restart as the cause) and reuses the existing Slack notification gate.
+
 ## [0.72.1] - 2026-08-31
 
 ### Changed

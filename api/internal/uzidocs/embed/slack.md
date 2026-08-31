@@ -239,6 +239,12 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   existing plan-gate message, right next to its action buttons.
   When the run recovers, the `⚠️ <flag>` context element drops off on its own
   and nudging stops — no action needed.
+- **Vault-locked nudge**: if your vault is locked (e.g. after a deploy
+  restarts the api) and it's blocking a queued run or a due schedule, you get
+  a one-time DM telling you to unlock so that work can proceed — it fires for
+  any locked vault with blocked work, not only after a deploy, and clears once
+  you unlock. Unlock the same way you always do: the in-app banner or password
+  prompt, not from Slack.
 
 ## Markdown rendering
 
