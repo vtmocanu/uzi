@@ -971,4 +971,111 @@ describe("deriveRunUsage.leadContext", () => {
     ]);
     expect(d.leadContext).toBeUndefined();
   });
+
+  it("populates leadContext from a lead RESULT frame — including a modelUsage-less/error one (read sits ABOVE the modelUsage early-out)", () => {
+    const reading = { used: 156_000, window: 200_000, pct: 78 };
+
+    // A success result frame WITH modelUsage still yields its context reading.
+    const withMu = deriveRunUsage([
+      msg("status", "lead", {
+        event: "result",
+        subtype: "success",
+        num_turns: 1,
+        duration_ms: 100,
+        modelUsage: {
+          "claude-sonnet-5": {
+            inputTokens: 100,
+            outputTokens: 10,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            costUSD: 0.01,
+          },
+        },
+        context: reading,
+      }),
+    ]);
+    expect(withMu.leadContext).toEqual(reading);
+
+    // The load-bearing case: an ERROR result frame with NO modelUsage. The old code's
+    // `if (!mu) continue` sat above the context read; the new placement reads context
+    // FIRST, so this modelUsage-less frame still delivers the meter.
+    const noMu = deriveRunUsage([
+      msg("error", "lead", {
+        event: "result",
+        subtype: "error_max_turns",
+        errors: [],
+        context: reading,
+      }),
+    ]);
+    expect(noMu.leadContext).toEqual(reading);
+  });
+
+  it("latest-wins across BOTH carriers: a later lead RESULT frame overrides an earlier lead usage frame", () => {
+    const d = deriveRunUsage([
+      // Earlier: M1-style lead usage frame carrying one reading.
+      assistantUsageCtx("lead", { input: 100, output: 10 }, { used: 40_000, window: 200_000, pct: 20 }),
+      // Later: M2-style lead terminal result frame carrying a DIFFERENT reading.
+      msg("status", "lead", {
+        event: "result",
+        subtype: "success",
+        num_turns: 1,
+        duration_ms: 100,
+        modelUsage: {
+          "claude-sonnet-5": {
+            inputTokens: 200,
+            outputTokens: 20,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            costUSD: 0.02,
+          },
+        },
+        context: { used: 156_000, window: 200_000, pct: 78 },
+      }),
+    ]);
+    // The result-frame (later in stream order) value wins. A broken result-frame read
+    // would leave the earlier usage-frame value (pct 20) winning.
+    expect(d.leadContext).toEqual({ used: 156_000, window: 200_000, pct: 78 });
+  });
+
+  it("IGNORES a USAGE frame whose agent is 'lead' but agent_instance is non-null (subagent lane)", () => {
+    // The lead lane is agent_instance ABSENT (null) AND the lead role — matching
+    // ActivityFeed's lane key and the comment near lines 208–212. A subagent-lane frame
+    // carrying a non-null agent_instance must never populate leadContext even when its
+    // agent field reads "lead". Covers the usage-frame predicate.
+    const d = deriveRunUsage([
+      {
+        ...assistantUsageCtx("lead", { input: 500, output: 50 }, { used: 190_000, window: 200_000, pct: 95 }),
+        agent_instance: "sub-123",
+      },
+    ]);
+    expect(d.leadContext).toBeUndefined();
+  });
+
+  it("IGNORES a RESULT frame whose agent is 'lead' but agent_instance is non-null (subagent lane)", () => {
+    // Same lead-lane guard on the result-frame carrier: a distinct non-null agent_instance
+    // is a subagent lane, so its context must not overwrite the real lead reading.
+    const reading = { used: 190_000, window: 200_000, pct: 95 };
+    const d = deriveRunUsage([
+      {
+        ...msg("status", "lead", {
+          event: "result",
+          subtype: "success",
+          num_turns: 1,
+          duration_ms: 100,
+          modelUsage: {
+            "claude-sonnet-5": {
+              inputTokens: 100,
+              outputTokens: 10,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+              costUSD: 0.01,
+            },
+          },
+          context: reading,
+        }),
+        agent_instance: "sub-123",
+      },
+    ]);
+    expect(d.leadContext).toBeUndefined();
+  });
 });

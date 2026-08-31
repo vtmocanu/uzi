@@ -1418,7 +1418,9 @@ export function RunView() {
           connected={connected}
           terminal={terminal}
           phaseUsageBySeq={usage.phaseUsageBySeq}
-          leadContext={usage.leadContext}
+          // `?? null` tells ActivityFeed "the parent already derived; do not re-derive"
+          // (PRD #516 / issue #553): null distinguishes "no reading" from "not computed".
+          leadContext={usage.leadContext ?? null}
         />
       </Card>
 

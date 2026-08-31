@@ -2251,10 +2251,14 @@ export class SdkExecutor implements Executor {
     // Issue #281: the lead's own text this turn, in emit order, for the no-progress
     // detector's verbatim-repeat check (joined into result.finalText below).
     const leadText: string[] = [];
-    // PRD #516 M1: the lead context reading is attached AT MOST ONCE per turn, on
-    // the same lead assistant frame that first latches usage. Turn-scoped so a turn
-    // with several assistant frames issues exactly one `getContextUsage()` call.
-    let contextAttached = false;
+    // PRD #516 M1 / issue #553 M2: the lead context reading is FIRED (not awaited)
+    // AT MOST ONCE per turn, on the first LEAD usage frame, and the resolved value
+    // is attached to the turn's TERMINAL result frame. Turn-scoped so a turn with
+    // several assistant frames issues exactly one `getContextUsage()` call; a
+    // non-undefined promise doubles as the "already fired" guard.
+    let contextPromise:
+      | Promise<{ used: number; window: number; pct: number } | undefined>
+      | undefined;
     let sawErrorResult = false;
     let errorSubtype = "unknown";
     // PRD #35. The observer rides the SAME iteration mapSdkMessage already does —
@@ -2350,24 +2354,44 @@ export class SdkExecutor implements Executor {
             // from a model-only frame. No usage ⇒ no model, deliberately.
             if (frameModel !== undefined) em.payload["model"] = frameModel;
             usageAttached = true;
-            // PRD #516 M1: CO-ATTACH the lead's live context-window fill on the SAME
-            // frame that got usage, once per turn. The first usage frame of a turn is
-            // the lead's assistant frame, and `getContextUsage()` is a main-loop-only
-            // control call, so this keys the reading to the lead and rides the
-            // consumer's existing `"usage" in payload` branch (Decision D5, D3). The
-            // `contextAttached` latch is set BEFORE the await so a slow/hanging call
-            // is issued at most once per turn; the read is timeout-guarded and never
-            // throws, so on absence/error/timeout no `context` key is written and the
-            // turn is unaffected (R1, R2, SC5). The await delays only this one em's
-            // emit; ordering is otherwise identical to before.
-            if (!contextAttached) {
-              contextAttached = true;
-              const context = await readLeadContext(
+            // PRD #516 M1 / issue #553 M2 (finding 2 + 3): FIRE the lead's live
+            // context-window read here, once per turn, on the first LEAD usage frame —
+            // but do NOT await it and do NOT attach on this frame. Two reasons: (a) a
+            // subagent frame can latch usage before the lead's within a turn, so the
+            // `em.agent === "lead"` guard keeps the reading keyed to the lead lane and
+            // off any subagent frame (finding 2); (b) awaiting inline sat on the hot
+            // message loop, so a hanging control call delayed every remaining frame of
+            // the turn by up to the timeout — firing without awaiting lets the read run
+            // concurrently while the turn streams (finding 3). The resolved value is
+            // attached below to the turn's terminal result frame. A non-undefined
+            // `contextPromise` doubles as the "already fired" guard, so `getContextUsage()`
+            // is issued at most once per turn.
+            //
+            // This floating (unawaited) promise is safe ONLY because `readLeadContext`
+            // NEVER rejects — it swallows every error/timeout to `undefined` (see its
+            // definition). If that contract ever changes, this becomes an unhandled
+            // rejection and must be re-guarded (e.g. `.catch(() => undefined)`).
+            if (contextPromise === undefined && em.agent === "lead") {
+              contextPromise = readLeadContext(
                 queryInstance,
                 this.contextUsageTimeoutMs,
               );
-              if (context) em.payload["context"] = context;
             }
+          }
+          // PRD #516 M1 / issue #553 M2: attach the (concurrently-read) lead context
+          // reading to the turn's TERMINAL result frame. Both result variants — success
+          // (`kind:"status"`) and error (`kind:"error"`) — come from mapResult with
+          // `agent: LEAD` and `payload.event === "result"`, so this is always the lead
+          // lane and always the LAST frame of the turn. Awaiting here therefore delays
+          // no in-turn frame; only turn completion waits, and only up to the timeout
+          // already baked into the read on a genuine hang (normally the read has long
+          // since resolved, so the residual await is ~0).
+          if (
+            contextPromise !== undefined &&
+            em.payload["event"] === "result"
+          ) {
+            const context = await contextPromise;
+            if (context) em.payload["context"] = context;
           }
           ctx.emit(em);
         }
