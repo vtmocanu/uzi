@@ -42,7 +42,7 @@ import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging } from "../lib/boardColumns";
 import { groupRuns, runMatchesQuery } from "../lib/runGroups";
 import { useDemoMode } from "../lib/demoMode";
-import { maskEmail } from "../lib/demoMask";
+import { maskEmail, maskRepoPath } from "../lib/demoMask";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -310,7 +310,7 @@ function RunRow({
           )}
           <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
             <span className="inline-flex items-center gap-1">
-              {run.repo_path}{" "}
+              {maskRepoPath(run.repo_path, demo)}{" "}
               <RunIssueRef
                 issueIid={run.issue_iid}
                 issueWebUrl={run.issue_web_url}

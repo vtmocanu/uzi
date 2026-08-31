@@ -3,6 +3,8 @@ import { api, ApiError, type IssueDraft, type JudgeFiledIssueRef, type Repo } fr
 import { Alert, Badge, Button, Input, Select, Textarea, cx } from "./ui";
 import { ExternalLinkIcon, FileTextIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 
 // isHttpsUrl mirrors RunView: a filed-issue URL is judge-adjacent data, so a link is
 // only rendered when the URL is genuinely https (never javascript:/data:).
@@ -45,6 +47,7 @@ export function OccurrenceFileIssue({
   // moves to the `filed` rung, so its group rollup may change).
   onFiled?: () => void;
 }) {
+  const demo = useDemoMode();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<IssueDraft | null>(null);
   const [loadingDraft, setLoadingDraft] = useState(false);
@@ -200,7 +203,7 @@ export function OccurrenceFileIssue({
                 <option value="">Select a repo…</option>
                 {repos.map((r) => (
                   <option key={r.id} value={r.id}>
-                    {r.path_with_namespace}
+                    {maskRepoPath(r.path_with_namespace, demo)}
                   </option>
                 ))}
               </Select>

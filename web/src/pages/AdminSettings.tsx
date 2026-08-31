@@ -34,6 +34,8 @@ import {
 import { AdminShell } from "../components/AdminShell";
 import { displayVersion, formatDay } from "../components/BuildInfoPopover";
 import { formatAgo } from "../lib/rateLimits";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 import { DocLink } from "../components/DocLink";
 import { DOC_ADMIN_SETTINGS, DOC_GITHUB_PROJECT_SYNC } from "../lib/doclinks";
 import { THEMES, THEME_LABELS } from "../lib/theme";
@@ -2006,6 +2008,7 @@ function DockerAllowlistCard({
   sources: Record<string, SettingSource>;
   onSaved: (resp: SettingsResponse) => void;
 }) {
+  const demo = useDemoMode();
   const [repos, setRepos] = useState<Repo[]>([]);
   // reposLoaded gates the out-of-visibility indicator: until listRepos succeeds we
   // cannot know which stored ids are genuinely outside this admin's visibility vs
@@ -2120,7 +2123,7 @@ function DockerAllowlistCard({
                     onChange={() => toggle(r.id)}
                     className="h-4 w-4 rounded border-edge accent-brand"
                   />
-                  <span className="truncate text-fg">{r.path_with_namespace}</span>
+                  <span className="truncate text-fg">{maskRepoPath(r.path_with_namespace, demo)}</span>
                 </label>
               ))}
             </div>

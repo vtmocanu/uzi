@@ -28,6 +28,8 @@ import {
   type Worker,
 } from "../lib/api";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
 import { canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -2720,6 +2722,7 @@ function RecommendationFiler({
   // rec keeps its clickable issue link but offers no way to file a second issue.
   actionHidden?: boolean;
 }) {
+  const demo = useDemoMode();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<IssueDraft | null>(null);
   const [loadingDraft, setLoadingDraft] = useState(false);
@@ -2873,7 +2876,7 @@ function RecommendationFiler({
                 <option value="">Select a repo…</option>
                 {repos.map((r) => (
                   <option key={r.id} value={r.id}>
-                    {r.path_with_namespace}
+                    {maskRepoPath(r.path_with_namespace, demo)}
                   </option>
                 ))}
               </Select>

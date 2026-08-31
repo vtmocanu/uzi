@@ -22,7 +22,7 @@ import {
 import { useJudgeTodo } from "../components/JudgeTodoContext";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
-import { maskEmail, maskName } from "../lib/demoMask";
+import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
 
 // PAGE_SIZE matches the API's default page; Load-more fetches the next page.
 const PAGE_SIZE = 30;
@@ -135,7 +135,7 @@ function FindingNotificationRow({
             </p>
           </div>
           {repoPath && (
-            <p className="mt-0.5 font-mono text-xs text-muted">{stripUnsafeChars(repoPath)}</p>
+            <p className="mt-0.5 font-mono text-xs text-muted">{stripUnsafeChars(maskRepoPath(repoPath, demo))}</p>
           )}
           <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-faint">
             {n.owner && (

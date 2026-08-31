@@ -68,7 +68,7 @@ import { ExternalLinkIcon, GripVerticalIcon, PlusIcon, XIcon } from "../componen
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
-import { maskName } from "../lib/demoMask";
+import { maskName, maskRepoPath } from "../lib/demoMask";
 
 const OPEN_KEY = "";
 const CLOSED_KEY = "__closed__";
@@ -103,6 +103,7 @@ export function Board() {
   const { id: repoId = "" } = useParams();
   const navigate = useNavigate();
   const { uziLabel, autopilotLabel } = useAuth();
+  const demo = useDemoMode();
   const [board, setBoard] = useState<BoardData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -1042,7 +1043,7 @@ export function Board() {
         backLabel="Boards"
         titleNode={
           <div className="flex flex-wrap items-center gap-2">
-            <h1 className="text-xl font-semibold tracking-tight">{board?.path_with_namespace ?? "Board"}</h1>
+            <h1 className="text-xl font-semibold tracking-tight">{board?.path_with_namespace ? maskRepoPath(board.path_with_namespace, demo) : "Board"}</h1>
             {board?.pipeline && <PipelineBadge pipeline={board.pipeline} />}
             {board?.pipeline && (
               <FixCiButton

@@ -31,6 +31,8 @@ import {
 } from "./ui";
 import { SweepLabelWarn } from "./SweepLabelWarn";
 import { RepoMultiSelect } from "./RepoMultiSelect";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 import { LockIcon } from "./icons";
 import { XIcon, TrashIcon, CopyIcon } from "./icons";
 import { ModelSelect } from "./ModelSelect";
@@ -158,6 +160,7 @@ export function ScheduleModal({
   onCloneToEdit?: (s: Schedule) => void;
 }) {
   const { uziLabel } = useAuth();
+  const demo = useDemoMode();
   const isEdit = !!editing;
   // A catalog default (PRD #589) is catalog-owned: its target/prompt/labels/guidance are
   // read-only (shown as the baked, sealed values) and the cadence, model, run flags, and
@@ -379,12 +382,14 @@ export function ScheduleModal({
     return () => window.clearTimeout(debounceRef.current);
   }, [timing, cron, runAtLocal, timezone]);
 
+  // Display-only (header line + SweepLabelWarn's repoPath, both pure display), so mask
+  // here; no consumer uses it as a key/value/selection/dirty-check input.
   const repoPath = useMemo(() => {
-    if (editing) return editing.repo_path;
-    if (pinned) return pinned.repoPath;
+    if (editing) return maskRepoPath(editing.repo_path, demo);
+    if (pinned) return maskRepoPath(pinned.repoPath, demo);
     // Create mode: the header line is cosmetic over N repos, so it names the first.
-    return repos.find((r) => r.id === selectedRepoIds[0])?.path_with_namespace ?? "";
-  }, [editing, pinned, repos, selectedRepoIds]);
+    return maskRepoPath(repos.find((r) => r.id === selectedRepoIds[0])?.path_with_namespace ?? "", demo);
+  }, [editing, pinned, repos, selectedRepoIds, demo]);
 
   const addLabel = () => {
     const t = labelInput.trim();
@@ -672,7 +677,7 @@ export function ScheduleModal({
                     <span aria-hidden="true" className="text-muted">
                       <LockIcon />
                     </span>
-                    {editing?.repo_path || editing?.repo_id}
+                    {editing?.repo_path ? maskRepoPath(editing.repo_path, demo) : editing?.repo_id}
                     <span className="text-[11px] font-normal text-faint">· fixed for this default</span>
                   </span>
                 </div>
@@ -686,11 +691,11 @@ export function ScheduleModal({
                   >
                     {repos.length === 0 && !repoId && <option value="">No repos available</option>}
                     {repoId && !repos.some((r) => r.id === repoId) && (
-                      <option value={repoId}>{editing?.repo_path || repoId}</option>
+                      <option value={repoId}>{editing?.repo_path ? maskRepoPath(editing.repo_path, demo) : repoId}</option>
                     )}
                     {repos.map((r) => (
                       <option key={r.id} value={r.id}>
-                        {r.path_with_namespace}
+                        {maskRepoPath(r.path_with_namespace, demo)}
                       </option>
                     ))}
                   </Select>
@@ -813,7 +818,7 @@ export function ScheduleModal({
                       <SweepLabelWarn
                         key={rid}
                         repoId={rid}
-                        repoPath={repos.find((r) => r.id === rid)?.path_with_namespace}
+                        repoPath={maskRepoPath(repos.find((r) => r.id === rid)?.path_with_namespace, demo)}
                         labels={labels}
                       />
                     ))

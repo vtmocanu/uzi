@@ -13,7 +13,7 @@ import { prefs } from "../lib/prefs";
 import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { cx, Toggle } from "./ui";
 import { useDemoMode, setDemoMode } from "../lib/demoMode";
-import { maskEmail, maskName } from "../lib/demoMask";
+import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
@@ -747,7 +747,7 @@ function SidebarContent({
                 key={r.id}
                 to={`/repos/${r.id}/board`}
                 icon={forgeIcon(forgeTypeById[r.connection_id])}
-                label={r.path_with_namespace}
+                label={maskRepoPath(r.path_with_namespace, demoMode)}
                 indent
                 onNavigate={onNavigate}
               />

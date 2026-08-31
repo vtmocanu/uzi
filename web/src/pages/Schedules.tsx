@@ -16,6 +16,8 @@ import {
 } from "../lib/api";
 import { relativeFromNow, ScheduleModal } from "../components/ScheduleModal";
 import { browserTimezone } from "../lib/timezone";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 import { DefaultJobs } from "../components/DefaultJobs";
 import { AddAnotherRepo, ScheduleGroupRow, ScheduleSubRow } from "../components/ScheduleGroupRow";
 import { LastRunOutcome, LastFireDetail, formatStamp } from "../components/LastRun";
@@ -501,6 +503,7 @@ function ScheduleRow({
   // Adds a sibling on repoId, promoting this standalone row into a group (PRD #636 M3).
   onAddRepo: (repoId: string) => void;
 }) {
+  const demo = useDemoMode();
   const off = !s.enabled;
   const fired = s.timing === "once" && s.status === "fired";
   const parked = s.status === "error";
@@ -543,7 +546,7 @@ function ScheduleRow({
           )}
         </div>
         <div className="mt-0.5 font-mono text-[12px] text-faint">
-          {s.repo_path || "repo unavailable"}
+          {s.repo_path ? maskRepoPath(s.repo_path, demo) : "repo unavailable"}
           {s.target === "prompt" && " · no issue"}
         </div>
       </td>
@@ -838,7 +841,8 @@ function MyScheduleSubRow({
   onEdit: () => void;
   onRemove: () => void;
 }) {
-  const repoLabel = s.repo_path || "repo unavailable";
+  const demo = useDemoMode();
+  const repoLabel = s.repo_path ? maskRepoPath(s.repo_path, demo) : "repo unavailable";
   const nextFire = s.next_fires[0] ?? s.next_fire_at;
   const [expanded, setExpanded] = useState(false);
   const panelId = `last-fire-${s.id}`;

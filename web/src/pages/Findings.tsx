@@ -24,6 +24,8 @@ import {
   type Repo,
 } from "../lib/api";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 import { Alert, Badge, Button, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
 import { AlertIcon, XIcon } from "../components/icons";
 
@@ -52,6 +54,7 @@ function seenInRunsLabel(n: number): string {
 }
 
 export function Findings() {
+  const demo = useDemoMode();
   const [searchParams, setSearchParams] = useSearchParams();
   const runAnchor = searchParams.get("run") ?? "";
   const repoFilter = searchParams.get("repo") ?? "";
@@ -237,7 +240,7 @@ export function Findings() {
           <option value="">All repos</option>
           {repos.map((r) => (
             <option key={r.id} value={r.id}>
-              {r.path_with_namespace}
+              {maskRepoPath(r.path_with_namespace, demo)}
             </option>
           ))}
         </select>
@@ -292,7 +295,7 @@ export function Findings() {
           <div className="space-y-5">
             {groups.map((g) => (
               <section key={g.repo_id} className="space-y-2">
-                <h2 className="font-mono text-xs font-semibold text-muted">{stripUnsafeChars(g.repo_path)}</h2>
+                <h2 className="font-mono text-xs font-semibold text-muted">{stripUnsafeChars(maskRepoPath(g.repo_path, demo))}</h2>
                 <ul className="space-y-2">
                   {g.findings.map((f) => (
                     <FindingRow

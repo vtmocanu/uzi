@@ -4,6 +4,8 @@ import { api, ApiError, type RunRequest } from "../lib/api";
 import { Button } from "./ui";
 import { PlayIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 
 // RunRequestCard renders a chat agent's start_run REQUEST (PRD #191 M5) as a
 // human-gated card. Like ProposalCard, the load-bearing rule is that title/repo_path
@@ -13,6 +15,7 @@ import { stripUnsafeChars } from "../lib/safeText";
 // PRD is refused with the same message); the run link comes from the app's start
 // response, never from model text.
 export function RunRequestCard({ request }: { request: RunRequest }) {
+  const demo = useDemoMode();
   const [state, setState] = useState<"pending" | "started" | "dismissed">("pending");
   const [runId, setRunId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -47,7 +50,7 @@ export function RunRequestCard({ request }: { request: RunRequest }) {
             (escaping does not touch a bidi override). Display only — Start posts
             repo_path/issue_iid, re-validated server-side. */}
         <div className="space-y-1">
-          <p className="font-mono text-[11px] text-faint">{stripUnsafeChars(request.repo_path)}</p>
+          <p className="font-mono text-[11px] text-faint">{stripUnsafeChars(maskRepoPath(request.repo_path, demo))}</p>
           <p className="text-sm font-semibold text-fg">
             Issue #{request.issue_iid}
             {request.title ? <span className="text-muted">{" · "}{stripUnsafeChars(request.title)}</span> : null}

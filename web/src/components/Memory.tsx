@@ -11,6 +11,8 @@ import { api, ApiError, type Memory, type MemoryBasis } from "../lib/api";
 import { Alert, Badge, Button, Card, EmptyState, SectionTitle } from "./ui";
 import { ThoughtIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 
 // Group the flat, newest-first list into per-repo buckets while preserving order:
 // the first time a repo_name is seen fixes its position, so the most-recently
@@ -46,6 +48,7 @@ function normalizeBasis(basis: Memory["basis"]): MemoryBasis {
 }
 
 export function Memory() {
+  const demo = useDemoMode();
   const [entries, setEntries] = useState<Memory[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -106,7 +109,7 @@ export function Memory() {
           {groups.map((g) => (
             <div key={g.repoName} className="space-y-2">
               <div className="flex items-center justify-between gap-2">
-                <SectionTitle className="text-base">{g.repoName}</SectionTitle>
+                <SectionTitle className="text-base">{maskRepoPath(g.repoName, demo)}</SectionTitle>
                 <span className="text-xs text-faint">
                   {g.entries.length} {g.entries.length === 1 ? "entry" : "entries"}
                 </span>

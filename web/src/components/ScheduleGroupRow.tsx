@@ -23,6 +23,8 @@ import { humanizeCron } from "../lib/schedulePresets";
 import { relativeFromNow } from "./ScheduleModal";
 import { Badge, Button, cx } from "./ui";
 import { ChevronDownIcon, PlusIcon } from "./icons";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 
 export function ScheduleGroupRow({
   name,
@@ -236,6 +238,7 @@ export function AddAnotherRepo({
   disabledReason?: string;
   onAddRepo: (repoId: string) => void;
 }) {
+  const demo = useDemoMode();
   const available = repos.filter((r) => !taken.has(r.id));
   const [repoId, setRepoId] = useState("");
   // Blocked (e.g. an issue-target schedule that can't span repos, issue #638 P1c) is
@@ -261,7 +264,7 @@ export function AddAnotherRepo({
         <option value="">Choose a repo…</option>
         {available.map((r) => (
           <option key={r.id} value={r.id}>
-            {r.path_with_namespace}
+            {maskRepoPath(r.path_with_namespace, demo)}
           </option>
         ))}
       </select>

@@ -22,7 +22,7 @@ import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, 
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
-import { maskName } from "../lib/demoMask";
+import { maskName, maskRepoPath } from "../lib/demoMask";
 
 interface Overview {
   runs: RunListItem[];
@@ -373,7 +373,7 @@ export function Dashboard() {
                     {/* Issue #124: forge-supplied issue title, untrusted (see RunsList). */}
                     <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(r.issue_title)}</p>
                     <p className="flex flex-wrap items-center gap-x-1 text-xs text-faint">
-                      {r.repo_path}{" "}
+                      {maskRepoPath(r.repo_path, demo)}{" "}
                       <RunIssueRef
                         issueIid={r.issue_iid}
                         issueWebUrl={r.issue_web_url}

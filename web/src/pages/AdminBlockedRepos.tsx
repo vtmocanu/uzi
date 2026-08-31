@@ -12,7 +12,7 @@ import { AdminShell } from "../components/AdminShell";
 import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
 import { useDemoMode } from "../lib/demoMode";
-import { maskEmail } from "../lib/demoMask";
+import { maskEmail, maskRepoPath } from "../lib/demoMask";
 
 // An override older than this is flagged stale (Q3): visibility, never auto-revocation.
 const STALE_DAYS = 30;
@@ -143,7 +143,7 @@ export function AdminBlockedRepos() {
                     <tr key={r.id} className="align-top transition-colors hover:bg-raised/30">
                       <td className="px-4 py-3 text-muted">{maskEmail(r.owner_email, demo)}</td>
                       <td className="px-4 py-3">
-                        <div className="font-medium text-fg">{r.path}</div>
+                        <div className="font-medium text-fg">{maskRepoPath(r.path, demo)}</div>
                         <div className="font-mono text-xs text-faint">{r.forge_type}</div>
                       </td>
                       <td className="px-4 py-3">
@@ -211,7 +211,7 @@ export function AdminBlockedRepos() {
       {/* Allow-anyway modal: names the exact block findings and requires a reason. */}
       {allowRepo && (
         <Modal
-          label={`Allow runs on ${allowRepo.path}`}
+          label={`Allow runs on ${maskRepoPath(allowRepo.path, demo)}`}
           onClose={closeAllow}
           closeOnBackdrop={!allowBusy}
         >
@@ -220,7 +220,7 @@ export function AdminBlockedRepos() {
               <div>
                 <h2 className="text-base font-semibold">Allow runs on this repo?</h2>
                 <p className="mt-0.5 text-xs text-muted">
-                  {(allowRepo.path)} · owned by {maskEmail(allowRepo.owner_email, demo)}
+                  {maskRepoPath(allowRepo.path, demo)} · owned by {maskEmail(allowRepo.owner_email, demo)}
                 </p>
               </div>
               <button
