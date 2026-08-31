@@ -548,6 +548,174 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(pushCalls, 2, "overlay push (rejected) then the fallback push (succeeds)");
     assert.strictEqual(calls.length, 1, "the PR was opened once after the successful fallback push");
   });
+
+  // (k) issue #631 (Item 1 regression) DOUBLE-FAULT: the overlay ALIGNS then its push is
+  // workflow-scope-rejected → the merge/rebase fallback both CONFLICT on an unrelated
+  // non-workflow file → failBaseAlignConflict preserves the diff. Pre-fix the preserved diff
+  // was taken from `trackingRef`, which the overlay's fetchAndPush had already advanced to the
+  // ALIGNED tip — so it carried the workflow-subtree change as a SUPERSET. Post-fix it is the
+  // pre-align agent tip's diff: exactly the agent's human-landable work, with NO workflow file.
+  it("(k) double-fault: overlay push rejected then merge+rebase conflict → preserved patch is the agent's work only, NOT a workflow superset", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    let pushCalls = 0;
+    git.pushBranch = (async () => {
+      pushCalls++;
+      // The overlay's push is workflow-scope-rejected → falls back to merge/rebase; the
+      // fallback then conflicts, so there is no second push.
+      throw new Error(
+        "git push origin ... failed: ! [remote rejected] refs/uzi-runner/agent/issue-61 -> agent/issue-61 " +
+          "(refusing to allow a Personal Access Token to create or update workflow " +
+          "`.github/workflows/ci.yml` without workflow scope)",
+      );
+    }) as typeof git.pushBranch;
+    // Branch edits a non-workflow file; main advances BOTH the workflow file AND the SAME
+    // non-workflow file divergently → the overlay aligns the workflow subtree (the branch
+    // touched no workflow, so canOverlay is true) but a whole-tree merge AND rebase both
+    // conflict on conflict.txt.
+    const exec = committingExecutor(
+      { "conflict.txt": "branch side\n" },
+      { "conflict.txt": "main side\n", ".github/workflows/ci.yml": CI_V2 },
+    );
+
+    const claim = githubClaim(61);
+    await githubRunner(github, exec).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    assert.strictEqual(strategies[0], "workflow-subtree", "the overlay was tried FIRST");
+    assert.ok(
+      strategies.includes("merge") && strategies.includes("rebase"),
+      "the fallback merge+rebase ran after the overlay push rejection",
+    );
+    assert.strictEqual(pushCalls, 1, "only the overlay push (rejected); the conflicting fallback pushes nothing");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body;
+    assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict");
+    assert.ok(failed.preserved_patch, "the pre-align diff is preserved for a human to land");
+    assert.match(failed.preserved_patch!, /conflict\.txt/, "the preserved patch carries the agent's work");
+    // The regression guard: pre-fix this diff came from the aligned overlay tip and carried the
+    // workflow-subtree change; post-fix it is the original agent tip's diff, so it must NOT.
+    assert.ok(
+      !failed.preserved_patch!.includes(".github/workflows/ci.yml"),
+      "the preserved patch must not carry the workflow-subtree superset",
+    );
+    assert.strictEqual(calls.length, 0, "no PR opened on the conflict fail");
+  });
+
+  // (l) issue #631 (Item 3): the merge is PRIMARY (null #377 diff → overlay skipped) and its
+  // push is rejected NON-FAST-FORWARD (an already-published branch — a resume, or the
+  // self_improve fixed branch — whose merge push cannot fast-forward). The rebase fallback also
+  // cannot force-push, so this must route to the typed preserve-and-fail — NOT rethrow to the
+  // generic catch (raw message, no preserved_patch), and NOT attempt a rebase.
+  it("(l) merge-fallback push rejected non-fast-forward → typed fail + preserved_patch, no rebase, no raw catch", async () => {
+    seedWorkflowsOnOrigin();
+    // null diff → overlay skipped → the merge is the primary align strategy.
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const nonFfMsg =
+      "git push origin ... failed: ! [rejected] agent/issue-62 -> agent/issue-62 (non-fast-forward)\n" +
+      "error: failed to push some refs to '...'\n" +
+      "hint: Updates were rejected because the tip of your current branch is behind\n" +
+      "hint: its remote counterpart. Integrate the remote changes (e.g.\n" +
+      "hint: 'git pull ...') before pushing again.";
+    let pushCalls = 0;
+    git.pushBranch = (async () => {
+      pushCalls++;
+      // The merge push cannot fast-forward an already-published branch.
+      throw new Error(nonFfMsg);
+    }) as typeof git.pushBranch;
+    const exec = committingExecutor({ "impl.ts": "export const x = 1;\n" }, { ".github/workflows/ci.yml": CI_V2 });
+
+    const claim = githubClaim(62);
+    await githubRunner(github, exec).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    assert.deepStrictEqual(strategies, ["merge"], "non-ff must not trigger a rebase attempt");
+    assert.strictEqual(pushCalls, 1, "only the merge push (rejected non-ff); no rebase push");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body;
+    assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict", "typed fail, not the generic catch");
+    assert.ok(failed.preserved_patch, "the pre-align diff is preserved for a human to land");
+    assert.match(failed.preserved_patch!, /impl\.ts/, "the preserved patch carries the agent's work");
+    assert.ok(
+      !(failed.failure_reason ?? "").includes("non-fast-forward"),
+      "the raw non-fast-forward text must not reach failure_reason (that would mean the generic catch)",
+    );
+    assert.strictEqual(calls.length, 0, "no PR opened");
+  });
+
+  // (m) issue #631 (Item 2 dedup): on the overlay-primary path the base-align gate REUSES the
+  // #377 guard's changedFiles result (identical barePath+trackingRef) instead of recomputing
+  // it. The two counted calls are the undeclared-zero-diff guard (:1471) plus the #377 guard;
+  // the align gate adds NONE (pre-fix it recomputed, making it one more — see (n)).
+  it("(m) overlay-primary path reuses the #377 changedFiles result (no redundant recompute)", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    let changedCalls = 0;
+    const realChanged = git.changedFiles.bind(git);
+    git.changedFiles = (async (...args: Parameters<typeof git.changedFiles>) => {
+      changedCalls++;
+      return realChanged(...args);
+    }) as typeof git.changedFiles;
+    const realPush = git.pushBranch.bind(git);
+    git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) =>
+      realPush(...args)) as typeof git.pushBranch;
+    // Real, non-null diff: the branch edits a non-workflow file, main advances the workflow
+    // file → the overlay aligns and pushes (as in (h)).
+    const exec = committingExecutor(
+      { "conflict.txt": "branch side\n" },
+      { ".github/workflows/ci.yml": CI_V2 },
+    );
+
+    const claim = githubClaim(63);
+    await githubRunner(github, exec).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "completed"]);
+    assert.strictEqual(calls.length, 1, "the overlaid branch was pushed and a PR opened");
+    assert.strictEqual(
+      changedCalls,
+      2,
+      "changedFiles: zero-diff guard + #377 guard; the align gate reuses, not recomputes",
+    );
+  });
+
+  // (n) issue #631 (Item 2): when #377's changedFiles FAILS OPEN (null diff), the base-align
+  // gate must RECOMPUTE rather than reuse the null — so a transient diff failure still gets a
+  // retry. Here changedFiles always returns null: the zero-diff guard (:1471), the #377 guard,
+  // AND the align-gate recompute all fire → exactly one more call than (m), and the run still
+  // reaches the fallback merge→rebase.
+  it("(n) null #377 diff still recomputes at the base-align gate", async () => {
+    seedWorkflowsOnOrigin();
+    const { github } = fakeGitHub();
+    const strategies = spyAlign();
+    let changedCalls = 0;
+    git.changedFiles = (async () => {
+      changedCalls++;
+      return null;
+    }) as typeof git.changedFiles;
+    git.pushBranch = (async () => {}) as typeof git.pushBranch;
+    // The branch edits the SAME workflow file main diverges → the fallback merge/rebase
+    // conflicts (as in (i)), proving the run reached the fallback after the recompute.
+    const exec = committingExecutor(
+      { ".github/workflows/ci.yml": "name: ci\non: [branch-edit]\njobs: {}\n" },
+      { ".github/workflows/ci.yml": CI_V2 },
+    );
+
+    const claim = githubClaim(64);
+    await githubRunner(github, exec).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    assert.deepStrictEqual(strategies, ["merge", "rebase"], "the run reached the fallback merge→rebase");
+    assert.strictEqual(
+      changedCalls,
+      3,
+      "zero-diff guard + #377 guard + align-gate recompute (a null result is not reused)",
+    );
+  });
 });
 
 describe("isNonFastForwardRejection", () => {
