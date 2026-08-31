@@ -258,6 +258,27 @@ type Config struct {
 	// pass runs at start when enabled so a schedule that came due while the api was
 	// down fires promptly after a restart instead of one cadence later.
 	SchedulerCheckInterval time.Duration
+	// VaultLockNoticeEnabled is the kill-switch for the vault-lock Slack notice
+	// (PRD #890, UZI_VAULT_LOCK_NOTICE_ENABLED, default true). It is the feature's
+	// ONLY global off-switch besides the per-user slack_notify gate (Decisions
+	// D1/D3): disabling scheduled runs (UZI_SCHEDULER_CHECK_INTERVAL=0) does NOT
+	// disable it, because the reconciler is wired independently of the scheduler
+	// goroutine. Like RegistrationEnabled it is a control switch, so a
+	// set-but-malformed value aborts boot rather than silently defaulting.
+	VaultLockNoticeEnabled bool
+	// VaultLockNoticeInterval is how often the vault-lock reconciler re-checks for
+	// newly-locked, work-blocked users (PRD #890). Default 15m. A non-positive
+	// parsed value is clamped back to the default rather than disabling the
+	// reconciler: D1 forbids this tuning knob from becoming a hidden second
+	// off-switch (UZI_VAULT_LOCK_NOTICE_ENABLED is the only interval-independent
+	// off-switch).
+	VaultLockNoticeInterval time.Duration
+	// VaultLockNoticeGraceDelay is the boot one-shot grace delay (PRD #890): the
+	// reconciler waits this long after boot before its first pass, so the boot
+	// sequence settles first. Default 30s. A non-positive value is fine here — it
+	// means "fire the one-shot immediately" — and is NOT clamped; the call site
+	// guards the timer for a zero/negative value.
+	VaultLockNoticeGraceDelay time.Duration
 	// SeedEmail/SeedPassword/SeedName optionally provision an admin at startup.
 	// Empty SeedEmail disables seeding. Validated at boot (see Load).
 	SeedEmail    string
@@ -713,6 +734,25 @@ func Load() (Config, error) {
 	// tight wake cadence is cheap (a single indexed claim query per tick) and keeps
 	// scheduled fires punctual.
 	cfg.SchedulerCheckInterval = parseNonNegDuration("UZI_SCHEDULER_CHECK_INTERVAL", time.Minute)
+
+	// Vault-lock Slack notice (PRD #890). The kill-switch is a control, so — same
+	// loud-on-misconfig stance as RegistrationEnabled — a set-but-malformed value
+	// aborts boot rather than silently defaulting to on.
+	vaultLockNotice, err := parseBool("UZI_VAULT_LOCK_NOTICE_ENABLED", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.VaultLockNoticeEnabled = vaultLockNotice
+	cfg.VaultLockNoticeInterval = parseNonNegDuration("UZI_VAULT_LOCK_NOTICE_INTERVAL", 15*time.Minute)
+	if cfg.VaultLockNoticeInterval <= 0 {
+		// Clamp a non-positive interval back to the default: D1 forbids this tuning
+		// knob from becoming a hidden second off-switch. The only off-switches are
+		// UZI_VAULT_LOCK_NOTICE_ENABLED and the per-user slack_notify gate.
+		cfg.VaultLockNoticeInterval = 15 * time.Minute
+	}
+	// The boot one-shot grace delay. Not clamped: a non-positive value legitimately
+	// means "fire the one-shot immediately", and the call site guards the timer.
+	cfg.VaultLockNoticeGraceDelay = parseNonNegDuration("UZI_VAULT_LOCK_NOTICE_GRACE", 30*time.Second)
 
 	// Per-user Claude rate-limit poller (PRD #53). parseNonNegDuration (not
 	// parseDuration): 0 is legitimate — it disables the engine. A nonzero value

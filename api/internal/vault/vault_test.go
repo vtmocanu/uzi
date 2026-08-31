@@ -3,6 +3,7 @@ package vault
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -33,6 +34,12 @@ type fakeVaultStore struct {
 	mu      sync.Mutex
 	vaults  map[uuid.UUID]store.UserVault
 	secrets []*fakeSecret
+
+	// clearNoticeCalls records every ClearVaultLockNotice(userID) the unlock hook
+	// fires (PRD #890 M1), so the unlock-hook test can assert it ran. clearNoticeErr,
+	// when set, forces the clear to fail — proving the unlock still succeeds anyway.
+	clearNoticeCalls []uuid.UUID
+	clearNoticeErr   error
 }
 
 func newFakeVaultStore() *fakeVaultStore {
@@ -123,6 +130,13 @@ func (f *fakeVaultStore) RewrapUserSecret(_ context.Context, arg store.RewrapUse
 		n++
 	}
 	return n, nil
+}
+
+func (f *fakeVaultStore) ClearVaultLockNotice(_ context.Context, userID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clearNoticeCalls = append(f.clearNoticeCalls, userID)
+	return f.clearNoticeErr
 }
 
 func newTestVault(t *testing.T) (*Vault, *secretbox.Box) {
@@ -485,5 +499,42 @@ func TestConcurrentFirstUnlockConsistent(t *testing.T) {
 	}
 	if !bytes.Equal(opened, secret) {
 		t.Fatalf("mismatch after race: got %q want %q", opened, secret)
+	}
+}
+
+// TestUnlockFiresClearNotice: a successful Unlock re-arms the vault-lock Slack notice
+// (PRD #890 M1) — the ClearVaultLockNotice hook fires for the unlocked user, ending the
+// current lock-episode so a later deploy that locks them again notifies afresh.
+func TestUnlockFiresClearNotice(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+
+	if err := v.Unlock(context.Background(), uid, "clear-notice-pw"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	if len(st.clearNoticeCalls) != 1 || st.clearNoticeCalls[0] != uid {
+		t.Fatalf("clearNoticeCalls = %v, want exactly [%v]", st.clearNoticeCalls, uid)
+	}
+}
+
+// TestUnlockClearNoticeErrorNonFatal: a ClearVaultLockNotice failure must NOT fail an
+// otherwise-valid unlock (PRD #890 M1) — the re-arm is best-effort and logged, mirroring
+// rewrapMasterSecrets. The vault ends unlocked despite the clear error.
+func TestUnlockClearNoticeErrorNonFatal(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	st.clearNoticeErr = errors.New("db hiccup on clear")
+	uid := uuid.New()
+
+	if err := v.Unlock(context.Background(), uid, "clear-err-pw"); err != nil {
+		t.Fatalf("Unlock must succeed despite a clear-notice error, got %v", err)
+	}
+	if !v.Unlocked(uid) {
+		t.Fatal("vault should be unlocked after a successful unlock, even when the clear hook errored")
+	}
+	// The clear hook must still have been ATTEMPTED — this is what proves the
+	// error path is exercised (and non-fatal). Without it the test would pass
+	// even if Unlock stopped calling ClearVaultLockNotice entirely.
+	if len(st.clearNoticeCalls) != 1 || st.clearNoticeCalls[0] != uid {
+		t.Fatalf("clearNoticeCalls = %v, want exactly [%v] (the failing clear hook must still have fired)", st.clearNoticeCalls, uid)
 	}
 }

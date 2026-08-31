@@ -65,7 +65,8 @@ func (b sweepGateBuilder) ForgeForConnection(string, string, []byte) (forge.Forg
 // to hand New a non-nil reader.
 type sweepGateSettings struct{}
 
-func (sweepGateSettings) UziLabel(context.Context) (string, error) { return "uzi", nil }
+func (sweepGateSettings) UziLabel(context.Context) (string, error)      { return "uzi", nil }
+func (sweepGateSettings) PublicBaseURL(context.Context) (string, error) { return "", nil }
 
 func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")

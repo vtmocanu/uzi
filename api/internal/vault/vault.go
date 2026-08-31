@@ -78,6 +78,10 @@ type Store interface {
 	CreateUserVaultIfAbsent(ctx context.Context, arg store.CreateUserVaultIfAbsentParams) (store.UserVault, error)
 	ListMasterSealedSecrets(ctx context.Context, userID uuid.UUID) ([]store.ListMasterSealedSecretsRow, error)
 	RewrapUserSecret(ctx context.Context, arg store.RewrapUserSecretParams) (int64, error)
+	// ClearVaultLockNotice re-arms the vault-lock Slack notice on a successful unlock
+	// (PRD #890 M1): it ends the current lock-episode so a later deploy that locks the
+	// user again can notify afresh. Best-effort — a failure never fails the unlock.
+	ClearVaultLockNotice(ctx context.Context, userID uuid.UUID) error
 }
 
 // Vault owns the per-user DEK cache and the wrap/unwrap crypto. It is safe for
@@ -139,6 +143,14 @@ func (v *Vault) unlock(ctx context.Context, userID uuid.UUID, password string, a
 	// DEK. Best-effort — a rewrap fault must never fail an otherwise-valid unlock;
 	// the rows stay 'master' and are retried on the next unlock.
 	v.rewrapMasterSecrets(ctx, userID)
+	// Re-arm the vault-lock Slack notice (PRD #890 M1): this successful unlock ends the
+	// current lock-episode, so a later deploy that locks the user again notifies afresh.
+	// On the SUCCESS tail so both success paths (cacheFromRow and create) reach it. Like
+	// rewrapMasterSecrets it is best-effort and logged: a DB hiccup on the clear must not
+	// fail an otherwise-valid unlock.
+	if err := v.q.ClearVaultLockNotice(ctx, userID); err != nil {
+		slog.Error("vault: clear lock-notice on unlock", "user", userID, "error", err)
+	}
 	return nil
 }
 

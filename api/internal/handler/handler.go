@@ -49,6 +49,11 @@ type Handler struct {
 	// accessor falls back to h.q. Deliberately narrow (see agentTemplateWriteStore)
 	// rather than making Handler.q an interface.
 	tmplWriteStore agentTemplateWriteStore
+	// vaultNoticeStore, when non-nil, replaces h.q for VaultLock's pre-ack of the
+	// vault-lock notice (PRD #890 D6), so that one DB touch can be faked in a unit test
+	// without a live database. nil in production — the accessor falls back to h.q.
+	// Deliberately narrow (see vaultNoticeClaimer), mirroring tmplWriteStore.
+	vaultNoticeStore vaultNoticeClaimer
 	// box is the generic secret cipher used by the per-user secret endpoints
 	// (Anthropic token). svc owns the forge-specific machinery (which also holds
 	// its own box for PAT sealing); the two share the same key material.
@@ -343,6 +348,27 @@ func (h *Handler) templateWriteStore() agentTemplateWriteStore {
 		return h.tmplWriteStore
 	}
 	return h.q
+}
+
+// vaultNoticeClaimer is the narrow slice of *store.Queries VaultLock touches to pre-ack a
+// deliberate lock (PRD #890 D6). Kept narrow, and injectable via vaultNoticeStore, so the
+// pre-ack can be unit-tested without a live database. *store.Queries satisfies it.
+type vaultNoticeClaimer interface {
+	ClaimVaultLockNotice(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
+}
+
+// vaultLockNoticeStore returns the injected vault-notice claimer, or the real
+// *store.Queries. nil-safe both ways: it returns a nil INTERFACE (not a typed-nil
+// wrapper) when neither is set, so struct-literal test handlers with no store get a
+// clean nil the caller can compare against.
+func (h *Handler) vaultLockNoticeStore() vaultNoticeClaimer {
+	if h.vaultNoticeStore != nil {
+		return h.vaultNoticeStore
+	}
+	if h.q != nil {
+		return h.q
+	}
+	return nil
 }
 
 // Reconciler receives the "labels changed, resync everything" signal from the

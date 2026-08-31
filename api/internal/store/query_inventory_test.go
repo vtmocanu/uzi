@@ -728,21 +728,37 @@ var queryInventory = []queryPin{
 			"affects 0 rows, then the owner's delete of that SAME id affects 1, which proves the 0 " +
 			"was the predicate and not a missing row"},
 
-	// ── user_vaults.sql — ALL THREE UNPINNED, and this is the convergence worth naming ──
+	// ── user_vaults.sql — the ORIGINAL THREE unpinned, the PRD #890 M1 THREE executed ──
 	// The per-user vault (Argon2 KEK + wrapped DEK) is the mechanism protecting every
-	// sealed_with='dek' secret, and NOT ONE of its queries has executed against a database.
-	// Measured, 0/0/0. It is not that nobody wrote a live test near it — four live-DB files
-	// mention "vault", which is exactly the false positive a name-based scan would report.
-	// They do not reach these queries: secrets_crud_livedb_test.go:24 states it passes a NIL
-	// vault on purpose ("real box (nil vault → the master-box seal path, which is all these
-	// tests need)"), a deliberate and locally reasonable choice that leaves the vault path
-	// with no live exercise anywhere.
+	// sealed_with='dek' secret, and until PRD #890 NOT ONE of its queries had executed
+	// against a database (measured 0/0/0 for GetUserVault / CreateUserVaultIfAbsent /
+	// DeleteUserVault, all still unpinned below). It is not that nobody wrote a live test
+	// near it — four live-DB files mention "vault", which is exactly the false positive a
+	// name-based scan would report. They do not reach those queries:
+	// secrets_crud_livedb_test.go:24 states it passes a NIL vault on purpose ("real box
+	// (nil vault → the master-box seal path, which is all these tests need)"), a deliberate
+	// and locally reasonable choice that leaves that path with no live exercise.
 	//
-	// 🔴 THIS MEETS THE WAVE'S OTHER VAULT FINDING. The same surface has /vault/unlock and
-	// /vault/passphrase sitting unguarded by any limiter-mount assertion. So the vault is
-	// simultaneously the place where a brute-force guard is unasserted and the place where no
-	// SQL has been executed under test. Recorded here rather than left implicit in three rows,
-	// because the two gaps are individually minor and jointly the weakest surface in the tree.
+	// PRD #890 M1 adds the three vault-lock-notice queries and, unlike the original three,
+	// EXECUTES each against real Postgres in TestVaultLockNoticeQueriesLiveDB (the sqlc-
+	// inference gate: a green generate does not prove the multi-subquery SELECT / the atomic
+	// RETURNING claim / the guarded re-arm actually run). So this file is now 3 executed +
+	// 3 still-unpinned — the original coverage gap is unchanged, not closed by M1.
+	{"ListUsersNeedingVaultLockNotice", "user_vaults.sql", "TestVaultLockNoticeQueriesLiveDB",
+		"direct call in vault_lock_notice_livedb_test.go — the PRD #890 M1 reconciler-eligibility " +
+			"query, executed against real Postgres with a seeded eligible user (vault row + confirmed " +
+			"Slack + a queued run) so the JOIN, the slack-deliverable gate, the pending-work EXISTS " +
+			"pair, and the two closed-int COUNT subqueries all run. sqlc's type inference is not " +
+			"Postgres's, so a green generate does not prove this multi-subquery SELECT executes"},
+	{"ClaimVaultLockNotice", "user_vaults.sql", "TestVaultLockNoticeQueriesLiveDB",
+		"direct call in vault_lock_notice_livedb_test.go — the atomic claim, executed against real " +
+			"Postgres: the first claim returns the user_id row, an immediate second claim returns " +
+			"pgx.ErrNoRows (the marked row no longer matches lock_notified_at IS NULL). That RETURNING-" +
+			"only-when-claimed behavior is the multi-replica dedup and a fake cannot stand in for it"},
+	{"ClearVaultLockNotice", "user_vaults.sql", "TestVaultLockNoticeQueriesLiveDB",
+		"direct call in vault_lock_notice_livedb_test.go — the unlock re-arm, executed against real " +
+			"Postgres: after a claim, ClearVaultLockNotice nulls lock_notified_at back so a re-claim " +
+			"once again returns the row (proves the IS NOT NULL guard and the episode cycle)"},
 	{"GetUserVault", "user_vaults.sql", unpinnedPin,
 		"0 executions. Production callers are vault.go:117, :200 and :265; every test in its path " +
 			"is a fake (vault/vault_test.go:76, workersvc/vault_gate_test.go:27, " +
@@ -921,7 +937,7 @@ func scanInventoryQueryNames(t *testing.T) map[string][]string {
 	out := map[string][]string{}
 	for _, name := range inventoryQueryFiles {
 		path := filepath.Join("queries", name)
-		b, err := os.ReadFile(path)
+		b, err := os.ReadFile(path) //nolint:gosec // path is a fixed inventoryQueryFiles entry joined under the repo's own queries/ dir, not user input
 		if err != nil {
 			t.Fatalf("read %s: %v (inventoryQueryFiles names a file that is not there — if it was "+
 				"renamed, rename it here and in the inventory)", path, err)

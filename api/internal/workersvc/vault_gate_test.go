@@ -51,6 +51,7 @@ func (m *memVaultStore) ListMasterSealedSecrets(context.Context, uuid.UUID) ([]s
 func (m *memVaultStore) RewrapUserSecret(context.Context, store.RewrapUserSecretParams) (int64, error) {
 	return 0, nil
 }
+func (m *memVaultStore) ClearVaultLockNotice(context.Context, uuid.UUID) error { return nil }
 
 // unlockedVault returns a vault with uid unlocked (its DEK cached).
 func unlockedVault(t *testing.T, uid uuid.UUID, box *secretbox.Box) *vault.Vault {
@@ -90,7 +91,7 @@ func TestClaimGateSkipsLockedOwner(t *testing.T) {
 // opened via the vault and delivered in the payload.
 func TestClaimUnlockedOwnerOpensDEKToken(t *testing.T) {
 	const pat = "bot-pat-DEKGATE-abcdef1234567890"
-	const token = "anthropic-oauth-DEKGATE-abcdef1234567890"
+	const token = "anthropic-oauth-DEKGATE-abcdef1234567890" //nolint:gosec // synthetic fake token for a test fixture, not a real credential
 
 	box := newBox(t)
 	uid := uuid.New()

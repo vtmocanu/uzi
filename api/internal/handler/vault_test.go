@@ -55,6 +55,7 @@ func (m *memVaultQ) ListMasterSealedSecrets(context.Context, uuid.UUID) ([]store
 func (m *memVaultQ) RewrapUserSecret(context.Context, store.RewrapUserSecretParams) (int64, error) {
 	return 0, nil
 }
+func (m *memVaultQ) ClearVaultLockNotice(context.Context, uuid.UUID) error { return nil }
 
 func testVault(t *testing.T) *vault.Vault {
 	t.Helper()
@@ -309,7 +310,7 @@ func TestPutAnthropicTokenLockedReturns409(t *testing.T) {
 	}
 	v.Lock(uid)
 
-	body, _ := json.Marshal(map[string]string{"token": "sk-ant-oat01-LOCKEDTEST-abcdef1234567890"})
+	body, _ := json.Marshal(map[string]string{"token": "sk-ant-oat01-LOCKEDTEST-abcdef1234567890"}) //nolint:gosec // synthetic fake token for a test fixture, not a real credential
 	rec := httptest.NewRecorder()
 	h.PutAnthropicToken(rec, authedAs(http.MethodPut, "/api/me/secrets/anthropic_token", body, uid))
 
@@ -359,5 +360,58 @@ func TestPutAnthropicTokenDEKSealedWhenUnlocked(t *testing.T) {
 	}
 	if ct, ok := db.lastArgs[2].([]byte); ok && bytes.Contains(ct, []byte(fixture)) {
 		t.Fatal("stored ciphertext contains the plaintext token")
+	}
+}
+
+// fakeVaultNoticeClaimer captures VaultLock's pre-ack of the vault-lock notice (PRD #890
+// D6) so it can be asserted without a live database. err, when set, is returned to prove
+// the pre-ack is best-effort (a failure must not fail the lock).
+type fakeVaultNoticeClaimer struct {
+	calls []uuid.UUID
+	err   error
+}
+
+func (f *fakeVaultNoticeClaimer) ClaimVaultLockNotice(_ context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	f.calls = append(f.calls, userID)
+	if f.err != nil {
+		return uuid.Nil, f.err
+	}
+	return userID, nil
+}
+
+// TestVaultLockPreAcksNotice: a deliberate lock pre-acknowledges the vault-lock notice
+// (PRD #890 D6) — VaultLock calls ClaimVaultLockNotice for the locking user, so the
+// reconciler does not later DM them to unlock.
+func TestVaultLockPreAcksNotice(t *testing.T) {
+	claimer := &fakeVaultNoticeClaimer{}
+	h := &Handler{vault: testVault(t), vaultNoticeStore: claimer}
+	uid := uuid.New()
+
+	rec := httptest.NewRecorder()
+	h.VaultLock(rec, authedAs(http.MethodPost, "/api/vault/lock", nil, uid))
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("VaultLock code = %d, want 204", rec.Code)
+	}
+	if len(claimer.calls) != 1 || claimer.calls[0] != uid {
+		t.Fatalf("ClaimVaultLockNotice calls = %v, want exactly [%v]", claimer.calls, uid)
+	}
+}
+
+// TestVaultLockPreAckErrorStill204: a pre-ack error is best-effort — the lock still
+// returns 204 (a DB hiccup on the mark must not fail the lock).
+func TestVaultLockPreAckErrorStill204(t *testing.T) {
+	claimer := &fakeVaultNoticeClaimer{err: context.DeadlineExceeded}
+	h := &Handler{vault: testVault(t), vaultNoticeStore: claimer}
+	uid := uuid.New()
+
+	rec := httptest.NewRecorder()
+	h.VaultLock(rec, authedAs(http.MethodPost, "/api/vault/lock", nil, uid))
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("VaultLock code = %d, want 204 despite a pre-ack error", rec.Code)
+	}
+	if len(claimer.calls) != 1 {
+		t.Fatalf("ClaimVaultLockNotice calls = %d, want 1", len(claimer.calls))
 	}
 }
