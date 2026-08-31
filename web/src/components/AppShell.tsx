@@ -13,6 +13,7 @@ import { prefs } from "../lib/prefs";
 import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { cx, Toggle } from "./ui";
 import { useDemoMode, setDemoMode } from "../lib/demoMode";
+import { maskEmail, maskName } from "../lib/demoMask";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
@@ -610,6 +611,11 @@ function SidebarContent({
   const navigate = useNavigate();
   const location = useLocation();
   const demoMode = useDemoMode();
+  // Single masked identity label (PRD #886 M3). Preserve the raw display_name ?? email
+  // fallback precedence, masking whichever branch is chosen, and derive the initial from
+  // the masked label so it matches the shown name (decision 7: Vlad → V, not the raw one).
+  const identityLabel = user ? (user.display_name ? maskName(user.display_name, demoMode) : maskEmail(user.email, demoMode)) : "";
+  const identityInitial = identityLabel[0]?.toUpperCase() ?? "?";
   const build = useBuildInfoSnapshot();
   const branding = useBranding();
   const showName = appMarkShowName(branding);
@@ -848,10 +854,10 @@ function SidebarContent({
                   Settings and the app-wide banner. */}
               <VaultBadge compact />
               <span
-                title={`${user.display_name ?? user.email} · ${user.is_admin ? "Administrator" : "User"}`}
+                title={`${identityLabel} · ${user.is_admin ? "Administrator" : "User"}`}
                 className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-raised text-xs font-semibold text-muted"
               >
-                {(user.display_name?.[0] ?? user.email[0] ?? "?").toUpperCase()}
+                {identityInitial}
               </span>
               <button
                 onClick={handleLogout}
@@ -884,11 +890,11 @@ function SidebarContent({
               </div>
               <div className="flex items-center gap-2">
                 <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-raised text-xs font-semibold text-muted">
-                  {(user.display_name?.[0] ?? user.email[0] ?? "?").toUpperCase()}
+                  {identityInitial}
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-xs font-medium text-fg">
-                    {user.display_name ?? user.email}
+                    {identityLabel}
                   </span>
                   <span className="block truncate text-[11px] text-faint">
                     {user.is_admin ? "Administrator" : "User"}

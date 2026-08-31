@@ -20,6 +20,7 @@ import { prefs } from "../lib/prefs";
 import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
 import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/theme";
 import { useDemoMode, setDemoMode } from "../lib/demoMode";
+import { maskEmail, maskName } from "../lib/demoMask";
 
 // One-time dismissal (per browser) of the rotate-your-legacy-token reminder.
 const ROTATE_NOTICE_KEY = "uzi.vault.rotateNoticeDismissed";
@@ -246,8 +247,8 @@ export function Settings() {
           <dl className="mt-3 divide-y divide-edge">
             {(
               [
-                ["Email", user.email],
-                ["Display name", user.display_name ?? "—"],
+                ["Email", maskEmail(user.email, demoMode)],
+                ["Display name", user.display_name !== null ? maskName(user.display_name, demoMode) : "—"],
                 ["Role", user.is_admin ? "Administrator" : "User"],
                 ["Account status", user.is_active ? "Active" : "Deactivated"],
                 ["Joined", new Date(user.created_at).toLocaleString()],

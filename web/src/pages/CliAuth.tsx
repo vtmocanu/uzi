@@ -18,6 +18,8 @@ import {
 } from "../lib/api";
 import { Alert, Button, Card, Field, Input, Skeleton } from "../components/ui";
 import { ScopePicker } from "../components/ScopePicker";
+import { useDemoMode } from "../lib/demoMode";
+import { maskEmail } from "../lib/demoMask";
 
 // A non-pending fetched request is terminal — there is nothing to approve. Map
 // each status to the line the page shows instead of the consent form.
@@ -29,6 +31,7 @@ const TERMINAL_STATUS_MESSAGE: Record<Exclude<CliAuthStatus, "pending">, string>
 };
 
 export function CliAuth() {
+  const demo = useDemoMode();
   const { user, loading: authLoading } = useAuth();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -163,7 +166,7 @@ export function CliAuth() {
                 </div>
                 <div className="flex justify-between gap-3 px-3 py-2">
                   <dt className="text-muted">Signed in as</dt>
-                  <dd className="min-w-0 truncate text-fg">{user?.email}</dd>
+                  <dd className="min-w-0 truncate text-fg">{maskEmail(user?.email, demo)}</dd>
                 </div>
                 <div className="flex justify-between gap-3 px-3 py-2">
                   <dt className="text-muted">Expires</dt>

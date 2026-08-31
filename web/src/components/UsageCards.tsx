@@ -2,6 +2,8 @@ import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import type { SelfUsage, AdminUsage, RunUsage } from "../lib/api";
 import { formatTokens, formatCost } from "../lib/formatTokens";
+import { useDemoMode } from "../lib/demoMode";
+import { maskEmail } from "../lib/demoMask";
 import { Card, SectionTitle } from "./ui";
 
 // PRD #40 §3–4: the dashboard usage cards. "Your usage" is for everyone; the
@@ -120,6 +122,7 @@ function Td({ children, left, total, cost }: { children?: ReactNode; left?: bool
 }
 
 export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
+  const demo = useDemoMode();
   const factory = breakdown(admin.factory.lifetime);
   const rows = admin.users.map((u) => ({ ...u, b: breakdown(u.usage) }));
   return (
@@ -146,7 +149,7 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
                 const pct = factory.total > 0 ? Math.round((u.b.total / factory.total) * 100) : 0;
                 return (
                   <tr key={u.user_id}>
-                    <Td left>{u.email}</Td>
+                    <Td left>{maskEmail(u.email, demo)}</Td>
                     <Td>{u.run_count}</Td>
                     <Td>{formatTokens(u.b.total)}</Td>
                     <Td>{formatTokens(u.b.out)}</Td>

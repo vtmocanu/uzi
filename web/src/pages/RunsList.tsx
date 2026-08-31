@@ -41,6 +41,8 @@ import { anthropicTokenCount } from "../lib/hasToken";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging } from "../lib/boardColumns";
 import { groupRuns, runMatchesQuery } from "../lib/runGroups";
+import { useDemoMode } from "../lib/demoMode";
+import { maskEmail } from "../lib/demoMask";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -231,6 +233,7 @@ function RunRow({
   // the priority pill + queue ordering refresh. Wired to the layout's reload.
   onExpedited?: () => void;
 }) {
+  const demo = useDemoMode();
   // A deliberate human stop (cancelled, or failed carrying a server-stamped
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
   // that into the pill's status so the shared StatusPill palette renders it calm.
@@ -317,7 +320,7 @@ function RunRow({
               />
             </span>
             {run.worker_name && <span>· {run.worker_name}</span>}
-            {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
+            {showOwner && run.owner_email && <span>· {maskEmail(run.owner_email, demo)}</span>}
             <span>· {new Date(run.updated_at).toLocaleString()}</span>
             {duration && <span className="font-mono tabular-nums">· {duration}</span>}
             {run.mr_iid != null && (
@@ -428,6 +431,7 @@ function RunRow({
 // admin-scoped lists are fetched here, since the non-admin majority never needs
 // them and the layout must stay role-agnostic.
 export function RunsList() {
+  const demo = useDemoMode();
   const { user, vaultUnlocked } = useAuth();
   const isAdmin = !!user?.is_admin;
   // Issue #256 M3: a 1s tick drives the live duration token on every row; the 10s
@@ -608,7 +612,7 @@ export function RunsList() {
                           the trust boundary and the validator is defence in depth behind
                           it -- not the other way round. */}
                       <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
-                      <span className="ml-2 text-xs text-faint">{w.owner_email}</span>
+                      <span className="ml-2 text-xs text-faint">{maskEmail(w.owner_email, demo)}</span>
                       {(w.template_reported || w.template_declared) && (
                         <span className="ml-2 text-xs text-faint">
                           template {w.template_reported ?? `${w.template_declared} (declared)`}
