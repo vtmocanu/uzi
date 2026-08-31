@@ -173,7 +173,7 @@ export function AdminBlockedRepos() {
                               )}
                             </div>
                             <div className="text-xs text-muted">
-                              by {ov.by} · {daysSince(ov.at)}d ago
+                              by {maskEmail(ov.by, demo)} · {daysSince(ov.at)}d ago
                             </div>
                             <div className="text-xs text-faint">Reason: {ov.reason}</div>
                           </div>

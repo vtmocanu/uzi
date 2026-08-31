@@ -15,12 +15,15 @@ import { DocLink } from "../components/DocLink";
 import { DOC_GITHUB_PROJECT_SYNC, DOC_REPO_AGENTS } from "../lib/doclinks";
 import { selectedForge } from "../lib/prefs";
 import { CAPABILITY_VOCABULARY } from "../lib/capabilityVocabulary";
+import { useDemoMode } from "../lib/demoMode";
+import { maskEmail } from "../lib/demoMask";
 
 export function Repos() {
   // The guardrail override write is admin-only (PRD #66 D8): a member sees the block
   // and a pointer to ask an admin, never an Allow/Revoke control.
   const { user } = useAuth();
   const isAdmin = user?.is_admin ?? false;
+  const demo = useDemoMode();
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
   const [connectionId, setConnectionId] = useState("");
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -879,7 +882,7 @@ export function Repos() {
                                     <Badge
                                       tone="warning"
                                       dot
-                                      title={`Allowed by ${ov.by} on ${new Date(ov.at).toLocaleString()}\nReason: ${ov.reason}`}
+                                      title={`Allowed by ${maskEmail(ov.by, demo)} on ${new Date(ov.at).toLocaleString()}\nReason: ${ov.reason}`}
                                     >
                                       allowed by admin
                                     </Badge>
