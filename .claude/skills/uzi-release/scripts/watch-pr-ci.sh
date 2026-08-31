@@ -38,7 +38,15 @@
 #  - A failure is CONFIRMED with one immediate re-query before exiting, because a
 #    freshly-started run can briefly report a stale non-success conclusion on a job
 #    that is actually still in_progress (skill step 4's stale-first-tick caveat).
+#  - The `classify` function is the shared lib/pr-checks-classify.sh, sourced below
+#    so this watcher and watch-prs-ci.sh cannot drift in what they count.
 set -uo pipefail
+
+# Shared `gh pr checks` classifier — sourced (not copied) so a state-policy edit
+# lands for every watcher at once. Resolved relative to this script, cwd-independent.
+_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/pr-checks-classify.sh
+. "$_LIB_DIR/lib/pr-checks-classify.sh"
 
 PR=""; INTERVAL=120; MAX_TICKS=40; WAIT_CR=0
 while [ $# -gt 0 ]; do
@@ -56,38 +64,19 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$PR" ] || { echo "usage: watch-pr-ci.sh <PR> [--interval S] [--max-ticks N] [--wait-cr]" >&2; exit 3; }
 
-# Classify one `gh pr checks` dump. Prints one of: FAIL / PENDING / GREEN, followed
-# by the failing rows (name<TAB>url) when FAIL. Reads the dump on stdin.
-classify() {
-  awk -F'\t' -v wait_cr="$WAIT_CR" '
-    function isfail(s){ return s=="fail"||s=="failure"||s=="cancelled"||s=="timed_out"||s=="action_required" }
-    function ispend(s){ return s=="pending"||s=="in_progress"||s=="queued"||s=="waiting" }
-    {
-      name=$1; state=$2; url=$4
-      if (name=="CodeRabbit" && !wait_cr) next   # CR assessed separately unless --wait-cr
-      if (isfail(state)) { fails[nf++]=name "\t" url }
-      else if (ispend(state)) pend++
-    }
-    END {
-      if (nf>0){ print "FAIL"; for(i=0;i<nf;i++) print fails[i] }
-      else if (pend>0) print "PENDING"
-      else print "GREEN"
-    }'
-}
-
 tick=0
 while [ "$tick" -lt "$MAX_TICKS" ]; do
   out="$(gh pr checks "$PR" 2>/dev/null)"
   if [ -z "$out" ]; then echo "[tick $tick] gh returned nothing (transient?); retrying"; sleep "$INTERVAL"; tick=$((tick+1)); continue; fi
 
-  verdict="$(printf '%s\n' "$out" | classify)"
+  verdict="$(printf '%s\n' "$out" | classify "$WAIT_CR")"
   head="$(printf '%s\n' "$verdict" | head -1)"
 
   case "$head" in
     FAIL)
       # Confirm with one immediate re-query to shake off a stale first-tick read.
       out2="$(gh pr checks "$PR" 2>/dev/null)"
-      verdict2="$(printf '%s\n' "$out2" | classify)"
+      verdict2="$(printf '%s\n' "$out2" | classify "$WAIT_CR")"
       if [ "$(printf '%s\n' "$verdict2" | head -1)" = "FAIL" ]; then
         echo "=== #$PR: FAILED JOB(S) after $((tick*INTERVAL))s — react now (read the log: gh run view --job <id> --log-failed) ==="
         printf '%s\n' "$verdict2" | tail -n +2 | awk -F'\t' '{printf "  FAIL  %-28s %s\n",$1,$2}'
