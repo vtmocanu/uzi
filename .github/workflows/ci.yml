@@ -480,7 +480,7 @@ jobs:
         # fail on the other. A newer semgrep can change rule/pattern semantics, the
         # same drift the pinned zizmor/shellcheck above guard against.
         # renovate: datasource=pypi depName=semgrep versioning=pep440
-        run: pipx install semgrep==1.164.0
+        run: pipx install semgrep==1.174.0
       - name: gate:repo (shell + yaml + formula + actions + secrets + sast)
         env:
           UZI_LINT_SHELL_REQUIRED: "1"
