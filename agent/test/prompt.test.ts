@@ -88,6 +88,9 @@ describe("buildPlanPrompt", () => {
       prompt.includes("(or an escaped `\\\\`)"),
       "the prompt shows the escaped-backslash form for file paths",
     );
+    // The complete-output guidance: dropping the "one complete piece" clause
+    // (which guards against a truncated plan_md) must fail this test.
+    assert.match(prompt, /one complete piece/);
   });
 
   it("notes when no subagents are available", () => {
