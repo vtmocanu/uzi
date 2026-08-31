@@ -141,8 +141,7 @@ function runnerTrackingRef(branch: string): string {
 // while claiming to have recovered its own). So alongside the ref we stamp the writing
 // run's id into the worker bare's own config, and the reseed reads the tracking ref back
 // ONLY when the stamp matches the claiming run. This is a worker-owned `config --local`
-// write, the same posture as disableAutoMaintenance — no new trust boundary. The key is
-// dot/slash-free so the dotted git-config name parses (`git config uzi-trackowner.<x>`).
+// write, the same posture as disableAutoMaintenance — no new trust boundary.
 //
 // issue #887 — the branch is carried in a git-config SUBSECTION, not flattened into the
 // variable name. git parses `section.subsection.variable` by the FIRST and LAST dot, so
