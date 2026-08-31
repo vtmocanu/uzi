@@ -306,3 +306,60 @@ WHERE s.kind = 'anthropic_token'
 	assertElig(multiA, false)
 	assertElig(multiB, false)
 }
+
+// TestUpsertDefaultInsertBranchMultiTokenNotPooledLiveDB guards the D12 reserved-key-leak
+// path (issue #804 / PRD #111 D2). UpsertDefaultUserSecret's INSERT branch is reachable in
+// the D12 "tokens exist with no default" state (a user holds anthropic_tokens but none is
+// is_default), and an UNCONDITIONAL born-eligible there would pool a token for a user who
+// already holds other, possibly reserved, tokens. The NOT EXISTS first-token guard prevents
+// that: the row the upsert creates for a MULTI-token user must be born auto_eligible=false.
+//
+// Reaching the state precisely: InsertUserSecret forces the FIRST token to default, so seed
+// two tokens (neither labelled 'default', or the upsert's INSERT would collide with the
+// label-unique index — the mirror-image 500 the query header documents), then
+// ClearDefaultUserSecret to leave ≥2 tokens with zero is_default. The upsert then takes its
+// INSERT branch (no is_default row to conflict on) and creates a new 'default'-labelled row.
+func TestUpsertDefaultInsertBranchMultiTokenNotPooledLiveDB(t *testing.T) {
+	ctx, q, pool := autoEligPool(t)
+	user := seedBareUser(ctx, t, pool)
+
+	// Two tokens (labels are NOT 'default', to keep the upsert on its INSERT-success path
+	// rather than the label-collision 500). The first is forced default and born eligible.
+	if _, err := q.InsertUserSecret(ctx, store.InsertUserSecretParams{
+		UserID: user, Kind: store.KindAnthropicToken, Label: "subscription", WantDefault: true,
+		Ciphertext: []byte("t1"), SealedWith: store.SealedWithMaster,
+	}); err != nil {
+		t.Fatalf("insert first token: %v", err)
+	}
+	if _, err := q.InsertUserSecret(ctx, store.InsertUserSecretParams{
+		UserID: user, Kind: store.KindAnthropicToken, Label: "console-key", WantDefault: false,
+		Ciphertext: []byte("t2"), SealedWith: store.SealedWithMaster,
+	}); err != nil {
+		t.Fatalf("insert second token: %v", err)
+	}
+
+	// Clear the default → the goal state: ≥2 anthropic_tokens, zero is_default.
+	if _, err := q.ClearDefaultUserSecret(ctx, store.ClearDefaultUserSecretParams{
+		UserID: user, Kind: store.KindAnthropicToken,
+	}); err != nil {
+		t.Fatalf("clear default: %v", err)
+	}
+
+	// The upsert now fires its INSERT branch (no is_default row to conflict on), creating a
+	// new 'default'-labelled row.
+	row, err := q.UpsertDefaultUserSecret(ctx, store.UpsertDefaultUserSecretParams{
+		UserID: user, Kind: store.KindAnthropicToken, Ciphertext: []byte("t3"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("upsert default (INSERT branch): %v", err)
+	}
+
+	// The reserved-key-leak guard: a multi-token user's newly created row is NOT born pooled.
+	if row.AutoEligible {
+		t.Errorf("newly created default for a multi-token user is auto_eligible=true; the reserved-key-leak guard requires false")
+	}
+	// ...and it IS the new default (the upsert's intent).
+	if !row.IsDefault {
+		t.Errorf("newly created default is_default=false, want true (the upsert must create the default)")
+	}
+}
