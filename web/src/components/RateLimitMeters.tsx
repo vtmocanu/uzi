@@ -299,6 +299,8 @@ export function RateLimitAnnouncer() {
   );
 }
 
+// MicroRow is one window's 5px forecast bar, showing its percentage and folding
+// the "resets in <countdown>" text into the bar's forecast tooltip.
 function MicroRow({
   label,
   win,
