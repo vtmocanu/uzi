@@ -2450,9 +2450,11 @@ export const mockApi = {
       kind: "anthropic_token",
       label: "default",
       is_default: true,
-      // A new token is never pooled (PRD #111 D2) — mirror the server default or
-      // the mock teaches the wrong lesson.
-      auto_eligible: false,
+      // The user's FIRST/SOLE anthropic_token is born pooled (issue #804) so a
+      // single-token user has a non-empty auto-select pool; token #2+ stays
+      // opt-in. Compute it faithfully off the "no existing anthropic_token" rule,
+      // evaluated BEFORE pushing this row, or the mock teaches the wrong lesson.
+      auto_eligible: secrets.filter((s) => s.kind === "anthropic_token").length === 0,
       created_at: now,
       updated_at: now,
     };
@@ -2482,7 +2484,10 @@ export const mockApi = {
       kind: "anthropic_token",
       label: trimmed,
       is_default: wantDefault,
-      auto_eligible: false,
+      // The user's FIRST/SOLE anthropic_token is born pooled (issue #804); token
+      // #2+ stays opt-in (auto_eligible false). Mirror the server or the mock
+      // teaches the wrong lesson.
+      auto_eligible: first,
       created_at: now,
       updated_at: now,
     };

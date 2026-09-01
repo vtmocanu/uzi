@@ -123,13 +123,14 @@ func TestListUnplaceableQueuedRunsForEphemeralLiveDB(t *testing.T) {
 		runID := queuedRunWithCaps(fx2, []string{"docker"})
 		// Bind an ephemeral worker to it.
 		if _, err := fx2.q.CreateEphemeralHostedWorker(fx2.ctx, store.CreateEphemeralHostedWorkerParams{
-			UserID:           fx2.userID,
-			Name:             "ephemeral-" + runID.String(),
-			TokenHash:        tokenHash(),
-			TemplateDeclared: pgtype.Text{String: "base", Valid: true},
-			HostedSize:       pgtype.Text{String: "m", Valid: true},
-			DockerEnabled:    pgtype.Bool{Bool: true, Valid: true},
-			EphemeralRunID:   runID,
+			UserID:            fx2.userID,
+			Name:              "ephemeral-" + runID.String(),
+			TokenHash:         tokenHash(),
+			TemplateDeclared:  pgtype.Text{String: "base", Valid: true},
+			HostedSize:        pgtype.Text{String: "m", Valid: true},
+			DockerEnabled:     pgtype.Bool{Bool: true, Valid: true},
+			EphemeralRunID:    runID,
+			AnthropicBindMode: "default",
 		}); err != nil {
 			t.Fatalf("CreateEphemeralHostedWorker: %v", err)
 		}
@@ -161,13 +162,14 @@ func TestListUnplaceableQueuedRunsForEphemeralLiveDB(t *testing.T) {
 		atCap.worker("base-only", capOf(1), false)
 		boundRun := queuedRunWithCaps(atCap, []string{"docker"})
 		if _, err := atCap.q.CreateEphemeralHostedWorker(atCap.ctx, store.CreateEphemeralHostedWorkerParams{
-			UserID:           atCap.userID,
-			Name:             "ephemeral-" + boundRun.String(),
-			TokenHash:        tokenHash(),
-			TemplateDeclared: pgtype.Text{String: "base", Valid: true},
-			HostedSize:       pgtype.Text{String: "m", Valid: true},
-			DockerEnabled:    pgtype.Bool{Bool: true, Valid: true},
-			EphemeralRunID:   boundRun,
+			UserID:            atCap.userID,
+			Name:              "ephemeral-" + boundRun.String(),
+			TokenHash:         tokenHash(),
+			TemplateDeclared:  pgtype.Text{String: "base", Valid: true},
+			HostedSize:        pgtype.Text{String: "m", Valid: true},
+			DockerEnabled:     pgtype.Bool{Bool: true, Valid: true},
+			EphemeralRunID:    boundRun,
+			AnthropicBindMode: "default",
 		}); err != nil {
 			t.Fatalf("seed at-cap ephemeral worker: %v", err)
 		}
@@ -208,13 +210,14 @@ func TestEphemeralAndPersistentQuotaCountsAreSeparateLiveDB(t *testing.T) {
 		 VALUES ($1, 'persistent', $2, 'base', 'hosted', 'm', false)`, fx.userID, tokenHash())
 	// One ephemeral hosted worker bound to the run.
 	if _, err := fx.q.CreateEphemeralHostedWorker(fx.ctx, store.CreateEphemeralHostedWorkerParams{
-		UserID:           fx.userID,
-		Name:             "ephemeral-" + runID.String(),
-		TokenHash:        tokenHash(),
-		TemplateDeclared: pgtype.Text{String: "base", Valid: true},
-		HostedSize:       pgtype.Text{String: "m", Valid: true},
-		DockerEnabled:    pgtype.Bool{Bool: true, Valid: true},
-		EphemeralRunID:   runID,
+		UserID:            fx.userID,
+		Name:              "ephemeral-" + runID.String(),
+		TokenHash:         tokenHash(),
+		TemplateDeclared:  pgtype.Text{String: "base", Valid: true},
+		HostedSize:        pgtype.Text{String: "m", Valid: true},
+		DockerEnabled:     pgtype.Bool{Bool: true, Valid: true},
+		EphemeralRunID:    runID,
+		AnthropicBindMode: "default",
 	}); err != nil {
 		t.Fatalf("CreateEphemeralHostedWorker: %v", err)
 	}
@@ -243,13 +246,14 @@ func TestCreateEphemeralHostedWorkerOnePerRunLiveDB(t *testing.T) {
 
 	mk := func(name string) error {
 		_, err := fx.q.CreateEphemeralHostedWorker(fx.ctx, store.CreateEphemeralHostedWorkerParams{
-			UserID:           fx.userID,
-			Name:             name,
-			TokenHash:        tokenHash(),
-			TemplateDeclared: pgtype.Text{String: "base", Valid: true},
-			HostedSize:       pgtype.Text{String: "m", Valid: true},
-			DockerEnabled:    pgtype.Bool{Bool: true, Valid: true},
-			EphemeralRunID:   runID,
+			UserID:            fx.userID,
+			Name:              name,
+			TokenHash:         tokenHash(),
+			TemplateDeclared:  pgtype.Text{String: "base", Valid: true},
+			HostedSize:        pgtype.Text{String: "m", Valid: true},
+			DockerEnabled:     pgtype.Bool{Bool: true, Valid: true},
+			EphemeralRunID:    runID,
+			AnthropicBindMode: "default",
 		})
 		return err
 	}

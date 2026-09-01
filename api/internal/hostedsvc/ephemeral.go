@@ -17,6 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // ephemeralProvisionBatch bounds how many unplaceable runs one ProvisionPass tick
@@ -255,6 +256,22 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 		return false, err
 	}
 
+	// Bind mode (issue #804): default an auto-provisioned burst worker to `auto` ONLY when
+	// the owner has ≥1 auto_eligible anthropic_token, so the auto-select pool is non-empty
+	// and the worker never parks its run in pool_wait (autoselect.ReasonPoolEmpty); a
+	// pre-existing multi-token owner who never opted in gets `default`. Read via qtx for a
+	// snapshot consistent with the rest of the tx — holding the provision lock over this
+	// read buys no atomicity (the auto_eligible toggle runs under a different lock class),
+	// it just keeps the read in one transaction.
+	hasPool, err := qtx.UserHasAutoEligibleAnthropicToken(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	mode := workersvc.BindModeDefault
+	if hasPool {
+		mode = workersvc.BindModeAuto
+	}
+
 	wkr, err := qtx.CreateEphemeralHostedWorker(ctx, store.CreateEphemeralHostedWorkerParams{
 		UserID:           userID,
 		Name:             ephemeralWorkerName(runID),
@@ -263,8 +280,9 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 		HostedSize:       pgtype.Text{String: p.cfg.DefaultSize, Valid: true},
 		// Explicit true/false (Valid always), never NULL: on a hosted row a false is a
 		// real "no sidecar", matching CreateHostedWorker.
-		DockerEnabled:  pgtype.Bool{Bool: docker, Valid: true},
-		EphemeralRunID: runID,
+		DockerEnabled:     pgtype.Bool{Bool: docker, Valid: true},
+		EphemeralRunID:    runID,
+		AnthropicBindMode: mode,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
