@@ -1,7 +1,7 @@
 # PRD #949: agent god-method split — RunRunner.execute() and SdkExecutor.run() phase extraction
 
 **GitHub Issue**: [#949](https://github.com/vtmocanu/uzi/issues/949)
-**Status**: Draft (created 2026-09-01)
+**Status**: Complete (created 2026-09-01, landed 2026-09-01)
 **Priority**: Medium
 **Parent**: epic #915 (Batch 2, P10; findings G1, G2, G5). Depends on P4 (#920, merged in PR #931).
 **Line refs**: re-derived at `5e343113` (post-Batch-1 main). The implementer must re-derive every boundary at their clone's base — file drift of a few lines is expected; the anchors below are identifiers, not offsets.
