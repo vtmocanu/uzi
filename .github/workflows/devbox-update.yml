@@ -55,6 +55,12 @@ jobs:
       - name: Checkout uzi
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
+          # Full history. The branch-clobber guard below diffs
+          # main...chore/devbox-toolchain-update (three-dot), which needs a merge base; a
+          # shallow checkout (default depth 1) has none, so that diff fails and the guard
+          # fail-closes on EVERY run once the branch exists, never updating it (observed on
+          # run 33485168333: "no merge base" -> stuck). fetch-depth 0 gives the merge base.
+          fetch-depth: 0
           # The PAT (if set) is what lets the bump PR trigger its own CI; else the
           # built-in token, which can still push and open a PR where the repo setting
           # allows it, and otherwise the issue fallback runs.
