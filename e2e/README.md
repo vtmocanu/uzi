@@ -164,6 +164,9 @@ headers, not the rows.
 | 49 | docker-sidecar | gitlab | no | PRD #83 M2: rootless DinD sidecar + Decision-3 efficacy |
 | 50 | worker-token-binding | gitlab | no | PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim |
 | 51 | auto-stop-poison | gitlab | no | PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to-API poison) |
+| 60 | schedules-sweep | gitlab | no | PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate skip, open-MR skip) |
+| 61 | schedules-prompt | gitlab | no | PRD #966 M4: scheduled prompt run (issue-less repo->MR run via run-now) |
+| 62 | self-improve | gitlab | no | PRD #966 M4: scheduled self_improve run (vault-unlocked, tracking issue, MR opened) |
 
 <!-- registry:end -->
 
