@@ -3,10 +3,11 @@
 // token never leaves the api — the SPA only ever sees percentages) and reuse the
 // shared MeterTrack + toneFor thresholds. The admin table is a separate page.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { isShownInSidebar, onSidebarTokensChanged } from "../lib/sidebarTokens";
 import { api, type RateLimitWindow, type TokenRateLimits } from "../lib/api";
+import { useAsyncData } from "../lib/useAsyncData";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
   formatAgo,
@@ -38,22 +39,16 @@ export function useMyRateLimits(intervalMs: number): {
   tokens: TokenRateLimits[] | null;
   loading: boolean;
 } {
-  const [tokens, setTokens] = useState<TokenRateLimits[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const load = useCallback(() => {
-    api
-      .getMyRateLimits()
-      .then((d) => {
-        setTokens(d.tokens);
-        setLoading(false);
-      })
-      .catch(() => setLoading(false));
-  }, []);
-  useEffect(() => {
-    load();
-  }, [load]);
-  usePollWhileVisible(load, intervalMs);
-  return { tokens, loading };
+  // Reimplemented over useAsyncData (PRD #950 M3, Tier C) with the exact old
+  // contract: `data` null-initial matches the old `tokens` null, and NO error is
+  // ever surfaced (the old catch only cleared loading) — so `error` is not
+  // destructured. The poll is composed on the hook's reload, not absorbed.
+  const { data, loading, reload } = useAsyncData(
+    async () => (await api.getMyRateLimits()).tokens,
+    [],
+  );
+  usePollWhileVisible(reload, intervalMs);
+  return { tokens: data, loading };
 }
 
 const CARD_BLURB =

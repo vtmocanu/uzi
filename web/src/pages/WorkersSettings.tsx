@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 
-import { api, type BindMode, type SecretMeta, type Worker } from "../lib/api";
+import { api, type BindMode, type Worker } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton } from "../components/ui";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
@@ -18,6 +18,7 @@ import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerStatGauges, formatBytes } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
+import { useAsyncData } from "../lib/useAsyncData";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
 import { DocLink } from "../components/DocLink";
@@ -44,9 +45,22 @@ export function WorkersSettings() {
   // The control plane's own release, from the same memoised GET /api/version the footer
   // uses — one coordinate, so the panel and the footer cannot disagree.
   const cpVersion = useAppVersion();
-  // The user's named tokens, for the per-worker picker (PRD #104 M3/M6). Read
-  // alongside the workers so a rebind can offer labels without a second round trip.
-  const [tokens, setTokens] = useState<SecretMeta[]>([]);
+  // The primary load reads workers + the user's named tokens together (PRD #104
+  // M3/M6) so a rebind can offer labels without a second round trip. Migrated to
+  // useAsyncData (PRD #950 M3, Tier C): `workers` is ALSO written by the separate
+  // 10s poll and by the mutation handlers, so it stays local state and the fetcher
+  // seeds it as a side effect; `tokens` is written only by this load, so it rides
+  // the hook's data bundle. The separate error-swallowing poll below is unchanged.
+  const { data, loading, error: loadError, reload } = useAsyncData(
+    async () => {
+      const [{ workers }, { secrets }] = await Promise.all([api.listWorkers(), api.listSecrets()]);
+      setWorkers(workers);
+      return secrets.filter((s) => s.kind === "anthropic_token");
+    },
+    [],
+    { fallback: "Failed to load workers" },
+  );
+  const tokens = data ?? [];
   // How many of them are opted into the auto-selection pool (web-ux F18). An `auto`
   // worker with ZERO pooled tokens HOLDS every claim in pool_wait (spending nothing,
   // #754) rather than falling back to the owner's default, so the page must not say it
@@ -54,7 +68,6 @@ export function WorkersSettings() {
   const pooledCount = tokens.filter((t) => t.auto_eligible).length;
   // Which worker's rebind is in flight, so only that row's picker disables.
   const [tokenBusy, setTokenBusy] = useState("");
-  const [loading, setLoading] = useState(true);
   const [name, setName] = useState("");
   // The declared worker template (PRD #18): what image the user says this worker
   // will run. Defaults to the base image; the worker later self-reports its
@@ -96,18 +109,6 @@ export function WorkersSettings() {
   const noticeRef = useRef<HTMLDivElement>(null);
   const announce = useCallback((text: string, tone: "success" | "warning" = "success") => {
     setNotice({ text, tone });
-  }, []);
-
-  const load = useCallback(async () => {
-    try {
-      const [{ workers }, { secrets }] = await Promise.all([api.listWorkers(), api.listSecrets()]);
-      setWorkers(workers);
-      setTokens(secrets.filter((s) => s.kind === "anthropic_token"));
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load workers"));
-    } finally {
-      setLoading(false);
-    }
   }, []);
 
   // rebind points one worker at a named token, or clears the binding when the
@@ -177,10 +178,6 @@ export function WorkersSettings() {
     [pooledCount, announce],
   );
 
-  useEffect(() => {
-    load();
-  }, [load]);
-
   // Liveness (PRD #49): re-fetch the fleet every 10s while the tab is visible — the
   // same rhythm the Dashboard uses — so live CPU/memory gauges refresh without a
   // reload (heartbeat cadence 15s × this 10s poll). A poll error keeps the last-good
@@ -205,7 +202,7 @@ export function WorkersSettings() {
       setCopied(false);
       setName("");
       setTemplate(DEFAULT_WORKER_TEMPLATE);
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to create worker"));
     } finally {
@@ -225,7 +222,7 @@ export function WorkersSettings() {
       // clicks and takes nothing back from the asymmetry the confirmation buys. A row
       // that silently vanishes is poor feedback whichever kind it was.
       announce(`Deleted ${stripUnsafeChars(name ?? "worker")}.`);
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to delete worker"));
     }
@@ -302,7 +299,7 @@ export function WorkersSettings() {
           </>
         }
       />
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
 
       {newToken && (
         <Card className="space-y-3 border-ok/40">
@@ -391,7 +388,7 @@ export function WorkersSettings() {
         hostedCount={workers.filter((w) => w.kind === "hosted").length}
         onProvisioned={async (worker) => {
           announce(`Provisioned ${worker.name} — it appears in your workers below.`);
-          await load();
+          await reload();
         }}
       />
 

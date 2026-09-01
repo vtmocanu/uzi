@@ -24,6 +24,7 @@ import {
   type Repo,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
@@ -64,8 +65,6 @@ export function Findings() {
 
   const [backlog, setBacklog] = useState<IncidentalFindingBacklog | null>(null);
   const [repos, setRepos] = useState<Repo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
   const [actionErr, setActionErr] = useState("");
   // Per-coordinate created-with-warning note from the just-clicked File (the forge issue WAS
   // created but its local disposition could not settle): kept so the filed row can surface the
@@ -75,28 +74,35 @@ export function Findings() {
   // backlog is the source of truth, so the row shows a friendly note and a reload reconciles.
   const [resolvedIds, setResolvedIds] = useState<Set<string>>(new Set());
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const data = await api.listFindings(
-        bucket as IncidentalFindingBucket,
-        repoFilter || undefined,
-        runAnchor || undefined,
+  // backlog is ALSO written by patchRow (the optimistic File/Dismiss row update), so it
+  // stays local and is set as a side effect here rather than bundled into the hook's data.
+  // skeleton:"always" reproduces the old load's own setLoading(true), which fired on every
+  // call including the 409 handlers' reload. error is load-only (mutations use actionErr).
+  const {
+    loading,
+    error,
+    reload: load,
+  } = useAsyncData(
+    async () => {
+      setBacklog(
+        await api.listFindings(
+          bucket as IncidentalFindingBucket,
+          repoFilter || undefined,
+          runAnchor || undefined,
+        ),
       );
-      setBacklog(data);
-    } catch (e) {
-      setError(errorMessage(e, "Failed to load the findings backlog"));
-    } finally {
-      setLoading(false);
-    }
-  }, [bucket, repoFilter, runAnchor]);
+    },
+    [bucket, repoFilter, runAnchor],
+    { skeleton: "always", fallback: "Failed to load the findings backlog" },
+  );
 
+  // These resets are tied to a deps change (bucket/repo/run filter), NOT to a reload():
+  // the 409 File/Dismiss handlers call load() without clearing them, so they must stay in
+  // their own effect keyed on the same deps as the load, preserving that exact behavior.
   useEffect(() => {
     setFiledWarnings({});
     setResolvedIds(new Set());
-    load();
-  }, [load]);
+  }, [bucket, repoFilter, runAnchor]);
 
   // The repo scope selector's options. Best-effort (a failure leaves All-repos as the only
   // option, and the backlog still renders); the selector defaults to All-repos-grouped.

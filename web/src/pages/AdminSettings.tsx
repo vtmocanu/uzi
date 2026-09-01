@@ -117,7 +117,6 @@ export function AdminSettings() {
   const [uziLabel, setUziLabel] = useState("");
   const [autopilotLabel, setAutopilotLabel] = useState("");
   const [defaultTheme, setDefaultTheme] = useState("");
-  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -142,24 +141,26 @@ export function AdminSettings() {
     setDefaultTheme(settings.default_theme);
   }, []);
 
-  const load = useCallback(async () => {
-    try {
-      applyResponse(await api.getSettings());
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load settings"));
-    } finally {
-      setLoading(false);
-    }
-    // Best-effort, independent of the settings load (PRD #32).
-    api
-      .vaultMigration()
-      .then(({ master_sealed }) => setMasterSealed(master_sealed))
-      .catch(() => setMasterSealed(null));
-  }, [applyResponse]);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+  // The settings form fields are seeded by applyResponse as a fetcher side effect
+  // (they are editable and also written by the save handler). The vaultMigration probe
+  // runs in a `finally` so it fires regardless of the settings-load outcome, exactly as
+  // the old load ran it after its own try/catch/finally (PRD #32). The hook owns
+  // loading and the load error (surfaced as loadError, unioned with the save error at
+  // the Alert below); masterSealed stays local, set as a side effect.
+  const { loading, error: loadError } = useAsyncData(
+    async () => {
+      try {
+        applyResponse(await api.getSettings());
+      } finally {
+        api
+          .vaultMigration()
+          .then(({ master_sealed }) => setMasterSealed(master_sealed))
+          .catch(() => setMasterSealed(null));
+      }
+    },
+    [applyResponse],
+    { fallback: "Failed to load settings" },
+  );
 
   // Poll only the live Slack connection state so the chip reflects connecting →
   // connected without a manual reload. Uses the dedicated status endpoint (not the
@@ -270,7 +271,7 @@ export function AdminSettings() {
         </nav>
       )}
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
       {notice && <Alert tone="success" message={notice} />}
 
       {masterSealed !== null && masterSealed > 0 && (

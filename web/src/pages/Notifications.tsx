@@ -5,7 +5,7 @@
 // Marking read is own-row only; the bell badge in AppShell refreshes via the shared
 // change event.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type Notification } from "../lib/api";
@@ -21,6 +21,7 @@ import {
   notificationTitle,
 } from "../lib/notifications";
 import { useJudgeTodo } from "../components/JudgeTodoContext";
+import { useAsyncData } from "../lib/useAsyncData";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
@@ -234,8 +235,9 @@ export function Notifications() {
   const [items, setItems] = useState<Notification[]>([]);
   const [unread, setUnread] = useState(0);
   const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  // error carries loadMore's failure; the primary load's failure comes from the
+  // hook below. The union of the two is rendered (see displayError).
   const [error, setError] = useState("");
 
   // The API paginates (offset/limit); the page walks it with a Load-more button
@@ -252,24 +254,22 @@ export function Notifications() {
     [scope],
   );
 
-  const load = useCallback(async () => {
-    setError("");
-    try {
+  // Primary load. items/unread/total are ALSO written by loadMore/markRead, so they
+  // stay local and are set as side effects here (never bundled into the hook's data).
+  // skeleton:"deps" reproduces the old setLoading(true) that lived in the EFFECT — it
+  // fired on every scope switch (a deps-driven refetch) but not on a manual reload.
+  const { loading, error: loadError } = useAsyncData(
+    async () => {
       const res = await fetchPage(0);
       setItems(res.notifications);
       setUnread(res.unread);
       setTotal(res.total);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load notifications"));
-    } finally {
-      setLoading(false);
-    }
-  }, [fetchPage]);
+    },
+    [fetchPage],
+    { skeleton: "deps", fallback: "Failed to load notifications" },
+  );
 
-  useEffect(() => {
-    setLoading(true);
-    load();
-  }, [load]);
+  const displayError = error || loadError;
 
   const loadMore = async () => {
     setLoadingMore(true);
@@ -339,10 +339,10 @@ export function Notifications() {
         }
       />
 
-      {error && <Alert message={error} />}
+      {displayError && <Alert message={displayError} />}
       {loading && <ListSkeleton rows={4} />}
 
-      {!loading && !error && (
+      {!loading && !displayError && (
         <>
           {items.length === 0 ? (
             <EmptyState

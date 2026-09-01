@@ -5,7 +5,7 @@
 // a fired `once` row shows as terminal; a status='error' (parked) row is called out
 // distinctly. The "New schedule" button and the per-row ✎ open the shared modal.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -15,6 +15,7 @@ import {
   type ScheduleCatalog,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { relativeFromNow, ScheduleModal } from "../components/ScheduleModal";
 import { browserTimezone } from "../lib/timezone";
 import { useDemoMode } from "../lib/demoMode";
@@ -101,8 +102,17 @@ export function Schedules() {
     tabRefs.current[target]?.focus();
   };
 
-  const load = useCallback(async () => {
-    try {
+  // schedules/catalog/repos are seeded here as fetcher side effects because all three
+  // are read AND written outside the load — the optimistic enable toggle rewrites
+  // schedules — so they stay local state rather than being derived from the hook's
+  // data. The hook owns the load error (surfaced as loadError, unioned with the
+  // mutation error below) and keeps the last-good rows on a reload failure, matching
+  // the old catch's `cur ?? []` (which kept the existing rows). No loading flag: the
+  // null schedules/catalog still gate the skeleton exactly as before, and on a
+  // first-load failure the fetcher throws before seeding so both stay null, which
+  // renders the skeleton the same as the old code did with catalog still null.
+  const { error: loadError, reload } = useAsyncData(
+    async () => {
       const [rows, cat, repoList] = await Promise.all([
         api.listSchedules(),
         api.listScheduleCatalog(),
@@ -111,16 +121,10 @@ export function Schedules() {
       setSchedules(rows);
       setCatalog(cat);
       setRepos(repoList);
-      setError("");
-    } catch (err) {
-      setError(errorMessage(err, "Could not load schedules"));
-      setSchedules((cur) => cur ?? []);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+    },
+    [],
+    { fallback: "Could not load schedules" },
+  );
 
   const toggleEnabled = async (s: Schedule) => {
     setBusyId(s.id);
@@ -133,7 +137,7 @@ export function Schedules() {
       const updated = await api.updateSchedule(s.id, { enabled: !s.enabled });
       setSchedules((rows) => (rows ? rows.map((r) => (r.id === s.id ? updated : r)) : rows));
       // Keep the catalog view's enablement pause-flags in sync.
-      load();
+      reload();
     } catch (err) {
       setError(errorMessage(err, "Could not update the schedule"));
       // Revert on failure.
@@ -156,7 +160,7 @@ export function Schedules() {
           ? `Started ${created} run${created === 1 ? "" : "s"} from this schedule.`
           : "Nothing fired — a matching run is already active (skipped by dedup).",
       );
-      load();
+      reload();
     } catch (err) {
       setError(errorMessage(err, "Could not run the schedule now"));
     } finally {
@@ -194,7 +198,7 @@ export function Schedules() {
           `Enabled “${entry.name}” on ${ok} repo${ok === 1 ? "" : "s"} → ${ok} schedule${ok === 1 ? "" : "s"}.`,
         );
       }
-      await load();
+      await reload();
     } finally {
       setBusyId("");
     }
@@ -207,7 +211,7 @@ export function Schedules() {
     try {
       await api.resetSchedule(s.id);
       setNotice("Reset to the catalog default.");
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Could not reset the schedule"));
     } finally {
@@ -225,7 +229,7 @@ export function Schedules() {
       const clone = await api.cloneSchedule(s.id);
       const label = s.origin === "default" && s.catalog_slug ? catalogName(catalog, s.catalog_slug) : "a schedule";
       setClonedFrom((m) => ({ ...m, [clone.id]: label }));
-      await load();
+      await reload();
       setEditing(clone);
       setTab("mine");
     } catch (err) {
@@ -240,7 +244,7 @@ export function Schedules() {
     setError("");
     try {
       await api.deleteSchedule(s.id);
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Could not remove the schedule"));
     } finally {
@@ -268,7 +272,7 @@ export function Schedules() {
     try {
       const sibling = await api.addScheduleRepo(source.id, repoId);
       setNotice("Added on another repo.");
-      await load();
+      await reload();
       if (sibling.sibling_group_id) {
         setExpandedGroups((s) => new Set(s).add(sibling.sibling_group_id as string));
       }
@@ -286,7 +290,7 @@ export function Schedules() {
   const onSaved = () => {
     setCreating(false);
     setEditing(null);
-    load();
+    reload();
   };
 
   // My schedules holds the owner-authored (and cloned) rows; catalog defaults live in
@@ -364,7 +368,7 @@ export function Schedules() {
             onRemove={removeSchedule}
             onEdit={setEditing}
             notice={notice}
-            error={error}
+            error={error || loadError}
           />
         </div>
       ) : (
@@ -374,7 +378,7 @@ export function Schedules() {
           id={panelId("mine")}
           aria-labelledby={tabId("mine")}
         >
-          {error && <Alert message={error} />}
+          {(error || loadError) && <Alert message={error || loadError} />}
           {notice && <Alert message={notice} tone="info" />}
           <p className="text-sm text-muted">
             {total === 0

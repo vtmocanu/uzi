@@ -6,7 +6,7 @@
 // property: the server withholds the code precisely so this page cannot auto-fill
 // it and the human must confirm the tab belongs to their own invocation.
 
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { Navigate, useLocation, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import {
@@ -17,6 +17,7 @@ import {
   type CliTokenScope,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Button, Card, Field, Input, Skeleton } from "../components/ui";
 import { ScopePicker } from "../components/ScopePicker";
 import { useDemoMode } from "../lib/demoMode";
@@ -31,16 +32,17 @@ const TERMINAL_STATUS_MESSAGE: Record<Exclude<CliAuthStatus, "pending">, string>
   expired: "This login request has expired. Run uzi login again in your terminal to start a new one.",
 };
 
+// The fetcher throws this sentinel when the page was opened without a ?request=
+// id — the hook only produces an error from a throw, and mapError maps it to the
+// missing-link message.
+const MISSING_REQUEST = Symbol("missing-request");
+
 export function CliAuth() {
   const demo = useDemoMode();
   const { user, loading: authLoading } = useAuth();
   const location = useLocation();
   const [searchParams] = useSearchParams();
   const requestId = searchParams.get("request");
-
-  const [meta, setMeta] = useState<CliAuthRequestMeta | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState("");
 
   const [code, setCode] = useState("");
   const [scope, setScope] = useState<CliTokenScope>("user");
@@ -52,35 +54,32 @@ export function CliAuth() {
 
   const isAdmin = user?.is_admin ?? false;
 
-  const load = useCallback(async () => {
-    if (!requestId) {
-      setLoadError("This link is missing its login request. Run uzi login again in your terminal.");
-      setLoading(false);
-      return;
-    }
-    try {
+  // Load only once the auth state is known and the user is signed in — otherwise
+  // the Navigate below sends them to log in first (the read is cookie-only).
+  const {
+    data: meta,
+    loading,
+    error: loadError,
+  } = useAsyncData<CliAuthRequestMeta>(
+    async () => {
+      if (!requestId) throw MISSING_REQUEST;
       const m = await api.getCliAuthRequest(requestId);
-      setMeta(m);
       if (m.status !== "pending") {
         setOutcome({ tone: "info", message: TERMINAL_STATUS_MESSAGE[m.status] });
       }
-    } catch (err) {
-      setLoadError(
-        err instanceof ApiError && err.status === 404
-          ? "This login request was not found. It may have already been used or expired."
-          : errorMessage(err, "Failed to load the login request."),
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [requestId]);
-
-  // Load only once the auth state is known and the user is signed in — otherwise
-  // the Navigate below sends them to log in first (the read is cookie-only).
-  useEffect(() => {
-    if (authLoading || !user) return;
-    load();
-  }, [authLoading, user, load]);
+      return m;
+    },
+    [requestId],
+    {
+      enabled: !authLoading && !!user,
+      mapError: (err) =>
+        err === MISSING_REQUEST
+          ? "This link is missing its login request. Run uzi login again in your terminal."
+          : err instanceof ApiError && err.status === 404
+            ? "This login request was not found. It may have already been used or expired."
+            : errorMessage(err, "Failed to load the login request."),
+    },
+  );
 
   // Not signed in → send to login, preserving the full URL so the consent page is
   // returned to after authenticating (password OR OIDC). The request id rides the

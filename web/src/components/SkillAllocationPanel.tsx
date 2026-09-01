@@ -8,9 +8,10 @@
 // edit — a non-admin sends my_skill_ids only, so the shared half is left
 // untouched (nil = untouched, server-side).
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { api, type Skill, type TemplateSkills } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { scopeBadgeTone, SCOPE_LABEL } from "../lib/skills";
 import { Alert, Badge, Button, Card, Spinner } from "./ui";
 
@@ -26,7 +27,6 @@ export function SkillAllocationPanel({
   const [allSkills, setAllSkills] = useState<Skill[]>([]);
   const [shared, setShared] = useState<Set<string>>(new Set());
   const [mine, setMine] = useState<Set<string>>(new Set());
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
@@ -35,22 +35,9 @@ export function SkillAllocationPanel({
   const [baseShared, setBaseShared] = useState<Set<string>>(new Set());
   const [baseMine, setBaseMine] = useState<Set<string>>(new Set());
 
-  const load = useCallback(async () => {
-    setError("");
-    try {
-      const [{ skills }, { allocations }] = await Promise.all([
-        api.listSkills(),
-        api.getTemplateSkills(templateId),
-      ]);
-      setAllSkills(skills);
-      applyAllocations(allocations);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load skill allocations"));
-    } finally {
-      setLoading(false);
-    }
-  }, [templateId]);
-
+  // applyAllocations seeds shared/mine and their baselines from a GET/PUT response.
+  // Declared ABOVE the useAsyncData call because the fetcher closes over it; it only
+  // writes setters, so hoisting it above the load changes nothing else.
   const applyAllocations = (a: TemplateSkills) => {
     const s = new Set(a.shared.map((x) => x.skill_id));
     const m = new Set(a.mine.map((x) => x.skill_id));
@@ -60,9 +47,22 @@ export function SkillAllocationPanel({
     setBaseMine(new Set(m));
   };
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  // allSkills is set only here, so it is seeded as a fetcher side effect; shared/mine
+  // and their baselines are also written by the edit toggles and Save, so
+  // applyAllocations seeds them as a side effect too. The hook owns loading and the
+  // load error (surfaced as loadError, unioned with the save error at the Alert below).
+  const { loading, error: loadError } = useAsyncData(
+    async () => {
+      const [{ skills }, { allocations }] = await Promise.all([
+        api.listSkills(),
+        api.getTemplateSkills(templateId),
+      ]);
+      setAllSkills(skills);
+      applyAllocations(allocations);
+    },
+    [templateId],
+    { fallback: "Failed to load skill allocations" },
+  );
 
   const byId = useMemo(() => new Map(allSkills.map((s) => [s.id, s])), [allSkills]);
 
@@ -139,7 +139,7 @@ export function SkillAllocationPanel({
         </p>
       </div>
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
       {notice && <Alert message={notice} tone="success" />}
 
       <div>
