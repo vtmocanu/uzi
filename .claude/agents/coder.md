@@ -174,11 +174,12 @@ half (`deadcode -test ./...` per module) gates at ZERO against a committed,
 EMPTY baseline — if it reddens, DELETE the function; adding a line to
 `api/.deadcode-baseline` is a deliberate suppression that owes a reason in a
 comment, and the gate treats an entry that has stopped being reported as a
-failure so a suppression cannot outlive its finding. The npm half (knip) stages
-the **exports/types family at `warn`: printed on every run, setting no exit
-code** — 22 findings on `web` and 53 on `agent` as of 2026-08-02 — while unused
-files and dependencies gate at zero. So a green `task deadcode:web` does not
-mean "no unused exports"; it means none of the *gating* tiers fired. Neither
+failure so a suppression cannot outlive its finding. The npm half (knip) now
+GATES the **exports/types family at `error`** — promoted from `warn` and burned
+to zero (issue #596/#597, 2026-08-29) — alongside unused files and dependencies,
+which already gated at zero. So a green `task deadcode:web` DOES mean "no new
+unused export" (DTO and contract types kept exported are covered by
+`ignoreExportsUsedInFile`, not a blanket suppression). Neither
 tool sees a dead **branch** (a `case` arm nothing reaches inside a live
 function); that stays the reviewer's job.
 
