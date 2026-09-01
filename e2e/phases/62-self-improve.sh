@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # phase:    self-improve
-# title:    PRD #966 M4: scheduled self_improve run (vault-unlocked, tracking issue, MR opened)
+# title:    PRD #966 M4: scheduled self_improve run (tracking issue, MR opened)
 # critical: no
 # lane:     gitlab
 # executor: any
@@ -11,33 +11,27 @@
 # restores: -
 # =============================================================================
 # PRD #966 M4 (stretch) — the `self_improve` run kind had zero wire coverage. Unlike
-# prompt/sweep, its real gate is the SCHEDULER, not the executor: fireSelfImprove
-# (api/internal/schedsvc/self_improve.go) skips with a typed reason unless the owner's
-# vault is UNLOCKED (SkipVaultLocked) and the per-repo open-self-improve-MR cap is under
-# its limit (SkipSelfImproveMRCapReached), and it files/reuses a tracking issue on the
-# forge (ensureTrackingIssue -> CreateIssue) and reads MR open-state (GetMergeRequest).
-# All of those forge routes are served by forge-fake, and the StubExecutor is
-# kind-agnostic, so a self_improve run reaches completed with an MR unchanged.
+# prompt/sweep, its gating lives in the SCHEDULER (fireSelfImprove,
+# api/internal/schedsvc/self_improve.go), not the executor: it files/reuses a tracking
+# issue on the forge (ensureTrackingIssue -> CreateIssue), reads MR open-state
+# (GetMergeRequest) to enforce a per-repo open-self-improve-MR cap (selfImproveMaxOpenMRs
+# = 2), and only then creates the run. All those forge routes are served by forge-fake,
+# and the StubExecutor is kind-agnostic, so a self_improve run reaches completed with an
+# MR unchanged. A fresh repo has 0 prior self-improve MRs (cap 0 < 2), so run-now starts.
 #
-# The two skip reasons above are the drivable blockers: this phase UNLOCKS the admin
-# vault first (the seam's precondition) and runs against a repo with no prior open
-# self-improve MR (cap = 0 < 2). If run-now still returns a skip instead of a start,
-# that skip reason IS the blocker to record — this phase asserts a Started, not a Skip.
+# On the run-now path the vault does NOT gate: the run-now HTTP handler builds its
+# scheduler with a NIL vault (api/internal/handler/handler.go NewHandler: schedsvc.New(…,
+# nil, nil, 0, …), "treated as always unlocked"), so fireSelfImprove's
+# `if e.vault != nil && !e.vault.Unlocked(...)` vault_locked branch is UNREACHABLE via
+# run-now. So this phase does NOT unlock the vault — that would be a vacuous control. The
+# vault_locked skip is only reachable through the BACKGROUND (non-nil-vault) scheduler and
+# belongs to a unit test, not this wire phase. This phase asserts a Started, not a Skip;
+# a skip reason (e.g. self_improve_mr_cap_reached) would be the recordable blocker.
 #
 # NOTE (SC9 / stretch): live behaviour is validated in CI; the full suite cannot run in
 # the M4 worker (agent image build fails at devbox). No runner.ts/executor.ts change is
 # made or needed — the stub drives self_improve to completed as-is.
-say "PRD #966 M4: scheduled self_improve run (vault-unlocked, tracking issue, MR opened)"
-
-# --- unlock the admin vault (fireSelfImprove's precondition) ------------------
-# Reuse phase 34-vault.sh's unlock call. The seed admin is boot-unlocked, so "as found"
-# is unlocked; this is idempotent and makes the phase sound under E2E_ONLY subsetting.
-# The uzc_ CLI token is admin-scoped, so the scheduled self_improve run (owned by admin)
-# sees the same unlocked DEK cache. We leave the vault unlocked (as found).
-apipost /api/vault/unlock "{\"password\":\"$ADMIN_PASS\"}" >/dev/null
-[ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = true ] \
-  || fail "admin vault must be unlocked before a self_improve fire (fireSelfImprove skips vault_locked otherwise)"
-pass "admin vault unlocked (self_improve precondition satisfied)"
+say "PRD #966 M4: scheduled self_improve run (tracking issue, MR opened)"
 
 # --- enable the self-improve catalog default ---------------------------------
 SID="$(uzi_cli schedule catalog enable self-improve --repo "$REPO_ID" --json | jq -r '.[0].schedule_id')"
