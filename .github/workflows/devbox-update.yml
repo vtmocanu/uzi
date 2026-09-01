@@ -153,14 +153,20 @@ jobs:
             elif git fetch --no-tags origin \
                    "+refs/heads/main:refs/remotes/origin/main" \
                    "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null; then
-              others="$(git diff --name-only "refs/remotes/origin/main...refs/remotes/origin/${BRANCH}" | grep -Fxv "${LOCK}" || true)"
-              if [ -z "${others}" ]; then
-                # Only the lock commit -> safe to refresh, but the push below leases against
-                # this exact SHA so a commit landing before the push rejects instead of being lost.
+              # Capture the diff status separately from grep: a `git diff` FAILURE (e.g. the
+              # branch has unrelated history with no merge base) must fail closed, whereas
+              # grep's rc 1 "no non-lock file" is the expected SAFE case.
+              diff_rc=0
+              changed="$(git diff --name-only "refs/remotes/origin/main...refs/remotes/origin/${BRANCH}")" || diff_rc=$?
+              if [ "${diff_rc}" -ne 0 ]; then
+                echo "git diff against ${BRANCH} failed (rc=${diff_rc}); treating as protected (fail closed)." >&2
+              elif [ -n "$(printf '%s\n' "${changed}" | grep -Fxv "${LOCK}" || true)" ]; then
+                echo "${BRANCH} carries commits touching files other than ${LOCK}; not clobbering."
+              else
+                # Only the lock commit -> safe to refresh; the push below leases against this
+                # exact SHA so a commit landing before the push rejects instead of being lost.
                 protected=false; push_mode="lease"
                 expected_sha="$(git rev-parse "refs/remotes/origin/${BRANCH}")"
-              else
-                echo "${BRANCH} carries commits touching files other than ${LOCK}; not clobbering."
               fi
             else
               echo "git fetch failed; treating ${BRANCH} as protected (fail closed)." >&2
