@@ -127,18 +127,46 @@ jobs:
           gh label create "${LABEL}" \
             --description "Dependency updates" --color 0366D6 --force >/dev/null 2>&1 || true
 
+          # Never clobber human work on the bot branch (mirrors roles-manifest-refresh.yml):
+          # refuse to force-push when an open PR already tracks it, OR the remote branch
+          # carries commits touching files other than the lock (a maintainer's
+          # conflict-resolution, a pinned package, or the deferred uxlab-lock bump). The
+          # bump is not lost -- it is surfaced as a tracking issue instead.
+          protected=false
+          if [ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')" ]; then
+            protected=true
+          else
+            git fetch --no-tags origin \
+              "+refs/heads/main:refs/remotes/origin/main" \
+              "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null || true
+            if git rev-parse --verify --quiet "refs/remotes/origin/${BRANCH}" >/dev/null; then
+              others="$(git diff --name-only "refs/remotes/origin/main...refs/remotes/origin/${BRANCH}" | grep -Fxv "${LOCK}" || true)"
+              [ -n "${others}" ] && protected=true
+            fi
+          fi
+
+          upsert_issue() {
+            existing="$(gh issue list --state open --label "${LABEL}" --search "devbox toolchain in:title" --json number --jq '.[0].number // empty')"
+            if [ -n "${existing}" ]; then
+              echo "Tracking issue #${existing} already open; not duplicating."
+            else
+              gh issue create --title "$1" --label "${LABEL}" --body "$2"
+            fi
+          }
+
+          if [ "${protected}" = true ]; then
+            echo "Branch ${BRANCH} has an open PR or human commits; not clobbering. Surfacing a tracking issue instead." >&2
+            upsert_issue "Devbox worker toolchain bump available (branch occupied)" \
+              "$(printf 'A newer validated `devbox.lock` bump is available, but `%s` has an open PR or human commits, so this run did not overwrite it. Merge or clear the branch and re-run the workflow.\n\n%s' "${BRANCH}" "${BODY}")"
+            exit 0
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "${BRANCH}"
           git add "${LOCK}"
           git commit -m "chore(deps): refresh devbox worker toolchain nixpkgs pin"
           git push --force origin "${BRANCH}"
-
-          # An open PR on the branch was just updated by the push -- nothing more to do.
-          if [ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')" ]; then
-            echo "Existing PR on ${BRANCH} updated by the push."
-            exit 0
-          fi
 
           if gh pr create --base main --head "${BRANCH}" \
                --title "chore(deps): refresh devbox worker toolchain (nixpkgs pin)" \
@@ -148,12 +176,5 @@ jobs:
           fi
 
           echo "PR creation refused (Actions-create-PR setting off and no DEVBOX_UPDATE_TOKEN); filing a tracking issue." >&2
-          existing="$(gh issue list --state open --label "${LABEL}" --search "devbox toolchain in:title" --json number --jq '.[0].number // empty')"
-          if [ -n "${existing}" ]; then
-            echo "Tracking issue #${existing} already open; not duplicating."
-          else
-            gh issue create \
-              --title "Devbox worker toolchain bump validated on ${BRANCH}" \
-              --label "${LABEL}" \
-              --body "$(printf 'A validated `devbox.lock` bump is pushed to `%s`. Open a PR from it (that triggers CI) and merge.\n\n%s' "${BRANCH}" "${BODY}")"
-          fi
+          upsert_issue "Devbox worker toolchain bump validated on ${BRANCH}" \
+            "$(printf 'A validated `devbox.lock` bump is pushed to `%s`. Open a PR from it (that triggers CI) and merge.\n\n%s' "${BRANCH}" "${BODY}")"
