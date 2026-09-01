@@ -249,8 +249,9 @@ Two things the workflow-scope entry does not prepare you for:
   editing: fix the file, then `git commit --fixup=INTRO_SHA` and
   `GIT_SEQUENCE_EDITOR=: git rebase --autosquash -i origin/main` — the fix lands in that
   commit and every later commit replays unchanged (verified on a three-commit stack).
-- **Verify the RANGE, not the tip.** `task scan:secrets` reads tracked files at HEAD and
-  goes green on a tip that is clean while an earlier commit still carries the literal.
+- **Verify the RANGE, not the tip.** `task scan:secrets` scans the working tree as it is on
+  disk (`gitleaks dir`) and gates on the index — one snapshot — so it goes green on a tip
+  that is clean while an earlier commit still carries the literal.
   `resume-recipe.md`'s step-7 pre-flight now runs gitleaks over `origin/main..HEAD` for
   exactly this reason — read by its `N commits scanned` line as well as `no leaks found`,
   because it prints the latter with rc 0 on an unresolved ref, and with the in-file allow
