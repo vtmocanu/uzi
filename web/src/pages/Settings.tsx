@@ -7,9 +7,9 @@
 // model) moved to the Run defaults tab (RunDefaults.tsx): this tab is who you
 // are and what you hold, that one is how your runs behave.
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, type SecretMeta } from "../lib/api";
+import { api } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "../components/ui";
@@ -65,7 +65,7 @@ export function Settings() {
     [],
     { fallback: "Failed to load settings" },
   );
-  const secrets: SecretMeta[] = data?.secrets ?? [];
+  const secrets = useMemo(() => data?.secrets ?? [], [data]);
 
   // Whole-set replace over PUT /me/settings, then tell the sidebar rail (a
   // separate mount) to refetch now rather than on its next poll.

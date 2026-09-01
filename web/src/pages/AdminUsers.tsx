@@ -29,19 +29,20 @@ export function AdminUsers() {
   const [judgeEnforceAll, setJudgeEnforceAll] = useState(false);
 
   const { loading, error: loadError } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       // The user list is the page; a failure here is fatal (the fetcher rethrows and
       // the hook turns it into loadError). The settings read is best-effort per the
       // judgeEnforceAll comment above: it only decides whether the per-user toggle is
       // annotated inert, so a settings-endpoint blip must NOT blank the whole table.
       // Keep it OUT of the fatal path — leave enforce=false on error.
       const { users } = await api.listUsers();
+      if (!isCurrent()) return;
       setUsers(users);
       try {
         const { settings } = await api.getSettings();
-        setJudgeEnforceAll(settings.judge_enforce_all === "true");
+        if (isCurrent()) setJudgeEnforceAll(settings.judge_enforce_all === "true");
       } catch {
-        setJudgeEnforceAll(false);
+        if (isCurrent()) setJudgeEnforceAll(false);
       }
     },
     [],

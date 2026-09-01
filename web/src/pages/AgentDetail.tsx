@@ -65,8 +65,9 @@ export function AgentDetail() {
   const editorRef = useRef<AgentTemplateEditorHandle>(null);
 
   const { loading, error } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const { template } = await api.getAgentTemplate(id);
+      if (!isCurrent()) return;
       setTemplate(template);
       // Only a caller who could actually press Reset has any use for the shipped
       // side, and only that caller passes the endpoint's authz — for a builtin row
@@ -76,7 +77,7 @@ export function AgentDetail() {
       if (template.is_builtin && isAdmin) {
         try {
           const { builtin } = await api.getBuiltinAgentTemplate(id);
-          setShipped({ kind: "ok", def: builtin });
+          if (isCurrent()) setShipped({ kind: "ok", def: builtin });
         } catch (err) {
           // THE STATUS IS THE WHOLE POINT: 409 is a fact about the RELEASE, any
           // other failure is a fact about ONE REQUEST, and only the first licenses
@@ -85,9 +86,10 @@ export function AgentDetail() {
           // and it is unreachable from here anyway, since the Reset card renders
           // only for callers the endpoint would not refuse.
           const status = err instanceof ApiError ? err.status : 0;
-          setShipped(
-            status === 409 || status === 403 ? { kind: "absent" } : { kind: "unavailable" },
-          );
+          if (isCurrent())
+            setShipped(
+              status === 409 || status === 403 ? { kind: "absent" } : { kind: "unavailable" },
+            );
         }
       }
     },

@@ -114,8 +114,9 @@ export function IssueView() {
         }
         // Declined (or forced retry failed): clear starting, no toast on decline.
         // The original load() began with setError(""), so a forced-retry failure
-        // toast never persisted (issue #856, spec: keep as-is); reload() does not
-        // clear it, so preserve that wipe explicitly here.
+        // toast never persisted (issue #856, spec: keep as-is). reload() now clears
+        // it too via onFetchStart (m2), so this explicit setError("") is redundant
+        // belt-and-suspenders — kept to make the intent local.
         setStarting(false);
         setError("");
         reload();
@@ -124,7 +125,9 @@ export function IssueView() {
       setError(errorMessage(err, "Could not start run"));
       setStarting(false);
       // As above: the old load() wiped this just-set message on entry so the toast
-      // never persisted; reproduce that clear now that reload() does not (issue #856).
+      // never persisted. reload() now clears it too via onFetchStart (m2), so this
+      // explicit setError("") is redundant belt-and-suspenders — kept for local intent
+      // (issue #856).
       setError("");
       reload();
     }

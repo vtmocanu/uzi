@@ -2250,8 +2250,9 @@ export function JudgePanel({
     error: loadErr,
     reload: fetchReview,
   } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const { review, pending_judge } = await api.getRunReview(run.id);
+      if (!isCurrent()) return;
       setReview(review);
       // Seed the poll's baseline to the verdict this fetch just put on screen (see the
       // invariant at baselineUpdatedAt): without it a poll that starts from server truth
