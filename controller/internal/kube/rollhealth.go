@@ -242,9 +242,13 @@ func deriveRollHealth(pods []corev1.Pod, wantHash, replicaFailure string, now ti
 		p := &pods[i]
 		// A terminal or terminating pod says nothing about the live rollout; remember
 		// one only so an all-terminal wantHash set keeps today's verdict rather than
-		// silently becoming `rolling`.
+		// silently becoming `rolling`. Keep the OLDEST such pod (earliest creation), not
+		// the first seen, so the fallback verdict is order-independent: the age arm below
+		// keys on CreationTimestamp, so retaining a list-order-arbitrary terminal pod would
+		// make an all-terminal set read `rolling` or `stuck` depending on List() order.
+		// Oldest is also the honest proxy for "how long has this worker been down".
 		if p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded || p.DeletionTimestamp != nil {
-			if fallback == nil {
+			if fallback == nil || p.CreationTimestamp.Before(&fallback.CreationTimestamp) {
 				fallback = p
 			}
 			continue

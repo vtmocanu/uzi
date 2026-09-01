@@ -274,6 +274,36 @@ func TestDeriveRollHealth(t *testing.T) {
 				}
 			},
 		},
+		{
+			// Order-independence of the all-terminal fallback: two terminal pods share
+			// wantHash, one OLD (> stuckAge, would be stuck) and one RECENT (< stuckAge,
+			// would be rolling), with the RECENT one listed FIRST. Keeping the first-seen
+			// terminal pod would pick the recent one and report `rolling`; the fallback must
+			// pick the OLDEST and report `stuck`. Paired with the reversed order below, the
+			// verdict is identical for both permutations.
+			name: "all-terminal fallback picks the oldest, recent-listed-first -> stuck",
+			pods: func() []corev1.Pod {
+				recent := workerPod("w1", want, time.Minute)
+				recent.Status.Phase = corev1.PodFailed
+				old := workerPod("w1", want, stuckAge+30*time.Minute)
+				old.Status.Phase = corev1.PodFailed
+				return []corev1.Pod{*recent, *old}
+			}(),
+			wantPhase: protocol.PhaseStuck,
+		},
+		{
+			// The reversed order of the case above: old-listed-first. Same two pods, same
+			// verdict — proving the fallback does not depend on List() order.
+			name: "all-terminal fallback picks the oldest, old-listed-first -> stuck",
+			pods: func() []corev1.Pod {
+				old := workerPod("w1", want, stuckAge+30*time.Minute)
+				old.Status.Phase = corev1.PodFailed
+				recent := workerPod("w1", want, time.Minute)
+				recent.Status.Phase = corev1.PodFailed
+				return []corev1.Pod{*old, *recent}
+			}(),
+			wantPhase: protocol.PhaseStuck,
+		},
 	}
 
 	for _, tc := range cases {
