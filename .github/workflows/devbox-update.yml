@@ -6,9 +6,10 @@
 # agent/devbox-global/devbox.lock, and the worker image bakes exactly that lock
 # (agent/templates/base/Dockerfile COPYs it before `devbox global install`). Renovate
 # tracks the npm/Go/CI-tool pins but not this lock, so it silently rots (the pin sat
-# ~6.5 weeks stale when #912 was filed). This weekly job runs `devbox update`, which
-# advances the pin to the newest nixpkgs-unstable commit -- so a bump CAN carry major
-# tool versions, which is intended (workers should get current, patched tools) and is
+# ~6.5 weeks stale when #912 was filed). This weekly job removes the lock and re-resolves
+# every package against the newest nixpkgs-unstable commit (a plain `devbox update` keeps
+# packages pinned to their current commit -- a no-op for versions), so a bump CAN carry
+# major tool versions, which is intended (workers should get current, patched tools) and is
 # exactly why it is VALIDATED and human-reviewed rather than applied blind.
 #
 # HOW IT VALIDATES WITHOUT A PAT, AND WHY A PR CAN FALL BACK TO AN ISSUE. A PR opened
@@ -88,15 +89,23 @@ jobs:
           sudo install -m 0755 "$(find "${tmp}" -type f -name devbox | head -n1)" /usr/local/bin/devbox
           devbox version
 
-      # `devbox update` re-resolves the nixpkgs pin; a transient nix binary-cache fetch can
-      # truncate (as it did on the first run), so retry a few times before giving up. A
-      # genuine failure (a package dropped upstream, say) still fails after the retries.
-      - name: devbox update (advance the worker toolchain nixpkgs pin)
+      # Force a FULL re-resolve. `devbox update` on its own keeps every package "resolved to
+      # its current version" (the old pinned commit) -- a no-op for tool versions (verified:
+      # it only advanced the nixpkgs-unstable alias while all 23 packages stayed on the old
+      # commit, so chromium etc. did not move). Removing the lock first makes devbox
+      # re-resolve every unversioned package against the CURRENT nixpkgs-unstable commit,
+      # which is what actually advances the versions (chromium 150 -> 152 in a local resolve).
+      # --no-install: the real install + toolchain-guard validation happens in the base-image
+      # build below, so the heavy runner install is skipped here. A transient nix binary-cache
+      # fetch can truncate (as it did on the first run), so retry; rm runs each attempt so a
+      # partial lock from a failed try never leaks into the next.
+      - name: devbox update (full re-resolve to the latest nixpkgs)
         working-directory: agent/devbox-global
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if devbox update; then exit 0; fi
+            rm -f devbox.lock
+            if devbox update --no-install; then exit 0; fi
             if [ "${attempt}" -lt 3 ]; then
               echo "devbox update attempt ${attempt} failed; retrying after backoff..." >&2
               sleep "$((attempt * 20))"
