@@ -226,67 +226,47 @@ func (g *gitLab) ListProjects(ctx context.Context) ([]Project, error) {
 		// heavy statistics/permissions blocks.
 		Simple: gitlab.Ptr(true),
 	}
-	var out []Project
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list projects", e) }
+	return paginate(wrap, func(page int) ([]Project, int, error) {
+		opt.Page = int64(page)
 		projects, resp, err := g.client.Projects.ListProjects(opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.wrapErr("list projects", err)
+			return nil, 0, err
 		}
+		var items []Project
 		for _, p := range projects {
 			if p == nil {
 				continue
 			}
-			out = append(out, Project{
+			items = append(items, Project{
 				ForgeProjectID:    p.ID,
 				PathWithNamespace: p.PathWithNamespace,
 				WebURL:            p.WebURL,
 				DefaultBranch:     p.DefaultBranch,
 			})
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list projects", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list projects", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, int(resp.NextPage), nil
+	})
 }
 
 func (g *gitLab) ListLabels(ctx context.Context, projectID int64) ([]Label, error) {
 	opt := &gitlab.ListLabelsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
-	var out []Label
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list labels", e) }
+	return paginate(wrap, func(page int) ([]Label, int, error) {
+		opt.Page = int64(page)
 		labels, resp, err := g.client.Labels.ListLabels(projectID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.wrapErr("list labels", err)
+			return nil, 0, err
 		}
+		var items []Label
 		for _, l := range labels {
 			if l == nil {
 				continue
 			}
-			out = append(out, Label{Name: l.Name, Color: l.Color})
+			items = append(items, Label{Name: l.Name, Color: l.Color})
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list labels", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list labels", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, int(resp.NextPage), nil
+	})
 }
 
 func (g *gitLab) EnsureLabels(ctx context.Context, projectID int64, labels []Label) error {
@@ -439,32 +419,22 @@ func (g *gitLab) UserExists(ctx context.Context, username string) (bool, error) 
 
 func (g *gitLab) ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]LabelEvent, error) {
 	opt := &gitlab.ListLabelEventsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
-	var out []LabelEvent
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list issue label events", e) }
+	return paginate(wrap, func(page int) ([]LabelEvent, int, error) {
+		opt.Page = int64(page)
 		events, resp, err := g.client.ResourceLabelEvents.ListIssueLabelEvents(projectID, issueIID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.wrapErr("list issue label events", err)
+			return nil, 0, err
 		}
+		var items []LabelEvent
 		for _, e := range events {
 			if e == nil {
 				continue
 			}
-			out = append(out, toLabelEvent(e))
+			items = append(items, toLabelEvent(e))
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list issue label events", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list issue label events", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, int(resp.NextPage), nil
+	})
 }
 
 // ListIssueComments returns an issue's human comments, oldest-first (PRD #381).
@@ -478,14 +448,14 @@ func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int6
 		OrderBy:     gitlab.Ptr("created_at"),
 		Sort:        gitlab.Ptr("asc"),
 	}
-	var out []IssueComment
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list issue comments", e) }
+	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
+		opt.Page = int64(page)
 		notes, resp, err := g.client.Notes.ListIssueNotes(projectID, issueIID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.wrapErr("list issue comments", err)
+			return nil, 0, err
 		}
+		var items []IssueComment
 		for _, n := range notes {
 			if n == nil || n.System {
 				continue
@@ -494,25 +464,15 @@ func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int6
 			if n.CreatedAt != nil {
 				createdAt = *n.CreatedAt
 			}
-			out = append(out, IssueComment{
+			items = append(items, IssueComment{
 				AuthorForgeUserID: n.Author.ID,
 				AuthorUsername:    n.Author.Username,
 				Body:              n.Body,
 				CreatedAt:         createdAt,
 			})
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list issue comments", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list issue comments", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, int(resp.NextPage), nil
+	})
 }
 
 func (g *gitLab) CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (IssueNote, error) {
@@ -544,14 +504,14 @@ func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (M
 // oldest-first (D8).
 func (g *gitLab) ListMergeRequestComments(ctx context.Context, projectID, mrIID int64) ([]MRComment, error) {
 	opt := &gitlab.ListMergeRequestDiscussionsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
-	var out []MRComment
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list merge request comments", e) }
+	out, err := paginate(wrap, func(page int) ([]MRComment, int, error) {
+		opt.Page = int64(page)
 		discussions, resp, err := g.client.Discussions.ListMergeRequestDiscussions(projectID, mrIID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.wrapErr("list merge request comments", err)
+			return nil, 0, err
 		}
+		var items []MRComment
 		for _, d := range discussions {
 			if d == nil {
 				continue
@@ -587,19 +547,13 @@ func (g *gitLab) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 						c.Line = &line
 					}
 				}
-				out = append(out, c)
+				items = append(items, c)
 			}
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
+		return items, int(resp.NextPage), nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
@@ -681,32 +635,22 @@ func (g *gitLab) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 
 func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
 	opt := &gitlab.ListJobsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
-	var out []Job
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list pipeline jobs", e) }
+	return paginate(wrap, func(page int) ([]Job, int, error) {
+		opt.Page = int64(page)
 		jobs, resp, err := g.client.Jobs.ListPipelineJobs(projectID, pipelineID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.wrapErr("list pipeline jobs", err)
+			return nil, 0, err
 		}
+		var items []Job
 		for _, j := range jobs {
 			if j == nil {
 				continue
 			}
-			out = append(out, Job{ID: j.ID, Name: j.Name, Stage: j.Stage, Status: j.Status, WebURL: j.WebURL})
+			items = append(items, Job{ID: j.ID, Name: j.Name, Stage: j.Stage, Status: j.Status, WebURL: j.WebURL})
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list pipeline jobs", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list pipeline jobs", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, int(resp.NextPage), nil
+	})
 }
 
 func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error) {

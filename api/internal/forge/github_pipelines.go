@@ -93,34 +93,28 @@ func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 		return nil, err
 	}
 	opt := &gh.ListWorkflowJobsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
-	var out []Job
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list pipeline jobs", e) }
+	return paginate(wrap, func(page int) ([]Job, int, error) {
+		opt.ListOptions.Page = page
 		jobs, resp, err := g.client.Actions.ListWorkflowJobs(ctx, slug.owner, slug.repo, pipelineID, opt)
 		if err != nil {
-			return nil, g.wrapErr("list pipeline jobs", err)
+			return nil, 0, err
 		}
+		var items []Job
 		if jobs != nil {
 			for _, j := range jobs.Jobs {
 				if j == nil {
 					continue
 				}
-				out = append(out, toGitHubJob(j))
+				items = append(items, toGitHubJob(j))
 			}
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list pipeline jobs", forgePaginationCapErr("item", maxForgeItems))
+		next := 0
+		if resp != nil {
+			next = resp.NextPage
 		}
-		if resp == nil || resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list pipeline jobs", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, next, nil
+	})
 }
 
 // JobLogTail returns at most maxBytes from the END of a job's log; maxBytes <= 0

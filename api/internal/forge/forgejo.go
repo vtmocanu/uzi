@@ -206,37 +206,27 @@ func (f *forgejo) ListProjects(ctx context.Context) ([]Project, error) {
 	// min_access_level), so a read-only repo comes back and must be dropped
 	// client-side: the picker only offers repos the bot can actually push to.
 	opt := gitea.ListReposOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
-	var out []Project
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return f.wrapErr("list projects", e) }
+	return paginate(wrap, func(page int) ([]Project, int, error) {
+		opt.Page = page
 		repos, resp, err := c.ListMyRepos(opt)
 		if err != nil {
-			return nil, f.wrapErr("list projects", err)
+			return nil, 0, err
 		}
+		var items []Project
 		for _, r := range repos {
 			if r == nil || r.Permissions == nil || !r.Permissions.Push {
 				continue
 			}
-			out = append(out, Project{
+			items = append(items, Project{
 				ForgeProjectID:    r.ID,
 				PathWithNamespace: r.FullName,
 				WebURL:            r.HTMLURL,
 				DefaultBranch:     r.DefaultBranch,
 			})
 		}
-		if len(out) > maxForgeItems {
-			return nil, f.wrapErr("list projects", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, f.wrapErr("list projects", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, resp.NextPage, nil
+	})
 }
 
 func (f *forgejo) ListLabels(ctx context.Context, projectID int64) ([]Label, error) {
@@ -264,27 +254,15 @@ func (f *forgejo) ListLabels(ctx context.Context, projectID int64) ([]Label, err
 // CreateIssue need (Forgejo's label writes are keyed by id, not name).
 func (f *forgejo) listRepoLabels(c *gitea.Client, slug repoSlug) ([]*gitea.Label, error) {
 	opt := gitea.ListLabelsOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
-	var out []*gitea.Label
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return f.wrapErr("list labels", e) }
+	return paginate(wrap, func(page int) ([]*gitea.Label, int, error) {
+		opt.Page = page
 		labels, resp, err := c.ListRepoLabels(slug.owner, slug.repo, opt)
 		if err != nil {
-			return nil, f.wrapErr("list labels", err)
+			return nil, 0, err
 		}
-		out = append(out, labels...)
-		if len(out) > maxForgeItems {
-			return nil, f.wrapErr("list labels", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, f.wrapErr("list labels", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return labels, resp.NextPage, nil
+	})
 }
 
 func (f *forgejo) EnsureLabels(ctx context.Context, projectID int64, labels []Label) error {
@@ -1090,14 +1068,14 @@ func (f *forgejo) ListIssueComments(ctx context.Context, projectID, issueIID int
 		return nil, err
 	}
 	opt := gitea.ListIssueCommentOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
-	var out []IssueComment
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return f.wrapErr("list issue comments", e) }
+	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
+		opt.Page = page
 		comments, resp, err := c.ListIssueComments(slug.owner, slug.repo, issueIID, opt)
 		if err != nil {
-			return nil, f.wrapErr("list issue comments", err)
+			return nil, 0, err
 		}
+		var items []IssueComment
 		for _, cm := range comments {
 			if cm == nil {
 				continue
@@ -1107,20 +1085,10 @@ func (f *forgejo) ListIssueComments(ctx context.Context, projectID, issueIID int
 				ic.AuthorForgeUserID = cm.Poster.ID
 				ic.AuthorUsername = cm.Poster.UserName
 			}
-			out = append(out, ic)
+			items = append(items, ic)
 		}
-		if len(out) > maxForgeItems {
-			return nil, f.wrapErr("list issue comments", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, f.wrapErr("list issue comments", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, resp.NextPage, nil
+	})
 }
 
 // forgejoLabelAction decodes Forgejo's UNDOCUMENTED label-event convention (R6):
