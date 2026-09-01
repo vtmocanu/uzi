@@ -87,9 +87,19 @@ if [ -n "$CL_FILE" ]; then
     echo "release-cut: --changelog-file does not contain a '## [$VERSION]' heading" >&2
     rm -f "$TMP"; exit 3
   fi
+  # If [Unreleased] already has entries, --changelog-file REPLACES them with the draft
+  # (the draft is expected to have folded them in), so surface what was there. Shipping
+  # merges dropped by mistake are still caught by the coverage oracle below.
+  oldbody="$(awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f{print}' "$CL")"
+  if [ -n "$(printf '%s' "$oldbody" | tr -d '[:space:]')" ]; then
+    echo "  NOTE: [Unreleased] had entries; the draft REPLACES them (confirm the draft folds them in). Was:" >&2
+    printf '%s\n' "$oldbody" | sed 's/^/    | /' >&2
+  fi
   awk -v f="$CL_FILE" '
     BEGIN{ buf=""; while((getline line < f)>0) buf=buf line "\n" }
-    /^## \[Unreleased\]/ && !done { print; print ""; printf "%s", buf; done=1; next }
+    /^## \[Unreleased\]/ && !done { print; print ""; printf "%s", buf; skip=1; done=1; next }
+    skip && /^## \[/ { skip=0; print "" }   # reached the next section: stop dropping, re-add one blank
+    skip { next }                            # drop the old [Unreleased] body so it is not duplicated
     { print }
     END{ if(!done){ print "release-cut: no [Unreleased] heading found" > "/dev/stderr"; exit 7 } }
   ' "$CL" > "$TMP" || { echo "release-cut: CHANGELOG insert failed" >&2; rm -f "$TMP"; exit 3; }
@@ -110,11 +120,21 @@ echo "  CHANGELOG: [$VERSION] section applied"
 
 # --- 3. Chart.yaml ------------------------------------------------------------
 CHART="deploy/chart/Chart.yaml"; TMP="$(mktemp)"
-awk -v v="$VERSION" '
+if ! awk -v v="$VERSION" '
   /^version:/    { print "version: " v; next }
   /^appVersion:/ { print "appVersion: \"" v "\""; next }
   { print }
-' "$CHART" > "$TMP" && mv "$TMP" "$CHART"
+' "$CHART" > "$TMP"; then
+  echo "release-cut: Chart.yaml rewrite (awk) failed" >&2; rm -f "$TMP"; exit 1
+fi
+mv "$TMP" "$CHART"
+# awk exits 0 even if NEITHER line matched (e.g. the Chart.yaml format changed), which
+# would silently leave the chart unbumped and only surface at tag time via
+# release.yml's assert-version, after main is already pushed. Confirm the bump took.
+if ! grep -qxF "version: $VERSION" "$CHART" || ! grep -qxF "appVersion: \"$VERSION\"" "$CHART"; then
+  echo "release-cut: Chart.yaml bump did not take — version/appVersion not set to $VERSION" >&2
+  exit 1
+fi
 echo "  Chart.yaml: version + appVersion -> $VERSION"
 
 # --- 4. worker-tag autobump ---------------------------------------------------

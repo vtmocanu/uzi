@@ -46,6 +46,15 @@ if [ -z "${OWNER:-}" ] || [ -z "${REPO:-}" ]; then
   exit 3
 fi
 
+# GHCR packages live under /users/<login> for a User owner and /orgs/<login> for an
+# Organization; picking the wrong one 404s and would report a published artifact as
+# missing. Select by owner type so a fork under an org verifies too.
+OWNER_KIND="$(gh api "users/${OWNER}" --jq '.type' 2>/dev/null)"
+case "$OWNER_KIND" in
+  Organization) PKG_OWNER_PATH="orgs/${OWNER}" ;;
+  *)            PKG_OWNER_PATH="users/${OWNER}" ;;   # User (the default; also the fallback if type is unreadable)
+esac
+
 fails=0
 pass() { printf '  PASS  %s\n' "$1"; }
 fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails+1)); }
@@ -54,22 +63,36 @@ echo "=== verifying $TAG on $OWNER/$REPO ==="
 
 # --- 1. image version tags on GHCR --------------------------------------------
 # A user's container package: /users/<owner>/packages/container/<repo>%2F<img>/versions
-img_has_tag() {   # $1=image short name -> rc 0 if $VERSION is among its tags
-  local img="$1" enc out
+# rc 0 = $VERSION is among the image's tags; 1 = not found; 2 = query error (a
+# transient gh/network blip must not be misreported as "not published"). --paginate
+# walks every version page (the wanted tag is newest so usually page 1, but do not
+# rely on it). Membership is tested in pure bash — no `printf | grep -q`, which can
+# SIGPIPE-flake under pipefail (see assert-changelog-covers-release.sh).
+img_has_tag() {
+  local img="$1" enc tags rc
   enc="${REPO}%2F${img}"
-  out="$(gh api "/users/${OWNER}/packages/container/${enc}/versions" \
-        --jq "[.[].metadata.container.tags[]] | map(select(. == \"${VERSION}\")) | length" 2>/dev/null)"
-  [ "${out:-0}" -gt 0 ] 2>/dev/null
+  tags="$(gh api --paginate "/${PKG_OWNER_PATH}/packages/container/${enc}/versions" \
+        --jq '.[].metadata.container.tags[]' 2>/dev/null)"; rc=$?
+  [ "$rc" -ne 0 ] && return 2
+  case $'\n'"$tags"$'\n' in (*$'\n'"$VERSION"$'\n'*) return 0 ;; (*) return 1 ;; esac
 }
 for img in api web controller agent-base agent-jvm; do
-  if img_has_tag "$img"; then pass "image ${REPO}/${img}:${VERSION} on GHCR"
-  else fail "image ${REPO}/${img}:${VERSION} NOT found on GHCR"; fi
+  img_has_tag "$img"; r=$?
+  case $r in
+    0) pass "image ${REPO}/${img}:${VERSION} on GHCR" ;;
+    2) fail "image ${REPO}/${img}: could not query GHCR (gh/network error) — re-run verify" ;;
+    *) fail "image ${REPO}/${img}:${VERSION} NOT found on GHCR" ;;
+  esac
 done
 
 # --- 2. chart version tag on GHCR ---------------------------------------------
 # The OCI Helm chart is <repo>/<repo> (ghcr.io/<owner>/<repo>/<repo>).
-if img_has_tag "$REPO"; then pass "chart ${REPO}/${REPO}:${VERSION} on GHCR"
-else fail "chart ${REPO}/${REPO}:${VERSION} NOT found on GHCR"; fi
+img_has_tag "$REPO"; r=$?
+case $r in
+  0) pass "chart ${REPO}/${REPO}:${VERSION} on GHCR" ;;
+  2) fail "chart ${REPO}/${REPO}: could not query GHCR (gh/network error) — re-run verify" ;;
+  *) fail "chart ${REPO}/${REPO}:${VERSION} NOT found on GHCR" ;;
+esac
 
 # --- 3. cosign signing lines in the release.yml run --------------------------
 RELRUN="$(gh run list --workflow release.yml --branch "$TAG" --limit 1 \
@@ -79,11 +102,28 @@ if [ -z "$RELRUN" ]; then
 else
   # cosign prints "Pushing signature to: <ref>" once per signed artifact. Six
   # publish jobs sign (5 images + chart), so expect at least 6 lines.
+  # Expected signatures = the signing steps that actually ran (success), NOT a hardcoded
+  # 6. On an app-only release the publish-agent jobs re-tag the prior signed digest and
+  # SKIP signing (release.yml gates the Sign step `if reuse != 'true'`), so a correct
+  # release can sign as few as 4 (api/web/controller/chart). Match both signing-step
+  # names ("Sign image (cosign keyless)" and "Package + push + sign chart") while
+  # EXCLUDING the "cosign-installer" setup step, which also contains "sign". Require the
+  # log's "Pushing signature to:" lines to match. (No --paginate: a release run has far
+  # fewer than one page of jobs.)
+  expected="$(gh api "repos/${OWNER}/${REPO}/actions/runs/${RELRUN}/jobs" \
+    --jq '[.jobs[].steps[] | select((.name|test("sign";"i")) and ((.name|test("installer";"i"))|not) and .conclusion=="success")] | length' 2>/dev/null)"
+  expected="${expected:-0}"
   sigs="$(gh run view "$RELRUN" --log 2>/dev/null | grep -cF 'Pushing signature to:')"
   sigs="${sigs:-0}"
-  if [ "$sigs" -ge 6 ]; then pass "cosign signed $sigs artifacts (release.yml run $RELRUN)"
-  elif [ "$sigs" -gt 0 ]; then fail "cosign signed only $sigs artifacts (expected >=6) in run $RELRUN"
-  else fail "no 'Pushing signature to:' lines in release.yml run $RELRUN — signing unproven"; fi
+  if [ "$expected" -ge 1 ] && [ "$sigs" -ge "$expected" ]; then
+    pass "cosign signed $sigs artifacts ($expected Sign steps ran; release.yml run $RELRUN)"
+  elif [ "$expected" -ge 1 ]; then
+    fail "cosign: $sigs 'Pushing signature to:' lines but $expected Sign steps ran in run $RELRUN — signing incomplete"
+  elif [ "$sigs" -ge 1 ]; then
+    pass "cosign signed $sigs artifacts (release.yml run $RELRUN; Sign-step count unavailable)"
+  else
+    fail "no 'Pushing signature to:' lines and no successful Sign steps in run $RELRUN — signing unproven"
+  fi
 fi
 
 # --- 4. GitHub Release exists and is latest ----------------------------------

@@ -72,8 +72,14 @@ classify() {
       if (status!="completed") { pend++; next }
       if (isfail(concl)) { fails[nf]=name "\t" url; if (isgate(name)) gate=1; nf++ } }
     END {
-      if (nf>0){ print "FAIL"; for(i=0;i<nf;i++) print fails[i]; print "GATEFAIL=" (gate?1:0) }
-      else if (pend>0) print "PENDING"
+      # PENDING takes priority over FAIL: `gh run rerun --failed` only works on a
+      # COMPLETED run, so while any job is still running we WAIT, even if a sibling job
+      # has already failed. Reporting FAIL early (the watch-run-ci.sh pattern) would fire
+      # the rerun against an in-progress run, which GitHub rejects, turning a transient
+      # flake into a hard exit 1 — the exact case cutting v0.74.0 hit. Only once every job
+      # is terminal do we evaluate FAIL, at which point the run is rerunnable.
+      if (pend>0) print "PENDING"
+      else if (nf>0){ print "FAIL"; for(i=0;i<nf;i++) print fails[i]; print "GATEFAIL=" (gate?1:0) }
       else print "GREEN" }'
 }
 
@@ -89,7 +95,11 @@ wait_requeued() {
   return 0   # proceed anyway; the budget still bounds us
 }
 
-reruns_left="$MAX_RERUNS"; tick=0; gh_errs=0
+tick=0; gh_errs=0
+# Per-workflow rerun budget, so a flake that burns release.yml's retries does not
+# leave brew.yml with none. Indirect vars (printf -v / ${!key}) keep it bash-3.2-safe;
+# key = RR_<workflow name with non-alnum -> _>.
+for wf in $WORKFLOWS; do printf -v "RR_${wf//[^a-zA-Z0-9]/_}" '%s' "$MAX_RERUNS"; done
 while [ "$tick" -lt "$MAX_TICKS" ]; do
   all_green=1; any_pending=0
   for wf in $WORKFLOWS; do
@@ -120,19 +130,20 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
 
         gatefail="$(printf '%s\n' "$verdict" | awk -F= '/^GATEFAIL=/{print $2}')"
         failrows="$(printf '%s\n' "$verdict" | sed '1d;/^GATEFAIL=/d')"
+        rrkey="RR_${wf//[^a-zA-Z0-9]/_}"; rrleft="${!rrkey}"
 
-        if [ "$gatefail" = "1" ] || [ "$reruns_left" -le 0 ]; then
+        if [ "$gatefail" = "1" ] || [ "$rrleft" -le 0 ]; then
           reason="non-transient gate failure"
-          [ "$gatefail" != "1" ] && reason="reruns exhausted ($MAX_RERUNS used)"
+          [ "$gatefail" != "1" ] && reason="reruns exhausted ($MAX_RERUNS used for $wf)"
           echo "=== $wf run $id: FAILED ($reason) — react now (gh run view --job <id> --log-failed) ==="
           printf '%s\n' "$failrows" | awk -F'\t' 'NF{printf "  FAIL  %-28s %s\n",$1,$2}'
           exit 1
         fi
 
-        echo "=== $wf run $id: transient failure, auto-rerunning ($reruns_left rerun(s) left) ==="
+        echo "=== $wf run $id: transient failure, auto-rerunning ($rrleft rerun(s) left for $wf) ==="
         printf '%s\n' "$failrows" | awk -F'\t' 'NF{printf "  rerun <- %-28s %s\n",$1,$2}'
         if gh run rerun "$id" --failed >/dev/null 2>&1; then
-          reruns_left=$((reruns_left-1)); any_pending=1
+          printf -v "$rrkey" '%s' "$((rrleft-1))"; any_pending=1
           wait_requeued "$id"
         else
           echo "=== $wf run $id: 'gh run rerun --failed' itself failed; surfacing ==="
@@ -143,7 +154,8 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
   done
 
   if [ "$all_green" -eq 1 ]; then
-    echo "=== $TAG: release.yml AND brew.yml all-green after $((tick*INTERVAL))s (reruns used: $((MAX_RERUNS-reruns_left))) ==="
+    used=0; for wf in $WORKFLOWS; do k="RR_${wf//[^a-zA-Z0-9]/_}"; used=$((used + MAX_RERUNS - ${!k})); done
+    echo "=== $TAG: release.yml AND brew.yml all-green after $((tick*INTERVAL))s (reruns used: $used) ==="
     exit 0
   fi
   [ "$any_pending" -eq 1 ] || true
