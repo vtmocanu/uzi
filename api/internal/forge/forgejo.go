@@ -1035,10 +1035,10 @@ func (f *forgejo) ListIssueLabelEvents(ctx context.Context, projectID, issueIID 
 	// call ERRORS on exactly the label events we need. See forgejoTimelineEntry.
 	var out []LabelEvent
 	for page := 1; ; page++ {
-		raw, err := f.rawGet(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/timeline?page=%d&limit=%d",
-			url.PathEscape(slug.owner), url.PathEscape(slug.repo), issueIID, page, forgejoPerPage))
+		raw, err := f.rawGetLimited(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/timeline?page=%d&limit=%d",
+			url.PathEscape(slug.owner), url.PathEscape(slug.repo), issueIID, page, forgejoPerPage), maxTraceBytes+1)
 		if err != nil {
-			return nil, err // already redacted by rawGet
+			return nil, err // already redacted by rawGetLimited
 		}
 		var entries []forgejoTimelineEntry
 		if err := json.Unmarshal(raw, &entries); err != nil {
@@ -1172,7 +1172,7 @@ func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
 	// BasicAuth ("username not set: only BasicAuth allowed"), a CLIENT-side gate the
 	// server does not impose for the GET (D5). The list carries no secret — sha1 is
 	// empty except at creation, only token_last_eight is returned — but the error
-	// path still routes through the redactor (rawGet does this).
+	// path still routes through the redactor (rawGetLimited does this).
 	//
 	// token_last_eight is the ONLY per-token fingerprint the list exposes (sha1 is
 	// empty post-creation), so on the astronomically rare last-eight COLLISION
@@ -1191,10 +1191,10 @@ func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
 	var matchedScopes []string
 	matches := 0
 	for page := 1; ; page++ {
-		raw, err := f.rawGet(ctx, fmt.Sprintf("/users/%s/tokens?page=%d&limit=%d",
-			url.PathEscape(u.UserName), page, forgejoPerPage))
+		raw, err := f.rawGetLimited(ctx, fmt.Sprintf("/users/%s/tokens?page=%d&limit=%d",
+			url.PathEscape(u.UserName), page, forgejoPerPage), maxTraceBytes+1)
 		if err != nil {
-			return TokenInfo{}, err // already redacted by rawGet
+			return TokenInfo{}, err // already redacted by rawGetLimited
 		}
 		var tokens []forgejoAccessToken
 		if err := json.Unmarshal(raw, &tokens); err != nil {
@@ -1239,40 +1239,18 @@ type forgejoAccessToken struct {
 	Scopes         []string `json:"scopes"`
 }
 
-// rawGet performs an authenticated GET against {baseURL}/api/v1{path} using the
-// driver's shared timeout client, for the two endpoints uzi cannot drive through
-// the gitea SDK (the issue timeline, whose SDK type mis-models the label field;
-// and token introspection, whose SDK method imposes a client-side BasicAuth gate —
-// both D5/M4). It returns the body and status. Every error is routed through the
-// PAT redactor, including a non-2xx body, so a hostile forge echoing the token in
-// an error cannot leak it (test #12).
-func (f *forgejo) rawGet(ctx context.Context, path string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/api/v1"+path, nil)
-	if err != nil {
-		return nil, f.wrapErr("build request", err)
-	}
-	req.Header.Set("Authorization", "token "+f.token)
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return nil, f.wrapErr(fmt.Sprintf("request %s", path), err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, f.wrapErr("read response", err)
-	}
-	if resp.StatusCode/100 != 2 {
-		return body, f.wrapErr(fmt.Sprintf("GET %s", path), fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
-	}
-	return body, nil
-}
-
-// rawGetLimited is rawGet's byte-bounded sibling: the response body is read through
-// an io.LimitReader(resp.Body, limit) so the TRANSFER itself is capped, for the job
-// log endpoint whose gitea SDK method (GetRepoActionJobLogs) buffers the whole body
-// into memory with an unbounded io.ReadAll before the driver sees its size. A
-// hostile forge streaming a multi-GB log body therefore cannot OOM the api: the read
-// stops at limit bytes. Auth, non-2xx handling and PAT redaction match rawGet.
+// rawGetLimited is THE raw-GET helper for the three endpoints uzi cannot drive
+// through the gitea SDK: the issue timeline (whose SDK type mis-models the label
+// field), token introspection (whose SDK method imposes a client-side BasicAuth
+// gate — both D5/M4), and the job log endpoint (whose SDK method
+// GetRepoActionJobLogs buffers the whole body into memory before the driver sees
+// its size). It performs an authenticated GET against {baseURL}/api/v1{path} using
+// the driver's shared timeout client and reads the response body through an
+// io.LimitReader(resp.Body, limit) so the TRANSFER itself is byte-bounded: a
+// hostile forge streaming a multi-GB body therefore cannot OOM the api, as the read
+// stops at limit bytes. Every error is routed through the PAT redactor, including a
+// non-2xx body, so a hostile forge echoing the token in an error cannot leak it
+// (test #12).
 func (f *forgejo) rawGetLimited(ctx context.Context, path string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/api/v1"+path, nil)
 	if err != nil {

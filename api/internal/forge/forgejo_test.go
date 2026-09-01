@@ -1147,6 +1147,89 @@ func TestForgejoM4ErrorsAreRedacted(t *testing.T) {
 	}
 }
 
+// TestForgejoRawGetLimitedStopsAtLimit is the PRD #917 M2 (epic finding S1) pin for
+// the byte cap that folding rawGet into rawGetLimited introduced. rawGetLimited is
+// now THE raw-GET helper for the three SDK-bypassing endpoints (issue timeline,
+// token introspection, job logs); this asserts its io.LimitReader actually bounds the
+// TRANSFER, so a hostile forge streaming a multi-GB body cannot OOM the api — the read
+// stops at limit bytes and the returned body length is <= limit, never the whole body.
+// A small local limit exercises the cap without allocating gigabytes (mirroring the
+// job-log over-cap technique in forgejo_pipelines_test.go, which serves a body larger
+// than the cap and asserts the read stops). The positive control proves a normal-size
+// body under the limit is returned in full, so the cap does not truncate legitimate
+// responses.
+func TestForgejoRawGetLimitedStopsAtLimit(t *testing.T) {
+	const oversized = 4096 // the served body, deliberately larger than the test cap
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/rawprobe": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte(strings.Repeat("A", oversized)))
+		},
+		"/repos/acme/widgets/rawsmall": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("small-body"))
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+	f, ok := d.(*forgejo)
+	if !ok {
+		t.Fatalf("expected *forgejo, got %T", d)
+	}
+
+	// Oversized: the io.LimitReader must stop the transfer at the cap.
+	const cap64 = int64(64)
+	body, err := f.rawGetLimited(context.Background(), "/repos/acme/widgets/rawprobe", cap64)
+	if err != nil {
+		t.Fatalf("rawGetLimited (oversized): %v", err)
+	}
+	if int64(len(body)) > cap64 {
+		t.Fatalf("read must stop at the cap: got %d bytes, want <= %d", len(body), cap64)
+	}
+	if int64(len(body)) != cap64 {
+		t.Fatalf("an oversized body must be capped to exactly the limit: got %d, want %d", len(body), cap64)
+	}
+
+	// Positive control: a body under the cap is returned whole (no truncation).
+	got, err := f.rawGetLimited(context.Background(), "/repos/acme/widgets/rawsmall", maxTraceBytes+1)
+	if err != nil {
+		t.Fatalf("rawGetLimited (normal): %v", err)
+	}
+	if string(got) != "small-body" {
+		t.Fatalf("a normal-size body must be returned in full, got %q", got)
+	}
+}
+
+// TestForgejoListIssueLabelEventsCapsOversizedTimeline is the end-to-end S1 pin for
+// the timeline call site, one of the two former unbounded-rawGet callers now routed
+// through rawGetLimited(maxTraceBytes+1). A hostile forge streaming a timeline body
+// LARGER than the cap must not be buffered whole: the transfer stops at
+// maxTraceBytes+1 bytes and the oversized "A"-run fails JSON parsing, producing the
+// same redacted parse-error shape rawGetLimited feeds ListIssueLabelEvents today
+// (never a panic or OOM). Mirrors forgejo_pipelines_test.go's over-cap technique:
+// serve maxTraceBytes+2 bytes rather than actually streaming gigabytes.
+func TestForgejoListIssueLabelEventsCapsOversizedTimeline(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/issues/11/timeline": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(strings.Repeat("A", maxTraceBytes+2)))
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	events, err := d.ListIssueLabelEvents(context.Background(), 7, 11)
+	if err == nil {
+		t.Fatalf("an oversized, unparseable timeline body must error, got %d events", len(events))
+	}
+	if events != nil {
+		t.Fatalf("no events must be returned on the capped/parse-failure path, got %+v", events)
+	}
+	// The parse failure is routed through the redactor (forgejo-prefixed), never a raw
+	// panic; a token was not in play here, so just assert the forgejo op-context shape.
+	if !strings.Contains(err.Error(), "forgejo:") {
+		t.Fatalf("expected a redacted forgejo-prefixed error, got %q", err.Error())
+	}
+}
+
 // TestForgejoListIssuesMapsAssignees pins PRD #767 M1: Forgejo/Gitea's inline
 // `assignees` array (sdk User.ID int64, nil-guarded) round-trips into
 // forge.Issue.Assignees, and an unassigned issue yields a non-nil empty slice.
