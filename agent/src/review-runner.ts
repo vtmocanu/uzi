@@ -15,8 +15,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { HookInput, HookJSONOutput, Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
+import type { Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import { spawnDetached } from "./sdk-spawn.js";
 import { uidSplitActive } from "./runner-uid.js";
 
@@ -25,14 +24,13 @@ import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { fenceNonce } from "./prompt.js";
-import { mapSdkMessage, isResult, isErrorResult } from "./sdk-messages.js";
+import { defaultQueryFn, mapSdkMessage, isResult, isErrorResult, promptStream } from "./sdk-messages.js";
+import { buildDenyAllHook } from "./model-pass.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { extractJsonObject } from "./judge-runner.js";
 import { rmTreeForce } from "./rmtree.js";
 import { errMessage } from "./util.js";
 import type { ClaimResponse, TaskReviewFinding, TaskReviewRequest } from "./protocol.js";
-
-const defaultQueryFn: SdkQueryFn = (params) => sdkQuery({ prompt: params.prompt as never, options: params.options });
 
 // Wall-clock cap on the single reviewer model turn, mirroring JUDGE_MODEL_TIMEOUT_MS.
 // Without it a review run whose model call hangs or retries indefinitely only ends when
@@ -257,19 +255,7 @@ export class ReviewRunner {
   }
 }
 
-// A PreToolUse deny for EVERY tool: the reviewer is read-only. A deny is authoritative
-// even under bypassPermissions (the same property guardrails.ts relies on).
-const denyAllTools = async (_input: HookInput): Promise<HookJSONOutput> => ({
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason: "the reviewer is read-only and runs no tools",
-  },
-});
-
-async function* promptStream(text: string): AsyncGenerator<unknown> {
-  yield { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
-}
+const denyAllTools = buildDenyAllHook("the reviewer is read-only and runs no tools");
 
 /** Build the reviewer's user prompt: the git diff, fenced as UNTRUSTED DATA under a
  *  per-prompt CSPRNG nonce (same pattern as the judge's trace fence) so a diff that

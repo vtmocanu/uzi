@@ -19,21 +19,19 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { HookInput, HookJSONOutput, Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
+import type { Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 
 import { spawnDetached } from "./sdk-spawn.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { fenceNonce } from "./prompt.js";
-import { mapSdkMessage, isResult, isErrorResult } from "./sdk-messages.js";
+import { defaultQueryFn, mapSdkMessage, isResult, isErrorResult, promptStream } from "./sdk-messages.js";
+import { buildDenyAllHook } from "./model-pass.js";
 import { extractJsonObject } from "./judge-runner.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { rmTreeForce } from "./rmtree.js";
 import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
-
-const defaultQueryFn: SdkQueryFn = (params) => sdkQuery({ prompt: params.prompt as never, options: params.options });
 
 // Wall-clock cap on a single summary model turn. DEFAULT 60s (not the judge's 5 min):
 // the plan summary blocks entry into `awaiting_approval` up to this cap (Decision 2),
@@ -278,20 +276,7 @@ export class SummaryRunner {
   }
 }
 
-// A PreToolUse deny for EVERY tool: the summary turn is read-only text-in/text-out. A
-// deny is authoritative even under bypassPermissions (the property guardrails.ts and the
-// judge both rely on).
-const denyAllTools = async (_input: HookInput): Promise<HookJSONOutput> => ({
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason: "the summary runner is read-only and runs no tools",
-  },
-});
-
-async function* promptStream(text: string): AsyncGenerator<unknown> {
-  yield { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
-}
+const denyAllTools = buildDenyAllHook("the summary runner is read-only and runs no tools");
 
 /** Coerce the parsed `deltas` value into a clean Delta[]. A non-array yields [] (the
  *  summary can still be useful); each element must be `{kind ∈ {added,changed,dropped},

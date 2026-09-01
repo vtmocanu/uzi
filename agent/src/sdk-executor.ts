@@ -24,7 +24,6 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type {
   Options as SdkOptions,
   SDKMessage,
@@ -100,10 +99,12 @@ import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import {
   assistantModelOf,
   assistantUsageOf,
+  defaultQueryFn,
   isErrorResult,
   isResult,
   mapSdkMessage,
   orphanInstanceKind,
+  promptStream,
   sessionIdOf,
 } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
@@ -201,12 +202,6 @@ export type SdkQueryFn = (params: {
 }) => AsyncIterable<SDKMessage> & {
   getContextUsage?(): Promise<ContextUsageReading>;
 };
-
-const defaultQueryFn: SdkQueryFn = (params) =>
-  // The real SDK `Query` has a required `getContextUsage()` returning the wider
-  // `SDKControlGetContextUsageResponse`; it satisfies the optional, narrower seam
-  // type above by covariance, so no cast is needed here.
-  sdkQuery({ prompt: params.prompt as never, options: params.options });
 
 /** PRD #516 R1: how long to wait on the `getContextUsage()` control call before
  *  giving up. A bare `await` on a call that never resolves (CLI mid-shutdown,
@@ -2505,15 +2500,6 @@ export class SdkExecutor implements Executor {
       state.wallArmedAt = undefined;
     }
   }
-}
-
-/** One-shot prompt stream: the SDK consumes the lead's user turn. */
-async function* promptStream(text: string): AsyncGenerator<unknown> {
-  yield {
-    type: "user",
-    message: { role: "user", content: text },
-    parent_tool_use_id: null,
-  };
 }
 
 /** Convert an optional seconds value (any number tolerated) to ms. */

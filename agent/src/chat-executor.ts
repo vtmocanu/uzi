@@ -30,15 +30,23 @@
 // is Phase 2; Phase 1 injects it from the ChatRunner/tests.
 
 import fs from "node:fs/promises";
-import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { Options as SdkOptions, EffortLevel, SDKMessage, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
+import type { Options as SdkOptions, EffortLevel, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { EmittedMessage } from "./executor.js";
 import type { UziToolHandlers } from "./uzi-tools.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { buildPreToolUseHook, buildPathGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
-import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
+import {
+  defaultQueryFn,
+  isErrorResult,
+  isResult,
+  mapSdkMessage,
+  promptStream,
+  sessionIdOf,
+} from "./sdk-messages.js";
+import type { SdkQueryFn } from "./sdk-executor.js";
+export type { SdkQueryFn };
 import { classifyLimitFailure, describeLimit, RateLimitObserver } from "./limit.js";
 import { errMessage } from "./util.js";
 
@@ -54,15 +62,6 @@ const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this chat";
 
 /** Why the chat session loop ended. */
 export type ChatEndReason = "idle" | "turn_cap" | "ended" | "error";
-
-/** Injectable seam over the SDK `query` (a fake in tests replays a scripted stream). */
-export type SdkQueryFn = (params: {
-  prompt: AsyncIterable<unknown>;
-  options: SdkOptions;
-}) => AsyncIterable<SDKMessage>;
-
-const defaultQueryFn: SdkQueryFn = (params) =>
-  sdkQuery({ prompt: params.prompt as never, options: params.options });
 
 /** A scheduled timer handle. The default wraps setTimeout; tests inject a fake
  *  that fires callbacks on demand so the turn cap, idle, and per-turn clocks are
@@ -518,7 +517,3 @@ function finishTurn(
   return result;
 }
 
-/** One-shot prompt stream: the SDK consumes the user's turn. */
-async function* promptStream(text: string): AsyncGenerator<unknown> {
-  yield { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
-}
