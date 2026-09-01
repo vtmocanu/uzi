@@ -33,7 +33,9 @@ pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 
 # db_psql: a SELECT of non-terminal runs echoes FAKE_DB_IDS (one id per line);
-# any UPDATE (the forced-cancel fallback) is logged to FAKE_DB_LOG.
+# any UPDATE (the forced-cancel fallback) is logged to FAKE_DB_LOG; the on-red
+# artifact-capture SELECTs echo recognizable markers so a captured runs.txt/
+# run-counts.txt has content the test can assert on.
 db_psql() {
   case "$1" in
     *"status not in"*)
@@ -41,20 +43,37 @@ db_psql() {
       printf '%s\n' ${FAKE_DB_IDS:-} ;;
     *"update runs"*)
       printf '%s\n' "$1" >> "${FAKE_DB_LOG:-/dev/null}" ;;
+    *"from runs order by"*)
+      printf 'FAKE_DB_RUNS r1 admin running issue\n' ;;
+    *"group by status"*)
+      printf 'FAKE_DB_COUNTS running issue 1\n' ;;
   esac
 }
 apipost() { printf 'apipost %s\n' "$1" >> "${FAKE_API_LOG:-/dev/null}"; printf '{}'; }
 # apipost_code performs the cancel POST AND returns the HTTP status (FAKE_CANCEL_CODE).
 apipost_code() { printf 'cancel %s\n' "$1" >> "${FAKE_API_LOG:-/dev/null}"; printf '%s' "${FAKE_CANCEL_CODE:-200}"; }
 wait_status() { :; }
+# fake_docker stands in for the `COMPOSE` array the driver uses ONLY in on-red
+# artifact capture: `docker compose logs …` (echo a marker so the captured svc.log
+# has content) and `docker compose ps …` (print nothing, i.e. no service running, so
+# 00-preflight's leg 4 takes the deferred-note path). COMPOSE=(fake_docker) is set in
+# the parent test shell and inherited by run_driver's subshell.
+fake_docker() {
+  case "$1" in
+    logs) printf 'FAKE_DOCKER_LOGS %s\n' "$*" ;;
+    ps)   ;;   # no running services
+    *)    ;;
+  esac
+}
 FAKES_EOF
 
 # --- fixture writer ----------------------------------------------------------
-# mkphase PATH TITLE CRITICAL REQUIRES PROVIDES HANDOFF  <<'BODY' ... BODY
+# mkphase PATH TITLE CRITICAL REQUIRES PROVIDES HANDOFF [RACESENS]  <<'BODY' ... BODY
 # Header via printf (needs the arg values); body via the caller's QUOTED heredoc
-# on stdin so `$FOO` in a body stays literal until the phase runs.
+# on stdin so `$FOO` in a body stays literal until the phase runs. The optional 7th
+# arg emits `# race-sensitive: <val>` (default: line omitted).
 mkphase() {
-  local path="$1" title="$2" crit="$3" req="$4" prov="$5" hand="$6" slug
+  local path="$1" title="$2" crit="$3" req="$4" prov="$5" hand="$6" rs="${7:-}" slug
   slug="$(basename "$path" .sh | sed 's/^[0-9][0-9]-//')"
   {
     printf '# shellcheck shell=bash\n'
@@ -63,6 +82,7 @@ mkphase() {
     printf '# critical: %s\n' "$crit"
     printf '# lane:     gitlab\n'
     printf '# executor: any\n'
+    [ -n "$rs" ] && printf '# race-sensitive: %s\n' "$rs"
     printf '# requires: %s\n' "$req"
     printf '# provides: %s\n' "$prov"
     printf '# handoff:  %s\n' "$hand"
@@ -110,6 +130,11 @@ run_driver() {
 # driver sourced INSIDE run_driver's subshell (which shellcheck cannot see); the
 # same reason applies to the per-case E2E_*/FAKE_* knobs set below.
 export ROOT="$REPO_ROOT" FORGE=gitlab EXECUTOR=stub
+# COMPOSE is an ARRAY (can't be exported), but run_driver's `( … )` is a subshell of
+# THIS shell, so a plain assignment here is visible inside it. The driver uses it only
+# for on-red artifact capture; fake_docker (in FAKES) is the command it resolves to.
+# shellcheck disable=SC2034  # consumed by driver.sh inside the run_driver subshell
+COMPOSE=(fake_docker)
 
 # ============================================================================
 # Case 1 — a body `false` then `pass ok` is recorded FAIL.
@@ -321,6 +346,118 @@ contains "$(cat "$RUNROOT/junit.xml")" "&lt;"  || bad "junit did not XML-escape 
 contains "$(cat "$RUNROOT/junit.xml")" "&quot;" || bad "junit did not XML-escape '\"'"
 awk -F'\t' 'NF!=4{bad=1} END{exit bad+0}' "$TSV" || bad "results.tsv has a row without exactly 4 columns"
 [ "$RC" -eq 1 ] || bad "exit code should be 1 on the injected fault (got $RC)"
+end
+
+# ============================================================================
+# Case 9 (PRD #966 M3) — on-red artifact capture. A FAILing phase populates
+# $RUNROOT/artifacts/<NN-slug>/ (phase.log + per-service docker logs + the db
+# enumerations) and writes the .keep-rundir sentinel.
+# Mutation: remove the `_capture_artifacts` call in the FAIL branch -> the dir and
+# the sentinel are absent.
+begin "case9: artifact capture on FAIL" 9
+mkphase "$PHASES_DIR/10-failcap.sh" "fail with capture" no "" "" "" <<'BODY'
+fail "boom in failcap"
+BODY
+run_driver 9
+adir="$RUNROOT/artifacts/10-failcap"
+[ -d "$adir" ] || bad "artifacts dir $adir was not created on FAIL"
+[ -f "$adir/phase.log" ] || bad "phase.log not captured"
+contains "$(cat "$adir/phase.log" 2>/dev/null)" "boom in failcap" || bad "phase.log missing the phase output"
+[ -f "$adir/api.log" ] || bad "api.log (docker logs) not captured"
+contains "$(cat "$adir/api.log" 2>/dev/null)" "FAKE_DOCKER_LOGS" || bad "api.log missing the fake-docker output"
+[ -f "$adir/runs.txt" ] || bad "runs.txt not captured"
+contains "$(cat "$adir/runs.txt" 2>/dev/null)" "FAKE_DB_RUNS" || bad "runs.txt missing the fake-db output"
+[ -f "$adir/run-counts.txt" ] || bad "run-counts.txt not captured"
+[ -f "$RUNROOT/.keep-rundir" ] || bad ".keep-rundir sentinel not written on FAIL"
+end
+
+# ============================================================================
+# Case 10 — no capture on an all-GREEN run: neither artifacts/ nor .keep-rundir.
+# Mutation: capture on every phase (not just FAIL/LEAK) -> artifacts/ appears green.
+begin "case10: no capture on GREEN" 10
+mkphase "$PHASES_DIR/10-greenA.sh" "green A" no "" "" "" <<'BODY'
+pass "all good A"
+BODY
+mkphase "$PHASES_DIR/11-greenB.sh" "green B" no "" "" "" <<'BODY'
+pass "all good B"
+BODY
+run_driver 10
+[ "$RC" -eq 0 ] || bad "green run should exit 0 (got $RC)"
+[ ! -d "$RUNROOT/artifacts" ] || bad "artifacts/ was created on an all-green run"
+[ ! -e "$RUNROOT/.keep-rundir" ] || bad ".keep-rundir written on an all-green run"
+end
+
+# ============================================================================
+# Case 11 — empty-FAIL-message fallback. A phase that dies on a BARE `false` (no
+# fail() call) has no `FAIL ` line, so results.tsv gets the "(no fail message; last
+# output: …)" fallback rather than an empty message.
+# Mutation: drop the fallback -> the message column is empty.
+begin "case11: empty-FAIL-message fallback" 11
+mkphase "$PHASES_DIR/10-bare.sh" "bare false" no "" "" "" <<'BODY'
+false
+BODY
+run_driver 11
+has_row bare FAIL || bad "bare-false phase not recorded FAIL"
+m="$(row_msg bare FAIL)"
+[ -n "$m" ] || bad "FAIL message is empty (fallback did not fire)"
+contains "$m" "no fail message" || bad "message is not the fallback: $m"
+end
+
+# ============================================================================
+# Case 12 — race-sensitive annotation. A `race-sensitive: yes` phase that FAILs has
+# "possible race" appended to its message; a non-race phase does not.
+# Mutation: drop the annotation -> the race phase's message lacks "possible race".
+begin "case12: race-sensitive annotation" 12
+mkphase "$PHASES_DIR/10-racy.sh" "racy phase" no "" "" "" yes <<'BODY'
+fail "timing assertion missed"
+BODY
+mkphase "$PHASES_DIR/11-calm.sh" "calm phase" no "" "" "" <<'BODY'
+fail "plain failure"
+BODY
+run_driver 12
+contains "$(row_msg racy FAIL)" "possible race" || bad "race-sensitive FAIL not annotated: $(row_msg racy FAIL)"
+contains "$(row_msg calm FAIL)" "possible race" && bad "non-race FAIL wrongly annotated: $(row_msg calm FAIL)"
+end
+
+# ============================================================================
+# Case 13 — the REAL e2e/phases/00-preflight.sh against a fixture $RUNROOT (real git,
+# no docker). A shared bare + safe.directory gitconfig PASSES; re-initing one bare
+# WITHOUT --shared (the E2E_FAULT_PREFLIGHT simulation) FAILs naming
+# core.sharedRepository. fake_docker's `ps` returns no agent, so leg 4 defers.
+# Mutation: weaken 00-preflight's assertion #1 -> the unshared run reads PASS.
+begin "case13: 00-preflight assertion + positive control" 13
+PF="$TMP/preflight-13"
+rm -rf "$PF"; mkdir -p "$PF/fakeremote" "$PF/agent-gitconfig" "$PF/logs"
+for r in repo repo2; do
+  git init --bare -q --shared=0777 "$PF/fakeremote/$r.git"
+  git -C "$PF/fakeremote/$r.git" symbolic-ref HEAD refs/heads/main
+  git -C "$PF" clone -q "$PF/fakeremote/$r.git" ".seed-$r" 2>/dev/null
+  git -C "$PF/.seed-$r" checkout -q -b main
+  printf 'seed %s\n' "$r" > "$PF/.seed-$r/README.md"
+  git -C "$PF/.seed-$r" add README.md
+  git -C "$PF/.seed-$r" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m seed
+  git -C "$PF/.seed-$r" push -q origin main
+  rm -rf "$PF/.seed-$r"
+done
+printf '[safe]\n\tdirectory = *\n' > "$PF/agent-gitconfig/gitconfig"
+PFRC=0; PFLOG=""
+run_preflight() {
+  PFLOG="$TMP/pflog-$RANDOM"
+  set +e
+  # shellcheck disable=SC1090
+  ( set -euo pipefail; source "$FAKES"; RUNROOT="$1"; source "$REPO_ROOT/e2e/phases/00-preflight.sh" ) > "$PFLOG" 2>&1
+  PFRC=$?
+  set -e
+}
+run_preflight "$PF"
+[ "$PFRC" -eq 0 ] || bad "preflight FAILED on a well-formed fixture (rc=$PFRC): $(cat "$PFLOG")"
+# Break repo.git: re-init WITHOUT --shared (core.sharedRepository becomes unset).
+rm -rf "$PF/fakeremote/repo.git"
+git init --bare -q "$PF/fakeremote/repo.git"
+git -C "$PF/fakeremote/repo.git" symbolic-ref HEAD refs/heads/main
+run_preflight "$PF"
+[ "$PFRC" -ne 0 ] || bad "preflight PASSED on an unshared bare (must FAIL)"
+contains "$(cat "$PFLOG")" "core.sharedRepository" || bad "preflight FAIL did not name core.sharedRepository: $(cat "$PFLOG")"
 end
 
 # ============================================================================

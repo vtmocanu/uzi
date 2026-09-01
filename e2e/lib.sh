@@ -55,6 +55,20 @@ cleanup() {
   fi
   say "tearing down (down -v)"
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  # --- rundir retention on a RED run (PRD #966 M3, D5) ------------------------
+  # A red run KEEPS its scratch dir so the per-phase artifacts/ the driver captured
+  # survive for post-mortem (and #967's upload). "Red" = a non-zero exit $code OR the
+  # driver's `$RUNROOT/.keep-rundir` sentinel, which the driver `touch`es on ANY
+  # FAIL/LEAK — so a non-strict LEAK, which exits 0, still keeps the dir per D5. The
+  # existing KEEP (KEEP_RUNDIR) path keeps it unconditionally and is handled first.
+  if [ -n "$KEEP" ]; then
+    exit $code
+  fi
+  if [ "$code" -ne 0 ] || [ -f "$RUNROOT/.keep-rundir" ]; then
+    printf '[cleanup] red run — rundir kept: %s\n' "$RUNROOT"
+    printf '[cleanup] artifacts: %s\n' "$RUNROOT/artifacts"
+    exit $code
+  fi
   # The scratch removal MUST NOT flip a passed run to red. Containers write into the
   # bind-mounted fakeremote/ as uids other than the host user — forge-fake's receive-pack
   # as root, the worker as its own in-image uid — so on a CI runner the non-root runner
@@ -62,7 +76,7 @@ cleanup() {
   # would become the script's exit status, overriding `exit $code` below and failing a
   # green run at teardown. Locally the files are user-owned, so this still cleans fully;
   # on CI the runner is ephemeral and any leftover scratch is discarded with the VM.
-  [ -n "$KEEP" ] || rm -rf "$RUNROOT" || true
+  rm -rf "$RUNROOT" || true
   exit $code
 }
 trap cleanup EXIT
@@ -576,7 +590,21 @@ for r in repo repo2; do
   # makes every receive-pack create objects/ and refs/ dirs 0777, so any uid can add into
   # a dir another uid created (object files stay 0444, but they are immutable and never
   # rewritten, only added). Set at init so it governs the seed push and every push after.
-  git init --bare -q --shared=0777 "$RUNROOT/fakeremote/$r.git"
+  #
+  # NOTE: git records `--shared=0777` in core.sharedRepository as `0666` (it strips the
+  # execute bits, which it re-adds for directories on its own); an omitted `--shared`
+  # leaves the key unset. 00-preflight.sh asserts the key is set to a world-shared value,
+  # not the literal 0777 — see that phase.
+  #
+  # E2E_FAULT_PREFLIGHT (PRD #966 M3) is the positive control for 00-preflight's first
+  # assertion: when set, the bares are inited WITHOUT sharedRepository, so the key is
+  # absent and preflight FAILs naming core.sharedRepository. The later
+  # `chmod -R a+rwX "$RUNROOT/fakeremote"` changes only filesystem bits, NOT this tracked
+  # config value, so the fault genuinely removes the fact preflight checks.
+  shared=--shared=0777
+  [ -n "${E2E_FAULT_PREFLIGHT:-}" ] && shared=
+  # shellcheck disable=SC2086  # ${shared:+"$shared"} drops the flag entirely when empty
+  git init --bare -q ${shared:+"$shared"} "$RUNROOT/fakeremote/$r.git"
   git -C "$RUNROOT/fakeremote/$r.git" symbolic-ref HEAD refs/heads/main
   # Allow pushes over git smart-HTTP (the E2E_GIT_SMART_HTTP variant); a no-op for
   # the default local-path remote.

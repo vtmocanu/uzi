@@ -57,6 +57,10 @@ Phase registry knobs (PRD #966 M2 — the driver reads these):
 - `E2E_FAULT_PHASE=<slug>` — inject a `fail` as the first statement of that phase,
   the live positive control for fail-soft: a non-critical target lets the suite
   continue (exactly one FAIL, exit 1), a critical one stops it (rest SKIP, exit 1).
+- `E2E_FAULT_PREFLIGHT=1` — init the fake bares **without** `--shared=0777`, the live
+  positive control for `00-preflight`: its first assertion then FAILs naming
+  `core.sharedRepository` (the #372 cross-uid push-race invariant). Because
+  `00-preflight` is `critical: yes`, the suite stops and every later phase is SKIP.
 
 Results and artifacts (written under the rundir, `$RUNROOT`):
 
@@ -65,10 +69,21 @@ Results and artifacts (written under the rundir, `$RUNROOT`):
 - `junit.xml` — one `testsuite`, one `testcase` per phase (a `<failure>` carries the
   `fail` message; `<skipped>` for a SKIP).
 - `summary.md` — the phase table, the tightest `wait_*` margins, and any leaks.
+- `artifacts/<NN-slug>/` — captured **only** for a FAIL or LEAK phase (nothing on a
+  PASS/SKIP): `phase.log` (the phase's own stdout), one `<service>.log` per service
+  (`api`, `agent`, `forge-fake`, `db`, via `docker compose logs --since`), `runs.txt`
+  (the run enumeration) and `run-counts.txt` (runs by status × kind). Capture is fully
+  guarded, so it can never change a phase's recorded status or the suite exit code.
 
 Fail-soft behavior: a red run now prints `summary.md` (every failing phase, not
 just the first) to stdout **before** teardown, and the suite exits `1` iff any
 phase FAILed (a LEAK alone exits 0 unless `E2E_STRICT_LEAKS=1`).
+
+Evidence on red (PRD #966 M3): a **red** run — any FAIL, or any LEAK (which writes a
+`$RUNROOT/.keep-rundir` sentinel even though a non-strict LEAK exits 0) — **keeps its
+rundir** instead of `rm -rf`-ing it, and `cleanup` prints the retained path and the
+`artifacts/` path so the per-phase evidence above survives for post-mortem (and #967's
+upload). A green run with no `KEEP_RUNDIR` is removed as before.
 
 ## Live-DB candidate-selection test (`run-store-it.sh`)
 
@@ -105,6 +120,7 @@ headers, not the rows.
 
 | NN | slug | lane | critical | title |
 |---|---|---|---|---|
+| 00 | preflight | any | yes | PRD #966 M3: preflight — harness invariants (#366 dubious-ownership / #372 cross-uid push race) |
 | 05 | lane-forgejo | forgejo | no | PRD #65 M9: the Forgejo lane (UZI_E2E_FORGE=forgejo) |
 | 06 | lane-github | github | no | PRD #238 M8: the GitHub lane (UZI_E2E_FORGE=github) |
 | 10 | least-privilege | gitlab | no | PRD #5 privilege checks: over-privileged connect is rejected + stored nothing; compliant connection is least-privilege |

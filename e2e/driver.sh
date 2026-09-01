@@ -12,6 +12,8 @@
 # DEPENDS (the caller must define these BEFORE sourcing; the hermetic test fakes
 # them): functions  say pass fail db_psql apipost apipost_code wait_status
 #         globals    ROOT RUNROOT ENVFILE FORGE EXECUTOR  (MARGINS_FILE optional)
+#                    COMPOSE (array; used ONLY by on-red artifact capture, which is
+#                    `|| true` throughout so a missing/short COMPOSE never reddens a run)
 #
 # KNOBS: PHASES_DIR (default $ROOT/e2e/phases), E2E_ONLY / E2E_SKIP (comma-lists
 #        of slug globs), E2E_STRICT_LEAKS, E2E_FAULT_PHASE.
@@ -103,13 +105,38 @@ _record() {
   printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$m" >> "$RUNROOT/results.tsv"
 }
 
-# _quarantine SLUG HANDOFF — end-of-phase LEAK sweep. Enumerate non-terminal runs
-# across ALL users; any id not held by a variable named in HANDOFF is a LEAK:
+# _capture_artifacts NN_SLUG SECS — on a FAIL/LEAK phase, snapshot evidence into
+# $RUNROOT/artifacts/<NN_SLUG>/ and `touch` the .keep-rundir sentinel that makes
+# cleanup keep the whole rundir on a red run (PRD #966 M3, D5). EVERYTHING here is
+# guarded (`|| true`, `2>/dev/null`) so a capture failure can NEVER change a phase's
+# recorded status or the suite exit code — it runs strictly AFTER _record. `--since`
+# is a DURATION (elapsed phase seconds + slack), so no wall-clock var is needed and a
+# service that is not up yet (e.g. agent before phase 13) simply yields an empty log.
+# Nothing is captured on a PASS/SKIP phase (this is only ever called on FAIL/LEAK).
+_capture_artifacts() {
+  local nn_slug="$1" secs="${2:-0}" dir svc since
+  dir="$RUNROOT/artifacts/$nn_slug"
+  mkdir -p "$dir" 2>/dev/null || true
+  touch "$RUNROOT/.keep-rundir" 2>/dev/null || true
+  since="$((secs + 30))s"
+  for svc in api agent forge-fake db; do
+    "${COMPOSE[@]}" logs --no-color --since "$since" "$svc" > "$dir/$svc.log" 2>&1 || true
+  done
+  db_psql "select id,user_id,status,kind from runs order by created_at" > "$dir/runs.txt" 2>/dev/null || true
+  db_psql "select status,kind,count(*) from runs group by status,kind order by status,kind" \
+    > "$dir/run-counts.txt" 2>/dev/null || true
+  [ -f "$RUNROOT/logs/$nn_slug.log" ] && cp "$RUNROOT/logs/$nn_slug.log" "$dir/phase.log" 2>/dev/null || true
+  return 0
+}
+
+# _quarantine NN_SLUG SLUG HANDOFF — end-of-phase LEAK sweep. Enumerate non-terminal
+# runs across ALL users; any id not held by a variable named in HANDOFF is a LEAK:
 # cancel via the API, fall back to a DB update on a non-2xx, then confirm it
 # reaches `cancelled`. Non-fatal by default; contributes to exit 1 under strict.
 # Runs only when db_psql is usable (a failing db_psql short-circuits to a no-op).
+# Each recorded LEAK also captures artifacts (D5), keyed on NN_SLUG.
 _quarantine() {
-  local slug="$1" handoff="$2" ids id name v held code forced
+  local nn_slug="$1" slug="$2" handoff="$3" ids id name v held code forced
   ids="$(db_psql "select id from runs where status not in ('completed','failed','cancelled')" 2>/dev/null)" || return 0
   [ -n "$ids" ] || return 0
   held=""
@@ -131,6 +158,7 @@ _quarantine() {
     esac
     wait_status "$id" cancelled 10 || true
     _record "$slug" LEAK 0 "leaked run $id cancelled${forced}" "$slug (quarantine)"
+    _capture_artifacts "$nn_slug" 0
   done
 }
 
@@ -231,6 +259,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   requires="$(_hdr requires "$f")"; [ "$requires" = "-" ] && requires=""
   provides="$(_hdr provides "$f")"; [ "$provides" = "-" ] && provides=""
   handoff="$(_hdr handoff "$f")";  [ "$handoff" = "-" ] && handoff=""
+  racesens="$(_hdr race-sensitive "$f")"   # "yes" on a phase with timing/concurrency asserts
 
   # 2. Lane filter (M1 behaviour): source a lane phase only when it matches $FORGE.
   case "$lane" in ""|any|"$FORGE") ;; *) continue ;; esac
@@ -267,7 +296,9 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
     [ -n "$producer" ] || producer="declared by no phase"
     m="requires: $miss_tok not satisfied for phase $slug (provided by: $producer)"
     _requires_intersects_failed "$requires" && m="$m [suspect_cascade]"
+    [ "$racesens" = yes ] && m="$m — possible race, see margins"
     _record "$slug" FAIL 0 "$m" "$title"
+    _capture_artifacts "$nn_slug" 0
     _note_failed "$provides"
     [ "$critical" = yes ] && CRITICAL_FAILED=1
     continue
@@ -300,14 +331,24 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   else
     msg="$(_strip_ansi < "$RUNROOT/logs/$nn_slug.log" | grep 'FAIL ' | tail -1 \
              | sed 's/^[[:space:]]*FAIL[[:space:]]*//')" || true
+    # Empty-FAIL-message fallback (PRD #966 M3): a phase that died on a BARE command
+    # under `set -e` (no `fail()` call) leaves no `FAIL ` line, so `msg` is empty and
+    # results.tsv/junit would carry an empty <failure> message. Fall back to the last
+    # non-empty line of the phase log, clearly marked as not a real fail message.
+    if [ -z "$msg" ]; then
+      last="$(_strip_ansi < "$RUNROOT/logs/$nn_slug.log" | grep -v '^[[:space:]]*$' | tail -1)" || true
+      msg="(no fail message; last output: $last)"
+    fi
     _requires_intersects_failed "$requires" && msg="$msg [suspect_cascade]"
+    [ "$racesens" = yes ] && msg="$msg — possible race, see margins"
     _record "$slug" FAIL "$secs" "$msg" "$title"
+    _capture_artifacts "$nn_slug" "$secs"
     _note_failed "$provides"
     [ "$critical" = yes ] && CRITICAL_FAILED=1
   fi
 
   # 9. End-of-phase quarantine (after the body ran).
-  _quarantine "$slug" "$handoff"
+  _quarantine "$nn_slug" "$slug" "$handoff"
 done
 
 # 10. Results — write the artifacts, then PRINT summary.md to stdout BEFORE we

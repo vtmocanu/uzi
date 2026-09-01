@@ -4,6 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: any
+# race-sensitive: yes
 # requires: -
 # provides: -
 # handoff:  -
