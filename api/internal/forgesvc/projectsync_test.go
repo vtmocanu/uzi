@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -796,6 +797,34 @@ func TestAdoptIntrospectionUnsupportedProceeds(t *testing.T) {
 	}
 	if len(st.links) != 1 {
 		t.Errorf("want a link persisted on the best-effort path")
+	}
+}
+
+// TestEnsureProjectScopeIntrospectionArms pins ensureProjectScope's two error arms
+// directly (projectsync.go:2049-2055): the introspection-unsupported SENTINEL proceeds
+// best-effort (nil), while any OTHER introspection error propagates wrapped with "token
+// introspection" so the caller never silently proceeds on unknown scopes. The sentinel ⇒
+// nil path is also observed end-to-end by TestAdoptIntrospectionUnsupportedProceeds; the
+// non-sentinel ⇒ propagate arm was previously unpinned.
+func TestEnsureProjectScopeIntrospectionArms(t *testing.T) {
+	// Sentinel ⇒ nil: an unintrospectable PAT proceeds best-effort.
+	sentinel := &fakeProjectSyncer{fakeForge: &fakeForge{}, tokenErr: forge.ErrTokenIntrospectionUnsupported}
+	if err := ensureProjectScope(context.Background(), sentinel); err != nil {
+		t.Fatalf("introspection-unsupported must proceed best-effort (nil), got %v", err)
+	}
+
+	// A generic, non-sentinel introspection error propagates wrapped.
+	boom := errors.New("transient 502 from forge")
+	generic := &fakeProjectSyncer{fakeForge: &fakeForge{}, tokenErr: boom}
+	err := ensureProjectScope(context.Background(), generic)
+	if err == nil {
+		t.Fatalf("a non-sentinel introspection error must propagate, got nil")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("propagated error must retain the cause, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "token introspection") {
+		t.Errorf("propagated error must be wrapped with %q context, got %q", "token introspection", err.Error())
 	}
 }
 
