@@ -188,14 +188,14 @@ func (g *github) ListProjects(ctx context.Context) ([]Project, error) {
 	opt := &gh.RepositoryListByAuthenticatedUserOptions{
 		ListOptions: gh.ListOptions{PerPage: githubPerPage},
 	}
-	var out []Project
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list projects", e) }
+	return paginate(wrap, func(page int) ([]Project, int, error) {
+		opt.Page = page
 		repos, resp, err := g.client.Repositories.ListByAuthenticatedUser(ctx, opt)
 		if err != nil {
-			return nil, g.wrapErr("list projects", err)
+			return nil, 0, err
 		}
+		var items []Project
 		for _, r := range repos {
 			// GitHub's list has no min-permission filter, so a read-only repo comes
 			// back and must be dropped client-side: the picker only offers repos the
@@ -203,25 +203,15 @@ func (g *github) ListProjects(ctx context.Context) ([]Project, error) {
 			if r == nil || !r.GetPermissions().GetPush() {
 				continue
 			}
-			out = append(out, Project{
+			items = append(items, Project{
 				ForgeProjectID:    r.GetID(),
 				PathWithNamespace: r.GetFullName(),
 				WebURL:            r.GetHTMLURL(),
 				DefaultBranch:     r.GetDefaultBranch(),
 			})
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list projects", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list projects", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, resp.NextPage, nil
+	})
 }
 
 func (g *github) ListLabels(ctx context.Context, projectID int64) ([]Label, error) {
@@ -248,27 +238,15 @@ func (g *github) ListLabels(ctx context.Context, projectID int64) ([]Label, erro
 // resolution — this backs ListLabels and EnsureLabels' missing-set computation.
 func (g *github) listRepoLabels(ctx context.Context, slug repoSlug) ([]*gh.Label, error) {
 	opt := &gh.ListOptions{PerPage: githubPerPage}
-	var out []*gh.Label
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list labels", e) }
+	return paginate(wrap, func(page int) ([]*gh.Label, int, error) {
+		opt.Page = page
 		labels, resp, err := g.client.Issues.ListLabels(ctx, slug.owner, slug.repo, opt)
 		if err != nil {
-			return nil, g.wrapErr("list labels", err)
+			return nil, 0, err
 		}
-		out = append(out, labels...)
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list labels", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list labels", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return labels, resp.NextPage, nil
+	})
 }
 
 func (g *github) EnsureLabels(ctx context.Context, projectID int64, labels []Label) error {
@@ -636,14 +614,14 @@ func (g *github) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 	// and a single label object. "labeled"→add, "unlabeled"→remove; other events are
 	// skipped. Chronological (oldest first), matching the GitLab driver. Paginated.
 	opt := &gh.ListOptions{PerPage: githubPerPage}
-	var out []LabelEvent
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list issue label events", e) }
+	return paginate(wrap, func(page int) ([]LabelEvent, int, error) {
+		opt.Page = page
 		events, resp, err := g.client.Issues.ListIssueEvents(ctx, slug.owner, slug.repo, int(issueIID), opt)
 		if err != nil {
-			return nil, g.wrapErr("list issue label events", err)
+			return nil, 0, err
 		}
+		var items []LabelEvent
 		for _, e := range events {
 			if e == nil {
 				continue
@@ -668,20 +646,10 @@ func (g *github) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 			if a := e.GetActor(); a != nil {
 				ev.Username = a.GetLogin()
 			}
-			out = append(out, ev)
+			items = append(items, ev)
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list issue label events", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list issue label events", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, resp.NextPage, nil
+	})
 }
 
 // ListIssueComments returns an issue's human comments, oldest-first (PRD #381).
@@ -694,14 +662,14 @@ func (g *github) ListIssueComments(ctx context.Context, projectID, issueIID int6
 		return nil, err
 	}
 	opt := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
-	var out []IssueComment
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return g.wrapErr("list issue comments", e) }
+	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
+		opt.Page = page
 		comments, resp, err := g.client.Issues.ListComments(ctx, slug.owner, slug.repo, int(issueIID), opt)
 		if err != nil {
-			return nil, g.wrapErr("list issue comments", err)
+			return nil, 0, err
 		}
+		var items []IssueComment
 		for _, c := range comments {
 			if c == nil {
 				continue
@@ -714,20 +682,10 @@ func (g *github) ListIssueComments(ctx context.Context, projectID, issueIID int6
 				ic.AuthorForgeUserID = u.GetID()
 				ic.AuthorUsername = u.GetLogin()
 			}
-			out = append(out, ic)
+			items = append(items, ic)
 		}
-		if len(out) > maxForgeItems {
-			return nil, g.wrapErr("list issue comments", forgePaginationCapErr("item", maxForgeItems))
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, g.wrapErr("list issue comments", forgePaginationCapErr("page", maxForgePages))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, resp.NextPage, nil
+	})
 }
 
 func (g *github) CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (IssueNote, error) {
@@ -1300,11 +1258,11 @@ type graphqlResponse struct {
 func (g *github) graphqlDo(ctx context.Context, query string, vars map[string]any, out any) error {
 	payload, err := json.Marshal(map[string]any{"query": query, "variables": vars})
 	if err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: encode request: %w", err))
+		return g.wrapErr("graphql: encode request", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.graphqlURL(), bytes.NewReader(payload))
 	if err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: build request: %w", err))
+		return g.wrapErr("graphql: build request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -1312,19 +1270,19 @@ func (g *github) graphqlDo(ctx context.Context, query string, vars map[string]an
 	// timeout; NEVER g.logClient (no auth, refuses redirects).
 	resp, err := g.client.Client().Do(req)
 	if err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: %w", err))
+		return g.wrapErr("graphql", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTraceBytes+1))
 	if err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: read response: %w", err))
+		return g.wrapErr("graphql: read response", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return g.redact.error(fmt.Errorf("github: graphql: status %d: %s", resp.StatusCode, string(body)))
+		return g.wrapErr("graphql", fmt.Errorf("status %d: %s", resp.StatusCode, string(body)))
 	}
 	var envelope graphqlResponse
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: decode response: %w", err))
+		return g.wrapErr("graphql: decode response", err)
 	}
 	if len(envelope.Errors) > 0 {
 		msgs := make([]string, 0, len(envelope.Errors))
@@ -1336,7 +1294,7 @@ func (g *github) graphqlDo(ctx context.Context, query string, vars map[string]an
 			}
 		}
 		// The joined message is still redacted so a reflected PAT never escapes.
-		redactedErr := g.redact.error(fmt.Errorf("github: graphql: %s", strings.Join(msgs, "; ")))
+		redactedErr := g.wrapErr("graphql", fmt.Errorf("%s", strings.Join(msgs, "; ")))
 		if notFound {
 			// Wrap the (already redacted) error so errors.Is(err,
 			// ErrGitHubUserNotFound) is true for the caller while the scrubbed
@@ -1349,7 +1307,7 @@ func (g *github) graphqlDo(ctx context.Context, query string, vars map[string]an
 	}
 	if out != nil {
 		if err := json.Unmarshal(envelope.Data, out); err != nil {
-			return g.redact.error(fmt.Errorf("github: graphql: decode data: %w", err))
+			return g.wrapErr("graphql: decode data", err)
 		}
 	}
 	return nil

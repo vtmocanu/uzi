@@ -24,3 +24,35 @@ var (
 func forgePaginationCapErr(kind string, limit int) error {
 	return fmt.Errorf("pagination exceeded %s backstop of %d; aborting (possible hostile or buggy forge)", kind, limit)
 }
+
+// paginate accumulates every page of a forge list into one slice, applying the
+// shared item/page backstops from this file. fetch is called once per page with the
+// forge page number to request (1-based); it maps that page's raw results into []T
+// and returns the forge's next-page pointer (0 == last page). wrap is the driver's
+// own redacting error idiom bound to the operation (e.g.
+// func(e error) error { return g.wrapErr("list projects", e) }); it wraps BOTH a
+// fetch error and a cap error so every failure carries the same driver+op prefix the
+// inline loops produced. fetch must return the RAW error (unwrapped) so paginate does
+// not double-wrap.
+func paginate[T any](wrap func(error) error, fetch func(page int) (items []T, next int, err error)) ([]T, error) {
+	var out []T
+	apiPage := 1
+	for iter := 1; ; iter++ {
+		items, next, err := fetch(apiPage)
+		if err != nil {
+			return nil, wrap(err)
+		}
+		out = append(out, items...)
+		if len(out) > maxForgeItems {
+			return nil, wrap(forgePaginationCapErr("item", maxForgeItems))
+		}
+		if next == 0 {
+			break
+		}
+		if iter >= maxForgePages {
+			return nil, wrap(forgePaginationCapErr("page", maxForgePages))
+		}
+		apiPage = next
+	}
+	return out, nil
+}

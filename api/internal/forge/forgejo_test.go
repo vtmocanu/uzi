@@ -812,7 +812,7 @@ func TestCheckForgejoVersion(t *testing.T) {
 // unparseable refusal must not leak it. Asserts the token is scrubbed from the
 // error while the sentinel and its errors.Is still survive.
 func TestForgejoVersionStringRedacted(t *testing.T) {
-	const token = "forgejo-token-reflected-into-version-0123456789"
+	const token = "forgejo-token-reflected-into-version-0123456789" //nolint:gosec // G101: fake fixture token; the test asserts it is redacted
 	m := newMockForgejo(t, map[string]http.HandlerFunc{
 		"/version": versionHandler(token), // {"version":"<token>"}
 	})
@@ -1107,7 +1107,7 @@ func TestForgejoTokenInfoAmbiguousCollisionFailsSafe(t *testing.T) {
 // called these out specifically. Each endpoint echoes the token in a 500 body; no
 // method may surface it.
 func TestForgejoM4ErrorsAreRedacted(t *testing.T) {
-	const token = "forgejo-m4-redaction-probe-0123456789"
+	const token = "forgejo-m4-redaction-probe-0123456789" //nolint:gosec // G101: fake fixture token; the test asserts it is redacted
 	leak := func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{"message": "boom " + token})
@@ -1144,6 +1144,177 @@ func TestForgejoM4ErrorsAreRedacted(t *testing.T) {
 		if strings.Contains(c.err.Error(), token) {
 			t.Errorf("%s leaked the PAT: %q", c.name, c.err.Error())
 		}
+	}
+}
+
+// TestForgejoRawGetLimitedStopsAtLimit is the PRD #917 M2 (epic finding S1) pin for
+// the byte cap that folding rawGet into rawGetLimited introduced. rawGetLimited is
+// now THE raw-GET helper for the three SDK-bypassing endpoints (issue timeline,
+// token introspection, job logs); this asserts its io.LimitReader actually bounds the
+// TRANSFER, so a hostile forge streaming a multi-GB body cannot OOM the api — the read
+// stops at limit bytes and the returned body length is <= limit, never the whole body.
+// A small local limit exercises the cap without allocating gigabytes (mirroring the
+// job-log over-cap technique in forgejo_pipelines_test.go, which serves a body larger
+// than the cap and asserts the read stops). The positive control proves a normal-size
+// body under the limit is returned in full, so the cap does not truncate legitimate
+// responses.
+func TestForgejoRawGetLimitedStopsAtLimit(t *testing.T) {
+	const oversized = 4096 // the served body, deliberately larger than the test cap
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/rawprobe": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte(strings.Repeat("A", oversized)))
+		},
+		"/repos/acme/widgets/rawsmall": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("small-body"))
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+	f, ok := d.(*forgejo)
+	if !ok {
+		t.Fatalf("expected *forgejo, got %T", d)
+	}
+
+	// Oversized: the io.LimitReader must stop the transfer at the cap.
+	const cap64 = int64(64)
+	body, err := f.rawGetLimited(context.Background(), "/repos/acme/widgets/rawprobe", cap64)
+	if err != nil {
+		t.Fatalf("rawGetLimited (oversized): %v", err)
+	}
+	if int64(len(body)) > cap64 {
+		t.Fatalf("read must stop at the cap: got %d bytes, want <= %d", len(body), cap64)
+	}
+	if int64(len(body)) != cap64 {
+		t.Fatalf("an oversized body must be capped to exactly the limit: got %d, want %d", len(body), cap64)
+	}
+
+	// Positive control: a body under the cap is returned whole (no truncation).
+	got, err := f.rawGetLimited(context.Background(), "/repos/acme/widgets/rawsmall", maxTraceBytes+1)
+	if err != nil {
+		t.Fatalf("rawGetLimited (normal): %v", err)
+	}
+	if string(got) != "small-body" {
+		t.Fatalf("a normal-size body must be returned in full, got %q", got)
+	}
+}
+
+// TestForgejoListIssueLabelEventsCapsOversizedTimeline is the end-to-end S1 pin for
+// the timeline call site, one of the two former unbounded-rawGet callers now routed
+// through rawGetLimited(maxTraceBytes+1). It is REVERT-SENSITIVE: it fails if the
+// io.LimitReader cap in rawGetLimited is removed.
+//
+// The mechanism is that truncating otherwise-VALID JSON is what produces the error,
+// so the cap is the sole discriminator between success and failure:
+//
+//   - Over-cap body (a valid JSON timeline array LARGER than the cap): read WHOLE
+//     (cap removed) it is valid JSON, so json.Unmarshal succeeds and
+//     ListIssueLabelEvents returns events with no error; read CAPPED (cap present)
+//     it is truncated at maxTraceBytes+1 bytes — cutting mid-array before the closing
+//     bracket — so json.Unmarshal fails and a redacted forgejo:-prefixed error is
+//     returned (never a panic or OOM). We assert the capped path errors; that
+//     assertion FAILS if the cap is reverted, because the whole body then parses.
+//   - Under-cap body (the SAME valid JSON shape, well under the cap): the paired
+//     control, which parses successfully regardless of the cap. It demonstrates the
+//     cap — not the JSON validity — is what turns the over-cap case into an error.
+//
+// A valid oversized array (not an "A"-run) is required: an "A"-run is invalid JSON at
+// ANY length, so it errors capped OR uncapped and cannot distinguish the two — the
+// vacuity this rework fixes. The over-cap body uses few, heavily-padded entries so
+// that when read whole it stays under forgejoPerPage (loop ends after one page) and
+// under maxForgeItems, i.e. the uncapped path returns success, not a pagination cap.
+// Mirrors forgejo_pipelines_test.go's over-cap technique of serving a maxTraceBytes-
+// class body rather than actually streaming gigabytes.
+func TestForgejoListIssueLabelEventsCapsOversizedTimeline(t *testing.T) {
+	ctx := context.Background()
+
+	// Build an oversized but VALID JSON timeline array. Few entries, each heavily
+	// padded, so the serialized length exceeds the cap while the entry count stays
+	// well under forgejoPerPage (loop ends after page 1) and maxForgeItems.
+	const padBytes = 2 << 20 // 2 MiB per entry; 9 entries comfortably exceed the 16 MiB cap
+	oversized := make([]forgejoTimelineEntry, 0, 9)
+	for i := 0; i < 9; i++ {
+		oversized = append(oversized, forgejoTimelineEntry{
+			ID:        int64(i + 1),
+			Type:      "label",
+			Body:      "1",
+			User:      &forgejoUserRef{Login: "labeler"},
+			Label:     &forgejoLabelRef{ID: 1, Name: strings.Repeat("A", padBytes)},
+			CreatedAt: time.Unix(0, 0).UTC(),
+		})
+	}
+	oversizedBody, err := json.Marshal(oversized)
+	if err != nil {
+		t.Fatalf("marshal oversized timeline: %v", err)
+	}
+	// Guard the premise: the served body must actually exceed the cap, or truncation
+	// would not corrupt it and the test would go vacuous.
+	if int64(len(oversizedBody)) <= maxTraceBytes+1 {
+		t.Fatalf("test bug: oversized body (%d bytes) must exceed the cap (%d)", len(oversizedBody), maxTraceBytes+1)
+	}
+	// And it must be < forgejoPerPage entries so the whole-read path stops after one
+	// page instead of looping into a pagination-cap error (which would also be a
+	// non-nil error and mask a reverted cap).
+	if len(oversized) >= forgejoPerPage {
+		t.Fatalf("test bug: oversized entry count (%d) must be < forgejoPerPage (%d)", len(oversized), forgejoPerPage)
+	}
+
+	overMock := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/issues/11/timeline": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(oversizedBody)
+		},
+	})
+	overDriver := newForgejoDriver(t, overMock, "forgejo-abcdefabcdef")
+
+	events, err := overDriver.ListIssueLabelEvents(ctx, 7, 11)
+	if err == nil {
+		// Cap removed → the whole valid body parses → success. This is the revert
+		// signal: with the cap present this branch never runs.
+		t.Fatalf("an over-cap valid-JSON timeline must be TRUNCATED at the cap and fail to parse; "+
+			"got %d events and no error (is the io.LimitReader cap gone?)", len(events))
+	}
+	if events != nil {
+		t.Fatalf("no events must be returned on the capped/parse-failure path, got %+v", events)
+	}
+	// The parse failure is routed through the redactor (forgejo-prefixed), never a raw
+	// panic; a token was not in play here, so just assert the forgejo op-context shape.
+	if !strings.Contains(err.Error(), "forgejo:") {
+		t.Fatalf("expected a redacted forgejo-prefixed error, got %q", err.Error())
+	}
+
+	// Paired control: the SAME valid-JSON shape, well UNDER the cap, parses to events
+	// with no error whether or not the cap is present. This proves the over-cap error
+	// above comes from truncation, not from the JSON shape being unparseable.
+	underBody, err := json.Marshal([]forgejoTimelineEntry{
+		{ID: 1, Type: "label", Body: "1", User: &forgejoUserRef{Login: "alice"},
+			Label: &forgejoLabelRef{ID: 5, Name: "bug"}, CreatedAt: time.Unix(0, 0).UTC()},
+		{ID: 2, Type: "label", Body: "", User: &forgejoUserRef{Login: "bob"},
+			Label: &forgejoLabelRef{ID: 6, Name: "wontfix"}, CreatedAt: time.Unix(0, 0).UTC()},
+	})
+	if err != nil {
+		t.Fatalf("marshal under-cap timeline: %v", err)
+	}
+	if int64(len(underBody)) > maxTraceBytes+1 {
+		t.Fatalf("test bug: control body (%d bytes) must stay under the cap (%d)", len(underBody), maxTraceBytes+1)
+	}
+	underMock := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/issues/11/timeline": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(underBody)
+		},
+	})
+	underDriver := newForgejoDriver(t, underMock, "forgejo-abcdefabcdef")
+
+	ctrl, err := underDriver.ListIssueLabelEvents(ctx, 7, 11)
+	if err != nil {
+		t.Fatalf("an under-cap valid-JSON timeline must parse cleanly, got error: %v", err)
+	}
+	if len(ctrl) != 2 {
+		t.Fatalf("under-cap control: expected 2 label events, got %d: %+v", len(ctrl), ctrl)
+	}
+	if ctrl[0].Action != "add" || ctrl[1].Action != "remove" {
+		t.Fatalf("under-cap control: expected [add, remove] actions, got [%s, %s]", ctrl[0].Action, ctrl[1].Action)
 	}
 }
 
