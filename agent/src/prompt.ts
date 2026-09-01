@@ -1012,6 +1012,19 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     "the plan as Markdown and STOP. Do NOT implement anything yet — a human must",
     "approve the plan first.",
     "",
+    // issue #858. The whole plan rides inside the submit_plan tool-call JSON as the
+    // `plan_md` string, and the SDK parses that JSON before uzi ever sees it — a
+    // malformed blob (unescaped control chars, a lone backslash in a Windows-style
+    // path, a truncated tail) is rejected by the harness, not uzi, and forces the
+    // lead to re-emit the whole plan. A nudge only: it shrinks, but cannot
+    // eliminate, model-side serialization failures. Kept in prompt.ts (not the
+    // schema) to stay minimal; inline plan_md acceptance is unchanged.
+    "When you serialize the plan into `plan_md`, keep the string valid JSON: write",
+    "file paths with `/` (or an escaped `\\\\`), avoid unescaped control characters,",
+    "and emit the plan in one complete piece rather than a truncated fragment — a",
+    "malformed `plan_md` is rejected before it reaches uzi and forces you to re-emit",
+    "the whole plan.",
+    "",
     // PRD #122 M1. Optional milestone breakdown on submit_plan. Unconditional inside
     // this builder because it is issue-only by construction (the executor calls it
     // for kind==="issue" only); the schema gate (signals.ts) is the belt to this

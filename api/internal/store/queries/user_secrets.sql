@@ -33,7 +33,7 @@
 -- This does NOT replace D12's transaction. It converts one silent failure into
 -- either the right answer or a loud one; serialising the set-default swap and the
 -- delete-default check is a different job, and still M2's.
-INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
+INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with)
 VALUES (@user_id, @kind, @label,
         -- Scoped to (user_id, kind), never to user_id alone: the partial unique
         -- index this defends is per-(user_id, kind), and under D9's future
@@ -42,6 +42,15 @@ VALUES (@user_id, @kind, @label,
         -- invisible-token bug, one kind over.
         @want_default::boolean
             OR NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = @user_id AND kind = @kind),
+        -- auto_eligible (PRD #111 D2 / issue #804): a user's FIRST/SOLE anthropic_token
+        -- is born opted INTO the auto-select pool, so a single-token owner's auto-mode
+        -- ephemeral workers have a non-empty pool to spend and never park in pool_wait.
+        -- Token #2+ stays opt-in false (the reserved-console-key hazard is multi-token).
+        -- Reuses the SAME first-token subquery as is_default just above; the
+        -- @kind = 'anthropic_token' guard keeps 00087's CHECK
+        -- (NOT auto_eligible OR kind = 'anthropic_token') satisfied for a future
+        -- non-anthropic first token.
+        (@kind = 'anthropic_token' AND NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = @user_id AND kind = @kind)),
         @ciphertext, @sealed_with)
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
@@ -90,12 +99,25 @@ RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 -- to make it unreachable again; until then this comment is the warning. (A
 -- no-default user whose rows are all labelled something else is fine: the insert
 -- simply creates a new default labelled 'default'.)
-INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
-VALUES ($1, $2, 'default', true, $3, $4)
+INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with)
+VALUES ($1, $2, 'default', true,
+        -- auto_eligible (PRD #111 D2 / issue #804): born opted into the auto-select
+        -- pool ONLY when this is the user's first token of the kind — the SAME
+        -- first-token guard InsertUserSecret uses. The NOT EXISTS is load-bearing, not
+        -- belt-and-braces: the INSERT branch of this upsert is REACHABLE in the D12
+        -- "tokens exist with no default" state (see the header comment), so an
+        -- unconditional true would pool a token for a user who already holds other,
+        -- possibly reserved, tokens — a reserved-key leak. The $2 = 'anthropic_token'
+        -- guard keeps 00087's kind CHECK satisfied even though kind is always
+        -- 'anthropic_token' on this path in practice.
+        ($2 = 'anthropic_token' AND NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = $1 AND kind = $2)),
+        $3, $4)
 ON CONFLICT (user_id, kind) WHERE is_default DO UPDATE
     SET ciphertext = EXCLUDED.ciphertext,
         sealed_with = EXCLUDED.sealed_with,
         updated_at = now()
+        -- NOT auto_eligible: rotation must PRESERVE the existing opt-in/opt-out state
+        -- the owner chose. Only the value moves on conflict (issue #804).
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: GetUserSecretCiphertext :one
@@ -336,3 +358,13 @@ WHERE user_id = $1 AND sealed_with = 'master';
 UPDATE user_secrets
 SET ciphertext = @ciphertext, sealed_with = 'dek', updated_at = now()
 WHERE id = @id AND user_id = @user_id AND sealed_with = 'master';
+
+-- name: UserHasAutoEligibleAnthropicToken :one
+-- True iff the user has opted at least one Anthropic token into the auto-select pool
+-- (PRD #111 M2 D2). The ephemeral provisioner (issue #804) reads this to decide a
+-- burst worker's bind mode: `auto` when the pool is non-empty, else `default`, so an
+-- auto worker never parks a run in pool_wait on an empty pool (autoselect.ReasonPoolEmpty).
+SELECT EXISTS (
+    SELECT 1 FROM user_secrets
+    WHERE user_id = @user_id AND kind = 'anthropic_token' AND auto_eligible
+);

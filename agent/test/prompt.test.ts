@@ -76,6 +76,23 @@ describe("buildPlanPrompt", () => {
     assert.match(prompt, /Do NOT implement anything yet/i);
   });
 
+  it("nudges the lead to keep plan_md valid JSON (issue #858)", () => {
+    // The whole plan rides inside the submit_plan tool-call JSON; a malformed
+    // plan_md is rejected by the SDK before uzi sees it. The prompt must carry the
+    // serialization-hygiene nudge. Non-vacuous by revert: dropping the prompt line
+    // fails these assertions.
+    assert.match(prompt, /keep the string valid JSON/);
+    assert.match(prompt, /unescaped control characters/);
+    // The escaped-backslash guidance renders as a literal `\\` in the prompt.
+    assert.ok(
+      prompt.includes("(or an escaped `\\\\`)"),
+      "the prompt shows the escaped-backslash form for file paths",
+    );
+    // The complete-output guidance: dropping the "one complete piece" clause
+    // (which guards against a truncated plan_md) must fail this test.
+    assert.match(prompt, /one complete piece/);
+  });
+
   it("notes when no subagents are available", () => {
     const p = buildPlanPrompt({
       issueIid: 1,

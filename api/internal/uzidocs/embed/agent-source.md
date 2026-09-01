@@ -141,8 +141,9 @@ human reads the diff before it can run anywhere.
 ### What approving does
 
 - A synced role sharing a name with an existing **builtin** overrides that
-  builtin's body. It stays a builtin — still shown with the shipped
-  template, still resettable to the embedded default via **Reset to
+  builtin's body — the synced body is what's shown and run, not the shipped
+  default. It stays a builtin — still labeled and grouped as one, still
+  resettable to the embedded default via **Reset to
   default** (see [Agent templates](./agent-templates.md#resetting-a-builtin-template)).
 - A synced role with a **new** name (no builtin or admin-authored global
   template by that name) is added as a global template, on by default like

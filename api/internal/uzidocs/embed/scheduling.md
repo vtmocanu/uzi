@@ -379,10 +379,12 @@ about *when* a run fires, it's about a queued run that can't find a worker to
 claim it at all. See [Capability-aware scheduling](./capability-scheduling.md)
 for the "no eligible worker" mechanics this builds on.
 
-Normally, a run that needs a capability (`docker` or `jvm`) none of your
-online workers has just sits queued until you start, or already have, a
-capable worker. With this on, uzi instead spins up a throwaway worker just
-for that one run.
+Normally, if a run needs a capability (`docker` or `jvm`) that none of your
+online workers has, it stays `queued` — not failed — waiting for an eligible
+worker to claim it, surfaced with a "no eligible worker" health reason (see
+[Capability-aware scheduling](./capability-scheduling.md#match-what-a-worker-advertises)).
+It claims as soon as you start, or already have, a capable worker online.
+With this on, uzi instead spins up a throwaway worker just for that one run.
 
 **Turning it on** takes two switches, both off by default: an admin enables
 the feature instance-wide from **Admin → Settings**, then you opt in from

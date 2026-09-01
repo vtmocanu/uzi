@@ -141,10 +141,19 @@ function runnerTrackingRef(branch: string): string {
 // while claiming to have recovered its own). So alongside the ref we stamp the writing
 // run's id into the worker bare's own config, and the reseed reads the tracking ref back
 // ONLY when the stamp matches the claiming run. This is a worker-owned `config --local`
-// write, the same posture as disableAutoMaintenance — no new trust boundary. The key is
-// dot/slash-free so the dotted git-config name parses (`git config uzi-trackowner.<x>`).
+// write, the same posture as disableAutoMaintenance — no new trust boundary.
+//
+// issue #887 — the branch is carried in a git-config SUBSECTION, not flattened into the
+// variable name. git parses `section.subsection.variable` by the FIRST and LAST dot, so
+// the middle keeps the branch VERBATIM (slashes and dots included) and the variable is the
+// fixed `owner`. The earlier form flattened `/`->`-` into the variable name, which collided:
+// `uzi/self-improve` and a literal `uzi-self-improve` mapped to the same key, so clearing
+// one branch's owner stamp (clearConflictingAncestorTrackingRefs) could wipe the other's
+// and cost a later resume its unpushed recovery state. The subsection encoding is reversible
+// and collision-free — distinct branches always land in distinct `[uzi-trackowner "<branch>"]`
+// blocks. (Legacy two-part stamps on a persistent bare become dead config no read touches.)
 function runnerTrackingOwnerKey(branch: string): string {
-  return `uzi-trackowner.${branch.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  return `uzi-trackowner.${branch}.owner`;
 }
 
 export interface RunnerClone {
@@ -940,6 +949,11 @@ export class GitCache {
   async fetchAgentBranch(barePath: string, clonePath: string, branch: string, runId: string): Promise<string> {
     const dst = runnerTrackingRef(branch);
     await this.withLock(barePath, async () => {
+      // issue #887: clear any legacy FLAT tracking ref that is a strict path-prefix
+      // (directory ancestor) of `dst`, or the fetch below aborts. See the helper's own
+      // doc for the full mechanism. Runs FIRST, under the same lock as the fetch/stamp,
+      // so the namespace is clear before the ref-store tries to create the dst directory.
+      await this.clearConflictingAncestorTrackingRefs(barePath, dst);
       await this.runGit(barePath, [
         "-c", "protocol.file.allow=user",
         "fetch", "--no-tags", `file://${clonePath}`,
@@ -952,6 +966,64 @@ export class GitCache {
       await this.runGit(barePath, ["config", "--local", runnerTrackingOwnerKey(branch), runId]);
     });
     return dst;
+  }
+
+  /**
+   * issue #887 — clear a legacy FLAT tracking ref that path-blocks the fetch's dst ref.
+   *
+   * git's ref store is a directory tree: a ref FILE at `refs/uzi-runner/uzi/self-improve`
+   * and a ref DIRECTORY at `refs/uzi-runner/uzi/self-improve/<runId>` cannot coexist,
+   * because the leaf file occupies the very path the directory needs (a D/F — directory/
+   * file — conflict). Before PRD #774 / ADR 0686 D9, a self_improve run's tracking ref was
+   * the flat leaf `refs/uzi-runner/uzi/self-improve`; #774 moved it to the per-run
+   * namespace `refs/uzi-runner/uzi/self-improve/<runId>`. On a worker whose persistent bare
+   * still carries the pre-#774 flat leaf, that leaf is a strict path-prefix (ancestor) of
+   * the new dst, so `fetch … :refs/uzi-runner/uzi/self-improve/<runId>` fails the whole
+   * update with "some local refs could not be updated" and the run dies. self_improve is
+   * the ONLY run kind whose ref shape changed leaf→namespace, so it is the only observed
+   * failure — we clear exactly the ancestor refs that can block dst.
+   *
+   * The mirror case — a legacy per-run DIRECTORY blocking a new FLAT leaf (a descendant path
+   * blocking its own ancestor) — is deliberately OUT OF SCOPE: no run kind moved
+   * namespace→leaf, so it does not arise here, and handling it would mean deleting a whole
+   * live subtree on a guess.
+   *
+   * Any conflicting ancestor found is ARCHIVED (its tip may carry unmerged commits) under
+   * refs/uzi-archive/<sanitized>/<sha> before it is deleted, and its dangling PRD #218
+   * owner-config key is cleared. Deepest-first so a partially-migrated bare with several
+   * stacked ancestors is cleaned bottom-up.
+   */
+  private async clearConflictingAncestorTrackingRefs(barePath: string, dst: string): Promise<void> {
+    // Only refs inside the tracking namespace can D/F-conflict with a tracking-ref dst.
+    if (!dst.startsWith(RUNNER_TRACKING_PREFIX)) return;
+    const suffix = dst.slice(RUNNER_TRACKING_PREFIX.length);
+    const parts = suffix.split("/");
+    // Cumulative prefixes STRICTLY shorter than the full branch: every part except the last.
+    // For suffix "uzi/self-improve/<runId>" this yields the branches "uzi" and
+    // "uzi/self-improve", i.e. the candidate refs refs/uzi-runner/uzi and
+    // refs/uzi-runner/uzi/self-improve — never the namespace root and never dst itself.
+    const candidates: string[] = [];
+    let acc = "refs/uzi-runner";
+    for (const part of parts.slice(0, -1)) {
+      acc = `${acc}/${part}`;
+      candidates.push(acc);
+    }
+    // Deepest-first: delete the most specific blocking leaf before its shorter ancestors.
+    for (const candidate of candidates.reverse()) {
+      if (!(await this.refExists(barePath, candidate))) continue;
+      const sha = (await this.runGit(barePath, ["rev-parse", candidate])).trim();
+      // Archive first so a possibly-unmerged tip is never lost by the delete. The
+      // <sanitized>/<sha> shape is D/F-safe within refs/uzi-archive (the sha leaf never
+      // collides with a sibling branch's subtree) and idempotent (re-archiving the same
+      // tip writes the same ref to the same sha).
+      const ancestorBranch = candidate.slice(RUNNER_TRACKING_PREFIX.length);
+      const sanitized = ancestorBranch.replace(/[^A-Za-z0-9_-]/g, "-");
+      await this.runGit(barePath, ["update-ref", `refs/uzi-archive/${sanitized}/${sha}`, sha]);
+      await this.runGit(barePath, ["update-ref", "-d", candidate]);
+      // Clear the now-dangling PRD #218 owner stamp for the deleted ref. tryGit swallows
+      // exit 5 (key absent), which runGit would instead throw on — see the helper notes.
+      await this.tryGit(barePath, ["config", "--local", "--unset", runnerTrackingOwnerKey(ancestorBranch)]);
+    }
   }
 
   /** PRD #122 M6: the tip of the worker-side tracking ref `fetchAgentBranch` wrote

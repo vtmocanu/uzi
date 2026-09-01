@@ -1342,3 +1342,88 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
     );
   });
 });
+
+// Issue #887 — a self_improve run's fetch-back writes the tracking ref
+// refs/uzi-runner/uzi/self-improve/<runId>. On a worker whose persistent bare still
+// carries the pre-#774 FLAT leaf ref refs/uzi-runner/uzi/self-improve, that leaf is a
+// strict path-prefix (directory ancestor) of the new dst, so the ref-store cannot create
+// the dst directory and the whole fetch aborts ("some local refs could not be updated").
+// fetchAgentBranch must clear the conflicting ancestor first (archiving its tip), land the
+// agent commit, and leave unrelated sibling tracking refs untouched.
+describe("issue #887 — fetchAgentBranch clears a D/F-conflicting legacy ancestor tracking ref", () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+  function refInBare(bare: string, ref: string): boolean {
+    try {
+      gitIn(bare, ["rev-parse", "--verify", "--quiet", ref]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("archives + deletes the flat ancestor, fetches the self-improve branch, and spares siblings", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+
+    // Seed the legacy pre-#774 FLAT leaf ref at main's commit — the ancestor that
+    // path-blocks refs/uzi-runner/uzi/self-improve/<runId>.
+    const mainSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+    gitIn(bare, ["update-ref", "refs/uzi-runner/uzi/self-improve", mainSha]);
+    // Its dangling PRD #218 owner stamp, keyed under the #887 subsection encoding
+    // (`uzi-trackowner.<branch>.owner`, branch verbatim in the subsection).
+    gitIn(bare, ["config", "--local", "uzi-trackowner.uzi/self-improve.owner", "old-run"]);
+    // issue #887 collision regression: a DISTINCT branch literally named "uzi-self-improve"
+    // (hyphen, not slash). The old flatten-to-variable-name encoding mapped both this and
+    // "uzi/self-improve" to the same key; the subsection encoding does not, so clearing the
+    // slash branch's stamp below must leave this hyphen branch's stamp untouched.
+    gitIn(bare, ["config", "--local", "uzi-trackowner.uzi-self-improve.owner", "sibling-run"]);
+    // An UNRELATED sibling tracking ref that must SURVIVE the clear.
+    gitIn(bare, ["update-ref", "refs/uzi-runner/agent/issue-999", mainSha]);
+
+    const runId = "37702d9d-887d-49c9-b3cd-7974a3b2ecde";
+    const branch = `uzi/self-improve/${runId}`;
+    const rc = await git.runnerCloneForBranch(bare, branch, `self-improve-${runId}`, runId);
+
+    // The agent commits in the runner clone.
+    fs.writeFileSync(path.join(rc.path, "SI.txt"), "self-improve\n");
+    gitIn(rc.path, ["add", "SI.txt"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "self-improve work"]);
+    const agentSha = gitIn(rc.path, ["rev-parse", "HEAD"]);
+
+    // Without the fix this THROWS ("some local refs could not be updated"); with it the
+    // ancestor is cleared first and the fetch lands.
+    const ref = await git.fetchAgentBranch(bare, rc.path, branch, runId);
+
+    assert.strictEqual(ref, `refs/uzi-runner/${branch}`);
+    assert.strictEqual(gitIn(bare, ["rev-parse", ref]), agentSha, "the self-improve commit landed in the worker bare");
+    // The flat ancestor is gone (it path-blocked dst).
+    assert.strictEqual(
+      refInBare(bare, "refs/uzi-runner/uzi/self-improve"),
+      false,
+      "the D/F-conflicting flat ancestor must be deleted",
+    );
+    // Its tip was archived first so a possibly-unmerged commit is never lost.
+    assert.strictEqual(
+      gitIn(bare, ["rev-parse", `refs/uzi-archive/uzi-self-improve/${mainSha}`]),
+      mainSha,
+      "the deleted ancestor's tip must be archived under refs/uzi-archive/<sanitized>/<sha>",
+    );
+    // The cleared ancestor's own owner stamp is gone (--get now exits non-zero → gitIn throws).
+    assert.throws(
+      () => gitIn(bare, ["config", "--local", "--get", "uzi-trackowner.uzi/self-improve.owner"]),
+      "the deleted ancestor's PRD #218 owner stamp must be unset",
+    );
+    // issue #887 collision regression: the DISTINCT "uzi-self-improve" (hyphen) branch's
+    // stamp must SURVIVE — the old encoding collided both onto one key and cleared it here.
+    assert.strictEqual(
+      gitIn(bare, ["config", "--local", "--get", "uzi-trackowner.uzi-self-improve.owner"]),
+      "sibling-run",
+      "a distinct hyphen-named branch's owner stamp must not be collaterally cleared",
+    );
+    // The unrelated sibling tracking ref is untouched — its tip is unchanged, not merely present.
+    assert.strictEqual(
+      gitIn(bare, ["rev-parse", "refs/uzi-runner/agent/issue-999"]),
+      mainSha,
+      "an unrelated sibling tracking ref must remain unchanged",
+    );
+  });
+});

@@ -101,11 +101,25 @@ its picker to **Auto-select from the pool** (or `uzi worker set-token
 <worker-id> --auto`) and each claim spends whichever of your **pooled**
 tokens has the most rate-limit headroom.
 
-It is opt-in **per token**, and the pool starts empty. On **Settings →
-Anthropic tokens**, tick **Auto-select from this token** on each one you are
-happy for uzi to spend; `uzi token pool <name> --on|--off` does the same. The
-pool is empty by default on purpose — one that helped itself to every
-credential would spend the one you reserved for something else.
+Your **first (or only) token starts in the pool automatically** — a
+single-token account gets auto-selection for free, nothing to opt in. That's
+safe by construction: with one token, the pool and your default are the same
+credential, so pooling it opens no new spend surface.
+
+**Every token after that starts opt-in**, and stays out until you say
+otherwise. On **Settings → Anthropic tokens**, tick **Auto-select from this
+token** on each one you are happy for uzi to spend; `uzi token pool <name>
+--on|--off` does the same. That's deliberate — a second token that helped
+itself into the pool would spend a credential you reserved for something
+else, which is the whole reason it starts out.
+
+> **A throwaway worker defaults to auto-select too.** A [worker uzi
+> auto-provisions for an unmet
+> capability](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability)
+> comes up set to **Auto-select from the pool** as long as you have at least
+> one pooled token, so a burst of throwaway workers spreads across your pool
+> instead of leaning on one credential. If your pool is empty, it quietly
+> spends your default token instead, the same as any other worker.
 
 **Opting a token in does not guarantee it gets picked.** Beside the toggle,
 each pooled token shows whether auto-selection could pick it *right now*:

@@ -23468,3 +23468,33 @@ combining `user_id` / `auto_approve` / `schedule_id` / `resume_of_run_id` / `kin
   `manual`/`autopilot`.
 - **Surfaced end to end.** RunDTO (`trigger_source`), `uzi run get --json` / `--field`, the
   `uzi admin runs` table, and the web `interface Run` mirror.
+
+## 594. Issue #804 — auto-provisioned EPHEMERAL workers default to Anthropic bind-mode `auto`, but only when the owner's auto-select pool is non-empty; a sole anthropic_token is born pool-eligible
+
+Serves human: hosted ephemeral (burst) workers should use the owner's auto-select pool by default
+rather than their single default token, without regressing owners who never opted in. Terse contract
+here; issue #804 and the query/provisioner code comments carry the richer rationale.
+
+- **Ephemeral-only default flip, made CONDITIONAL.** `EphemeralProvisioner.provisionOne`
+  (`api/internal/hostedsvc/ephemeral.go`) sets `AnthropicBindMode = auto` for an auto-provisioned burst
+  worker **only when the owner has ≥1 `auto_eligible` anthropic_token** (queried via new
+  `UserHasAutoEligibleAnthropicToken`); otherwise it falls back to `default`. A blanket `auto` would
+  park the run in `pool_wait` (`autoselect.ReasonPoolEmpty`) for any owner with an empty pool — and,
+  since §581 (PRD #754) removed the owner-default fallback, there is no rescue — including a
+  pre-existing multi-token user who never opted in. The conditional avoids that stall/regression.
+- **A user's FIRST/SOLE anthropic_token is now born `auto_eligible = true`**, so a single-token owner's
+  pool is non-empty and their ephemeral run auto-selects their only token. Applied at insert on BOTH
+  write paths — `InsertUserSecret` and `UpsertDefaultUserSecret` — each guarded by the SAME
+  `@kind = 'anthropic_token' AND NOT EXISTS (… same user, same kind)` first-token subquery, so the
+  auto-eligibility is tied to *being the first anthropic_token*, never to the `is_default` pointer.
+- **Token #2+ stays opt-in `auto_eligible = false`**, preserving PRD #111 D2's reserved-console-key
+  protection: a later-added token is never silently pooled. The `kind = 'anthropic_token'` predicate on
+  the born-eligible clause also keeps migration 00087's `CHECK (NOT auto_eligible OR kind =
+  'anthropic_token')` satisfied and prevents a reserved-key leak on the upsert path.
+- **Migration `00182_backfill_sole_token_auto_eligible.sql`** backfills existing sole-anthropic_token
+  users to `auto_eligible = true`, so users created before this change get the same non-empty pool.
+- **Persistent hosted workers are deliberately unchanged** (still default to `default`). This is an
+  ephemeral/burst-worker default only.
+
+Cross-refs: PRD #754 pool-only auto lane + `pool_wait` (§581); PRD #111 D2 opt-in / reserved-console-key
+protection and D7's removed fallback (§581); migration 00087's `auto_eligible` CHECK.

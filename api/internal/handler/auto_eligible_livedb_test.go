@@ -65,18 +65,26 @@ func TestAutoEligibleToggleLiveDB(t *testing.T) {
 	owner := mkSecretUser(t, pool)
 	stranger := mkSecretUser(t, pool)
 
-	rec := h.createToken(t, owner, "default", "sk-ant-autoeligible-owner-0000000000", true)
+	// A user's FIRST/SOLE anthropic_token is born auto-eligible (issue #804), so seed a
+	// preceding first token to hold that role; the token under test here is the owner's
+	// SECOND, which is the opt-in default we exercise (born OUT, toggled IN, then OUT).
+	if rec := h.createToken(t, owner, "default", "sk-ant-autoeligible-owner-first-0000", true); rec.Code != http.StatusCreated {
+		t.Fatalf("create first token: code %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	rec := h.createToken(t, owner, "console-key", "sk-ant-autoeligible-owner-0000000000", false)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: code %d, body %s", rec.Code, rec.Body.String())
 	}
 	tok := decodeSecret(t, rec).Secret.ID
 
-	// --- A new token is OUT of the pool ------------------------------------
-	// D2's default, and the one that must never drift: a token that silently
-	// arrived in the pool would spend an account the user reserved for something
-	// else, which is the whole reason the pool is opt-in.
+	// --- A new NON-FIRST token is OUT of the pool --------------------------
+	// D2's default for the reserved token, and the one that must never drift: a
+	// second token that silently arrived in the pool would spend an account the user
+	// reserved for something else, which is the whole reason #2+ stays opt-in (issue
+	// #804 keeps only the FIRST/SOLE token auto-eligible).
 	if autoEligibleOf(t, h, owner, tok) {
-		t.Fatal("a newly created token is already in the pool; the D2 default must be OUT")
+		t.Fatal("a newly created non-first token is already in the pool; the opt-in default for token #2+ must be OUT")
 	}
 
 	// --- Toggling on, and the response reporting it ------------------------
@@ -183,6 +191,14 @@ func TestSelfRateLimitsAutoStatusLiveDB(t *testing.T) {
 	stale := mk("stale", false)
 	lowRoom := mk("low-room", false)
 	noGauge := mk("no-gauge", false)
+
+	// notPooled is the user's FIRST token, which issue #804 makes born auto-eligible;
+	// opt it back OUT so it genuinely models a token the owner never put in the pool —
+	// the case that must classify not_pooled even with a wide-open gauge reading. The
+	// count stays 5 and no throwaway token pollutes the listing below.
+	if rec := patchAutoEligible(t, h, owner, notPooled, `{"auto_eligible":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("opt not-pooled OUT: code %d, body %s", rec.Code, rec.Body.String())
+	}
 
 	for _, id := range []string{fresh, stale, lowRoom, noGauge} {
 		if rec := patchAutoEligible(t, h, owner, id, `{"auto_eligible":true}`); rec.Code != http.StatusOK {

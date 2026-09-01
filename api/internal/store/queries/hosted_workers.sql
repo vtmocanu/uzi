@@ -113,8 +113,12 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND kind = 'hosted' AND ep
 -- requires template_declared/hosted_size NOT NULL on a hosted row, docker_enabled an
 -- explicit true/false). ephemeral_run_id is cast to a non-null uuid so the param is a
 -- plain uuid.UUID: the provisioner always has a concrete run to bind to.
-INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id)
-VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size, @docker_enabled, true, @ephemeral_run_id::uuid)
+--
+-- anthropic_bind_mode is now caller-supplied (issue #804): the provisioner passes `auto`
+-- when the owner has ≥1 auto_eligible anthropic_token (a non-empty auto-select pool) and
+-- `default` otherwise, so an auto worker never parks a run in pool_wait on an empty pool.
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode)
+VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size, @docker_enabled, true, @ephemeral_run_id::uuid, @anthropic_bind_mode)
 RETURNING *;
 
 -- name: DeleteEphemeralWorkerForRun :execrows

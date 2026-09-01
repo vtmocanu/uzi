@@ -366,6 +366,13 @@ describe("parseReview", () => {
     assert.equal(r.model, "haiku");
   });
 
+  it("parses a fenced block with prose before the object inside the fence", () => {
+    const text =
+      '```json\nNote: focused on correctness.\n{"verdict":"ok","summary":"s","recommendations":[]}\n```';
+    const r = parseReview(text, "haiku");
+    assert.equal(r.verdict, "ok");
+  });
+
   it("parses JSON embedded in prose and drops unknown categories", () => {
     const text =
       'Here is my assessment: {"verdict":"issues","summary":"s","recommendations":[' +

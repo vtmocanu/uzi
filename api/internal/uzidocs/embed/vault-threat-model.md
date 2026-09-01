@@ -115,7 +115,15 @@ accepted and bounded rather than closed:
    controller delivers it as a file-mounted k8s Secret (never an env var —
    the same `/proc/<pid>/environ` leak class [proc-hardening.md](proc-hardening.md)
    closes for the worker's own credentials), and a k8s Secret is
-   base64-encoded, not encrypted, at that layer. Anyone who can read it can
+   base64-encoded, not encrypted, at that layer by default — even with etcd
+   encryption-at-rest enabled, protection needs an encrypting provider
+   configured for the `secrets` resource specifically (an
+   `EncryptionConfiguration` with the resource merely listed is not enough),
+   and it is not retroactive: a Secret written before that provider was
+   configured stays plaintext in etcd until something rewrites it, so a
+   worker join token already delivered is not automatically protected just
+   because the cluster operator turns on encryption-at-rest later. Anyone
+   who can read it can
    impersonate that worker: claim its owner's runs, and receive their
    decrypted forge PAT and Anthropic token in the claim response. Bounded by
    the worker namespace holding nothing else and the controller's own RBAC
