@@ -1,7 +1,7 @@
 # PRD #963: forgesvc/projectsync.go file split — provision/seed, forward+reverse sync, visibility/share
 
 **GitHub Issue**: [#963](https://github.com/vtmocanu/uzi/issues/963)
-**Status**: Draft (created 2026-09-01)
+**Status**: Done (created 2026-09-01)
 **Priority**: Medium
 **Parent**: epic #915 (Batch 2, P13; finding A8). Decided 2026-09-01 evening. Same recipe as #921 (`prds/done/921-workersvc-file-split.md`, PR #955): same-package, move-only, one seam per commit.
 **Line refs**: at `01be854` (current main). Implementer re-derives at their base; anchors are identifiers, not offsets.
