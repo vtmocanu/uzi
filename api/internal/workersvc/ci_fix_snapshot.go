@@ -21,6 +21,9 @@ import (
 // claim payload. It targets the token SHAPES a teammate's pipeline might print:
 //   - GitLab token families (glpat-, gloas-, glrt-, glcbt-, glptt-, glsoat-,
 //     glimt-, glagent-, gldt- deploy tokens) — a long base62/underscore/dash body.
+//   - GitHub token families (PRD #954 M1): classic PATs (ghp_/gho_/ghu_/ghs_/ghr_)
+//     and fine-grained github_pat_ — the GitHub driver has been live since
+//     2026-08-08 and parses github_pat_ itself.
 //   - Anthropic keys (sk-ant-...), the shape of a printed per-user token.
 //   - Auth header lines a `curl -v` / `set -x` echo would emit: PRIVATE-TOKEN,
 //     Authorization (Bearer ...), and a bare "Bearer <token>".
@@ -33,6 +36,8 @@ import (
 // residual risk (docs/configuration.md); the snapshot is owner/admin-visible only.
 var snapshotSecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`gl(pat|oas|rt|cbt|ptt|soat|imt|agent|dt)-[A-Za-z0-9_\-]{16,}`),
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{16,}`),
+	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{16,}`),
 	regexp.MustCompile(`sk-ant-[A-Za-z0-9_\-]{16,}`),
 	regexp.MustCompile(`uz[caw]_[A-Za-z0-9_\-]{16,}`),
 	// Header lines a `curl -v` / `set -x` echoes — redact the WHOLE value to EOL

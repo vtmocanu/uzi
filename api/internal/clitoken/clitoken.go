@@ -42,6 +42,12 @@ const (
 	PrefixAdmin = "uza_"
 )
 
+// Prefixes lists every minted CLI class prefix. It exists so the secret-scrub
+// binding test (secretscrub_test) can range over the minted prefixes and a new
+// prefix is added on the same line the test iterates — pinning that every minted
+// credential shape has a matching scrub pattern.
+var Prefixes = []string{PrefixUser, PrefixAdmin}
+
 // tokenBytes is the random payload length in bytes (256 bits of entropy), the
 // same as jointoken.
 const tokenBytes = 32

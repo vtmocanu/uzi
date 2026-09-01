@@ -584,12 +584,16 @@ func TestReplierScrubsSecretsFromReply(t *testing.T) {
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
-	r.HandleMessage(context.Background(), reply("token is glpat-x, use it"))
+	// A ≥16-char body is required since PRD #954 widened the GitLab scrub pattern; assembled
+	// from two halves so no token-shaped literal sits in source (gitleaks' gitlab-pat rule and
+	// GitHub push protection both blocked the contiguous form, 2026-09-01).
+	const fakeGitLabPAT = "glpat-" + "notARealValue" + "0123456"
+	r.HandleMessage(context.Background(), reply("token is "+fakeGitLabPAT+", use it"))
 
 	if len(sub.submitted) != 1 {
 		t.Fatalf("want one submit, got %d", len(sub.submitted))
 	}
-	if strings.Contains(sub.submitted[0].body, "glpat-x") {
+	if strings.Contains(sub.submitted[0].body, fakeGitLabPAT) {
 		t.Fatalf("a credential in the reply must be scrubbed before the worker sees it: %q", sub.submitted[0].body)
 	}
 	if !strings.Contains(sub.submitted[0].body, "[redacted]") {
