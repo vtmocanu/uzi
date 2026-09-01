@@ -111,7 +111,7 @@ describe("Schedules — a mutation error clears on onSaved → reload() (item 4c
       </MemoryRouter>,
     );
     fireEvent.click(screen.getByRole("tab", { name: /My schedules/ }));
-    await waitFor(() => expect(screen.getByText("Sweep eligible PRD issues")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
 
     // Fail the toggle → the mutation error is shown.
     fireEvent.click(screen.getByRole("switch", { name: "Disable schedule" }));
