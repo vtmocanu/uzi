@@ -544,6 +544,10 @@ var wantRouteMounts = []routeMount{
 	// PRD #71: a single boolean UPDATE on the caller's own users row, spends no
 	// Anthropic token at toggle time — noLimiter, matching /me/autopilot beside it.
 	{"PUT", "/api/me/ci-autofix", noLimiter},
+	// issue #916: the AI-attribution opt-out. A single boolean UPDATE on the caller's
+	// own users row, spends no Anthropic token at toggle time — noLimiter, matching
+	// /me/ci-autofix and /me/autopilot beside it.
+	{"PUT", "/api/me/attribution", noLimiter},
 	// PRD #649: a single boolean UPDATE on the caller's own users row (the ephemeral
 	// auto-provisioning opt-in), spends no Anthropic token at toggle time —
 	// noLimiter, matching /me/ci-autofix and /me/autopilot beside it.

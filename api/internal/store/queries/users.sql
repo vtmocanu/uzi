@@ -94,6 +94,13 @@ RETURNING *;
 UPDATE users SET ci_autofix_enabled = $2 WHERE id = $1
 RETURNING *;
 
+-- name: SetUserAttributionEnabled :one
+-- Flip a user's AI-attribution opt-out (issue #916). When false the worker suppresses
+-- the SDK's Co-Authored-By: Claude commit trailer; default true (current behavior).
+-- The caller passes the target id: the session user for PUT /api/me/attribution.
+UPDATE users SET attribution_enabled = $2 WHERE id = $1
+RETURNING *;
+
 -- name: SetUserJudgeAnthropicSecret :one
 -- Point a user's JUDGE lane at one of their own Anthropic credentials, or clear the
 -- binding back to their default (PRD #104 M4, D1). Per-user, not per-worker: which

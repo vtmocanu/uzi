@@ -47,6 +47,9 @@ func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
 		"autopilot_enabled", "judge_enabled", "ci_autofix_enabled",
+		// issue #916: the per-user AI-attribution opt-out. Default true (current
+		// behavior); when false the worker suppresses the Co-Authored-By trailer.
+		"attribution_enabled",
 		// PRD #649: the per-user opt-in to ephemeral worker auto-provisioning.
 		"ephemeral_workers_enabled",
 		// PRD #35 Decision 7: the per-user DEFAULT for the usage-limit park. A default,
