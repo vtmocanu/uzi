@@ -810,7 +810,7 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// asserting on "safe" would pass via the title even if the rail never drew the label (vacuous).
 	// "credsafe" carries the same hostile control/bidi bytes but a tail that only the rail's
 	// account-label render can put into the frame.
-	detailCredLabel := "\x1b[2J\u202E\x07\x01credsafe" //nolint:gosec // G101: not a credential \u2014 a hostile control/bidi-byte sanitization fixture whose display label happens to contain "cred"; the test asserts it is stripped, never a secret.
+	detailCredLabel := "\x1b[2J\u202E\x07\x01credsafe" //nolint:gosec // G101: not a credential - a hostile control/bidi-byte sanitization fixture whose display label happens to contain "cred"; the test asserts it is stripped, never a secret.
 	next, _ = detail.Update(detailLoadedMsg{
 		// A hostile milestone title exercises renderMilestones' crew-rail draw (D7): the
 		// in-progress id makes the row render its title through renderer.Plain. The hostile
