@@ -159,6 +159,7 @@ uzi ships a catalogue of standing automations you can enable per repo, so the fa
 | `bug-hunt` | a deep audit of one subsystem, one focused fix | weekly |
 | `self-improve` | scans the codebase and opens a self-improvement PR | every couple of days |
 | `feature-bingo` | brainstorms one new feature and proposes it | weekly |
+| `refactor-scout` | proposes one structural refactor, never implements it | biweekly |
 
 `feature-bingo` is the factory designing its own next machine: once a week it reads the existing ideas, checks what already exists so it does not repeat itself, and opens a PR proposing exactly one concrete new feature. Every scheduled job falls back to a plain report when it has nothing worth landing, so a quiet week produces no empty pull requests. See [docs/scheduling.md](docs/scheduling.md).
 
