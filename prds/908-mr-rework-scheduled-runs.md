@@ -1,10 +1,14 @@
-# PRD #908: Autofix (MR rework + CI autofix) for scheduled runs
+# PRD #908: Autofix for scheduled runs, and CI autofix on by default
 
 **Issue**: #908
 **Status**: Draft — ready for implementation
 **Priority**: Medium
 **Design companion**: `prds/908-mr-rework-scheduled-runs-design.md` (the board-free recorder decision, mechanism, contracts, and risks — read it for the MR-rework half's deep design).
-**Scope**: `api/` + `docs/` only. No `agent/` change, no `web/` code change, **no new migration**.
+**Scope**: `api/` + `web/` + `docs/`. No `agent/` change. **Adds one migration** (ci_autofix tri-state — Part B). No `.github/workflows/**` changes.
+
+This PRD has two parts:
+- **Part A (M1–M6)** — extend both autofix lanes (mr_rework + ci_fix) to scheduled runs (prompt + self_improve). `api/` + `docs/` only, no migration.
+- **Part B (M7–M10)** — make CI autofix **on by default** by restructuring its enablement to mirror mr_rework's model (admin global default-on + per-user nullable tri-state). This is a **global** change (affects issue-run CI autofix too, not just scheduled runs) and touches `api/` + `web/` + one migration.
 
 ## Problem
 
@@ -64,12 +68,19 @@ enablement model:
   → `users.mr_rework_enabled` → `runs.mr_rework_enabled` → `run_schedules.mr_rework_enabled`, all
   default-ON, any explicit `false` disables). The prompt path already stamps the schedule toggle;
   M1 adds the same stamp to self_improve.
-- **CI autofix** stays **user opt-in, default-off** (`users.ci_autofix_enabled`, migration 00115,
-  `DEFAULT false`). No per-run/per-schedule toggle exists for it and this PRD adds none — a
-  scheduled run inherits the owner's user-level opt-in. This satisfies "don't pay unless you
-  enable it" more strictly than mr_rework (you must opt in at all). A per-schedule ci_autofix
-  toggle is a possible follow-up (it would need a new column + web work), deliberately out of
-  scope here.
+- **CI autofix** is restructured to **on by default** (Part B), mirroring mr_rework's model: a new
+  admin global setting `ci_autofix_enabled` (default `"true"`) plus the per-user column made a
+  **nullable tri-state** (NULL = inherit the global default). Today it is `users.ci_autofix_enabled
+  BOOLEAN NOT NULL DEFAULT false` (user opt-in only, no admin global). A scheduled run then inherits
+  the owner's resolved setting, so once default-on the maintainer's scheduled MRs get CI autofix
+  without an explicit opt-in. **Because the current column is NOT NULL, history cannot distinguish
+  "opted out" from "never chose"** — so the migration folds existing `false` rows into inherit
+  (NULL = on) and preserves existing `true` rows (explicit opt-in). Anyone who had deliberately
+  turned it off is re-enabled; an admin can turn the whole instance off via the new global, and any
+  user can re-opt-out explicitly. This was the user's chosen approach (over a forward-only default
+  or a plain backfill). Per-run/per-schedule ci_autofix toggles are a possible follow-up (mr_rework
+  itself gained its four layers across #700 then #841); Part B ships the admin + user layers that
+  deliver default-on.
 
 **The MR-rework open-MR signal (fact 1) is solved with a board-free MR-state recorder** (design
 companion §1): reuse `runs.mr_state` as the gate signal (so the candidate query, ledger eviction,
@@ -80,9 +91,10 @@ query then widens by one line and keeps its `mr_state = 'opened'` gate. Rejected
 (pure Option A / pure Option B) and the "second Go writer of mr_state over disjoint run sets"
 invariant reasoning are in the companion §1.
 
-**No new migration** — every column already exists (`users.mr_rework_enabled` 00165;
-`runs`/`run_schedules.mr_rework_enabled` 00179; `users.ci_autofix_enabled` 00115). Live head is
-00181.
+**Migrations**: Part A needs **none** (all mr_rework columns exist — `users.mr_rework_enabled`
+00165, `runs`/`run_schedules.mr_rework_enabled` 00179). Part B adds **one** migration making
+`users.ci_autofix_enabled` nullable + the data fold above (number assigned at merge time, draft
+00182; live head is 00181).
 
 ### Resolved decisions
 
@@ -156,15 +168,61 @@ Dependency-ordered. **Offline** = unit-testable with in-memory fakes. **LiveDB**
   per-MR uniqueness hold for the new branches. One live-forge end-to-end per lane (a landed review
   comment → rework; a red pipeline → ci_fix), and the mr_rework schedule toggle Off suppressing it.
 
-- [ ] **M6 — Docs.** *(Offline)*
+- [ ] **M6 — Docs (Part A).** *(Offline)*
   Update `docs/scheduling.md`: prompt and self_improve MRs now participate in both autofix lanes;
   mr_rework default-on with the four-layer opt-out (per-schedule toggle in the web ScheduleModal +
-  CLI `--mr-rework`), ci_autofix user opt-in default-off. `npm run build`'s `check-docs.mjs` passes.
+  CLI `--mr-rework`). (The ci_autofix default-on docs are M10.) `npm run build`'s `check-docs.mjs`
+  passes.
 
-**Parallelism** (per user CLAUDE.md PRD-parallelization convention): M1, M2, M6 touch disjoint
-files → parallel. M3 and M4 are a pair (M4's *validation* needs M3's recorder to populate
-`mr_state`, though the M4 query edits are independent). **Wave 1**: {M1, M2, M6} + {M3, M4};
-**Wave 2**: {M5}.
+### Part B — CI autofix on by default (global)
+
+Mirror mr_rework's admin-global + per-user tri-state. The map below is grounded in the current
+code; the "template" column is the mr_rework symbol to copy.
+
+- [ ] **M7 — Admin global `ci_autofix_enabled` setting + detector fail-closed read.** *(Offline)*
+  In `api/internal/settings/settings.go` add (all NEW — settings.go has zero ci_autofix refs today):
+  `KeyCiAutofixEnabled = "ci_autofix_enabled"`, `DefaultCiAutofixEnabled = "true"`, the `Defaults`
+  map entry, a three-state error-propagating accessor mirroring `MrReworkEnabled` (~settings.go:870),
+  and the `validateBool` case (~:1439). Wire `settings.Cache` into the `CIAutoFix` detector
+  (`poller/ci_autofix.go`: add the field to the struct/`ciAutofixStore` interface/`NewCIAutoFix` and
+  its `cmd/server/main.go:541` construction) and add the fail-closed read at the top of `detect`,
+  mirroring `mr_review_watch.go:105-112`. Delivers the admin global default-on kill-switch.
+
+- [ ] **M8 — User column → nullable tri-state + candidate-gate + Go-type ripple.** *(Offline + LiveDB)*
+  New migration: `ALTER TABLE users ALTER COLUMN ci_autofix_enabled DROP NOT NULL, DROP DEFAULT`,
+  then the data fold — `UPDATE users SET ci_autofix_enabled = NULL WHERE ci_autofix_enabled = false`
+  (existing `true` rows preserved). Change the candidate gate `ci_autofix.sql:67` `AND
+  u.ci_autofix_enabled` → `AND u.ci_autofix_enabled IS NOT FALSE` (mirrors mr_rework: NULL/true pass,
+  explicit false excludes). Regenerate sqlc; the Go field `store.User.CiAutofixEnabled` flips
+  `bool` → `pgtype.Bool` — fix the one hand-written reader `handler/handler.go:476` (`toDTO`) and the
+  `SetUserCIAutofixEnabled` SET-query params (`users.sql`, currently `bool`, returns `*`).
+
+- [ ] **M9 — Tri-state over the API + web toggles.** *(Offline; web)*
+  Retrofit the dedicated endpoints to carry inherit/clear: `handler/ci_autofix_toggle.go`
+  (`setCIAutofixRequest{Enabled bool}` → nullable), `SetCIAutofixEnabled` (self, `PUT /me/ci-autofix`)
+  and `SetUserCIAutofixEnabled` (admin, `PUT /admin/users/{id}/ci-autofix`), and the DTO
+  `apitypes/user.go:32` + web `api.ts:34` `User.ci_autofix_enabled` → `boolean | null`. Update the web
+  toggles to tri-state, mirroring RunDefaults' mr_rework checkbox (`checked={x !== false}`):
+  `web/src/pages/RunDefaults.tsx` (self) and `web/src/pages/AdminUsers.tsx` (admin per-user). No web
+  admin card for the global is needed — the global round-trips through the generic `GET/PUT
+  /admin/settings` like mr_rework's global does.
+
+- [ ] **M10 — Tests + docs (Part B).** *(Offline + LiveDB)*
+  Migration test: an existing `false` row becomes NULL, a `true` row is preserved. Candidate query:
+  a NULL-user run is a candidate (default-on), an explicit-`false` user is excluded, and with the
+  admin global off the detector skips the whole repo (fail-closed). Settings accessor test mirroring
+  mr_rework's. Web tri-state toggle test. Docs: `docs/scheduling.md` + wherever ci_autofix is
+  documented now say it is on by default with the admin global + per-user opt-out, and note the
+  one-time migration re-enables prior opt-outs.
+
+**Parallelism** (per user CLAUDE.md PRD-parallelization convention). **Part A**: M1, M2, M6 touch
+disjoint files → parallel; M3 and M4 are a pair (M4's *validation* needs M3's recorder to populate
+`mr_state`, though the M4 query edits are independent). **Part B**: M7 and M8 are largely disjoint
+(settings/detector vs migration/store) but M9 depends on M8's type flip, and M10 tests all three;
+run M7+M8 in parallel, then M9, then M10. **Part A and Part B are independent** (disjoint files
+except both edit `ci_autofix.sql`: Part A M4 widens its kind filter, Part B M8 changes its user gate
+— coordinate that one file or sequence the two edits). Suggested waves: **Wave 1** {M1, M2, M6, M7,
+M8} + {M3, M4}; **Wave 2** {M9}; **Wave 3** {M5, M10}.
 
 ## Success criteria
 
@@ -177,8 +235,12 @@ files → parallel. M3 and M4 are a pair (M4's *validation* needs M3's recorder 
    schedule's runs — verified for a prompt schedule and the self_improve schedule.
 4. The per-MR cap halt (mr_rework) and the start/halt notices (ci_autofix) on an issueless branch
    produce an inbox notification and post to no nonexistent issue, without crashing.
-5. Full gate green (`task gate:api`, `task gate:agent` unaffected, docs check) plus the `*LiveDB`
-   sweep with a positive control (named tests `--- PASS`, `RUN > 0`, zero `--- SKIP`).
+5. **(Part B)** CI autofix is on by default: a user who never touched the setting (NULL) gets a
+   `ci_fix` run on a failed agent-MR pipeline; an explicit per-user `false` gets none; the admin
+   global set to false suppresses it instance-wide. The migration turns a prior `false` row into
+   inherit (on) and preserves a prior `true` row.
+6. Full gate green (`task gate:api`, `task gate:web`, `task gate:agent` unaffected, docs check) plus
+   the `*LiveDB` sweep with a positive control (named tests `--- PASS`, `RUN > 0`, zero `--- SKIP`).
 
 ## Risks & dependencies
 
@@ -196,13 +258,23 @@ files → parallel. M3 and M4 are a pair (M4's *validation* needs M3's recorder 
   is the dropped feedback this PRD addresses).
 - **R4 (cost on unattended lanes)** — each cycle spends the owner's Anthropic token; bounded by
   mr_rework's default-on four-layer opt-out + admin cap, and by ci_autofix being opt-in default-off.
-- **R5 (no migration)** — if an implementer thinks a migration is needed, the design was misread;
-  escalate rather than add a column.
+- **R5 (Part A adds no migration)** — Part A's columns all exist; if an implementer thinks Part A
+  needs a migration, the design was misread. (Part B deliberately adds exactly one — the ci_autofix
+  nullable conversion.)
+- **R6 (Part B re-enables prior opt-outs) — the one behavior-change risk the user accepted.** The
+  current `ci_autofix_enabled` is NOT NULL, so the migration cannot tell a deliberate opt-out from a
+  never-set default; folding `false → NULL` turns CI autofix back on for anyone who had switched it
+  off. This ships to all self-hosters, not just this instance. Mitigations: the admin global lets an
+  operator turn the whole instance off in one place, any user can explicitly opt out again after the
+  migration, and M10's docs must call out the one-time re-enable so operators are not surprised by
+  new token spend. Alternatives (forward-only default; or a plain backfill with no admin global)
+  were considered and rejected by the user in favor of this consistent, reversible model.
 
 ## Workflow-scope note (uzi worker)
 
 Per `.claude/rules/prds.md`: implementation and validation touch **no** `.github/workflows/**` —
-changes are in `api/` and `docs/`, and the LiveDB sweep runs via `./e2e/run-store-it.sh` (a
-script, not a workflow file). Live-forge validation is post-merge, outside the branch diff. So
-`git diff --name-only <base>..HEAD` shows zero `.github/workflows/**` entries — safe for the
-worker PAT that lacks `workflow` scope.
+changes are in `api/`, `web/`, and `docs/` (Part B adds one migration under
+`api/internal/store/migrations/`), and the LiveDB sweep runs via `./e2e/run-store-it.sh` (a script,
+not a workflow file). Live-forge validation is post-merge, outside the branch diff. So `git diff
+--name-only <base>..HEAD` shows zero `.github/workflows/**` entries — safe for the worker PAT that
+lacks `workflow` scope.
