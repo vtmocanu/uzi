@@ -57,9 +57,11 @@ func Scrub(s string) string {
 	return s
 }
 
-// ScrubSlackTokens replaces only Slack token substrings. slack-go's validation errors
-// return Slack's error code (e.g. "invalid_auth"), not the token, so this is
-// defense-in-depth for error strings rather than a primary control.
+// ScrubSlackTokens replaces only Slack token substrings — the bot/app/user families
+// AND the xoxe- refresh family, which falls outside the x(ox|app)- shape. slack-go's
+// validation errors return Slack's error code (e.g. "invalid_auth"), not the token, so
+// this is defense-in-depth for error strings rather than a primary control.
 func ScrubSlackTokens(s string) string {
-	return slackTokenPattern.ReplaceAllString(s, "[redacted]")
+	s = slackTokenPattern.ReplaceAllString(s, "[redacted]")
+	return slackRefreshPattern.ReplaceAllString(s, "[redacted]")
 }
