@@ -15,12 +15,26 @@
 # the CALLER's cwd: it CreateTaskRun → `git push origin HEAD:refs/heads/uzi/task/<id>`
 # (handoff.go:145) → dispatch. That push, and `handoff rm`'s `git push --delete`, run
 # under uzi_cli's `env -i`, so the git child sees only that env — which is why lib.sh
-# now writes $RUNROOT/host-gitconfig (host-path insteadOf → local bare, plus
-# safe.directory=* for the #366 dubious-ownership class) and points uzi_cli's
-# GIT_CONFIG_GLOBAL at it. This phase proves that transport with a positive control
-# BEFORE any handoff (so a transport mistake fails in one line, not as a worker-clone
-# timeout), then drives both handoff legs: a plain (no-MR) task whose branch is rm-able,
-# and an --mr task whose branch is exempt from rm.
+# writes $RUNROOT/host-gitconfig and points uzi_cli's GIT_CONFIG_GLOBAL at it.
+#
+# TRANSPORT: origin is a REAL git-over-https URL to forge-fake's host-published git
+# smart-HTTP endpoint — https://uzi-bot:<pat>@127.0.0.1:<port>/group/repo.git — with NO
+# insteadOf. `git remote get-url origin` returns that URL VERBATIM (no rewrite), so
+# resolveHandoffRepo (handoff.go:187) reads it, parseRepoPath (handoff.go:238) parses it
+# to `group/repo` (url.Parse Host=127.0.0.1:<port>, Path=/group/repo; userinfo is not in
+# Path), and it matches the seeded repo — so handoff needs no --repo. The transport is
+# real HTTP Basic auth (uzi-bot:<pat>, the compose FORGE_FAKE_EXPECT_USER/EXPECT_PAT;
+# forge-fake 401s otherwise) with sslVerify off for the self-signed forge-fake.e2e cert.
+# This is the SAME endpoint phase 20-git-push-basic-auth exercises for the worker; since
+# forge-fake serves the shared bare, the worker's pushed branch is visible here too.
+# (An insteadOf rewrite to the local bare would break resolveHandoffRepo: get-url expands
+# insteadOf, so it would return the local PATH, which parseRepoPath cannot map to
+# group/repo — handoff would error before dispatch.)
+#
+# This phase proves that transport with a positive control BEFORE any handoff (so a
+# transport/auth mistake fails in one line, not as a worker-clone timeout), then drives
+# both handoff legs: a plain (no-MR) task whose branch is rm-able, and an --mr task whose
+# branch is exempt from rm.
 #
 # A task run AUTO-RUNS: auto_approve is baked true (task.sql), so there is NO plan gate
 # and NO approve step (unlike the issue phase) — wait_status ... completed works
@@ -29,29 +43,35 @@
 # no-MR task), giving the topology seed ← marker ← stub on uzi/task/<id>.
 say "PRD #966 M5: task/handoff run kind via \`uzi handoff\` (+ host-gitconfig transport)"
 
-# --- Setup: a host-side clone of the bare, under the host gitconfig -----------
+# --- Setup: a host-side clone of forge-fake's git smart-HTTP endpoint ---------
 # hgit runs the phase's OWN host git (clone/commit/fetch/ls-remote/remote) — these are
 # NOT uzi_cli, so they need GIT_CONFIG_GLOBAL set explicitly to reach the same host
-# gitconfig the handoff CLI reads (insteadOf rewrites the https URL to the local bare;
-# safe.directory=* trusts the bind-mounted bare on a CI runner). remote.origin.url stays
-# the https URL — only the transport is rewritten.
+# gitconfig the handoff CLI reads (sslVerify=false for the self-signed forge-fake.e2e
+# cert; safe.directory=* trusts the bind-mounted bare on a CI runner).
+#
+# HANDOFF_URL is a REAL git-over-https URL with embedded Basic creds and the dynamic
+# published port. uzi-bot is the compose FORGE_FAKE_EXPECT_USER literal; DUMMY_FORGE_PAT
+# (== FORGE_FAKE_EXPECT_PAT) and FAKE_PORT are bootstrap globals from run-e2e.sh, inherited
+# by this phase subshell. origin therefore resolves (get-url returns this verbatim, no
+# rewrite) to group/repo for resolveHandoffRepo — no insteadOf, no --repo needed.
 WC="$RUNROOT/handoff-wc"
 rm -rf "$WC"
+HANDOFF_URL="https://uzi-bot:${DUMMY_FORGE_PAT}@127.0.0.1:${FAKE_PORT}/group/repo.git"
 hgit() { GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" git -C "$WC" "$@"; }
-GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" git clone -q https://forge-fake.e2e/group/repo.git "$WC" \
-  || fail "handoff: host-side clone of the fake bare (via host-gitconfig insteadOf) FAILED — the transport is misconfigured. Check \$RUNROOT/host-gitconfig's insteadOf + safe.directory (see the lib.sh anchor 'HOST-side CLI's GIT_CONFIG_GLOBAL for \`uzi handoff\`')."
+GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" git clone -q "$HANDOFF_URL" "$WC" \
+  || fail "handoff: host-side clone of forge-fake's git endpoint FAILED — the transport is misconfigured. Check \$RUNROOT/host-gitconfig (sslVerify/safe.directory) and that forge-fake is up on 127.0.0.1:${FAKE_PORT} with Basic auth uzi-bot:<pat> (see the lib.sh anchor 'HOST-side CLI's GIT_CONFIG_GLOBAL for \`uzi handoff\`')."
 
-# --- Positive control: origin resolves to the https URL AND the bare is reachable ----
-# resolveHandoffRepo (handoff.go:180) reads `git remote get-url origin` and parses it to
-# group/repo; the phase reads the SAME url. ls-remote proves the insteadOf rewrite + bare
-# reachability BEFORE the handoff, so a transport mistake fails here in one line rather
-# than as a worker-clone timeout deep in the run.
-ORIGIN_URL="$(hgit remote get-url origin)" || fail "handoff: git remote get-url origin failed"
-[ "$ORIGIN_URL" = 'https://forge-fake.e2e/group/repo.git' ] \
-  || fail "handoff: origin url should be the https forge-fake URL (what resolveHandoffRepo parses), got '$ORIGIN_URL'"
-hgit ls-remote origin >/dev/null \
-  || fail "handoff: ls-remote origin failed — the host-gitconfig insteadOf does not reach the local bare"
-pass "transport control: origin=$ORIGIN_URL, ls-remote reaches the bare"
+# --- Positive control: the real Basic-authed git-over-https transport works ----
+# resolveHandoffRepo (handoff.go:187) reads `git remote get-url origin` and parseRepoPath
+# (handoff.go:238) maps it to group/repo; here origin IS the https URL (get-url does not
+# rewrite it). ls-remote reaches forge-fake's Basic-gated git endpoint and lists the seed
+# refs, proving transport + auth BEFORE the handoff — so a transport/auth mistake fails
+# here in one line rather than as a worker-clone timeout deep in the run.
+hgit ls-remote origin >/dev/null 2>&1 \
+  || fail "handoff transport: ls-remote origin failed (forge-fake git endpoint unreachable or auth wrong)"
+hgit config --get remote.origin.url | grep -qF '/group/repo.git' \
+  || fail "handoff: origin url should point at the group/repo.git endpoint, got '$(hgit config --get remote.origin.url)'"
+pass "transport control: ls-remote reaches forge-fake's Basic-authed git endpoint (origin=group/repo.git)"
 
 # --- Leg 1: plain handoff (no MR) --------------------------------------------
 # Commit a marker so the pushed branch tip is distinguishable, then hand off from inside

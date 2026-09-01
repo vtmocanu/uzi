@@ -732,21 +732,28 @@ EOF
 # The HOST-side CLI's GIT_CONFIG_GLOBAL for `uzi handoff` (PRD #966 M5). The handoff
 # CLI runs its own `git push`/`git remote get-url`/`git push --delete` client-side in
 # the caller's cwd under uzi_cli's `env -i` (see the uzi_cli() env below), so the git
-# child sees ONLY that env — it needs a global config FILE pointing at the local bare.
-# Unlike the worker's agent-gitconfig (CONTAINER paths /fakeremote/repo.git), these are
-# HOST absolute paths, because the handoff CLI and the phase's own host git run on the
-# host. safe.directory=* is required for the same #366 dubious-ownership reason the
-# worker's gitconfig documents: the bind-mounted bare's owner uid differs from the CI
-# runner's, and env -i cannot pass an inline `-c safe.directory`. insteadOf rewrites the
-# https forge-fake URL to the local bare so the CLI's push/delete/remote hit it directly
-# (a plain path, no auth). NON-quoted heredoc so $RUNROOT expands to the absolute path.
+# child sees ONLY that env — it needs a global config FILE.
+#
+# The origin is a REAL git-over-https URL to forge-fake's host-published git smart-HTTP
+# endpoint (https://uzi-bot:<pat>@127.0.0.1:<port>/group/repo.git), NOT an insteadOf
+# rewrite to the local bare. insteadOf is fundamentally incompatible with handoff here:
+# `git remote get-url origin` EXPANDS insteadOf, so resolveHandoffRepo (handoff.go) would
+# read the rewritten LOCAL PATH instead of the https URL and parseRepoPath could never
+# derive `group/repo` from it (a bare filesystem path has no url.Parse Host, so it yields
+# the whole path) — handoff would error before dispatch with "could not match origin".
+# So there is no insteadOf and no repo2 entry: the phase's clone/push/delete all go over
+# the real Basic-authed https endpoint (the SAME endpoint phase 20-git-push-basic-auth
+# exercises for the worker; forge-fake 401s without uzi-bot:<pat>).
+#
+# safe.directory=* is retained for the same #366 dubious-ownership reason the worker's
+# gitconfig documents, and http.sslVerify=false because forge-fake's cert is self-signed
+# for forge-fake.e2e while we connect to 127.0.0.1 (no name match), so the host CLI's git
+# over https must not verify. env -i cannot pass an inline `-c`, hence the file.
 cat > "$RUNROOT/host-gitconfig" <<EOF
 [safe]
 	directory = *
-[url "$RUNROOT/fakeremote/repo.git"]
-	insteadOf = https://forge-fake.e2e/group/repo.git
-[url "$RUNROOT/fakeremote/repo2.git"]
-	insteadOf = https://forge-fake.e2e/group/repo2.git
+[http]
+	sslVerify = false
 EOF
 
 # Per-run env-file: strong generated secrets for the base stack + the scratch dir
