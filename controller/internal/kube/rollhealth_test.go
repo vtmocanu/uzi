@@ -229,6 +229,81 @@ func TestDeriveRollHealth(t *testing.T) {
 				}
 			},
 		},
+		{
+			// The bug: two pods from one ReplicaSet share wantHash — a Failed/Evicted zombie
+			// stuck in PodInitializing and a Running+Ready replacement. Selecting the FIRST
+			// match picks the zombie (name-order List is deterministic), whose age then trips
+			// the stuck arm and never self-clears. Prefer-live must pick the Ready pod
+			// regardless of order, so the zombie is listed FIRST here.
+			name: "an evicted zombie sharing wantHash does not shadow the live Ready pod (order-independent)",
+			pods: func() []corev1.Pod {
+				zombie := waiting(workerPod("w1", want, stuckAge+27*time.Minute), "dind", "PodInitializing", 0, true)
+				zombie.Status.Phase = corev1.PodFailed
+				live := ready(workerPod("w1", want, time.Hour), testNow.Add(-5*time.Minute))
+				return []corev1.Pod{*zombie, *live}
+			}(),
+			wantPhase: protocol.PhaseSettled,
+			check: func(t *testing.T, h reconcile.RollHealth) {
+				if h.PodPhase != "Running" {
+					t.Errorf("PodPhase = %q, want \"Running\": the evicted zombie was selected instead of "+
+						"the live pod", h.PodPhase)
+				}
+				if h.BlockingContainer != "" {
+					t.Errorf("BlockingContainer = %q, want empty: the live pod is Ready with nothing to "+
+						"blame — a non-empty value means the zombie's dind init container was read", h.BlockingContainer)
+				}
+				if h.BlockingReason != "" {
+					t.Errorf("BlockingReason = %q, want empty: the live pod is Ready — a non-empty reason "+
+						"means the zombie's PodInitializing was read", h.BlockingReason)
+				}
+			},
+		},
+		{
+			// The fallback pin: when ONLY terminal pods match wantHash, keep today's verdict
+			// (stuck for an old PodFailed) rather than silently dropping to rolling.
+			name: "a lone old PodFailed pod matching wantHash stays stuck (status quo preserved, not silenced to rolling)",
+			pods: func() []corev1.Pod {
+				z := workerPod("w1", want, stuckAge+time.Minute)
+				z.Status.Phase = corev1.PodFailed
+				return []corev1.Pod{*z}
+			}(),
+			wantPhase: protocol.PhaseStuck,
+			check: func(t *testing.T, h reconcile.RollHealth) {
+				if h.BlockingContainer != "" {
+					t.Errorf("BlockingContainer = %q, want empty: no container to blame on a bare PodFailed", h.BlockingContainer)
+				}
+			},
+		},
+		{
+			// Order-independence of the all-terminal fallback: two terminal pods share
+			// wantHash, one OLD (> stuckAge, would be stuck) and one RECENT (< stuckAge,
+			// would be rolling), with the RECENT one listed FIRST. Keeping the first-seen
+			// terminal pod would pick the recent one and report `rolling`; the fallback must
+			// pick the OLDEST and report `stuck`. Paired with the reversed order below, the
+			// verdict is identical for both permutations.
+			name: "all-terminal fallback picks the oldest, recent-listed-first -> stuck",
+			pods: func() []corev1.Pod {
+				recent := workerPod("w1", want, time.Minute)
+				recent.Status.Phase = corev1.PodFailed
+				old := workerPod("w1", want, stuckAge+30*time.Minute)
+				old.Status.Phase = corev1.PodFailed
+				return []corev1.Pod{*recent, *old}
+			}(),
+			wantPhase: protocol.PhaseStuck,
+		},
+		{
+			// The reversed order of the case above: old-listed-first. Same two pods, same
+			// verdict — proving the fallback does not depend on List() order.
+			name: "all-terminal fallback picks the oldest, old-listed-first -> stuck",
+			pods: func() []corev1.Pod {
+				old := workerPod("w1", want, stuckAge+30*time.Minute)
+				old.Status.Phase = corev1.PodFailed
+				recent := workerPod("w1", want, time.Minute)
+				recent.Status.Phase = corev1.PodFailed
+				return []corev1.Pod{*old, *recent}
+			}(),
+			wantPhase: protocol.PhaseStuck,
+		},
 	}
 
 	for _, tc := range cases {
