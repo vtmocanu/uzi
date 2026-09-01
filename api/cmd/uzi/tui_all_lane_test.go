@@ -120,3 +120,41 @@ func TestDetailAllLaneIconIsNeutral(t *testing.T) {
 		t.Errorf("the active stalled lane should still show ▲\n%s", rail)
 	}
 }
+
+// TestDetailSelectedCrewRoleHasExplicitForeground pins issue #938's crew-rail half: a SELECTED
+// crew lane's role carries the explicit tungsten foreground so it stays legible on the warm
+// selection bar (on a light terminal the default-ink role would otherwise wash into it), the
+// same treatment boardRow's selected floor title got. Unselected rows keep the default ink
+// (nil fg). Mutation that reddens this: reverting laneRow's selected role to paintSeg(nil,...).
+func TestDetailSelectedCrewRoleHasExplicitForeground(t *testing.T) {
+	now := time.Now()
+	// Two actors -> lanes [ALL, lead, coder]. Move selection ALL -> lead -> coder so a REAL
+	// lane (never the meta ALL row) is selected; coder never carries the lead's inline meter,
+	// so the role span is drawn exactly as laneRow builds it, with nothing appended after it.
+	m := loadDetail(t, "a44a44a4-4444", "ok", []apitypes.MessageDTO{
+		msgDTO(1, "text", "lead", "", "", "planning", now.Add(-time.Minute)),
+		msgDTO(2, "text", "coder", "toolu_a", "impl", "writing", now),
+	})
+	m = press(t, m, "j")
+	m = press(t, m, "j")
+	if sel, ok := m.detail.selectedLane(); !ok || sel.Role != "coder" {
+		t.Fatalf("expected the coder lane selected, got %+v (ok=%v)", sel, ok)
+	}
+	// Raw content (NOT ansi.Strip): the assertion is about the SGR the role span carries.
+	out := m.View().Content
+
+	// The selected role is painted with tungsten over the warm selection bar, exactly as
+	// laneRow draws it (leading space + capped role). This is the span that vanishes if the
+	// selected branch falls back to nil fg.
+	selRole := paintSeg(m.pal.tungsten, m.pal.selBg, false, " "+m.renderer.Plain("coder", 14))
+	if !strings.Contains(out, selRole) {
+		t.Errorf("selected crew role is not painted with the tungsten fg over the selection bar\nwant span %q\n%s", selRole, out)
+	}
+	// Control (non-vacuous): the UNSELECTED lead role must NOT carry the tungsten-over-selBg
+	// span — an unselected row has no selection bg and keeps the default ink. If this appeared,
+	// the assertion above could pass for the wrong reason (every role tungsten-painted).
+	unselRole := paintSeg(m.pal.tungsten, m.pal.selBg, false, " "+m.renderer.Plain("lead", 14))
+	if strings.Contains(out, unselRole) {
+		t.Errorf("unselected crew role must keep default ink, not tungsten over the selection bar\ngot span %q\n%s", unselRole, out)
+	}
+}
