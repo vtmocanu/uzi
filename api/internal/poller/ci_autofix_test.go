@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -195,6 +196,7 @@ func (n *cfNotifier) Notify(_ context.Context, note notifysvc.Notification) (sto
 // CI-autofix snapshot needs. Reusing apForge's method set would not give us
 // controllable ListPipelineJobs/JobLogTail, so this is a focused fake.
 type cfForge struct {
+	forgetest.BaseFake
 	jobs      []forge.Job
 	logTail   string
 	jobsErr   error
@@ -222,59 +224,6 @@ func (f *cfForge) CreateIssueNote(_ context.Context, _, iid int64, body string) 
 		*f.ops = append(*f.ops, "comment")
 	}
 	return forge.IssueNote{ID: 1, Body: body}, nil
-}
-
-// Unused-by-ci-autofix interface methods, stubbed to satisfy forge.Forge.
-func (f *cfForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
-	return forge.BotIdentity{}, nil
-}
-func (f *cfForge) ListProjects(context.Context) ([]forge.Project, error)    { return nil, nil }
-func (f *cfForge) ListLabels(context.Context, int64) ([]forge.Label, error) { return nil, nil }
-func (f *cfForge) EnsureLabels(context.Context, int64, []forge.Label) error { return nil }
-func (f *cfForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
-	return forge.Issue{}, nil
-}
-func (f *cfForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
-	return forge.Issue{}, nil
-}
-func (f *cfForge) UpdateIssueDescription(context.Context, int64, int64, string) error { return nil }
-func (f *cfForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
-	return nil
-}
-func (f *cfForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
-	return nil, nil
-}
-func (f *cfForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
-	return nil, nil
-}
-func (f *cfForge) UserExists(context.Context, string) (bool, error) { return false, nil }
-func (f *cfForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
-	return forge.MergeRequest{}, nil
-}
-func (f *cfForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
-	return nil, nil
-}
-func (f *cfForge) ReplyMergeRequestComment(context.Context, int64, int64, string, string) error {
-	return nil
-}
-func (f *cfForge) ResolveMergeRequestThread(context.Context, int64, int64, string) error {
-	return nil
-}
-func (f *cfForge) TokenInfo(context.Context) (forge.TokenInfo, error) { return forge.TokenInfo{}, nil }
-func (f *cfForge) ProjectRole(context.Context, int64, int64) (forge.Role, bool, error) {
-	return forge.RoleNone, false, nil
-}
-func (f *cfForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
-	return forge.BranchProtection{}, nil
-}
-func (f *cfForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
-	return forge.Pipeline{}, forge.ErrNoPipeline
-}
-func (f *cfForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
-	return forge.Pipeline{}, forge.ErrNoPipeline
-}
-func (f *cfForge) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
-	return nil, nil
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
