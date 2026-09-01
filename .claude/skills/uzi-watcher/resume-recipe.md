@@ -87,13 +87,14 @@ cd <the repo>                              # your normal checkout; work happens 
    ```sh
    git add -A && git commit -m "chore: recover work from run RUN"   # skip if step 5 restored nothing
    ```
-7. **Pre-flight (both `.github/workflows` checks must be empty)** — confirms no workflow
+7. **Pre-flight (both `.github/workflows` checks must be empty, and gitleaks over the RANGE clean)** — confirms no workflow
    surprise (YOUR token has `workflow` scope, so an intended workflow edit is fine to push;
    an empty result just means a plain rebase already landed main's copy):
    ```sh
    git diff --name-only origin/main..HEAD -- .github/workflows/
    git log  --name-only origin/main..HEAD -- .github/workflows/
    git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty
+   gitleaks git --log-opts="origin/main..HEAD" --no-banner   # push protection scans EVERY commit: must print "no leaks found"
    ```
 8. **Gate the touched components** (only the ones the diff touches): `task gate:api`,
    `gate:web`, `gate:agent`, `gate:controller`, and `./e2e/run-store-it.sh` if a `*_livedb`
