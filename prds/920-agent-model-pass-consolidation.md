@@ -43,6 +43,13 @@ One `runReadOnlyModelPass(opts)` helper (new `agent/src/model-pass.ts`) owning t
 - **D2 — `onResult` hook rather than a richer return type.** The judge is the only consumer needing the raw result frame (rate-limit classification); an optional callback keeps review/summary call sites one-liner simple and avoids inventing a union return.
 - **D3 — timeout constants stay per-runner.** JUDGE_MODEL_TIMEOUT_MS and REVIEW_MODEL_TIMEOUT_MS are both 5 minutes today, but the helper takes `timeoutMs` rather than baking one in — the values being equal is a coincidence, not a contract.
 - **D4 — chat-executor and sdk-executor are M1-only consumers.** Their promptStream/defaultQueryFn copies consolidate, but their execution paths (tool-bearing, not read-only) do NOT move to runReadOnlyModelPass; the helper is for the tool-less advice lane only.
+- **D5 — advice-lane failure cap stays 500, not runner.ts's 512.** M3 folded the two
+  `safeReportFailed` copies into one `safeReportFailed()` in model-pass.ts and named the
+  cap `ADVICE_FAILURE_REASON_LEN = 500`. runner.ts's `MAX_FAILURE_REASON_LEN` is 512; the
+  two lanes are checked and found NOT equal, so per the M3 instruction the advice lane
+  keeps its own 500 rather than silently changing either value (a cap is a behavior). The
+  judge's `LimitReachedError` → structured-facts mapping is preserved via the reporter's
+  optional `cause` param; review/summary pass no cause and get the plain failure_reason path.
 
 ## Risks & mitigations
 

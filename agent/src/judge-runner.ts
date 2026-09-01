@@ -14,7 +14,7 @@ import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn, mapSdkMessage } from "./sdk-messages.js";
-import { runReadOnlyModelPass } from "./model-pass.js";
+import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
 import type { EmittedMessage } from "./executor.js";
 import { classifyLimitFailure, LimitReachedError } from "./limit.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
@@ -153,7 +153,7 @@ export class JudgeRunner {
     const targetId = claim.target_run_id;
     if (!targetId) {
       this.log.warn("judge claim missing target_run_id; failing", { run_id: judgeRunId });
-      await this.safeReportFailed(judgeRunId, "judge claim carried no target run");
+      await safeReportFailed(this.client, this.log, "judge", judgeRunId, "judge claim carried no target run");
       return;
     }
     // Build the review. Any failure BEFORE the post still lands the deterministic
@@ -206,7 +206,7 @@ export class JudgeRunner {
       this.log.info("judge run completed", { run_id: judgeRunId, target: targetId, verdict: review.verdict });
     } catch (err) {
       this.log.warn("judge post/complete failed", { run_id: judgeRunId, error: errMessage(err) });
-      await this.safeReportFailed(judgeRunId, errMessage(err), err);
+      await safeReportFailed(this.client, this.log, "judge", judgeRunId, errMessage(err), err);
     }
   }
 
@@ -301,22 +301,6 @@ export class JudgeRunner {
     return { text, result };
   }
 
-  private async safeReportFailed(runId: string, reason: string, cause?: unknown): Promise<void> {
-    try {
-      // PRD #35: on a usage-limit death report the STRUCTURED facts and let the
-      // server compose the sentence from its own allowlisted enum (Decision 8).
-      // failure_reason is omitted in that case rather than set to a worker-composed
-      // string — sending both would have the worker's text win and would carry an
-      // unvalidated rateLimitType into the run row by a second route.
-      const body =
-        cause instanceof LimitReachedError
-          ? { status: "failed" as const, rate_limit_type: cause.rateLimitType, limit_resets_at: cause.resetsAtMs }
-          : { status: "failed" as const, failure_reason: reason.slice(0, 500) };
-      await this.client.reportState(runId, body);
-    } catch (err) {
-      this.log.warn("judge failed-state report failed", { run_id: runId, error: errMessage(err) });
-    }
-  }
 }
 
 /** Build the judge's user prompt: target metadata + steering log + the

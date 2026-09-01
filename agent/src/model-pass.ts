@@ -42,9 +42,10 @@ import { uidSplitActive } from "./runner-uid.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { rmTreeForce } from "./rmtree.js";
 import { promptStream, mapSdkMessage, isResult, isErrorResult } from "./sdk-messages.js";
-import { RateLimitObserver, type RateLimitObservation } from "./limit.js";
+import { RateLimitObserver, LimitReachedError, type RateLimitObservation } from "./limit.js";
 import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
+import type { WorkerClient } from "./client.js"; // type-only — erased at runtime; client.ts imports no runner/model-pass, so no cycle
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
 
 /** A PreToolUse deny for EVERY tool: the advice runners (judge/review/summary) are
@@ -176,4 +177,37 @@ async function consume(opts: ReadOnlyModelPassOpts, homeDir: string, abort: Abor
     }
   }
   return text;
+}
+
+/** The advice lane's failure_reason byte cap. Deliberately 500 — NOT runner.ts's
+ *  MAX_FAILURE_REASON_LEN (512). The two lanes cap independently; unifying them would be
+ *  a behavior change (a cap is behavior), so the advice lane keeps 500. See PRD #920 D5.
+ *  Module-local (not exported): its only consumer is safeReportFailed below, and the agent
+ *  knip gate (`exports: error`, ignoreExportsUsedInFile scoped to interface+type only)
+ *  reddens on an exported constant used solely in its own file. */
+const ADVICE_FAILURE_REASON_LEN = 500;
+
+/** Best-effort "this advice run failed" report. NEVER throws into the caller — a
+ *  state-report failure must not fail an advice run (judge/review/summary). The optional
+ *  `cause` lets the judge map a LimitReachedError to the server's structured limit facts
+ *  (PRD #35 Decision 8): failure_reason is OMITTED in that case so the server composes the
+ *  sentence from its own allowlisted enum rather than the worker smuggling an unvalidated
+ *  rateLimitType in as free text. */
+export async function safeReportFailed(
+  client: Pick<WorkerClient, "reportState">,
+  log: Logger,
+  label: string,
+  runId: string,
+  reason: string,
+  cause?: unknown,
+): Promise<void> {
+  try {
+    const body =
+      cause instanceof LimitReachedError
+        ? { status: "failed" as const, rate_limit_type: cause.rateLimitType, limit_resets_at: cause.resetsAtMs }
+        : { status: "failed" as const, failure_reason: reason.slice(0, ADVICE_FAILURE_REASON_LEN) };
+    await client.reportState(runId, body);
+  } catch (err) {
+    log.warn(`${label} failed-state report failed`, { run_id: runId, error: errMessage(err) });
+  }
 }

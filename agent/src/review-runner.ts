@@ -18,7 +18,7 @@ import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn } from "./sdk-messages.js";
-import { runReadOnlyModelPass } from "./model-pass.js";
+import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { extractJsonObject } from "./judge-runner.js";
 import { errMessage } from "./util.js";
@@ -93,13 +93,13 @@ export class ReviewRunner {
     const targetId = claim.review_target_run_id;
     if (!targetId) {
       this.log.warn("review claim missing review_target_run_id; failing", { run_id: reviewRunId });
-      await this.safeReportFailed(reviewRunId, "review claim carried no target run");
+      await safeReportFailed(this.client, this.log, "review", reviewRunId, "review claim carried no target run");
       return;
     }
     const branch = claim.branch?.trim();
     if (!branch) {
       this.log.warn("review claim missing branch; failing", { run_id: reviewRunId, target: targetId });
-      await this.safeReportFailed(reviewRunId, "review claim carried no branch to review");
+      await safeReportFailed(this.client, this.log, "review", reviewRunId, "review claim carried no branch to review");
       return;
     }
 
@@ -154,7 +154,7 @@ export class ReviewRunner {
       });
     } catch (err) {
       this.log.warn("review post/complete failed", { run_id: reviewRunId, error: errMessage(err) });
-      await this.safeReportFailed(reviewRunId, errMessage(err));
+      await safeReportFailed(this.client, this.log, "review", reviewRunId, errMessage(err));
     }
   }
 
@@ -189,13 +189,6 @@ export class ReviewRunner {
     });
   }
 
-  private async safeReportFailed(runId: string, reason: string): Promise<void> {
-    try {
-      await this.client.reportState(runId, { status: "failed", failure_reason: reason.slice(0, 500) });
-    } catch (err) {
-      this.log.warn("review failed-state report failed", { run_id: runId, error: errMessage(err) });
-    }
-  }
 }
 
 /** Build the reviewer's user prompt: the git diff, fenced as UNTRUSTED DATA under a
