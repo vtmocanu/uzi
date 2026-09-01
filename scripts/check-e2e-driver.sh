@@ -18,9 +18,9 @@
 # (2) provides round-trip, (3) requires-miss names both phases, (4) env: token
 # validation, (5) critical-stop + suspect_cascade, (6) quarantine LEAK + DB
 # fallback, (7) ONLY/SKIP honour critical, (8) fault injection + artifact shapes.
-# The test currently emits 13 cases (several behaviours split into a/b sub-cases),
-# so 13 >= 8 passes with headroom; the floor catches a driver test that regressed
-# BELOW its designed coverage, not one that grew.
+# The test emits more than 8 cases (several behaviours split into a/b sub-cases,
+# and later milestones add more), so it passes with headroom; the floor catches a
+# driver test that regressed BELOW its designed coverage, not one that grew.
 #
 # EXIT CODES:
 #     2 = the instrument is broken (driver.test.sh missing, or NO tally line)

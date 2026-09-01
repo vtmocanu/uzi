@@ -534,6 +534,10 @@ wait_notes() {
 say "provisioning scratch dir $RUNROOT (project $PROJECT, web $BASE, executor $EXECUTOR)"
 mkdir -p "$RUNROOT/certs" "$RUNROOT/agent-gitconfig" "$RUNROOT/fakeremote" "$RUNROOT/forge-fake-state"
 chmod a+rwX "$RUNROOT/forge-fake-state"  # forge-fake persists its recorded state here (survives the restart)
+# Clear any red-run evidence from a REUSED E2E_RUN_DIR (a prior red run keeps the rundir,
+# PRD #966 M3): a stale .keep-rundir sentinel or artifacts/ would make this run's cleanup
+# wrongly report "red run — rundir kept" and skip teardown even when it passes green.
+rm -f "$RUNROOT/.keep-rundir"; rm -rf "$RUNROOT/artifacts"
 # Arm the wait_* margin recorder now that the scratch dir exists (PRD #97 M9). Waits
 # before this point (there are none that matter) simply go unrecorded.
 MARGINS_FILE="$RUNROOT/wait-margins.tsv"

@@ -778,7 +778,7 @@ tasks:
       # is the PASS=0 guard: driver.test.sh prints `cases=N passed=N`, and a crashed or
       # gutted zero-case run would exit 0 with no tally and read green. check-e2e-driver.sh
       # asserts the tally exists, c == p, and c >= 8 (the 8 PRD #966 M2 driver behaviours;
-      # the test currently emits 13). See the script header.
+      # the test emits more as sub-cases are added). See the script header.
       - ./scripts/check-e2e-driver.sh
 
   check:spec-numbering:
