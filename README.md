@@ -73,16 +73,25 @@ Open <http://127.0.0.1:8080> and register. The first account to register becomes
 
 ### On Kubernetes (Helm)
 
-The chart ships to GitHub Container Registry as a public, signed OCI artifact. It is an umbrella: one release brings up the API, the web app, and a CloudNativePG Postgres cluster in a single namespace.
+The chart ships to GitHub Container Registry as a public OCI artifact. It is an umbrella: one release brings up the API, the web app, and a CloudNativePG Postgres cluster in a single namespace.
+
+The chart and images are cosign-signed by the release workflow, so verify before installing:
 
 ```sh
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/vtmocanu/uzi/\.github/workflows/release\.yml@refs/tags/.*$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  ghcr.io/vtmocanu/uzi/uzi:<version>
+
 helm install uzi oci://ghcr.io/vtmocanu/uzi/uzi \
   --version <version> \
   --namespace uzi --create-namespace \
   --values my-values.yaml
 ```
 
-Your `my-values.yaml` sets the secrets, your public host, and turns the bundled Postgres on. See [deploy/README.md](deploy/README.md) for the values reference.
+Your `my-values.yaml` sets the secrets, your public host, and turns the bundled Postgres on. See [deploy/README.md](deploy/README.md) for the values reference and [docs/container-signing.md](docs/container-signing.md) for verification details.
+
+On a public host, provision your admin before anyone else can: the first account to register becomes the admin. Seed one with `UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD`, or register yours immediately and set `UZI_REGISTRATION_ENABLED=false` to close signups (see [docs/configuration.md](docs/configuration.md)).
 
 ### Connect a forge
 
