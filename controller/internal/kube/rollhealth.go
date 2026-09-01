@@ -234,12 +234,26 @@ func deriveRollHealth(pods []corev1.Pod, wantHash, replicaFailure string, now ti
 
 	// Prefer a pod matching what the deployment asks for. A pod carrying a different
 	// hash is the OLD one still terminating, which says nothing about the new one.
-	var current *corev1.Pod
+	var current, fallback *corev1.Pod
 	for i := range pods {
-		if pods[i].Annotations[AnnotationSpecHash] == wantHash {
-			current = &pods[i]
-			break
+		if pods[i].Annotations[AnnotationSpecHash] != wantHash {
+			continue
 		}
+		p := &pods[i]
+		// A terminal or terminating pod says nothing about the live rollout; remember
+		// one only so an all-terminal wantHash set keeps today's verdict rather than
+		// silently becoming `rolling`.
+		if p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded || p.DeletionTimestamp != nil {
+			if fallback == nil {
+				fallback = p
+			}
+			continue
+		}
+		current = p
+		break
+	}
+	if current == nil {
+		current = fallback // only terminal pods matched: preserve status quo, do not drop to rolling
 	}
 	if current == nil {
 		// Only stale pods: the new one is not up yet. Same state as the gap.
