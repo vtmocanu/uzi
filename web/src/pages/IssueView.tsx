@@ -58,14 +58,14 @@ export function IssueView() {
   const [scheduling, setScheduling] = useState(false);
 
   const { data, loading, error: loadError, reload } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const [{ issue }, { runs }, { workers }, { secrets }] = await Promise.all([
         api.getIssue(repoId, iidNum),
         api.listRuns({ repoId, issueIid: iidNum }),
         api.listWorkers(),
         api.listSecrets(),
       ]);
-      setIssue(issue);
+      if (isCurrent()) setIssue(issue);
       return {
         runs,
         hasWorker: workers.length > 0,
@@ -73,7 +73,7 @@ export function IssueView() {
       };
     },
     [repoId, iidNum],
-    { fallback: "Failed to load the issue" },
+    { fallback: "Failed to load the issue", onFetchStart: () => setError("") },
   );
   const runs = data?.runs ?? [];
   const hasWorker = data?.hasWorker ?? false;

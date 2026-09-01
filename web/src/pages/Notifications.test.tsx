@@ -294,6 +294,49 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     expect(screen.getByText("Open Judge").closest("a")?.getAttribute("href")).toBe("/judge");
   });
 
+  // Issue #961 item 1 (m2). A failed Load-more sets the LOCAL `error` slot, which is
+  // unioned into `displayError` and so hides the whole list behind the Alert. Before the
+  // old load()'s recovery was restored, that error had no way to clear on a scope switch
+  // (a deps refetch), leaving the list unrecoverable. The fix adds
+  // `onFetchStart: () => setError("")` so a Mine/All switch wipes the stale loadMore error.
+  // Mutation-checked: deleting that opt leaves the error set across the scope switch, so
+  // the list stays hidden and "all view row" never appears (red: Unable to find "all view
+  // row").
+  it("recovers a list hidden by a Load-more failure when the scope switches (item 1)", async () => {
+    vi.mocked(useAuth).mockReturnValue({ user: { id: "admin", is_admin: true } } as unknown as ReturnType<typeof useAuth>);
+    const page1 = Array.from({ length: 30 }, (_, i) =>
+      aNotif({ id: `p1-${i}`, kind: "run_failed", payload: { title: `row ${i}`, body: "" } }),
+    );
+    mockApi.listNotifications
+      .mockResolvedValueOnce({ notifications: page1, unread: 0, total: 31 }) // initial Mine load
+      .mockRejectedValueOnce(new Error("boom")) // the 2nd page (Load more) fails
+      .mockResolvedValueOnce({
+        // the All-users deps refetch succeeds
+        notifications: [aNotif({ id: "a1", kind: "run_failed", payload: { title: "all view row", body: "" } })],
+        unread: 0,
+        total: 1,
+      });
+
+    render(
+      <MemoryRouter>
+        <Notifications />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("row 0")).toBeTruthy());
+    fireEvent.click(screen.getByText(/Load more/));
+
+    // The Load-more failure hides the whole list behind the error union (displayError).
+    await waitFor(() => expect(screen.getByText("Failed to load more")).toBeTruthy());
+    expect(screen.queryByText("row 0")).toBeNull();
+
+    // Switching scope is a deps refetch; onFetchStart clears the stale loadMore error, so
+    // the list renders again and the error is gone.
+    fireEvent.click(screen.getByText("All users"));
+    await waitFor(() => expect(screen.getByText("all view row")).toBeTruthy());
+    expect(screen.queryByText("Failed to load more")).toBeNull();
+  });
+
   it("pages the inbox with Load more (offset paging), then hides the button", async () => {
     // Non-judge rows, so paging is measured on its own. Thirty consecutive judge_review
     // rows would collapse into ONE group header (PRD #98 M5, Decision 5) and every

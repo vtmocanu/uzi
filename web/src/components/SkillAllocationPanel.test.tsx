@@ -145,4 +145,28 @@ describe("SkillAllocationPanel", () => {
     // Proves the assertion targets the attribute, not the visible text.
     expect(badge.textContent).not.toContain(DESC);
   });
+
+  // Issue #961 item 4b (m2). The panel mounts without a `key`, so switching the selected
+  // template is a `templateId` DEPS refetch, not a remount. A save error set on the old
+  // template must not persist onto the new one; onFetchStart wipes it on the refetch.
+  //
+  // Mutation-checked: removing the onFetchStart opt leaves "Failed to save allocations"
+  // shown after the templateId prop changes (observed red: text still present, expected null).
+  it("clears a save error when the templateId prop changes without remounting (item 4b)", async () => {
+    mockApi.setTemplateSkills.mockRejectedValue(new Error("save boom"));
+    const { rerender } = render(
+      <SkillAllocationPanel templateId="t-coder" isAdmin={false} userId="u-mira" />,
+    );
+
+    // Make the panel dirty, then fail the save so the local error slot is set.
+    const mine = within(await screen.findByRole("group", { name: /My skills for this agent/ }));
+    fireEvent.click(mine.getByRole("checkbox", { name: /qdrant-kb/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Save allocations/ }));
+    await waitFor(() => expect(screen.getByText("Failed to save allocations")).toBeTruthy());
+
+    // Switch templates in place (deps refetch, no remount) → onFetchStart clears the error.
+    rerender(<SkillAllocationPanel templateId="t-reviewer" isAdmin={false} userId="u-mira" />);
+    await waitFor(() => expect(mockApi.getTemplateSkills).toHaveBeenCalledWith("t-reviewer"));
+    await waitFor(() => expect(screen.queryByText("Failed to save allocations")).toBeNull());
+  });
 });

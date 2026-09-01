@@ -112,18 +112,19 @@ export function Schedules() {
   // first-load failure the fetcher throws before seeding so both stay null, which
   // renders the skeleton the same as the old code did with catalog still null.
   const { error: loadError, reload } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const [rows, cat, repoList] = await Promise.all([
         api.listSchedules(),
         api.listScheduleCatalog(),
         api.listRepos().then((r) => r.repos),
       ]);
+      if (!isCurrent()) return;
       setSchedules(rows);
       setCatalog(cat);
       setRepos(repoList);
     },
     [],
-    { fallback: "Could not load schedules" },
+    { fallback: "Could not load schedules", onFetchStart: () => setError("") },
   );
 
   const toggleEnabled = async (s: Schedule) => {
@@ -352,7 +353,10 @@ export function Schedules() {
       {/* One tabpanel per tab, each labelled by its tab; the inactive one is unmounted,
           so its id/aria-controls link is live only for the shown panel (APG tabs). */}
       {schedules === null || catalog === null ? (
-        <ListSkeleton rows={4} />
+        <>
+          {(error || loadError) && <Alert message={error || loadError} />}
+          <ListSkeleton rows={4} />
+        </>
       ) : tab === "defaults" ? (
         <div role="tabpanel" id={panelId("defaults")} aria-labelledby={tabId("defaults")}>
           <DefaultJobs

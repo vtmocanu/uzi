@@ -52,16 +52,17 @@ export function SkillAllocationPanel({
   // applyAllocations seeds them as a side effect too. The hook owns loading and the
   // load error (surfaced as loadError, unioned with the save error at the Alert below).
   const { loading, error: loadError } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const [{ skills }, { allocations }] = await Promise.all([
         api.listSkills(),
         api.getTemplateSkills(templateId),
       ]);
+      if (!isCurrent()) return;
       setAllSkills(skills);
       applyAllocations(allocations);
     },
     [templateId],
-    { fallback: "Failed to load skill allocations" },
+    { fallback: "Failed to load skill allocations", onFetchStart: () => setError("") },
   );
 
   const byId = useMemo(() => new Map(allSkills.map((s) => [s.id, s])), [allSkills]);
