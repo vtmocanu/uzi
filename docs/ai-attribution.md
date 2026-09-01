@@ -6,11 +6,10 @@ audience: user
 
 # AI attribution in commits
 
-Every commit uzi's worker makes carries a `Co-Authored-By: Claude
-<noreply@anthropic.com>` trailer, added by the Agent SDK itself. On by
-default, so it matches today's behavior for everyone who never touches the
-setting. Turn it off if your organization's policy requires no AI
-attribution in git history.
+Every commit uzi's worker makes carries the Agent SDK's standard
+`Co-Authored-By: Claude` attribution trailer. On by default, so it matches
+today's behavior for everyone who never touches the setting. Turn it off if
+your organization's policy requires no AI attribution in git history.
 
 ## Opt out
 
@@ -23,10 +22,12 @@ which admins can enable or disable for any individual user).
 
 ## When it takes effect
 
-The value is read fresh from your account on each run claim, so it applies
-starting with **the next run you start** — no worker restart needed. A run
-that's already running or queued when you flip the toggle keeps whatever the
-setting was when it claimed the work.
+The value is read fresh from your account each time a worker **claims** a run
+— not when the run is created — so no worker restart is needed. It applies to
+every run claimed after you change it, including one that is still queued: a
+queued run hasn't been claimed yet, so it picks up the current setting when a
+worker takes it. A run that is already running keeps the setting it was
+claimed with, until it next resumes (a resume re-reads the current value).
 
 ## Scope: the commit trailer only
 
