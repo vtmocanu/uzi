@@ -311,7 +311,7 @@ func runLogsPagingServer(t *testing.T, total int, failAfterReq int) (*httptest.S
 		}
 		for {
 			old := atomic.LoadInt32(&minAfter)
-			if int32(after) >= old || atomic.CompareAndSwapInt32(&minAfter, old, int32(after)) {
+			if int32(after) >= old || atomic.CompareAndSwapInt32(&minAfter, old, int32(after)) { //nolint:gosec // G109: test-only cursor from a small paginated fixture, never overflows int32
 				break
 			}
 		}
@@ -546,6 +546,7 @@ func TestHTTPClientStatusMapping(t *testing.T) {
 		{http.StatusForbidden, ExitAuth},
 		{http.StatusNotFound, ExitNotFound},
 		{http.StatusConflict, ExitConflict},
+		{http.StatusRequestEntityTooLarge, ExitUsage}, // oversize body keeps the 400's exit code across the 413 flip
 		{http.StatusInternalServerError, ExitUnreachable},
 		{http.StatusBadGateway, ExitUnreachable},
 		{http.StatusTeapot, ExitGeneric}, // an unenumerated 4xx falls to generic
@@ -771,7 +772,7 @@ func TestBuildInfoIsGatedByCredentialSafeBase(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		c := NewHTTPClient(Settings{URL: srv.URL, Token: "uzc_SECRETTOKENVALUE"})
+		c := NewHTTPClient(Settings{URL: srv.URL, Token: "uzc_SECRETTOKENVALUE"}) //nolint:gosec //gitleaks:allow // fake uzi CLI token fixture, never a real credential
 		if _, err := c.BuildInfo(context.Background()); err != nil {
 			t.Fatalf("BuildInfo: %v", err)
 		}

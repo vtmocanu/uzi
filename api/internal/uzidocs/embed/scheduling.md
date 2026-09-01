@@ -226,14 +226,16 @@ cadence. A schedule that has never fired reads `last_fire: null`.
 
 ## Default jobs
 
-uzi ships a small **catalog of built-in default jobs** — eight generic,
+uzi ships a small **catalog of built-in default jobs** — nine generic,
 repo-agnostic schedules covering the standing automations most projects want
 from day one: a weekly test-improvement pass, a weekly docs-hygiene sweep, a
-deep bug-hunt audit, a feature-brainstorm prompt, daily sweeps over the
-`bug` and `Planned` labels and over issues **assigned to the uzi-bot
+deep bug-hunt audit, a feature-brainstorm prompt, a biweekly propose-only
+refactoring scout that surveys for one structural refactor and opens an MR
+with a proposal file (never implementing it, `refactor-scout`), daily sweeps
+over the `bug` and `Planned` labels and over issues **assigned to the uzi-bot
 account** (`assigned-sweep`), and self-improvement — an autonomous audit of
 the enabled repo's own codebase that picks one top improvement. Each has a
-baked cron cadence and, for the four prompt
+baked cron cadence and, for the five prompt
 jobs, a baked prompt; two of the three sweeps instead carry a baked label
 selector, and the third (`assigned-sweep`) carries the non-label "assigned"
 selector kind instead (see [Targets](#targets) above); self-improvement

@@ -3,6 +3,7 @@ package httpx
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -39,6 +40,21 @@ func JSON(w http.ResponseWriter, status int, v any) {
 // Error writes a JSON error body: {"error": "<message>"}.
 func Error(w http.ResponseWriter, status int, message string) {
 	JSON(w, status, map[string]string{"error": message})
+}
+
+// RespondDecodeError writes the correct HTTP error for a DecodeJSONLimited failure.
+// An oversize body (*http.MaxBytesError, matchable via errors.As) gets a truthful
+// 413 with uzi's OWN prose — never err.Error(), which is net/http's fixed literal
+// "http: request body too large" (pinned by Hyrum's law; echoing it couples our
+// wire contract to a stdlib constant). Any other decode failure (malformed JSON,
+// unknown field, EOF handling stays the caller's) gets the caller's 400 fallbackMsg.
+func RespondDecodeError(w http.ResponseWriter, err error, fallbackMsg string) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		Error(w, http.StatusRequestEntityTooLarge, "the request body is too large")
+		return
+	}
+	Error(w, http.StatusBadRequest, fallbackMsg)
 }
 
 // PathUUID parses the named chi URL param as a UUID. On failure it writes a 400

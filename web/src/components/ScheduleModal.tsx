@@ -59,7 +59,7 @@ export interface PinnedIssue {
 }
 
 const TARGET_OPTIONS: { value: ScheduleTarget; title: string; desc: string }[] = [
-  { value: "issue", title: "Issue", desc: "Pin one PRD issue" },
+  { value: "issue", title: "Issue", desc: "Pin one issue" },
   { value: "sweep", title: "Label sweep", desc: "Issues matching a label" },
   { value: "prompt", title: "Prompt", desc: "No issue → opens an MR" },
 ];
@@ -1133,6 +1133,7 @@ function BakedTargetDetail({
   labels: string[];
   bakedGuidance: string;
 }) {
+  const { uziLabel } = useAuth();
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2">
@@ -1167,7 +1168,7 @@ function BakedTargetDetail({
           <span className="block text-sm font-medium text-muted">Labels</span>
           <div className="flex flex-wrap gap-1.5">
             {labels.length === 0 ? (
-              <span className="text-[12px] text-faint">the PRD label</span>
+              <span className="text-[12px] text-faint">the {uziLabel} label</span>
             ) : (
               labels.map((l) => (
                 <span

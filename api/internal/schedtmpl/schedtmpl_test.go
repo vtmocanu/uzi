@@ -11,14 +11,15 @@ import (
 )
 
 // catalogSlugs is the exact set of default scheduled jobs the product ships
-// (PRD #589 M1, extended by PRD #590 M1 with self-improve and PRD #767 M4 with
-// assigned-sweep). Keep it sorted — Catalog() returns its slice sorted by slug and
-// TestCatalogSetIsExactlyEight compares index-for-index.
+// (PRD #589 M1, extended by PRD #590 M1 with self-improve, PRD #767 M4 with
+// assigned-sweep, and issue #928 with refactor-scout). Keep it sorted — Catalog()
+// returns its slice sorted by slug and TestCatalogSetIsExactlyNine compares
+// index-for-index.
 var catalogSlugs = []string{
-	"assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "self-improve", "test-improvement",
+	"assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "refactor-scout", "self-improve", "test-improvement",
 }
 
-func TestCatalogSetIsExactlyEight(t *testing.T) {
+func TestCatalogSetIsExactlyNine(t *testing.T) {
 	got := schedtmpl.Catalog()
 	if len(got) != len(catalogSlugs) {
 		t.Fatalf("got %d catalog entries, want %d", len(got), len(catalogSlugs))

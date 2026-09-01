@@ -101,7 +101,7 @@ Two preconditions, both easy to trip:
 
 - **The repo must still be enabled in uzi.** The sync rides the normal issue
   poll, so a disabled repo is not polled and the close is never seen.
-- **The issue must still carry the PRD label.** Strip it and the close goes
+- **The issue must still carry the `uzi` label.** Strip it and the close goes
   unobserved: uzi syncs a label-less issue only while it is **open**, so once
   it closes it is neither re-read nor kept, and the cached row still says open
   until the next reconcile drops it. Filed issues get the label automatically,

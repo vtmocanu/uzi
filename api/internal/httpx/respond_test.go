@@ -159,6 +159,58 @@ func TestDecodeJSONLimitedCapBoundary(t *testing.T) {
 	}
 }
 
+// TestRespondDecodeErrorOversizeWrites413 feeds RespondDecodeError a real
+// *http.MaxBytesError (the exact error type DecodeJSONLimited returns on an over-cap
+// body) and asserts a truthful 413 carrying uzi's OWN prose — never net/http's
+// "http: request body too large" literal, whose leakage the poison-route discipline
+// (handler/worker_messages_poison_livedb_test.go:441-467) pins against.
+func TestRespondDecodeErrorOversizeWrites413(t *testing.T) {
+	var dst payload
+	err := DecodeJSONLimited(httptest.NewRecorder(), requestWithBody(oversizeJSON(t, maxBodyBytes+1024)), &dst)
+	var maxErr *http.MaxBytesError
+	if !errors.As(err, &maxErr) {
+		t.Fatalf("fixture did not produce a *http.MaxBytesError, got %T (%v)", err, err)
+	}
+
+	rec := httptest.NewRecorder()
+	RespondDecodeError(rec, err, "invalid request body")
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+	if got := rec.Body.String(); got != "{\"error\":\"the request body is too large\"}\n" {
+		t.Fatalf("body = %q, want the uzi prose envelope", got)
+	}
+	if strings.Contains(rec.Body.String(), "http:") {
+		t.Fatalf("413 body leaked net/http's stdlib literal: %q", rec.Body.String())
+	}
+}
+
+// TestRespondDecodeErrorPlainWrites400 feeds RespondDecodeError an ordinary decode
+// failure (an unknown field) and asserts the caller's 400 fallback message, proving
+// only *http.MaxBytesError diverts to 413.
+func TestRespondDecodeErrorPlainWrites400(t *testing.T) {
+	var dst payload
+	err := DecodeJSONLimited(httptest.NewRecorder(), requestWithBody(`{"s":"hi","extra":1}`), &dst)
+	if err == nil {
+		t.Fatal("fixture did not produce a decode error")
+	}
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		t.Fatalf("fixture unexpectedly produced a *http.MaxBytesError: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	RespondDecodeError(rec, err, "invalid request body")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if got := rec.Body.String(); got != "{\"error\":\"invalid request body\"}\n" {
+		t.Fatalf("body = %q, want the fallback envelope", got)
+	}
+}
+
 func TestJSONWritesStatusBodyAndContentType(t *testing.T) {
 	rec := httptest.NewRecorder()
 	JSON(rec, http.StatusCreated, payload{S: "ok"})

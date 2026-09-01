@@ -39,10 +39,15 @@ func TestScrubSecretsCoversAllFamilies(t *testing.T) {
 	// uziToken is a fake uzi CLI credential (uzc_ + a ≥16-char body): the scrub must
 	// strip it (PRD #64 Risk 14 — UZI_TOKEN lives in a GitLab CI variable and could
 	// echo into a status/title string bound for Slack), never a real secret.
-	const uziToken = "uzc_A1b2C3d4E5f6G7h8i9j0k1" //gitleaks:allow // fake uzi CLI credential fixture: the value ScrubSecrets must strip below, never a real secret
-	in := "leak xoxb-bottok xapp-apptok sk-ant-not-a-real-key glpat-not-a-real-pat " + uziToken + " end"
+	const uziToken = "uzc_A1b2C3d4E5f6G7h8i9j0k1" //nolint:gosec //gitleaks:allow // fake uzi CLI credential fixture: the value ScrubSecrets must strip below, never a real secret
+	// fakeGitLabPAT needs a ≥16-char body since PRD #954 widened the GitLab pattern, which
+	// makes a contiguous literal EXACTLY the shape gitleaks' gitlab-pat rule and GitHub push
+	// protection match (both blocked the first push of #954, 2026-09-01). Assembled from two
+	// halves so the token never appears in source; the scrub sees the joined value at runtime.
+	const fakeGitLabPAT = "glpat-" + "notARealPat" + "0123456789"
+	in := "leak xoxb-bottok xapp-apptok sk-ant-not-a-real-key " + fakeGitLabPAT + " " + uziToken + " end"
 	got := ScrubSecrets(in)
-	for _, secret := range []string{"xoxb-bottok", "xapp-apptok", "sk-ant-not-a-real-key", "glpat-not-a-real-pat", uziToken} {
+	for _, secret := range []string{"xoxb-bottok", "xapp-apptok", "sk-ant-not-a-real-key", fakeGitLabPAT, uziToken} {
 		if contains(got, secret) {
 			t.Errorf("ScrubSecrets left %q in %q", secret, got)
 		}

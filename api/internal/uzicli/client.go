@@ -729,6 +729,11 @@ func statusError(status int, body []byte) *ExitError {
 			msg = "conflict"
 		}
 		return Exitf(ExitConflict, "%s", msg)
+	case status == http.StatusRequestEntityTooLarge:
+		if msg == "" {
+			msg = "request too large"
+		}
+		return Exitf(ExitUsage, "%s", msg)
 	case status >= 500:
 		if msg == "" {
 			msg = fmt.Sprintf("server error (%d)", status)

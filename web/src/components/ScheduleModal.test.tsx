@@ -72,7 +72,7 @@ describe("target switching swaps the fields", () => {
     fireEvent.click(screen.getByRole("radio", { name: /Label sweep/ }));
     expect(screen.getByPlaceholderText("add label…")).toBeTruthy();
     expect(screen.queryByLabelText("Issue number")).toBeNull();
-    // The PRD-label default hint is stated.
+    // The uzi-label default hint is stated.
     expect(screen.getByText(/Empty ⇒/i)).toBeTruthy();
 
     // Prompt reveals the textarea (Decision 10) and drops the label control.

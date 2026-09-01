@@ -12,8 +12,8 @@ GitHub **Projects v2** board's built-in **Status** single-select field, for
 a user who prefers GitHub's native UI. **GitHub only** — GitLab and Forgejo
 repos are untouched. The label always stays canonical; Status is a
 projection of it, never the other way round. Only column labels sync
-(`Planned`, `In Progress`, `Human Review`, `Later`, …); other labels (`PRD`,
-`bug`, `autopilot`, …) are never touched.
+(`Planned`, `In Progress`, `Human Review`, `Later`, …); other labels (`bug`,
+`autopilot`, …) are never touched.
 
 ## Forward vs. reverse — why reverse isn't instant
 

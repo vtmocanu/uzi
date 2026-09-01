@@ -522,7 +522,7 @@ export function RunsList() {
             <EmptyState
               icon={<ActivityIcon />}
               title="No runs yet"
-              description="Open a board and press Start run on a PRD card — the agent plans, waits for your approval, then implements and opens a merge/pull request."
+              description="Open a board and press Start run on a runnable card — the agent plans, waits for your approval, then implements and opens a merge/pull request."
               action={
                 <Link to="/repos" className="text-sm font-medium text-brand hover:text-brand-hover">
                   Go to boards →

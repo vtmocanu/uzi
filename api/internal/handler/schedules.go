@@ -196,7 +196,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 
 	var req apitypes.ScheduleRequest
 	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
 	applyCreateDefaults(&req)
@@ -297,7 +297,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	var req apitypes.ScheduleRequest
 	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
 	cur, err := h.q.GetRunScheduleForUser(r.Context(), store.GetRunScheduleForUserParams{ID: id, UserID: user.ID})
@@ -540,7 +540,7 @@ func runNowResponse(out schedsvc.FireOutcome) apitypes.RunNowResponse {
 func (h *Handler) PreviewSchedule(w http.ResponseWriter, r *http.Request) {
 	var req apitypes.SchedulePreviewRequest
 	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
 	n := req.N
@@ -631,7 +631,7 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 	// zone. Any other decode error is a malformed request (400).
 	var req apitypes.EnableCatalogRequest
 	if derr := httpx.DecodeJSONLimited(w, r, &req); derr != nil && !errors.Is(derr, io.EOF) {
-		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		httpx.RespondDecodeError(w, derr, "invalid request body")
 		return
 	}
 	tz := catalogTimezone(job)
@@ -776,7 +776,7 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 	// repo" case, not a malformed request; any other decode error is a 400.
 	var req apitypes.ScheduleCloneRequest
 	if derr := httpx.DecodeJSONLimited(w, r, &req); derr != nil && !errors.Is(derr, io.EOF) {
-		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		httpx.RespondDecodeError(w, derr, "invalid request body")
 		return
 	}
 
@@ -903,7 +903,7 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 
 	var req apitypes.AddScheduleRepoRequest
 	if derr := httpx.DecodeJSONLimited(w, r, &req); derr != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		httpx.RespondDecodeError(w, derr, "invalid request body")
 		return
 	}
 	if strings.TrimSpace(req.RepoID) == "" {

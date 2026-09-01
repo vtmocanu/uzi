@@ -23,9 +23,9 @@ Create one and connect its token: see [GitLab bot setup](./gitlab-bot-setup.md) 
 
 ## 3. Open a board
 
-Once a repo is enabled, its board appears in the sidebar: `PRD`-labeled
-issues become cards, and dragging a card between columns relabels the issue
-on the forge. See [Board](./board.md).
+Once a repo is enabled, its board appears in the sidebar, showing the
+repo's open issues; the `uzi`-labeled ones are the runnable ones. Dragging
+a card between columns relabels the issue on the forge. See [Board](./board.md).
 
 ## 4. Add your Anthropic token
 

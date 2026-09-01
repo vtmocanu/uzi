@@ -1,5 +1,5 @@
 // Boards home: the projects the bot can see. Enabling one starts tracking its
-// PRD issues on a kanban board.
+// issues on a kanban board.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
@@ -713,7 +713,7 @@ export function Repos() {
         title="Boards"
         description={
           <>
-            Projects your bot can see. Enable one to track its PRD issues on a board. See the{" "}
+            Projects your bot can see. Enable one to track its issues on a board. See the{" "}
             <DocLink slug={DOC_REPO_AGENTS}>repo agents</DocLink> guide.
           </>
         }
