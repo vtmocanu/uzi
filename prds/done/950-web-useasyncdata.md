@@ -1,14 +1,16 @@
 # PRD #950: web useAsyncData hook for the hand-rolled load/loading/error fetch cycle
 
 **GitHub Issue**: [#950](https://github.com/vtmocanu/uzi/issues/950)
-**Status**: Draft (created 2026-09-01)
+**Status**: Implemented (created 2026-09-01; M1–M3 complete)
 **Priority**: Medium
 **Parent**: epic #915 (Batch 2, P8; finding W2). Depends on P3 (#919, merged in PR #935 — `errorMessage()` is a building block here).
 **Line refs**: re-derived at `5e343113`. Implementer re-derives at their base; anchors are identifiers, not offsets.
 
 ## Problem
 
-The load/loading/error fetch cycle is hand-rolled **33 times** (28 sites in 24 page files + 5 in components; the epic's "~23 pages" undercounted — `AdminSettings` holds 3 independent cycles, `Judge` and `RunsList` 2 each). The canonical shape, repeated near-verbatim:
+The load/loading/error fetch cycle is hand-rolled **34 times** (29 sites in 25 page files + 5 in components; the epic's "~23 pages" undercounted — `AdminSettings` holds 3 independent cycles, `Judge` and `RunsList` 2 each). The canonical shape, repeated near-verbatim:
+
+> **AI-synced 2026-09-01 (implementation).** The original draft counted **33** cycles / **26** migratable, missing `pages/RunDefaults.tsx` — a Tier-A cycle structurally identical to `Settings.tsx` (state `loading`/`error`, `Promise.all([listSecrets, getMySettings])`, `errorMessage(err, "Failed to load settings")`) present at the base commit but named in neither the migrate nor the exclude list. It was folded in as the 27th migratable site (wave 1); counts corrected throughout to **34** total / **27** migratable so Success Criterion 1 (the exclusion list is the complete remainder) holds.
 
 ```tsx
 const load = useCallback(async () => {
@@ -18,11 +20,11 @@ const load = useCallback(async () => {
 useEffect(() => { load() }, [load]);
 ```
 
-**Zero `AbortController` exists in `web/src`**, and of the 33 pattern-carrying cycles only `RunsList` (excluded here) guards its primary load against stale responses; none of the 26 migratable sites do — a hook that always guards is a strict improvement on every one of them.
+**Zero `AbortController` exists in `web/src`**, and of the 34 pattern-carrying cycles only `RunsList` (excluded here) guards its primary load against stale responses; none of the 27 migratable sites do — a hook that always guards is a strict improvement on every one of them.
 
 ## Solution
 
-One shared hook, then migrate 26 sites in two waves. The remaining 7 pattern-carrying sites are **deliberately excluded** (each needs a design decision or has no error/loading contract to preserve) and are enumerated below so the sweep has a checkable end state.
+One shared hook, then migrate 27 sites in two waves. The remaining 7 pattern-carrying sites are **deliberately excluded** (each needs a design decision or has no error/loading contract to preserve) and are enumerated below so the sweep has a checkable end state.
 
 ### The hook
 
@@ -39,7 +41,7 @@ Requirements (each traced to a migratable site that needs it):
 
 **Test-environment trap (measured):** `web/vite.config.ts` splits vitest into a "jsdom" project and a "node" project, and `src/lib/**` belongs to **node** — but a per-file `// @vitest-environment jsdom` docblock outranks the project setting (76 of 118 files carry one). `useAsyncData.test.tsx` needs that docblock or renderHook dies in the node environment.
 
-### Migration wave 1 — Tier A, mechanical (16 sites)
+### Migration wave 1 — Tier A, mechanical (17 sites)
 
 | File | State names | Cycle at 5e343113 | Variant |
 |---|---|---|---|
@@ -52,6 +54,7 @@ Requirements (each traced to a migratable site that needs it):
 | `pages/ForgeSettings.tsx` | `error`,`loading` | 98-137 | `Promise.all` ×2 |
 | `pages/IssueView.tsx` | `issue`,`runs`,`hasWorker`,`hasToken`,`loading`,`error` | 51-80 | deps `[repoId, iidNum]`; `Promise.all` ×4 |
 | `pages/Settings.tsx` | `secrets`,`sidebarTokenIds`,`loading`,`error` | 42-72 | `Promise.all` ×2 |
+| `pages/RunDefaults.tsx` | `secrets`,`loading`,`error` | ~190-219 | `Promise.all` ×2 feeding a settings form (like `Settings.tsx`); found during implementation (see AI-synced note above) |
 | `pages/Skills.tsx` | `skills`,`loading`,`error` | 47-67 | plain |
 | `pages/ToolAllowlist.tsx` | `entries`,`loading`,`error` | 15-36 | plain |
 | `pages/AdminSettings.tsx` (`UpdatesSettingsCard` :741) | `status`,`loading`,`error` | 743-767 | `skeleton: "always"` |
@@ -81,21 +84,21 @@ Requirements (each traced to a migratable site that needs it):
 
 ## Milestones
 
-- [ ] **M1 — the hook + its tests.** `web/src/lib/useAsyncData.ts` + `useAsyncData.test.tsx` (with the `@vitest-environment jsdom` docblock). Tests cover: success, error (message from fallback and from custom mapper), reload, `enabled` false→true, all three `skeleton` levels (initial / deps / always — each asserting when loading does AND does not re-arm), and the stale-response guard (two overlapping loads — the slower stale one must not clobber). Mutation-check the guard test: break the generation check and confirm the test fails. `task gate:web` green.
-- [ ] **M2 — wave 1 (16 Tier A sites).** Behavior-preserving per site: same state semantics, same error strings (each site's `errorMessage` fallback verbatim), nested best-effort fetches stay inside the fetcher. Existing page tests pass **unmodified** — if a migration seems to *require* a test edit, that is semantic drift: fix the code, never the test. Commit M2 complete before starting M3, so an M3 stall cannot lose M2. `task gate:web` green.
-- [ ] **M3 — wave 2 (10 Tier B/C sites).** Each wrinkle from the table preserved; poll paths composed, never absorbed. Existing page tests pass **unmodified** (same required-test-edit-means-drift rule) — `RunsList.test.tsx:1140`-style negative assertions on excluded pages must be untouched and still green. `task gate:web` green.
+- [x] **M1 — the hook + its tests.** `web/src/lib/useAsyncData.ts` + `useAsyncData.test.tsx` (with the `@vitest-environment jsdom` docblock). Tests cover: success, error (message from fallback and from custom mapper), reload, `enabled` false→true, all three `skeleton` levels (initial / deps / always — each asserting when loading does AND does not re-arm), and the stale-response guard (two overlapping loads — the slower stale one must not clobber). Mutation-check the guard test: break the generation check and confirm the test fails. `task gate:web` green. _(Done. `reload()` also returns a settle `Promise<void>` so migrated `await load()` call sites keep their await semantics.)_
+- [x] **M2 — wave 1 (17 Tier A sites, incl. `RunDefaults`).** Behavior-preserving per site: same state semantics, same error strings (each site's `errorMessage` fallback verbatim), nested best-effort fetches stay inside the fetcher. Existing page tests pass **unmodified** — if a migration seems to *require* a test edit, that is semantic drift: fix the code, never the test. Commit M2 complete before starting M3, so an M3 stall cannot lose M2. `task gate:web` green.
+- [x] **M3 — wave 2 (10 Tier B/C sites).** Each wrinkle from the table preserved; poll paths composed, never absorbed. Existing page tests pass **unmodified** (same required-test-edit-means-drift rule) — `RunsList.test.tsx:1140`-style negative assertions on excluded pages must be untouched and still green. `task gate:web` green.
 
 ## Success criteria
 
-1. All 26 named sites use `useAsyncData`; the exclusion list above is the complete remainder (verified by re-running the enumeration grep for the `try/catch(errorMessage)/finally(setLoading)` shape over `web/src/pages` + `web/src/components` and reading the hits — no post-filtering, per the repo's sweep rules).
+1. All 27 named sites use `useAsyncData`; the exclusion list above is the complete remainder (verified by re-running the enumeration grep for the `try/catch(errorMessage)/finally(setLoading)` shape over `web/src/pages` + `web/src/components` and reading the hits — no post-filtering, per the repo's sweep rules).
 2. **Zero page-test edits**: the loading→error→retry→loaded flows pinned by e.g. `AdminSettingsUpdates.test.tsx:227-239` and `Memory.test.tsx:38-71` pass byte-identical. (M1's new hook tests are the only test additions.)
-3. Every migrated site is now stale-response guarded (the hook's generation counter) — a strict improvement over the 16 Tier A sites that had no guard, with no regression to the excluded pages' stronger discipline.
+3. Every migrated site is now stale-response guarded (the hook's generation counter) — a strict improvement over the 17 Tier A sites that had no guard, with no regression to the excluded pages' stronger discipline. (Where a value is optimistically mutated outside the load — e.g. `IssueView.issue`, `Agents.allocations`, `Findings.backlog` — it stays local state set as a fetcher side effect, so its behavior is unchanged; the site's primary load is guarded.)
 4. `task gate:web` green (includes knip zero-tolerance — the hook's exports must all be consumed).
 5. No `.github/workflows/**` in the branch diff (implementation or validation).
 
 ## Decision Log
 
-- **D1 — string error state, not a rich error object.** Every migratable site stores the `errorMessage()` string today; returning the raw `unknown` would push mapping into 26 render paths and change nothing for the user.
+- **D1 — string error state, not a rich error object.** Every migratable site stores the `errorMessage()` string today; returning the raw `unknown` would push mapping into 27 render paths and change nothing for the user.
 - **D2 — generation counter over AbortController.** No fetch in `web/src` is abortable today (the api client has no signal plumbing); the counter delivers the same stale-response correctness without touching `lib/api.ts` (4093 lines, out of scope), and it is the pattern `Judge.tsx` already documents as superseding `alive` flags.
 - **D3 — polling stays outside the hook.** Four sites' tests and comments pin "poll failures never blank working data"; a hook that unified the paths would redden `RunsList.test.tsx:1140` and regress deliberate behavior. `usePollWhileVisible` + `reload` composes where wanted.
 - **D4 — the 7 entangled sites are excluded, not "done worse".** Migrating `Dashboard`/`Board`/`RunsList`/`Judge`/`Repos` means changing UX contracts (skeleton gating, toast diffing, threaded liveness); that is a design PRD, not a dedup.
