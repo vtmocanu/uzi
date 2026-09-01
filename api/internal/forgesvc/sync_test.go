@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -19,6 +20,8 @@ import (
 // other methods are unused by the sync/watcher paths under test. The MR-watch
 // tests (mr_watch_test.go) drive mr/mrErr and updateErr.
 type fakeForge struct {
+	forgetest.BaseFake
+
 	issues    []forge.Issue
 	listErr   error
 	listCalls []forge.ListIssuesOptions
@@ -99,16 +102,6 @@ func (f *fakeForge) UpdateIssueDescription(_ context.Context, projectID, issueII
 	return nil
 }
 
-func (f *fakeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
-	return forge.BotIdentity{}, nil
-}
-func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) { return nil, nil }
-func (f *fakeForge) ProjectCIConfigPath(context.Context, int64) (string, error) {
-	return "", nil
-}
-func (f *fakeForge) ListLabels(context.Context, int64) ([]forge.Label, error) {
-	return nil, nil
-}
 func (f *fakeForge) EnsureLabels(_ context.Context, _ int64, labels []forge.Label) error {
 	f.ensureCalls = append(f.ensureCalls, labels)
 	return f.ensureErr
@@ -166,9 +159,6 @@ func (f *fakeForge) GetIssue(_ context.Context, _ int64, issueIID int64) (forge.
 	}
 	return forge.Issue{}, nil
 }
-func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
-	return forge.Issue{}, nil
-}
 func (f *fakeForge) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove []string) error {
 	f.updateCalls = append(f.updateCalls, mrUpdateCall{add: add, remove: remove})
 	return f.updateErr
@@ -186,38 +176,9 @@ func (f *fakeForge) GetMergeRequest(_ context.Context, _, mrIID int64) (forge.Me
 	}
 	return f.mr, nil
 }
-func (f *fakeForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
-	return nil, nil
-}
-func (f *fakeForge) ReplyMergeRequestComment(context.Context, int64, int64, string, string) error {
-	return nil
-}
-func (f *fakeForge) ResolveMergeRequestThread(context.Context, int64, int64, string) error {
-	return nil
-}
-func (f *fakeForge) UserExists(context.Context, string) (bool, error) { return false, nil }
-func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
-	return nil, nil
-}
-func (f *fakeForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
-	return nil, nil
-}
-func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
-	return forge.IssueNote{}, nil
-}
-func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
-	return forge.TokenInfo{}, nil
-}
-func (f *fakeForge) ProjectRole(context.Context, int64, int64) (forge.Role, bool, error) {
-	return forge.RoleNone, false, nil
-}
-func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
-	return forge.BranchProtection{}, nil
-}
 
 // Pipeline reads (PRD #6). LatestPipeline/LatestMRPipeline are scriptable via the
-// pipelineBy* maps; a missing key is the no-CI case (ErrNoPipeline). ListPipelineJobs
-// and JobLogTail stay no-ops (unused by the sync milestone).
+// pipelineBy* maps; a missing key is the no-CI case (ErrNoPipeline).
 func (f *fakeForge) LatestPipeline(_ context.Context, _ int64, ref string) (forge.Pipeline, error) {
 	f.latestPipeRefs = append(f.latestPipeRefs, ref)
 	if err, ok := f.pipelineRefErr[ref]; ok {
@@ -238,10 +199,6 @@ func (f *fakeForge) LatestMRPipeline(_ context.Context, _, mrIID int64) (forge.P
 	}
 	return forge.Pipeline{}, forge.ErrNoPipeline
 }
-func (f *fakeForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
-	return nil, nil
-}
-func (f *fakeForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
 
 // fakeStore records what the sync writes, standing in for *store.Queries. The
 // MR-close watcher fields (candidates/issue/columns/mrStateWrites) are exercised
