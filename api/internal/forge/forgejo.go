@@ -967,7 +967,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 					mc.Path = &path
 				}
 				if rc.LineNum != 0 {
-					line := int(rc.LineNum)
+					line := int(rc.LineNum) //nolint:gosec // G115: a review-comment line number from the forge; cannot realistically exceed int range
 					mc.Line = &line
 				}
 				out = append(out, mc)
