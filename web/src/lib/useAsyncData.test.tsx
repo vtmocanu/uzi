@@ -82,8 +82,23 @@ describe("useAsyncData", () => {
       useAsyncData(() => Promise.resolve(++n), []),
     );
     await waitFor(() => expect(result.current.data).toBe(1));
-    act(() => result.current.reload());
+    act(() => { void result.current.reload(); });
     await waitFor(() => expect(result.current.data).toBe(2));
+  });
+
+  it("reload() returns a promise that settles AFTER data updates (await reload())", async () => {
+    // Migrated mutation handlers do `await reload()` before clearing a busy spinner,
+    // so the returned promise must not resolve until the refetch's state is applied.
+    let n = 0;
+    const { result } = renderHook(() =>
+      useAsyncData(() => Promise.resolve(++n), []),
+    );
+    await waitFor(() => expect(result.current.data).toBe(1));
+    await act(async () => {
+      await result.current.reload();
+    });
+    // Immediately after the awaited reload resolves, the new data is already applied.
+    expect(result.current.data).toBe(2);
   });
 
   it("enabled:false never fetches; flipping to true fetches with loading armed first", async () => {
@@ -131,7 +146,7 @@ describe("useAsyncData", () => {
     expect(result.current.loading).toBe(false);
 
     // Manual reload(): does NOT re-arm either.
-    act(() => result.current.reload());
+    act(() => { void result.current.reload(); });
     expect(result.current.loading).toBe(false);
     await act(async () => {
       calls[2].resolve("c");
@@ -161,7 +176,7 @@ describe("useAsyncData", () => {
     expect(result.current.data).toBe("b");
 
     // Manual reload() does NOT re-arm.
-    act(() => result.current.reload());
+    act(() => { void result.current.reload(); });
     expect(result.current.loading).toBe(false);
     await act(async () => {
       calls[2].resolve("c");
@@ -180,7 +195,7 @@ describe("useAsyncData", () => {
     });
     expect(result.current.loading).toBe(false);
 
-    act(() => result.current.reload());
+    act(() => { void result.current.reload(); });
     expect(result.current.loading).toBe(true);
     await act(async () => {
       calls[1].resolve("b");

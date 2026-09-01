@@ -21,7 +21,7 @@ export function useAsyncData<T>(
     fallback?: string; // errorMessage(err, fallback) when no mapError
     mapError?: (err: unknown) => string; // overrides fallback when provided
   },
-): { data: T | null; loading: boolean; error: string; reload: () => void } {
+): { data: T | null; loading: boolean; error: string; reload: () => Promise<void> } {
   const enabled = opts?.enabled ?? true;
   const skeleton = opts?.skeleton ?? "initial";
 
@@ -47,7 +47,7 @@ export function useAsyncData<T>(
   const firstRef = useRef(true);
 
   const runFetch = useCallback(
-    (trigger: "deps" | "reload") => {
+    (trigger: "deps" | "reload"): Promise<void> => {
       const first = firstRef.current;
       firstRef.current = false;
       // Arm the skeleton (set loading true before awaiting) per the level:
@@ -60,7 +60,10 @@ export function useAsyncData<T>(
         first;
       const gen = ++genRef.current;
       if (arm) setLoading(true);
-      fetcherRef.current().then(
+      // Return the settle promise so a caller can `await reload()` — the migrated
+      // mutation handlers await their refetch before clearing a row's busy spinner,
+      // exactly as they awaited the inline `load()` today.
+      return fetcherRef.current().then(
         (result) => {
           if (gen !== genRef.current) return; // a newer fetch superseded this one
           setData(result);
@@ -77,7 +80,7 @@ export function useAsyncData<T>(
     [skeleton],
   );
 
-  const reload = useCallback(() => runFetch("reload"), [runFetch]);
+  const reload = useCallback((): Promise<void> => runFetch("reload"), [runFetch]);
 
   useEffect(() => {
     if (!enabled) {
@@ -89,7 +92,7 @@ export function useAsyncData<T>(
     // monotonic invalidation counter, not a DOM node, so reading its live value
     // in cleanup is intentional, not the stale-node hazard the rule guards.
     const genCounter = genRef;
-    runFetch("deps");
+    void runFetch("deps"); // deps-driven fetch; its settle promise is only awaited via reload()
     // Bump the generation so a fetch in flight when deps change / the component
     // unmounts never applies its result.
     return () => {
