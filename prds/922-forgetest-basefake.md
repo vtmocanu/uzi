@@ -7,7 +7,7 @@
 **Related**:
 - `api/internal/forge/forge.go` — the 25-method `Forge` interface.
 - The six full implementers (3352 lines of stubs total): `handler/forge_test.go:19` (only UserExists meaningful, ~90 lines of no-op stubs), `seed/seed_test.go:17`, `poller/autopilot_test.go`, `poller/ci_autofix_test.go` (`cfForge`), `privcheck/checker_test.go:27`, `forgesvc/sync_test.go:21`. Consumers use tiny subsets (privcheck 4/25 methods, autopilot 3/25).
-- NOT in scope: `workersvc/ci_fix_snapshot_test.go` — it **embeds the interface itself** (`forge.Forge`), so it inherits new methods already and is not one of the six (ARCHITECTURE.md documents this distinction).
+- NOT in scope: `workersvc/ci_fix_snapshot_test.go` — it **embeds the interface itself** (`forge.Forge`), so it inherits new methods already and is not one of the six (root CLAUDE.md's Architecture bullet documents this distinction; ARCHITECTURE.md does NOT enumerate the fakes at all — fact-checked 2026-09-01).
 - Line refs at `0fdec3791dad53d28f44193290f04a139e8a0719`; the interface-tax mechanism fact-checked at `f8e3116`.
 
 ## Problem
@@ -22,9 +22,9 @@ Default semantics (the load-bearing design choice, see D2): methods a test did n
 
 ## Milestones
 
-- [ ] **M1 — forgetest.BaseFake + its own test.** New package with `BaseFake` (all 25 methods; `ErrNotStubbed` defaults; documented absence-sentinel exceptions). A compile-time `var _ forge.Forge = (*BaseFake)(nil)` assertion. One test proving the default behavior (an unstubbed call returns ErrNotStubbed naming the method — the loud-failure property is the contract). `task gate:api` green (deadcode gate: the package is imported only from tests, which `deadcode -test` covers — verify `task deadcode:api` stays green before assuming).
+- [ ] **M1 — forgetest.BaseFake + its own test.** New package with `BaseFake` (all 25 methods; `ErrNotStubbed` defaults; documented absence-sentinel exceptions). A compile-time `var _ forge.Forge = (*BaseFake)(nil)` assertion. **The default-behavior test must be table-driven over ALL 25 methods** (each invoked, each asserted to return ErrNotStubbed naming itself): this is both the contract proof AND the deadcode shield — the compile-time assertion creates NO reachability (it is not a call), so a BaseFake method that every fake overrides and nothing ever invokes CAN be flagged by `deadcode -test` (fact-checked mechanism). `task deadcode:api` green is a REQUIRED verification here, not an assumption. `task gate:api` green.
 - [ ] **M2 — migrate the six fakes.** One commit per package (handler, seed, poller ×2, privcheck, forgesvc): embed `forgetest.BaseFake`, delete the no-op stubs, keep each fake's meaningful methods verbatim. Existing tests must stay green **unmodified** — if a test starts failing with ErrNotStubbed, that test was silently depending on a no-op stub's zero return; STOP and replicate the old stub's return explicitly in that fake (visible now, which is the improvement), noting it in the MR. `task gate:api` green.
-- [ ] **M3 — fix the docs that enumerate the six.** ARCHITECTURE.md's forge-layer section and root CLAUDE.md's Architecture bullet both enumerate the six fakes and their history (the "this said five until 2026-08-19" parenthetical); update them to describe the BaseFake pattern (interface change = drivers + BaseFake) while preserving the correction history per house style. Also re-verify the embedder note (`workersvc/ci_fix_snapshot_test.go`) still holds and say so with the date.
+- [ ] **M3 — fix the doc that enumerates the six.** Root CLAUDE.md's Architecture bullet is the ONLY place enumerating the six fakes and their history (the "this said five until 2026-08-19" parenthetical) — ARCHITECTURE.md's forge section lists the interface and drivers but never the fakes (fact-checked 2026-09-01; do not hunt for an enumeration there). Update the CLAUDE.md bullet to describe the BaseFake pattern (interface change = drivers + BaseFake) while preserving the correction history per house style; optionally ADD a one-line pointer in ARCHITECTURE.md's forge section. Also re-verify the embedder note (`workersvc/ci_fix_snapshot_test.go`) still holds and say so with the date.
 
 ## Success criteria
 
@@ -42,6 +42,7 @@ Default semantics (the load-bearing design choice, see D2): methods a test did n
 
 ## Risks & mitigations
 
+- **Ratchet surfacing (`whole-files: true`).** The six touched test files are whole-files-touched, so any pre-existing golangci finding in them gates. Low probability on test files, but run `task lint:api` early and budget for fixing or justifying whatever surfaces.
 - **A test silently depended on a no-op stub's zero return.** By design that now fails loudly with the method name (D2); the fix is an explicit stub, disclosed in the MR. This is the PRD's only real behavioral risk and it manifests as a red test, never a silent pass.
 - **Interface drift during flight.** If `forge.Forge` gains a method while this PRD is in a sweep run, BaseFake fails to compile — loud, and the fix is one method. The compile-time assertion in M1 guarantees the loudness.
 - **Docs claim drift (M3).** The ARCHITECTURE.md/CLAUDE.md sentences being edited have their own correction-history style; preserve the dated parentheticals rather than flattening them (house rule: past-tense records stay).

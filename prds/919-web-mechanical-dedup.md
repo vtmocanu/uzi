@@ -13,7 +13,7 @@
 
 Two idioms are hand-copied across `web/`:
 
-1. **`err instanceof ApiError ? err.message : "<fallback>"` appears 130× across 31 files.** Every catch block re-derives "how do I get a message out of this error", and nothing owns the answer.
+1. **The ApiError message-extraction idiom is copied everywhere.** The exact form `err instanceof ApiError ? err.message : "<fallback>"` appears 131× across 31 files; the wider anchor `instanceof ApiError ?` (which catches variant variable names and reformatting) finds **157 occurrences across 40 files** (architect review @ 601ea91). The migration surface is the wider set: 40 files. Every catch block re-derives "how do I get a message out of this error", and nothing owns the answer.
 2. **The ticking-clock pattern** (`useState(() => Date.now())` + `setInterval(() => setNow(Date.now()), ms)` + cleanup) is inlined 6× across 4 files.
 
 ## Solution
@@ -32,7 +32,7 @@ export function useNow(intervalMs: number): number
 
 ## Milestones
 
-- [ ] **M1 — errorMessage() + migrate the 130 sites.** Add the function to `lib/apiError.ts` (beside the class — its natural owner) with a unit test (ApiError in → its message; plain Error / string / undefined in → fallback). Migrate all 130 occurrences across the 31 files. Sweep: `git grep -F 'instanceof ApiError ? err' -- web/src/` returns zero when done — calibrate the pattern against a known-present site before trusting the first count, and check for variant spellings (different variable names than `err`) by also sweeping `git grep -F 'instanceof ApiError ?' -- web/src/` and reading the residue; a site with extra logic in the ternary arms stays inline and is listed in the MR. Existing page tests stay green **unmodified** (they pin rendered error copy and are the behavior-preservation proof). `task gate:web` green — knip gates unused exports, so the helper must actually be imported everywhere it replaces the idiom.
+- [ ] **M1 — errorMessage() + migrate all sites (157 across 40 files).** Add the function to `lib/apiError.ts` (beside the class — its natural owner) with a unit test (ApiError in → its message; plain Error / string / undefined in → fallback). Migrate every occurrence the wider anchor finds — do NOT stop at the 131 exact-idiom hits; the remaining ~26 are variant spellings of the same responsibility. Sweep: `git grep -F 'instanceof ApiError ? err' -- web/src/` returns zero when done — calibrate the pattern against a known-present site before trusting the first count, and check for variant spellings (different variable names than `err`) by also sweeping `git grep -F 'instanceof ApiError ?' -- web/src/` and reading the residue; a site with extra logic in the ternary arms stays inline and is listed in the MR. Existing page tests stay green **unmodified** (they pin rendered error copy and are the behavior-preservation proof). `task gate:web` green — knip gates unused exports, so the helper must actually be imported everywhere it replaces the idiom.
 - [ ] **M2 — useNow(ms) + migrate the 6 sites.** New `lib/useNow.ts` hook: returns `now`, ticks on `intervalMs`, cleans up on unmount. Unit test with fake timers: initial value, advance-by-interval updates, unmount clears (assert via `vi.getTimerCount()` or spy on clearInterval — a positive control that cleanup ran, not just absence of errors). Migrate the 6 sites; each keeps its current interval value verbatim. Note `RunView.tsx` has 3 of the 6 — after migration its three hooks must not be accidentally merged into one shared ticker if their intervals differ (read them; merge only true duplicates). `task gate:web` green.
 
 ## Success criteria
@@ -49,6 +49,6 @@ export function useNow(intervalMs: number): number
 
 ## Risks & mitigations
 
-- **The 130-site migration touches 31 files → wide but shallow merge-conflict surface.** Land as one MR, quickly; it conflicts textually with almost nothing (single-expression rewrites) and the epic's Batch 1 keeps other web PRDs out of flight simultaneously.
+- **The 157-site migration touches 40 files → wide but shallow merge-conflict surface.** Land as one MR, quickly; it conflicts textually with almost nothing (single-expression rewrites) and the epic's Batch 1 keeps other web PRDs out of flight simultaneously.
 - **A variant spelling escapes the sweep** (different variable name, reformatted ternary). Mitigated by the two-tier sweep in M1 (exact idiom, then the wider `instanceof ApiError ?` anchor with hand-read residue) — per the epic's rule that a multi-phrasing claim cannot be post-filtered on one phrasing.
 - **Mock-mode drift.** Neither helper touches the api client or mocks; `mockApi` paths are unaffected. The `typeof realApi` typecheck remains the guard.

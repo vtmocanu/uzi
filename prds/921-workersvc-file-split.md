@@ -27,13 +27,13 @@ Seams (approximate service.go ranges at the pinned SHA):
 
 ## Milestones
 
-- [ ] **M1 — seams 1+2 (pgtype helpers, sweeper).** Move-only commits: function bodies byte-identical (verify with `git diff --color-moved=dimmed-zebra` showing pure moves; any non-move edit in a moved function is a red flag). The approve-freeze log line `workersvc: approve-time milestone freeze` and its callers move untouched — external docs grep for that exact string (`.claude/rules/go.md`'s approve-freeze entry), so its text is load-bearing. Full suite proof: `task gate:api` green AND the live-DB sweep `./e2e/run-store-it.sh` with its positive control (named tests `--- PASS`, `RUN>0`, `SKIP=0`) since workersvc is store-heavy.
-- [ ] **M2 — seams 3+4+5.** Same discipline, three commits (one per seam) so review stays per-theme. `task gate:api` + live-DB sweep green again.
+- [ ] **M1 — seams 1+2 (pgtype helpers, sweeper).** Move-only commits: function bodies byte-identical (verify with `git diff --color-moved=dimmed-zebra` showing pure moves; any non-move edit in a moved function is a red flag). Full suite proof: `task gate:api` green AND the live-DB sweep `./e2e/run-store-it.sh` with its positive control (named tests `--- PASS`, `RUN>0`, `SKIP=0`) since workersvc is store-heavy.
+- [ ] **M2 — seams 3+4+5.** Same discipline, three commits (one per seam) so review stays per-theme. The approve-freeze log line `workersvc: approve-time milestone freeze` sits inside seam 3 (service.go:5749/:5751, the SubmitInput region) and moves here — it must move byte-identical: external docs grep for that exact string (`.claude/rules/go.md`'s approve-freeze entry), so its text is load-bearing. `task gate:api` + live-DB sweep green again.
 - [ ] **M3 — settings.boolSetting.** Add `boolSetting(ctx, key) (bool, error)` using `Defaults[key] == "true"`, propagating the read error (all 11 accessors share the same switch body including the error path — fact-checked; `MrReworkEnabled`'s deliberate error propagation is the same shape, not an exception). Migrate the 11: SlackEnabled, JudgeEnabled, GithubProjectSyncEnabled, EphemeralWorkersEnabled, MrReworkEnabled, JudgeEnforceAll, AgentSourceEnabled, ReleaseCheckEnabled, ReleaseCheckBannerEnabled, HealthEnabled, CapabilityAwareScheduling. Do NOT touch Branding's inner closure or AgentSourceCredentialConfigured (different shapes, correctly excluded). Existing settings tests green unmodified. `task gate:api` green.
 
 ## Success criteria
 
-1. `service.go` under ~2500 lines, every moved function byte-identical, zero exported-API diff (`go doc ./internal/workersvc` output unchanged modulo source locations).
+1. `service.go` reduced by the five named seams — they sum to roughly 3000 moved lines, so the file lands around ~3500 (a >40% reduction). Every moved function byte-identical, zero exported-API diff (`go doc ./internal/workersvc` output unchanged modulo source locations). Do NOT split beyond the five named seams to chase a smaller number: un-named moves are riskier and defeat the move-only safety argument; further seams are a follow-up PRD.
 2. Full `task gate:api` AND `./e2e/run-store-it.sh` green with positive controls.
 3. `git grep -c 'case "true"' -- api/internal/settings/settings.go` drops to the helper (plus Branding's closure).
 4. No `.github/workflows/**` in the branch diff.
