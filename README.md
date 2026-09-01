@@ -239,6 +239,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for 
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [prds/](prds/) for active work. The upside of catching uzi this early is that you get to shape where it goes, so issues and PRs are genuinely welcome.
 
+## Disclaimer
+
+uzi is alpha software that runs autonomous AI agents. They read your code, run commands inside their workers, and open pull requests on your forge using your own model tokens. **Use it at your own risk**, on repositories and infrastructure you own or are authorised to change.
+
+You stay in control by design: review the plan before you approve it, and review the diff before you merge it. uzi opens pull requests but never merges them, and never touches `main`. Nothing lands without a human deciding to merge it.
+
+uzi is provided "as is", without warranty of any kind (see [LICENSE](LICENSE)). You are responsible for what you approve, merge, and deploy.
+
 ## License
 
 [MIT](LICENSE) © 2026 Vlad Mocanu / METAMINDS
