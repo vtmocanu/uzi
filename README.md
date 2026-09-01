@@ -1,10 +1,9 @@
-<h1 align="center">uzi</h1>
-
 <p align="center"><b>An AI dark factory: issues in, reviewed pull requests out.</b></p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <a href="https://github.com/vtmocanu/uzi/releases"><img src="https://img.shields.io/github/v/release/vtmocanu/uzi" alt="Latest release"></a>
+  <a href="https://github.com/vtmocanu/uzi/actions/workflows/e2e.yml"><img src="https://github.com/vtmocanu/uzi/actions/workflows/e2e.yml/badge.svg?branch=main" alt="Nightly E2E"></a>
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status: alpha">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome">
   <a href="https://github.com/vtmocanu/uzi/stargazers"><img src="https://img.shields.io/github/stars/vtmocanu/uzi" alt="GitHub stars"></a>
