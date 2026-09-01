@@ -97,9 +97,10 @@
     //     and hook-returned refs read in render (ChatMessages). 12 sites.
     //   purity              - deliberate `Date.now()` in render for the 10s-poll
     //     status badges (Board.tsx/PipelineBadge/RunHealthBadge, commented). 4.
-    //   immutability        - a mapper read inside its own effect's callback
-    //     while its declaration is still initializing, so fully defined by the
-    //     time the async catch runs (Repos.tsx syncErrorMessage). 1 site.
+    //   immutability        - a mapper forward-referenced inside a useCallback
+    //     while its own declaration is still initializing, so fully defined by
+    //     the time the effect invokes that callback (Repos.tsx syncErrorMessage,
+    //     read in loadSyncStatus's async catch). 1 site.
     "react/set-state-in-effect": "off",
     "react/refs": "off",
     "react/purity": "off",
