@@ -1,114 +1,173 @@
-# PRD #914: CI autofix on by default (simple)
+# PRD #914: CI autofix on by default (mirror mr_rework — admin global + per-user tri-state)
 
 **Issue**: #914
 **Status**: Draft — ready for implementation
 **Priority**: Medium
 **Split from**: #908 (this was #908's former Part B; #908 keeps Part A — autofix for scheduled runs).
-**Scope**: `api/` (one migration) + `docs/`. No `web/` change, no Go type change, no gate change.
-No `.github/workflows/**` changes.
+**Scope**: `api/` (one migration) + `web/`. No `agent/` change. No `.github/workflows/**` changes.
 
 ## Problem
 
 CI autofix (`kind='ci_fix'`, `api/internal/poller/ci_autofix.go`) pushes a fix when an agent-MR
-head pipeline fails. It is user opt-in, default-off: `users.ci_autofix_enabled BOOLEAN NOT NULL
-DEFAULT false` (migration 00115), gated in `ListCIAutofixCandidateRefs`
-(`ci_autofix.sql:67`, `AND u.ci_autofix_enabled`). Because the default is off and there is no
-promotion, most users never get automatic CI fixes even where the feature applies.
+head pipeline fails. Its enablement is a single user-level boolean,
+`users.ci_autofix_enabled BOOLEAN NOT NULL DEFAULT false` (migration 00115), gated in the candidate
+query `ListCIAutofixCandidateRefs` (`ci_autofix.sql:67`, `AND u.ci_autofix_enabled`). There is
+**no admin global** and the default is **off**, so most users never get automatic CI fixes.
+
+The sibling lane, MR rework (`kind='mr_rework'`, PRD #700/#841), already has the model we want: an
+admin global setting (default-on) plus a per-user **nullable tri-state** (NULL = inherit). This PRD
+brings CI autofix to that same model so it is **on by default**, with a fleet-wide kill-switch, and
+stops the two sibling autofix features from diverging.
 
 ## Solution
 
-Turn CI autofix on for everyone — **the deliberately simple version**. Flip the column default to
-`true` and backfill existing rows on; keep everything else exactly as it is:
+Mirror mr_rework's admin-global + per-user tri-state, and turn everyone on:
 
-- **No type change** — `ci_autofix_enabled` stays a plain `NOT NULL bool`.
-- **No candidate-query change** — `ci_autofix.sql:67` `AND u.ci_autofix_enabled` keeps working;
-  after the backfill every user is `true`, and new users default `true`.
-- **No web change, no `bool → pgtype.Bool` ripple, no admin global.** Opt-out still works exactly as
-  today (a user sets their toggle to off).
+- **New admin global** `settings.ci_autofix_enabled`, default `"true"` — an instance-wide
+  kill-switch, read fail-closed by the detector (mirrors `MrReworkEnabled`).
+- **Per-user column becomes a nullable tri-state**: `users.ci_autofix_enabled` → nullable
+  `boolean`, NULL = inherit the global default. Gate changes from `AND u.ci_autofix_enabled` to
+  `AND u.ci_autofix_enabled IS NOT FALSE` (NULL/true pass, explicit false excludes) — mr_rework's
+  shape.
+- **Turn everyone on now**: the migration folds existing `false → NULL` (inherit = on) and preserves
+  existing `true`. New users get NULL (no default) = inherit = on automatically.
 
-### Why not the mr_rework mirror (tri-state + admin global)?
+### Migration decision (turn everyone on) and its consequences
 
-That was considered and **deliberately rejected as over-scoped for this ask.** Mirroring mr_rework
-(a nullable tri-state + an admin global setting + web tri-state UI) would be the "consistent" end
-state, but it pulls in the full `bool → pgtype.Bool` ripple and web work for what is fundamentally a
-default flip. The user chose simple. Two honest consequences of that choice, recorded as decisions:
+The current column is `NOT NULL`, so history cannot distinguish "opted out" from "never chose"
+(both are `false`). The chosen approach **turns everyone on** by folding `false → NULL`:
 
-- **D1 — turn everyone on (backfill), do NOT preserve existing opt-outs. This is a deliberate
-  simplicity-over-best-practice trade.** Best practice for a cost-incurring feature is to never
-  silently override a user's explicit opt-out (i.e. preserve it), but preserving is impossible
-  without making the column nullable (the current `NOT NULL` data cannot distinguish "opted out"
-  from "never chose") — exactly the tri-state work being avoided here. So the backfill re-enables
-  anyone who had turned CI autofix off. This is the explicit ask ("turn it on for everyone"); on
-  this instance it is a non-issue (single maintainer), and for self-hosters it is a documented
-  one-time change (M2 docs). If preserving opt-outs later matters, the tri-state upgrade
-  (mirroring mr_rework) is the follow-up.
-- **D2 — no admin kill-switch in this PRD.** With no admin global, an operator turns CI autofix off
-  only per-user, not fleet-wide. Acceptable for the simple version; a fleet-wide admin global
-  (mirroring `settings.mr_rework_enabled`) is a clean **follow-up** if an operator ever needs it. Flag
-  it in the docs so the absence is a known, deliberate gap, not a surprise.
+- **This re-enables prior opt-outs** — a deliberate, accepted trade (the ask was "on for everyone").
+  Best practice would preserve explicit opt-outs, but that is what the tri-state *going forward*
+  gives us; for the *existing* NOT-NULL data it is unrecoverable, so we fold. On this instance
+  (single maintainer) it is a non-issue; for self-hosters it is a documented one-time change (R1).
+- **New users get default-on for free.** `CreateUser` and the OIDC insert (`queries/users.sql`) do
+  **not** set `ci_autofix_enabled` — they relied on the column DEFAULT. Dropping the default means a
+  new row is NULL = inherit = on, with no seeding change and no path that silently re-introduces
+  `false` (a confirmed positive, not a regression — stated because a reader might fear `DROP DEFAULT`
+  orphans user provisioning).
 
-### Independent of #908 (no sequencing)
+### The 7 divergences from a straight mr_rework copy (grounded in current code, review-verified)
 
-Unlike the earlier combined plan, the simple version **does not touch `ci_autofix.sql`** — it only
-changes a migration + docs. So it does **not** conflict with #908's M4 (which widens
-`ci_autofix.sql`'s kind filter) and needs no "land after #908" sequencing. The two PRDs are fully
-independent and can run in parallel.
+mr_rework is the template, but ci_autofix differs in ways that make this more than a copy:
+
+1. **No admin global exists for ci_autofix** — `settings.go` has zero `ci_autofix` refs. The key
+   const, default, `Defaults` map entry, accessor (~settings.go:870), and `validateBool` case
+   (~settings.go:1439) are all NEW.
+2. **The detector has no settings dependency** — `CIAutoFix` (`ci_autofix.go:59-60`) has only `q
+   ciAutofixStore`, no `set`; `ciAutofixStore` (`:25-26`) has no settings accessor; `NewCIAutoFix`
+   (`:74`) + its `cmd/server/main.go:541` wiring take no `settings.Cache`. All NEW, to add the
+   fail-closed global read (mirror `mr_review_watch.go:105-112`, whose accessor genuinely
+   propagates the store error / fails closed).
+3. **The per-user gate is in SQL, not Go** — `ci_autofix.sql:67` (generated `ci_autofix.sql.go:142`).
+   The `IS NOT FALSE` edit has no mr_rework analog. **No second gate exists**: the only other
+   `ci_fix` create path is the manual "Fix CI" button (`handler/ci_fix.go` → `CreateCIFixRun`), which
+   does not read `ci_autofix_enabled` at all (human-approved by design), so changing only the SQL is
+   sufficient.
+4. **Different API/UI surface** — ci_autofix is on the `User` DTO (`apitypes/user.go:32`) with
+   dedicated endpoints (`handler/ci_autofix_toggle.go`, `PUT /me/ci-autofix` `handler.go:935`,
+   `PUT /admin/users/{id}/ci-autofix` `handler.go:1182`), not `PUT /me/settings`. Both handler
+   methods call the single store query `SetUserCIAutofixEnabled` (one param struct to flip). The
+   `setCIAutofixRequest{Enabled bool}` and web `(enabled: boolean)` signatures have no inherit/clear
+   value today. **No CLI surface** (`api/cmd/uzi` has none — correct to omit).
+5. **SET-query return shape** — `SetUserCIAutofixEnabled` returns `RETURNING *` (full `User` →
+   `toDTO`); its param flips `bool → pgtype.Bool`.
+6. **`bool → pgtype.Bool` ripple** — `store.User.CiAutofixEnabled` is `bool` (`models.go:638`); the
+   one hand-written reader is `handler/handler.go:476` (`toDTO`; it is display-only, but a naive
+   `.Bool` there would show "Off" for a default-on NULL user, so resolve inherit→true). The two
+   hand-written writers are `handler/ci_autofix_toggle.go:39` and `:68`. Plus ~16 sqlc-generated
+   scan sites (15 in `users.sql.go` + `slack.sql.go:98`) that regenerate automatically — the
+   compiler catches every bare-bool use.
+7. **No web admin card** — even mr_rework's global has no typed web admin field; it round-trips
+   through the generic `GET/PUT /admin/settings`. The ci_autofix global is backend-only.
 
 ## Milestones
 
-**Offline** = unit-testable. **LiveDB** = needs `./e2e/run-store-it.sh`.
+**Offline** = unit-testable with fakes. **LiveDB** = needs `./e2e/run-store-it.sh`. **web** = touches
+`web/`.
 
-- [ ] **M1 — Migration: default-on + backfill.** *(Offline + LiveDB)*
-  New migration (number at merge time; live head is 00181):
-  - Up: `ALTER TABLE users ALTER COLUMN ci_autofix_enabled SET DEFAULT true;` then
-    `UPDATE users SET ci_autofix_enabled = true WHERE ci_autofix_enabled = false;`
-  - Down: `UPDATE users SET ci_autofix_enabled = false; ALTER TABLE users ALTER COLUMN
-    ci_autofix_enabled SET DEFAULT false;` — **lossy by construction**: the Up discards which rows
-    were originally off, so Down cannot restore them and simply returns everyone to off. State this
-    in the migration comment.
-  No `sqlc` type change (the column stays `NOT NULL bool`), so `store.User.CiAutofixEnabled` stays
-  `bool` and there is no reader ripple. LiveDB test: a user row created after the migration defaults
-  to `true`; a pre-existing `false` row is now `true`; and `ListCIAutofixCandidateRefs` returns that
-  user's failed-pipeline branch (with a token on file). A user who explicitly sets `false` afterward
-  is excluded (the existing gate still enforces opt-out). Run via `./e2e/run-store-it.sh` with a
-  positive control (named tests `--- PASS`, `RUN > 0`, zero `--- SKIP`).
+- [ ] **M1 — Admin global `ci_autofix_enabled` setting + detector fail-closed read.** *(Offline)*
+  In `settings.go` add (all NEW): `KeyCiAutofixEnabled = "ci_autofix_enabled"`, `DefaultCiAutofixEnabled
+  = "true"`, the `Defaults` map entry, a three-state error-propagating accessor mirroring
+  `MrReworkEnabled` (~:870), and the `validateBool` case (~:1439). Wire `settings.Cache` into the
+  `CIAutoFix` detector (struct field + `ciAutofixStore` interface + `NewCIAutoFix` + `cmd/server/main.go:541`)
+  and add the fail-closed read at the top of `detect`, mirroring `mr_review_watch.go:105-112`.
+  **Also fix the now-stale comment at `cmd/server/main.go:538-540`** ("per-user ci_autofix_enabled
+  (default-OFF)" and "kill-switch is simply NOT wiring it") — both become false once the global exists.
 
-- [ ] **M2 — Docs + stale-comment fix.** *(Offline)*
-  Update wherever ci_autofix is documented to say it is **on by default** with a per-user opt-out
-  (there is no admin global — note that as a deliberate, followed-up gap), and note the one-time
-  migration re-enables prior opt-outs. Fix the now-stale in-tree comment at
-  `api/cmd/server/main.go:538-540` ("per-user ci_autofix_enabled (default-OFF)") to say default-ON;
-  the "kill-switch is simply NOT wiring it" half stays true (this PRD adds no global). Update the web
-  copy that reads "Off by default." at `web/src/pages/RunDefaults.tsx:513` — a **string-only** edit,
-  no logic change (the toggle stays a plain bool). If `check-docs.mjs` runs in the web build, keep it
-  green.
+- [ ] **M2 — User column → nullable tri-state + candidate gate + Go-type ripple.** *(Offline + LiveDB)*
+  New migration (number at merge time; live head 00181):
+  - Up: `ALTER TABLE users ALTER COLUMN ci_autofix_enabled DROP NOT NULL, DROP DEFAULT;` then
+    `UPDATE users SET ci_autofix_enabled = NULL WHERE ci_autofix_enabled = false;` (existing `true`
+    preserved).
+  - Down (**lossy — state it in the migration comment**): `UPDATE users SET ci_autofix_enabled =
+    false WHERE ci_autofix_enabled IS NULL;` then `ALTER TABLE users ALTER COLUMN ci_autofix_enabled
+    SET NOT NULL, SET DEFAULT false;`. Rollback collapses every inherit-on (NULL) row to off; it
+    cannot restore the pre-Up values. (Unlike mr_rework's Down, which is a trivial `DROP COLUMN`
+    because 00165 *added* a nullable column — this ALTERs an existing NOT-NULL one, so the template's
+    Down does not transfer.)
+
+  Change `ci_autofix.sql:67` `AND u.ci_autofix_enabled` → `AND u.ci_autofix_enabled IS NOT FALSE`.
+  Regenerate sqlc; `store.User.CiAutofixEnabled` flips `bool` → `pgtype.Bool` — fix `handler/handler.go:476`
+  (`toDTO`, resolve inherit→true) and the `SetUserCIAutofixEnabled` param.
+
+- [ ] **M3 — Tri-state over the API + web toggles.** *(Offline; web)*
+  Retrofit the dedicated endpoints to carry inherit/clear: `handler/ci_autofix_toggle.go`
+  (`setCIAutofixRequest`, both handler methods → the single `SetUserCIAutofixEnabled` param as
+  `pgtype.Bool`), the DTO `apitypes/user.go:32` + web `api.ts:34` `User.ci_autofix_enabled` →
+  `boolean | null`. Update the web toggles to tri-state, mirroring RunDefaults' mr_rework checkbox
+  (`checked={x !== false}`): `web/src/pages/RunDefaults.tsx` (self, incl. the "Off by default." copy at
+  `:513`) and `web/src/pages/AdminUsers.tsx` (admin). **Do not miss these ripple sites** (review-found):
+  the two web API client methods `web/src/lib/api.ts:3067` + `:3125` `(enabled: boolean)` →
+  `boolean | null`; both mock setters `web/src/mocks/mockApi.ts:2356-2367`; and the fixtures that
+  hardcode `ci_autofix_enabled: false` (`web/src/mocks/data.ts` ×6 + ~10 web test files) — update the
+  ones M4's positive-control tests assert on so they don't assert "off" for a default-on user.
+
+- [ ] **M4 — Tests + docs.** *(Offline + LiveDB)*
+  Migration test: an existing `false` row becomes NULL, a `true` row is preserved, a fresh row is NULL.
+  Candidate query (**extend `api/internal/store/ci_autofix_integration_test.go:55-59`, which seeds only
+  `{true,false,true}` — add a NULL case**): a NULL-user run is a candidate (default-on), an explicit
+  `false` user is excluded, and with the admin global off the detector skips the whole repo
+  (fail-closed). Settings accessor test mirroring mr_rework's. Web tri-state toggle test. Docs:
+  wherever ci_autofix is documented, state it is on by default with the admin global + per-user
+  opt-out, and note the one-time migration re-enables prior opt-outs. `*LiveDB` sweep via
+  `./e2e/run-store-it.sh` with a positive control (named tests `--- PASS`, `RUN > 0`, zero `--- SKIP`).
+
+**Ordering**: M1 (global + detector) and M2 (migration + gate + types) are largely disjoint and can
+run in parallel; M3 depends on M2's type flip; M4 tests all three.
 
 ## Success criteria
 
-1. A newly created user gets a `ci_fix` run on a failed agent-MR pipeline without opting in; an
-   existing user who was off is now on; a user who explicitly turns it off afterward gets none.
-2. The migration flips existing `false` rows to `true` and sets the column default to `true`.
-3. Full gate green (`task gate:api`, plus `task gate:web` for the M2 copy edit) and the `*LiveDB`
-   sweep with a positive control.
+1. A user who never touched the setting (NULL) — including every newly created user — gets a `ci_fix`
+   run on a failed agent-MR pipeline; an explicit per-user `false` gets none; the admin global set to
+   false suppresses it instance-wide.
+2. The migration turns a prior `false` row into inherit (on), preserves a prior `true` row, and a
+   fresh user row is NULL (on).
+3. Full gate green (`task gate:api`, `task gate:web`) plus the `*LiveDB` sweep with a positive control.
 
-## Risks
+## Risks & dependencies
 
-- **R1 — re-enables prior opt-outs (accepted).** The backfill turns CI autofix on for everyone,
-  including anyone who deliberately turned it off. This is the explicit "turn it on for everyone"
-  ask; the docs (M2) call it out so self-hosters are not surprised by new token spend. Preserving
-  opt-outs was rejected because it requires the nullable tri-state (not simple).
-- **R2 — no fleet-wide kill-switch.** Without an admin global, an operator can only opt users out
-  one at a time. Acceptable for the simple version; the admin global is a clean follow-up (mirror
-  `settings.mr_rework_enabled`).
-- **R3 — Down migration is lossy.** Rollback returns everyone to off; it cannot restore who was
-  originally off (the Up discarded that). Stated in the migration comment.
-- **R4 — cost on all users.** Default-on means every user's failed agent-MR pipeline can trigger a
-  `ci_fix` run burning their token; bounded by the existing `CIAutofixMaxAttempts` cap. (A cheaper
-  fleet-wide bound would be R2's admin global — follow-up.)
+- **R1 — re-enables prior opt-outs (accepted).** Folding `false → NULL` turns CI autofix on for
+  everyone, including anyone who deliberately turned it off. Explicit ask; mitigated by the new admin
+  global (one-place instance-off), explicit per-user re-opt-out, and a docs call-out (M4) so operators
+  are not surprised by new token spend.
+- **R2 — Down migration is lossy.** Rollback collapses every inherit-on (NULL) row to off; it cannot
+  restore pre-Up values. Stated in the migration comment (M2). The feature is reversible (admin
+  global); the *schema rollback* is not.
+- **R3 — sequencing with #908.** Both #908 (Part A, M4 widens `ci_autofix.sql`'s kind filter, line 44)
+  and this PRD (M2 changes `ci_autofix.sql`'s user gate, line 67) edit the same query + its generated
+  `.sql.go`. **Land this AFTER #908 merges** so M2 rebases onto the widened filter; racing both means
+  this MR conflicts on that file (small — two different lines + the regenerated const).
+- **R4 — `bool → pgtype.Bool` semantic slips.** A site treating the scanned value as a bare bool (or
+  reading NULL as false) compiles but breaks inherit — the `toDTO` display reader especially. The gate
+  + M4's candidate-query NULL-case test are the guard.
+- **R5 — cost on all users.** Default-on means every user's failed agent-MR pipeline can trigger a
+  `ci_fix` run burning their token; bounded by the existing `CIAutofixMaxAttempts` cap (`main.go:541`)
+  and the new admin global + per-user opt-out.
 
 ## Workflow-scope note (uzi worker)
 
 Per `.claude/rules/prds.md`: implementation and validation touch **no** `.github/workflows/**` —
-changes are one migration under `api/internal/store/migrations/`, plus docs and one web string, and
-the LiveDB sweep runs via `./e2e/run-store-it.sh`. So `git diff --name-only <base>..HEAD` shows zero
+changes are in `api/` (incl. one migration under `api/internal/store/migrations/`) and `web/`, and the
+LiveDB sweep runs via `./e2e/run-store-it.sh`. So `git diff --name-only <base>..HEAD` shows zero
 `.github/workflows/**` entries — safe for the worker PAT that lacks `workflow` scope.
