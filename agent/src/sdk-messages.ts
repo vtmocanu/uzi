@@ -41,7 +41,20 @@
 // the lane heals as soon as any frame in it carries the role. Recorded as
 // Decision 8's fourth degradation case in prds/99-activity-instance-lanes.md.
 
+import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { EmittedMessage } from "./executor.js";
+import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
+
+/** One-shot user-turn prompt stream: the SDK consumes a single user message. */
+export async function* promptStream(text: string): AsyncGenerator<unknown> {
+  yield { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
+}
+
+// The real SDK `Query` has a required getContextUsage() returning the wider
+// SDKControlGetContextUsageResponse; it satisfies the optional, narrower seam
+// type by covariance, so no cast is needed here.
+export const defaultQueryFn: SdkQueryFn = (params) =>
+  sdkQuery({ prompt: params.prompt as never, options: params.options });
 
 /** The lead runs on the main thread; subagents carry a `subagent_type`. */
 const LEAD = "lead";

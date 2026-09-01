@@ -7,14 +7,16 @@
 # skills, instructions) as configuration, so a hostile repo cannot widen the
 # agent's own permissions from inside its own tree. See ARCHITECTURE.md's
 # guardrails section and agent/src/sdk-executor.ts (the lead executor, the widest
-# blast radius of the five sites). There are exactly five real assignments today
-# -- judge-runner.ts, sdk-executor.ts, chat-executor.ts, summary-runner.ts,
-# review-runner.ts -- and ALL are `settingSources: []`. This rule forbids any
+# blast radius of the sites). There are exactly three real assignments today
+# -- sdk-executor.ts, chat-executor.ts, and model-pass.ts (the consolidated
+# advice-lane site: PRD #920 M2 folded the former judge-runner.ts /
+# summary-runner.ts / review-runner.ts literals into one query site in
+# runReadOnlyModelPass) -- and ALL are `settingSources: []`. This rule forbids any
 # other value.
 #
 # THE PATTERN. `settingSources: $X` matches every assignment; `pattern-not:
 # settingSources: []` subtracts the exact empty-array literal. So the clean tree
-# (all five sites `[]`) yields ZERO findings, while any EXPLICIT non-empty VALUE
+# (all three sites `[]`) yields ZERO findings, while any EXPLICIT non-empty VALUE
 # fires: an array with elements (`settingSources: ["project"]`), a variable
 # (`settingSources: someVar`), or any other expression in the value position.
 # semgrep parses TypeScript, so the many `settingSources: []` mentions in COMMENTS

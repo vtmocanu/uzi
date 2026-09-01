@@ -15,25 +15,15 @@
 // text can never drive an action, and the system prompt frames the inputs as data the
 // model must never take instructions from (Decision 10).
 
-import { promises as fs } from "node:fs";
 import os from "node:os";
-import path from "node:path";
 
-import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { HookInput, HookJSONOutput, Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
-
-import { spawnDetached } from "./sdk-spawn.js";
-import { uidSplitActive } from "./runner-uid.js";
-import { buildSdkEnv } from "./sdk-env.js";
 import { fenceNonce } from "./prompt.js";
-import { mapSdkMessage, isResult, isErrorResult } from "./sdk-messages.js";
+import { defaultQueryFn } from "./sdk-messages.js";
+import { runReadOnlyModelPass } from "./model-pass.js";
 import { extractJsonObject } from "./judge-runner.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
-import { rmTreeForce } from "./rmtree.js";
 import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
-
-const defaultQueryFn: SdkQueryFn = (params) => sdkQuery({ prompt: params.prompt as never, options: params.options });
 
 // Wall-clock cap on a single summary model turn. DEFAULT 60s (not the judge's 5 min):
 // the plan summary blocks entry into `awaiting_approval` up to this cap (Decision 2),
@@ -199,98 +189,26 @@ export class SummaryRunner {
     return { summary, deltas: coerceDeltas(rec.deltas) };
   }
 
-  /** One tool-less text turn under a wall-clock cap. Mirrors JudgeRunner.runModel: an
-   *  own ephemeral homeDir, buildSdkEnv, a Promise.race against a timeout that aborts the
-   *  SDK query AND rejects the race, and best-effort cleanup that never throws into the
-   *  caller. Returns the accumulated text; THROWS on timeout or an error result so the
-   *  public methods can catch → null. */
+  /** One tool-less text turn under a wall-clock cap, via runReadOnlyModelPass: an own
+   *  ephemeral homeDir, the isolation-shaped options, a Promise.race against a timeout
+   *  that aborts the SDK query AND rejects the race, and best-effort cleanup that never
+   *  throws into the caller. Returns the accumulated text; THROWS on timeout or an error
+   *  result so the public methods can catch → null. */
   private async runModel(token: string, model: string, prompt: string): Promise<string> {
-    const homeDir = await fs.mkdtemp(path.join(this.homeRoot, "uzi-summary-"));
-    // Same rationale as JudgeRunner.runModel: under the uid split the SDK CLI runs as the
-    // `runner` uid, but fs.mkdtemp forces 0700 (worker-owned), so widen to 2770 (group
-    // `runner` rwx) so the runner can write $HOME/.claude and the worker can still rm it.
-    // Single-uid path leaves 0700 (the CLI runs as the worker — same uid, tighter).
-    if (uidSplitActive()) await fs.chmod(homeDir, 0o2770);
-    const abort = new AbortController();
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        abort.abort();
-        reject(new Error(`summary model call exceeded ${this.modelTimeoutMs}ms`));
-      }, this.modelTimeoutMs);
-    });
-    try {
-      return await Promise.race([this.consumeModel(token, model, prompt, homeDir, abort), timeout]);
-    } finally {
-      if (timer) clearTimeout(timer);
-      // Best-effort cleanup: the dir is named `uzi-summary-*` (not a run UUID), so the
-      // M6 reclaim sweep skips it by design — this warn is the only thing that will flag
-      // a stranded dir. A cleanup failure must NEVER fail a run, so it is caught here and
-      // never allowed to throw into the advisory caller.
-      await rmTreeForce(homeDir).catch((e) =>
-        this.log.warn("summary HOME cleanup failed", { home_dir: homeDir, error: errMessage(e) }),
-      );
-    }
-  }
-
-  private async consumeModel(
-    token: string,
-    model: string,
-    prompt: string,
-    homeDir: string,
-    abort: AbortController,
-  ): Promise<string> {
-    const env = buildSdkEnv(token, homeDir);
-    const options: SdkOptions = {
-      env: env as unknown as Record<string, string | undefined>,
-      abortController: abort,
-      // Tool-less shape, identical to the judge's consumeModel: no repo settings and a
-      // deny-all tool hook, so untrusted issue/PRD/plan text can drive no action.
-      settingSources: [],
+    return runReadOnlyModelPass({
+      token,
+      model,
       systemPrompt: SUMMARY_SYSTEM_PROMPT,
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      includePartialMessages: false,
-      hooks: {
-        PreToolUse: [{ hooks: [denyAllTools] }],
-      },
-      // Route the SDK CLI through the runner-uid detached spawn like every other SDK
-      // spawn (uniform execution boundary); the deny-all hook already blocks code-exec,
-      // so this is defense-in-depth.
-      spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
-    };
-    if (model) options.model = model;
-
-    let text = "";
-    for await (const msg of this.queryFn({ prompt: promptStream(prompt), options })) {
-      for (const em of mapSdkMessage(msg)) {
-        if (em.kind === "text") {
-          const t = (em.payload as { text?: string }).text;
-          if (t) text += t;
-        }
-      }
-      if (isResult(msg)) {
-        if (isErrorResult(msg)) throw new Error("summary model call returned an error result");
-        break;
-      }
-    }
-    return text;
+      prompt,
+      homeRoot: this.homeRoot,
+      homePrefix: "uzi-summary-",
+      label: "summary",
+      timeoutMs: this.modelTimeoutMs,
+      queryFn: this.queryFn,
+      denyReason: "the summary runner is read-only and runs no tools",
+      log: this.log,
+    });
   }
-}
-
-// A PreToolUse deny for EVERY tool: the summary turn is read-only text-in/text-out. A
-// deny is authoritative even under bypassPermissions (the property guardrails.ts and the
-// judge both rely on).
-const denyAllTools = async (_input: HookInput): Promise<HookJSONOutput> => ({
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason: "the summary runner is read-only and runs no tools",
-  },
-});
-
-async function* promptStream(text: string): AsyncGenerator<unknown> {
-  yield { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
 }
 
 /** Coerce the parsed `deltas` value into a clean Delta[]. A non-array yields [] (the
