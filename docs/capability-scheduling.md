@@ -140,7 +140,7 @@ trade-off; there's no partial setting between "checked" and "not checked".
 emit-when-set rows — `REQUIRED_CAPABILITIES`, `REQUIRED_TOOLS`, and
 `SIZE_CLASS` — see [the CLI reference](./cli.md#commands).
 
-## What this doesn't do yet
+## What's shipped and what's still deferred
 
 Auto-provisioning a throwaway worker on demand for a capability-unmet queued
 run **has shipped** (opt-in, off by default) — see
