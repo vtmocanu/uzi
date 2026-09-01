@@ -661,7 +661,8 @@ export function calibrateReview(review: ReviewRequest, failureClass: string | nu
 // summary runner (PRD #362 M3a), which parses the same fenced/prose-wrapped JSON shape.
 export function extractJsonObject(text: string): unknown {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = fence ? fence[1] : sliceFirstObject(text);
+  const inner = fence ? fence[1]! : text;
+  const candidate = sliceFirstObject(inner);
   if (!candidate) throw new Error("no JSON object found in the model output");
   return JSON.parse(candidate);
 }
