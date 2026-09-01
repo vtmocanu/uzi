@@ -206,7 +206,8 @@ An agent drives it fully headless with a Bearer token in `UZI_TOKEN`: no browser
 - **[Findings](docs/findings.md)**: incidental bugs a run spots outside its task, deduped and filed on your say-so.
 - **The worker fleet**: load balancing across workers, [ephemeral workers](docs/hosted-workers.md) for one-off capabilities, and on-demand [devbox](https://www.jetify.com/devbox) tools ([worker docs](docs/worker-tools.md)).
 - **Your tokens**: pool more than one and auto-select the one with the most [rate-limit](docs/rate-limits.md) headroom; a run that hits a cap pauses and resumes on its own.
-- **[Memory](docs/memory.md)**, **[agent templates and skills](docs/agent-templates.md)**, **[OIDC SSO](docs/oidc.md)**, **[GitHub Projects sync](docs/github-project-sync.md)**, and **[cosign-signed images](docs/container-signing.md)**.
+- **[Agents and skills](docs/agent-templates.md)**: a dozen built-in agent templates (lead, reviewer, and others), each with its own model, tools, and prompt, that you can clone and customise, or bring your own per repo in `.claude/agents/`, chosen at the plan gate ([repo agents](docs/repo-agents.md)). Agents pull in skills, Markdown playbooks loaded on demand.
+- **[Memory](docs/memory.md)**, **[OIDC SSO](docs/oidc.md)**, **[GitHub Projects sync](docs/github-project-sync.md)**, and **[cosign-signed images](docs/container-signing.md)**.
 - The whole web UI is responsive, so you can browse the factory and approve a plan from your phone.
 
 ## Multi-forge
