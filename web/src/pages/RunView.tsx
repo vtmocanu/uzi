@@ -35,6 +35,7 @@ import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/li
 import { canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
+import { useAsyncData } from "../lib/useAsyncData";
 import { effectiveWorkerCaps } from "../lib/workerCaps";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import {
@@ -2214,8 +2215,6 @@ export function JudgePanel({
   pollMaxTries?: number;
 }) {
   const [review, setReview] = useState<RunReview | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [loadErr, setLoadErr] = useState("");
   const [actionErr, setActionErr] = useState("");
   const [rerunning, setRerunning] = useState(false);
   const [queued, setQueued] = useState(false);
@@ -2240,8 +2239,18 @@ export function JudgePanel({
 
   const eligible = JUDGE_ELIGIBLE_KINDS.has(run.kind);
 
-  const fetchReview = useCallback(async () => {
-    try {
+  // The mount load, via useAsyncData: enabled:eligible reproduces the old effect's
+  // `if (!eligible) { setLoading(false); return; }` (eligible is derived from run.kind,
+  // stable per mount). review/pendingJudge/baselineUpdatedAt are ALSO written by the poll
+  // and the 409 re-fetch, so they stay local and are set as side effects here (never
+  // bundled into the hook's data). The hook clears its error on success, so no explicit
+  // clear is needed; the old catch's fallback becomes `fallback`.
+  const {
+    loading,
+    error: loadErr,
+    reload: fetchReview,
+  } = useAsyncData(
+    async () => {
       const { review, pending_judge } = await api.getRunReview(run.id);
       setReview(review);
       // Seed the poll's baseline to the verdict this fetch just put on screen (see the
@@ -2256,21 +2265,10 @@ export function JudgePanel({
       // the whole app over a missing optional field. (api/internal/uzicli/client.go
       // handles the same skew on the CLI side.)
       setPendingJudge(pending_judge ?? null);
-      setLoadErr("");
-    } catch (e) {
-      setLoadErr(errorMessage(e, "Failed to load the review"));
-    } finally {
-      setLoading(false);
-    }
-  }, [run.id]);
-
-  useEffect(() => {
-    if (!eligible) {
-      setLoading(false);
-      return;
-    }
-    fetchReview();
-  }, [eligible, fetchReview]);
+    },
+    [run.id],
+    { enabled: eligible, fallback: "Failed to load the review" },
+  );
 
   // The file-issue picker lists every repo the caller has connected (PRD #68 Decision 4).
   // Best-effort: a failure (or a bare test double) just leaves the picker empty.

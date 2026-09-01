@@ -3,10 +3,11 @@
 // revoke, and the "Revoke all" panic button. The scope picker is offered ONLY to
 // admins (a non-admin can mint only a 'user' token). See PRD #64 M6.
 
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type CliToken, type CliTokenScope } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { CLI_TOKEN_STALE_DAYS, isCliTokenStale } from "../lib/cliTokens";
 import { useDemoMode } from "../lib/demoMode";
 import { maskIp } from "../lib/demoMask";
@@ -20,8 +21,20 @@ export function CliTokens() {
   const { user } = useAuth();
   const isAdmin = user?.is_admin ?? false;
 
-  const [tokens, setTokens] = useState<CliToken[]>([]);
-  const [loading, setLoading] = useState(true);
+  const {
+    data,
+    loading,
+    error: loadError,
+    reload,
+  } = useAsyncData<{ tokens: CliToken[] }>(
+    async () => {
+      const { tokens } = await api.listCliTokens();
+      return { tokens };
+    },
+    [],
+    { fallback: "Failed to load CLI tokens" },
+  );
+  const tokens = data?.tokens ?? [];
   const [error, setError] = useState("");
 
   const [name, setName] = useState("");
@@ -42,21 +55,6 @@ export function CliTokens() {
   // the panic button and stops every CLI/CI job at once, so it asks first.
   const [confirmingAll, setConfirmingAll] = useState(false);
   const confirmRef = useRef<HTMLDivElement>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const { tokens } = await api.listCliTokens();
-      setTokens(tokens);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load CLI tokens"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
 
   // Focus the warning when the confirm arms (not the destructive button — that is
   // how a confirmation becomes a formality), mirroring WorkersSettings.
@@ -83,7 +81,7 @@ export function CliTokens() {
       setCopied(false);
       setName("");
       setScope("user");
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to create CLI token"));
     } finally {
@@ -105,7 +103,7 @@ export function CliTokens() {
     setError("");
     try {
       await api.revokeCliToken(id);
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to revoke token"));
     }
@@ -116,7 +114,7 @@ export function CliTokens() {
     setConfirmingAll(false);
     try {
       await api.revokeAllCliTokens();
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to revoke tokens"));
     }
@@ -136,7 +134,7 @@ export function CliTokens() {
         </p>
       </div>
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
 
       {/* Show-once mint result. Only its hash is stored, so this is the one and only
           time the value appears — the copy affordance + warning mirror the worker

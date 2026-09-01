@@ -3,9 +3,8 @@
 // the capacity view leads with who is near a wall. Same table conventions as
 // Admin → Users; the meters reuse the shared MeterTrack + toneFor thresholds.
 
-import { useCallback, useEffect, useState } from "react";
 import { api, type AdminRateLimitUser, type MyRateLimits, type TokenRateLimits } from "../lib/api";
-import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
   formatAgo,
@@ -131,28 +130,19 @@ function UserCell({
 }
 
 export function AdminRateLimits() {
-  const [users, setUsers] = useState<AdminRateLimitUser[]>([]);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
+  // The poll reuses the hook's reload, so a poll failure surfaces the same error
+  // the initial load would (PRD #950 M3, Tier C). skeleton stays "initial" (the
+  // hook default), so the 60s poll's reload never re-shows the ListSkeleton — as
+  // today's poll never set loading true.
+  const { data, loading, error, reload } = useAsyncData(
+    async () => (await api.getAdminRateLimits()).users,
+    [],
+    { fallback: "Failed to load rate limits" },
+  );
+  const users = data ?? [];
   const now = useNow();
 
-  const load = useCallback(() => {
-    api
-      .getAdminRateLimits()
-      .then(({ users }) => {
-        setUsers(users);
-        setLoading(false);
-      })
-      .catch((err) => {
-        setError(errorMessage(err, "Failed to load rate limits"));
-        setLoading(false);
-      });
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-  usePollWhileVisible(load, 60_000);
+  usePollWhileVisible(reload, 60_000);
 
   const rows = sortAdminRows(users);
 

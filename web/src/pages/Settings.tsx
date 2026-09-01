@@ -7,10 +7,11 @@
 // model) moved to the Run defaults tab (RunDefaults.tsx): this tab is who you
 // are and what you hold, that one is how your runs behave.
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "../components/ui";
 import { AnthropicTokens } from "../components/AnthropicTokens";
 import { SettingsShell } from "../components/SettingsShell";
@@ -39,11 +40,11 @@ export function Settings() {
     prefs.set(ROTATE_NOTICE_KEY, true);
     setRotateDismissed(true);
   };
-  const [secrets, setSecrets] = useState<SecretMeta[]>([]);
-  const [loading, setLoading] = useState(true);
   // busy is the page-level guard the token card also respects, so two token
   // mutations cannot race each other's reloads.
   const [busy] = useState(false);
+  // `error` is the load error (from the hook, as `loadError`) OR an error set by a
+  // mutation handler / the token card here — the two share the one Alert slot below.
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -52,24 +53,19 @@ export function Settings() {
   // load and reload together.
   const [sidebarTokenIds, setSidebarTokenIds] = useState<string[]>([]);
 
-  const load = useCallback(async () => {
-    try {
+  const { data, loading, error: loadError, reload } = useAsyncData(
+    async () => {
       const [{ secrets: rows }, { settings }] = await Promise.all([
         api.listSecrets(),
         api.getMySettings(),
       ]);
-      setSecrets(rows.filter((s) => s.kind === "anthropic_token"));
       setSidebarTokenIds(settings.sidebar_token_ids ?? []);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load settings"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+      return { secrets: rows.filter((s) => s.kind === "anthropic_token") };
+    },
+    [],
+    { fallback: "Failed to load settings" },
+  );
+  const secrets: SecretMeta[] = data?.secrets ?? [];
 
   // Whole-set replace over PUT /me/settings, then tell the sidebar rail (a
   // separate mount) to refetch now rather than on its next poll.
@@ -117,14 +113,14 @@ export function Settings() {
 
   return (
     <SettingsShell description="Your Anthropic tokens, vault, appearance, and account.">
-      {error && <Alert message={error} />}
+      {(loadError || error) && <Alert message={loadError || error} />}
       {notice && <Alert tone="success" message={notice} />}
 
       <AnthropicTokens
         secrets={secrets}
         loading={loading}
         busy={busy}
-        reload={load}
+        reload={reload}
         onError={setError}
         onNotice={setNotice}
         judgeSecretId={user?.judge_anthropic_secret_id ?? null}

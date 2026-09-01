@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, isOpenMRConflict, openMRConflictMRIID, preferForgeUrl, type IssueDetail, type RunListItem } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
 import { activeRunInHistory, effectiveRunStatus, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
@@ -44,20 +45,20 @@ export function IssueView() {
   const navigate = useNavigate();
   const { uziLabel, autopilotLabel } = useAuth();
 
+  // `issue` is also written by the `promote` handler (setIssue at :promote), so it
+  // stays local and the fetcher sets it as a side effect rather than routing through
+  // the hook's read-only `data`.
   const [issue, setIssue] = useState<IssueDetail | null>(null);
-  const [runs, setRuns] = useState<RunListItem[]>([]);
-  const [hasWorker, setHasWorker] = useState(false);
-  const [hasToken, setHasToken] = useState(false);
-  const [loading, setLoading] = useState(true);
+  // `error` is the load error (from the hook, as `loadError`) OR a startRun/promote
+  // handler error kept here — the two share the one Alert slot below.
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
   const [promoting, setPromoting] = useState(false);
   // PRD #241: the "Schedule…" entry point, pre-pinned to this issue.
   const [scheduling, setScheduling] = useState(false);
 
-  const load = useCallback(async () => {
-    setError("");
-    try {
+  const { data, loading, error: loadError, reload } = useAsyncData(
+    async () => {
       const [{ issue }, { runs }, { workers }, { secrets }] = await Promise.all([
         api.getIssue(repoId, iidNum),
         api.listRuns({ repoId, issueIid: iidNum }),
@@ -65,19 +66,18 @@ export function IssueView() {
         api.listSecrets(),
       ]);
       setIssue(issue);
-      setRuns(runs);
-      setHasWorker(workers.length > 0);
-      setHasToken(hasAnthropicToken(secrets));
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load the issue"));
-    } finally {
-      setLoading(false);
-    }
-  }, [repoId, iidNum]);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+      return {
+        runs,
+        hasWorker: workers.length > 0,
+        hasToken: hasAnthropicToken(secrets),
+      };
+    },
+    [repoId, iidNum],
+    { fallback: "Failed to load the issue" },
+  );
+  const runs = data?.runs ?? [];
+  const hasWorker = data?.hasWorker ?? false;
+  const hasToken = data?.hasToken ?? false;
 
   const startRun = async () => {
     if (!issue) return;
@@ -113,13 +113,20 @@ export function IssueView() {
           }
         }
         // Declined (or forced retry failed): clear starting, no toast on decline.
+        // The original load() began with setError(""), so a forced-retry failure
+        // toast never persisted (issue #856, spec: keep as-is); reload() does not
+        // clear it, so preserve that wipe explicitly here.
         setStarting(false);
-        load();
+        setError("");
+        reload();
         return;
       }
       setError(errorMessage(err, "Could not start run"));
       setStarting(false);
-      load();
+      // As above: the old load() wiped this just-set message on entry so the toast
+      // never persisted; reproduce that clear now that reload() does not (issue #856).
+      setError("");
+      reload();
     }
   };
 
@@ -166,7 +173,7 @@ export function IssueView() {
         <span className="text-muted">#{iid}</span>
       </nav>
 
-      {error && <Alert message={error} />}
+      {(loadError || error) && <Alert message={loadError || error} />}
       {loading && <p className="text-faint">Loading issue…</p>}
 
       {issue && (

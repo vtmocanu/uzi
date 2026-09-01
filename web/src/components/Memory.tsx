@@ -6,9 +6,10 @@
 // arms a confirm before it fires. The store is inert/advisory — memory is read back
 // into a future run as untrusted, nonce-fenced context, never as instructions.
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { api, type Memory, type MemoryBasis } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, EmptyState, SectionTitle } from "./ui";
 import { ThoughtIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -50,30 +51,27 @@ function normalizeBasis(basis: Memory["basis"]): MemoryBasis {
 
 export function Memory() {
   const demo = useDemoMode();
-  const [entries, setEntries] = useState<Memory[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-
-  const load = useCallback(async () => {
-    try {
+  const {
+    data,
+    loading,
+    error: loadError,
+    reload,
+  } = useAsyncData<{ entries: Memory[] }>(
+    async () => {
       const { memories } = await api.listMemory();
-      setEntries(memories);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load memory"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+      return { entries: memories };
+    },
+    [],
+    { fallback: "Failed to load memory" },
+  );
+  const entries = data?.entries ?? [];
+  const [error, setError] = useState("");
 
   const remove = async (id: string) => {
     setError("");
     try {
       await api.deleteMemory(id);
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to delete memory"));
     }
@@ -93,7 +91,7 @@ export function Memory() {
         </p>
       </div>
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
 
       {loading ? (
         <div className="space-y-2">

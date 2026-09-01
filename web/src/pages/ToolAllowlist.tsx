@@ -2,9 +2,10 @@
 // tool profile. Admin-only page (gated by AdminRoute). The version policy is
 // optional: leave "Pinned version" blank to allow any version.
 
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { api, type ToolAllowlistEntry } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Button, Card, EmptyState, Field, Input, ListSkeleton } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
@@ -12,28 +13,25 @@ import { DOC_WORKER_TOOLS } from "../lib/doclinks";
 import { PackageIcon } from "../components/icons";
 
 export function ToolAllowlist() {
-  const [entries, setEntries] = useState<ToolAllowlistEntry[]>([]);
-  const [loading, setLoading] = useState(true);
+  const {
+    data,
+    loading,
+    error: loadError,
+    reload,
+  } = useAsyncData<{ entries: ToolAllowlistEntry[] }>(
+    async () => {
+      const { allowlist } = await api.listToolAllowlist();
+      return { entries: allowlist };
+    },
+    [],
+    { fallback: "Failed to load the allowlist" },
+  );
+  const entries = data?.entries ?? [];
   const [error, setError] = useState("");
   const [name, setName] = useState("");
   const [pinned, setPinned] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      const { allowlist } = await api.listToolAllowlist();
-      setEntries(allowlist);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load the allowlist"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
 
   const add = async (e: FormEvent) => {
     e.preventDefault();
@@ -48,7 +46,7 @@ export function ToolAllowlist() {
       setName("");
       setPinned("");
       setNote("");
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to add the package"));
     } finally {
@@ -60,7 +58,7 @@ export function ToolAllowlist() {
     setError("");
     try {
       await api.deleteToolAllowlistEntry(id);
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to remove the package"));
     }
@@ -77,7 +75,7 @@ export function ToolAllowlist() {
       }
     >
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
 
       <Card className="space-y-4">
         <form onSubmit={add} className="flex flex-wrap items-end gap-3">

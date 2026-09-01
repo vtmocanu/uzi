@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, isTerminalRun, type Chat as ChatDTO, type Run, type Worker } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import {
   CHAT_MAX_TURNS,
   chatFromRun,
@@ -66,29 +67,23 @@ function ChatStatusBadge({ status }: { status: string }) {
 
 export function ChatList() {
   const navigate = useNavigate();
-  const [chats, setChats] = useState<ChatDTO[]>([]);
-  const [workers, setWorkers] = useState<Worker[]>([]);
-  const [loading, setLoading] = useState(true);
+  // `error` is the load error (from the hook, as `loadError`) OR a start/continue
+  // handler error kept here (startChat, and ConversationRow via onError) — the two
+  // share the one Alert slot below.
   const [error, setError] = useState("");
   const [prompt, setPrompt] = useState("");
   const [starting, setStarting] = useState(false);
 
-  const load = useCallback(async () => {
-    setError("");
-    try {
+  const { data, loading, error: loadError } = useAsyncData(
+    async () => {
       const [chatRes, { workers }] = await Promise.all([api.listChats(), api.listWorkers()]);
-      setChats(sortConversations(chatRes.chats));
-      setWorkers(workers);
-    } catch (e) {
-      setError(errorMessage(e, "Failed to load chats"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+      return { chats: sortConversations(chatRes.chats), workers };
+    },
+    [],
+    { fallback: "Failed to load chats" },
+  );
+  const chats = data?.chats ?? [];
+  const workers = data?.workers ?? [];
 
   const startChat = async () => {
     const p = prompt.trim();
@@ -117,7 +112,7 @@ export function ChatList() {
         description="Talk to uzi about itself, your runs, and ideas. It answers on your worker, from your token — and can draft issues you confirm."
       />
 
-      {error && <Alert message={error} />}
+      {(loadError || error) && <Alert message={loadError || error} />}
       {!loading && !online && <WorkerOfflineBanner />}
 
       <Card className="space-y-3">

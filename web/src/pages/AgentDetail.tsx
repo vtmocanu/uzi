@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import {
@@ -9,6 +9,7 @@ import {
   type BuiltinDefinition,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import {
   driftedColumns,
   provenanceBadgeKind,
@@ -55,8 +56,6 @@ export function AgentDetail() {
   const isAdmin = !!user?.is_admin;
 
   const [template, setTemplate] = useState<AgentTemplate | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
   const [formError, setFormError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -65,8 +64,8 @@ export function AgentDetail() {
   // is a ref rather than lifted state.
   const editorRef = useRef<AgentTemplateEditorHandle>(null);
 
-  const load = useCallback(async () => {
-    try {
+  const { loading, error } = useAsyncData(
+    async () => {
       const { template } = await api.getAgentTemplate(id);
       setTemplate(template);
       // Only a caller who could actually press Reset has any use for the shipped
@@ -91,16 +90,10 @@ export function AgentDetail() {
           );
         }
       }
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load template"));
-    } finally {
-      setLoading(false);
-    }
-  }, [id, isAdmin]);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+    },
+    [id, isAdmin],
+    { fallback: "Failed to load template" },
+  );
 
   const save = async (input: AgentTemplateInput) => {
     setFormError("");

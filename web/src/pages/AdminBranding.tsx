@@ -12,7 +12,6 @@
 
 import {
   useCallback,
-  useEffect,
   useRef,
   useState,
   type FormEvent,
@@ -24,6 +23,7 @@ import {
   type UpdateSettingsPayload,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import {
   Alert,
   Button,
@@ -70,8 +70,9 @@ export function AdminBranding() {
   // Bumped after every upload/delete so the preview <img> re-fetches past the cache.
   const [logoRev, setLogoRev] = useState(0);
 
-  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  // Kept local: the save / upload / clear handlers below still set this, so it is
+  // merged with the hook's load error at the one page-level Alert.
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -86,22 +87,19 @@ export function AdminBranding() {
     setBrandPlaque(settings.brand_plaque === "true");
   }, []);
 
-  const load = useCallback(async () => {
-    try {
+  // Every loaded value is editable/derived form state the handlers below also write,
+  // so the fetcher seeds them as side effects exactly as the old load did; the hook
+  // only owns loading + the load error.
+  const { loading, error: loadError } = useAsyncData(
+    async () => {
       const [resp, brand] = await Promise.all([api.getSettings(), api.branding()]);
       applySettings(resp.settings);
       setAppPresent(brand.app_logo_present);
       setBrandPresent(brand.brand_logo_present);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load branding"));
-    } finally {
-      setLoading(false);
-    }
-  }, [applySettings]);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+    },
+    [applySettings],
+    { fallback: "Failed to load branding" },
+  );
 
   const dirty =
     saved !== null &&
@@ -285,7 +283,7 @@ export function AdminBranding() {
         </Card>
       ) : (
         <form onSubmit={save} className="space-y-6">
-          {error && <Alert message={error} />}
+          {(error || loadError) && <Alert message={error || loadError} />}
           {notice && <Alert message={notice} tone="success" />}
 
           <div className="grid gap-6 lg:grid-cols-[1fr_20rem]">
