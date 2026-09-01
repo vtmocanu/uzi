@@ -144,6 +144,12 @@ SELECT default_effort FROM users WHERE id = $1;
 UPDATE users SET default_effort = @default_effort WHERE id = @id
 RETURNING default_effort;
 
+-- name: GetUserAttributionEnabled :one
+-- The run owner's AI-attribution opt-out (issue #916). Read at run-claim assembly,
+-- keyed on the run owner, so flipping the toggle takes effect on the next claim with
+-- no worker restart. NOT NULL column (default true) → always a definite bool.
+SELECT attribution_enabled FROM users WHERE id = $1;
+
 -- name: GetUserJudgeModel :one
 -- The current user's per-user judge model override (PRD #69 M2); NULL = inherit
 -- the instance judge_model. Read at judge-claim assembly, keyed on the run owner.

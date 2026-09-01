@@ -176,6 +176,10 @@ func ciFixClaimPayload(t *testing.T) ClaimPayload {
 			PipelineID:      pgtype.Int8{Int64: 4200, Valid: true},
 			FailureSnapshot: snapJSON,
 		},
+		// issue #916: a fresh owner defaults to attribution-on (the NOT NULL column's
+		// default true), so the ci_fix golden carries attribution_enabled: true just like
+		// the shared skills golden. ci_fix rides the same assembleClaim site.
+		attributionEnabled: true,
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
 			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
@@ -215,13 +219,13 @@ func TestCIFixClaimWireContract(t *testing.T) {
 	got = append(got, '\n')
 	path := filepath.FromSlash(ciFixWireFixture)
 	if os.Getenv("UPDATE_GOLDEN") != "" {
-		if err := os.WriteFile(path, got, 0o644); err != nil {
+		if err := os.WriteFile(path, got, 0o644); err != nil { //nolint:gosec // G306: test golden fixture is non-sensitive and 0644 keeps it readable in the repo
 			t.Fatalf("update golden: %v", err)
 		}
 		t.Logf("wrote %s", path)
 		return
 	}
-	want, err := os.ReadFile(path)
+	want, err := os.ReadFile(path) //nolint:gosec // G304: path is a fixed in-repo golden constant, not attacker-controlled
 	if err != nil {
 		t.Fatalf("read golden (run `UPDATE_GOLDEN=1 go test` to create it): %v", err)
 	}

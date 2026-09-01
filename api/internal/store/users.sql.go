@@ -150,6 +150,20 @@ func (q *Queries) CreateUserOIDC(ctx context.Context, arg CreateUserOIDCParams) 
 	return i, err
 }
 
+const getUserAttributionEnabled = `-- name: GetUserAttributionEnabled :one
+SELECT attribution_enabled FROM users WHERE id = $1
+`
+
+// The run owner's AI-attribution opt-out (issue #916). Read at run-claim assembly,
+// keyed on the run owner, so flipping the toggle takes effect on the next claim with
+// no worker restart. NOT NULL column (default true) → always a definite bool.
+func (q *Queries) GetUserAttributionEnabled(ctx context.Context, id uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, getUserAttributionEnabled, id)
+	var attribution_enabled bool
+	err := row.Scan(&attribution_enabled)
+	return attribution_enabled, err
+}
+
 const getUserByEmail = `-- name: GetUserByEmail :one
 SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled FROM users WHERE email = $1
 `

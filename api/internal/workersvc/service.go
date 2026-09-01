@@ -698,6 +698,11 @@ type Store interface {
 	// claim assembly, keyed on the run owner. NULL ⇒ inherit (worker omits the SDK
 	// effort key, so the SDK default `high` applies).
 	GetUserDefaultEffort(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-user AI-attribution opt-out (issue #916): read LIVE at standard run-claim
+	// assembly, keyed on the run owner, so flipping the toggle takes effect on the
+	// next claim with no worker restart. NOT NULL column (default true) ⇒ a definite
+	// bool; false tells the worker to suppress the Co-Authored-By: Claude trailer.
+	GetUserAttributionEnabled(ctx context.Context, id uuid.UUID) (bool, error)
 	// Per-user judge model override (PRD #69 M2): read at judge-claim assembly,
 	// keyed on the run owner. NULL ⇒ inherit the instance judge_model.
 	GetUserJudgeModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
@@ -1145,7 +1150,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // worker-held answer deadline gone and no user-visible signal — on the ordinary
 // restart path this comment already names.
 func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string) (store.Worker, error) {
-	max := int32(s.p.RunMaxRequeues)
+	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
 		WorkerID:      pgUUID(wkr.ID),
@@ -1858,7 +1863,7 @@ func (s *Service) autoChoice(ctx context.Context, run store.Run) (secretChoice, 
 		// The gauge is a SMALLINT 0..100 and headroom is derived from it by subtraction,
 		// so the value is in range by construction and the narrowing cannot truncate.
 		// runs.anthropic_headroom_pct carries a CHECK BETWEEN 0 AND 100 as the backstop.
-		h := int16(out.Headroom)
+		h := int16(out.Headroom) //nolint:gosec // G115: Headroom is 0..100 by construction (see comment above; DB CHECK 0..100), so the narrowing cannot truncate
 		return secretChoice{secretID: &id, reason: string(out.Reason), headroom: &h}, nil
 	}
 	// NOT picked. The auto lane NEVER resolves the non-pooled owner default (#754).
@@ -2099,6 +2104,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, fmt.Errorf("default effort lookup: %w", err)
 	}
 
+	// The run owner's AI-attribution opt-out (issue #916), read live per claim so a
+	// flipped toggle takes effect on the next claim/resume with no worker restart —
+	// exactly like the effort/model reads above. NOT NULL column ⇒ always a definite bool.
+	attributionEnabled, err := s.q.GetUserAttributionEnabled(ctx, run.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("attribution lookup: %w", err)
+	}
+
 	// Skills (PRD #16): the per-run union of every skill allocated to any template
 	// for this run's owner (shared ∪ overlay), after precedence + the per-run cap.
 	// Re-assembled on every claim, including resume — a skill deleted between claim
@@ -2336,6 +2349,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
 			DefaultModel:           textPtr(defaultModel),
 			DefaultEffort:          textPtr(defaultEffort),
+			AttributionEnabled:     attributionEnabled,
 			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read
 			// straight off the run row — not re-derived from the schedule. false for every
 			// run that did not opt in, so omitempty keeps its claim byte-identical to today.
@@ -3603,7 +3617,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// Harmless on every heartbeat (the query COALESCEs the derived budget against the
 		// existing immutable columns, so only the FIRST report that carries a frozen list
 		// writes it — a later report re-supplies the same config and changes nothing).
-		runningParams.RunMaxIterations = int32(s.p.RunMaxIterations)
+		runningParams.RunMaxIterations = int32(s.p.RunMaxIterations) //nolint:gosec // G115: RunMaxIterations is a small bounded config int (env RUN_MAX_ITERATIONS), never near int32 range
 		runningParams.RunTimeoutSeconds = int32(s.p.RunTimeout.Seconds())
 		runningParams.MilestoneBudgetCap = milestoneBudgetCap
 		runningParams.BudgetWallCeilingSeconds = budgetWallCeilingSeconds
@@ -5645,7 +5659,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// same statement, or the cap stops meaning anything.
 	if kind == "revise_plan" {
 		row, err := s.q.CreateRunReviseInputIfUnderCap(ctx, store.CreateRunReviseInputIfUnderCapParams{
-			RunID: runID, Body: pgText(body), MaxRevisions: int32(s.p.PlanMaxRevisions),
+			RunID: runID, Body: pgText(body), MaxRevisions: int32(s.p.PlanMaxRevisions), //nolint:gosec // G115: PlanMaxRevisions is a small bounded config int (env PLAN_MAX_REVISIONS), never near int32 range
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return SubmitInputResult{}, ErrReviseCapReached
@@ -5718,7 +5732,7 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 		// this run's effective budget from its frozen milestone count, atomically with the
 		// candidate→frozen copy. IDEMPOTENT via COALESCE — a re-gate resume re-supplies the
 		// same config and never changes a budget frozen once.
-		RunMaxIterations:         int32(s.p.RunMaxIterations),
+		RunMaxIterations:         int32(s.p.RunMaxIterations), //nolint:gosec // G115: RunMaxIterations is a small bounded config int (env RUN_MAX_ITERATIONS), never near int32 range
 		RunTimeoutSeconds:        int32(s.p.RunTimeout.Seconds()),
 		MilestoneBudgetCap:       milestoneBudgetCap,
 		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
@@ -5941,7 +5955,7 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 	cleanBody, _ := stripNUL(auditBody)
 	if _, err := s.q.CreateScopeCeilingInput(ctx, store.CreateScopeCeilingInputParams{
 		RunID:        run.ID,
-		ScopeCeiling: pgtype.Int4{Int32: int32(ceiling), Valid: true},
+		ScopeCeiling: pgtype.Int4{Int32: int32(ceiling), Valid: true}, //nolint:gosec // G115: ceiling is a small bounded scope-cap count, never near int32 range
 		Body:         pgText(cleanBody),
 	}); err != nil {
 		return SubmitInputResult{}, err
@@ -6036,7 +6050,7 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	now := s.now()
 	staleCutoff := pgTime(now.Add(-s.p.WorkerHeartbeatStale))
 	claimCutoff := pgTime(now.Add(-s.p.ClaimGrace))
-	max := int32(s.p.RunMaxRequeues)
+	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 
 	var res SweepResult
 	var err error
@@ -6417,7 +6431,7 @@ func pgIntPtr(v *int) pgtype.Int4 {
 	if v == nil {
 		return pgtype.Int4{}
 	}
-	return pgtype.Int4{Int32: int32(*v), Valid: true}
+	return pgtype.Int4{Int32: int32(*v), Valid: true} //nolint:gosec // G115: max_concurrent_runs is a small operator-set worker capacity, never near int32 range
 }
 
 // pgFloat4Ptr maps an optional float (nil = "not reported") onto a nullable real

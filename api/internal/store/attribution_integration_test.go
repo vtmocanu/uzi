@@ -46,6 +46,10 @@ func TestAttributionEnabledLiveDB(t *testing.T) {
 	if !fresh.AttributionEnabled {
 		t.Fatalf("a fresh user must default attribution_enabled=true, got false")
 	}
+	// The narrow claim-assembly read (issue #916 M2) must agree with the full row.
+	if got, err := q.GetUserAttributionEnabled(ctx, uid); err != nil || !got {
+		t.Fatalf("GetUserAttributionEnabled on a fresh user = %v (err %v), want true", got, err)
+	}
 
 	// Opt out → false persists and is returned.
 	off, err := q.SetUserAttributionEnabled(ctx, store.SetUserAttributionEnabledParams{ID: uid, AttributionEnabled: false})
@@ -58,6 +62,11 @@ func TestAttributionEnabledLiveDB(t *testing.T) {
 	if reread, err := q.GetUserByID(ctx, uid); err != nil || reread.AttributionEnabled {
 		t.Fatalf("opt-out did not persist: got enabled=%v err=%v", reread.AttributionEnabled, err)
 	}
+	// SC3 liveness at the DB layer: the narrow read the claim path uses reflects the
+	// flipped value immediately, with no snapshot in between.
+	if got, err := q.GetUserAttributionEnabled(ctx, uid); err != nil || got {
+		t.Fatalf("GetUserAttributionEnabled after opt-out = %v (err %v), want false", got, err)
+	}
 
 	// Opt back in → true persists and is returned.
 	on, err := q.SetUserAttributionEnabled(ctx, store.SetUserAttributionEnabledParams{ID: uid, AttributionEnabled: true})
@@ -69,5 +78,8 @@ func TestAttributionEnabledLiveDB(t *testing.T) {
 	}
 	if reread, err := q.GetUserByID(ctx, uid); err != nil || !reread.AttributionEnabled {
 		t.Fatalf("opt-in did not persist: got enabled=%v err=%v", reread.AttributionEnabled, err)
+	}
+	if got, err := q.GetUserAttributionEnabled(ctx, uid); err != nil || !got {
+		t.Fatalf("GetUserAttributionEnabled after opt-in = %v (err %v), want true", got, err)
 	}
 }

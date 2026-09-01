@@ -147,7 +147,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			ClaudemdEnabled: true,     // PRD #246: repo owner opted into advisory CLAUDE.md; rides the claim byte-for-byte (no omitempty)
 			ForgeType:       "gitlab", // PRD #65 R8: emitted on every claim, "gitlab" for a GitLab connection
 		},
-		Secrets: ClaimSecrets{
+		Secrets: ClaimSecrets{ //nolint:gosec // G101: placeholder fixture strings (…-PLACEHOLDER), not real credentials
 			ForgeUsername:       "uzi-bot",
 			ForgePAT:            "FORGE-PAT-PLACEHOLDER",
 			AnthropicOAuthToken: "ANTHROPIC-OAUTH-PLACEHOLDER",
@@ -189,6 +189,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			QuestionMax:            5,
 			QuestionTimeoutSeconds: 86400,
 			DefaultModel:           strptr("sonnet"),
+			AttributionEnabled:     true, // issue #916: always-present bool, default true
 			SkillMaxBytes:          65536,
 			SkillsMaxPerRun:        32,
 			ToolPackages:           []string{"kubectl@1.31", "jq"}, // PRD #18 M3 tier-1 list
@@ -219,14 +220,14 @@ func TestClaimSkillsWireContract(t *testing.T) {
 
 	path := filepath.FromSlash(wireContractFixture)
 	if os.Getenv("UPDATE_GOLDEN") != "" {
-		if err := os.WriteFile(path, got, 0o644); err != nil {
+		if err := os.WriteFile(path, got, 0o644); err != nil { //nolint:gosec // G306: test golden fixture is non-sensitive and 0644 keeps it readable in the repo
 			t.Fatalf("update golden: %v", err)
 		}
 		t.Logf("wrote %s", path)
 		return
 	}
 
-	want, err := os.ReadFile(path)
+	want, err := os.ReadFile(path) //nolint:gosec // G304: path is a fixed in-repo golden constant, not attacker-controlled
 	if err != nil {
 		t.Fatalf("read golden (run `UPDATE_GOLDEN=1 go test` to create it): %v", err)
 	}
