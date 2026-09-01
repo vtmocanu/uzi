@@ -1,8 +1,3 @@
-<p align="center">
-  <img src=".github/readme/uzi-hero.jpg" width="640"
-       alt="A dark factory floor: a lead robot orchestrating from a console while worker bots assemble glowing code crates on a conveyor belt, a locked main vault, green and red CI status lights, and a human approving at a panel, under a neon uzi sign">
-</p>
-
 <h1 align="center">uzi</h1>
 
 <p align="center"><b>An AI dark factory: issues in, reviewed pull requests out.</b></p>
@@ -13,6 +8,11 @@
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status: alpha">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome">
   <a href="https://github.com/vtmocanu/uzi/stargazers"><img src="https://img.shields.io/github/stars/vtmocanu/uzi" alt="GitHub stars"></a>
+</p>
+
+<p align="center">
+  <img src=".github/readme/uzi-hero.jpg" width="640"
+       alt="A dark factory floor: a lead robot orchestrating from a console while worker bots assemble glowing code crates on a conveyor belt, a locked main vault, green and red CI status lights, and a human approving at a panel, under a neon uzi sign">
 </p>
 
 A **dark factory** runs with the lights off: no human on the floor. Machines take the raw input, do the work, and hand back a finished part. I built one for software. It is called **uzi** (Uzinele Întunecate, "dark factories"), and it is open source.
