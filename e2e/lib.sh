@@ -729,6 +729,26 @@ cat > "$RUNROOT/agent-gitconfig/neutral" <<'EOF'
 	directory = *
 EOF
 
+# The HOST-side CLI's GIT_CONFIG_GLOBAL for `uzi handoff` (PRD #966 M5). The handoff
+# CLI runs its own `git push`/`git remote get-url`/`git push --delete` client-side in
+# the caller's cwd under uzi_cli's `env -i` (see the uzi_cli() env below), so the git
+# child sees ONLY that env — it needs a global config FILE pointing at the local bare.
+# Unlike the worker's agent-gitconfig (CONTAINER paths /fakeremote/repo.git), these are
+# HOST absolute paths, because the handoff CLI and the phase's own host git run on the
+# host. safe.directory=* is required for the same #366 dubious-ownership reason the
+# worker's gitconfig documents: the bind-mounted bare's owner uid differs from the CI
+# runner's, and env -i cannot pass an inline `-c safe.directory`. insteadOf rewrites the
+# https forge-fake URL to the local bare so the CLI's push/delete/remote hit it directly
+# (a plain path, no auth). NON-quoted heredoc so $RUNROOT expands to the absolute path.
+cat > "$RUNROOT/host-gitconfig" <<EOF
+[safe]
+	directory = *
+[url "$RUNROOT/fakeremote/repo.git"]
+	insteadOf = https://forge-fake.e2e/group/repo.git
+[url "$RUNROOT/fakeremote/repo2.git"]
+	insteadOf = https://forge-fake.e2e/group/repo2.git
+EOF
+
 # Per-run env-file: strong generated secrets for the base stack + the scratch dir
 # the overlay bind-mounts. UZI_WORKER_TOKEN is only a placeholder here (the worker is
 # not up yet); run-e2e.sh EXPORTS the real minted token before the agent starts, and a
@@ -755,7 +775,10 @@ EOF
 
 
 # hoisted from phase 18 (PRD #966 M1): used by multiple phases
-uzi_cli() { env -i HOME="$RUNROOT" PATH="$PATH" UZI_URL="$BASE" UZI_TOKEN="$UZI_TOKEN_VAL" UZI_SKILL_AUTO_UPGRADE=0 UZI_VERSION_CHECK=0 "$UZI_BIN" "$@"; }
+# GIT_CONFIG_GLOBAL points the CLI's own client-side git (PRD #966 M5 `uzi handoff`
+# push/delete/remote-get-url) at the host-gitconfig above; harmless to the non-git CLI
+# phases (18/60/61/62), which never spawn git so git never consults it.
+uzi_cli() { env -i HOME="$RUNROOT" PATH="$PATH" UZI_URL="$BASE" UZI_TOKEN="$UZI_TOKEN_VAL" GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" UZI_SKILL_AUTO_UPGRADE=0 UZI_VERSION_CHECK=0 "$UZI_BIN" "$@"; }
 
 # hoisted from phase 37 (PRD #966 M1): used by multiple phases
 run_printed_instructions() {

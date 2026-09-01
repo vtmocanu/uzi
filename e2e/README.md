@@ -167,6 +167,7 @@ headers, not the rows.
 | 60 | schedules-sweep | gitlab | no | PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate skip, open-MR skip) |
 | 61 | schedules-prompt | gitlab | no | PRD #966 M4: scheduled prompt run (issue-less repo->MR run via run-now) |
 | 62 | self-improve | gitlab | no | PRD #966 M4: scheduled self_improve run (tracking issue, MR opened) |
+| 70 | handoff | gitlab | no | PRD #966 M5: task/handoff run kind via `uzi handoff` (+ host-gitconfig transport) |
 
 <!-- registry:end -->
 
