@@ -18,6 +18,31 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.74.0] - 2026-09-01
+
+### Added
+
+- **Per-user setting to disable AI attribution in worker commits and MR descriptions ([#942](https://github.com/vtmocanu/uzi/pull/942)).**
+  A new per-user toggle in Settings lets each user opt out of the AI attribution that uzi's worker adds to its git commits and merge-request descriptions; the current attribution stays on by default, with a backfill migration for existing users.
+
+### Changed
+
+- **Forge driver internals consolidated: shared wrapErr, bounded rawGet, and a pagination helper ([#937](https://github.com/vtmocanu/uzi/pull/937)).**
+  Internal refactor across the GitLab, Forgejo, and GitHub drivers extracting shared error wrapping, a size-bounded raw GET, and a common pagination helper, with no change to forge behaviour.
+- **Shared forgetest.BaseFake behind the forge.Forge test fakes ([#939](https://github.com/vtmocanu/uzi/pull/939)).**
+  Internal refactor giving the forge test fakes one shared base implementation so a new interface method no longer has to be hand-stubbed in each, with no runtime behaviour change.
+- **Agent read-only model passes consolidated into runReadOnlyModelPass ([#931](https://github.com/vtmocanu/uzi/pull/931)).**
+  Internal refactor unifying the agent's read-only model passes (judge, review, chat) onto a single helper, with no change to what those passes do.
+- **Web mechanical dedup: shared errorMessage() and useNow() helpers ([#935](https://github.com/vtmocanu/uzi/pull/935)).**
+  Internal refactor extracting repeated error-message formatting and current-time logic into shared helpers across the web components, with no UI behaviour change.
+- **Dependency bumps: @anthropic-ai/claude-agent-sdk to 0.3.245 ([#923](https://github.com/vtmocanu/uzi/pull/923)), agent-browser to 0.35.0 ([#924](https://github.com/vtmocanu/uzi/pull/924)), and gitlab.com/gitlab-org/api/client-go/v2 to v2.59.0 ([#925](https://github.com/vtmocanu/uzi/pull/925)).**
+  Routine dependency updates; the agent-SDK bump is patch-level parity with Claude Code (0.3.242 through 0.3.245) with no uzi code change required.
+
+### Fixed
+
+- **Selected floor-row title stays legible on light terminals in the CLI TUI ([#940](https://github.com/vtmocanu/uzi/pull/940)).**
+  The selected floor row's title in the TUI board was drawn in a colour that vanished against light terminal backgrounds; it now keeps contrast in both light and dark themes.
+
 ## [0.73.0] - 2026-09-01
 
 ### Added
@@ -3633,7 +3658,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.73.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.74.0...HEAD
+[0.74.0]: https://github.com/vtmocanu/uzi/compare/v0.73.0...v0.74.0
 [0.73.0]: https://github.com/vtmocanu/uzi/compare/v0.72.1...v0.73.0
 [0.72.1]: https://github.com/vtmocanu/uzi/compare/v0.72.0...v0.72.1
 [0.72.0]: https://github.com/vtmocanu/uzi/compare/v0.71.2...v0.72.0
