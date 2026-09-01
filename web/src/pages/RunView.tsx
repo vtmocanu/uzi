@@ -34,6 +34,7 @@ import { maskRepoPath } from "../lib/demoMask";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
 import { canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useNow } from "../lib/useNow";
 import { effectiveWorkerCaps } from "../lib/workerCaps";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import {
@@ -100,11 +101,7 @@ export function stageForMessages(messages: RunMessage[]): string {
 
 // LiveElapsed ticks a wall-clock timer for a still-running run.
 function LiveElapsed({ since }: { since: string }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
+  const now = useNow(1000);
   const start = new Date(since).getTime();
   if (!Number.isFinite(start)) return null;
   return <span className="text-xs tabular-nums text-faint">{formatDuration(now - start)}</span>;
@@ -123,11 +120,7 @@ function LiveElapsed({ since }: { since: string }) {
  * renders only in this branch — so without this the strip below could not be asserted.
  */
 export function HealthFlag({ run }: { run: Run }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 30_000);
-    return () => clearInterval(id);
-  }, []);
+  const now = useNow(30_000);
   const show = shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   const stuck = show && Number.isFinite(since) ? ` · stuck for ${formatElapsed(now - since)}` : "";
@@ -434,16 +427,11 @@ export function LimitWaitPanel({
   onStop: () => void;
 }) {
   const parked = run.status === "limit_wait";
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    // Only while parked: off the park there is no clock, and a 1s interval running
-    // for the life of every run view is pure waste. 1s (not HealthFlag's 30s)
-    // because the countdown drops to seconds in its last minute, which is exactly
-    // when someone is watching it.
-    if (!parked) return;
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [parked]);
+  // Only while parked: off the park there is no clock, and a 1s interval running
+  // for the life of every run view is pure waste. 1s (not HealthFlag's 30s)
+  // because the countdown drops to seconds in its last minute, which is exactly
+  // when someone is watching it.
+  const now = useNow(parked ? 1000 : null);
 
   // Terminal: no future limit to have an opinion about, and the server would no-op
   // the write anyway. Nothing renders at all — not a disabled checkbox, which would

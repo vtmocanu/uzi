@@ -4,8 +4,8 @@
 // countdowns tick between the 60s polls. Kept free of the api client so it unit-
 // tests without the mock; types are imported type-only (erased at build).
 
-import { useEffect, useState } from "react";
 import { toneFor } from "../components/Meter";
+import { useNow as useNowClock } from "./useNow";
 import type { AdminRateLimitUser, AutoStatus, MyRateLimits, RateLimitSource, TokenRateLimits } from "./api";
 import type { BadgeTone } from "../components/ui";
 
@@ -439,10 +439,5 @@ export function rowForecast(
 // 60s polls (Decision 7). Default 30s: fine-grained enough for "1h 23m" without
 // re-rendering every second.
 export function useNow(intervalMs = 30_000): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), intervalMs);
-    return () => clearInterval(id);
-  }, [intervalMs]);
-  return now;
+  return useNowClock(intervalMs);
 }
