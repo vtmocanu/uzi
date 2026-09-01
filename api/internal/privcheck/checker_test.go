@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 )
 
 // roleResult / protResult script the per-project forge answers.
@@ -23,8 +24,10 @@ type protResult struct {
 }
 
 // fakeForge is a scriptable Forge for the checker tests. Only the four methods
-// the checker calls carry behavior; the rest satisfy the interface with zeros.
+// the checker calls carry behavior; the rest are inherited from the embedded
+// forgetest.BaseFake, which fails loudly (ErrNotStubbed) on any unexpected call.
 type fakeForge struct {
+	forgetest.BaseFake
 	identity  forge.BotIdentity
 	verifyErr error
 	tokenInfo forge.TokenInfo
@@ -46,66 +49,6 @@ func (f *fakeForge) ProjectRole(_ context.Context, projectID, _ int64) (forge.Ro
 func (f *fakeForge) DefaultBranchProtection(_ context.Context, projectID int64, _ string, _ int64) (forge.BranchProtection, error) {
 	p := f.prots[projectID]
 	return p.bp, p.err
-}
-
-// Pipeline reads (PRD #6) are unused by this fake — stubbed to satisfy forge.Forge.
-func (f *fakeForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
-	return forge.Pipeline{}, forge.ErrNoPipeline
-}
-func (f *fakeForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
-	return forge.Pipeline{}, forge.ErrNoPipeline
-}
-func (f *fakeForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
-	return nil, nil
-}
-func (f *fakeForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
-func (f *fakeForge) ProjectCIConfigPath(context.Context, int64) (string, error)    { return "", nil }
-
-// Unused-by-checker methods.
-func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) { return nil, nil }
-func (f *fakeForge) ListLabels(context.Context, int64) ([]forge.Label, error) {
-	return nil, nil
-}
-func (f *fakeForge) EnsureLabels(context.Context, int64, []forge.Label) error { return nil }
-func (f *fakeForge) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
-	return nil, nil
-}
-func (f *fakeForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
-	return forge.Issue{}, nil
-}
-func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
-	return forge.Issue{}, nil
-}
-
-// PRD #72 M5: no-op stub — this fake's tests never patch a description.
-func (f *fakeForge) UpdateIssueDescription(context.Context, int64, int64, string) error {
-	return nil
-}
-
-func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
-	return nil
-}
-func (f *fakeForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
-	return forge.MergeRequest{}, nil
-}
-func (f *fakeForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
-	return nil, nil
-}
-func (f *fakeForge) ReplyMergeRequestComment(context.Context, int64, int64, string, string) error {
-	return nil
-}
-func (f *fakeForge) ResolveMergeRequestThread(context.Context, int64, int64, string) error {
-	return nil
-}
-func (f *fakeForge) UserExists(context.Context, string) (bool, error) { return false, nil }
-func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
-	return nil, nil
-}
-func (f *fakeForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
-	return nil, nil
-}
-func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
-	return forge.IssueNote{}, nil
 }
 
 var now = time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
