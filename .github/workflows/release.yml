@@ -174,11 +174,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
-      # Local composite: retrying, checksum-pinned cosign install (issue #945). The
-      # upstream sigstore/cosign-installer exposes no retry hook, so a transient TLS
-      # download failure on one runner stalled the whole Release; this survives it
-      # while keeping the same pinned cosign version. Needs the repo checked out
-      # first (every publish job's actions/checkout runs above).
+      # Retrying, checksum-pinned cosign install (issue #945; rationale in the action
+      # header). Needs the repo checked out first (actions/checkout runs above).
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
@@ -231,11 +228,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
-      # Local composite: retrying, checksum-pinned cosign install (issue #945). The
-      # upstream sigstore/cosign-installer exposes no retry hook, so a transient TLS
-      # download failure on one runner stalled the whole Release; this survives it
-      # while keeping the same pinned cosign version. Needs the repo checked out
-      # first (every publish job's actions/checkout runs above).
+      # Retrying, checksum-pinned cosign install (issue #945; rationale in the action
+      # header). Needs the repo checked out first (actions/checkout runs above).
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
@@ -278,11 +272,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
-      # Local composite: retrying, checksum-pinned cosign install (issue #945). The
-      # upstream sigstore/cosign-installer exposes no retry hook, so a transient TLS
-      # download failure on one runner stalled the whole Release; this survives it
-      # while keeping the same pinned cosign version. Needs the repo checked out
-      # first (every publish job's actions/checkout runs above).
+      # Retrying, checksum-pinned cosign install (issue #945; rationale in the action
+      # header). Needs the repo checked out first (actions/checkout runs above).
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
@@ -364,11 +355,8 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
-      # Local composite: retrying, checksum-pinned cosign install (issue #945). The
-      # upstream sigstore/cosign-installer exposes no retry hook, so a transient TLS
-      # download failure on one runner stalled the whole Release; this survives it
-      # while keeping the same pinned cosign version. Needs the repo checked out
-      # first (every publish job's actions/checkout runs above).
+      # Retrying, checksum-pinned cosign install (issue #945; rationale in the action
+      # header). Needs the repo checked out first (actions/checkout runs above).
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
@@ -508,11 +496,8 @@ jobs:
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
         with:
           version: v4.2.4
-      # Local composite: retrying, checksum-pinned cosign install (issue #945). The
-      # upstream sigstore/cosign-installer exposes no retry hook, so a transient TLS
-      # download failure on one runner stalled the whole Release; this survives it
-      # while keeping the same pinned cosign version. Needs the repo checked out
-      # first (every publish job's actions/checkout runs above).
+      # Retrying, checksum-pinned cosign install (issue #945; rationale in the action
+      # header). Needs the repo checked out first (actions/checkout runs above).
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
