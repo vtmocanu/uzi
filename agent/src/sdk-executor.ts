@@ -910,6 +910,17 @@ export class SdkExecutor implements Executor {
     const effort = ctx.config?.default_effort;
     if (effort) baseOptions.effort = effort;
 
+    // issue #916: the owner's AI-attribution opt-out, carried on the claim (resolved live
+    // per claim server-side). When explicitly false, suppress the Agent SDK's default
+    // Co-Authored-By: Claude commit trailer via Settings.attribution — empty string hides
+    // attribution (sdk.d.ts). Touch only commit+pr; leave sessionUrl at its default. When
+    // true or absent, set nothing so the SDK default is preserved (Decision 4) and an older
+    // server that omits the field keeps today's behavior. Reaches both the plan turn and the
+    // implement turn via the baseOptions spread (like effort above).
+    if (ctx.config?.attribution_enabled === false) {
+      baseOptions.settings = { attribution: { commit: "", pr: "" } };
+    }
+
     // PRD #122 M2: the wall budget the run STARTED with, kept so the loop can scale the
     // worker's own soft wall reference by the server-served delta exactly once (below).
     // On a resume this is already the scaled claim value; on a fresh run it is the global
