@@ -53,8 +53,8 @@ const (
 	// structurally excluded from every value-producing read — see SecretKeys.
 	KeySlackEnabled  = "slack_enabled"
 	KeyPublicBaseURL = "public_base_url"
-	KeySlackBotToken = "slack_bot_token"
-	KeySlackAppToken = "slack_app_token"
+	KeySlackBotToken = "slack_bot_token" //nolint:gosec // G101: DB setting-key name, not a credential value
+	KeySlackAppToken = "slack_app_token" //nolint:gosec // G101: DB setting-key name, not a credential value
 	// Run-judge keys (PRD #46 Decision 7). judge_enabled is the global kill-switch
 	// (text "true"/"false"); judge_model is the model the judge runs on (opus by
 	// default since PRD #69; a model alias, validated with the PRD #17 rules).
@@ -162,7 +162,7 @@ const (
 	// from the forge push PAT; read-only and clone-scoped — it can never push. Its
 	// decrypt accessor lands in M3 (clone auth), so none is added here (an unused
 	// accessor would trip deadcode).
-	KeyAgentSourceCredential = "agent_source_credential"
+	KeyAgentSourceCredential = "agent_source_credential" //nolint:gosec // G101: DB setting-key name, not a credential value
 	// Engine-managed agent-source last-sync status keys (PRD #602 M3). Like the
 	// selfimprove_* engine state, these are deliberately absent from Defaults so
 	// Known() rejects a generic-PUT write; the reconcile job sets them via
