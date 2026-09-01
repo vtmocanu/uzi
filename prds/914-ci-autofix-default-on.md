@@ -6,6 +6,28 @@
 **Split from**: #908 (this was #908's former Part B; #908 keeps Part A — autofix for scheduled runs).
 **Scope**: `api/` (one migration) + `web/`. No `agent/` change. No `.github/workflows/**` changes.
 
+## 🔴 HARD PRECONDITION — DO NOT START UNLESS #908 HAS ALREADY MERGED TO `main`
+
+**If you are a uzi worker (or any implementer) picking this up: STOP and check first.** This PRD
+edits the exact same query that #908 edits (`ListCIAutofixCandidateRefs` in
+`api/internal/store/queries/ci_autofix.sql`). It **must not be started before #908 lands** — doing
+so produces a guaranteed merge conflict and can build on a candidate query that has not yet been
+widened for scheduled runs.
+
+**Precondition check (offline — run against the cloned `main` you are working from):**
+
+1. The recorder file `api/internal/forgesvc/scheduled_mr_watch.go` **exists** (it is created only by
+   #908), **and**
+2. `ListCIAutofixCandidateRefs` in `api/internal/store/queries/ci_autofix.sql` already lists
+   `'prompt'` and `'self_improve'` in its `r.kind IN (...)` filter (widened by #908's M4).
+
+**If EITHER check fails, #908 has NOT landed. Do NOT plan, do NOT implement, do NOT open an MR.**
+Immediately cancel/abort this run and report that #914 is blocked on #908 (not yet merged). It is
+correct to cancel here — this is a deliberate ordering gate, not a failure. The run can be
+re-triggered after #908 is on `main`.
+
+Only when **both** checks pass may you proceed with the milestones below.
+
 ## Problem
 
 CI autofix (`kind='ci_fix'`, `api/internal/poller/ci_autofix.go`) pushes a fix when an agent-MR
@@ -154,10 +176,11 @@ run in parallel; M3 depends on M2's type flip; M4 tests all three.
 - **R2 — Down migration is lossy.** Rollback collapses every inherit-on (NULL) row to off; it cannot
   restore pre-Up values. Stated in the migration comment (M2). The feature is reversible (admin
   global); the *schema rollback* is not.
-- **R3 — sequencing with #908.** Both #908 (Part A, M4 widens `ci_autofix.sql`'s kind filter, line 44)
-  and this PRD (M2 changes `ci_autofix.sql`'s user gate, line 67) edit the same query + its generated
-  `.sql.go`. **Land this AFTER #908 merges** so M2 rebases onto the widened filter; racing both means
-  this MR conflicts on that file (small — two different lines + the regenerated const).
+- **R3 — sequencing with #908 (now a HARD precondition, see the top of this PRD).** Both #908
+  (Part A, M4 widens `ci_autofix.sql`'s kind filter, line 44) and this PRD (M2 changes
+  `ci_autofix.sql`'s user gate, line 67) edit the same query + its generated `.sql.go`. This is no
+  longer "prefer to land after" — it is a **STOP gate**: the worker must run the precondition check
+  at the top and **cancel the run** if #908 has not merged, rather than produce a conflicting MR.
 - **R4 — `bool → pgtype.Bool` semantic slips.** A site treating the scanned value as a bare bool (or
   reading NULL as false) compiles but breaks inherit — the `toDTO` display reader especially. The gate
   + M4's candidate-query NULL-case test are the guard.
