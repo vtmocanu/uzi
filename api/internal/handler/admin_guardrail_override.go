@@ -8,8 +8,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -46,9 +44,8 @@ func (h *Handler) SetRepoGuardrailOverride(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+	id, ok := httpx.PathUUID(w, r, "id", "repo")
+	if !ok {
 		return
 	}
 	var req setGuardrailOverrideRequest
@@ -101,9 +98,8 @@ func (h *Handler) SetRepoGuardrailOverride(w http.ResponseWriter, r *http.Reques
 // next gate call. Same admin-only, unscoped-by-id shape and 404-on-unknown-id contract
 // as SetRepoGuardrailOverride.
 func (h *Handler) ClearRepoGuardrailOverride(w http.ResponseWriter, r *http.Request) {
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+	id, ok := httpx.PathUUID(w, r, "id", "repo")
+	if !ok {
 		return
 	}
 	repo, err := h.q.ClearRepoGuardrailOverride(r.Context(), id)

@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -60,9 +59,8 @@ func (h *Handler) DeleteMyMemory(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid memory id")
+	id, ok := httpx.PathUUID(w, r, "id", "memory")
+	if !ok {
 		return
 	}
 	n, err := h.q.DeleteAgentMemory(r.Context(), store.DeleteAgentMemoryParams{ID: id, UserID: user.ID})

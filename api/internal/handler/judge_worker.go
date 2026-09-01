@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -69,9 +68,8 @@ func (h *Handler) WorkerRunTrace(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	targetID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	targetID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	after := int32(0)
@@ -172,9 +170,8 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	targetID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	targetID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	var req workerReviewRequest

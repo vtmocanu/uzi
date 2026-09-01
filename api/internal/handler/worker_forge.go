@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -70,9 +69,8 @@ func (h *Handler) resolveForgeRun(w http.ResponseWriter, r *http.Request) (worke
 		httpx.Error(w, http.StatusUnauthorized, forgeErrAuth)
 		return workersvc.ForgeConn{}, nil, false
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
+	runID, ok := httpx.PathUUIDMsg(w, r, "id", forgeErrInvalid)
+	if !ok {
 		return workersvc.ForgeConn{}, nil, false
 	}
 	conn, err := h.wsvc.ForgeConnForRun(r.Context(), wkr, runID)

@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -51,9 +50,8 @@ func (h *Handler) WorkerTaskReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	targetID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	targetID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	var req workerTaskReviewRequest
@@ -141,9 +139,8 @@ func (h *Handler) GetTaskReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	res, err := h.wsvc.GetTaskReviewPanel(r.Context(), user.ID, user.IsAdmin, id)

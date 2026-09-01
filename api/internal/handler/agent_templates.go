@@ -11,7 +11,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -400,7 +399,7 @@ func (h *Handler) GetRenderedAgentTemplate(w http.ResponseWriter, r *http.Reques
 	// the browser from MIME-sniffing it into something executable.
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write(agenttmpl.Render(templateToDefinition(t))); err != nil {
+	if _, err := w.Write(agenttmpl.Render(templateToDefinition(t))); err != nil { //nolint:gosec // G705: response is text/markdown with X-Content-Type-Options: nosniff (headers set above), not served as HTML
 		slog.Error("write rendered template", "error", err)
 	}
 }
@@ -638,9 +637,8 @@ func (h *Handler) loadTemplateForViewer(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return store.AgentTemplate{}, false
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid template id")
+	id, ok := httpx.PathUUID(w, r, "id", "template")
+	if !ok {
 		return store.AgentTemplate{}, false
 	}
 	t, err := h.q.GetAgentTemplateForViewer(r.Context(), store.GetAgentTemplateForViewerParams{
@@ -669,9 +667,8 @@ func (h *Handler) loadTemplateForWrite(w http.ResponseWriter, r *http.Request) (
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return store.User{}, store.AgentTemplate{}, false
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid template id")
+	id, ok := httpx.PathUUID(w, r, "id", "template")
+	if !ok {
 		return store.User{}, store.AgentTemplate{}, false
 	}
 	t, err := h.templateWriteStore().GetAgentTemplate(r.Context(), id)

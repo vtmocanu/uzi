@@ -10,7 +10,6 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -366,9 +365,8 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	secretID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid secret id")
+	secretID, ok := httpx.PathUUID(w, r, "id", "secret")
+	if !ok {
 		return
 	}
 	var req struct {
@@ -383,6 +381,7 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 
 	// Validate + seal the new value (if any) BEFORE the transaction: sealing needs
 	// no DB, and a locked vault must surface as a 409 without ever opening a tx.
+	var err error
 	var newLabel string
 	if req.Label != nil {
 		newLabel, err = validateSecretLabel(*req.Label)
@@ -526,9 +525,8 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	secretID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid secret id")
+	secretID, ok := httpx.PathUUID(w, r, "id", "secret")
+	if !ok {
 		return
 	}
 	// A POINTER, so "field omitted" is distinguishable from "set to false". A plain
@@ -548,7 +546,7 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 
 	var out store.SetUserSecretAutoEligibleRow
 	var found bool
-	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
 		if _, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
 			ID: secretID, UserID: user.ID,
 		}); gerr != nil {
@@ -598,14 +596,13 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	secretID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid secret id")
+	secretID, ok := httpx.PathUUID(w, r, "id", "secret")
+	if !ok {
 		return
 	}
 
 	var found, refusedDefault bool
-	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
 		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
 			ID: secretID, UserID: user.ID,
 		})

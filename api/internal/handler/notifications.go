@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -207,9 +206,8 @@ func (h *Handler) MarkNotificationRead(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid notification id")
+	id, ok := httpx.PathUUID(w, r, "id", "notification")
+	if !ok {
 		return
 	}
 	row, err := h.q.MarkNotificationRead(r.Context(), store.MarkNotificationReadParams{ID: id, UserID: user.ID})
@@ -238,14 +236,14 @@ func parseNotifPage(r *http.Request) (lim, off int32, err error) {
 		if v > maxNotifLimit {
 			v = maxNotifLimit
 		}
-		lim = int32(v)
+		lim = int32(v) //nolint:gosec // G109: v is clamped to [1, maxNotifLimit] just above
 	}
 	if s := r.URL.Query().Get("offset"); s != "" {
 		v, e := strconv.Atoi(s)
 		if e != nil || v < 0 {
 			return 0, 0, errors.New("invalid offset")
 		}
-		off = int32(v)
+		off = int32(v) //nolint:gosec // G109: pagination offset, validated non-negative; a pathological value causes a query error, not unsafe behavior
 	}
 	return lim, off, nil
 }

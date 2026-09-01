@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
@@ -178,9 +177,8 @@ func (h *Handler) SetTemplateSkills(w http.ResponseWriter, r *http.Request) {
 // template they may not see. Writes the error response and returns ok=false on
 // any failure; an invisible template is 404 (existence hidden).
 func (h *Handler) templateIDForSkills(w http.ResponseWriter, r *http.Request, actor store.User) (uuid.UUID, bool) {
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid template id")
+	id, ok := httpx.PathUUID(w, r, "id", "template")
+	if !ok {
 		return uuid.UUID{}, false
 	}
 	if _, err := h.q.GetAgentTemplateForViewer(r.Context(), store.GetAgentTemplateForViewerParams{

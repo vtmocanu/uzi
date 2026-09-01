@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -389,9 +388,8 @@ func (h *Handler) chatUserAndID(w http.ResponseWriter, r *http.Request) (userID,
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return uuid.Nil, uuid.Nil, false
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid chat id")
+	id, ok = httpx.PathUUID(w, r, "id", "chat")
+	if !ok {
 		return uuid.Nil, uuid.Nil, false
 	}
 	return u.ID, id, true
@@ -403,9 +401,8 @@ func (h *Handler) chatProposalIDs(w http.ResponseWriter, r *http.Request) (userI
 	if !valid {
 		return uuid.Nil, uuid.Nil, uuid.Nil, false
 	}
-	propID, err := uuid.Parse(chi.URLParam(r, "pid"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid proposal id")
+	propID, ok = httpx.PathUUID(w, r, "pid", "proposal")
+	if !ok {
 		return uuid.Nil, uuid.Nil, uuid.Nil, false
 	}
 	return uid, id, propID, true

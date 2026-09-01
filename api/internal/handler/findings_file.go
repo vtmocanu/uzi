@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -64,9 +62,8 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	findingID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid finding id")
+	findingID, ok := httpx.PathUUID(w, r, "id", "finding")
+	if !ok {
 		return
 	}
 	var req fileFindingRequest
@@ -350,9 +347,8 @@ func (h *Handler) DismissFinding(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	findingID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid finding id")
+	findingID, ok := httpx.PathUUID(w, r, "id", "finding")
+	if !ok {
 		return
 	}
 	var req dismissFindingRequest

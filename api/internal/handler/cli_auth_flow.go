@@ -13,7 +13,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -375,9 +374,8 @@ func (h *Handler) writeCLIPollStatus(w http.ResponseWriter, ctx context.Context,
 // anti-race/anti-async-phishing property. M6's consent page must therefore render a
 // code input, not auto-fill.
 func (h *Handler) CLIAuthGetRequest(w http.ResponseWriter, r *http.Request) {
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid request id")
+	id, ok := httpx.PathUUID(w, r, "id", "request")
+	if !ok {
 		return
 	}
 	row, err := h.q.GetCLIAuthRequest(r.Context(), id)

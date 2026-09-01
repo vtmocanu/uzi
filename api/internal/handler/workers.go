@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -692,9 +691,8 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid worker id")
+	id, ok := httpx.PathUUID(w, r, "id", "worker")
+	if !ok {
 		return
 	}
 	if err := h.wsvc.DeleteWorker(r.Context(), user.ID, id); err != nil {
@@ -733,9 +731,8 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid worker id")
+	id, ok := httpx.PathUUID(w, r, "id", "worker")
+	if !ok {
 		return
 	}
 	var req struct {
@@ -1008,9 +1005,8 @@ func (h *Handler) DispatchTaskRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	run, err := h.wsvc.DispatchTaskRun(r.Context(), user.ID, id)
@@ -1117,9 +1113,8 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	run, err := h.wsvc.GetRunForViewer(r.Context(), user.ID, user.IsAdmin, id)
@@ -1221,9 +1216,8 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	after := int32(0)
@@ -1250,6 +1244,7 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 		bounded = true
 	}
 	var msgs []store.RunMessage
+	var err error
 	if bounded {
 		msgs, err = h.wsvc.ListRunMessagesForViewerPage(r.Context(), user.ID, user.IsAdmin, id, after, limit)
 	} else {
@@ -1280,9 +1275,8 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	var req apitypes.RunInputRequest
@@ -1303,6 +1297,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	// the requirement INTACT and the retry stays gated. Owner- and awaiting_approval-scoped in
 	// SQL, and inert for any kind other than approve_plan (the gate only runs for approve_plan).
 	var res workersvc.SubmitInputResult
+	var err error
 	if req.OverrideCapabilities {
 		res, err = h.wsvc.SubmitInputWithCapabilityOverride(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
 	} else {
@@ -1493,9 +1488,8 @@ func (h *Handler) ListRunInputs(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	rows, err := h.wsvc.ListFollowUpInputs(r.Context(), user.ID, id)
