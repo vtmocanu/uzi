@@ -1,7 +1,7 @@
 # PRD #920: agent read-only model-pass consolidation (runReadOnlyModelPass)
 
 **GitHub Issue**: [#920](https://github.com/vtmocanu/uzi/issues/920)
-**Status**: Draft (created 2026-09-01)
+**Status**: Complete (created 2026-09-01; completed 2026-09-01)
 **Priority**: High (security-relevant dedup: the isolation shape must currently stay correct in three places, and they have begun to diverge)
 **Parent**: epic #915 (Batch 1, P4)
 **Related**:
