@@ -125,7 +125,7 @@ export function RunDefaults() {
       await api.setAttributionEnabled(enabled);
       await refresh();
     } catch (err) {
-      setAttributionError(err instanceof ApiError ? err.message : "Failed to update AI attribution");
+      setAttributionError(errorMessage(err, "Failed to update AI attribution"));
     } finally {
       setAttributionBusy(false);
     }
