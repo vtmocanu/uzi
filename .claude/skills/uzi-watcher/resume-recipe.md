@@ -94,9 +94,12 @@ cd <the repo>                              # your normal checkout; work happens 
    git diff --name-only origin/main..HEAD -- .github/workflows/
    git log  --name-only origin/main..HEAD -- .github/workflows/
    git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty
-   gitleaks git --log-opts="origin/main..HEAD" --no-banner --redact   # push protection scans EVERY commit: must print "no leaks found"; --redact keeps a real hit out of the log
-   for c in $(git rev-list origin/main..HEAD); do git grep -c LITERAL "$c" -- DIR; done   # after a push-protection rejection: the retired literal, every line 0
+   go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --log-opts="origin/main..HEAD" --no-banner --redact   # EVERY commit in the range (push protection scans them all); must print "no leaks found". Same pinned route as scripts/scan-secrets.sh; --redact is a no-op without -v, harmless
    ```
+   After a push-protection rejection specifically, also run `git log -S 'THE_LITERAL' origin/main..HEAD` (the literal
+   GitHub named) — it must print nothing. GitHub's pattern set is not gitleaks',
+   so a clean range scan alone does not prove the push will be accepted; see SKILL.md's
+   *Push protection* subsection for the fold-into-the-introducing-commit step that precedes it.
 8. **Gate the touched components** (only the ones the diff touches): `task gate:api`,
    `gate:web`, `gate:agent`, `gate:controller`, and `./e2e/run-store-it.sh` if a `*_livedb`
    test changed. Use the repo's pinned toolchains (`GOTOOLCHAIN`, node@24 for web — see the

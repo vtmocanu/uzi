@@ -233,34 +233,33 @@ PR → admin-merge → cleanup.
 ### Push protection: the second push-rejection class, and it changes one landing step
 
 **A `GH013 … Push cannot contain secrets` rejection is GitHub Push Protection, not the
-workflow-scope guardrail, and the work is recoverable the same way** (the bundle-out
-above, then `resume-recipe.md`). Measured 2026-09-01 on #954: the run finished all three
-milestones, its `task gate:api` was green, and the push was refused for a "GitLab Access
-Token" — two 20-character `glpat-` TEST FIXTURES that a widened scrub pattern had forced
-from `glpat-x`. `task scan:secrets` (gitleaks) flags the same lines, but it lives in
-`gate:repo`, which the worker's component gate never runs.
+workflow-scope guardrail, and the work is recoverable the same way (see above).**
+Measured 2026-09-01 on #954: the run finished all three milestones, its `task gate:api`
+was green, and the push was refused for a "GitLab Access Token" — two 20-character
+`glpat-` TEST FIXTURES that a widened scrub pattern had forced from `glpat-x`. `task
+scan:secrets` (gitleaks) flags the same lines, but it lives in `gate:repo`, which the
+worker's component gate never runs.
 
 Two things the workflow-scope entry does not prepare you for:
 
 - **Push protection scans EVERY commit in the push, so a fix commit on top is refused
   too.** Rewriting the literal at the tip and pushing again fails identically, with the
-  ORIGINAL commit named in the message. The literal must be removed from the commit that
-  introduced it before the first push: `git reset --soft` back over the stack (or a
-  cherry-pick chain), fold the fix into that commit, re-apply the rest. Nothing was on the
-  remote, so this is history editing with no downstream.
+  ORIGINAL commit named in the message. The literal must leave the commit that introduced
+  it before the first push, and nothing is on the remote yet, so this is plain history
+  editing: fix the file, then `git commit --fixup=INTRO_SHA` and
+  `GIT_SEQUENCE_EDITOR=: git rebase --autosquash -i origin/main` — the fix lands in that
+  commit and every later commit replays unchanged (verified on a three-commit stack).
 - **Verify the RANGE, not the tip.** `task scan:secrets` reads tracked files at HEAD and
   goes green on a tip that is clean while an earlier commit still carries the literal.
-  The checks that match what GitHub does: `gitleaks git --log-opts="origin/main..HEAD"
-  --no-banner --redact` over the whole range (must print `no leaks found`; `--redact` keeps a
-  real hit out of the terminal and any captured log), and a per-commit grep
-  for the retired literal (`for c in $(git rev-list origin/main..HEAD); do git grep -c
-  LITERAL "$c" -- DIR; done`, every line 0). Both are in `resume-recipe.md`'s step-7
-  pre-flight now.
+  `resume-recipe.md`'s step-7 pre-flight now runs gitleaks over `origin/main..HEAD` for
+  exactly this reason; after a push-protection rejection, additionally confirm the
+  literal GitHub named is gone from every commit with `git log -S 'THE_LITERAL'
+  origin/main..HEAD` (must print nothing) — GitHub's pattern set is not gitleaks', so a
+  clean range scan alone does not prove GitHub will accept the push.
 
-The fixture form that satisfies both scanners is a constant assembled from parts
-(`"glpat-" + "notAReal" + "0123456789"`); `//gitleaks:allow` silences gitleaks only, and
-push protection has no in-file allow directive. The authoring-side rule, so a PRD never
-ships this shape in the first place, is in `.claude/rules/prds.md`.
+The fixture form that satisfies both scanners, and why `//gitleaks:allow` is not enough,
+is the authoring-side rule in `.claude/rules/prds.md` (*A PRD whose tests need
+secret-SHAPED strings*); it is not repeated here.
 
 ### Proactive backups (before anything goes wrong)
 
@@ -767,8 +766,8 @@ Read the reason: `uzi run get RUN --json | jq '{status, failure_reason, health_r
 Common causes: the workflow-scope push rejection above; a GitHub Push Protection
 rejection (`GH013 … Push cannot contain secrets` — see *Push protection* under the PVC
 recovery section: recoverable, but the fix must be folded into the introducing commit);
-a `limit_wait` that never cleared; a genuine gate failure. Report the `failure_reason` verbatim and decide re-run vs. revise
-vs. hand back to the user.
+a `limit_wait` that never cleared; a genuine gate failure.
+Report the `failure_reason` verbatim and decide re-run vs. revise vs. hand back to the user.
 
 ## Cross-session handoff
 
