@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type User } from "../lib/api";
+import { api, type User } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Card, ListSkeleton } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { useDemoMode } from "../lib/demoMode";
@@ -37,7 +38,7 @@ export function AdminUsers() {
         setJudgeEnforceAll(false);
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load users");
+      setError(errorMessage(err, "Failed to load users"));
     } finally {
       setLoading(false);
     }
@@ -54,7 +55,7 @@ export function AdminUsers() {
       const { user } = await api.setUserActive(u.id, !u.is_active);
       setUsers((prev) => prev.map((x) => (x.id === user.id ? user : x)));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      setError(errorMessage(err, "Update failed"));
     } finally {
       setBusyId(null);
     }
@@ -70,7 +71,7 @@ export function AdminUsers() {
       const { user } = await api.setUserJudgeEnabled(u.id, !u.judge_enabled);
       setUsers((prev) => prev.map((x) => (x.id === user.id ? user : x)));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      setError(errorMessage(err, "Update failed"));
     } finally {
       setJudgeBusyId(null);
     }
@@ -86,7 +87,7 @@ export function AdminUsers() {
       const { user } = await api.setUserCIAutofixEnabled(u.id, !u.ci_autofix_enabled);
       setUsers((prev) => prev.map((x) => (x.id === user.id ? user : x)));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      setError(errorMessage(err, "Update failed"));
     } finally {
       setCiAutofixBusyId(null);
     }

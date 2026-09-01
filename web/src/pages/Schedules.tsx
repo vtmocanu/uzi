@@ -14,6 +14,7 @@ import {
   type Schedule,
   type ScheduleCatalog,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { relativeFromNow, ScheduleModal } from "../components/ScheduleModal";
 import { browserTimezone } from "../lib/timezone";
 import { useDemoMode } from "../lib/demoMode";
@@ -112,7 +113,7 @@ export function Schedules() {
       setRepos(repoList);
       setError("");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not load schedules");
+      setError(errorMessage(err, "Could not load schedules"));
       setSchedules((cur) => cur ?? []);
     }
   }, []);
@@ -134,7 +135,7 @@ export function Schedules() {
       // Keep the catalog view's enablement pause-flags in sync.
       load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not update the schedule");
+      setError(errorMessage(err, "Could not update the schedule"));
       // Revert on failure.
       setSchedules((rows) =>
         rows ? rows.map((r) => (r.id === s.id ? { ...r, enabled: s.enabled } : r)) : rows,
@@ -157,7 +158,7 @@ export function Schedules() {
       );
       load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not run the schedule now");
+      setError(errorMessage(err, "Could not run the schedule now"));
     } finally {
       setBusyId("");
     }
@@ -208,7 +209,7 @@ export function Schedules() {
       setNotice("Reset to the catalog default.");
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not reset the schedule");
+      setError(errorMessage(err, "Could not reset the schedule"));
     } finally {
       setBusyId("");
     }
@@ -228,7 +229,7 @@ export function Schedules() {
       setEditing(clone);
       setTab("mine");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not clone the schedule");
+      setError(errorMessage(err, "Could not clone the schedule"));
     } finally {
       setBusyId("");
     }
@@ -241,7 +242,7 @@ export function Schedules() {
       await api.deleteSchedule(s.id);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not remove the schedule");
+      setError(errorMessage(err, "Could not remove the schedule"));
     } finally {
       setBusyId("");
     }
@@ -275,7 +276,7 @@ export function Schedules() {
       if (err instanceof ApiError && err.status === 409) {
         setNotice("That schedule is already on that repo.");
       } else {
-        setError(err instanceof ApiError ? err.message : "Could not add the repo");
+        setError(errorMessage(err, "Could not add the repo"));
       }
     } finally {
       setBusyId("");

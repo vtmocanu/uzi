@@ -5,6 +5,7 @@ import { prefs } from "../lib/prefs";
 import { stripUnsafeChars } from "../lib/safeText";
 import { deriveRunUsage, type PhaseUsage } from "../lib/runUsage";
 import { useReconnectingBanner, useTailOnAppend } from "../lib/useFollowScroll";
+import { useNow } from "../lib/useNow";
 import {
   buildToolIndex,
   describeError,
@@ -378,18 +379,6 @@ function relativeTime(iso: string, now: number): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
-}
-
-// useNow ticks a coarse clock so relative timestamps + the recency split age without
-// the feed needing a re-render from elsewhere. The active speaker's `working` never
-// depends on this tick (it trusts run.health), so the coarse cadence is harmless.
-function useNow(intervalMs: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(id);
-  }, [intervalMs]);
-  return now;
 }
 
 // Keep the DOM bounded on very long runs: past the trigger, render only the most

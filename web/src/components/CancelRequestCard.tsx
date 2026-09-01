@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { api, ApiError, type CancelRequest } from "../lib/api";
+import { api, type CancelRequest } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Button } from "./ui";
 import { XIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -24,7 +25,7 @@ export function CancelRequestCard({ request }: { request: CancelRequest }) {
       setState("cancelled");
     } catch (e) {
       // The server maps 404 → "run not found", 409 → "run has already finished".
-      setErr(e instanceof ApiError ? e.message : "Action failed");
+      setErr(errorMessage(e, "Action failed"));
     } finally {
       setBusy(false);
     }

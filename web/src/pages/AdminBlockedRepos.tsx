@@ -6,7 +6,8 @@
 // caveat: if privilege checks were never run, an empty list is "unknown", not "none".
 
 import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, type BlockedRepo } from "../lib/api";
+import { api, type BlockedRepo } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, Textarea } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { Modal } from "../components/Modal";
@@ -42,7 +43,7 @@ export function AdminBlockedRepos() {
       setRepos(res.repos);
       setChecksUnknown(res.checks_unknown);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load blocked repos");
+      setError(errorMessage(err, "Failed to load blocked repos"));
     } finally {
       setLoading(false);
     }
@@ -79,7 +80,7 @@ export function AdminBlockedRepos() {
       setAllowReason("");
       await load();
     } catch (err) {
-      setAllowError(err instanceof ApiError ? err.message : "Failed to allow the repo");
+      setAllowError(errorMessage(err, "Failed to allow the repo"));
     } finally {
       setAllowBusy(false);
     }
@@ -92,7 +93,7 @@ export function AdminBlockedRepos() {
       await api.clearRepoGuardrailOverride(repo.id);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to revoke the override");
+      setError(errorMessage(err, "Failed to revoke the override"));
     } finally {
       setRevokeBusyId(null);
     }

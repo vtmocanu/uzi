@@ -5,7 +5,8 @@
 // only ever touch their own mapping.
 
 import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, type SlackLink } from "../lib/api";
+import { api, type SlackLink } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, type BadgeTone, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
 import { DocLink } from "./DocLink";
 import { DOC_SLACK } from "../lib/doclinks";
@@ -42,7 +43,7 @@ export function SlackNotifications() {
       setLink(slack);
       setOverride(slack.member_id ?? "");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load notification settings");
+      setError(errorMessage(err, "Failed to load notification settings"));
     } finally {
       setLoading(false);
     }
@@ -60,7 +61,7 @@ export function SlackNotifications() {
       const { slack } = await api.setMySlackNotify(notify);
       setLink(slack);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to update notifications");
+      setError(errorMessage(err, "Failed to update notifications"));
     } finally {
       setBusy(false);
     }
@@ -80,7 +81,7 @@ export function SlackNotifications() {
           : "Override cleared. uzi will fall back to matching you by email.",
       );
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save the override");
+      setError(errorMessage(err, "Failed to save the override"));
     } finally {
       setBusy(false);
     }
@@ -94,7 +95,7 @@ export function SlackNotifications() {
       await api.testMySlackDM();
       setNotice("Test DM sent. Check your Slack messages from uzi.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to send the test DM");
+      setError(errorMessage(err, "Failed to send the test DM"));
     } finally {
       setBusy(false);
     }

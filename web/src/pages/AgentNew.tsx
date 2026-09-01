@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type AgentTemplateInput } from "../lib/api";
+import { api, type AgentTemplateInput } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Button, Card } from "../components/ui";
 import { AgentTemplateEditor } from "../components/AgentTemplateEditor";
 import { DocLink } from "../components/DocLink";
@@ -30,7 +31,7 @@ export function AgentNew() {
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
       navigate(`/agents/${encodeURIComponent(template.id)}`);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to create template");
+      setError(errorMessage(err, "Failed to create template"));
       setBusy(false);
     }
   };

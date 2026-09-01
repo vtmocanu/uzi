@@ -20,6 +20,7 @@ import {
   type Card as CardData,
   type RunListItem,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate, type StartRunGate } from "../lib/runStream";
 import {
@@ -499,7 +500,7 @@ export function Board() {
       const { board } = await api.getBoard(repoId);
       setBoard(board);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load board");
+      setError(errorMessage(err, "Failed to load board"));
     } finally {
       setLoading(false);
     }
@@ -615,11 +616,7 @@ export function Board() {
             await createAndOpen(true);
             return;
           } catch (retryErr) {
-            setError(
-              retryErr instanceof ApiError
-                ? retryErr.message
-                : "Could not start run",
-            );
+            setError(errorMessage(retryErr, "Could not start run"));
           }
         }
         // Declined (or forced retry failed): clear starting, no toast on decline.
@@ -627,7 +624,7 @@ export function Board() {
         loadPreconditions();
         return;
       }
-      setError(err instanceof ApiError ? err.message : "Could not start run");
+      setError(errorMessage(err, "Could not start run"));
       setStarting(null);
       loadPreconditions();
     }
@@ -645,7 +642,7 @@ export function Board() {
       // encodeURIComponent the id (see safeNextPath in Login.tsx).
       navigate(`/runs/${encodeURIComponent(run.id)}`);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not start CI fix");
+      setError(errorMessage(err, "Could not start CI fix"));
       setFixingRef(null);
     }
   };
@@ -657,7 +654,7 @@ export function Board() {
       const { board } = await api.syncRepo(repoId);
       setBoard(board);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Refresh failed");
+      setError(errorMessage(err, "Refresh failed"));
     } finally {
       setSyncing(false);
     }
@@ -691,7 +688,7 @@ export function Board() {
       return true;
     } catch (err) {
       suppressToastIids.current.delete(iid); // the move failed — nothing to suppress
-      setError(err instanceof ApiError ? err.message : "Move failed");
+      setError(errorMessage(err, "Move failed"));
       return false;
     }
   };
@@ -706,7 +703,7 @@ export function Board() {
       const { card: updated } = await api.promoteIssue(repoId, card.iid);
       setBoard((b) => (b ? { ...b, cards: b.cards.map((c) => (c.iid === updated.iid ? updated : c)) } : b));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not promote the issue");
+      setError(errorMessage(err, "Could not promote the issue"));
     } finally {
       setPromoting(null);
     }
@@ -804,7 +801,7 @@ export function Board() {
       try {
         await api.setBoardPrefs(repoId, { extra_labels, show_all });
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : "Could not save your board view");
+        setError(errorMessage(err, "Could not save your board view"));
         try {
           const fresh = await api.getBoardPrefs(repoId);
           // Guard the same stale-repo trap the load effect guards: the route swaps
@@ -950,7 +947,7 @@ export function Board() {
         }
         return true;
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : "Could not save the new order");
+        setError(errorMessage(err, "Could not save the new order"));
         return false;
       } finally {
         reorderRef.current = false;
@@ -2068,7 +2065,7 @@ function CreateIssueForm({
       await api.createIssue(repoId, title.trim(), description);
       onCreated();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : "Could not create the issue");
+      onError(errorMessage(err, "Could not create the issue"));
     } finally {
       setSaving(false);
     }
@@ -2252,7 +2249,7 @@ function ColumnSettings({
       );
       onSaved(updated);
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : "Could not save columns");
+      onError(errorMessage(err, "Could not save columns"));
     } finally {
       setSaving(false);
     }

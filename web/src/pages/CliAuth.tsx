@@ -16,6 +16,7 @@ import {
   type CliAuthStatus,
   type CliTokenScope,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Button, Card, Field, Input, Skeleton } from "../components/ui";
 import { ScopePicker } from "../components/ScopePicker";
 import { useDemoMode } from "../lib/demoMode";
@@ -67,9 +68,7 @@ export function CliAuth() {
       setLoadError(
         err instanceof ApiError && err.status === 404
           ? "This login request was not found. It may have already been used or expired."
-          : err instanceof ApiError
-            ? err.message
-            : "Failed to load the login request.",
+          : errorMessage(err, "Failed to load the login request."),
       );
     } finally {
       setLoading(false);
@@ -121,9 +120,7 @@ export function CliAuth() {
       setFormError(
         err instanceof ApiError && err.status === 409
           ? "This request is no longer pending, so there is nothing to deny."
-          : err instanceof ApiError
-            ? err.message
-            : "Failed to deny the request.",
+          : errorMessage(err, "Failed to deny the request."),
       );
     } finally {
       setBusy(false);

@@ -1,7 +1,8 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type AuthConfig } from "../lib/api";
+import { api, type AuthConfig } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { emailDomainAllowed } from "../lib/emailDomain";
 import { useDemoMode } from "../lib/demoMode";
 import { maskDomains } from "../lib/demoMask";
@@ -59,7 +60,7 @@ export function Register() {
       await register(email, password, displayName);
       navigate("/dashboard");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Something went wrong");
+      setError(errorMessage(err, "Something went wrong"));
     } finally {
       setSubmitting(false);
     }

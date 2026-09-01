@@ -5,7 +5,8 @@
 
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type Skill, type SkillScope } from "../lib/api";
+import { api, type Skill, type SkillScope } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import {
   bodyError,
   byteLength,
@@ -55,7 +56,7 @@ export function Skills() {
       const { skills } = await api.listSkills();
       setSkills(skills);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load skills");
+      setError(errorMessage(err, "Failed to load skills"));
     } finally {
       setLoading(false);
     }
@@ -94,7 +95,7 @@ export function Skills() {
       setNotice("Reset to the shipped default.");
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to reset");
+      setError(errorMessage(err, "Failed to reset"));
     } finally {
       setBusyId(null);
     }
@@ -109,7 +110,7 @@ export function Skills() {
       setNotice("Skill deleted.");
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to delete");
+      setError(errorMessage(err, "Failed to delete"));
     } finally {
       setBusyId(null);
     }
@@ -513,7 +514,7 @@ function SkillEditor({
       }
       onSaved();
     } catch (err) {
-      setServerError(err instanceof ApiError ? err.message : "Failed to save");
+      setServerError(errorMessage(err, "Failed to save"));
       setBusy(false);
     }
   };

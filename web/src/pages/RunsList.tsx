@@ -18,7 +18,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useOutletContext, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, isTerminalRun, preferForgeUrl, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
+import { api, isTerminalRun, preferForgeUrl, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill, cx } from "../components/ui";
 import { ActivityIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
@@ -135,7 +136,7 @@ export function RunsLayout() {
       setRuns(runs);
       setTokenCount(anthropicTokenCount(secrets));
     } catch (err) {
-      if (isAlive()) setError(err instanceof ApiError ? err.message : "Failed to load runs");
+      if (isAlive()) setError(errorMessage(err, "Failed to load runs"));
     } finally {
       if (isAlive()) setLoading(false);
     }
@@ -469,7 +470,7 @@ export function RunsList() {
         setAdminWorkers(w.workers);
       })
       .catch((err) => {
-        if (alive) setAdminError(err instanceof ApiError ? err.message : "Failed to load factory status");
+        if (alive) setAdminError(errorMessage(err, "Failed to load factory status"));
       })
       .finally(() => {
         if (alive) setAdminLoading(false);

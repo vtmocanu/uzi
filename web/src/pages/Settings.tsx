@@ -9,7 +9,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type SecretMeta } from "../lib/api";
+import { api, type SecretMeta } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "../components/ui";
 import { AnthropicTokens } from "../components/AnthropicTokens";
 import { SettingsShell } from "../components/SettingsShell";
@@ -60,7 +61,7 @@ export function Settings() {
       setSecrets(rows.filter((s) => s.kind === "anthropic_token"));
       setSidebarTokenIds(settings.sidebar_token_ids ?? []);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load settings");
+      setError(errorMessage(err, "Failed to load settings"));
     } finally {
       setLoading(false);
     }
@@ -82,7 +83,7 @@ export function Settings() {
       setSidebarTokenIds(settings.sidebar_token_ids ?? next);
       emitSidebarTokensChanged();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to update the sidebar meters");
+      setError(errorMessage(err, "Failed to update the sidebar meters"));
     }
   };
 
@@ -107,7 +108,7 @@ export function Settings() {
       await api.putMySettings({ theme: override });
       await refresh(); // sync themeOverride + re-apply the authoritative theme
     } catch (err) {
-      setThemeError(err instanceof ApiError ? err.message : "Failed to save theme");
+      setThemeError(errorMessage(err, "Failed to save theme"));
       await refresh(); // revert the optimistic stamp to the server's truth
     } finally {
       setThemeBusy(false);

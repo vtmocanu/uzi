@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type ForgeConnection, type ProjectSyncOwnerKind, type ProjectSyncStatus, type Repo, type ToolAllowlistEntry } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { repoFindings } from "../lib/privilege";
 import { useAuth } from "../auth/AuthContext";
 import { Alert, Badge, Button, Card, EmptyState, Input, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
@@ -199,7 +200,7 @@ export function Repos() {
       } else {
         setSyncStatus(null);
         setSyncLinked(false);
-        setSyncError(err instanceof ApiError ? err.message : "Failed to load the sync status");
+        setSyncError(errorMessage(err, "Failed to load the sync status"));
       }
     } finally {
       setSyncLoading(false);
@@ -403,7 +404,7 @@ export function Repos() {
           setConnectionId(match);
         }
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : "Failed to load connections");
+        setError(errorMessage(err, "Failed to load connections"));
       } finally {
         setLoading(false);
       }
@@ -418,7 +419,7 @@ export function Repos() {
       const { repos } = await api.listProjects(connId);
       setRepos(repos);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load projects");
+      setError(errorMessage(err, "Failed to load projects"));
     } finally {
       setRefreshing(false);
     }
@@ -442,7 +443,7 @@ export function Repos() {
         setError(err.message);
         setEnableViolations(body?.violations ?? []);
       } else {
-        setError(err instanceof ApiError ? err.message : "Update failed");
+        setError(errorMessage(err, "Update failed"));
       }
     } finally {
       setBusyId(null);
@@ -461,7 +462,7 @@ export function Repos() {
       setRepos((prev) => prev.filter((r) => r.id !== repo.id));
       setConfirmRemoveId(null);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Remove failed");
+      setError(errorMessage(err, "Remove failed"));
     } finally {
       setBusyId(null);
     }
@@ -480,7 +481,7 @@ export function Repos() {
       const { repo: updated } = await api.setRepoSkillsEnabled(repo.id, enabled);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      setError(errorMessage(err, "Update failed"));
     } finally {
       setSkillsBusyId(null);
     }
@@ -494,7 +495,7 @@ export function Repos() {
       const { repo: updated } = await api.setRepoClaudemdEnabled(repo.id, enabled);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      setError(errorMessage(err, "Update failed"));
     } finally {
       setClaudemdBusyId(null);
     }
@@ -513,7 +514,7 @@ export function Repos() {
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
       setConfirmTrustId(null);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      setError(errorMessage(err, "Update failed"));
     } finally {
       setTrustBusyId(null);
     }
@@ -546,7 +547,7 @@ export function Repos() {
       setToolSelection(new Set(profile.packages));
       setToolsRepoId(repo.id);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load the tool profile");
+      setError(errorMessage(err, "Failed to load the tool profile"));
     } finally {
       setToolsBusy(false);
     }
@@ -568,7 +569,7 @@ export function Repos() {
       await api.setRepoToolProfile(repoId, [...toolSelection]);
       setToolsRepoId(null);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save the tool profile");
+      setError(errorMessage(err, "Failed to save the tool profile"));
     } finally {
       setToolsBusy(false);
     }
@@ -584,7 +585,7 @@ export function Repos() {
       const { repo: updated } = await api.setRepoDevboxOptIn(repo.id, enabled);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      setError(errorMessage(err, "Update failed"));
     } finally {
       setToolsBusy(false);
     }
@@ -602,7 +603,7 @@ export function Repos() {
       const { repo: updated } = await api.setRepoFoldImproveUziBacklog(repo.id, enabled);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      setError(errorMessage(err, "Update failed"));
     } finally {
       setToolsBusy(false);
     }
@@ -619,7 +620,7 @@ export function Repos() {
       const { repo: updated } = await api.setRepoRequiredCapabilities(repo.id, nextCaps);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      setError(errorMessage(err, "Update failed"));
     } finally {
       setToolsBusy(false);
     }
@@ -656,7 +657,7 @@ export function Repos() {
       setAllowReason("");
       await loadProjects(connectionId);
     } catch (err) {
-      setAllowError(err instanceof ApiError ? err.message : "Failed to allow the repo");
+      setAllowError(errorMessage(err, "Failed to allow the repo"));
     } finally {
       setAllowBusy(false);
     }
@@ -671,7 +672,7 @@ export function Repos() {
       await api.clearRepoGuardrailOverride(repo.id);
       await loadProjects(connectionId);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to revoke the override");
+      setError(errorMessage(err, "Failed to revoke the override"));
     } finally {
       setOverrideBusyId(null);
     }

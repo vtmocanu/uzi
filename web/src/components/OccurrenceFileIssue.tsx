@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { api, ApiError, type IssueDraft, type JudgeFiledIssueRef, type Repo } from "../lib/api";
+import { api, type IssueDraft, type JudgeFiledIssueRef, type Repo } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Input, Select, Textarea, cx } from "./ui";
 import { ExternalLinkIcon, FileTextIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -125,7 +126,7 @@ export function OccurrenceFileIssue({
       setTitle(stripUnsafeChars(draft.title));
       setDescription(stripUnsafeChars(draft.description));
     } catch (e) {
-      setDraftErr(e instanceof ApiError ? e.message : "Could not load the draft");
+      setDraftErr(errorMessage(e, "Could not load the draft"));
     } finally {
       setLoadingDraft(false);
     }
@@ -140,7 +141,7 @@ export function OccurrenceFileIssue({
       onFiled?.();
     } catch (e) {
       // Forge rejected the write: the draft stays open with its edits intact.
-      setFileErr(e instanceof ApiError ? e.message : "Could not file the issue");
+      setFileErr(errorMessage(e, "Could not file the issue"));
     } finally {
       setBusy(false);
     }
