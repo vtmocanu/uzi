@@ -9,12 +9,14 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // fakeForge is a mocked Forge whose VerifyToken and ListProjects are scripted;
 // the label/issue methods are unused by the seed path.
 type fakeForge struct {
+	forgetest.BaseFake
 	identity   forge.BotIdentity
 	verifyErr  error
 	projects   []forge.Project
@@ -27,72 +29,6 @@ func (f *fakeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
 func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) {
 	return f.projects, f.projectErr
 }
-func (f *fakeForge) ListLabels(context.Context, int64) ([]forge.Label, error) { return nil, nil }
-func (f *fakeForge) EnsureLabels(context.Context, int64, []forge.Label) error { return nil }
-func (f *fakeForge) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
-	return nil, nil
-}
-func (f *fakeForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
-	return forge.Issue{}, nil
-}
-func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
-	return forge.Issue{}, nil
-}
-
-// PRD #72 M5: no-op stub — this fake's tests never patch a description.
-func (f *fakeForge) UpdateIssueDescription(context.Context, int64, int64, string) error {
-	return nil
-}
-
-func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
-	return nil
-}
-func (f *fakeForge) UserExists(context.Context, string) (bool, error) { return false, nil }
-func (f *fakeForge) ProjectCIConfigPath(context.Context, int64) (string, error) {
-	return "", nil
-}
-func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
-	return nil, nil
-}
-func (f *fakeForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
-	return nil, nil
-}
-func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
-	return forge.IssueNote{}, nil
-}
-func (f *fakeForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
-	return forge.MergeRequest{}, nil
-}
-func (f *fakeForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
-	return nil, nil
-}
-func (f *fakeForge) ReplyMergeRequestComment(context.Context, int64, int64, string, string) error {
-	return nil
-}
-func (f *fakeForge) ResolveMergeRequestThread(context.Context, int64, int64, string) error {
-	return nil
-}
-func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
-	return forge.TokenInfo{}, nil
-}
-func (f *fakeForge) ProjectRole(context.Context, int64, int64) (forge.Role, bool, error) {
-	return forge.RoleNone, false, nil
-}
-func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
-	return forge.BranchProtection{}, nil
-}
-
-// Pipeline reads (PRD #6) are unused by this fake — stubbed to satisfy forge.Forge.
-func (f *fakeForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
-	return forge.Pipeline{}, forge.ErrNoPipeline
-}
-func (f *fakeForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
-	return forge.Pipeline{}, forge.ErrNoPipeline
-}
-func (f *fakeForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
-	return nil, nil
-}
-func (f *fakeForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
 
 // fakeSvc stands in for *forgesvc.Service. It records whether a client was built
 // (to prove the existing-connection path never re-verifies) and seals PATs with
