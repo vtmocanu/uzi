@@ -1,18 +1,17 @@
-<p align="center">
-  <img src=".github/readme/uzi-hero.jpg" width="640"
-       alt="A dark factory floor: a lead robot orchestrating from a console while worker bots assemble glowing code crates on a conveyor belt, a locked main vault, green and red CI status lights, and a human approving at a panel, under a neon uzi sign">
-</p>
-
-<h1 align="center">uzi</h1>
-
 <p align="center"><b>An AI dark factory: issues in, reviewed pull requests out.</b></p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <a href="https://github.com/vtmocanu/uzi/releases"><img src="https://img.shields.io/github/v/release/vtmocanu/uzi" alt="Latest release"></a>
+  <a href="https://github.com/vtmocanu/uzi/actions/workflows/e2e.yml"><img src="https://github.com/vtmocanu/uzi/actions/workflows/e2e.yml/badge.svg?branch=main" alt="Nightly E2E"></a>
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status: alpha">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome">
   <a href="https://github.com/vtmocanu/uzi/stargazers"><img src="https://img.shields.io/github/stars/vtmocanu/uzi" alt="GitHub stars"></a>
+</p>
+
+<p align="center">
+  <img src=".github/readme/uzi-hero.jpg" width="640"
+       alt="A dark factory floor: a lead robot orchestrating from a console while worker bots assemble glowing code crates on a conveyor belt, a locked main vault, green and red CI status lights, and a human approving at a panel, under a neon uzi sign">
 </p>
 
 A **dark factory** runs with the lights off: no human on the floor. Machines take the raw input, do the work, and hand back a finished part. I built one for software. It is called **uzi** (Uzinele Întunecate, "dark factories"), and it is open source.
@@ -206,7 +205,8 @@ An agent drives it fully headless with a Bearer token in `UZI_TOKEN`: no browser
 - **[Findings](docs/findings.md)**: incidental bugs a run spots outside its task, deduped and filed on your say-so.
 - **The worker fleet**: load balancing across workers, [ephemeral workers](docs/hosted-workers.md) for one-off capabilities, and on-demand [devbox](https://www.jetify.com/devbox) tools ([worker docs](docs/worker-tools.md)).
 - **Your tokens**: pool more than one and auto-select the one with the most [rate-limit](docs/rate-limits.md) headroom; a run that hits a cap pauses and resumes on its own.
-- **[Memory](docs/memory.md)**, **[agent templates and skills](docs/agent-templates.md)**, **[OIDC SSO](docs/oidc.md)**, **[GitHub Projects sync](docs/github-project-sync.md)**, and **[cosign-signed images](docs/container-signing.md)**.
+- **[Agents and skills](docs/agent-templates.md)**: a dozen built-in agent templates (lead, reviewer, and others), each with its own model, tools, and prompt, that you can clone and customise, or bring your own per repo in `.claude/agents/`, chosen at the plan gate ([repo agents](docs/repo-agents.md)). Agents pull in skills, Markdown playbooks loaded on demand.
+- **[Memory](docs/memory.md)**, **[OIDC SSO](docs/oidc.md)**, **[GitHub Projects sync](docs/github-project-sync.md)**, and **[cosign-signed images](docs/container-signing.md)**.
 - The whole web UI is responsive, so you can browse the factory and approve a plan from your phone.
 
 ## Multi-forge
@@ -238,6 +238,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [prds/](prds/) for active work. The upside of catching uzi this early is that you get to shape where it goes, so issues and PRs are genuinely welcome.
+
+## Disclaimer
+
+uzi is alpha software that runs autonomous AI agents. They read your code, run commands inside their workers, and open pull requests on your forge using your own model tokens. **Use it at your own risk**, on repositories and infrastructure you own or are authorised to change.
+
+You stay in control by design: review the plan before you approve it, and review the diff before you merge it. uzi opens pull requests but never merges them, and never touches `main`. Nothing lands without a human deciding to merge it.
+
+uzi is provided "as is", without warranty of any kind (see [LICENSE](LICENSE)). You are responsible for what you approve, merge, and deploy.
 
 ## License
 
