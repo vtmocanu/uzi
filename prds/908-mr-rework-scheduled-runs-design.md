@@ -204,9 +204,10 @@ cost than reinventing two correctness paths that must not regress on the unatten
 - Wherever `SetReworkCanceller` is wired onto the forgesvc `Service` (search
   `SetReworkCanceller`) — no change, the recorder reuses the same field. Verify the poller
   constructs forgesvc with the canceller already set (it does today for `SyncMRStates`).
-- `docs/scheduling.md` — state that prompt and self_improve MRs now participate in MR
-  rework, default-on, with the per-schedule mr-rework toggle as the opt-out; note
-  ci_autofix parity is a separate follow-up.
+- `docs/scheduling.md` — state that prompt and self_improve MRs now participate in BOTH autofix
+  lanes: mr_rework (default-on, per-schedule toggle as the opt-out) and ci_autofix (on the owner's
+  existing user-level opt-in). NOTE: ci_autofix *scheduled-run parity* is IN scope in this PRD
+  (M2 decouple + M4 widen); only ci_autofix *default-on* is the separate follow-up (#914).
 
 **Entry point**: `poller.runPollOnce` — the new `SyncScheduledMRStates` call slots between
 `SyncMRStates` and the existing `mrReviewWatch.detect`, so a scheduled run's `mr_state` is
@@ -472,12 +473,13 @@ to withhold self_improve.
    deliberately deferred. **Confirm inbox-only is acceptable**, or the MR-note method becomes
    its own scoped issue.
 
-2. **ci_autofix parity is explicitly out of scope.** `ListCIAutofixCandidateRefs`
-   (`api/internal/store/queries/ci_autofix.sql`, search `AND r.kind IN ('issue', 'ci_fix')`)
-   has the identical `kind`-and-`issueIIDFromBranch` gating, so scheduled-run MRs also get no
-   CI-autofix today. Note that ci_autofix has **no** `mr_state` gate (it is pipeline-driven),
-   so bringing it to scheduled runs would **not** need the recorder — it is a smaller, separate
-   change. This design does not touch it. Confirm that stays a follow-up issue.
+2. **ci_autofix scheduled-run parity — RESOLVED: now IN scope in this PRD (#908).**
+   `ListCIAutofixCandidateRefs` (`ci_autofix.sql`, `AND r.kind IN ('issue', 'ci_fix')`) has the
+   identical `kind`-and-`issueIIDFromBranch` gating, so scheduled-run MRs get no CI-autofix today.
+   ci_autofix has **no** `mr_state` gate (it is pipeline-driven), so bringing it to scheduled runs
+   needs **no recorder** — just the M2 detector decouple + the M4 kind-filter widen (both already
+   cover it). What moved to a **separate issue (#914)** is only ci_autofix *default-on* (flipping
+   its user-level opt-in to default-on) — a different concern from scheduled-run parity.
 
 3. **Recorder `LIMIT` burst bound = 100** (mirrors `ListMRWatchCandidates`' hardcoded 100).
    Confirm that is a fine per-repo-per-tick ceiling for scheduled MRs, or set a smaller value.
