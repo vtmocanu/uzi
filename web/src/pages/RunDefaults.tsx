@@ -17,7 +17,7 @@ import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
 
 export function RunDefaults() {
-  const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel } = useAuth();
+  const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel, uziLabel } = useAuth();
   // Kept local: the save handlers below still set this on failure, so it is merged
   // with the hook's load error at the one page-level Alert.
   const [error, setError] = useState("");
@@ -331,7 +331,7 @@ export function RunDefaults() {
           <p className="mt-2 text-sm text-muted">
             With autopilot on, adding the{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">autopilot</code> label alongside{" "}
-            <code className="rounded bg-raised px-1 py-0.5 text-fg">PRD</code> on an issue in GitLab starts a
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">{uziLabel}</code> on an issue in GitLab starts a
             run <strong className="text-fg">unattended</strong>: it skips the pre-execution plan review and
             spends <strong className="text-fg">your own Anthropic tokens</strong>. The plan is still recorded
             for the audit trail, and the merge-request review stays your human gate. Attribution uses the

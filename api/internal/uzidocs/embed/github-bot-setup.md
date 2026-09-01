@@ -139,7 +139,7 @@ step](./github-project-sync.md#the-adopt-flow-step-by-step).
 ## 6. Enable the repo
 
 Open **Boards**, pick the connection, and enable each repo you added the bot to.
-This makes its board appear in the sidebar and starts syncing its `PRD`-labeled
+This makes its board appear in the sidebar and starts syncing its `uzi`-labeled
 issues (see [Board](./board.md)).
 
 If verification fails, check: the token's scope is exactly `repo`, it's a

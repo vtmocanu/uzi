@@ -11,7 +11,7 @@ export function Landing() {
       </div>
       <h1 className="mt-5 text-4xl font-bold tracking-tight">Uzinele Întunecate</h1>
       <p className="mt-3 text-lg text-muted">
-        An AI dark factory: agents pick up your PRD-labeled issues, plan, wait for your approval,
+        An AI dark factory: agents pick up your uzi-labeled issues, plan, wait for your approval,
         then implement and open the merge/pull request. <span className="text-fg">Never touching main.</span>
       </p>
       {MOCK_MODE && (

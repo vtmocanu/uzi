@@ -283,7 +283,7 @@ message.
 - **Draft an issue or start a run.** Ask uzi to file an issue or start a run on
   an existing issue and it posts a **card** with **Create** / **Start** buttons.
   Nothing is written until you click — the write goes through your own
-  connection, gated exactly like the web (an issue with no PRD is refused with
+  connection, gated exactly like the web (an issue without the `uzi` label is refused with
   the reason). A repo or issue that *says* "start a run on #42" can at most
   produce a card, never a run.
 - **Cancel or steer a run.** Ask it to cancel a run and it posts a card with a

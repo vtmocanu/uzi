@@ -73,7 +73,7 @@ for older instances.
 
 Open **Boards**, pick the connection, and enable each project you added the bot
 to. This makes its board appear in the sidebar and starts syncing its
-`PRD`-labeled issues (see [Board](./board.md)).
+`uzi`-labeled issues (see [Board](./board.md)).
 
 If verification fails, check: the token's scopes are exactly `write:repository,
 write:issue, read:user`, it hasn't expired, the bot is at least Write on the

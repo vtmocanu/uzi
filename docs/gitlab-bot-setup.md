@@ -35,7 +35,7 @@ Project → **Manage → Members → Invite members**, add the bot with role **D
 
 ## 5. Enable the repo
 
-Open **Boards**, pick the connection, and enable each project you added the bot to. This makes its board appear in the sidebar and starts syncing its issues: the `PRD`-labeled ones, which are the ones uzi works, plus its other open issues, which the board hides until you ask for them (see [Board](./board.md)).
+Open **Boards**, pick the connection, and enable each project you added the bot to. This makes its board appear in the sidebar and starts syncing its issues: the `uzi`-labeled ones, which are the ones uzi works, plus its other open issues, which the board hides until you ask for them (see [Board](./board.md)).
 
 If verification fails, check: the PAT's scope is `api`, it hasn't expired, and the bot is at least Developer on the target project.
 
