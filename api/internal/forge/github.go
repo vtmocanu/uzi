@@ -1300,11 +1300,11 @@ type graphqlResponse struct {
 func (g *github) graphqlDo(ctx context.Context, query string, vars map[string]any, out any) error {
 	payload, err := json.Marshal(map[string]any{"query": query, "variables": vars})
 	if err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: encode request: %w", err))
+		return g.wrapErr("graphql: encode request", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.graphqlURL(), bytes.NewReader(payload))
 	if err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: build request: %w", err))
+		return g.wrapErr("graphql: build request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -1312,19 +1312,19 @@ func (g *github) graphqlDo(ctx context.Context, query string, vars map[string]an
 	// timeout; NEVER g.logClient (no auth, refuses redirects).
 	resp, err := g.client.Client().Do(req)
 	if err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: %w", err))
+		return g.wrapErr("graphql", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTraceBytes+1))
 	if err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: read response: %w", err))
+		return g.wrapErr("graphql: read response", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return g.redact.error(fmt.Errorf("github: graphql: status %d: %s", resp.StatusCode, string(body)))
+		return g.wrapErr("graphql", fmt.Errorf("status %d: %s", resp.StatusCode, string(body)))
 	}
 	var envelope graphqlResponse
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return g.redact.error(fmt.Errorf("github: graphql: decode response: %w", err))
+		return g.wrapErr("graphql: decode response", err)
 	}
 	if len(envelope.Errors) > 0 {
 		msgs := make([]string, 0, len(envelope.Errors))
@@ -1336,7 +1336,7 @@ func (g *github) graphqlDo(ctx context.Context, query string, vars map[string]an
 			}
 		}
 		// The joined message is still redacted so a reflected PAT never escapes.
-		redactedErr := g.redact.error(fmt.Errorf("github: graphql: %s", strings.Join(msgs, "; ")))
+		redactedErr := g.wrapErr("graphql", fmt.Errorf("%s", strings.Join(msgs, "; ")))
 		if notFound {
 			// Wrap the (already redacted) error so errors.Is(err,
 			// ErrGitHubUserNotFound) is true for the caller while the scrubbed
@@ -1349,7 +1349,7 @@ func (g *github) graphqlDo(ctx context.Context, query string, vars map[string]an
 	}
 	if out != nil {
 		if err := json.Unmarshal(envelope.Data, out); err != nil {
-			return g.redact.error(fmt.Errorf("github: graphql: decode data: %w", err))
+			return g.wrapErr("graphql: decode data", err)
 		}
 	}
 	return nil

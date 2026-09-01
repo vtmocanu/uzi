@@ -82,10 +82,21 @@ func newGitLab(baseURL, token string, timeout time.Duration) (*gitLab, error) {
 	}, nil
 }
 
+// wrapErr adds op context and routes the error through the PAT redactor so no
+// error this driver surfaces can carry the token. A nil error passes through as
+// nil. (No rate-limit classification: the go-gitlab client handles 429/Retry-After
+// at the transport layer; see the client-construction comment.)
+func (g *gitLab) wrapErr(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return g.redact.error(fmt.Errorf("gitlab: %s: %w", op, err))
+}
+
 func (g *gitLab) VerifyToken(ctx context.Context) (BotIdentity, error) {
 	u, _, err := g.client.Users.CurrentUser(gitlab.WithContext(ctx))
 	if err != nil {
-		return BotIdentity{}, g.redact.error(fmt.Errorf("gitlab: verify token: %w", err))
+		return BotIdentity{}, g.wrapErr("verify token", err)
 	}
 	// IsAdmin rides on the same GET /user response VerifyToken already makes:
 	// GitLab only returns is_admin:true for an admin caller, and omits it for a
@@ -102,7 +113,7 @@ func (g *gitLab) TokenInfo(ctx context.Context) (TokenInfo, error) {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return TokenInfo{}, ErrTokenIntrospectionUnsupported
 		}
-		return TokenInfo{}, g.redact.error(fmt.Errorf("gitlab: token info: %w", err))
+		return TokenInfo{}, g.wrapErr("token info", err)
 	}
 	info := TokenInfo{
 		Scopes: append([]string(nil), t.Scopes...),
@@ -147,7 +158,7 @@ func (g *gitLab) ProjectRole(ctx context.Context, projectID, forgeUserID int64) 
 			// was enabled). Reported as a finding by the checker, not an error.
 			return RoleNone, false, nil
 		}
-		return RoleNone, false, g.redact.error(fmt.Errorf("gitlab: project role: %w", err))
+		return RoleNone, false, g.wrapErr("project role", err)
 	}
 	return roleForAccessLevel(int(m.AccessLevel)), true, nil
 }
@@ -166,7 +177,7 @@ func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, b
 				WriteRoleCanMerge: true,
 			}, nil
 		}
-		return BranchProtection{}, g.redact.error(fmt.Errorf("gitlab: branch protection: %w", err))
+		return BranchProtection{}, g.wrapErr("branch protection", err)
 	}
 	bp := BranchProtection{Protected: true}
 	for _, pl := range pb.PushAccessLevels {
@@ -221,7 +232,7 @@ func (g *gitLab) ListProjects(ctx context.Context) ([]Project, error) {
 		page++
 		projects, resp, err := g.client.Projects.ListProjects(opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list projects: %w", err))
+			return nil, g.wrapErr("list projects", err)
 		}
 		for _, p := range projects {
 			if p == nil {
@@ -235,13 +246,13 @@ func (g *gitLab) ListProjects(ctx context.Context) ([]Project, error) {
 			})
 		}
 		if len(out) > maxForgeItems {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list projects: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, g.wrapErr("list projects", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list projects: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, g.wrapErr("list projects", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -256,7 +267,7 @@ func (g *gitLab) ListLabels(ctx context.Context, projectID int64) ([]Label, erro
 		page++
 		labels, resp, err := g.client.Labels.ListLabels(projectID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list labels: %w", err))
+			return nil, g.wrapErr("list labels", err)
 		}
 		for _, l := range labels {
 			if l == nil {
@@ -265,13 +276,13 @@ func (g *gitLab) ListLabels(ctx context.Context, projectID int64) ([]Label, erro
 			out = append(out, Label{Name: l.Name, Color: l.Color})
 		}
 		if len(out) > maxForgeItems {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list labels: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, g.wrapErr("list labels", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list labels: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, g.wrapErr("list labels", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -296,7 +307,7 @@ func (g *gitLab) EnsureLabels(ctx context.Context, projectID int64, labels []Lab
 			opt.Color = gitlab.Ptr(l.Color)
 		}
 		if _, _, err := g.client.Labels.CreateLabel(projectID, opt, gitlab.WithContext(ctx)); err != nil {
-			return g.redact.error(fmt.Errorf("gitlab: create label %q: %w", l.Name, err))
+			return g.wrapErr(fmt.Sprintf("create label %q", l.Name), err)
 		}
 	}
 	return nil
@@ -329,7 +340,7 @@ func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 		page++
 		issues, resp, err := g.client.Issues.ListProjectIssues(projectID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list issues: %w", err))
+			return nil, g.wrapErr("list issues", err)
 		}
 		for _, i := range issues {
 			if i == nil {
@@ -343,13 +354,13 @@ func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 			}
 		}
 		if len(out) > maxForgeItems {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list issues: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, g.wrapErr("list issues", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list issues: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, g.wrapErr("list issues", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -359,7 +370,7 @@ func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 func (g *gitLab) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue, error) {
 	i, _, err := g.client.Issues.GetIssue(projectID, issueIID, gitlab.WithContext(ctx))
 	if err != nil {
-		return Issue{}, g.redact.error(fmt.Errorf("gitlab: get issue: %w", err))
+		return Issue{}, g.wrapErr("get issue", err)
 	}
 	return toIssue(i), nil
 }
@@ -375,7 +386,7 @@ func (g *gitLab) CreateIssue(ctx context.Context, projectID int64, title, descri
 	}
 	i, _, err := g.client.Issues.CreateIssue(projectID, opt, gitlab.WithContext(ctx))
 	if err != nil {
-		return Issue{}, g.redact.error(fmt.Errorf("gitlab: create issue: %w", err))
+		return Issue{}, g.wrapErr("create issue", err)
 	}
 	return toIssue(i), nil
 }
@@ -394,7 +405,7 @@ func (g *gitLab) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 		opt.RemoveLabels = &l
 	}
 	if _, _, err := g.client.Issues.UpdateIssue(projectID, issueIID, opt, gitlab.WithContext(ctx)); err != nil {
-		return g.redact.error(fmt.Errorf("gitlab: update issue labels: %w", err))
+		return g.wrapErr("update issue labels", err)
 	}
 	return nil
 }
@@ -405,7 +416,7 @@ func (g *gitLab) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 func (g *gitLab) UpdateIssueDescription(ctx context.Context, projectID, issueIID int64, description string) error {
 	opt := &gitlab.UpdateIssueOptions{Description: &description}
 	if _, _, err := g.client.Issues.UpdateIssue(projectID, issueIID, opt, gitlab.WithContext(ctx)); err != nil {
-		return g.redact.error(fmt.Errorf("gitlab: update issue description: %w", err))
+		return g.wrapErr("update issue description", err)
 	}
 	return nil
 }
@@ -421,7 +432,7 @@ func (g *gitLab) UserExists(ctx context.Context, username string) (bool, error) 
 		Username: gitlab.Ptr(username),
 	}, gitlab.WithContext(ctx))
 	if err != nil {
-		return false, g.redact.error(fmt.Errorf("gitlab: lookup user: %w", err))
+		return false, g.wrapErr("lookup user", err)
 	}
 	return len(users) > 0, nil
 }
@@ -434,7 +445,7 @@ func (g *gitLab) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 		page++
 		events, resp, err := g.client.ResourceLabelEvents.ListIssueLabelEvents(projectID, issueIID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list issue label events: %w", err))
+			return nil, g.wrapErr("list issue label events", err)
 		}
 		for _, e := range events {
 			if e == nil {
@@ -443,13 +454,13 @@ func (g *gitLab) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 			out = append(out, toLabelEvent(e))
 		}
 		if len(out) > maxForgeItems {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list issue label events: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, g.wrapErr("list issue label events", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list issue label events: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, g.wrapErr("list issue label events", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -473,7 +484,7 @@ func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int6
 		page++
 		notes, resp, err := g.client.Notes.ListIssueNotes(projectID, issueIID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list issue comments: %w", err))
+			return nil, g.wrapErr("list issue comments", err)
 		}
 		for _, n := range notes {
 			if n == nil || n.System {
@@ -491,13 +502,13 @@ func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int6
 			})
 		}
 		if len(out) > maxForgeItems {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list issue comments: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, g.wrapErr("list issue comments", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list issue comments: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, g.wrapErr("list issue comments", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -509,7 +520,7 @@ func (g *gitLab) CreateIssueNote(ctx context.Context, projectID, issueIID int64,
 		Body: gitlab.Ptr(body),
 	}, gitlab.WithContext(ctx))
 	if err != nil {
-		return IssueNote{}, g.redact.error(fmt.Errorf("gitlab: create issue note: %w", err))
+		return IssueNote{}, g.wrapErr("create issue note", err)
 	}
 	return IssueNote{ID: note.ID, Body: note.Body}, nil
 }
@@ -517,7 +528,7 @@ func (g *gitLab) CreateIssueNote(ctx context.Context, projectID, issueIID int64,
 func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error) {
 	mr, _, err := g.client.MergeRequests.GetMergeRequest(projectID, mrIID, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		return MergeRequest{}, g.redact.error(fmt.Errorf("gitlab: get merge request: %w", err))
+		return MergeRequest{}, g.wrapErr("get merge request", err)
 	}
 	return toMergeRequest(mr), nil
 }
@@ -539,7 +550,7 @@ func (g *gitLab) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 		page++
 		discussions, resp, err := g.client.Discussions.ListMergeRequestDiscussions(projectID, mrIID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list merge request comments: %w", err))
+			return nil, g.wrapErr("list merge request comments", err)
 		}
 		for _, d := range discussions {
 			if d == nil {
@@ -580,13 +591,13 @@ func (g *gitLab) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 			}
 		}
 		if len(out) > maxForgeItems {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list merge request comments: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list merge request comments: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -600,7 +611,7 @@ func (g *gitLab) ReplyMergeRequestComment(ctx context.Context, projectID, mrIID 
 	_, _, err := g.client.Discussions.AddMergeRequestDiscussionNote(projectID, mrIID, replyID,
 		&gitlab.AddMergeRequestDiscussionNoteOptions{Body: gitlab.Ptr(body)}, gitlab.WithContext(ctx))
 	if err != nil {
-		return g.redact.error(fmt.Errorf("gitlab: reply merge request comment: %w", err))
+		return g.wrapErr("reply merge request comment", err)
 	}
 	return nil
 }
@@ -611,7 +622,7 @@ func (g *gitLab) ResolveMergeRequestThread(ctx context.Context, projectID, mrIID
 	_, _, err := g.client.Discussions.ResolveMergeRequestDiscussion(projectID, mrIID, resolveID,
 		&gitlab.ResolveMergeRequestDiscussionOptions{Resolved: gitlab.Ptr(true)}, gitlab.WithContext(ctx))
 	if err != nil {
-		return g.redact.error(fmt.Errorf("gitlab: resolve merge request thread: %w", err))
+		return g.wrapErr("resolve merge request thread", err)
 	}
 	return nil
 }
@@ -627,7 +638,7 @@ func (g *gitLab) LatestPipeline(ctx context.Context, projectID int64, ref string
 	}
 	pipelines, _, err := g.client.Pipelines.ListProjectPipelines(projectID, opt, gitlab.WithContext(ctx))
 	if err != nil {
-		return Pipeline{}, g.redact.error(fmt.Errorf("gitlab: latest pipeline: %w", err))
+		return Pipeline{}, g.wrapErr("latest pipeline", err)
 	}
 	// A hostile forge could return a one-element list whose single entry is a JSON
 	// null, which decodes to a nil *PipelineInfo that passes len==0 but panics on
@@ -649,7 +660,7 @@ func (g *gitLab) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 	// pipelines the branch-ref query misses.
 	pipelines, _, err := g.client.MergeRequests.ListMergeRequestPipelines(projectID, mrIID, gitlab.WithContext(ctx))
 	if err != nil {
-		return Pipeline{}, g.redact.error(fmt.Errorf("gitlab: latest MR pipeline: %w", err))
+		return Pipeline{}, g.wrapErr("latest MR pipeline", err)
 	}
 	// Skip nil elements: a hostile forge could return a null entry in the list,
 	// which decodes to a nil *PipelineInfo and would panic the max-by-id scan.
@@ -676,7 +687,7 @@ func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 		page++
 		jobs, resp, err := g.client.Jobs.ListPipelineJobs(projectID, pipelineID, opt, gitlab.WithContext(ctx))
 		if err != nil {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list pipeline jobs: %w", err))
+			return nil, g.wrapErr("list pipeline jobs", err)
 		}
 		for _, j := range jobs {
 			if j == nil {
@@ -685,13 +696,13 @@ func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 			out = append(out, Job{ID: j.ID, Name: j.Name, Stage: j.Stage, Status: j.Status, WebURL: j.WebURL})
 		}
 		if len(out) > maxForgeItems {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list pipeline jobs: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, g.wrapErr("list pipeline jobs", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, g.redact.error(fmt.Errorf("gitlab: list pipeline jobs: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, g.wrapErr("list pipeline jobs", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -713,16 +724,16 @@ func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxByte
 	url := g.baseURL + "/api/v4/projects/" + strconv.FormatInt(projectID, 10) + "/jobs/" + strconv.FormatInt(jobID, 10) + "/trace"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: build request: %w", err))
+		return "", g.wrapErr("job log tail: build request", err)
 	}
 	req.Header.Set("PRIVATE-TOKEN", g.token)
 	resp, err := g.logClient.Do(req)
 	if err != nil {
-		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: %w", err))
+		return "", g.wrapErr("job log tail", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode/100 != 2 {
-		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: status %d", resp.StatusCode))
+		return "", g.wrapErr("job log tail", fmt.Errorf("status %d", resp.StatusCode))
 	}
 	// Fail closed past a hard ceiling. The LimitReader bounds the transfer to
 	// maxTraceBytes+1 bytes, so the read stops long before a pathological body is
@@ -730,9 +741,13 @@ func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxByte
 	// The returned tail is separately capped to maxBytes.
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxTraceBytes+1))
 	if err != nil {
-		return "", g.redact.error(fmt.Errorf("gitlab: read job trace: %w", err))
+		return "", g.wrapErr("read job trace", err)
 	}
 	if len(data) > maxTraceBytes {
+		// Intentionally NOT routed through wrapErr: this is a single-segment
+		// fail-closed message with no "op: detail" boundary, so wrapErr's
+		// "gitlab: <op>: <err>" form would insert a second colon and change the
+		// bytes. It already goes through redact.error, so the PAT cannot leak.
 		return "", g.redact.error(fmt.Errorf("gitlab: job %d trace exceeds the %d-byte ceiling", jobID, maxTraceBytes))
 	}
 	if maxBytes > 0 && len(data) > maxBytes {
@@ -753,7 +768,7 @@ func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxByte
 func (g *gitLab) ProjectCIConfigPath(ctx context.Context, projectID int64) (string, error) {
 	p, _, err := g.client.Projects.GetProject(int(projectID), nil, gitlab.WithContext(ctx))
 	if err != nil {
-		return "", g.redact.error(fmt.Errorf("gitlab: get project: %w", err))
+		return "", g.wrapErr("get project", err)
 	}
 	return p.CIConfigPath, nil
 }

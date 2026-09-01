@@ -151,6 +151,10 @@ func (g *github) JobLogTail(ctx context.Context, projectID, jobID int64, maxByte
 		return "", err // already sanitized; never carries the raw pre-signed URL
 	}
 	if len(data) > maxTraceBytes {
+		// Intentionally NOT routed through wrapErr: this is a single-segment
+		// fail-closed message with no "op: detail" boundary, so wrapErr's
+		// "github: <op>: <err>" form would insert a second colon and change the
+		// bytes. It already goes through redact.error, so the PAT cannot leak.
 		return "", g.redact.error(fmt.Errorf("github: job %d log exceeds the %d-byte ceiling", jobID, maxTraceBytes))
 	}
 	if maxBytes > 0 && len(data) > maxBytes {

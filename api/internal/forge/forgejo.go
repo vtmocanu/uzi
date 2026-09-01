@@ -99,9 +99,20 @@ func (f *forgejo) newClient(ctx context.Context) (*gitea.Client, error) {
 		// A NewClient failure here can only come from the base URL (the version
 		// round-trip is disabled); route it through the redactor in case the token
 		// ever appears.
-		return nil, f.redact.error(fmt.Errorf("forgejo: new client: %w", err))
+		return nil, f.wrapErr("new client", err)
 	}
 	return c, nil
+}
+
+// wrapErr adds op context and routes the error through the PAT redactor so no
+// error this driver surfaces can carry the token. A nil error passes through as
+// nil. (No rate-limit classification: the gitea SDK never surfaces a typed
+// rate-limit error, so there is no equivalent to github's errors.As branch.)
+func (f *forgejo) wrapErr(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return f.redact.error(fmt.Errorf("forgejo: %s: %w", op, err))
 }
 
 // repoSlugFor resolves a numeric projectID to its owner/repo pair, caching the
@@ -118,7 +129,7 @@ func (f *forgejo) repoSlugFor(c *gitea.Client, projectID int64) (repoSlug, error
 	}
 	r, _, err := c.GetRepoByID(projectID)
 	if err != nil {
-		return repoSlug{}, f.redact.error(fmt.Errorf("forgejo: resolve repo %d: %w", projectID, err))
+		return repoSlug{}, f.wrapErr(fmt.Sprintf("resolve repo %d", projectID), err)
 	}
 	if r == nil || r.Owner == nil {
 		return repoSlug{}, fmt.Errorf("forgejo: resolve repo %d: incomplete repository payload", projectID)
@@ -143,14 +154,14 @@ func (f *forgejo) VerifyToken(ctx context.Context) (BotIdentity, error) {
 	// surfaces it to the user verbatim.
 	raw, _, err := c.ServerVersion()
 	if err != nil {
-		return BotIdentity{}, f.redact.error(fmt.Errorf("forgejo: read server version: %w", err))
+		return BotIdentity{}, f.wrapErr("read server version", err)
 	}
 	if err := f.checkForgejoVersion(raw); err != nil {
 		return BotIdentity{}, err
 	}
 	u, _, err := c.GetMyUserInfo()
 	if err != nil {
-		return BotIdentity{}, f.redact.error(fmt.Errorf("forgejo: verify token: %w", err))
+		return BotIdentity{}, f.wrapErr("verify token", err)
 	}
 	// Forgejo always emits is_admin (no omitempty), so false means a real
 	// non-admin — the privilege checker treats true as a violation.
@@ -201,7 +212,7 @@ func (f *forgejo) ListProjects(ctx context.Context) ([]Project, error) {
 		page++
 		repos, resp, err := c.ListMyRepos(opt)
 		if err != nil {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list projects: %w", err))
+			return nil, f.wrapErr("list projects", err)
 		}
 		for _, r := range repos {
 			if r == nil || r.Permissions == nil || !r.Permissions.Push {
@@ -215,13 +226,13 @@ func (f *forgejo) ListProjects(ctx context.Context) ([]Project, error) {
 			})
 		}
 		if len(out) > maxForgeItems {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list projects: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, f.wrapErr("list projects", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list projects: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, f.wrapErr("list projects", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -259,17 +270,17 @@ func (f *forgejo) listRepoLabels(c *gitea.Client, slug repoSlug) ([]*gitea.Label
 		page++
 		labels, resp, err := c.ListRepoLabels(slug.owner, slug.repo, opt)
 		if err != nil {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list labels: %w", err))
+			return nil, f.wrapErr("list labels", err)
 		}
 		out = append(out, labels...)
 		if len(out) > maxForgeItems {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list labels: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, f.wrapErr("list labels", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list labels: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, f.wrapErr("list labels", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -302,7 +313,7 @@ func (f *forgejo) EnsureLabels(ctx context.Context, projectID int64, labels []La
 			color = forgejoDefaultLabelColor
 		}
 		if _, _, err := c.CreateLabel(slug.owner, slug.repo, gitea.CreateLabelOption{Name: l.Name, Color: color}); err != nil {
-			return f.redact.error(fmt.Errorf("forgejo: create label %q: %w", l.Name, err))
+			return f.wrapErr(fmt.Sprintf("create label %q", l.Name), err)
 		}
 	}
 	return nil
@@ -347,7 +358,7 @@ func (f *forgejo) ListIssues(ctx context.Context, projectID int64, opts ListIssu
 		page++
 		issues, resp, err := c.ListRepoIssues(slug.owner, slug.repo, opt)
 		if err != nil {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list issues: %w", err))
+			return nil, f.wrapErr("list issues", err)
 		}
 		for _, i := range issues {
 			if i == nil || i.PullRequest != nil {
@@ -361,13 +372,13 @@ func (f *forgejo) ListIssues(ctx context.Context, projectID int64, opts ListIssu
 			}
 		}
 		if len(out) > maxForgeItems {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list issues: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, f.wrapErr("list issues", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list issues: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, f.wrapErr("list issues", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -385,7 +396,7 @@ func (f *forgejo) GetIssue(ctx context.Context, projectID, issueIID int64) (Issu
 	}
 	i, _, err := c.GetIssue(slug.owner, slug.repo, issueIID)
 	if err != nil {
-		return Issue{}, f.redact.error(fmt.Errorf("forgejo: get issue: %w", err))
+		return Issue{}, f.wrapErr("get issue", err)
 	}
 	return toForgejoIssue(i), nil
 }
@@ -417,13 +428,13 @@ func (f *forgejo) UpdateIssueDescription(ctx context.Context, projectID, issueII
 	if err != nil {
 		// Redaction is per-method and not automatic, so the INTERNAL read's error
 		// needs wrapping too — it carries the same client and the same PAT.
-		return f.redact.error(fmt.Errorf("forgejo: update issue description: read current issue: %w", err))
+		return f.wrapErr("update issue description: read current issue", err)
 	}
 	if _, _, err := c.EditIssue(slug.owner, slug.repo, issueIID, gitea.EditIssueOption{
 		Title: cur.Title,
 		Body:  &description,
 	}); err != nil {
-		return f.redact.error(fmt.Errorf("forgejo: update issue description: %w", err))
+		return f.wrapErr("update issue description", err)
 	}
 	return nil
 }
@@ -450,7 +461,7 @@ func (f *forgejo) CreateIssue(ctx context.Context, projectID int64, title, descr
 	}
 	i, _, err := c.CreateIssue(slug.owner, slug.repo, opt)
 	if err != nil {
-		return Issue{}, f.redact.error(fmt.Errorf("forgejo: create issue: %w", err))
+		return Issue{}, f.wrapErr("create issue", err)
 	}
 	return toForgejoIssue(i), nil
 }
@@ -503,7 +514,7 @@ func (f *forgejo) UpdateIssueLabels(ctx context.Context, projectID, issueIID int
 		return err
 	}
 	if _, _, err := c.ReplaceIssueLabels(slug.owner, slug.repo, issueIID, gitea.IssueLabelsOption{Labels: ids}); err != nil {
-		return f.redact.error(fmt.Errorf("forgejo: update issue labels: %w", err))
+		return f.wrapErr("update issue labels", err)
 	}
 	return nil
 }
@@ -520,20 +531,20 @@ func (f *forgejo) issueLabelNames(c *gitea.Client, slug repoSlug, issueIID int64
 		page++
 		labels, resp, err := c.GetIssueLabels(slug.owner, slug.repo, issueIID, opt)
 		if err != nil {
-			return nil, nil, f.redact.error(fmt.Errorf("forgejo: list issue labels: %w", err))
+			return nil, nil, f.wrapErr("list issue labels", err)
 		}
 		for _, l := range labels {
 			names[l.Name] = struct{}{}
 			ids[l.Name] = l.ID
 		}
 		if len(names) > maxForgeItems {
-			return nil, nil, f.redact.error(fmt.Errorf("forgejo: list issue labels: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, nil, f.wrapErr("list issue labels", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, nil, f.redact.error(fmt.Errorf("forgejo: list issue labels: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, nil, f.wrapErr("list issue labels", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -581,7 +592,7 @@ func (f *forgejo) resolveLabelIDs(c *gitea.Client, slug repoSlug, names []string
 		if !ok {
 			created, _, err := c.CreateLabel(slug.owner, slug.repo, gitea.CreateLabelOption{Name: name, Color: forgejoDefaultLabelColor})
 			if err != nil {
-				return nil, f.redact.error(fmt.Errorf("forgejo: create missing label %q: %w", name, err))
+				return nil, f.wrapErr(fmt.Sprintf("create missing label %q", name), err)
 			}
 			id = created.ID
 		}
@@ -606,7 +617,7 @@ func (f *forgejo) UserExists(ctx context.Context, username string) (bool, error)
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return false, nil
 		}
-		return false, f.redact.error(fmt.Errorf("forgejo: lookup user: %w", err))
+		return false, f.wrapErr("lookup user", err)
 	}
 	return true, nil
 }
@@ -625,7 +636,7 @@ func (f *forgejo) ProjectRole(ctx context.Context, projectID, forgeUserID int64)
 	// caller (privcheck checks the bot); GetUserByID works for any visible user.
 	u, _, err := c.GetUserByID(forgeUserID)
 	if err != nil {
-		return RoleNone, false, f.redact.error(fmt.Errorf("forgejo: resolve user %d: %w", forgeUserID, err))
+		return RoleNone, false, f.wrapErr(fmt.Sprintf("resolve user %d", forgeUserID), err)
 	}
 	res, resp, err := c.CollaboratorPermission(slug.owner, slug.repo, u.UserName)
 	if err != nil {
@@ -636,7 +647,7 @@ func (f *forgejo) ProjectRole(ctx context.Context, projectID, forgeUserID int64)
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return RoleNone, false, nil
 		}
-		return RoleNone, false, f.redact.error(fmt.Errorf("forgejo: project role: %w", err))
+		return RoleNone, false, f.wrapErr("project role", err)
 	}
 	if res == nil {
 		return RoleNone, false, fmt.Errorf("forgejo: project role: empty permission payload")
@@ -699,7 +710,7 @@ func (f *forgejo) DefaultBranchProtection(ctx context.Context, projectID int64, 
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return BranchProtection{Protected: false, WriteRoleCanPush: true, WriteRoleCanMerge: true}, nil
 		}
-		return BranchProtection{}, f.redact.error(fmt.Errorf("forgejo: branch protection: %w", err))
+		return BranchProtection{}, f.wrapErr("branch protection", err)
 	}
 	// user_can_push / user_can_merge are the calling bot's authoritative rights.
 	// Forgejo folds the write-role capability and any per-user grant into these two
@@ -804,7 +815,7 @@ func (f *forgejo) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (
 	}
 	pr, _, err := c.GetPullRequest(slug.owner, slug.repo, mrIID)
 	if err != nil {
-		return MergeRequest{}, f.redact.error(fmt.Errorf("forgejo: get merge request: %w", err))
+		return MergeRequest{}, f.wrapErr("get merge request", err)
 	}
 	return toForgejoMergeRequest(pr), nil
 }
@@ -848,7 +859,7 @@ func (f *forgejo) CreateIssueNote(ctx context.Context, projectID, issueIID int64
 	}
 	note, _, err := c.CreateIssueComment(slug.owner, slug.repo, issueIID, gitea.CreateIssueCommentOption{Body: body})
 	if err != nil {
-		return IssueNote{}, f.redact.error(fmt.Errorf("forgejo: create issue note: %w", err))
+		return IssueNote{}, f.wrapErr("create issue note", err)
 	}
 	return IssueNote{ID: note.ID, Body: note.Body}, nil
 }
@@ -885,7 +896,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 		page++
 		comments, resp, err := c.ListIssueComments(slug.owner, slug.repo, mrIID, icOpt)
 		if err != nil {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list merge request comments: %w", err))
+			return nil, f.wrapErr("list merge request comments", err)
 		}
 		for _, cm := range comments {
 			if cm == nil {
@@ -899,13 +910,13 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 			out = append(out, mc)
 		}
 		if len(out) > maxForgeItems {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list merge request comments: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, f.wrapErr("list merge request comments", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list merge request comments: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, f.wrapErr("list merge request comments", forgePaginationCapErr("page", maxForgePages))
 		}
 		icOpt.Page = resp.NextPage
 	}
@@ -917,7 +928,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 		page++
 		reviews, resp, err := c.ListPullReviews(slug.owner, slug.repo, mrIID, revOpt)
 		if err != nil {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list merge request comments: %w", err))
+			return nil, f.wrapErr("list merge request comments", err)
 		}
 		for _, r := range reviews {
 			if r == nil {
@@ -933,7 +944,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 			}
 			reviewComments, _, err := c.ListPullReviewComments(slug.owner, slug.repo, mrIID, r.ID)
 			if err != nil {
-				return nil, f.redact.error(fmt.Errorf("forgejo: list merge request comments: %w", err))
+				return nil, f.wrapErr("list merge request comments", err)
 			}
 			for _, rc := range reviewComments {
 				if rc == nil {
@@ -963,13 +974,13 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 			}
 		}
 		if len(out) > maxForgeItems {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list merge request comments: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, f.wrapErr("list merge request comments", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list merge request comments: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, f.wrapErr("list merge request comments", forgePaginationCapErr("page", maxForgePages))
 		}
 		revOpt.Page = resp.NextPage
 	}
@@ -995,7 +1006,7 @@ func (f *forgejo) ReplyMergeRequestComment(ctx context.Context, projectID, mrIID
 	}
 	if _, _, err := c.CreatePullReviewCommentReply(slug.owner, slug.repo, mrIID, commentID,
 		gitea.CreatePullReviewCommentReplyOptions{Body: body}); err != nil {
-		return f.redact.error(fmt.Errorf("forgejo: reply merge request comment: %w", err))
+		return f.wrapErr("reply merge request comment", err)
 	}
 	return nil
 }
@@ -1031,7 +1042,7 @@ func (f *forgejo) ListIssueLabelEvents(ctx context.Context, projectID, issueIID 
 		}
 		var entries []forgejoTimelineEntry
 		if err := json.Unmarshal(raw, &entries); err != nil {
-			return nil, f.redact.error(fmt.Errorf("forgejo: parse issue timeline: %w", err))
+			return nil, f.wrapErr("parse issue timeline", err)
 		}
 		for _, e := range entries {
 			// Only label events; other timeline entries (comments, milestone/title
@@ -1051,14 +1062,14 @@ func (f *forgejo) ListIssueLabelEvents(ctx context.Context, projectID, issueIID 
 			out = append(out, ev)
 		}
 		if len(out) > maxForgeItems {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list issue label events: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, f.wrapErr("list issue label events", forgePaginationCapErr("item", maxForgeItems))
 		}
 		// The timeline is chronological (oldest first), matching the GitLab driver.
 		if len(entries) < forgejoPerPage {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list issue label events: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, f.wrapErr("list issue label events", forgePaginationCapErr("page", maxForgePages))
 		}
 	}
 	return out, nil
@@ -1085,7 +1096,7 @@ func (f *forgejo) ListIssueComments(ctx context.Context, projectID, issueIID int
 		page++
 		comments, resp, err := c.ListIssueComments(slug.owner, slug.repo, issueIID, opt)
 		if err != nil {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list issue comments: %w", err))
+			return nil, f.wrapErr("list issue comments", err)
 		}
 		for _, cm := range comments {
 			if cm == nil {
@@ -1099,13 +1110,13 @@ func (f *forgejo) ListIssueComments(ctx context.Context, projectID, issueIID int
 			out = append(out, ic)
 		}
 		if len(out) > maxForgeItems {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list issue comments: %w", forgePaginationCapErr("item", maxForgeItems)))
+			return nil, f.wrapErr("list issue comments", forgePaginationCapErr("item", maxForgeItems))
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list issue comments: %w", forgePaginationCapErr("page", maxForgePages)))
+			return nil, f.wrapErr("list issue comments", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -1155,7 +1166,7 @@ func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
 	// admits the bot querying itself, D5), so resolve the bot's own login first.
 	u, _, err := c.GetMyUserInfo()
 	if err != nil {
-		return TokenInfo{}, f.redact.error(fmt.Errorf("forgejo: token info: identify bot: %w", err))
+		return TokenInfo{}, f.wrapErr("token info: identify bot", err)
 	}
 	// Hand-rolled, NOT via the SDK: gitea-sdk's ListAccessTokens refuses without
 	// BasicAuth ("username not set: only BasicAuth allowed"), a CLIENT-side gate the
@@ -1187,7 +1198,7 @@ func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
 		}
 		var tokens []forgejoAccessToken
 		if err := json.Unmarshal(raw, &tokens); err != nil {
-			return TokenInfo{}, f.redact.error(fmt.Errorf("forgejo: parse tokens: %w", err))
+			return TokenInfo{}, f.wrapErr("parse tokens", err)
 		}
 		for _, tk := range tokens {
 			if tk.TokenLastEight == last8 {
@@ -1199,7 +1210,7 @@ func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
 			break
 		}
 		if page >= maxForgePages {
-			return TokenInfo{}, f.redact.error(fmt.Errorf("forgejo: token info: %w", forgePaginationCapErr("page", maxForgePages)))
+			return TokenInfo{}, f.wrapErr("token info", forgePaginationCapErr("page", maxForgePages))
 		}
 	}
 	if matches == 1 {
@@ -1238,20 +1249,20 @@ type forgejoAccessToken struct {
 func (f *forgejo) rawGet(ctx context.Context, path string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/api/v1"+path, nil)
 	if err != nil {
-		return nil, f.redact.error(fmt.Errorf("forgejo: build request: %w", err))
+		return nil, f.wrapErr("build request", err)
 	}
 	req.Header.Set("Authorization", "token "+f.token)
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, f.redact.error(fmt.Errorf("forgejo: request %s: %w", path, err))
+		return nil, f.wrapErr(fmt.Sprintf("request %s", path), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, f.redact.error(fmt.Errorf("forgejo: read response: %w", err))
+		return nil, f.wrapErr("read response", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return body, f.redact.error(fmt.Errorf("forgejo: GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body))))
+		return body, f.wrapErr(fmt.Sprintf("GET %s", path), fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 	return body, nil
 }
@@ -1265,20 +1276,20 @@ func (f *forgejo) rawGet(ctx context.Context, path string) ([]byte, error) {
 func (f *forgejo) rawGetLimited(ctx context.Context, path string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/api/v1"+path, nil)
 	if err != nil {
-		return nil, f.redact.error(fmt.Errorf("forgejo: build request: %w", err))
+		return nil, f.wrapErr("build request", err)
 	}
 	req.Header.Set("Authorization", "token "+f.token)
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, f.redact.error(fmt.Errorf("forgejo: request %s: %w", path, err))
+		return nil, f.wrapErr(fmt.Sprintf("request %s", path), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
-		return nil, f.redact.error(fmt.Errorf("forgejo: read response: %w", err))
+		return nil, f.wrapErr("read response", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return body, f.redact.error(fmt.Errorf("forgejo: GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body))))
+		return body, f.wrapErr(fmt.Sprintf("GET %s", path), fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 	return body, nil
 }
