@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
@@ -132,9 +131,8 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 // needs that asks the user. The field being silently ignored is safe precisely
 // because the only reachable effect would be the one we are refusing.
 func (h *Handler) SetUserJudgeEnabled(w http.ResponseWriter, r *http.Request) {
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid user id")
+	id, ok := httpx.PathUUID(w, r, "id", "user")
+	if !ok {
 		return
 	}
 	var req setJudgeRequest
@@ -371,9 +369,8 @@ func (h *Handler) GetRunReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	res, pending, err := h.wsvc.GetRunReviewPanel(r.Context(), user.ID, user.IsAdmin, id)
@@ -409,9 +406,8 @@ func (h *Handler) RerunJudge(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	judge, err := h.wsvc.RerunJudge(r.Context(), user.ID, user.IsAdmin, id)

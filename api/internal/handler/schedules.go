@@ -1223,9 +1223,8 @@ func (h *Handler) scheduleParam(w http.ResponseWriter, r *http.Request) (store.U
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return store.User{}, uuid.Nil, false
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid schedule id")
+	id, ok := httpx.PathUUID(w, r, "id", "schedule")
+	if !ok {
 		return store.User{}, uuid.Nil, false
 	}
 	return user, id, true
@@ -1430,7 +1429,7 @@ func scheduleColumns(m apitypes.ScheduleRequest) (issueIID pgtype.Int8, labels [
 // if one slipped past validation. A nil pointer is SQL NULL = unlimited.
 func maxIssuesColumn(m apitypes.ScheduleRequest) pgtype.Int4 {
 	if m.Target == "sweep" && m.MaxIssues != nil {
-		return pgtype.Int4{Int32: int32(*m.MaxIssues), Valid: true}
+		return pgtype.Int4{Int32: int32(*m.MaxIssues), Valid: true} //nolint:gosec // G115: MaxIssues is validated to [1, MaxSweepIssues] before persist
 	}
 	return pgtype.Int4{}
 }
@@ -1675,7 +1674,7 @@ func catalogTimezone(j schedtmpl.DefaultJob) string {
 // sweep with a positive value, NULL (unlimited) otherwise — mirroring maxIssuesColumn.
 func catalogMaxIssues(j schedtmpl.DefaultJob) pgtype.Int4 {
 	if j.Target == "sweep" && j.MaxIssues > 0 {
-		return pgtype.Int4{Int32: int32(j.MaxIssues), Valid: true}
+		return pgtype.Int4{Int32: int32(j.MaxIssues), Valid: true} //nolint:gosec // G115: MaxIssues from the built-in DefaultJob catalog, a small compile-time constant
 	}
 	return pgtype.Int4{}
 }
@@ -1723,7 +1722,7 @@ func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pg
 	}
 	jMax := int32(0)
 	if job.Target == "sweep" && job.MaxIssues > 0 {
-		jMax = int32(job.MaxIssues)
+		jMax = int32(job.MaxIssues) //nolint:gosec // G115: MaxIssues from the built-in DefaultJob catalog, a small compile-time constant
 	}
 	rMax := int32(0)
 	if maxIssues.Valid {

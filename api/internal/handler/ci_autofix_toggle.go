@@ -5,8 +5,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -53,9 +51,8 @@ func (h *Handler) SetCIAutofixEnabled(w http.ResponseWriter, r *http.Request) {
 // sets the flag on the target user's OWN account, so the auto-fix still only ever
 // spends that user's tokens — an admin cannot redirect the spend elsewhere.
 func (h *Handler) SetUserCIAutofixEnabled(w http.ResponseWriter, r *http.Request) {
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid user id")
+	id, ok := httpx.PathUUID(w, r, "id", "user")
+	if !ok {
 		return
 	}
 	var req setCIAutofixRequest

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -53,14 +52,12 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
-	recID, err := uuid.Parse(chi.URLParam(r, "recID"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid recommendation id")
+	recID, ok := httpx.PathUUID(w, r, "recID", "recommendation")
+	if !ok {
 		return
 	}
 	var req fileIssueRequest

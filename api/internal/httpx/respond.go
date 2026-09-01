@@ -6,6 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 )
 
 // maxBodyBytes caps request bodies decoded via DecodeJSON / DecodeJSONLimited
@@ -36,6 +39,25 @@ func JSON(w http.ResponseWriter, status int, v any) {
 // Error writes a JSON error body: {"error": "<message>"}.
 func Error(w http.ResponseWriter, status int, message string) {
 	JSON(w, status, map[string]string{"error": message})
+}
+
+// PathUUID parses the named chi URL param as a UUID. On failure it writes a 400
+// with body {"error":"invalid <label> id"} and returns ok=false; the caller just
+// returns. On success it returns the parsed UUID and ok=true.
+func PathUUID(w http.ResponseWriter, r *http.Request, param, label string) (uuid.UUID, bool) {
+	return PathUUIDMsg(w, r, param, "invalid "+label+" id")
+}
+
+// PathUUIDMsg is PathUUID with a caller-supplied error message, for the few sites
+// whose 400 message does not fit the "invalid <label> id" template. On failure it
+// writes a 400 with body {"error":"<message>"} and returns ok=false.
+func PathUUIDMsg(w http.ResponseWriter, r *http.Request, param, message string) (uuid.UUID, bool) {
+	id, err := uuid.Parse(chi.URLParam(r, param))
+	if err != nil {
+		Error(w, http.StatusBadRequest, message)
+		return uuid.Nil, false
+	}
+	return id, true
 }
 
 // DecodeJSON reads and decodes a JSON request body into dst, rejecting unknown

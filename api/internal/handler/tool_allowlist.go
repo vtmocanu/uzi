@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -175,9 +174,8 @@ func (h *Handler) UpdateToolAllowlistEntry(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusForbidden, "admin only")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid allowlist entry id")
+	id, ok := httpx.PathUUID(w, r, "id", "allowlist entry")
+	if !ok {
 		return
 	}
 	var req toolAllowlistWriteRequest
@@ -221,9 +219,8 @@ func (h *Handler) DeleteToolAllowlistEntry(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusForbidden, "admin only")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid allowlist entry id")
+	id, ok := httpx.PathUUID(w, r, "id", "allowlist entry")
+	if !ok {
 		return
 	}
 	n, err := h.q.DeleteToolAllowlistEntry(r.Context(), id)

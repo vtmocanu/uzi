@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -119,9 +118,8 @@ func (h *Handler) WorkerChatGetRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	row, err := h.wsvc.GetRunForWorker(r.Context(), wkr, runID)
@@ -164,9 +162,8 @@ func (h *Handler) WorkerChatRunMessages(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	after := int32(0)
@@ -258,9 +255,8 @@ func (h *Handler) WorkerCreateProposal(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	var req workerProposalRequest
@@ -272,6 +268,7 @@ func (h *Handler) WorkerCreateProposal(w http.ResponseWriter, r *http.Request) {
 	// UUIDs); repo_id is accepted for back-compat. Path resolution is user-scoped, so
 	// an unknown/foreign path is 404.
 	var repoID uuid.UUID
+	var err error
 	switch {
 	case strings.TrimSpace(req.RepoPath) != "":
 		repoID, err = h.wsvc.ResolveRepoForWorker(r.Context(), wkr, strings.TrimSpace(req.RepoPath))

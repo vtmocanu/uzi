@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -187,9 +185,8 @@ func (h *Handler) RevokeCLIToken(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid token id")
+	id, ok := httpx.PathUUID(w, r, "id", "token")
+	if !ok {
 		return
 	}
 	n, err := h.q.RevokeCLIToken(r.Context(), store.RevokeCLITokenParams{ID: id, UserID: user.ID})

@@ -323,7 +323,7 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 	// absent).
 	if err := h.q.ShiftBoardColumnsFrom(r.Context(), store.ShiftBoardColumnsFromParams{
 		RepoID:       repo.ID,
-		FromPosition: int32(pos),
+		FromPosition: int32(pos), //nolint:gosec // G115: pos is a board column position from humanReviewPlacement, a small bounded index
 	}); err != nil {
 		slog.Error("shift board columns for Human Review", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -332,7 +332,7 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 	if err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
 		RepoID:    repo.ID,
 		LabelName: board.ColumnHumanReview,
-		Position:  int32(pos),
+		Position:  int32(pos), //nolint:gosec // G115: pos is a board column position from humanReviewPlacement, a small bounded index
 	}); err != nil {
 		slog.Error("insert Human Review board column", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1106,9 +1106,8 @@ func (h *Handler) repoForRequest(w http.ResponseWriter, r *http.Request) (store.
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return store.GetRepoForUserRow{}, false
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+	id, ok := httpx.PathUUID(w, r, "id", "repo")
+	if !ok {
 		return store.GetRepoForUserRow{}, false
 	}
 	repo, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID})

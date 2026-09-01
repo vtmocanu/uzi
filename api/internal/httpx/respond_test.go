@@ -1,11 +1,15 @@
 package httpx
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 )
 
 // body wraps a string in a request whose Body is that string. httptest.NewRequest
@@ -196,5 +200,96 @@ func TestErrorWritesErrorEnvelope(t *testing.T) {
 	}
 	if got := strings.TrimSpace(rec.Body.String()); got != `{"error":"bad request"}` {
 		t.Fatalf("body = %q, want %q", got, `{"error":"bad request"}`)
+	}
+}
+
+// requestWithParam builds a *http.Request carrying a single chi URL param, the way
+// the router would populate it, so PathUUID/PathUUIDMsg see chi.URLParam(r, param).
+func requestWithParam(param, value string) *http.Request {
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add(param, value)
+	return httptest.NewRequest(http.MethodGet, "/x", nil).
+		WithContext(context.WithValue(context.Background(), chi.RouteCtxKey, rctx))
+}
+
+const validUUID = "11111111-1111-1111-1111-111111111111"
+
+func TestPathUUIDValidLeavesWriterUntouched(t *testing.T) {
+	rec := httptest.NewRecorder()
+	got, ok := PathUUID(rec, requestWithParam("id", validUUID), "id", "run")
+	if !ok {
+		t.Fatal("PathUUID reported ok=false on a valid UUID")
+	}
+	if got != uuid.MustParse(validUUID) {
+		t.Fatalf("parsed UUID = %v, want %v", got, validUUID)
+	}
+	// The success path must not touch the ResponseWriter: default recorder code and
+	// an empty body.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("writer Code = %d, want the untouched default %d", rec.Code, http.StatusOK)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("writer body = %q, want empty", rec.Body.String())
+	}
+}
+
+func TestPathUUIDInvalidWrites400Envelope(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"malformed", "not-a-uuid"},
+		{"empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			got, ok := PathUUID(rec, requestWithParam("id", tc.value), "id", "run")
+			if ok {
+				t.Fatal("PathUUID reported ok=true on an invalid value")
+			}
+			if got != uuid.Nil {
+				t.Fatalf("returned UUID = %v, want uuid.Nil", got)
+			}
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+			}
+			// Body must be byte-identical to the inline httpx.Error sites being migrated,
+			// including json.Encoder's trailing newline.
+			if got := rec.Body.String(); got != "{\"error\":\"invalid run id\"}\n" {
+				t.Fatalf("body = %q, want %q", got, "{\"error\":\"invalid run id\"}\n")
+			}
+		})
+	}
+}
+
+func TestPathUUIDMsgUsesCustomMessage(t *testing.T) {
+	// Invalid input: the custom message is rendered verbatim, 400, ok=false.
+	rec := httptest.NewRecorder()
+	got, ok := PathUUIDMsg(rec, requestWithParam("id", "not-a-uuid"), "id", "invalid request")
+	if ok {
+		t.Fatal("PathUUIDMsg reported ok=true on an invalid value")
+	}
+	if got != uuid.Nil {
+		t.Fatalf("returned UUID = %v, want uuid.Nil", got)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if body := rec.Body.String(); body != "{\"error\":\"invalid request\"}\n" {
+		t.Fatalf("body = %q, want %q", body, "{\"error\":\"invalid request\"}\n")
+	}
+
+	// Valid input passes through with ok=true and an untouched writer.
+	okRec := httptest.NewRecorder()
+	id, ok := PathUUIDMsg(okRec, requestWithParam("id", validUUID), "id", "invalid request")
+	if !ok {
+		t.Fatal("PathUUIDMsg reported ok=false on a valid UUID")
+	}
+	if id != uuid.MustParse(validUUID) {
+		t.Fatalf("parsed UUID = %v, want %v", id, validUUID)
+	}
+	if okRec.Code != http.StatusOK {
+		t.Fatalf("writer Code = %d, want the untouched default %d", okRec.Code, http.StatusOK)
 	}
 }

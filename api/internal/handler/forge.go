@@ -10,7 +10,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -325,9 +324,8 @@ func (h *Handler) VerifyConnection(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid connection id")
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
 		return
 	}
 	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
@@ -386,9 +384,8 @@ func (h *Handler) UpdateConnection(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid connection id")
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
 		return
 	}
 	var req updateConnectionRequest
@@ -475,9 +472,8 @@ func (h *Handler) PrivilegeCheck(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid connection id")
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
 		return
 	}
 	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
@@ -502,9 +498,8 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid connection id")
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
 		return
 	}
 	rows, err := h.q.DeleteForgeConnectionForUser(r.Context(), store.DeleteForgeConnectionForUserParams{ID: id, UserID: user.ID})
@@ -529,9 +524,8 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid connection id")
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
 		return
 	}
 	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
@@ -750,9 +744,8 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+	id, ok := httpx.PathUUID(w, r, "id", "repo")
+	if !ok {
 		return
 	}
 	var req setRepoEnabledRequest
@@ -839,9 +832,8 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+	id, ok := httpx.PathUUID(w, r, "id", "repo")
+	if !ok {
 		return
 	}
 	row, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID})
@@ -930,9 +922,8 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+	id, ok := httpx.PathUUID(w, r, "id", "repo")
+	if !ok {
 		return
 	}
 	var req patchRepoRequest
@@ -963,6 +954,7 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var repo store.Repo
+	var err error
 	switch {
 	case trustSet:
 		// One atomic round-trip sets both trust columns; a nil field is left unchanged

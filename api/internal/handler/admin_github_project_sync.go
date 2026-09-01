@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
@@ -59,9 +58,8 @@ func (h *Handler) ownerOrAdminRepoID(w http.ResponseWriter, r *http.Request) (uu
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return uuid.Nil, false
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+	id, ok := httpx.PathUUID(w, r, "id", "repo")
+	if !ok {
 		return uuid.Nil, false
 	}
 	if !user.IsAdmin {

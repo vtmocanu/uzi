@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -42,9 +40,8 @@ func (h *Handler) GetRepoToolProfile(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+	id, ok := httpx.PathUUID(w, r, "id", "repo")
+	if !ok {
 		return
 	}
 	// Ownership gate: the repo must belong to the caller's connection.
@@ -82,9 +79,8 @@ func (h *Handler) SetRepoToolProfile(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+	id, ok := httpx.PathUUID(w, r, "id", "repo")
+	if !ok {
 		return
 	}
 	var req struct {

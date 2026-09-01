@@ -3,9 +3,6 @@ package handler
 import (
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
-
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 )
 
@@ -32,9 +29,8 @@ import (
 // has that id (a controller cordoning a worker the api has since dropped); 400 on a
 // malformed workerID; 500 on a store error.
 func (h *Handler) ControllerCordonWorker(w http.ResponseWriter, r *http.Request) {
-	id, err := uuid.Parse(chi.URLParam(r, "workerID"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid worker id")
+	id, ok := httpx.PathUUID(w, r, "workerID", "worker")
+	if !ok {
 		return
 	}
 	found, err := h.hsvc.Cordon(r.Context(), id)
@@ -67,9 +63,8 @@ func (h *Handler) ControllerCordonWorker(w http.ResponseWriter, r *http.Request)
 // uncordoning a worker the api has since dropped); 400 on a malformed workerID; 500 on
 // a store error.
 func (h *Handler) ControllerUncordonWorker(w http.ResponseWriter, r *http.Request) {
-	id, err := uuid.Parse(chi.URLParam(r, "workerID"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid worker id")
+	id, ok := httpx.PathUUID(w, r, "workerID", "worker")
+	if !ok {
 		return
 	}
 	found, err := h.hsvc.Uncordon(r.Context(), id)

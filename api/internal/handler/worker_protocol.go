@@ -12,7 +12,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -454,9 +453,8 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	var req struct {
@@ -557,9 +555,8 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	var req workersvc.StateRequest
@@ -612,9 +609,8 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	inputs, err := h.wsvc.ConsumeInputs(r.Context(), wkr, runID)
@@ -641,9 +637,8 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	status, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
@@ -713,9 +708,8 @@ func (h *Handler) WorkerSaveMemory(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	var req apitypes.AgentMemoryWriteRequest
@@ -766,9 +760,8 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	rows, err := h.wsvc.ListMemoryForRun(r.Context(), wkr, runID)
@@ -803,9 +796,8 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	runID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
 		return
 	}
 	tip := r.Header.Get("X-Uzi-Checkpoint-Tip")
