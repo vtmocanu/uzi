@@ -770,7 +770,7 @@ chain in the diagram above, with no intervening `running`.
   the PRD's M8). Size-aware provisioning and Path 2 (an approve-time
   capability denial) remain deferred. PRD #649 surfaced both gates in the
   SPA: an admin kill-switch card in Admin Settings
-  (`web/src/pages/AdminSettings.tsx`), a per-user opt-in toggle in the
+  (`web/src/pages/adminSettings/EphemeralWorkersCard.tsx`), a per-user opt-in toggle in the
   hosted-worker section of the Workers page
   (`web/src/components/HostedWorkers.tsx`), gated on the hosted-config
   `ephemeral_enabled` derived signal, and an `ephemeral` badge in the fleet
