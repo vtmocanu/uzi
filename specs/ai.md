@@ -22195,13 +22195,13 @@ Terse contract; richer rationale is in PRD #557's Decision Log.
   every other GraphQL error stays a plain redacted error, unchanged for existing
   callers. `ResolveUserNodeID` is the only caller that inspects it.
 - **The not-found mapping is scoped to the resolve step, not the whole surface.**
-  `forgesvc/projectsync.go`'s `ShareWithUser`/`Unshare` translate
+  `forgesvc/projectsync_share.go`'s `ShareWithUser`/`Unshare` translate
   `forge.ErrGitHubUserNotFound` → the new sentinel `ErrProjectSyncUserNotFound` (422 via
   `writeProjectSyncError`) only around the username→node-id resolve call.
   `GetVisibility`/`SetVisibility` share the same preamble and link-row read but never
   touch that translation, so a stale/bad board node id on the visibility path still
   surfaces as a generic 500, never a false "user not found" 422.
-- **Four service methods** (`forgesvc/projectsync.go`): `GetVisibility`, `SetVisibility`,
+- **Four service methods** (`forgesvc/projectsync_share.go`): `GetVisibility`, `SetVisibility`,
   `ShareWithUser`, `Unshare` — each through the existing `projectSyncPreamble` (instance
   flag + GitHub-only + `ProjectBoardSyncer` assertion + scope check) and the link row's
   `ProjectNodeID` (`GetGithubProjectLinkByRepo`), reusing #364/#534's plumbing rather than
