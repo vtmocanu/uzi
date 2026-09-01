@@ -713,7 +713,7 @@ export function Repos() {
         title="Boards"
         description={
           <>
-            Projects your bot can see. Enable one to track its PRD issues on a board. See the{" "}
+            Projects your bot can see. Enable one to track its issues on a board. See the{" "}
             <DocLink slug={DOC_REPO_AGENTS}>repo agents</DocLink> guide.
           </>
         }

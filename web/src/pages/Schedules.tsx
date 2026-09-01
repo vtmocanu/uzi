@@ -947,7 +947,7 @@ function Legend() {
         <Badge tone="info" dot>
           sweep
         </Badge>
-        fires on issues matching a label (default: PRD)
+        fires on issues matching a label (default: uzi)
       </span>
       <span className="flex items-center gap-1.5">
         <Badge tone="ok" dot>
@@ -967,7 +967,7 @@ function targetTitle(s: Schedule): string {
     case "sweep":
       return s.labels && s.labels.length > 0
         ? `Sweep · label ${s.labels.join(", ")}`
-        : "Sweep eligible PRD issues";
+        : "Sweep eligible issues";
     case "prompt":
       return s.prompt ? `Prompt: ${truncate(s.prompt, 42)}` : "Prompt";
     case "self_improve":

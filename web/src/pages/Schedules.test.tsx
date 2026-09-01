@@ -108,7 +108,7 @@ function renderPage() {
 describe("Schedules list", () => {
   it("renders a row per schedule with its target badge and cron", async () => {
     renderPage();
-    await waitFor(() => expect(screen.getByText("Sweep eligible PRD issues")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
     expect(screen.getByText("Prompt: hunt flaky tests")).toBeTruthy();
     // The cron string is shown verbatim (canonical source of truth).
     expect(screen.getByText("0 2 * * 1-5")).toBeTruthy();
@@ -129,7 +129,7 @@ describe("Schedules list", () => {
   it("still shows the auto-approve chip for a non-self_improve row (control)", async () => {
     only1({ target: "sweep", origin: "user", auto_approve: true, wait_on_limit: false });
     renderPage();
-    await waitFor(() => expect(screen.getByText("Sweep eligible PRD issues")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
     expect(screen.getByText("auto-approve")).toBeTruthy();
   });
 
@@ -138,7 +138,7 @@ describe("Schedules list", () => {
       sched({ id, enabled: input.enabled ?? true }),
     );
     renderPage();
-    await waitFor(() => expect(screen.getByText("Sweep eligible PRD issues")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
 
     // s1 is enabled; disabling it sends { enabled: false }.
     const toggle = screen.getByRole("switch", { name: "Disable schedule" });
@@ -776,7 +776,7 @@ describe("Schedules — issue-target add-repo gating + sub-row badges (issue #63
       sched({ id: "sw1", target: "sweep", origin: "user", sibling_group_id: null }),
     ]);
     renderPage();
-    await waitFor(() => expect(screen.getByText("Sweep eligible PRD issues")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
 
     // Discriminates the P1c gate: a sweep row's add-repo control is NOT disabled, so the
     // disabled assertion above is driven by target === "issue", not an always-off control.

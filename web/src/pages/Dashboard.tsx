@@ -295,7 +295,7 @@ export function Dashboard() {
               done={data.reposEnabled > 0}
               index={3}
               title="Enable a repo"
-              hint="Enabled repos get a kanban board of their PRD-labeled issues."
+              hint="Enabled repos get a kanban board of their uzi-labeled issues."
               to="/repos"
               cta="Repos"
             />
