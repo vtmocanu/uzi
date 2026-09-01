@@ -1930,6 +1930,36 @@ func TestClaimFailsOnDefaultEffortLookupError(t *testing.T) {
 	}
 }
 
+// TestClaimFailsOnAttributionLookupError mirrors the default_model/default_effort
+// lookup-error tests (PRD #916): a failing per-user attribution lookup propagates
+// wrapped as "attribution lookup: %w", not as a credential failure.
+func TestClaimFailsOnAttributionLookupError(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-ATTRERR-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-ATTRERR-abcdef1234567890"))
+	fs := &fakeStore{
+		claimRun: store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 11, Valid: true}, Status: "claimed"},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic:             sealedTok,
+		attributionEnabledErr: errors.New("db down"),
+	}
+
+	_, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	if err == nil {
+		t.Fatal("expected Claim to fail when the attribution lookup errors")
+	}
+	if !strings.Contains(err.Error(), "attribution lookup") {
+		t.Fatalf("error should be wrapped as an attribution lookup failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "db down") {
+		t.Fatalf("error should wrap the underlying cause, got: %v", err)
+	}
+}
+
 func TestClaimIdleReturnsNilPayload(t *testing.T) {
 	fs := &fakeStore{claimErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())

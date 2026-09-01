@@ -43,6 +43,13 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 	strptr := func(s string) *string { return &s }
 	i64ptr := func(v int64) *int64 { return &v }
 	intptr := func(v int) *int { return &v }
+	// The one credential-shaped field that raises gosec G101 is extracted here so the
+	// suppression sits on the exact triggering string-assignment, NOT on the ClaimSecrets
+	// composite-literal brace. gosec anchors G101 for a struct literal to the composite-lit
+	// node, so a blanket nolint on that brace would silence G101 for every field in the
+	// literal, hiding a future credential field. Kept narrow here: this assignment is the
+	// only line gosec flags, and the composite literal below carries no gosec suppression.
+	anthropicOAuthToken := "ANTHROPIC-OAUTH-PLACEHOLDER" //nolint:gosec // G101: placeholder fixture string (…-PLACEHOLDER), not a real credential
 	return ClaimPayload{
 		RunID:            "11111111-1111-1111-1111-111111111111",
 		Kind:             RunKindIssue,
@@ -147,10 +154,10 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			ClaudemdEnabled: true,     // PRD #246: repo owner opted into advisory CLAUDE.md; rides the claim byte-for-byte (no omitempty)
 			ForgeType:       "gitlab", // PRD #65 R8: emitted on every claim, "gitlab" for a GitLab connection
 		},
-		Secrets: ClaimSecrets{ //nolint:gosec // G101: placeholder fixture strings (…-PLACEHOLDER), not real credentials
+		Secrets: ClaimSecrets{
 			ForgeUsername:       "uzi-bot",
 			ForgePAT:            "FORGE-PAT-PLACEHOLDER",
-			AnthropicOAuthToken: "ANTHROPIC-OAUTH-PLACEHOLDER",
+			AnthropicOAuthToken: anthropicOAuthToken,
 		},
 		Agents: []ClaimAgent{
 			{
