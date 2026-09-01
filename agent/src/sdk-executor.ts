@@ -399,6 +399,57 @@ interface RunDrive {
   reportedSessionId: boolean;
 }
 
+/**
+ * Cross-phase state carrier for SdkExecutor.run() (PRD #949 M3). `phaseSetup`
+ * (P1-P4) populates every non-optional field; `phasePlanGate` (P5) fills the four
+ * optional products the run loop consumes; run()'s finally reads
+ * state/onSignal/depsAbort/depsInstall/provisionDir off it. Deliberately
+ * UNEXPORTED — knip `deadcode:agent` gates the export/type tier at zero.
+ *
+ * `onSignal` is stored as the SAME function reference the abort listener was
+ * registered with, so run()'s finally removes the exact listener rather than
+ * leaking a rebuilt closure. `baseOptions` is the ONE SdkOptions instance the
+ * plan turn, the revise loop and the implement turn all read — it is never
+ * reconstructed, so the guardrail-bearing `settingSources: []` and PreToolUse
+ * hooks thread through every phase unchanged.
+ */
+interface DriveState {
+  oauthToken: string;
+  toolEnv: Awaited<ReturnType<typeof provisionRunTools>>["toolEnv"];
+  provisionDir: Awaited<ReturnType<typeof provisionRunTools>>["provisionDir"];
+  depsAbort: AbortController;
+  depsInstall: Promise<JsDepsInstall>;
+  depsResults: JsDepsResult[];
+  depsTruncated: boolean;
+  maxIterations: number;
+  latestProgress: MilestoneProgress | undefined;
+  frozenMilestones: Milestone[] | undefined;
+  maxRevisions: number;
+  prepared: Awaited<ReturnType<typeof prepareSkillPlugin>>;
+  repoInstructionsBlock: string | undefined;
+  survivorNames: Set<string>;
+  assembled: ReturnType<typeof assembleAgents>;
+  leadModel: string | undefined;
+  planSubagentNames: string[];
+  subagentCanWrite: ReturnType<typeof subagentWriteCapabilities>;
+  preToolUse: (
+    allowedSubagents: string[],
+  ) => NonNullable<SdkOptions["hooks"]>["PreToolUse"];
+  isIssueRun: boolean;
+  baseOptions: SdkOptions;
+  initialWallMs: number;
+  wallScaled: boolean;
+  state: RunDrive;
+  idleMs: number;
+  onSignal: () => void;
+  resumeId: string | undefined;
+  // --- Products of phasePlanGate (P5), consumed by phaseRunLoop (P6-P8) ---
+  approvedPlan?: string;
+  approvedSelection?: AgentSelectionParse;
+  preApproved?: boolean;
+  budget?: { asked: number };
+}
+
 export class SdkExecutor implements Executor {
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
@@ -561,6 +612,46 @@ export class SdkExecutor implements Executor {
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
     this.spawnedPids.clear();
+    const drive = await this.phaseSetup(ctx);
+    try {
+      const early = await this.phasePlanGate(ctx, drive);
+      if (early !== undefined) return early;
+      return await this.phaseRunLoop(ctx, drive);
+    } finally {
+      this.disarmWall(drive.state);
+      if (ctx.signal) ctx.signal.removeEventListener("abort", drive.onSignal);
+      // PRD #121 M2: no install may outlive the run. On every path that never reached
+      // the join — plan rejected, cancelled, no plan submitted, ci_fix not_code — the
+      // install may still be in flight, and the runner tears the clone down and pushes
+      // with the PAT the moment this returns. Abort FIRST so the await is bounded by a
+      // kill rather than by the install's own 10-minute cap (that is what stops a
+      // rejected plan blocking on deps nobody needs); the promise already carries its
+      // own catch, so awaiting it can never throw here and mask the real failure.
+      drive.depsAbort.abort();
+      await drive.depsInstall;
+      // Reap every agent subprocess before returning, so none survives into the
+      // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
+      // too, not just the runner's explicit pre-push call.
+      this.killAgentTree();
+      // Remove the per-run provisioning dir (the synthesized devbox.json + profile
+      // symlinks). The nix STORE is global (on the data volume), NOT here, so this
+      // never evicts the warm-start cache. Best-effort.
+      if (drive.provisionDir)
+        await fs
+          .rm(drive.provisionDir, { recursive: true, force: true })
+          .catch(() => undefined);
+    }
+  }
+
+  /**
+   * Phases P1-P4 (PRD #949 M3): OAuth/HOME/provisioning + JS-deps kickoff, skills +
+   * agent roster, hooks/MCP/`baseOptions`, and the wall-clock/watchdog/cancel wiring.
+   * Runs BEFORE run()'s try (verbatim to its pre-try prologue), so a throw here — a
+   * missing token, a provisioning failure — never reaches the finally, exactly as
+   * before the split. Returns the populated carrier; the cancel listener it registers
+   * closes over the same `state`/`depsAbort` objects it stores on the carrier.
+   */
+  private async phaseSetup(ctx: RunContext): Promise<DriveState> {
     const oauthToken = ctx.oauthToken?.trim();
     if (!oauthToken) {
       // OAuth is the sole supported credential (no API keys). Detect its
@@ -621,13 +712,18 @@ export class SdkExecutor implements Executor {
     let maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
     // PRD #122 M2: the newest progress snapshot the lead has reported, carried into the
     // next iteration's `running` report so the server sees it. Updated after each turn.
-    let latestProgress: MilestoneProgress | undefined;
+    // Initialized undefined here (the gate/loop phases assign it via the carrier);
+    // the explicit `= undefined` keeps the no-unassigned-vars lint quiet now that
+    // this declaration and its later assignments live in different methods.
+    let latestProgress: MilestoneProgress | undefined = undefined;
     // PRD #122 M6: the milestone list FROZEN at the gate, hoisted out of the block-scoped
     // `candidateMilestones` inside the plan-and-gate block so the implement loop can name
     // the milestones in its prompt. Assigned once the gate resolves `approve`; it stays
     // undefined on the pre-approved resume path (no plan-and-gate block runs there) —
     // acceptable for M6, which introduces no claim change to carry it across a resume.
-    let frozenMilestones: Milestone[] | undefined;
+    // Initialized undefined for the same reason as latestProgress above: it is
+    // assigned in phasePlanGate through the carrier, not here.
+    let frozenMilestones: Milestone[] | undefined = undefined;
     const maxRevisions = planMaxRevisionsOf(ctx.config);
 
     // Skills (PRD #16 M4 + M6). Assemble the run's skill set and materialize a
@@ -957,7 +1053,61 @@ export class SdkExecutor implements Executor {
     // The SDK session id evolves across turns; resume each turn from the last.
     let resumeId = ctx.sessionId ?? undefined;
 
-    try {
+    return {
+      oauthToken,
+      toolEnv,
+      provisionDir,
+      depsAbort,
+      depsInstall,
+      depsResults,
+      depsTruncated,
+      maxIterations,
+      latestProgress,
+      frozenMilestones,
+      maxRevisions,
+      prepared,
+      repoInstructionsBlock,
+      survivorNames,
+      assembled,
+      leadModel,
+      planSubagentNames,
+      subagentCanWrite,
+      preToolUse,
+      isIssueRun,
+      baseOptions,
+      initialWallMs,
+      wallScaled,
+      state,
+      idleMs,
+      onSignal,
+      resumeId,
+    };
+  }
+
+  /**
+   * Phase P5 (PRD #949 M3): the plan gate + revise loop. Returns an ExecutorResult
+   * to short-circuit run() (the ci_fix `not_code` outcome — the single early return
+   * moved verbatim), or `undefined` to continue into the implement loop after writing
+   * its products (approvedPlan, approvedSelection, preApproved, budget, the possibly-
+   * updated resumeId/frozenMilestones) onto the carrier. Every throw (plan rejected,
+   * cancelled, unwired gate, unexpected verdict) propagates through run()'s try to the
+   * finally exactly as before the split.
+   */
+  private async phasePlanGate(
+    ctx: RunContext,
+    drive: DriveState,
+  ): Promise<ExecutorResult | undefined> {
+    const {
+      baseOptions,
+      state,
+      idleMs,
+      oauthToken,
+      planSubagentNames,
+      subagentCanWrite,
+      maxRevisions,
+    } = drive;
+    let resumeId = drive.resumeId;
+    let frozenMilestones = drive.frozenMilestones;
       // --- PRD #35 Decision 6b + PRD #209 D4: skip planning for an approved plan ---
       //
       // Fires when the plan is approved, there is plan text to implement, AND either a
@@ -1356,6 +1506,52 @@ export class SdkExecutor implements Executor {
         this.log.info("ci_fix run: not_code verdict", { run_id: ctx.runId });
         return { branch: ctx.branch, fixVerdict: "not_code" };
       }
+
+      drive.resumeId = resumeId;
+      drive.frozenMilestones = frozenMilestones;
+      drive.approvedPlan = approvedPlan;
+      drive.approvedSelection = approvedSelection;
+      drive.preApproved = preApproved;
+      drive.budget = budget;
+      return undefined;
+  }
+
+  /**
+   * Phases P6-P8 (PRD #949 M3): post-plan roster setup, the milestone/turn loop, and
+   * result assembly. No early returns — the sole `return result` at the end is the
+   * method's only return, so it hands back to run(), which returns it and runs the
+   * finally. The declared* accumulators, scopeCapped and the stall triple stay locals
+   * here (the finally never reads them); only what crosses a phase boundary is carried.
+   */
+  private async phaseRunLoop(
+    ctx: RunContext,
+    drive: DriveState,
+  ): Promise<ExecutorResult> {
+    const {
+      depsInstall,
+      leadModel,
+      assembled,
+      survivorNames,
+      prepared,
+      baseOptions,
+      repoInstructionsBlock,
+      preToolUse,
+      isIssueRun,
+      frozenMilestones,
+      state,
+      idleMs,
+      initialWallMs,
+      toolEnv,
+    } = drive;
+    const preApproved = drive.preApproved!;
+    const approvedPlan = drive.approvedPlan!;
+    const approvedSelection = drive.approvedSelection!;
+    const budget = drive.budget!;
+    let { depsResults, depsTruncated } = drive;
+    let resumeId = drive.resumeId;
+    let maxIterations = drive.maxIterations;
+    let latestProgress = drive.latestProgress;
+    let wallScaled = drive.wallScaled;
 
       // --- Join the JS dependency install (PRD #121 M2) ---------------------
       // The IMPLEMENT phase must never race the install. Past this point the agent
@@ -1976,30 +2172,6 @@ export class SdkExecutor implements Executor {
       // actual diff, so no zero-slice special-casing here.
       if (isIssueRun && scopeCapped) result.scopeCapped = scopeCapped;
       return result;
-    } finally {
-      this.disarmWall(state);
-      if (ctx.signal) ctx.signal.removeEventListener("abort", onSignal);
-      // PRD #121 M2: no install may outlive the run. On every path that never reached
-      // the join — plan rejected, cancelled, no plan submitted, ci_fix not_code — the
-      // install may still be in flight, and the runner tears the clone down and pushes
-      // with the PAT the moment this returns. Abort FIRST so the await is bounded by a
-      // kill rather than by the install's own 10-minute cap (that is what stops a
-      // rejected plan blocking on deps nobody needs); the promise already carries its
-      // own catch, so awaiting it can never throw here and mask the real failure.
-      depsAbort.abort();
-      await depsInstall;
-      // Reap every agent subprocess before returning, so none survives into the
-      // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
-      // too, not just the runner's explicit pre-push call.
-      this.killAgentTree();
-      // Remove the per-run provisioning dir (the synthesized devbox.json + profile
-      // symlinks). The nix STORE is global (on the data volume), NOT here, so this
-      // never evicts the warm-start cache. Best-effort.
-      if (provisionDir)
-        await fs
-          .rm(provisionDir, { recursive: true, force: true })
-          .catch(() => undefined);
-    }
   }
 
   /**

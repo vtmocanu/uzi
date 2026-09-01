@@ -3,13 +3,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import type { GitCache } from "./git.js";
+import type { GitCache, RunnerClone } from "./git.js";
 import {
   gitBasicCredential,
   isNonFastForwardRejection,
   isWorkflowScopeRejection,
 } from "./git.js";
-import type { Executor, RunContext } from "./executor.js";
+import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
@@ -251,6 +251,42 @@ interface ActiveRun {
   shuttingDown: boolean;
 }
 
+/**
+ * PRD #949 M2 — the per-run state carrier for RunRunner.execute(). Holds the
+ * cross-phase state the extracted phase methods, the (still-inline) back half, and
+ * the catch/finally read: the const collaborators built in the prologue plus the
+ * mutables the phases fill in (barePath/worktreePath/branch/runnerClone/result and
+ * the park/shutdown flags). Unexported on purpose — an exported-but-unused carrier
+ * would redden knip (deadcode:agent).
+ */
+interface RunFlight {
+  readonly runId: string;
+  readonly executor: Executor;
+  readonly runHome: string | undefined;
+  readonly runScopedSecrets: string[];
+  readonly runLog: Logger;
+  readonly redact: ReturnType<typeof makeRedactor>;
+  readonly redactText: ReturnType<typeof makeTextRedactor>;
+  readonly batcher: MessageBatcher;
+  readonly cancel: AbortController;
+  readonly steering: SteeringChannel;
+  readonly reportState: (
+    body: Parameters<WorkerClient["reportState"]>[1],
+  ) => ReturnType<WorkerClient["reportState"]>;
+  observedSessionId: string | undefined;
+  barePath: string | undefined;
+  worktreePath: string | undefined;
+  branch: string | undefined;
+  active: ActiveRun | undefined;
+  parked: boolean;
+  preserveSession: boolean;
+  lastPublish: number;
+  lastPublishedTip: string | undefined;
+  runnerClone: RunnerClone | undefined;
+  ciFixHumanApproved: boolean;
+  result: ExecutorResult | undefined;
+}
+
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
   /** How often the steering channel polls /inputs (default 3s). */
@@ -432,1811 +468,26 @@ export class RunRunner {
       runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
     for (const s of runScopedSecrets) this.log.addSecret(s);
 
-    const runLog = this.log.child({
-      run_id: runId,
-      issue_iid: claim.issue_iid,
-    });
-    // Same secret set for both redactors: the batcher scrubs run_message payloads;
-    // redactText scrubs strings that reach the API outside a payload (failure_reason,
-    // and the PRD #99 agent_label/agent_instance the batcher now carries alongside
-    // the payload — `redact` walks inside a payload object and never sees them).
-    const secrets = [
-      claim.secrets.forge_pat,
-      claim.secrets.anthropic_oauth_token,
-      this.joinToken,
+    const flight = this.buildFlight(
+      claim,
+      runId,
+      executor,
+      runHome,
       gitBasic,
-    ];
-    const redact = makeRedactor(secrets);
-    const redactText = makeTextRedactor(secrets);
-    const batcher = new MessageBatcher(
-      this.client,
-      runId,
-      claim.last_seq,
-      this.batchMs,
-      runLog,
-      redact,
-      redactText,
+      runScopedSecrets,
     );
-
-    // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the
-    // steering channel, which the executor's ctx.signal watches.
-    const cancel = new AbortController();
-    // PRD #41: `notify` lets the steering channel post a feed notice when it discards a
-    // verdict/revision written against a stale plan version — wired to the batcher here
-    // so the channel never reaches into runner internals.
-    const steering = new SteeringChannel(
-      this.client,
-      runId,
-      this.pollMs,
-      runLog,
-      cancel,
-      {
-        notify: (text) =>
-          batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
-      },
-    );
-    // issue #552 M3: a graceful `uzi run stop` (PRD #517 M4) consumed into the worker's
-    // stopRequested flag is lost if the worker dies before winding the park down. The
-    // server re-delivers the durable runs.stop_kind='stopped' fact as claim.stop_pending
-    // on every claim; seeding it here reconstructs the sticky stop state so the resumed
-    // run's interactive park ends `stopped` immediately (steering.awaitFollowUp's arm-time
-    // check) instead of waiting out the idle timeout. Absent ⇒ untouched (today's path).
-    if (claim.stop_pending) steering.seedStopRequested();
-
-    // Last SDK session id the executor observed; carried on EVERY state report so
-    // resume survives a lost report.
-    let observedSessionId: string | undefined;
-    // Returns the server's acknowledgement (PRD #35), which every caller here still
-    // ignores. Widened from Promise<void> so the park branch can read it without
-    // re-plumbing this closure; the annotation is the only change, and awaiting a
-    // value nobody binds behaves exactly as before.
-    const reportState = (
-      body: Parameters<WorkerClient["reportState"]>[1],
-    ): ReturnType<WorkerClient["reportState"]> =>
-      this.client.reportState(
-        runId,
-        observedSessionId ? { ...body, session_id: observedSessionId } : body,
-      );
-
-    // PRD #108 M3: the batcher's breaker reports OUT OF BAND, never through itself —
-    // `concat` is order-preserving, so an emitted explanation would queue behind the
-    // poison that tripped it and never land. reportState has bounded retries,
-    // 4xx-fatal semantics, and treats an already-terminal server response as
-    // success, so if the run has already reported terminal this is a safe no-op
-    // rather than a second, racing terminal report. Fire-and-forget: the batcher's
-    // trip path must never block on the network.
-    batcher.onPermanentFailureReport(({ reason }) => {
-      void reportState({
-        status: "failed",
-        failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-      }).catch((e) =>
-        runLog.error("could not report the message-transport failure", {
-          error: errMessage(e),
-        }),
-      );
-    });
-
-    let barePath: string | undefined;
-    let worktreePath: string | undefined;
-    // PRD #267: time-based origin-checkpoint gate state (per run). `lastPublish` starts
-    // at run start so the first time-based publish fires ~one interval in; both are
-    // updated by ANY origin publish (milestone or time). Decision 9: the publish "new
-    // work" test keys on `lastPublishedTip`, NOT the fetch-skip below.
-    let lastPublish = this.now();
-    let lastPublishedTip: string | undefined;
-    // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
-    // catch can name it. `runnerClone` is declared inside the try and there is no
-    // `result` on those paths, so `runnerClone.branch` is the source of truth and it is
-    // copied here the moment the clone exists.
-    let branch: string | undefined;
-    // PRD #218 M1: this run's shutdown-registry entry, hoisted so the catch can read
-    // `active.shuttingDown` to tell a graceful shutdown apart from every other failure.
-    let active: ActiveRun | undefined;
-    // PRD #35: set ONLY by a park the server acknowledged as `limit_wait`. It gates
-    // the two filesystem removals in the finally and nothing else. Declared here
-    // rather than in the catch so the finally can see it; false is the safe default,
-    // so every path that never reaches the park logic cleans up exactly as before.
-    let parked = false;
-    // PRD #556 M1: set ONLY by a worker-shutdown interrupt (the `active?.shuttingDown`
-    // catch branch). Like `parked`, it gates EXACTLY the two filesystem removals in the
-    // finally (the sibling skills plugin dir and the per-run HOME) and nothing else — so
-    // a same-worker re-claim within the affinity grace can resume the SDK session. It is
-    // a distinct flag from `parked` on purpose: `parked` also drives park-only report
-    // semantics, resume seeding, and the park log, none of which apply to a shutdown.
-    let preserveSession = false;
+    const { runLog, batcher, reportState, redactText, steering } = flight;
     try {
-      runLog.info("run claimed", {
-        repo: claim.repo.url,
-        branch: claim.branch ?? null,
-      });
-      await reportState({ status: "running" });
-      steering.start();
-
-      barePath = await this.git.ensureClone(
-        claim.repo.clone_url,
-        claim.secrets.forge_pat,
-        claim.secrets.forge_username,
-      );
-      const runnerClone = await this.runnerCloneForClaim(barePath, claim);
-      worktreePath = runnerClone.path;
-      branch = runnerClone.branch;
-      // PRD #218 M1: register for the shutdown fetch-back now that a clone exists to
-      // fetch from. The late-register guard covers the race where shutdown() already
-      // fired before this run reached here — abort it at once so it does not run to
-      // completion past the grace window.
-      active = { cancel, shuttingDown: false };
-      this.activeRuns.set(runId, active);
-      if (this.shuttingDownGlobal) {
-        active.shuttingDown = true;
-        cancel.abort();
-      }
-      batcher.emit({
-        kind: "status",
-        agent: "worker",
-        payload: { text: `runner clone ready on ${runnerClone.branch}` },
-      });
-
-      // PRD #218 M3 / #759 M5: say what a resume recovered, in a WORKER status rather than by
-      // the lead noticing the tree changed under it. Two axes cross here — WHAT kind of work
-      // was recovered, committed vs. uncommitted, and each is honest about a distinct outcome:
-      //   - COMMITTED work (priorCommits > 0): the tracking-ref leg (same-worker, its owner
-      //     stamp matched THIS run — M2) or the checkpoint leg (cross-worker, #122 M8). The
-      //     message says which and names the count.
-      //   - UNCOMMITTED WIP (runnerClone.wipRecovered — #759 M2): a `wip(park):` marker was
-      //     `reset --soft` back to the working tree, so its edits returned UNCOMMITTED and the
-      //     marker never enters the history. priorCommits was computed AFTER that reset (off
-      //     the marker's parent), so it NEVER counts the marker — a pure WIP recovery has
-      //     priorCommits === 0. This is a PARTIAL, unreviewed snapshot, NOT a committed
-      //     milestone, so its wording says to verify it against the plan.
-      //   - NOTHING recovered on a RESUME (session id present, seededFrom "default", no WIP):
-      //     no origin branch, no tracking ref THIS run owns, no recoverable WIP — a
-      //     cross-worker resume (R1) or a diverged checkpoint that could not be applied. The
-      //     tree is lost for this run; admit it (the #218 M3 loss notice, unchanged wording).
-      //
-      // Branch order is load-bearing: the pure-WIP branch (3) MUST precede the loss branch (4).
-      // A cross-worker DIVERGED WIP recovery (#759 M2 leg #4) recovers the WIP tree onto the new
-      // floor but leaves seededFrom === "default" (the base is the floor, not the checkpoint) with
-      // wipRecovered === true. If the loss branch ran first it would FALSELY fire "no earlier work
-      // could be recovered" on exactly that successful recovery. With branch 3 ahead of it, the
-      // loss notice fires only when NOTHING — committed or WIP — was recovered: the residual
-      // #218-M3 loss case.
-      const wipRecovered = runnerClone.wipRecovered === true;
-      if (runnerClone.seededFrom === "tracking" && runnerClone.priorCommits > 0) {
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: wipRecovered
-              ? `recovered ${runnerClone.priorCommits} commit(s) plus your uncommitted work-in-progress from this run's interrupted attempt`
-              : `recovered ${runnerClone.priorCommits} commit(s) of work from this run's interrupted attempt`,
-          },
-        });
-      } else if (runnerClone.seededFrom === "checkpoint" && runnerClone.priorCommits > 0) {
-        // PRD #122 M8: seeded off ANOTHER worker's brokered checkpoint (origin's
-        // refs/uzi-checkpoints/<branch>) — a cross-worker recovery the lead cannot infer
-        // from the tree alone. priorCommits counts what the checkpoint carries. Gated on
-        // priorCommits > 0 (like the tracking notice above) so it never claims to have
-        // "recovered 0 commit(s) from a checkpoint". #759 M5: a checkpoint can ALSO carry a
-        // reset-soft'd WIP tree alongside its commits — mention it when it did.
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: wipRecovered
-              ? `recovered ${runnerClone.priorCommits} commit(s) plus your uncommitted work-in-progress from a checkpoint on another worker`
-              : `recovered ${runnerClone.priorCommits} commit(s) from a checkpoint on another worker`,
-          },
-        });
-      } else if (wipRecovered) {
-        // PRD #759 M5: a PURE uncommitted-WIP recovery — no committed milestones came back
-        // (priorCommits === 0). This is the #685 shape and covers same-worker tracking with
-        // zero commits, a cross-worker clean checkpoint with zero commits, AND the
-        // cross-worker DIVERGED cherry-pick leg (seededFrom stays "default"/origin). The
-        // recovered content is an UNCOMMITTED, PARTIAL snapshot from an interrupted attempt,
-        // NOT a committed milestone — so tell the agent to verify it against the plan before
-        // building on it. This branch precedes the loss notice so the diverged case
-        // (seededFrom === "default" + wipRecovered) never falsely reports total loss.
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text:
-              "recovered your uncommitted work-in-progress from this run's interrupted attempt — " +
-              "a partial snapshot, so verify it against the plan before continuing",
-          },
-        });
-      } else if (claim.session_id != null && runnerClone.seededFrom === "default") {
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text:
-              "no earlier work could be recovered for this run on this worker — " +
-              "starting from the default branch, so some work may be repeated",
-          },
-        });
-      }
-      // PRD #122 M8: a mirrored checkpoint existed but DIVERGED from origin, so origin won
-      // and the checkpointed work was set aside. Independent of the seed leg (the base is
-      // origin/default here, not the checkpoint) — say so LOUDLY rather than dropping it
-      // silently.
-      if (runnerClone.checkpointSetAside) {
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: "checkpointed work was set aside — origin diverged; starting from origin",
-          },
-        });
-      }
-
-      // PRD #628 M4: signal the server to CLEAR this run's stale milestones_completed when
-      // the reseed recovered NO committed work (seededFrom === "default", equivalently
-      // priorCommits === 0). milestones_completed is a monotone union server-side, so pass-1's
-      // milestones would otherwise read as "done" while pass-2 re-implements them from the
-      // default branch — the "marked done but still working on them" symptom. This is a
-      // DEDICATED, ONE-SHOT run-start report: the field rides THIS report only and NEVER a
-      // reportIteration heartbeat (the server clears on it, so emitting it per-heartbeat would
-      // wipe live progress every iteration). AWAITED because correctness depends on delivery
-      // (reportState has bounded retries) — but best-effort in spirit: it must not fail the run,
-      // so a failed report is logged and swallowed. Keyed on the TREE signal, NOT the session
-      // signal (RESUME_LINEAGE_BREAK_EVENT) — the two diverge once M2 lands, and a re-claim that
-      // recovers the tree via checkpoint (seededFrom "checkpoint") legitimately keeps its
-      // milestones. Gated on claim.session_id != null (a RESUME), mirroring the tree-loss
-      // feed message at ~:603: a brand-new first attempt has no prior milestones to clear,
-      // so it must NOT emit a spurious extra run-start report (that perturbs the status-report
-      // sequence other runner tests assert, e.g. runner-push-mr).
-      if (claim.session_id != null && runnerClone.seededFrom === "default") {
-        try {
-          await reportState({ status: "running", seeded_from_default: true });
-        } catch (e) {
-          runLog.warn("could not report seeded_from_default (milestone reset signal)", {
-            error: errMessage(e),
-          });
-        }
-      }
-
-      // Resume preflight (issue #105). The claim carries the session id the run last
-      // reported, but the transcript it names lives under the per-run HOME on the
-      // worker that WROTE it — and a requeued run whose affinity grace lapsed can land
-      // on a different worker, where it does not exist. Not only cross-worker: a session
-      // is keyed by HOME *and* cwd, so a replaced volume or a changed clone path loses
-      // it on the same box. The SDK resolves a resume locally, so an unresolvable id
-      // does not start fresh: it fails the very first turn with `error_during_execution`
-      // and takes the whole run with it. If it is gone, drop the resume and SAY so —
-      // continuing without the earlier context beats losing the run, but only if the
-      // feed admits the context is gone rather than quietly re-treading ground.
-      //
-      // The check globs this HOME's project dirs rather than computing the one the cwd
-      // encodes to (sdk-session.ts explains why the computed path would false-absent on
-      // a symlinked data dir). A per-run HOME holds exactly one project dir — this run's
-      // own clone — so the glob is precise here regardless.
-      //
-      // Only when this run HAS a private HOME: the stub executor has none (main.ts),
-      // which is exactly the "no SDK session to resume" case, so the e2e stub flow is
-      // untouched by construction rather than by an executor-kind check here.
-      // PRD #88: seed the open question id from the claim. The server re-delivers it
-      // from the runs row on every resume, so a worker that picks up a run parked
-      // before a death re-parks on the SAME question rather than minting a new id —
-      // which is what keeps an answer the user already submitted valid. Without this
-      // seeding the identity guard would still be keyed on identity, but the identity
-      // itself would change across the requeue, reproducing exactly the silent
-      // rejection the clock-based designs were rejected for.
-      if (claim.open_question_id)
-        this.openQuestionIds.set(runId, claim.open_question_id);
-
-      let sessionId = claim.session_id ?? undefined;
-      if (
-        sessionId &&
-        runHome &&
-        !(await sessionTranscriptResolvable(runHome, sessionId, runLog))
-      ) {
-        sessionId = undefined;
-        runLog.warn(
-          "resume session transcript is not resolvable here; starting a fresh SDK session",
-          {
-            run_home: runHome,
-            event: RESUME_LINEAGE_BREAK_EVENT,
-          },
-        );
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            // Says what is true without over-claiming a cause: the usual one is a
-            // re-claim by another worker, but the same box loses it too if the cwd
-            // changed or the volume was replaced. Both facts the reader needs are
-            // stated — the context is gone, AND that is why work may be re-tread.
-            text:
-              "this run was picked up again, but its earlier session could not be found on this worker — " +
-              "continuing WITHOUT its earlier context, so some work may be repeated",
-            event: RESUME_LINEAGE_BREAK_EVENT,
-          },
-        });
-      } else if (claim.session_id != null && sessionId != null) {
-        // PRD #556 M2 (D5) — the positive resume signal, mutually exclusive with the
-        // lineage-break branch above. This fires only when a REAL prior session existed
-        // (claim.session_id != null — a resume, not a fresh first attempt and not a
-        // seeded run whose claim.session_id is null) AND it RESOLVED on THIS worker's
-        // HOME (the preflight above did NOT clear sessionId). Because the guard above
-        // requires `runHome` to even attempt resolution, sessionId survives with no
-        // runHome (stub executor / e2e) too — but there the resume is a no-op with no
-        // transcript to resolve, so guarding on the same runHome condition keeps this
-        // silent there, matching the lineage-break guard's intent.
-        if (runHome) {
-          runLog.info(
-            "resume session transcript resolved here; continuing the prior SDK session",
-            {
-              run_home: runHome,
-              event: RESUME_CONTINUED_EVENT,
-            },
-          );
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: {
-              text:
-                "this run was picked up again and its earlier session was found on this worker — " +
-                "continuing WITH its prior context (no re-plan)",
-              event: RESUME_CONTINUED_EVENT,
-            },
-          });
-        }
-      }
-      // Tell the lead whenever the branch it is standing on already carries commits it did
-      // not make this turn, so the honest degradation never becomes silently duplicated work.
-      // PRD #218 M3 widened the condition to `priorCommits > 0` alone: it previously fired
-      // ONLY when the resume was dropped, which missed the case where the session survives but
-      // the TREE was recovered from the tracking ref (or is prior pushed work), where the lead
-      // equally needs to know its branch is not empty. A fresh run reading its own empty
-      // first-attempt branch counts 0 and gets nothing.
-      //
-      // PRD #209 D7: this note normally reaches the lead in the PLANNING prompt, but a
-      // session-less SEEDED run has no planning turn, so it rides the IMPLEMENT prompt instead
-      // (threaded on the pre-approved path) — otherwise a requeued seeded run whose transcript
-      // was dropped would re-implement cold on a branch that already carries pushed commits,
-      // with no prior-work note.
-      const priorWork =
-        runnerClone.priorCommits > 0
-          ? { commits: runnerClone.priorCommits }
-          : undefined;
-
-      // PRD #209 (D4): a SEEDED run's plan was authored by the user at create time, so
-      // it is approved with NO server-side approve_plan input and — on a fresh seeded
-      // run — no SDK session. That is a legitimate "approved, no session" state, NOT the
-      // dropped-transcript one the `&& sessionId` guard below protects against: there
-      // was never a session to lose. The runner is the layer that can tell the two apart
-      // (it holds the preflight result), so it folds `seeded` into planApproved here
-      // rather than leaving the executor to read the claim.
-      const seeded = claim.plan_source === "seeded";
-
-      // PRD #209 M4 — staleness guard. A seeded run carries the commit the user planned
-      // against (claim.planned_base_commit). evaluateBaseStaleness compares it to the
-      // clone's resolved base (runnerClone.baseCommit, the same field forwarded into
-      // RunContext below): only a seeded run sets planned_base_commit, so an ordinary run
-      // yields undefined and proceeds silently. On a divergence it either returns a warning
-      // to emit (default) or, under --require-base (claim.require_base_match), THROWS
-      // BaseCommitDivergedError BEFORE any implement work — the generic catch-all then
-      // fails the run, so it never implements against a diverged base (Open Question 3).
-      const staleWarning = evaluateBaseStaleness(
-        claim.planned_base_commit ?? undefined,
-        runnerClone.baseCommit,
-        claim.require_base_match ?? false,
-      );
-      if (staleWarning) {
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: { text: staleWarning },
-        });
-      }
-
-      // PRD #37: parse the checked-out repo's own agent roster and report it on
-      // this first post-checkout `running` state report. It rides the STATE report
-      // rather than the gate so that an autopilot run — which never parks at
-      // awaiting_approval — records what was detected just the same. The roster is
-      // inert data: nothing is assembled until a selection picks the repo source.
-      const detection = await this.parseRepoAgents(
-        runnerClone.path,
-        batcher,
-        runLog,
-      );
-      const repoAgents = detection.agents;
-      if (detection.ok) {
-        // Non-fatal, and fire-and-forget (matching the session-id report below): an
-        // INFORMATIONAL roster report must never fail a run. An older API without the
-        // repo_agents field 400s DisallowUnknownFields, which the client treats as
-        // permanent — awaiting the report here would turn a working run into a failed
-        // one over a field the run does not depend on. On a detection FAILURE we send
-        // no roster at all, so the column stays NULL ("not reported") rather than `[]`
-        // ("scanned, found none") — the two must stay distinguishable.
-        void reportState({
-          status: "running",
-          repo_agents: repoAgentSummaries(repoAgents),
-        }).catch((e) =>
-          runLog.warn("could not report repo agent roster", {
-            error: errMessage(e),
-          }),
-        );
-      }
-
-      // PRD #84 M4: infer the run's requirement set from the checked-out clone with the
-      // deterministic scan, ONCE, best-effort. A scan failure must never break a run, so
-      // it is caught and yields `undefined` ("emit nothing"). The result rides the same
-      // two reports as `milestones` — the CANDIDATE set on the awaiting_approval report and
-      // the FROZEN set on the autopilot running report — threaded through gatePlan below.
-      let toolchainDetection: ToolchainDetection | undefined;
-      try {
-        toolchainDetection = await detectToolchain(runnerClone.path);
-      } catch (err) {
-        runLog.warn("toolchain detection failed; continuing without a requirement set", {
-          error: errMessage(err),
-        });
-      }
-
-      // Cross-run memory (PRD #90): fetch this run's (user, repo) memory so the
-      // executor can compose it into the lead's plan prompt as inert, nonce-fenced,
-      // untrusted-advisory context. Guarded HARD — a fetch failure (older API, repo-
-      // less run 404/409, transport error) or an empty store injects NOTHING and
-      // never fails the run: memory is advisory, never load-bearing.
-      let memory: Awaited<ReturnType<WorkerClient["getMemory"]>> = [];
-      try {
-        memory = await this.client.getMemory(runId);
-      } catch (err) {
-        runLog.warn("could not fetch cross-run memory; continuing without it", {
-          error: errMessage(err),
-        });
-      }
-
-      // PRD #71 M5: did a HUMAN approve this ci_fix plan? On a PRE-APPROVED RESUME the gate
-      // does not run this execution, so derive from durable claim state. The server CLEARS
-      // auto_approve the moment a run PARKS at the plan gate (SetRunAwaitingApproval,
-      // symmetric with the seeded plan_source='agent' decouple), so a resumed run still
-      // carrying auto_approve=true was AUTO-approved WITHOUT ever parking (no human), while
-      // auto_approve=false means either a manual run or an auto run that parked and was
-      // human-approved. A fresh run's gate closure overwrites this precisely.
-      let ciFixHumanApproved = (claim.auto_approve ?? false) !== true;
-
-      // PRD #759 M4: resume a provably-reviewed approved run without re-plan/re-gate on a
-      // dropped-session cross-worker resume. plan_source==='agent' is a POSITIVE allowlist
-      // (worker-authored-but-gated; #209 D8 makes plan_source track plan_md provenance) — do
-      // NOT write `!== "seeded"`, which fails OPEN on any future unreviewed provenance value.
-      // humanApproved is computed FRESH from claim.auto_approve here (NOT reused from the
-      // mutable ciFixHumanApproved, which the gate closure reassigns): the server clears
-      // auto_approve when a run parks at the plan gate, so auto_approve!==true ⟺ a human saw
-      // the gate. recoveryFailed ⟺ the reseed recovered NOTHING: no committed tree AND no WIP
-      // snapshot. seededFrom "default" ALONE is not loss — the diverged cross-worker cherry-pick
-      // leg recovers the WIP onto the advanced floor with seededFrom "default" + wipRecovered
-      // true (ADR-0759; the reseed-feed block above special-cases the same pair as a WIP
-      // recovery, not total loss). So wipRecovered is folded in here too — without it a
-      // human-approved run whose WIP came back cleanly on the diverged leg would FALSELY re-gate.
-      // The re-gate fallback (FLAG D) needs BOTH: an autopilot recovery-failed resume has no
-      // human at the gate to protect, but a human-approved recovery-failed run RE-GATES so the
-      // human notices the lost tree — #209's loss-detection gate, kept exactly where #209 put it.
-      const humanApproved = (claim.auto_approve ?? false) !== true; // false ⟺ a human saw the gate
-      const recoveryFailed =
-        runnerClone.seededFrom === "default" && runnerClone.wipRecovered !== true; // no tree AND no WIP
-      const m4ResumeReviewedPlan =
-        (claim.plan_approved ?? false) &&
-        claim.plan_source === "agent" &&
-        !!claim.plan_md?.trim() &&
-        !sessionId &&
-        !seeded && // the D4-row-3 dropped-session case
-        !(humanApproved && recoveryFailed); // re-gate a human-approved run that lost its tree
-
-      const ctx: RunContext = {
-        runId,
-        kind: claim.kind ?? "issue",
-        issueIid: claim.issue_iid,
-        issueTitle: claim.issue_title,
-        issueDescription: claim.issue_description,
-        // PRD #381: carry the snapshotted issue-comment set onto the ctx; the SDK
-        // executor threads it to buildPlanPrompt for nonce-fenced rendering. Absent/
-        // null ⇒ nothing is rendered.
-        issueComments: claim.issue_comments,
-        // PRD #700 M4: carry the mr_rework run's snapshotted MR review comments onto
-        // the ctx, exactly like issueComments; the SDK executor threads it to
-        // buildPlanPrompt for nonce-fenced rendering. Absent/null (every non-mr_rework
-        // kind) ⇒ nothing is rendered.
-        reviewComments: claim.review_comments,
-        pipeline: claim.pipeline,
-        worktreePath: runnerClone.path,
-        branch: runnerClone.branch,
-        // PRD #501 REC B: thread the autopilot flag to plan-build time so the plan
-        // builders render the no-human-in-the-loop note. Absent ⇒ false.
-        autoApprove: claim.auto_approve ?? false,
-        // PRD #517 M3: an interactive task run parks at awaiting_followup on signal_done
-        // instead of finalizing (see the awaitFollowUp callback below). Absent ⇒ false, so
-        // every non-interactive run (and every older server) is byte-identical to today.
-        interactive: claim.interactive ?? false,
-        // The seed resolved this in the bare; forwarding it is what stops the lead from
-        // guessing the branch's parent (judge rec, run 51757591).
-        baseCommit: runnerClone.baseCommit,
-        defaultBranchCommit: runnerClone.defaultBranchCommit,
-        emit: (m) => batcher.emit(m),
-        oauthToken: claim.secrets.anthropic_oauth_token,
-        // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
-        // and whether the intent summary is already set so the executor skips
-        // re-generating it on a resume/re-claim (Decision 3). Both absent on older
-        // servers, which the summary hooks tolerate (undefined model → account default,
-        // false present → generate).
-        summaryModel: claim.summary_model ?? undefined,
-        summaryIntentPresent: claim.summary_intent_present ?? false,
-        agents: claim.agents,
-        repoAgents,
-        skills: claim.skills,
-        skillsDropped: claim.skills_dropped,
-        repoSkillsEnabled: claim.repo.skills_enabled ?? false,
-        repoClaudemdEnabled: claim.repo.claudemd_enabled ?? false,
-        memory,
-        // Issue #297: the self_improve in-flight avoid-set (best-effort; absent ⇒ empty).
-        inflightTargets: claim.inflight_targets,
-        // PRD #686 D11: the open self-improve MRs' "what was proposed" text (best-effort;
-        // absent ⇒ empty, so the picker's non-overlap block is simply omitted).
-        openSelfImproveMRs: claim.self_improve_open_mrs,
-        // PRD #686 M4: dogfood flag (absent ⇒ generic; older server never sets it).
-        selfImproveDogfood: claim.self_improve_dogfood,
-        config: claim.config,
-        // Preflighted above: the claim's id, or undefined when its transcript is not
-        // on this worker (issue #105).
-        sessionId,
-        priorWork,
-        // issue #222: this run executed before (it reported a session), so this claim's
-        // reseed wiped whatever an earlier attempt left in the tree. Read the RAW
-        // claim.session_id, not the `sessionId` var cleared above on a dropped transcript —
-        // a dropped-session resume still had its tree destroyed. Same discriminator the
-        // reseed feed-status uses (this.emit "starting from the default branch" above).
-        resumed: claim.session_id != null,
-        // PRD #35 Decision 6b + PRD #209 D4. The RUNNER is the only layer that knows
-        // all the facts, which is why it resolves them here rather than the executor
-        // reading the claim: the server said the plan is approved, and EITHER a session
-        // id arrived that issue #105's transcript check did NOT drop (`sessionId` is
-        // cleared above when it did) OR the run is SEEDED. Passing plan_approved through
-        // on a dropped-session NON-seeded run would make the executor skip planning for a
-        // run whose session is gone — the one case (D4 row 3) where it must re-plan. A
-        // seeded run (D4 row 2) is approved with no session by construction, and that is
-        // fine because there was never a session to lose.
-        planApproved:
-          (claim.plan_approved ?? false) &&
-          (!!sessionId || seeded || m4ResumeReviewedPlan),
-        // PRD #759 M4: a provably-reviewed cross-worker resume skips the re-gate and
-        // embeds the persisted plan body on the implement turn. Drives the relaxed
-        // preApproved session guard and the embedSeededPlan reviewedResume term.
-        reviewedPlanResume: m4ResumeReviewedPlan,
-        // PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park):
-        // marker reset --soft back to the tree), so a cold resumed lead is told to treat
-        // the dirty tree as mid-edit and reconcile it against the plan (R1).
-        wipRecovered: runnerClone.wipRecovered,
-        // PRD #209: the executor relaxes its own session guard for a seeded run and
-        // emits the "plan supplied externally" feed line off this.
-        seeded,
-        approvedPlan: claim.plan_md ?? undefined,
-        // The persisted selection, replayed on the claim (PRD #35). Passed through
-        // unconditionally rather than gated on planApproved: it is the run's
-        // selection whether or not this particular resume skips the gate, and the
-        // executor only reads it on the path that has no verdict to supply one.
-        approvedSelection: claim.agent_selection,
-        signal: cancel.signal,
-        // Persist the SDK session id the moment the executor learns it, so a
-        // re-queued run can resume it. Best-effort.
-        onSessionId: (sessionId) => {
-          observedSessionId = sessionId;
-          void reportState({ status: "running" }).catch((e) =>
-            runLog.warn("could not persist session id", {
-              error: errMessage(e),
-            }),
-          );
-        },
-        // The plan gate: surface the plan, post awaiting_approval, and return the
-        // verdict the steering channel resolves (bounded so an abandoned plan
-        // fails rather than wedging the worker). An autopilot claim short-circuits
-        // to an approve verdict (see gatePlan) — the run never parks at the gate.
-        gatePlan: async (planMd, milestones, onAwaitingApproval) => {
-          // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
-          // short-circuit — it parks for human review even on an auto-triggered run. We
-          // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
-          // unchanged. Non-ci_fix and code-plan ci_fix runs keep today's behavior exactly.
-          const forceGate = claim.kind === "ci_fix" && isCIConfigPlan(planMd);
-          const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate;
-          const verdict = await this.gatePlan(
-            runId,
-            planMd,
-            milestones,
-            batcher,
-            steering,
-            reportState,
-            runLog,
-            effectiveAutoApprove,
-            repoAgents,
-            toolchainDetection,
-            // PRD #212: the runner clone path for the gate's runner-uid `git status`.
-            // Use runnerClone.path (const, string), NOT the `worktreePath` local
-            // (string | undefined — does not narrow in this closure).
-            runnerClone.path,
-            onAwaitingApproval,
-          );
-          // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
-          // (not the auto short-circuit). Read by the pre-push guard below.
-          ciFixHumanApproved = verdict.kind === "approve" && !effectiveAutoApprove;
-          return verdict;
-        },
-        // PRD #88 clarification park: surface the question, post awaiting_input, and
-        // return the answer the steering channel resolves. An autopilot claim
-        // short-circuits to a sentinel answer (see askUser) — such a run never parks.
-        askUser: (questions) =>
-          this.askUser(
-            runId,
-            questions,
-            batcher,
-            steering,
-            reportState,
-            runLog,
-            claim.auto_approve ?? false,
-            claim.config ?? null,
-          ),
-        pullFollowUp: () => steering.pullFollowUp(),
-        // PRD #517 M3: the interactive-task follow-up park. The executor calls this after a
-        // clean signal_done on an interactive run (it has already checkpoint-pushed): report
-        // awaiting_followup, verify the park took, then BLOCK on the steering channel until
-        // the next follow-up (or an idle/cancel end).
-        //
-        // CONSUME-BEFORE-REPORT ORDERING (the server's SetRunRunning wake guard): the report
-        // of `running` that un-parks the run is the loop's NEXT reportIteration, which the
-        // executor only reaches AFTER this resolves with a follow-up. steering.awaitFollowUp
-        // resolves that follow-up ONLY from the poll loop's post-route service step, i.e.
-        // after ConsumeRunInputs stamped consumed_at — so a consumed follow_up input always
-        // exists before `running` is reported, and the server admits the wake. This mirrors
-        // askUser's settle discipline; the ordering is satisfied by construction here.
-        awaitFollowUp: async (idleMs) => {
-          // issue #552 M1 (mid-turn wake-guard bug): report `awaiting_followup` — which stamps
-          // the open_followup_id watermark — ONLY when the run is genuinely going idle. If a
-          // follow-up (or stop/cancel) arrived mid-turn and is already buffered, reporting the
-          // park would fold that already-consumed-but-not-yet-applied follow-up INTO the
-          // watermark, so its own wake `running` report would then fail the server's
-          // `id > watermark` guard and strand a live run at awaiting_followup. Skip the park
-          // report in that case and service the buffered outcome directly (the run stays
-          // `running`, no spurious park). A follow-up arriving AFTER this point is consumed
-          // after the stamp, so its id > watermark and it wakes normally.
-          //
-          // issue #559 M2: the park report now CARRIES the watermark it wants stamped —
-          // `open_followup_id` = the highest follow_up id the worker has already DELIVERED
-          // (steering.getLastDeliveredFollowUpId()). The server clamps/floors this instead of
-          // deriving MAX(consumed follow_up id) itself. This closes the residual race where a
-          // follow-up consumed by the poll loop DURING this report's DB round-trip would fold
-          // into a server-derived MAX(consumed) and strand the run: the last-DELIVERED id does
-          // NOT advance during the round-trip (the follow-up waiter is armed only AFTER this
-          // report returns, below), so the racing follow-up is excluded and its later wake wins.
-          if (!steering.hasPendingFollowUpOutcome()) {
-            // Read the ACK the same way askUser and the limit park do: the park TOOK only if
-            // the server reports `awaiting_followup`. SetRunAwaitingFollowup (M2) matches
-            // nothing when the run went terminal under us or is no longer ours (or is not an
-            // interactive task) — without this check the worker would block on a follow-up no
-            // surface can produce, since the status never changed. Fail loudly instead.
-            const ack = await reportState({
-              status: "awaiting_followup",
-              open_followup_id: steering.getLastDeliveredFollowUpId(),
-            });
-            const parked = (ack as { status?: string } | undefined)?.status;
-            if (parked !== "awaiting_followup") {
-              throw new Error(
-                `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
-              );
-            }
-            runLog.info("interactive task: awaiting follow-up", { run_id: runId });
-          } else {
-            // issue #559 M3: the SKIP path. A follow-up (or stop/cancel) is already buffered,
-            // so we deliberately do NOT report awaiting_followup (that would fold the
-            // not-yet-applied follow-up into the watermark — the #558/#552 fix above) and
-            // service the buffered outcome directly. But skipping the park report ALSO skips
-            // the ACK that, on the non-skip path, caught a mid-turn reclaim or terminal
-            // transition (status != awaiting_followup → throw). Restore that ownership/
-            // terminality check cheaply with a read-only ownership probe.
-            //
-            // ONLY a DEFINITIVE answer throws: a terminal status, or a definitive NOT-OWNED
-            // (HTTP 404 → reclaimed by another worker). A TRANSIENT error (network / 5xx /
-            // anything that is neither a 404 nor a terminal status) logs a warning and
-            // PROCEEDS — the non-skip path's reportState has bounded retries and never fails
-            // the run on a transient blip, and the run self-heals anyway at the next
-            // ACK-checked park report plus the SetRunRunning worker_id pin. We must not
-            // introduce a new spurious-failure mode, so a transient probe error is not one.
-            let ownershipStatus: string | undefined;
-            try {
-              ownershipStatus = (await this.client.getRunOwnership(runId)).status;
-            } catch (err) {
-              if (err instanceof RequestError && err.status === 404) {
-                throw new Error(
-                  `${REASON_FOLLOWUP_NOT_PARKED} (server reports the run is not owned by this worker)`,
-                );
-              }
-              // Transient (network / 5xx / unreadable): proceed and let the next park
-              // report's ACK + the SetRunRunning worker_id pin be the backstop.
-              runLog.warn(
-                "interactive task: ownership probe failed transiently on the follow-up skip path; proceeding",
-                { run_id: runId, error: String(err) },
-              );
-            }
-            if (ownershipStatus !== undefined && FOLLOWUP_TERMINAL_STATUSES.has(ownershipStatus)) {
-              throw new Error(
-                `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${ownershipStatus})`,
-              );
-            }
-          }
-          return steering.awaitFollowUp(idleMs);
-        },
-        // PRD #122 M2: carry the lead's live progress into the `running` report and return
-        // the server-computed effective budget from the ack. Async (unlike M4's fire-and-
-        // forget void) so the loop can apply the budget — but still fire-and-forget in
-        // spirit: reportState has bounded retries, and the try/catch here guarantees a
-        // failed report returns undefined ("no budget update") rather than failing the run.
-        reportIteration: async (iteration, progress) => {
-          try {
-            const ack = await reportState({
-              status: "running",
-              iteration_count: iteration,
-              // Omit the fields entirely when the lead has reported no progress, so the
-              // wire shape matches an old worker's (additive-optional, never null/[]).
-              ...(progress
-                ? {
-                    milestones_completed: progress.completed,
-                    milestones_in_progress: progress.in_progress,
-                  }
-                : {}),
-            });
-            const b: IterationBudget = {};
-            if (typeof ack.budgetMaxIterations === "number")
-              b.maxIterations = ack.budgetMaxIterations;
-            if (typeof ack.budgetWallSeconds === "number")
-              b.wallSeconds = ack.budgetWallSeconds;
-            // PRD #634 M2: carry the operator scope ceiling + fresh completed count off the
-            // ACK so m3's loop-top gate can read them off `served`.
-            if (typeof ack.scopeCeiling === "number")
-              b.scopeCeiling = ack.scopeCeiling;
-            if (typeof ack.completedCount === "number")
-              b.completedCount = ack.completedCount;
-            // Without the scope/completed fields in this return guard, a non-budget-scaled
-            // run's ACK (no budget fields) would return `undefined` and m3's loop-top gate at
-            // `if (served)` would never see the ceiling. This is behavior-preserving for the
-            // existing budget logic — sdk-executor.ts's budget block type-checks each field
-            // individually, so making `served` truthy more often is inert for budget (it only
-            // newly enables m3's scope read).
-            return b.maxIterations !== undefined ||
-              b.wallSeconds !== undefined ||
-              b.scopeCeiling !== undefined ||
-              b.completedCount !== undefined
-              ? b
-              : undefined;
-          } catch (e) {
-            runLog.warn("could not report iteration", { error: errMessage(e) });
-            return undefined;
-          }
-        },
-        // PRD #122 M6: durably checkpoint the run's committed milestone work MID-RUN
-        // (Decisions 6, 7, 10, 10b). It is the SAME credential-free fetch-back the done and
-        // park paths use (#218's fetchAgentBranch), fired at a milestone boundary so a hard
-        // crash loses at most "since the last milestone" rather than the whole run.
-        //
-        // REAP-BEFORE-GIT is the load-bearing invariant (B1/M4 audit): when reaping, the
-        // agent tree is killed BEFORE any CREDENTIALED git runs, so a survivor cannot read a
-        // credential out of a git child's /proc/environ — the same ordering the done path
-        // uses (killAgentTree before fetchBackBestEffort). The pre-reap tip reads below
-        // (branchTip/trackingTip) are credential-free local rev-parse, and the only
-        // credential-bearing-CLASS op here is the fetch-back, itself credential-free
-        // (file://, no PAT) — so a future credentialed git op MUST stay after the reap.
-        // Best-effort throughout: a checkpoint must NEVER fail the run.
-        checkpoint: async (opts) => {
-          // `barePath` is the outer `let` (string | undefined); it is set before the run
-          // reaches the executor, but narrow it so the closure is honest rather than `!`.
-          if (!barePath) return;
-          // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
-          // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
-          // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
-          const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
-          const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
-          const tipUnmovedSinceFetch =
-            trackTip !== null && cloneTip !== null && trackTip === cloneTip;
-
-          // Skip ONLY the fetch (and reap) when there is nothing new to fetch — do NOT return,
-          // so the origin-publish gate below still runs (Decision 9: a commit fetched at an
-          // earlier iteration can become publish-eligible on a later tip-unmoved iteration once
-          // the interval opens). Reap-before-git is preserved: we reap only on the fetch path,
-          // strictly before the credential-free fetch-back.
-          if (!tipUnmovedSinceFetch) {
-            // Reap ONLY on the model-cooperative checkpoint (Decision 10b), STRICTLY before
-            // any CREDENTIALED git — the done path likewise reaps before its fetch-back. The
-            // fallback (reap:false) must NOT reap: a backgrounded dev server the lead means to
-            // reuse next iteration must survive.
-            if (opts.reap) executor.killAgentTree?.();
-            // Fetch back, credential-free (#218's helper): brings the committed work into
-            // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
-            await this.fetchBackBestEffort(
-              barePath,
-              runnerClone.path,
-              runnerClone.branch,
-              runId,
-              runLog,
-            );
-          } else {
-            runLog.info("checkpoint fetch skipped: branch tip unmoved since last checkpoint", {
-              run_id: runId,
-              branch: runnerClone.branch,
-            });
-          }
-
-          // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to
-          // the api via publishCheckpoint, no PAT — publishCheckpointBestEffort -> git.checkpointPack
-          // (local objects) -> client.publishCheckpoint (worker join token)), so it is safe on the
-          // reap:false path with the agent tree ALIVE. PRD #122 Decisions 10b/14 dissolved the
-          // reap/publish coupling for the broker (it was a property of the rejected worker-side
-          // push, not a correctness invariant); reap:false originally did not publish purely for
-          // scope + broker cost, which the time-gate now bounds (<=1 publish/interval/run).
-          //   - reap:true  (milestone): publish whenever there is new committed work not yet on
-          //     origin. Behaviourally equivalent to the old always-publish minus a redundant
-          //     re-publish of an already-published tip.
-          //   - reap:false (iteration boundary, PRD #267): publish only when the time-gate is open
-          //     AND there is new committed work. "new work" keys on lastPublishedTip (Decision 9),
-          //     NOT the fetch-skip above, so a commit that then goes idle for >= the interval still
-          //     ships exactly once.
-          const hasNewWork = cloneTip !== null && cloneTip !== lastPublishedTip;
-          const timeGateOpen =
-            this.checkpointIntervalMs > 0 &&
-            this.now() - lastPublish >= this.checkpointIntervalMs;
-          let published = false;
-          if (hasNewWork && (opts.reap || timeGateOpen)) {
-            published = await this.publishCheckpointBestEffort(
-              barePath,
-              runnerClone.branch,
-              runId,
-              runLog,
-            );
-            // Advance the time-gate on every ATTEMPT (not just success): this bounds broker
-            // retry cadence to <= 1 publish/interval/run even under a persistent broker
-            // failure, so a failing publish cannot spam every iteration.
-            lastPublish = this.now();
-            // PRD #267 Fix 1 (Decision 9 / the "worst-case loss ~one interval" criterion):
-            // advance lastPublishedTip ONLY on a CONFIRMED landed publish. On failure the tip
-            // stays un-advanced, so hasNewWork stays true and the time-gate retries the SAME
-            // tip at the next interval boundary — the idle commit still ships (bounded loss),
-            // rather than being marked published-and-forgotten by a transient broker failure.
-            if (published) {
-              lastPublishedTip = cloneTip ?? lastPublishedTip;
-              // PRD #267 M3: make the time-based publish observable — the "committed work is
-              // now safe on origin" moment for a reap:false checkpoint (the milestone/reap:true
-              // publish is already visible via its running report below). Only for the time
-              // path so we do not double-log the milestone case.
-              if (!opts.reap) {
-                runLog.info("checkpoint published to origin (time-based)", {
-                  run_id: runId,
-                  branch: runnerClone.branch,
-                  tip: cloneTip,
-                });
-              }
-            }
-          }
-          // Report the checkpointed milestone as a `running` report — additive-optional
-          // (milestone fields omitted when no progress) and wrapped so it never throws. NO
-          // iteration_count: a checkpoint is not an iteration-boundary report, so leaving it
-          // out keeps it from regressing the server's GREATEST-merged iteration counter.
-          //
-          // PRD #267 Fix 2: emit ONLY when there was real activity — a fetch (tip moved since
-          // the last checkpoint) OR a publish. On a pure-idle checkpoint (tip unmoved AND
-          // nothing published) stay silent, restoring the pre-M1 early-return behaviour while
-          // still signalling a time-based publish of an idle tip ("work is now safe on origin").
-          if (!tipUnmovedSinceFetch || published) {
-            await reportState({
-              status: "running",
-              ...(opts.progress
-                ? {
-                    milestones_completed: opts.progress.completed,
-                    milestones_in_progress: opts.progress.in_progress,
-                  }
-                : {}),
-            }).catch((e) =>
-              runLog.warn("could not report checkpoint progress", {
-                error: errMessage(e),
-              }),
-            );
-          }
-        },
-        // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
-        // state for the executor's no-progress detector — the runner-owned clone's branch
-        // tip (committed work) plus `git status --porcelain` (uncommitted changes). Both are
-        // runner-uid reads of the runner-owned clone (branchTip / worktreeStatus), the same
-        // reads the checkpoint closure and the plan gate already do. Returns null when EITHER
-        // read fails — an unresolvable tip OR an unreadable status — which the executor treats
-        // as "cannot assert unchanged" (no trip). worktreeStatus (not planChangedFiles) is used
-        // deliberately: planChangedFiles swallows a failed read to [], which the fingerprint
-        // would encode identically to a genuinely clean tree, so a persistently failing status
-        // could let the detector trip without the tree ever having been verified (CodeRabbit #655).
-        worktreeFingerprint: async () => {
-          if (!barePath) return null;
-          const tip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
-          if (tip === null) return null;
-          const dirty = await this.git.worktreeStatus(runnerClone.path);
-          if (dirty === null) return null;
-          return `${tip}\n${dirty.join("\n")}`;
-        },
-      };
-
-      const result = await executor.run(ctx);
-
-      // Reap any agent-backgrounded subprocess BEFORE the PAT touches a git child
-      // env — otherwise a survivor could read the PAT from that child's
-      // /proc/environ during the push (M4 audit B1). This run's executor reaps only
-      // this run's subprocess tree (per-run instance, Decision 4); a concurrent
-      // sibling's tree is untouched. The SDK executor also self-reaps in its run()
-      // finally; this is the explicit, load-bearing call at the security boundary.
-      executor.killAgentTree?.();
-
-      // A ci_fix run that judged the failure not a code problem (PRD #6) completes
-      // with the diagnosis and NO push/MR — there is nothing to land.
-      if (result.fixVerdict === "not_code") {
-        executor.killAgentTree?.();
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: "not a code problem: completing with the diagnosis, no merge request",
-          },
-        });
-        await batcher.close();
-        await reportState({ status: "completed", fix_verdict: "not_code" });
-        runLog.info("ci_fix run completed with not_code verdict", {
-          run_id: runId,
-        });
-        return;
-      }
-
-      // issue #279: a DECLARED report-only run — the lead's deliverable is a report,
-      // command output, or verification result with NO code change to land, so the run
-      // completes with its findings and NO push/MR (mirroring the ci_fix not_code path
-      // above). killAgentTree was already called at the security boundary above, so we do
-      // NOT double-call it here (the not_code block's second call is a redundancy — not
-      // copied). Returns before fetchAgentBranch: there is no branch to fetch or push.
-      if (result.reportOnly) {
-        // issue #299: a report-only completion opens NO branch and NO MR, so if this run
-        // ALREADY published committed work to a checkpoint ref on origin
-        // (refs/uzi-checkpoints/<branch>), completing report-only would leave that ref
-        // orphaned — un-landed, with nothing to supersede it. ADR-0279 documented this as
-        // an accepted edge resting on the convention "a genuine zero-code run never
-        // checkpoints"; enforce that convention here instead. Detection is the UNION of
-        // two signals, each covering a gap the other has:
-        //   - lastPublishedTip: a checkpoint THIS worker confirmed-landed mid-run (set only
-        //     on a landed publish), which may not yet be mirrored into the bare's local ref.
-        //   - hasCommittedCheckpoint: origin's checkpoint ref, mirrored into the bare at
-        //     clone/fetch time — catches a checkpoint a PRIOR/cross-worker attempt landed.
-        //     Per PRD #759 it IGNORES a marker-only `wip(park):` checkpoint (an abandoned
-        //     usage-limit-park WIP marker with no committed milestone below it), while a
-        //     real committed milestone still blocks.
-        // A genuine zero-code run trips NEITHER (nothing committed ⇒ no pack ⇒ no publish),
-        // so it still completes report-only below. Refuse loudly, mirroring the
-        // undeclared-empty-diff FAIL path, rather than opening a delete-ref capability.
-        const publishedCheckpoint =
-          lastPublishedTip !== undefined ||
-          (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
-        if (publishedCheckpoint) {
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: {
-              text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
-            },
-          });
-          await batcher.close();
-          await reportState({
-            status: "failed",
-            failure_reason:
-              "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
-              runnerClone.branch +
-              ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
-          });
-          runLog.info("run failed: report_only declared after a checkpoint was published", {
-            run_id: runId,
-          });
-          return;
-        }
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: "report-only run: recording findings; no branch pushed and no merge request opened",
-          },
-        });
-        await batcher.close();
-        await reportState({
-          status: "completed",
-          report_only: true,
-          report_md: result.summary,
-        });
-        runLog.info("run completed report-only (no MR)", { run_id: runId });
-        return;
-      }
-
-      // (b) fetch-back (PRD #51 M3): the agent committed in the RUNNER clone, so the
-      // worker now fetches the agent branch BACK into its own bare (single-branch
-      // refspec, file://+pack transport, protocol.file.allow pinned — the six B2
-      // invariants live in git.fetchAgentBranch) before it inspects or pushes. Done
-      // AFTER killAgentTree so no agent process is concurrently mutating the clone,
-      // and it brings the agent's objects into the worker bare so the push does not
-      // depend on the (soon torn-down) runner clone. `trackingRef` is what push +
-      // changedFiles read; the runner clone is never a git source for either.
-      const trackingRef = await this.git.fetchAgentBranch(
-        barePath,
-        runnerClone.path,
-        result.branch,
-        runId,
-      );
-
-      // issue #279: an UNDECLARED zero-diff guard, ISSUE runs only. A declared report_only
-      // already returned above, so reaching here on an issue run with a confirmed-empty diff
-      // is the ambiguous "forgot to commit / should have set report_only" case — a
-      // committed-nothing issue run must not open an empty MR.
-      if ((claim.kind ?? "issue") === "issue") {
-        const changedForGuard = await this.git.changedFiles(barePath, trackingRef);
-        // changedFiles returns null on diff-FAILURE (keep pushing — fail open) and [] on a
-        // CONFIRMED-empty diff. report_only is the sanctioned zero-diff success — a declared
-        // report_only already returned above, so reaching here undeclared+empty is the
-        // ambiguous case; fail with an actionable reason instead of opening an empty MR.
-        if (changedForGuard !== null && changedForGuard.length === 0) {
-          // PRD #634 M3: an operator scope directive can truncate a run at its very first
-          // milestone boundary, before any milestone produced committed work — a legitimate
-          // zero-slice, NOT the ambiguous "forgot to commit" failure below. But guard against
-          // orphaning: if this run DID publish a checkpoint to origin (a mid-run milestone
-          // landed there), there IS committed work to land, so fall through to the push+MR
-          // path. Only the genuinely-empty case completes report-only with no MR. Detection
-          // reuses the SAME publishedCheckpoint union the declared-report_only path uses,
-          // which (PRD #759) ignores a marker-only `wip(park):` checkpoint while a real
-          // committed milestone still blocks.
-          if (result.scopeCapped) {
-            const publishedCheckpoint =
-              lastPublishedTip !== undefined ||
-              (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
-            if (!publishedCheckpoint) {
-              batcher.emit({
-                kind: "status",
-                agent: "worker",
-                payload: {
-                  text: "operator scope directive stopped this run before any milestone produced committed work; recording it, no merge request",
-                },
-              });
-              await batcher.close();
-              await reportState({
-                status: "completed",
-                report_only: true,
-                scope_capped: true,
-                report_md:
-                  result.summary ??
-                  "Stopped by operator scope directive before any committed work; nothing to land.",
-              });
-              runLog.info("run completed scope-capped with no committed work (no MR)", {
-                run_id: runId,
-              });
-              return;
-            }
-            // published checkpoint exists → there IS work to land; fall through to push+MR.
-          } else {
-            batcher.emit({
-              kind: "status",
-              agent: "worker",
-              payload: {
-                text: "no changes were committed and report_only was not set; failing",
-              },
-            });
-            await batcher.close();
-            await reportState({
-              status: "failed",
-              failure_reason:
-                "signal_done was called but no changes were committed, and report_only was not set. If this run's deliverable is a report or command output with no code change, call signal_done with report_only: true.",
-            });
-            runLog.info("run failed: signal_done with empty diff and no report_only", {
-              run_id: runId,
-            });
-            return;
-          }
-        }
-      }
-
-      // issue #341: a `prompt` run (schedule-fired ad-hoc work) that reaches signal_done
-      // having committed NOTHING has no diff to land, so pushing it would open an empty
-      // merge request — the #242 pathology, for the schedule path. Unlike the issue-kind
-      // guard above, a zero-commit prompt run is not the ambiguous "forgot to commit"
-      // failure: an ad-hoc prompt whose deliverable is an investigation/answer legitimately
-      // produces no code, so it completes as report-only (no branch, no MR), mirroring the
-      // declared report_only terminal above — INCLUDING its issue #299 checkpoint-orphan
-      // guard — rather than failing. ADR-0279 §2 forbids broadening the issue-kind gate
-      // onto other kinds precisely because they have their own terminal paths; this IS that
-      // separate terminal for `prompt`. A prompt run that DID commit falls through to the
-      // normal push/MR path unchanged.
-      if (claim.kind === "prompt") {
-        const changedForPrompt = await this.git.changedFiles(barePath, trackingRef);
-        // Preserve the null-vs-[] split: changedFiles returns null on diff-FAILURE (keep
-        // pushing — fail open) and [] on a CONFIRMED-empty diff. Only a confirmed-empty
-        // diff completes report-only; a diff-failure must NOT be treated as empty.
-        if (changedForPrompt !== null && changedForPrompt.length === 0) {
-          // issue #299: a report-only completion opens NO branch and NO MR, so if this run
-          // ALREADY published committed work to a checkpoint ref on origin
-          // (refs/uzi-checkpoints/<branch>), completing report-only would orphan that ref.
-          // This mirrors the declared report_only terminal above: detect via the UNION of
-          // lastPublishedTip (a checkpoint THIS worker confirmed-landed mid-run) and
-          // hasCommittedCheckpoint (origin's checkpoint ref, mirrored into the bare at
-          // clone/fetch time — catches a prior/cross-worker landing; per PRD #759 it ignores
-          // a marker-only `wip(park):` checkpoint while a real committed milestone still
-          // blocks). A genuine zero-code prompt run trips NEITHER and still completes
-          // report-only below.
-          const publishedCheckpoint =
-            lastPublishedTip !== undefined ||
-            (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
-          if (publishedCheckpoint) {
-            batcher.emit({
-              kind: "status",
-              agent: "worker",
-              payload: {
-                text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
-              },
-            });
-            await batcher.close();
-            await reportState({
-              status: "failed",
-              failure_reason:
-                "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
-                runnerClone.branch +
-                ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
-            });
-            runLog.info("prompt run failed: report_only after a checkpoint was published", {
-              run_id: runId,
-            });
-            return;
-          }
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: {
-              text: "prompt run committed no changes: recording findings; no branch pushed and no merge request opened",
-            },
-          });
-          await batcher.close();
-          await reportState({
-            status: "completed",
-            report_only: true,
-            report_md: result.summary,
-          });
-          runLog.info("prompt run completed report-only (no MR): zero-diff", {
-            run_id: runId,
-          });
-          return;
-        }
-      }
-
-      // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
-      // repo, the worker itself runs the test suites and flags any guard-critical
-      // path the change touched, folding both into the MR description. Best-effort —
-      // gathered before the push so the MR opens with its evidence, and a suite that
-      // can't run is reported "skipped", never failing the run.
-      let selfImproveSection: string | undefined;
-      // PRD #686 M4: uzi's SELF_IMPROVE_CHECKS (go test ./..., web/agent npm test,
-      // web build) are hardcoded to uzi's OWN layout and are meaningless against an
-      // arbitrary target repo, so this evidence block runs ONLY in dogfood mode. In
-      // generic mode it is skipped: selfImproveSection stays unset and no uzi-shaped
-      // check/guard-path evidence is produced — the generic plan directive already
-      // told the agent to discover and run the target repo's own gates during the run.
-      if (claim.kind === "self_improve" && claim.self_improve_dogfood) {
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: "self-improvement: running the test suites for MR evidence",
-          },
-        });
-        // changedFiles returns null when the diff could not be computed → pass null
-        // through so the MR section fails CLOSED (a loud "guard-path check unavailable"
-        // note) instead of silently suppressing the flag (M5 audit). Under (b) this is
-        // a WORKER-BARE tree-diff of the fetched tracking ref (no runner-owned config
-        // source read), while the checks below still run in the runner clone.
-        const changed = await this.git.changedFiles(barePath, trackingRef);
-        // M9: the checks execute agent-authored code as the worker uid, so they run
-        // under a SCRUBBED replacement env (no join token / API URL / PAT / OAuth token
-        // by construction) with the run's provisioned toolchains on PATH. The frozen
-        // `--ignore-scripts` install runs best-effort so vitest/tsc exist; a failure
-        // just leaves the check honestly skipped.
-        //
-        // PRD #121 M2: this used the hardcoded `["web", "agent"]` dir list; it now
-        // reuses the same lockfile-driven installer the executor runs pre-plan, so
-        // there is ONE install path instead of two that can drift. For the uzi repo
-        // that discovery resolves to exactly web/ + agent/ (the only two tracked
-        // package.json files, both with a package-lock.json), which is what
-        // SELF_IMPROVE_CHECKS pre-flights on — asserted in js-deps.test.ts. The
-        // executor has already installed these once; re-running is deliberate, because
-        // the agent may have edited a package.json or lockfile during the run and the
-        // checks must test what it actually left behind.
-        const checkEnv = buildCheckEnv(
-          process.env,
-          runHome ?? os.tmpdir(),
-          result.toolEnv,
-        );
-        const deps = await installJsDeps(runnerClone.path, checkEnv).catch(
-          () => ({ results: [], truncated: false }),
-        );
-        for (const note of deps.results) {
-          runLog.info("self-improve: dependency install", { ...note });
-        }
-        // A truncated scan means `results` is a PREFIX of the repo's project dirs, so a
-        // check may be about to run somewhere provisioning never reached. Say so rather
-        // than let the notes above read as full coverage.
-        if (deps.truncated) {
-          runLog.warn(
-            "self-improve: dependency discovery hit its bound; some dirs were not installed",
-            {
-              installed_dirs: deps.results.length,
-            },
-          );
-        }
-        const checkRunner = this.checkRunner ?? defaultCheckRunner(checkEnv);
-        const checks = await runSelfImproveChecks(
-          runnerClone.path,
-          checkRunner,
-        );
-        selfImproveSection = selfImproveMrSection(
-          changed === null ? null : flagGuardPaths(changed),
-          checks,
-        );
-      }
-
-      // Guard-critical flag for an ad-hoc scheduled prompt run (PRD #241 Decision 10,
-      // the one worker-side follow-up). self_improve gets this flag by KIND — it is
-      // hardcoded API-side to uzi's own repo, a decision the worker CANNOT reproduce:
-      // the claim carries no repo-identity field, so there is no clean worker-side
-      // "is this the uzi repo" signal to gate on (flagged for the owner in the M8
-      // report — a repo-identity flag on the claim would be the API-side alternative).
-      // Instead we key the flag on the CHANGED PATHS: GUARD_CRITICAL_PATTERNS match
-      // uzi's own security-critical source paths only, so flagGuardPaths fires exactly
-      // when a prompt run actually touches uzi's guard surface (i.e. it targets the
-      // uzi repo) and is an empty no-op on any other repo. We do NOT run
-      // SELF_IMPROVE_CHECKS here — those are uzi's own gate suite and are meaningless
-      // against an arbitrary repo. Best-effort, gathered before the push like the
-      // self_improve evidence above.
-      let promptGuardSection: string | undefined;
-      if (claim.kind === "prompt") {
-        // null (diff failed) → fail CLOSED with a loud "guard-path check unavailable"
-        // note, exactly as the self_improve path does above (M5 audit).
-        const changed = await this.git.changedFiles(barePath, trackingRef);
-        promptGuardSection = guardCriticalMrSection(
-          changed === null ? null : flagGuardPaths(changed),
-        );
-      }
-
-      // PRD #71 M5 (load-bearing): for an auto-approved ci_fix run (no human in the loop),
-      // REFUSE to push a diff that touches a protected CI-config path, or a diff that could
-      // not be computed. A human-approved run (manual, or an auto CI-config plan that parked
-      // and was approved) is never blocked — a human was in the loop, as in the manual flow.
-      if (claim.kind === "ci_fix" && !ciFixHumanApproved) {
-        // Capture the narrowed bare path in a const the SAME way the push block does
-        // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
-        const pushBarePathForGuard = barePath;
-        // Worker-side FLOOR: when the claim omits ci_config_paths (a bug or an older
-        // server), fall back to the static defaults so the backstop cannot fail OPEN.
-        // This floor covers the static defaults only; the server-produced set additionally
-        // carries the project's real ci_config_path (see DEFAULT_CI_CONFIG_PATHS).
-        const ciConfigPaths = claim.config?.ci_config_paths?.length
-          ? claim.config.ci_config_paths
-          : DEFAULT_CI_CONFIG_PATHS;
-        const changed = await this.git.changedFiles(pushBarePathForGuard, trackingRef);
-        const flagged = changed === null ? null : flagCIConfigPaths(changed, ciConfigPaths);
-        if (changed === null || (flagged && flagged.length > 0)) {
-          const reason =
-            changed === null
-              ? "auto CI-fix push refused: could not compute the diff to verify it does not edit CI config (failing closed)"
-              : `auto CI-fix push refused: an auto-approved fix may not edit CI config (${flagged!.join(", ")}); a CI-config fix needs human approval`;
-          batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
-          runLog.warn("ci-fix: CI-config push guard refused push", { run_id: runId, reason });
-          // Fail the run CLOSED — no push, no MR. Throwing here lands on the method's
-          // generic catch (the `else` at ~:1203), which reports status:"failed" with this
-          // reason and does NOT re-queue (unlike LimitReached/shutdown). Same terminal
-          // convention the push/MR failures use.
-          throw new Error(reason);
-        }
-      }
-
-      // PRD #377 M1: a GitHub run whose branch touches .github/workflows/** cannot be
-      // pushed by the bot's repo-only PAT (privcheck forbids the workflow scope by design).
-      // Detect it here, BEFORE the doomed push, and end the run in a typed `failed` outcome
-      // that preserves the agent's diff for a human to land — instead of face-planting into
-      // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
-      // Serves every forge-pushing kind (the failed path is not issue-gated).
-      // #377 / issue #631: computed once here, reused by the base-align overlay gate below
-      // (both read changedFiles(barePath, trackingRef)); recomputed there only if this failed open.
-      let changedForWf: string[] | null = null;
-      if (claim.repo.forge_type === "github") {
-        // Capture the narrowed bare path in a const the SAME way the push block does
-        // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
-        const wfBarePath = barePath;
-        changedForWf = await this.git.changedFiles(wfBarePath, trackingRef);
-        // D6: a null diff (diff-computation failure) fails OPEN to the normal push — do not
-        // fail a possibly-legitimate non-workflow run on an inability to compute the diff.
-        const wfHits =
-          changedForWf === null
-            ? null
-            : flagCIConfigPaths(changedForWf, [".github/workflows/**"]);
-        if (wfHits && wfHits.length > 0) {
-          // Compose an actionable, capped failure_reason that names the offending path(s)
-          // (truncating the path LIST if needed, never the doc link) and points at
-          // docs/github-bot-setup.md.
-          const reason = composeWorkflowScopeReason(wfHits);
-          // Preserve the agent's diff so a human can land it without re-deriving it from the
-          // transcript. redactText scrubs the run's secrets before it reaches the api; a null
-          // diff (best-effort failure) just omits the patch — the typed failure still lands.
-          const rawPatch = await this.git.workflowScopeDiff(wfBarePath, trackingRef);
-          const patch = rawPatch === null ? undefined : redactText(rawPatch);
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: {
-              text:
-                "branch changes .github/workflows, which the bot token cannot push; failing early and preserving the diff for a human to land",
-            },
-          });
-          runLog.info(
-            "run failed: branch touches .github/workflows which the bot PAT cannot push; preserving diff",
-            { run_id: runId, paths: wfHits },
-          );
-          await batcher.close();
-          await reportState({
-            status: "failed",
-            failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-            fail_origin: "workflow_scope_missing",
-            preserved_patch: patch,
-          });
-          return;
-        }
-      }
-
-      // The single authenticated finalize push (PAT-bearing, worker-owned; the agent never
-      // has a credential). Captured once as a closure so the align path (below) and the
-      // normal path push through EXACTLY ONE code path — the run must never push twice.
-      // PRD #284 Layer A: a transient push failure (a dropped HTTP/2 stream, a 5xx, a
-      // connection reset) retries rather than discarding the agent's already-committed work;
-      // a permanent rejection (auth, protected branch, non-fast-forward) fails fast and
-      // propagates to the catch below. The push is idempotent on retry (non-forced, same
-      // commits → "Everything up-to-date"). Capture the narrowed bare path: barePath is an
-      // outer `let` (string | undefined) and TS drops the narrowing inside the closure.
-      const finalizeBarePath = barePath;
-      const pushToOrigin = () =>
-        withForgeRetry(
-          () =>
-            this.git.pushBranch(
-              finalizeBarePath,
-              result.branch,
-              claim.secrets.forge_pat,
-              claim.repo.clone_url,
-              claim.secrets.forge_username,
-            ),
-          { log: runLog },
-        );
-
-      // PRD #456 M1: a GitHub run can be merely BEHIND the default branch on
-      // .github/workflows/** (main advanced those files after this run's clone base) WITHOUT
-      // having touched them. The bot's repo-only PAT push is then rejected atomically —
-      // losing ALL the run's work — even though #377's guard above (which fires only when the
-      // BRANCH modifies a workflow) did not trip. Align the branch's workflow tree with the
-      // FRESH default before pushing: merge first (SHA-preserving, D2), and if the merged push
-      // is STILL workflow-scope-rejected fall back to a rebase (the empirically proven #422
-      // recovery). On an unresolvable conflict, fail the run typed + preserve the diff (M2)
-      // rather than face-plant into GitHub's opaque rejection and discard the committed work.
-      // GitHub-only: GitLab/Forgejo impose no workflow-scope rule.
-      let alignPushed = false;
-      if (claim.repo.forge_type === "github") {
-        const alignBarePath = barePath;
-        const alignDefaultBranch =
-          claim.repo.default_branch?.trim() ||
-          (await this.git.defaultBranchName(alignBarePath)) ||
-          "main";
-        // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
-        // that may well succeed (the branch may not actually be behind) — fall through to the
-        // normal push, never fail a run on an inability to compute the align target.
-        let defaultTip: string | undefined;
-        let differs = false;
-        try {
-          defaultTip = await this.git.fetchDefaultTip(
-            alignBarePath,
-            alignDefaultBranch,
-            claim.secrets.forge_pat,
-            claim.repo.clone_url,
-            claim.secrets.forge_username,
-          );
-          differs = await this.git.workflowTreeDiffers(
-            alignBarePath,
-            trackingRef,
-            defaultTip,
-          );
-        } catch (e) {
-          runLog.warn(
-            "finalize base-align: could not compute the align target; pushing without aligning",
-            { run_id: runId, error: errMessage(e) },
-          );
-        }
-        if (defaultTip && differs) {
-          // The pre-align committed agent tip — the base every align strategy starts from, so
-          // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
-          const originalAgentTip = await this.git.branchTip(
-            runnerClone.path,
-            result.branch,
-          );
-          if (!originalAgentTip) {
-            runLog.warn(
-              "finalize base-align: could not resolve the branch tip; pushing without aligning",
-              { run_id: runId },
-            );
-          } else {
-            // The conflict-failure path (M2). The abort already ran inside
-            // alignBranchWithDefault; here we preserve the diff via #377's preserved_patch and
-            // fail typed. We diff the pre-align agent tip (`originalAgentTip`, declared at :1848,
-            // non-null under the :1852 guard) — NOT `trackingRef` — so the preserved patch is
-            // exactly the agent's human-landable work. Issue #631: when a strategy ALIGNED and
-            // then had its push rejected (the overlay's arm (c), or a merge/rebase whose push was
-            // rejected) `fetchAndPush` re-fetched the ALIGNED tip into `trackingRef`, so diffing
-            // `trackingRef` yielded a SUPERSET (agent work PLUS the aligning strategy's own
-            // workflow-subtree/merge changes) if a LATER strategy then conflicted and landed here.
-            // Diffing `originalAgentTip` eliminates that superset: its objects were fetched into
-            // the worker bare by the finalize `fetchAgentBranch` before any align, so
-            // workflowScopeDiff resolves it. In the non-push conflict paths originalAgentTip ==
-            // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
-            // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
-            const defTip = defaultTip;
-            const failBaseAlignConflict = async () => {
-              const rawPatch = await this.git.workflowScopeDiff(alignBarePath, originalAgentTip);
-              const patch = rawPatch === null ? undefined : redactText(rawPatch);
-              batcher.emit({
-                kind: "status",
-                agent: "worker",
-                payload: {
-                  text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
-                },
-              });
-              runLog.info("run failed: finalize base-align conflict; preserving diff", {
-                run_id: runId,
-              });
-              await batcher.close();
-              await reportState({
-                status: "failed",
-                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
-                fail_origin: "finalize_base_align_conflict",
-                preserved_patch: patch,
-              });
-            };
-
-            // Run one align STRATEGY, treating an UNEXPECTED throw (the S3 count-mismatch
-            // guard, or any git error) exactly like a `"conflict"` return. This is the whole
-            // point of the feature: the agent's work must be PRESERVED on failure, so an
-            // unexpected align error must route to failBaseAlignConflict (typed fail + diff),
-            // NOT escape to the generic catch below (raw message, no preserved_patch, defaulted
-            // fail_origin). Scoped to the align OPERATION only — the push keeps its own
-            // handling (workflow-scope → rebase fallback; any other push error rethrows).
-            const alignOp = async (strategy: "merge" | "rebase"): Promise<"aligned" | "conflict"> => {
-              try {
-                return await this.git.alignBranchWithDefault(
-                  runnerClone.path,
-                  result.branch,
-                  originalAgentTip,
-                  defTip,
-                  strategy,
-                );
-              } catch (e) {
-                runLog.warn(
-                  "finalize base-align: unexpected error during align; preserving diff and failing typed",
-                  { run_id: runId, strategy, error: errMessage(e) },
-                );
-                return "conflict";
-              }
-            };
-
-            // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
-            const fetchAndPush = async () => {
-              await this.git.fetchAgentBranch(
-                alignBarePath,
-                runnerClone.path,
-                result.branch,
-                runId,
-              );
-              await pushToOrigin();
-              alignPushed = true;
-            };
-
-            // Push the aligned branch. Two rejections here are the base-align-conflict path,
-            // not a mislabel: a REPEAT workflow-scope rejection means the default's workflow
-            // files moved again DURING our align (double-TOCTOU); a NON-FAST-FORWARD rejection
-            // means the rebase fallback rewrote the history of an already-published branch (a
-            // resume, or the self_improve fixed branch) so this non-forced push cannot
-            // fast-forward, and force-push is denied by the guardrails by design. Both preserve
-            // the diff and fail typed rather than lose it to the generic catch. Any OTHER push
-            // error still rethrows unchanged (a genuine auth/transient/protected-branch failure
-            // must not be mislabelled as a base-align conflict). Returns true if it
-            // preserved-and-failed (the caller must then `return`), false on a successful push.
-            const pushAlignedOrPreserve = async (): Promise<boolean> => {
-              try {
-                await fetchAndPush();
-                return false;
-              } catch (e) {
-                const nonFf = isNonFastForwardRejection(e);
-                if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
-                // Record WHICH cause fired so an operator reading logs can tell the two apart:
-                // a repeat workflow-scope rejection (the default's workflow files moved again
-                // DURING our align) versus a non-fast-forward (the rebase rewrote an
-                // already-published branch's history, a resume or the self_improve fixed
-                // branch, that the bot cannot force-push).
-                runLog.info(
-                  nonFf
-                    ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
-                    : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
-                  { run_id: runId },
-                );
-                await failBaseAlignConflict();
-                return true;
-              }
-            };
-
-            // Issue #627 — the overlay gate (correctness pin). FRESHLY recompute the branch's
-            // workflow-change signal here: the #377 guard earlier FAILS OPEN on a null diff, so
-            // a branch that modified a workflow file can still reach this block. Overlaying the
-            // default's workflow subtree would then CLOBBER that agent edit, so the overlay is
-            // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
-            // file. Any other case (null diff, or a real workflow edit) falls straight into the
-            // EXISTING merge → rebase → preserve chain, unchanged.
-            // Issue #631: reuse the #377 guard's changedFiles result (identical barePath+trackingRef);
-            // recompute only when #377 failed open (null diff), so a transient diff failure gets a retry.
-            const alignChanged =
-              changedForWf === null
-                ? await this.git.changedFiles(alignBarePath, trackingRef)
-                : changedForWf;
-            const alignWfHits =
-              alignChanged === null
-                ? null
-                : flagCIConfigPaths(alignChanged, [".github/workflows/**"]);
-            const canOverlay =
-              alignChanged !== null && alignWfHits !== null && alignWfHits.length === 0;
-
-            // Emit once here so the status fires on BOTH the overlay and the fallback paths.
-            batcher.emit({
-              kind: "status",
-              agent: "worker",
-              payload: {
-                text: "branch is behind the default branch on .github/workflows; aligning before pushing",
-              },
-            });
-
-            // PRIMARY (issue #627): overlay ONLY the default tip's .github/workflows/ subtree
-            // onto the agent tip. It cannot conflict and is a fast-forward (original agent SHAs
-            // preserved, nothing rebased), and it makes the tip's workflow tree equal main's —
-            // all GitHub's tip-vs-default check requires — WITHOUT dragging in main's unrelated
-            // changes the way a whole-tree merge/rebase does. Invoked OUTSIDE alignOp on
-            // purpose: alignOp maps any throw to "conflict" (→ preserve-and-fail), which is
-            // WRONG for the overlay — an overlay error must fall back to merge/rebase, not
-            // preserve-and-fail. So the overlay gets its own try/catch here.
-            let overlayHandled = false;
-            if (canOverlay) {
-              let overlayAligned = false;
-              try {
-                const res = await this.git.alignBranchWithDefault(
-                  runnerClone.path,
-                  result.branch,
-                  originalAgentTip,
-                  defTip,
-                  "workflow-subtree",
-                );
-                overlayAligned = res === "aligned"; // the overlay never returns "conflict"
-              } catch (e) {
-                // (b) the overlay git op threw (a GENUINE unexpected git error) → fall back to
-                // merge/rebase, NOT preserve-and-fail. Distinct message from (c) below.
-                runLog.warn(
-                  "finalize base-align: workflow-subtree overlay errored; falling back to merge/rebase",
-                  { run_id: runId, error: errMessage(e) },
-                );
-              }
-              if (overlayAligned) {
-                try {
-                  await fetchAndPush(); // sets alignPushed = true on success
-                  overlayHandled = true;
-                } catch (e) {
-                  if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
-                  // (c) the overlay pushed but was STILL rejected (workflow-scope: the default
-                  // moved again during our align; or non-fast-forward: a resumed/rewritten
-                  // branch) → fall back to merge/rebase. Distinct message from (b) above so an
-                  // operator can tell the two failure modes apart.
-                  runLog.info(
-                    "finalize base-align: workflow-subtree overlay push still rejected; falling back to merge/rebase",
-                    { run_id: runId },
-                  );
-                }
-              }
-            }
-
-            if (!overlayHandled) {
-              const mergeRes = await alignOp("merge");
-              if (mergeRes === "aligned") {
-                try {
-                  await fetchAndPush();
-                } catch (e) {
-                  if (isNonFastForwardRejection(e)) {
-                    // Issue #631: a non-fast-forward rejection (an already-published branch — a resume, or
-                    // the self_improve fixed branch — whose merge push cannot fast-forward) can't be cleared
-                    // by the rebase fallback (it also can't force-push), so preserve the diff and fail typed
-                    // rather than escape to the generic catch (raw message, no preserved_patch). This
-                    // matches pushAlignedOrPreserve (:1945-1946), which likewise fails typed on non-ff.
-                    // (The overlay push catch at :2020 handles non-ff differently — it can still fall
-                    // back to merge/rebase — so this arm deliberately does NOT mirror it: once at the
-                    // merge, a rebase cannot clear a non-ff on an already-published branch.)
-                    runLog.info(
-                      "finalize base-align: merge push rejected non-fast-forward; preserving diff and failing typed",
-                      { run_id: runId },
-                    );
-                    await failBaseAlignConflict();
-                    return;
-                  }
-                  if (!isWorkflowScopeRejection(e)) throw e;
-                  // The merge did NOT clear GitHub's workflow-scope rejection → the proven
-                  // rebase fallback (#422). alignBranchWithDefault rewinds to originalAgentTip
-                  // first, so the rebase replays the ORIGINAL agent commits onto the fresh
-                  // default rather than the merge commit.
-                  runLog.info(
-                    "finalize base-align: merge push still workflow-scope-rejected; trying rebase fallback",
-                    { run_id: runId },
-                  );
-                  const rebaseRes = await alignOp("rebase");
-                  if (rebaseRes === "aligned") {
-                    if (await pushAlignedOrPreserve()) return;
-                  } else {
-                    await failBaseAlignConflict();
-                    return;
-                  }
-                }
-              } else {
-                // The merge conflicted (or errored) — a rebase may still replay cleanly where a
-                // single merge did not, so try it before giving up.
-                runLog.info("finalize base-align: merge conflicted; trying rebase", {
-                  run_id: runId,
-                });
-                const rebaseRes = await alignOp("rebase");
-                if (rebaseRes === "aligned") {
-                  if (await pushAlignedOrPreserve()) return;
-                } else {
-                  await failBaseAlignConflict();
-                  return;
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // PRD #400 M2: a TASK run always pushes its branch back (the deliverable is the
-      // commits the user pulls from uzi/task/<id>) but opens a merge request only when
-      // it opted in (`uzi handoff --mr` → runs.open_mr → claim.open_mr). Every non-task
-      // kind keeps its current MR behaviour unconditionally. This is a distinct
-      // kind+flag gate on MR-OPEN only — a no-MR task still pushes, so it does NOT take
-      // the report_only path above (which pushes nothing).
-      const openMr = claim.kind !== "task" || claim.open_mr === true;
-
-      // The agent signalled done. The WORKER now performs the authenticated push
-      // (+ MR when openMr) with the PAT — the agent never had a credential.
-      batcher.emit({
-        kind: "status",
-        agent: "worker",
-        payload: {
-          text: openMr
-            ? "work complete; pushing branch and opening merge request"
-            : "work complete; pushing branch (no merge request — pull the branch)",
-        },
-      });
-      // The finalize push. Skipped when the PRD #456 align path above already pushed the
-      // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
-      // successful align-push and the normal push converge here without ever double-pushing.
-      if (!alignPushed) {
-        await pushToOrigin();
-      }
-
-      // PRD #400 M2: a no-MR task completes HERE — the branch is pushed, there is
-      // nothing more to open. Report the branch on the completion payload (the same
-      // `branch: result.branch` the MR path reports below) so runs.branch carries
-      // uzi/task/<id> and the user knows exactly what to pull. No mr_iid/mr_web_url:
-      // there is no merge request.
-      if (!openMr) {
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: `task complete; pushed ${result.branch} (no merge request — pull the branch)`,
-          },
-        });
-        await batcher.close();
-        await reportState({
-          status: "completed",
-          branch: result.branch,
-          prd_done_path: result.prdDonePath,
-          milestones_completed: result.milestonesCompleted,
-        });
-        runLog.info("task run completed (no MR)", { branch: result.branch });
-        return;
-      }
-
-      const targetBranch =
-        claim.repo.default_branch?.trim() ||
-        (await this.git.defaultBranchName(barePath)) ||
-        "main";
-      // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
-      // the worker opens an MR on GitLab and a PR on Forgejo/GitHub from the same code
-      // path; each client derives its own API base + project from repo.url (D9).
-      // createMergeRequest is idempotent: for a ci_fix on an existing agent branch it
-      // returns the EXISTING MR/PR (no second one, PRD #6); for a fresh ci-fix/pipeline-N
-      // or agent/issue-N branch it opens one. Reporting its iid keeps the fix branch
-      // watched so the verification sync can stamp the verdict.
-      const forge =
-        claim.repo.forge_type === "forgejo"
-          ? this.forgejo
-          : claim.repo.forge_type === "github"
-            ? this.github
-            : this.gitlab;
-      // PRD #284 Layer A/D3: wrap the WHOLE createMergeRequest call (POST → duplicate
-      // → findOpenMr GET) in the retry loop, not just its final thrown status. It is
-      // already idempotent — on a duplicate it adopts the existing MR/PR — but a
-      // transient findOpenMr failure after a duplicate POST would otherwise fail a run
-      // whose MR actually exists; retrying the whole call re-runs it instead.
-      const mr = await withForgeRetry(
-        () =>
-          forge.createMergeRequest({
-            repoUrl: claim.repo.url,
-            pat: claim.secrets.forge_pat,
-            sourceBranch: result.branch,
-            targetBranch,
-            title: mrTitle(claim, result.scopeCapped),
-            description: mrDescription(
-              claim,
-              result.branch,
-              result.agentSelection,
-              selfImproveSection,
-              promptGuardSection,
-              result.gatesUnverified,
-              result.gatesDiscoveryTruncated,
-              result.scopeCapped,
-            ),
-          }),
-        { log: runLog },
-      );
-      batcher.emit({
-        kind: "status",
-        agent: "worker",
-        payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
-      });
-
-      await batcher.close();
-      // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
-      // links it directly instead of reconstructing the URL by string surgery. Omit
-      // it when the forge returned none (mr.webUrl empty) so the server lands NULL and
-      // the legacy forgeUrls.ts reconstruction still applies (R8, additive+optional).
-      // prd_done_path (PRD #72 M4) rides the same terminal report. Omitted when the
-      // executor set nothing — same `|| undefined` shape as mr_web_url on this line,
-      // so "old worker" and "moved no PRD" are indistinguishable on the wire by
-      // design, and the api treats both as NULL.
-      // PRD #265 M1: the finished-milestone ids the lead declared on signal_done ride the
-      // same terminal report. Omitted when the executor set nothing (non-issue run, or the
-      // lead declared none) — same absent-vs-present discipline as prd_done_path, so the
-      // server UNIONs them into milestones_completed only when actually declared and a
-      // no-declaration completion is byte-identical to before.
-      await reportState({
-        status: "completed",
-        branch: result.branch,
-        mr_iid: mr.iid,
-        mr_web_url: mr.webUrl || undefined,
-        prd_done_path: result.prdDonePath,
-        milestones_completed: result.milestonesCompleted,
-        // PRD #634 M3: stamp the scope-capped disposition so the server records
-        // stop_kind='scope_capped'. OMITTED (not false) on a normal completion, so the wire
-        // shape is unchanged for every non-truncated run.
-        scope_capped: result.scopeCapped ? true : undefined,
-      });
-      runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
+      await this.phaseClone(claim, flight);
+      const sessionId = await this.phaseResume(claim, flight);
+      await this.phasePreflightHandoff(claim, flight, sessionId);
+      await this.phasePublish(claim, flight);
     } catch (err) {
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
       // `failed` and it lets the finally erase the session this run wants to resume from.
       if (err instanceof LimitReachedError) {
-        parked = await this.handleLimitReached(
+        flight.parked = await this.handleLimitReached(
           err,
           claim,
           batcher,
@@ -2252,7 +503,10 @@ export class RunRunner {
         // not. Only when the run actually parked (a resume is coming) and a clone
         // existed to fetch from. Best-effort: a park that fails is worse than a park
         // that loses work (D4), so a failed fetch-back must not undo the park.
-        if (parked && barePath && worktreePath && branch) {
+        if (flight.parked && flight.barePath && flight.worktreePath && flight.branch) {
+          const barePath = flight.barePath;
+          const worktreePath = flight.worktreePath;
+          const branch = flight.branch;
           // Belt-and-braces reap before we read the runner-owned clone, matching the
           // done path and the shutdown branch — safe today (the executor's run() finally
           // reaps first) but kept consistent across all three fetch-back sites.
@@ -2288,7 +542,7 @@ export class RunRunner {
           // git push / PAT (ADR-628 guardrail invariants).
           await this.publishCheckpointBestEffort(barePath, branch, runId, runLog);
         }
-      } else if (active?.shuttingDown) {
+      } else if (flight.active?.shuttingDown) {
         // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
         // run mid-flight. The DISCRIMINATOR is the flag, never the error: a user
         // steering-cancel aborts the same controller with the same REASON_CANCELLED and
@@ -2297,7 +551,10 @@ export class RunRunner {
         // catch is entered); killAgentTree here is the belt-and-braces reap at the
         // security boundary before we read the runner-owned clone.
         executor.killAgentTree?.();
-        if (barePath && worktreePath && branch) {
+        if (flight.barePath && flight.worktreePath && flight.branch) {
+          const barePath = flight.barePath;
+          const worktreePath = flight.worktreePath;
+          const branch = flight.branch;
           await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
         }
         // PRD #556 M1: a shutdown interrupt now preserves the same two filesystem dirs a
@@ -2305,7 +562,7 @@ export class RunRunner {
         // resumable SDK transcript), so a same-worker re-claim within the affinity grace
         // can resume the SDK session instead of restarting it from scratch. Scoped to
         // ONLY those two fs removals in the finally — every other cleanup still runs.
-        preserveSession = true;
+        flight.preserveSession = true;
         runLog.info("run interrupted by worker shutdown; leaving it for requeue");
         await batcher.close().catch(() => undefined);
         // NO reportState: the run stays non-terminal so the server's sweeper requeues
@@ -2429,8 +686,8 @@ export class RunRunner {
       //     CLAUDE.md before concluding flake — `node --test` prints `ℹ fail 0`
       //     for a timeout, so the tally will say everything passed while the exit
       //     code says otherwise. A hang here is this bug until proven otherwise.
-      if (worktreePath) {
-        await this.git.removeRunnerClone(worktreePath).catch((e) =>
+      if (flight.worktreePath) {
+        await this.git.removeRunnerClone(flight.worktreePath).catch((e) =>
           runLog.warn("runner clone cleanup failed", {
             error: errMessage(e),
           }),
@@ -2439,9 +696,9 @@ export class RunRunner {
       // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
       // M4). It is OUTSIDE the runner clone, so removeRunnerClone does not reach it;
       // leave it and each run leaks a dir. Best-effort, like the clone cleanup.
-      if (worktreePath && !parked && !preserveSession) {
+      if (flight.worktreePath && !flight.parked && !flight.preserveSession) {
         await fs
-          .rm(skillsPluginDir(worktreePath), { recursive: true, force: true })
+          .rm(skillsPluginDir(flight.worktreePath), { recursive: true, force: true })
           .catch((e) =>
             runLog.warn("skills plugin cleanup failed", {
               error: errMessage(e),
@@ -2459,12 +716,12 @@ export class RunRunner {
       // measured for one run). Still best-effort and still swallowing its own
       // error: this is a `finally`, and a cleanup that threw would convert a
       // completed run into a failed one, which is strictly worse than a leak.
-      if (runHome && !parked && !preserveSession) {
+      if (runHome && !flight.parked && !flight.preserveSession) {
         await rmTreeForce(runHome).catch((e) =>
           runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
         );
       }
-      if (parked) {
+      if (flight.parked) {
         // ~170 MB of Go module cache was measured under a single run HOME, so say
         // what is being held and why — an operator reading disk pressure needs to
         // connect it to a parked run rather than to a leak.
@@ -2474,7 +731,7 @@ export class RunRunner {
             run_home: runHome,
           },
         );
-      } else if (preserveSession) {
+      } else if (flight.preserveSession) {
         // PRD #556 M1: a shutdown-preserved HOME holds the same ~170 MB of Go module
         // cache a parked one does, so log it with its provenance too — an operator
         // reading disk pressure needs to connect the held dir to the shutdown interrupt
@@ -2488,6 +745,1869 @@ export class RunRunner {
       }
     }
   }
+
+  private async phasePublish(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    const { runLog, batcher, reportState, redactText, executor, runHome } = flight;
+    const runId = claim.run_id;
+    const result = flight.result!;
+    const runnerClone = flight.runnerClone!;
+    const barePath = flight.barePath!;
+    const lastPublishedTip = flight.lastPublishedTip;
+    const ciFixHumanApproved = flight.ciFixHumanApproved;
+    // A ci_fix run that judged the failure not a code problem (PRD #6) completes
+    // with the diagnosis and NO push/MR — there is nothing to land.
+    if (result.fixVerdict === "not_code") {
+      executor.killAgentTree?.();
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "not a code problem: completing with the diagnosis, no merge request",
+        },
+      });
+      await batcher.close();
+      await reportState({ status: "completed", fix_verdict: "not_code" });
+      runLog.info("ci_fix run completed with not_code verdict", {
+        run_id: runId,
+      });
+      return;
+    }
+
+    // issue #279: a DECLARED report-only run — the lead's deliverable is a report,
+    // command output, or verification result with NO code change to land, so the run
+    // completes with its findings and NO push/MR (mirroring the ci_fix not_code path
+    // above). killAgentTree was already called at the security boundary above, so we do
+    // NOT double-call it here (the not_code block's second call is a redundancy — not
+    // copied). Returns before fetchAgentBranch: there is no branch to fetch or push.
+    if (result.reportOnly) {
+      // issue #299: a report-only completion opens NO branch and NO MR, so if this run
+      // ALREADY published committed work to a checkpoint ref on origin
+      // (refs/uzi-checkpoints/<branch>), completing report-only would leave that ref
+      // orphaned — un-landed, with nothing to supersede it. ADR-0279 documented this as
+      // an accepted edge resting on the convention "a genuine zero-code run never
+      // checkpoints"; enforce that convention here instead. Detection is the UNION of
+      // two signals, each covering a gap the other has:
+      //   - lastPublishedTip: a checkpoint THIS worker confirmed-landed mid-run (set only
+      //     on a landed publish), which may not yet be mirrored into the bare's local ref.
+      //   - hasCommittedCheckpoint: origin's checkpoint ref, mirrored into the bare at
+      //     clone/fetch time — catches a checkpoint a PRIOR/cross-worker attempt landed.
+      //     Per PRD #759 it IGNORES a marker-only `wip(park):` checkpoint (an abandoned
+      //     usage-limit-park WIP marker with no committed milestone below it), while a
+      //     real committed milestone still blocks.
+      // A genuine zero-code run trips NEITHER (nothing committed ⇒ no pack ⇒ no publish),
+      // so it still completes report-only below. Refuse loudly, mirroring the
+      // undeclared-empty-diff FAIL path, rather than opening a delete-ref capability.
+      const publishedCheckpoint =
+        lastPublishedTip !== undefined ||
+        (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
+      if (publishedCheckpoint) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
+          },
+        });
+        await batcher.close();
+        await reportState({
+          status: "failed",
+          failure_reason:
+            "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
+            runnerClone.branch +
+            ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
+        });
+        runLog.info("run failed: report_only declared after a checkpoint was published", {
+          run_id: runId,
+        });
+        return;
+      }
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "report-only run: recording findings; no branch pushed and no merge request opened",
+        },
+      });
+      await batcher.close();
+      await reportState({
+        status: "completed",
+        report_only: true,
+        report_md: result.summary,
+      });
+      runLog.info("run completed report-only (no MR)", { run_id: runId });
+      return;
+    }
+
+    // (b) fetch-back (PRD #51 M3): the agent committed in the RUNNER clone, so the
+    // worker now fetches the agent branch BACK into its own bare (single-branch
+    // refspec, file://+pack transport, protocol.file.allow pinned — the six B2
+    // invariants live in git.fetchAgentBranch) before it inspects or pushes. Done
+    // AFTER killAgentTree so no agent process is concurrently mutating the clone,
+    // and it brings the agent's objects into the worker bare so the push does not
+    // depend on the (soon torn-down) runner clone. `trackingRef` is what push +
+    // changedFiles read; the runner clone is never a git source for either.
+    const trackingRef = await this.git.fetchAgentBranch(
+      barePath,
+      runnerClone.path,
+      result.branch,
+      runId,
+    );
+
+    // issue #279: an UNDECLARED zero-diff guard, ISSUE runs only. A declared report_only
+    // already returned above, so reaching here on an issue run with a confirmed-empty diff
+    // is the ambiguous "forgot to commit / should have set report_only" case — a
+    // committed-nothing issue run must not open an empty MR.
+    if ((claim.kind ?? "issue") === "issue") {
+      const changedForGuard = await this.git.changedFiles(barePath, trackingRef);
+      // changedFiles returns null on diff-FAILURE (keep pushing — fail open) and [] on a
+      // CONFIRMED-empty diff. report_only is the sanctioned zero-diff success — a declared
+      // report_only already returned above, so reaching here undeclared+empty is the
+      // ambiguous case; fail with an actionable reason instead of opening an empty MR.
+      if (changedForGuard !== null && changedForGuard.length === 0) {
+        // PRD #634 M3: an operator scope directive can truncate a run at its very first
+        // milestone boundary, before any milestone produced committed work — a legitimate
+        // zero-slice, NOT the ambiguous "forgot to commit" failure below. But guard against
+        // orphaning: if this run DID publish a checkpoint to origin (a mid-run milestone
+        // landed there), there IS committed work to land, so fall through to the push+MR
+        // path. Only the genuinely-empty case completes report-only with no MR. Detection
+        // reuses the SAME publishedCheckpoint union the declared-report_only path uses,
+        // which (PRD #759) ignores a marker-only `wip(park):` checkpoint while a real
+        // committed milestone still blocks.
+        if (result.scopeCapped) {
+          const publishedCheckpoint =
+            lastPublishedTip !== undefined ||
+            (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
+          if (!publishedCheckpoint) {
+            batcher.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: "operator scope directive stopped this run before any milestone produced committed work; recording it, no merge request",
+              },
+            });
+            await batcher.close();
+            await reportState({
+              status: "completed",
+              report_only: true,
+              scope_capped: true,
+              report_md:
+                result.summary ??
+                "Stopped by operator scope directive before any committed work; nothing to land.",
+            });
+            runLog.info("run completed scope-capped with no committed work (no MR)", {
+              run_id: runId,
+            });
+            return;
+          }
+          // published checkpoint exists → there IS work to land; fall through to push+MR.
+        } else {
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "no changes were committed and report_only was not set; failing",
+            },
+          });
+          await batcher.close();
+          await reportState({
+            status: "failed",
+            failure_reason:
+              "signal_done was called but no changes were committed, and report_only was not set. If this run's deliverable is a report or command output with no code change, call signal_done with report_only: true.",
+          });
+          runLog.info("run failed: signal_done with empty diff and no report_only", {
+            run_id: runId,
+          });
+          return;
+        }
+      }
+    }
+
+    // issue #341: a `prompt` run (schedule-fired ad-hoc work) that reaches signal_done
+    // having committed NOTHING has no diff to land, so pushing it would open an empty
+    // merge request — the #242 pathology, for the schedule path. Unlike the issue-kind
+    // guard above, a zero-commit prompt run is not the ambiguous "forgot to commit"
+    // failure: an ad-hoc prompt whose deliverable is an investigation/answer legitimately
+    // produces no code, so it completes as report-only (no branch, no MR), mirroring the
+    // declared report_only terminal above — INCLUDING its issue #299 checkpoint-orphan
+    // guard — rather than failing. ADR-0279 §2 forbids broadening the issue-kind gate
+    // onto other kinds precisely because they have their own terminal paths; this IS that
+    // separate terminal for `prompt`. A prompt run that DID commit falls through to the
+    // normal push/MR path unchanged.
+    if (claim.kind === "prompt") {
+      const changedForPrompt = await this.git.changedFiles(barePath, trackingRef);
+      // Preserve the null-vs-[] split: changedFiles returns null on diff-FAILURE (keep
+      // pushing — fail open) and [] on a CONFIRMED-empty diff. Only a confirmed-empty
+      // diff completes report-only; a diff-failure must NOT be treated as empty.
+      if (changedForPrompt !== null && changedForPrompt.length === 0) {
+        // issue #299: a report-only completion opens NO branch and NO MR, so if this run
+        // ALREADY published committed work to a checkpoint ref on origin
+        // (refs/uzi-checkpoints/<branch>), completing report-only would orphan that ref.
+        // This mirrors the declared report_only terminal above: detect via the UNION of
+        // lastPublishedTip (a checkpoint THIS worker confirmed-landed mid-run) and
+        // hasCommittedCheckpoint (origin's checkpoint ref, mirrored into the bare at
+        // clone/fetch time — catches a prior/cross-worker landing; per PRD #759 it ignores
+        // a marker-only `wip(park):` checkpoint while a real committed milestone still
+        // blocks). A genuine zero-code prompt run trips NEITHER and still completes
+        // report-only below.
+        const publishedCheckpoint =
+          lastPublishedTip !== undefined ||
+          (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
+        if (publishedCheckpoint) {
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
+            },
+          });
+          await batcher.close();
+          await reportState({
+            status: "failed",
+            failure_reason:
+              "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
+              runnerClone.branch +
+              ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
+          });
+          runLog.info("prompt run failed: report_only after a checkpoint was published", {
+            run_id: runId,
+          });
+          return;
+        }
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "prompt run committed no changes: recording findings; no branch pushed and no merge request opened",
+          },
+        });
+        await batcher.close();
+        await reportState({
+          status: "completed",
+          report_only: true,
+          report_md: result.summary,
+        });
+        runLog.info("prompt run completed report-only (no MR): zero-diff", {
+          run_id: runId,
+        });
+        return;
+      }
+    }
+
+    // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
+    // repo, the worker itself runs the test suites and flags any guard-critical
+    // path the change touched, folding both into the MR description. Best-effort —
+    // gathered before the push so the MR opens with its evidence, and a suite that
+    // can't run is reported "skipped", never failing the run.
+    let selfImproveSection: string | undefined;
+    // PRD #686 M4: uzi's SELF_IMPROVE_CHECKS (go test ./..., web/agent npm test,
+    // web build) are hardcoded to uzi's OWN layout and are meaningless against an
+    // arbitrary target repo, so this evidence block runs ONLY in dogfood mode. In
+    // generic mode it is skipped: selfImproveSection stays unset and no uzi-shaped
+    // check/guard-path evidence is produced — the generic plan directive already
+    // told the agent to discover and run the target repo's own gates during the run.
+    if (claim.kind === "self_improve" && claim.self_improve_dogfood) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "self-improvement: running the test suites for MR evidence",
+        },
+      });
+      // changedFiles returns null when the diff could not be computed → pass null
+      // through so the MR section fails CLOSED (a loud "guard-path check unavailable"
+      // note) instead of silently suppressing the flag (M5 audit). Under (b) this is
+      // a WORKER-BARE tree-diff of the fetched tracking ref (no runner-owned config
+      // source read), while the checks below still run in the runner clone.
+      const changed = await this.git.changedFiles(barePath, trackingRef);
+      // M9: the checks execute agent-authored code as the worker uid, so they run
+      // under a SCRUBBED replacement env (no join token / API URL / PAT / OAuth token
+      // by construction) with the run's provisioned toolchains on PATH. The frozen
+      // `--ignore-scripts` install runs best-effort so vitest/tsc exist; a failure
+      // just leaves the check honestly skipped.
+      //
+      // PRD #121 M2: this used the hardcoded `["web", "agent"]` dir list; it now
+      // reuses the same lockfile-driven installer the executor runs pre-plan, so
+      // there is ONE install path instead of two that can drift. For the uzi repo
+      // that discovery resolves to exactly web/ + agent/ (the only two tracked
+      // package.json files, both with a package-lock.json), which is what
+      // SELF_IMPROVE_CHECKS pre-flights on — asserted in js-deps.test.ts. The
+      // executor has already installed these once; re-running is deliberate, because
+      // the agent may have edited a package.json or lockfile during the run and the
+      // checks must test what it actually left behind.
+      const checkEnv = buildCheckEnv(
+        process.env,
+        runHome ?? os.tmpdir(),
+        result.toolEnv,
+      );
+      const deps = await installJsDeps(runnerClone.path, checkEnv).catch(
+        () => ({ results: [], truncated: false }),
+      );
+      for (const note of deps.results) {
+        runLog.info("self-improve: dependency install", { ...note });
+      }
+      // A truncated scan means `results` is a PREFIX of the repo's project dirs, so a
+      // check may be about to run somewhere provisioning never reached. Say so rather
+      // than let the notes above read as full coverage.
+      if (deps.truncated) {
+        runLog.warn(
+          "self-improve: dependency discovery hit its bound; some dirs were not installed",
+          {
+            installed_dirs: deps.results.length,
+          },
+        );
+      }
+      const checkRunner = this.checkRunner ?? defaultCheckRunner(checkEnv);
+      const checks = await runSelfImproveChecks(
+        runnerClone.path,
+        checkRunner,
+      );
+      selfImproveSection = selfImproveMrSection(
+        changed === null ? null : flagGuardPaths(changed),
+        checks,
+      );
+    }
+
+    // Guard-critical flag for an ad-hoc scheduled prompt run (PRD #241 Decision 10,
+    // the one worker-side follow-up). self_improve gets this flag by KIND — it is
+    // hardcoded API-side to uzi's own repo, a decision the worker CANNOT reproduce:
+    // the claim carries no repo-identity field, so there is no clean worker-side
+    // "is this the uzi repo" signal to gate on (flagged for the owner in the M8
+    // report — a repo-identity flag on the claim would be the API-side alternative).
+    // Instead we key the flag on the CHANGED PATHS: GUARD_CRITICAL_PATTERNS match
+    // uzi's own security-critical source paths only, so flagGuardPaths fires exactly
+    // when a prompt run actually touches uzi's guard surface (i.e. it targets the
+    // uzi repo) and is an empty no-op on any other repo. We do NOT run
+    // SELF_IMPROVE_CHECKS here — those are uzi's own gate suite and are meaningless
+    // against an arbitrary repo. Best-effort, gathered before the push like the
+    // self_improve evidence above.
+    let promptGuardSection: string | undefined;
+    if (claim.kind === "prompt") {
+      // null (diff failed) → fail CLOSED with a loud "guard-path check unavailable"
+      // note, exactly as the self_improve path does above (M5 audit).
+      const changed = await this.git.changedFiles(barePath, trackingRef);
+      promptGuardSection = guardCriticalMrSection(
+        changed === null ? null : flagGuardPaths(changed),
+      );
+    }
+
+    // PRD #71 M5 (load-bearing): for an auto-approved ci_fix run (no human in the loop),
+    // REFUSE to push a diff that touches a protected CI-config path, or a diff that could
+    // not be computed. A human-approved run (manual, or an auto CI-config plan that parked
+    // and was approved) is never blocked — a human was in the loop, as in the manual flow.
+    if (claim.kind === "ci_fix" && !ciFixHumanApproved) {
+      // Capture the narrowed bare path in a const the SAME way the push block does
+      // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
+      const pushBarePathForGuard = barePath;
+      // Worker-side FLOOR: when the claim omits ci_config_paths (a bug or an older
+      // server), fall back to the static defaults so the backstop cannot fail OPEN.
+      // This floor covers the static defaults only; the server-produced set additionally
+      // carries the project's real ci_config_path (see DEFAULT_CI_CONFIG_PATHS).
+      const ciConfigPaths = claim.config?.ci_config_paths?.length
+        ? claim.config.ci_config_paths
+        : DEFAULT_CI_CONFIG_PATHS;
+      const changed = await this.git.changedFiles(pushBarePathForGuard, trackingRef);
+      const flagged = changed === null ? null : flagCIConfigPaths(changed, ciConfigPaths);
+      if (changed === null || (flagged && flagged.length > 0)) {
+        const reason =
+          changed === null
+            ? "auto CI-fix push refused: could not compute the diff to verify it does not edit CI config (failing closed)"
+            : `auto CI-fix push refused: an auto-approved fix may not edit CI config (${flagged!.join(", ")}); a CI-config fix needs human approval`;
+        batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
+        runLog.warn("ci-fix: CI-config push guard refused push", { run_id: runId, reason });
+        // Fail the run CLOSED — no push, no MR. Throwing here lands on the method's
+        // generic catch (the `else` at ~:1203), which reports status:"failed" with this
+        // reason and does NOT re-queue (unlike LimitReached/shutdown). Same terminal
+        // convention the push/MR failures use.
+        throw new Error(reason);
+      }
+    }
+
+    // PRD #377 M1: a GitHub run whose branch touches .github/workflows/** cannot be
+    // pushed by the bot's repo-only PAT (privcheck forbids the workflow scope by design).
+    // Detect it here, BEFORE the doomed push, and end the run in a typed `failed` outcome
+    // that preserves the agent's diff for a human to land — instead of face-planting into
+    // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
+    // Serves every forge-pushing kind (the failed path is not issue-gated).
+    // #377 / issue #631: computed once here, reused by the base-align overlay gate below
+    // (both read changedFiles(barePath, trackingRef)); recomputed there only if this failed open.
+    let changedForWf: string[] | null = null;
+    if (claim.repo.forge_type === "github") {
+      // Capture the narrowed bare path in a const the SAME way the push block does
+      // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
+      const wfBarePath = barePath;
+      changedForWf = await this.git.changedFiles(wfBarePath, trackingRef);
+      // D6: a null diff (diff-computation failure) fails OPEN to the normal push — do not
+      // fail a possibly-legitimate non-workflow run on an inability to compute the diff.
+      const wfHits =
+        changedForWf === null
+          ? null
+          : flagCIConfigPaths(changedForWf, [".github/workflows/**"]);
+      if (wfHits && wfHits.length > 0) {
+        // Compose an actionable, capped failure_reason that names the offending path(s)
+        // (truncating the path LIST if needed, never the doc link) and points at
+        // docs/github-bot-setup.md.
+        const reason = composeWorkflowScopeReason(wfHits);
+        // Preserve the agent's diff so a human can land it without re-deriving it from the
+        // transcript. redactText scrubs the run's secrets before it reaches the api; a null
+        // diff (best-effort failure) just omits the patch — the typed failure still lands.
+        const rawPatch = await this.git.workflowScopeDiff(wfBarePath, trackingRef);
+        const patch = rawPatch === null ? undefined : redactText(rawPatch);
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text:
+              "branch changes .github/workflows, which the bot token cannot push; failing early and preserving the diff for a human to land",
+          },
+        });
+        runLog.info(
+          "run failed: branch touches .github/workflows which the bot PAT cannot push; preserving diff",
+          { run_id: runId, paths: wfHits },
+        );
+        await batcher.close();
+        await reportState({
+          status: "failed",
+          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+          fail_origin: "workflow_scope_missing",
+          preserved_patch: patch,
+        });
+        return;
+      }
+    }
+
+    // The single authenticated finalize push (PAT-bearing, worker-owned; the agent never
+    // has a credential). Captured once as a closure so the align path (below) and the
+    // normal path push through EXACTLY ONE code path — the run must never push twice.
+    // PRD #284 Layer A: a transient push failure (a dropped HTTP/2 stream, a 5xx, a
+    // connection reset) retries rather than discarding the agent's already-committed work;
+    // a permanent rejection (auth, protected branch, non-fast-forward) fails fast and
+    // propagates to the catch below. The push is idempotent on retry (non-forced, same
+    // commits → "Everything up-to-date"). Capture the narrowed bare path: barePath is an
+    // outer `let` (string | undefined) and TS drops the narrowing inside the closure.
+    const finalizeBarePath = barePath;
+    const pushToOrigin = () =>
+      withForgeRetry(
+        () =>
+          this.git.pushBranch(
+            finalizeBarePath,
+            result.branch,
+            claim.secrets.forge_pat,
+            claim.repo.clone_url,
+            claim.secrets.forge_username,
+          ),
+        { log: runLog },
+      );
+
+    // PRD #456 M1: a GitHub run can be merely BEHIND the default branch on
+    // .github/workflows/** (main advanced those files after this run's clone base) WITHOUT
+    // having touched them. The bot's repo-only PAT push is then rejected atomically —
+    // losing ALL the run's work — even though #377's guard above (which fires only when the
+    // BRANCH modifies a workflow) did not trip. Align the branch's workflow tree with the
+    // FRESH default before pushing: merge first (SHA-preserving, D2), and if the merged push
+    // is STILL workflow-scope-rejected fall back to a rebase (the empirically proven #422
+    // recovery). On an unresolvable conflict, fail the run typed + preserve the diff (M2)
+    // rather than face-plant into GitHub's opaque rejection and discard the committed work.
+    // GitHub-only: GitLab/Forgejo impose no workflow-scope rule.
+    let alignPushed = false;
+    if (claim.repo.forge_type === "github") {
+      const alignBarePath = barePath;
+      const alignDefaultBranch =
+        claim.repo.default_branch?.trim() ||
+        (await this.git.defaultBranchName(alignBarePath)) ||
+        "main";
+      // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
+      // that may well succeed (the branch may not actually be behind) — fall through to the
+      // normal push, never fail a run on an inability to compute the align target.
+      let defaultTip: string | undefined;
+      let differs = false;
+      try {
+        defaultTip = await this.git.fetchDefaultTip(
+          alignBarePath,
+          alignDefaultBranch,
+          claim.secrets.forge_pat,
+          claim.repo.clone_url,
+          claim.secrets.forge_username,
+        );
+        differs = await this.git.workflowTreeDiffers(
+          alignBarePath,
+          trackingRef,
+          defaultTip,
+        );
+      } catch (e) {
+        runLog.warn(
+          "finalize base-align: could not compute the align target; pushing without aligning",
+          { run_id: runId, error: errMessage(e) },
+        );
+      }
+      if (defaultTip && differs) {
+        // The pre-align committed agent tip — the base every align strategy starts from, so
+        // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
+        const originalAgentTip = await this.git.branchTip(
+          runnerClone.path,
+          result.branch,
+        );
+        if (!originalAgentTip) {
+          runLog.warn(
+            "finalize base-align: could not resolve the branch tip; pushing without aligning",
+            { run_id: runId },
+          );
+        } else {
+          // The conflict-failure path (M2). The abort already ran inside
+          // alignBranchWithDefault; here we preserve the diff via #377's preserved_patch and
+          // fail typed. We diff the pre-align agent tip (`originalAgentTip`, declared at :1848,
+          // non-null under the :1852 guard) — NOT `trackingRef` — so the preserved patch is
+          // exactly the agent's human-landable work. Issue #631: when a strategy ALIGNED and
+          // then had its push rejected (the overlay's arm (c), or a merge/rebase whose push was
+          // rejected) `fetchAndPush` re-fetched the ALIGNED tip into `trackingRef`, so diffing
+          // `trackingRef` yielded a SUPERSET (agent work PLUS the aligning strategy's own
+          // workflow-subtree/merge changes) if a LATER strategy then conflicted and landed here.
+          // Diffing `originalAgentTip` eliminates that superset: its objects were fetched into
+          // the worker bare by the finalize `fetchAgentBranch` before any align, so
+          // workflowScopeDiff resolves it. In the non-push conflict paths originalAgentTip ==
+          // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
+          // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
+          const defTip = defaultTip;
+          const failBaseAlignConflict = async () => {
+            const rawPatch = await this.git.workflowScopeDiff(alignBarePath, originalAgentTip);
+            const patch = rawPatch === null ? undefined : redactText(rawPatch);
+            batcher.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
+              },
+            });
+            runLog.info("run failed: finalize base-align conflict; preserving diff", {
+              run_id: runId,
+            });
+            await batcher.close();
+            await reportState({
+              status: "failed",
+              failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
+              fail_origin: "finalize_base_align_conflict",
+              preserved_patch: patch,
+            });
+          };
+
+          // Run one align STRATEGY, treating an UNEXPECTED throw (the S3 count-mismatch
+          // guard, or any git error) exactly like a `"conflict"` return. This is the whole
+          // point of the feature: the agent's work must be PRESERVED on failure, so an
+          // unexpected align error must route to failBaseAlignConflict (typed fail + diff),
+          // NOT escape to the generic catch below (raw message, no preserved_patch, defaulted
+          // fail_origin). Scoped to the align OPERATION only — the push keeps its own
+          // handling (workflow-scope → rebase fallback; any other push error rethrows).
+          const alignOp = async (strategy: "merge" | "rebase"): Promise<"aligned" | "conflict"> => {
+            try {
+              return await this.git.alignBranchWithDefault(
+                runnerClone.path,
+                result.branch,
+                originalAgentTip,
+                defTip,
+                strategy,
+              );
+            } catch (e) {
+              runLog.warn(
+                "finalize base-align: unexpected error during align; preserving diff and failing typed",
+                { run_id: runId, strategy, error: errMessage(e) },
+              );
+              return "conflict";
+            }
+          };
+
+          // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
+          const fetchAndPush = async () => {
+            await this.git.fetchAgentBranch(
+              alignBarePath,
+              runnerClone.path,
+              result.branch,
+              runId,
+            );
+            await pushToOrigin();
+            alignPushed = true;
+          };
+
+          // Push the aligned branch. Two rejections here are the base-align-conflict path,
+          // not a mislabel: a REPEAT workflow-scope rejection means the default's workflow
+          // files moved again DURING our align (double-TOCTOU); a NON-FAST-FORWARD rejection
+          // means the rebase fallback rewrote the history of an already-published branch (a
+          // resume, or the self_improve fixed branch) so this non-forced push cannot
+          // fast-forward, and force-push is denied by the guardrails by design. Both preserve
+          // the diff and fail typed rather than lose it to the generic catch. Any OTHER push
+          // error still rethrows unchanged (a genuine auth/transient/protected-branch failure
+          // must not be mislabelled as a base-align conflict). Returns true if it
+          // preserved-and-failed (the caller must then `return`), false on a successful push.
+          const pushAlignedOrPreserve = async (): Promise<boolean> => {
+            try {
+              await fetchAndPush();
+              return false;
+            } catch (e) {
+              const nonFf = isNonFastForwardRejection(e);
+              if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
+              // Record WHICH cause fired so an operator reading logs can tell the two apart:
+              // a repeat workflow-scope rejection (the default's workflow files moved again
+              // DURING our align) versus a non-fast-forward (the rebase rewrote an
+              // already-published branch's history, a resume or the self_improve fixed
+              // branch, that the bot cannot force-push).
+              runLog.info(
+                nonFf
+                  ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
+                  : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
+                { run_id: runId },
+              );
+              await failBaseAlignConflict();
+              return true;
+            }
+          };
+
+          // Issue #627 — the overlay gate (correctness pin). FRESHLY recompute the branch's
+          // workflow-change signal here: the #377 guard earlier FAILS OPEN on a null diff, so
+          // a branch that modified a workflow file can still reach this block. Overlaying the
+          // default's workflow subtree would then CLOBBER that agent edit, so the overlay is
+          // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
+          // file. Any other case (null diff, or a real workflow edit) falls straight into the
+          // EXISTING merge → rebase → preserve chain, unchanged.
+          // Issue #631: reuse the #377 guard's changedFiles result (identical barePath+trackingRef);
+          // recompute only when #377 failed open (null diff), so a transient diff failure gets a retry.
+          const alignChanged =
+            changedForWf === null
+              ? await this.git.changedFiles(alignBarePath, trackingRef)
+              : changedForWf;
+          const alignWfHits =
+            alignChanged === null
+              ? null
+              : flagCIConfigPaths(alignChanged, [".github/workflows/**"]);
+          const canOverlay =
+            alignChanged !== null && alignWfHits !== null && alignWfHits.length === 0;
+
+          // Emit once here so the status fires on BOTH the overlay and the fallback paths.
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "branch is behind the default branch on .github/workflows; aligning before pushing",
+            },
+          });
+
+          // PRIMARY (issue #627): overlay ONLY the default tip's .github/workflows/ subtree
+          // onto the agent tip. It cannot conflict and is a fast-forward (original agent SHAs
+          // preserved, nothing rebased), and it makes the tip's workflow tree equal main's —
+          // all GitHub's tip-vs-default check requires — WITHOUT dragging in main's unrelated
+          // changes the way a whole-tree merge/rebase does. Invoked OUTSIDE alignOp on
+          // purpose: alignOp maps any throw to "conflict" (→ preserve-and-fail), which is
+          // WRONG for the overlay — an overlay error must fall back to merge/rebase, not
+          // preserve-and-fail. So the overlay gets its own try/catch here.
+          let overlayHandled = false;
+          if (canOverlay) {
+            let overlayAligned = false;
+            try {
+              const res = await this.git.alignBranchWithDefault(
+                runnerClone.path,
+                result.branch,
+                originalAgentTip,
+                defTip,
+                "workflow-subtree",
+              );
+              overlayAligned = res === "aligned"; // the overlay never returns "conflict"
+            } catch (e) {
+              // (b) the overlay git op threw (a GENUINE unexpected git error) → fall back to
+              // merge/rebase, NOT preserve-and-fail. Distinct message from (c) below.
+              runLog.warn(
+                "finalize base-align: workflow-subtree overlay errored; falling back to merge/rebase",
+                { run_id: runId, error: errMessage(e) },
+              );
+            }
+            if (overlayAligned) {
+              try {
+                await fetchAndPush(); // sets alignPushed = true on success
+                overlayHandled = true;
+              } catch (e) {
+                if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
+                // (c) the overlay pushed but was STILL rejected (workflow-scope: the default
+                // moved again during our align; or non-fast-forward: a resumed/rewritten
+                // branch) → fall back to merge/rebase. Distinct message from (b) above so an
+                // operator can tell the two failure modes apart.
+                runLog.info(
+                  "finalize base-align: workflow-subtree overlay push still rejected; falling back to merge/rebase",
+                  { run_id: runId },
+                );
+              }
+            }
+          }
+
+          if (!overlayHandled) {
+            const mergeRes = await alignOp("merge");
+            if (mergeRes === "aligned") {
+              try {
+                await fetchAndPush();
+              } catch (e) {
+                if (isNonFastForwardRejection(e)) {
+                  // Issue #631: a non-fast-forward rejection (an already-published branch — a resume, or
+                  // the self_improve fixed branch — whose merge push cannot fast-forward) can't be cleared
+                  // by the rebase fallback (it also can't force-push), so preserve the diff and fail typed
+                  // rather than escape to the generic catch (raw message, no preserved_patch). This
+                  // matches pushAlignedOrPreserve (:1945-1946), which likewise fails typed on non-ff.
+                  // (The overlay push catch at :2020 handles non-ff differently — it can still fall
+                  // back to merge/rebase — so this arm deliberately does NOT mirror it: once at the
+                  // merge, a rebase cannot clear a non-ff on an already-published branch.)
+                  runLog.info(
+                    "finalize base-align: merge push rejected non-fast-forward; preserving diff and failing typed",
+                    { run_id: runId },
+                  );
+                  await failBaseAlignConflict();
+                  return;
+                }
+                if (!isWorkflowScopeRejection(e)) throw e;
+                // The merge did NOT clear GitHub's workflow-scope rejection → the proven
+                // rebase fallback (#422). alignBranchWithDefault rewinds to originalAgentTip
+                // first, so the rebase replays the ORIGINAL agent commits onto the fresh
+                // default rather than the merge commit.
+                runLog.info(
+                  "finalize base-align: merge push still workflow-scope-rejected; trying rebase fallback",
+                  { run_id: runId },
+                );
+                const rebaseRes = await alignOp("rebase");
+                if (rebaseRes === "aligned") {
+                  if (await pushAlignedOrPreserve()) return;
+                } else {
+                  await failBaseAlignConflict();
+                  return;
+                }
+              }
+            } else {
+              // The merge conflicted (or errored) — a rebase may still replay cleanly where a
+              // single merge did not, so try it before giving up.
+              runLog.info("finalize base-align: merge conflicted; trying rebase", {
+                run_id: runId,
+              });
+              const rebaseRes = await alignOp("rebase");
+              if (rebaseRes === "aligned") {
+                if (await pushAlignedOrPreserve()) return;
+              } else {
+                await failBaseAlignConflict();
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // PRD #400 M2: a TASK run always pushes its branch back (the deliverable is the
+    // commits the user pulls from uzi/task/<id>) but opens a merge request only when
+    // it opted in (`uzi handoff --mr` → runs.open_mr → claim.open_mr). Every non-task
+    // kind keeps its current MR behaviour unconditionally. This is a distinct
+    // kind+flag gate on MR-OPEN only — a no-MR task still pushes, so it does NOT take
+    // the report_only path above (which pushes nothing).
+    const openMr = claim.kind !== "task" || claim.open_mr === true;
+
+    // The agent signalled done. The WORKER now performs the authenticated push
+    // (+ MR when openMr) with the PAT — the agent never had a credential.
+    batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: openMr
+          ? "work complete; pushing branch and opening merge request"
+          : "work complete; pushing branch (no merge request — pull the branch)",
+      },
+    });
+    // The finalize push. Skipped when the PRD #456 align path above already pushed the
+    // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
+    // successful align-push and the normal push converge here without ever double-pushing.
+    if (!alignPushed) {
+      await pushToOrigin();
+    }
+
+    // PRD #400 M2: a no-MR task completes HERE — the branch is pushed, there is
+    // nothing more to open. Report the branch on the completion payload (the same
+    // `branch: result.branch` the MR path reports below) so runs.branch carries
+    // uzi/task/<id> and the user knows exactly what to pull. No mr_iid/mr_web_url:
+    // there is no merge request.
+    if (!openMr) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `task complete; pushed ${result.branch} (no merge request — pull the branch)`,
+        },
+      });
+      await batcher.close();
+      await reportState({
+        status: "completed",
+        branch: result.branch,
+        prd_done_path: result.prdDonePath,
+        milestones_completed: result.milestonesCompleted,
+      });
+      runLog.info("task run completed (no MR)", { branch: result.branch });
+      return;
+    }
+
+    const targetBranch =
+      claim.repo.default_branch?.trim() ||
+      (await this.git.defaultBranchName(barePath)) ||
+      "main";
+    // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
+    // the worker opens an MR on GitLab and a PR on Forgejo/GitHub from the same code
+    // path; each client derives its own API base + project from repo.url (D9).
+    // createMergeRequest is idempotent: for a ci_fix on an existing agent branch it
+    // returns the EXISTING MR/PR (no second one, PRD #6); for a fresh ci-fix/pipeline-N
+    // or agent/issue-N branch it opens one. Reporting its iid keeps the fix branch
+    // watched so the verification sync can stamp the verdict.
+    const forge =
+      claim.repo.forge_type === "forgejo"
+        ? this.forgejo
+        : claim.repo.forge_type === "github"
+          ? this.github
+          : this.gitlab;
+    // PRD #284 Layer A/D3: wrap the WHOLE createMergeRequest call (POST → duplicate
+    // → findOpenMr GET) in the retry loop, not just its final thrown status. It is
+    // already idempotent — on a duplicate it adopts the existing MR/PR — but a
+    // transient findOpenMr failure after a duplicate POST would otherwise fail a run
+    // whose MR actually exists; retrying the whole call re-runs it instead.
+    const mr = await withForgeRetry(
+      () =>
+        forge.createMergeRequest({
+          repoUrl: claim.repo.url,
+          pat: claim.secrets.forge_pat,
+          sourceBranch: result.branch,
+          targetBranch,
+          title: mrTitle(claim, result.scopeCapped),
+          description: mrDescription(
+            claim,
+            result.branch,
+            result.agentSelection,
+            selfImproveSection,
+            promptGuardSection,
+            result.gatesUnverified,
+            result.gatesDiscoveryTruncated,
+            result.scopeCapped,
+          ),
+        }),
+      { log: runLog },
+    );
+    batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
+    });
+
+    await batcher.close();
+    // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
+    // links it directly instead of reconstructing the URL by string surgery. Omit
+    // it when the forge returned none (mr.webUrl empty) so the server lands NULL and
+    // the legacy forgeUrls.ts reconstruction still applies (R8, additive+optional).
+    // prd_done_path (PRD #72 M4) rides the same terminal report. Omitted when the
+    // executor set nothing — same `|| undefined` shape as mr_web_url on this line,
+    // so "old worker" and "moved no PRD" are indistinguishable on the wire by
+    // design, and the api treats both as NULL.
+    // PRD #265 M1: the finished-milestone ids the lead declared on signal_done ride the
+    // same terminal report. Omitted when the executor set nothing (non-issue run, or the
+    // lead declared none) — same absent-vs-present discipline as prd_done_path, so the
+    // server UNIONs them into milestones_completed only when actually declared and a
+    // no-declaration completion is byte-identical to before.
+    await reportState({
+      status: "completed",
+      branch: result.branch,
+      mr_iid: mr.iid,
+      mr_web_url: mr.webUrl || undefined,
+      prd_done_path: result.prdDonePath,
+      milestones_completed: result.milestonesCompleted,
+      // PRD #634 M3: stamp the scope-capped disposition so the server records
+      // stop_kind='scope_capped'. OMITTED (not false) on a normal completion, so the wire
+      // shape is unchanged for every non-truncated run.
+      scope_capped: result.scopeCapped ? true : undefined,
+    });
+    runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
+  }
+
+  private buildFlight(
+    claim: ClaimResponse,
+    runId: string,
+    executor: Executor,
+    runHome: string | undefined,
+    gitBasic: string,
+    runScopedSecrets: string[],
+  ): RunFlight {
+    const runLog = this.log.child({
+      run_id: runId,
+      issue_iid: claim.issue_iid,
+    });
+    // Same secret set for both redactors: the batcher scrubs run_message payloads;
+    // redactText scrubs strings that reach the API outside a payload (failure_reason,
+    // and the PRD #99 agent_label/agent_instance the batcher now carries alongside
+    // the payload — `redact` walks inside a payload object and never sees them).
+    const secrets = [
+      claim.secrets.forge_pat,
+      claim.secrets.anthropic_oauth_token,
+      this.joinToken,
+      gitBasic,
+    ];
+    const redact = makeRedactor(secrets);
+    const redactText = makeTextRedactor(secrets);
+    const batcher = new MessageBatcher(
+      this.client,
+      runId,
+      claim.last_seq,
+      this.batchMs,
+      runLog,
+      redact,
+      redactText,
+    );
+
+    // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the
+    // steering channel, which the executor's ctx.signal watches.
+    const cancel = new AbortController();
+    // PRD #41: `notify` lets the steering channel post a feed notice when it discards a
+    // verdict/revision written against a stale plan version — wired to the batcher here
+    // so the channel never reaches into runner internals.
+    const steering = new SteeringChannel(
+      this.client,
+      runId,
+      this.pollMs,
+      runLog,
+      cancel,
+      {
+        notify: (text) =>
+          batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+      },
+    );
+    // issue #552 M3: a graceful `uzi run stop` (PRD #517 M4) consumed into the worker's
+    // stopRequested flag is lost if the worker dies before winding the park down. The
+    // server re-delivers the durable runs.stop_kind='stopped' fact as claim.stop_pending
+    // on every claim; seeding it here reconstructs the sticky stop state so the resumed
+    // run's interactive park ends `stopped` immediately (steering.awaitFollowUp's arm-time
+    // check) instead of waiting out the idle timeout. Absent ⇒ untouched (today's path).
+    if (claim.stop_pending) steering.seedStopRequested();
+
+    // Last SDK session id the executor observed; carried on EVERY state report so
+    // resume survives a lost report.
+    // Returns the server's acknowledgement (PRD #35), which every caller here still
+    // ignores. Widened from Promise<void> so the park branch can read it without
+    // re-plumbing this closure; the annotation is the only change, and awaiting a
+    // value nobody binds behaves exactly as before.
+    const flight: RunFlight = {
+      runId,
+      executor,
+      runHome,
+      runScopedSecrets,
+      runLog,
+      redact,
+      redactText,
+      batcher,
+      cancel,
+      steering,
+      observedSessionId: undefined,
+      reportState: (body) =>
+        this.client.reportState(
+          runId,
+          flight.observedSessionId
+            ? { ...body, session_id: flight.observedSessionId }
+            : body,
+        ),
+      barePath: undefined,
+      worktreePath: undefined,
+      // PRD #267: time-based origin-checkpoint gate state (per run). `lastPublish` starts
+      // at run start so the first time-based publish fires ~one interval in; both are
+      // updated by ANY origin publish (milestone or time). Decision 9: the publish "new
+      // work" test keys on `lastPublishedTip`, NOT the fetch-skip below.
+      lastPublish: this.now(),
+      lastPublishedTip: undefined,
+      // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
+      // catch can name it. `runnerClone` is declared inside the try and there is no
+      // `result` on those paths, so `runnerClone.branch` is the source of truth and it is
+      // copied here the moment the clone exists.
+      branch: undefined,
+      // PRD #218 M1: this run's shutdown-registry entry, hoisted so the catch can read
+      // `active.shuttingDown` to tell a graceful shutdown apart from every other failure.
+      active: undefined,
+      // PRD #35: set ONLY by a park the server acknowledged as `limit_wait`. It gates
+      // the two filesystem removals in the finally and nothing else. Declared here
+      // rather than in the catch so the finally can see it; false is the safe default,
+      // so every path that never reaches the park logic cleans up exactly as before.
+      parked: false,
+      // PRD #556 M1: set ONLY by a worker-shutdown interrupt (the `active?.shuttingDown`
+      // catch branch). Like `parked`, it gates EXACTLY the two filesystem removals in the
+      // finally (the sibling skills plugin dir and the per-run HOME) and nothing else — so
+      // a same-worker re-claim within the affinity grace can resume the SDK session. It is
+      // a distinct flag from `parked` on purpose: `parked` also drives park-only report
+      // semantics, resume seeding, and the park log, none of which apply to a shutdown.
+      preserveSession: false,
+      ciFixHumanApproved: false,
+      runnerClone: undefined,
+      result: undefined,
+    };
+
+    // PRD #108 M3: the batcher's breaker reports OUT OF BAND, never through itself —
+    // `concat` is order-preserving, so an emitted explanation would queue behind the
+    // poison that tripped it and never land. reportState has bounded retries,
+    // 4xx-fatal semantics, and treats an already-terminal server response as
+    // success, so if the run has already reported terminal this is a safe no-op
+    // rather than a second, racing terminal report. Fire-and-forget: the batcher's
+    // trip path must never block on the network.
+    batcher.onPermanentFailureReport(({ reason }) => {
+      void flight
+        .reportState({
+          status: "failed",
+          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+        })
+        .catch((e) =>
+          runLog.error("could not report the message-transport failure", {
+            error: errMessage(e),
+          }),
+        );
+    });
+
+    return flight;
+  }
+
+  private async phaseClone(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    const { runLog, reportState, steering, batcher, cancel } = flight;
+    const runId = claim.run_id;
+    runLog.info("run claimed", {
+      repo: claim.repo.url,
+      branch: claim.branch ?? null,
+    });
+    await reportState({ status: "running" });
+    steering.start();
+
+    const barePath = (flight.barePath = await this.git.ensureClone(
+      claim.repo.clone_url,
+      claim.secrets.forge_pat,
+      claim.secrets.forge_username,
+    ));
+    const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+    flight.worktreePath = runnerClone.path;
+    flight.branch = runnerClone.branch;
+    // PRD #218 M1: register for the shutdown fetch-back now that a clone exists to
+    // fetch from. The late-register guard covers the race where shutdown() already
+    // fired before this run reached here — abort it at once so it does not run to
+    // completion past the grace window.
+    const active: ActiveRun = (flight.active = { cancel, shuttingDown: false });
+    this.activeRuns.set(runId, active);
+    if (this.shuttingDownGlobal) {
+      active.shuttingDown = true;
+      cancel.abort();
+    }
+    batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: { text: `runner clone ready on ${runnerClone.branch}` },
+    });
+  }
+
+  private async phaseResume(
+    claim: ClaimResponse,
+    flight: RunFlight,
+  ): Promise<string | undefined> {
+    const { runLog, reportState, batcher, runHome } = flight;
+    const runId = claim.run_id;
+    const runnerClone = flight.runnerClone!;
+    // PRD #218 M3 / #759 M5: say what a resume recovered, in a WORKER status rather than by
+    // the lead noticing the tree changed under it. Two axes cross here — WHAT kind of work
+    // was recovered, committed vs. uncommitted, and each is honest about a distinct outcome:
+    //   - COMMITTED work (priorCommits > 0): the tracking-ref leg (same-worker, its owner
+    //     stamp matched THIS run — M2) or the checkpoint leg (cross-worker, #122 M8). The
+    //     message says which and names the count.
+    //   - UNCOMMITTED WIP (runnerClone.wipRecovered — #759 M2): a `wip(park):` marker was
+    //     `reset --soft` back to the working tree, so its edits returned UNCOMMITTED and the
+    //     marker never enters the history. priorCommits was computed AFTER that reset (off
+    //     the marker's parent), so it NEVER counts the marker — a pure WIP recovery has
+    //     priorCommits === 0. This is a PARTIAL, unreviewed snapshot, NOT a committed
+    //     milestone, so its wording says to verify it against the plan.
+    //   - NOTHING recovered on a RESUME (session id present, seededFrom "default", no WIP):
+    //     no origin branch, no tracking ref THIS run owns, no recoverable WIP — a
+    //     cross-worker resume (R1) or a diverged checkpoint that could not be applied. The
+    //     tree is lost for this run; admit it (the #218 M3 loss notice, unchanged wording).
+    //
+    // Branch order is load-bearing: the pure-WIP branch (3) MUST precede the loss branch (4).
+    // A cross-worker DIVERGED WIP recovery (#759 M2 leg #4) recovers the WIP tree onto the new
+    // floor but leaves seededFrom === "default" (the base is the floor, not the checkpoint) with
+    // wipRecovered === true. If the loss branch ran first it would FALSELY fire "no earlier work
+    // could be recovered" on exactly that successful recovery. With branch 3 ahead of it, the
+    // loss notice fires only when NOTHING — committed or WIP — was recovered: the residual
+    // #218-M3 loss case.
+    const wipRecovered = runnerClone.wipRecovered === true;
+    if (runnerClone.seededFrom === "tracking" && runnerClone.priorCommits > 0) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: wipRecovered
+            ? `recovered ${runnerClone.priorCommits} commit(s) plus your uncommitted work-in-progress from this run's interrupted attempt`
+            : `recovered ${runnerClone.priorCommits} commit(s) of work from this run's interrupted attempt`,
+        },
+      });
+    } else if (runnerClone.seededFrom === "checkpoint" && runnerClone.priorCommits > 0) {
+      // PRD #122 M8: seeded off ANOTHER worker's brokered checkpoint (origin's
+      // refs/uzi-checkpoints/<branch>) — a cross-worker recovery the lead cannot infer
+      // from the tree alone. priorCommits counts what the checkpoint carries. Gated on
+      // priorCommits > 0 (like the tracking notice above) so it never claims to have
+      // "recovered 0 commit(s) from a checkpoint". #759 M5: a checkpoint can ALSO carry a
+      // reset-soft'd WIP tree alongside its commits — mention it when it did.
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: wipRecovered
+            ? `recovered ${runnerClone.priorCommits} commit(s) plus your uncommitted work-in-progress from a checkpoint on another worker`
+            : `recovered ${runnerClone.priorCommits} commit(s) from a checkpoint on another worker`,
+        },
+      });
+    } else if (wipRecovered) {
+      // PRD #759 M5: a PURE uncommitted-WIP recovery — no committed milestones came back
+      // (priorCommits === 0). This is the #685 shape and covers same-worker tracking with
+      // zero commits, a cross-worker clean checkpoint with zero commits, AND the
+      // cross-worker DIVERGED cherry-pick leg (seededFrom stays "default"/origin). The
+      // recovered content is an UNCOMMITTED, PARTIAL snapshot from an interrupted attempt,
+      // NOT a committed milestone — so tell the agent to verify it against the plan before
+      // building on it. This branch precedes the loss notice so the diverged case
+      // (seededFrom === "default" + wipRecovered) never falsely reports total loss.
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text:
+            "recovered your uncommitted work-in-progress from this run's interrupted attempt — " +
+            "a partial snapshot, so verify it against the plan before continuing",
+        },
+      });
+    } else if (claim.session_id != null && runnerClone.seededFrom === "default") {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text:
+            "no earlier work could be recovered for this run on this worker — " +
+            "starting from the default branch, so some work may be repeated",
+        },
+      });
+    }
+    // PRD #122 M8: a mirrored checkpoint existed but DIVERGED from origin, so origin won
+    // and the checkpointed work was set aside. Independent of the seed leg (the base is
+    // origin/default here, not the checkpoint) — say so LOUDLY rather than dropping it
+    // silently.
+    if (runnerClone.checkpointSetAside) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "checkpointed work was set aside — origin diverged; starting from origin",
+        },
+      });
+    }
+
+    // PRD #628 M4: signal the server to CLEAR this run's stale milestones_completed when
+    // the reseed recovered NO committed work (seededFrom === "default", equivalently
+    // priorCommits === 0). milestones_completed is a monotone union server-side, so pass-1's
+    // milestones would otherwise read as "done" while pass-2 re-implements them from the
+    // default branch — the "marked done but still working on them" symptom. This is a
+    // DEDICATED, ONE-SHOT run-start report: the field rides THIS report only and NEVER a
+    // reportIteration heartbeat (the server clears on it, so emitting it per-heartbeat would
+    // wipe live progress every iteration). AWAITED because correctness depends on delivery
+    // (reportState has bounded retries) — but best-effort in spirit: it must not fail the run,
+    // so a failed report is logged and swallowed. Keyed on the TREE signal, NOT the session
+    // signal (RESUME_LINEAGE_BREAK_EVENT) — the two diverge once M2 lands, and a re-claim that
+    // recovers the tree via checkpoint (seededFrom "checkpoint") legitimately keeps its
+    // milestones. Gated on claim.session_id != null (a RESUME), mirroring the tree-loss
+    // feed message at ~:603: a brand-new first attempt has no prior milestones to clear,
+    // so it must NOT emit a spurious extra run-start report (that perturbs the status-report
+    // sequence other runner tests assert, e.g. runner-push-mr).
+    if (claim.session_id != null && runnerClone.seededFrom === "default") {
+      try {
+        await reportState({ status: "running", seeded_from_default: true });
+      } catch (e) {
+        runLog.warn("could not report seeded_from_default (milestone reset signal)", {
+          error: errMessage(e),
+        });
+      }
+    }
+
+    // Resume preflight (issue #105). The claim carries the session id the run last
+    // reported, but the transcript it names lives under the per-run HOME on the
+    // worker that WROTE it — and a requeued run whose affinity grace lapsed can land
+    // on a different worker, where it does not exist. Not only cross-worker: a session
+    // is keyed by HOME *and* cwd, so a replaced volume or a changed clone path loses
+    // it on the same box. The SDK resolves a resume locally, so an unresolvable id
+    // does not start fresh: it fails the very first turn with `error_during_execution`
+    // and takes the whole run with it. If it is gone, drop the resume and SAY so —
+    // continuing without the earlier context beats losing the run, but only if the
+    // feed admits the context is gone rather than quietly re-treading ground.
+    //
+    // The check globs this HOME's project dirs rather than computing the one the cwd
+    // encodes to (sdk-session.ts explains why the computed path would false-absent on
+    // a symlinked data dir). A per-run HOME holds exactly one project dir — this run's
+    // own clone — so the glob is precise here regardless.
+    //
+    // Only when this run HAS a private HOME: the stub executor has none (main.ts),
+    // which is exactly the "no SDK session to resume" case, so the e2e stub flow is
+    // untouched by construction rather than by an executor-kind check here.
+    // PRD #88: seed the open question id from the claim. The server re-delivers it
+    // from the runs row on every resume, so a worker that picks up a run parked
+    // before a death re-parks on the SAME question rather than minting a new id —
+    // which is what keeps an answer the user already submitted valid. Without this
+    // seeding the identity guard would still be keyed on identity, but the identity
+    // itself would change across the requeue, reproducing exactly the silent
+    // rejection the clock-based designs were rejected for.
+    if (claim.open_question_id)
+      this.openQuestionIds.set(runId, claim.open_question_id);
+
+    let sessionId = claim.session_id ?? undefined;
+    if (
+      sessionId &&
+      runHome &&
+      !(await sessionTranscriptResolvable(runHome, sessionId, runLog))
+    ) {
+      sessionId = undefined;
+      runLog.warn(
+        "resume session transcript is not resolvable here; starting a fresh SDK session",
+        {
+          run_home: runHome,
+          event: RESUME_LINEAGE_BREAK_EVENT,
+        },
+      );
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          // Says what is true without over-claiming a cause: the usual one is a
+          // re-claim by another worker, but the same box loses it too if the cwd
+          // changed or the volume was replaced. Both facts the reader needs are
+          // stated — the context is gone, AND that is why work may be re-tread.
+          text:
+            "this run was picked up again, but its earlier session could not be found on this worker — " +
+            "continuing WITHOUT its earlier context, so some work may be repeated",
+          event: RESUME_LINEAGE_BREAK_EVENT,
+        },
+      });
+    } else if (claim.session_id != null && sessionId != null) {
+      // PRD #556 M2 (D5) — the positive resume signal, mutually exclusive with the
+      // lineage-break branch above. This fires only when a REAL prior session existed
+      // (claim.session_id != null — a resume, not a fresh first attempt and not a
+      // seeded run whose claim.session_id is null) AND it RESOLVED on THIS worker's
+      // HOME (the preflight above did NOT clear sessionId). Because the guard above
+      // requires `runHome` to even attempt resolution, sessionId survives with no
+      // runHome (stub executor / e2e) too — but there the resume is a no-op with no
+      // transcript to resolve, so guarding on the same runHome condition keeps this
+      // silent there, matching the lineage-break guard's intent.
+      if (runHome) {
+        runLog.info(
+          "resume session transcript resolved here; continuing the prior SDK session",
+          {
+            run_home: runHome,
+            event: RESUME_CONTINUED_EVENT,
+          },
+        );
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text:
+              "this run was picked up again and its earlier session was found on this worker — " +
+              "continuing WITH its prior context (no re-plan)",
+            event: RESUME_CONTINUED_EVENT,
+          },
+        });
+      }
+    }
+    return sessionId;
+  }
+
+  private async phasePreflightHandoff(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    sessionId: string | undefined,
+  ): Promise<ExecutorResult> {
+    const { runLog, reportState, batcher, steering, cancel, executor } = flight;
+    const runId = claim.run_id;
+    const runnerClone = flight.runnerClone!;
+    const barePath = flight.barePath;
+    // Tell the lead whenever the branch it is standing on already carries commits it did
+    // not make this turn, so the honest degradation never becomes silently duplicated work.
+    // PRD #218 M3 widened the condition to `priorCommits > 0` alone: it previously fired
+    // ONLY when the resume was dropped, which missed the case where the session survives but
+    // the TREE was recovered from the tracking ref (or is prior pushed work), where the lead
+    // equally needs to know its branch is not empty. A fresh run reading its own empty
+    // first-attempt branch counts 0 and gets nothing.
+    //
+    // PRD #209 D7: this note normally reaches the lead in the PLANNING prompt, but a
+    // session-less SEEDED run has no planning turn, so it rides the IMPLEMENT prompt instead
+    // (threaded on the pre-approved path) — otherwise a requeued seeded run whose transcript
+    // was dropped would re-implement cold on a branch that already carries pushed commits,
+    // with no prior-work note.
+    const priorWork =
+      runnerClone.priorCommits > 0
+        ? { commits: runnerClone.priorCommits }
+        : undefined;
+
+    // PRD #209 (D4): a SEEDED run's plan was authored by the user at create time, so
+    // it is approved with NO server-side approve_plan input and — on a fresh seeded
+    // run — no SDK session. That is a legitimate "approved, no session" state, NOT the
+    // dropped-transcript one the `&& sessionId` guard below protects against: there
+    // was never a session to lose. The runner is the layer that can tell the two apart
+    // (it holds the preflight result), so it folds `seeded` into planApproved here
+    // rather than leaving the executor to read the claim.
+    const seeded = claim.plan_source === "seeded";
+
+    // PRD #209 M4 — staleness guard. A seeded run carries the commit the user planned
+    // against (claim.planned_base_commit). evaluateBaseStaleness compares it to the
+    // clone's resolved base (runnerClone.baseCommit, the same field forwarded into
+    // RunContext below): only a seeded run sets planned_base_commit, so an ordinary run
+    // yields undefined and proceeds silently. On a divergence it either returns a warning
+    // to emit (default) or, under --require-base (claim.require_base_match), THROWS
+    // BaseCommitDivergedError BEFORE any implement work — the generic catch-all then
+    // fails the run, so it never implements against a diverged base (Open Question 3).
+    const staleWarning = evaluateBaseStaleness(
+      claim.planned_base_commit ?? undefined,
+      runnerClone.baseCommit,
+      claim.require_base_match ?? false,
+    );
+    if (staleWarning) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: staleWarning },
+      });
+    }
+
+    // PRD #37: parse the checked-out repo's own agent roster and report it on
+    // this first post-checkout `running` state report. It rides the STATE report
+    // rather than the gate so that an autopilot run — which never parks at
+    // awaiting_approval — records what was detected just the same. The roster is
+    // inert data: nothing is assembled until a selection picks the repo source.
+    const detection = await this.parseRepoAgents(
+      runnerClone.path,
+      batcher,
+      runLog,
+    );
+    const repoAgents = detection.agents;
+    if (detection.ok) {
+      // Non-fatal, and fire-and-forget (matching the session-id report below): an
+      // INFORMATIONAL roster report must never fail a run. An older API without the
+      // repo_agents field 400s DisallowUnknownFields, which the client treats as
+      // permanent — awaiting the report here would turn a working run into a failed
+      // one over a field the run does not depend on. On a detection FAILURE we send
+      // no roster at all, so the column stays NULL ("not reported") rather than `[]`
+      // ("scanned, found none") — the two must stay distinguishable.
+      void reportState({
+        status: "running",
+        repo_agents: repoAgentSummaries(repoAgents),
+      }).catch((e) =>
+        runLog.warn("could not report repo agent roster", {
+          error: errMessage(e),
+        }),
+      );
+    }
+
+    // PRD #84 M4: infer the run's requirement set from the checked-out clone with the
+    // deterministic scan, ONCE, best-effort. A scan failure must never break a run, so
+    // it is caught and yields `undefined` ("emit nothing"). The result rides the same
+    // two reports as `milestones` — the CANDIDATE set on the awaiting_approval report and
+    // the FROZEN set on the autopilot running report — threaded through gatePlan below.
+    let toolchainDetection: ToolchainDetection | undefined;
+    try {
+      toolchainDetection = await detectToolchain(runnerClone.path);
+    } catch (err) {
+      runLog.warn("toolchain detection failed; continuing without a requirement set", {
+        error: errMessage(err),
+      });
+    }
+
+    // Cross-run memory (PRD #90): fetch this run's (user, repo) memory so the
+    // executor can compose it into the lead's plan prompt as inert, nonce-fenced,
+    // untrusted-advisory context. Guarded HARD — a fetch failure (older API, repo-
+    // less run 404/409, transport error) or an empty store injects NOTHING and
+    // never fails the run: memory is advisory, never load-bearing.
+    let memory: Awaited<ReturnType<WorkerClient["getMemory"]>> = [];
+    try {
+      memory = await this.client.getMemory(runId);
+    } catch (err) {
+      runLog.warn("could not fetch cross-run memory; continuing without it", {
+        error: errMessage(err),
+      });
+    }
+
+    // PRD #71 M5: did a HUMAN approve this ci_fix plan? On a PRE-APPROVED RESUME the gate
+    // does not run this execution, so derive from durable claim state. The server CLEARS
+    // auto_approve the moment a run PARKS at the plan gate (SetRunAwaitingApproval,
+    // symmetric with the seeded plan_source='agent' decouple), so a resumed run still
+    // carrying auto_approve=true was AUTO-approved WITHOUT ever parking (no human), while
+    // auto_approve=false means either a manual run or an auto run that parked and was
+    // human-approved. A fresh run's gate closure overwrites this precisely.
+    flight.ciFixHumanApproved = (claim.auto_approve ?? false) !== true;
+
+    // PRD #759 M4: resume a provably-reviewed approved run without re-plan/re-gate on a
+    // dropped-session cross-worker resume. plan_source==='agent' is a POSITIVE allowlist
+    // (worker-authored-but-gated; #209 D8 makes plan_source track plan_md provenance) — do
+    // NOT write `!== "seeded"`, which fails OPEN on any future unreviewed provenance value.
+    // humanApproved is computed FRESH from claim.auto_approve here (NOT reused from the
+    // mutable ciFixHumanApproved, which the gate closure reassigns): the server clears
+    // auto_approve when a run parks at the plan gate, so auto_approve!==true ⟺ a human saw
+    // the gate. recoveryFailed ⟺ the reseed recovered NOTHING: no committed tree AND no WIP
+    // snapshot. seededFrom "default" ALONE is not loss — the diverged cross-worker cherry-pick
+    // leg recovers the WIP onto the advanced floor with seededFrom "default" + wipRecovered
+    // true (ADR-0759; the reseed-feed block above special-cases the same pair as a WIP
+    // recovery, not total loss). So wipRecovered is folded in here too — without it a
+    // human-approved run whose WIP came back cleanly on the diverged leg would FALSELY re-gate.
+    // The re-gate fallback (FLAG D) needs BOTH: an autopilot recovery-failed resume has no
+    // human at the gate to protect, but a human-approved recovery-failed run RE-GATES so the
+    // human notices the lost tree — #209's loss-detection gate, kept exactly where #209 put it.
+    const humanApproved = (claim.auto_approve ?? false) !== true; // false ⟺ a human saw the gate
+    const recoveryFailed =
+      runnerClone.seededFrom === "default" && runnerClone.wipRecovered !== true; // no tree AND no WIP
+    const m4ResumeReviewedPlan =
+      (claim.plan_approved ?? false) &&
+      claim.plan_source === "agent" &&
+      !!claim.plan_md?.trim() &&
+      !sessionId &&
+      !seeded && // the D4-row-3 dropped-session case
+      !(humanApproved && recoveryFailed); // re-gate a human-approved run that lost its tree
+
+    const ctx: RunContext = {
+      runId,
+      kind: claim.kind ?? "issue",
+      issueIid: claim.issue_iid,
+      issueTitle: claim.issue_title,
+      issueDescription: claim.issue_description,
+      // PRD #381: carry the snapshotted issue-comment set onto the ctx; the SDK
+      // executor threads it to buildPlanPrompt for nonce-fenced rendering. Absent/
+      // null ⇒ nothing is rendered.
+      issueComments: claim.issue_comments,
+      // PRD #700 M4: carry the mr_rework run's snapshotted MR review comments onto
+      // the ctx, exactly like issueComments; the SDK executor threads it to
+      // buildPlanPrompt for nonce-fenced rendering. Absent/null (every non-mr_rework
+      // kind) ⇒ nothing is rendered.
+      reviewComments: claim.review_comments,
+      pipeline: claim.pipeline,
+      worktreePath: runnerClone.path,
+      branch: runnerClone.branch,
+      // PRD #501 REC B: thread the autopilot flag to plan-build time so the plan
+      // builders render the no-human-in-the-loop note. Absent ⇒ false.
+      autoApprove: claim.auto_approve ?? false,
+      // PRD #517 M3: an interactive task run parks at awaiting_followup on signal_done
+      // instead of finalizing (see the awaitFollowUp callback below). Absent ⇒ false, so
+      // every non-interactive run (and every older server) is byte-identical to today.
+      interactive: claim.interactive ?? false,
+      // The seed resolved this in the bare; forwarding it is what stops the lead from
+      // guessing the branch's parent (judge rec, run 51757591).
+      baseCommit: runnerClone.baseCommit,
+      defaultBranchCommit: runnerClone.defaultBranchCommit,
+      emit: (m) => batcher.emit(m),
+      oauthToken: claim.secrets.anthropic_oauth_token,
+      // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
+      // and whether the intent summary is already set so the executor skips
+      // re-generating it on a resume/re-claim (Decision 3). Both absent on older
+      // servers, which the summary hooks tolerate (undefined model → account default,
+      // false present → generate).
+      summaryModel: claim.summary_model ?? undefined,
+      summaryIntentPresent: claim.summary_intent_present ?? false,
+      agents: claim.agents,
+      repoAgents,
+      skills: claim.skills,
+      skillsDropped: claim.skills_dropped,
+      repoSkillsEnabled: claim.repo.skills_enabled ?? false,
+      repoClaudemdEnabled: claim.repo.claudemd_enabled ?? false,
+      memory,
+      // Issue #297: the self_improve in-flight avoid-set (best-effort; absent ⇒ empty).
+      inflightTargets: claim.inflight_targets,
+      // PRD #686 D11: the open self-improve MRs' "what was proposed" text (best-effort;
+      // absent ⇒ empty, so the picker's non-overlap block is simply omitted).
+      openSelfImproveMRs: claim.self_improve_open_mrs,
+      // PRD #686 M4: dogfood flag (absent ⇒ generic; older server never sets it).
+      selfImproveDogfood: claim.self_improve_dogfood,
+      config: claim.config,
+      // Preflighted above: the claim's id, or undefined when its transcript is not
+      // on this worker (issue #105).
+      sessionId,
+      priorWork,
+      // issue #222: this run executed before (it reported a session), so this claim's
+      // reseed wiped whatever an earlier attempt left in the tree. Read the RAW
+      // claim.session_id, not the `sessionId` var cleared above on a dropped transcript —
+      // a dropped-session resume still had its tree destroyed. Same discriminator the
+      // reseed feed-status uses (this.emit "starting from the default branch" above).
+      resumed: claim.session_id != null,
+      // PRD #35 Decision 6b + PRD #209 D4. The RUNNER is the only layer that knows
+      // all the facts, which is why it resolves them here rather than the executor
+      // reading the claim: the server said the plan is approved, and EITHER a session
+      // id arrived that issue #105's transcript check did NOT drop (`sessionId` is
+      // cleared above when it did) OR the run is SEEDED. Passing plan_approved through
+      // on a dropped-session NON-seeded run would make the executor skip planning for a
+      // run whose session is gone — the one case (D4 row 3) where it must re-plan. A
+      // seeded run (D4 row 2) is approved with no session by construction, and that is
+      // fine because there was never a session to lose.
+      planApproved:
+        (claim.plan_approved ?? false) &&
+        (!!sessionId || seeded || m4ResumeReviewedPlan),
+      // PRD #759 M4: a provably-reviewed cross-worker resume skips the re-gate and
+      // embeds the persisted plan body on the implement turn. Drives the relaxed
+      // preApproved session guard and the embedSeededPlan reviewedResume term.
+      reviewedPlanResume: m4ResumeReviewedPlan,
+      // PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park):
+      // marker reset --soft back to the tree), so a cold resumed lead is told to treat
+      // the dirty tree as mid-edit and reconcile it against the plan (R1).
+      wipRecovered: runnerClone.wipRecovered,
+      // PRD #209: the executor relaxes its own session guard for a seeded run and
+      // emits the "plan supplied externally" feed line off this.
+      seeded,
+      approvedPlan: claim.plan_md ?? undefined,
+      // The persisted selection, replayed on the claim (PRD #35). Passed through
+      // unconditionally rather than gated on planApproved: it is the run's
+      // selection whether or not this particular resume skips the gate, and the
+      // executor only reads it on the path that has no verdict to supply one.
+      approvedSelection: claim.agent_selection,
+      signal: cancel.signal,
+      // Persist the SDK session id the moment the executor learns it, so a
+      // re-queued run can resume it. Best-effort.
+      onSessionId: (sessionId) => {
+        flight.observedSessionId = sessionId;
+        void reportState({ status: "running" }).catch((e) =>
+          runLog.warn("could not persist session id", {
+            error: errMessage(e),
+          }),
+        );
+      },
+      // The plan gate: surface the plan, post awaiting_approval, and return the
+      // verdict the steering channel resolves (bounded so an abandoned plan
+      // fails rather than wedging the worker). An autopilot claim short-circuits
+      // to an approve verdict (see gatePlan) — the run never parks at the gate.
+      gatePlan: async (planMd, milestones, onAwaitingApproval) => {
+        // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
+        // short-circuit — it parks for human review even on an auto-triggered run. We
+        // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
+        // unchanged. Non-ci_fix and code-plan ci_fix runs keep today's behavior exactly.
+        const forceGate = claim.kind === "ci_fix" && isCIConfigPlan(planMd);
+        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate;
+        const verdict = await this.gatePlan(
+          runId,
+          planMd,
+          milestones,
+          batcher,
+          steering,
+          reportState,
+          runLog,
+          effectiveAutoApprove,
+          repoAgents,
+          toolchainDetection,
+          // PRD #212: the runner clone path for the gate's runner-uid `git status`.
+          // Use runnerClone.path (const, string), NOT the `worktreePath` local
+          // (string | undefined — does not narrow in this closure).
+          runnerClone.path,
+          onAwaitingApproval,
+        );
+        // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
+        // (not the auto short-circuit). Read by the pre-push guard below.
+        flight.ciFixHumanApproved = verdict.kind === "approve" && !effectiveAutoApprove;
+        return verdict;
+      },
+      // PRD #88 clarification park: surface the question, post awaiting_input, and
+      // return the answer the steering channel resolves. An autopilot claim
+      // short-circuits to a sentinel answer (see askUser) — such a run never parks.
+      askUser: (questions) =>
+        this.askUser(
+          runId,
+          questions,
+          batcher,
+          steering,
+          reportState,
+          runLog,
+          claim.auto_approve ?? false,
+          claim.config ?? null,
+        ),
+      pullFollowUp: () => steering.pullFollowUp(),
+      // PRD #517 M3: the interactive-task follow-up park. The executor calls this after a
+      // clean signal_done on an interactive run (it has already checkpoint-pushed): report
+      // awaiting_followup, verify the park took, then BLOCK on the steering channel until
+      // the next follow-up (or an idle/cancel end).
+      //
+      // CONSUME-BEFORE-REPORT ORDERING (the server's SetRunRunning wake guard): the report
+      // of `running` that un-parks the run is the loop's NEXT reportIteration, which the
+      // executor only reaches AFTER this resolves with a follow-up. steering.awaitFollowUp
+      // resolves that follow-up ONLY from the poll loop's post-route service step, i.e.
+      // after ConsumeRunInputs stamped consumed_at — so a consumed follow_up input always
+      // exists before `running` is reported, and the server admits the wake. This mirrors
+      // askUser's settle discipline; the ordering is satisfied by construction here.
+      awaitFollowUp: async (idleMs) => {
+        // issue #552 M1 (mid-turn wake-guard bug): report `awaiting_followup` — which stamps
+        // the open_followup_id watermark — ONLY when the run is genuinely going idle. If a
+        // follow-up (or stop/cancel) arrived mid-turn and is already buffered, reporting the
+        // park would fold that already-consumed-but-not-yet-applied follow-up INTO the
+        // watermark, so its own wake `running` report would then fail the server's
+        // `id > watermark` guard and strand a live run at awaiting_followup. Skip the park
+        // report in that case and service the buffered outcome directly (the run stays
+        // `running`, no spurious park). A follow-up arriving AFTER this point is consumed
+        // after the stamp, so its id > watermark and it wakes normally.
+        //
+        // issue #559 M2: the park report now CARRIES the watermark it wants stamped —
+        // `open_followup_id` = the highest follow_up id the worker has already DELIVERED
+        // (steering.getLastDeliveredFollowUpId()). The server clamps/floors this instead of
+        // deriving MAX(consumed follow_up id) itself. This closes the residual race where a
+        // follow-up consumed by the poll loop DURING this report's DB round-trip would fold
+        // into a server-derived MAX(consumed) and strand the run: the last-DELIVERED id does
+        // NOT advance during the round-trip (the follow-up waiter is armed only AFTER this
+        // report returns, below), so the racing follow-up is excluded and its later wake wins.
+        if (!steering.hasPendingFollowUpOutcome()) {
+          // Read the ACK the same way askUser and the limit park do: the park TOOK only if
+          // the server reports `awaiting_followup`. SetRunAwaitingFollowup (M2) matches
+          // nothing when the run went terminal under us or is no longer ours (or is not an
+          // interactive task) — without this check the worker would block on a follow-up no
+          // surface can produce, since the status never changed. Fail loudly instead.
+          const ack = await reportState({
+            status: "awaiting_followup",
+            open_followup_id: steering.getLastDeliveredFollowUpId(),
+          });
+          const parked = (ack as { status?: string } | undefined)?.status;
+          if (parked !== "awaiting_followup") {
+            throw new Error(
+              `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
+            );
+          }
+          runLog.info("interactive task: awaiting follow-up", { run_id: runId });
+        } else {
+          // issue #559 M3: the SKIP path. A follow-up (or stop/cancel) is already buffered,
+          // so we deliberately do NOT report awaiting_followup (that would fold the
+          // not-yet-applied follow-up into the watermark — the #558/#552 fix above) and
+          // service the buffered outcome directly. But skipping the park report ALSO skips
+          // the ACK that, on the non-skip path, caught a mid-turn reclaim or terminal
+          // transition (status != awaiting_followup → throw). Restore that ownership/
+          // terminality check cheaply with a read-only ownership probe.
+          //
+          // ONLY a DEFINITIVE answer throws: a terminal status, or a definitive NOT-OWNED
+          // (HTTP 404 → reclaimed by another worker). A TRANSIENT error (network / 5xx /
+          // anything that is neither a 404 nor a terminal status) logs a warning and
+          // PROCEEDS — the non-skip path's reportState has bounded retries and never fails
+          // the run on a transient blip, and the run self-heals anyway at the next
+          // ACK-checked park report plus the SetRunRunning worker_id pin. We must not
+          // introduce a new spurious-failure mode, so a transient probe error is not one.
+          let ownershipStatus: string | undefined;
+          try {
+            ownershipStatus = (await this.client.getRunOwnership(runId)).status;
+          } catch (err) {
+            if (err instanceof RequestError && err.status === 404) {
+              throw new Error(
+                `${REASON_FOLLOWUP_NOT_PARKED} (server reports the run is not owned by this worker)`,
+              );
+            }
+            // Transient (network / 5xx / unreadable): proceed and let the next park
+            // report's ACK + the SetRunRunning worker_id pin be the backstop.
+            runLog.warn(
+              "interactive task: ownership probe failed transiently on the follow-up skip path; proceeding",
+              { run_id: runId, error: String(err) },
+            );
+          }
+          if (ownershipStatus !== undefined && FOLLOWUP_TERMINAL_STATUSES.has(ownershipStatus)) {
+            throw new Error(
+              `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${ownershipStatus})`,
+            );
+          }
+        }
+        return steering.awaitFollowUp(idleMs);
+      },
+      // PRD #122 M2: carry the lead's live progress into the `running` report and return
+      // the server-computed effective budget from the ack. Async (unlike M4's fire-and-
+      // forget void) so the loop can apply the budget — but still fire-and-forget in
+      // spirit: reportState has bounded retries, and the try/catch here guarantees a
+      // failed report returns undefined ("no budget update") rather than failing the run.
+      reportIteration: async (iteration, progress) => {
+        try {
+          const ack = await reportState({
+            status: "running",
+            iteration_count: iteration,
+            // Omit the fields entirely when the lead has reported no progress, so the
+            // wire shape matches an old worker's (additive-optional, never null/[]).
+            ...(progress
+              ? {
+                  milestones_completed: progress.completed,
+                  milestones_in_progress: progress.in_progress,
+                }
+              : {}),
+          });
+          const b: IterationBudget = {};
+          if (typeof ack.budgetMaxIterations === "number")
+            b.maxIterations = ack.budgetMaxIterations;
+          if (typeof ack.budgetWallSeconds === "number")
+            b.wallSeconds = ack.budgetWallSeconds;
+          // PRD #634 M2: carry the operator scope ceiling + fresh completed count off the
+          // ACK so m3's loop-top gate can read them off `served`.
+          if (typeof ack.scopeCeiling === "number")
+            b.scopeCeiling = ack.scopeCeiling;
+          if (typeof ack.completedCount === "number")
+            b.completedCount = ack.completedCount;
+          // Without the scope/completed fields in this return guard, a non-budget-scaled
+          // run's ACK (no budget fields) would return `undefined` and m3's loop-top gate at
+          // `if (served)` would never see the ceiling. This is behavior-preserving for the
+          // existing budget logic — sdk-executor.ts's budget block type-checks each field
+          // individually, so making `served` truthy more often is inert for budget (it only
+          // newly enables m3's scope read).
+          return b.maxIterations !== undefined ||
+            b.wallSeconds !== undefined ||
+            b.scopeCeiling !== undefined ||
+            b.completedCount !== undefined
+            ? b
+            : undefined;
+        } catch (e) {
+          runLog.warn("could not report iteration", { error: errMessage(e) });
+          return undefined;
+        }
+      },
+      // PRD #122 M6: durably checkpoint the run's committed milestone work MID-RUN
+      // (Decisions 6, 7, 10, 10b). It is the SAME credential-free fetch-back the done and
+      // park paths use (#218's fetchAgentBranch), fired at a milestone boundary so a hard
+      // crash loses at most "since the last milestone" rather than the whole run.
+      //
+      // REAP-BEFORE-GIT is the load-bearing invariant (B1/M4 audit): when reaping, the
+      // agent tree is killed BEFORE any CREDENTIALED git runs, so a survivor cannot read a
+      // credential out of a git child's /proc/environ — the same ordering the done path
+      // uses (killAgentTree before fetchBackBestEffort). The pre-reap tip reads below
+      // (branchTip/trackingTip) are credential-free local rev-parse, and the only
+      // credential-bearing-CLASS op here is the fetch-back, itself credential-free
+      // (file://, no PAT) — so a future credentialed git op MUST stay after the reap.
+      // Best-effort throughout: a checkpoint must NEVER fail the run.
+      checkpoint: async (opts) => {
+        // `barePath` is the outer `let` (string | undefined); it is set before the run
+        // reaches the executor, but narrow it so the closure is honest rather than `!`.
+        if (!barePath) return;
+        // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
+        // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
+        // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
+        const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+        const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
+        const tipUnmovedSinceFetch =
+          trackTip !== null && cloneTip !== null && trackTip === cloneTip;
+
+        // Skip ONLY the fetch (and reap) when there is nothing new to fetch — do NOT return,
+        // so the origin-publish gate below still runs (Decision 9: a commit fetched at an
+        // earlier iteration can become publish-eligible on a later tip-unmoved iteration once
+        // the interval opens). Reap-before-git is preserved: we reap only on the fetch path,
+        // strictly before the credential-free fetch-back.
+        if (!tipUnmovedSinceFetch) {
+          // Reap ONLY on the model-cooperative checkpoint (Decision 10b), STRICTLY before
+          // any CREDENTIALED git — the done path likewise reaps before its fetch-back. The
+          // fallback (reap:false) must NOT reap: a backgrounded dev server the lead means to
+          // reuse next iteration must survive.
+          if (opts.reap) executor.killAgentTree?.();
+          // Fetch back, credential-free (#218's helper): brings the committed work into
+          // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
+          await this.fetchBackBestEffort(
+            barePath,
+            runnerClone.path,
+            runnerClone.branch,
+            runId,
+            runLog,
+          );
+        } else {
+          runLog.info("checkpoint fetch skipped: branch tip unmoved since last checkpoint", {
+            run_id: runId,
+            branch: runnerClone.branch,
+          });
+        }
+
+        // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to
+        // the api via publishCheckpoint, no PAT — publishCheckpointBestEffort -> git.checkpointPack
+        // (local objects) -> client.publishCheckpoint (worker join token)), so it is safe on the
+        // reap:false path with the agent tree ALIVE. PRD #122 Decisions 10b/14 dissolved the
+        // reap/publish coupling for the broker (it was a property of the rejected worker-side
+        // push, not a correctness invariant); reap:false originally did not publish purely for
+        // scope + broker cost, which the time-gate now bounds (<=1 publish/interval/run).
+        //   - reap:true  (milestone): publish whenever there is new committed work not yet on
+        //     origin. Behaviourally equivalent to the old always-publish minus a redundant
+        //     re-publish of an already-published tip.
+        //   - reap:false (iteration boundary, PRD #267): publish only when the time-gate is open
+        //     AND there is new committed work. "new work" keys on lastPublishedTip (Decision 9),
+        //     NOT the fetch-skip above, so a commit that then goes idle for >= the interval still
+        //     ships exactly once.
+        const hasNewWork = cloneTip !== null && cloneTip !== flight.lastPublishedTip;
+        const timeGateOpen =
+          this.checkpointIntervalMs > 0 &&
+          this.now() - flight.lastPublish >= this.checkpointIntervalMs;
+        let published = false;
+        if (hasNewWork && (opts.reap || timeGateOpen)) {
+          published = await this.publishCheckpointBestEffort(
+            barePath,
+            runnerClone.branch,
+            runId,
+            runLog,
+          );
+          // Advance the time-gate on every ATTEMPT (not just success): this bounds broker
+          // retry cadence to <= 1 publish/interval/run even under a persistent broker
+          // failure, so a failing publish cannot spam every iteration.
+          flight.lastPublish = this.now();
+          // PRD #267 Fix 1 (Decision 9 / the "worst-case loss ~one interval" criterion):
+          // advance lastPublishedTip ONLY on a CONFIRMED landed publish. On failure the tip
+          // stays un-advanced, so hasNewWork stays true and the time-gate retries the SAME
+          // tip at the next interval boundary — the idle commit still ships (bounded loss),
+          // rather than being marked published-and-forgotten by a transient broker failure.
+          if (published) {
+            flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+            // PRD #267 M3: make the time-based publish observable — the "committed work is
+            // now safe on origin" moment for a reap:false checkpoint (the milestone/reap:true
+            // publish is already visible via its running report below). Only for the time
+            // path so we do not double-log the milestone case.
+            if (!opts.reap) {
+              runLog.info("checkpoint published to origin (time-based)", {
+                run_id: runId,
+                branch: runnerClone.branch,
+                tip: cloneTip,
+              });
+            }
+          }
+        }
+        // Report the checkpointed milestone as a `running` report — additive-optional
+        // (milestone fields omitted when no progress) and wrapped so it never throws. NO
+        // iteration_count: a checkpoint is not an iteration-boundary report, so leaving it
+        // out keeps it from regressing the server's GREATEST-merged iteration counter.
+        //
+        // PRD #267 Fix 2: emit ONLY when there was real activity — a fetch (tip moved since
+        // the last checkpoint) OR a publish. On a pure-idle checkpoint (tip unmoved AND
+        // nothing published) stay silent, restoring the pre-M1 early-return behaviour while
+        // still signalling a time-based publish of an idle tip ("work is now safe on origin").
+        if (!tipUnmovedSinceFetch || published) {
+          await reportState({
+            status: "running",
+            ...(opts.progress
+              ? {
+                  milestones_completed: opts.progress.completed,
+                  milestones_in_progress: opts.progress.in_progress,
+                }
+              : {}),
+          }).catch((e) =>
+            runLog.warn("could not report checkpoint progress", {
+              error: errMessage(e),
+            }),
+          );
+        }
+      },
+      // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
+      // state for the executor's no-progress detector — the runner-owned clone's branch
+      // tip (committed work) plus `git status --porcelain` (uncommitted changes). Both are
+      // runner-uid reads of the runner-owned clone (branchTip / worktreeStatus), the same
+      // reads the checkpoint closure and the plan gate already do. Returns null when EITHER
+      // read fails — an unresolvable tip OR an unreadable status — which the executor treats
+      // as "cannot assert unchanged" (no trip). worktreeStatus (not planChangedFiles) is used
+      // deliberately: planChangedFiles swallows a failed read to [], which the fingerprint
+      // would encode identically to a genuinely clean tree, so a persistently failing status
+      // could let the detector trip without the tree ever having been verified (CodeRabbit #655).
+      worktreeFingerprint: async () => {
+        if (!barePath) return null;
+        const tip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+        if (tip === null) return null;
+        const dirty = await this.git.worktreeStatus(runnerClone.path);
+        if (dirty === null) return null;
+        return `${tip}\n${dirty.join("\n")}`;
+      },
+    };
+
+    const result = await executor.run(ctx);
+
+    // Reap any agent-backgrounded subprocess BEFORE the PAT touches a git child
+    // env — otherwise a survivor could read the PAT from that child's
+    // /proc/environ during the push (M4 audit B1). This run's executor reaps only
+    // this run's subprocess tree (per-run instance, Decision 4); a concurrent
+    // sibling's tree is untouched. The SDK executor also self-reaps in its run()
+    // finally; this is the explicit, load-bearing call at the security boundary.
+    executor.killAgentTree?.();
+    flight.result = result;
+    return result;
+  }
+
 
   /**
    * PRD #218 M1 — trigger the graceful worker shutdown. SYNCHRONOUS and does NO git:

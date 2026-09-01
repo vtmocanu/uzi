@@ -433,6 +433,33 @@ describe("RunRunner — worker-performed push + MR", () => {
     assert.strictEqual(fs.existsSync(worktreeDirFor(21)), false);
   });
 
+  // PRD #6 / M1 characterization: a ci_fix run whose executor judges the failure NOT a
+  // code problem completes with fix_verdict "not_code" and lands NOTHING — no branch push
+  // and no merge request ("there is nothing to land"). The not_code terminal in
+  // execute() returns BEFORE the push/MR stack; this guards the fall-through a later
+  // phase-method split of execute() could reintroduce. Sibling of the report-only
+  // precedent above (both open NEITHER a push NOR an MR).
+  it("completes a ci_fix not_code run with NO push and NO MR (PRD #6)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    const exec: Executor = {
+      run: async (ctx) => ({ branch: ctx.branch, fixVerdict: "not_code" }),
+    };
+    const claim = gitlabClaim(50, { kind: "ci_fix" });
+    await runner(exec, gitlab).execute(claim);
+
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
+    assert.strictEqual(completed.status, "completed");
+    assert.strictEqual(completed.fix_verdict, "not_code");
+    assert.strictEqual(pushed, false, "no branch pushed on a not_code run");
+    assert.strictEqual(calls.length, 0, "no MR opened on a not_code run");
+  });
+
   // issue #279: an issue run that signalled done but committed NOTHING and did NOT set
   // report_only is the ambiguous "forgot to commit / should have set report_only" case —
   // it must fail with an actionable reason rather than open an empty MR.
