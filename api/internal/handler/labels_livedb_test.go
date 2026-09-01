@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -36,5 +37,37 @@ func TestRepoLabelsForeignRepo404LiveDB(t *testing.T) {
 				t.Fatalf("%s on a foreign repo status = %d, want 404 (body %s)", tc.name, rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// TestRepoLabelsOversizeBody413LiveDB is the handler-level half of PRD #954 M3 (S3):
+// an over-cap body on an OWNED labels route (so repoForRequest passes and DecodeJSONLimited
+// is what fails) answers a truthful 413 carrying uzi's own prose — not the 400 the site
+// used to return, and not net/http's "http: request body too large" literal. Needs a live
+// DB because the 413 fires only AFTER the owner-scoped repoForRequest lookup.
+func TestRepoLabelsOversizeBody413LiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// A well-formed JSON body strictly larger than the 1 MiB cap, so it crosses on SIZE
+	// rather than on any malformation (a truncated body would 400 and prove nothing).
+	body := `{"labels":["` + strings.Repeat("a", 1<<20) + `"]}`
+	if len(body) <= 1<<20 {
+		t.Fatalf("oversize fixture is %d bytes, not over the 1 MiB cap it exists to cross", len(body))
+	}
+
+	req := userReq(http.MethodPost, "/api/repos/"+f.repoID.String()+"/labels/check", body,
+		f.owner.ID, map[string]string{"id": f.repoID.String()})
+	rec := httptest.NewRecorder()
+	f.h.CheckRepoLabels(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize body status = %d, want 413 (body %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "too large") {
+		t.Fatalf("413 body %q does not carry uzi's oversize prose", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "http:") {
+		t.Fatalf("413 body leaked net/http's stdlib literal: %q", rec.Body.String())
 	}
 }
