@@ -752,10 +752,16 @@ func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix strin
 		dot, dotC = "◉", m.pal.tungsten
 	}
 	cursor := paintSeg(nil, bg, false, " ")
+	var roleFg color.Color
 	if selected {
 		cursor = paintSeg(m.pal.tungsten, bg, true, "▸")
+		// A selected row needs an explicit role foreground or its default-ink title vanishes into
+		// the warm selection bar (issue #938, mirroring boardRow's selected floor title): tungsten
+		// (ld(#7c5200,#c9a061)) reads on both selBg variants and matches the ▸ cursor and selected
+		// id ink. Unselected rows keep nil (the intended quiet default ink).
+		roleFg = m.pal.tungsten
 	}
-	line := cursor + paintSeg(dotC, bg, false, dot) + paintSeg(nil, bg, false, " "+m.renderer.Plain(l.Role, 14))
+	line := cursor + paintSeg(dotC, bg, false, dot) + paintSeg(roleFg, bg, false, " "+m.renderer.Plain(l.Role, 14))
 	if suffix != "" {
 		// A ·N ordinal disambiguates two lanes of one role (laneSuffixes). It is DERIVED, not
 		// the opaque SDK invocation id, so the id tail never reaches the rail — a lone role
