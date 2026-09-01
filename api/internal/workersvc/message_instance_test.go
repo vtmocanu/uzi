@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -36,7 +37,7 @@ func (b *instanceBroadcaster) PublishInput(uuid.UUID)                        {}
 // string, because every downstream consumer's role-name fallback keys off Valid.
 func TestAppendMessagesCarriesInstanceAndLabel(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), LastSeq: 0}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{
@@ -127,7 +128,7 @@ func TestIncomingMessageDecodesWorkerJSONKeys(t *testing.T) {
 // and nothing for the `uzi` CLI, which prints to a terminal.
 func TestAppendMessagesCapsAttributionFields(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), LastSeq: 0}}
 	svc := New(fs, newBox(t), testParams())
 	b := &instanceBroadcaster{}
 	svc.SetBroadcaster(b)
@@ -159,7 +160,7 @@ func TestAppendMessagesCapsAttributionFields(t *testing.T) {
 // batch. (handler/cli_auth_flow.go:148 documents the same trap.)
 func TestAppendMessagesCapCutsOnRuneBoundary(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), LastSeq: 0}}
 	svc := New(fs, newBox(t), testParams())
 
 	// 3-byte runes: a byte cut lands mid-sequence for most offsets.
@@ -183,7 +184,7 @@ func TestAppendMessagesCapCutsOnRuneBoundary(t *testing.T) {
 // cap must be inert for realistic values, or every lane title silently changes.
 func TestAppendMessagesLeavesShortAttributionAlone(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), LastSeq: 0}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{
@@ -205,7 +206,7 @@ func TestAppendMessagesLeavesShortAttributionAlone(t *testing.T) {
 // wrong lane if the broadcast drops the id.
 func TestAppendMessagesBroadcastsInstanceAndLabel(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), LastSeq: 0}}
 	svc := New(fs, newBox(t), testParams())
 	b := &instanceBroadcaster{}
 	svc.SetBroadcaster(b)

@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -89,7 +90,7 @@ func TestClaimChatCarriesDefaultEffort(t *testing.T) {
 	fs := &fakeStore{
 		chatClaimRun:  store.Run{ID: uuid.New(), UserID: uid, Kind: RunKindChat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
 		anthropic:     sealedTok,
-		defaultEffort: pgText("max"),
+		defaultEffort: pgconv.TextOrNull("max"),
 	}
 	svc := New(fs, box, testParams())
 	payload, err := svc.ClaimChat(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})

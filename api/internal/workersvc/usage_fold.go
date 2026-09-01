@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -331,9 +332,9 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			RunID:         runID,
 			Seq:           m.Seq,
 			Kind:          m.Kind,
-			Agent:         pgText(m.Agent),
-			AgentInstance: pgText(m.AgentInstance),
-			AgentLabel:    pgText(m.AgentLabel),
+			Agent:         pgconv.TextOrNull(m.Agent),
+			AgentInstance: pgconv.TextOrNull(m.AgentInstance),
+			AgentLabel:    pgconv.TextOrNull(m.AgentLabel),
 			Payload:       []byte(m.Payload),
 		})
 		if err != nil {

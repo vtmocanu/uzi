@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -58,10 +59,10 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 		// PRD #841 M1: the schedule's mr_rework override, stamped THROUGH live-inherit
 		// (D1) — nil ⇒ NULL ⇒ the run follows the owner default at read time. Threaded
 		// as *bool (not the schedule column yet) so M2 can pass sched.MrReworkEnabled.
-		MrReworkEnabled: pgBoolPtr(mrReworkEnabled),
+		MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
 		// PRD #300: the schedule's per-schedule model override, frozen onto this run.
 		// nil → NULL → the run inherits the owner's per-user Worker default.
-		Model: pgTextPtr(model),
+		Model: pgconv.TextPtr(model),
 		// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto this
 		// run at fire time (M1 stores only; delivery M3, worker behaviour M4).
 		OverrideSubagentModel: overrideSubagentModel,

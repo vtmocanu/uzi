@@ -32,6 +32,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -1142,8 +1143,8 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
-		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
-		WorkerID:      pgUUID(wkr.ID),
+		FailureReason: pgconv.TextOrNull("worker restarted; run orphaned and out of re-queue budget"),
+		WorkerID:      pgconv.UUID(wkr.ID),
 		MaxRequeues:   max,
 	})
 	if err != nil {
@@ -1157,7 +1158,7 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 		s.maybeEnqueueJudgeByID(ctx, id)
 	}
 	if _, err := s.q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
-		WorkerID:    pgUUID(wkr.ID),
+		WorkerID:    pgconv.UUID(wkr.ID),
 		MaxRequeues: max,
 	}); err != nil {
 		return store.Worker{}, err
@@ -1177,10 +1178,10 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// later milestone's peer subquery can read workers.capabilities directly.
 	storedCaps := capability.Filter(append(capability.SelfReportable(capabilities), capability.TemplateCapabilities(template)...))
 	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
-		Version:           pgText(version),
-		TemplateReported:  pgText(template),
+		Version:           pgconv.TextOrNull(version),
+		TemplateReported:  pgconv.TextOrNull(template),
 		Capabilities:      storedCaps,
-		MaxConcurrentRuns: pgIntPtr(maxConcurrentRuns),
+		MaxConcurrentRuns: pgconv.Int4Ptr(maxConcurrentRuns),
 		ID:                wkr.ID,
 	})
 	if err != nil {
@@ -1215,10 +1216,10 @@ type WorkerStats struct {
 func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats) (store.Worker, error) {
 	arg := store.HeartbeatWorkerParams{ID: wkr.ID}
 	if stats != nil {
-		arg.StatsCpuPct = pgFloat4Ptr(stats.CPUPct)
+		arg.StatsCpuPct = pgconv.Float4Ptr(stats.CPUPct)
 		arg.StatsMemBytes = pgtype.Int8{Int64: stats.MemBytes, Valid: true}
-		arg.StatsMemLimitBytes = int8Param(stats.MemLimit)
-		arg.StatsSource = pgText(stats.Source)
+		arg.StatsMemLimitBytes = pgconv.Int8Ptr(stats.MemLimit)
+		arg.StatsSource = pgconv.TextOrNull(stats.Source)
 	}
 	return s.q.HeartbeatWorker(ctx, arg)
 }
@@ -1306,9 +1307,9 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 	capabilityAware := s.capabilityAwareOn(ctx)
 
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
-		WorkerID:            pgUUID(wkr.ID),
+		WorkerID:            pgconv.UUID(wkr.ID),
 		UserID:              wkr.UserID,
-		AffinityCutoff:      pgTime(s.now().Add(-s.p.WorkerAffinityCeiling)),
+		AffinityCutoff:      pgconv.Time(s.now().Add(-s.p.WorkerAffinityCeiling)),
 		IsDockerWorker:      isDocker,
 		DockerRepoAllowlist: allowlist,
 		WorkerCaps:          wkr.Capabilities,
@@ -1316,9 +1317,9 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		// PRD #529 Decision 4: an ephemeral worker may claim only its bound run.
 		IsEphemeral:           wkr.Ephemeral,
 		EphemeralRunID:        wkr.EphemeralRunID,
-		SpreadCutoff:          pgTime(s.now().Add(-s.p.WorkerSpreadGrace)),
-		BackgroundGraceCutoff: pgTime(s.now().Add(-s.p.WorkerBackgroundGrace)),
-		HeartbeatCutoff:       pgTime(s.now().Add(-s.p.WorkerHeartbeatStale)),
+		SpreadCutoff:          pgconv.Time(s.now().Add(-s.p.WorkerSpreadGrace)),
+		BackgroundGraceCutoff: pgconv.Time(s.now().Add(-s.p.WorkerBackgroundGrace)),
+		HeartbeatCutoff:       pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale)),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1390,8 +1391,8 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 		}
 		if _, ferr := s.q.MarkRunFailedByID(ctx, store.MarkRunFailedByIDParams{
 			ID:            run.ID,
-			FailureReason: pgText(err.Error()),
-			FailOrigin:    pgText(failOrigin),
+			FailureReason: pgconv.TextOrNull(err.Error()),
+			FailOrigin:    pgconv.TextOrNull(failOrigin),
 		}); ferr != nil {
 			return ferr
 		}
@@ -1859,7 +1860,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams.IterationCount = req.IterationCount
 		runningParams.SessionID = sessionID
 		runningParams.ID = runID
-		runningParams.WorkerID = pgUUID(wkr.ID)
+		runningParams.WorkerID = pgconv.UUID(wkr.ID)
 		// PRD #122 M2 (Decision 5/5b): the budget-scaling config the SQL freeze reads.
 		// Harmless on every heartbeat (the query COALESCEs the derived budget against the
 		// existing immutable columns, so only the FIRST report that carries a frozen list
@@ -1894,7 +1895,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if req.SeededFromDefault != nil && *req.SeededFromDefault {
 			if _, cerr := s.q.ClearRunMilestonesCompleted(ctx, store.ClearRunMilestonesCompletedParams{
 				ID:       runID,
-				WorkerID: pgUUID(wkr.ID),
+				WorkerID: pgconv.UUID(wkr.ID),
 			}); cerr != nil {
 				return store.Run{}, false, cerr
 			}
@@ -1916,7 +1917,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// (SQL NULL) param the query's COALESCE keeps out of the column.
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
-			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			MilestonesCandidate:  milestonesParam(owned.Kind, req.Milestones),
 			InferredCapabilities: inferredCaps,
 			InferredTools:        inferredTools,
@@ -1941,7 +1942,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			return store.Run{}, false, fmt.Errorf("%w: open_question_id is too long", ErrInvalidState)
 		}
 		rows, err = s.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
-			OpenQuestionID: pgText(qid), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			OpenQuestionID: pgconv.TextOrNull(qid), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "awaiting_followup":
 		// PRD #517 M2/M3 (Decision 3): the interactive-task park. On signal_done an
@@ -1967,8 +1968,8 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// worker that omits open_followup_id lands NULL and the query's COALESCE
 			// fallback recomputes the server-derived max-consumed watermark. A present
 			// value is clamped to ≤ max-consumed by the query's LEAST.
-			OpenFollowupID: int8Param(req.OpenFollowupID),
-			SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			OpenFollowupID: pgconv.Int8Ptr(req.OpenFollowupID),
+			SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "completed":
 		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
@@ -1993,7 +1994,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// byte-identical to before.
 		var scopeStopKind pgtype.Text
 		if req.ScopeCapped != nil && *req.ScopeCapped && owned.ScopeCeiling.Valid {
-			scopeStopKind = pgText("scope_capped")
+			scopeStopKind = pgconv.TextOrNull("scope_capped")
 		}
 		// PRD #634 M4: settle the still-pending scope audit row at completion. 'applied' when
 		// this is a genuine scope-capped completion (scopeStopKind set); 'declined' otherwise —
@@ -2009,14 +2010,14 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			settleScopeDisposition = "declined"
 		}
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
-			Branch: stripNULParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
+			Branch: stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
 			PrdDonePath:         clampWirePRDDonePath(owned, req.PrdDonePath),
 			ReportOnly:          reportOnly,
 			ReportMd:            clampWireReportMd(owned, req.ReportMd, reportOnly),
 			MilestonesCompleted: completedIDs,
 			StopKind:            scopeStopKind,
-			ID:                  runID, WorkerID: pgUUID(wkr.ID),
+			ID:                  runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
@@ -2043,7 +2044,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// called. rows drives the same applied/not-applied logic below (execrows, like
 			// SetRunFailed).
 			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
-				ID: runID, WorkerID: pgUUID(wkr.ID),
+				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		case owned.StopKind.Valid && owned.StopKind.String == "stopped":
 			// PRD #517 M4: a graceful stop stamped stop_kind='stopped' BEFORE this report.
@@ -2056,7 +2057,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// exactly like the 'cancelled' arm: status 'cancelled', fail_origin NULL (CHECK-safe,
 			// no new vocabulary value), which Gate 0 of maybeEnqueueJudge excludes from judging.
 			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
-				ID: runID, WorkerID: pgUUID(wkr.ID),
+				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		case owned.StopKind.Valid && owned.StopKind.String == "plan_rejected":
 			// A live plan-reject: stamp fail_origin='plan_rejected' (overriding the untrusted
@@ -2064,9 +2065,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// RejectRunServerSide path rather than defaulting to agent_failure.
 			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
 				FailureReason:  limitAwareFailureReason(req),
-				FailOrigin:     pgText("plan_rejected"),
+				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
-				SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		default:
 			// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
@@ -2089,9 +2090,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				// server" would then be false on exactly the path a human reads. When the
 				// fields are absent this is nil and every other failure path is untouched.
 				FailureReason:  limitAwareFailureReason(req),
-				FailOrigin:     pgText(failOrigin),
+				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
-				SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		}
 	default:
@@ -2107,8 +2108,8 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// Best-effort: a failure here must not fail the worker's terminal report.
 	if req.MrIID != nil {
 		if _, mrErr := s.q.ReconcileRunMR(ctx, store.ReconcileRunMRParams{
-			MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), Branch: stripNULParam(req.Branch),
-			ID: runID, WorkerID: pgUUID(wkr.ID),
+			MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), Branch: stripNULParam(req.Branch),
+			ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		}); mrErr != nil {
 			slog.Warn("reconcile run mr", "run", runID, "error", mrErr)
 		}
@@ -2133,7 +2134,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if settleScopeDisposition != "" {
 			if _, setErr := s.q.SettleScopeInputDisposition(ctx, store.SettleScopeInputDispositionParams{
 				RunID:       runID,
-				Disposition: pgText(settleScopeDisposition),
+				Disposition: pgconv.TextOrNull(settleScopeDisposition),
 			}); setErr != nil {
 				slog.Warn("settle scope input disposition", "run", runID, "disposition", settleScopeDisposition, "error", setErr)
 			}
@@ -2200,7 +2201,7 @@ func inferredRequirementParams(req StateRequest) (inferredCaps, inferredTools []
 	if req.SizeClass != nil {
 		switch *req.SizeClass {
 		case "s", "m", "l":
-			sizeClass = pgText(*req.SizeClass)
+			sizeClass = pgconv.TextOrNull(*req.SizeClass)
 		}
 	}
 	return inferredCaps, inferredTools, sizeClass
@@ -2314,7 +2315,7 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 	if err != nil {
 		return p, fmt.Errorf("encode agent exclusions: %w", err)
 	}
-	p.AgentSource = pgText(sel.Source)
+	p.AgentSource = pgconv.TextOrNull(sel.Source)
 	p.AgentExclusions = exclusions
 	return p, nil
 }
@@ -2336,7 +2337,7 @@ func (s *Service) rosterFor(ctx context.Context, run store.Run, source string, r
 		}
 		return repoAgentNames(run.RepoAgents), nil
 	}
-	templates, err := s.q.ListClaimAgentTemplates(ctx, pgUUID(run.UserID))
+	templates, err := s.q.ListClaimAgentTemplates(ctx, pgconv.UUID(run.UserID))
 	if err != nil {
 		return nil, fmt.Errorf("list claim agent templates: %w", err)
 	}
@@ -2356,7 +2357,7 @@ func (s *Service) rosterFor(ctx context.Context, run store.Run, source string, r
 // that approve_plan would reject, and the picker's "N of your templates" count is
 // exact even when the owner has a disabled or shadowed template (PRD #37 M4-fix).
 func (s *Service) OwnAgentRoster(ctx context.Context, userID uuid.UUID) ([]RepoAgent, error) {
-	templates, err := s.q.ListClaimAgentTemplates(ctx, pgUUID(userID))
+	templates, err := s.q.ListClaimAgentTemplates(ctx, pgconv.UUID(userID))
 	if err != nil {
 		return nil, fmt.Errorf("list claim agent templates: %w", err)
 	}
@@ -2473,7 +2474,7 @@ func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.U
 	// Per-run write cap: the spam bound within one run (Decision M4). Counted on
 	// run_id, so it survives even when older entries have been evicted from the
 	// (user,repo) set.
-	n, err := s.q.CountAgentMemoryForRun(ctx, pgUUID(runID))
+	n, err := s.q.CountAgentMemoryForRun(ctx, pgconv.UUID(runID))
 	if err != nil {
 		return store.AgentMemory{}, err
 	}
@@ -2484,11 +2485,11 @@ func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.U
 	mem, err := s.q.InsertAgentMemory(ctx, store.InsertAgentMemoryParams{
 		UserID:   run.UserID,
 		RepoID:   repoID,
-		RunID:    pgUUID(runID),
+		RunID:    pgconv.UUID(runID),
 		Title:    title,
 		Body:     body,
-		Basis:    pgText(basis),
-		Evidence: pgText(evidence),
+		Basis:    pgconv.TextOrNull(basis),
+		Evidence: pgconv.TextOrNull(evidence),
 	})
 	if err != nil {
 		return store.AgentMemory{}, err
@@ -2573,7 +2574,7 @@ func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {
-	run, err := s.q.GetRunOwnedByWorker(ctx, store.GetRunOwnedByWorkerParams{ID: runID, WorkerID: pgUUID(wkr.ID)})
+	run, err := s.q.GetRunOwnedByWorker(ctx, store.GetRunOwnedByWorkerParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRunNotOwned
@@ -2625,7 +2626,7 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 	if !run.RepoID.Valid {
 		return ForgeConn{}, ErrForgeNoRepo
 	}
-	row, err := s.q.GetRunForgeConnForWorker(ctx, store.GetRunForgeConnForWorkerParams{RunID: runID, WorkerID: pgUUID(wkr.ID)})
+	row, err := s.q.GetRunForgeConnForWorker(ctx, store.GetRunForgeConnForWorkerParams{RunID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 	if err != nil {
 		// The worker owns the run and it has a repo, so a no-rows here is a race (the
 		// claim dropped between the two reads); treat it as not-owned rather than a 500.
@@ -2843,7 +2844,7 @@ func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, temp
 		UserID:            userID,
 		Name:              name,
 		TokenHash:         hash,
-		TemplateDeclared:  pgText(templateDeclared),
+		TemplateDeclared:  pgconv.TextOrNull(templateDeclared),
 		AnthropicSecretID: secretID,
 		AnthropicBindMode: bindMode,
 	})
@@ -2871,7 +2872,7 @@ func (s *Service) resolveSecretLabel(ctx context.Context, userID uuid.UUID, labe
 		}
 		return pgtype.UUID{}, err
 	}
-	return pgUUID(id), nil
+	return pgconv.UUID(id), nil
 }
 
 // SetWorkerAnthropicToken points a worker at one of its owner's Anthropic
@@ -2910,7 +2911,7 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 			}
 			return store.Worker{}, err
 		}
-		bind = pgUUID(*secretID)
+		bind = pgconv.UUID(*secretID)
 	}
 	wkr, err := s.q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
 		ID:                workerID,
@@ -2947,7 +2948,7 @@ func (s *Service) SetUserJudgeToken(ctx context.Context, userID uuid.UUID, secre
 			}
 			return store.User{}, err
 		}
-		bind = pgUUID(*secretID)
+		bind = pgconv.UUID(*secretID)
 	}
 	return s.q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
 		ID:                     userID,
@@ -2982,7 +2983,7 @@ func (s *Service) ListWorkers(ctx context.Context, userID uuid.UUID) ([]store.Li
 // fallback and the running/claimed sweeps still recover.
 func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) error {
 	active, err := s.q.CountWorkerNonTerminalRuns(ctx, store.CountWorkerNonTerminalRunsParams{
-		WorkerID: pgUUID(workerID), UserID: userID,
+		WorkerID: pgconv.UUID(workerID), UserID: userID,
 	})
 	if err != nil {
 		return err
@@ -3147,7 +3148,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if target, unsafe := planpolicy.Screen(scrubbed); unsafe {
 			return store.Run{}, fmt.Errorf("%w: %s", ErrPlanUnsafe, target)
 		}
-		planMD = pgText(scrubbed)
+		planMD = pgconv.TextOrNull(scrubbed)
 		planSource = planSourceSeeded
 		if seed.Selection != nil {
 			sel := *seed.Selection
@@ -3157,7 +3158,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			if err := validateSelectionShape(sel); err != nil {
 				return store.Run{}, err
 			}
-			agentSource = pgText(sel.Source)
+			agentSource = pgconv.TextOrNull(sel.Source)
 			enc, err := encodeJSONArray(sel.Exclusions)
 			if err != nil {
 				return store.Run{}, fmt.Errorf("encode seeded agent exclusions: %w", err)
@@ -3175,7 +3176,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			if !plannedCommitRe.MatchString(pc) {
 				return store.Run{}, ErrInvalidPlannedCommit
 			}
-			plannedBaseCommit = pgText(pc)
+			plannedBaseCommit = pgconv.TextOrNull(pc)
 		}
 		requireBaseMatch = seed.RequireBase
 	}
@@ -3306,7 +3307,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// query COALESCEs run over owner), and an explicit true/false is a per-run override.
 		// Every M1 caller passes nil except a future request/schedule override (M2/M3), so
 		// behaviour is byte-identical to today.
-		MrReworkEnabled: pgBoolPtr(mrReworkEnabled),
+		MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
 		// PRD #209 seeded-plan columns, listed explicitly (runtime.sql's 🔴 warning):
 		// all zero-valued to the not-seeded state above unless seed != nil. The M4
 		// staleness-guard pair (planned_base_commit, require_base_match) is here for the
@@ -3321,7 +3322,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// PRD #300: the per-schedule model override, frozen onto the run at fire time.
 		// nil for every non-scheduled caller (interactive, label-poller autopilot) →
 		// NULL → the run inherits the owner's per-user Worker default at claim assembly.
-		Model: pgTextPtr(model),
+		Model: pgconv.TextPtr(model),
 		// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto the
 		// run at fire time. false for every non-scheduled caller (interactive,
 		// label-poller autopilot) → the default lane where subagent pins win. M1 stores
@@ -3440,7 +3441,7 @@ func (s *Service) originColumn(ctx context.Context, repoID uuid.UUID, issue stor
 		labels = []string{}
 	}
 	col, _, _ := board.ResolveColumn(labels, issue.State, position)
-	return pgtype.Text{String: col, Valid: true}
+	return pgconv.Text(col) // always valid: "" = the implicit Open column, never NULL
 }
 
 // GetRun returns a run owned by the user.
@@ -3523,10 +3524,10 @@ func (s *Service) ListRunsForUser(ctx context.Context, userID uuid.UUID, repoID 
 		// PRD #320 D8: the D4 fail-open cutoff for the row's priority_class column, built
 		// the same way as ClaimRun's BackgroundGraceCutoff so the pill and the claim order
 		// are one decision. A demoted run created before it reads `restored`, not stuck.
-		BackgroundGraceCutoff: pgTime(s.now().Add(-s.p.WorkerBackgroundGrace)),
+		BackgroundGraceCutoff: pgconv.Time(s.now().Add(-s.p.WorkerBackgroundGrace)),
 	}
 	if repoID != nil {
-		arg.RepoID = pgUUID(*repoID)
+		arg.RepoID = pgconv.UUID(*repoID)
 	}
 	if issueIID != nil {
 		arg.IssueIid = pgtype.Int8{Int64: *issueIID, Valid: true}
@@ -3548,7 +3549,7 @@ func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRuns
 // (PRD #320 D8 fail-open flag for the row's priority_class), shared by both callers of
 // the query (the admin DTO path and the self_improve in-flight avoid-set).
 func (s *Service) activeRunsPriorityCutoff() pgtype.Timestamptz {
-	return pgTime(s.now().Add(-s.p.WorkerBackgroundGrace))
+	return pgconv.Time(s.now().Add(-s.p.WorkerBackgroundGrace))
 }
 
 // RunUsageTotal returns one run's rolled-up token/cost totals (PRD #40 M3). Returns

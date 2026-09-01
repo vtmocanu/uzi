@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -72,8 +73,8 @@ type TaskReviewWithFindings struct {
 // failure returns ErrRunNotFound so the endpoint reveals nothing.
 func (s *Service) authorizeTaskReviewTarget(ctx context.Context, wkr store.Worker, targetID uuid.UUID) (review, target store.Run, err error) {
 	review, err = s.q.GetActiveTaskReviewRunForWorkerTarget(ctx, store.GetActiveTaskReviewRunForWorkerTargetParams{
-		WorkerID:    pgUUID(wkr.ID),
-		TargetRunID: pgUUID(targetID),
+		WorkerID:    pgconv.UUID(wkr.ID),
+		TargetRunID: pgconv.UUID(targetID),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -116,7 +117,7 @@ func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID
 	}
 	if _, err := s.q.UpsertTaskReviewWithFindings(ctx, store.UpsertTaskReviewWithFindingsParams{
 		TargetRunID: target.ID,
-		ReviewRunID: pgUUID(review.ID),
+		ReviewRunID: pgconv.UUID(review.ID),
 		UserID:      target.UserID,
 		Status:      sub.Status,
 		SummaryMd:   sub.SummaryMd,

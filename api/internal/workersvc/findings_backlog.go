@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -60,15 +61,15 @@ func (s *Service) FindingsBacklog(ctx context.Context, ownerUserID uuid.UUID, bu
 	rows, err := s.q.ListFindingsBacklog(ctx, store.ListFindingsBacklogParams{
 		UserID: ownerUserID,
 		Status: findingBucketStatus(bucket),
-		RepoID: nullableUUID(repoFilter), // uuid.Nil → SQL NULL → the repo predicate is a no-op
-		RunID:  nullableUUID(runFilter),  // uuid.Nil → SQL NULL → the run semi-join is a no-op
+		RepoID: pgconv.UUIDOrNull(repoFilter),
+		RunID:  pgconv.UUIDOrNull(runFilter),
 	})
 	if err != nil {
 		return apitypes.IncidentalFindingBacklogDTO{}, err
 	}
 	openCount, err := s.q.CountOpenFindingsForUser(ctx, store.CountOpenFindingsForUserParams{
 		UserID: ownerUserID,
-		RepoID: nullableUUID(repoFilter),
+		RepoID: pgconv.UUIDOrNull(repoFilter),
 	})
 	if err != nil {
 		return apitypes.IncidentalFindingBacklogDTO{}, err

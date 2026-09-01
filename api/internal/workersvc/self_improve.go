@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -52,7 +53,7 @@ func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.
 		// PRD #590 M1: the schedule-driven fire path threads the schedule's per-schedule
 		// model override and "apply model also to agents" opt-in; the bespoke engine passes
 		// nil/false, freezing NULL/false onto its run exactly as before.
-		Model:                 pgTextPtr(model),
+		Model:                 pgconv.TextPtr(model),
 		OverrideSubagentModel: overrideSubagentModel,
 	})
 	if err != nil {

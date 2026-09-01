@@ -1,6 +1,10 @@
 package workersvc
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+)
 
 // ptr returns a pointer to v. Local to this pin file; workersvc's other test
 // files declare a differently-typed strptr, so a distinct generic name avoids
@@ -16,30 +20,30 @@ func ptr[T any](v T) *T { return &v }
 //	pgTextPtr  → pgconv.TextPtr        (nil → NULL, &"" → valid empty)
 func TestTextParamVsPgTextPtrSplit(t *testing.T) {
 	// textParam: nil and &"" both collapse to NULL; a non-empty value is valid.
-	if got := textParam(nil); got.Valid {
+	if got := pgconv.TextPtrOrNull(nil); got.Valid {
 		t.Errorf("textParam(nil): got Valid=%v, want Valid=false (NULL)", got.Valid)
 	}
 	// LOAD-BEARING: textParam(&"") → NULL. This is the distinction the pgconv
 	// migration must preserve — textParam maps ""→NULL (→ pgconv.TextPtrOrNull),
 	// unlike pgTextPtr just below which maps ""→valid-empty (→ pgconv.TextPtr).
-	if got := textParam(ptr("")); got.Valid {
+	if got := pgconv.TextPtrOrNull(ptr("")); got.Valid {
 		t.Errorf("textParam(&\"\"): got Valid=%v, want Valid=false (NULL)", got.Valid)
 	}
-	if got := textParam(ptr("x")); !got.Valid || got.String != "x" {
+	if got := pgconv.TextPtrOrNull(ptr("x")); !got.Valid || got.String != "x" {
 		t.Errorf("textParam(&\"x\"): got {Valid=%v String=%q}, want {Valid=true String=\"x\"}", got.Valid, got.String)
 	}
 
 	// pgTextPtr: only nil collapses to NULL; &"" is a VALID empty string.
-	if got := pgTextPtr(nil); got.Valid {
+	if got := pgconv.TextPtr(nil); got.Valid {
 		t.Errorf("pgTextPtr(nil): got Valid=%v, want Valid=false (NULL)", got.Valid)
 	}
 	// LOAD-BEARING: pgTextPtr(&"") → valid empty string. The opposite of
 	// textParam(&"") above — pgTextPtr maps ""→valid-empty (→ pgconv.TextPtr),
 	// and swapping it to textParam's ""→NULL body would corrupt behavior.
-	if got := pgTextPtr(ptr("")); !got.Valid || got.String != "" {
+	if got := pgconv.TextPtr(ptr("")); !got.Valid || got.String != "" {
 		t.Errorf("pgTextPtr(&\"\"): got {Valid=%v String=%q}, want {Valid=true String=\"\"}", got.Valid, got.String)
 	}
-	if got := pgTextPtr(ptr("x")); !got.Valid || got.String != "x" {
+	if got := pgconv.TextPtr(ptr("x")); !got.Valid || got.String != "x" {
 		t.Errorf("pgTextPtr(&\"x\"): got {Valid=%v String=%q}, want {Valid=true String=\"x\"}", got.Valid, got.String)
 	}
 }
@@ -61,13 +65,13 @@ func TestPgInt4ClampVsInt4Ptr(t *testing.T) {
 	}
 
 	// int4Ptr: only nil→NULL, no clamp — a pointed-to 0 is a VALID 0.
-	if got := int4Ptr(nil); got.Valid {
+	if got := pgconv.Int4Ptr32(nil); got.Valid {
 		t.Errorf("int4Ptr(nil): got Valid=%v, want Valid=false (NULL)", got.Valid)
 	}
-	if got := int4Ptr(ptr(int32(0))); !got.Valid || got.Int32 != 0 {
+	if got := pgconv.Int4Ptr32(ptr(int32(0))); !got.Valid || got.Int32 != 0 {
 		t.Errorf("int4Ptr(&0): got {Valid=%v Int32=%d}, want {Valid=true Int32=0} — int4Ptr does NOT clamp", got.Valid, got.Int32)
 	}
-	if got := int4Ptr(ptr(int32(7))); !got.Valid || got.Int32 != 7 {
+	if got := pgconv.Int4Ptr32(ptr(int32(7))); !got.Valid || got.Int32 != 7 {
 		t.Errorf("int4Ptr(&7): got {Valid=%v Int32=%d}, want {Valid=true Int32=7}", got.Valid, got.Int32)
 	}
 }

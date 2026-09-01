@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -42,9 +43,9 @@ func (s *Service) CancelReworkForMR(ctx context.Context, repoID uuid.UUID, mrIID
 		_, err = s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
 			RunID:      run.ID,
 			Kind:       "cancel",
-			Body:       pgText(reason),
-			StopKind:   pgText("cancelled"),
-			StopReason: pgText(reason),
+			Body:       pgconv.TextOrNull(reason),
+			StopKind:   pgconv.TextOrNull("cancelled"),
+			StopReason: pgconv.TextOrNull(reason),
 		})
 		return err
 	}
@@ -52,7 +53,7 @@ func (s *Service) CancelReworkForMR(ctx context.Context, repoID uuid.UUID, mrIID
 	if _, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{
 		ID:         run.ID,
 		UserID:     run.UserID,
-		StopReason: pgText(reason),
+		StopReason: pgconv.TextOrNull(reason),
 	}); err != nil {
 		return err
 	}

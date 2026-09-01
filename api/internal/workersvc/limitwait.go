@@ -12,6 +12,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -504,7 +505,7 @@ func limitFailureReason(rateLimitType *string, resetsAt *time.Time, detail strin
 // math/rand rather than crypto/rand deliberately: this is stampede avoidance, not a
 // secret. An attacker who could predict it would learn when their own run resumes.
 func limitParkJitter() time.Duration {
-	return limitParkJitterMin + time.Duration(rand.Int63n(int64(limitParkJitterMax-limitParkJitterMin+1)))
+	return limitParkJitterMin + time.Duration(rand.Int63n(int64(limitParkJitterMax-limitParkJitterMin+1))) //nolint:gosec // G404: retry jitter spreads promotion waves; not a security token
 }
 
 // setLimitWait is SetState's `limit_wait` arm: the impure half of the park.
@@ -565,15 +566,15 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 
 	if !d.Park {
 		rows, err := s.q.SetRunFailed(ctx, store.SetRunFailedParams{
-			FailureReason: pgText(d.Reason),
+			FailureReason: pgconv.TextOrNull(d.Reason),
 			// PRD #69 M7a: this failure is definitionally rate-limit-caused — the run hit
 			// an Anthropic usage limit and decided NOT to park (opt-out, or the wait budget
 			// is spent). Stamp the class as a server-side literal rather than trusting the
 			// worker's fail_origin, since the server owns the fact that this is the limit path.
-			FailOrigin: pgText("rate_limited"),
+			FailOrigin: pgconv.TextOrNull("rate_limited"),
 			SessionID:  sessionID,
 			ID:         run.ID,
-			WorkerID:   pgUUID(wkr.ID),
+			WorkerID:   pgconv.UUID(wkr.ID),
 		})
 		if err != nil {
 			return rows, err
@@ -586,7 +587,7 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 		if rows > 0 && run.ScopeCeiling.Valid {
 			if _, setErr := s.q.SettleScopeInputDisposition(ctx, store.SettleScopeInputDispositionParams{
 				RunID:       run.ID,
-				Disposition: pgText("declined"),
+				Disposition: pgconv.TextOrNull("declined"),
 			}); setErr != nil {
 				slog.Warn("settle scope input disposition (rate-limit opt-out)", "run", run.ID, "error", setErr)
 			}
@@ -623,10 +624,10 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 
 	return s.q.SetRunLimitWait(ctx, store.SetRunLimitWaitParams{
 		ID:             run.ID,
-		WorkerID:       pgUUID(wkr.ID),
-		LimitResetsAt:  pgTimePtr(d.LimitResetsAt),
-		RateLimitType:  pgTextPtr(d.RateLimitType),
-		RetryNotBefore: pgTime(d.RetryNotBefore),
+		WorkerID:       pgconv.UUID(wkr.ID),
+		LimitResetsAt:  pgconv.TimePtr(d.LimitResetsAt),
+		RateLimitType:  pgconv.TextPtr(d.RateLimitType),
+		RetryNotBefore: pgconv.Time(d.RetryNotBefore),
 		// PRD #217 M2: record the credential this run was spending so its NEXT claim
 		// excludes it (runs.limit_dead_secret_id). Passed straight through from the run
 		// row — an invalid/NULL AnthropicSecretID writes NULL, i.e. no exclusion, which
@@ -655,36 +656,7 @@ func limitAwareFailureReason(req StateRequest) pgtype.Text {
 	if t, ok := validReportedReset(req.LimitResetsAt); ok {
 		resetsAt = &t
 	}
-	return pgText(limitFailureReason(CoerceRateLimitType(req.RateLimitType), resetsAt, ""))
-}
-
-// pgTimePtr / pgTextPtr lift the park decision's optional fields into the pgtype
-// forms the generated params take. Nil becomes SQL NULL, which for
-// limit_resets_at and rate_limit_type is the honest answer ("the worker reported
-// nothing usable") rather than a placeholder.
-func pgTimePtr(t *time.Time) pgtype.Timestamptz {
-	if t == nil {
-		return pgtype.Timestamptz{}
-	}
-	return pgtype.Timestamptz{Time: *t, Valid: true}
-}
-
-func pgTextPtr(s *string) pgtype.Text {
-	if s == nil {
-		return pgtype.Text{}
-	}
-	return pgtype.Text{String: *s, Valid: true}
-}
-
-// pgBoolPtr maps a tri-state *bool to a nullable pgtype.Bool: nil ⇒ SQL NULL (inherit),
-// else the explicit value. Used to stamp runs.mr_rework_enabled / the schedule override
-// (PRD #841 M1) THROUGH the caller's pointer with no owner-default snapshot — the
-// live-inherit model (D1), unlike resolveWaitOnLimit which snapshots.
-func pgBoolPtr(b *bool) pgtype.Bool {
-	if b == nil {
-		return pgtype.Bool{}
-	}
-	return pgtype.Bool{Bool: *b, Valid: true}
+	return pgconv.TextOrNull(limitFailureReason(CoerceRateLimitType(req.RateLimitType), resetsAt, ""))
 }
 
 // resolveWaitOnLimit answers "does THIS new run park on a usage limit" (PRD #35

@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -103,9 +104,9 @@ func newAutoStopFixture(t *testing.T) *autoStopFixture {
 	wedged, peer, workerID := uuid.New(), uuid.New(), uuid.New()
 	fs := &autoStopFakeStore{
 		runs: map[uuid.UUID]store.Run{
-			wedged: {ID: wedged, Kind: "issue", Status: "running", WorkerID: pgUUID(workerID)},
+			wedged: {ID: wedged, Kind: "issue", Status: "running", WorkerID: pgconv.UUID(workerID)},
 		},
-		workers:  map[uuid.UUID]store.Worker{workerID: {ID: workerID, LastHeartbeatAt: pgTime(t0)}},
+		workers:  map[uuid.UUID]store.Worker{workerID: {ID: workerID, LastHeartbeatAt: pgconv.Time(t0)}},
 		failRows: 1,
 	}
 	p := testParams()
@@ -813,7 +814,7 @@ func TestAutoStopTreatsAStaleHeartbeatAsNoLivePoller(t *testing.T) {
 	// takes the server-side half rather than being asked to stop itself.
 	f := newAutoStopFixture(t)
 	for id, w := range f.fs.workers {
-		w.LastHeartbeatAt = pgTime(t0.Add(-2 * testParams().WorkerHeartbeatStale))
+		w.LastHeartbeatAt = pgconv.Time(t0.Add(-2 * testParams().WorkerHeartbeatStale))
 		f.fs.workers[id] = w
 	}
 	if n := f.sweep(t); n != 1 {
@@ -884,7 +885,7 @@ func TestAutoStopWillNotKillOverAStableUsageFoldFailure(t *testing.T) {
 	w := worker()
 	runID := uuid.New()
 	fs := &usageFoldFakeStore{
-		persistFakeStore: persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running"}},
+		persistFakeStore: persistFakeStore{run: store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: "running"}},
 		foldErr:          errors.New("run_usage upsert failed"),
 	}
 	p := testParams()
@@ -994,7 +995,7 @@ func TestSweepReportsAutoStopsAndRunsAfterTheDetector(t *testing.T) {
 	f.svc.q = fs
 	f.svc.healthSettings = defaultHealthSettings()
 	fs.active = []store.ListActiveRunsForHealthRow{
-		{ID: f.wedged, UserID: uuid.New(), Status: "running", Health: healthOK, StartedAt: pgTime(t0.Add(-time.Hour))},
+		{ID: f.wedged, UserID: uuid.New(), Status: "running", Health: healthOK, StartedAt: pgconv.Time(t0.Add(-time.Hour))},
 	}
 
 	res, err := f.svc.Sweep(context.Background())

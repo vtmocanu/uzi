@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -17,8 +18,8 @@ import (
 // It is called on a ticker and once immediately at boot (the orphan sweep).
 func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	now := s.now()
-	staleCutoff := pgTime(now.Add(-s.p.WorkerHeartbeatStale))
-	claimCutoff := pgTime(now.Add(-s.p.ClaimGrace))
+	staleCutoff := pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale))
+	claimCutoff := pgconv.Time(now.Add(-s.p.ClaimGrace))
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 
 	var res SweepResult
@@ -44,8 +45,8 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// persisted budget_wall_seconds, falling back to the global RUN_TIMEOUT for a
 	// NULL-budget run, so a scaled run is not failed at the global 2h.
 	timedOut, err := s.q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-		FailureReason:        pgText("run exceeded RUN_TIMEOUT"),
-		Now:                  pgTime(now),
+		FailureReason:        pgconv.TextOrNull("run exceeded RUN_TIMEOUT"),
+		Now:                  pgconv.Time(now),
 		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
 	})
 	if err != nil {
@@ -62,7 +63,7 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// Fail-over-cap before re-queue: the two are disjoint on requeue_count, but
 	// failing first keeps a run that just hit the cap from being re-queued.
 	failed, err := s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
-		FailureReason: pgText("worker lost; exceeded re-queue budget"),
+		FailureReason: pgconv.TextOrNull("worker lost; exceeded re-queue budget"),
 		MaxRequeues:   max,
 		Cutoff:        staleCutoff,
 	})
@@ -112,7 +113,7 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// older than ChatIdleTimeout is completed even though its worker is alive (so no
 	// stale-worker sweep above fired for it). Disabled when ChatIdleTimeout is 0.
 	if s.p.ChatIdleTimeout > 0 {
-		idleChats, err := s.q.SweepIdleChatRuns(ctx, pgTime(now.Add(-s.p.ChatIdleTimeout)))
+		idleChats, err := s.q.SweepIdleChatRuns(ctx, pgconv.Time(now.Add(-s.p.ChatIdleTimeout)))
 		if err != nil {
 			return res, fmt.Errorf("sweep idle chat runs: %w", err)
 		}
@@ -127,7 +128,7 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// when ProposalConfirmStuckTimeout is 0. No broadcast — proposals have no live
 	// channel; the browser re-reads on its next proposal fetch.
 	if s.p.ProposalConfirmStuckTimeout > 0 {
-		recovered, err := s.q.SweepStuckConfirmingProposals(ctx, pgTime(now.Add(-s.p.ProposalConfirmStuckTimeout)))
+		recovered, err := s.q.SweepStuckConfirmingProposals(ctx, pgconv.Time(now.Add(-s.p.ProposalConfirmStuckTimeout)))
 		if err != nil {
 			return res, fmt.Errorf("sweep stuck confirming proposals: %w", err)
 		}
@@ -145,7 +146,7 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// No persistFail.evict here, unlike the stale-worker requeue above. autoStopWedgedRuns
 	// already evicts on `run.Status != "running"`, which a parked run satisfied for the
 	// whole park, so the streak is long gone by the time this fires.
-	promoted, err := s.q.PromoteLimitWaitRuns(ctx, pgTime(now))
+	promoted, err := s.q.PromoteLimitWaitRuns(ctx, pgconv.Time(now))
 	if err != nil {
 		return res, fmt.Errorf("promote limit-wait runs: %w", err)
 	}

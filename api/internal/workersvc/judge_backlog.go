@@ -6,9 +6,9 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -89,18 +89,6 @@ func rationalePreview(s string) string {
 	return strings.TrimRight(string(runes[:RationalePreviewMaxRunes]), " \t\r\n") + "…"
 }
 
-// nullableUUID maps the absent-anchor sentinel to a SQL NULL. It exists because the shared
-// pgUUID helper always sets Valid=true: handing it uuid.Nil would send the all-zero uuid as
-// a REAL value, the query's `run_anchor IS NULL` escape hatch would not fire, and every
-// unanchored backlog request would silently filter against a run that does not exist —
-// i.e. return nothing at all.
-func nullableUUID(id uuid.UUID) pgtype.UUID {
-	if id == uuid.Nil {
-		return pgtype.UUID{}
-	}
-	return pgUUID(id)
-}
-
 // coord is the dedup grain (PRD #98 Decision 2): the (category, target) pair. It is a
 // DISPLAY key — #68/#94 key filed/disposition state per (review_id, category, target), so
 // the same idea in two runs stays two coordinates with independent triage state.
@@ -166,7 +154,7 @@ const JudgeBacklogMaxRows = 2000
 func (s *Service) JudgeRecommendationBacklog(ctx context.Context, ownerUserID uuid.UUID, bucket string, runAnchor uuid.UUID, categories []string) (apitypes.JudgeBacklogDTO, error) {
 	rows, err := s.q.ListJudgeRecommendationRowsForUser(ctx, store.ListJudgeRecommendationRowsForUserParams{
 		UserID:    ownerUserID,
-		RunAnchor: nullableUUID(runAnchor), // uuid.Nil → SQL NULL → the anchor predicate is a no-op
+		RunAnchor: pgconv.UUIDOrNull(runAnchor),
 		// categories is a NULL-sentinel slice, the same idea as nullableUUID's uuid.Nil → NULL:
 		// a NIL slice maps to SQL NULL, so the category predicate is a no-op and all labels
 		// return. A non-nil EMPTY slice ([]string{}) is NOT the same — it maps to an empty

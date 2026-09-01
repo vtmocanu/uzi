@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -155,7 +156,7 @@ func TestHealthPersistFailingSelfClearsAfterASuccess(t *testing.T) {
 	svc.persistFail.recordSuccess(r.ID, t0)
 	fs.writes = nil
 	r.Health = healthLooping
-	r.HealthReason = pgText(reasonPersistFailing)
+	r.HealthReason = pgconv.TextOrNull(reasonPersistFailing)
 	fs.active = []store.ListActiveRunsForHealthRow{r}
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {

@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 )
 
 // TestCoerceFailOrigin pins the three-way contract (PRD #69 M7a): nil stays nil,
@@ -196,7 +198,7 @@ func TestSetStateFailedCoercesUnknownOriginToAgentFailure(t *testing.T) {
 // as agent_failure (and is not judged).
 func TestSetStateFailedCancelledRoutesToCancel(t *testing.T) {
 	run := runningRun(false)
-	run.StopKind = pgText("cancelled")
+	run.StopKind = pgconv.TextOrNull("cancelled")
 	fs, svc, wkr := limitParkFixture(t, run)
 
 	worker := "run cancelled"
@@ -222,7 +224,7 @@ func TestSetStateFailedCancelledRoutesToCancel(t *testing.T) {
 // path) rather than defaulting to agent_failure, and must NOT route to CancelRunByWorker.
 func TestSetStateFailedPlanRejectedStampsPlanRejected(t *testing.T) {
 	run := runningRun(false)
-	run.StopKind = pgText("plan_rejected")
+	run.StopKind = pgconv.TextOrNull("plan_rejected")
 	fs, svc, wkr := limitParkFixture(t, run)
 
 	worker := "plan rejected: not aligned with the issue"
@@ -254,7 +256,7 @@ func TestSetStateFailedPlanRejectedStampsPlanRejected(t *testing.T) {
 // calling SetRunFailed with fail_origin='agent_failure' (fs.setFailed set, fs.cancelledByWorker nil).
 func TestSetStateFailedStoppedRoutesToCancel(t *testing.T) {
 	run := runningRun(false)
-	run.StopKind = pgText("stopped")
+	run.StopKind = pgconv.TextOrNull("stopped")
 	fs, svc, wkr := limitParkFixture(t, run)
 
 	worker := "finalize failed: push rejected"

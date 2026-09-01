@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -37,12 +38,12 @@ func selfImproveClaimFixture(t *testing.T, selfRunID uuid.UUID, repoID uuid.UUID
 	fs := &fakeStore{
 		claimRun: store.Run{
 			ID: selfRunID, UserID: owner, Kind: RunKindSelfImprove, Status: "claimed",
-			RepoID:   pgUUID(repoID),
+			RepoID:   pgconv.UUID(repoID),
 			IssueIid: pgtype.Int8{Int64: 1, Valid: true}, IssueTitle: "improve uzi", IssueDescription: "d",
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/uzi", RepoPath: "g/uzi",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:   sealedDefault,
@@ -82,18 +83,18 @@ func TestSelfImproveClaimCarriesInflightTargets(t *testing.T) {
 	fs.activeRunsAll = []store.ListActiveRunsAllRow{
 		// (a) an active issue run on the SAME repo — the only entry that must survive.
 		{Run: store.Run{
-			ID: uuid.New(), RepoID: pgUUID(repoID), Kind: "issue", Status: "running",
+			ID: uuid.New(), RepoID: pgconv.UUID(repoID), Kind: "issue", Status: "running",
 			IssueIid:         pgtype.Int8{Int64: 293, Valid: true},
 			IssueTitle:       "Self-improvement picker skips in-progress work",
 			MilestonesFrozen: mustMilestonesJSON(t, apitypes.Milestone{ID: "m3", Title: "Graceful-skip for deadcode:web/deadcode:agent when knip absent"}),
 		}},
 		// (b) the self_improve run itself — same id as claimRun, must be excluded.
 		{Run: store.Run{
-			ID: selfRunID, RepoID: pgUUID(repoID), Kind: RunKindSelfImprove, Status: "claimed",
+			ID: selfRunID, RepoID: pgconv.UUID(repoID), Kind: RunKindSelfImprove, Status: "claimed",
 		}},
 		// (c) a run on a DIFFERENT repo — must be excluded.
 		{Run: store.Run{
-			ID: uuid.New(), RepoID: pgUUID(otherRepoID), Kind: "issue", Status: "running",
+			ID: uuid.New(), RepoID: pgconv.UUID(otherRepoID), Kind: "issue", Status: "running",
 			IssueIid:   pgtype.Int8{Int64: 999, Valid: true},
 			IssueTitle: "unrelated",
 		}},

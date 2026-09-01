@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -94,14 +95,14 @@ func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uui
 	}
 	reviewID, err := s.q.UpsertRunReviewWithRecommendations(ctx, store.UpsertRunReviewWithRecommendationsParams{
 		TargetRunID:      target.ID,
-		JudgeRunID:       pgUUID(judge.ID),
+		JudgeRunID:       pgconv.UUID(judge.ID),
 		UserID:           target.UserID,
 		Verdict:          sub.Verdict,
 		SummaryMd:        sub.SummaryMd,
 		JudgeModel:       sub.JudgeModel,
 		Status:           sub.Status,
-		ProducedByRunID:  pgUUID(judge.ID),
-		ProducedByUserID: pgUUID(target.UserID),
+		ProducedByRunID:  pgconv.UUID(judge.ID),
+		ProducedByUserID: pgconv.UUID(target.UserID),
 		Recommendations:  recsJSON,
 	})
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -115,7 +116,7 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		RunID:               id,
 		UserID:              userID,
 		RepoID:              repoID,
-		Branch:              pgText(branch),
+		Branch:              pgconv.TextOrNull(branch),
 		BaseBranch:          pgTextTrimNarg(baseBranch),
 		OpenMr:              openMR,
 		Interactive:         interactive,
@@ -158,7 +159,7 @@ func (s *Service) handoffBudget(interactive bool) (budgetWall, budgetIters pgtyp
 		return
 	}
 	if secs := int(s.p.HandoffRunTimeout.Seconds()); secs > 0 {
-		budgetWall = pgtype.Int4{Int32: int32(min(secs, budgetWallCeilingSeconds)), Valid: true}
+		budgetWall = pgtype.Int4{Int32: int32(min(secs, budgetWallCeilingSeconds)), Valid: true} //nolint:gosec // G115: min() bounds the value to budgetWallCeilingSeconds, a small constant well within int32
 	}
 	if s.p.HandoffRunMaxIterations > 0 && s.p.HandoffRunMaxIterations <= math.MaxInt32 {
 		budgetIters = pgtype.Int4{Int32: int32(s.p.HandoffRunMaxIterations), Valid: true}
@@ -208,9 +209,9 @@ func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targe
 		RunID:       id,
 		UserID:      userID,
 		RepoID:      repoID,
-		Branch:      pgText(branch),
+		Branch:      pgconv.TextOrNull(branch),
 		BaseBranch:  pgTextTrimNarg(baseBranch),
-		TargetRunID: pgUUID(targetRunID),
+		TargetRunID: pgconv.UUID(targetRunID),
 		IssueTitle:  deriveTaskReviewTitle(branch),
 	})
 	if err != nil {
@@ -269,9 +270,9 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 		RunID:               id,
 		UserID:              userID,
 		RepoID:              repoID,
-		Branch:              pgText(branch),
+		Branch:              pgconv.TextOrNull(branch),
 		BaseBranch:          pgTextTrimNarg(baseBranch),
-		ThenFixOfRunID:      pgUUID(originalRunID),
+		ThenFixOfRunID:      pgconv.UUID(originalRunID),
 		IssueTitle:          deriveThenFixTitle(branch),
 		IssueDescription:    description,
 		BudgetWallSeconds:   budgetWall,
@@ -344,5 +345,5 @@ func pgTextTrimNarg(s string) pgtype.Text {
 	if s == "" {
 		return pgtype.Text{}
 	}
-	return pgText(s)
+	return pgconv.TextOrNull(s)
 }

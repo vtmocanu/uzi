@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 
 	"golang.org/x/mod/semver"
@@ -583,43 +584,26 @@ func (s *Service) RecordRollHealth(ctx context.Context, rep RollHealthReport) (i
 	return s.q.UpsertWorkerRollHealth(ctx, store.UpsertWorkerRollHealthParams{
 		WorkerID:             rep.WorkerID,
 		Phase:                rep.Phase,
-		PhaseSince:           timestamptzPtr(rep.PhaseSince),
-		TargetImage:          pgText(rep.TargetImage),
-		PodPhase:             pgText(rep.PodPhase),
-		BlockingContainer:    textParam(rep.BlockingContainer),
-		BlockingReason:       textParam(rep.BlockingReason),
+		PhaseSince:           pgconv.TimePtr(rep.PhaseSince),
+		TargetImage:          pgconv.TextOrNull(rep.TargetImage),
+		PodPhase:             pgconv.TextOrNull(rep.PodPhase),
+		BlockingContainer:    pgconv.TextPtrOrNull(rep.BlockingContainer),
+		BlockingReason:       pgconv.TextPtrOrNull(rep.BlockingReason),
 		RestartCount:         rep.RestartCount,
-		LastExitCode:         int4Ptr(rep.LastExitCode),
+		LastExitCode:         pgconv.Int4Ptr32(rep.LastExitCode),
 		ControllerReportedAt: pgtype.Timestamptz{Time: rep.ControllerReportedAt, Valid: !rep.ControllerReportedAt.IsZero()},
 		ObservedAt:           pgtype.Timestamptz{Time: rep.ObservedAt, Valid: true},
 		PollIntervalSeconds:  pgInt4(rep.PollIntervalSeconds),
-		WorkerImageTag:       pgText(rep.WorkerImageTag),
+		WorkerImageTag:       pgconv.TextOrNull(rep.WorkerImageTag),
 		TagValid:             tagValid,
 	})
-}
-
-// timestamptzPtr / int4Ptr render an optional wire value as SQL NULL rather than a
-// zero. A zero time would claim a phase began at the epoch; a zero exit code would
-// claim a clean exit for a container that never terminated.
-func timestamptzPtr(t *time.Time) pgtype.Timestamptz {
-	if t == nil {
-		return pgtype.Timestamptz{}
-	}
-	return pgtype.Timestamptz{Time: *t, Valid: true}
-}
-
-func int4Ptr(v *int32) pgtype.Int4 {
-	if v == nil {
-		return pgtype.Int4{}
-	}
-	return pgtype.Int4{Int32: *v, Valid: true}
 }
 
 func pgInt4(v int) pgtype.Int4 {
 	if v <= 0 {
 		return pgtype.Int4{}
 	}
-	return pgtype.Int4{Int32: int32(v), Valid: true}
+	return pgtype.Int4{Int32: int32(v), Valid: true} //nolint:gosec // G115: v is a small positive operator-set count, never near int32 range
 }
 
 // -------------------------------------------------------------------------

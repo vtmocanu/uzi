@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -85,7 +86,7 @@ func newAutoFixture(t *testing.T) autoFixture {
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:          sealedDefault,
@@ -626,7 +627,7 @@ func TestAutoDoesNotRetryOnALockedVault(t *testing.T) {
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:          []byte("the-default-must-never-be-opened-here"),

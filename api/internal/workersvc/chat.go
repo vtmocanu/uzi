@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
@@ -153,11 +154,11 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 		return nil, nil // idle: owner locked
 	}
 	run, err := s.q.ClaimChatRun(ctx, store.ClaimChatRunParams{
-		WorkerID: pgUUID(wkr.ID),
+		WorkerID: pgconv.UUID(wkr.ID),
 		UserID:   wkr.UserID,
 		// PRD #529 Decision 4: an ephemeral (run-bound) worker never claims a chat.
 		IsEphemeral:    wkr.Ephemeral,
-		AffinityCutoff: pgTime(s.now().Add(-s.p.WorkerAffinityGrace)),
+		AffinityCutoff: pgconv.Time(s.now().Add(-s.p.WorkerAffinityGrace)),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -264,7 +265,7 @@ func (s *Service) CreateChatRun(ctx context.Context, userID uuid.UUID, message s
 		UserID:           userID,
 		IssueTitle:       title,
 		IssueDescription: message,
-		Title:            pgText(title),
+		Title:            pgconv.TextOrNull(title),
 	})
 	if err != nil {
 		return store.Run{}, err
@@ -349,7 +350,7 @@ func (s *Service) SubmitChatMessage(ctx context.Context, userID, runID uuid.UUID
 		return SubmitInputResult{}, ErrChatTurnCapReached
 	}
 	if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
-		RunID: runID, Kind: "follow_up", Body: pgText(message),
+		RunID: runID, Kind: "follow_up", Body: pgconv.TextOrNull(message),
 	}); err != nil {
 		return SubmitInputResult{}, err
 	}
@@ -383,13 +384,13 @@ func (s *Service) ContinueChat(ctx context.Context, userID, runID uuid.UUID) (st
 	}
 	title := src.Title
 	if !title.Valid {
-		title = pgText(src.IssueTitle)
+		title = pgconv.TextOrNull(src.IssueTitle)
 	}
 	run, err := s.q.CreateChatContinueRun(ctx, store.CreateChatContinueRunParams{
 		UserID:        userID,
 		IssueTitle:    src.IssueTitle,
 		Title:         title,
-		ResumeOfRunID: pgUUID(src.ID),
+		ResumeOfRunID: pgconv.UUID(src.ID),
 		WorkerID:      src.WorkerID, // affinity to the worker whose disk holds the session (may be NULL)
 	})
 	if err != nil {
@@ -553,7 +554,7 @@ func (s *Service) ResolveRepoForWorker(ctx context.Context, wkr store.Worker, re
 func (s *Service) ListRunsForWorker(ctx context.Context, wkr store.Worker, limit int) ([]store.ListRunsForWorkerUserRow, error) {
 	return s.q.ListRunsForWorkerUser(ctx, store.ListRunsForWorkerUserParams{
 		UserID: wkr.UserID,
-		Lim:    int32(clampLimit(limit, workerRunsDefaultLimit, workerRunsMaxLimit)),
+		Lim:    int32(clampLimit(limit, workerRunsDefaultLimit, workerRunsMaxLimit)), //nolint:gosec // G115: clampLimit bounds the result to workerRunsMaxLimit, a small constant well within int32
 	})
 }
 
@@ -583,7 +584,7 @@ func (s *Service) ListRunMessagesForWorker(ctx context.Context, wkr store.Worker
 	return s.q.ListRunMessagesForWorkerPage(ctx, store.ListRunMessagesForWorkerPageParams{
 		RunID:    runID,
 		AfterSeq: afterSeq,
-		Lim:      int32(clampLimit(limit, workerMessagesDefaultLimit, workerMessagesMaxLimit)),
+		Lim:      int32(clampLimit(limit, workerMessagesDefaultLimit, workerMessagesMaxLimit)), //nolint:gosec // G115: clampLimit bounds the result to workerMessagesMaxLimit, a small constant well within int32
 	})
 }
 

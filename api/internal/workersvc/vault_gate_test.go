@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
@@ -107,7 +108,7 @@ func TestClaimUnlockedOwnerOpensDEKToken(t *testing.T) {
 		claimRun: store.Run{ID: uuid.New(), UserID: uid, Status: "claimed"},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:           dekTok,
@@ -147,7 +148,7 @@ func TestClaimLockRaceRequeuesNeverFails(t *testing.T) {
 		claimRun: store.Run{ID: runID, UserID: uid, Status: "claimed"},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:           []byte("locked-so-never-decrypted"),

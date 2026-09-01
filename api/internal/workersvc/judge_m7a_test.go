@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -26,7 +27,7 @@ func TestJudgeClaimCarriesFailureClass(t *testing.T) {
 		fs := &fakeStore{
 			claimRun:     judgeRun(uid, target),
 			anthropic:    sealedTok,
-			runByIDPlain: store.Run{ID: target, FailOrigin: pgText("provisioning_failed")},
+			runByIDPlain: store.Run{ID: target, FailOrigin: pgconv.TextOrNull("provisioning_failed")},
 		}
 		svc := New(fs, box, testParams())
 		svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
@@ -74,7 +75,7 @@ func TestPreStartInfraFailureSkipsJudge(t *testing.T) {
 			fs, svc, run := eligibleFixture(t)
 			run.Status = "failed"
 			run.IterationCount = 0
-			run.FailOrigin = pgText(origin)
+			run.FailOrigin = pgconv.TextOrNull(origin)
 			svc.maybeEnqueueJudge(context.Background(), run)
 			if fs.createdJudgeRun != nil {
 				t.Fatalf("%s at iteration 0 is a pre-start infra failure and must NOT be judged, got %+v", origin, fs.createdJudgeRun)
@@ -106,7 +107,7 @@ func TestAgentFailureAtIterZeroStillJudged(t *testing.T) {
 	fs, svc, run := eligibleFixture(t)
 	run.Status = "failed"
 	run.IterationCount = 0
-	run.FailOrigin = pgText("agent_failure")
+	run.FailOrigin = pgconv.TextOrNull("agent_failure")
 	svc.maybeEnqueueJudge(context.Background(), run)
 	if fs.createdJudgeRun == nil {
 		t.Fatal("agent_failure at iteration 0 is judgeable (not pre-start infra) and must still be enqueued")
@@ -120,7 +121,7 @@ func TestPreStartInfraOriginAtNonZeroIterStillJudged(t *testing.T) {
 	fs, svc, run := eligibleFixture(t)
 	run.Status = "failed"
 	run.IterationCount = 3
-	run.FailOrigin = pgText("provisioning_failed")
+	run.FailOrigin = pgconv.TextOrNull("provisioning_failed")
 	svc.maybeEnqueueJudge(context.Background(), run)
 	if fs.createdJudgeRun == nil {
 		t.Fatal("a provisioning_failed origin at iteration_count>0 is not pre-start-gated (conjunction) and must be enqueued")

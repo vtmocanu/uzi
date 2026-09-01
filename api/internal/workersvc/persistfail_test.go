@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -154,7 +155,7 @@ func TestAppendMessagesDropsASubThresholdStreakWhenTheRunLeavesRunning(t *testin
 	w := worker()
 	runID := uuid.New()
 	fs := &persistFakeStore{
-		run:       store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running"},
+		run:       store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: "running"},
 		poisonSeq: 1,
 		insertErr: unstorableErr(),
 	}
@@ -206,7 +207,7 @@ func TestAppendMessagesComparisonSetIsRunningRunsOnly(t *testing.T) {
 		t.Run(tc.status, func(t *testing.T) {
 			w := worker()
 			runID, accused := uuid.New(), uuid.New()
-			fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: tc.status}}
+			fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: tc.status}}
 			clk := t0
 			svc := persistSvc(fs, &clk)
 
@@ -228,7 +229,7 @@ func TestAppendMessagesTerminalRunNeverJoinsTheComparisonSet(t *testing.T) {
 	// terminal arm therefore has to be evaluated BEFORE the success arm.
 	w := worker()
 	runID := uuid.New()
-	fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "completed"}}
+	fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: "completed"}}
 	clk := t0
 	svc := persistSvc(fs, &clk)
 
@@ -537,7 +538,7 @@ func TestAppendMessagesRecordsAStreakOnRepeatedUnstorableBatches(t *testing.T) {
 	w := worker()
 	runID := uuid.New()
 	fs := &persistFakeStore{
-		run:       store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running"},
+		run:       store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: "running"},
 		poisonSeq: 1,
 		insertErr: unstorableErr(),
 	}
@@ -586,7 +587,7 @@ func TestAppendMessagesEvictsInsteadOfCountingOnATerminalRun(t *testing.T) {
 	w := worker()
 	runID := uuid.New()
 	fs := &persistFakeStore{
-		run:       store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running"},
+		run:       store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: "running"},
 		poisonSeq: 1,
 		insertErr: unstorableErr(),
 	}
@@ -612,7 +613,7 @@ func TestAppendMessagesSuccessResetsTheStreak(t *testing.T) {
 	w := worker()
 	runID := uuid.New()
 	fs := &persistFakeStore{
-		run:       store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running"},
+		run:       store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: "running"},
 		poisonSeq: 9,
 		insertErr: unstorableErr(),
 	}
@@ -652,7 +653,7 @@ func TestAppendMessagesPartialApplyAdvancesLastSeqExactlyOnce(t *testing.T) {
 	w := worker()
 	runID := uuid.New()
 	fs := &persistFakeStore{
-		run:       store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running", LastSeq: 0},
+		run:       store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: "running", LastSeq: 0},
 		poisonSeq: 5,
 		insertErr: unstorableErr(),
 	}
@@ -693,7 +694,7 @@ func TestAppendMessagesPartialApplyCostsAtMostOneStreakReset(t *testing.T) {
 	w := worker()
 	runID := uuid.New()
 	fs := &persistFakeStore{
-		run:       store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running", LastSeq: 0},
+		run:       store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: "running", LastSeq: 0},
 		poisonSeq: 1, // nothing stores: last_seq stays 0
 		insertErr: unstorableErr(),
 	}
@@ -733,7 +734,7 @@ func TestNoteOversizeBatchCountsOnlyOwnedNonTerminalRuns(t *testing.T) {
 	clk := t0
 
 	t.Run("owned and running", func(t *testing.T) {
-		fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running", LastSeq: 42}}
+		fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: "running", LastSeq: 42}}
 		svc := persistSvc(fs, &clk)
 		for i := 0; i < 5; i++ {
 			svc.NoteOversizeBatch(context.Background(), w, runID)
@@ -771,7 +772,7 @@ func TestNoteOversizeBatchCountsOnlyOwnedNonTerminalRuns(t *testing.T) {
 	// the human approved it.
 	for _, status := range []string{"cancelled", "completed", "failed", "awaiting_approval", "queued", "claimed"} {
 		t.Run("not running: "+status, func(t *testing.T) {
-			fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: status}}
+			fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID), Status: status}}
 			svc := persistSvc(fs, &clk)
 			for i := 0; i < 12; i++ {
 				svc.NoteOversizeBatch(context.Background(), w, runID)
