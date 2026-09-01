@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type User } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, ListSkeleton } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { useDemoMode } from "../lib/demoMode";
@@ -10,12 +11,16 @@ import { maskEmail, maskName } from "../lib/demoMask";
 export function AdminUsers() {
   const demo = useDemoMode();
   const { user: me } = useAuth();
+  // users is seeded by the load but ALSO updated optimistically by the toggle
+  // handlers below (setUsers(prev => …)), so it stays a local state and the fetcher
+  // seeds it as a side effect rather than riding in the hook's data bundle.
   const [users, setUsers] = useState<User[]>([]);
+  // Kept local: the toggle handlers below still set this on failure, so it is merged
+  // with the hook's load error at the one page-level Alert.
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
   const [judgeBusyId, setJudgeBusyId] = useState<string | null>(null);
   const [ciAutofixBusyId, setCiAutofixBusyId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   // Whether the admin has ENFORCED the judge instance-wide (PRD #69 M4). Under
   // enforced mode the per-user judge flag is bypassed at enqueue (Decision 3), so the
   // per-user toggle in this table is INERT — greyed and annotated, not removed. Read
@@ -23,12 +28,13 @@ export function AdminUsers() {
   // it false so the toggle stays live rather than falsely claiming to be inert.
   const [judgeEnforceAll, setJudgeEnforceAll] = useState(false);
 
-  const load = useCallback(async () => {
-    try {
-      // The user list is the page; a failure here is fatal. The settings read is
-      // best-effort per the judgeEnforceAll comment above: it only decides whether the
-      // per-user toggle is annotated inert, so a settings-endpoint blip must NOT blank
-      // the whole table. Keep it OUT of the fatal path — leave enforce=false on error.
+  const { loading, error: loadError } = useAsyncData(
+    async () => {
+      // The user list is the page; a failure here is fatal (the fetcher rethrows and
+      // the hook turns it into loadError). The settings read is best-effort per the
+      // judgeEnforceAll comment above: it only decides whether the per-user toggle is
+      // annotated inert, so a settings-endpoint blip must NOT blank the whole table.
+      // Keep it OUT of the fatal path — leave enforce=false on error.
       const { users } = await api.listUsers();
       setUsers(users);
       try {
@@ -37,16 +43,10 @@ export function AdminUsers() {
       } catch {
         setJudgeEnforceAll(false);
       }
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load users"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+    },
+    [],
+    { fallback: "Failed to load users" },
+  );
 
   const toggle = async (u: User) => {
     setError("");
@@ -95,7 +95,7 @@ export function AdminUsers() {
 
   return (
     <AdminShell description="Deactivating a user blocks their login and immediately ends every active session.">
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
       {loading ? (
         <ListSkeleton rows={4} />
       ) : (

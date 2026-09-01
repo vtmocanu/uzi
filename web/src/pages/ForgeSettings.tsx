@@ -3,9 +3,10 @@
 // on-demand "Check privileges" action). Inside SettingsShell; per-row busy
 // state instead of one page-wide busy flag.
 
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { Fragment, useState } from "react";
 import { api, ApiError, type ForgeConnection, type PrivilegeReport } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { privilegeBadge } from "../lib/privilege";
 import { forgePlatform } from "../lib/forgeNoun";
 import { inferForgeType, defaultUrlForType } from "../lib/forgeInfer";
@@ -81,14 +82,11 @@ function connectHints(forgeType: string): ConnectHints {
 
 export function ForgeSettings() {
   const demo = useDemoMode();
+  // `connections` is also patched in place by the privilege `check` handler, so it
+  // stays local and the fetcher below sets it as a side effect rather than routing
+  // through the hook's read-only `data`.
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
-  const [allowedUrls, setAllowedUrls] = useState<string[]>([]);
   const [baseUrl, setBaseUrl] = useState("");
-  // The advertised forge types (PRD #65 D11). The picker below is shown only when
-  // more than one is advertised; while the API advertises just ["gitlab"] (today,
-  // until M6b), it stays hidden and forgeType defaults to that single value, so the
-  // connect form behaves exactly as before — the milestone lands dark.
-  const [forgeTypes, setForgeTypes] = useState<string[]>([]);
   const [forgeType, setForgeType] = useState("gitlab");
   // Cosmetic auto-change highlight (PRD #337 D9): when a sync handler moves the
   // *other* field, mark it so a CSS keyframe flashes it, making the coupling
@@ -105,18 +103,15 @@ export function ForgeSettings() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [checkingId, setCheckingId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   // Per-connection draft of the user's own forge username (PRD #19 M3). Seeded from
   // the stored value on load; keyed by connection id so multiple connections edit
   // independently.
   const [usernameDrafts, setUsernameDrafts] = useState<Record<string, string>>({});
 
-  const load = useCallback(async () => {
-    try {
+  const { data, loading, error: loadError, reload } = useAsyncData(
+    async () => {
       const [cfg, conns] = await Promise.all([api.forgeConfig(), api.listConnections()]);
-      setAllowedUrls(cfg.allowed_base_urls);
       setBaseUrl((prev) => prev || cfg.allowed_base_urls[0] || "");
-      setForgeTypes(cfg.forge_types);
       // The selection defaults to gitlab (the useState seed above), so a single-type
       // config sends forge_type: "gitlab" exactly as the form does now. Once the user
       // opens the picker (only shown when >1 type is advertised) their choice wins.
@@ -125,16 +120,17 @@ export function ForgeSettings() {
       setUsernameDrafts(
         Object.fromEntries(conns.connections.map((c) => [c.id, c.human_username ?? ""])),
       );
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load forge settings"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+      return { allowedUrls: cfg.allowed_base_urls, forgeTypes: cfg.forge_types };
+    },
+    [],
+    { fallback: "Failed to load forge settings" },
+  );
+  // The advertised forge types (PRD #65 D11). The picker below is shown only when
+  // more than one is advertised; while the API advertises just ["gitlab"] (today,
+  // until M6b), it stays hidden and forgeType defaults to that single value, so the
+  // connect form behaves exactly as before — the milestone lands dark.
+  const allowedUrls = data?.allowedUrls ?? [];
+  const forgeTypes = data?.forgeTypes ?? [];
 
   const resetMessages = () => {
     setError("");
@@ -151,7 +147,7 @@ export function ForgeSettings() {
       const { connection } = await api.createConnection(baseUrl, token, forgeType);
       setToken("");
       setNotice(`Connected as ${maskUsername(connection.bot_username, "bot", demo)}.`);
-      await load();
+      await reload();
     } catch (err) {
       if (err instanceof ApiError && err.status === 422) {
         const body = err.body as { violations?: string[] } | null;
@@ -171,7 +167,7 @@ export function ForgeSettings() {
     try {
       const { connection } = await api.verifyConnection(id);
       setNotice(`Verified ${maskUsername(connection.bot_username, "bot", demo)}.`);
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Verify failed"));
     } finally {
@@ -206,7 +202,7 @@ export function ForgeSettings() {
     setBusyId(id);
     try {
       await api.deleteConnection(id);
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Delete failed"));
     } finally {
@@ -230,7 +226,7 @@ export function ForgeSettings() {
             : "Forge username cleared.",
         );
       }
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Save failed"));
     } finally {
@@ -273,7 +269,7 @@ export function ForgeSettings() {
 
   return (
     <SettingsShell description="Connect the bot account uzi acts through.">
-      {error && <Alert message={error} />}
+      {(loadError || error) && <Alert message={loadError || error} />}
       {connectViolations && (
         <Card className="border-danger/40 bg-danger/5">
           <p className="text-sm font-medium text-danger">The token was not saved — it is over-privileged:</p>

@@ -5,10 +5,11 @@
 // in one scroll; the discriminator is that everything here shapes future runs,
 // while everything on Account is who you are and what you hold.
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, type SecretMeta } from "../lib/api";
+import { api } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
 import { ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
@@ -17,8 +18,8 @@ import { SettingsShell } from "../components/SettingsShell";
 
 export function RunDefaults() {
   const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel } = useAuth();
-  const [secrets, setSecrets] = useState<SecretMeta[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Kept local: the save handlers below still set this on failure, so it is merged
+  // with the hook's load error at the one page-level Alert.
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [autopilotBusy, setAutopilotBusy] = useState(false);
@@ -187,13 +188,15 @@ export function RunDefaults() {
   const [effortBusy, setEffortBusy] = useState(false);
 
   // secrets feed the judge token picker; settings carry the saved worker model.
-  const load = useCallback(async () => {
-    try {
+  // secrets is read-only display, set only here, so it rides in the hook's data
+  // bundle. The settings fields seed editable form state the Save handlers also
+  // write, so they stay local and are seeded as side effects exactly as before.
+  const { data, loading, error: loadError } = useAsyncData(
+    async () => {
       const [{ secrets: rows }, { settings }] = await Promise.all([
         api.listSecrets(),
         api.getMySettings(),
       ]);
-      setSecrets(rows.filter((s) => s.kind === "anthropic_token"));
       const model = settings.default_model ?? "";
       setDefaultModel(model);
       setSavedModel(model);
@@ -207,16 +210,12 @@ export function RunDefaults() {
       setDefaultEffort(eff);
       setSavedEffort(eff);
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load settings"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+      return { secrets: rows.filter((s) => s.kind === "anthropic_token") };
+    },
+    [],
+    { fallback: "Failed to load settings" },
+  );
+  const secrets = data?.secrets ?? [];
 
   const modelWarning = modelFieldWarning(defaultModel);
   const modelDirty = defaultModel.trim() !== savedModel;
@@ -323,7 +322,7 @@ export function RunDefaults() {
 
   return (
     <SettingsShell description="How your runs behave: autopilot, usage limits, the judge, CI fixes, the model, and reasoning effort.">
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
       {notice && <Alert tone="success" message={notice} />}
 
       <Card className="space-y-4">

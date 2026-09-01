@@ -4,9 +4,10 @@
 // auto-match misses, and a self-test DM. All writes are self-scoped — a user can
 // only ever touch their own mapping.
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { api, type SlackLink } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, type BadgeTone, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
 import { DocLink } from "./DocLink";
 import { DOC_SLACK } from "../lib/doclinks";
@@ -31,27 +32,23 @@ const WORKSPACE_ALERT: Record<Exclude<SlackLink["workspace"], "connected">, stri
 
 export function SlackNotifications() {
   const [link, setLink] = useState<SlackLink | null>(null);
-  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [override, setOverride] = useState("");
-  const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
-  const load = useCallback(async () => {
-    try {
+  // `link` is also written by the mutation handlers below (a save reflects the new
+  // state without a refetch), so it stays local state and the fetcher sets it as a
+  // side effect rather than being bundled into the hook's `data`.
+  const { loading, error: loadError } = useAsyncData(
+    async () => {
       const { slack } = await api.getMySlack();
       setLink(slack);
       setOverride(slack.member_id ?? "");
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load notification settings"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+    },
+    [],
+    { fallback: "Failed to load notification settings" },
+  );
+  const [error, setError] = useState("");
 
   const toggleNotify = async (notify: boolean) => {
     setError("");
@@ -119,7 +116,7 @@ export function SlackNotifications() {
         </p>
       </div>
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
       {notice && <Alert tone="success" message={notice} />}
 
       {loading || link === null ? (

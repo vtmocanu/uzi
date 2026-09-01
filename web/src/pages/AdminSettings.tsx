@@ -19,6 +19,7 @@ import {
   type UpdateSettingsPayload,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { useAuth } from "../auth/AuthContext";
 import {
   Alert,
@@ -739,32 +740,29 @@ function releaseExcerpt(body: string | undefined, max = 300): string {
 // unreachable) / "never" (no check yet) status in words. It renders NO release
 // markdown as HTML — the excerpt is a plain React text node.
 function UpdatesSettingsCard() {
+  // status is seeded by the load but ALSO updated by checkNow / saveToggle, so it
+  // stays local and the fetcher seeds it as a side effect.
   const [status, setStatus] = useState<ReleaseCheckStatus | null>(null);
-  const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
   // Which toggle is mid-save; null when idle. A save disables BOTH toggle inputs
   // (deliberate concurrent-write protection — see the `disabled` guards below), while
   // this value still records which of the two rows is the one being saved.
   const [savingToggle, setSavingToggle] = useState<"enabled" | "banner" | null>(null);
   const [copied, setCopied] = useState(false);
+  // Kept local: checkNow / saveToggle set this on failure, so it is merged with the
+  // hook's load error at the one Alert below.
   const [error, setError] = useState("");
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
+  // skeleton: "always" mirrors the old load's setLoading(true) on every call, so a
+  // Retry (reload) re-arms the skeleton exactly as it did before.
+  const { loading, error: loadError, reload } = useAsyncData(
+    async () => {
       const { release_check } = await api.getReleaseCheck();
       setStatus(release_check);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load release-check status"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
+    },
+    [],
+    { fallback: "Failed to load release-check status", skeleton: "always" },
+  );
 
   const checkNow = async () => {
     setError("");
@@ -846,7 +844,7 @@ function UpdatesSettingsCard() {
         )}
       </div>
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
 
       {loading ? (
         <Skeleton className="h-24 w-full" />
@@ -855,8 +853,8 @@ function UpdatesSettingsCard() {
         // above) plus a retry path instead of a permanent skeleton — the "Check
         // now" button is gated on `status`, so this is the only way back.
         <div className="space-y-3">
-          {!error && <Alert message="Failed to load release-check status." />}
-          <Button variant="secondary" size="sm" onClick={() => void load()} disabled={loading}>
+          {!error && !loadError && <Alert message="Failed to load release-check status." />}
+          <Button variant="secondary" size="sm" onClick={() => void reload()} disabled={loading}>
             Retry
           </Button>
         </div>
@@ -1265,8 +1263,9 @@ const SKILLS_PRESET_URL = "https://github.com/vtmocanu/skills";
 const SKILLS_PRESET_FOLDER = "product-agents/";
 
 function AgentSourceSettingsCard() {
+  // view is seeded by the load's resetForm but ALSO updated by refreshView / syncNow /
+  // checkForUpdates, so it stays local and the fetcher seeds it as a side effect.
   const [view, setView] = useState<AgentSourceView | null>(null);
-  const [loading, setLoading] = useState(true);
   const [url, setUrl] = useState("");
   const [ref, setRef] = useState("");
   // Repo-relative subfolder role files are read from (PRD #702 M1). The server
@@ -1301,6 +1300,8 @@ function AgentSourceSettingsCard() {
   const [updateMsg, setUpdateMsg] = useState<{ tone: "success" | "warning" | "danger"; text: string } | null>(
     null,
   );
+  // Kept local: the save / sync / approve / preset / check / bump handlers below all
+  // set this, so it is merged with the hook's load error at the one Alert below.
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -1324,20 +1325,17 @@ function AgentSourceSettingsCard() {
     setView(agent_source);
   }, []);
 
-  const load = useCallback(async () => {
-    try {
+  // The initial load resets the form (resetForm) — as does an explicit Save via
+  // reload() below — while refreshView (used by Sync/Approve/Bump) deliberately does
+  // NOT, preserving unsaved edits. The hook owns loading + the load error only.
+  const { loading, error: loadError, reload } = useAsyncData(
+    async () => {
       const { agent_source } = await api.getAgentSource();
       resetForm(agent_source);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load agent-source settings"));
-    } finally {
-      setLoading(false);
-    }
-  }, [resetForm]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
+    },
+    [resetForm],
+    { fallback: "Failed to load agent-source settings" },
+  );
 
   // Preset: fill the URL + folder for uzi's canonical roster and resolve its latest tag
   // at click time (PRD #702 M3). The URL/folder are filled IMMEDIATELY so a resolve
@@ -1410,7 +1408,7 @@ function AgentSourceSettingsCard() {
       setCredential("");
       // updateSettings returns the settings envelope, not the agent-source view —
       // re-read so the status/credential-configured/staged panels reflect the save.
-      await load();
+      await reload();
       setNotice("Agent-source settings saved.");
     } catch (err) {
       setError(errorMessage(err, "Failed to save agent-source settings"));
@@ -1577,7 +1575,7 @@ function AgentSourceSettingsCard() {
         </p>
       </div>
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
       {notice && <Alert tone="success" message={notice} />}
 
       {loading ? (

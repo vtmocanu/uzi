@@ -3,10 +3,11 @@
 // read returns them; admins see all scopes). Everyone can author their own
 // "Mine" skills; only admins create Global or edit/reset Builtin & Global.
 
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type Skill, type SkillScope } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import {
   bodyError,
   byteLength,
@@ -43,28 +44,25 @@ type ConfirmState = { id: string; action: "reset" | "delete" } | null;
 export function Skills() {
   const { user } = useAuth();
   const isAdmin = !!user?.is_admin;
-  const [skills, setSkills] = useState<Skill[]>([]);
-  const [loading, setLoading] = useState(true);
+  const {
+    data,
+    loading,
+    error: loadError,
+    reload,
+  } = useAsyncData<{ skills: Skill[] }>(
+    async () => {
+      const { skills } = await api.listSkills();
+      return { skills };
+    },
+    [],
+    { fallback: "Failed to load skills" },
+  );
+  const skills = useMemo(() => data?.skills ?? [], [data]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [edit, setEdit] = useState<EditState>(null);
   const [confirm, setConfirm] = useState<ConfirmState>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const { skills } = await api.listSkills();
-      setSkills(skills);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load skills"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
 
   const groups = useMemo(() => {
     const builtin: Skill[] = [];
@@ -83,7 +81,7 @@ export function Skills() {
   const afterSave = (msg: string) => {
     setEdit(null);
     setNotice(msg);
-    load();
+    reload();
   };
 
   const runReset = async (id: string) => {
@@ -93,7 +91,7 @@ export function Skills() {
     try {
       await api.resetSkill(id);
       setNotice("Reset to the shipped default.");
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to reset"));
     } finally {
@@ -108,7 +106,7 @@ export function Skills() {
     try {
       await api.deleteSkill(id);
       setNotice("Skill deleted.");
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to delete"));
     } finally {
@@ -164,7 +162,7 @@ export function Skills() {
         }
       />
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
       {notice && <Alert message={notice} tone="success" />}
 
       {loading ? (

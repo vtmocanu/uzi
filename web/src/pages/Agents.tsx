@@ -4,11 +4,12 @@
 // admins additionally toggle which builtin/global templates are global defaults.
 // Anyone can author a private ("Mine") agent; admins can also publish globals.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import {
   isLeadTemplateName,
   provenanceBadgeKind,
@@ -33,35 +34,32 @@ const SHADOWED_HINT =
 export function Agents() {
   const { user } = useAuth();
   const isAdmin = !!user?.is_admin;
-  const [templates, setTemplates] = useState<AgentTemplate[]>([]);
+  // `allocations` is also written by the toggle handlers (setMyOverride /
+  // setGlobalDefault), so it stays local and the fetcher sets it as a side effect
+  // rather than routing through the hook's read-only `data`.
   const [allocations, setAllocations] = useState<TemplateAllocation[]>([]);
+  // `error` is the load error (from the hook, as `loadError`) OR a toggle-handler
+  // error kept here — the two share one Alert slot below.
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [loading, setLoading] = useState(true);
   // A single global busy flag disables ALL toggles during any in-flight
   // allocation PUT: each PUT replace-sets the whole half, so two rapid toggles
   // must not fire from stale state and drop one (reviewer M7 ride-along).
   const [busy, setBusy] = useState(false);
 
-  const load = useCallback(async () => {
-    setError("");
-    try {
+  const { data, loading, error: loadError } = useAsyncData(
+    async () => {
       const [{ templates }, { templates: alloc }] = await Promise.all([
         api.listAgentTemplates(),
         api.getTemplateAllocations(),
       ]);
-      setTemplates(templates);
       setAllocations(alloc);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load templates"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+      return { templates };
+    },
+    [],
+    { fallback: "Failed to load templates" },
+  );
+  const templates = useMemo(() => data?.templates ?? [], [data]);
 
   const allocById = useMemo(() => new Map(allocations.map((a) => [a.id, a])), [allocations]);
 
@@ -133,7 +131,7 @@ export function Agents() {
         }
       />
 
-      {error && <Alert message={error} />}
+      {(loadError || error) && <Alert message={loadError || error} />}
       {notice && <Alert message={notice} tone="success" />}
 
       {loading ? (

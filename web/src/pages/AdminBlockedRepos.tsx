@@ -5,9 +5,10 @@
 // Repos page uses inline. Backed by the STORED privilege report, so it inherits R1's
 // caveat: if privilege checks were never run, an empty list is "unknown", not "none".
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { api, type BlockedRepo } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, Textarea } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { Modal } from "../components/Modal";
@@ -24,9 +25,20 @@ function daysSince(iso: string): number {
 
 export function AdminBlockedRepos() {
   const demo = useDemoMode();
-  const [repos, setRepos] = useState<BlockedRepo[]>([]);
-  const [checksUnknown, setChecksUnknown] = useState(false);
-  const [loading, setLoading] = useState(true);
+  // repos + checksUnknown are set only by the load, so they ride in the hook's data
+  // bundle and are read below with the same initial values the old useState had.
+  const { data, loading, error: loadError, reload } = useAsyncData(
+    async () => {
+      const res = await api.adminListBlockedRepos();
+      return { repos: res.repos, checksUnknown: res.checks_unknown };
+    },
+    [],
+    { fallback: "Failed to load blocked repos" },
+  );
+  const repos = data?.repos ?? [];
+  const checksUnknown = data?.checksUnknown ?? false;
+  // Kept local: the Allow-anyway / Revoke handlers below still set the page error, so
+  // it is merged with the hook's load error at the one page-level Alert.
   const [error, setError] = useState("");
   // The repo whose Allow-anyway modal is open, plus the reason and in-flight POST.
   const [allowRepo, setAllowRepo] = useState<BlockedRepo | null>(null);
@@ -36,22 +48,6 @@ export function AdminBlockedRepos() {
   // Alert would sit behind the backdrop, unseen). Distinct from the page `error`.
   const [allowError, setAllowError] = useState("");
   const [revokeBusyId, setRevokeBusyId] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const res = await api.adminListBlockedRepos();
-      setRepos(res.repos);
-      setChecksUnknown(res.checks_unknown);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to load blocked repos"));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
 
   const openAllow = (repo: BlockedRepo) => {
     setError("");
@@ -78,7 +74,7 @@ export function AdminBlockedRepos() {
       await api.setRepoGuardrailOverride(allowRepo.id, reason);
       setAllowRepo(null);
       setAllowReason("");
-      await load();
+      await reload();
     } catch (err) {
       setAllowError(errorMessage(err, "Failed to allow the repo"));
     } finally {
@@ -91,7 +87,7 @@ export function AdminBlockedRepos() {
     setRevokeBusyId(repo.id);
     try {
       await api.clearRepoGuardrailOverride(repo.id);
-      await load();
+      await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to revoke the override"));
     } finally {
@@ -102,7 +98,7 @@ export function AdminBlockedRepos() {
   return (
     <AdminShell description="Every user's repos the push/merge guardrail refuses right now, plus any an admin has explicitly allowed. Fixing branch protection on the forge clears the block on the next sync; an override persists until revoked.">
 
-      {error && <Alert message={error} />}
+      {(error || loadError) && <Alert message={error || loadError} />}
 
       {/* R1 caveat: never let a never-checked connection read as clean. */}
       {checksUnknown && (
