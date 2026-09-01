@@ -433,6 +433,12 @@ and the standing preference here is not to spin up review agents by default (202
   independent of CI, so **if there is no `coderabbitai[bot]` issue comment on the PR by the
   time CI is green (plus a short grace, ~10 min from PR open), treat it as down** and run
   `/code-review` on the PR instead (the user asked for exactly this fallback, 2026-09-01).
+  **Run it at `low` by default; use `medium` only for an important PR** — "important" being
+  the same criteria that escalate to a bespoke `reviewer` (security / auth / credential
+  touching, subtle state / concurrency logic, or a large diff). Low/medium are the
+  "fewer, high-confidence findings" tiers, which is what a fallback pass wants; do not reach
+  for high/max here (user preference, 2026-09-01). Never run `/code-review` at all when a
+  CodeRabbit review already landed — assess that instead; this is strictly the CR-absent path.
   Then merge on green CI + a clean local review, and say in the merge note that the review
   was local because CodeRabbit never appeared. `watch-pr.sh` cannot tell "down" from
   "slow" — it exits 2 on timeout either way — so on a CR-absent PR watch CI directly
