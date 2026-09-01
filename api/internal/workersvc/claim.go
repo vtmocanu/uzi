@@ -393,6 +393,13 @@ type ClaimConfig struct {
 	// is no per-run/per-schedule freeze; the owner's per-user value is the only
 	// source.
 	DefaultEffort *string `json:"default_effort,omitempty"`
+	// AttributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
+	// LIVE from the owner's users row on every claim. When false, the worker suppresses
+	// the Agent SDK's Co-Authored-By: Claude commit trailer for this run (agent-side, a
+	// later milestone). Always sent (NOT omitempty): the column is NOT NULL so the value
+	// is always definite, and an un-upgraded worker that ignores the key keeps today's
+	// behavior (attribution on). Default true = current behavior.
+	AttributionEnabled bool `json:"attribution_enabled"`
 	// OverrideSubagentModel, when true, tells the worker to apply the run's resolved
 	// model (DefaultModel / the lead model) to EVERY subagent, overriding each
 	// template's own model: pin — across both the own roster and the cloned repo's

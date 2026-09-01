@@ -94,6 +94,13 @@ RETURNING *;
 UPDATE users SET ci_autofix_enabled = $2 WHERE id = $1
 RETURNING *;
 
+-- name: SetUserAttributionEnabled :one
+-- Flip a user's AI-attribution opt-out (issue #916). When false the worker suppresses
+-- the SDK's Co-Authored-By: Claude commit trailer; default true (current behavior).
+-- The caller passes the target id: the session user for PUT /api/me/attribution.
+UPDATE users SET attribution_enabled = $2 WHERE id = $1
+RETURNING *;
+
 -- name: SetUserJudgeAnthropicSecret :one
 -- Point a user's JUDGE lane at one of their own Anthropic credentials, or clear the
 -- binding back to their default (PRD #104 M4, D1). Per-user, not per-worker: which
@@ -136,6 +143,12 @@ SELECT default_effort FROM users WHERE id = $1;
 -- reasoning effort. Own-user only; the caller passes the session user's id.
 UPDATE users SET default_effort = @default_effort WHERE id = @id
 RETURNING default_effort;
+
+-- name: GetUserAttributionEnabled :one
+-- The run owner's AI-attribution opt-out (issue #916). Read at run-claim assembly,
+-- keyed on the run owner, so flipping the toggle takes effect on the next claim with
+-- no worker restart. NOT NULL column (default true) → always a definite bool.
+SELECT attribution_enabled FROM users WHERE id = $1;
 
 -- name: GetUserJudgeModel :one
 -- The current user's per-user judge model override (PRD #69 M2); NULL = inherit

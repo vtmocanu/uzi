@@ -441,6 +441,11 @@ export interface ClaimConfig {
    *  worker tracks the SDK's closed set (mirror of the Go `agenttmpl.EffortLevels`
    *  and the web EffortSelect list — no shared source, keep in lockstep). */
   default_effort?: EffortLevel;
+  /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
+   *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
+   *  for this run. Always sent by an upgraded server (NOT null); absent on an older
+   *  server ⇒ treat as true (attribution on, today's behavior). */
+  attribution_enabled?: boolean;
   /** PRD #305: apply the run's resolved model to every subagent, overriding pins,
    *  across both rosters. Absent/false = pins win (today's behavior). */
   override_subagent_model?: boolean;

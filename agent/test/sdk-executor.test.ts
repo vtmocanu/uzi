@@ -299,6 +299,44 @@ describe("SdkExecutor plan gate", () => {
   });
 });
 
+describe("SdkExecutor attribution opt-out (issue #916)", () => {
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+  const planThenDone = (): Script[] => [
+    [submitPlan("# Plan\n- step 1"), resultSuccess()], // planning turn
+    [assistantText("implementing"), signalDone(), resultSuccess()], // loop turn 1
+  ];
+
+  it("explicit false → sets Settings.attribution empty on BOTH the plan and implement turns", async () => {
+    const { queryFn, turns } = fakeTurns(planThenDone());
+    const probe = makeCtx({ agents: [lead, coder, reviewer], config: { attribution_enabled: false } }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(turns.length, 2);
+    // Plan turn carries the suppression...
+    assert.deepEqual(turns[0]!.options.settings, { attribution: { commit: "", pr: "" } });
+    // ...and it cascades into the implement turn via the baseOptions spread.
+    assert.deepEqual(turns[1]!.options.settings, { attribution: { commit: "", pr: "" } });
+  });
+
+  it("explicit true → sets nothing (SDK default preserved, no settings key)", async () => {
+    const { queryFn, turns } = fakeTurns(planThenDone());
+    const probe = makeCtx({ agents: [lead, coder, reviewer], config: { attribution_enabled: true } }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.equal(turns[0]!.options.settings, undefined);
+    assert.equal(turns[1]!.options.settings, undefined);
+  });
+
+  it("absent field (null config) → sets nothing (back-compat with an older server)", async () => {
+    const { queryFn, turns } = fakeTurns(planThenDone());
+    const probe = makeCtx({ agents: [lead, coder, reviewer], config: null }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.equal(turns[0]!.options.settings, undefined);
+    assert.equal(turns[1]!.options.settings, undefined);
+  });
+});
+
 describe("SdkExecutor plan revision loop (PRD #41)", () => {
   const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
   const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };

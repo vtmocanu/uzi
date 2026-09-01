@@ -474,6 +474,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		WaitOnLimit:             u.WaitOnLimit,
 		JudgeEnabled:            u.JudgeEnabled,
 		CIAutofixEnabled:        u.CiAutofixEnabled,
+		AttributionEnabled:      u.AttributionEnabled,
 		EphemeralWorkersEnabled: u.EphemeralWorkersEnabled,
 		CreatedAt:               u.CreatedAt.Time,
 		// The judge binding's id; the LABEL is filled in only by the routes that
@@ -933,6 +934,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// caller's own tokens auto-fixing failed pipelines on their agent MR
 			// branches. Session-scoped identity (never the body), like autopilot.
 			r.Put("/me/ci-autofix", h.SetCIAutofixEnabled)
+			// Current-user AI-attribution opt-out (issue #916): per-user consent for the
+			// worker to stamp the SDK's Co-Authored-By: Claude commit trailer; default on.
+			// Session-scoped identity (never the body), like autopilot.
+			r.Put("/me/attribution", h.SetAttributionEnabled)
 			// Current-user ephemeral-worker auto-provisioning opt-in (PRD #529/#649):
 			// per-user consent to have uzi spin a run-bound throwaway hosted worker for
 			// one of the caller's own unplaceable runs. Session-scoped identity (never

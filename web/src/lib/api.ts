@@ -32,6 +32,11 @@ export interface User {
   // Default false; the user toggles their own from Settings, an admin can force any
   // user's.
   ci_autofix_enabled: boolean;
+  // attribution_enabled is the per-user opt-out for AI attribution in worker commits
+  // (issue #916). Default TRUE (today's behavior): when true the worker's commits keep
+  // the Co-Authored-By: Claude trailer; when false it is suppressed on the user's next
+  // run. Owner-only; toggled from their own Settings.
+  attribution_enabled: boolean;
   // ephemeral_workers_enabled is the per-user opt-in to have the api auto-provision a
   // run-bound throwaway hosted worker when one of the user's runs is unplaceable for a
   // capability (PRD #529/#649). Default false; toggled from the Workers page. No
@@ -3124,6 +3129,10 @@ const realApi = {
   // the body carries no user id. Returns the updated user.
   setCIAutofixEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/ci-autofix", { enabled }),
+  // Flip the current user's AI-attribution opt-out (issue #916). Session identity only —
+  // the body carries no user id. Returns the updated user.
+  setAttributionEnabled: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/attribution", { enabled }),
   // Flip the current user's ephemeral-workers opt-in (PRD #649). Session identity
   // only — the body carries no user id. Returns the updated user.
   setEphemeralWorkersEnabled: (enabled: boolean) =>

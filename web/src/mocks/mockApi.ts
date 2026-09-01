@@ -2366,6 +2366,14 @@ export const mockApi = {
     return delay({ user: { ...u } });
   },
 
+  // ── AI-attribution opt-out (issue #916) ──────────────────────────────────────
+  // Own-user (session identity, never a body id, mirroring the server). Default true.
+  setAttributionEnabled: async (enabled: boolean) => {
+    const u = requireSession();
+    u.attribution_enabled = enabled;
+    return delay({ user: { ...u } }, 200);
+  },
+
   // ── Ephemeral-workers opt-in (PRD #649) ──────────────────────────────────────
   // Own-user (session identity, never a body id, mirroring the server).
   setEphemeralWorkersEnabled: async (enabled: boolean) => {
