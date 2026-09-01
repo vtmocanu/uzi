@@ -137,6 +137,8 @@ jobs:
           # --exit-code` distinguishes a CONFIRMED-absent branch (rc 2, safe to create) from
           # a query error (other rc, fail closed). The bump is surfaced as a tracking issue.
           protected=true
+          push_mode=""
+          expected_sha=""
           if ! open_pr="$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"; then
             echo "gh pr list failed; treating ${BRANCH} as protected (fail closed)." >&2
           elif [ -n "${open_pr}" ]; then
@@ -145,7 +147,7 @@ jobs:
             ls_rc=0
             git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1 || ls_rc=$?
             if [ "${ls_rc}" -eq 2 ]; then
-              protected=false  # remote branch confirmed absent -> safe to create fresh
+              protected=false; push_mode="create"  # remote branch confirmed absent
             elif [ "${ls_rc}" -ne 0 ]; then
               echo "git ls-remote failed (rc=${ls_rc}); treating ${BRANCH} as protected (fail closed)." >&2
             elif git fetch --no-tags origin \
@@ -153,7 +155,10 @@ jobs:
                    "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null; then
               others="$(git diff --name-only "refs/remotes/origin/main...refs/remotes/origin/${BRANCH}" | grep -Fxv "${LOCK}" || true)"
               if [ -z "${others}" ]; then
-                protected=false  # branch carries only the lock commit -> safe to refresh
+                # Only the lock commit -> safe to refresh, but the push below leases against
+                # this exact SHA so a commit landing before the push rejects instead of being lost.
+                protected=false; push_mode="lease"
+                expected_sha="$(git rev-parse "refs/remotes/origin/${BRANCH}")"
               else
                 echo "${BRANCH} carries commits touching files other than ${LOCK}; not clobbering."
               fi
@@ -183,7 +188,25 @@ jobs:
           git checkout -B "${BRANCH}"
           git add "${LOCK}"
           git commit -m "chore(deps): refresh devbox worker toolchain nixpkgs pin"
-          git push --force origin "${BRANCH}"
+
+          # Atomic publish. A confirmed-absent branch is created with a plain push (which
+          # fails, safely, if someone raced us to create it); an existing safe branch is
+          # overwritten with --force-with-lease against the exact SHA the guard fetched, so
+          # a commit landing between the check and the push rejects the lease instead of
+          # being clobbered. Either rejection surfaces a tracking issue, not a failed run.
+          push_rc=0
+          if [ "${push_mode}" = "create" ]; then
+            git push origin "HEAD:refs/heads/${BRANCH}" || push_rc=$?
+          else
+            git push --force-with-lease="refs/heads/${BRANCH}:${expected_sha}" \
+              origin "HEAD:refs/heads/${BRANCH}" || push_rc=$?
+          fi
+          if [ "${push_rc}" -ne 0 ]; then
+            echo "Push to ${BRANCH} rejected (it changed after the safety check); surfacing a tracking issue." >&2
+            upsert_issue "Devbox worker toolchain bump: ${BRANCH} changed during the run" \
+              "$(printf 'The push to `%s` was rejected because it changed after the safety check (a concurrent commit, or a raced branch creation). Re-run the workflow.\n\n%s' "${BRANCH}" "${BODY}")"
+            exit 0
+          fi
 
           if gh pr create --base main --head "${BRANCH}" \
                --title "chore(deps): refresh devbox worker toolchain (nixpkgs pin)" \
