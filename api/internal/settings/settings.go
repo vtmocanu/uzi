@@ -53,8 +53,8 @@ const (
 	// structurally excluded from every value-producing read — see SecretKeys.
 	KeySlackEnabled  = "slack_enabled"
 	KeyPublicBaseURL = "public_base_url"
-	KeySlackBotToken = "slack_bot_token"
-	KeySlackAppToken = "slack_app_token"
+	KeySlackBotToken = "slack_bot_token" //nolint:gosec // G101: DB setting-key name, not a credential value
+	KeySlackAppToken = "slack_app_token" //nolint:gosec // G101: DB setting-key name, not a credential value
 	// Run-judge keys (PRD #46 Decision 7). judge_enabled is the global kill-switch
 	// (text "true"/"false"); judge_model is the model the judge runs on (opus by
 	// default since PRD #69; a model alias, validated with the PRD #17 rules).
@@ -162,7 +162,7 @@ const (
 	// from the forge push PAT; read-only and clone-scoped — it can never push. Its
 	// decrypt accessor lands in M3 (clone auth), so none is added here (an unused
 	// accessor would trip deadcode).
-	KeyAgentSourceCredential = "agent_source_credential"
+	KeyAgentSourceCredential = "agent_source_credential" //nolint:gosec // G101: DB setting-key name, not a credential value
 	// Engine-managed agent-source last-sync status keys (PRD #602 M3). Like the
 	// selfimprove_* engine state, these are deliberately absent from Defaults so
 	// Known() rejects a generic-PUT write; the reconcile job sets them via
@@ -733,15 +733,7 @@ func (c *Cache) DefaultTheme(ctx context.Context) (string, error) {
 // junk-tolerance defaulting OFF, so a malformed value never silently turns the
 // integration on.
 func (c *Cache) SlackEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeySlackEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultSlackEnabled == "true", err
-	}
+	return c.boolSetting(ctx, KeySlackEnabled)
 }
 
 // BrandingConfig is the allowlisted instance-branding config (PRD #685 M1, extended
@@ -805,15 +797,7 @@ func (c *Cache) PublicBaseURL(ctx context.Context) (string, error) {
 // junk-tolerance as SlackEnabled, so a malformed value never silently turns token
 // spend on.
 func (c *Cache) JudgeEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyJudgeEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultJudgeEnabled == "true", err
-	}
+	return c.boolSetting(ctx, KeyJudgeEnabled)
 }
 
 // GithubProjectSyncEnabled reports whether the GitHub Projects v2 Status sync is
@@ -822,15 +806,7 @@ func (c *Cache) JudgeEnabled(ctx context.Context) (bool, error) {
 // the same strict junk-tolerance as JudgeEnabled, so a malformed value never
 // silently starts writing to a user's project board.
 func (c *Cache) GithubProjectSyncEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyGithubProjectSyncEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultGithubProjectSyncEnabled == "true", err
-	}
+	return c.boolSetting(ctx, KeyGithubProjectSyncEnabled)
 }
 
 // EphemeralWorkersEnabled reports whether ephemeral worker auto-provisioning is
@@ -841,15 +817,7 @@ func (c *Cache) GithubProjectSyncEnabled(ctx context.Context) (bool, error) {
 // the per-user opt-in (users.ephemeral_workers_enabled) is checked separately, and
 // both must be true before the provisioner acts.
 func (c *Cache) EphemeralWorkersEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyEphemeralWorkersEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultEphemeralWorkersEnabled == "true", err
-	}
+	return c.boolSetting(ctx, KeyEphemeralWorkersEnabled)
 }
 
 // MrReworkEnabled reports whether the MR review-watcher auto-rework feature is
@@ -868,15 +836,7 @@ func (c *Cache) EphemeralWorkersEnabled(ctx context.Context) (bool, error) {
 // the error to false here — that would move the fail-closed decision away from the
 // caller that owns it.
 func (c *Cache) MrReworkEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyMrReworkEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultMrReworkEnabled == "true", err
-	}
+	return c.boolSetting(ctx, KeyMrReworkEnabled)
 }
 
 // MrReworkCap returns the admin-configured cap on rework cycles per MR (PRD #700 M5
@@ -905,15 +865,7 @@ func (c *Cache) MrReworkCap(ctx context.Context) (int, error) {
 // the same strict junk-tolerance as JudgeEnabled, so a malformed row never
 // silently turns forced token spend on.
 func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyJudgeEnforceAll)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultJudgeEnforceAll == "true", err
-	}
+	return c.boolSetting(ctx, KeyJudgeEnforceAll)
 }
 
 // JudgeModel returns the model alias the judge runs on (PRD #46 Decision 7). Falls
@@ -934,15 +886,7 @@ func (c *Cache) SummaryModel(ctx context.Context) (string, error) {
 // (PRD #602 M3). Strict "true"/"false" with a false fallback, like JudgeEnabled
 // — a malformed value never silently starts cloning an external repo.
 func (c *Cache) AgentSourceEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyAgentSourceEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultAgentSourceEnabled == "true", err
-	}
+	return c.boolSetting(ctx, KeyAgentSourceEnabled)
 }
 
 // AgentSourceRepoURL returns the configured https clone URL (PRD #602 M3), or ""
@@ -1064,30 +1008,14 @@ func (c *Cache) AgentSourceStatus(ctx context.Context) (AgentSourceStatus, error
 // same junk-tolerance as SlackEnabled but defaulting ON, so a malformed value never
 // silently disables the check.
 func (c *Cache) ReleaseCheckEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyReleaseCheckEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultReleaseCheckEnabled == "true", err
-	}
+	return c.boolSetting(ctx, KeyReleaseCheckEnabled)
 }
 
 // ReleaseCheckBannerEnabled reports whether the intrusive escalation banner is
 // enabled (PRD #836 M1). Independent of the master gate: it governs only the banner
 // (the pip and admin card do not depend on it). Same junk-tolerant defaulting ON.
 func (c *Cache) ReleaseCheckBannerEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyReleaseCheckBannerEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultReleaseCheckBannerEnabled == "true", err
-	}
+	return c.boolSetting(ctx, KeyReleaseCheckBannerEnabled)
 }
 
 // ReleaseCheckInterval returns the release-check poll cadence (PRD #836 M1). Stored
@@ -1157,15 +1085,7 @@ func (c *Cache) ReleaseStatus(ctx context.Context) (ReleaseStatus, error) {
 // compiled-in default (true), the same junk-tolerance as SlackEnabled but
 // defaulting ON — a malformed value never silently disables detection.
 func (c *Cache) HealthEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyHealthEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultHealthEnabled == "true", err
-	}
+	return c.boolSetting(ctx, KeyHealthEnabled)
 }
 
 // CapabilityAwareScheduling reports whether capability-aware scheduling is enabled
@@ -1176,15 +1096,7 @@ func (c *Cache) HealthEnabled(ctx context.Context) (bool, error) {
 // clause trivially true (best-effort claiming) while the docker allowlist clause stays
 // enforced.
 func (c *Cache) CapabilityAwareScheduling(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyCapabilityAwareScheduling)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultCapabilityAwareScheduling == "true", err
-	}
+	return c.boolSetting(ctx, KeyCapabilityAwareScheduling)
 }
 
 // HealthStallSeconds / HealthSlowSeconds / HealthQueuedSeconds /
@@ -1283,6 +1195,21 @@ func (c *Cache) intSetting(ctx context.Context, key string) (int, error) {
 		n, _ = strconv.Atoi(Defaults[key])
 	}
 	return n, err
+}
+
+// boolSetting resolves a 3-state bool setting: the stored "true"/"false" text, or
+// the compiled-in default for any other value — the strict junk-tolerance every bool
+// accessor shares. A cold read error is propagated so a strict caller can surface it.
+func (c *Cache) boolSetting(ctx context.Context, key string) (bool, error) {
+	v, err := c.get(ctx, key)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return Defaults[key] == "true", err
+	}
 }
 
 // SlackBotToken returns the effective Slack bot token in plaintext (PRD #25):
