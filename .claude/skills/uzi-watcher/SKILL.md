@@ -252,7 +252,9 @@ Two things the workflow-scope entry does not prepare you for:
 - **Verify the RANGE, not the tip.** `task scan:secrets` reads tracked files at HEAD and
   goes green on a tip that is clean while an earlier commit still carries the literal.
   `resume-recipe.md`'s step-7 pre-flight now runs gitleaks over `origin/main..HEAD` for
-  exactly this reason; after a push-protection rejection, additionally confirm the
+  exactly this reason — read by its `N commits scanned` line as well as `no leaks found`,
+  because it prints the latter with rc 0 on an unresolved ref, and with the in-file allow
+  directives disabled, because GitHub honours none of them; after a push-protection rejection, additionally confirm the
   literal GitHub named is gone from every commit with `git log -S 'THE_LITERAL'
   origin/main..HEAD` (must print nothing) — GitHub's pattern set is not gitleaks', so a
   clean range scan alone does not prove GitHub will accept the push.
@@ -260,6 +262,11 @@ Two things the workflow-scope entry does not prepare you for:
 The fixture form that satisfies both scanners, and why `//gitleaks:allow` is not enough,
 is the authoring-side rule in `.claude/rules/prds.md` (*A PRD whose tests need
 secret-SHAPED strings*); it is not repeated here.
+
+All of this is a per-incident stopgap. The mechanism-level fix — a pre-push range scan in
+the worker's finalize path with a typed `fail_origin`, mirroring the workflow-scope guard in
+`agent/src/ci-config-guard.ts` — is issue #974; until it lands, this subsection is the
+whole remedy, and `uzi run get` reports the class only as free-text `failure_reason`.
 
 ### Proactive backups (before anything goes wrong)
 
