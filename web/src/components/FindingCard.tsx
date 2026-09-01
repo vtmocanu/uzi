@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api, ApiError, isHttpsUrl, type IncidentalFindingFiledIssue } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Badge, Button } from "./ui";
 import { AlertIcon, ExternalLinkIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -60,7 +61,7 @@ export function FindingCard({
       setState("resolved");
       return;
     }
-    setErr(e instanceof ApiError ? e.message : "Could not file the finding");
+    setErr(errorMessage(e, "Could not file the finding"));
   };
 
   const file = async (edits?: { title?: string; description?: string; labels?: string[] }) => {
@@ -91,7 +92,7 @@ export function FindingCard({
       setEditLabels(draft.labels);
       setState("editing");
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : "Could not load the draft");
+      setErr(errorMessage(e, "Could not load the draft"));
     } finally {
       setBusy(false);
     }
@@ -110,7 +111,7 @@ export function FindingCard({
       if (e instanceof ApiError && e.status === 409) {
         setState("resolved");
       } else {
-        setErr(e instanceof ApiError ? e.message : "Could not dismiss the finding");
+        setErr(errorMessage(e, "Could not dismiss the finding"));
       }
     } finally {
       setBusy(false);

@@ -7,7 +7,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type SecretMeta } from "../lib/api";
+import { api, type SecretMeta } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
 import { ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
@@ -31,7 +32,7 @@ export function RunDefaults() {
       // Re-fetch the session so useAuth().user reflects the new opt-in everywhere.
       await refresh();
     } catch (err) {
-      setAutopilotError(err instanceof ApiError ? err.message : "Failed to update autopilot");
+      setAutopilotError(errorMessage(err, "Failed to update autopilot"));
     } finally {
       setAutopilotBusy(false);
     }
@@ -52,7 +53,7 @@ export function RunDefaults() {
       // new default everywhere it is read.
       await refresh();
     } catch (err) {
-      setWaitLimitError(err instanceof ApiError ? err.message : "Failed to update the usage-limit default");
+      setWaitLimitError(errorMessage(err, "Failed to update the usage-limit default"));
     } finally {
       setWaitLimitBusy(false);
     }
@@ -71,7 +72,7 @@ export function RunDefaults() {
       await api.setJudgeEnabled(enabled);
       await refresh();
     } catch (err) {
-      setJudgeError(err instanceof ApiError ? err.message : "Failed to update run judge");
+      setJudgeError(errorMessage(err, "Failed to update run judge"));
     } finally {
       setJudgeBusy(false);
     }
@@ -87,7 +88,7 @@ export function RunDefaults() {
       await api.setJudgeEnabled(user?.judge_enabled ?? false, label === "" ? null : label);
       await refresh();
     } catch (err) {
-      setJudgeError(err instanceof ApiError ? err.message : "Failed to change the judge's token");
+      setJudgeError(errorMessage(err, "Failed to change the judge's token"));
     } finally {
       setJudgeBusy(false);
     }
@@ -103,7 +104,7 @@ export function RunDefaults() {
       await api.setCIAutofixEnabled(enabled);
       await refresh();
     } catch (err) {
-      setCiAutofixError(err instanceof ApiError ? err.message : "Failed to update CI autofix");
+      setCiAutofixError(errorMessage(err, "Failed to update CI autofix"));
     } finally {
       setCiAutofixBusy(false);
     }
@@ -128,7 +129,7 @@ export function RunDefaults() {
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
     } catch (err) {
       setMrReworkError(
-        err instanceof ApiError ? err.message : "Failed to update the MR review setting",
+        errorMessage(err, "Failed to update the MR review setting"),
       );
     } finally {
       setMrReworkBusy(false);
@@ -186,7 +187,7 @@ export function RunDefaults() {
       setSavedEffort(eff);
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load settings");
+      setError(errorMessage(err, "Failed to load settings"));
     } finally {
       setLoading(false);
     }
@@ -214,7 +215,7 @@ export function RunDefaults() {
           : `Worker model set to ${model}. It applies to your next run.`,
       );
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save worker model");
+      setError(errorMessage(err, "Failed to save worker model"));
     } finally {
       setModelBusy(false);
     }
@@ -240,7 +241,7 @@ export function RunDefaults() {
           : `Judge model set to ${model}. It applies to your next judged run.`,
       );
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save judge model");
+      setError(errorMessage(err, "Failed to save judge model"));
     } finally {
       setJudgeModelBusy(false);
     }
@@ -267,7 +268,7 @@ export function RunDefaults() {
           : `Summary model set to ${model}. It applies to your next run's summaries.`,
       );
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save summary model");
+      setError(errorMessage(err, "Failed to save summary model"));
     } finally {
       setSummaryModelBusy(false);
     }
@@ -293,7 +294,7 @@ export function RunDefaults() {
           : `Reasoning effort set to ${eff}. It applies to your next run.`,
       );
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save reasoning effort");
+      setError(errorMessage(err, "Failed to save reasoning effort"));
     } finally {
       setEffortBusy(false);
     }

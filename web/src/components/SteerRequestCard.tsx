@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { api, ApiError, type SteerRequest } from "../lib/api";
+import { api, type SteerRequest } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Button, Textarea } from "./ui";
 import { ChevronsRightIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -31,7 +32,7 @@ export function SteerRequestCard({ request }: { request: SteerRequest }) {
       setState("sent");
     } catch (e) {
       // The server maps 404 → "run not found", 409 → terminal or "issue runs only".
-      setErr(e instanceof ApiError ? e.message : "Action failed");
+      setErr(errorMessage(e, "Action failed"));
     } finally {
       setBusy(false);
     }

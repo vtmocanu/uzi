@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { api, ApiError, isHttpsUrl, type CreatedIssue, type IssueProposal, type ProposalStatus } from "../lib/api";
+import { api, isHttpsUrl, type CreatedIssue, type IssueProposal, type ProposalStatus } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Badge, Button } from "./ui";
 import { ExternalLinkIcon, FileTextIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -31,7 +32,7 @@ export function ProposalCard({ chatId, proposal }: { chatId: string; proposal: I
       setIssue(issue);
       setStatus("confirmed");
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : "Action failed");
+      setErr(errorMessage(e, "Action failed"));
     } finally {
       setBusy(false);
     }
@@ -44,7 +45,7 @@ export function ProposalCard({ chatId, proposal }: { chatId: string; proposal: I
       await api.dismissProposal(chatId, proposal.id); // 204, no body
       setStatus("dismissed");
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : "Action failed");
+      setErr(errorMessage(e, "Action failed"));
     } finally {
       setBusy(false);
     }

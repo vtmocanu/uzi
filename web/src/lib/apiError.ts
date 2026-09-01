@@ -16,3 +16,9 @@ export class ApiError extends Error {
     this.name = "ApiError";
   }
 }
+
+// errorMessage pulls the server-supplied message off an ApiError and otherwise
+// returns the caller's fallback — the one message-extraction idiom every catch site shares.
+export function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof ApiError ? err.message : fallback;
+}

@@ -23,6 +23,7 @@ import {
   type IncidentalFindingBucket,
   type Repo,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
@@ -85,7 +86,7 @@ export function Findings() {
       );
       setBacklog(data);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to load the findings backlog");
+      setError(errorMessage(e, "Failed to load the findings backlog"));
     } finally {
       setLoading(false);
     }
@@ -166,7 +167,7 @@ export function Findings() {
           setResolvedIds((s) => new Set(s).add(findingID));
           load();
         } else {
-          setActionErr(e instanceof ApiError ? e.message : "Could not file the finding");
+          setActionErr(errorMessage(e, "Could not file the finding"));
         }
       }
     },
@@ -184,7 +185,7 @@ export function Findings() {
           setResolvedIds((s) => new Set(s).add(findingID));
           load();
         } else {
-          setActionErr(e instanceof ApiError ? e.message : "Could not dismiss the finding");
+          setActionErr(errorMessage(e, "Could not dismiss the finding"));
         }
       }
     },

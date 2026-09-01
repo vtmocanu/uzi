@@ -18,7 +18,6 @@ import { Link, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import {
   api,
-  ApiError,
   type JudgeBacklog,
   type JudgeBacklogBucket,
   type JudgeCategoryStats,
@@ -29,6 +28,7 @@ import {
   type RecommendationCategory,
   type Repo,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import {
   bucketTabCount,
   bucketTabLabel,
@@ -156,7 +156,7 @@ export function Judge() {
       // would fetch, without the round-trip.
       setJudgeTodo(data.triage.todo);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to load the backlog");
+      setError(errorMessage(e, "Failed to load the backlog"));
     } finally {
       setLoading(false);
     }
@@ -369,7 +369,7 @@ export function Judge() {
           undo: res.settled,
         });
       } catch (e) {
-        setActionErr(e instanceof ApiError ? e.message : "Could not apply the disposition");
+        setActionErr(errorMessage(e, "Could not apply the disposition"));
       }
     },
     [showToast, setJudgeTodo, loadCategoryStats],

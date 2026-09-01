@@ -27,6 +27,7 @@ import {
   type TriageCounts,
   type Worker,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
@@ -713,7 +714,7 @@ export function PoolWaitPanel({
         setNote("This run is no longer waiting.");
         await onResumed();
       } else {
-        setNote(e instanceof ApiError ? e.message : "Could not resume the run.");
+        setNote(errorMessage(e, "Could not resume the run."));
       }
     } finally {
       setBusy(false);
@@ -826,7 +827,7 @@ export function RunView() {
     try {
       await fn();
     } catch (e) {
-      setActionErr(e instanceof ApiError ? e.message : "Action failed");
+      setActionErr(errorMessage(e, "Action failed"));
     } finally {
       setBusy(false);
     }
@@ -2269,7 +2270,7 @@ export function JudgePanel({
       setPendingJudge(pending_judge ?? null);
       setLoadErr("");
     } catch (e) {
-      setLoadErr(e instanceof ApiError ? e.message : "Failed to load the review");
+      setLoadErr(errorMessage(e, "Failed to load the review"));
     } finally {
       setLoading(false);
     }
@@ -2440,7 +2441,7 @@ export function JudgePanel({
       if (e instanceof ApiError && e.status === 409 && /already in progress/i.test(e.message)) {
         await fetchReview();
       } else {
-        setActionErr(e instanceof ApiError ? e.message : "Could not re-run the judge");
+        setActionErr(errorMessage(e, "Could not re-run the judge"));
       }
     } finally {
       setRerunning(false);
@@ -2796,7 +2797,7 @@ function RecommendationFiler({
       setTitle(stripUnsafeChars(draft.title));
       setDescription(stripUnsafeChars(draft.description));
     } catch (e) {
-      setDraftErr(e instanceof ApiError ? e.message : "Could not load the draft");
+      setDraftErr(errorMessage(e, "Could not load the draft"));
     } finally {
       setLoadingDraft(false);
     }
@@ -2810,7 +2811,7 @@ function RecommendationFiler({
       setLocal({ iid: issue.iid, web_url: issue.web_url, warning });
     } catch (e) {
       // Forge rejected the write (mock E): the draft stays open with its edits intact.
-      setFileErr(e instanceof ApiError ? e.message : "Could not file the issue");
+      setFileErr(errorMessage(e, "Could not file the issue"));
     } finally {
       setBusy(false);
     }
@@ -3059,7 +3060,7 @@ function DispositionControls({
       await onChanged();
     } catch (e) {
       focusAfterMutation.current = false;
-      onError(e instanceof ApiError ? e.message : "Could not update the disposition");
+      onError(errorMessage(e, "Could not update the disposition"));
     } finally {
       setBusy(false);
       setMenuOpen(false);

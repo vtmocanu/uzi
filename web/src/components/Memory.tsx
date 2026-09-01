@@ -7,7 +7,8 @@
 // into a future run as untrusted, nonce-fenced context, never as instructions.
 
 import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, type Memory, type MemoryBasis } from "../lib/api";
+import { api, type Memory, type MemoryBasis } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Card, EmptyState, SectionTitle } from "./ui";
 import { ThoughtIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -58,7 +59,7 @@ export function Memory() {
       const { memories } = await api.listMemory();
       setEntries(memories);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load memory");
+      setError(errorMessage(err, "Failed to load memory"));
     } finally {
       setLoading(false);
     }
@@ -74,7 +75,7 @@ export function Memory() {
       await api.deleteMemory(id);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to delete memory");
+      setError(errorMessage(err, "Failed to delete memory"));
     }
   };
 

@@ -11,7 +11,8 @@
 // A user on an instance without hosting has no use for the concept (Decision 12).
 
 import { useEffect, useState, type FormEvent } from "react";
-import { api, ApiError, type HostedConfig, type Worker } from "../lib/api";
+import { api, type HostedConfig, type Worker } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { useAuth } from "../auth/AuthContext";
 import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "./ui";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES } from "../lib/workerTemplates";
@@ -89,7 +90,7 @@ export function HostedWorkers({
       // quota being reached (409 — delete one and retry) from provisioning being
       // switched off underneath us (403 — this card should not have been shown, so
       // our config read is stale) and from the rate limiter (429).
-      setError(err instanceof ApiError ? err.message : "Failed to provision worker");
+      setError(errorMessage(err, "Failed to provision worker"));
     } finally {
       setBusy(false);
     }
@@ -108,7 +109,7 @@ export function HostedWorkers({
       await refresh();
     } catch (err) {
       setEphemeralError(
-        err instanceof ApiError ? err.message : "Failed to update auto-provisioning",
+        errorMessage(err, "Failed to update auto-provisioning"),
       );
     } finally {
       setEphemeralBusy(false);

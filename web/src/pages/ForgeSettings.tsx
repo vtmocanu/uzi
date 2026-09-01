@@ -5,6 +5,7 @@
 
 import { Fragment, useCallback, useEffect, useState } from "react";
 import { api, ApiError, type ForgeConnection, type PrivilegeReport } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { privilegeBadge } from "../lib/privilege";
 import { forgePlatform } from "../lib/forgeNoun";
 import { inferForgeType, defaultUrlForType } from "../lib/forgeInfer";
@@ -125,7 +126,7 @@ export function ForgeSettings() {
         Object.fromEntries(conns.connections.map((c) => [c.id, c.human_username ?? ""])),
       );
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load forge settings");
+      setError(errorMessage(err, "Failed to load forge settings"));
     } finally {
       setLoading(false);
     }
@@ -157,7 +158,7 @@ export function ForgeSettings() {
         setError(err.message);
         setConnectViolations(body?.violations ?? []);
       } else {
-        setError(err instanceof ApiError ? err.message : "Connect failed");
+        setError(errorMessage(err, "Connect failed"));
       }
     } finally {
       setConnecting(false);
@@ -172,7 +173,7 @@ export function ForgeSettings() {
       setNotice(`Verified ${maskUsername(connection.bot_username, "bot", demo)}.`);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Verify failed");
+      setError(errorMessage(err, "Verify failed"));
     } finally {
       setBusyId(null);
     }
@@ -194,7 +195,7 @@ export function ForgeSettings() {
       );
       setExpandedId(id);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Privilege check failed");
+      setError(errorMessage(err, "Privilege check failed"));
     } finally {
       setCheckingId(null);
     }
@@ -207,7 +208,7 @@ export function ForgeSettings() {
       await api.deleteConnection(id);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Delete failed");
+      setError(errorMessage(err, "Delete failed"));
     } finally {
       setBusyId(null);
     }
@@ -231,7 +232,7 @@ export function ForgeSettings() {
       }
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Save failed");
+      setError(errorMessage(err, "Save failed"));
     } finally {
       setBusyId(null);
     }

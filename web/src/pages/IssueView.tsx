@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, isOpenMRConflict, openMRConflictMRIID, preferForgeUrl, type IssueDetail, type RunListItem } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
 import { activeRunInHistory, effectiveRunStatus, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
@@ -68,7 +69,7 @@ export function IssueView() {
       setHasWorker(workers.length > 0);
       setHasToken(hasAnthropicToken(secrets));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load the issue");
+      setError(errorMessage(err, "Failed to load the issue"));
     } finally {
       setLoading(false);
     }
@@ -108,7 +109,7 @@ export function IssueView() {
             await createAndOpen(true);
             return;
           } catch (retryErr) {
-            setError(retryErr instanceof ApiError ? retryErr.message : "Could not start run");
+            setError(errorMessage(retryErr, "Could not start run"));
           }
         }
         // Declined (or forced retry failed): clear starting, no toast on decline.
@@ -116,7 +117,7 @@ export function IssueView() {
         load();
         return;
       }
-      setError(err instanceof ApiError ? err.message : "Could not start run");
+      setError(errorMessage(err, "Could not start run"));
       setStarting(false);
       load();
     }
@@ -140,7 +141,7 @@ export function IssueView() {
       const { card } = await api.promoteIssue(repoId, issue.iid);
       setIssue({ ...issue, labels: card.labels });
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not promote the issue");
+      setError(errorMessage(err, "Could not promote the issue"));
     } finally {
       setPromoting(false);
     }

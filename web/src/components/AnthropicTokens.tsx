@@ -7,7 +7,8 @@
 // and not an edit-in-place field.
 
 import { useEffect, useState, type FormEvent } from "react";
-import { api, ApiError, type AutoStatus, type SecretMeta, type Worker } from "../lib/api";
+import { api, type AutoStatus, type SecretMeta, type Worker } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { isVaultLocked } from "../lib/api";
 import { autoChipFor } from "../lib/rateLimits";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
@@ -27,7 +28,7 @@ const D6_HINT =
 
 function errText(err: unknown, fallback: string): string {
   if (isVaultLocked(err)) return VAULT_LOCKED;
-  return err instanceof ApiError ? err.message : fallback;
+  return errorMessage(err, fallback);
 }
 
 // D5 says the delete confirmation must NAME the affected workers, and it says so

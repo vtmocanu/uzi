@@ -7,7 +7,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type AgentTemplate, type TemplateAllocation } from "../lib/api";
+import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import {
   isLeadTemplateName,
   provenanceBadgeKind,
@@ -52,7 +53,7 @@ export function Agents() {
       setTemplates(templates);
       setAllocations(alloc);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load templates");
+      setError(errorMessage(err, "Failed to load templates"));
     } finally {
       setLoading(false);
     }
@@ -86,7 +87,7 @@ export function Agents() {
       const { templates: next } = await api.setTemplateAllocations({ my_overrides });
       setAllocations(next);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to update allocation");
+      setError(errorMessage(err, "Failed to update allocation"));
     } finally {
       setBusy(false);
     }
@@ -104,7 +105,7 @@ export function Agents() {
       const { templates: next } = await api.setTemplateAllocations({ global_default_ids });
       setAllocations(next);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to update global default");
+      setError(errorMessage(err, "Failed to update global default"));
     } finally {
       setBusy(false);
     }

@@ -20,10 +20,10 @@ import {
 } from "react";
 import {
   api,
-  ApiError,
   type AppSettings,
   type UpdateSettingsPayload,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import {
   Alert,
   Button,
@@ -93,7 +93,7 @@ export function AdminBranding() {
       setAppPresent(brand.app_logo_present);
       setBrandPresent(brand.brand_logo_present);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load branding");
+      setError(errorMessage(err, "Failed to load branding"));
     } finally {
       setLoading(false);
     }
@@ -134,7 +134,7 @@ export function AdminBranding() {
       applySettings(resp.settings);
       setNotice("Branding saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save branding");
+      setError(errorMessage(err, "Failed to save branding"));
     } finally {
       setBusy(false);
     }
@@ -162,7 +162,7 @@ export function AdminBranding() {
       setLogoRev((r) => r + 1);
       setNotice("Logo uploaded.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to upload logo");
+      setError(errorMessage(err, "Failed to upload logo"));
     } finally {
       setBusy(false);
     }
@@ -179,7 +179,7 @@ export function AdminBranding() {
       setLogoRev((r) => r + 1);
       setNotice("Logo removed.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to remove logo");
+      setError(errorMessage(err, "Failed to remove logo"));
     } finally {
       setBusy(false);
     }
