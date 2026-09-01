@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -130,6 +131,7 @@ type apNote struct {
 }
 
 type apForge struct {
+	forgetest.BaseFake
 	events    map[int64][]forge.LabelEvent
 	eventsErr error
 	issue     forge.Issue
@@ -145,9 +147,6 @@ func (f *apForge) ListIssueLabelEvents(_ context.Context, _, iid int64) ([]forge
 	}
 	return f.events[iid], nil
 }
-func (f *apForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
-	return nil, nil
-}
 func (f *apForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
 	return f.issue, f.issueErr
 }
@@ -160,64 +159,6 @@ func (f *apForge) CreateIssueNote(_ context.Context, _, iid int64, body string) 
 		*f.ops = append(*f.ops, "comment")
 	}
 	return forge.IssueNote{ID: 1, Body: body}, nil
-}
-
-// Unused-by-autopilot interface methods.
-func (f *apForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
-	return forge.BotIdentity{}, nil
-}
-func (f *apForge) ListProjects(context.Context) ([]forge.Project, error) { return nil, nil }
-func (f *apForge) ProjectCIConfigPath(context.Context, int64) (string, error) {
-	return "", nil
-}
-func (f *apForge) ListLabels(context.Context, int64) ([]forge.Label, error) { return nil, nil }
-func (f *apForge) EnsureLabels(context.Context, int64, []forge.Label) error { return nil }
-func (f *apForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
-	return forge.Issue{}, nil
-}
-
-// PRD #72 M5: no-op stub — this fake's tests never patch a description.
-func (f *apForge) UpdateIssueDescription(context.Context, int64, int64, string) error {
-	return nil
-}
-
-func (f *apForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
-	return nil
-}
-func (f *apForge) UserExists(context.Context, string) (bool, error) { return false, nil }
-func (f *apForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
-	return forge.MergeRequest{}, nil
-}
-func (f *apForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
-	return nil, nil
-}
-func (f *apForge) ReplyMergeRequestComment(context.Context, int64, int64, string, string) error {
-	return nil
-}
-func (f *apForge) ResolveMergeRequestThread(context.Context, int64, int64, string) error {
-	return nil
-}
-func (f *apForge) TokenInfo(context.Context) (forge.TokenInfo, error) { return forge.TokenInfo{}, nil }
-func (f *apForge) ProjectRole(context.Context, int64, int64) (forge.Role, bool, error) {
-	return forge.RoleNone, false, nil
-}
-func (f *apForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
-	return forge.BranchProtection{}, nil
-}
-
-// Pipeline reads (PRD #6) are unused by this fake — stubbed to satisfy forge.Forge.
-func (f *apForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
-	return forge.Pipeline{}, forge.ErrNoPipeline
-}
-func (f *apForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
-	return forge.Pipeline{}, forge.ErrNoPipeline
-}
-func (f *apForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
-	return nil, nil
-}
-func (f *apForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
-func (f *apForge) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
-	return nil, nil
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
