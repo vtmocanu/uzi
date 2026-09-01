@@ -125,8 +125,8 @@ func TestDeliberatePerListDivergences(t *testing.T) {
 		}
 		// The Slack-only path (slacksvc.ScrubTokens -> ScrubSlackTokens) must carry the
 		// refresh family too; it did not on the first cut of change A (PR #968 review).
-		if out := secretscrub.ScrubSlackTokens("refresh " + xoxe + " here"); strings.Contains(out, xoxe) {
-			t.Errorf("secretscrub.ScrubSlackTokens did not redact the Slack refresh token: %q", out)
+		if out := secretscrub.ScrubSlackTokens("refresh " + xoxe + " here"); out != "refresh [redacted] here" {
+			t.Errorf("secretscrub.ScrubSlackTokens should yield the exact redacted text, got %q", out)
 		}
 		// Recorded divergence: xoxe- is a Slack family, so it lives only in
 		// secretscrub — the snapshot list must NOT redact it.
