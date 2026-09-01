@@ -46,6 +46,29 @@
 
 set -euo pipefail
 
+# --- `--list`: dump the phase registry and exit (PRD #966 M2) ----------------
+# Handled BEFORE the `env -i` re-exec below so it needs no docker and no clean
+# environment — it only reads the phase-file headers. Prints one row per phase
+# (NN slug | lane | critical | title | requires | provides) so a developer can
+# see the registry (and the durable slug identifiers for E2E_ONLY / E2E_SKIP)
+# without standing up the stack.
+if [ "${1:-}" = --list ]; then
+  _list_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  printf '%-4s %-26s %-8s %-9s %-16s %-16s %s\n' \
+    NN SLUG LANE CRITICAL REQUIRES PROVIDES TITLE
+  for _pf in "$_list_root"/e2e/phases/[0-9][0-9]-*.sh; do
+    [ -e "$_pf" ] || continue
+    _base="$(basename "$_pf" .sh)"
+    _nn="${_base%%-*}"
+    _slug="${_base#[0-9][0-9]-}"
+    _hv() { sed -n "s/^# $1:[[:space:]]*//p" "$_pf" | head -1; }
+    printf '%-4s %-26s %-8s %-9s %-16s %-16s %s\n' \
+      "$_nn" "$_slug" "$(_hv lane)" "$(_hv critical)" \
+      "$(_hv requires)" "$(_hv provides)" "$(_hv title)"
+  done
+  exit 0
+fi
+
 # --- shell hygiene: re-exec under a CLEAN environment ------------------------
 # THE HARNESS MUST TEST WHAT THE REPO SHIPS, NOT WHAT THE OPERATOR'S SHELL EXPORTS.
 #
@@ -104,7 +127,8 @@ if [ "${1:-}" != "--e2e-sanitized" ]; then
     HOME PATH TMPDIR TERM CI \
     DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY DOCKER_TLS_CERTDIR \
     UZI_E2E_EXECUTOR UZI_E2E_COMPOSE_PROJECT UZI_E2E_COMPLETE_TIMEOUT UZI_E2E_FORGE \
-    E2E_RUN_DIR E2E_GIT_SMART_HTTP KEEP_STACK KEEP_RUNDIR
+    E2E_RUN_DIR E2E_GIT_SMART_HTTP KEEP_STACK KEEP_RUNDIR \
+    PHASES_DIR E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE
   do
     [ -n "${!_v+set}" ] && _e2e_env+=("$_v=${!_v}")
   done
@@ -167,11 +191,15 @@ fi
 RUNROOT="${E2E_RUN_DIR:-${TMPDIR:-/tmp}/uzi-e2e-$$}"
 RUNROOT="${RUNROOT%/}"
 ENVFILE="$RUNROOT/e2e.env"
+# shellcheck disable=SC2034  # read by lib.sh csrf/login/apiget (PRD #966 M1 split)
 JAR="$RUNROOT/admin.jar"
+# shellcheck disable=SC2034  # read by lib.sh cleanup (PRD #966 M1 split)
 KEEP="${KEEP_RUNDIR:-}"
 
 # Dummy credentials (must match the api overlay's seed literals).
+# shellcheck disable=SC2034  # read by lib.sh login (PRD #966 M1 split)
 ADMIN_EMAIL="admin@uzi.e2e"
+# shellcheck disable=SC2034  # read by lib.sh login (PRD #966 M1 split)
 ADMIN_PASS="e2e-admin-password-000000"
 # shellcheck disable=SC2034  # read by phase files (PRD #966 M1 split)
 DUMMY_FORGE_PAT="e2e-dummy-forge-pat-000000"
@@ -179,10 +207,12 @@ DUMMY_FORGE_PAT="e2e-dummy-forge-pat-000000"
 DUMMY_ANTHROPIC="sk-ant-e2e-dummy-do-not-use-000000"
 
 WEB_PORT="$(( 20000 + (RANDOM % 20000) ))"
+# shellcheck disable=SC2034  # read by lib.sh api helpers (PRD #966 M1 split)
 BASE="http://127.0.0.1:${WEB_PORT}"
 # forge-fake's /_e2e surface, published on the next loopback port (see the
 # fake_post/fake_state helpers below).
 FAKE_PORT="$(( WEB_PORT + 1 ))"
+# shellcheck disable=SC2034  # read by lib.sh fake_post/fake_state (PRD #966 M1 split)
 FAKE_BASE="https://127.0.0.1:${FAKE_PORT}"
 
 COMPOSE=(docker compose -p "$PROJECT" --project-directory "$ROOT" --env-file "$ENVFILE"
@@ -230,37 +260,19 @@ pass "board columns seeded"
 
 # =============================================================================
 
-# --- phase registry driver (PRD #966 M1) -------------------------------------
-# Source each phase file in lexical order (05/06 forge lanes, then 10..51 gitlab)
-# in the SAME process: plain `source`, no subshell, no fail-soft — fail() keeps
-# its `exit 1`, so reaching the roll-call below means every phase passed. The
-# driver semantics (fail-soft, contract validation, quarantine, selection,
-# listing) are M2. The lane filter reproduces today's behaviour: a phase whose
-# `lane:` names a specific forge runs only when it matches $FORGE; a gitlab run
-# therefore skips the two focused forge lanes, exactly as the old
-# `if [ "$FORGE" = … ]; then … exit 0; fi` wrappers did.
+# --- phase registry driver (PRD #966 M2) -------------------------------------
+# All driver semantics — lane filter, ONLY/SKIP selection, requires validation,
+# the errexit-safe subshell-per-phase, provides round-trip, fail-soft + critical,
+# end-of-phase quarantine, results (results.tsv / junit.xml / summary.md) and the
+# roll-call — live in e2e/driver.sh. It is sourced HERE at top level (never inside
+# a function) so its loop and its `source "$RUNROOT/phase.env.next"` run in this
+# shell: a `declare -p`-dumped var re-sourced inside a function becomes
+# function-local, which would silently break every phase's `provides:`.
 #
-# The driver emits no `==> ` banner (the phases emit their own, inside the moved
-# bodies); its progress line uses a `[phase]` prefix so it never enters the SC1
-# banner diff.
-RAN_TITLES=()
-for f in "$ROOT"/e2e/phases/[0-9][0-9]-*.sh; do
-  lane="$(sed -n 's/^# lane:[[:space:]]*//p' "$f" | head -1)"
-  case "$lane" in ""|any|"$FORGE") ;; *) continue ;; esac
-  title="$(sed -n 's/^# title:[[:space:]]*//p' "$f" | head -1)"
-  printf '[phase] %s\n' "$(basename "$f" .sh)"
-  # shellcheck disable=SC1090  # phase path is a runtime glob; not statically resolvable
-  source "$f"
-  RAN_TITLES+=("$title")
-done
-
-# --- roll-call (PRD #966 M1) -------------------------------------------------
-# Generated from the phases that actually ran, replacing the old hand-maintained
-# "All E2E checks passed. (M6 runtime + …)" string. It is the only place a reader
-# who did not watch the output learns what the run covered, so PRD #98 M8c's
-# "landed invisible to the summary" hole cannot reopen: a phase that ran is named
-# here by construction. Reaching this line means every phase passed (fail() exits 1).
-printf '\n\033[32mAll E2E checks passed.\033[0m (executor=%s%s)\n' "$EXECUTOR" "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}"
-for t in "${RAN_TITLES[@]}"; do
-  printf '  - %s\n' "$t"
-done
+# driver.sh reads the functions (say/pass/fail/db_psql/apipost/apipost_code/
+# wait_status) and globals (ROOT/RUNROOT/ENVFILE/FORGE/EXECUTOR) established above,
+# plus the E2E_ONLY / E2E_SKIP / E2E_STRICT_LEAKS / E2E_FAULT_PHASE knobs (kept in
+# the env -i allowlist at the top of this file). It ENDS WITH `exit`, so this is
+# the last thing the entry script runs and its exit drives the cleanup trap.
+# shellcheck disable=SC1090  # $ROOT is a runtime path; driver.sh is sourced by design
+source "$ROOT/e2e/driver.sh"
