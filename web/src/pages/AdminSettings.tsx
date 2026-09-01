@@ -148,14 +148,19 @@ export function AdminSettings() {
   // loading and the load error (surfaced as loadError, unioned with the save error at
   // the Alert below); masterSealed stays local, set as a side effect.
   const { loading, error: loadError } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       try {
-        applyResponse(await api.getSettings());
+        const resp = await api.getSettings();
+        if (isCurrent()) applyResponse(resp);
       } finally {
         api
           .vaultMigration()
-          .then(({ master_sealed }) => setMasterSealed(master_sealed))
-          .catch(() => setMasterSealed(null));
+          .then(({ master_sealed }) => {
+            if (isCurrent()) setMasterSealed(master_sealed);
+          })
+          .catch(() => {
+            if (isCurrent()) setMasterSealed(null);
+          });
       }
     },
     [applyResponse],
@@ -757,8 +762,9 @@ function UpdatesSettingsCard() {
   // skeleton: "always" mirrors the old load's setLoading(true) on every call, so a
   // Retry (reload) re-arms the skeleton exactly as it did before.
   const { loading, error: loadError, reload } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const { release_check } = await api.getReleaseCheck();
+      if (!isCurrent()) return;
       setStatus(release_check);
     },
     [],
@@ -1330,8 +1336,9 @@ function AgentSourceSettingsCard() {
   // reload() below — while refreshView (used by Sync/Approve/Bump) deliberately does
   // NOT, preserving unsaved edits. The hook owns loading + the load error only.
   const { loading, error: loadError, reload } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const { agent_source } = await api.getAgentSource();
+      if (!isCurrent()) return;
       resetForm(agent_source);
     },
     [resetForm],

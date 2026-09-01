@@ -40,8 +40,9 @@ export function SlackNotifications() {
   // state without a refetch), so it stays local state and the fetcher sets it as a
   // side effect rather than being bundled into the hook's `data`.
   const { loading, error: loadError } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const { slack } = await api.getMySlack();
+      if (!isCurrent()) return;
       setLink(slack);
       setOverride(slack.member_id ?? "");
     },

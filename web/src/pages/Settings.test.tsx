@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -239,5 +240,57 @@ describe("Settings — per-token 'Show in sidebar' toggle", () => {
       expect(mockApi.putMySettings).toHaveBeenCalledWith({ sidebar_token_ids: ["sec-2"] }),
     );
     await waitFor(() => expect(extra.checked).toBe(true));
+  });
+});
+
+// ── Item 2 (issue #961): a stable `secrets` identity while `data` is null ──
+// Pre-fix `const secrets = data?.secrets ?? []` minted a fresh array identity on every
+// render WHILE `data` was null (during the load, and after a load failure `data` stays
+// null): `undefined ?? []` builds a new `[]` each render. AnthropicTokens' two fetching
+// effects are keyed on `[secrets]` (listWorkers, getMyRateLimits), so every re-render in
+// that window re-fired both requests and flickered the auto-fetch chips. The
+// `useMemo(() => data?.secrets ?? [], [data])` fix memoizes the fallback on the (stable
+// null) `data`, so a re-render with `data` unchanged reuses the same `[]` and the effects
+// do not re-run. (Once `data` loads, `data?.secrets ?? []` already returns the stable
+// `data.secrets` — the churn is null-window-only, which is why this test keeps data null.)
+describe("Settings — stable secrets identity while data is null (item 2)", () => {
+  it("does not re-fire the token card's [secrets]-keyed fetches on a re-render while data is null", async () => {
+    // Fail the settings load so `data` stays null across re-renders (the churn window).
+    mockApi.listSecrets.mockRejectedValue(new Error("load boom"));
+
+    const { rerender } = render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    // Mount seeds the token card with secrets=[] and runs both effects once; the load then
+    // fails and leaves data null. Wait for both to settle, then reset the counters.
+    await waitFor(() => expect(mockApi.listWorkers).toHaveBeenCalled());
+    await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
+    await screen.findByText("Failed to load settings");
+    mockApi.listWorkers.mockClear();
+    mockApi.getMyRateLimits.mockClear();
+
+    // Re-render Settings twice with `data` still null (no refetch: the hook's deps are []).
+    rerender(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    rerender(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    // Flush passive effects so any re-run would be visible by the assertion.
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Fixed: memoized `[]` is stable across the re-renders, so neither effect re-runs.
+    // Mutation-checked: reverting Settings.tsx to `data?.secrets ?? []` mints a fresh `[]`
+    // each re-render and both fetches fire again here (observed red).
+    expect(mockApi.listWorkers).not.toHaveBeenCalled();
+    expect(mockApi.getMyRateLimits).not.toHaveBeenCalled();
   });
 });

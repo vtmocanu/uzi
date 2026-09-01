@@ -259,14 +259,19 @@ export function Notifications() {
   // skeleton:"deps" reproduces the old setLoading(true) that lived in the EFFECT — it
   // fired on every scope switch (a deps-driven refetch) but not on a manual reload.
   const { loading, error: loadError } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const res = await fetchPage(0);
+      if (!isCurrent()) return;
       setItems(res.notifications);
       setUnread(res.unread);
       setTotal(res.total);
     },
     [fetchPage],
-    { skeleton: "deps", fallback: "Failed to load notifications" },
+    {
+      skeleton: "deps",
+      fallback: "Failed to load notifications",
+      onFetchStart: () => setError(""),
+    },
   );
 
   const displayError = error || loadError;

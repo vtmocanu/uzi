@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { act, cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { IssueView } from "./IssueView";
 import { api, ApiError, type Card, type IssueDetail, type Run, type SecretMeta, type Worker } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -562,5 +562,123 @@ describe("IssueView — a long column name does not overflow the page (web-ux S3
     renderIssueView();
     await screen.findByText("A small typo fix");
     expect(screen.getByText("In Progress")).toBeTruthy();
+  });
+});
+
+// Issue #961 item 3 (m2). Navigating A→B on the same route element refetches on the
+// [repoId, iidNum] deps change. If A's in-flight fetch resolves AFTER B's, its
+// `setIssue(A)` must be dropped: the fetcher guards `setIssue` with `if (isCurrent())`,
+// and the hook's own generation guard already protects `data` (the runs). Without the
+// guard the header flips to A's title while the runs stay B's — the exact "A's header
+// beside B's runs" mix this pins against.
+//
+// Mutation-checked: dropping `if (isCurrent())` around setIssue makes A's late resolve
+// call setIssue(A), so "Issue A" renders (observed red: Unable to satisfy — "Issue A"
+// found where the test expects null, "Issue B" header replaced).
+describe("IssueView — a superseded fetch cannot seed a stale issue header (item 3)", () => {
+  function NavToB() {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate("/repos/repo-1/issues/8")}>
+        go to B
+      </button>
+    );
+  }
+
+  it("keeps B's header when A's fetch resolves last", async () => {
+    setAuth();
+
+    let resolveA!: (v: { issue: IssueDetail }) => void;
+    let resolveB!: (v: { issue: IssueDetail }) => void;
+    const pA = new Promise<{ issue: IssueDetail }>((r) => (resolveA = r));
+    const pB = new Promise<{ issue: IssueDetail }>((r) => (resolveB = r));
+    mockApi.getIssue.mockImplementation((_repo: string, iid: number) => (iid === 7 ? pA : pB));
+
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route
+            path="/repos/:repoId/issues/:iid"
+            element={
+              <>
+                <NavToB />
+                <IssueView />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    // A is in flight (getIssue(7) pending); navigate to B before A resolves.
+    await waitFor(() => expect(mockApi.getIssue).toHaveBeenCalledWith("repo-1", 7));
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await waitFor(() => expect(mockApi.getIssue).toHaveBeenCalledWith("repo-1", 8));
+
+    // B resolves first and lands its header...
+    await act(async () => {
+      resolveB({ issue: anIssue({ iid: 8, title: "Issue B" }) });
+    });
+    await screen.findByText("Issue B");
+
+    // ...then A resolves LAST and must be dropped as stale — no A/B header mix.
+    await act(async () => {
+      resolveA({ issue: anIssue({ iid: 7, title: "Issue A" }) });
+    });
+    expect(screen.getByText("Issue B")).toBeTruthy();
+    expect(screen.queryByText("Issue A")).toBeNull();
+  });
+});
+
+// Issue #961 item 4a (m2). A promote failure sets the shared `error` slot. Navigating to
+// another issue is a deps refetch; onFetchStart wipes that error so a stale promote toast
+// does not bleed onto the next issue (matching the two startRun paths that already wipe it).
+//
+// Mutation-checked: removing the onFetchStart opt leaves the promote error on screen after
+// navigation (observed red: "forge said no" still present, expected null).
+describe("IssueView — a promote error clears on issue navigation (item 4a)", () => {
+  function NavToB() {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate("/repos/repo-1/issues/8")}>
+        go to B
+      </button>
+    );
+  }
+
+  it("wipes the promote error when navigating to another issue", async () => {
+    setAuth();
+    mockApi.getIssue.mockImplementation(async (_repo: string, iid: number) => ({
+      issue:
+        iid === 7
+          ? anIssue({ iid: 7, title: "Issue A", labels: ["documentation"] })
+          : anIssue({ iid: 8, title: "Issue B", labels: ["documentation"] }),
+    }));
+    mockApi.promoteIssue.mockRejectedValue(new ApiError(500, "forge said no"));
+
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route
+            path="/repos/:repoId/issues/:iid"
+            element={
+              <>
+                <NavToB />
+                <IssueView />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("Issue A");
+    fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
+    await waitFor(() => expect(screen.getByText("forge said no")).toBeTruthy());
+
+    // Navigate to B: the deps refetch fires onFetchStart, wiping the promote error.
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+    expect(screen.queryByText("forge said no")).toBeNull();
   });
 });

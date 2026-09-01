@@ -83,14 +83,13 @@ export function Findings() {
     error,
     reload: load,
   } = useAsyncData(
-    async () => {
-      setBacklog(
-        await api.listFindings(
-          bucket as IncidentalFindingBucket,
-          repoFilter || undefined,
-          runAnchor || undefined,
-        ),
+    async ({ isCurrent }) => {
+      const rows = await api.listFindings(
+        bucket as IncidentalFindingBucket,
+        repoFilter || undefined,
+        runAnchor || undefined,
       );
+      if (isCurrent()) setBacklog(rows);
     },
     [bucket, repoFilter, runAnchor],
     { skeleton: "always", fallback: "Failed to load the findings backlog" },

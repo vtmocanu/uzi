@@ -91,8 +91,9 @@ export function AdminBranding() {
   // so the fetcher seeds them as side effects exactly as the old load did; the hook
   // only owns loading + the load error.
   const { loading, error: loadError } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const [resp, brand] = await Promise.all([api.getSettings(), api.branding()]);
+      if (!isCurrent()) return;
       applySettings(resp.settings);
       setAppPresent(brand.app_logo_present);
       setBrandPresent(brand.brand_logo_present);
