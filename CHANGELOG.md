@@ -18,12 +18,34 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.73.0] - 2026-09-01
+
 ### Added
 
 - **Slack DM when a locked vault is blocking your work ([#890](https://github.com/vtmocanu/uzi/issues/890)).**
   A boot reconciler now DMs each Slack-linked user whose locked vault is blocking a queued run or a due schedule, once per lock-episode, so they unlock before the work silently stalls; the copy is cause-neutral (it never asserts a restart as the cause) and reuses the existing Slack notification gate.
 - **`scripts/init-env.sh` generates the local secrets so a fresh `docker compose up` just works ([#894](https://github.com/vtmocanu/uzi/issues/894)).**
   A new `./scripts/init-env.sh` (also `task init`) writes `.env` with freshly generated `JWT_SECRET`, `UZI_SECRET_KEY` and `POSTGRES_PASSWORD`, starting from `.env.example` so every other option stays documented; it is generate-once (writes only when `.env` is absent and never regenerates, keeping the encryption key and Postgres password stable), the `${VAR:?}` compose guards are unchanged so a non-local misconfig still fails loudly, and the Kubernetes/Helm deploy still uses explicit secrets.
+- **Clickable MR/PR chip in the Runs view ([#803](https://github.com/vtmocanu/uzi/issues/803), PR [#901](https://github.com/vtmocanu/uzi/pull/901)).**
+  The merge-request chip on a run row is now a real deep-link to the forge request, preferring the persisted `mr_web_url` and otherwise reconstructing it from the run's own issue URL; it opens in a new tab while the rest of the card still follows the stretched link to the run detail.
+- **Ephemeral workers default to auto-select credential mode ([#804](https://github.com/vtmocanu/uzi/issues/804), PR [#905](https://github.com/vtmocanu/uzi/pull/905)).**
+  An auto-provisioned throwaway worker now defaults to auto-select (using the owner's eligible token pool) instead of "use my default token", conditioned on a non-empty pool to avoid a pool-wait stall; a user's first or sole Anthropic token is born auto-eligible (new writes plus a backfill migration for existing sole-token users), so a single-token user's run spends their own token. Pinned and persistent workers are unchanged.
+
+### Changed
+
+- **Docs accuracy pass across the in-app and CLI docs ([#664](https://github.com/vtmocanu/uzi/issues/664), PR [#903](https://github.com/vtmocanu/uzi/pull/903)).**
+  Folded CodeRabbit findings from PR [#656](https://github.com/vtmocanu/uzi/pull/656) into the shipped docs (Homebrew `brew trust` per-formula wording, run-summary model description, CI-autofix token wording, 2FA and OIDC clarification, and others), keeping the `docs/` source and the embedded `api/internal/uzidocs/embed` mirror in sync.
+
+### Fixed
+
+- **self_improve run no longer fails on `fetchAgentBranch` ([#887](https://github.com/vtmocanu/uzi/issues/887), PR [#902](https://github.com/vtmocanu/uzi/pull/902)).**
+  The legacy flat `refs/uzi-runner/uzi/self-improve` tracking ref D/F-conflicted with the new per-cycle `refs/uzi-runner/uzi/self-improve/<runId>` ref; the conflicting ancestor is now archived and cleared before the fetch, so per-cycle self-improve runs succeed.
+- **Sidebar forecast rate-limit tooltip keeps the "resets in" countdown ([#859](https://github.com/vtmocanu/uzi/issues/859), PR [#904](https://github.com/vtmocanu/uzi/pull/904)).**
+  Forecast rows now carry the reset countdown in their tooltip, matching the safe rows.
+- **Plan-submission serialization nudge to cut retry loops ([#858](https://github.com/vtmocanu/uzi/issues/858), PR [#900](https://github.com/vtmocanu/uzi/pull/900)).**
+  The plan prompt now nudges the lead to keep `plan_md` valid JSON (escaped paths, no unescaped control characters, one complete piece), reducing SDK-side rejections that forced whole-plan re-emits. A mitigation, not a full fix.
+- **judge-runner tolerates prose before the JSON inside a fenced block (PR [#907](https://github.com/vtmocanu/uzi/pull/907)).**
+  `extractJsonObject` now runs the balanced-object scan on the fence inner content, so a model assessment with a prose preamble inside the fenced block still parses.
 
 ## [0.72.1] - 2026-08-31
 
@@ -3611,7 +3633,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.72.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.73.0...HEAD
+[0.73.0]: https://github.com/vtmocanu/uzi/compare/v0.72.1...v0.73.0
 [0.72.1]: https://github.com/vtmocanu/uzi/compare/v0.72.0...v0.72.1
 [0.72.0]: https://github.com/vtmocanu/uzi/compare/v0.71.2...v0.72.0
 [0.71.2]: https://github.com/vtmocanu/uzi/compare/v0.71.1...v0.71.2
