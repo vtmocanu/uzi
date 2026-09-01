@@ -87,14 +87,28 @@ cd <the repo>                              # your normal checkout; work happens 
    ```sh
    git add -A && git commit -m "chore: recover work from run RUN"   # skip if step 5 restored nothing
    ```
-7. **Pre-flight (both `.github/workflows` checks must be empty)** — confirms no workflow
+7. **Pre-flight (both `.github/workflows` checks must be empty, and gitleaks over the RANGE clean)** — confirms no workflow
    surprise (YOUR token has `workflow` scope, so an intended workflow edit is fine to push;
    an empty result just means a plain rebase already landed main's copy):
    ```sh
    git diff --name-only origin/main..HEAD -- .github/workflows/
    git log  --name-only origin/main..HEAD -- .github/workflows/
    git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty
+   git rev-list --count origin/main..HEAD                                     # the range length: must be > 0, and must equal the scan's "N commits scanned" line below
+   go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --log-opts="origin/main..HEAD" --no-banner --ignore-gitleaks-allow   # EVERY commit in the range (push protection scans them all); pinned like scripts/scan-secrets.sh
    ```
+   Read the scan by its two lines, not by its exit code: `N commits scanned.` must match the
+   `rev-list` count (measured on 8.30.1: an unresolved `origin/main` prints a git `fatal`,
+   then `0 commits scanned.`, then `no leaks found`, rc 0 — the fail-open shape), and then
+   `no leaks found`. `--ignore-gitleaks-allow` matters because GitHub honours no in-file
+   allow directive; a `.gitleaksignore` or a `.gitleaks.toml` allowlist would silence this
+   scan the same way, so a green here with either present in the tree proves nothing.
+   After a push-protection rejection specifically, also run `git log -S 'THE_LITERAL' origin/main..HEAD` (the literal
+   GitHub named) — it must print nothing AND exit 0, after the `rev-list` count above has
+   already proven the range resolves: an unresolved ref prints nothing too, with a `fatal`
+   on stderr and rc 128, which reads as "literal gone" if only stdout is watched. GitHub's pattern set is not gitleaks',
+   so a clean range scan alone does not prove the push will be accepted; see SKILL.md's
+   *Push protection* subsection for the fold-into-the-introducing-commit step that precedes it.
 8. **Gate the touched components** (only the ones the diff touches): `task gate:api`,
    `gate:web`, `gate:agent`, `gate:controller`, and `./e2e/run-store-it.sh` if a `*_livedb`
    test changed. Use the repo's pinned toolchains (`GOTOOLCHAIN`, node@24 for web — see the

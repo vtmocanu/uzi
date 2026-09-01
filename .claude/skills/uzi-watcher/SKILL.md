@@ -230,6 +230,45 @@ in this skill dir is the consolidated, run-kind-agnostic recipe for landing it: 
 isolated worktree → restore uncommitted → rebase → pre-flight (workflow/migration) → gate →
 PR → admin-merge → cleanup.
 
+### Push protection: the second push-rejection class, and it changes one landing step
+
+**A `GH013 … Push cannot contain secrets` rejection is GitHub Push Protection, not the
+workflow-scope guardrail, and the work is recoverable the same way (see above).**
+Measured 2026-09-01 on #954: the run finished all three milestones, its `task gate:api`
+was green, and the push was refused for a "GitLab Access Token" — two 20-character
+`glpat-` TEST FIXTURES that a widened scrub pattern had forced from `glpat-x`. `task
+scan:secrets` (gitleaks) flags the same lines, but it lives in `gate:repo`, which the
+worker's component gate never runs.
+
+Two things the workflow-scope entry does not prepare you for:
+
+- **Push protection scans EVERY commit in the push, so a fix commit on top is refused
+  too.** Rewriting the literal at the tip and pushing again fails identically, with the
+  ORIGINAL commit named in the message. The literal must leave the commit that introduced
+  it before the first push, and nothing is on the remote yet, so this is plain history
+  editing: fix the file, `git add` it, then `git commit --fixup=INTRO_SHA` and
+  `GIT_SEQUENCE_EDITOR=: git rebase --autosquash -i origin/main` — the fix lands in that
+  commit and every later commit replays unchanged (verified on a three-commit stack).
+- **Verify the RANGE, not the tip.** `task scan:secrets` scans the working tree as it is on
+  disk (`gitleaks dir`) and gates on the index — one snapshot — so it goes green on a tip
+  that is clean while an earlier commit still carries the literal.
+  `resume-recipe.md`'s step-7 pre-flight now runs gitleaks over `origin/main..HEAD` for
+  exactly this reason — read by its `N commits scanned` line as well as `no leaks found`,
+  because it prints the latter with rc 0 on an unresolved ref, and with the in-file allow
+  directives disabled, because GitHub honours none of them; after a push-protection rejection, additionally confirm the
+  literal GitHub named is gone from every commit with `git log -S 'THE_LITERAL'
+  origin/main..HEAD` (must print nothing and exit 0, on a range already proven to resolve) — GitHub's pattern set is not gitleaks', so a
+  clean range scan alone does not prove GitHub will accept the push.
+
+The fixture form that satisfies both scanners, and why `//gitleaks:allow` is not enough,
+is the authoring-side rule in `.claude/rules/prds.md` (*A PRD whose tests need
+secret-SHAPED strings*); it is not repeated here.
+
+All of this is a per-incident stopgap. The mechanism-level fix — a pre-push range scan in
+the worker's finalize path with a typed `fail_origin`, mirroring the workflow-scope guard in
+`agent/src/ci-config-guard.ts` — is issue #974; until it lands, this subsection is the
+whole remedy, and `uzi run get` reports the class only as free-text `failure_reason`.
+
 ### Proactive backups (before anything goes wrong)
 
 The recovery above is reactive — after a push rejection or a lost run. When you are
@@ -738,9 +777,11 @@ as supersession.
 ## When a run fails
 
 Read the reason: `uzi run get RUN --json | jq '{status, failure_reason, health_reason}'`.
-Common causes: the workflow-scope push rejection above; a `limit_wait` that never cleared;
-a genuine gate failure. Report the `failure_reason` verbatim and decide re-run vs. revise
-vs. hand back to the user.
+Common causes: the workflow-scope push rejection above; a GitHub Push Protection
+rejection (`GH013 … Push cannot contain secrets` — see *Push protection* under the PVC
+recovery section: recoverable, but the fix must be folded into the introducing commit);
+a `limit_wait` that never cleared; a genuine gate failure.
+Report the `failure_reason` verbatim and decide re-run vs. revise vs. hand back to the user.
 
 ## Cross-session handoff
 
