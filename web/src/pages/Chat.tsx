@@ -8,7 +8,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { api, ApiError, isTerminalRun, type Chat as ChatDTO, type Run, type Worker } from "../lib/api";
+import { api, isTerminalRun, type Chat as ChatDTO, type Run, type Worker } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import {
   CHAT_MAX_TURNS,
   chatFromRun,
@@ -79,7 +80,7 @@ export function ChatList() {
       setChats(sortConversations(chatRes.chats));
       setWorkers(workers);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to load chats");
+      setError(errorMessage(e, "Failed to load chats"));
     } finally {
       setLoading(false);
     }
@@ -102,7 +103,7 @@ export function ChatList() {
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
       navigate(`/chat/${encodeURIComponent(run.id)}`, { state: { seed: chatFromRun(run) } });
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to start the chat");
+      setError(errorMessage(e, "Failed to start the chat"));
       setStarting(false);
     }
   };
@@ -185,7 +186,7 @@ function ConversationRow({
       const { run } = await api.continueChat(chat.id);
       onContinued(run);
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : "Failed to continue the chat");
+      onError(errorMessage(err, "Failed to continue the chat"));
       setBusy(false);
     }
   };
@@ -257,7 +258,7 @@ export function ChatConversation() {
     try {
       await fn();
     } catch (e) {
-      setActionErr(e instanceof ApiError ? e.message : "Action failed");
+      setActionErr(errorMessage(e, "Action failed"));
     } finally {
       setBusy(false);
     }

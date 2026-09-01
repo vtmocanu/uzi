@@ -8,6 +8,7 @@ import {
   type AgentTemplateInput,
   type BuiltinDefinition,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import {
   driftedColumns,
   provenanceBadgeKind,
@@ -91,7 +92,7 @@ export function AgentDetail() {
         }
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load template");
+      setError(errorMessage(err, "Failed to load template"));
     } finally {
       setLoading(false);
     }
@@ -110,7 +111,7 @@ export function AgentDetail() {
       setTemplate(template);
       setNotice("Saved.");
     } catch (err) {
-      setFormError(err instanceof ApiError ? err.message : "Failed to save");
+      setFormError(errorMessage(err, "Failed to save"));
     } finally {
       setBusy(false);
     }
@@ -162,7 +163,7 @@ export function AgentDetail() {
       // reading as the same claim.
       setNotice("Reset to the shipped definition.");
     } catch (err) {
-      setFormError(err instanceof ApiError ? err.message : "Failed to reset");
+      setFormError(errorMessage(err, "Failed to reset"));
     } finally {
       setBusy(false);
     }
@@ -175,7 +176,7 @@ export function AgentDetail() {
       await api.deleteAgentTemplate(id);
       navigate("/agents");
     } catch (err) {
-      setFormError(err instanceof ApiError ? err.message : "Failed to delete");
+      setFormError(errorMessage(err, "Failed to delete"));
       setBusy(false);
     }
   };

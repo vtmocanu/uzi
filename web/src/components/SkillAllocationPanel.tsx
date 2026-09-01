@@ -9,7 +9,8 @@
 // untouched (nil = untouched, server-side).
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError, type Skill, type TemplateSkills } from "../lib/api";
+import { api, type Skill, type TemplateSkills } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { scopeBadgeTone, SCOPE_LABEL } from "../lib/skills";
 import { Alert, Badge, Button, Card, Spinner } from "./ui";
 
@@ -44,7 +45,7 @@ export function SkillAllocationPanel({
       setAllSkills(skills);
       applyAllocations(allocations);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load skill allocations");
+      setError(errorMessage(err, "Failed to load skill allocations"));
     } finally {
       setLoading(false);
     }
@@ -106,7 +107,7 @@ export function SkillAllocationPanel({
       applyAllocations(allocations);
       setNotice("Allocations saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save allocations");
+      setError(errorMessage(err, "Failed to save allocations"));
     } finally {
       setBusy(false);
     }

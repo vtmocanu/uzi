@@ -3,6 +3,7 @@ import type { RunMessage } from "../lib/api";
 import type { PhaseUsage } from "../lib/runUsage";
 import { feedWindowLabel, parseFeedInstant } from "../lib/limitWait";
 import { formatTokens, formatCost } from "../lib/formatTokens";
+import { useNow } from "../lib/useNow";
 import { Markdown } from "./Markdown";
 import { cx } from "./ui";
 import {
@@ -819,11 +820,7 @@ function ToolResultBody({
 }
 
 function RunningIndicator({ start }: { start: string }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
+  const now = useNow(1000);
   return (
     <span className="inline-flex items-center gap-1.5 text-xs text-warn">
       <span

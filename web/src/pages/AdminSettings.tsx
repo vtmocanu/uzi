@@ -18,6 +18,7 @@ import {
   type SettingsResponse,
   type UpdateSettingsPayload,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { useAuth } from "../auth/AuthContext";
 import {
   Alert,
@@ -144,7 +145,7 @@ export function AdminSettings() {
     try {
       applyResponse(await api.getSettings());
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load settings");
+      setError(errorMessage(err, "Failed to load settings"));
     } finally {
       setLoading(false);
     }
@@ -212,7 +213,7 @@ export function AdminSettings() {
       // instance default restyles their session live.
       await refresh();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save settings");
+      setError(errorMessage(err, "Failed to save settings"));
     } finally {
       setBusy(false);
     }
@@ -502,7 +503,7 @@ function JudgeSettingsCard({
       setBudget(resp.settings.judge_daily_budget);
       setNotice("Run judge settings saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save run judge settings");
+      setError(errorMessage(err, "Failed to save run judge settings"));
     } finally {
       setBusy(false);
     }
@@ -656,7 +657,7 @@ function EphemeralWorkersCard({
       setEnabled(resp.settings.ephemeral_workers_enabled === "true");
       setNotice("Ephemeral workers settings saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save ephemeral workers settings");
+      setError(errorMessage(err, "Failed to save ephemeral workers settings"));
     } finally {
       setBusy(false);
     }
@@ -755,7 +756,7 @@ function UpdatesSettingsCard() {
       const { release_check } = await api.getReleaseCheck();
       setStatus(release_check);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load release-check status");
+      setError(errorMessage(err, "Failed to load release-check status"));
     } finally {
       setLoading(false);
     }
@@ -772,7 +773,7 @@ function UpdatesSettingsCard() {
       const { release_check } = await api.checkReleaseNow();
       setStatus(release_check);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to run the release check");
+      setError(errorMessage(err, "Failed to run the release check"));
     } finally {
       setChecking(false);
     }
@@ -799,7 +800,7 @@ function UpdatesSettingsCard() {
       const { release_check } = await api.getReleaseCheck();
       setStatus(release_check);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save update settings");
+      setError(errorMessage(err, "Failed to save update settings"));
     } finally {
       setSavingToggle(null);
     }
@@ -1030,7 +1031,7 @@ function SummarySettingsCard({
       setModel(resp.settings.summary_model);
       setNotice("Run summary settings saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save run summary settings");
+      setError(errorMessage(err, "Failed to save run summary settings"));
     } finally {
       setBusy(false);
     }
@@ -1328,7 +1329,7 @@ function AgentSourceSettingsCard() {
       const { agent_source } = await api.getAgentSource();
       resetForm(agent_source);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load agent-source settings");
+      setError(errorMessage(err, "Failed to load agent-source settings"));
     } finally {
       setLoading(false);
     }
@@ -1375,10 +1376,10 @@ function AgentSourceSettingsCard() {
       // Graceful: URL+folder stay filled so the admin can still edit/Save.
       setPresetMsg({
         tone: "danger",
-        text:
-          err instanceof ApiError
-            ? err.message
-            : "Could not resolve the latest tag. The URL and folder are filled — set a ref by hand or try again.",
+        text: errorMessage(
+          err,
+          "Could not resolve the latest tag. The URL and folder are filled — set a ref by hand or try again.",
+        ),
       });
     } finally {
       setResolving(false);
@@ -1412,7 +1413,7 @@ function AgentSourceSettingsCard() {
       await load();
       setNotice("Agent-source settings saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save agent-source settings");
+      setError(errorMessage(err, "Failed to save agent-source settings"));
     } finally {
       setSavingConfig(false);
     }
@@ -1436,7 +1437,7 @@ function AgentSourceSettingsCard() {
         setNotice("Sync complete. The source matches what is applied — nothing to review.");
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Sync failed");
+      setError(errorMessage(err, "Sync failed"));
     } finally {
       setSyncing(false);
     }
@@ -1465,7 +1466,7 @@ function AgentSourceSettingsCard() {
         await refreshView();
         setError("The staged snapshot changed since you reviewed it. Review the refreshed diff below, then approve again.");
       } else {
-        setError(err instanceof ApiError ? err.message : "Failed to apply the staged changes");
+        setError(errorMessage(err, "Failed to apply the staged changes"));
       }
     } finally {
       setApplying(false);
@@ -1499,7 +1500,7 @@ function AgentSourceSettingsCard() {
         setUpdateMsg({ tone: "success", text: "No update available — you're on the latest." });
       }
     } catch (err) {
-      setUpdateMsg({ tone: "danger", text: err instanceof ApiError ? err.message : "Update check failed" });
+      setUpdateMsg({ tone: "danger", text: errorMessage(err, "Update check failed") });
     } finally {
       setChecking(false);
     }
@@ -1531,7 +1532,7 @@ function AgentSourceSettingsCard() {
     } catch (err) {
       setUpdateMsg({
         tone: "danger",
-        text: err instanceof ApiError ? err.message : "Failed to update the pinned ref",
+        text: errorMessage(err, "Failed to update the pinned ref"),
       });
     } finally {
       setBumping(false);
@@ -1904,7 +1905,7 @@ function HealthSettingsCard({
       setValues(Object.fromEntries(HEALTH_FIELDS.map((f) => [f.key, resp.settings[f.key]])));
       setNotice("Run-health settings saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save run-health settings");
+      setError(errorMessage(err, "Failed to save run-health settings"));
     } finally {
       setBusy(false);
     }
@@ -2070,7 +2071,7 @@ function DockerAllowlistCard({
       setSelected(new Set(parseAllowlist(resp.settings.docker_repo_allowlist)));
       setNotice("Docker worker repo allowlist saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save the docker repo allowlist");
+      setError(errorMessage(err, "Failed to save the docker repo allowlist"));
     } finally {
       setBusy(false);
     }
@@ -2189,7 +2190,7 @@ function CapabilitySchedulingCard({
       setEnabled(resp.settings.capability_aware_scheduling === "true");
       setNotice("Capability-aware scheduling setting saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save the capability scheduling setting");
+      setError(errorMessage(err, "Failed to save the capability scheduling setting"));
     } finally {
       setBusy(false);
     }
@@ -2272,7 +2273,7 @@ function GithubProjectSyncCard({
       setEnabled(resp.settings.github_project_sync_enabled === "true");
       setNotice("GitHub Projects sync setting saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save the GitHub Projects sync setting");
+      setError(errorMessage(err, "Failed to save the GitHub Projects sync setting"));
     } finally {
       setBusy(false);
     }
@@ -2379,7 +2380,7 @@ function SlackSettingsCard({
       setAppToken("");
       setNotice("Slack settings saved.");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save Slack settings");
+      setError(errorMessage(err, "Failed to save Slack settings"));
     } finally {
       setBusy(false);
     }

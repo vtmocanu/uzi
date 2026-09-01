@@ -5,7 +5,8 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type CliToken, type CliTokenScope } from "../lib/api";
+import { api, type CliToken, type CliTokenScope } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { CLI_TOKEN_STALE_DAYS, isCliTokenStale } from "../lib/cliTokens";
 import { useDemoMode } from "../lib/demoMode";
 import { maskIp } from "../lib/demoMask";
@@ -47,7 +48,7 @@ export function CliTokens() {
       const { tokens } = await api.listCliTokens();
       setTokens(tokens);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load CLI tokens");
+      setError(errorMessage(err, "Failed to load CLI tokens"));
     } finally {
       setLoading(false);
     }
@@ -84,7 +85,7 @@ export function CliTokens() {
       setScope("user");
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to create CLI token");
+      setError(errorMessage(err, "Failed to create CLI token"));
     } finally {
       setBusy(false);
     }
@@ -106,7 +107,7 @@ export function CliTokens() {
       await api.revokeCliToken(id);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to revoke token");
+      setError(errorMessage(err, "Failed to revoke token"));
     }
   };
 
@@ -117,7 +118,7 @@ export function CliTokens() {
       await api.revokeAllCliTokens();
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to revoke tokens");
+      setError(errorMessage(err, "Failed to revoke tokens"));
     }
   };
 

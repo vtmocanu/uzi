@@ -4,7 +4,8 @@
 // Admin → Users; the meters reuse the shared MeterTrack + toneFor thresholds.
 
 import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, type AdminRateLimitUser, type MyRateLimits, type TokenRateLimits } from "../lib/api";
+import { api, type AdminRateLimitUser, type MyRateLimits, type TokenRateLimits } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
   formatAgo,
@@ -143,7 +144,7 @@ export function AdminRateLimits() {
         setLoading(false);
       })
       .catch((err) => {
-        setError(err instanceof ApiError ? err.message : "Failed to load rate limits");
+        setError(errorMessage(err, "Failed to load rate limits"));
         setLoading(false);
       });
   }, []);

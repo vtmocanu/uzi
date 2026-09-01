@@ -6,6 +6,7 @@
 import { useCallback, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Badge, Button, Input, cx } from "./ui";
 
 // VaultBadge is the compact lock/unlock status pill. `compact` (the collapsed
@@ -100,9 +101,7 @@ function VaultUnlockBanner({ credential }: { credential: "password" | "passphras
           ? credential === "password"
             ? "Incorrect password."
             : "Incorrect passphrase."
-          : err instanceof ApiError
-            ? err.message
-            : "Failed to unlock the vault.";
+          : errorMessage(err, "Failed to unlock the vault.");
       setError(
         next >= 2 && credential === "password"
           ? base + " Still locked with the right password? Sign out and back in to re-create your vault."
@@ -191,7 +190,7 @@ function VaultPassphraseCreate() {
       await refresh();
     } catch (err) {
       setError(
-        err instanceof ApiError ? err.message : "Failed to set your vault passphrase.",
+        errorMessage(err, "Failed to set your vault passphrase."),
       );
     } finally {
       setBusy(false);

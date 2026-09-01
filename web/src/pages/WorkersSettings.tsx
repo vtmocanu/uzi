@@ -6,7 +6,8 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 
-import { api, ApiError, type BindMode, type SecretMeta, type Worker } from "../lib/api";
+import { api, type BindMode, type SecretMeta, type Worker } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton } from "../components/ui";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
 import { useAppVersion } from "../components/AppShell";
@@ -103,7 +104,7 @@ export function WorkersSettings() {
       setWorkers(workers);
       setTokens(secrets.filter((s) => s.kind === "anthropic_token"));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load workers");
+      setError(errorMessage(err, "Failed to load workers"));
     } finally {
       setLoading(false);
     }
@@ -143,7 +144,7 @@ export function WorkersSettings() {
           mode === "auto" && pooledCount === 0 ? "warning" : "success",
         );
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : "Failed to change the worker's token");
+        setError(errorMessage(err, "Failed to change the worker's token"));
       } finally {
         setTokenBusy("");
       }
@@ -206,7 +207,7 @@ export function WorkersSettings() {
       setTemplate(DEFAULT_WORKER_TEMPLATE);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to create worker");
+      setError(errorMessage(err, "Failed to create worker"));
     } finally {
       setBusy(false);
     }
@@ -226,7 +227,7 @@ export function WorkersSettings() {
       announce(`Deleted ${stripUnsafeChars(name ?? "worker")}.`);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to delete worker");
+      setError(errorMessage(err, "Failed to delete worker"));
     }
   };
 

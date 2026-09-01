@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image/color"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -809,7 +810,7 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// asserting on "safe" would pass via the title even if the rail never drew the label (vacuous).
 	// "credsafe" carries the same hostile control/bidi bytes but a tail that only the rail's
 	// account-label render can put into the frame.
-	detailCredLabel := "\x1b[2J\u202E\x07\x01credsafe"
+	detailCredLabel := "\x1b[2J\u202E\x07\x01credsafe" //nolint:gosec // G101: not a credential - a hostile control/bidi-byte sanitization fixture whose display label happens to contain "cred"; the test asserts it is stripped, never a secret.
 	next, _ = detail.Update(detailLoadedMsg{
 		// A hostile milestone title exercises renderMilestones' crew-rail draw (D7): the
 		// in-progress id makes the row render its title through renderer.Plain. The hostile
@@ -2284,6 +2285,87 @@ func TestDetailAddFrameTotalOnZeroValue(t *testing.T) {
 	d.addFrame(laneFrame{Seq: 1})
 	if len(d.frames) != 1 {
 		t.Errorf("dedup did not hold; seen map not initialized: got %d frames", len(d.frames))
+	}
+}
+
+// TestTUIBoardSelectedFloorTitleHasExplicitForeground pins issue #938 fix 2: a SELECTED
+// floor-band row's title carries the explicit tungsten foreground, so it stays legible on
+// the warm selection bar (on a light terminal the default-ink title would otherwise be
+// dark-on-dark). Unselected floor titles keep the default ink (nil fg). Mutation that
+// reddens this: reverting the floor-band `default` case to leave titleC nil.
+func TestTUIBoardSelectedFloorTitleHasExplicitForeground(t *testing.T) {
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "selectedtitle"}},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "othertitle"}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = next.(tuiModel)
+	out := m.View().Content
+
+	// The selected (cursor-0) floor title is drawn exactly as boardRow draws it: the tungsten
+	// fg over the warm selection bg. Reconstruct that span and require it present — this is the
+	// span that disappears if the floor-band default case is dropped.
+	selTitle := paintSeg(m.pal.tungsten, m.pal.selBg, false, "selectedtitle")
+	if !strings.Contains(out, selTitle) {
+		t.Errorf("selected floor title is not painted with the tungsten fg over the selection bar\nwant span %q\n%s", selTitle, out)
+	}
+	// Control (non-vacuous): the UNSELECTED floor title must NOT carry the tungsten fg — it
+	// keeps the default ink (nil fg). If this span appeared, the assertion above could pass for
+	// the wrong reason (every floor title tungsten-painted regardless of selection).
+	otherTungsten := paintSeg(m.pal.tungsten, nil, false, "othertitle")
+	if strings.Contains(out, otherTungsten) {
+		t.Errorf("unselected floor title must keep default ink, not the tungsten fg\ngot span %q\n%s", otherTungsten, out)
+	}
+}
+
+// TestTUIInitRequestsBackgroundColor pins issue #938 fix 1: Init issues
+// tea.RequestBackgroundColor at startup so the terminal reports its background and the
+// BackgroundColorMsg path can flip the theme. We inspect initCmds without executing any Cmd
+// (the tick cmds block on tea.Tick), comparing function pointers.
+func TestTUIInitRequestsBackgroundColor(t *testing.T) {
+	fake := &uzicli.FakeClient{}
+	m := tuiTestModel(t, fake, "")
+	want := reflect.ValueOf(tea.RequestBackgroundColor).Pointer()
+	found := false
+	for _, c := range m.initCmds() {
+		if c != nil && reflect.ValueOf(c).Pointer() == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("initCmds does not include tea.RequestBackgroundColor; the theme probe will never fire")
+	}
+}
+
+// TestTUIBackgroundColorMsgFlipsPalette pins that the BackgroundColorMsg handler flips
+// m.dark and rebuilds the palette in BOTH directions — the path fix 1 makes actually fire.
+func TestTUIBackgroundColorMsgFlipsPalette(t *testing.T) {
+	fake := &uzicli.FakeClient{}
+	m := tuiTestModel(t, fake, "") // dark=true by default
+	darkSelBg := m.pal.selBg
+
+	// A light background reported by the terminal → light theme.
+	next, _ := m.Update(tea.BackgroundColorMsg{Color: lipgloss.Color("#ffffff")})
+	m = next.(tuiModel)
+	if m.dark {
+		t.Errorf("a light background must set m.dark=false")
+	}
+	if fgSGR(m.pal.selBg) == fgSGR(darkSelBg) {
+		t.Errorf("selBg did not change when flipping to the light theme")
+	}
+	if fgSGR(m.pal.selBg) != fgSGR(newPalette(false).selBg) {
+		t.Errorf("flipped selBg %v does not match newPalette(false).selBg %v", m.pal.selBg, newPalette(false).selBg)
+	}
+
+	// The converse: a dark background reported → dark theme again.
+	next, _ = m.Update(tea.BackgroundColorMsg{Color: lipgloss.Color("#000000")})
+	m = next.(tuiModel)
+	if !m.dark {
+		t.Errorf("a dark background must set m.dark=true")
+	}
+	if fgSGR(m.pal.selBg) != fgSGR(newPalette(true).selBg) {
+		t.Errorf("flipped-back selBg %v does not match newPalette(true).selBg %v", m.pal.selBg, newPalette(true).selBg)
 	}
 }
 

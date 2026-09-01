@@ -8,7 +8,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type Notification } from "../lib/api";
+import { api, type Notification } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
 import { BellIcon } from "../components/icons";
 import {
@@ -259,7 +260,7 @@ export function Notifications() {
       setUnread(res.unread);
       setTotal(res.total);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load notifications");
+      setError(errorMessage(err, "Failed to load notifications"));
     } finally {
       setLoading(false);
     }
@@ -279,7 +280,7 @@ export function Notifications() {
       setUnread(res.unread);
       setTotal(res.total);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load more");
+      setError(errorMessage(err, "Failed to load more"));
     } finally {
       setLoadingMore(false);
     }

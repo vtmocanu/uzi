@@ -27,12 +27,14 @@ import {
   type TriageCounts,
   type Worker,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
 import { canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { stripUnsafeChars } from "../lib/safeText";
+import { useNow } from "../lib/useNow";
 import { effectiveWorkerCaps } from "../lib/workerCaps";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import {
@@ -99,11 +101,7 @@ export function stageForMessages(messages: RunMessage[]): string {
 
 // LiveElapsed ticks a wall-clock timer for a still-running run.
 function LiveElapsed({ since }: { since: string }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
+  const now = useNow(1000);
   const start = new Date(since).getTime();
   if (!Number.isFinite(start)) return null;
   return <span className="text-xs tabular-nums text-faint">{formatDuration(now - start)}</span>;
@@ -122,11 +120,7 @@ function LiveElapsed({ since }: { since: string }) {
  * renders only in this branch — so without this the strip below could not be asserted.
  */
 export function HealthFlag({ run }: { run: Run }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 30_000);
-    return () => clearInterval(id);
-  }, []);
+  const now = useNow(30_000);
   const show = shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   const stuck = show && Number.isFinite(since) ? ` · stuck for ${formatElapsed(now - since)}` : "";
@@ -433,16 +427,11 @@ export function LimitWaitPanel({
   onStop: () => void;
 }) {
   const parked = run.status === "limit_wait";
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    // Only while parked: off the park there is no clock, and a 1s interval running
-    // for the life of every run view is pure waste. 1s (not HealthFlag's 30s)
-    // because the countdown drops to seconds in its last minute, which is exactly
-    // when someone is watching it.
-    if (!parked) return;
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [parked]);
+  // Only while parked: off the park there is no clock, and a 1s interval running
+  // for the life of every run view is pure waste. 1s (not HealthFlag's 30s)
+  // because the countdown drops to seconds in its last minute, which is exactly
+  // when someone is watching it.
+  const now = useNow(parked ? 1000 : null);
 
   // Terminal: no future limit to have an opinion about, and the server would no-op
   // the write anyway. Nothing renders at all — not a disabled checkbox, which would
@@ -713,7 +702,7 @@ export function PoolWaitPanel({
         setNote("This run is no longer waiting.");
         await onResumed();
       } else {
-        setNote(e instanceof ApiError ? e.message : "Could not resume the run.");
+        setNote(errorMessage(e, "Could not resume the run."));
       }
     } finally {
       setBusy(false);
@@ -826,7 +815,7 @@ export function RunView() {
     try {
       await fn();
     } catch (e) {
-      setActionErr(e instanceof ApiError ? e.message : "Action failed");
+      setActionErr(errorMessage(e, "Action failed"));
     } finally {
       setBusy(false);
     }
@@ -2269,7 +2258,7 @@ export function JudgePanel({
       setPendingJudge(pending_judge ?? null);
       setLoadErr("");
     } catch (e) {
-      setLoadErr(e instanceof ApiError ? e.message : "Failed to load the review");
+      setLoadErr(errorMessage(e, "Failed to load the review"));
     } finally {
       setLoading(false);
     }
@@ -2440,7 +2429,7 @@ export function JudgePanel({
       if (e instanceof ApiError && e.status === 409 && /already in progress/i.test(e.message)) {
         await fetchReview();
       } else {
-        setActionErr(e instanceof ApiError ? e.message : "Could not re-run the judge");
+        setActionErr(errorMessage(e, "Could not re-run the judge"));
       }
     } finally {
       setRerunning(false);
@@ -2796,7 +2785,7 @@ function RecommendationFiler({
       setTitle(stripUnsafeChars(draft.title));
       setDescription(stripUnsafeChars(draft.description));
     } catch (e) {
-      setDraftErr(e instanceof ApiError ? e.message : "Could not load the draft");
+      setDraftErr(errorMessage(e, "Could not load the draft"));
     } finally {
       setLoadingDraft(false);
     }
@@ -2810,7 +2799,7 @@ function RecommendationFiler({
       setLocal({ iid: issue.iid, web_url: issue.web_url, warning });
     } catch (e) {
       // Forge rejected the write (mock E): the draft stays open with its edits intact.
-      setFileErr(e instanceof ApiError ? e.message : "Could not file the issue");
+      setFileErr(errorMessage(e, "Could not file the issue"));
     } finally {
       setBusy(false);
     }
@@ -3059,7 +3048,7 @@ function DispositionControls({
       await onChanged();
     } catch (e) {
       focusAfterMutation.current = false;
-      onError(e instanceof ApiError ? e.message : "Could not update the disposition");
+      onError(errorMessage(e, "Could not update the disposition"));
     } finally {
       setBusy(false);
       setMenuOpen(false);

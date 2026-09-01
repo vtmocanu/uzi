@@ -55,7 +55,7 @@ func (f *forgejo) LatestPipeline(ctx context.Context, projectID int64, ref strin
 	}
 	runs, _, err := c.ListRepoActionRuns(slug.owner, slug.repo, opt)
 	if err != nil {
-		return Pipeline{}, f.redact.error(fmt.Errorf("forgejo: latest pipeline: %w", err))
+		return Pipeline{}, f.wrapErr("latest pipeline", err)
 	}
 	// A hostile forge could return a null entry in workflow_runs, which decodes to
 	// a nil *ActionWorkflowRun that passes len==0 but panics on deref.
@@ -84,7 +84,7 @@ func (f *forgejo) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) 
 	}
 	pr, _, err := c.GetPullRequest(slug.owner, slug.repo, mrIID)
 	if err != nil {
-		return Pipeline{}, f.redact.error(fmt.Errorf("forgejo: latest MR pipeline: %w", err))
+		return Pipeline{}, f.wrapErr("latest MR pipeline", err)
 	}
 	if pr == nil || pr.Head == nil || pr.Head.Sha == "" {
 		// A PR with no resolvable head commit is NOT "no CI" (ErrNoPipeline, which the
@@ -99,7 +99,7 @@ func (f *forgejo) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) 
 	}
 	runs, _, err := c.ListRepoActionRuns(slug.owner, slug.repo, opt)
 	if err != nil {
-		return Pipeline{}, f.redact.error(fmt.Errorf("forgejo: latest MR pipeline: %w", err))
+		return Pipeline{}, f.wrapErr("latest MR pipeline", err)
 	}
 	// A hostile forge could return a null entry in workflow_runs, which decodes to
 	// a nil *ActionWorkflowRun that passes len==0 but panics on deref.
@@ -124,34 +124,28 @@ func (f *forgejo) ListPipelineJobs(ctx context.Context, projectID, pipelineID in
 		return nil, err
 	}
 	opt := gitea.ListRepoActionJobsOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
-	var out []Job
-	page := 0
-	for {
-		page++
+	wrap := func(e error) error { return f.wrapErr("list pipeline jobs", e) }
+	return paginate(wrap, func(page int) ([]Job, int, error) {
+		opt.Page = page
 		jobs, resp, err := c.ListRepoActionRunJobs(slug.owner, slug.repo, pipelineID, opt)
 		if err != nil {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list pipeline jobs: %w", err))
+			return nil, 0, err
 		}
+		var items []Job
 		if jobs != nil {
 			for _, j := range jobs.Jobs {
 				if j == nil {
 					continue
 				}
-				out = append(out, toForgejoJob(j))
+				items = append(items, toForgejoJob(j))
 			}
 		}
-		if len(out) > maxForgeItems {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list pipeline jobs: %w", forgePaginationCapErr("item", maxForgeItems)))
+		next := 0
+		if resp != nil {
+			next = resp.NextPage
 		}
-		if resp == nil || resp.NextPage == 0 {
-			break
-		}
-		if page >= maxForgePages {
-			return nil, f.redact.error(fmt.Errorf("forgejo: list pipeline jobs: %w", forgePaginationCapErr("page", maxForgePages)))
-		}
-		opt.Page = resp.NextPage
-	}
-	return out, nil
+		return items, next, nil
+	})
 }
 
 // JobLogTail returns at most maxBytes from the END of a job's log (a failure's
@@ -175,9 +169,13 @@ func (f *forgejo) JobLogTail(ctx context.Context, projectID, jobID int64, maxByt
 	}
 	data, err := f.rawGetLimited(ctx, fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", slug.owner, slug.repo, jobID), maxTraceBytes+1)
 	if err != nil {
-		return "", f.redact.error(fmt.Errorf("forgejo: job log tail: %w", err))
+		return "", f.wrapErr("job log tail", err)
 	}
 	if len(data) > maxTraceBytes {
+		// Intentionally NOT routed through wrapErr: this is a single-segment
+		// fail-closed message with no "op: detail" boundary, so wrapErr's
+		// "forgejo: <op>: <err>" form would insert a second colon and change the
+		// bytes. It already goes through redact.error, so the PAT cannot leak.
 		return "", f.redact.error(fmt.Errorf("forgejo: job %d log exceeds the %d-byte ceiling", jobID, maxTraceBytes))
 	}
 	if maxBytes > 0 && len(data) > maxBytes {

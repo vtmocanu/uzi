@@ -1,7 +1,8 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, MOCK_MODE, type AuthConfig } from "../lib/api";
+import { api, MOCK_MODE, type AuthConfig } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Button, Card, Field, Input, Skeleton } from "../components/ui";
 
 // Enumerated OIDC callback error codes (PRD #45, Decision 9). The callback only
@@ -89,7 +90,7 @@ export function Login() {
       await login(email, password);
       navigate(returnTo);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Something went wrong");
+      setError(errorMessage(err, "Something went wrong"));
     } finally {
       setSubmitting(false);
     }

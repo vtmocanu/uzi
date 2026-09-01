@@ -3,7 +3,8 @@
 // optional: leave "Pinned version" blank to allow any version.
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { api, ApiError, type ToolAllowlistEntry } from "../lib/api";
+import { api, type ToolAllowlistEntry } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Alert, Button, Card, EmptyState, Field, Input, ListSkeleton } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
@@ -24,7 +25,7 @@ export function ToolAllowlist() {
       const { allowlist } = await api.listToolAllowlist();
       setEntries(allowlist);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load the allowlist");
+      setError(errorMessage(err, "Failed to load the allowlist"));
     } finally {
       setLoading(false);
     }
@@ -49,7 +50,7 @@ export function ToolAllowlist() {
       setNote("");
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to add the package");
+      setError(errorMessage(err, "Failed to add the package"));
     } finally {
       setBusy(false);
     }
@@ -61,7 +62,7 @@ export function ToolAllowlist() {
       await api.deleteToolAllowlistEntry(id);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to remove the package");
+      setError(errorMessage(err, "Failed to remove the package"));
     }
   };
 

@@ -801,7 +801,7 @@ func (g *github) ResolveRepositoryOwnerType(ctx context.Context, owner string) (
 		// interface implementation) — redact and refuse rather than guess. No PAT
 		// is interpolated into this message, but route it through redact for
 		// consistency with the other resolvers.
-		return "", g.redact.error(fmt.Errorf("github: resolve owner type: unexpected owner __typename %q for %q", out.RepositoryOwner.TypeName, owner))
+		return "", g.wrapErr("resolve owner type", fmt.Errorf("unexpected owner __typename %q for %q", out.RepositoryOwner.TypeName, owner))
 	}
 }
 

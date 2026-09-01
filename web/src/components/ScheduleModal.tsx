@@ -10,13 +10,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
-  ApiError,
   type Repo,
   type Schedule,
   type ScheduleInput,
   type ScheduleTarget,
   type ScheduleTiming,
 } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { useAuth } from "../auth/AuthContext";
 import {
   Alert,
@@ -516,7 +516,7 @@ export function ScheduleModal({
         await createFanOut();
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not save the schedule");
+      setError(errorMessage(err, "Could not save the schedule"));
     } finally {
       setSaving(false);
     }
@@ -558,7 +558,7 @@ export function ScheduleModal({
       await api.deleteSchedule(editing.id);
       onSaved();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not delete the schedule");
+      setError(errorMessage(err, "Could not delete the schedule"));
       setDeleting(false);
     }
   };

@@ -225,17 +225,26 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	return m
 }
 
-func (m tuiModel) Init() tea.Cmd {
+// initCmds is the pre-batch Cmd slice, extracted from Init so a test can inspect the
+// startup commands without executing any (some members block on tea.Tick).
+// tea.RequestBackgroundColor is the bare Cmd value (a func() Msg): issuing it from
+// startup makes the terminal report its background colour, which drives the
+// tea.BackgroundColorMsg handler in Update that flips m.dark and rebuilds the palette —
+// so a light terminal actually gets the light theme instead of the dark default.
+func (m tuiModel) initCmds() []tea.Cmd {
 	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), m.fetchSecretsCmd(),
-		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickCmd(), stripTickCmd()}
+		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickCmd(), stripTickCmd(),
+		tea.RequestBackgroundColor}
 	if m.skewCheck {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
 	}
 	if m.view == viewDetail {
 		cmds = append(cmds, m.loadDetailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
 	}
-	return tea.Batch(cmds...)
+	return cmds
 }
+
+func (m tuiModel) Init() tea.Cmd { return tea.Batch(m.initCmds()...) }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(boardPollInterval, func(time.Time) tea.Msg { return boardTickMsg{} })

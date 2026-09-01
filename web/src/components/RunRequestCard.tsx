@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, type RunRequest } from "../lib/api";
+import { api, type RunRequest } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { Button } from "./ui";
 import { PlayIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -30,7 +31,7 @@ export function RunRequestCard({ request }: { request: RunRequest }) {
       setState("started");
     } catch (e) {
       // The server returns the same PRD/gate refusal the board start button produces.
-      setErr(e instanceof ApiError ? e.message : "Action failed");
+      setErr(errorMessage(e, "Action failed"));
     } finally {
       setBusy(false);
     }
