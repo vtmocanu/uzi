@@ -11,7 +11,7 @@ Loaded when you touch `web/`. The repo-wide map is the root `CLAUDE.md`.
 ```sh
 task gate:web                              # deps-check + lint + deadcode + check-docs + typecheck + test
 task lint:web                              # the lint slot alone (oxlint; NOT ratcheted)
-task deadcode:web                          # the dead-code slot alone (knip) — exports tier is `warn`, see below; a missing knip loud-SKIPs (exit 0) here, exit 2 in CI (UZI_DEADCODE_WEB_REQUIRED=1)
+task deadcode:web                          # the dead-code slot alone (knip) — every rule incl. the unused-export/type family gates at `error` since #596 (this line said `warn` until 2026-09-01); a missing knip loud-SKIPs (exit 0) here, exit 2 in CI (UZI_DEADCODE_WEB_REQUIRED=1)
 task test:web                              # vitest run
 task typecheck:web                         # or check-docs:web, individually
 cd web && npx vitest run src/pages/Foo.test.tsx    # single file — no target
