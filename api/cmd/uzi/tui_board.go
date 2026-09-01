@@ -902,6 +902,14 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		titleC = m.pal.amber
 	case bandDone:
 		titleC = m.pal.faintC
+	default: // floor band
+		// Unselected floor rows keep nil (default ink, the intended quiet look). A SELECTED
+		// floor row needs an explicit foreground or its default-fg title vanishes into the
+		// warm selection bar on a light terminal (dark-on-dark). tungsten (ld(#7c5200,#c9a061))
+		// resolves dark-on-light-selBg and light-on-dark-selBg, matching the selected id ink.
+		if sel {
+			titleC = m.pal.tungsten
+		}
 	}
 	idC := m.pal.faintC
 	if sel {
