@@ -1,6 +1,6 @@
 ---
 name: release
-version: 6
+version: 4
 description: Runs the project's release/PR/merge workflow. Never modifies code. Reports exact errors and stops on failure.
 tools: Bash, Read, Grep, Glob, SendMessage, TaskUpdate, TaskList, TaskGet
 model: sonnet

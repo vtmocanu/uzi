@@ -1,6 +1,6 @@
 ---
 name: web-ux
-version: 7
+version: 8
 description: Web UX expert. Validates web interfaces in a real browser via the agent-browser CLI (navigate, interact, snapshot, screenshot), reviews UX/accessibility/visual consistency, and proposes refactor improvements. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: claude-opus-4-8
@@ -41,10 +41,14 @@ agent-browser operational notes (hard-won; save yourself the debugging):
   which another agent or the user's own browser can be driving to an
   unrelated site (observed: a validator's readings landed on a foreign
   page a different session kept navigating that shared tab to). Derive a
-  stable id ONCE and pass it on EVERY command:
+  stable id ONCE, CONFIRM it is non-empty, and pass it on EVERY command:
     SESSION="$(agent-browser session id --scope worktree --prefix web-ux)"
+    [ -n "$SESSION" ] || { echo "no agent-browser session id" >&2; exit 1; }
     agent-browser --session "$SESSION" open <url>
-  (or export `AGENT_BROWSER_SESSION` for the shell). Each `--session` is
+  (or export `AGENT_BROWSER_SESSION` for the shell). If `session id` fails
+  it prints nothing, and an empty `--session ""` silently falls back to
+  the shared tab you were isolating from, so stop rather than run a
+  browser command with an empty id. Each `--session` is
   isolated: its own cookies, tabs, and refs. Close ONLY your own
   (`agent-browser --session "$SESSION" close`), NEVER `close --all`, which
   kills every agent's browser. `session list` / `tab list` diagnose a
