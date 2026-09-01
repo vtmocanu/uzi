@@ -61,6 +61,7 @@ const baseUser: User = {
   autopilot_enabled: false,
   judge_enabled: false,
   ci_autofix_enabled: false,
+  attribution_enabled: true,
   ephemeral_workers_enabled: false,
   wait_on_limit: false,
   judge_anthropic_secret_id: null,

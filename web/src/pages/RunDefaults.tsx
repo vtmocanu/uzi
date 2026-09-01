@@ -109,6 +109,27 @@ export function RunDefaults() {
     }
   };
 
+  // AI-attribution opt-out (issue #916). DEFAULT ON, unlike CI-autofix above: when on
+  // (the default) the worker keeps the Co-Authored-By: Claude trailer on its commits;
+  // turning it off suppresses that trailer on the user's next run. Its own busy/error
+  // pair, independent of CI-autofix — separate endpoints, and one failing must not
+  // disable or blame the other.
+  const [attributionBusy, setAttributionBusy] = useState(false);
+  const [attributionError, setAttributionError] = useState("");
+
+  const toggleAttribution = async (enabled: boolean) => {
+    setAttributionError("");
+    setAttributionBusy(true);
+    try {
+      await api.setAttributionEnabled(enabled);
+      await refresh();
+    } catch (err) {
+      setAttributionError(err instanceof ApiError ? err.message : "Failed to update AI attribution");
+    } finally {
+      setAttributionBusy(false);
+    }
+  };
+
   // MR review rework opt-in (PRD #700 M6). Default ON: null/absent reads as
   // enabled, only an explicit false opts the account out. Stored as the raw
   // tri-state so the checkbox reflects "!== false". Unlike autopilot/judge/CI-autofix
@@ -525,6 +546,37 @@ export function RunDefaults() {
             onChange={(e) => toggleCIAutofix(e.target.checked)}
           />
           <span className="text-fg">Automatically fix my failed CI pipelines</span>
+        </label>
+      </Card>
+
+      {/* AI attribution in commits (issue #916). Placed beside Automatic CI fixes, but
+          DEFAULT ON (opt-out) rather than default-off — turning it off suppresses the
+          Co-Authored-By: Claude trailer on the worker's commits. This affects only the
+          commit trailer; uzi's merge-request bodies are worker-built and already carry
+          no AI attribution, so the copy must not claim it changes MR descriptions. */}
+      <Card className="space-y-4">
+        <div>
+          <SectionTitle>AI attribution in commits</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            Every commit uzi's worker makes includes a{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">Co-Authored-By: Claude</code>{" "}
+            trailer. Turn this off if your organization's policy requires no AI attribution in git
+            history. On by default; the change takes effect on your next run. (Merge-request
+            descriptions are unaffected — they already carry no AI attribution.)
+          </p>
+        </div>
+
+        {attributionError && <Alert message={attributionError} />}
+
+        <label className="flex items-center gap-3 text-sm">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={user?.attribution_enabled ?? true}
+            disabled={attributionBusy}
+            onChange={(e) => toggleAttribution(e.target.checked)}
+          />
+          <span className="text-fg">Include the Co-Authored-By: Claude trailer in my worker commits</span>
         </label>
       </Card>
 

@@ -32,6 +32,7 @@ vi.mock("../lib/api", async (importActual) => {
       setAutopilotEnabled: vi.fn(),
       setWaitOnLimit: vi.fn(),
       setJudgeEnabled: vi.fn(),
+      setAttributionEnabled: vi.fn(),
       getMySettings: vi.fn(),
       putMySettings: vi.fn(),
       vaultLock: vi.fn(),
@@ -61,6 +62,7 @@ const baseUser: User = {
   autopilot_enabled: false,
   judge_enabled: false,
   ci_autofix_enabled: false,
+  attribution_enabled: true,
   ephemeral_workers_enabled: false,
   wait_on_limit: false,
   judge_anthropic_secret_id: null,
@@ -547,5 +549,109 @@ describe("Run defaults — usage-limit default (PRD #35 M3)", () => {
     const autopilot = screen.getByLabelText("Enable autopilot for my account") as HTMLInputElement;
     expect(autopilot.disabled).toBe(false);
     expect(mockApi.setAutopilotEnabled).not.toHaveBeenCalled();
+  });
+});
+
+// Issue #916 M4: the per-user AI-attribution opt-out. DEFAULT ON (opt-out), the
+// OPPOSITE of ci_autofix — so a field-absent user renders CHECKED, and the copy must
+// describe the commit trailer, never the MR description.
+describe("Run defaults — AI attribution opt-out (issue #916 M4)", () => {
+  const attributionToggle = () =>
+    screen.getByLabelText(
+      "Include the Co-Authored-By: Claude trailer in my worker commits",
+    ) as HTMLInputElement;
+
+  it("describes the commit trailer and does not claim it changes MR descriptions", () => {
+    const { container } = render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const text = container.textContent ?? "";
+    expect(text).toMatch(/Co-Authored-By: Claude/);
+    expect(text).toMatch(/on your next run/i);
+    // The real effect is the commit trailer; MR descriptions are explicitly unaffected.
+    expect(text).toMatch(/Merge-request descriptions are unaffected/i);
+  });
+
+  it("reflects the current opt-out state (on, the default)", () => {
+    mockAuth({ ...baseUser, attribution_enabled: true });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(attributionToggle().checked).toBe(true);
+  });
+
+  it("reflects the current opt-out state (off)", () => {
+    mockAuth({ ...baseUser, attribution_enabled: false });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(attributionToggle().checked).toBe(false);
+  });
+
+  // The shipped column default is ON, so a field-absent response must render the
+  // toggle CHECKED — matching the DB default rather than assuming OFF.
+  it("assumes the shipped default-on when attribution_enabled is absent", () => {
+    mockAuth({ ...baseUser, attribution_enabled: undefined as unknown as boolean });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(attributionToggle().checked).toBe(true);
+  });
+
+  it("toggling off calls the API with false and refreshes the session", async () => {
+    mockAuth({ ...baseUser, attribution_enabled: true });
+    mockApi.setAttributionEnabled.mockResolvedValue({
+      user: { ...baseUser, attribution_enabled: false },
+    });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    fireEvent.click(attributionToggle());
+
+    await waitFor(() =>
+      expect(mockApi.setAttributionEnabled).toHaveBeenCalledWith(false),
+    );
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("toggling on (from off) calls the API with true", async () => {
+    mockAuth({ ...baseUser, attribution_enabled: false });
+    mockApi.setAttributionEnabled.mockResolvedValue({
+      user: { ...baseUser, attribution_enabled: true },
+    });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    fireEvent.click(attributionToggle());
+
+    await waitFor(() =>
+      expect(mockApi.setAttributionEnabled).toHaveBeenCalledWith(true),
+    );
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("surfaces an error and does not leave the toggle stuck", async () => {
+    mockApi.setAttributionEnabled.mockRejectedValue(new ApiError(500, "internal error"));
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    fireEvent.click(attributionToggle());
+
+    expect(await screen.findByText("internal error")).toBeTruthy();
+    expect(attributionToggle().disabled).toBe(false);
   });
 });
