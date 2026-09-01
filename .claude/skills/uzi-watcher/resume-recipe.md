@@ -104,7 +104,9 @@ cd <the repo>                              # your normal checkout; work happens 
    allow directive; a `.gitleaksignore` or a `.gitleaks.toml` allowlist would silence this
    scan the same way, so a green here with either present in the tree proves nothing.
    After a push-protection rejection specifically, also run `git log -S 'THE_LITERAL' origin/main..HEAD` (the literal
-   GitHub named) — it must print nothing. GitHub's pattern set is not gitleaks',
+   GitHub named) — it must print nothing AND exit 0, after the `rev-list` count above has
+   already proven the range resolves: an unresolved ref prints nothing too, with a `fatal`
+   on stderr and rc 128, which reads as "literal gone" if only stdout is watched. GitHub's pattern set is not gitleaks',
    so a clean range scan alone does not prove the push will be accepted; see SKILL.md's
    *Push protection* subsection for the fold-into-the-introducing-commit step that precedes it.
 8. **Gate the touched components** (only the ones the diff touches): `task gate:api`,

@@ -257,7 +257,7 @@ Two things the workflow-scope entry does not prepare you for:
   because it prints the latter with rc 0 on an unresolved ref, and with the in-file allow
   directives disabled, because GitHub honours none of them; after a push-protection rejection, additionally confirm the
   literal GitHub named is gone from every commit with `git log -S 'THE_LITERAL'
-  origin/main..HEAD` (must print nothing) — GitHub's pattern set is not gitleaks', so a
+  origin/main..HEAD` (must print nothing and exit 0, on a range already proven to resolve) — GitHub's pattern set is not gitleaks', so a
   clean range scan alone does not prove GitHub will accept the push.
 
 The fixture form that satisfies both scanners, and why `//gitleaks:allow` is not enough,
