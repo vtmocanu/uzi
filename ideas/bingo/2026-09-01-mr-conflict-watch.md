@@ -8,7 +8,7 @@ uzi automates two of the three things that can block a completed run's MR from
 landing, and is completely blind to the third.
 
 **What it does know.** A red pipeline on an agent branch becomes a `ci_fix` run
-(`api/internal/poller/poller.go:429`, `e.ciAutoFix.detect(ctx, r, f)`). New review
+(`api/internal/poller/poller.go:428`, `e.ciAutoFix.detect(ctx, r, f)`). New review
 comments become an `mr_rework` run (`poller.go:440`, `e.mrReviewWatch.detect(ctx, r, f)`).
 PRD #6's own rationale names the problem shape exactly: *"an agent's MR with failing CI
 looks \"done\" in uzi while being unmergeable"* (`prds/done/6-ci-status-integration.md:11`).
@@ -135,7 +135,7 @@ The mr_watch candidate set is already precisely "MRs a human is sitting on":
   observation.** `unknown` never fires and never clears; only `conflicted` held
   continuously for `MR_CONFLICT_QUIET_PERIOD` (default ~10m) is actionable — the same
   debounce shape as `MRReviewWatch`'s `quietPeriod`
-  (`api/internal/poller/mr_review_watch.go:73`). The poller re-GETs every tick anyway,
+  (`api/internal/poller/mr_review_watch.go:72`). The poller re-GETs every tick anyway,
   so no bespoke re-poll loop is needed.
 
 - **Suppress the harmful rework.** Add a gate to `detectOne` beside GATE 1
@@ -161,8 +161,8 @@ The mr_watch candidate set is already precisely "MRs a human is sitting on":
   `:49-53`) and add a separate warn-toned badge rendered beside `MrChip`
   (`web/src/components/MrChip.tsx`) on the board card and run view. Add
   `mr_mergeable` to the run DTOs next to `mr_state` (`web/src/lib/api.ts:553` and
-  `:1802`), carrying forward that field's own staleness caveat verbatim ("as of last
-  sync").
+  `:1802`), carrying forward that field's own staleness caveat verbatim ("a
+  superseded run's value can be stale").
 
 - **Mock parity is a CONTRACT here, not a convenience.** `web/src/mocks/mockApi.ts`
   becomes a second implementation of "when does the conflict badge show". Do **not**
@@ -188,7 +188,7 @@ structurally a clone of `MRReviewWatch`: injected store/runs/notifier/settings
 interfaces, admin kill-switch read once per repo and **failing closed** on error
 (`mr_review_watch.go:101-113`, the `KeyMrReworkEnabled` idiom at
 `api/internal/settings/settings.go:251`), per-candidate log-and-skip, a candidate
-query cloned from `ListMRReworkCandidates` (`mr_rework.sql:35-53`) including its
+query cloned from `ListMRReworkCandidates` (`mr_rework.sql:35-67`) including its
 `COALESCE(per_branch.mr_rework_enabled, u.mr_rework_enabled) IS NOT FALSE` opt-out
 chain and its Anthropic-token EXISTS gate.
 
@@ -201,7 +201,7 @@ branch **in place**, pushes a fix commit, **never merges**. Distinguish with a
 nullable `runs.mr_rework_cause text CHECK (cause IN ('review','conflict'))`, which
 selects the prompt context block worker-side. This avoids widening
 `runs_kind_check`, the claim wire, the judge allowlist
-(`api/internal/workersvc/judge_enqueue.go:21`), and every kind label in web/CLI.
+(`api/internal/workersvc/judge_enqueue.go:22`), and every kind label in web/CLI.
 The trade-off, stated so nobody meets it by surprise: the two loops would share one
 cap ledger row unless it gains a second counter — so add `align_attempt_count` to
 `mr_rework_ledger` (`00168`) rather than sharing `attempt_count`, since a conflict
