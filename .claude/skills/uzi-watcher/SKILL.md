@@ -251,7 +251,8 @@ Two things the workflow-scope entry does not prepare you for:
 - **Verify the RANGE, not the tip.** `task scan:secrets` reads tracked files at HEAD and
   goes green on a tip that is clean while an earlier commit still carries the literal.
   The checks that match what GitHub does: `gitleaks git --log-opts="origin/main..HEAD"
-  --no-banner` over the whole range (must print `no leaks found`), and a per-commit grep
+  --no-banner --redact` over the whole range (must print `no leaks found`; `--redact` keeps a
+  real hit out of the terminal and any captured log), and a per-commit grep
   for the retired literal (`for c in $(git rev-list origin/main..HEAD); do git grep -c
   LITERAL "$c" -- DIR; done`, every line 0). Both are in `resume-recipe.md`'s step-7
   pre-flight now.

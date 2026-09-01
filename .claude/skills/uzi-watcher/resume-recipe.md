@@ -94,7 +94,8 @@ cd <the repo>                              # your normal checkout; work happens 
    git diff --name-only origin/main..HEAD -- .github/workflows/
    git log  --name-only origin/main..HEAD -- .github/workflows/
    git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty
-   gitleaks git --log-opts="origin/main..HEAD" --no-banner   # push protection scans EVERY commit: must print "no leaks found"
+   gitleaks git --log-opts="origin/main..HEAD" --no-banner --redact   # push protection scans EVERY commit: must print "no leaks found"; --redact keeps a real hit out of the log
+   for c in $(git rev-list origin/main..HEAD); do git grep -c LITERAL "$c" -- DIR; done   # after a push-protection rejection: the retired literal, every line 0
    ```
 8. **Gate the touched components** (only the ones the diff touches): `task gate:api`,
    `gate:web`, `gate:agent`, `gate:controller`, and `./e2e/run-store-it.sh` if a `*_livedb`
