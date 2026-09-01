@@ -642,6 +642,7 @@ type User struct {
 	EphemeralWorkersEnabled bool               `json:"ephemeral_workers_enabled"`
 	DefaultEffort           pgtype.Text        `json:"default_effort"`
 	MrReworkEnabled         pgtype.Bool        `json:"mr_rework_enabled"`
+	AttributionEnabled      bool               `json:"attribution_enabled"`
 }
 
 type UserSecret struct {

@@ -30,6 +30,10 @@ type UserDTO struct {
 	// #71). Default false; the user toggles their own from Settings, and an admin
 	// can force-toggle any user's from the admin users surface.
 	CIAutofixEnabled bool `json:"ci_autofix_enabled"`
+	// AttributionEnabled is the user's opt-out for AI attribution in worker commits
+	// (issue #916). Default true (current behavior); when false the worker suppresses
+	// the SDK's Co-Authored-By: Claude commit trailer.
+	AttributionEnabled bool `json:"attribution_enabled"`
 	// EphemeralWorkersEnabled is the user's per-user opt-in to run-bound throwaway
 	// hosted worker auto-provisioning (PRD #529/#649). Default false; the user
 	// toggles their own from the Workers page. Both this and the admin instance

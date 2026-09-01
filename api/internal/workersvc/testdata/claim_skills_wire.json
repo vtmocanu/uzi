@@ -103,6 +103,7 @@
     "question_max": 5,
     "question_timeout_seconds": 86400,
     "default_model": "sonnet",
+    "attribution_enabled": true,
     "skill_max_bytes": 65536,
     "skills_max_per_run": 32,
     "tool_packages": [

@@ -43,6 +43,13 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 	strptr := func(s string) *string { return &s }
 	i64ptr := func(v int64) *int64 { return &v }
 	intptr := func(v int) *int { return &v }
+	// The one credential-shaped field that raises gosec G101 is extracted here so the
+	// suppression sits on the exact triggering string-assignment, NOT on the ClaimSecrets
+	// composite-literal brace. gosec anchors G101 for a struct literal to the composite-lit
+	// node, so a blanket nolint on that brace would silence G101 for every field in the
+	// literal, hiding a future credential field. Kept narrow here: this assignment is the
+	// only line gosec flags, and the composite literal below carries no gosec suppression.
+	anthropicOAuthToken := "ANTHROPIC-OAUTH-PLACEHOLDER" //nolint:gosec // G101: placeholder fixture string (…-PLACEHOLDER), not a real credential
 	return ClaimPayload{
 		RunID:            "11111111-1111-1111-1111-111111111111",
 		Kind:             RunKindIssue,
@@ -150,7 +157,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		Secrets: ClaimSecrets{
 			ForgeUsername:       "uzi-bot",
 			ForgePAT:            "FORGE-PAT-PLACEHOLDER",
-			AnthropicOAuthToken: "ANTHROPIC-OAUTH-PLACEHOLDER",
+			AnthropicOAuthToken: anthropicOAuthToken,
 		},
 		Agents: []ClaimAgent{
 			{
@@ -189,6 +196,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			QuestionMax:            5,
 			QuestionTimeoutSeconds: 86400,
 			DefaultModel:           strptr("sonnet"),
+			AttributionEnabled:     true, // issue #916: always-present bool, default true
 			SkillMaxBytes:          65536,
 			SkillsMaxPerRun:        32,
 			ToolPackages:           []string{"kubectl@1.31", "jq"}, // PRD #18 M3 tier-1 list
@@ -219,14 +227,14 @@ func TestClaimSkillsWireContract(t *testing.T) {
 
 	path := filepath.FromSlash(wireContractFixture)
 	if os.Getenv("UPDATE_GOLDEN") != "" {
-		if err := os.WriteFile(path, got, 0o644); err != nil {
+		if err := os.WriteFile(path, got, 0o644); err != nil { //nolint:gosec // G306: test golden fixture is non-sensitive and 0644 keeps it readable in the repo
 			t.Fatalf("update golden: %v", err)
 		}
 		t.Logf("wrote %s", path)
 		return
 	}
 
-	want, err := os.ReadFile(path)
+	want, err := os.ReadFile(path) //nolint:gosec // G304: path is a fixed in-repo golden constant, not attacker-controlled
 	if err != nil {
 		t.Fatalf("read golden (run `UPDATE_GOLDEN=1 go test` to create it): %v", err)
 	}

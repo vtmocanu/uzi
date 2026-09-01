@@ -116,6 +116,12 @@ type fakeStore struct {
 	// defaultEffortErr forces the lookup to fail for the error-path test.
 	defaultEffort    pgtype.Text
 	defaultEffortErr error
+	// attributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
+	// live at standard-claim assembly. The zero value is false; scheduleModelStore sets
+	// it to true so existing fixtures mirror a fresh user's default-on state, and a test
+	// flips it to prove the false path. attributionEnabledErr forces the lookup to fail.
+	attributionEnabled    bool
+	attributionEnabledErr error
 	// judgeModel is the run owner's per-user judge_model override (PRD #69 M2);
 	// the zero value is NULL/inherit, so existing judge fixtures resolve the
 	// instance value unchanged. judgeModelErr models a user-row read fault, which
@@ -693,6 +699,9 @@ func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text
 func (f *fakeStore) GetUserDefaultEffort(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultEffort, f.defaultEffortErr
 }
+func (f *fakeStore) GetUserAttributionEnabled(context.Context, uuid.UUID) (bool, error) {
+	return f.attributionEnabled, f.attributionEnabledErr
+}
 func (f *fakeStore) GetUserJudgeModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.judgeModel, f.judgeModelErr
 }
@@ -1204,7 +1213,7 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	// Opaque fake secrets (deliberately not a real PAT/token format, so secret
 	// scanners don't flag the fixtures). The code treats both as opaque bytes.
 	const pat = "bot-pat-REDACTIONTEST-abcdef1234567890"
-	const token = "anthropic-oauth-CLAIMTEST-abcdef1234567890"
+	const token = "anthropic-oauth-CLAIMTEST-abcdef1234567890" //nolint:gosec // G101: fake Anthropic fixture token, sealed into a test box, never a real secret
 
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte(pat))
@@ -1547,6 +1556,9 @@ func scheduleModelStore(t *testing.T, runModel, userDefault pgtype.Text) *fakeSt
 		},
 		anthropic:    sealedTok,
 		defaultModel: userDefault,
+		// issue #916: default a fresh owner to attribution-on, mirroring the NOT NULL
+		// column's default true. Dedicated attribution tests flip this to prove false.
+		attributionEnabled: true,
 	}
 }
 
@@ -1616,6 +1628,89 @@ func TestClaimOmitsOverrideSubagentModelWhenFrozenOff(t *testing.T) {
 	}
 	if strings.Contains(string(b), "override_subagent_model") {
 		t.Fatalf("an off run's override_subagent_model must be omitted from the wire; got %s", b)
+	}
+}
+
+// issue #916 M2: the run owner's attribution_enabled value rides the standard claim as
+// Config.AttributionEnabled, read LIVE per claim from the owner's users row. Owner ON (a
+// fresh user's default) ⇒ the claim carries true, so today's Co-Authored-By behavior is
+// unchanged. Mirrors TestClaimDeliversOverrideSubagentModelWhenFrozenOn's seam.
+func TestClaimDeliversAttributionEnabledWhenOwnerOn(t *testing.T) {
+	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs.attributionEnabled = true
+
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if !payload.Config.AttributionEnabled {
+		t.Fatalf("owner attribution_enabled=true must ride the claim config; got %+v", payload.Config)
+	}
+	// Always-present bool (NOT omitempty): the true value is on the wire, unlike the
+	// omitempty flags, so an upgraded worker always sees a definite value.
+	b, err := json.Marshal(payload.Config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if !strings.Contains(string(b), `"attribution_enabled":true`) {
+		t.Fatalf("attribution_enabled=true must be present on the wire; got %s", b)
+	}
+}
+
+// issue #916 M2: owner OFF ⇒ the claim carries false, which the worker later uses to
+// suppress the Co-Authored-By: Claude trailer. The key is still present on the wire (NOT
+// omitempty), so false is a definite signal rather than an absence. Mirrors
+// TestClaimOmitsOverrideSubagentModelWhenFrozenOff but asserts PRESENCE, not omission,
+// because attribution_enabled is a plain always-present bool.
+func TestClaimDeliversAttributionDisabledWhenOwnerOff(t *testing.T) {
+	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs.attributionEnabled = false
+
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.Config.AttributionEnabled {
+		t.Fatalf("owner attribution_enabled=false must ride the claim config as false; got %+v", payload.Config)
+	}
+	b, err := json.Marshal(payload.Config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if !strings.Contains(string(b), `"attribution_enabled":false`) {
+		t.Fatalf("attribution_enabled=false must be present (not omitted) on the wire; got %s", b)
+	}
+}
+
+// issue #916 M2, SC3 (liveness): attribution_enabled is read at claim assembly, not
+// snapshotted at run creation. Assembling twice for the same run while the owner's stored
+// value flips between claims yields a claim reflecting the CURRENT value each time — so a
+// flipped toggle takes effect on the next claim/resume with no worker restart. If the
+// value were instead read from a run-row snapshot, GetUserAttributionEnabled would not be
+// consulted and the second claim would not change, which this test would catch.
+func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
+	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs.attributionEnabled = true
+
+	svc := New(fs, newBox(t), testParams())
+
+	first, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("first Claim: %v", err)
+	}
+	if !first.Config.AttributionEnabled {
+		t.Fatalf("first claim should reflect the owner's on value; got %+v", first.Config)
+	}
+
+	// Flip the owner's stored value (as SetUserAttributionEnabled would) and re-assemble.
+	fs.attributionEnabled = false
+
+	second, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("second Claim: %v", err)
+	}
+	if second.Config.AttributionEnabled {
+		t.Fatalf("second claim must re-read the flipped-off value live; got %+v", second.Config)
 	}
 }
 
@@ -1829,6 +1924,36 @@ func TestClaimFailsOnDefaultEffortLookupError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "default effort lookup") {
 		t.Fatalf("error should be wrapped as a default-effort lookup failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "db down") {
+		t.Fatalf("error should wrap the underlying cause, got: %v", err)
+	}
+}
+
+// TestClaimFailsOnAttributionLookupError mirrors the default_model/default_effort
+// lookup-error tests (PRD #916): a failing per-user attribution lookup propagates
+// wrapped as "attribution lookup: %w", not as a credential failure.
+func TestClaimFailsOnAttributionLookupError(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-ATTRERR-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-ATTRERR-abcdef1234567890"))
+	fs := &fakeStore{
+		claimRun: store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 11, Valid: true}, Status: "claimed"},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic:             sealedTok,
+		attributionEnabledErr: errors.New("db down"),
+	}
+
+	_, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	if err == nil {
+		t.Fatal("expected Claim to fail when the attribution lookup errors")
+	}
+	if !strings.Contains(err.Error(), "attribution lookup") {
+		t.Fatalf("error should be wrapped as an attribution lookup failure, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "db down") {
 		t.Fatalf("error should wrap the underlying cause, got: %v", err)
@@ -4208,8 +4333,8 @@ func TestClaimCredentialFailureNotifiesFailed(t *testing.T) {
 // the server at claim time. The test drives exactly that: one worker identity,
 // three claims, three bindings.
 func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
-	const defaultToken = "anthropic-DEFAULT-abcdef1234567890" //gitleaks:allow // fake Anthropic token fixture: sealed into a test box below to prove claim-time credential resolution, never a real secret
-	const consoleToken = "anthropic-CONSOLE-abcdef1234567890"
+	const defaultToken = "anthropic-DEFAULT-abcdef1234567890" //nolint:gosec // G101: fake Anthropic token fixture, sealed into a test box below to prove claim-time credential resolution, never a real secret; gitleaks:allow
+	const consoleToken = "anthropic-CONSOLE-abcdef1234567890" //nolint:gosec // G101: fake Anthropic token fixture, never a real secret; gitleaks:allow
 
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte("bot-pat-REBIND-abcdef1234567890"))
@@ -4364,7 +4489,7 @@ func TestClaimBoundToVanishedSecretFailsClosed(t *testing.T) {
 // per user (M4), not per worker. Getting this wrong would silently bill
 // retrospectives to whichever worker happened to pick them up.
 func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
-	const defaultToken = "anthropic-JUDGEDEFAULT-abcdef1234567" //gitleaks:allow // fake Anthropic token fixture: sealed into a test box below to prove the judge lane spends the owner's default, never a real secret
+	const defaultToken = "anthropic-JUDGEDEFAULT-abcdef1234567" //nolint:gosec // G101: fake Anthropic token fixture, sealed into a test box below to prove the judge lane spends the owner's default, never a real secret; gitleaks:allow
 
 	box := newBox(t)
 	sealedDefault, _ := box.Seal([]byte(defaultToken))
@@ -4437,8 +4562,8 @@ func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
 // milestone's whole point — retrospectives billed to a different account from the
 // runs they review.
 func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
-	const defaultToken = "anthropic-DEFAULT-judgebind-abcdef12" //gitleaks:allow // fake Anthropic token fixture: the credential this test asserts is NOT spent, never a real secret
-	const judgeToken = "anthropic-JUDGEKEY-judgebind-abcdef1"   //gitleaks:allow // fake Anthropic token fixture: the judge-bound credential this test asserts IS spent, never a real secret
+	const defaultToken = "anthropic-DEFAULT-judgebind-abcdef12" //nolint:gosec // G101: fake Anthropic token fixture, the credential this test asserts is NOT spent, never a real secret; gitleaks:allow
+	const judgeToken = "anthropic-JUDGEKEY-judgebind-abcdef1"   //nolint:gosec // G101: fake Anthropic token fixture, the judge-bound credential this test asserts IS spent, never a real secret; gitleaks:allow
 
 	box := newBox(t)
 	sealedDefault, _ := box.Seal([]byte(defaultToken))
@@ -4493,7 +4618,7 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 // default is resolved to an id and opened BY id like everything else, so "no by-id
 // lookup" now describes a claim that opened nothing at all.
 func TestJudgeClaimUnboundUsesDefault(t *testing.T) {
-	const defaultToken = "anthropic-DEFAULT-unbound-abcdef1234" //gitleaks:allow // fake Anthropic token fixture: sealed into a test box below to prove an unbound judge claim falls back to the default, never a real secret
+	const defaultToken = "anthropic-DEFAULT-unbound-abcdef1234" //nolint:gosec // G101: fake Anthropic token fixture, sealed into a test box below to prove an unbound judge claim falls back to the default, never a real secret; gitleaks:allow
 	box := newBox(t)
 	sealedDefault, _ := box.Seal([]byte(defaultToken))
 
@@ -4592,7 +4717,7 @@ func TestJudgeBoundToVanishedSecretFailsClosed(t *testing.T) {
 // and rides the ORDINARY run lane, not assembleJudgeClaim, so without an explicit
 // branch it would silently follow the claiming worker's binding instead.
 func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
-	const judgeToken = "anthropic-JUDGEKEY-selfimprove-abcd"
+	const judgeToken = "anthropic-JUDGEKEY-selfimprove-abcd" //nolint:gosec // G101: fake Anthropic token fixture, never a real secret; gitleaks:allow
 
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte("bot-pat-SELFIMPROVE-abcdef1234567890"))
