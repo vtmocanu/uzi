@@ -246,7 +246,7 @@ Two things the workflow-scope entry does not prepare you for:
   too.** Rewriting the literal at the tip and pushing again fails identically, with the
   ORIGINAL commit named in the message. The literal must leave the commit that introduced
   it before the first push, and nothing is on the remote yet, so this is plain history
-  editing: fix the file, then `git commit --fixup=INTRO_SHA` and
+  editing: fix the file, `git add` it, then `git commit --fixup=INTRO_SHA` and
   `GIT_SEQUENCE_EDITOR=: git rebase --autosquash -i origin/main` — the fix lands in that
   commit and every later commit replays unchanged (verified on a three-commit stack).
 - **Verify the RANGE, not the tip.** `task scan:secrets` scans the working tree as it is on
