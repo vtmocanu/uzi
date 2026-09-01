@@ -188,7 +188,8 @@ async function consume(opts: ReadOnlyModelPassOpts, homeDir: string, abort: Abor
 const ADVICE_FAILURE_REASON_LEN = 500;
 
 /** Best-effort "this advice run failed" report. NEVER throws into the caller — a
- *  state-report failure must not fail an advice run (judge/review/summary). The optional
+ *  state-report failure must not fail an advice run (judge/review — summary has no
+ *  failed-state path and does not call this). The optional
  *  `cause` lets the judge map a LimitReachedError to the server's structured limit facts
  *  (PRD #35 Decision 8): failure_reason is OMITTED in that case so the server composes the
  *  sentence from its own allowlisted enum rather than the worker smuggling an unvalidated
