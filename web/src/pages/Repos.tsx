@@ -1,5 +1,5 @@
 // Boards home: the projects the bot can see. Enabling one starts tracking its
-// PRD issues on a kanban board.
+// issues on a kanban board.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
