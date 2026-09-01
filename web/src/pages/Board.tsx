@@ -616,11 +616,7 @@ export function Board() {
             await createAndOpen(true);
             return;
           } catch (retryErr) {
-            setError(
-              retryErr instanceof ApiError
-                ? retryErr.message
-                : "Could not start run",
-            );
+            setError(errorMessage(retryErr, "Could not start run"));
           }
         }
         // Declined (or forced retry failed): clear starting, no toast on decline.

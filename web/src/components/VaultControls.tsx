@@ -101,9 +101,7 @@ function VaultUnlockBanner({ credential }: { credential: "password" | "passphras
           ? credential === "password"
             ? "Incorrect password."
             : "Incorrect passphrase."
-          : err instanceof ApiError
-            ? err.message
-            : "Failed to unlock the vault.";
+          : errorMessage(err, "Failed to unlock the vault.");
       setError(
         next >= 2 && credential === "password"
           ? base + " Still locked with the right password? Sign out and back in to re-create your vault."

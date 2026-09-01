@@ -1376,10 +1376,10 @@ function AgentSourceSettingsCard() {
       // Graceful: URL+folder stay filled so the admin can still edit/Save.
       setPresetMsg({
         tone: "danger",
-        text:
-          err instanceof ApiError
-            ? err.message
-            : "Could not resolve the latest tag. The URL and folder are filled — set a ref by hand or try again.",
+        text: errorMessage(
+          err,
+          "Could not resolve the latest tag. The URL and folder are filled — set a ref by hand or try again.",
+        ),
       });
     } finally {
       setResolving(false);
