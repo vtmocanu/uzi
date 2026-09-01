@@ -90,6 +90,12 @@ const state = {
   // Issue comments the autopilot terminal hook + poller post (GitLab "notes"). A
   // flat list carrying issue_iid so the harness can count per issue (PRD #19 M6).
   notes: /** @type {any[]} */ ([]),
+  // MR review discussions (PRD #966 M6). Keyed by mr iid -> [rawNote]. The GitLab
+  // driver's ListMergeRequestComments GETs /merge_requests/:iid/discussions and
+  // flattens each discussion's notes, so the GET route below wraps each stored note
+  // in its own single-note discussion. The harness appends via the /_e2e mutator to
+  // drive the mr_rework detector (settled review comment above the high-water mark).
+  mrNotes: /** @type {Record<number, any[]>} */ ({}),
   // Resource label events per issue (iid -> [event]), the signal the autopilot
   // detector reads to decide "who added the autopilot label, and which
   // application" (ListIssueLabelEvents). GitLab returns them oldest-first with
@@ -148,7 +154,7 @@ function persist() {
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify(
-        { issues: Object.values(state.issues), mrs: state.mrs, notes: state.notes, labelEvents: state.labelEvents, pipelines: state.pipelines, forgejoRuns: state.forgejoRuns, githubRuns: state.githubRuns, forgejoLabelIds: state.forgejoLabelIds },
+        { issues: Object.values(state.issues), mrs: state.mrs, notes: state.notes, mrNotes: state.mrNotes, labelEvents: state.labelEvents, pipelines: state.pipelines, forgejoRuns: state.forgejoRuns, githubRuns: state.githubRuns, forgejoLabelIds: state.forgejoLabelIds },
         null,
         2,
       ),
@@ -169,6 +175,7 @@ function load() {
     for (const issue of saved.issues || []) state.issues[issue.iid] = issue;
     state.mrs = Array.isArray(saved.mrs) ? saved.mrs : [];
     state.notes = Array.isArray(saved.notes) ? saved.notes : [];
+    state.mrNotes = saved.mrNotes && typeof saved.mrNotes === "object" ? saved.mrNotes : {};
     state.labelEvents = saved.labelEvents && typeof saved.labelEvents === "object" ? saved.labelEvents : {};
     state.pipelines = saved.pipelines && typeof saved.pipelines === "object" ? saved.pipelines : {};
     state.forgejoRuns = Array.isArray(saved.forgejoRuns) ? saved.forgejoRuns : [];
@@ -765,6 +772,33 @@ const server = https.createServer(
       persist();
       log("MR", mr.iid, "state ->", want);
       return send(res, 200, mr);
+    }
+
+    // Append an MR review discussion note (PRD #966 M6). The mr_rework detector
+    // reads these via the discussions route above. Body: {id, body, created_at,
+    // author_id, system}. author_id DEFAULTS to 2 (NOT 1) because forge-fake's
+    // /api/v4/user returns id 1 (the connection's bot id) and
+    // BuildReviewCommentsSnapshot drops notes whose author.id == the bot id — a
+    // bot-authored note is a silent no-fire — so the caller passes a reviewer id
+    // explicitly and the default is safe. E2E-only mutator.
+    const mrDiscPost = method === "POST" && path.match(/^\/_e2e\/mrs\/(\d+)\/discussions$/);
+    if (mrDiscPost) {
+      const iid = Number(mrDiscPost[1]);
+      const mr = state.mrs.find((m) => m.iid === iid);
+      if (!mr) return send(res, 404, { message: "404 Not found (no such MR)" });
+      const body = await readBody(req);
+      const note = {
+        id: Number.isFinite(body.id) ? Number(body.id) : state.nextNoteId++,
+        body: body.body || "",
+        created_at: body.created_at || new Date().toISOString(),
+        author_id: Number.isFinite(body.author_id) ? Number(body.author_id) : 2,
+        author_username: body.author_username || "reviewer",
+        system: !!body.system,
+      };
+      (state.mrNotes[iid] = state.mrNotes[iid] || []).push(note);
+      persist();
+      log("MR discussion note", iid, "id", note.id, "author", note.author_id, JSON.stringify((note.body || "").slice(0, 48)));
+      return send(res, 201, note);
     }
 
     // Set/flip a ref's pipeline — the harness stand-in for CI running (PRD #6).
@@ -1601,6 +1635,33 @@ const server = https.createServer(
         const mr = state.mrs.find((m) => m.iid === Number(mrPipes[1]));
         const p = mr ? state.pipelines[mr.source_branch] : null;
         return send(res, 200, p ? [pipelineInfo(p)] : []);
+      }
+
+      // MR review discussions (PRD #966 M6). ListMergeRequestDiscussions: the driver
+      // (gitlab.go ListMergeRequestComments) flattens discussion.notes and drops
+      // system notes, so each stored raw note is returned as its own single-note
+      // discussion. Shapes match go-gitlab byte-for-byte: note id/author.id are JSON
+      // numbers (int64), system is a bool, created_at is RFC3339, and a top-level note
+      // OMITS `position` (so the driver leaves HeadSHA=="" and the detector's GATE 2 is
+      // debounce-only). discussion.id is a string.
+      const mrDiscussions = rest.match(/^\/merge_requests\/(\d+)\/discussions$/);
+      if (method === "GET" && mrDiscussions) {
+        const iid = Number(mrDiscussions[1]);
+        const raw = state.mrNotes[iid] || [];
+        const discussions = raw.map((n) => ({
+          id: `disc-${n.id}`,
+          individual_note: false,
+          notes: [
+            {
+              id: n.id,
+              body: n.body || "",
+              system: !!n.system,
+              author: { id: n.author_id, username: n.author_username || "reviewer" },
+              created_at: n.created_at,
+            },
+          ],
+        }));
+        return send(res, 200, discussions);
       }
 
       // Merge requests.

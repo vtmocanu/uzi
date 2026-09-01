@@ -168,6 +168,7 @@ headers, not the rows.
 | 61 | schedules-prompt | gitlab | no | PRD #966 M4: scheduled prompt run (issue-less repo->MR run via run-now) |
 | 62 | self-improve | gitlab | no | PRD #966 M4: scheduled self_improve run (tracking issue, MR opened) |
 | 70 | handoff | gitlab | no | PRD #966 M5: task/handoff run kind via `uzi handoff` (+ host-gitconfig transport) |
+| 71 | mr-rework | gitlab | no | PRD #966 M6: mr_rework run kind (review-landed rework on a settled MR) |
 
 <!-- registry:end -->
 
