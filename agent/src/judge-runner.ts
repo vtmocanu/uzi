@@ -8,24 +8,16 @@
 // command-not-found fallback the API pre-scanned into the claim (Decision 4), so a
 // finding still lands.
 
-import { promises as fs } from "node:fs";
 import os from "node:os";
-import path from "node:path";
-
-import type { Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
-import { spawnDetached } from "./sdk-spawn.js";
-import { uidSplitActive } from "./runner-uid.js";
 
 import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
-import { buildSdkEnv } from "./sdk-env.js";
 import { fenceNonce } from "./prompt.js";
-import { defaultQueryFn, mapSdkMessage, isResult, isErrorResult, promptStream } from "./sdk-messages.js";
-import { buildDenyAllHook } from "./model-pass.js";
+import { defaultQueryFn, mapSdkMessage } from "./sdk-messages.js";
+import { runReadOnlyModelPass } from "./model-pass.js";
 import type { EmittedMessage } from "./executor.js";
-import { classifyLimitFailure, LimitReachedError, RateLimitObserver } from "./limit.js";
+import { classifyLimitFailure, LimitReachedError } from "./limit.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
-import { rmTreeForce } from "./rmtree.js";
 import { errMessage } from "./util.js";
 import type {
   ClaimResponse,
@@ -268,113 +260,44 @@ export class JudgeRunner {
   }
 
   private async runModel(token: string, model: string, prompt: string): Promise<{ text: string; result?: EmittedMessage }> {
-    const homeDir = await fs.mkdtemp(path.join(this.homeRoot, "uzi-judge-"));
-    // PRD #51 M4: the judge SDK CLI runs as the `runner` uid (spawnClaudeCodeProcess ->
-    // runnerSpawn), but fs.mkdtemp FORCES mode 0700 (Node ignores umask) and JudgeRunner
-    // runs in the WORKER process, so the HOME is worker-owned 0700 — the runner gets ZERO
-    // access (the setgid /data/agent-home parent sets the dir's group `runner`, but 0700
-    // grants the group nothing) and the judge CLI cannot write $HOME/.claude. Under the
-    // split, widen it to 2770 (group `runner` rwx) so the runner can use it and the worker
-    // (a `runner`-group member) can still rm it on cleanup. The unit-test / single-uid (#58)
-    // path leaves 0700 (the judge runs as the worker — same uid, 0700 is correct + tighter).
-    if (uidSplitActive()) await fs.chmod(homeDir, 0o2770);
-    // Wall-clock cap: abort the SDK query (native cancellation) AND hard-reject the
-    // race, so a hung/retrying model call can never wedge the judge run — runModel
-    // settles within JUDGE_MODEL_TIMEOUT_MS and judge() falls back.
-    const abort = new AbortController();
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        abort.abort();
-        reject(new Error(`judge model call exceeded ${this.modelTimeoutMs}ms`));
-      }, this.modelTimeoutMs);
-    });
-    try {
-      return await Promise.race([this.consumeModel(token, model, prompt, homeDir, abort), timeout]);
-    } finally {
-      if (timer) clearTimeout(timer);
-      // PRD #108 M6: the same permission-restoring removal the run lane uses.
-      //
-      // The EXPOSURE differs from a run's HOME — a judge run fetches a trace and
-      // calls the model, so it populates no Go module cache and no EACCES leak has
-      // been observed here — but the MECHANISM is identical, and shipping the fix
-      // at one of two identical call sites reads as an oversight six months out.
-      //
-      // The warn matters more than the helper swap. This used to be a total
-      // swallow (`.catch(() => {})`), and the M6 reclaim sweep will never collect
-      // this directory either: it is named `uzi-judge-*`, not a run UUID, so the
-      // sweep's RUN_ID_RE filter skips it BY DESIGN. If one ever strands, this line
-      // is the only thing anywhere that will say so. Still best-effort — a cleanup
-      // must never fail a judge run.
-      await rmTreeForce(homeDir).catch((e) =>
-        this.log.warn("judge HOME cleanup failed", { home_dir: homeDir, error: errMessage(e) }),
-      );
-    }
-  }
-
-  private async consumeModel(
-    token: string,
-    model: string,
-    prompt: string,
-    homeDir: string,
-    abort: AbortController,
-  ): Promise<{ text: string; result?: EmittedMessage }> {
-    const env = buildSdkEnv(token, homeDir);
-    const options: SdkOptions = {
-      env: env as unknown as Record<string, string | undefined>,
-      abortController: abort,
-      // No repo settings, and a deny-all tool hook: the judge reasons from text only.
-      settingSources: [],
-      systemPrompt: JUDGE_SYSTEM_PROMPT,
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      includePartialMessages: false,
-      hooks: {
-        PreToolUse: [{ hooks: [denyAllTools] }],
-      },
-      // PRD #51 M4: the judge's model-reasoning SDK CLI is an execution surface, so route
-      // it through the runner-uid spawn like every other SDK spawn (uniform boundary). The
-      // judge's worker-side HTTP (trace-fetch + verdict POST, which use the join token)
-      // stays on the worker (Decision 1) — those run in this Node process, not the CLI. The
-      // deny-all tool hook already blocks code-exec, so this is defense-in-depth.
-      spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
-    };
-    if (model) options.model = model;
-
-    let text = "";
     // The terminal success frame mapped to a run message (PRD #69 M6): mapSdkMessage
     // routes a result frame through mapResult, which carries event:"result" + modelUsage
     // — the only fields the API's foldRunUsage reads. Surfaced to execute() to post so a
-    // run_usage row lands for the judge; undefined on the error/limit path (it throws).
+    // run_usage row lands for the judge; left undefined on the error/limit path (onResult
+    // throws before capturing it).
     let result: EmittedMessage | undefined;
-    // PRD #35 Decision 14: a judge run NEVER parks. It is executed by this runner,
-    // not RunRunner, so it never reaches that cleanup carve-out at all — and parking
-    // it would mean duplicating detection, the park report and a second carve-out
-    // into this file for the cheapest run kind in the product. Its value also decays:
-    // maybeEnqueueJudge fires once on the reviewed run's terminal transition, so a
-    // judge parked for up to seven days would be reviewing a run nobody remembers,
-    // and losing it loses no user work. What it DOES get is Decision 8's better
-    // death — the structured limit facts on the failed report, so the server can say
-    // why instead of leaving "judge model call returned an error result".
-    const rateLimits = new RateLimitObserver();
-    for await (const msg of this.queryFn({ prompt: promptStream(prompt), options })) {
-      rateLimits.observe(msg);
-      for (const em of mapSdkMessage(msg)) {
-        if (em.kind === "text") {
-          const t = (em.payload as { text?: string }).text;
-          if (t) text += t;
-        }
-      }
-      if (isResult(msg)) {
-        if (isErrorResult(msg)) {
-          const limit = classifyLimitFailure(msg, rateLimits.latest, Date.now());
+    const text = await runReadOnlyModelPass({
+      token,
+      model,
+      systemPrompt: JUDGE_SYSTEM_PROMPT,
+      prompt,
+      homeRoot: this.homeRoot,
+      homePrefix: "uzi-judge-",
+      label: "judge",
+      timeoutMs: this.modelTimeoutMs,
+      queryFn: this.queryFn,
+      denyReason: "the judge is read-only and runs no tools",
+      log: this.log,
+      // PRD #35 Decision 14: a judge run NEVER parks. It is executed by this runner,
+      // not RunRunner, so it never reaches that cleanup carve-out at all — and parking
+      // it would mean duplicating detection, the park report and a second carve-out
+      // into this file for the cheapest run kind in the product. Its value also decays:
+      // maybeEnqueueJudge fires once on the reviewed run's terminal transition, so a
+      // judge parked for up to seven days would be reviewing a run nobody remembers,
+      // and losing it loses no user work. What it DOES get is Decision 8's better
+      // death — the structured limit facts on the failed report, so the server can say
+      // why instead of leaving "judge model call returned an error result".
+      onResult: (msg, { isError, latest }) => {
+        if (isError) {
+          const limit = classifyLimitFailure(msg, latest, Date.now());
           if (limit) throw new LimitReachedError(limit);
           throw new Error("judge model call returned an error result");
         }
+        // The terminal success frame → run_usage: mapSdkMessage routes it through
+        // mapResult (event:"result" + modelUsage, the only fields foldRunUsage reads).
         result = mapSdkMessage(msg)[0];
-        break;
-      }
-    }
+      },
+    });
     return { text, result };
   }
 
@@ -395,8 +318,6 @@ export class JudgeRunner {
     }
   }
 }
-
-const denyAllTools = buildDenyAllHook("the judge is read-only and runs no tools");
 
 /** Build the judge's user prompt: target metadata + steering log + the
  *  command-not-found signal + the owner's known improve_uzi targets (issue #232) + a

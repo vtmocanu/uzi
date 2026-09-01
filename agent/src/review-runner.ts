@@ -11,24 +11,16 @@
 // It is REPORT-ONLY: it pushes NOTHING and opens no merge request. The deliverable is
 // the structured findings POSTed to `POST /worker/runs/{target}/task-review`.
 
-import { promises as fs } from "node:fs";
 import os from "node:os";
-import path from "node:path";
-
-import type { Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
-import { spawnDetached } from "./sdk-spawn.js";
-import { uidSplitActive } from "./runner-uid.js";
 
 import type { WorkerClient } from "./client.js";
 import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
-import { buildSdkEnv } from "./sdk-env.js";
 import { fenceNonce } from "./prompt.js";
-import { defaultQueryFn, mapSdkMessage, isResult, isErrorResult, promptStream } from "./sdk-messages.js";
-import { buildDenyAllHook } from "./model-pass.js";
+import { defaultQueryFn } from "./sdk-messages.js";
+import { runReadOnlyModelPass } from "./model-pass.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { extractJsonObject } from "./judge-runner.js";
-import { rmTreeForce } from "./rmtree.js";
 import { errMessage } from "./util.js";
 import type { ClaimResponse, TaskReviewFinding, TaskReviewRequest } from "./protocol.js";
 
@@ -183,67 +175,18 @@ export class ReviewRunner {
   }
 
   private async runModel(token: string, prompt: string): Promise<string> {
-    const homeDir = await fs.mkdtemp(path.join(this.homeRoot, "uzi-review-"));
-    // Same permission handling as JudgeRunner.runModel: under the M4 uid-split the SDK
-    // CLI runs as the `runner` uid, but fs.mkdtemp forces 0700 on a worker-owned dir, so
-    // widen it to 2770 (group `runner`) so the runner can write $HOME/.claude. The
-    // single-uid path leaves 0700 (the review runs as the worker — same uid).
-    if (uidSplitActive()) await fs.chmod(homeDir, 0o2770);
-    const abort = new AbortController();
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        abort.abort();
-        reject(new Error(`review model call exceeded ${this.modelTimeoutMs}ms`));
-      }, this.modelTimeoutMs);
-    });
-    try {
-      return await Promise.race([this.consumeModel(token, prompt, homeDir, abort), timeout]);
-    } finally {
-      if (timer) clearTimeout(timer);
-      // Best-effort HOME cleanup (the reclaim sweep skips a `uzi-review-*` dir by its
-      // RUN_ID_RE filter, so this line is the only collector). A cleanup must never fail
-      // a review run.
-      await rmTreeForce(homeDir).catch((e) =>
-        this.log.warn("review HOME cleanup failed", { home_dir: homeDir, error: errMessage(e) }),
-      );
-    }
-  }
-
-  private async consumeModel(token: string, prompt: string, homeDir: string, abort: AbortController): Promise<string> {
-    const env = buildSdkEnv(token, homeDir);
-    const options: SdkOptions = {
-      env: env as unknown as Record<string, string | undefined>,
-      abortController: abort,
-      // No repo settings, and a deny-all tool hook: the reviewer reasons from text only.
-      settingSources: [],
+    return runReadOnlyModelPass({
+      token,
       systemPrompt: REVIEW_SYSTEM_PROMPT,
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      includePartialMessages: false,
-      hooks: {
-        PreToolUse: [{ hooks: [denyAllTools] }],
-      },
-      // Route the model-reasoning SDK CLI through the runner-uid spawn like every other
-      // SDK spawn (uniform boundary). The deny-all tool hook already blocks code-exec, so
-      // this is defense-in-depth.
-      spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
-    };
-
-    let text = "";
-    for await (const msg of this.queryFn({ prompt: promptStream(prompt), options })) {
-      for (const em of mapSdkMessage(msg)) {
-        if (em.kind === "text") {
-          const t = (em.payload as { text?: string }).text;
-          if (t) text += t;
-        }
-      }
-      if (isResult(msg)) {
-        if (isErrorResult(msg)) throw new Error("review model call returned an error result");
-        break;
-      }
-    }
-    return text;
+      prompt,
+      homeRoot: this.homeRoot,
+      homePrefix: "uzi-review-",
+      label: "review",
+      timeoutMs: this.modelTimeoutMs,
+      queryFn: this.queryFn,
+      denyReason: "the reviewer is read-only and runs no tools",
+      log: this.log,
+    });
   }
 
   private async safeReportFailed(runId: string, reason: string): Promise<void> {
@@ -254,8 +197,6 @@ export class ReviewRunner {
     }
   }
 }
-
-const denyAllTools = buildDenyAllHook("the reviewer is read-only and runs no tools");
 
 /** Build the reviewer's user prompt: the git diff, fenced as UNTRUSTED DATA under a
  *  per-prompt CSPRNG nonce (same pattern as the judge's trace fence) so a diff that
