@@ -5953,9 +5953,18 @@ func clampInt(v, lo, hi int) int {
 // disposition is left NULL (the worker settles it in m4). No stop_kind is stamped.
 func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling int, auditBody string) (SubmitInputResult, error) {
 	cleanBody, _ := stripNUL(auditBody)
+	// ceiling is clampInt'd into [len(completed), len(frozen)] by the caller, so it is a
+	// small non-negative milestone count. The explicit int32 bound makes that provable to
+	// the integer-conversion analyzers (gosec G115 / CodeQL go/incorrect-integer-conversion)
+	// at the cast, mirroring task.go's budget-iters guard; the >MaxInt32 arm is unreachable
+	// for a milestone count and falls back to 0 ("complete nothing further"), the safe direction.
+	ceil32 := int32(0)
+	if ceiling >= 0 && ceiling <= math.MaxInt32 {
+		ceil32 = int32(ceiling)
+	}
 	if _, err := s.q.CreateScopeCeilingInput(ctx, store.CreateScopeCeilingInputParams{
 		RunID:        run.ID,
-		ScopeCeiling: pgtype.Int4{Int32: int32(ceiling), Valid: true}, //nolint:gosec // G115: ceiling is a small bounded scope-cap count, never near int32 range
+		ScopeCeiling: pgtype.Int4{Int32: ceil32, Valid: true},
 		Body:         pgText(cleanBody),
 	}); err != nil {
 		return SubmitInputResult{}, err
