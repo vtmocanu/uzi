@@ -95,7 +95,7 @@ func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 	opt := &gh.ListWorkflowJobsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
 	wrap := func(e error) error { return g.wrapErr("list pipeline jobs", e) }
 	return paginate(wrap, func(page int) ([]Job, int, error) {
-		opt.ListOptions.Page = page
+		opt.Page = page
 		jobs, resp, err := g.client.Actions.ListWorkflowJobs(ctx, slug.owner, slug.repo, pipelineID, opt)
 		if err != nil {
 			return nil, 0, err

@@ -190,7 +190,7 @@ func (g *github) ListProjects(ctx context.Context) ([]Project, error) {
 	}
 	wrap := func(e error) error { return g.wrapErr("list projects", e) }
 	return paginate(wrap, func(page int) ([]Project, int, error) {
-		opt.ListOptions.Page = page
+		opt.Page = page
 		repos, resp, err := g.client.Repositories.ListByAuthenticatedUser(ctx, opt)
 		if err != nil {
 			return nil, 0, err
@@ -664,7 +664,7 @@ func (g *github) ListIssueComments(ctx context.Context, projectID, issueIID int6
 	opt := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
 	wrap := func(e error) error { return g.wrapErr("list issue comments", e) }
 	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
-		opt.ListOptions.Page = page
+		opt.Page = page
 		comments, resp, err := g.client.Issues.ListComments(ctx, slug.owner, slug.repo, int(issueIID), opt)
 		if err != nil {
 			return nil, 0, err
