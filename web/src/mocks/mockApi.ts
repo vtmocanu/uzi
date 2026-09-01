@@ -1342,6 +1342,15 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    slug: "refactor-scout",
+    name: "Refactor scout",
+    description: "Biweekly propose-only scout that surveys the repo for one high-value structural refactor and opens an MR adding it as a proposal file.",
+    target: "prompt", cron: "0 5 1,15 * *", timezone: "UTC", model: "fable",
+    prompt:
+      "Survey this repository for ONE high-value structural refactor worth proposing — and PROPOSE it, never implement it. This job never changes the code under refactor; its only output is a single proposal file. Pick a candidate from these shapes: duplication with 3+ occurrences of the same responsibility, an oversized file with a natural cohesion seam, dead branches or config the gates cannot see, or a costly consistency defect — the one with the best impact-to-effort ratio.\n\nDedup before you propose: read the existing `ideas/refactors/` folder INCLUDING already-declined proposals and their decline reasons, and do not re-propose a recorded idea unless the evidence has materially changed (say exactly what changed). Carry your own rigour — derive every count from a named command you ran, cite each claim as `file:line @ <sha>`, and mark it verified or plausible. File it ONLY if it passes its own rubric (impact >= effort, behavior-preserving or flagged, a dedup needs 3+ same-responsibility occurrences, a split needs a real seam).\n\nStay on the propose-only, structural side of the self-improvement job, which IMPLEMENTS small fixes — this one proposes refactors too big or risky for one unattended MR. Write the proposal to a single new file `ideas/refactors/YYYY-MM-DD-<slug>.md` (create the folder if needed), commit it, and open a merge request titled `refactor-scout: <slug>`. If nothing clears the bar this cycle, make no change and open no MR: leave a short note on what you surveyed and why nothing qualified.",
+    labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
+  },
+  {
     slug: "bug-triage",
     name: "Bug triage sweep",
     description: "Daily sweep over open issues labelled \"bug\", starting a run for the oldest few.",

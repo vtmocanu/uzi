@@ -560,8 +560,8 @@ bundles assignee+label under one "edit issue metadata" permission, and that
 bundling is version-dependent, so re-check on a major GitLab upgrade.
 
 Since PRD #589, a `run_schedules` row can also be `origin='default'`: a
-`go:embed`'d catalog (`api/internal/schedtmpl/`, eight entries, mirroring
-`agenttmpl/builtins`) that a user enables per repo. The newest, `assigned-sweep`
+`go:embed`'d catalog (`api/internal/schedtmpl/`, nine entries, mirroring
+`agenttmpl/builtins`) that a user enables per repo. One of them, `assigned-sweep`
 (PRD #767 M4), sweeps issues assigned to the uzi-bot via a new non-label
 `SelectorAssigned` selector kind, distinct from the other sweeps' label selector. A default row stores no
 prompt of its own — it carries `catalog_slug` and the scheduler resolves the
