@@ -35,9 +35,9 @@ migration, and it accumulates silently because nothing fails.
   registration, generated code, or config- or convention-driven entry
   points, so confirm none of those reaches the symbol before calling it
   dead. Deleted the last caller of a helper? That makes the helper a
-  candidate too, held to those same reachability checks before you
-  call it dead — the last LITERAL caller going does not rule out a
-  reflection, DI, or config-driven path still reaching it.
+  candidate too, not a proven orphan: the last LITERAL caller going
+  does not rule out those same non-literal paths, so hold it to the
+  same checks.
 - Report orphans as Non-blocking with the evidence (symbol, its
   definition site, and the search that found no callers), unless the
   task was explicitly a cleanup, where they are Blocking.
