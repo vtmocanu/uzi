@@ -226,6 +226,46 @@ func TestCheckTokenIntrospectionUnsupported(t *testing.T) {
 	}
 }
 
+// TestCheckTokenIntrospectionErrorDowngrades pins the NON-sentinel downgrade arm of
+// CheckToken (checker.go:44-50): a GENERIC introspection error (not
+// forge.ErrTokenIntrospectionUnsupported) becomes the generic "could not verify" warning
+// — NOT the per-forge introspection-unsupported message — with no blocking violation, and
+// a zero forge.TokenInfo{} is evaluated (so no scopes bleed through). This is the caller
+// consequence of forgejo.TokenInfo's fail-safe returning a non-sentinel error.
+func TestCheckTokenIntrospectionErrorDowngrades(t *testing.T) {
+	c := NewChecker()
+
+	// A transient, non-sentinel introspection error (e.g. the forgejo fail-safe error).
+	f := &fakeForge{tokenErr: errors.New("transient 502 from forge")}
+	tr := c.CheckToken(context.Background(), f, forge.TypeGitHub, false, now)
+
+	if len(tr.Violations) != 0 {
+		t.Fatalf("a transient introspection error must not block; got violations %v", tr.Violations)
+	}
+	if !hasFinding(tr.Warnings, "could not verify token scopes against the forge") {
+		t.Fatalf("want the GENERIC downgrade warning, got %v", tr.Warnings)
+	}
+	// It must NOT reuse the per-forge introspection-unsupported message, which is reserved
+	// for the sentinel error.
+	if hasFinding(tr.Warnings, "classic PAT") {
+		t.Fatalf("a generic error must not surface the github introspection-unsupported hint, got %v", tr.Warnings)
+	}
+	// A zero TokenInfo was evaluated: no scopes, not active.
+	if len(tr.Scopes) != 0 {
+		t.Fatalf("a downgraded introspection error must evaluate a zero TokenInfo (no scopes), got %v", tr.Scopes)
+	}
+	if tr.Active {
+		t.Fatalf("a downgraded introspection error must evaluate a zero TokenInfo (not active)")
+	}
+
+	// The admin flag still turns into a violation even when scopes can't be read (the
+	// admin check rides on VerifyToken, not TokenInfo).
+	trAdmin := c.CheckToken(context.Background(), f, forge.TypeGitHub, true, now)
+	if !hasFinding(trAdmin.Violations, "instance admin") {
+		t.Fatalf("admin check must apply without introspection; got %v", trAdmin.Violations)
+	}
+}
+
 // TestCheckFullReport walks the per-repo matrix through the full Check path.
 func TestCheckFullReport(t *testing.T) {
 	f := &fakeForge{

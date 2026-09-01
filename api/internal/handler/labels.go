@@ -24,7 +24,7 @@ func (h *Handler) CheckRepoLabels(w http.ResponseWriter, r *http.Request) {
 	}
 	var req apitypes.LabelCheckRequest
 	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
@@ -55,7 +55,7 @@ func (h *Handler) EnsureRepoLabels(w http.ResponseWriter, r *http.Request) {
 	}
 	var req apitypes.LabelEnsureRequest
 	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)

@@ -1100,6 +1100,153 @@ func TestForgejoTokenInfoAmbiguousCollisionFailsSafe(t *testing.T) {
 	if strings.Contains(err.Error(), token) {
 		t.Errorf("collision error leaked the PAT: %q", err.Error())
 	}
+	// The fail-safe must hand back the zero TokenInfo (no scopes leak through), and the
+	// error must NOT be the introspection-unsupported sentinel — the checker branches on
+	// that sentinel to choose a different, per-forge warning message.
+	assertZeroForgejoTokenInfo(t, info)
+	if errors.Is(err, ErrTokenIntrospectionUnsupported) {
+		t.Error("a collision must not masquerade as the introspection-unsupported sentinel; the caller branches on it")
+	}
+}
+
+// assertZeroForgejoTokenInfo asserts info is the zero TokenInfo: the fail-safe arms of
+// TokenInfo must never let scopes, an Active flag, or an expiry leak through.
+func assertZeroForgejoTokenInfo(t *testing.T, info TokenInfo) {
+	t.Helper()
+	if len(info.Scopes) != 0 {
+		t.Errorf("fail-safe TokenInfo must carry no scopes, got %v", info.Scopes)
+	}
+	if info.Active {
+		t.Error("fail-safe TokenInfo must not be Active")
+	}
+	if !info.ExpiresAt.IsZero() {
+		t.Errorf("fail-safe TokenInfo must have a zero ExpiresAt, got %v", info.ExpiresAt)
+	}
+}
+
+// TestForgejoTokenInfoNotFoundFailsSafe covers the matches==0 arm: the authenticating
+// token does not appear in its owner's own token list, so no listed entry matches its
+// last-eight. That is a fail-SAFE generic error (never scopes), and it must NOT be the
+// introspection-unsupported sentinel — privcheck.CheckToken branches on that sentinel to
+// pick a different warning. Mutation check: change the matches==0 arm to return
+// {Scopes: matchedScopes, Active: true}, nil and this test reddens.
+func TestForgejoTokenInfoNotFoundFailsSafe(t *testing.T) {
+	const token = "forgejo-pat-aaaa-bbbb-11112222"
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/user": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "login": "uzi-bot", "is_admin": false})
+		},
+		"/users/uzi-bot/tokens": func(w http.ResponseWriter, _ *http.Request) {
+			// None of the listed tokens matches the authenticating PAT's last eight.
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 1, "name": "other", "token_last_eight": "99998888", "scopes": []string{"read:user"}},
+				{"id": 2, "name": "spare", "token_last_eight": "77776666", "scopes": []string{"write:issue"}},
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, token)
+
+	info, err := d.TokenInfo(context.Background())
+	if err == nil {
+		t.Fatalf("a token absent from its owner's list must fail safe (error), got %+v", info)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error must report the token was not found, got %q", err.Error())
+	}
+	assertZeroForgejoTokenInfo(t, info)
+	if errors.Is(err, ErrTokenIntrospectionUnsupported) {
+		t.Error("a not-found result must not masquerade as the introspection-unsupported sentinel; the caller branches on it")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Errorf("not-found error leaked the PAT: %q", err.Error())
+	}
+}
+
+// TestForgejoTokenInfoCrossPageCollisionFailsSafe splits a last-eight collision ACROSS
+// two pages, exercising the pagination loop and the cross-page matches/matchedScopes
+// accumulation that a single-page fixture never reaches. Page 1 returns exactly
+// forgejoPerPage tokens (so the loop does NOT break — len == forgejoPerPage) including one
+// last-eight match; page 2 returns one more match, then a short page ends paging. So
+// matches==2 accumulated across pages ⇒ fail safe. Mutation check: a pick-first rewrite of
+// the >1/==1 logic reddens this alongside the same-page collision test.
+func TestForgejoTokenInfoCrossPageCollisionFailsSafe(t *testing.T) {
+	const token = "forgejo-pat-aaaa-bbbb-11112222"
+	last8 := token[len(token)-8:]
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/user": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "login": "uzi-bot", "is_admin": false})
+		},
+		"/users/uzi-bot/tokens": func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Query().Get("page") {
+			case "1":
+				// A FULL page (== forgejoPerPage) so the loop does not break; one entry
+				// matches the authenticating PAT's last eight (over-scoped "all").
+				list := make([]map[string]any, 0, forgejoPerPage)
+				list = append(list, map[string]any{"id": 1, "name": "godmode", "token_last_eight": last8, "scopes": []string{"all"}})
+				for i := 1; i < forgejoPerPage; i++ {
+					list = append(list, map[string]any{"id": 100 + i, "name": "filler", "token_last_eight": "00000000", "scopes": []string{"read:user"}})
+				}
+				_ = json.NewEncoder(w).Encode(list)
+			default:
+				// A SHORT page (< forgejoPerPage) ends paging, and it carries a SECOND
+				// match — so matches==2 across pages, which must fail safe.
+				_ = json.NewEncoder(w).Encode([]map[string]any{
+					{"id": 2, "name": "clean", "token_last_eight": last8, "scopes": []string{"write:issue"}},
+				})
+			}
+		},
+	})
+	d := newForgejoDriver(t, m, token)
+
+	info, err := d.TokenInfo(context.Background())
+	if err == nil {
+		t.Fatalf("a collision split across pages must fail safe (error), got %+v", info)
+	}
+	assertZeroForgejoTokenInfo(t, info)
+	if errors.Is(err, ErrTokenIntrospectionUnsupported) {
+		t.Error("a cross-page collision must not masquerade as the introspection-unsupported sentinel")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Errorf("cross-page collision error leaked the PAT: %q", err.Error())
+	}
+}
+
+// TestForgejoTokenInfoPageCapFailsSafe drives the maxForgePages backstop: the token list
+// forge advertises a perpetually full page (== forgejoPerPage) with no match, so the loop
+// never breaks and never matches — only the page cap can stop the spin. It fails safe with
+// the shared "backstop" error, a zero TokenInfo, and not the introspection sentinel.
+func TestForgejoTokenInfoPageCapFailsSafe(t *testing.T) {
+	defer func(o int) { maxForgePages = o }(maxForgePages)
+	maxForgePages = 2
+
+	const token = "forgejo-pat-aaaa-bbbb-11112222"
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/user": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "login": "uzi-bot", "is_admin": false})
+		},
+		"/users/uzi-bot/tokens": func(w http.ResponseWriter, _ *http.Request) {
+			// Always a FULL page (== forgejoPerPage), none matching: the loop never breaks
+			// and never matches, forcing it to page until page >= maxForgePages.
+			list := make([]map[string]any, 0, forgejoPerPage)
+			for i := 0; i < forgejoPerPage; i++ {
+				list = append(list, map[string]any{"id": 100 + i, "name": "filler", "token_last_eight": "00000000", "scopes": []string{"read:user"}})
+			}
+			_ = json.NewEncoder(w).Encode(list)
+		},
+	})
+	d := newForgejoDriver(t, m, token)
+
+	info, err := d.TokenInfo(context.Background())
+	if err == nil {
+		t.Fatalf("an unbounded token list must trip the page cap (error), got %+v", info)
+	}
+	if !strings.Contains(err.Error(), "backstop") {
+		t.Errorf("page-cap error must name the backstop, got %q", err.Error())
+	}
+	assertZeroForgejoTokenInfo(t, info)
+	if errors.Is(err, ErrTokenIntrospectionUnsupported) {
+		t.Error("a page-cap result must not masquerade as the introspection-unsupported sentinel")
+	}
 }
 
 // TestForgejoM4ErrorsAreRedacted is test #12 for the M4 methods, including the two
