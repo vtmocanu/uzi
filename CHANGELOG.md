@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release publish jobs tolerate a transient cosign download failure ([#946](https://github.com/vtmocanu/uzi/pull/946)).**
+  The image and chart signing jobs now install a pinned, checksum-verified cosign through a local action that retries the download, so a one-off TLS hiccup on a runner no longer fails a publish job and stalls the GitHub Release (issue [#945](https://github.com/vtmocanu/uzi/issues/945)).
+
 ## [0.74.0] - 2026-09-01
 
 ### Added

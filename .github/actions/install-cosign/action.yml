@@ -1,0 +1,67 @@
+# Retrying, checksum-pinned cosign install (issue #945).
+#
+# Replaces sigstore/cosign-installer on the release signing path. The action
+# exposes no retry hook, so a transient TLS/download failure on one runner
+# (curl exit 35, observed on release.yml run 33503117288) failed a publish job
+# and -- because publish-release needs: every publish job -- stalled the whole
+# GitHub Release until an operator re-ran the job by hand.
+#
+# This fetches the SAME pinned cosign binary the action fetched, but with curl
+# retries + backoff, and verifies it against an embedded sha256. An immutable
+# release means an immutable binary, so pinning the digest here is strictly
+# stronger than trusting the fetched checksums file and matches how this repo
+# pins its actions by SHA. To bump cosign: change cosign-release at every call
+# site in release.yml AND add the new digest to COSIGN_SHA256 below.
+name: Install cosign
+description: Install a pinned cosign release with a retrying, checksum-verified download.
+inputs:
+  cosign-release:
+    description: cosign release tag to install (e.g. v3.1.3).
+    required: true
+runs:
+  using: composite
+  steps:
+    # ${{ inputs.* }} goes through env: (never interpolated into the script body).
+    - name: Install cosign (pinned, retrying)
+      shell: bash
+      env:
+        COSIGN_RELEASE: ${{ inputs.cosign-release }}
+      # github-env: the only $GITHUB_PATH write is a constant ($HOME/.local/bin),
+      # never attacker input -- see the inline note at the write site below.
+      run: | # zizmor: ignore[github-env]
+        set -euo pipefail
+        declare -A COSIGN_SHA256=(
+          [v3.1.3]=4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
+        )
+        expected="${COSIGN_SHA256[$COSIGN_RELEASE]:-}"
+        if [ -z "$expected" ]; then
+          echo "::error::install-cosign: no pinned sha256 for cosign $COSIGN_RELEASE; add it to COSIGN_SHA256 in .github/actions/install-cosign/action.yml." >&2
+          exit 1
+        fi
+        dir="$(mktemp -d)"
+        # --retry-all-errors is what makes curl retry the transient TLS-connect
+        # failure (exit 35) this action exists to survive -- plain --retry does not
+        # cover connection-level errors. Up to 5 retries with curl's default
+        # exponential backoff. linux-amd64 matches every publish job's
+        # `platforms: linux/amd64`.
+        curl --fail --location --show-error --silent \
+          --retry 5 --retry-all-errors \
+          --connect-timeout 15 --max-time 300 \
+          -o "$dir/cosign" \
+          "https://github.com/sigstore/cosign/releases/download/${COSIGN_RELEASE}/cosign-linux-amd64"
+        got="$(sha256sum "$dir/cosign" | awk '{print $1}')"
+        if [ "$got" != "$expected" ]; then
+          echo "::error::install-cosign: cosign $COSIGN_RELEASE sha256 mismatch (got $got, expected $expected)." >&2
+          exit 1
+        fi
+        # Install into a user-writable dir and put it on PATH for later steps via
+        # $GITHUB_PATH -- avoids assuming write access to a system dir (holds on any
+        # runner, not just GitHub-hosted), matching how the upstream action and the
+        # setup-* actions install their tools.
+        dest="$HOME/.local/bin"
+        mkdir -p "$dest"
+        install -m 0755 "$dir/cosign" "$dest/cosign"
+        # Constant path, not attacker input (github-env suppressed on the run: line).
+        echo "$dest" >> "$GITHUB_PATH"
+        # $GITHUB_PATH only affects SUBSEQUENT steps, so verify by full path here.
+        "$dest/cosign" version
