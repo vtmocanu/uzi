@@ -23,7 +23,7 @@ first one — it's a genuinely different shape of run:
 
 | | PRD flow (`uzi run create`) | Handoff flow (`uzi handoff`) |
 |---|---|---|
-| Trigger | A forge issue, usually PRD-labelled | A local checkout + inline context |
+| Trigger | A forge issue, usually `uzi`-labelled | A local checkout + inline context |
 | Gate | Plan approval before implementation | None — the worker starts immediately |
 | Deliverable | A merge request you review | Commits on a branch you pull |
 | Record | The issue + MR are the durable history | The run transcript in uzi; no forge artifact by default |
