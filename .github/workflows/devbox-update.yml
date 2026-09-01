@@ -127,21 +127,38 @@ jobs:
           gh label create "${LABEL}" \
             --description "Dependency updates" --color 0366D6 --force >/dev/null 2>&1 || true
 
-          # Never clobber human work on the bot branch (mirrors roles-manifest-refresh.yml):
-          # refuse to force-push when an open PR already tracks it, OR the remote branch
-          # carries commits touching files other than the lock (a maintainer's
-          # conflict-resolution, a pinned package, or the deferred uxlab-lock bump). The
-          # bump is not lost -- it is surfaced as a tracking issue instead.
-          protected=false
-          if [ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')" ]; then
-            protected=true
+          # Never clobber human work on the bot branch (mirrors roles-manifest-refresh.yml,
+          # hardened to FAIL CLOSED per review): the branch is treated as protected unless
+          # every check POSITIVELY confirms it is safe to overwrite -- an open PR tracks it,
+          # OR the remote branch carries commits touching files other than the lock (a
+          # maintainer's conflict-resolution, a pinned package, or the deferred uxlab-lock
+          # bump). A failed gh/git query leaves it protected, so a transient API/network blip
+          # skips the push (retried next run) instead of risking a clobber. `ls-remote
+          # --exit-code` distinguishes a CONFIRMED-absent branch (rc 2, safe to create) from
+          # a query error (other rc, fail closed). The bump is surfaced as a tracking issue.
+          protected=true
+          if ! open_pr="$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"; then
+            echo "gh pr list failed; treating ${BRANCH} as protected (fail closed)." >&2
+          elif [ -n "${open_pr}" ]; then
+            echo "Open PR #${open_pr} tracks ${BRANCH}; not clobbering."
           else
-            git fetch --no-tags origin \
-              "+refs/heads/main:refs/remotes/origin/main" \
-              "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null || true
-            if git rev-parse --verify --quiet "refs/remotes/origin/${BRANCH}" >/dev/null; then
+            ls_rc=0
+            git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1 || ls_rc=$?
+            if [ "${ls_rc}" -eq 2 ]; then
+              protected=false  # remote branch confirmed absent -> safe to create fresh
+            elif [ "${ls_rc}" -ne 0 ]; then
+              echo "git ls-remote failed (rc=${ls_rc}); treating ${BRANCH} as protected (fail closed)." >&2
+            elif git fetch --no-tags origin \
+                   "+refs/heads/main:refs/remotes/origin/main" \
+                   "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null; then
               others="$(git diff --name-only "refs/remotes/origin/main...refs/remotes/origin/${BRANCH}" | grep -Fxv "${LOCK}" || true)"
-              [ -n "${others}" ] && protected=true
+              if [ -z "${others}" ]; then
+                protected=false  # branch carries only the lock commit -> safe to refresh
+              else
+                echo "${BRANCH} carries commits touching files other than ${LOCK}; not clobbering."
+              fi
+            else
+              echo "git fetch failed; treating ${BRANCH} as protected (fail closed)." >&2
             fi
           fi
 
