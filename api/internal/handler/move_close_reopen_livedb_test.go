@@ -320,6 +320,32 @@ func TestMoveIssueCloseReopenLiveDB(t *testing.T) {
 		}
 	})
 
+	// 3b — reopen to an unconfigured column 400s: the close case skips column validation,
+	// but a reopen/move to a column that has no board_columns row must still be rejected
+	// before any forge call — the guard is `!isClose && target != ""`.
+	t.Run("reopen to unconfigured column is rejected", func(t *testing.T) {
+		stub.reset()
+		mustExecT(ctx, t, f.pool,
+			`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+			 VALUES ($1, 304, 't', 'closed', '[]'::jsonb, 'https://x', false, now(), now())`, f.repoID)
+
+		rr := httptest.NewRecorder()
+		f.h.MoveIssue(rr, boardWriterReq(f.user, f.repoID, "304", `{"to_column":"Nonexistent"}`))
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("move status = %d, want 400 for an unconfigured target column; body=%s", rr.Code, rr.Body.String())
+		}
+		// The reject must precede any forge mutation and leave the cache closed.
+		stub.mu.Lock()
+		gotEvents := append([]string(nil), stub.stateEvents...)
+		stub.mu.Unlock()
+		if len(gotEvents) != 0 {
+			t.Fatalf("wire state_event = %v, want none — validation must reject before the forge call", gotEvents)
+		}
+		if state, _ := issueStateAndPos(ctx, t, f, 304); state != "closed" {
+			t.Fatalf("cache state = %q, want still closed after a 400", state)
+		}
+	})
+
 	// 4 — forge failure → 502, cache untouched: the state_event PUT returns 500, so the
 	// close 502s and the cache is left opened (the AutoMove/SetIssueLabel snap-back).
 	t.Run("forge failure 502 leaves cache untouched", func(t *testing.T) {
