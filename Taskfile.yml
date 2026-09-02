@@ -265,6 +265,11 @@ tasks:
       # the destructive e2e leaked-project reclaim's selection contract so a future
       # edit that would tear down the wrong project reddens here instead of on a host.
       - task: test:e2e-reclaim
+      # hermetic sibling of test:e2e-reclaim (PRD #966 M2): a fake docker/curl/psql, no
+      # daemon. It exercises the e2e phase-registry driver's fail-soft/quarantine/provides
+      # semantics AND guards the tally (>= 8 cases, c == p) so a gutted driver test cannot
+      # read green. Before `scan:secrets`, which is deliberately last because it dominates.
+      - task: test:e2e-driver
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: check:spec-numbering
@@ -277,6 +282,11 @@ tasks:
       # it runs before `scan:secrets` too. A tree fact (a duplicate goose prefix panics
       # the runner at boot and in every *LiveDB test), so it belongs in gate:repo.
       - task: check:migration-numbering
+      # e2e/README.md registry-table drift guard (PRD #966 M2): reads only the phase-file
+      # headers (no docker), regenerates the table and diffs it against the committed
+      # README. Sub-second and offline, so it runs before `scan:secrets` too. A tree fact
+      # (a new e2e/phases/NN-*.sh file must appear in the generated README table).
+      - task: check:e2e-registry-doc
       # Binary/control-byte text-file guard (PRD #500 M2): also sub-second and offline,
       # so it runs before `scan:secrets` too. A tree fact (a NEW text-extension file
       # carrying a raw NUL or other control byte passes lint/typecheck/tests invisibly),
@@ -760,6 +770,17 @@ tasks:
       # `uzi` stack, store-it, the current run, and an EPERM/alive pid are all skipped).
       - ./e2e/reclaim-leaked-e2e.test.sh
 
+  test:e2e-driver:
+    desc: hermetic behavioural test of the e2e phase-registry driver, tally-guarded (fake docker/curl/psql)
+    cmds:
+      # e2e/driver.test.sh runs the REAL driver (e2e/driver.sh) against fixture phase
+      # files with fake helper functions -- no stack, no daemon, no network. The wrapper
+      # is the PASS=0 guard: driver.test.sh prints `cases=N passed=N`, and a crashed or
+      # gutted zero-case run would exit 0 with no tally and read green. check-e2e-driver.sh
+      # asserts the tally exists, c == p, and c >= 8 (the 8 PRD #966 M2 driver behaviours;
+      # the test emits more as sub-cases are added). See the script header.
+      - ./scripts/check-e2e-driver.sh
+
   check:spec-numbering:
     desc: specs/ai.md section numbers are unique (whole-file), with a canary proving the detector fired
     cmds:
@@ -789,6 +810,18 @@ tasks:
       # (instrument broken). Both args are explicit so this echo shows exactly what is
       # scanned. See the script header.
       - ./scripts/check-migration-numbering.sh scripts/migration-numbering-canary api/internal/store/migrations
+
+  check:e2e-registry-doc:
+    desc: e2e/README.md's phase-registry table matches the e2e/phases/NN-*.sh headers (docs:sync drift shape)
+    cmds:
+      # The registry table in e2e/README.md is GENERATED from the phase-file headers,
+      # not hand-maintained -- a new phase file must appear in the README. This is the
+      # docs:sync drift-check shape: regenerate to a temp, diff against the committed
+      # README, non-zero on drift; exit 2 if the markers are missing (instrument broken).
+      # It reads ONLY the phase headers (the fields `./e2e/run-e2e.sh --list` prints),
+      # never standing up the stack, so docs/dev-conventions.md:79 (run-e2e.sh is not a
+      # gate recipe) stays true. `task e2e:registry-doc` is the writer. See the header.
+      - ./scripts/check-e2e-registry-doc.sh
 
   check:no-binary-text:
     desc: no NEW text-extension source file is git-binary or carries control bytes, with a canary proving the detector fired
@@ -1928,6 +1961,16 @@ tasks:
       - mkdir -p api/internal/uzidocs/embed
       - rm -f api/internal/uzidocs/embed/*.md
       - cp docs/*.md api/internal/uzidocs/embed/
+
+  # e2e:registry-doc regenerates the phase-registry table in e2e/README.md from the
+  # e2e/phases/NN-*.sh headers and splices it between the registry:begin/end markers.
+  # NOT a gate target and NOT under gate: it WRITES the tree; check:e2e-registry-doc
+  # is what gates (the docs:sync writer/drift-test relationship). Reads only the phase
+  # headers, so it needs no docker.
+  e2e:registry-doc:
+    desc: regenerate the e2e/README.md phase-registry table from the e2e/phases headers
+    cmds:
+      - ./scripts/check-e2e-registry-doc.sh --write
 
   # -------------------------------------------------------------------- nudge --
   # A NUDGE is not a gate. This target is DELIBERATELY absent from `gate` and from

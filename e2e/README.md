@@ -43,6 +43,48 @@ Knobs (env vars):
   keeps its speed without cancelling an in-flight sync or losing an autopilot comment.
   Overlay-only; the production default is untouched.
 
+Phase registry knobs (PRD #966 M2 — the driver reads these):
+
+- `E2E_ONLY=<glob[,glob]>` — run only the phases whose slug matches one of these
+  comma-separated globs (e.g. `E2E_ONLY='mr-*,happy-*'`). `critical: yes` phases
+  (boot seed, worker-online, happy path) always run regardless, so a subset still
+  boots a usable stack.
+- `E2E_SKIP=<glob[,glob]>` — the inverse: skip the phases whose slug matches. As
+  with `E2E_ONLY`, critical phases are never skipped.
+- `E2E_STRICT_LEAKS=1` — make an end-of-phase quarantine **LEAK** (a non-terminal
+  run left behind and not declared via a `handoff:` header) a **FAIL** instead of a
+  non-fatal note, so a leaked run reddens the suite.
+- `E2E_FAULT_PHASE=<slug>` — inject a `fail` as the first statement of that phase,
+  the live positive control for fail-soft: a non-critical target lets the suite
+  continue (exactly one FAIL, exit 1), a critical one stops it (rest SKIP, exit 1).
+- `E2E_FAULT_PREFLIGHT=1` — init the fake bares **without** `--shared=0777`, the live
+  positive control for `00-preflight`: its first assertion then FAILs naming
+  `core.sharedRepository` (the #372 cross-uid push-race invariant). Because
+  `00-preflight` is `critical: yes`, the suite stops and every later phase is SKIP.
+
+Results and artifacts (written under the rundir, `$RUNROOT`):
+
+- `results.tsv` — one tab-separated row per phase: `slug`, status
+  (`PASS`|`FAIL`|`SKIP`|`LEAK`), seconds, message.
+- `junit.xml` — one `testsuite`, one `testcase` per phase (a `<failure>` carries the
+  `fail` message; `<skipped>` for a SKIP).
+- `summary.md` — the phase table, the tightest `wait_*` margins, and any leaks.
+- `artifacts/<NN-slug>/` — captured **only** for a FAIL or LEAK phase (nothing on a
+  PASS/SKIP): `phase.log` (the phase's own stdout), one `<service>.log` per service
+  (`api`, `agent`, `forge-fake`, `db`, via `docker compose logs --since`), `runs.txt`
+  (the run enumeration) and `run-counts.txt` (runs by status × kind). Capture is fully
+  guarded, so it can never change a phase's recorded status or the suite exit code.
+
+Fail-soft behavior: a red run now prints `summary.md` (every failing phase, not
+just the first) to stdout **before** teardown, and the suite exits `1` iff any
+phase FAILed (a LEAK alone exits 0 unless `E2E_STRICT_LEAKS=1`).
+
+Evidence on red (PRD #966 M3): a **red** run — any FAIL, or any LEAK (which writes a
+`$RUNROOT/.keep-rundir` sentinel even though a non-strict LEAK exits 0) — **keeps its
+rundir** instead of `rm -rf`-ing it, and `cleanup` prints the retained path and the
+`artifacts/` path so the per-phase evidence above survives for post-mortem (and #967's
+upload). A green run with no `KEEP_RUNDIR` is removed as before.
+
 ## Live-DB candidate-selection test (`run-store-it.sh`)
 
 The MR-close watcher's candidate-selection query (`ListMRWatchCandidates`) is the
@@ -62,100 +104,74 @@ The Go test (`api/internal/store/mr_watch_integration_test.go`) skips cleanly un
 a plain `go test ./...` when `UZI_TEST_DATABASE_URL` is unset. The full PRD #24 gate
 is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
 
-## What it asserts
+## Phase registry (what it asserts)
 
-1. **Boot seed** provisions the admin, the (dummy) Anthropic token, and the forge
-   connection + one enabled repo — deterministically, no registration race.
-2. **Cancel path**: a run with no live poller is cancelled server-side
-   (`queued → cancelled`).
-3. **Token → online**: a worker join token is issued via the API and the worker
-   registers and reports `online`.
-4. **Happy path**: create a PRD issue → start a run → the run halts at
-   `awaiting_approval` with a plan → approve → the worker pushes
-   `agent/issue-N` to the remote and opens an MR → `completed` with `branch` +
-   `mr_iid`.
-   - **Repo agents, detect→choose→apply (PRD #37)**: the seeded repo ships a
-     `.claude/agents/` roster (`repo-coder`, `repo-reviewer`), so the parked run
-     reports `repo_agents` at the gate (detection is executor-independent — the
-     stub exercises it). The harness then approves with a structured `selection`
-     (`source: repo`, excluding `repo-reviewer`) and asserts the completed run
-     persisted `agent_source=repo` + `agent_exclusions=[repo-reviewer]`.
-5. **Restart-resilience**: `docker compose down && up` (keeping volumes) while the
-   run is parked at the gate; the orphaned run is re-queued, re-claimed, and
-   driven to completion, with a **gapless** `run_messages` seq across the
-   restart.
-6. **Secret hygiene**: the bot PAT, the Anthropic token, and the worker join
-   token appear in **no** container log and **nowhere** on the worker's `/data`.
-7. **`/proc` hardening (M6) + uid boundary (PRD #51 M4/M5)**: the join token is
-   delivered by file — the `worker_token` Docker secret at
-   `/run/secrets/worker_token` (same path prod uses), so it is absent from every
-   process's `/proc/<pid>/environ`; and the entrypoint forces that secret to
-   `0400 worker:worker`, so a `setpriv`-to-`runner` read is **denied** while a
-   `setpriv`-to-`worker` read **succeeds** — the runner uid, which runs the
-   untrusted agent/checks/provision, cannot read the worker's credential. See
-   [../docs/proc-hardening.md](../docs/proc-hardening.md).
-8. **MR-close watcher (PRD #24)**: with the poller sped to ~2s, closing the
-   completed run's MR *without merging* (via forge-fake's `/_e2e` mutator) moves
-   the card **Human Review → In Progress**; reopening restores it
-   **In Progress → Human Review**; and a **manual drag wins** — after the card is
-   dragged to another column, reopening the MR does not fight the placement (the
-   reopen edge's source-column guard backs off). The candidate-selection SQL is
-   covered separately against a real Postgres — see `run-store-it.sh` below.
-9. **Bounded worker concurrency (PRD #42, stub-only, last phase)**: the single
-   worker is reconfigured to `WORKER_MAX_CONCURRENT_RUNS=2` and enables a **second**
-   repo (`group/repo2`, served by the fake only when `FORGE_FAKE_PROJECT2` is set).
-   Two runs on the two **different** repos are then shown to run **genuinely
-   concurrently** — both reach `awaiting_approval` at once, which a cap-1 worker
-   cannot (a slot is held across the gate), on the **same** worker — the API worker
-   listing reports `active_runs=2`/`max_concurrent_runs=2` while both are live, both
-   land MRs on **independent** git bare-caches with no message cross-talk, and a
-   **mid-run `SIGKILL`** of the agent re-queues **both** in-flight runs together (the
-   sweeper's worker-loss recovery at N=2), after which a restarted worker re-claims
-   both by affinity and completes them. **Stated limit**: the stub executor is
-   already concurrency-safe, so this exercises the worker-loop + server + API path,
-   **not** the M1 per-run executor kill/reap isolation fix (guarded by an `agent/`
-   unit test).
-10. **Live `/api/ws` + `uzi` CLI (PRD #97 M2)** — two full-wire-only consumers no
-    lower layer reaches. **WS**: the agent's Node 22 global `WebSocket` subscribes to
-    `/api/ws?run=<id>` (the browser's primary real-time transport; every *other*
-    stream assertion here uses the REST `?after=<seq>` replay), authenticating with
-    the admin **session cookie** plumbed into the upgrade — a GET upgrade behind
-    `RequireUser`, with a same-origin (CSWSH) check and per-run authz. It subscribes
-    **first**, then approves the parked plan on socket open, and asserts it receives a
-    live `run_message` frame (hub-broadcast → client wire, not REST replay); a
-    **no-cookie** upgrade is separately asserted to be **rejected**, so the gate is
-    non-vacuous. A third leg (PRD #112 M1) repeats the subscribe over a **Bearer
-    `uzc_` token with no `Origin` header** — the headless `uzi tui` shape — approving
-    from inside the socket over the same token, with a **bogus-Bearer** rejection as
-    its own negative control; that is the only place both credential classes are
-    driven against one route. **CLI**: `api/cmd/uzi` is built on the host and pointed at the live
-    api, authed headless via a minted `uzc_` `$UZI_TOKEN` (from `POST
-    /api/me/cli-tokens`); `uzi run list --json` must parse and its run-id set must
-    equal `GET /api/runs`'s, then `uzi run approve` drives a parked run to
-    `completed` — so DTO/route drift in either consumer turns the run red.
-11. **Auto-stop of a persistence loop (PRD #108 M5, direct-to-API, last phase)**:
-    the real stub agent can't poison itself — it never emits a permanently-
-    unstorable payload, and its in-flight hold isn't abort-aware — so this phase
-    runs at end-of-file, after the agent container has already been `compose
-    stop`ped by the PRD #104 binding phase above, and mints a **synthetic
-    worker** that drives `/api/worker/*` directly with `curl` (the same
-    technique the PRD #104 phase uses), making it the queue's sole claimant. It
-    creates two runs, **A** (poison target) and **B** (peer), claims both,
-    drives them `claimed→running`, then on a ~3s cadence repeatedly POSTs a
-    permanently-unstorable message (`{"n":1e1000000}`, SQLSTATE 22003 →
-    `ErrUnstorableMessage`, HTTP 400) to A while sustaining B's successful
-    appends and the worker heartbeat. It asserts the whole journey: A flips
-    `health='looping'` with the persist-failing reason, then the sweeper
-    auto-stops it — `status='failed'` + `stop_kind='auto_stopped'` — while peer
-    B is unaffected (not failed, not auto-stopped). It then folds in the two
-    remedies `docs/run-auto-stopped.md` prints, proving each is followable end
-    to end via the real CLI: `uzi run get <id>` surfaces
-    `stop_kind=auto_stopped`, and `uzi worker list` shows the worker's VERSION
-    column (a printed instruction is otherwise an untested claim). **Stated
-    limit**: the phase is executor-independent (it never touches the stub or SDK
-    path) and runs ~135-165s of real sweep/escalation time, so — like the auto-stop feature it
-    exercises — it depends on a live peer run and a fresh worker heartbeat for
-    its whole duration.
+The suite is now a **phase registry**: each assertion group lives in its own file
+`e2e/phases/NN-<slug>.sh`, sourced in `NN` order by a fail-soft driver
+(`e2e/driver.sh`). The driver runs each phase in an errexit-safe subshell, records
+a PASS/FAIL/SKIP/LEAK verdict, and keeps going after a non-critical failure so one
+red phase no longer discards every downstream verdict. `./e2e/run-e2e.sh --list`
+prints the table below (it reads only the phase-file headers, so it needs no
+docker). The table is generated — `task check:e2e-registry-doc` fails if it drifts
+from the phase files, and `task e2e:registry-doc` regenerates it. Edit the phase
+headers, not the rows.
+
+<!-- registry:begin (generated by `task e2e:registry-doc`; do not edit by hand) -->
+
+| NN | slug | lane | critical | title |
+|---|---|---|---|---|
+| 00 | preflight | any | yes | PRD #966 M3: preflight — harness invariants (#366 dubious-ownership / #372 cross-uid push race) |
+| 05 | lane-forgejo | forgejo | no | PRD #65 M9: the Forgejo lane (UZI_E2E_FORGE=forgejo) |
+| 06 | lane-github | github | no | PRD #238 M8: the GitHub lane (UZI_E2E_FORGE=github) |
+| 10 | least-privilege | gitlab | no | PRD #5 privilege checks: over-privileged connect is rejected + stored nothing; compliant connection is least-privilege |
+| 11 | skills-authz | gitlab | no | PRD #16 skills authz: a non-admin cannot reach admin / other-user surfaces |
+| 12 | cancel-queued | gitlab | no | cancel path: a queued run is cancelled server-side (no live poller) |
+| 13 | worker-join-online | gitlab | yes | issue a worker join token and bring the worker online |
+| 14 | worker-resource-stats | gitlab | no | worker self-reports container CPU/memory stats (PRD #49) |
+| 15 | happy-path-restart | gitlab | yes | happy path: create a PRD issue and start a run |
+| 16 | usage-limit-park | gitlab | no | PRD #35: opt-in park -> sweeper promotes -> resume SKIPS the gate -> completes |
+| 17 | live-ws-cookie | gitlab | no | PRD #97 M2: a live /api/ws subscription receives a run_message frame during a run (not REST replay) |
+| 18 | cli-smoke | gitlab | no | PRD #97 M2: uzi CLI drives the live api (run list matches + approve advances a run) |
+| 19 | live-ws-bearer | gitlab | no | PRD #112 M1: a Bearer (uzc_) /api/ws subscription receives a live run_message frame |
+| 20 | git-push-basic-auth | gitlab | no | PRD #97 M1: worker pushes the agent branch over git-over-HTTPS Basic auth (default coverage) |
+| 21 | protected-branch-refused | gitlab | no | PRD #97 M1: the fake remote refuses a push to main under BOTH transports (protected-branch backstop) |
+| 22 | steer-queue-delivery | gitlab | no | PRD #95: steer-queue delivery — Queued -> Delivered on consume, no run_message, no forge/token |
+| 23 | secret-hygiene | gitlab | no | secret-hygiene assertions |
+| 24 | xff-trust-boundary | gitlab | no | PRD #58: XFF forgery from the agent container must NOT mint fresh rate-limit buckets |
+| 25 | uid-boundary | gitlab | no | PRD #51 M6: uid-boundary regression assertions (live image, setpriv-to-uid) |
+| 26 | plan-reject-verbatim | gitlab | no | PRD #33: live plan reject with a verbatim reason -> verbatim failure_reason back through the worker |
+| 27 | mr-close-watcher | gitlab | no | PRD #24: MR-close watcher (Human Review <-> In Progress on MR close/reopen) |
+| 28 | skills-templates-tools | gitlab | no | PRD #16: skill delivery (builtin allocated -> claim -> synthesized plugin dir) |
+| 29 | autopilot-lifecycle | gitlab | no | PRD #19 autopilot: map + opt-in the repo owner |
+| 30 | autopilot-carry-item | gitlab | no | carry-item: concurrent cross-key settings PUT — the FOR UPDATE serialization rejects the equal-label race |
+| 31 | ci-status-fix | gitlab | no | PRD #6: CI status sync + Fix CI + the verification stamp |
+| 32 | agent-mr-fix-crosskind | gitlab | no | PRD #6: agent-MR same-branch fix + cross-kind race |
+| 33 | uzi-eligibility-gate | gitlab | no | PRD #764: uzi run-eligibility gate (no PRD link required + Promote) |
+| 34 | vault | gitlab | no | PRD #32: per-user vault (dek sealing, claim gating, restart lock, lazy rewrap) |
+| 35 | judge-funnel | gitlab | no | PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> persist-first notification |
+| 36 | file-forge-issue | gitlab | no | PRD #68: file a forge issue from a judge recommendation |
+| 37 | printed-instructions-menu | gitlab | no | PRD #98 M8c: printed instructions EXECUTED verbatim from the emitting command's own output |
+| 38 | closed-issue-poller | gitlab | no | PRD #98 M8b/B6': a closed forge issue reaches Done THROUGH THE POLLER (M6's wiring) |
+| 39 | review-row-cap | gitlab | no | PRD #98 M8b/B4': the server's row cap, and the truncation remedy executed against it |
+| 40 | chat-agent | gitlab | no | PRD #39: in-app chat agent (stub) — create -> read(red-team) -> propose -> confirm -> dismiss -> idle -> continue |
+| 41 | interleave-stream | gitlab | no | PRD #43 M5: interleaved multi-agent stream persists + replays (gapless seq, per-agent attribution) |
+| 43 | plan-revision-loop | gitlab | no | PRD #41: plan-revision loop (revise_plan -> re-plan -> re-park -> approve -> MR) |
+| 44 | ask-user-clarification | gitlab | no | PRD #88: ask-user clarification (park -> answer -> resume -> approve -> MR) |
+| 45 | bounded-concurrency | gitlab | no | PRD #42 bounded-concurrency scenario (stub-only) |
+| 46 | run-health | gitlab | no | PRD #47: run-health detection (stall / loop / in-flight suppression) |
+| 47 | rate-limit-meters | gitlab | no | PRD #53/#104: per-token rate-limit meters (seeded gauge row -> /me) |
+| 48 | auto-selection | gitlab | no | PRD #111 M6: an auto worker picks the emptiest pooled token, and degrades safely |
+| 49 | docker-sidecar | gitlab | no | PRD #83 M2: rootless DinD sidecar + Decision-3 efficacy |
+| 50 | worker-token-binding | gitlab | no | PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim |
+| 51 | auto-stop-poison | gitlab | no | PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to-API poison) |
+| 59 | restart-agent | gitlab | no | PRD #966: restart the agent worker before schedule phases 60-62 |
+| 60 | schedules-sweep | gitlab | no | PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate skip, open-MR skip) |
+| 61 | schedules-prompt | gitlab | no | PRD #966 M4: scheduled prompt run (issue-less repo->MR run via run-now) |
+| 62 | self-improve | gitlab | no | PRD #966 M4: scheduled self_improve run (tracking issue, MR opened) |
+| 70 | handoff | gitlab | no | PRD #966 M5: task/handoff run kind via `uzi handoff` (+ host-gitconfig transport) |
+| 71 | mr-rework | gitlab | no | PRD #966 M6: mr_rework run kind (review-landed rework on a settled MR) |
+
+<!-- registry:end -->
 
 ## How the fakes are wired (no real GitLab, no live session)
 

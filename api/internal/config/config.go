@@ -388,6 +388,13 @@ type Config struct {
 	// behaviour for operators who want CI awareness off.
 	CIWatchRunWindow time.Duration
 	CIWatchMaxRefs   int
+	// MRReviewQuietPeriod is the review-landed debounce the MR review-watcher (PRD
+	// #24 mr_rework) waits after the newest review comment before it queues a rework,
+	// so an in-flight review thread is not acted on mid-conversation. Default 3m; a
+	// negative or malformed value falls back to the default. The e2e overlay sets it
+	// to 2s so the harness can exercise mr_rework inside its runtime budget (PRD #966
+	// D6, same shape as SWEEP_INTERVAL).
+	MRReviewQuietPeriod time.Duration
 	// CIFixMaxJobs caps how many failed jobs a Fix CI snapshot captures;
 	// CIFixLogTailBytes caps each job's captured log tail. Both bound the snapshot
 	// size (jobs × tail) frozen onto a ci_fix run at queue time.
@@ -820,6 +827,7 @@ func Load() (Config, error) {
 	// 0 (or unset) delegates to the sweeper's own built-in 15s default, so current
 	// behaviour is preserved unless SWEEP_INTERVAL is explicitly set.
 	cfg.SweepInterval = parseNonNegDuration("SWEEP_INTERVAL", 0)
+	cfg.MRReviewQuietPeriod = parseNonNegDuration("MR_REVIEW_QUIET_PERIOD", 3*time.Minute)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
 	// PRD #628 D3a: the run-lane affinity ceiling. ClaimRun now pins a promoted run

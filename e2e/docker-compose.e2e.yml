@@ -110,6 +110,14 @@ services:
       # worker-loss requeue are bounded by ~2s rather than ~15s. Product knob added in
       # the same change; unset ⇒ the api's built-in 15s default.
       SWEEP_INTERVAL: 2s
+      # MR review-watcher debounce (PRD #966 M6 / D6): the review-landed quiet period
+      # the mr_rework detector waits after the newest review comment before queuing a
+      # rework. Shrunk from the shipped 3m default so phase 71 can inject a note and
+      # observe the rework fire inside the suite's runtime budget. Overlay-only; the
+      # production default (config.go) is untouched. CI_WATCH_MAX_REFS is deliberately
+      # left unset here so it takes its >0 default — it gates the whole pipeline/MR
+      # detector and mr_rework never fires with it at 0.
+      MR_REVIEW_QUIET_PERIOD: 2s
       # Point the SSRF allowlist + the boot seed at the fake forge.
       FORGE_ALLOWED_BASE_URLS: https://forge-fake.e2e
       # Poll rarely by DEFAULT: the harness drives issues/runs directly, and a long

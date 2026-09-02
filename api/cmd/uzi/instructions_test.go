@@ -960,6 +960,12 @@ func TestInstructionEvidenceIsWellFormed(t *testing.T) {
 	// test, not silently satisfy it by making every `where` unfindable in an empty string.
 	// Deliberately NOT asserted: "at least one entry is evidenceE2E" — that would have failed
 	// before the first row landed, which is how a useful check gets deleted.
+	//
+	// PRD #966 M1 split the monolithic run-e2e.sh into a driver (run-e2e.sh) + e2e/lib.sh +
+	// e2e/phases/NN-*.sh, so an evidence `where` address now lives in whichever phase file its
+	// row moved to. Search the WHOLE harness (driver + lib + every phase) rather than only
+	// run-e2e.sh; a label that appears in no harness file still reddens this test, which is the
+	// property the positive control protects.
 	e2eScript, err := os.ReadFile("../../../e2e/run-e2e.sh")
 	if err != nil {
 		t.Fatalf("cannot read e2e/run-e2e.sh (%v) — the evidence addresses below would all be "+
@@ -968,7 +974,25 @@ func TestInstructionEvidenceIsWellFormed(t *testing.T) {
 	if len(e2eScript) == 0 {
 		t.Fatal("e2e/run-e2e.sh is empty; every evidenceE2E address would be trivially unfindable")
 	}
+	harnessFiles := []string{"../../../e2e/lib.sh"}
+	phaseFiles, err := filepath.Glob("../../../e2e/phases/[0-9][0-9]-*.sh")
+	if err != nil {
+		t.Fatalf("cannot glob e2e/phases/*.sh (%v); the evidence addresses would be unverifiable", err)
+	}
+	if len(phaseFiles) == 0 {
+		t.Fatal("no e2e/phases/*.sh files found; evidenceE2E addresses moved there by PRD #966 M1 would be unfindable")
+	}
+	harnessFiles = append(harnessFiles, phaseFiles...)
 	e2e := string(e2eScript)
+	for _, hf := range harnessFiles {
+		//nolint:gosec // hf is a fixed glob of in-repo harness files (e2e/lib.sh + e2e/phases/NN-*.sh), never user input
+		b, err := os.ReadFile(hf)
+		if err != nil {
+			t.Fatalf("cannot read harness file %s (%v); an evidenceE2E address there would be "+
+				"unverifiable, and an unverifiable check must fail rather than pass quietly", hf, err)
+		}
+		e2e += "\n" + string(b)
+	}
 
 	goTestFuncs := goFuncNames(t, "../..")
 	root := newRootCmd(fakeEnv(&uzicli.FakeClient{}))
@@ -1052,8 +1076,9 @@ func TestInstructionEvidenceIsWellFormed(t *testing.T) {
 			if strings.TrimSpace(k.where) == "" {
 				t.Errorf("%q claims e2e evidence with no `where` label", k.command)
 			} else if !strings.Contains(e2e, k.where) {
-				t.Errorf("%q claims e2e evidence at %q, which no longer appears in e2e/run-e2e.sh. The "+
-					"row was renamed or removed; the claim outlived its address.", k.command, k.where)
+				t.Errorf("%q claims e2e evidence at %q, which no longer appears in the e2e harness "+
+					"(run-e2e.sh, lib.sh, or any phases/*.sh). The row was renamed or removed; the "+
+					"claim outlived its address.", k.command, k.where)
 			}
 		case evidenceGoTest:
 			if strings.TrimSpace(k.where) == "" {
