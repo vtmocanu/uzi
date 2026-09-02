@@ -15,7 +15,7 @@ import { mockApi } from "./mockApi";
 // This runs under the node environment (the default for `src/mocks/**`, see the
 // project split in vite.config.ts) with no `@vitest-environment jsdom` and no
 // localStorage shim. Note the import chain is NOT free of module-load storage
-// access — `mockApi.ts`'s top-level `const loadedSettings = loadSettings();` calls
+// access — `mockApi/settings.ts`'s top-level `const loadedSettings = loadSettings();` calls
 // `localStorage.getItem(...)`, which is undefined under node. The import survives
 // only because `loadSettings()` wraps that read in a try/catch that swallows the
 // ReferenceError. So the node-safety of this file depends on that guard staying in

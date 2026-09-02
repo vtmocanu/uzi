@@ -100,7 +100,7 @@ export const mockWorkers: Worker[] = [
     // panel's B-1 divergence line. Coherent rather than contrived: the controller is
     // rolling this worker to the PINNED tag 0.4.1 and the pod is wedged getting there.
     // One worker carrying both states is what keeps PRD #58's quota headroom intact —
-    // see the note in mockApi.ts.
+    // see the note in mockApi/workers.ts.
     upgrade_target: "0.4.1",
     upgrade_blocking_container: "seed-nix",
     upgrade_blocking_reason: "CrashLoopBackOff",

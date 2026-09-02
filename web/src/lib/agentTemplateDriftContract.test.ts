@@ -13,7 +13,7 @@ import type { AgentTemplate, BuiltinDefinition } from "./api";
 //
 // WHAT THIS PINS. "Has this row drifted from the definition this binary ships?" has three
 // implementations and compare.go's own doc comment names their divergence as the hazard it
-// exists to prevent: agenttmpl.SameContent (the Go half), mockApi.ts's sameContent and
+// exists to prevent: agenttmpl.SameContent (the Go half), mockApi/agents.ts's sameContent and
 // agentTemplates.ts's driftedColumns (this half). No divergence can be CONSTRUCTED today --
 // all three fold null/"" and null/[] identically, compare tools order-sensitively and never
 // trim -- which is exactly why the agreement is pinned to a shared artifact before a fourth

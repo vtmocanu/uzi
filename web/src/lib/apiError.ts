@@ -1,5 +1,5 @@
 // ApiError lives in its own leaf module (not the `api.ts` barrel) so the
-// mock-mode client `mocks/mockApi.ts` can import it as a runtime value without
+// mock-mode client `mocks/mockApi/` can import it as a runtime value without
 // creating a runtime import cycle with `lib/api.ts` — the cycle
 // (api → mockApi → api) that caused the vitest `No "ApiError" export is defined
 // on the "../lib/api" mock` flake (issue #165). It needs no imports.
