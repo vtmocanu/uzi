@@ -22,6 +22,11 @@ const developerAccessLevel = int(gitlab.DeveloperPermissions) // 30
 // maximum, minimizing round-trips on busy projects.
 const perPage = 100
 
+// gitlabDefaultLabelColor is used when EnsureLabels is handed a label with no
+// color. GitLab's label-create API rejects a create with a missing color, so
+// the driver supplies a neutral default rather than fail (mirrors forgejo/github).
+const gitlabDefaultLabelColor = "#ededed"
+
 // maxTraceBytes is the fail-closed ceiling on a single job trace JobLogTail will
 // process. Well above any real CI log's tail need (the snapshot keeps only the
 // last CI_FIX_LOG_TAIL_BYTES, 32 KiB), so a legitimate trace never trips it; a
@@ -283,9 +288,11 @@ func (g *gitLab) EnsureLabels(ctx context.Context, projectID int64, labels []Lab
 			continue
 		}
 		opt := &gitlab.CreateLabelOptions{Name: gitlab.Ptr(l.Name)}
-		if l.Color != "" {
-			opt.Color = gitlab.Ptr(l.Color)
+		color := l.Color
+		if color == "" {
+			color = gitlabDefaultLabelColor
 		}
+		opt.Color = gitlab.Ptr(color)
 		if _, _, err := g.client.Labels.CreateLabel(projectID, opt, gitlab.WithContext(ctx)); err != nil {
 			return g.wrapErr(fmt.Sprintf("create label %q", l.Name), err)
 		}
