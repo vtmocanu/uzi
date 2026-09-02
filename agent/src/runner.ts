@@ -2964,6 +2964,14 @@ export class RunRunner {
     // inherit a dead run's orphan ref. A requeue/resume keeps the same run_id, so a run
     // resuming its OWN parked work matches; every other run does not.
     const runId = claim.run_id;
+    // PRD #1030 M3: a SEPARATE, additional signal (not the runId ownership anchor) — a
+    // RESUME is `claim.session_id != null` (a run that executed before, re-claimed after a
+    // rate-limit park), distinct from a fresh first attempt or a seeded run (session_id
+    // null). Threaded into the clone path to relax ONLY the cross-worker checkpoint
+    // ancestry test on an unpushed branch (see runnerCloneForBranch): when `main` advanced
+    // during the park, a valid mirrored checkpoint diverges from the moved default and the
+    // strict-descendant test would discard the committed milestones and cold-start.
+    const resume = claim.session_id != null;
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
@@ -2979,10 +2987,11 @@ export class RunRunner {
         cloneBranch.branch,
         cloneBranch.slug,
         runId,
+        resume,
       );
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume);
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
