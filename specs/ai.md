@@ -20619,7 +20619,7 @@ only bites once the agent image is current (see Decision 2).
   also to agents" toggle under the Model control (first-class on Inherit) plus a "model on all agents"
   run-detail badge; CLI `uzi schedule create/edit --apply-model-to-agents`, a `schedule get` detail
   row, and `uzi run get --field override_subagent_model` (auto-derived from `RunDTO`). A pre-existing
-  bug was fixed in passing: `buildScheduleEditRequest` (`api/cmd/uzi/schedule.go`) did not restate the
+  bug was fixed in passing: `buildScheduleEditRequest` (`api/cmd/uzi/schedule_request.go`) did not restate the
   replace-semantics `model` field, so a partial `schedule edit` silently wiped a schedule's stored
   model — it now restates BOTH `model` and `override_subagent_model`.
 - **Verification.** agent/ both-rosters unit matrix calibrated on PINNED subagents
