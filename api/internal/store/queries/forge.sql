@@ -353,6 +353,35 @@ SET title            = EXCLUDED.title,
     synced_at        = now()
 RETURNING *;
 
+-- name: UpdateIssueState :one
+-- Flip an issue's cached open/closed state ONLY (the bare-close path, PRD #1034 M2).
+-- Deliberately touches nothing else: labels, assignee_ids and board_position are all
+-- left exactly as the last sync/move stored them — a close leaves the card's column
+-- membership intact (a closed card renders in the Closed lane regardless via
+-- board.ResolveColumn) and its slot is meaningless while closed. Forge-first: the
+-- caller has already written the forge, this only mirrors the result into the cache.
+-- Keyed on (repo_id, forge_issue_iid) like every other issues write here, never on
+-- forge_issue_iid alone (that iid is per-project, not global). RETURNING * so the
+-- service returns the re-cached row for the single-card re-render.
+UPDATE issues
+SET state = $3, synced_at = now()
+WHERE repo_id = $1 AND forge_issue_iid = $2
+RETURNING *;
+
+-- name: ReopenIssueState :one
+-- Reopen's cache flip (PRD #1034 M2): set state back to 'opened' AND NULL board_position
+-- in one statement, so a reopened card lands at the BOTTOM of its destination lane
+-- (ListIssuesByRepo sorts board_position ASC NULLS LAST) rather than silently inheriting
+-- its stale pre-close slot. Neither UpsertIssue nor UpsertIssueLabels can null
+-- board_position (both omit it by design to protect manual order), so this is the only
+-- path that resets it. Labels are left untouched here; the subsequent AutoMove applies the
+-- drop-target column's labels (with State already flipped to opened, or its EXCLUDED.state
+-- write would clobber this flip back to closed — see forgesvc.ReopenIssue).
+UPDATE issues
+SET state = 'opened', board_position = NULL, synced_at = now()
+WHERE repo_id = $1 AND forge_issue_iid = $2
+RETURNING *;
+
 -- name: ListIssuesByRepo :many
 -- The board payload's issue half. In PRODUCTION the only caller is handler.buildBoard, so
 -- this ORDER BY is the board's rendered order and changing it changes nothing else. (There
