@@ -18,8 +18,38 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Propose-only `refactor-scout` refactoring default added to the schedule catalog ([#962](https://github.com/vtmocanu/uzi/pull/962)).**
+  A new opt-in catalog default that periodically surveys a repository for refactoring opportunities and reports them, without opening code changes on its own; off by default and enabled per repository like the other catalog defaults.
+- **Configurable MR review quiet period, plus expanded end-to-end harness coverage ([#976](https://github.com/vtmocanu/uzi/pull/976)).**
+  Adds a `MR_REVIEW_QUIET_PERIOD` setting controlling how long the MR review watcher waits for a review to settle before reworking, and rebuilds the e2e test harness around a phase registry with fail-soft reporting and run-kind/schedule coverage.
+
+### Changed
+
+- **httpx.PathUUID helper for the repeated uuid.Parse(chi.URLParam) handler pattern ([#952](https://github.com/vtmocanu/uzi/pull/952)).**
+  Internal refactor consolidating the handler sites that parse a UUID path parameter onto one helper, with no change to request handling.
+- **workersvc/service.go split, with a shared boolSetting helper ([#955](https://github.com/vtmocanu/uzi/pull/955)).**
+  Internal refactor breaking up the worker service file and extracting a boolean-setting helper, with no runtime behaviour change.
+- **Agent run god-methods split into phase steps ([#957](https://github.com/vtmocanu/uzi/pull/957)).**
+  Internal refactor extracting phases out of the agent's RunRunner.execute() and SdkExecutor.run() methods, with no change to how a run executes.
+- **Web load/loading/error fetch cycle consolidated into a useAsyncData hook ([#958](https://github.com/vtmocanu/uzi/pull/958)).**
+  Internal refactor replacing the hand-rolled load/loading/error/reload pattern repeated across the web pages with one shared hook.
+- **forgesvc/projectsync.go split by concern ([#975](https://github.com/vtmocanu/uzi/pull/975)).**
+  Internal refactor separating provision/seed, forward and reverse sync, and visibility/share into their own files, with no change to sync behaviour.
+- **pgconv package consolidating the duplicated pgtype parameter helpers ([#977](https://github.com/vtmocanu/uzi/pull/977)).**
+  Internal refactor unifying the repeated pgtype conversion helpers with explicit Text vs TextOrNull semantics, with no change to stored values.
+- **Web file splits: api.ts DTO types, AdminSettings cards, and mocks/data.ts domains ([#978](https://github.com/vtmocanu/uzi/pull/978)).**
+  Internal refactor breaking large web modules into focused files, with no UI behaviour change.
+
 ### Fixed
 
+- **Notifications page recovers after a failed Load more, and stale errors clear on refetch ([#973](https://github.com/vtmocanu/uzi/pull/973)).**
+  Post-migration follow-up to the useAsyncData hook: the Notifications list is no longer stuck hidden after one failed Load more, promote/save/schedule mutation errors clear when their view refetches, unguarded side-effect fetches are guarded against stale responses, and a disabled hook no longer reloads.
+- **Evicted zombie pod no longer permanently badges a healthy hosted worker "Upgrade failed" ([#953](https://github.com/vtmocanu/uzi/pull/953)).**
+  The controller stopped treating a leftover evicted pod as an upgrade failure, so a healthy hosted worker keeps its correct status.
+- **Secret scrubbing hardened, with fail-safe token handling and a request size limit ([#968](https://github.com/vtmocanu/uzi/pull/968)).**
+  Widened secret-prefix detection (including the Slack xoxe- family), a fail-safe default in TokenInfo, and a 413 on oversized JSON request bodies, pinned by characterization tests.
 - **Release publish jobs tolerate a transient cosign download failure ([#946](https://github.com/vtmocanu/uzi/pull/946)).**
   The image and chart signing jobs now install a pinned, checksum-verified cosign through a local action that retries the download, so a one-off TLS hiccup on a runner no longer fails a publish job and stalls the GitHub Release (issue [#945](https://github.com/vtmocanu/uzi/issues/945)).
 
