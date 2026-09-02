@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"unicode/utf8"
 
@@ -554,7 +555,7 @@ func (s *Service) ResolveRepoForWorker(ctx context.Context, wkr store.Worker, re
 func (s *Service) ListRunsForWorker(ctx context.Context, wkr store.Worker, limit int) ([]store.ListRunsForWorkerUserRow, error) {
 	return s.q.ListRunsForWorkerUser(ctx, store.ListRunsForWorkerUserParams{
 		UserID: wkr.UserID,
-		Lim:    int32(clampLimit(limit, workerRunsDefaultLimit, workerRunsMaxLimit)), //nolint:gosec // G115: clampLimit bounds the result to workerRunsMaxLimit, a small constant well within int32
+		Lim:    clampLimit(limit, workerRunsDefaultLimit, workerRunsMaxLimit),
 	})
 }
 
@@ -584,7 +585,7 @@ func (s *Service) ListRunMessagesForWorker(ctx context.Context, wkr store.Worker
 	return s.q.ListRunMessagesForWorkerPage(ctx, store.ListRunMessagesForWorkerPageParams{
 		RunID:    runID,
 		AfterSeq: afterSeq,
-		Lim:      int32(clampLimit(limit, workerMessagesDefaultLimit, workerMessagesMaxLimit)), //nolint:gosec // G115: clampLimit bounds the result to workerMessagesMaxLimit, a small constant well within int32
+		Lim:      clampLimit(limit, workerMessagesDefaultLimit, workerMessagesMaxLimit),
 	})
 }
 
@@ -596,15 +597,22 @@ const (
 	workerMessagesMaxLimit     = 200
 )
 
-// clampLimit returns limit clamped to [1, max], or def when limit <= 0 (unset).
-func clampLimit(limit, def, max int) int {
+// clampLimit returns limit clamped to [1, max] as an int32, or def when limit <= 0
+// (unset). max is a small worker paging cap well within int32; the explicit
+// math.MaxInt32 guard on the cast makes it provable to the integer-conversion
+// analyzers (gosec G115 / CodeQL go/incorrect-integer-conversion), mirroring
+// submit.go's scope-ceiling guard. The >MaxInt32 arm is unreachable for these caps.
+func clampLimit(limit, def, max int) int32 {
 	if limit <= 0 {
-		return def
+		limit = def
 	}
 	if limit > max {
-		return max
+		limit = max
 	}
-	return limit
+	if limit < 0 || limit > math.MaxInt32 {
+		return 0
+	}
+	return int32(limit)
 }
 
 // -------------------------------------------------------------------------
