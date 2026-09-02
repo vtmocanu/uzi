@@ -18470,7 +18470,7 @@ place; issue #223 is fully delivered.
     `fixtures/agent-template-drift/cases.json`, a `(shipped, stored, expected)` case table read by both
     `api/internal/agenttmpl/drift_contract_test.go` (folds each case through `agenttmpl.SameContent`) and
     `web/src/lib/agentTemplateDriftContract.test.ts` (folds through `driftedColumns` in
-    `web/src/lib/agentTemplates.ts` and the now-`export`ed `sameContent` in `web/src/mocks/mockApi.ts`) —
+    `web/src/lib/agentTemplates.ts` and the now-`export`ed `sameContent` in `web/src/mocks/mockApi/agents.ts`, re-exported through the `mockApi/` barrel) —
     the `fixtures/run-usage/` cross-language pattern (§465), so `-count=1` is load-bearing for the Go half
     (the fixture is above the module and cache-invisible). `expected.differs` pins `SameContent` and
     `sameContent`; `expected.columns` pins `driftedColumns`. The recorded history above stands: no divergence
