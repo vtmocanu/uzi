@@ -7,7 +7,7 @@ import { minsAgo } from "./time";
 
 // ── Chat conversations (PRD #39 M4) ──────────────────────────────────────────
 // Chat rides the run machinery, so a conversation is a run with kind='chat' and
-// no repo (repo_id "" stands in for the real backend's nullable repo_id — the
+// no repo (repo_id is null, matching the real backend's nullable repo_id — the
 // chat UI never reads it). Their message logs seed the same store maps as issue
 // runs so the streaming machinery renders them unchanged.
 

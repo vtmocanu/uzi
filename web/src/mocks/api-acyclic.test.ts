@@ -194,7 +194,17 @@ function describeOffender(o: Offender): string {
 }
 
 describe("mock graph does not import runtime values from the api barrel (issue #165)", () => {
-  for (const file of mockSourceFiles()) {
+  const files = mockSourceFiles();
+
+  it("discovers the mock source files to guard", () => {
+    // A zero-length walk would register no per-file cases below and let the
+    // suite pass green with no cycle protection at all (a directory move,
+    // rename, or filter change could silence the guard). The recursive walk
+    // covers data/*.ts plus engine/mockApi/socket/store, so > 5 is a safe floor.
+    expect(files.length).toBeGreaterThan(5);
+  });
+
+  for (const file of files) {
     const rel = file.slice(MOCKS_DIR.length + 1);
     it(`${rel} imports only types from the api barrel`, () => {
       const source = readFileSync(file, "utf8");
