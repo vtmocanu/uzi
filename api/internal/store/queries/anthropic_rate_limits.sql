@@ -15,9 +15,22 @@
 --
 -- ORDER BY keeps a tick's work deterministic, which makes a slow tick's log
 -- readable and a partial tick's coverage predictable rather than arbitrary.
-SELECT id, user_id, ciphertext, sealed_with FROM user_secrets
-WHERE kind = 'anthropic_token'
-ORDER BY user_id, id;
+--
+-- The JOIN to users carries the token owner's notify_early_limit_reset flag (PRD
+-- #1020): the poller gates the early-reset alert on the owner's per-user opt-in
+-- without a second per-token lookup. INNER JOIN on the owning user is total — every
+-- user_secret has an owner — so it drops no token.
+SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset
+FROM user_secrets s
+JOIN users u ON s.user_id = u.id
+WHERE s.kind = 'anthropic_token'
+ORDER BY s.user_id, s.id;
+
+-- name: GetRateLimitsForToken :one
+-- The full stored gauge row for ONE token (PRD #1020): the poller reads the prior
+-- reading before writing the new one, so it can compare the previously reported reset
+-- time against the fresh reading and detect an early window reset.
+SELECT * FROM anthropic_rate_limits WHERE user_secret_id = $1;
 
 -- name: UpsertRateLimits :exec
 -- Overwrite ONE token's gauge row each poll tick (PRD #53 D4, repointed by #104

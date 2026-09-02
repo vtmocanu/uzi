@@ -44,6 +44,7 @@ function aUser(over: Partial<User> = {}): User {
     attribution_enabled: true,
     ephemeral_workers_enabled: false,
     wait_on_limit: false,
+    notify_early_limit_reset: false,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,
     created_at: "2026-01-01T00:00:00Z",

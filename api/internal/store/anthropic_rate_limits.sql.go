@@ -32,17 +32,43 @@ func (q *Queries) DeleteRateLimits(ctx context.Context, userID uuid.UUID) (int64
 	return result.RowsAffected(), nil
 }
 
+const getRateLimitsForToken = `-- name: GetRateLimitsForToken :one
+SELECT user_secret_id, user_id, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, source, synced_at FROM anthropic_rate_limits WHERE user_secret_id = $1
+`
+
+// The full stored gauge row for ONE token (PRD #1020): the poller reads the prior
+// reading before writing the new one, so it can compare the previously reported reset
+// time against the fresh reading and detect an early window reset.
+func (q *Queries) GetRateLimitsForToken(ctx context.Context, userSecretID uuid.UUID) (AnthropicRateLimit, error) {
+	row := q.db.QueryRow(ctx, getRateLimitsForToken, userSecretID)
+	var i AnthropicRateLimit
+	err := row.Scan(
+		&i.UserSecretID,
+		&i.UserID,
+		&i.FiveHourPct,
+		&i.FiveHourResetsAt,
+		&i.SevenDayPct,
+		&i.SevenDayResetsAt,
+		&i.Source,
+		&i.SyncedAt,
+	)
+	return i, err
+}
+
 const listAnthropicTokensToPoll = `-- name: ListAnthropicTokensToPoll :many
-SELECT id, user_id, ciphertext, sealed_with FROM user_secrets
-WHERE kind = 'anthropic_token'
-ORDER BY user_id, id
+SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset
+FROM user_secrets s
+JOIN users u ON s.user_id = u.id
+WHERE s.kind = 'anthropic_token'
+ORDER BY s.user_id, s.id
 `
 
 type ListAnthropicTokensToPollRow struct {
-	ID         uuid.UUID `json:"id"`
-	UserID     uuid.UUID `json:"user_id"`
-	Ciphertext []byte    `json:"ciphertext"`
-	SealedWith string    `json:"sealed_with"`
+	ID                    uuid.UUID `json:"id"`
+	UserID                uuid.UUID `json:"user_id"`
+	Ciphertext            []byte    `json:"ciphertext"`
+	SealedWith            string    `json:"sealed_with"`
+	NotifyEarlyLimitReset bool      `json:"notify_early_limit_reset"`
 }
 
 // Every anthropic_token secret to poll each tick (PRD #104 M5): the token's id and
@@ -61,6 +87,11 @@ type ListAnthropicTokensToPollRow struct {
 //
 // ORDER BY keeps a tick's work deterministic, which makes a slow tick's log
 // readable and a partial tick's coverage predictable rather than arbitrary.
+//
+// The JOIN to users carries the token owner's notify_early_limit_reset flag (PRD
+// #1020): the poller gates the early-reset alert on the owner's per-user opt-in
+// without a second per-token lookup. INNER JOIN on the owning user is total — every
+// user_secret has an owner — so it drops no token.
 func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropicTokensToPollRow, error) {
 	rows, err := q.db.Query(ctx, listAnthropicTokensToPoll)
 	if err != nil {
@@ -75,6 +106,7 @@ func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropi
 			&i.UserID,
 			&i.Ciphertext,
 			&i.SealedWith,
+			&i.NotifyEarlyLimitReset,
 		); err != nil {
 			return nil, err
 		}

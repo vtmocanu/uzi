@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
+  EARLY_LIMIT_RESET_KIND,
   groupNotifications,
   JUDGE_GROUP_WINDOW_MS,
   notificationBody,
   notificationLink,
+  notificationTitle,
   type GroupableNotification,
 } from "./notifications";
 
@@ -44,6 +46,29 @@ describe("notificationLink (Decision 4: kind-conditional, NOT a URL edit)", () =
     expect(notificationLink("judge_review", null)).toBeNull();
     expect(notificationLink("run_failed", undefined)).toBeNull();
     expect(notificationLink("judge_review", "")).toBeNull();
+  });
+});
+
+// PRD #1020 M5: the early-limit-reset inbox renderer. The kind is account-level (no
+// run), so its only renderer seam is a fixed title — an unrendered kind would show the
+// raw humanized string "early limit reset", and it must carry no deep link.
+describe("early_limit_reset inbox renderer (PRD #1020 M5)", () => {
+  it("gives the kind a fixed human title, not the raw humanized kind", () => {
+    const title = notificationTitle(EARLY_LIMIT_RESET_KIND, {});
+    expect(title).toBe("7-day rate limit reset early");
+    // The failure this guards: falling through to kind.replace(/_/g, " ").
+    expect(title).not.toBe("early limit reset");
+  });
+
+  it("prefers an explicit payload.title when present", () => {
+    expect(
+      notificationTitle(EARLY_LIMIT_RESET_KIND, { title: "Weekly limit reopened early" }),
+    ).toBe("Weekly limit reopened early");
+  });
+
+  it("offers no link — the alert is account-level and carries no run", () => {
+    expect(notificationLink(EARLY_LIMIT_RESET_KIND, null)).toBeNull();
+    expect(notificationLink(EARLY_LIMIT_RESET_KIND, undefined)).toBeNull();
   });
 });
 

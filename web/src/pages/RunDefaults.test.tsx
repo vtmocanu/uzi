@@ -31,6 +31,7 @@ vi.mock("../lib/api", async (importActual) => {
       listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
       setAutopilotEnabled: vi.fn(),
       setWaitOnLimit: vi.fn(),
+      setNotifyEarlyReset: vi.fn(),
       setJudgeEnabled: vi.fn(),
       setAttributionEnabled: vi.fn(),
       getMySettings: vi.fn(),
@@ -65,6 +66,7 @@ const baseUser: User = {
   attribution_enabled: true,
   ephemeral_workers_enabled: false,
   wait_on_limit: false,
+  notify_early_limit_reset: false,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,
   created_at: "2026-01-01T00:00:00Z",
@@ -549,6 +551,76 @@ describe("Run defaults — usage-limit default (PRD #35 M3)", () => {
     const autopilot = screen.getByLabelText("Enable autopilot for my account") as HTMLInputElement;
     expect(autopilot.disabled).toBe(false);
     expect(mockApi.setAutopilotEnabled).not.toHaveBeenCalled();
+  });
+});
+
+// PRD #1020 M5: the per-user early-limit-reset Slack alert opt-in. DEFAULT ON, so a
+// field-absent user renders CHECKED. It sits on the SAME usage-limits surface as the
+// wait-on-limit default and writes its own dedicated endpoint (setNotifyEarlyReset).
+describe("Run defaults — early-limit-reset alert (PRD #1020 M5)", () => {
+  const earlyToggle = () =>
+    screen.getByLabelText("Alert me when my 7-day limit resets early") as HTMLInputElement;
+
+  it("reflects the current opt-in state (on)", () => {
+    mockAuth({ ...baseUser, notify_early_limit_reset: true });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(earlyToggle().checked).toBe(true);
+  });
+
+  it("reflects the current opt-in state (off)", () => {
+    mockAuth({ ...baseUser, notify_early_limit_reset: false });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(earlyToggle().checked).toBe(false);
+  });
+
+  // The shipped column default is ON, so a field-absent response must render the
+  // toggle CHECKED — matching the DB default rather than assuming OFF.
+  it("assumes the shipped default-on when notify_early_limit_reset is absent", () => {
+    mockAuth({ ...baseUser, notify_early_limit_reset: undefined as unknown as boolean });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(earlyToggle().checked).toBe(true);
+  });
+
+  it("toggling calls the API with the flipped value and refreshes the session", async () => {
+    // baseUser has notify_early_limit_reset:false, so the checkbox starts off and a
+    // click sends true.
+    mockApi.setNotifyEarlyReset.mockResolvedValue({
+      user: { ...baseUser, notify_early_limit_reset: true },
+    });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    fireEvent.click(earlyToggle());
+
+    await waitFor(() => expect(mockApi.setNotifyEarlyReset).toHaveBeenCalledWith(true));
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("surfaces an error and does not leave the toggle stuck", async () => {
+    mockApi.setNotifyEarlyReset.mockRejectedValue(new ApiError(500, "internal error"));
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    fireEvent.click(earlyToggle());
+
+    expect(await screen.findByText("internal error")).toBeTruthy();
+    expect(earlyToggle().disabled).toBe(false);
   });
 });
 

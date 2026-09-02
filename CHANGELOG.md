@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Slack DM alert when your Anthropic 7-day rate limit resets early ([#1020](https://github.com/vtmocanu/uzi/issues/1020)).**
+  A new opt-out setting (on by default) fires a loud Slack DM, plus a durable inbox notification, when uzi's usage poller sees your weekly window reopen more than 8 hours before its previously expected reset; it only notifies and does not resume parked runs early.
+
 ## [0.75.1] - 2026-09-02
 
 ### Fixed
