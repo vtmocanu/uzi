@@ -64,7 +64,11 @@ func (g *github) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 	if err != nil {
 		return Pipeline{}, err
 	}
-	pr, _, err := g.client.PullRequests.Get(ctx, slug.owner, slug.repo, int(mrIID))
+	num, err := ghNum(mrIID)
+	if err != nil {
+		return Pipeline{}, g.wrapErr("latest MR pipeline", err)
+	}
+	pr, _, err := g.client.PullRequests.Get(ctx, slug.owner, slug.repo, num)
 	if err != nil {
 		return Pipeline{}, g.wrapErr("latest MR pipeline", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -128,6 +129,19 @@ func (g *github) wrapErr(op string, err error) error {
 	default:
 		return g.redact.error(fmt.Errorf("github: %s: %w", op, err))
 	}
+}
+
+// ghNum narrows a project-scoped int64 IID (a GitHub issue or PR number) to the
+// int the go-github client requires. GitHub issue and PR numbers are always small
+// positive integers, far below math.MaxInt32, so the guard is defensive: it turns
+// the silent truncation govulncheck's sibling static analysis (CodeQL
+// go/incorrect-integer-conversion) flags — impossible on the 64-bit build target,
+// where int is 64-bit — into an explicit out-of-range error instead.
+func ghNum(iid int64) (int, error) {
+	if iid < 0 || iid > math.MaxInt32 {
+		return 0, fmt.Errorf("number %d out of range", iid)
+	}
+	return int(iid), nil
 }
 
 // repoSlugFor resolves a numeric projectID to its owner/repo pair, caching the
