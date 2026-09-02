@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -382,7 +383,7 @@ func runHandoffRm(env Env, gf *globalFlags, cmd *cobra.Command, id string) error
 	if err != nil {
 		return err
 	}
-	if run.Kind != "task" {
+	if run.Kind != runkind.Task {
 		return uzicli.Exitf(uzicli.ExitUsage, "run %s is not a handoff task (kind=%s)", id, run.Kind)
 	}
 	// issue #403 F1: an open merge request needs its source branch. The exemption is BRANCH-WIDE
