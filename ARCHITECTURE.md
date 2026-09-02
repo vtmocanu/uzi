@@ -620,6 +620,14 @@ queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiti
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
 
+The `runs.kind` domain itself (the eight values threaded through this section —
+`issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt`/`task`/`mr_rework`) has one Go
+home, `api/internal/runkind` (PRD #983): its constants and `All()` are pinned to the DB
+`runs_kind_check` constraint by a migration-parity test, with decoupled per-side mirrors
+— the agent's `RUN_KIND_PROFILES` table (`agent/src/run-kind.ts`) and the web's
+`RUN_KINDS` (`web/src/lib/runKind.ts`) — kept in sync via `fixtures/run-kinds/registry.json`.
+Adding a ninth kind follows the checklist in `api/internal/runkind/doc.go`.
+
 `running ⇄ awaiting_input` can fire twice over — once **pre-run**, ending the
 planning turn with a question instead of a plan, and again **mid-run**, at any
 point in the implement ⇄ review loop after approval — and the two resolve
