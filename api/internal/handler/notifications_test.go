@@ -283,12 +283,36 @@ func TestListNotificationsPageClampAndValidation(t *testing.T) {
 		t.Fatalf("offset = %d, want 7", db.listOff)
 	}
 
-	for _, bad := range []string{"limit=0", "limit=abc", "offset=-1", "offset=x"} {
+	for _, bad := range []string{"limit=0", "limit=abc", "offset=-1", "offset=x", "offset=2147483648"} {
 		rec := httptest.NewRecorder()
 		h.ListNotifications(rec, notifUser(httptest.NewRequest(http.MethodGet, "/api/notifications?"+bad, nil), user, false))
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("?%s: status = %d, want 400", bad, rec.Code)
 		}
+	}
+}
+
+// TestListNotificationsOffsetUpperBound pins CodeQL #28: an offset above
+// math.MaxInt32 must be a 400 "invalid offset", NOT truncated to a negative
+// int32 that reaches the query (which Postgres rejects as a 500). Failing-first
+// against the unfixed code, ListNotifications returns 200 and the fake records a
+// negative offset; the fix rejects it before any query runs.
+func TestListNotificationsOffsetUpperBound(t *testing.T) {
+	user := uuid.New()
+	db := &fakeNotifDB{}
+	h := &Handler{q: store.New(db)}
+
+	rec := httptest.NewRecorder()
+	h.ListNotifications(rec, notifUser(httptest.NewRequest(http.MethodGet, "/api/notifications?offset=2147483648", nil), user, false))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid offset") {
+		t.Fatalf("body = %q, want it to contain \"invalid offset\"", rec.Body.String())
+	}
+	if db.listOff < 0 {
+		t.Fatalf("listOff = %d: a truncated negative offset reached the query", db.listOff)
 	}
 }
 
