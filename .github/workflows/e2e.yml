@@ -67,8 +67,9 @@ jobs:
       # -- it is set per-step below.
       UZI_E2E_FORGE: ${{ matrix.forge }}
       # A red run already auto-retains its rundir (lib.sh cleanup keeps it when the exit
-      # code is non-zero, PRD #966 M3 D5), which covers the if: failure() upload below;
-      # KEEP_RUNDIR=1 makes retention unconditional as belt-and-braces.
+      # code is non-zero, PRD #966 M3 D5), which covers the failure-path upload below;
+      # KEEP_RUNDIR=1 makes retention unconditional as belt-and-braces (also covering a
+      # timed-out lane, where the harness may be killed before it can decide to retain).
       KEEP_RUNDIR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -88,12 +89,14 @@ jobs:
           E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
         run: ./e2e/run-e2e.sh
 
-      # On failure, keep the rundir's evidence: summary.md (the phase table + wait_*
-      # margins + leaks), junit.xml, results.tsv and the per-phase artifacts/ tree.
-      # if-no-files-found: warn, since a harness that died before writing results may
-      # leave none. Name the artifact per lane so three parallel lanes do not collide.
+      # On failure OR a timed-out (cancelled) lane, keep the rundir's evidence:
+      # summary.md (the phase table + wait_* margins + leaks), junit.xml, results.tsv
+      # and the per-phase artifacts/ tree. if-no-files-found: warn, since a harness that
+      # died or was killed before writing results may leave none. Name the artifact per
+      # lane so three parallel lanes do not collide. failure() misses a timeout (the job
+      # is cancelled, not failed), so both cleanup steps gate on failure() || cancelled().
       - name: Upload E2E rundir on failure
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: e2e-rundir-${{ matrix.forge }}
@@ -105,14 +108,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # On failure, keep exactly ONE open issue PER LANE: comment on the existing one,
+      # On failure or a timed-out lane, keep exactly ONE open issue PER LANE: comment on the existing one,
       # else open it. Uses the built-in GITHUB_TOKEN (no PAT). The label is upserted
       # first so the `gh issue list --label` lookup cannot error on a missing label.
       # A per-lane label (nightly-e2e-<forge>) gives each forge its own tracking issue
       # and avoids a create race between the parallel matrix lanes. The body embeds
       # summary.md so the tracker shows every failing phase, not just a run URL.
       - name: Open or update failure issue
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORGE_LANE: ${{ matrix.forge }}
