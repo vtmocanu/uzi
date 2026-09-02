@@ -15,7 +15,7 @@ import type {
   RunUsage,
   UserSettings,
   CatalogEntry,
-  CliToken,
+  AdminCliToken,
   Board,
   Card,
   BoardColumn,
@@ -133,7 +133,6 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 {
   // 1. key-set equality, both directions.
   const _runMissing: never = null as unknown as Exclude<keyof Run, keyof typeof runFull>;
-  // @ts-expect-error #982: scope_ceiling, base_branch, open_mr, interactive, dispatched_at, branch_has_active_run, branch_has_open_mr — reconciled in M4
   const _runExtra: never = null as unknown as Exclude<keyof typeof runFull, keyof Run>;
   // 2. nullability with the mapper-normalized exemptions applied.
   const _runZero: ZeroOf<Run, "plan_changed_files" | "required_capabilities" | "required_tools"> = runZero;
@@ -151,7 +150,6 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // is_revising) match. Same three ZeroOf exemptions, inherited from Run.
 {
   const _runListItemMissing: never = null as unknown as Exclude<keyof RunListItem, keyof typeof runListItemFull>;
-  // @ts-expect-error #982: scope_ceiling, base_branch, open_mr, interactive, dispatched_at, branch_has_active_run, branch_has_open_mr — reconciled in M4
   const _runListItemExtra: never = null as unknown as Exclude<keyof typeof runListItemFull, keyof RunListItem>;
   const _runListItemZero: ZeroOf<RunListItem, "plan_changed_files" | "required_capabilities" | "required_tools"> =
     runListItemZero;
@@ -201,13 +199,16 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // 🔴 DISCOVERED DRIFT (not in the M2 plan): schedule.next_fires. The mapper only sets
 // NextFires for a recurring schedule with a valid cron (handler/schedules.go:1612-1614);
 // a once (or invalid-cron) schedule leaves it nil, so the wire emits `null`, but TS
-// types it `next_fires: string[]` (never-null). Carried under the directive below until
-// M4 reconciles it (TS → `string[] | null`, or the mapper normalizes to []). labels is
+// types it `next_fires: string[]` (never-null). This is the ONE directive M4 deliberately
+// KEEPS (every other #982 directive is removed): widening to `string[] | null` would
+// surface two UNGUARDED `next_fires[0]` index sites (DefaultJobs.tsx / Schedules.tsx) as a
+// red gate — a latent crash-on-once-schedule that is a BEHAVIOUR fix needing its own
+// regression test (filed as its own bug), out of scope for this type-only PRD. labels is
 // already typed `string[] | null` in TS, so it needs NO exemption.
 {
   const _scheduleMissing: never = null as unknown as Exclude<keyof Schedule, keyof typeof scheduleFull>;
   const _scheduleExtra: never = null as unknown as Exclude<keyof typeof scheduleFull, keyof Schedule>;
-  // @ts-expect-error #982: schedule.next_fires — mapper leaves it nil (→ null) for a once schedule, TS types next_fires: string[]; DISCOVERED in M2, reconciled in M4
+  // @ts-expect-error #982: next_fires is null on the wire for once/invalid-cron schedules; widening to string[] | null is deferred to its own bug (two unguarded next_fires[0] index sites, DefaultJobs.tsx / Schedules.tsx, would crash — a behaviour fix with a regression test, not this type-only PRD)
   const _scheduleZero: ZeroOf<Schedule, "override_subagent_model"> = scheduleZero;
   const _scheduleFull: Widen<Schedule> = scheduleFull;
   void _scheduleMissing;
@@ -246,14 +247,13 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // pgx (WorkerDTO.Capabilities doc; passed through at handler/workers.go:203), so the wire
 // is [] though the nil-slice zero marshals null.
 //
-// 🔴 DISCOVERED DRIFT (not in the M2 plan): worker.docker. The mapper emits null for an
-// external worker (boolPtrValue, handler/workers.go:201) but TS types `docker?: boolean`
-// (never-null). Carried under the directive below until M4 reconciles it (TS →
-// `docker?: boolean | null`). Every other pointer field is typed X|null in TS.
+// worker.docker: the mapper emits null for an external worker (boolPtrValue,
+// handler/workers.go:201). DISCOVERED in M2 as a drift against the then-`docker?: boolean`
+// TS type; RECONCILED in M4 — TS is now `docker?: boolean | null`, so the null is accepted
+// and no directive or exemption is needed. Every other pointer field is typed X|null in TS.
 {
   const _workerMissing: never = null as unknown as Exclude<keyof Worker, keyof typeof workerFull>;
   const _workerExtra: never = null as unknown as Exclude<keyof typeof workerFull, keyof Worker>;
-  // @ts-expect-error #982: worker.docker — mapper emits null for an external worker (workers.go:201), TS types docker?: boolean; DISCOVERED in M2, reconciled in M4
   const _workerZero: ZeroOf<Worker, "capabilities"> = workerZero;
   const _workerFull: Widen<Worker> = workerFull;
   void _workerMissing;
@@ -264,12 +264,11 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 
 // ── AdminWorker (M2) ────────────────────────────────────────────────────────
 // AdminWorker extends Worker + owner_email; the embedded WorkerDTO fields marshal inline,
-// so full.json carries the Worker keys AND owner_email. Same capabilities exemption and
-// same inherited worker.docker drift directive as Worker.
+// so full.json carries the Worker keys AND owner_email. Same capabilities exemption and the
+// same inherited worker.docker null, now reconciled in M4 (docker?: boolean | null) — no directive.
 {
   const _adminWorkerMissing: never = null as unknown as Exclude<keyof AdminWorker, keyof typeof adminWorkerFull>;
   const _adminWorkerExtra: never = null as unknown as Exclude<keyof typeof adminWorkerFull, keyof AdminWorker>;
-  // @ts-expect-error #982: worker.docker (inherited) — mapper emits null for an external worker (workers.go:250), TS types docker?: boolean; DISCOVERED in M2, reconciled in M4
   const _adminWorkerZero: ZeroOf<AdminWorker, "capabilities"> = adminWorkerZero;
   const _adminWorkerFull: Widen<AdminWorker> = adminWorkerFull;
   void _adminWorkerMissing;
@@ -352,13 +351,13 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _userSettingsFull;
 }
 
-// ── CatalogEntry (M2, HAS DRIFT) ────────────────────────────────────────────
-// TS CatalogEntry lacks BOTH selector_kind (schedule.go:211) and mr_rework_enabled
-// (schedule.go:221), so _catalogEntryExtra fails — carried under the directive until M4.
-// labels is typed `string[] | null` in TS, so it needs no ZeroOf exemption.
+// ── CatalogEntry (M2 drift, RECONCILED M4) ──────────────────────────────────
+// TS CatalogEntry lacked BOTH selector_kind (schedule.go:211) and mr_rework_enabled
+// (schedule.go:221); M4 added them (optional, to avoid the scheduleCatalog mock cascade),
+// so _catalogEntryExtra is now `never` and the directive is gone. labels is typed
+// `string[] | null` in TS, so it needs no ZeroOf exemption.
 {
   const _catalogEntryMissing: never = null as unknown as Exclude<keyof CatalogEntry, keyof typeof catalogEntryFull>;
-  // @ts-expect-error #982: selector_kind, mr_rework_enabled — reconciled in M4
   const _catalogEntryExtra: never = null as unknown as Exclude<keyof typeof catalogEntryFull, keyof CatalogEntry>;
   const _catalogEntryZero: ZeroOf<CatalogEntry> = catalogEntryZero;
   const _catalogEntryFull: Widen<CatalogEntry> = catalogEntryFull;
@@ -368,15 +367,18 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _catalogEntryFull;
 }
 
-// ── CliToken (M2, HAS DRIFT) ────────────────────────────────────────────────
-// TS CliToken lacks user_id and owner_email (AdminCLITokenDTO, cli_token.go:24-25), so
-// _cliTokenExtra fails — carried under the directive until M4 adds AdminCliToken.
+// ── CliToken / AdminCliToken (M2 drift, RECONCILED M4) ──────────────────────
+// The cli_token fixture is recorded from Go's AdminCLITokenDTO, so it carries user_id and
+// owner_email that the per-user CliToken type lacks. M2 checked it against CliToken and
+// carried the two extra keys under a directive; M4 adds AdminCliToken (extends CliToken +
+// user_id + owner_email) and checks the admin fixture against it, so _cliTokenExtra is now
+// `never` and the directive is gone. (The web SPA does not fetch the admin list today — it
+// is CLI-only — so AdminCliToken has no admin-page fetch to retype; it exists for this pin.)
 {
-  const _cliTokenMissing: never = null as unknown as Exclude<keyof CliToken, keyof typeof cliTokenFull>;
-  // @ts-expect-error #982: user_id, owner_email — reconciled in M4
-  const _cliTokenExtra: never = null as unknown as Exclude<keyof typeof cliTokenFull, keyof CliToken>;
-  const _cliTokenZero: ZeroOf<CliToken> = cliTokenZero;
-  const _cliTokenFull: Widen<CliToken> = cliTokenFull;
+  const _cliTokenMissing: never = null as unknown as Exclude<keyof AdminCliToken, keyof typeof cliTokenFull>;
+  const _cliTokenExtra: never = null as unknown as Exclude<keyof typeof cliTokenFull, keyof AdminCliToken>;
+  const _cliTokenZero: ZeroOf<AdminCliToken> = cliTokenZero;
+  const _cliTokenFull: Widen<AdminCliToken> = cliTokenFull;
   void _cliTokenMissing;
   void _cliTokenExtra;
   void _cliTokenZero;

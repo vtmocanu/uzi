@@ -164,6 +164,45 @@ guaranteed (the exemptions above) or already typed `X | null` in TS. In particul
 it `tools: string[] | null` (`apiTypes.ts:150`), so there is no drift and no
 `@ts-expect-error` directive (the Tools WARNING's REAL-drift branch does not apply here).
 
+### M4 — reconciled, type-only (directives removed)
+
+M4 added the missing TS fields (all **OPTIONAL**, following `apiTypes.ts`'s established
+convention for a wire field that is always present but is kept optional to avoid forcing
+mock-object updates — the `is_planning?`/`trigger_source?`/`priority?` fields document this)
+and widened the one nullable field. Each new field made its `@ts-expect-error #982`
+directive unused, and tsc (TS2578) forced its removal — the self-cleaning ratchet. What
+landed:
+
+| TS type | reconciliation | directive removed |
+|---|---|---|
+| `Run` | +7 optional fields: `scope_ceiling?: number \| null`, `base_branch?: string \| null`, `open_mr?: boolean`, `interactive?: boolean`, `dispatched_at?: string \| null`, `branch_has_active_run?: boolean`, `branch_has_open_mr?: boolean` (docs from `apitypes/run.go`) | `_runExtra` |
+| `RunListItem extends Run` | inherits the 7 above | `_runListItemExtra` |
+| `CatalogEntry` | +`selector_kind?: string`, +`mr_rework_enabled?: boolean \| null` (docs from `apitypes/schedule.go`) | `_catalogEntryExtra` |
+| `Worker` / `AdminWorker` | `docker?: boolean` → `docker?: boolean \| null` (the wire sends `null` for an external worker) | `_workerZero` / `_adminWorkerZero` |
+| `CliToken` (admin fixture) | new `export interface AdminCliToken extends CliToken { user_id: string; owner_email: string }` (from `AdminCLITokenDTO`, `cli_token.go:24-25`); the `cli_token` fixture is recorded from `AdminCLITokenDTO`, so its `check` block is retyped from `CliToken` to `AdminCliToken` | `_cliTokenExtra` |
+
+**No consumer breaks (purely additive).** The field-anchored audit
+(`git grep -n -E '\.(scope_ceiling|base_branch|open_mr|interactive|dispatched_at|branch_has_active_run|branch_has_open_mr|selector_kind)\b' -- 'web/src/**/*.ts' 'web/src/**/*.tsx' ':!*.test.*' ':!web/src/mocks/**'`)
+returns **0 lines**, so the 7 `Run` fields and CatalogEntry's `selector_kind` have no call
+site. The two `docker` consumers (`RunView.tsx:1630`, `WorkersSettings.tsx:484`) both use
+`w.docker === true`, which is null-safe, so the widening is tsc-clean.
+
+**No admin-page fetch to retype.** The PRD anticipated retyping "the admin CLI-tokens page's
+fetch" to `AdminCliToken[]`, but the web SPA does not fetch the admin list — `GET
+/admin/cli-tokens` (serving `AdminCLITokenDTO`) is consumed ONLY by the `uzi admin
+cli-tokens` CLI; the web's `CliTokens.tsx` reads the per-user `GET /me/cli-tokens` (returning
+`CliToken`). So `AdminCliToken` was added for the contract pin, no production fetch changed,
+and no mock fixture needed editing.
+
+**The `next_fires` directive is the ONE that REMAINS** (every other `@ts-expect-error #982`
+is gone). `Schedule.next_fires` is `null` on the wire for a once/invalid-cron schedule, but
+widening `string[]` → `string[] | null` would surface two UNGUARDED `next_fires[0]` index
+sites (`DefaultJobs.tsx:383`, `Schedules.tsx:855`) as a red gate — a latent
+crash-on-once-schedule. That is a BEHAVIOUR fix that needs its own regression test (filed as
+its own bug), out of scope for this type-only PRD, so its directive stays with a reason
+naming the deferral. `Worker.docker` was reconciled (no unguarded index site), so only
+`next_fires` remains.
+
 ## What the TS half pins (three compile-time assertions per DTO)
 
 ```ts

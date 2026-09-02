@@ -238,7 +238,7 @@ and matters here exactly as `fixtures/run-usage/README.md` explains: the fixture
     but TS already types it `string[] | null` (apiTypes.ts:150), so NO drift and no directive
     (the Tools WARNING's real-drift branch did not apply). No `@ts-expect-error` was added in M3.
   - Gates green: `task gate:api`, `task gate:web`, `task scan:secrets`; `TestNoServerDeps` green.
-- [ ] **M4 — reconcile, type-only.** Add the 7 `Run` fields (doc comments from
+- [x] **M4 — reconcile, type-only.** Add the 7 `Run` fields (doc comments from
   `apitypes/run.go`), `CatalogEntry.selector_kind` and `mr_rework_enabled?: boolean |
   null`, `AdminCliToken extends CliToken` with `user_id`/`owner_email` (and retype the
   admin CLI-tokens page's fetch to it), and whatever M2/M3 surfaced; remove every
@@ -258,6 +258,31 @@ and matters here exactly as `fixtures/run-usage/README.md` explains: the fixture
     normalizes `next_fires` to `[]`, which is out of scope for a type-only PRD). Removing
     the two `@ts-expect-error #982` directives on the Worker/AdminWorker/Schedule `_zero`
     assertions is what tsc will insist on once these land.
+  - Landed (type-only, all additive): `Run` +7 OPTIONAL fields (`scope_ceiling?`,
+    `base_branch?`, `open_mr?`, `interactive?`, `dispatched_at?`, `branch_has_active_run?`,
+    `branch_has_open_mr?`; optional to avoid the Run mock cascade); `CatalogEntry`
+    +`selector_kind?` +`mr_rework_enabled?: boolean | null`; `Worker`/`AdminWorker`
+    `docker?: boolean` → `docker?: boolean | null`; new `export interface AdminCliToken
+    extends CliToken { user_id; owner_email }`. Removed every `@ts-expect-error #982`
+    directive EXCEPT `Schedule.next_fires` (see below). Field-anchored audit: **0** consumer
+    hits, so purely additive; the two `docker` consumers use `w.docker === true` (null-safe).
+    `tsc --noEmit`, `apiContract.test.ts` (69 tests), `task gate:web` and `task scan:secrets`
+    all green.
+  - 🔴 **`next_fires` NOT reconciled — the one documented exception.** Widening
+    `next_fires: string[]` → `string[] | null` would surface two UNGUARDED `next_fires[0]`
+    index sites (`DefaultJobs.tsx:383`, `Schedules.tsx:855`) as a red gate — a latent
+    crash-on-once-schedule that is a BEHAVIOUR fix needing its own regression test (filed as
+    its own incidental bug), out of scope for this type-only PRD. So `next_fires` stays
+    `string[]` and its `@ts-expect-error #982` directive is KEPT (reason rewritten to name
+    the deferral) — the ONLY directive remaining after M4.
+  - **No admin-page fetch retyped.** The PRD anticipated retyping "the admin CLI-tokens
+    page's fetch" to `AdminCliToken[]`, but the web SPA does not fetch the admin list: `GET
+    /admin/cli-tokens` (serving `AdminCLITokenDTO`) is consumed only by the `uzi admin
+    cli-tokens` CLI, and the web's `CliTokens.tsx` reads the per-user `GET /me/cli-tokens`
+    (returning `CliToken`). `AdminCliToken` was added for the contract pin; no production
+    fetch changed and no mock fixture needed editing. The `cli_token` `check` block (its
+    fixture is recorded from `AdminCLITokenDTO`) was retyped from `CliToken` to
+    `AdminCliToken`, which is what removed its directive.
 - [ ] **M5 — doc-sync.** `ARCHITECTURE.md`'s DTO / apitypes paragraph gains one sentence
   pointing at `fixtures/api-contract/`; `.claude/rules/web.md` and `.claude/rules/go.md`
   each gain the rule "a DTO field change is a THREE-file edit — Go struct, fixture,

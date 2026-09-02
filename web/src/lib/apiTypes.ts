@@ -1145,6 +1145,18 @@ export interface CliToken {
   expires_at: string | null;
 }
 
+// AdminCliToken is one row of the factory-wide standing-credential inventory
+// (apitypes.AdminCLITokenDTO, admin read-only): the per-user CliToken plus the owner
+// attribution — user_id and owner_email — that the `uzi admin cli-tokens` CLI list
+// carries. The token value and its hash appear in no field (the value is never stored;
+// the hash is projected out server-side). The web SPA does not fetch this list today
+// (only the CLI's `GET /admin/cli-tokens` does); this type exists so the api⇄SPA
+// contract fixture (PRD #982) can pin the admin DTO's shape against a TS definition.
+export interface AdminCliToken extends CliToken {
+  user_id: string;
+  owner_email: string;
+}
+
 // CliTokenMint is the POST /me/cli-tokens response: the plaintext token shown
 // exactly once (only its hash is stored) plus the row's metadata, mirroring
 // CreateWorker's {worker, token}. `token` is the only place the value ever
@@ -1371,6 +1383,18 @@ export interface CatalogEntry {
   max_issues: number;
   auto_approve: boolean;
   wait_on_limit: boolean;
+  /** PRD #767 M4: a sweep entry's selector kind — "label" (the default) selects by
+   *  `labels`, "assigned" selects issues assigned to the uzi-bot account (and carries no
+   *  labels). Empty/"label" for every non-assigned entry, so the enable-UI/CLI can describe
+   *  an assigned sweep honestly rather than rendering its empty labels as a label selector.
+   *  OPTIONAL here only to avoid forcing mock-object updates; the server always sends it. */
+  selector_kind?: string;
+  /** PRD #841 M2: the per-schedule MR-rework override a default is seeded with — null =
+   *  inherit the owner default (the catalog default), so the enable-a-default UI reflects
+   *  that a default job follows the user's global setting unless explicitly set. Tri-state
+   *  (`boolean | null`), unlike wait_on_limit's plain bool. OPTIONAL here only to avoid
+   *  forcing mock-object updates. */
+  mr_rework_enabled?: boolean | null;
 }
 
 // CatalogEnablement records that the caller already has `slug` enabled on `repo_id`
@@ -1460,7 +1484,9 @@ export interface Worker {
   // Whether this hosted worker carries the rootless-DinD sidecar (PRD #83 M3).
   // Absent/undefined or null for an external worker (docker is not applicable),
   // false for a hosted worker without the sidecar, true for a docker-capable one.
-  docker?: boolean;
+  // The wire sends null (not just absent) for an external worker — boolPtrValue on the
+  // nil *bool (handler/workers.go:201) — so this is `boolean | null`, not just optional.
+  docker?: boolean | null;
   // Auto-provisioned, run-bound throwaway hosted worker (PRD #529/#649): the api
   // provisions it on demand for a run needing a capability no online worker has and
   // reaps it when the run finishes. true marks such a worker; absent/false for a
@@ -1996,6 +2022,38 @@ export interface Run {
   required_capabilities?: string[];
   required_tools?: string[];
   size_class?: string;
+  /** PRD #634 M2: the operator scope ceiling — the count of milestones the run may
+   *  complete over the immutable frozen list; null = unbounded. Rides the running-report
+   *  ACK and the claim payload (both built by runToDTO). OPTIONAL here only to avoid forcing
+   *  mock-object updates; the server always sends it. */
+  scope_ceiling?: number | null;
+  /** PRD #400: the task/handoff source ref a kind='task' run branched from — null when it
+   *  inherited the caller's local HEAD, and on every non-task run. For a handoff created
+   *  without --base (issue #403 F3) it is the resolved SEED COMMIT sha the auto-review uses
+   *  as its diff base. OPTIONAL here only to avoid forcing mock-object updates. */
+  base_branch?: string | null;
+  /** PRD #400: whether a kind='task' run's worker opens an MR at the end (false by default
+   *  and for every non-task run — a plain handoff produces commits on the branch, not an
+   *  MR). Always on the wire; OPTIONAL here only to avoid forcing mock-object updates. */
+  open_mr?: boolean;
+  /** PRD #517 M1: marks a long-lived, conversational task run — the worker keeps it alive
+   *  (parking in awaiting_followup) after signal_done rather than terminating. Set at create
+   *  from --interactive; false by default and for every non-task run. Always on the wire;
+   *  OPTIONAL here only to avoid forcing mock-object updates. */
+  interactive?: boolean;
+  /** PRD #400 Decision 6: when the CLI stamped a task run's dispatch gate — the moment it
+   *  became claimable, after its uzi/task/<id> branch was seeded. Null on every non-task run
+   *  and on a task run not yet dispatched. OPTIONAL here only to avoid forcing mock updates. */
+  dispatched_at?: string | null;
+  /** issue #403 F1/F6: server-computed `uzi handoff rm` preconditions, stamped only on the
+   *  owner/admin GetRun detail read for a kind='task' run — false on every non-task run and
+   *  on the list/create/worker DTO paths. branch_has_active_run is true while ANY run on the
+   *  shared uzi/task/<id> branch is non-terminal (rm would race a live push);
+   *  branch_has_open_mr is true when the branch's owning task opened an MR (rm exempt — the
+   *  MR needs its source branch). Always on the wire (bool); OPTIONAL here only to avoid
+   *  forcing mock-object updates. */
+  branch_has_active_run?: boolean;
+  branch_has_open_mr?: boolean;
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW
