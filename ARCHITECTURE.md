@@ -689,7 +689,7 @@ chain in the diagram above, with no intervening `running`.
   `adr/0759-protect-run-work-usage-limit-park.md` for the full Decision Log. <!-- check-docs:ignore-path -->
 
 - **Affinity now holds through a worker roll, and the forge-checkpoint net behind
-  it is reliable and observable ([PRD #1030](prds/1030-worker-resume-durability.md)).**
+  it is reliable and observable ([PRD #1030](prds/done/1030-worker-resume-durability.md)).**
   Before this PRD, `ClaimRun`'s affinity leg fell open the instant a parked run's
   owner started draining — including a routine image roll — so a park landing on a
   worker mid-roll cold-restarted on a peer with no clone (`resume_lineage_break`,

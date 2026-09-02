@@ -119,7 +119,7 @@ Recorded here because it is the invariant most likely to be "simplified" wrong. 
 
 ## Amendment — PRD #1030 (2026-09-02)
 
-PRD #1030 (`prds/1030-worker-resume-durability.md`) hit the gap this amendment records: a
+PRD #1030 (`prds/done/1030-worker-resume-durability.md`) hit the gap this amendment records: a
 parked run's owner worker was cordoned for a routine image roll (not dead, not torn down),
 and D3a's affinity leg — as designed above — released the run to a peer anyway, forcing a
 cold cross-worker resume (`resume_lineage_break`, incident run #1009). This amendment also
