@@ -61,6 +61,22 @@ type Store interface {
 	GetDefaultUserSecretID(ctx context.Context, arg store.GetDefaultUserSecretIDParams) (uuid.UUID, error)
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 	UpsertRateLimits(ctx context.Context, arg store.UpsertRateLimitsParams) error
+	// GetRateLimitsForToken reads the prior gauge row for a token before the tick
+	// overwrites it, so early-reset detection can compare the previously reported
+	// 7-day reset against the fresh reading (PRD #1020 M2). Returns pgx.ErrNoRows
+	// when the token has no prior row.
+	GetRateLimitsForToken(ctx context.Context, userSecretID uuid.UUID) (store.AnthropicRateLimit, error)
+	// GetUserByID backs the poke path's owner-setting lookup: the poke listing
+	// carries no settings, so the notify_early_limit_reset opt-in is read here (PRD
+	// #1020 M2). The tick path already has the flag on its row and needs no lookup.
+	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
+}
+
+// EarlyResetNotifier delivers the loud "7-day window reset early" alert (PRD #1020
+// M3). *notifysvc.Service satisfies it. Optional and nil-safe: a nil notifier (the
+// default) means detection still runs and logs but does not deliver.
+type EarlyResetNotifier interface {
+	NotifyEarlyReset(ctx context.Context, userID uuid.UUID, expected, observed time.Time) (store.Notification, error)
 }
 
 // TokenOpener opens a user's Anthropic token via the vault path (PRD #53 D1/D3).
@@ -99,7 +115,16 @@ type Engine struct {
 	// poke carries poke-on-token-save signals (D3b): a user whose token was just
 	// saved is polled out-of-band so meters appear in seconds, not a full interval.
 	poke chan uuid.UUID
+
+	// notifier delivers the early-reset alert (PRD #1020 M3). Optional and nil-safe:
+	// nil (the default) means detection runs and logs but does not deliver.
+	notifier EarlyResetNotifier
 }
+
+// SetNotifier wires the early-reset alert collaborator (PRD #1020 M3), mirroring
+// forgesvc.SetNotifier. Call once at startup, before the engine runs. A nil notifier
+// (the default) leaves detection running but silent.
+func (e *Engine) SetNotifier(n EarlyResetNotifier) { e.notifier = n }
 
 // New builds an Engine. interval is the poll cadence; the caller only starts the
 // engine when interval > 0 (0 disables it). probe is UZI_USAGE_PROBE. logger may
@@ -189,8 +214,10 @@ func (e *Engine) tickAll(ctx context.Context) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			// Open from the already-fetched row (no per-row re-fetch, no N+1). The
-			// ciphertext stays in this goroutine and is never logged.
-			e.pollToken(tickCtx, row.UserID, row.ID, false, func() ([]byte, error) {
+			// ciphertext stays in this goroutine and is never logged. The owner's
+			// notify_early_limit_reset opt-in rides along on the row (JOIN in
+			// ListAnthropicTokensToPoll), so detection needs no second lookup here.
+			e.pollToken(tickCtx, row.UserID, row.ID, false, row.NotifyEarlyLimitReset, func() ([]byte, error) {
 				return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
 			})
 		}(row)
@@ -217,7 +244,18 @@ func (e *Engine) pokeUser(ctx context.Context, userID uuid.UUID) {
 		}
 		return
 	}
-	e.pollToken(ctx, userID, secretID, true, func() ([]byte, error) {
+	// The poke listing carries no owner settings, so read the notify_early_limit_reset
+	// opt-in here. Detection MUST run on this path too: if a poke upserts the fresh
+	// reading without detecting, it advances the stored prev to the moved reset epoch
+	// and silently consumes the early-reset edge, losing the alert forever. The single
+	// extra query is affordable on this rare out-of-band path.
+	notifyEarly := false
+	if u, uerr := e.store.GetUserByID(ctx, userID); uerr == nil {
+		notifyEarly = u.NotifyEarlyLimitReset
+	} else {
+		e.logger.Error("usage poller: read owner settings for poke", "user", userID.String(), "error", uerr)
+	}
+	e.pollToken(ctx, userID, secretID, true, notifyEarly, func() ([]byte, error) {
 		return e.opener.Open(ctx, userID, store.KindAnthropicToken)
 	})
 }
@@ -232,7 +270,7 @@ func (e *Engine) pokeUser(ctx context.Context, userID uuid.UUID) {
 // must not silence its owner's other meters, which is precisely the case this
 // feature exists to support (a throttled subscription alongside a working console
 // key).
-func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, ignoreBackoff bool, open func() ([]byte, error)) {
+func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, ignoreBackoff, notifyEarly bool, open func() ([]byte, error)) {
 	if ignoreBackoff {
 		e.clearBackoff(secretID)
 	} else if e.inBackoff(secretID) {
@@ -258,7 +296,7 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, igno
 
 	reading, err := e.client.Usage(ctx, token)
 	if err == nil {
-		e.upsert(ctx, userID, secretID, reading)
+		e.observe(ctx, userID, secretID, notifyEarly, reading)
 		e.clearBackoff(secretID)
 		return
 	}
@@ -281,13 +319,103 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, igno
 	}
 	preading, perr := e.client.ProbeHeaders(ctx, token)
 	if perr == nil {
-		e.upsert(ctx, userID, secretID, preading)
+		e.observe(ctx, userID, secretID, notifyEarly, preading)
 		e.clearBackoff(secretID)
 		return
 	}
 	// The probe also failed (refused, transport, or malformed) — no usable fallback,
 	// so back off to avoid hammering a persistently refusing credential (D5).
 	e.setBackoff(secretID)
+}
+
+// earlyResetThreshold: only alert when the weekly window reopened comfortably
+// ahead of its advertised reset, so poll jitter never trips it (PRD #1020 D2).
+const earlyResetThreshold = 8 * time.Hour
+
+// exhaustionPct: the prior window counts as "was limiting" at/above this. Set
+// below 100 because a routine sync floors a limit_report 100 to 99
+// (fractionToPct, anthropic/client.go) while still exhausted (PRD #1020 D8).
+const exhaustionPct = 95
+
+// observe writes the fresh reading and, when the owner opted in, fires the early
+// 7-day reset alert (PRD #1020 M2). It wraps EVERY upsert path — tick and poke —
+// on purpose: the upsert advances the stored prev to the new reset boundary, so an
+// upsert that skipped detection would silently consume the moved-epoch edge and
+// lose the alert forever.
+//
+// Ordering is at-most-once (D7): read prev, decide, upsert next FIRST, then notify.
+// A notify error is logged, not fatal, and never before the write.
+func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, notifyEarly bool, next anthropic.Reading) {
+	if !notifyEarly {
+		// Opt-out (or the default): upsert as today, no read, no fire.
+		e.upsert(ctx, userID, secretID, next)
+		return
+	}
+
+	// Read prev BEFORE the upsert overwrites it. A missing row (ErrNoRows) or a read
+	// failure means no comparison basis → no fire, but the write still proceeds.
+	prev, err := e.store.GetRateLimitsForToken(ctx, secretID)
+	hasPrev := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		e.logger.Error("usage poller: read prior gauge for early-reset", "secret", secretID.String(), "error", err)
+	}
+
+	now := e.now().UTC()
+	fire, expected := earlyResetFires(prev, hasPrev, next, now)
+
+	// Upsert FIRST, always, then notify (D7: never notify before the write lands).
+	e.upsert(ctx, userID, secretID, next)
+
+	if !fire {
+		return
+	}
+	if e.notifier == nil {
+		// Detection ran but delivery is disabled (the default; unit tests without a
+		// notifier). Log so the edge is not entirely invisible.
+		e.logger.Info("usage poller: early 7-day reset detected (no notifier wired)",
+			"user", userID.String(), "secret", secretID.String())
+		return
+	}
+	if _, nerr := e.notifier.NotifyEarlyReset(ctx, userID, expected, now); nerr != nil {
+		e.logger.Error("usage poller: notify early reset", "user", userID.String(), "error", nerr)
+	}
+}
+
+// earlyResetFires is the D8 predicate. With T = prev.SevenDayResetsAt, it fires iff
+// the prior window was genuinely constrained (a pending, limiting 7-day window), the
+// fresh reading reports a moved-later reset epoch (the ONLY accepted "reset observed"
+// signal — a lone pct drop with an unchanged resets_at must NOT fire), and now is
+// strictly more than earlyResetThreshold before T. It returns T as the expected reset.
+func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic.Reading, now time.Time) (bool, time.Time) {
+	if !hasPrev {
+		return false, time.Time{}
+	}
+	// was constrained: prev.SevenDayResetsAt set AND a genuine pending reset (in the
+	// future relative to prev.SyncedAt).
+	if !prev.SevenDayResetsAt.Valid || !prev.SyncedAt.Valid {
+		return false, time.Time{}
+	}
+	t := prev.SevenDayResetsAt.Time
+	if !t.After(prev.SyncedAt.Time) {
+		return false, time.Time{}
+	}
+	// window was limiting: a limit_report source, or a pct at/above exhaustionPct.
+	limiting := prev.Source.Valid && prev.Source.String == anthropic.SourceLimitReport
+	if !limiting && prev.SevenDayPct.Valid && int(prev.SevenDayPct.Int16) >= exhaustionPct {
+		limiting = true
+	}
+	if !limiting {
+		return false, time.Time{}
+	}
+	// reset observed (moved epoch): next.SevenDay.ResetsAt set AND strictly after T.
+	if next.SevenDay.ResetsAt == nil || !next.SevenDay.ResetsAt.After(t) {
+		return false, time.Time{}
+	}
+	// early: now strictly before T - threshold (exactly -threshold is NOT early).
+	if !now.Before(t.Add(-earlyResetThreshold)) {
+		return false, time.Time{}
+	}
+	return true, t
 }
 
 // upsert overwrites ONE TOKEN's gauge row (PRD #53 D4, repointed by #104 M5).
