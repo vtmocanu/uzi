@@ -24,7 +24,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/theme"
@@ -46,13 +45,6 @@ const (
 // crowded namespace, one typing 200 gets a rejected write instead of a
 // ResourceQuota incident.
 const maxHostedWorkerQuota = 20
-
-// maxJudgeDailyBudget bounds the per-user judge daily budget (PRD #69 M5 Decision
-// 9). 0 means unlimited (the guard is off); a positive count caps judge runs per
-// rolling 24h. The upper bound only catches a fat-fingered value — no real user
-// runs thousands of judges a day — so an admin meaning 50 and typing 50000 gets a
-// rejected write instead of an effectively-unlimited guard.
-const maxJudgeDailyBudget = 10000
 
 // maxMrReworkCap bounds the per-MR rework-cycle cap (PRD #700 M5 Decision 2). The
 // cap is a small loop guard (default 5, mirroring ci-autofix's maxAttempts), so the
@@ -238,15 +230,6 @@ func (c *Cache) PublicBaseURL(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyPublicBaseURL)
 }
 
-// JudgeEnabled reports whether the run-judge feature is enabled instance-wide
-// (PRD #46 Decision 7): the global kill-switch. Stored as the text "true"/"false";
-// any other value falls back to the compiled-in default (false) — the same strict
-// junk-tolerance as SlackEnabled, so a malformed value never silently turns token
-// spend on.
-func (c *Cache) JudgeEnabled(ctx context.Context) (bool, error) {
-	return c.boolSetting(ctx, KeyJudgeEnabled)
-}
-
 // GithubProjectSyncEnabled reports whether the GitHub Projects v2 Status sync is
 // enabled instance-wide (PRD #364): the global kill-switch. Stored as the text
 // "true"/"false"; any other value falls back to the compiled-in default (false) —
@@ -306,29 +289,6 @@ func (c *Cache) MrReworkCap(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// JudgeEnforceAll reports whether the judge is enforced for every run (PRD #69),
-// bypassing the per-user judge_enabled opt-in gate. Stored as the text
-// "true"/"false"; any other value falls back to the compiled-in default (false) —
-// the same strict junk-tolerance as JudgeEnabled, so a malformed row never
-// silently turns forced token spend on.
-func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
-	return c.boolSetting(ctx, KeyJudgeEnforceAll)
-}
-
-// JudgeModel returns the model alias the judge runs on (PRD #46 Decision 7). Falls
-// back to the strong DefaultJudgeModel ("opus", PRD #69 Decision 1).
-func (c *Cache) JudgeModel(ctx context.Context) (string, error) {
-	return c.get(ctx, KeyJudgeModel)
-}
-
-// SummaryModel returns the model alias the inline run-summary generator runs on
-// (PRD #362 Decision 8). Falls back to DefaultSummaryModel ("haiku"). The per-user
-// override (users.summary_model) is resolved user-value-wins at issue-run claim
-// assembly, mirroring JudgeModel but on the issue-run claim rather than the judge.
-func (c *Cache) SummaryModel(ctx context.Context) (string, error) {
-	return c.get(ctx, KeySummaryModel)
-}
-
 // HealthEnabled reports whether the run-health detector is enabled instance-wide
 // (PRD #47). Stored as "true"/"false"; any other value falls back to the
 // compiled-in default (true), the same junk-tolerance as SlackEnabled but
@@ -380,21 +340,6 @@ func (c *Cache) HealthNudgeCooldownSeconds(ctx context.Context) (int, error) {
 // Validate cannot reach retroactively.
 func (c *Cache) HostedWorkerQuota(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyHostedWorkerQuota)
-}
-
-// JudgeCooldownSeconds returns the per-user judge cooldown in seconds (PRD #69 M5
-// Decision 9); 0 disables the cooldown guard. Best-effort at the enqueue gate — the
-// caller proceeds (fails open) on a read error, since the guard is a soft cost
-// backstop, not a correctness control.
-func (c *Cache) JudgeCooldownSeconds(ctx context.Context) (int, error) {
-	return c.intSetting(ctx, KeyJudgeCooldownSeconds)
-}
-
-// JudgeDailyBudget returns the per-user judge daily budget as a count (PRD #69 M5
-// Decision 9); 0 means unlimited (the guard is off). Best-effort at the enqueue
-// gate, like JudgeCooldownSeconds.
-func (c *Cache) JudgeDailyBudget(ctx context.Context) (int, error) {
-	return c.intSetting(ctx, KeyJudgeDailyBudget)
 }
 
 // DockerRepoAllowlist returns the set of repo ids a docker-enabled worker may claim
@@ -687,18 +632,6 @@ func validateSlackToken(value, prefix, kind string) error {
 	return nil
 }
 
-// validateModelAlias is the format gate for the judge model setting (PRD #46): a
-// non-empty model alias / id, checked with the shared PRD #17 rules (single token,
-// no control chars, length-capped). Blank is rejected here (unlike the per-user
-// inherit case) — the judge always needs a concrete model.
-func validateModelAlias(value string) error {
-	if strings.TrimSpace(value) == "" {
-		return errors.New("must not be empty")
-	}
-	_, err := agenttmpl.ValidateModel(value)
-	return err
-}
-
 // ValidatePublicBaseURL enforces the deep-link base-URL rule (PRD #25): a
 // parseable URL with an http or https scheme and a host. It becomes a button URL
 // in every DM, so no other scheme is allowed. Reused by config to check the
@@ -807,30 +740,6 @@ func validateMrReworkCap(value string) error {
 	}
 	if n < 1 || n > maxMrReworkCap {
 		return fmt.Errorf("must be between 1 and %d rework cycles", maxMrReworkCap)
-	}
-	return nil
-}
-
-// validateJudgeDailyBudget is the write-time gate for the per-user judge daily
-// budget (PRD #69 M5 Decision 9): a base-10 integer in {0} ∪ [1, maxJudgeDailyBudget],
-// where 0 is the documented "unlimited / guard off" value rather than a rejection.
-// Negatives, non-integers, and values above the cap are refused.
-//
-// Like validateHostedWorkerQuota, the explicit Validate case this backs is
-// load-bearing: Validate's default branch falls through to ValidateLabel, which
-// accepts any non-empty ≤64-char string — so without this case "abc" would save and
-// intSetting would silently fall back to the compiled-in default on every read, an
-// admin's typed cap silently ignored.
-func validateJudgeDailyBudget(value string) error {
-	n, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil {
-		return errors.New("must be a whole number of judge runs")
-	}
-	if n == 0 {
-		return nil
-	}
-	if n < 0 || n > maxJudgeDailyBudget {
-		return fmt.Errorf("must be 0 (unlimited) or between 1 and %d judge runs", maxJudgeDailyBudget)
 	}
 	return nil
 }
