@@ -250,41 +250,6 @@ func (cfg RenderConfig) ephemeralRequest(w protocol.DesiredWorker) resource.Quan
 	return resource.MustParse(workerDefaultEphemeralRequest)
 }
 
-// dindResources builds the DinD sidecar's requests+limits from cfg, falling back to the
-// dindDefault* constants for any field a cluster did not override (config validated every
-// override string as a k8s quantity at boot, so MustParse here is safe).
-func (cfg RenderConfig) dindResources() corev1.ResourceRequirements {
-	pick := func(override, def string) string {
-		if override != "" {
-			return override
-		}
-		return def
-	}
-	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(pick(cfg.DinDRequestCPU, dindDefaultRequestCPU)),
-			corev1.ResourceMemory: resource.MustParse(pick(cfg.DinDRequestMemory, dindDefaultRequestMemory)),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(pick(cfg.DinDLimitCPU, dindDefaultLimitCPU)),
-			corev1.ResourceMemory: resource.MustParse(pick(cfg.DinDLimitMemory, dindDefaultLimitMemory)),
-		},
-	}
-}
-
-var (
-	dindInitResources = corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("50m"),
-			corev1.ResourceMemory: resource.MustParse("32Mi"),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("100m"),
-			corev1.ResourceMemory: resource.MustParse("64Mi"),
-		},
-	}
-)
-
 // namespaceFor picks a worker's namespace: the dedicated privileged docker tier for
 // a docker worker, #58's restricted default otherwise. The two never overlap (the
 // controller config refuses equal namespaces), which is what keeps the restricted

@@ -1,6 +1,7 @@
 package kube
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -137,3 +138,38 @@ func (cfg RenderConfig) dindDataSize() resource.Quantity {
 	}
 	return resource.MustParse(dindDataDefaultSize)
 }
+
+// dindResources builds the DinD sidecar's requests+limits from cfg, falling back to the
+// dindDefault* constants for any field a cluster did not override (config validated every
+// override string as a k8s quantity at boot, so MustParse here is safe).
+func (cfg RenderConfig) dindResources() corev1.ResourceRequirements {
+	pick := func(override, def string) string {
+		if override != "" {
+			return override
+		}
+		return def
+	}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(pick(cfg.DinDRequestCPU, dindDefaultRequestCPU)),
+			corev1.ResourceMemory: resource.MustParse(pick(cfg.DinDRequestMemory, dindDefaultRequestMemory)),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(pick(cfg.DinDLimitCPU, dindDefaultLimitCPU)),
+			corev1.ResourceMemory: resource.MustParse(pick(cfg.DinDLimitMemory, dindDefaultLimitMemory)),
+		},
+	}
+}
+
+var (
+	dindInitResources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("50m"),
+			corev1.ResourceMemory: resource.MustParse("32Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+	}
+)
