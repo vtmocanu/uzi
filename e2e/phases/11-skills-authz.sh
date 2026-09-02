@@ -5,7 +5,7 @@
 # lane:     gitlab
 # executor: any
 # requires: FRESHJAR
-# provides: -
+# provides: TID
 # handoff:  -
 # mutates:  -
 # restores: -
@@ -32,7 +32,9 @@
 #      is no `repos_test.go` anywhere under `api/` (PRD #97 M4, fable review).
 # Uses the fresh non-admin user registered above (FRESHJAR).
 say "PRD #16 skills authz: a non-admin cannot reach admin / other-user surfaces"
-# $TID is also consumed by the PRD #16 skill-delivery phase further down — resolve it here.
+# $TID is also consumed by the PRD #16 skill-delivery phase (28) further down — resolve it
+# here and declare `provides: TID` so the driver round-trips it across PRD #966's per-phase
+# subshells (a bare assignment would die with this subshell, leaving 28 with an unbound var).
 TID="$(apiget /api/agent-templates | jq -r '.templates[0].id // empty')"
 [ -n "$TID" ] || fail "no agent template to authorize against"
 

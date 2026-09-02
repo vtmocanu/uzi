@@ -92,7 +92,8 @@ say "PRD #98 M8c: printed instructions EXECUTED verbatim from the emitting comma
 #
 # The `|| fail` on the exec below is a FLOOR (an instruction that errors is definitionally
 # false), not the row's assertion — every caller asserts an OUTCOME afterwards.
-PRINTED_OUT="$RUNROOT/.printed-instruction.out"
+# PRINTED_OUT is a lib.sh top-level global (the run_printed_instructions scratch path),
+# so it is available to this phase and to review-row-cap (39) without a per-phase set.
 # --- arrange: one coordinate on TWO reviews ----------------------------------
 # The undo row needs the group dismiss to settle TWO members, because the count assertion
 # is the mechanism and a count of 1 makes it indistinguishable from `head -1`. Two members
