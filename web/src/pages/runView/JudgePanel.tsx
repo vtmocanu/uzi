@@ -143,7 +143,7 @@ export function JudgePanel({
       // Absent destructures to undefined, and `undefined !== null` is true — every
       // `pendingJudge !== null` guard would then walk into `pendingJudge.state` and throw
       // during render. There is no ErrorBoundary in web/src, so that TypeError would blank
-      // the whole app over a missing optional field. (api/internal/uzicli/client.go
+      // the whole app over a missing optional field. (api/internal/uzicli/client_runs.go
       // handles the same skew on the CLI side.)
       setPendingJudge(pending_judge ?? null);
     },

@@ -72,6 +72,12 @@ func LabelChanged(committed, updates map[string]string) bool {
 	return false
 }
 
+// reservedSelfImproveLabel is the self-improve tracker's label. Its canonical home is
+// schedsvc.SelfImproveTrackingLabel; settings cannot import schedsvc (schedsvc imports
+// settings), so the value is mirrored here and pinned to the canonical one by an external
+// test so the two cannot drift. See ValidateMerged.
+const reservedSelfImproveLabel = "uzi-self-improve"
+
 // ValidateMerged enforces the cross-key label rules on the effective post-update
 // state (current values overlaid with the pending update), so a PUT touching one
 // key is still checked against the others' stored values. PRD #764: the
@@ -79,12 +85,6 @@ func LabelChanged(committed, updates map[string]string) bool {
 // equal pair would autopilot every runnable issue, conflating "uzi's to run" with
 // "skip the plan gate" — and from the finding label (see below). Each error names the
 // key to change.
-// reservedSelfImproveLabel is the self-improve tracker's label. Its canonical home is
-// schedsvc.SelfImproveTrackingLabel; settings cannot import schedsvc (schedsvc imports
-// settings), so the value is mirrored here and pinned to the canonical one by an external
-// test so the two cannot drift. See ValidateMerged.
-const reservedSelfImproveLabel = "uzi-self-improve"
-
 func ValidateMerged(merged map[string]string) error {
 	if merged[KeyUziLabel] == merged[KeyAutopilotLabel] {
 		return errors.New("uzi_label must differ from autopilot_label")

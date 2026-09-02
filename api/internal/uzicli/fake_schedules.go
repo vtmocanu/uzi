@@ -9,15 +9,6 @@ import (
 // fake_schedules.go holds the FakeClient schedule methods (uzi schedule) split
 // out of fake.go (PRD #1017).
 
-// StreamRun replays StreamEvents to a subscriber and then holds the stream open
-// until the caller cancels, mirroring a live socket that has simply gone quiet
-// rather than one that ended. StreamErr models an unusable socket (the D8
-// fall-back-to-polling path); it is returned in preference to Err so a test can
-// have the REST reads succeed while only the stream fails, which is exactly the
-// degradation the TUI has to handle and which a global Err cannot express.
-//
-// The events go through NormalizeRunEvent, like the live decode boundary, so a
-// fake cannot deliver a frame shape the real client would have made inert.
 func (f *FakeClient) ListSchedules(context.Context) ([]apitypes.ScheduleDTO, error) {
 	if f.Err != nil {
 		return nil, f.Err
