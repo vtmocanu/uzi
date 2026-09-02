@@ -6,6 +6,7 @@
   "is_active": false,
   "autopilot_enabled": false,
   "wait_on_limit": false,
+  "notify_early_limit_reset": false,
   "judge_enabled": false,
   "ci_autofix_enabled": false,
   "attribution_enabled": false,
