@@ -28,14 +28,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/theme"
 )
 
-// maxHostedWorkerQuota bounds the per-user hosted-worker quota (PRD #58). Each
-// unit is a real pod plus its volumes, so the number an admin types spends cluster
-// capacity; the worker namespace's ResourceQuota is the actual backstop (Decision
-// 8) and this only catches a typo — an admin meaning 2 and typing 20 gets a
-// crowded namespace, one typing 200 gets a rejected write instead of a
-// ResourceQuota incident.
-const maxHostedWorkerQuota = 20
-
 // maxMrReworkCap bounds the per-MR rework-cycle cap (PRD #700 M5 Decision 2). The
 // cap is a small loop guard (default 5, mirroring ci-autofix's maxAttempts), so the
 // upper bound only catches a fat-fingered value — no MR legitimately needs hundreds
@@ -213,17 +205,6 @@ func (c *Cache) GithubProjectSyncEnabled(ctx context.Context) (bool, error) {
 	return c.boolSetting(ctx, KeyGithubProjectSyncEnabled)
 }
 
-// EphemeralWorkersEnabled reports whether ephemeral worker auto-provisioning is
-// enabled instance-wide (PRD #529 M2): the global kill-switch. Stored as the text
-// "true"/"false"; any other value falls back to the compiled-in default (false) —
-// the same strict junk-tolerance as JudgeEnabled, so a malformed value never
-// silently starts spinning cluster capacity on demand. This is the INSTANCE gate;
-// the per-user opt-in (users.ephemeral_workers_enabled) is checked separately, and
-// both must be true before the provisioner acts.
-func (c *Cache) EphemeralWorkersEnabled(ctx context.Context) (bool, error) {
-	return c.boolSetting(ctx, KeyEphemeralWorkersEnabled)
-}
-
 // MrReworkEnabled reports whether the MR review-watcher auto-rework feature is
 // enabled instance-wide (PRD #700 M5 Decision 5): the admin global kill-switch.
 // Stored as the text "true"/"false"; any OTHER value falls back to the compiled-in
@@ -272,19 +253,6 @@ func (c *Cache) MrReworkCap(ctx context.Context) (int, error) {
 // enforced.
 func (c *Cache) CapabilityAwareScheduling(ctx context.Context) (bool, error) {
 	return c.boolSetting(ctx, KeyCapabilityAwareScheduling)
-}
-
-// HostedWorkerQuota returns the per-user hosted-worker quota (PRD #58 Decision 8);
-// 0 means self-service provisioning is disabled.
-//
-// Its caller (the provision handler) reads it STRICTLY — a non-nil error is a 500,
-// not a fallback — unlike the best-effort `v, _ :=` label reads. Those degrade
-// toward the safe side (an unlabeled issue stays gated); this one would degrade
-// toward provisioning against a number no admin chose, on a cold-cache blip. The
-// junk-tolerance inside intSetting still applies to a hand-edited row, which
-// Validate cannot reach retroactively.
-func (c *Cache) HostedWorkerQuota(ctx context.Context) (int, error) {
-	return c.intSetting(ctx, KeyHostedWorkerQuota)
 }
 
 // DockerRepoAllowlist returns the set of repo ids a docker-enabled worker may claim
@@ -575,32 +543,6 @@ func validateEnum(value string, allowed ...string) error {
 		}
 	}
 	return fmt.Errorf("must be one of: %s", strings.Join(allowed, ", "))
-}
-
-// validateHostedWorkerQuota is the write-time gate for the per-user hosted-worker
-// quota (PRD #58 Decision 8): a base-10 integer in {0} ∪ [1, maxHostedWorkerQuota],
-// where 0 is the documented "self-service disabled" value rather than a rejection.
-// Negatives and non-integers are refused.
-//
-// The explicit Validate case this backs is load-bearing, not decoration. Validate's
-// default branch falls through to ValidateLabel, which accepts any non-empty
-// ≤64-char string — so an integer key that is in Defaults but missing from the
-// switch would accept "abc", and intSetting would then silently fall back to the
-// compiled-in default on every read. An admin typing 0 to disable self-service
-// would be told it saved and would still get 2. An int setting must fail the WRITE,
-// which is the only moment a human is present to be told.
-func validateHostedWorkerQuota(value string) error {
-	n, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil {
-		return errors.New("must be a whole number of workers")
-	}
-	if n == 0 {
-		return nil
-	}
-	if n < 0 || n > maxHostedWorkerQuota {
-		return fmt.Errorf("must be 0 (self-service disabled) or between 1 and %d workers", maxHostedWorkerQuota)
-	}
-	return nil
 }
 
 // validateMrReworkCap is the write-time gate for the per-MR rework-cycle cap (PRD
