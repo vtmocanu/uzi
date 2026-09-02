@@ -18,6 +18,8 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.75.0] - 2026-09-02
+
 ### Added
 
 - **Propose-only `refactor-scout` refactoring default added to the schedule catalog ([#962](https://github.com/vtmocanu/uzi/pull/962)).**
@@ -3693,7 +3695,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.74.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.75.0...HEAD
+[0.75.0]: https://github.com/vtmocanu/uzi/compare/v0.74.0...v0.75.0
 [0.74.0]: https://github.com/vtmocanu/uzi/compare/v0.73.0...v0.74.0
 [0.73.0]: https://github.com/vtmocanu/uzi/compare/v0.72.1...v0.73.0
 [0.72.1]: https://github.com/vtmocanu/uzi/compare/v0.72.0...v0.72.1
