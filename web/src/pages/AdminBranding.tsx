@@ -8,7 +8,7 @@
 // never touch the settings surface (Decision D7) — they go through the dedicated
 // uploadBrandingLogo/deleteBrandingLogo endpoints, and their presence is read from
 // the public branding() endpoint's *_present flags. See the string↔bool split note
-// on AppSettings / Branding in lib/api.ts.
+// on AppSettings / Branding in lib/apiTypes.ts.
 
 import {
   useCallback,

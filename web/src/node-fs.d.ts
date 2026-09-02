@@ -10,6 +10,18 @@
 declare module "node:fs" {
   export function readFileSync(path: URL | string, encoding: "utf8"): string;
   export function existsSync(path: URL | string): boolean;
+  // The mock-graph acyclic guard (mocks/api-acyclic.test.ts) enumerates every
+  // non-test mock source by a recursive directory walk. Only the
+  // withFileTypes+recursive overload is used; declared TYPE-only, as above.
+  export interface Dirent {
+    name: string;
+    parentPath: string;
+    isFile(): boolean;
+  }
+  export function readdirSync(
+    path: URL | string,
+    options: { recursive?: boolean; withFileTypes: true },
+  ): Dirent[];
 }
 
 // The changelog parity gate (changelog.parity.test.ts) shells out to the parity

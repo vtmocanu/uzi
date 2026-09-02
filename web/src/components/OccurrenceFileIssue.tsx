@@ -74,7 +74,7 @@ export function OccurrenceFileIssue({
   // issue written from text that no longer exists.
   //
   // What is missing is the ability to SEE it: JudgeOccurrence (and its enclosing group)
-  // ships no review timestamp — see lib/api.ts — so the comparison RunView makes is not
+  // ships no review timestamp — see lib/apiTypes.ts — so the comparison RunView makes is not
   // computable from this DTO. The server does not merely have the column, it ALREADY READS
   // it: `rv.updated_at` is the leading sort key of the backlog query
   // (api/internal/store/queries/judge_recommendations.sql:100, `ORDER BY rv.updated_at

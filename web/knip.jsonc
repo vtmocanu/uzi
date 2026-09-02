@@ -109,7 +109,7 @@
   // 🔴 KEEPS DTO/CONTRACT TYPES EXPORTED WITHOUT FLAGGING THEM (issue #596). Some
   // exported types are constructed by exactly one file yet exported deliberately, so
   // a reader finds the wire/response shape at the barrel rather than having to open
-  // the one call site: the ~13 `src/lib/api.ts` request/response DTOs
+  // the one call site: the ~13 `src/lib/apiTypes.ts` request/response DTOs
   // (PrivilegeTokenReport, ForgeConfig, CliTokenMint, ScheduleStatus, RunNowResponse,
   // AdminUsageUser, MyRateLimitsResponse, AdminRateLimits, ChatListResponse, ...) plus
   // the parsed-shape types `ReleaseGroup` (changelog.ts), `QuestionOption`

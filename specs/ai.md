@@ -22142,7 +22142,7 @@ the terse contract.
 
 - **Instance kill-switch keeps its admin-only shape.** `github_project_sync_enabled` (settings key
   `KeyGithubProjectSyncEnabled`, default `false`) gets a toggle card in Admin → Instance settings
-  (`web/src/pages/AdminSettings.tsx#GithubProjectSyncCard`, sends only its own key on save). It is
+  (`web/src/pages/adminSettings/GithubProjectSyncCard.tsx`, sends only its own key on save). It is
   the whole-instance master gate and stays ADMIN-only via the unchanged `PUT /api/admin/settings`.
   A GitHub-only feature; GitLab/Forgejo repos are untouched.
 
