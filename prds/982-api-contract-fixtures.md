@@ -160,7 +160,7 @@ gate:api` and `task gate:web` green at each. `-count=1` is already carried by `t
 and matters here exactly as `fixtures/run-usage/README.md` explains: the fixtures sit above
 `api/`, so a fixture-only edit leaves a bare `go test` printing `ok (cached)`.
 
-- [ ] **M1 — mechanism + `Run`/`RunListItem`, mutation-checked.** The reflection
+- [x] **M1 — mechanism + `Run`/`RunListItem`, mutation-checked.** The reflection
   `populate` helper and the `contractCase` table in `apitypes/contract_test.go`; `Widen`,
   `ZeroOf` and the `check` pattern in `web/src/lib/apiContract.test.ts`; the two fixtures
   per DTO for `RunDTO` and `RunListItemDTO`; `fixtures/api-contract/README.md` (the
