@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -99,7 +100,7 @@ func TestWorkerCreateProposalAuthzAndCaps(t *testing.T) {
 	uid, runID, repoID := uuid.New(), uuid.New(), uuid.New()
 	wkr := store.Worker{ID: uuid.New(), UserID: uid}
 	base := func() *workerChatStore {
-		return &workerChatStore{userID: uid, repoID: repoID, repoPath: "g/r", chatRun: store.Run{ID: runID, UserID: uid, Kind: workersvc.RunKindChat, Status: "running"}}
+		return &workerChatStore{userID: uid, repoID: repoID, repoPath: "g/r", chatRun: store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "running"}}
 	}
 	body := `{"repo_id":"` + repoID.String() + `","title":"Add a job","description":"d","labels":["enhancement"]}`
 
@@ -124,7 +125,7 @@ func TestWorkerCreateProposalAuthzAndCaps(t *testing.T) {
 
 	// A non-chat run target → 409.
 	st = base()
-	st.chatRun.Kind = workersvc.RunKindIssue
+	st.chatRun.Kind = runkind.Issue
 	rec = httptest.NewRecorder()
 	newWorkerChatHandler(st).WorkerCreateProposal(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/proposals", wkr, runID, body))
 	if rec.Code != http.StatusConflict {
@@ -164,7 +165,7 @@ func TestWorkerCreateProposalAuthzAndCaps(t *testing.T) {
 func TestWorkerCreateProposalViaRepoPath(t *testing.T) {
 	uid, runID, repoID := uuid.New(), uuid.New(), uuid.New()
 	wkr := store.Worker{ID: uuid.New(), UserID: uid}
-	st := &workerChatStore{userID: uid, repoID: repoID, repoPath: "g/r", chatRun: store.Run{ID: runID, UserID: uid, Kind: workersvc.RunKindChat, Status: "running"}}
+	st := &workerChatStore{userID: uid, repoID: repoID, repoPath: "g/r", chatRun: store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "running"}}
 	h := newWorkerChatHandler(st)
 
 	// repo_path resolves and creates the proposal against the resolved id.
@@ -202,7 +203,7 @@ func TestWorkerCreateProposalViaRepoPath(t *testing.T) {
 func TestWorkerCreateProposalIsRateLimited(t *testing.T) {
 	uid, runID, repoID := uuid.New(), uuid.New(), uuid.New()
 	wkr := store.Worker{ID: uuid.New(), UserID: uid}
-	st := &workerChatStore{userID: uid, repoID: repoID, chatRun: store.Run{ID: runID, UserID: uid, Kind: workersvc.RunKindChat, Status: "running"}}
+	st := &workerChatStore{userID: uid, repoID: repoID, chatRun: store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "running"}}
 	h := newWorkerChatHandler(st)
 
 	lim := mw.NewLimiter(1, time.Minute, nil)
@@ -228,7 +229,7 @@ func TestWorkerCreateProposalIsRateLimited(t *testing.T) {
 func TestWorkerChatReadsAreUserScoped(t *testing.T) {
 	uid, runID := uuid.New(), uuid.New()
 	wkr := store.Worker{ID: uuid.New(), UserID: uid}
-	st := &workerChatStore{userID: uid, chatRun: store.Run{ID: runID, UserID: uid, Kind: workersvc.RunKindChat, Status: "running"}}
+	st := &workerChatStore{userID: uid, chatRun: store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "running"}}
 	h := newWorkerChatHandler(st)
 
 	// List: the worker's user's runs.
@@ -266,7 +267,7 @@ func TestWorkerChatReadsAreUserScoped(t *testing.T) {
 func TestWorkerChatMessagesPagingBounds(t *testing.T) {
 	uid, runID := uuid.New(), uuid.New()
 	wkr := store.Worker{ID: uuid.New(), UserID: uid}
-	st := &workerChatStore{userID: uid, chatRun: store.Run{ID: runID, UserID: uid, Kind: workersvc.RunKindChat, Status: "running"}}
+	st := &workerChatStore{userID: uid, chatRun: store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "running"}}
 	h := newWorkerChatHandler(st)
 
 	// An over-cap limit is clamped to the max; an absent limit uses the default max.
