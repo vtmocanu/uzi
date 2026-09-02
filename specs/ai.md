@@ -5142,7 +5142,7 @@ Decision 2 (user, 2026-07-10 — the review-round tightening was reverted after 
 
 ## 178. Web plan gate, the M4-fix own-roster single source of truth, visual parity
 
-- **PlanPanel** (`web/src/pages/RunView.tsx`) grows the "Agents for this run" section per
+- **PlanPanel** (`web/src/pages/runView/PlanPanel.tsx`) grows the "Agents for this run" section per
   the approved mock (`prds/mockups/37-agent-picker-mock.html`): two source radio cards
   (detected/none pills), per-agent exclusion chips, a pinned `lead` summary line, a live
   approve-button label; States A (repo default) and B (own default, repo card inert).
