@@ -22,6 +22,10 @@ RUN npm ci --ignore-scripts
 
 COPY web/ ./
 COPY docs/ /app/docs/
+# apiContract.test.ts imports repo-root fixtures/api-contract/*.json as typed JSON
+# modules; `npm run build`'s `tsc --noEmit` typechecks it, so the sibling dir must be
+# present here too (else TS2307). Mirrors web/Dockerfile.
+COPY fixtures/api-contract/ /app/fixtures/api-contract/
 ENV VITE_UZI_MOCK=1
 RUN npm run build
 
