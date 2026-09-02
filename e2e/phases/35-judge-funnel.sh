@@ -7,8 +7,8 @@
 # requires: -
 # provides: J_RUN
 # handoff:  -
-# mutates:  settings:judge_enabled=true,judge_model=haiku (:51); per-user judge opt-in PUT /api/me/judge enabled=true (:52)
-# restores: - (judge global + opt-in turned OFF by 39-review-row-cap :362-363, not in-phase — see the header note about the concurrency capacity math)
+# mutates:  settings:judge_enabled=true,judge_model=haiku; per-user judge opt-in PUT /api/me/judge enabled=true (both restored in-phase at the end)
+# restores: settings:judge_enabled=false + per-user opt-in OFF, in-phase at the end (39-review-row-cap re-disables idempotently as belt-and-braces)
 # =============================================================================
 # PRD #46 — run judge + notifications inbox, end to end. UZI_E2E_EXECUTOR=stub
 # selects the STUB judge queryFn (judge-runner-stub.ts): the judge model call makes
@@ -40,8 +40,13 @@
 #     UpsertRunReviewWithRecommendations on the same target (UNIQUE target_run_id).
 # Consequence: the PRD #68 phase below can no longer read a judge-produced
 # recommendation, so it seeds its own coordinate directly (see there).
-# Judge is turned OFF again at the end so the later concurrency section's capacity math
-# is unaffected.
+# This phase turns judge OFF again at the END OF ITS OWN BODY (global + per-user opt-in),
+# so the later concurrency section's capacity math is unaffected even if a downstream
+# phase is skipped or fails. Nothing between here and phase 45 needs judge auto-enqueue
+# on: 36 reads this review and direct-seeds its own recommendation (its own run is
+# cancelled), 37 direct-seeds review rows, 38's poller is not gated on judge_enabled, and
+# 39 direct-INSERTs `completed` rows (no terminal transition, so maybeEnqueueJudge never
+# fires). 39-review-row-cap re-disables idempotently as belt-and-braces.
 # =============================================================================
 say "PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> persist-first notification"
 
@@ -92,4 +97,12 @@ pass "judge run $J_JUDGE is repo-less (Anthropic-only claim; no forge PAT)"
 [ "$(apiget /api/notifications | jq --arg r "$J_RUN" '[.notifications[] | select(.run_id==$r and .kind=="judge_review")] | length')" -ge 1 ] \
   || fail "PRD #46: no judge_review inbox notification for the reviewed run (persist-first delivery)"
 pass "persist-first: a judge_review inbox notification landed for the reviewed run"
+
+# Restore judge OFF here, in-phase, so no later phase is left relying on 39 to do it.
+# The judged run + its review are already persisted above, and nothing downstream needs
+# judge auto-enqueue on (see the header note), so disabling now is safe and keeps the
+# concurrency capacity math clean regardless of which later phases run.
+apiput /api/admin/settings '{"settings":{"judge_enabled":"false"}}' >/dev/null
+apiput /api/me/judge '{"enabled":false}' >/dev/null
+pass "judge disabled again in-phase (global + opt-in); 39 re-disables idempotently"
 

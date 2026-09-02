@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  compose:agent(stopped) (:40, never restarted in-phase); a spare anthropic_token(console-key, deleted); a binding-test worker; runs created then cancelled
-# restores: - (agent restarted by 59-restart-agent)
+# restores: - (agent restart is ENFORCED downstream: 59-restart-agent provides SCHED_AGENT_UP, required by 60-62; 51 needs it stopped so 50 cannot restore it itself)
 # ---------------------------------------------------------------------------
 # PRD #104: a worker's token binding reaches the CLAIM PAYLOAD, and a rebind takes
 # effect on the very next claim with no restart.

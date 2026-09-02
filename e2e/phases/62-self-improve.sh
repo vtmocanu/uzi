@@ -4,7 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: REPO_ID UZI_BIN UZI_TOKEN_VAL
+# requires: REPO_ID UZI_BIN UZI_TOKEN_VAL SCHED_AGENT_UP
 # provides: -
 # handoff:  -
 # mutates:  -
