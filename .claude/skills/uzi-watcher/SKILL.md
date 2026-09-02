@@ -209,8 +209,21 @@ Needs kube access to your deployment's worker namespace — **read the context a
 from your own kubeconfig; they are deployment-specific, do not hard-code them** (and this is
 a public file).
 
-1. **Find the worker:** `uzi run get RUN --json | jq -r .worker_id`. Its pod is
-   `uzi-hw-WORKER_ID-*` in the worker namespace.
+1. **Find the worker — but do NOT trust the run's *current* `worker_id` after a
+   resume.** `uzi run get RUN --json | jq -r .worker_id` names the worker the run is
+   claimed on *now*. After a rate-limit resume, or a `resume_lineage_break` (worker log:
+   "no earlier work could be recovered for this run on this worker — starting from the
+   default branch"), that is the **cold-reassignment** worker and it has **no clone** — the
+   work is on the worker that ran the run *before* the interruption. So if
+   `refs/uzi-runner/agent/issue-N` is absent on the current worker's pod, enumerate the ref
+   across **every** `uzi-hw-*` pod (`git --git-dir=BARE for-each-ref refs/uzi-runner/`) and
+   recover from whichever pod holds the tip. Worker PVCs are **persistent and survive a pod
+   *roll*** (an image upgrade replaces the pod, not the volume), so the previous worker's
+   *current* pod still holds the ref. (Measured 2026-09-02, run #1009: an
+   `agent-base` image auto-roll landed at the same instant as the 5-hour-limit resume, so the
+   run was re-claimed on a fresh worker and cold-started from the default branch while its
+   full reviewed tip sat on the previous worker's PVC; `jq .worker_id` pointed at the cold
+   worker.) Its pod is `uzi-hw-WORKER_ID-*` in the worker namespace.
 2. **Bundle the branch out** of the bare clone on the worker's data volume, base excluded so
    it stays small: `git --git-dir=BARE bundle create /tmp/r.bundle
    refs/uzi-runner/agent/issue-N ^MERGEBASE` (where `MERGEBASE` = `git
