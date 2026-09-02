@@ -7924,7 +7924,7 @@ line, recorded per the phase-2 follow-ups.
   exactly this), server-validated, with no roster fetch and no allow-list (the product has none).
   - Why the flags rather than `--agents`: `--agents` implied an additive allow-list the wire model does
     not have; the two faithful flags map exactly to `{source, exclusions}`. Realized on `run approve`
-    (`api/cmd/uzi/run.go`). `--exclude-agents` without `--agent-source` is a **usage error** (exit 2),
+    (`api/cmd/uzi/run_lifecycle.go`). `--exclude-agents` without `--agent-source` is a **usage error** (exit 2),
     since without a fetch the CLI cannot know the source's roster.
   - **The skill↔cobra-tree drift test enforces this**: a SKILL.md that still says `--agents` fails the
     test (§284).
@@ -9432,7 +9432,7 @@ rule (Feature #64). PRD #95 Decisions 9 + 10, chat caveat N3.
   file, and hoists the queue into its own card lifted to `useRunStream` (§328 B1). After the
   seam, M2 (crew/scroll: `ActivityFeed.tsx` + the follow-scroll hook) and M3 (delivery:
   hub/workersvc/`ConsumeInputs` + the queue card + `useRunStream`) touch disjoint files.
-- **CLI parity: `uzi run inputs <run-id>`** (`api/cmd/uzi/run.go` → `RunInputs` client →
+- **CLI parity: `uzi run inputs <run-id>`** (`api/cmd/uzi/run_steer.go` → `RunInputs` client →
   `GET /runs/{id}/inputs`) prints each follow-up with its delivery state (`queued`/
   `delivered`) + relative age, `--json` for the raw DTO. Owner-scoped, so a `uzc_` or
   read-only `uza_` token reads its own and 404s on another owner's.
@@ -19367,7 +19367,7 @@ in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-s
   reserved for the Workers attention badge.
 
 - **CLI: deliberately NO new command (recorded as out-of-scope, not an oversight).** `uzi run list`
-  already prints `ID KIND STATUS TITLE` and supports `--json` (`api/cmd/uzi/run.go`), so an agent or
+  already prints `ID KIND STATUS TITLE` and supports `--json` (`api/cmd/uzi/run_get.go`), so an agent or
   script derives an in-progress tally client-side from `ListRuns`. A dedicated count subcommand would
   duplicate the badge's purely-ambient-UI purpose with no headless capability the list verb lacks, so
   none was added.
