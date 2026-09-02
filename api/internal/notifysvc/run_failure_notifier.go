@@ -31,7 +31,7 @@ type runReader interface {
 //
 // INBOX-ONLY BY DESIGN. It builds the Notification with Slack == nil, so Notify
 // persists the inbox row and skips Slack entirely. The existing slacksvc failed
-// DM (notifier.go) already covers Slack for opted-in users; passing a SlackRender
+// DM (slacksvc/notifier_state.go, renderThreadBlocks) already covers Slack for opted-in users; passing a SlackRender
 // here would double-DM them. Inbox and Slack are therefore split cleanly: this
 // adapter owns the inbox, slacksvc owns the DM.
 //

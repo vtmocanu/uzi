@@ -14,7 +14,7 @@ Anthropic accounts carry a 7-day (weekly) usage limit alongside the 5-hour rolli
 A per-user setting (default **on**) that fires a loud Slack **DM to the user** the moment uzi's usage poller observes the account's 7-day window reset **at least 8h before** its previously-recorded expected reset. It reuses two existing subsystems and adds no new service, port, or trust boundary:
 
 - **Detection** rides the existing per-token usage poller (PRD #53, `api/internal/usagepoller/engine.go`) and the `anthropic_rate_limits` gauge (`seven_day_pct`, `seven_day_resets_at`). Each tick already fetches the account's fresh weekly window; we compare it to the stored one.
-- **Delivery** rides the existing notifications seam: `notifysvc.Service.Notify(...)` → slacksvc `handleNotify` (`api/internal/slacksvc/notifier.go:280`), which opens a DM to a linked user and **silently drops** users with no linked / confirmed Slack. "Inert without Slack" is therefore already the built-in behavior.
+- **Delivery** rides the existing notifications seam: `notifysvc.Service.Notify(...)` → slacksvc `handleNotify` (`api/internal/slacksvc/notifier_notify.go`), which opens a DM to a linked user and **silently drops** users with no linked / confirmed Slack. "Inert without Slack" is therefore already the built-in behavior.
 
 ## Scope
 
@@ -66,7 +66,7 @@ In `pollToken`, read the current stored row as `prev` (new `:one` query `GetRate
 ### Delivery (M3)
 Delivery rides `notifysvc.Service.Notify(ctx, Notification{UserID, Kind, Payload, Slack: &SlackRender{…}})` (`service.go:136`; `Kind` is free text, no CHECK, so **no migration** for a new kind). `Notify` is **persist-first**: it `InsertNotification` (a durable inbox row + bell badge) and *then*, when `Slack` is set, DMs the linked user via `handleNotify` (drops unlinked/opted-out silently). **So this feature writes an inbox row on every fire, DM or not** — embraced, not bypassed (D3); it means M5 must add a **web inbox renderer** for the new kind (an unrendered kind shows as "unknown", `web/src/lib/notifications.ts`).
 
-The slacksvc Block Kit render mirrors `notificationBlocks` (`notifier.go:339`): a `🚨`-led header, then `reset ~Xh early`, `observed at HH:MM`, `expected HH:MM` (user-local where the render has tz, else UTC ISO). **Wording note**: the reset is seen on the *next* tick, so the figure is "observed at poll time" and understates the true earliness by up to one `UsagePollInterval` — say "observed", do not imply an exact reset instant.
+The slacksvc Block Kit render mirrors `notificationBlocks` (`notifier_notify.go`): a `🚨`-led header, then `reset ~Xh early`, `observed at HH:MM`, `expected HH:MM` (user-local where the render has tz, else UTC ISO). **Wording note**: the reset is seen on the *next* tick, so the figure is "observed at poll time" and understates the true earliness by up to one `UsagePollInterval` — say "observed", do not imply an exact reset instant.
 
 The engine gains a **nil-safe** `notifier` collaborator wired via a new `SetNotifier` (pattern: `forgesvc.SetNotifier` at `forgesvc/service.go:191`; `main.go` already builds `notifier` at ~`:485` and `usageEngine` at ~`:784`, a two-line wire). Nil notifier = detection logs but does not deliver (safe default, and the unit tests' default).
 
@@ -87,7 +87,7 @@ Mirror the `wait_on_limit` setting end to end — and note this is a **gate-enfo
 |---|---|---|---|---|
 | M1 | Setting storage + DTO + gauge getter: `users.notify_early_limit_reset` migration (default true), sqlc (`SetUserNotifyEarlyReset` in `users.sql`, `GetRateLimitsForToken`, `ListAnthropicTokensToPoll` users-JOIN), `UserDTO` field + `toDTO` + contract fixtures + web type | `store/migrations/*`, `store/queries/{users,anthropic_rate_limits}.sql`, generated sqlc, `apitypes/user.go`, `handler.go` (toDTO), `fixtures/api-contract/user.*.json`, `web/src/lib/apiTypes.ts` | No | 1 (parallel) |
 | M2 | Early-reset detection in the usage poller: prior-row compare, `earlyResetThreshold` predicate (moved-epoch signal), setting gate, upsert-then-notify order, nil-safe notifier wiring; characterization + mutation-checked tests | `usagepoller/engine.go`, `usagepoller/*_test.go`, `main.go` (wire) | No | 2 (needs M1 + M3's kind) |
-| M3 | Loud Slack DM render: `notifysvc` kind + slacksvc Block Kit render (observed-time wording), injected-mention-inert test | `notifysvc/*`, `slacksvc/notifier.go`, `slacksvc/*_test.go` | No | 1 (parallel; must precede M2 integration) |
+| M3 | Loud Slack DM render: `notifysvc` kind + slacksvc Block Kit render (observed-time wording), injected-mention-inert test | `notifysvc/*`, `slacksvc/notifier_notify.go`, `slacksvc/*_test.go` | No | 1 (parallel; must precede M2 integration) |
 | M4 | Toggle HTTP route `PUT /api/me/notify-early-reset` (own handler file) | `handler/notifyearlyreset.go`, route registration | **Yes — #1008** (handler route-table split) | 3 (after #1008) |
 | M5 | Web toggle on the user-settings surface **+ inbox renderer for the new notification kind** | `web/src/**` settings surface, `web/src/lib/notifications.ts` | #1007 **already landed** (PR #1018) — unblocked, just rebase on main | 3 |
 | M6 | CLI toggle (mirror `--wait-on-limit`) | `api/cmd/uzi/*` | **Yes — #1009** (CLI file splits) | 3 (after #1009) |

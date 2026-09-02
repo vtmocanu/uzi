@@ -2,7 +2,7 @@
 // mixed-forge — one board can carry a GitLab card (Merge Request) beside a Forgejo
 // card (Pull Request) — so the noun is chosen per card/run from its forge_type,
 // never scattered as ternaries across ~8 components. Its Go twin is
-// slacksvc/notifier.go (forgeMrNoun), kept adjacent-in-review with the same mapping.
+// slacksvc/notifier_state.go (forgeMrAbbrev / forgeMrRef), kept adjacent-in-review with the same mapping.
 //
 // Acceptance (D2): a grep for the Title-Case GitLab-noun literal across web/src
 // returns exactly one non-test hit — MR_NOUN below. Every other exported form here
