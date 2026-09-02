@@ -60,4 +60,87 @@ func TestPublishWorkflowScopeRejectedSkipsCleanly(t *testing.T) {
 	if res.Ref != "refs/uzi-checkpoints/agent/issue-456" {
 		t.Errorf("Ref = %q, want the server-derived checkpoint ref", res.Ref)
 	}
+	// The benign-skip arm must NOT persist a tip: a stale first-only/skip tip would make
+	// the later terminal CAS-delete refuse and leave a stale ref.
+	if len(fs.checkpointTips) != 0 {
+		t.Errorf("SetRunCheckpointTip called %d time(s) on a workflow-scope skip, want 0", len(fs.checkpointTips))
+	}
+}
+
+// TestPublishPersistsTipOnEverySuccessAndNotOnSkip pins PRD #1042 M2: a CAS-accepted
+// advance (err == nil) persists the just-published tip to runs.checkpoint_tip on EVERY
+// success — so the tip ADVANCES across multiple publishes, not first-only — while a
+// benign-skip publish (ErrNotDescendant) persists nothing.
+func TestPublishPersistsTipOnEverySuccessAndNotOnSkip(t *testing.T) {
+	box := newBox(t)
+	sealed, err := box.Seal([]byte("pat"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	fs := &fakeStore{
+		runOwned: store.Run{
+			Kind:     runkind.Issue,
+			IssueIid: pgtype.Int8{Int64: 456, Valid: true},
+			Branch:   pgtype.Text{},
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl:      "https://gitlab.example.com/team/repo",
+			DefaultBranch:   pgtype.Text{String: "main", Valid: true},
+			BaseUrl:         "https://gitlab.example.com",
+			BotUsername:     "uzi-bot",
+			TokenCiphertext: sealed,
+		},
+	}
+	svc := New(fs, box, testParams())
+	svc.SetForgeBaseURLAllowed(func(u string) bool { return u == "https://gitlab.example.com" })
+
+	runID := uuid.New()
+
+	// First successful publish → persists tip1.
+	svc.SetPublishFn(func(context.Context, pushbroker.Options) (pushbroker.Result, error) {
+		return pushbroker.Result{}, nil
+	})
+	const tip1 = "1111111111111111111111111111111111111111"
+	res, err := svc.Publish(context.Background(), worker(), runID, tip1, []byte("pack"))
+	if err != nil {
+		t.Fatalf("Publish(tip1): %v", err)
+	}
+	if !res.Published {
+		t.Fatalf("Published = false on a CAS-accepted advance, want true")
+	}
+	if len(fs.checkpointTips) != 1 {
+		t.Fatalf("after publish 1: SetRunCheckpointTip called %d time(s), want 1", len(fs.checkpointTips))
+	}
+	if got := fs.checkpointTips[0]; got.ID != runID || got.CheckpointTip.String != tip1 || !got.CheckpointTip.Valid {
+		t.Fatalf("persisted tip1 = {id:%v tip:%q valid:%v}, want {id:%v tip:%q valid:true}",
+			got.ID, got.CheckpointTip.String, got.CheckpointTip.Valid, runID, tip1)
+	}
+
+	// Second successful publish with a DIFFERENT tip → tip ADVANCES (not first-only).
+	const tip2 = "2222222222222222222222222222222222222222"
+	if _, err := svc.Publish(context.Background(), worker(), runID, tip2, []byte("pack")); err != nil {
+		t.Fatalf("Publish(tip2): %v", err)
+	}
+	if len(fs.checkpointTips) != 2 {
+		t.Fatalf("after publish 2: SetRunCheckpointTip called %d time(s), want 2 (tip must advance on every success, not first-only)", len(fs.checkpointTips))
+	}
+	if got := fs.checkpointTips[1]; got.CheckpointTip.String != tip2 {
+		t.Fatalf("persisted tip on publish 2 = %q, want %q (advanced)", got.CheckpointTip.String, tip2)
+	}
+
+	// A benign-skip publish (ErrNotDescendant) must persist NOTHING.
+	svc.SetPublishFn(func(context.Context, pushbroker.Options) (pushbroker.Result, error) {
+		return pushbroker.Result{}, pushbroker.ErrNotDescendant
+	})
+	const tip3 = "3333333333333333333333333333333333333333"
+	res, err = svc.Publish(context.Background(), worker(), runID, tip3, []byte("pack"))
+	if err != nil {
+		t.Fatalf("Publish(skip): %v", err)
+	}
+	if res.Published {
+		t.Fatalf("Published = true on a not-descendant skip, want false")
+	}
+	if len(fs.checkpointTips) != 2 {
+		t.Fatalf("after benign skip: SetRunCheckpointTip called %d time(s) total, want 2 (a skip must not persist)", len(fs.checkpointTips))
+	}
 }

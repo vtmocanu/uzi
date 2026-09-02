@@ -468,6 +468,9 @@ type Store interface {
 	SetRunAwaitingFollowup(ctx context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
+	// SetRunCheckpointTip records runs.checkpoint_tip on every successful checkpoint
+	// publish (PRD #1042 M2); best-effort, never fails the publish.
+	SetRunCheckpointTip(ctx context.Context, arg store.SetRunCheckpointTipParams) (int64, error)
 	ReconcileRunMR(ctx context.Context, arg store.ReconcileRunMRParams) (int64, error)
 	// SetRunLimitWait parks a run until the owner's Anthropic usage window reopens
 	// (PRD #35); PromoteLimitWaitRuns is the sweeper pass that brings it back. The
@@ -2811,6 +2814,17 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	})
 	switch {
 	case err == nil:
+		// The CAS-accepted advance is the ONLY arm that persists the tip: it runs on
+		// EVERY successful publish (mid-run/park/shutdown all route through here), so
+		// runs.checkpoint_tip tracks the just-published tip and the terminal CAS-delete's
+		// stale-tip fallback stays diagnosable. Persist is best-effort — a failure must
+		// NOT fail the publish, since the ref is already advanced on the forge.
+		if _, perr := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
+			CheckpointTip: pgtype.Text{String: tipOid, Valid: true},
+			ID:            runID,
+		}); perr != nil {
+			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", perr)
+		}
 		return PublishResult{Published: true, Ref: ref}, nil
 	case errors.Is(err, pushbroker.ErrNotDescendant):
 		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
