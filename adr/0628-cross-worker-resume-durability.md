@@ -176,6 +176,44 @@ deployment has no metrics surface for it yet). Both landed as part of the same
 resume-durability story as the affinity fix above: a park's original worker not surviving
 the wait is exactly the case the checkpoint net exists to cover.
 
+## Amendment — issue #1042: owner-anchor checkpoint tip (2026-09-02)
+
+The #1030 amendment above closed the affinity/pushbroker gap but left one residual open
+(its Deferred list and D8(c)): a resumed run that never published its own checkpoint could
+still adopt a *prior* run's diverged checkpoint on the same branch, because adoption keyed
+only on ancestry (strictly-descends-the-floor), not on ownership. Issue #1042 closes it.
+
+**Decision: one nullable `runs.checkpoint_tip TEXT` column (migration 00184, additive, no
+backfill) closes both halves; `checkpoint_run_id` decided against.** The PRD's Deferred
+entry floated `runs.checkpoint_tip`/`checkpoint_run_id` as a pair. Only the tip column
+shipped: `Service.Publish` writes the just-published tip to `runs.checkpoint_tip` on every
+successful (CAS-accepted) publish, best-effort (a persist failure does not fail the
+publish) and never on a benign skip. Both the delete-side and adoption-side guards below
+key on tip-equality alone; an identical-tip coincidence across two different runs is
+harmless, so the extra `checkpoint_run_id` discriminator buys nothing and was dropped.
+
+**Delete half — api-only, live the moment api deploys.** The terminal
+`deleteCheckpointBestEffort` cleanup now skips the delete entirely when `checkpoint_tip` is
+NULL — a never-published run owns nothing, which is the root cause of the clobber this
+closes. When non-NULL, it deletes compare-and-swap: `pushbroker.Delete` gained
+`ExpectedOldTip`, checked both locally (list-and-compare) and at the wire via a manual
+`git-receive-pack` command binding `Old=tip, New=zero` (no packfile) — the same
+manual-receive-pack technique the #1030 amendment's publish fix used, now applied to
+delete, closing the list→delete TOCTOU on a real forge. A CAS refusal (ref advanced past
+our tip, or already absent) is benign success (nil, never retried); only a transport/auth
+fault returns an error. This half needs no worker-fleet roll.
+
+**Adoption half — additive-optional, needs a worker-fleet roll.** The run's
+`checkpoint_tip` is threaded into the claim payload (`ClaimPayload.CheckpointTip` /
+`ClaimResponse.checkpoint_tip`), and the agent's `runnerCloneForBranch` resume-adopt leg now
+adopts a mirrored checkpoint only when its rev-parsed SHA equals this run's
+`checkpoint_tip`; NULL or mismatch sets it aside and falls to the origin/default floor
+instead of seeding off a prior (possibly plan-rejected) run's work. The disjoint-history
+guard from #628/#1030 is retained unchanged. Trap #5 still holds: a same-run resume whose
+own checkpoint advanced still adopts, because its persisted tip moved with it (Publish
+persists on every publish, not just the first). An old worker ignores the new claim field
+and keeps today's (pre-#1042) adoption behavior until its image rolls.
+
 ## Consequences
 
 - **A `limit_wait` park whose original worker survives** now resumes **on that worker** — recovering both session and tree with zero new git machinery — for a park lasting far beyond 2 minutes, because the liveness leg keeps it pinned while the worker heartbeats and is non-draining. This is the common multi-hour-park case.
