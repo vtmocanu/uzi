@@ -200,50 +200,6 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "List, inspect, and drive runs",
 	}
 
-	wait := &cobra.Command{
-		Use:   "wait <run-id>",
-		Short: "Block until a run reaches a chosen state",
-		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
-			"With no `--until`, it stops on any state that needs you or ends the run: " +
-			strings.Join(defaultWaitStates, ", ") + ". It does NOT stop " +
-			"on queued/claimed/running (still working), limit_wait (auto-resumes), or pool_wait " +
-			"(an auto run held on an empty token pool; resumes when a token is pooled), so a bare " +
-			"`uzi run wait <id>` waits for the plan gate OR the end.\n\n" +
-			"Transitions print to stderr; `--json` prints the final run object (same shape as " +
-			"`run get --json`) to stdout. Exit codes: 0 a target state was reached (including if " +
-			"the run was already in one); 4 not found; 6 server unreachable after repeated " +
-			"failures; 7 `--timeout` elapsed before any target state.\n\n" +
-			"After approving a plan, NARROW the second wait — `run wait <id> --until " +
-			"completed,failed,cancelled` — because a run lingers at awaiting_approval for a beat " +
-			"after a successful approve, so a bare `run wait` would return immediately at the " +
-			"gate it just cleared.\n\n" +
-			"To wait for a REVISED plan after `run revise`, capture the latest plan seq first " +
-			"(`run logs <id> --json | jq -rs '[.[]|select(.kind==\"plan\")|.seq]|max // 0'`), then " +
-			"`run wait <id> --min-plan-seq <seq>`. That gates ONLY the awaiting_approval stop — it " +
-			"returns at the gate only once a plan message with seq > <seq> exists, so it does not " +
-			"return on the stale gate left by the pre-revise plan. Terminal states (and every other " +
-			"target) still stop unconditionally.",
-		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := env.client(gf)
-			if err != nil {
-				return err
-			}
-			until, _ := cmd.Flags().GetStringSlice("until")
-			interval, _ := cmd.Flags().GetDuration("interval")
-			timeout, _ := cmd.Flags().GetDuration("timeout")
-			minPlanSeq, _ := cmd.Flags().GetInt("min-plan-seq")
-			return runWait(env, gf, c, cmd, args[0], until, interval, timeout, minPlanSeq)
-		},
-	}
-	wait.Flags().StringSlice("until", nil,
-		"comma-separated run statuses to wait for (default: "+strings.Join(defaultWaitStates, ",")+")")
-	wait.Flags().Duration("interval", runWaitPollInterval, "how often to poll the run's status")
-	wait.Flags().Duration("timeout", 0, "give up with exit 7 after this long (default: no timeout)")
-	wait.Flags().Int("min-plan-seq", -1,
-		"after `run revise`, only stop at awaiting_approval once a plan message with seq > N exists "+
-			"(-1 = off; 0 = wait for any plan, since plan seqs start at 1). Terminal states still stop unconditionally")
-
 	expedite := &cobra.Command{
 		Use:   "expedite <run-id>",
 		Short: "Bump a queued run to the front of the claim queue (or --clear to undo)",
@@ -345,7 +301,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	mrRework.Flags().Bool("enabled", true, "whether this run's MR review comments are auto-reworked; pass --enabled=false to turn it off")
 	mrRework.Flags().Bool("clear", false, "clear the per-run override back to inherit (follow the account default)")
 
-	cmd.AddCommand(newRunListCmd(env, gf), newRunGetCmd(env, gf), newRunLogsCmd(env, gf), wait, newRunReviewCmd(env, gf), newRunCreateCmd(env, gf), newRunApproveCmd(env, gf), newRunRejectCmd(env, gf), newRunReviseCmd(env, gf), newRunCancelCmd(env, gf), newRunStopCmd(env, gf), newRunScopeCmd(env, gf), newRunFollowUpCmd(env, gf), newRunAnswerCmd(env, gf), newRunInputsCmd(env, gf), expedite, resumeNow, mrRework)
+	cmd.AddCommand(newRunListCmd(env, gf), newRunGetCmd(env, gf), newRunLogsCmd(env, gf), newRunWaitCmd(env, gf), newRunReviewCmd(env, gf), newRunCreateCmd(env, gf), newRunApproveCmd(env, gf), newRunRejectCmd(env, gf), newRunReviseCmd(env, gf), newRunCancelCmd(env, gf), newRunStopCmd(env, gf), newRunScopeCmd(env, gf), newRunFollowUpCmd(env, gf), newRunAnswerCmd(env, gf), newRunInputsCmd(env, gf), expedite, resumeNow, mrRework)
 	return cmd
 }
 
