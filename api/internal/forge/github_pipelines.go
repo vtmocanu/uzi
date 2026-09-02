@@ -138,8 +138,10 @@ func (g *github) latestPipelineFromChecks(ctx context.Context, slug repoSlug, re
 	// check-suite, re-query workflow-runs filtered by that suite id. GitHub lists an
 	// Actions run under check-runs even when the branch/head_sha-filtered workflow-runs
 	// list is (transiently) empty, so this recovers a NATIVE workflow-run pipeline — its
-	// id is in the same space as the normal path, keeping ListPipelineJobs/JobLogTail
-	// working. Newest suite id (single monotonic id space) so a re-run's suite wins.
+	// id is a workflow-RUN id, the same space as the normal path, keeping
+	// ListPipelineJobs/JobLogTail working. Pick the newest Actions check-SUITE id so a
+	// re-run's suite wins (that suite id only SELECTS the run to recover; the returned
+	// pipeline's id is the workflow-run id, not the suite id).
 	if suiteID, ok := newestActionsSuiteID(runs); ok {
 		opt := &gh.ListWorkflowRunsOptions{
 			CheckSuiteID: suiteID,
@@ -176,8 +178,19 @@ func (g *github) latestPipelineFromChecks(ctx context.Context, slug repoSlug, re
 		webURL = fmt.Sprintf("https://github.com/%s/%s/commit/%s/checks", slug.owner, slug.repo, headSHA)
 	}
 	return Pipeline{
-		// ID is ALWAYS the newest check-suite id (single monotonic id space — never mix
-		// in check-run ids, which would collide with the workflow-run id space).
+		// ID is the newest check-SUITE id — a monotonic id space WITHIN this external-CI
+		// synthesis path for a given ref (never mix in check-run ids). This is NOT the
+		// same id sequence as the recovery/native path, which returns a workflow-RUN id;
+		// they are distinct GitHub id sequences. That is safe because a ref does not flip
+		// paths in normal operation: a repo whose CI is GitHub Actions stays on the
+		// recovery/native workflow-run path, and a repo whose CI is external stays on
+		// synthesis. The one known edge: if ACTIONS-RECOVERY's check_suite_id re-query is
+		// transiently empty for an Actions repo, that ref could momentarily synthesize a
+		// suite-id pipeline instead of its usual workflow-run id; because the two id
+		// sequences are unordered relative to each other, the ci_fix verification stamp's
+		// `pipeline_id < observed_pipeline_id` progress check could skip a single tick.
+		// Bounded and non-corrupting (the next non-empty recovery restores the run-id
+		// space), so it is left as-is.
 		ID:        newestSuiteID(runs, suites),
 		Ref:       ref,
 		SHA:       headSHA,
@@ -355,10 +368,17 @@ func collapseCheckRun(r *gh.CheckRun) string {
 // combineCheckRunStatuses folds a head commit's check-runs into ONE neutral pipeline
 // status, mirroring GitHub's combined-status precedence: any failure wins, else any
 // still-running yields in_progress, else any attention (action_required/stale/
-// cancelled) yields action_required, else success. The strings are stored verbatim so
+// cancelled) yields action_required, else "success" ONLY when at least one check-run
+// actually collapsed to "success". A set with NO failure, NO pending, NO attention and
+// NO real success — i.e. every check-run is neutral/skipped, or a completed run has a
+// nil conclusion that collapses to "" — returns "neutral": a token that is neither
+// pipelinestatus.IsFailed nor IsSuccess, so neither the mr_rework GATE 1 (IsSuccess) nor
+// the fix gate (IsFailed) fires. This matches the NATIVE workflow-run path, which stores
+// "neutral"/"skipped" verbatim (also not IsSuccess); greening an all-neutral head here
+// would be an asymmetric false-green. The strings are stored verbatim so
 // pipelinestatus.IsFailed/IsSuccess classify them exactly as the workflow-run path.
 func combineCheckRunStatuses(runs []*gh.CheckRun) string {
-	var hasFailure, hasPending, hasAttention bool
+	var hasFailure, hasPending, hasAttention, hasSuccess bool
 	for _, r := range runs {
 		switch collapseCheckRun(r) {
 		case "failure", "timed_out", "startup_failure", "error":
@@ -367,6 +387,8 @@ func combineCheckRunStatuses(runs []*gh.CheckRun) string {
 			hasPending = true
 		case "action_required", "stale", "cancelled":
 			hasAttention = true
+		case "success":
+			hasSuccess = true
 		}
 	}
 	switch {
@@ -376,8 +398,12 @@ func combineCheckRunStatuses(runs []*gh.CheckRun) string {
 		return "in_progress"
 	case hasAttention:
 		return "action_required"
-	default:
+	case hasSuccess:
 		return "success"
+	default:
+		// All neutral/skipped/empty: neither IsFailed nor IsSuccess, mirroring the
+		// native path's verbatim "neutral"/"skipped".
+		return "neutral"
 	}
 }
 

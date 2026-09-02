@@ -135,7 +135,8 @@ SELECT per_branch.branch AS ref,
        ps.sha
 FROM per_branch
 JOIN pipeline_statuses ps
-    ON ps.repo_id = $1::uuid AND ps.ref = per_branch.branch AND ps.status = 'failed'
+    ON ps.repo_id = $1::uuid AND ps.ref = per_branch.branch
+   AND ps.status IN ('failed', 'failure', 'error', 'timed_out', 'startup_failure')
 JOIN repos rp ON rp.id = $1::uuid
 JOIN users u ON u.id = per_branch.user_id
 WHERE per_branch.branch <> rp.default_branch
@@ -188,7 +189,15 @@ type ListCIAutofixCandidateRefsRow struct {
 //     no anthropic_token_ciphertext column.
 //
 // The row carries the newest failed pipeline the detector will evaluate
-// (pipeline_id / web_url / sha from pipeline_statuses, status = 'failed').
+// (pipeline_id / web_url / sha from pipeline_statuses, whose status is any of the
+// forge failure spellings {failed, failure, error, timed_out, startup_failure}).
+// ps.status is the RAW forge pipeline status stored VERBATIM by the driver, so the
+// failure spelling is forge-specific: GitLab "failed"; Forgejo "failure"/"error";
+// GitHub Actions "failure"/"timed_out"/"startup_failure". This IN-list is the SQL twin
+// of pipelinestatus.IsFailed / pipelinestatus.failedStatuses (api/internal/pipelinestatus/
+// pipelinestatus.go) and MUST stay in sync with it: a new forge failure status added
+// there MUST be added here, or the automatic ci_fix candidate query silently never
+// matches that forge's failed pipelines (issue #1005).
 func (q *Queries) ListCIAutofixCandidateRefs(ctx context.Context, repoID uuid.UUID) ([]ListCIAutofixCandidateRefsRow, error) {
 	rows, err := q.db.Query(ctx, listCIAutofixCandidateRefs, repoID)
 	if err != nil {

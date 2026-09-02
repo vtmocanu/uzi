@@ -492,6 +492,62 @@ func TestGitHubLatestMRPipelineSynthesisAllGreen(t *testing.T) {
 	}
 }
 
+// TestGitHubLatestMRPipelineSynthesisAllNeutral: every external check-run is
+// neutral/skipped (no failure, no pending, no attention, NO real success) → the
+// synthesized status must be "neutral", which is NEITHER IsFailed nor IsSuccess. This
+// pins the Edit-2 fix: the old `default: return "success"` false-greened such a head
+// through mr_rework's GATE 1 (IsSuccess), an asymmetry with the native workflow-run
+// path (which stores "neutral"/"skipped" verbatim, also not IsSuccess).
+func TestGitHubLatestMRPipelineSynthesisAllNeutral(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		runs []map[string]any
+	}{
+		{"all-skipped", []map[string]any{
+			checkRun(61, "lint", "completed", "skipped", "u1", "some-ci", 950, "neutsha"),
+			checkRun(62, "test", "completed", "skipped", "u2", "some-ci", 950, "neutsha"),
+		}},
+		{"all-neutral", []map[string]any{
+			checkRun(63, "lint", "completed", "neutral", "u3", "some-ci", 951, "neutsha"),
+			checkRun(64, "test", "completed", "neutral", "u4", "some-ci", 951, "neutsha"),
+		}},
+		{"neutral+skipped", []map[string]any{
+			checkRun(65, "lint", "completed", "neutral", "u5", "some-ci", 952, "neutsha"),
+			checkRun(66, "test", "completed", "skipped", "u6", "some-ci", 952, "neutsha"),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const headSHA = "neutsha"
+			runs := tc.runs
+			m := newMockGitHub(t, map[string]http.HandlerFunc{
+				"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, map[string]any{"number": 4, "state": "open", "head": map[string]any{"sha": headSHA, "ref": "feature"}})
+				},
+				"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+				},
+				"/repos/acme/widgets/commits/" + headSHA + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, map[string]any{"total_count": len(runs), "check_runs": runs})
+				},
+			})
+			d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+			p, err := d.LatestMRPipeline(context.Background(), 7, 4)
+			if err != nil {
+				t.Fatalf("LatestMRPipeline: %v", err)
+			}
+			if pipelinestatus.IsSuccess(p.Status) {
+				t.Errorf("status %q must NOT be IsSuccess (all-neutral must not false-green)", p.Status)
+			}
+			if pipelinestatus.IsFailed(p.Status) {
+				t.Errorf("status %q must NOT be IsFailed (nothing actually failed)", p.Status)
+			}
+			if p.Status != "neutral" {
+				t.Errorf("status = %q, want neutral", p.Status)
+			}
+		})
+	}
+}
+
 // TestGitHubLatestMRPipelineSynthesisPrecedence pins the combine precedence for the
 // attention/pending mixes: neither classifies as failed or success.
 func TestGitHubLatestMRPipelineSynthesisPrecedence(t *testing.T) {
