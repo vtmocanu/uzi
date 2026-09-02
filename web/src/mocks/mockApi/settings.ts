@@ -634,6 +634,14 @@ export const settingsApi = {
     return delay({ user: { ...u } }, 200);
   },
 
+  // ── Early-limit-reset Slack alert opt-in (PRD #1020 M4/M5) ────────────────────
+  // Own-user (session identity, never a body id, mirroring the server). Default true.
+  setNotifyEarlyReset: async (enabled: boolean) => {
+    const u = requireSession();
+    u.notify_early_limit_reset = enabled;
+    return delay({ user: { ...u } }, 200);
+  },
+
   // ── Run-judge opt-in (PRD #46) ───────────────────────────────────────────────
   // Own-user (session identity, never a body id, mirroring the server's audit H3).
   setJudgeEnabled: async (enabled: boolean, anthropicToken?: string | null) => {

@@ -492,6 +492,145 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
   });
 });
 
+describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
+  // M3: when `main` advances during a rate-limit park, a resumed run must NOT discard its
+  // valid mirrored checkpoint. On a RESUME with no origin/<branch> (unpushed branch) the
+  // strict-descendant ancestry test against the moved default is skipped — the checkpoint
+  // is adopted using the disjoint-history guard only (sharesHistory, already encoded in
+  // checkpointExists). A FRESH run keeps the strict/floor behaviour, and an EXISTING
+  // origin/<branch> keeps the strict test even on resume (competing published work).
+
+  /** Worker A commits `milestones` real (committed) commits on `branch` off the current
+   *  floor, then publishes them as the branch's brokered checkpoint WITHOUT pushing
+   *  origin/<branch> (originExists=false, the incident shape). Returns the checkpoint tip. */
+  async function publishCommittedCheckpoint(
+    gitA: GitCache,
+    bareA: string,
+    issue: number,
+    branch: string,
+    milestones: string[],
+  ): Promise<string> {
+    const seed = await gitA.createOrAttachRunnerClone(bareA, issue, "run-A");
+    let tip = gitIn(seed.path, ["rev-parse", "HEAD"]);
+    for (const m of milestones) tip = commit(seed.path, m);
+    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    const packed = await gitA.checkpointPack(bareA, branch);
+    assert.ok(packed, "worker A builds a checkpoint pack from its tracking ref");
+    assert.strictEqual(packed!.tipOid, tip, "the pack tip is the committed checkpoint tip");
+    const pack = await drain(packed!.pack);
+    assert.ok(pack.length > 0, "the checkpoint pack is non-empty");
+    publishPackToOrigin(pack, tip, `refs/uzi-checkpoints/${branch}`);
+    return tip;
+  }
+
+  it("RESUME adopts a checkpoint that DIVERGED from a default that moved during the park (no origin/<branch>)", async () => {
+    const branch = "agent/issue-10301";
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    const cpTip = await publishCommittedCheckpoint(gitA, bareA, 10301, branch, ["M1.txt", "M2.txt"]);
+
+    // `main` advances during the park on a file DISJOINT from the milestones → the
+    // checkpoint diverges from the new floor (it is no longer a strict descendant).
+    const advancedFloor = advanceOriginMain("MAIN_ADVANCE.txt", "landed while parked\n");
+
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const floorSha = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    assert.strictEqual(floorSha, advancedFloor, "worker B's floor is the advanced main");
+    // Preconditions: the checkpoint is genuinely DIVERGED (not reachable from the floor) but
+    // still shares history with the floor (so the disjoint guard admits it).
+    assert.throws(
+      () => gitIn(bareB, ["merge-base", "--is-ancestor", floorSha, cpTip]),
+      "the checkpoint does NOT descend the advanced floor (diverged — the strict test would set it aside)",
+    );
+    assert.doesNotThrow(
+      () => gitIn(bareB, ["merge-base", floorSha, cpTip]),
+      "the checkpoint shares history with the floor (the disjoint-history guard admits it)",
+    );
+
+    // THE RESUME (resume=true, no origin/<branch>): adopt the checkpoint despite divergence.
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10301, "run-B", true);
+
+    assert.strictEqual(rc.seededFrom, "checkpoint", "resume adopts the diverged checkpoint, not the default floor");
+    assert.strictEqual(rc.baseCommit, cpTip, "the base is the checkpoint tip (committed milestones preserved)");
+    assert.notStrictEqual(rc.checkpointSetAside, true, "the checkpoint is NOT set aside on resume");
+    assert.ok(rc.priorCommits > 0, `priorCommits must be > 0 (milestones recovered), got ${rc.priorCommits}`);
+    // The committed milestone commits are present on the working branch.
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), true, "milestone M1 recovered onto the branch");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M2.txt")), true, "milestone M2 recovered onto the branch");
+    const subjects = gitIn(rc.path, ["log", "--format=%s"]);
+    assert.ok(
+      subjects.includes("work M1.txt") && subjects.includes("work M2.txt"),
+      `both milestone commits are in the resulting history, got: ${JSON.stringify(subjects)}`,
+    );
+  });
+
+  it("FRESH run (resume=false) does NOT inherit a diverged checkpoint — strict/floor behaviour unchanged (set aside)", async () => {
+    const branch = "agent/issue-10302";
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    const cpTip = await publishCommittedCheckpoint(gitA, bareA, 10302, branch, ["M1.txt", "M2.txt"]);
+
+    const advancedFloor = advanceOriginMain("MAIN_ADVANCE.txt", "landed while parked\n");
+
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const floorSha = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    assert.strictEqual(floorSha, advancedFloor);
+    assert.throws(
+      () => gitIn(bareB, ["merge-base", "--is-ancestor", floorSha, cpTip]),
+      "precondition: the checkpoint is diverged",
+    );
+
+    // A FRESH run (resume=false — session_id == null): the strict-descendant test applies,
+    // so the diverged checkpoint is set aside and the run cold-starts from the default floor.
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10302, "run-B", false);
+
+    assert.strictEqual(rc.seededFrom, "default", "a fresh run falls through to the default floor");
+    assert.strictEqual(rc.baseCommit, floorSha, "the base is the advanced default floor");
+    assert.strictEqual(rc.checkpointSetAside, true, "the diverged checkpoint is set aside for a fresh run");
+    assert.strictEqual(rc.priorCommits, 0, "nothing recovered on a fresh cold start");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), false, "a fresh run does NOT inherit the prior checkpoint's work");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M2.txt")), false, "…nor its second milestone");
+  });
+
+  it("RESUME with an EXISTING origin/<branch> still applies the strict-descendant test (diverged published origin wins)", async () => {
+    const branch = "agent/issue-10303";
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    const cpTip = await publishCommittedCheckpoint(gitA, bareA, 10303, branch, ["M1.txt", "M2.txt"]);
+
+    // A COMPETING PUBLISHED origin/<branch> off the same floor but on a DIFFERENT line than
+    // the checkpoint — genuinely competing published work the relaxed rule must NOT discard.
+    const floorAtOrigin = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    const floorTree = gitIn(fx.originPath, ["rev-parse", "HEAD^{tree}"]);
+    const originBranchTip = mkCommit(fx.originPath, floorTree, [floorAtOrigin], "published divergent origin work");
+    gitIn(fx.originPath, ["update-ref", `refs/heads/${branch}`, originBranchTip]);
+
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    assert.strictEqual(
+      gitIn(bareB, ["rev-parse", `refs/remotes/origin/${branch}`]),
+      originBranchTip,
+      "precondition: origin/<branch> exists at the published divergent tip",
+    );
+    // The checkpoint does NOT descend origin/<branch> (they diverge) — so the strict test bites.
+    assert.throws(
+      () => gitIn(bareB, ["merge-base", "--is-ancestor", originBranchTip, cpTip]),
+      "precondition: the checkpoint does not descend the published origin branch (diverged)",
+    );
+
+    // RESUME, but origin/<branch> EXISTS → the strict-descendant test is KEPT: the published
+    // origin branch is the floor and wins; the checkpoint is set aside, not blindly adopted.
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10303, "run-B", true);
+
+    assert.strictEqual(rc.seededFrom, "origin", "the published origin branch is the floor even on resume");
+    assert.strictEqual(rc.baseCommit, originBranchTip, "the base is the origin branch tip, NOT the checkpoint");
+    assert.strictEqual(rc.checkpointSetAside, true, "the diverged checkpoint is set aside — the strict test still bites");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), false, "the checkpoint's work was NOT blindly adopted over published origin");
+  });
+});
+
 describe("GitCache.hasCommittedCheckpoint (issue #771 / PRD #759)", () => {
   // The report-only orphan guard must fire on a checkpoint that holds COMMITTED work but
   // NOT on one whose tip is only an abandoned `wip(park):` marker (the usage-limit park

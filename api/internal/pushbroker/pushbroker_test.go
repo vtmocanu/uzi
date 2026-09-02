@@ -72,7 +72,7 @@ func (f *gitFixture) pushMain() {
 func (f *gitFixture) pack(tip, base string) []byte {
 	f.t.Helper()
 	revs := run(f.t, f.work, "git", "rev-list", tip, "^"+base, "--objects")
-	cmd := exec.Command("git", "-C", f.work, "pack-objects", "--stdout")
+	cmd := exec.Command("git", "-C", f.work, "pack-objects", "--stdout") //nolint:gosec // G204: test helper invoking the real git against a test-owned temp repo path, not attacker input.
 	cmd.Stdin = strings.NewReader(revs)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
@@ -86,8 +86,8 @@ func (f *gitFixture) pack(tip, base string) []byte {
 // originRef returns the sha origin has for a ref, or "" if absent.
 func (f *gitFixture) originRef(ref string) string {
 	f.t.Helper()
-	cmd := exec.Command("git", "-C", f.bare, "rev-parse", "--verify", "--quiet", ref)
-	out, _ := cmd.Output() // non-zero exit on a missing ref is expected → ""
+	cmd := exec.Command("git", "-C", f.bare, "rev-parse", "--verify", "--quiet", ref) //nolint:gosec // G204: test helper invoking the real git against a test-owned temp repo path, not attacker input.
+	out, _ := cmd.Output()                                                            // non-zero exit on a missing ref is expected → ""
 	return strings.TrimSpace(string(out))
 }
 
@@ -152,6 +152,57 @@ func TestPublishFirstCheckpointOnNeverPushedBranch(t *testing.T) {
 	// origin's heads must be untouched: the feature branch was NEVER pushed to heads.
 	if got := f.originRef("refs/heads/agent/issue-7"); got != "" {
 		t.Fatalf("publish wrote refs/heads/agent/issue-7 = %q; it must only touch the checkpoint ns", got)
+	}
+}
+
+// TestPublishFirstCheckpointAfterDefaultAdvanced is the issue-#1009 regression: the
+// agent's branch was NEVER pushed to refs/heads, AND origin's default branch has
+// advanced since the worker cloned. The worker's non-thin pack excludes everything
+// reachable from the branch-point (base == D_old), but origin's main now points at
+// D_new, so a depth-1 fetch pulls only D_new's snapshot — D_old is absent from the
+// broker's storer. remote.PushContext recomputes its send-set by walking from the tip
+// and excluding D_new, hits the branch-point's excluded parent D_old (not in the
+// storer), and fails LOCALLY with "object not found" before any bytes leave — even
+// though the REMOTE holds D_old and could resolve the pack. The manual receive-pack
+// forward ships the pack verbatim and lets the remote do reachability, so the
+// checkpoint is created.
+func TestPublishFirstCheckpointAfterDefaultAdvanced(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base") // D_old — the pack's exclude boundary
+	f.pushMain()
+
+	// Work on a feature branch off base and build the worker's non-thin pack (^base),
+	// but never push the branch to heads.
+	f.git("checkout", "-b", "agent/issue-9", base)
+	tip := f.commit("b.txt", "one\n", "c1")
+	pack := f.pack(tip, base)
+
+	// Origin's default advances to D_new on a DIFFERENT path than the feature branch
+	// touched, so D_new descends D_old (D_old stays reachable on origin) but the
+	// feature tip does not descend D_new.
+	f.git("checkout", "main")
+	f.commit("main-only.txt", "advanced\n", "main advance")
+	f.pushMain() // origin main = D_new != D_old = base
+
+	res, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL:      f.cloneURL(),
+		Branch:        "agent/issue-9",
+		DefaultBranch: "main",
+		DeclaredTip:   tip,
+		Pack:          pack,
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if res.Ref != "refs/uzi-checkpoints/agent/issue-9" {
+		t.Fatalf("ref = %q, want refs/uzi-checkpoints/agent/issue-9", res.Ref)
+	}
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-9"); got != tip {
+		t.Fatalf("origin checkpoint = %q, want tip %q", got, tip)
+	}
+	// origin's heads must be untouched: the feature branch was NEVER pushed to heads.
+	if got := f.originRef("refs/heads/agent/issue-9"); got != "" {
+		t.Fatalf("publish wrote refs/heads/agent/issue-9 = %q; it must only touch the checkpoint ns", got)
 	}
 }
 
@@ -290,6 +341,96 @@ func TestPublishAdvancesCheckpointNonForced(t *testing.T) {
 	}
 }
 
+// TestPublishSameTipTwiceReportsSuccess is the PRD #1030 M1 resume scenario: a run
+// resumed on a cold worker with lastPublishedTip reset and NO new commits re-declares
+// the tip origin's checkpoint ref already holds. Re-publishing the SAME tip must be a
+// genuine SUCCESS (nil error → Published=true at the caller), NOT ErrNotDescendant —
+// otherwise the worker emits a misleading "checkpoint publish skipped: not_descendant"
+// feed line every interval and never advances lastPublishedTip. Before the fix the
+// strict-descendant check ran first and returned ErrNotDescendant (base == declared.Hash),
+// so the already-up-to-date short-circuit was dead code; this pins it reachable.
+func TestPublishSameTipTwiceReportsSuccess(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	tip := f.commit("b.txt", "one\n", "c1")
+
+	opts := pushbroker.Options{
+		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip, Pack: f.pack(tip, base),
+	}
+	if _, err := pushbroker.Publish(context.Background(), opts); err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	ref := "refs/uzi-checkpoints/main"
+	if got := f.originRef(ref); got != tip {
+		t.Fatalf("checkpoint = %q, want tip %q", got, tip)
+	}
+
+	// Re-publish the SAME tip; origin's checkpoint ref already equals it.
+	res, err := pushbroker.Publish(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("second Publish of same tip = %v; want success (not a not_descendant skip)", err)
+	}
+	if res.Ref != ref {
+		t.Fatalf("ref = %q, want %q", res.Ref, ref)
+	}
+	if got := f.originRef(ref); got != tip {
+		t.Fatalf("checkpoint changed on same-tip re-publish: got %q, want unchanged %q", got, tip)
+	}
+}
+
+// TestPublishNeverForcesDivergedCheckpoint pins the never-forced invariant at the
+// Publish level: if origin's checkpoint ref is moved OUT-OF-BAND to a commit X the
+// declared tip does not descend, Publish must skip (ErrNotDescendant) AND leave origin's
+// ref STILL pointing at X — never force-moving a diverged checkpoint. (The pure wire-CAS
+// race between fetch and forward is not reproducible in the file:// harness; this covers
+// the reachable local strict-descendant + never-clobber guarantee.)
+func TestPublishNeverForcesDivergedCheckpoint(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	tip1 := f.commit("b.txt", "one\n", "c1")
+
+	// Create the checkpoint ref at tip1.
+	if _, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip1, Pack: f.pack(tip1, base),
+	}); err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	ref := "refs/uzi-checkpoints/main"
+	if got := f.originRef(ref); got != tip1 {
+		t.Fatalf("checkpoint = %q, want tip1 %q", got, tip1)
+	}
+
+	// Out of band, move origin's checkpoint ref to a DIVERGENT commit X (a sibling off
+	// base that does not descend tip1) via a force-push against the bare — simulating a
+	// concurrent/rogue mover. The force-push also transfers X's objects into origin.
+	f.git("checkout", "-b", "fork", base)
+	x := f.commit("x.txt", "divergent\n", "x")
+	f.git("push", "origin", "--force", "fork:"+ref)
+	if got := f.originRef(ref); got != x {
+		t.Fatalf("out-of-band setup failed: checkpoint = %q, want X %q", got, x)
+	}
+
+	// Declare a tip that descends tip1 but NOT X.
+	f.git("checkout", "main")
+	tip2 := f.commit("c.txt", "two\n", "c2")
+
+	_, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip2, Pack: f.pack(tip2, tip1),
+	})
+	if err == nil {
+		t.Fatal("Publish accepted a tip that does not descend the diverged checkpoint; want ErrNotDescendant")
+	}
+	if !isNotDescendant(err) {
+		t.Fatalf("err = %v, want ErrNotDescendant", err)
+	}
+	// CRUCIAL never-forced assertion: the diverged checkpoint ref was NOT clobbered.
+	if got := f.originRef(ref); got != x {
+		t.Fatalf("diverged checkpoint was force-moved: got %q, want unchanged X %q", got, x)
+	}
+}
+
 func TestPublishRejectsNonDescendantAndDoesNotMoveRef(t *testing.T) {
 	f := newGitFixture(t)
 	base := f.commit("a.txt", "base\n", "base")
@@ -335,13 +476,80 @@ func TestPublishTipMissingFromPack(t *testing.T) {
 	}
 }
 
+// TestDeleteRemovesCheckpointRef pins PRD #1030 M4's cleanup: after a checkpoint ref
+// exists on origin, Delete removes it; deleting again is idempotent (nil, ref stays
+// absent); and origin's heads are never touched. A stale checkpoint ref left behind
+// would later block a new run on the same branch with a not_descendant skip, which is
+// exactly what this cleanup prevents.
+func TestDeleteRemovesCheckpointRef(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	tip := f.commit("b.txt", "one\n", "c1")
+
+	// Publish a checkpoint so origin holds refs/uzi-checkpoints/main.
+	if _, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip, Pack: f.pack(tip, base),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	ref := "refs/uzi-checkpoints/main"
+	if got := f.originRef(ref); got != tip {
+		t.Fatalf("precondition: checkpoint = %q, want tip %q", got, tip)
+	}
+	mainBefore := f.originRef("refs/heads/main")
+
+	// Delete removes it.
+	if err := pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL(), Branch: "main",
+	}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got := f.originRef(ref); got != "" {
+		t.Fatalf("checkpoint ref not deleted: origin = %q, want absent", got)
+	}
+
+	// Idempotent: deleting an already-absent ref is success, not an error.
+	if err := pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL(), Branch: "main",
+	}); err != nil {
+		t.Fatalf("second Delete of absent ref = %v; want nil (idempotent)", err)
+	}
+	if got := f.originRef(ref); got != "" {
+		t.Fatalf("checkpoint ref reappeared: origin = %q, want absent", got)
+	}
+
+	// origin's heads are untouched — Delete only ever touches the checkpoint namespace.
+	if got := f.originRef("refs/heads/main"); got != mainBefore {
+		t.Fatalf("Delete moved refs/heads/main: got %q, want unchanged %q", got, mainBefore)
+	}
+}
+
+// TestDeleteAbsentRefOnFreshRemoteIsNil covers the never-published case: a run that
+// never landed a checkpoint (or a branch that never had one) must still delete
+// cleanly. Origin carries only main; the checkpoint ref never existed.
+func TestDeleteAbsentRefOnFreshRemoteIsNil(t *testing.T) {
+	f := newGitFixture(t)
+	f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+
+	if err := pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL(), Branch: "agent/issue-7",
+	}); err != nil {
+		t.Fatalf("Delete of never-existing ref = %v; want nil", err)
+	}
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-7"); got != "" {
+		t.Fatalf("delete created a ref: origin = %q, want absent", got)
+	}
+}
+
 func isNotDescendant(err error) bool { return errors.Is(err, pushbroker.ErrNotDescendant) }
 
 // run executes a command (optionally in dir) and returns stdout, failing the test
 // on a non-zero exit with stderr attached.
 func run(t *testing.T, dir, name string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(name, args...)
+	cmd := exec.Command(name, args...) //nolint:gosec // G204: generic test command runner; name/args are test-controlled constants, not attacker input.
 	if dir != "" {
 		cmd.Dir = dir
 	}

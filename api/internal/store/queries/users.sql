@@ -59,6 +59,14 @@ RETURNING *;
 UPDATE users SET wait_on_limit = $2 WHERE id = $1
 RETURNING *;
 
+-- name: SetUserNotifyEarlyReset :one
+-- Flip a user's early-limit-reset notification opt-in (PRD #1020). Per-user consent
+-- to be alerted when the poller observes the owner's Anthropic usage window has reset
+-- earlier than its previously reported reset time; default true. Set from the user's
+-- own Settings page.
+UPDATE users SET notify_early_limit_reset = $2 WHERE id = $1
+RETURNING *;
+
 -- name: SetUserJudgeEnabled :one
 -- Flip a user's run-retrospective opt-in (PRD #46 Decision 7). Per-user consent to
 -- spend the user's own Anthropic tokens judging every finished run; default false.

@@ -282,6 +282,11 @@ interface RunFlight {
   preserveSession: boolean;
   lastPublish: number;
   lastPublishedTip: string | undefined;
+  /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
+   *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
+   *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
+   *  not spam the feed. */
+  reportedPublishOutcomes: Set<string>;
   runnerClone: RunnerClone | undefined;
   ciFixHumanApproved: boolean;
   result: ExecutorResult | undefined;
@@ -312,6 +317,12 @@ export interface RunnerOptions {
   /** PRD #267: min interval between time-based origin checkpoint publishes on the
    *  reap:false path; 0 disables. Default 20m. */
   checkpointIntervalMs?: number;
+  /** PRD #1030 M4: CLIENT-side cap (ms) on the graceful-shutdown durability sequence
+   *  (WIP-marker commit + fetch-back + checkpoint publish) so a slow/unreachable forge
+   *  cannot hang the shutdown past the k8s termination grace. Default 15s — see the
+   *  budget note at the shutdown branch. Injectable so a test can drive the timeout
+   *  deterministically against a hanging publish. */
+  shutdownPublishTimeoutMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
   /** Injectable answer-deadline timer for tests; defaults to setTimeout (unref'd)
@@ -354,6 +365,8 @@ export class RunRunner {
   /** PRD #267: min interval between time-based origin checkpoint publishes on the
    *  reap:false path; 0 disables. */
   private readonly checkpointIntervalMs: number;
+  /** PRD #1030 M4: client-side cap (ms) on the graceful-shutdown durability sequence. */
+  private readonly shutdownPublishTimeoutMs: number;
   /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable.
    *  Also feeds the PRD #88 answer-deadline math (askUser), so that budget is testable
    *  on the same clock. */
@@ -427,6 +440,7 @@ export class RunRunner {
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
     this.checkRunner = opts.checkRunner;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
+    this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.now = opts.now ?? (() => Date.now());
     this.setTimer =
       opts.setTimer ??
@@ -503,7 +517,8 @@ export class RunRunner {
         // not. Only when the run actually parked (a resume is coming) and a clone
         // existed to fetch from. Best-effort: a park that fails is worse than a park
         // that loses work (D4), so a failed fetch-back must not undo the park.
-        if (flight.parked && flight.barePath && flight.worktreePath && flight.branch) {
+        if (flight.parked) {
+          if (flight.barePath && flight.worktreePath && flight.branch) {
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
           const branch = flight.branch;
@@ -535,12 +550,37 @@ export class RunRunner {
           // nothing to origin (verified 2026-08-23); either way no spurious tree is
           // published. It runs AFTER the fetch-back so the tracking ref checkpointPack reads
           // is current. Best-effort
-          // (publishCheckpointBestEffort swallows/logs every failure — null pack, non-2xx,
-          // thrown error — and never throws): a publish failure must never undo the park,
-          // exactly as the fetch-back above must not (D4). The publish stays on the
+          // (publishCheckpointBestEffort swallows/logs/surfaces every failure — null pack,
+          // non-2xx, thrown error — and never throws): a publish failure must never undo the
+          // park, exactly as the fetch-back above must not (D4). The publish stays on the
           // join-token seam (checkpointPack local read → client.publishCheckpoint), never a
           // git push / PAT (ADR-628 guardrail invariants).
-          await this.publishCheckpointBestEffort(barePath, branch, runId, runLog);
+          //
+          // issue #1030: the park-publish result is now EXPLICIT on the feed rather than
+          // ignored — a success line, and a failure line that names the durability
+          // consequence (a resume on another worker restarts from the default branch). The
+          // `false` case covers a real publish failure AND an empty park (null pack / no
+          // committed work): in both, nothing landed on refs/uzi-checkpoints/<branch>, so a
+          // cross-worker resume does restart from default, which the line states truthfully.
+          // publishCheckpointBestEffort ALSO emits the specific HTTP/skip outcome (deduped),
+          // so a failure shows both the cause and this consequence. This batcher.emit lands
+          // because handleLimitReached now FLUSHES (not closes) the batcher on the park
+          // branch, leaving it open until the close just below.
+          const parkPublished = await this.publishCheckpointBestEffort(flight, barePath, branch);
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: parkPublished
+                ? "park checkpoint published to origin"
+                : "park checkpoint NOT published — a resume on another worker will restart from the default branch",
+            },
+          });
+          }
+          // Close the batcher on the park path (handleLimitReached deferred the close so the
+          // checkpoint-publish outcome above could reach the feed). Closed exactly once here
+          // for every parked run, including the edge where the paths above were absent.
+          await batcher.close().catch(() => undefined);
         }
       } else if (flight.active?.shuttingDown) {
         // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
@@ -555,7 +595,63 @@ export class RunRunner {
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
           const branch = flight.branch;
-          await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+          // PRD #1030 M4: publish a FINAL checkpoint on graceful shutdown, mirroring the
+          // park path's ordering (commitWipMarker → fetchBackBestEffort → publishCheckpoint).
+          // Before M4 this branch was fetch-back ONLY, so a roll-while-running / eviction /
+          // OOM / node-drain lost up to a whole ~20-min checkpoint interval of committed
+          // work AND any uncommitted mid-milestone edits. Now:
+          //   1. commitWipMarker captures uncommitted work into a throwaway `wip(park):`
+          //      marker commit (best-effort; the .catch is belt-and-braces so nothing here
+          //      undoes the requeue), exactly as the park path does — the shutdown branch
+          //      previously did NOT do this, so uncommitted work was lost even from the marker.
+          //   2. fetchBackBestEffort moves that tip to the local tracking ref.
+          //   3. publishCheckpointBestEffort brokers the delta to refs/uzi-checkpoints/<branch>
+          //      AFTER the fetch-back (so checkpointPack reads the current tip), one-shot and
+          //      unconditional on the join-token seam (never a git push / PAT), same signature
+          //      the park path uses. So a DIFFERENT worker re-claiming this requeued run
+          //      recovers the committed tree instead of cold-starting from the default branch.
+          //
+          // BUDGET (issue #1030 M4 / PRD #1030): this whole best-effort sequence runs inside
+          // the k8s termination grace. No terminationGracePeriodSeconds is set on the worker
+          // pod (confirmed in controller/internal/kube/materializer.go), so the default 30s
+          // applies: after SIGTERM the process must exit before SIGKILL at 30s. The local git
+          // steps (marker, fetch-back) are sub-second; the ONLY step that can hang is the
+          // publish RPC to the api, and the server-side maxPublishDuration is 60s — longer
+          // than the entire grace — so the CLIENT must not simply await it. We cap the whole
+          // sequence with a Promise.race against shutdownPublishTimeoutMs (default 15s): that
+          // leaves ~15s of the 30s grace for the runtime's own SIGTERM teardown and for the
+          // concurrently-aborted sibling runs' sequences (shutdown() aborts every active run
+          // at once; their catch branches race the same wall clock, so the cost is the slowest
+          // plus contention, not the sum). 15s is generous for a healthy publish yet caps a
+          // hung/unreachable forge well short of both the 30s SIGKILL and the 60s server cap.
+          const durability = (async (): Promise<boolean> => {
+            await this.git.commitWipMarker(worktreePath).catch(() => false);
+            await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+            return this.publishCheckpointBestEffort(flight, barePath, branch);
+          })();
+          // undefined ⇒ the budget elapsed before the sequence finished: nothing confirmably
+          // landed, so a cross-worker resume does restart from default — the same truthful
+          // consequence as an outright publish failure. `=== true` folds false + undefined
+          // into the NOT-published line. The orphaned durability promise (on a timeout) is
+          // best-effort and never rejects, so leaving it running past this point is safe.
+          const published = await this.raceShutdownBudget(
+            durability,
+            this.shutdownPublishTimeoutMs,
+          );
+          // issue #1030 M4: surface the outcome on the feed the same way the park path does,
+          // reusing the batcher emit + the reportPublishOutcome dedupe from M1. This lands
+          // because it is emitted BEFORE the single batcher.close() below — the shutdown
+          // branch closes the batcher exactly once, further down, never here.
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text:
+                published === true
+                  ? "shutdown checkpoint published to origin"
+                  : "shutdown checkpoint NOT published — a resume on another worker will restart from the default branch",
+            },
+          });
         }
         // PRD #556 M1: a shutdown interrupt now preserves the same two filesystem dirs a
         // park does (the sibling skills plugin dir and the per-run HOME holding the
@@ -1712,6 +1808,8 @@ export class RunRunner {
       // work" test keys on `lastPublishedTip`, NOT the fetch-skip below.
       lastPublish: this.now(),
       lastPublishedTip: undefined,
+      // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
+      reportedPublishOutcomes: new Set<string>(),
       // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
       // catch can name it. `runnerClone` is declared inside the try and there is no
       // `result` on those paths, so `runnerClone.branch` is the source of truth and it is
@@ -2521,10 +2619,9 @@ export class RunRunner {
         let published = false;
         if (hasNewWork && (opts.reap || timeGateOpen)) {
           published = await this.publishCheckpointBestEffort(
+            flight,
             barePath,
             runnerClone.branch,
-            runId,
-            runLog,
           );
           // Advance the time-gate on every ATTEMPT (not just success): this bounds broker
           // retry cadence to <= 1 publish/interval/run even under a persistent broker
@@ -2638,6 +2735,30 @@ export class RunRunner {
    * with a warn (D4): a fetch-back that fails must not undo the park or block the
    * requeue.
    */
+  /**
+   * PRD #1030 M4: bound a best-effort promise by a client-side budget, resolving to
+   * `undefined` when the budget elapses first (never rejecting). Used to cap the
+   * graceful-shutdown durability sequence so a slow/unreachable forge cannot hang the
+   * shutdown past the k8s termination grace — see the budget note at the shutdown branch.
+   * The timer is armed through `this.setTimer` (unref'd) so a pending budget never keeps
+   * the event loop alive, and is cancelled the moment `work` settles so a completed
+   * publish leaves no dangling timer.
+   */
+  private async raceShutdownBudget<T>(
+    work: Promise<T>,
+    budgetMs: number,
+  ): Promise<T | undefined> {
+    let cancelTimer: (() => void) | undefined;
+    const timeout = new Promise<undefined>((resolve) => {
+      cancelTimer = this.setTimer(() => resolve(undefined), budgetMs);
+    });
+    try {
+      return await Promise.race([work, timeout]);
+    } finally {
+      cancelTimer?.();
+    }
+  }
+
   private async fetchBackBestEffort(
     barePath: string,
     worktreePath: string,
@@ -2659,30 +2780,64 @@ export class RunRunner {
    * to the api's publish RPC, which lands it at `refs/uzi-checkpoints/<branch>` for another
    * worker to recover cross-worker. Fired on BOTH the milestone (reap:true) checkpoint and
    * the PRD #267 time-gated (reap:false) checkpoint, always AFTER the fetch-back updated the
-   * tracking ref checkpointPack reads. Every failure — a null pack, a non-2xx (returned as
-   * null by the client), a thrown error — is swallowed with a warn so a publish NEVER fails
-   * the run.
+   * tracking ref checkpointPack reads. Every non-success — a null pack (nothing to publish),
+   * a non-2xx ({@link PublishResult} `ok: false`), a best-effort skip, or a thrown error — is
+   * swallowed (never fails the run) but, since issue #1030, is also SURFACED: a non-2xx,
+   * skip, or thrown error emits a deduped run-feed line (see {@link reportPublishOutcome}); a
+   * null pack stays silent because there was genuinely nothing to publish.
    *
-   * Returns `true` IFF the publish confirmably LANDED (a non-null publish response), so the
-   * caller can advance `lastPublishedTip` only on confirmed success (PRD #267 Fix 1): a
-   * swallowed failure returns `false`, leaving the tip un-advanced so `hasNewWork` stays
-   * true and the time-gate retries at the next interval boundary.
+   * Returns `true` IFF the publish confirmably LANDED (a 2xx whose body reports
+   * `published: true`), so the caller can advance `lastPublishedTip` only on confirmed
+   * success (PRD #267 Fix 1): a swallowed failure returns `false`, leaving the tip
+   * un-advanced so `hasNewWork` stays true and the time-gate retries at the next interval
+   * boundary.
+   *
+   * issue #1030: a failure or a best-effort SKIP is no longer swallowed silently. A non-2xx
+   * (HTTP <code>), a 2xx `{ published: false, skipped: <reason> }`, or a thrown error each
+   * emits a `status` line onto the run feed and a `runLog.warn`, deduped per distinct
+   * outcome per run (see {@link reportPublishOutcome}). A null pack (nothing to publish —
+   * an absent tracking ref or an unmoved tip) is NOT a failure and stays silent.
    */
   private async publishCheckpointBestEffort(
+    flight: RunFlight,
     barePath: string,
     branch: string,
-    runId: string,
-    runLog: Logger,
   ): Promise<boolean> {
     try {
       const packed = await this.git.checkpointPack(barePath, branch);
-      if (!packed) return false;
-      const res = await this.client.publishCheckpoint(runId, packed.tipOid, packed.pack);
-      return res !== null; // client returns null on any non-2xx / empty body
+      if (!packed) return false; // nothing to publish — not a failure, stay silent
+      const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack);
+      if (res.ok && res.body.published === true) return true;
+      if (res.ok) {
+        // A 2xx that did NOT publish: a best-effort server-side skip. Name the reason.
+        const reason = res.body.skipped ?? "unknown";
+        this.reportPublishOutcome(flight, `skip:${reason}`, `checkpoint publish skipped: ${reason}`);
+      } else {
+        this.reportPublishOutcome(
+          flight,
+          `http:${res.httpStatus}`,
+          `checkpoint publish failed: HTTP ${res.httpStatus}`,
+        );
+      }
+      return false;
     } catch (e) {
-      runLog.warn("checkpoint publish failed", { error: errMessage(e) });
+      this.reportPublishOutcome(flight, "error", `checkpoint publish failed: ${errMessage(e)}`);
       return false;
     }
+  }
+
+  /**
+   * issue #1030: make a checkpoint-publish failure or skip VISIBLE. Always `runLog.warn`s
+   * the outcome; emits a run-feed `status` line at most ONCE per distinct outcome key per
+   * run, so the ~20-min time-gated retry of a persistently-failing publish does not spam the
+   * feed. Reuses the same `batcher.emit({ kind: "status", agent: "worker", … })` mechanism
+   * every other worker-authored status line uses.
+   */
+  private reportPublishOutcome(flight: RunFlight, key: string, text: string): void {
+    flight.runLog.warn(text, { run_id: flight.runId });
+    if (flight.reportedPublishOutcomes.has(key)) return;
+    flight.reportedPublishOutcomes.add(key);
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
   }
 
   /**
@@ -2795,7 +2950,13 @@ export class RunRunner {
       agent: "worker",
       payload: { ...feedPayload },
     });
-    await batcher.close().catch(() => undefined);
+    // issue #1030: FLUSH (not close) here so the limit_wait feed line lands before the state
+    // report, exactly as the prior close did — but leave the batcher OPEN so the park
+    // durability block in execute() can emit the checkpoint-publish outcome onto the feed.
+    // execute()'s park block closes the batcher once, on every parked run. The two
+    // non-park returns below still CLOSE it themselves, since execute() emits nothing more
+    // on those paths.
+    await batcher.flush().catch(() => undefined);
 
     let ack: StateAck;
     try {
@@ -2807,6 +2968,7 @@ export class RunRunner {
         "could not report the park; cleaning up as an unparked run",
         { error: errMessage(e) },
       );
+      await batcher.close().catch(() => undefined);
       return false;
     }
 
@@ -2815,6 +2977,7 @@ export class RunRunner {
         applied: ack.applied,
         server_status: ack.status ?? "unknown",
       });
+      await batcher.close().catch(() => undefined);
       return false;
     }
     return true;
@@ -2890,6 +3053,14 @@ export class RunRunner {
     // inherit a dead run's orphan ref. A requeue/resume keeps the same run_id, so a run
     // resuming its OWN parked work matches; every other run does not.
     const runId = claim.run_id;
+    // PRD #1030 M3: a SEPARATE, additional signal (not the runId ownership anchor) — a
+    // RESUME is `claim.session_id != null` (a run that executed before, re-claimed after a
+    // rate-limit park), distinct from a fresh first attempt or a seeded run (session_id
+    // null). Threaded into the clone path to relax ONLY the cross-worker checkpoint
+    // ancestry test on an unpushed branch (see runnerCloneForBranch): when `main` advanced
+    // during the park, a valid mirrored checkpoint diverges from the moved default and the
+    // strict-descendant test would discard the committed milestones and cold-start.
+    const resume = claim.session_id != null;
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
@@ -2905,10 +3076,11 @@ export class RunRunner {
         cloneBranch.branch,
         cloneBranch.slug,
         runId,
+        resume,
       );
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume);
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.

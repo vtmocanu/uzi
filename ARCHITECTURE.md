@@ -688,6 +688,39 @@ chain in the diagram above, with no intervening `running`.
   snapshot from recovering a committed milestone. See
   `adr/0759-protect-run-work-usage-limit-park.md` for the full Decision Log. <!-- check-docs:ignore-path -->
 
+- **Affinity now holds through a worker roll, and the forge-checkpoint net behind
+  it is reliable and observable ([PRD #1030](prds/done/1030-worker-resume-durability.md)).**
+  Before this PRD, `ClaimRun`'s affinity leg fell open the instant a parked run's
+  owner started draining — including a routine image roll — so a park landing on a
+  worker mid-roll cold-restarted on a peer with no clone (`resume_lineage_break`,
+  incident run #1009), even though the owner's worker **row and PVC survive** a
+  roll. The fix distinguishes **roll** from **teardown** with no new column: a roll
+  sets `draining_since` but keeps the worker row (`RegisterWorker` clears
+  `draining_since` when the pod returns, per PRD #422 above); a teardown deletes
+  the row **API-side** (`DeleteWorkerForUser`/`ReapEphemeralWorkers`) *before* the
+  controller's kube teardown runs, so `teardown ⟺ row absent`. `ClaimRun` now holds
+  the pin while the owner's row exists and it is either draining or heartbeat-fresh,
+  and falls open immediately only when the row is gone (teardown) or the row is
+  heartbeat-stale with no drain in progress (death/hang) — bounded by the existing
+  `WORKER_AFFINITY_CEILING`. A companion `@claimant_draining` claim parameter keeps a
+  draining worker's own claim scoped to **its own** promoted run, so lifting the
+  "draining workers claim nothing" early return does not let it pick up a new or
+  fallen-open run (preserving PRD #422 D7). Independently, `pushbroker.Publish`
+  (`api/internal/pushbroker/pushbroker.go`) no longer fails `object not found` the
+  first time a checkpoint publishes after `main` has advanced past a worker's clone
+  base: it now forwards the worker's already-built pack through a manual
+  `git-receive-pack` session, with `Command.Old` bound to the fetched checkpoint
+  tip as a server-side, never-forced compare-and-swap, instead of asking go-git to
+  recompute a send-set from a depth-1 local snapshot that lacks the old default's
+  history. Publish failures and skips are now surfaced on the run feed (not just
+  logged silently), and the api's failure log carries `run_id`/`worker_id`/`reason`.
+  A graceful shutdown now publishes a final checkpoint within the k8s termination
+  grace, and every terminal transition best-effort deletes the run's
+  `refs/uzi-checkpoints/<branch>`, so a stale ref cannot block a later run on the
+  same issue. See [ADR-628](adr/0628-cross-worker-resume-durability.md)'s PRD #1030
+  amendment for the roll-vs-teardown discriminator and the pushbroker mechanism in
+  full.
+
 - **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
   oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),
   or the caller's own re-queued run if it is still inside its **affinity

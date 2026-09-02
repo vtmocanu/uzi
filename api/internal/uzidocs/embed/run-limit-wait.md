@@ -41,8 +41,31 @@ A run can pause and resume more than once if the limit keeps recurring, backing 
 
 A run that isn't set up to wait still fails the moment it hits a limit, the same as before — but the failure now says why, instead of a bare error: *"Anthropic usage limit (5-hour) reached; resets at 2026-07-28T02:00:00Z"*. Re-run it once that time passes, or turn on waiting so next time it doesn't have to.
 
+## Alert when the 7-day window resets early
+
+Anthropic's 5-hour window resets like clockwork, but the 7-day (weekly) window
+sometimes reopens *earlier* than the reset time it originally advertised. uzi's
+usage poller already tracks that expected reset time per token, so it notices
+when this happens: if a token's weekly window comes back more than 8 hours
+before its previously-recorded reset, uzi can tell you right away instead of
+you finding out only when the nominal time finally arrives.
+
+- **On by default** — the same **Settings → Anthropic usage limits** card as
+  the pause toggle above has its own checkbox, *"Alert me when my 7-day limit
+  resets early"*. It's independent of whether waiting on limits is turned on.
+- **A Slack DM, loud on purpose** — a `🚨 7-DAY RATE LIMIT RESET EARLY` message
+  naming the expected reset time, when it was actually observed, and how many
+  hours you got back. It needs a linked Slack account to reach you (see
+  [Slack notifications](slack.md)); with no Slack linked, the alert is still
+  recorded as a notification in your inbox, just not DMed.
+- **The 8-hour threshold is fixed**, not a setting you can tune.
+- **It only tells you** — it does not resume a paused run early or otherwise
+  act on your behalf. A run parked with [wait on limit](#on-by-default) still
+  resumes on the schedule described above; this alert just lets you know
+  sooner that the account itself has room again.
+
 ## Not the same as waiting for a pooled token
 
 A **`limit_wait`** pause (this page) and a **`pool_wait`** hold are both non-terminal waits, but for different reasons with different resolutions. `limit_wait` means a token you were actually spending hit its Anthropic rate limit, and it clears when that window resets. `pool_wait` means an `auto`-lane worker's token pool was genuinely empty — there was nothing to spend at all — and it clears when you opt a token into the pool, or on demand with `uzi run resume-now`. See [Letting uzi pick the token (auto-selection)](anthropic-token.md#letting-uzi-pick-the-token-auto-selection) for the pooled-token wait.
 
-Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Configuration](configuration.md)
+Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Configuration](configuration.md) · [Slack notifications](slack.md)

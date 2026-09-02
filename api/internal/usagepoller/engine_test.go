@@ -2,6 +2,7 @@ package usagepoller
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
@@ -25,8 +28,11 @@ import (
 type fakeStore struct {
 	rows []store.ListAnthropicTokensToPollRow
 
-	mu      sync.Mutex
-	upserts map[uuid.UUID]store.UpsertRateLimitsParams // keyed by user_secret_id
+	mu        sync.Mutex
+	upserts   map[uuid.UUID]store.UpsertRateLimitsParams // keyed by user_secret_id
+	prev      map[uuid.UUID]store.AnthropicRateLimit     // keyed by user_secret_id
+	notify    map[uuid.UUID]bool                         // keyed by user id
+	upsertErr error                                      // when set, UpsertRateLimits fails (no write)
 }
 
 func newFakeStore(users ...uuid.UUID) *fakeStore {
@@ -36,10 +42,24 @@ func newFakeStore(users ...uuid.UUID) *fakeStore {
 			ID: u, UserID: u, Ciphertext: []byte("ct"), SealedWith: store.SealedWithDEK,
 		})
 	}
-	return &fakeStore{rows: rows, upserts: map[uuid.UUID]store.UpsertRateLimitsParams{}}
+	return &fakeStore{
+		rows:    rows,
+		upserts: map[uuid.UUID]store.UpsertRateLimitsParams{},
+		prev:    map[uuid.UUID]store.AnthropicRateLimit{},
+		notify:  map[uuid.UUID]bool{},
+	}
 }
 func (f *fakeStore) ListAnthropicTokensToPoll(context.Context) ([]store.ListAnthropicTokensToPollRow, error) {
-	return f.rows, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Reflect any per-user notify opt-in onto the poll rows (the production JOIN),
+	// keeping the tick path and the poke path reading the same flag.
+	out := make([]store.ListAnthropicTokensToPollRow, len(f.rows))
+	for i, r := range f.rows {
+		r.NotifyEarlyLimitReset = f.notify[r.UserID]
+		out[i] = r
+	}
+	return out, nil
 }
 func (f *fakeStore) GetDefaultUserSecretID(_ context.Context, arg store.GetDefaultUserSecretIDParams) (uuid.UUID, error) {
 	// secret id == user id in this fake, so the user's default is the user id.
@@ -51,8 +71,38 @@ func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecret
 func (f *fakeStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.upsertErr != nil {
+		// A failed write records nothing: prev stays at the old epoch (SC5).
+		return f.upsertErr
+	}
 	f.upserts[arg.UserSecretID] = arg
+	// Mirror the write into prev, so a following tick's GetRateLimitsForToken sees the
+	// row this tick just wrote — the once-only edge-consumption property depends on it.
+	f.prev[arg.UserSecretID] = store.AnthropicRateLimit(arg)
 	return nil
+}
+func (f *fakeStore) GetRateLimitsForToken(_ context.Context, secretID uuid.UUID) (store.AnthropicRateLimit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.prev[secretID]; ok {
+		return r, nil
+	}
+	return store.AnthropicRateLimit{}, pgx.ErrNoRows
+}
+func (f *fakeStore) GetUserByID(_ context.Context, id uuid.UUID) (store.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return store.User{ID: id, NotifyEarlyLimitReset: f.notify[id]}, nil
+}
+func (f *fakeStore) setNotify(userID uuid.UUID, on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notify[userID] = on
+}
+func (f *fakeStore) setPrev(secretID uuid.UUID, r store.AnthropicRateLimit) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prev[secretID] = r
 }
 func (f *fakeStore) got(secretID uuid.UUID) (store.UpsertRateLimitsParams, bool) {
 	f.mu.Lock()
@@ -132,6 +182,11 @@ func (c *clock) now() time.Time {
 func (c *clock) advance(d time.Duration) {
 	c.mu.Lock()
 	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+func (c *clock) set(t time.Time) {
+	c.mu.Lock()
+	c.t = t
 	c.mu.Unlock()
 }
 
@@ -365,10 +420,19 @@ type multiTokenStore struct {
 
 	mu      sync.Mutex
 	upserts map[uuid.UUID]store.UpsertRateLimitsParams // keyed by user_secret_id
+	prev    map[uuid.UUID]store.AnthropicRateLimit     // keyed by user_secret_id
+	notify  map[uuid.UUID]bool                         // keyed by user id
 }
 
 func (m *multiTokenStore) ListAnthropicTokensToPoll(context.Context) ([]store.ListAnthropicTokensToPollRow, error) {
-	return m.rows, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]store.ListAnthropicTokensToPollRow, len(m.rows))
+	for i, r := range m.rows {
+		r.NotifyEarlyLimitReset = m.notify[r.UserID]
+		out[i] = r
+	}
+	return out, nil
 }
 func (m *multiTokenStore) GetDefaultUserSecretID(context.Context, store.GetDefaultUserSecretIDParams) (uuid.UUID, error) {
 	return m.rows[0].ID, nil
@@ -380,7 +444,23 @@ func (m *multiTokenStore) UpsertRateLimits(_ context.Context, arg store.UpsertRa
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.upserts[arg.UserSecretID] = arg
+	if m.prev != nil {
+		m.prev[arg.UserSecretID] = store.AnthropicRateLimit(arg)
+	}
 	return nil
+}
+func (m *multiTokenStore) GetRateLimitsForToken(_ context.Context, secretID uuid.UUID) (store.AnthropicRateLimit, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r, ok := m.prev[secretID]; ok {
+		return r, nil
+	}
+	return store.AnthropicRateLimit{}, pgx.ErrNoRows
+}
+func (m *multiTokenStore) GetUserByID(_ context.Context, id uuid.UUID) (store.User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return store.User{ID: id, NotifyEarlyLimitReset: m.notify[id]}, nil
 }
 func (m *multiTokenStore) got(secretID uuid.UUID) (store.UpsertRateLimitsParams, bool) {
 	m.mu.Lock()
@@ -481,4 +561,413 @@ func (passthroughOpener) Open(_ context.Context, _ uuid.UUID, _ string) ([]byte,
 }
 func (passthroughOpener) OpenSealed(_ uuid.UUID, _, _ string, ciphertext []byte) ([]byte, error) {
 	return ciphertext, nil
+}
+
+// --- early-reset detection (PRD #1020 M2) ---
+
+type earlyResetCall struct {
+	userID             uuid.UUID
+	expected, observed time.Time
+}
+
+// fakeNotifier captures NotifyEarlyReset calls so a test can assert fire/silence and
+// the exact (expected, observed) times passed.
+type fakeNotifier struct {
+	mu    sync.Mutex
+	calls []earlyResetCall
+}
+
+func (f *fakeNotifier) NotifyEarlyReset(_ context.Context, userID uuid.UUID, expected, observed time.Time) (store.Notification, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, earlyResetCall{userID: userID, expected: expected, observed: observed})
+	return store.Notification{}, nil
+}
+func (f *fakeNotifier) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+func (f *fakeNotifier) last() (earlyResetCall, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.calls) == 0 {
+		return earlyResetCall{}, false
+	}
+	return f.calls[len(f.calls)-1], true
+}
+
+// prevRow builds a stored gauge row for the 7-day window: resetsAt is the previously
+// reported reset T, syncedAt when it was observed. A pending, limiting prior window
+// (the "was constrained" precondition) is prevRow with syncedAt < resetsAt and either
+// source=limit_report or sevenPct >= exhaustionPct.
+func prevRow(userID, secretID uuid.UUID, sevenPct int16, source string, resetsAt, syncedAt time.Time) store.AnthropicRateLimit {
+	return store.AnthropicRateLimit{
+		UserSecretID:     secretID,
+		UserID:           userID,
+		SevenDayPct:      pgtype.Int2{Int16: sevenPct, Valid: true},
+		SevenDayResetsAt: pgtype.Timestamptz{Time: resetsAt, Valid: true},
+		Source:           pgtype.Text{String: source, Valid: true},
+		SyncedAt:         pgtype.Timestamptz{Time: syncedAt, Valid: true},
+	}
+}
+
+// readingWithReset is a fresh reading whose 7-day window reports resetsAt (a *time.Time,
+// nil = unset — the moved-epoch guard's other input).
+func readingWithReset(sevenPct int, source string, resetsAt *time.Time) anthropic.Reading {
+	r := reading(0, sevenPct, source)
+	r.SevenDay.ResetsAt = resetsAt
+	return r
+}
+
+// TestEarlyResetDetection is the mutation-checked table over (prev, next, now). Each
+// SILENT case is designed to FLIP to firing if the guard it targets were removed, and
+// says which mutation it pins.
+func TestEarlyResetDetection(t *testing.T) {
+	// T is the previously advertised 7-day reset; the prior sync is well before it, so
+	// the window was genuinely pending. `moved` is a later reset epoch the fresh reading
+	// reports (the accepted "reset observed" signal).
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	synced := tReset.Add(-72 * time.Hour)
+	moved := tReset.Add(72 * time.Hour)
+
+	cases := []struct {
+		name       string
+		prevPct    int16
+		prevSource string
+		nextResets *time.Time
+		nextPct    int
+		nextSource string
+		now        time.Time
+		notify     bool
+		wantFire   bool
+		why        string
+	}{
+		{
+			name: "fires_limit_report", prevPct: 99, prevSource: anthropic.SourceLimitReport,
+			nextResets: &moved, nextPct: 10, nextSource: anthropic.SourceUsageEndpoint,
+			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: true,
+			why: "constrained (limit_report), epoch moved later, 10h > 8h early",
+		},
+		{
+			name: "fires_high_pct", prevPct: 96, prevSource: anthropic.SourceUsageEndpoint,
+			nextResets: &moved, nextPct: 10, nextSource: anthropic.SourceUsageEndpoint,
+			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: true,
+			why: "constrained via pct>=95 (not limit_report), epoch moved, 10h early",
+		},
+		{
+			name: "silent_modestly_inside_8h", prevPct: 99, prevSource: anthropic.SourceLimitReport,
+			nextResets: &moved, nextPct: 10, nextSource: anthropic.SourceUsageEndpoint,
+			now: tReset.Add(-6 * time.Hour), notify: true, wantFire: false,
+			why: "6h < 8h threshold -> silent; WOULD fire if earlyResetThreshold were 0",
+		},
+		{
+			name: "silent_on_time", prevPct: 99, prevSource: anthropic.SourceLimitReport,
+			nextResets: &moved, nextPct: 10, nextSource: anthropic.SourceUsageEndpoint,
+			now: tReset, notify: true, wantFire: false,
+			why: "earliness ~0 -> silent",
+		},
+		{
+			name: "silent_boundary_exactly_8h", prevPct: 99, prevSource: anthropic.SourceLimitReport,
+			nextResets: &moved, nextPct: 10, nextSource: anthropic.SourceUsageEndpoint,
+			now: tReset.Add(-earlyResetThreshold), notify: true, wantFire: false,
+			why: "now == T-8h; now.Before(T-8h) is strict, so exactly -8h is NOT early",
+		},
+		{
+			name: "silent_not_constrained", prevPct: 50, prevSource: anthropic.SourceUsageEndpoint,
+			nextResets: &moved, nextPct: 10, nextSource: anthropic.SourceUsageEndpoint,
+			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
+			why: "prev not limiting (pct 50 < 95, not limit_report) -> silent; WOULD fire if the source/pct guard were dropped",
+		},
+		{
+			name: "silent_setting_off", prevPct: 99, prevSource: anthropic.SourceLimitReport,
+			nextResets: &moved, nextPct: 10, nextSource: anthropic.SourceUsageEndpoint,
+			now: tReset.Add(-10 * time.Hour), notify: false, wantFire: false,
+			why: "owner opted out -> no read, no fire, even with a fireable config",
+		},
+		{
+			name: "silent_pct_jitter_epoch_unchanged", prevPct: 100, prevSource: anthropic.SourceLimitReport,
+			nextResets: &tReset, nextPct: 99, nextSource: anthropic.SourceUsageEndpoint,
+			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
+			why: "resets_at unchanged (== T, not > T) -> silent; WOULD fire if the moved-epoch requirement were dropped",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := uuid.New()
+			st := newFakeStore(u)
+			st.setNotify(u, tc.notify)
+			st.setPrev(u, prevRow(u, u, tc.prevPct, tc.prevSource, tReset, synced))
+			next := readingWithReset(tc.nextPct, tc.nextSource, tc.nextResets)
+			cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) { return next, nil }}
+			notif := &fakeNotifier{}
+			e, clk := newEngine(t, st, &fakeOpener{}, cl, true)
+			clk.set(tc.now)
+			e.SetNotifier(notif)
+
+			e.tickAll(context.Background())
+
+			// The upsert must happen on EVERY reading, fire or not.
+			if _, ok := st.got(u); !ok {
+				t.Fatal("upsert must happen on every successful reading")
+			}
+			if fired := notif.count() > 0; fired != tc.wantFire {
+				t.Fatalf("fired=%v, want %v (%s)", fired, tc.wantFire, tc.why)
+			}
+			if tc.wantFire {
+				call, _ := notif.last()
+				if !call.expected.Equal(tReset) {
+					t.Errorf("expected reset = %v, want T=%v", call.expected, tReset)
+				}
+				if !call.observed.Equal(tc.now) {
+					t.Errorf("observed = %v, want now=%v", call.observed, tc.now)
+				}
+				if call.userID != u {
+					t.Errorf("notified user = %v, want %v", call.userID, u)
+				}
+			}
+		})
+	}
+}
+
+// TestEarlyResetUpsertBeforeNotify: the fresh reading is written to the gauge BEFORE
+// the notify fires (D7 ordering), so the upserted row already reflects the moved epoch.
+func TestEarlyResetUpsertBeforeNotify(t *testing.T) {
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	moved := tReset.Add(72 * time.Hour)
+	u := uuid.New()
+	st := newFakeStore(u)
+	st.setNotify(u, true)
+	st.setPrev(u, prevRow(u, u, 99, anthropic.SourceLimitReport, tReset, tReset.Add(-72*time.Hour)))
+	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+		return readingWithReset(10, anthropic.SourceUsageEndpoint, &moved), nil
+	}}
+	notif := &fakeNotifier{}
+	e, clk := newEngine(t, st, &fakeOpener{}, cl, true)
+	clk.set(tReset.Add(-10 * time.Hour))
+	e.SetNotifier(notif)
+
+	e.tickAll(context.Background())
+
+	if notif.count() != 1 {
+		t.Fatalf("notify calls = %d, want 1", notif.count())
+	}
+	got, ok := st.got(u)
+	if !ok {
+		t.Fatal("expected an upserted row")
+	}
+	if !got.SevenDayResetsAt.Valid || !got.SevenDayResetsAt.Time.Equal(moved) {
+		t.Errorf("upserted reset = %v, want the moved epoch %v (write must land before notify)", got.SevenDayResetsAt.Time, moved)
+	}
+}
+
+// TestEarlyResetFailedUpsertDoesNotNotify: SC5. When the gauge write fails, the moved
+// epoch is NOT persisted, so prev still holds the old boundary and the edge is not
+// consumed. Notifying anyway would re-fire on every subsequent tick until the write
+// lands, breaking at-most-once. A failed upsert must therefore stay silent — even
+// though every fire precondition (constrained prior, moved epoch, ≥8h early) holds.
+func TestEarlyResetFailedUpsertDoesNotNotify(t *testing.T) {
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	moved := tReset.Add(72 * time.Hour)
+	u := uuid.New()
+	st := newFakeStore(u)
+	st.setNotify(u, true)
+	st.setPrev(u, prevRow(u, u, 99, anthropic.SourceLimitReport, tReset, tReset.Add(-72*time.Hour)))
+	st.upsertErr = errors.New("boom") // the write fails on this tick
+	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+		return readingWithReset(10, anthropic.SourceUsageEndpoint, &moved), nil
+	}}
+	notif := &fakeNotifier{}
+	e, clk := newEngine(t, st, &fakeOpener{}, cl, true)
+	clk.set(tReset.Add(-10 * time.Hour)) // 10h early → well past the 8h threshold
+	e.SetNotifier(notif)
+
+	e.tickAll(context.Background())
+
+	if notif.count() != 0 {
+		t.Fatalf("notify calls = %d, want 0 (a failed upsert must not fire — SC5)", notif.count())
+	}
+	// The write did not land, so the edge was not consumed: a later successful tick
+	// with the same reading can still fire exactly once.
+	if _, ok := st.got(u); ok {
+		t.Error("a failed upsert recorded a write; prev must stay at the old epoch")
+	}
+}
+
+// TestEarlyResetOnceOnly: after firing, the upserted `next` becomes `prev`; a second
+// identical tick does NOT re-fire because the epoch has not moved again (next.resets ==
+// prev.resets). The moved-epoch guard is what consumes the edge — the second tick keeps
+// a high pct + limit_report source, so only the unchanged epoch prevents the re-fire.
+func TestEarlyResetOnceOnly(t *testing.T) {
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	moved := tReset.Add(72 * time.Hour)
+	u := uuid.New()
+	st := newFakeStore(u)
+	st.setNotify(u, true)
+	st.setPrev(u, prevRow(u, u, 100, anthropic.SourceLimitReport, tReset, tReset.Add(-72*time.Hour)))
+	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+		return readingWithReset(100, anthropic.SourceLimitReport, &moved), nil
+	}}
+	notif := &fakeNotifier{}
+	e, clk := newEngine(t, st, &fakeOpener{}, cl, true)
+	clk.set(tReset.Add(-10 * time.Hour))
+	e.SetNotifier(notif)
+
+	e.tickAll(context.Background()) // fires
+	e.tickAll(context.Background()) // identical epoch -> edge already consumed
+
+	if notif.count() != 1 {
+		t.Fatalf("notify calls = %d, want exactly 1 (the moved-epoch edge is consumed once)", notif.count())
+	}
+}
+
+// TestEarlyResetPerTokenFanOut: N tokens each early-resetting produce N NotifyEarlyReset
+// calls in one tick.
+func TestEarlyResetPerTokenFanOut(t *testing.T) {
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	moved := tReset.Add(72 * time.Hour)
+	synced := tReset.Add(-72 * time.Hour)
+	user := uuid.New()
+	tokA, tokB, tokC := uuid.New(), uuid.New(), uuid.New()
+	st := &multiTokenStore{
+		rows: []store.ListAnthropicTokensToPollRow{
+			{ID: tokA, UserID: user, Ciphertext: []byte("a"), SealedWith: store.SealedWithMaster},
+			{ID: tokB, UserID: user, Ciphertext: []byte("b"), SealedWith: store.SealedWithMaster},
+			{ID: tokC, UserID: user, Ciphertext: []byte("c"), SealedWith: store.SealedWithMaster},
+		},
+		upserts: map[uuid.UUID]store.UpsertRateLimitsParams{},
+		prev: map[uuid.UUID]store.AnthropicRateLimit{
+			tokA: prevRow(user, tokA, 99, anthropic.SourceLimitReport, tReset, synced),
+			tokB: prevRow(user, tokB, 99, anthropic.SourceLimitReport, tReset, synced),
+			tokC: prevRow(user, tokC, 99, anthropic.SourceLimitReport, tReset, synced),
+		},
+		notify: map[uuid.UUID]bool{user: true},
+	}
+	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+		return readingWithReset(10, anthropic.SourceUsageEndpoint, &moved), nil
+	}}
+	notif := &fakeNotifier{}
+	e, clk := newEngine(t, st, passthroughOpener{}, cl, true)
+	clk.set(tReset.Add(-10 * time.Hour))
+	e.SetNotifier(notif)
+
+	e.tickAll(context.Background())
+
+	if notif.count() != 3 {
+		t.Fatalf("notify calls = %d, want 3 (one per early-resetting token)", notif.count())
+	}
+}
+
+// TestEarlyResetSettingOffSuppressesAllTokens: with the owner opted out, NONE of their
+// tokens fire even though every one is a fireable configuration.
+func TestEarlyResetSettingOffSuppressesAllTokens(t *testing.T) {
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	moved := tReset.Add(72 * time.Hour)
+	synced := tReset.Add(-72 * time.Hour)
+	user := uuid.New()
+	tokA, tokB := uuid.New(), uuid.New()
+	st := &multiTokenStore{
+		rows: []store.ListAnthropicTokensToPollRow{
+			{ID: tokA, UserID: user, Ciphertext: []byte("a"), SealedWith: store.SealedWithMaster},
+			{ID: tokB, UserID: user, Ciphertext: []byte("b"), SealedWith: store.SealedWithMaster},
+		},
+		upserts: map[uuid.UUID]store.UpsertRateLimitsParams{},
+		prev: map[uuid.UUID]store.AnthropicRateLimit{
+			tokA: prevRow(user, tokA, 99, anthropic.SourceLimitReport, tReset, synced),
+			tokB: prevRow(user, tokB, 99, anthropic.SourceLimitReport, tReset, synced),
+		},
+		notify: map[uuid.UUID]bool{user: false}, // opted out
+	}
+	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+		return readingWithReset(10, anthropic.SourceUsageEndpoint, &moved), nil
+	}}
+	notif := &fakeNotifier{}
+	e, clk := newEngine(t, st, passthroughOpener{}, cl, true)
+	clk.set(tReset.Add(-10 * time.Hour))
+	e.SetNotifier(notif)
+
+	e.tickAll(context.Background())
+
+	if notif.count() != 0 {
+		t.Fatalf("notify calls = %d, want 0 (setting OFF suppresses every token)", notif.count())
+	}
+	// The gauges are still written — detection being off does not suppress the upsert.
+	if _, ok := st.got(tokA); !ok {
+		t.Error("token A gauge must still be upserted with the setting off")
+	}
+}
+
+// TestEarlyResetNoPriorRow: with the setting on but no prior gauge row
+// (GetRateLimitsForToken -> ErrNoRows), detection is silent and errors nothing.
+func TestEarlyResetNoPriorRow(t *testing.T) {
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	moved := tReset.Add(72 * time.Hour)
+	u := uuid.New()
+	st := newFakeStore(u)
+	st.setNotify(u, true) // no setPrev: GetRateLimitsForToken returns ErrNoRows
+	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+		return readingWithReset(10, anthropic.SourceUsageEndpoint, &moved), nil
+	}}
+	notif := &fakeNotifier{}
+	e, clk := newEngine(t, st, &fakeOpener{}, cl, true)
+	clk.set(tReset.Add(-10 * time.Hour))
+	e.SetNotifier(notif)
+
+	e.tickAll(context.Background())
+
+	if notif.count() != 0 {
+		t.Fatalf("notify calls = %d, want 0 (no prior row -> no comparison basis)", notif.count())
+	}
+	if _, ok := st.got(u); !ok {
+		t.Error("the first reading must still be upserted")
+	}
+}
+
+// TestEarlyResetNilNotifier: with the setting on and a fireable config but NO notifier
+// wired, detection runs without panic and still upserts. The default (unit) path.
+func TestEarlyResetNilNotifier(t *testing.T) {
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	moved := tReset.Add(72 * time.Hour)
+	u := uuid.New()
+	st := newFakeStore(u)
+	st.setNotify(u, true)
+	st.setPrev(u, prevRow(u, u, 99, anthropic.SourceLimitReport, tReset, tReset.Add(-72*time.Hour)))
+	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+		return readingWithReset(10, anthropic.SourceUsageEndpoint, &moved), nil
+	}}
+	e, clk := newEngine(t, st, &fakeOpener{}, cl, true)
+	clk.set(tReset.Add(-10 * time.Hour))
+	// No SetNotifier: e.notifier stays nil.
+
+	e.tickAll(context.Background()) // must not panic
+
+	if _, ok := st.got(u); !ok {
+		t.Error("detection with a nil notifier must still upsert")
+	}
+}
+
+// TestEarlyResetOnPokePath: the poke/single-token path runs detection too, reading the
+// owner opt-in via GetUserByID. A poke that skipped detection would upsert the moved
+// epoch and silently consume the alert edge.
+func TestEarlyResetOnPokePath(t *testing.T) {
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	moved := tReset.Add(72 * time.Hour)
+	u := uuid.New()
+	st := newFakeStore(u)
+	st.setNotify(u, true)
+	st.setPrev(u, prevRow(u, u, 99, anthropic.SourceLimitReport, tReset, tReset.Add(-72*time.Hour)))
+	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+		return readingWithReset(10, anthropic.SourceUsageEndpoint, &moved), nil
+	}}
+	notif := &fakeNotifier{}
+	e, clk := newEngine(t, st, &fakeOpener{}, cl, true)
+	clk.set(tReset.Add(-10 * time.Hour))
+	e.SetNotifier(notif)
+
+	e.pokeUser(context.Background(), u)
+
+	if notif.count() != 1 {
+		t.Fatalf("notify calls = %d, want 1 (detection must run on the poke path)", notif.count())
+	}
 }
