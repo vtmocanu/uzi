@@ -452,6 +452,10 @@ const realApi = {
    */
   setWaitOnLimit: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/wait-on-limit", { enabled }),
+  // Flip the current user's early-limit-reset Slack alert opt-in (PRD #1020 M4/M5).
+  // Session identity only — the body carries no user id. Returns the updated user.
+  setNotifyEarlyReset: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/notify-early-reset", { enabled }),
   // Flip the current user's run-judge opt-in (PRD #46). Session identity only —
   // the body carries no user id. Returns the updated user.
   // enabled is required; anthropicToken is the three-way token field (PRD #104 M4):

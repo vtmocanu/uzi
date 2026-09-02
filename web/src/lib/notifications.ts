@@ -25,6 +25,10 @@ export function onNotificationsChanged(cb: () => void): () => void {
 export function notificationTitle(kind: string, payload: Record<string, unknown>): string {
   const t = payload.title;
   if (typeof t === "string" && t.trim() !== "") return t;
+  // The early-limit-reset ping (PRD #1020) is account-level and carries no run — an
+  // absent/empty payload.title must NOT fall through to the humanized kind
+  // ("early limit reset"), so give it a fixed human title here.
+  if (kind === EARLY_LIMIT_RESET_KIND) return "7-day rate limit reset early";
   return kind.replace(/_/g, " ");
 }
 
@@ -42,6 +46,11 @@ const JUDGE_REVIEW_KIND = "judge_review";
 // Its payload is { run_id, repo_id, repo_path, count, finding_ids }; the deep-link opens the
 // Findings backlog filtered to that run.
 export const INCIDENTAL_FINDING_KIND = "incidental_finding";
+
+// The kind the early-limit-reset alert carries (PRD #1020). Account-level (no run_id), so
+// notificationLink correctly returns null for it — the only renderer seam it needs is a
+// fixed inbox title in notificationTitle, since its payload may omit `title`.
+export const EARLY_LIMIT_RESET_KIND = "early_limit_reset";
 
 // notificationLink is the inbox's deep-link, and it is KIND-CONDITIONAL on purpose.
 //

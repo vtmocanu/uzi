@@ -60,6 +60,27 @@ export function RunDefaults() {
     }
   };
 
+  const [earlyResetBusy, setEarlyResetBusy] = useState(false);
+  const [earlyResetError, setEarlyResetError] = useState("");
+
+  // PRD #1020: the per-user opt-in for the early-limit-reset Slack alert. Its own
+  // busy/error pair rather than sharing wait-on-limit's — independent writes to
+  // independent endpoints, and one failing must not disable or blame the other.
+  const toggleNotifyEarlyReset = async (enabled: boolean) => {
+    setEarlyResetError("");
+    setEarlyResetBusy(true);
+    try {
+      await api.setNotifyEarlyReset(enabled);
+      // Same reason as wait-on-limit: re-read the session so useAuth().user carries
+      // the new default everywhere it is read.
+      await refresh();
+    } catch (err) {
+      setEarlyResetError(errorMessage(err, "Failed to update the early-reset alert"));
+    } finally {
+      setEarlyResetBusy(false);
+    }
+  };
+
   const [judgeBusy, setJudgeBusy] = useState(false);
   const [judgeError, setJudgeError] = useState("");
 
@@ -393,6 +414,28 @@ export function RunDefaults() {
           />
           <span className="text-fg">Pause my new runs on a usage limit instead of failing them</span>
         </label>
+
+        {/* PRD #1020: the early-limit-reset Slack alert opt-in. On the SAME usage-limits
+            surface because it is the other thing that happens around your Anthropic
+            window. Default ON — a field-absent user renders CHECKED, matching the DB
+            default rather than assuming OFF. Independent write from the pause default
+            above, so its own busy/error pair. */}
+        {earlyResetError && <Alert message={earlyResetError} />}
+
+        <label className="flex items-center gap-3 text-sm">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={user?.notify_early_limit_reset ?? true}
+            disabled={earlyResetBusy}
+            onChange={(e) => toggleNotifyEarlyReset(e.target.checked)}
+          />
+          <span className="text-fg">Alert me when my 7-day limit resets early</span>
+        </label>
+        <p className="text-sm text-faint">
+          Sends a Slack DM when your weekly Anthropic limit reopens more than 8 hours before
+          its expected reset. On by default; needs a linked Slack account to reach you.
+        </p>
       </Card>
 
       <Card className="space-y-4">
