@@ -319,6 +319,17 @@ func TestCIAutofixCandidateFailureSpellingsLiveDB(t *testing.T) {
 	insertRun("agent/issue-103", 103, 203)
 	insertPipeline("agent/issue-103", 7103, "error")
 
+	// Negative boundary: two branches eligible in every other way (same owner, token,
+	// opt-in, non-default branch, mr_iid) but whose pipeline status is a deliberate
+	// NON-failure — 'cancelled' (a human cancel) and 'success' (a pass). Neither is a
+	// failure, so neither may surface as a candidate. Guards the ps.status IN (...)
+	// list against a future accidental superset.
+	notCandidates := []string{"agent/issue-104", "agent/issue-105"}
+	insertRun("agent/issue-104", 104, 204)
+	insertPipeline("agent/issue-104", 7104, "cancelled")
+	insertRun("agent/issue-105", 105, 205)
+	insertPipeline("agent/issue-105", 7105, "success")
+
 	cands, err := q.ListCIAutofixCandidateRefs(ctx, repoID)
 	if err != nil {
 		t.Fatalf("ListCIAutofixCandidateRefs: %v", err)
@@ -334,6 +345,12 @@ func TestCIAutofixCandidateFailureSpellingsLiveDB(t *testing.T) {
 		if got[ref] != pid {
 			t.Errorf("branch %q with a non-GitLab failure spelling must be a candidate (pipeline_id %d), got %d — the ps.status predicate hardcodes GitLab's \"failed\" spelling",
 				ref, pid, got[ref])
+		}
+	}
+	for _, ref := range notCandidates {
+		if _, ok := got[ref]; ok {
+			t.Errorf("branch %q has a NON-failure pipeline status (cancelled/success) and must NOT be an auto-fix candidate — the ps.status IN (...) predicate has become a superset of the failure set",
+				ref)
 		}
 	}
 }
