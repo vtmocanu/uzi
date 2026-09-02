@@ -553,6 +553,13 @@ rm -f "$RUNROOT/.keep-rundir"; rm -rf "$RUNROOT/artifacts"
 MARGINS_FILE="$RUNROOT/wait-margins.tsv"
 : > "$MARGINS_FILE"
 
+# Shared scratch path for the run_printed_instructions helper (below), used by the
+# printed-instructions-menu (37) and review-row-cap (39) phases. Defined here as a
+# top-level global so it reaches EVERY such phase across PRD #966's per-phase subshells;
+# a phase-local assignment (37 used to set it) dies with that subshell and leaves 39's
+# call reading an unbound var under `set -u`.
+PRINTED_OUT="$RUNROOT/.printed-instruction.out"
+
 # Self-signed cert for forge-fake.e2e (trusted by api/worker/git in the overlay).
 cat > "$RUNROOT/certs/openssl.cnf" <<'EOF'
 [req]
