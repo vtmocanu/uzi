@@ -2902,7 +2902,7 @@ func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issue
 		// benign. Mirrors forgesvc.ProjectSyncService.launchSeed's recover idiom.
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("checkpoint cleanup: delete panicked", "run", runID, "branch", branch, "panic", r)
+				slog.Error("checkpoint cleanup: delete panicked", "run", runID, "branch", branch, "panic", secretscrub.Scrub(fmt.Sprint(r)))
 			}
 		}()
 		// Detached from the request/report ctx (which is already returning to the
