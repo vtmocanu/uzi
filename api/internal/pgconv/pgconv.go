@@ -23,6 +23,7 @@
 package pgconv
 
 import (
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -109,13 +110,22 @@ func BoolPtr(p *bool) pgtype.Bool {
 }
 
 // Int4Ptr maps a nil pointer to SQL NULL; a non-nil pointer is valid with its
-// pointee narrowed to int32.
+// pointee narrowed to int32. A value outside the int32 range is saturated to the
+// representable bound (math.MinInt32 / math.MaxInt32) rather than silently wrapping
+// — the explicit bound also makes the cast provable to gosec G115 / CodeQL
+// go/incorrect-integer-conversion. The sole caller (worker concurrency cap) is
+// already validated to a small band, so the saturation arms are unreachable today.
 func Int4Ptr(p *int) pgtype.Int4 {
 	if p == nil {
 		return pgtype.Int4{}
 	}
-	//nolint:gosec // G115: caller-scoped small ints (worker capacity), never near int32 range
-	return pgtype.Int4{Int32: int32(*p), Valid: true}
+	v := *p
+	if v > math.MaxInt32 {
+		v = math.MaxInt32
+	} else if v < math.MinInt32 {
+		v = math.MinInt32
+	}
+	return pgtype.Int4{Int32: int32(v), Valid: true}
 }
 
 // Int4Ptr32 maps a nil pointer to SQL NULL; a non-nil pointer is valid with its

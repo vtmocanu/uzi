@@ -1,6 +1,7 @@
 package pgconv
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -262,6 +263,9 @@ func TestInt4Ptr(t *testing.T) {
 		{"nil is null", nil, false, 0},
 		{"zero value is valid", ptr(0), true, 0},
 		{"normal", ptr(7), true, 7},
+		{"max int32 kept", ptr(math.MaxInt32), true, math.MaxInt32},
+		{"above max saturates", ptr(math.MaxInt32 + 1), true, math.MaxInt32},
+		{"below min saturates", ptr(math.MinInt32 - 1), true, math.MinInt32},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
