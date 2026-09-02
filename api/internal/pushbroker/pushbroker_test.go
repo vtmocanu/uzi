@@ -341,6 +341,96 @@ func TestPublishAdvancesCheckpointNonForced(t *testing.T) {
 	}
 }
 
+// TestPublishSameTipTwiceReportsSuccess is the PRD #1030 M1 resume scenario: a run
+// resumed on a cold worker with lastPublishedTip reset and NO new commits re-declares
+// the tip origin's checkpoint ref already holds. Re-publishing the SAME tip must be a
+// genuine SUCCESS (nil error → Published=true at the caller), NOT ErrNotDescendant —
+// otherwise the worker emits a misleading "checkpoint publish skipped: not_descendant"
+// feed line every interval and never advances lastPublishedTip. Before the fix the
+// strict-descendant check ran first and returned ErrNotDescendant (base == declared.Hash),
+// so the already-up-to-date short-circuit was dead code; this pins it reachable.
+func TestPublishSameTipTwiceReportsSuccess(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	tip := f.commit("b.txt", "one\n", "c1")
+
+	opts := pushbroker.Options{
+		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip, Pack: f.pack(tip, base),
+	}
+	if _, err := pushbroker.Publish(context.Background(), opts); err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	ref := "refs/uzi-checkpoints/main"
+	if got := f.originRef(ref); got != tip {
+		t.Fatalf("checkpoint = %q, want tip %q", got, tip)
+	}
+
+	// Re-publish the SAME tip; origin's checkpoint ref already equals it.
+	res, err := pushbroker.Publish(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("second Publish of same tip = %v; want success (not a not_descendant skip)", err)
+	}
+	if res.Ref != ref {
+		t.Fatalf("ref = %q, want %q", res.Ref, ref)
+	}
+	if got := f.originRef(ref); got != tip {
+		t.Fatalf("checkpoint changed on same-tip re-publish: got %q, want unchanged %q", got, tip)
+	}
+}
+
+// TestPublishNeverForcesDivergedCheckpoint pins the never-forced invariant at the
+// Publish level: if origin's checkpoint ref is moved OUT-OF-BAND to a commit X the
+// declared tip does not descend, Publish must skip (ErrNotDescendant) AND leave origin's
+// ref STILL pointing at X — never force-moving a diverged checkpoint. (The pure wire-CAS
+// race between fetch and forward is not reproducible in the file:// harness; this covers
+// the reachable local strict-descendant + never-clobber guarantee.)
+func TestPublishNeverForcesDivergedCheckpoint(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	tip1 := f.commit("b.txt", "one\n", "c1")
+
+	// Create the checkpoint ref at tip1.
+	if _, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip1, Pack: f.pack(tip1, base),
+	}); err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	ref := "refs/uzi-checkpoints/main"
+	if got := f.originRef(ref); got != tip1 {
+		t.Fatalf("checkpoint = %q, want tip1 %q", got, tip1)
+	}
+
+	// Out of band, move origin's checkpoint ref to a DIVERGENT commit X (a sibling off
+	// base that does not descend tip1) via a force-push against the bare — simulating a
+	// concurrent/rogue mover. The force-push also transfers X's objects into origin.
+	f.git("checkout", "-b", "fork", base)
+	x := f.commit("x.txt", "divergent\n", "x")
+	f.git("push", "origin", "--force", "fork:"+ref)
+	if got := f.originRef(ref); got != x {
+		t.Fatalf("out-of-band setup failed: checkpoint = %q, want X %q", got, x)
+	}
+
+	// Declare a tip that descends tip1 but NOT X.
+	f.git("checkout", "main")
+	tip2 := f.commit("c.txt", "two\n", "c2")
+
+	_, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip2, Pack: f.pack(tip2, tip1),
+	})
+	if err == nil {
+		t.Fatal("Publish accepted a tip that does not descend the diverged checkpoint; want ErrNotDescendant")
+	}
+	if !isNotDescendant(err) {
+		t.Fatalf("err = %v, want ErrNotDescendant", err)
+	}
+	// CRUCIAL never-forced assertion: the diverged checkpoint ref was NOT clobbered.
+	if got := f.originRef(ref); got != x {
+		t.Fatalf("diverged checkpoint was force-moved: got %q, want unchanged X %q", got, x)
+	}
+}
+
 func TestPublishRejectsNonDescendantAndDoesNotMoveRef(t *testing.T) {
 	f := newGitFixture(t)
 	base := f.commit("a.txt", "base\n", "base")

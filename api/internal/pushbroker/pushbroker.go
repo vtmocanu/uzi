@@ -220,6 +220,24 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	branchTip := resolveHash(repo, branchRef)
 	checkpointTip := resolveHash(repo, checkpointRef)
 
+	// Already up to date: origin's checkpoint ref ALREADY points at exactly the declared
+	// tip. This is a genuine SUCCESS — "the checkpoint ref already reflects your tip" — so
+	// it returns (result, nil), which the caller maps to Published=true, advances
+	// lastPublishedTip on, and stops re-attempting. This is the resume scenario PRD #1030
+	// M1 targets: a run resumed on a cold worker with lastPublishedTip reset and no new
+	// commits re-declares the tip origin already holds.
+	//
+	// The check MUST sit BEFORE the strict-descendant check (step 5): there base ==
+	// checkpointTip == the declared tip, and strictDescends returns (false, nil) for
+	// base == declared.Hash, which would otherwise misreport an already-current tip as
+	// ErrNotDescendant (a "skipped: not_descendant" feed line every interval). No pack
+	// apply or tip-presence check is needed first: origin already holds the tip AT the
+	// checkpoint ref, so its presence is proven and there is nothing to advance. tipHash
+	// is non-zero (guarded above), so this fires only for a real, matching checkpoint ref.
+	if checkpointTip == tipHash {
+		return result, nil
+	}
+
 	// Step 3: apply the received pack into the SAME storer, from a FRESH reader (the
 	// budget pre-pass consumed its own reader). The base objects from step 2 provide
 	// the parent chain for the worker's (non-thin) delta pack.
@@ -289,12 +307,9 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// compare-and-swap in agreement, so a refs/uzi-checkpoints/* ref — which is NOT under
 	// refs/heads and so is NOT protected by the remote's denyNonFastForwards — can never
 	// be force-moved by a mismatch between the two advertisements.
-	if checkpointTip == tipHash {
-		// Already up to date: origin's checkpoint already points at the declared tip. An
-		// empty command set fails ReferenceUpdateRequest.validate(), so short-circuit
-		// BEFORE building/sending the request.
-		return result, nil
-	}
+	// The already-up-to-date case (checkpointTip == tipHash) returned success far above,
+	// before the pack apply and ancestry checks, so by here the declared tip strictly
+	// descends the fetched checkpoint tip and there is a real update to forward.
 	pushErr := forwardPack(ctx, remote, auth, checkpointRef, checkpointTip, tipHash, o.Pack)
 	switch {
 	case pushErr == nil:
