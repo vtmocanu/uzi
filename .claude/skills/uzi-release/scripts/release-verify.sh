@@ -105,13 +105,16 @@ else
   # Expected signatures = the signing steps that actually ran (success), NOT a hardcoded
   # 6. On an app-only release the publish-agent jobs re-tag the prior signed digest and
   # SKIP signing (release.yml gates the Sign step `if reuse != 'true'`), so a correct
-  # release can sign as few as 4 (api/web/controller/chart). Match both signing-step
-  # names ("Sign image (cosign keyless)" and "Package + push + sign chart") while
-  # EXCLUDING the "cosign-installer" setup step, which also contains "sign". Require the
-  # log's "Pushing signature to:" lines to match. (No --paginate: a release run has far
-  # fewer than one page of jobs.)
+  # release can sign as few as 4 (api/web/controller/chart). Match the two signing-step
+  # names DIRECTLY ("Sign image (cosign keyless)" and "Package + push + sign chart").
+  # Do NOT match on a bare "sign" and exclude "installer": the cosign install step is
+  # named "Run ./.github/actions/install-cosign", which contains "cosign" (so it matches
+  # "sign") but NOT "installer", so that exclusion missed it and double-counted every job
+  # (12 vs 6, false FAIL — measured v0.75.0, 2026-09-02). Require the log's "Pushing
+  # signature to:" lines to match. (No --paginate: a release run has far fewer than one
+  # page of jobs.)
   expected="$(gh api "repos/${OWNER}/${REPO}/actions/runs/${RELRUN}/jobs" \
-    --jq '[.jobs[].steps[] | select((.name|test("sign";"i")) and ((.name|test("installer";"i"))|not) and .conclusion=="success")] | length' 2>/dev/null)"
+    --jq '[.jobs[].steps[] | select((.name|test("sign image|sign chart";"i")) and .conclusion=="success")] | length' 2>/dev/null)"
   expected="${expected:-0}"
   sigs="$(gh run view "$RELRUN" --log 2>/dev/null | grep -cF 'Pushing signature to:')"
   sigs="${sigs:-0}"
