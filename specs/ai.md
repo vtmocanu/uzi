@@ -16289,7 +16289,7 @@ is one new read plus one normalization, and each has exactly one correctness pro
   said, and `pendingJudgeToDTO` applies the mapping — so a second consumer cannot invent
   a third spelling, and the closed union is a server promise the clients may lean on
   rather than a convention each re-derives. The CLI's own phrase mapper
-  (`pendingJudgePhrase`, `cmd/uzi/run.go`) defaults in the same direction for a different
+  (`pendingJudgePhrase`, `cmd/uzi/review_render.go`) defaults in the same direction for a different
   reason: an old CLI against a new server is the deployment order this repo ships in, and
   the failure to avoid is a blank phrase in `run r1: judge `.
 
@@ -22001,7 +22001,7 @@ Decision Log; this is the terse contract.
 
 - **Surfacing.** The run DTO (`api/internal/apitypes/run.go`) carries
   `required_capabilities`/`required_tools`/`size_class`; the web plan-gate readiness summary renders
-  them with an override button; the CLI (`api/cmd/uzi/run.go`, `uzi run get`) shows them in its rows.
+  them with an override button; the CLI (`api/cmd/uzi/run_render.go`, `uzi run get`) shows them in its rows.
 
 ## 566. PRD #517 — interactive, long-lived task runs: opt-in park at a new `awaiting_followup`, `run stop` wind-down, worker-side idle backstop
 
