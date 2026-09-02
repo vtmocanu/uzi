@@ -7,7 +7,7 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  forge_connections.forge_type gitlab->forgejo (test DB, :30); +1 forgejo connection row via connect POST (:82); $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (:162)+recreates api; fake forgejo-version pinned 15.0.4
+# mutates:  forge_connections.forge_type gitlab->forgejo (test DB); +1 forgejo connection row via connect POST; $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (recreates api); fake forgejo-version pinned 15.0.4 in both <16 legs
 # restores: fake forgejo-version->16.0.0 (explicit restores + EXIT-trap fail-safe)
 # PRD #65 M9 — the Forgejo lane (UZI_E2E_FORGE=forgejo). A FOCUSED lifecycle
 # against the same fake's /api/v1 table, run INSTEAD of the GitLab suite. Skipped
@@ -49,6 +49,12 @@ pass "forgejo connection reports least-privilege ✓ (VerifyToken + D6/D6b via t
 #    version-downgrade finding (D4 + forge.ErrForgeVersionUnsupported), not the
 #    generic "could not verify token".
 say "forgejo version gate: a < 16.0.0 server is refused with the downgrade finding"
+# Fail-safe covering BOTH <16 legs below (this db-flip leg and the connect-POST leg
+# further down): each pins the fake to 15.0.4 and can `fail` on its asserts before the
+# explicit restore. Restore 16.0.0 on ANY exit so a mid-leg fail can't strand the fake
+# at 15.0.4 for every later forgejo-lane phase. The explicit restores reset it between
+# legs; `trap - EXIT` drops this once the last leg's restore has run.
+trap 'fake_post /_e2e/forgejo-version '\''{"version":"16.0.0+gitea-1.22.0"}'\'' >/dev/null 2>&1 || true' EXIT
 fake_post /_e2e/forgejo-version '{"version":"15.0.4+gitea-1.22.0"}' >/dev/null
 FJDOWN="$(apipost "/api/forge/connections/$CONN_ID/privilege-check" '')"
 echo "$FJDOWN" | jq -e '.report.status == "error"' >/dev/null 2>&1 \
@@ -84,11 +90,7 @@ GC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e",
 [ "$(jq -r '.connection.forge_type // empty' "$FJGOOD")" = forgejo ] || fail "created connection is not forge_type=forgejo: $(cat "$FJGOOD")"
 pass "forgejo connect POST created a connection against a good >=16 instance (VerifyToken + scope gate pass) ✓"
 # b) < 16.0.0 -> refused at VerifyToken's version gate (not created).
-fake_post /_e2e/forgejo-version '{"version":"15.0.4+gitea-1.22.0"}' >/dev/null
-# Fail-safe: a `fail` in this <16 leg (the connect POST at :90, or the version-finding
-# assert at :99) would otherwise strand the fake pinned at 15.0.4 for every later
-# forgejo-lane phase. Restore 16.0.0 on ANY exit; the explicit restore below clears it.
-trap 'fake_post /_e2e/forgejo-version '\''{"version":"16.0.0+gitea-1.22.0"}'\'' >/dev/null 2>&1 || true' EXIT
+fake_post /_e2e/forgejo-version '{"version":"15.0.4+gitea-1.22.0"}' >/dev/null   # 2nd <16 leg; EXIT trap already armed above
 FJLOW="$RUNROOT/fj-low.json"
 LC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-good-pat-000000"}' "$FJLOW")"
 case "$LC" in 2*) fail "forgejo connect against a <16 instance must be refused, got $LC ($(cat "$FJLOW"))";; esac

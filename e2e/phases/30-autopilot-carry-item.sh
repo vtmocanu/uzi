@@ -8,11 +8,11 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  uzi_label/autopilot_label (raced at :19-20, restored :31); registers user2 + forge connection CONN2 (:37,:40)
-# restores: uzi_label/autopilot_label->defaults (:31)
+# mutates:  uzi_label/autopilot_label (raced by the concurrent PUTs, restored to defaults below); registers user2 + forge connection CONN2
+# restores: uzi_label/autopilot_label->defaults (admin settings PUT after the race)
 # --- autopilot #4: carry-item e2e (settings race + username collision) -------
 # CROSS-PHASE DEPENDENCY (documented, deliberately NOT a `requires:`): the 409
-# collision below (:45-49) relies on 29-autopilot-lifecycle having mapped owner-alice.
+# collision below (the user2 forge-connection PUT) relies on 29-autopilot-lifecycle having mapped owner-alice.
 # That is DB state (a hardcoded literal 'owner-alice', not a round-tripped shell var),
 # so `requires:` — which only validates shell vars / env lines — cannot express it.
 # user2/JAR2/CONN2 are all set in-phase, so nothing here round-trips either.
