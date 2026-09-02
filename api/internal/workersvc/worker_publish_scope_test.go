@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -142,5 +143,57 @@ func TestPublishPersistsTipOnEverySuccessAndNotOnSkip(t *testing.T) {
 	}
 	if len(fs.checkpointTips) != 2 {
 		t.Fatalf("after benign skip: SetRunCheckpointTip called %d time(s) total, want 2 (a skip must not persist)", len(fs.checkpointTips))
+	}
+}
+
+// TestPublishSucceedsDespiteTipPersistError pins PRD #1042 M2's best-effort property in the
+// err == nil arm: the runs.checkpoint_tip persist is fire-and-log, so a SetRunCheckpointTip
+// error must NOT fail the publish — the checkpoint ref is already advanced on the forge, so
+// the CAS-accepted advance still returns Published=true and a nil error. This is the only
+// test that drives fakeStore.checkpointTipErr non-nil, exercising the perr != nil branch; it
+// would fail if the err == nil arm were changed to propagate the persist error.
+func TestPublishSucceedsDespiteTipPersistError(t *testing.T) {
+	box := newBox(t)
+	sealed, err := box.Seal([]byte("pat"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	fs := &fakeStore{
+		runOwned: store.Run{
+			Kind:     runkind.Issue,
+			IssueIid: pgtype.Int8{Int64: 456, Valid: true},
+			Branch:   pgtype.Text{},
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl:      "https://gitlab.example.com/team/repo",
+			DefaultBranch:   pgtype.Text{String: "main", Valid: true},
+			BaseUrl:         "https://gitlab.example.com",
+			BotUsername:     "uzi-bot",
+			TokenCiphertext: sealed,
+		},
+		// Force the best-effort persist to fail on every SetRunCheckpointTip call.
+		checkpointTipErr: errors.New("boom"),
+	}
+	svc := New(fs, box, testParams())
+	svc.SetForgeBaseURLAllowed(func(u string) bool { return u == "https://gitlab.example.com" })
+	// A CAS-accepted advance (publishFn returns nil), exactly like the success case above.
+	svc.SetPublishFn(func(context.Context, pushbroker.Options) (pushbroker.Result, error) {
+		return pushbroker.Result{}, nil
+	})
+
+	res, err := svc.Publish(context.Background(), worker(), uuid.New(), "0123456789abcdef0123456789abcdef01234567", []byte("pack"))
+	// A persist failure must NOT fail the publish: the ref is already advanced on the forge.
+	if err != nil {
+		t.Fatalf("Publish returned a non-nil error when only the tip persist failed: %v (a persist failure must not fail the publish)", err)
+	}
+	if !res.Published {
+		t.Errorf("Published = false despite a CAS-accepted advance, want true (persist error is best-effort)")
+	}
+	if res.Ref != "refs/uzi-checkpoints/agent/issue-456" {
+		t.Errorf("Ref = %q, want the server-derived checkpoint ref", res.Ref)
+	}
+	// The persist WAS attempted (and errored) — the err == nil arm still tries the write.
+	if len(fs.checkpointTips) != 1 {
+		t.Errorf("SetRunCheckpointTip called %d time(s), want 1 (the err == nil arm attempts the best-effort persist)", len(fs.checkpointTips))
 	}
 }
