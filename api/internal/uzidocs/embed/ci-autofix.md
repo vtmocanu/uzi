@@ -88,6 +88,18 @@ guard above) is stubbed on Forgejo and GitHub: they have no equivalent
 per-project setting today, so the guard there falls back to the default
 protected-path globs.
 
+On GitHub, an agent-MR branch's CI is exposed through check-runs / check-suites
+on the head commit rather than the Actions workflow-runs list; when that list
+comes up empty, the GitHub driver now falls back to the head commit's
+check-runs (recovering the underlying Actions workflow run when possible), so
+a GitHub Actions branch gets a real pipeline status instead of reading as "no
+pipeline" — this is what lets the loop guard above evaluate and lets automatic
+CI fixes trigger for GitHub Actions CI. That fixes pipeline *detection*, not
+end-to-end validation: automatic CI-fix on GitHub is still unvalidated
+end-to-end, and for CI run by something other than GitHub Actions, detection
+works from check-runs but the failure snapshot a fix run reads (job logs)
+stays Actions-only, so a fix attempt there has less to go on.
+
 ## Good to know
 
 - **Never your default branch.** Only a branch an agent run of yours
