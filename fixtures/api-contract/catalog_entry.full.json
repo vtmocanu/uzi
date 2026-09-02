@@ -1,0 +1,19 @@
+{
+  "slug": "x",
+  "name": "x",
+  "description": "x",
+  "target": "x",
+  "cron": "x",
+  "timezone": "x",
+  "model": "x",
+  "prompt": "x",
+  "selector_kind": "x",
+  "labels": [
+    "x"
+  ],
+  "guidance": "x",
+  "max_issues": 1,
+  "auto_approve": true,
+  "wait_on_limit": true,
+  "mr_rework_enabled": true
+}

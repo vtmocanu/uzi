@@ -1,0 +1,8 @@
+{
+  "settings": null,
+  "secrets": null,
+  "sources": null,
+  "slack_status": "",
+  "oidc_status": "",
+  "oidc_provider_name": ""
+}

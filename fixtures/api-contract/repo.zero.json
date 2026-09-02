@@ -1,0 +1,19 @@
+{
+  "id": "",
+  "connection_id": "",
+  "forge_project_id": 0,
+  "path_with_namespace": "",
+  "web_url": "",
+  "default_branch": null,
+  "enabled": false,
+  "repo_skills_enabled": false,
+  "repo_claudemd_enabled": false,
+  "repo_devbox_opt_in": false,
+  "repo_fold_improve_uzi_backlog": false,
+  "required_capabilities": null,
+  "pipeline": null,
+  "guardrail_override": null,
+  "guardrail_blocked": false,
+  "docker_allowlisted": false,
+  "docker_blocked": false
+}

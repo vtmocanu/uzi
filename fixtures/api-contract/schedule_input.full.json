@@ -1,0 +1,22 @@
+{
+  "target": "x",
+  "repo_id": "x",
+  "issue_iid": 1,
+  "labels": [
+    "x"
+  ],
+  "prompt": "x",
+  "timing": "x",
+  "cron_expr": "x",
+  "run_at": "2020-01-02T03:04:05Z",
+  "timezone": "x",
+  "auto_approve": true,
+  "wait_on_limit": true,
+  "mr_rework_enabled": true,
+  "enabled": true,
+  "max_issues": 1,
+  "guidance": "x",
+  "model": "x",
+  "override_subagent_model": true,
+  "sibling_group_id": "x"
+}

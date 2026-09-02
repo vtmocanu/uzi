@@ -1,0 +1,14 @@
+{
+  "settings": {
+    "x": "x"
+  },
+  "secrets": {
+    "x": true
+  },
+  "sources": {
+    "x": "x"
+  },
+  "slack_status": "x",
+  "oidc_status": "x",
+  "oidc_provider_name": "x"
+}

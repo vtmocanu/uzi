@@ -1,0 +1,126 @@
+{
+  "id": "x",
+  "repo_id": "x",
+  "forge_type": "x",
+  "kind": "x",
+  "issue_iid": 1,
+  "issue_title": "x",
+  "issue_description": "x",
+  "has_prd_link": true,
+  "title": "x",
+  "resume_of_run_id": "x",
+  "status": "x",
+  "requeue_count": 1,
+  "iteration_count": 1,
+  "is_planning": true,
+  "auto_approve": true,
+  "trigger_source": "x",
+  "milestones": [
+    {
+      "id": "x",
+      "title": "x"
+    }
+  ],
+  "milestones_candidate": [
+    {
+      "id": "x",
+      "title": "x"
+    }
+  ],
+  "milestones_completed": [
+    "x"
+  ],
+  "milestones_in_progress": [
+    "x"
+  ],
+  "budget_max_iterations": 1,
+  "budget_wall_seconds": 1,
+  "scope_ceiling": 1,
+  "worker_id": "x",
+  "branch": "x",
+  "base_branch": "x",
+  "open_mr": true,
+  "interactive": true,
+  "dispatched_at": "2020-01-02T03:04:05Z",
+  "mr_iid": 1,
+  "mr_web_url": "x",
+  "branch_has_active_run": true,
+  "branch_has_open_mr": true,
+  "issue_web_url": "x",
+  "mr_state": "x",
+  "failure_reason": "x",
+  "stop_kind": "x",
+  "stop_reason": "x",
+  "health": "x",
+  "health_reason": "x",
+  "health_since": "2020-01-02T03:04:05Z",
+  "plan_md": "x",
+  "plan_source": "x",
+  "summary_intent": "x",
+  "summary_plan": "x",
+  "summary_deltas": [
+    {
+      "kind": "x",
+      "text": "x"
+    }
+  ],
+  "pipeline_ref": "x",
+  "pipeline_web_url": "x",
+  "fix_verdict": "x",
+  "report_only": true,
+  "report_md": "x",
+  "preserved_patch": "x",
+  "prd_done_path": "x",
+  "prd_patch_settled_at": "2020-01-02T03:04:05Z",
+  "claimed_at": "2020-01-02T03:04:05Z",
+  "started_at": "2020-01-02T03:04:05Z",
+  "finished_at": "2020-01-02T03:04:05Z",
+  "created_at": "2020-01-02T03:04:05Z",
+  "updated_at": "2020-01-02T03:04:05Z",
+  "repo_agents": [
+    {
+      "name": "x",
+      "description": "x"
+    }
+  ],
+  "agent_source": "x",
+  "agent_exclusions": [
+    "x"
+  ],
+  "own_agents": [
+    {
+      "name": "x",
+      "description": "x"
+    }
+  ],
+  "anthropic_secret_id": "x",
+  "anthropic_secret_label": "x",
+  "anthropic_select_reason": "x",
+  "anthropic_headroom_pct": 1,
+  "usage": {
+    "input_tokens": 1,
+    "cache_read_tokens": 1,
+    "cache_creation_tokens": 1,
+    "output_tokens": 1,
+    "cost_usd": 1.5
+  },
+  "wait_on_limit": true,
+  "mr_rework_enabled": true,
+  "limit_resets_at": "2020-01-02T03:04:05Z",
+  "retry_not_before": "2020-01-02T03:04:05Z",
+  "limit_wait_count": 1,
+  "rate_limit_type": "x",
+  "model": "x",
+  "override_subagent_model": true,
+  "priority": "x",
+  "required_capabilities": [
+    "x"
+  ],
+  "required_tools": [
+    "x"
+  ],
+  "size_class": "x",
+  "plan_changed_files": [
+    "x"
+  ]
+}

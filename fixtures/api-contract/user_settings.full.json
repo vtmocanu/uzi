@@ -1,0 +1,11 @@
+{
+  "default_model": "x",
+  "default_effort": "x",
+  "judge_model": "x",
+  "summary_model": "x",
+  "theme": "x",
+  "mr_rework_enabled": true,
+  "sidebar_token_ids": [
+    "x"
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "id": "x",
+  "connection_id": "x",
+  "forge_project_id": 1,
+  "path_with_namespace": "x",
+  "web_url": "x",
+  "default_branch": "x",
+  "enabled": true,
+  "repo_skills_enabled": true,
+  "repo_claudemd_enabled": true,
+  "repo_devbox_opt_in": true,
+  "repo_fold_improve_uzi_backlog": true,
+  "required_capabilities": [
+    "x"
+  ],
+  "pipeline": {
+    "ref": "x",
+    "status": "x",
+    "web_url": "x",
+    "pipeline_id": 1,
+    "synced_at": "2020-01-02T03:04:05Z"
+  },
+  "guardrail_override": {
+    "reason": "x",
+    "by": "x",
+    "at": "2020-01-02T03:04:05Z"
+  },
+  "guardrail_blocked": true,
+  "docker_allowlisted": true,
+  "docker_blocked": true,
+  "github_project_sync": {
+    "linked": true,
+    "healthy": true,
+    "last_error": "x",
+    "last_synced_at": "2020-01-02T03:04:05Z"
+  }
+}

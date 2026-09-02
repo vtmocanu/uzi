@@ -1,0 +1,18 @@
+{
+  "id": "x",
+  "name": "x",
+  "description": "x",
+  "model": "x",
+  "tools": [
+    "x"
+  ],
+  "prompt_body": "x",
+  "is_builtin": true,
+  "scope": "x",
+  "user_id": "x",
+  "updated_by": "x",
+  "origin": "x",
+  "differs_from_builtin": true,
+  "created_at": "2020-01-02T03:04:05Z",
+  "updated_at": "2020-01-02T03:04:05Z"
+}

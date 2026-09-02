@@ -1,0 +1,7 @@
+{
+  "input_tokens": 1,
+  "cache_read_tokens": 1,
+  "cache_creation_tokens": 1,
+  "output_tokens": 1,
+  "cost_usd": 1.5
+}

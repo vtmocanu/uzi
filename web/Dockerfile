@@ -38,6 +38,12 @@ COPY docs/ /app/docs/
 # viewer bundles docs/: web/src/lib/changelog.ts resolves `../../../CHANGELOG.md`,
 # which lands at /app/CHANGELOG.md only if this sibling layout is preserved here.
 COPY CHANGELOG.md /app/CHANGELOG.md
+# The API-contract tests (web/src/lib/apiContract.test.ts) import the recorded wire
+# fixtures as typed JSON modules (compile-time keyof/typeof checks), resolving
+# `../../../fixtures/api-contract/*.json`, which lands at /app/fixtures/api-contract/
+# only if this sibling layout is preserved here. `tsc --noEmit` (in `npm run build`)
+# typechecks the test files, so a missing fixtures dir fails the build with TS2307.
+COPY fixtures/api-contract/ /app/fixtures/api-contract/
 RUN npm run build
 
 # --- runtime stage ---

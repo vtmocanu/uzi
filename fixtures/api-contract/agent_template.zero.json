@@ -1,0 +1,16 @@
+{
+  "id": "",
+  "name": "",
+  "description": "",
+  "model": null,
+  "tools": null,
+  "prompt_body": "",
+  "is_builtin": false,
+  "scope": "",
+  "user_id": null,
+  "updated_by": null,
+  "origin": null,
+  "differs_from_builtin": false,
+  "created_at": "0001-01-01T00:00:00Z",
+  "updated_at": "0001-01-01T00:00:00Z"
+}

@@ -1,0 +1,20 @@
+{
+  "target": "",
+  "repo_id": "",
+  "issue_iid": null,
+  "labels": null,
+  "prompt": "",
+  "timing": "",
+  "cron_expr": "",
+  "run_at": null,
+  "timezone": "",
+  "auto_approve": null,
+  "wait_on_limit": null,
+  "mr_rework_enabled": null,
+  "enabled": null,
+  "max_issues": null,
+  "guidance": null,
+  "model": null,
+  "override_subagent_model": null,
+  "sibling_group_id": null
+}
