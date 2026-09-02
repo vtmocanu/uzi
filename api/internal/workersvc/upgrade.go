@@ -599,6 +599,7 @@ func (s *Service) RecordRollHealth(ctx context.Context, rep RollHealthReport) (i
 	})
 }
 
+// pgInt4 converts a positive integer to a valid PostgreSQL int4 value and represents nonpositive values as null.
 func pgInt4(v int) pgtype.Int4 {
 	if v <= 0 {
 		return pgtype.Int4{}

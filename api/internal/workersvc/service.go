@@ -2188,7 +2188,8 @@ func (s *Service) maybeTeardownEphemeral(ctx context.Context, wkr store.Worker, 
 //     WIPE a prior tool set; leaving it nil makes the query keep the existing column.
 //     The worker only emits required_tools when non-empty, so this loses no behaviour.
 //   - sizeClass: clamped to the {s,m,l} vocabulary; an absent or off-vocabulary value is
-//     an invalid pgtype.Text (SQL NULL) the query's COALESCE keeps out of the column.
+// inferredRequirementParams filters reported capabilities and tools and accepts only valid size classes.
+// It returns a NULL size class when the reported value is absent or invalid.
 func inferredRequirementParams(req StateRequest) (inferredCaps, inferredTools []string, sizeClass pgtype.Text) {
 	if req.RequiredCapabilities != nil {
 		inferredCaps = capability.Filter(*req.RequiredCapabilities)

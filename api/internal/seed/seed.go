@@ -74,7 +74,9 @@ type ForgeService interface {
 //     retries on the next start.
 //
 // Static misconfiguration (PAT without seed email, non-allowlisted base URL) is
-// already rejected at config.Load, so it cannot reach here.
+// ForgeConnection provisions the configured GitLab connection and repositories for the seed administrator.
+// It leaves an existing matching connection unchanged and logs runtime forge or encryption failures without
+// returning them; database errors are returned.
 func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.Config) error {
 	if cfg.SeedForgePAT == "" {
 		return nil

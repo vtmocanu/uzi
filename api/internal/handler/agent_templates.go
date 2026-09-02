@@ -824,7 +824,7 @@ func storeColumns(def agenttmpl.Definition) (pgtype.Text, []byte, error) {
 // hasControlChar reports whether s contains a rune that would break out of a
 // single frontmatter line: a newline, carriage return, any other control
 // character, or the Unicode replacement character (malformed UTF-8). A plain
-// space is not a control character, so ordinary multi-word text is unaffected.
+// hasControlChar reports whether s contains a control character or the Unicode replacement character.
 func hasControlChar(s string) bool {
 	for _, r := range s {
 		if r == unicode.ReplacementChar || unicode.IsControl(r) {
@@ -835,7 +835,7 @@ func hasControlChar(s string) bool {
 }
 
 // isUniqueViolation reports whether err is a Postgres unique-constraint failure
-// (SQLSTATE 23505).
+// isUniqueViolation reports whether err is a PostgreSQL unique-constraint violation.
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"

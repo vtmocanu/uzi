@@ -30,7 +30,7 @@ import (
 )
 
 // Text builds an ALWAYS-valid pgtype.Text, including for "" (which stores a
-// valid empty string, NOT SQL NULL). Use it when "" is a legitimate value.
+// Text creates a valid PostgreSQL text value, including when s is empty.
 func Text(s string) pgtype.Text {
 	return pgtype.Text{String: s, Valid: true}
 }
@@ -44,7 +44,8 @@ func TextOrNull(s string) pgtype.Text {
 }
 
 // TextPtr maps a nil pointer to SQL NULL; a non-nil pointer is always valid,
-// so &"" produces a VALID empty string (not NULL).
+// TextPtr converts a string pointer to a PostgreSQL text value, using NULL for nil
+// pointers and a valid value for non-nil pointers, including pointers to empty strings.
 func TextPtr(p *string) pgtype.Text {
 	if p == nil {
 		return pgtype.Text{}
@@ -53,7 +54,8 @@ func TextPtr(p *string) pgtype.Text {
 }
 
 // TextPtrOrNull maps both a nil pointer AND a pointer to "" to SQL NULL; any
-// other pointee is valid.
+// TextPtrOrNull converts nil pointers and pointers to empty strings to NULL; other
+// pointed-to strings are returned as valid text.
 func TextPtrOrNull(p *string) pgtype.Text {
 	if p == nil || *p == "" {
 		return pgtype.Text{}
@@ -62,7 +64,7 @@ func TextPtrOrNull(p *string) pgtype.Text {
 }
 
 // UUID builds an ALWAYS-valid pgtype.UUID, including for uuid.Nil (which writes
-// the real all-zero UUID, NOT SQL NULL).
+// UUID constructs a valid PostgreSQL UUID value, including for the all-zero UUID.
 func UUID(u uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: u, Valid: true}
 }
@@ -76,7 +78,8 @@ func UUIDOrNull(u uuid.UUID) pgtype.UUID {
 }
 
 // UUIDPtr maps a nil pointer to SQL NULL; a non-nil pointer is valid with its
-// pointee (including uuid.Nil, which stays a valid all-zero UUID).
+// UUIDPtr converts a UUID pointer to a PostgreSQL UUID value, preserving uuid.Nil as a valid value.
+// A nil pointer produces a NULL value.
 func UUIDPtr(p *uuid.UUID) pgtype.UUID {
 	if p == nil {
 		return pgtype.UUID{}
@@ -85,13 +88,14 @@ func UUIDPtr(p *uuid.UUID) pgtype.UUID {
 }
 
 // Time builds an ALWAYS-valid pgtype.Timestamptz, including the zero time
-// (which is still "valid, present", NOT SQL NULL).
+// Time creates a valid PostgreSQL timestamptz value, including for the zero time.
 func Time(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t, Valid: true}
 }
 
 // TimePtr maps a nil pointer to SQL NULL; a non-nil pointer is valid with its
-// pointee.
+// TimePtr converts a time pointer to a PostgreSQL timestamptz value.
+// A nil pointer produces a NULL value; otherwise, the pointed-to time is valid.
 func TimePtr(p *time.Time) pgtype.Timestamptz {
 	if p == nil {
 		return pgtype.Timestamptz{}
@@ -100,7 +104,7 @@ func TimePtr(p *time.Time) pgtype.Timestamptz {
 }
 
 // BoolPtr maps a nil pointer to SQL NULL; a non-nil pointer is valid with its
-// pointee.
+// BoolPtr converts a boolean pointer to a PostgreSQL boolean value, using NULL for nil pointers.
 func BoolPtr(p *bool) pgtype.Bool {
 	if p == nil {
 		return pgtype.Bool{}
@@ -109,7 +113,9 @@ func BoolPtr(p *bool) pgtype.Bool {
 }
 
 // Int4Ptr maps a nil pointer to SQL NULL; a non-nil pointer is valid with its
-// pointee narrowed to int32.
+// Int4Ptr converts an optional int value to a PostgreSQL int4 value.
+// A nil pointer produces a NULL value; otherwise, the value is narrowed to int32.
+// The returned value is valid when p is non-nil.
 func Int4Ptr(p *int) pgtype.Int4 {
 	if p == nil {
 		return pgtype.Int4{}
@@ -119,7 +125,8 @@ func Int4Ptr(p *int) pgtype.Int4 {
 }
 
 // Int4Ptr32 maps a nil pointer to SQL NULL; a non-nil pointer is valid with its
-// pointee.
+// Int4Ptr32 converts a pointer to an int32 value into a PostgreSQL int4 value.
+// A nil pointer produces a NULL value.
 func Int4Ptr32(p *int32) pgtype.Int4 {
 	if p == nil {
 		return pgtype.Int4{}
@@ -128,7 +135,8 @@ func Int4Ptr32(p *int32) pgtype.Int4 {
 }
 
 // Int8Ptr maps a nil pointer to SQL NULL; a non-nil pointer is valid with its
-// pointee.
+// Int8Ptr converts an int64 pointer to a PostgreSQL int8 value.
+// A nil pointer produces a NULL value; otherwise, the pointee is returned as a valid value.
 func Int8Ptr(p *int64) pgtype.Int8 {
 	if p == nil {
 		return pgtype.Int8{}
@@ -137,7 +145,7 @@ func Int8Ptr(p *int64) pgtype.Int8 {
 }
 
 // Float4Ptr maps a nil pointer to SQL NULL; a non-nil pointer is valid with its
-// pointee narrowed to float32.
+// A nil pointer produces a NULL value.
 func Float4Ptr(p *float64) pgtype.Float4 {
 	if p == nil {
 		return pgtype.Float4{}

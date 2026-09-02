@@ -73,7 +73,8 @@ type Service struct {
 }
 
 // New builds a Service. slack may be nil (delivery is then inbox-only). A
-// non-positive cap falls back to DefaultUserCap.
+// New constructs a notification service with the provided store, Slack notifier, retention cap, and logger.
+// A nil logger uses the default logger, and a non-positive cap uses DefaultUserCap. A nil Slack notifier disables Slack delivery.
 func New(q Store, slack Slacker, cap int, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()

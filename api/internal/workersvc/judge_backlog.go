@@ -80,7 +80,7 @@ const RationalePreviewMaxRunes = 280
 // is CLIENT-side — RunView.tsx renders judge free text as escaped React text — and every
 // consumer of this field must do the same. Escaping here would double-escape in the SPA and
 // print HTML entities into the terminal from `uzi review backlog`. Secrets and control
-// characters were already scrubbed at the review-POST ingest (judge_review.go).
+// rationalePreview limits rationale text to 280 runes and appends an ellipsis when truncation occurs. It trims trailing whitespace from truncated text.
 func rationalePreview(s string) string {
 	runes := []rune(s)
 	if len(runes) <= RationalePreviewMaxRunes {

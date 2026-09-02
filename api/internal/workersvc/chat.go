@@ -601,7 +601,8 @@ const (
 // (unset). max is a small worker paging cap well within int32; the explicit
 // math.MaxInt32 guard on the cast makes it provable to the integer-conversion
 // analyzers (gosec G115 / CodeQL go/incorrect-integer-conversion), mirroring
-// submit.go's scope-ceiling guard. The >MaxInt32 arm is unreachable for these caps.
+// clampLimit applies the default and maximum bounds to a pagination limit.
+// It returns zero when the resulting value cannot be represented as an int32.
 func clampLimit(limit, def, max int) int32 {
 	if limit <= 0 {
 		limit = def

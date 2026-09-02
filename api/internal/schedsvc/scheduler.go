@@ -938,7 +938,7 @@ func nonBlank(in []string) []string {
 }
 
 // isNoRows reports whether err signals "no such row" from the store — the marker
-// that a repo lookup found nothing, i.e. the repo is gone or no longer owned.
+// isNoRows reports whether err indicates that no repository row was found.
 func isNoRows(err error) bool {
 	return errors.Is(err, pgx.ErrNoRows)
 }

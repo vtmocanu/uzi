@@ -503,7 +503,7 @@ func limitFailureReason(rateLimitType *string, resetsAt *time.Time, detail strin
 // an exact-value assertion rather than a range check.
 //
 // math/rand rather than crypto/rand deliberately: this is stampede avoidance, not a
-// secret. An attacker who could predict it would learn when their own run resumes.
+// limitParkJitter generates a random duration between 60 and 180 seconds for parked-run promotion.
 func limitParkJitter() time.Duration {
 	return limitParkJitterMin + time.Duration(rand.Int63n(int64(limitParkJitterMax-limitParkJitterMin+1))) //nolint:gosec // G404: retry jitter spreads promotion waves; not a security token
 }
@@ -647,7 +647,8 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 //     report.
 //   - the replacement fires ONLY when the fields are present. Absent, this falls
 //     straight through to sanitizeFailureReason and no other failure path in the
-//     product changes behaviour.
+// limitAwareFailureReason sanitizes a regular failure reason or builds a usage-limit
+// failure reason from the reported rate-limit type and reset time.
 func limitAwareFailureReason(req StateRequest) pgtype.Text {
 	if req.RateLimitType == nil && req.LimitResetsAt == nil {
 		return sanitizeFailureReason(req.FailureReason)

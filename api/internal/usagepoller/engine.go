@@ -330,6 +330,7 @@ func (e *Engine) clearBackoff(secretID uuid.UUID) {
 	delete(e.backoff, secretID)
 }
 
+// pgInt2 converts an integer to a valid PostgreSQL smallint value.
 func pgInt2(v int) pgtype.Int2 { return pgtype.Int2{Int16: int16(v), Valid: true} } //nolint:gosec // G115: v is a rate-limit percentage (0-100), far within int16 range
 
 // wipe best-effort zeroizes the token after use (matching the vault's own hygiene;

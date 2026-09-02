@@ -17,7 +17,7 @@ import (
 // cancel — then trim and cap the length (the same 2048-rune bound as failure_reason). An
 // empty / whitespace-only / NUL-only body stores NULL, never an empty string. Shared by
 // both cancel paths (server-side + live) and, since PRD #517 M4, by the graceful `stop`
-// path, which carries the operator's OPTIONAL stop reason the same way a cancel does.
+// stopReasonParam converts an optional stop reason to nullable PostgreSQL text after removing NUL characters, trimming whitespace, and limiting it to 2048 runes. Empty results are represented as NULL.
 func stopReasonParam(body string) pgtype.Text {
 	clean, _ := stripNUL(body)
 	clean = truncateRunes(strings.TrimSpace(clean), maxFailureReasonRunes)
@@ -33,7 +33,8 @@ func stopReasonParam(body string) pgtype.Text {
 // 500s, reportState's bounded retries exhaust, and the terminal state never lands,
 // leaving the run to the server-side sweeper. The breaker's own permanent-failure
 // report travels this exact field, so a poisoned run reporting its own poison could
-// fail to record that it failed.
+// sanitizeFailureReason converts a worker failure reason to nullable PostgreSQL text.
+// It removes NUL characters, limits the result to 2048 runes, and represents nil or empty input as SQL NULL.
 func sanitizeFailureReason(s *string) pgtype.Text {
 	if s == nil {
 		return pgtype.Text{}
@@ -49,7 +50,7 @@ func sanitizeFailureReason(s *string) pgtype.Text {
 // rune (Trojan-Source defense) while SPARING \n and \t so the diff's line structure
 // survives, then applies the byte bound. A NUL would raise 22021 on this terminal
 // `failed` write exactly as it does for failure_reason (see stripNULParam); the byte cap
-// bounds a hostile or buggy worker. A value that sanitizes to empty maps to NULL.
+// clampWirePreservedPatch sanitizes a preserved patch for database storage, enforcing a byte limit and mapping nil or empty values to SQL NULL.
 func clampWirePreservedPatch(s *string) pgtype.Text {
 	if s == nil {
 		return pgtype.Text{}
@@ -71,7 +72,7 @@ func clampWirePreservedPatch(s *string) pgtype.Text {
 // these columns is an index key (00020_workers_runs.sql; no index references
 // session_id or branch), so a cap would be lossy data loss for no storability gain.
 // A NUL-only value strips to "", which pgconv.TextOrNull maps to NULL — for session_id that is
-// its documented "no change" sentinel, which is the right outcome for garbage input.
+// stripNULParam removes NUL characters from a worker-provided text value and converts empty results to SQL NULL.
 func stripNULParam(s *string) pgtype.Text {
 	if s == nil {
 		return pgtype.Text{}
@@ -80,6 +81,7 @@ func stripNULParam(s *string) pgtype.Text {
 	return pgconv.TextOrNull(clean)
 }
 
+// textPtr returns a pointer to the text value when valid, or nil for invalid text.
 func textPtr(t pgtype.Text) *string {
 	if !t.Valid {
 		return nil

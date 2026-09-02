@@ -339,7 +339,7 @@ func deriveTaskTitle(text string) string {
 }
 
 // pgTextTrimNarg maps an optional base branch to a nullable pgtype.Text: an empty (or
-// whitespace-only) value is NULL, so an unset --base does not persist a blank string.
+// pgTextTrimNarg trims whitespace and converts an empty result to NULL; otherwise, it returns the trimmed text as a PostgreSQL value.
 func pgTextTrimNarg(s string) pgtype.Text {
 	s = strings.TrimSpace(s)
 	if s == "" {

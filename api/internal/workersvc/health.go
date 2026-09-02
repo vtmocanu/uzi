@@ -752,7 +752,7 @@ func olderThan(now time.Time, ts pgtype.Timestamptz, d time.Duration) bool {
 // or its enum CHANGES (a genuinely new episode), PRESERVES the existing timestamp
 // when only the reason changes within the same enum (so a queued run flipping
 // no-worker → waiting keeps the UI's "stuck for Xm" counting from the original flag),
-// and clears it when the run returns to ok.
+// healthSince determines the start time for a run's current health episode, preserving it when the health state is unchanged and clearing it when the run is healthy.
 func healthSince(now time.Time, target string, r store.ListActiveRunsForHealthRow) pgtype.Timestamptz {
 	switch {
 	case target == healthOK:
