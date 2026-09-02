@@ -25,6 +25,8 @@
 // tones, so those entries are not cross-checked against IsFailed (which is correct).
 package pipelinestatus
 
+import "sort"
+
 // failedStatuses are the terminal-FAILURE statuses across all three forges — the
 // pipelineBadge.ts "failed" tone: GitLab "failed"; Forgejo Actions run status
 // "failure"; Forgejo CommitStatusState "error" (an errored status is a failure,
@@ -49,6 +51,19 @@ var failedStatuses = map[string]struct{}{
 func IsFailed(status string) bool {
 	_, ok := failedStatuses[status]
 	return ok
+}
+
+// FailedStatuses returns the raw forge statuses IsFailed treats as terminal
+// failures, sorted, for callers that must mirror the set (e.g. the ci_autofix
+// candidate SQL predicate). Keep any new failure status in failedStatuses; this
+// accessor and IsFailed both read from it.
+func FailedStatuses() []string {
+	out := make([]string, 0, len(failedStatuses))
+	for s := range failedStatuses {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // IsSuccess reports a terminal PASS. Both forges spell it "success", so this needs

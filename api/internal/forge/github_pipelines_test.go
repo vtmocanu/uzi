@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/pipelinestatus"
 )
 
 // TestGitHubActionsStatusFold pins item-9 / D8: while not completed the neutral
@@ -337,6 +339,425 @@ func TestIsDisallowedLogIP(t *testing.T) {
 		if got := isDisallowedLogIP(ip); got != tc.disallowed {
 			t.Errorf("isDisallowedLogIP(%s) = %v, want %v", tc.ip, got, tc.disallowed)
 		}
+	}
+}
+
+// checkRun builds one check-runs API entry. appSlug/suiteID/headSHA are optional
+// (empty string / zero omit the sub-object or field).
+func checkRun(id int, name, status string, conclusion any, htmlURL, appSlug string, suiteID int, suiteHeadSHA string) map[string]any {
+	cr := map[string]any{
+		"id": id, "name": name, "status": status, "conclusion": conclusion, "html_url": htmlURL,
+	}
+	if appSlug != "" {
+		cr["app"] = map[string]any{"slug": appSlug}
+	}
+	if suiteID != 0 || suiteHeadSHA != "" {
+		cs := map[string]any{}
+		if suiteID != 0 {
+			cs["id"] = suiteID
+		}
+		if suiteHeadSHA != "" {
+			cs["head_sha"] = suiteHeadSHA
+		}
+		cr["check_suite"] = cs
+	}
+	return cr
+}
+
+func writeJSON(w http.ResponseWriter, v any) { _ = json.NewEncoder(w).Encode(v) }
+
+// TestGitHubLatestMRPipelineRecoversActionsRunFromChecks is the reported repro
+// (issue #1005): the head_sha-filtered workflow-runs list is empty, but the head
+// commit's check-runs belong to a github-actions check-suite. The driver must
+// re-query workflow-runs by that check_suite_id and return the NATIVE workflow run
+// (its id in the workflow-run space, so ListPipelineJobs/JobLogTail keep working) —
+// NOT ErrNoPipeline. FAILS on the pre-fix code (which returned ErrNoPipeline).
+func TestGitHubLatestMRPipelineRecoversActionsRunFromChecks(t *testing.T) {
+	const headSHA = "headsha999"
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"number": 4, "state": "open", "head": map[string]any{"sha": headSHA, "ref": "feature"}})
+		},
+		// One path serves BOTH the head_sha (empty) and the check_suite_id (the run)
+		// queries — branch on the query string.
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("check_suite_id") == "555" {
+				writeJSON(w, map[string]any{"total_count": 1, "workflow_runs": []map[string]any{{
+					"id": 900, "head_branch": "feature", "head_sha": headSHA,
+					"status": "completed", "conclusion": "failure",
+					"html_url": "https://github.com/acme/widgets/actions/runs/900",
+				}}})
+				return
+			}
+			writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+		},
+		"/repos/acme/widgets/commits/" + headSHA + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 3, "check_runs": []map[string]any{
+				checkRun(11, "linux failure", "completed", "failure", "u-linux", "github-actions", 555, headSHA),
+				checkRun(12, "macos failure", "completed", "failure", "u-macos", "github-actions", 555, headSHA),
+				checkRun(13, "ready success", "completed", "success", "u-ready", "github-actions", 555, headSHA),
+			}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	p, err := d.LatestMRPipeline(context.Background(), 7, 4)
+	if err != nil {
+		t.Fatalf("LatestMRPipeline: %v", err)
+	}
+	if p.ID != 900 {
+		t.Errorf("recovery must return the native workflow-run id 900, got %d", p.ID)
+	}
+	if p.SHA != headSHA {
+		t.Errorf("SHA = %q, want %q", p.SHA, headSHA)
+	}
+	if !pipelinestatus.IsFailed(p.Status) {
+		t.Errorf("status %q must classify as failed", p.Status)
+	}
+	if p.WebURL != "https://github.com/acme/widgets/actions/runs/900" {
+		t.Errorf("WebURL = %q, want the native run url", p.WebURL)
+	}
+}
+
+// TestGitHubLatestMRPipelineSynthesizesExternalCI covers external (non-Actions) CI:
+// the check-runs belong to some_ci, not github-actions, so no workflow run is
+// recoverable. The driver must SYNTHESIZE a neutral pipeline from the check-runs
+// (status "failure", id = newest check-suite id, sha = head, WebURL = the failed
+// check-run's page) rather than return ErrNoPipeline.
+func TestGitHubLatestMRPipelineSynthesizesExternalCI(t *testing.T) {
+	const headSHA = "extsha42"
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"number": 4, "state": "open", "head": map[string]any{"sha": headSHA, "ref": "feature"}})
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+		},
+		"/repos/acme/widgets/commits/" + headSHA + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 2, "check_runs": []map[string]any{
+				checkRun(21, "lint", "completed", "success", "u-lint", "some-ci", 777, headSHA),
+				checkRun(22, "build", "completed", "failure", "u-build-failed", "some-ci", 777, headSHA),
+			}})
+		},
+		"/repos/acme/widgets/commits/" + headSHA + "/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 2, "check_suites": []map[string]any{
+				{"id": 770, "head_sha": headSHA},
+				{"id": 777, "head_sha": headSHA},
+			}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	p, err := d.LatestMRPipeline(context.Background(), 7, 4)
+	if err != nil {
+		t.Fatalf("LatestMRPipeline: %v", err)
+	}
+	if p.Status != "failure" || !pipelinestatus.IsFailed(p.Status) {
+		t.Errorf("status = %q, want failure (IsFailed)", p.Status)
+	}
+	if p.SHA != headSHA {
+		t.Errorf("SHA = %q, want %q", p.SHA, headSHA)
+	}
+	if p.ID != 777 {
+		t.Errorf("ID = %d, want the newest check-suite id 777", p.ID)
+	}
+	if p.WebURL != "u-build-failed" {
+		t.Errorf("WebURL = %q, want the failed check-run's html_url", p.WebURL)
+	}
+}
+
+// TestGitHubLatestMRPipelineSynthesisAllGreen: every external check-run succeeded →
+// synthesized status "success" (IsSuccess).
+func TestGitHubLatestMRPipelineSynthesisAllGreen(t *testing.T) {
+	const headSHA = "greensha"
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"number": 4, "state": "open", "head": map[string]any{"sha": headSHA, "ref": "feature"}})
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+		},
+		"/repos/acme/widgets/commits/" + headSHA + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 2, "check_runs": []map[string]any{
+				checkRun(31, "lint", "completed", "success", "u1", "some-ci", 888, headSHA),
+				checkRun(32, "test", "completed", "success", "u2", "some-ci", 888, headSHA),
+			}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	p, err := d.LatestMRPipeline(context.Background(), 7, 4)
+	if err != nil {
+		t.Fatalf("LatestMRPipeline: %v", err)
+	}
+	if p.Status != "success" || !pipelinestatus.IsSuccess(p.Status) {
+		t.Errorf("status = %q, want success (IsSuccess)", p.Status)
+	}
+}
+
+// TestGitHubLatestMRPipelineSynthesisAllNeutral: every external check-run is
+// neutral/skipped (no failure, no pending, no attention, NO real success) → the
+// synthesized status must be "neutral", which is NEITHER IsFailed nor IsSuccess. This
+// pins the Edit-2 fix: the old `default: return "success"` false-greened such a head
+// through mr_rework's GATE 1 (IsSuccess), an asymmetry with the native workflow-run
+// path (which stores "neutral"/"skipped" verbatim, also not IsSuccess).
+func TestGitHubLatestMRPipelineSynthesisAllNeutral(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		runs []map[string]any
+	}{
+		{"all-skipped", []map[string]any{
+			checkRun(61, "lint", "completed", "skipped", "u1", "some-ci", 950, "neutsha"),
+			checkRun(62, "test", "completed", "skipped", "u2", "some-ci", 950, "neutsha"),
+		}},
+		{"all-neutral", []map[string]any{
+			checkRun(63, "lint", "completed", "neutral", "u3", "some-ci", 951, "neutsha"),
+			checkRun(64, "test", "completed", "neutral", "u4", "some-ci", 951, "neutsha"),
+		}},
+		{"neutral+skipped", []map[string]any{
+			checkRun(65, "lint", "completed", "neutral", "u5", "some-ci", 952, "neutsha"),
+			checkRun(66, "test", "completed", "skipped", "u6", "some-ci", 952, "neutsha"),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const headSHA = "neutsha"
+			runs := tc.runs
+			m := newMockGitHub(t, map[string]http.HandlerFunc{
+				"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, map[string]any{"number": 4, "state": "open", "head": map[string]any{"sha": headSHA, "ref": "feature"}})
+				},
+				"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+				},
+				"/repos/acme/widgets/commits/" + headSHA + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, map[string]any{"total_count": len(runs), "check_runs": runs})
+				},
+			})
+			d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+			p, err := d.LatestMRPipeline(context.Background(), 7, 4)
+			if err != nil {
+				t.Fatalf("LatestMRPipeline: %v", err)
+			}
+			if pipelinestatus.IsSuccess(p.Status) {
+				t.Errorf("status %q must NOT be IsSuccess (all-neutral must not false-green)", p.Status)
+			}
+			if pipelinestatus.IsFailed(p.Status) {
+				t.Errorf("status %q must NOT be IsFailed (nothing actually failed)", p.Status)
+			}
+			if p.Status != "neutral" {
+				t.Errorf("status = %q, want neutral", p.Status)
+			}
+		})
+	}
+}
+
+// TestGitHubLatestMRPipelineSynthesisPrecedence pins the combine precedence for the
+// attention/pending mixes: neither classifies as failed or success.
+func TestGitHubLatestMRPipelineSynthesisPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		second     map[string]any // the non-success check-run
+		wantStatus string
+	}{
+		{"success+action_required", checkRun(42, "deploy", "completed", "action_required", "u", "some-ci", 900, "mixsha"), "action_required"},
+		{"success+in_progress", checkRun(42, "build", "in_progress", nil, "u", "some-ci", 900, "mixsha"), "in_progress"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const headSHA = "mixsha"
+			m := newMockGitHub(t, map[string]http.HandlerFunc{
+				"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, map[string]any{"number": 4, "state": "open", "head": map[string]any{"sha": headSHA, "ref": "feature"}})
+				},
+				"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+				},
+				"/repos/acme/widgets/commits/" + headSHA + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, map[string]any{"total_count": 2, "check_runs": []map[string]any{
+						checkRun(41, "lint", "completed", "success", "u", "some-ci", 900, headSHA),
+						tc.second,
+					}})
+				},
+			})
+			d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+			p, err := d.LatestMRPipeline(context.Background(), 7, 4)
+			if err != nil {
+				t.Fatalf("LatestMRPipeline: %v", err)
+			}
+			if p.Status != tc.wantStatus {
+				t.Errorf("status = %q, want %q", p.Status, tc.wantStatus)
+			}
+			if pipelinestatus.IsFailed(p.Status) || pipelinestatus.IsSuccess(p.Status) {
+				t.Errorf("status %q must be neither failed nor success", p.Status)
+			}
+		})
+	}
+}
+
+// TestGitHubLatestMRPipelineHonestNoCI: empty workflow-runs AND empty check-runs AND
+// empty check-suites → still ErrNoPipeline. The check-runs endpoint MUST be queried
+// (asserted via checkRunsHit) so this genuinely exercises the new path — on the
+// pre-fix code the endpoint is never hit.
+func TestGitHubLatestMRPipelineHonestNoCI(t *testing.T) {
+	const headSHA = "nocish"
+	checkRunsHit := false
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"number": 4, "state": "open", "head": map[string]any{"sha": headSHA, "ref": "feature"}})
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+		},
+		"/repos/acme/widgets/commits/" + headSHA + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+			checkRunsHit = true
+			writeJSON(w, map[string]any{"total_count": 0, "check_runs": []map[string]any{}})
+		},
+		"/repos/acme/widgets/commits/" + headSHA + "/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 0, "check_suites": []map[string]any{}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	if _, err := d.LatestMRPipeline(context.Background(), 7, 4); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("no workflow runs AND no checks must be ErrNoPipeline, got %v", err)
+	}
+	if !checkRunsHit {
+		t.Fatal("the fix must consult the check-runs endpoint before giving up")
+	}
+}
+
+// TestGitHubLatestPipelineBranchSynthesizesFromChecks is the branch-path (LatestPipeline)
+// analog: empty branch workflow-runs + failing external check-runs whose head SHA is
+// carried only on the associated check-suite. The driver must resolve the REAL head
+// commit SHA from the suite (mr_rework staleness gate) and synthesize a failed pipeline.
+func TestGitHubLatestPipelineBranchSynthesizesFromChecks(t *testing.T) {
+	const branchHead = "branchhead999"
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+		},
+		// Branch path keys the check APIs on the branch ref "feature".
+		"/repos/acme/widgets/commits/feature/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+			// No top-level head_sha on the run; the SHA lives on its check-suite.
+			writeJSON(w, map[string]any{"total_count": 1, "check_runs": []map[string]any{
+				checkRun(51, "e2e", "completed", "failure", "u-e2e-failed", "some-ci", 1001, branchHead),
+			}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	p, err := d.LatestPipeline(context.Background(), 7, "feature")
+	if err != nil {
+		t.Fatalf("LatestPipeline: %v", err)
+	}
+	if p.SHA != branchHead {
+		t.Errorf("SHA = %q, want the resolved branch-head %q", p.SHA, branchHead)
+	}
+	if !pipelinestatus.IsFailed(p.Status) {
+		t.Errorf("status %q must classify as failed", p.Status)
+	}
+	if p.ID != 1001 {
+		t.Errorf("ID = %d, want the check-suite id 1001", p.ID)
+	}
+}
+
+// TestGitHubLatestMRPipelineRecoversActionsRunFromSuiteOnly is the FINDING-2 pin: the
+// head_sha-filtered workflow-runs list is empty AND the head's check-RUNS list is empty,
+// but a github-actions check-SUITE is listed for the head. ACTIONS-RECOVERY must resolve
+// the Actions suite id from the SUITES list (not only from check-runs), re-query
+// workflow-runs by that suite id, and return the NATIVE workflow run — NOT ErrNoPipeline.
+// FAILS on the pre-fix code, which read the suite id from check-runs only, skipped
+// recovery, and returned ErrNoPipeline (len(runs)==0).
+func TestGitHubLatestMRPipelineRecoversActionsRunFromSuiteOnly(t *testing.T) {
+	const headSHA = "suiteonly777"
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"number": 4, "state": "open", "head": map[string]any{"sha": headSHA, "ref": "feature"}})
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("check_suite_id") == "666" {
+				writeJSON(w, map[string]any{"total_count": 1, "workflow_runs": []map[string]any{{
+					"id": 900, "head_branch": "feature", "head_sha": headSHA,
+					"status": "completed", "conclusion": "failure",
+					"html_url": "https://github.com/acme/widgets/actions/runs/900",
+				}}})
+				return
+			}
+			writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+		},
+		// Check-RUNS empty: the recoverable Actions suite is exposed ONLY via check-suites.
+		"/repos/acme/widgets/commits/" + headSHA + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 0, "check_runs": []map[string]any{}})
+		},
+		"/repos/acme/widgets/commits/" + headSHA + "/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 1, "check_suites": []map[string]any{
+				{"id": 666, "head_sha": headSHA, "app": map[string]any{"slug": "github-actions"}},
+			}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	p, err := d.LatestMRPipeline(context.Background(), 7, 4)
+	if err != nil {
+		t.Fatalf("LatestMRPipeline: %v", err)
+	}
+	if p.ID != 900 {
+		t.Errorf("recovery must return the native workflow-run id 900, got %d", p.ID)
+	}
+	if p.SHA != headSHA {
+		t.Errorf("SHA = %q, want %q", p.SHA, headSHA)
+	}
+	if !pipelinestatus.IsFailed(p.Status) {
+		t.Errorf("status %q must classify as failed", p.Status)
+	}
+	if p.WebURL != "https://github.com/acme/widgets/actions/runs/900" {
+		t.Errorf("WebURL = %q, want the native run url", p.WebURL)
+	}
+}
+
+// TestGitHubLatestPipelineBranchPinsSuitesToCheckRunsCommit is the FINDING-1 pin: on the
+// branch path the check-runs and check-suites fetches both key on a branch NAME, so a
+// push landing between them makes check-runs describe commit A and check-suites commit B.
+// The synthesized pipeline must be pinned to the check-RUNS commit — its SHA and suite id
+// come from commit A — and the check-suites request must be made against the RESOLVED
+// SHA, not the branch name. FAILS on the pre-fix code, which fetched suites by the branch
+// ref and let commit B's newer suite id leak into the synthesized pipeline.
+func TestGitHubLatestPipelineBranchPinsSuitesToCheckRunsCommit(t *testing.T) {
+	const commitA = "commitaaaa111" // the commit the check-runs describe
+	const commitB = "commitbbbb222" // the branch head after a mid-fetch push
+	var suitesReqRef string
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+		},
+		// Check-RUNS keyed on the branch ref describe commit A (external CI → synthesis).
+		"/repos/acme/widgets/commits/feature/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 1, "check_runs": []map[string]any{
+				checkRun(51, "e2e", "completed", "failure", "u-e2e-failed", "some-ci", 1000, commitA),
+			}})
+		},
+		// Branch-ref check-suites: what the BUGGY code queries — the branch advanced, so
+		// this describes commit B and carries a NEWER suite id (2000).
+		"/repos/acme/widgets/commits/feature/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+			suitesReqRef = "feature"
+			writeJSON(w, map[string]any{"total_count": 1, "check_suites": []map[string]any{
+				{"id": 2000, "head_sha": commitB},
+			}})
+		},
+		// Resolved-SHA check-suites: what the FIXED code queries — commit A's suite (1000).
+		"/repos/acme/widgets/commits/" + commitA + "/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+			suitesReqRef = commitA
+			writeJSON(w, map[string]any{"total_count": 1, "check_suites": []map[string]any{
+				{"id": 1000, "head_sha": commitA},
+			}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	p, err := d.LatestPipeline(context.Background(), 7, "feature")
+	if err != nil {
+		t.Fatalf("LatestPipeline: %v", err)
+	}
+	if suitesReqRef != commitA {
+		t.Errorf("check-suites must be fetched by the resolved SHA %q, got %q", commitA, suitesReqRef)
+	}
+	if p.SHA != commitA {
+		t.Errorf("SHA = %q, want the check-runs commit %q", p.SHA, commitA)
+	}
+	if p.ID != 1000 {
+		t.Errorf("ID = %d, want commit A's suite id 1000 (not commit B's 2000)", p.ID)
 	}
 }
 

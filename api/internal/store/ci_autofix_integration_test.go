@@ -247,3 +247,110 @@ func TestCIAutofixLiveDB(t *testing.T) {
 		t.Fatalf("the kept ref must survive eviction: %v", err)
 	}
 }
+
+// TestCIAutofixCandidateFailureSpellingsLiveDB pins the issue #1005 forge-neutrality
+// fix: ListCIAutofixCandidateRefs must match EVERY forge's failure spelling, not just
+// GitLab's "failed". ps.status is the RAW forge pipeline status (GitHub Actions stores
+// "failure"/"timed_out"/"startup_failure"; Forgejo "failure"/"error"), so a GitHub or
+// Forgejo failed pipeline was silently never a candidate under the old `= 'failed'`
+// predicate — the reported symptom ("no ci_fix run has ever existed" on a GitHub repo
+// even with auto-fix enabled). This test seeds three otherwise-eligible agent-MR
+// branches whose pipeline statuses are "failure", "timed_out", and "error", and asserts
+// all three surface. It FAILS on the old `= 'failed'` predicate (0 candidates) and
+// PASSES with the IN-list fix. Its own repo/connection/user keep it independent of
+// TestCIAutofixLiveDB's exact-count assertion.
+func TestCIAutofixCandidateFailureSpellingsLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	owner := uuid.New()
+	connID, repoID := uuid.New(), uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO users (id, email, password_hash, ci_autofix_enabled) VALUES ($1, $2, 'x', true)`,
+		owner, fmt.Sprintf("autofix-spellings-%s@e2e", owner))
+	mustExec(ctx, t, pool,
+		`INSERT INTO user_secrets (user_id, kind, ciphertext, label) VALUES ($1, 'anthropic_token', $2, 'default')`,
+		owner, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'github', 'https://github.e2e', 'bot', 1, $3)`, connID, owner, []byte{0x1})
+	// Distinct forge_project_id from TestCIAutofixLiveDB (UNIQUE(connection_id,
+	// forge_project_id)); this test owns its own connection anyway.
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 2, 'gh/r', 'https://github.e2e/gh/r', 'main', true)`, repoID, connID)
+
+	insertRun := func(branch string, issueIID, mrIID int64) {
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, branch, mr_iid, created_at)
+			 VALUES ($1, $2, 'issue', $3, 't', 'd', 'completed', $4, $5, now())`,
+			owner, repoID, issueIID, branch, mrIID)
+	}
+	insertPipeline := func(ref string, pipelineID int64, status string) {
+		mustExec(ctx, t, pool,
+			`INSERT INTO pipeline_statuses (repo_id, ref, pipeline_id, sha, status, web_url, synced_at)
+			 VALUES ($1, $2, $3, 'deadbeef', $4, 'https://github.e2e/p', now())`,
+			repoID, ref, pipelineID, status)
+	}
+
+	// Three eligible agent-MR branches, each with a non-GitLab failure spelling. Under
+	// the old `= 'failed'` predicate NONE of these match; under the fix all three do.
+	want := map[string]int64{
+		"agent/issue-101": 7101, // GitHub Actions run conclusion "failure"
+		"agent/issue-102": 7102, // GitHub Actions run conclusion "timed_out"
+		"agent/issue-103": 7103, // Forgejo CommitStatusState "error"
+	}
+	insertRun("agent/issue-101", 101, 201)
+	insertPipeline("agent/issue-101", 7101, "failure")
+	insertRun("agent/issue-102", 102, 202)
+	insertPipeline("agent/issue-102", 7102, "timed_out")
+	insertRun("agent/issue-103", 103, 203)
+	insertPipeline("agent/issue-103", 7103, "error")
+
+	// Negative boundary: two branches eligible in every other way (same owner, token,
+	// opt-in, non-default branch, mr_iid) but whose pipeline status is a deliberate
+	// NON-failure — 'cancelled' (a human cancel) and 'success' (a pass). Neither is a
+	// failure, so neither may surface as a candidate. Guards the ps.status IN (...)
+	// list against a future accidental superset.
+	notCandidates := []string{"agent/issue-104", "agent/issue-105"}
+	insertRun("agent/issue-104", 104, 204)
+	insertPipeline("agent/issue-104", 7104, "cancelled")
+	insertRun("agent/issue-105", 105, 205)
+	insertPipeline("agent/issue-105", 7105, "success")
+
+	cands, err := q.ListCIAutofixCandidateRefs(ctx, repoID)
+	if err != nil {
+		t.Fatalf("ListCIAutofixCandidateRefs: %v", err)
+	}
+	got := make(map[string]int64, len(cands))
+	for _, c := range cands {
+		got[c.Ref.String] = c.PipelineID
+	}
+	if len(got) != len(want) {
+		t.Fatalf("want %d candidates (failure/timed_out/error spellings), got %d: %+v", len(want), len(got), cands)
+	}
+	for ref, pid := range want {
+		if got[ref] != pid {
+			t.Errorf("branch %q with a non-GitLab failure spelling must be a candidate (pipeline_id %d), got %d — the ps.status predicate hardcodes GitLab's \"failed\" spelling",
+				ref, pid, got[ref])
+		}
+	}
+	for _, ref := range notCandidates {
+		if _, ok := got[ref]; ok {
+			t.Errorf("branch %q has a NON-failure pipeline status (cancelled/success) and must NOT be an auto-fix candidate — the ps.status IN (...) predicate has become a superset of the failure set",
+				ref)
+		}
+	}
+}
