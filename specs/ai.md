@@ -10338,7 +10338,7 @@ covered end to end" would be wrong on four counts. All true as of the M8a commit
   group with disagreeing members, so `topRung` never has to *choose* and the
   `dismissed > done > filed` precedence ladder, the single most-duplicated logic
   across the two implementations, is never exercised. That is a coverage gap, not
-  a defect. Truncation is unreachable in demo mode (`mockApi.ts` hardcodes
+  a defect. Truncation is unreachable in demo mode (`mockApi/judge.ts` hardcodes
   `truncated: false`). Since the fixture *is* the demo, the blind spot is shared
   by the demo and by every mock-backed vitest.
 - **`OccurrenceFileIssue` has zero tests** — 236 lines, and the only forge-writing
@@ -11342,7 +11342,7 @@ the tree now carries a lot of them.
 
 ## 378. PRD #98 seam 6 — the mock↔server golden fixture is the fidelity mechanism, and `-count=1` at the gate is what keeps it live
 
-`web/src/mocks/mockApi.ts` is not a stub: it reimplements the judge backlog's dedup, the
+`web/src/mocks/mockApi/judge.ts` is not a stub: it reimplements the judge backlog's dedup, the
 `dismissed > done > filed > todo` rollup, `run_count`, the rationale preview and the `?bucket=`
 filter, all of which also exist in Go. Until this fixture, their agreement was verified only by
 reading — and when it drifts two things break at once and neither announces itself: the demo lies,
@@ -21215,7 +21215,7 @@ no new route, no notification-path change.
   connects Slack. The UI disables the controls anyway because inviting input that can have no
   visible effect for possibly weeks is worse UX than a clear "not available yet".
 - **Test surface: extend, don't fork.** Go handler tests assert individual DTO fields (not exact
-  JSON), so the added field is non-breaking; they gain `workspace` assertions. `mockApi.ts` (the
+  JSON), so the added field is non-breaking; they gain `workspace` assertions. `mockApi/settings.ts` (the
   demo backend, not the test harness) persists `Omit<SlackLink, "state" | "workspace">` — workspace
   is server-derived, never persisted — and injects it in `slackLinkResponse()` consistently with its
   admin-side `slack_status: "disabled"`, so demo mode shows `unconfigured`. Web state branches are
@@ -22282,7 +22282,7 @@ Decision Log; this is the terse contract.
   `kind='prompt'` report-only terminal above is unchanged and still suppresses the empty-run
   MR, so a quiet week opens nothing. Guardrails live in the bodies: docs-hygiene = mechanical
   fixes only + never `CLAUDE.md`/`.claude/`; test-improvement = test files only. The mock
-  copies in `web/src/mocks/mockApi.ts` are kept in lockstep.
+  copies in `web/src/mocks/mockApi/schedules.ts` are kept in lockstep.
 - **Out of scope, recorded so the boundary is explicit.** Self-improvement-as-a-default-job
   is a deliberate follow-up (PRD #590); this catalog ships 6 generic entries (bug-hunt,
   bug-triage, docs-hygiene, feature-bingo, planned-sweep, test-improvement), NOT the

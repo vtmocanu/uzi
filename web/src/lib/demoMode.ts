@@ -1,7 +1,7 @@
 // PRD #886 — Demo mode state + reactivity.
 //
 // Per-device "demo mode" toggle, persisted in localStorage under `uzi_demo_mode`
-// (mirrors the `uzi_mock_scenario` convention in web/src/mocks/mockApi.ts). When on,
+// (mirrors the `uzi_mock_scenario` convention in web/src/mocks/mockApi/shared.ts). When on,
 // pure-display sites mask identifying values (see demoMask.ts) for clean screenshots;
 // the real data in the DB/API is untouched and no other user is affected. Off by
 // default. Every localStorage access is wrapped in try/catch — a private window can

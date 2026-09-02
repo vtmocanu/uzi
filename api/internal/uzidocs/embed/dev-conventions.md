@@ -593,7 +593,7 @@ tripwire rather than silently proxying it anywhere.
 
 **`npm run dev` alone does NOT reach mock mode.** The switch is
 `VITE_UZI_MOCK=1`, read once at build time (`web/src/lib/api.ts`) to swap in
-`src/mocks/mockApi.ts` and `MockRunSocket` for the real `api`/socket — so a
+`src/mocks/mockApi/` and `MockRunSocket` for the real `api`/socket — so a
 mock bundle contains no code path to a live backend at all, not just a
 disabled one. There's no separate demo `npm` script for this; run
 `VITE_UZI_MOCK=1 npm run dev` directly (Vite reads the var the same way at
@@ -601,7 +601,7 @@ dev-server start), or use the Dockerfile above for a full static build.
 
 **Demo scenarios**, once in mock mode: `?mock=<name>` on the URL, or the
 `uzi_mock_scenario` `localStorage` key for a sticky choice across reloads
-(`src/mocks/mockApi.ts`'s `mockScenario()`). It's a single string, so
+(`src/mocks/mockApi/shared.ts`'s `mockScenario()`). It's a single string, so
 scenarios are mutually exclusive by construction. Known values:
 
 - `oidc`, `oidc-degraded`, `sso-only` — the PRD #45 OIDC UX, otherwise
