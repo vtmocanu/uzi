@@ -120,8 +120,42 @@ cd "$ROOT/api"
 # denied_cli_dismiss and workersvc's task_review both used `[]byte{0x2}`, and the
 # second one failed on the UNIQUE constraint). Derive token hashes from a fresh
 # uuid, the way handler/hosted_provision_livedb_test.go documents.
+#
+# PKGS is the ONE list; ci.yml's "LiveDB tests" step carries the same five, and the
+# per-package check below is what makes a stale list visible: a listed package that
+# contributes zero *LiveDB tests prints `ok <pkg> 0.01s [no tests to run]`, which the
+# aggregate exit code and the aggregate PASS count both read as green.
+PKGS=(
+  ./internal/store/...
+  ./internal/handler/...
+  ./internal/forgesvc/...
+  ./internal/schedsvc/...
+  ./internal/workersvc/...
+)
+LOG="$(mktemp -t uzi-store-it-log)"
 UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
-  -run 'LiveDB$' ./internal/store/... ./internal/handler/... \
-  ./internal/forgesvc/... ./internal/schedsvc/... ./internal/workersvc/...
+  -run 'LiveDB$' "${PKGS[@]}" 2>&1 | tee "$LOG"
+
+# Gate on the gate, mirrored from ci.yml. (1) Aggregate: the suite must have RUN
+# something and SKIPPED nothing -- with the DSN unset or Postgres unreachable every test
+# self-skips and `go test` still prints ok. (2) Per package: each listed package must
+# have produced an `ok <pkg> <N>s` line with NO `[no tests to run]` suffix, so a package
+# whose LiveDB tests were renamed, moved, or never existed cannot hide behind the others.
+ran=$(grep -c '^--- PASS' "$LOG" || true)
+skipped=$(grep -c '^--- SKIP' "$LOG" || true)
+echo "LiveDB: $ran passed, $skipped skipped"
+if [ "$ran" -eq 0 ] || [ "$skipped" -gt 0 ]; then
+  printf '\n\033[1;31m==> FAIL: the live-DB tests did not actually run against Postgres (ran=%s skipped=%s).\033[0m\n' "$ran" "$skipped" >&2
+  exit 1
+fi
+for p in "${PKGS[@]}"; do
+  root="github.com/vtmocanu/uzi/api/${p#./}"
+  root="${root%/...}"
+  if ! grep -qE "^ok[[:space:]]+${root}[[:space:]]+[0-9.]+s$" "$LOG"; then
+    printf '\n\033[1;31m==> FAIL: %s reported no LiveDB test run (no plain "ok <pkg> <N>s" line; a "[no tests to run]" suffix means the package is listed but contributes nothing).\033[0m\n' "$root" >&2
+    exit 1
+  fi
+done
+rm -f "$LOG"
 
 printf '\n\033[32mStore integration tests passed.\033[0m\n'
