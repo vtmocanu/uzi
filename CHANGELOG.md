@@ -18,6 +18,26 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.75.1] - 2026-09-02
+
+### Fixed
+
+- **GitHub Actions pipeline now detected on agent branches; `pipeline_ref` no longer stays null ([#1010](https://github.com/vtmocanu/uzi/pull/1010)).**
+  The ci_fix and mr_rework flows could not detect a GitHub Actions pipeline on an agent branch, so `pipeline_ref` stayed null and CI-fix and MR-rework never triggered; the GitHub forge driver now resolves the branch pipeline.
+
+### Changed
+
+- **run-kind registry: one Go source of truth for `runs.kind` ([#997](https://github.com/vtmocanu/uzi/pull/997)).**
+  The eight run kinds are now sourced from a single Go registry with parity-pinned agent and web mirrors, replacing the previously duplicated kind tables; no runtime behavior change.
+- **API contract fixtures pin the hot DTOs against the web types ([#1000](https://github.com/vtmocanu/uzi/pull/1000)).**
+  Differential wire-shape tests compare the Go apitypes/handler DTOs to web's apiTypes.ts so the two cannot silently drift; internal test infrastructure, no product behavior change.
+- **mockApi split into per-domain modules ([#1011](https://github.com/vtmocanu/uzi/pull/1011)).**
+  The web mock API under `web/src/mocks/mockApi/` is now composed from per-domain modules into one typeof-realApi object; internal refactor of dev/test infrastructure, no UI behavior change.
+- **Web generation-counter copy deduped into `useAsyncData` ([#1012](https://github.com/vtmocanu/uzi/pull/1012)).**
+  Judge.tsx and the `deferred()` test fixture now reuse useAsyncData's generation-counter instead of a duplicated copy; internal refactor, no behavior change.
+- **Routine dependency bumps: `@anthropic-ai/claude-agent-sdk` to 0.3.246 ([#987](https://github.com/vtmocanu/uzi/pull/987)), `gitlab.com/gitlab-org/api/client-go/v2` to v2.59.1 ([#988](https://github.com/vtmocanu/uzi/pull/988)), and `actions/upload-artifact` to v7.0.1 ([#989](https://github.com/vtmocanu/uzi/pull/989)).**
+  Routine updates; the agent-SDK bump is additive (user_message_uuid, costBasis, modelPricing, perTaskStopAffordance) with no uzi code change required, and the upload-artifact major only raises the runner floor that GitHub-hosted runners already meet.
+
 ## [0.75.0] - 2026-09-02
 
 ### Added
@@ -3695,7 +3715,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.75.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.75.1...HEAD
+[0.75.1]: https://github.com/vtmocanu/uzi/compare/v0.75.0...v0.75.1
 [0.75.0]: https://github.com/vtmocanu/uzi/compare/v0.74.0...v0.75.0
 [0.74.0]: https://github.com/vtmocanu/uzi/compare/v0.73.0...v0.74.0
 [0.73.0]: https://github.com/vtmocanu/uzi/compare/v0.72.1...v0.73.0
