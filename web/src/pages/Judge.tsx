@@ -20,7 +20,6 @@ import {
   api,
   type JudgeBacklog,
   type JudgeBacklogBucket,
-  type JudgeCategoryStats,
   type JudgeDispositionCoord,
   type JudgeOccurrence,
   type JudgeRecommendationGroup,
@@ -29,6 +28,7 @@ import {
   type Repo,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { useAsyncData } from "../lib/useAsyncData";
 import {
   bucketTabCount,
   bucketTabLabel,
@@ -121,10 +121,11 @@ export function Judge() {
   // aggregate: bucket → category → group count, held WHOLE in state and indexed at render by
   // the active bucket (categoryCounts below). Uncapped and anchor-aware, but now TAB-SCOPED
   // and TRIAGE-VARIANT — a mark-done moves a group between buckets — so it is refetched on
-  // every disposition/undo/file mutation and on a run-anchor change (loadCategoryStats),
-  // though NOT on a bucket-tab or category toggle since all buckets arrive in one payload.
-  // Defaults to {} so a slow or failed fetch renders 0-count chips rather than crashing.
-  const [categoryStats, setCategoryStats] = useState<JudgeCategoryStats["counts_by_bucket"]>({});
+  // every disposition/undo/file mutation (via reloadCategoryStats()) and on a run-anchor
+  // change (the useAsyncData deps below), though NOT on a bucket-tab or category toggle since
+  // all buckets arrive in one payload.
+  // Derived below from the useAsyncData hook, defaulting to {} so a slow or failed fetch
+  // renders 0-count chips rather than crashing (see categoryStats).
   // Whether `categoryStats` reflects the LATEST issued fetch. A disposition installs the new
   // `triage` (recommendation totals) synchronously but refetches the matrix async, so between
   // the two the bridge line would reconcile the new recommendation count against the STALE
@@ -174,52 +175,46 @@ export function Judge() {
   // five buckets in one payload, so the active tab's counts are DERIVED at render below
   // (categoryCounts) with no round-trip. The aggregate is TAB-SCOPED and TRIAGE-VARIANT now
   // (a mark-done moves a group between buckets), reversing PRD #244's fetched-once property.
-  // Best-effort: a failure leaves the chips at 0. `loadCategoryStats` is keyed on runAnchor
-  // only — the anchor is the sole request input — and the dispose/undo/file handlers below
-  // call it explicitly on the same triggers that re-read the backlog.
+  // Best-effort: a failure leaves the chips at 0. The fetch is keyed on runAnchor only — the
+  // anchor is the sole request input — and the dispose/undo/file handlers below call
+  // reloadCategoryStats() explicitly on the same triggers that re-read the backlog.
   //
   // Self-healing transient (Decision 6): right after a bulk mark-done on the To-triage tab the
   // acted-on card stays visible at its new rollup (dispose re-renders it, never filters it
   // out) while a refetched `todo` chip has already decremented — a brief, deliberate mismatch
   // that reconciles on the next navigation/load.
   //
-  // Every fetch stamps a monotonic generation and only applies its result if it is still the
-  // latest issued (categoryStatsGen). Without this, a back-to-back mutation (e.g. mark-done
-  // then undo within one response window) resolves last-in-by-ARRIVAL, so a stale post-action
-  // matrix could stick on the chips until the next navigation. The guard also invalidates any
-  // in-flight fetch on unmount / run-anchor change (the effect cleanup bumps the generation),
-  // so no response lands on an unmounted page — the discipline the old `alive` flag had.
-  const categoryStatsGen = useRef(0);
-  const loadCategoryStats = useCallback(async () => {
-    const gen = ++categoryStatsGen.current;
-    // The matrix in hand no longer matches the latest issued fetch — hide the bridge until this
-    // fetch lands (or keep it hidden if it fails). Reset every call so a post-mutation refetch
-    // suppresses the transient new-recs-vs-old-groups reconciliation.
-    setCategoryStatsFresh(false);
-    try {
+  // The stale-response/generation guard lives in useAsyncData now (one place): every fetch
+  // stamps a monotonic generation and only applies its result if it is still the latest issued.
+  // Without this, a back-to-back mutation (e.g. mark-done then undo within one response window)
+  // resolves last-in-by-ARRIVAL, so a stale post-action matrix could stick on the chips until
+  // the next navigation. The hook's guard also invalidates any in-flight fetch on unmount /
+  // run-anchor change, so no response lands on an unmounted page — the discipline the old
+  // `alive` flag had. Our own setCategoryStatsFresh side-effect rides the same stamp via
+  // isCurrent(), so a superseded fetch cannot flip freshness true either.
+  const {
+    data: categoryStatsData,
+    reload: reloadCategoryStats,
+  } = useAsyncData(
+    async ({ isCurrent }) => {
       const stats = await api.getJudgeCategoryStats(runAnchor || undefined);
-      if (gen === categoryStatsGen.current) {
-        setCategoryStats(stats.counts_by_bucket);
-        setCategoryStatsFresh(true);
-      }
-    } catch {
-      /* chips render with 0 counts — a progressive enhancement, never a blocker */
-    }
-  }, [runAnchor]);
-
-  useEffect(() => {
-    // Alias the generation ref to a local so the cleanup does not read
-    // `categoryStatsGen.current` directly (react-hooks/exhaustive-deps): this ref is a
-    // monotonic invalidation counter, not a DOM node, so reading its live value in cleanup
-    // is intentional, not the stale-node hazard the rule guards against.
-    const genRef = categoryStatsGen;
-    loadCategoryStats();
-    // Invalidate any in-flight fetch so a late response never overwrites a fresher one (or
-    // lands after unmount): the next issued fetch — or this cleanup — advances the generation.
-    return () => {
-      genRef.current++;
-    };
-  }, [loadCategoryStats]);
+      // Only the latest issued fetch may flip the freshness flag true — the hook's gen guard
+      // drops a superseded result, and isCurrent() is the same stamp for our own side-effect.
+      if (isCurrent()) setCategoryStatsFresh(true);
+      return stats.counts_by_bucket;
+    },
+    [runAnchor],
+    {
+      // Reset every fetch (deps-driven and reload) so a post-mutation refetch hides the bridge
+      // until the fresh matrix lands — the pre-hook setCategoryStatsFresh(false) opener.
+      onFetchStart: () => setCategoryStatsFresh(false),
+      // Best-effort: a failed matrix fetch leaves the chips at 0 and the bridge hidden; the
+      // hook's own error slot is unused here (Judge keeps its own loading/error state).
+      mapError: () => "",
+    },
+  );
+  // Defaults to {} so a slow or failed fetch renders 0-count chips rather than crashing.
+  const categoryStats = categoryStatsData ?? {};
 
   // The chip row is per-tab: index the whole matrix by the resolved bucket (todo/filed/done/
   // dismissed/all — `all` is a real key, so indexing is uniform). A bucket with no groups is
@@ -236,8 +231,8 @@ export function Judge() {
   // bare `load` so the chips track a filing the same way they track a dispose/undo.
   const reloadAfterMutation = useCallback(() => {
     load();
-    loadCategoryStats();
-  }, [load, loadCategoryStats]);
+    reloadCategoryStats();
+  }, [load, reloadCategoryStats]);
 
   // The file-issue picker lists every connected repo (#68). Best-effort: a failure just
   // leaves the picker empty and the draft still opens.
@@ -347,7 +342,7 @@ export function Judge() {
         // a disposition moves a group between buckets, so the tab-scoped chip counts are now
         // stale. The bulk response carries the acted-on rows and the triage totals but NOT the
         // per-category matrix, so this is a separate round-trip.
-        loadCategoryStats();
+        reloadCategoryStats();
         setSelected(new Set());
         const verb = status === "done" ? "marked done" : "dismissed";
         showToast({
@@ -372,7 +367,7 @@ export function Judge() {
         setActionErr(errorMessage(e, "Could not apply the disposition"));
       }
     },
-    [showToast, setJudgeTodo, loadCategoryStats],
+    [showToast, setJudgeTodo, reloadCategoryStats],
   );
 
   const undo = useCallback(async () => {
@@ -419,8 +414,8 @@ export function Judge() {
     // state either outcome would have implied. Refresh the chip matrix alongside the backlog —
     // an undo moves groups back between buckets, same as a dispose (Decision 6).
     await load();
-    loadCategoryStats();
-  }, [toast, load, loadCategoryStats]);
+    reloadCategoryStats();
+  }, [toast, load, reloadCategoryStats]);
 
   const toggleSelect = (key: string) => {
     setSelected((prev) => {
