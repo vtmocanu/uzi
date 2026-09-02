@@ -41,7 +41,8 @@ func All() []string {
 }
 
 // JudgeEligible reports whether a run of this kind may be reviewed by the judge
-// (PRD #46 allowlist: issue, ci_fix). Moved here from workersvc.judgeEligibleKinds.
+// (PRD #46 allowlist: issue, ci_fix). Consolidates the former per-package
+// judge-eligibility allowlist that workersvc held.
 func JudgeEligible(kind string) bool { return kind == Issue || kind == CIFix }
 
 // Listed reports whether a run of this kind appears on the general Runs list and is
