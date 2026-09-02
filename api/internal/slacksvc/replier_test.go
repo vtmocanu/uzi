@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -227,7 +228,7 @@ func TestReplierSteerPendingSubmitsToTarget(t *testing.T) {
 		user:   user,
 		anchor: store.SlackRunMessage{RunID: chatRun, ChannelID: "D1", RootTs: "root1"},
 	}
-	sub := &fakeSubmitter{run: store.Run{ID: chatRun, UserID: user.ID, Kind: runKindChat, Status: "running"}}
+	sub := &fakeSubmitter{run: store.Run{ID: chatRun, UserID: user.ID, Kind: runkind.Chat, Status: "running"}}
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 	steer := NewSteerPendings()
@@ -260,7 +261,7 @@ func TestReplierSteerChatTargetSurfacesMessage(t *testing.T) {
 	targetRun := uuid.New()
 	fs := &fakeReplierStore{user: user, anchor: store.SlackRunMessage{RunID: uuid.New(), ChannelID: "D1", RootTs: "root1"}}
 	sub := &fakeSubmitter{
-		run:      store.Run{ID: targetRun, UserID: user.ID, Kind: runKindChat, Status: "running"},
+		run:      store.Run{ID: targetRun, UserID: user.ID, Kind: runkind.Chat, Status: "running"},
 		steerErr: errors.New("Steering applies to issue runs, not chats — reply in the chat itself to continue it."),
 	}
 	fp := &fakePoster{}
