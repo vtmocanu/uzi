@@ -63,21 +63,21 @@ Twelve new files (six github, five forgejo, one gitlab), none optional (`github_
 
 ## Milestones
 
-- [ ] **M1: Baseline proofs, then the GitHub leaf seams: `github_graphql.go`, `github_auth.go`, `github_access.go`.**
+- [x] **M1: Baseline proofs, then the GitHub leaf seams: `github_graphql.go`, `github_auth.go`, `github_access.go`.**
   - Capture the proofs **before** any move, on the branch base: `cd api && go doc -u -all ./internal/forge > /tmp/forge-doc.before` (**`-u` is mandatory**, see D1); `go test -count=1 -race ./internal/forge/...` green; `task lint:api` 0 issues.
   - Commit 1: the GraphQL cluster (`:1218-1314`) into `github_graphql.go`; fix the in-block positional comment at `:1203` (`github.go:610` → "`newGitHub`") in the same commit and list it in the PR. Commit 2: `VerifyToken`, `TokenInfo`, `parseGitHubScopes` into `github_auth.go`. Commit 3: `ProjectRole`, `roleForGitHubPermissions`, `DefaultBranchProtection` into `github_access.go`. File shape: `package forge`, imports, blank line, two-line header. No indentation changes (top-level declarations move to top level), so plain `git diff --color-moved=dimmed-zebra origin/main..HEAD -- api/internal/forge/` must show each as a moved block; reaching for `-w` or `--color-moved-ws` is the signal something other than a move happened.
   - Verification: `go doc -u -all ./internal/forge | diff /tmp/forge-doc.before -` empty; `task gate:api` green; `git diff --stat origin/main..HEAD -- 'api/internal/forge/*_test.go'` empty.
-- [ ] **M2: The GitHub bulk seams: `github_labels.go`, `github_issues.go`, `github_mr.go`.**
+- [x] **M2: The GitHub bulk seams: `github_labels.go`, `github_issues.go`, `github_mr.go`.**
   - Commit 4: labels (`:217-284`, `:371-426`, `:607-658`). Commit 5: issues (`:285-370`, `:427-455`, `:659-719`, `:1143-1217`). Commit 6: merge requests (`:569-606`, `:720-1087`). After this `github.go` is the consts, the struct, the constructor, the two shared helpers and `ListProjects`: ≈195 lines.
   - Sweep each moved block for positional comments (`above`, `below`, `:NNN`, "this file", "in github.go") that the move makes false and fix them in the same commit, listed in the PR (the #963 recipe).
   - Verification as M1, plus each commit `go test -count=1 -race ./internal/forge/...` green on its own (the #963 D2 rule: a bisectable history).
-- [ ] **M3: The Forgejo seams, same order: `forgejo_auth.go`, `forgejo_access.go`, `forgejo_labels.go`, `forgejo_issues.go`, `forgejo_mr.go`.**
+- [x] **M3: The Forgejo seams, same order: `forgejo_auth.go`, `forgejo_access.go`, `forgejo_labels.go`, `forgejo_issues.go`, `forgejo_mr.go`.**
   - Commit 7: auth (`:144-185`, `:1128-1221`); `checkForgejoVersion` (`:186-199`) **stays** (D2) and `VerifyToken` calls it cross-file. Commit 8: access (`:603-712`). Commit 9: labels (`:232-299`, `:447-581`, `:1001-1060`, `:1099-1127`); `sameNameSet` (`:771-784`) **stays** (D4, cross-driver). Commit 10: issues (`:300-446`, `:582-602`, `:713-770`, `:829-858`, `:1061-1098`). Commit 11: merge requests (`:785-828`, `:859-1000`). After this `forgejo.go` is the consts, both types, the constructor, the four shared helpers, `sameNameSet`, `checkForgejoVersion` and `ListProjects`: ≈220 lines.
   - Verification as M2.
-- [ ] **M4: `gitlab_pipelines.go`.**
+- [x] **M4: `gitlab_pipelines.go`.**
   - Commit 12: the five pipeline reads and `toPipeline` (`:584-742`) into `gitlab_pipelines.go`, matching the two existing `_pipelines.go` siblings. The const block, `DefaultBranchProtection` and every other declaration stay in `gitlab.go` (D3), so `gitlab_test.go:724`/`:884` remain true without an edit.
   - Verification as M1.
-- [ ] **M5: Comment and doc repoints, design record.**
+- [x] **M5: Comment and doc repoints, design record.**
   - One commit, clearly labelled as comment/doc-only: `projectsync.go:11` and `:32` (`graphqlDo (github.go)` → `github_graphql.go`); `e2e/phases/06-lane-github.sh:29` (`github.go / github_pipelines.go` → `github_auth.go` for `VerifyToken` + `TokenInfo`, or "the github_*.go driver files"); `e2e/phases/05-lane-forgejo.sh:103` (`forgejo.go:179/182` → `forgejo.go`'s `checkForgejoVersion`, identifier only). No test file is touched (SC1).
   - `adr/0238-github-driver.md:22` (`github.go` + `github_pipelines.go` implement the full `Forge` interface → `github.go` and its `github_*.go` seam files) and `:43` (`DefaultBranchProtection` → `github_access.go`); ADRs are durable present-tense records, so a stale file claim there is a wrong doc, not a typo.
   - `specs/ai.md:22193` (`graphqlDo` → `github_graphql.go`). Read `:19563` (`github.go`/`github_pipelines.go`, go-github) and leave it if it reads as a file-level context list (it does at `6e1e999`). Leave the §289 line refs, `prds/**`, `ideas/**` and every `prds/done/**` mention (past-tense).
