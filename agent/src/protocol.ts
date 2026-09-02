@@ -620,6 +620,9 @@ export interface ClaimResponse {
   branch?: string | null;
   /** SDK session to resume (M3); null/absent for a fresh run. */
   session_id?: string | null;
+  /** Resume: the tip THIS run last published to its checkpoint ref (owner-anchor).
+   *  Adoption of refs/uzi-checkpoints/<branch> requires the remote tip to equal this. */
+  checkpoint_tip?: string | null;
   /** High-water mark of run_messages.seq; the worker continues numbering here. */
   last_seq: number;
   /** Structured PRD #3 templates — the lead plus any subagents — consumed
