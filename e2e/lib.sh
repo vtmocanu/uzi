@@ -81,12 +81,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The worker join token, minted once (after the API is up) then handed to every
-# `up`/recreate via the base compose `worker_token` Docker secret (env source
-# UZI_WORKER_TOKEN, exported below). The entrypoint hardens that secret to 0400
-# worker:worker on every start, so it persists read-only across restarts and the
-# runner uid cannot read it (PRD #51 M5) — no per-start file re-delivery needed.
-# shellcheck disable=SC2034  # set by phase 13 (provides: WTOKEN), read by later phases (PRD #966 M1 split)
+# The worker join token, minted once by phase 13 (after the API is up) then handed to
+# every `up`/recreate via the base compose `worker_token` Docker secret (env source
+# UZI_WORKER_TOKEN, which phase 13 exports AND provides so it reaches later phases). The
+# entrypoint hardens that secret to 0400 worker:worker on every start, so it persists
+# read-only across restarts and the runner uid cannot read it (PRD #51 M5) — no per-start
+# file re-delivery needed.
+# shellcheck disable=SC2034  # set by phase 13 (provides: WTOKEN UZI_WORKER_TOKEN), read by later phases (PRD #966 M1 split)
 WTOKEN=""
 
 # retry_read CMD [ARGS...] — run a READ-ONLY command with a short bounded retry, so one
@@ -767,9 +768,11 @@ EOF
 
 # Per-run env-file: strong generated secrets for the base stack + the scratch dir
 # the overlay bind-mounts. UZI_WORKER_TOKEN is only a placeholder here (the worker is
-# not up yet); run-e2e.sh EXPORTS the real minted token before the agent starts, and a
-# shell export overrides the --env-file value for the `worker_token` secret source
-# (verified: compose ranks shell env above --env-file for an env-sourced secret).
+# not up yet); phase 13 mints the real token, EXPORTS it before starting the agent, and
+# declares `provides: UZI_WORKER_TOKEN` so the export is round-tripped to every later
+# phase across PRD #966's per-phase subshells (a bare export would not survive). A shell
+# export overrides the --env-file value for the `worker_token` secret source (verified:
+# compose ranks shell env above --env-file for an env-sourced secret).
 cat > "$ENVFILE" <<EOF
 E2E_RUN_DIR=$RUNROOT
 E2E_WEB_PORT=$WEB_PORT

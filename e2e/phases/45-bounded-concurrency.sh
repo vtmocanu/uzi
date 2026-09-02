@@ -5,7 +5,7 @@
 # lane:     gitlab
 # executor: any
 # race-sensitive: yes
-# requires: -
+# requires: UZI_WORKER_TOKEN
 # provides: -
 # handoff:  -
 # mutates:  -
@@ -53,8 +53,10 @@ else
     || fail "could not enable group/repo2"
   pass "second repo group/repo2 enabled (id $REPO2_ID)"
 
-  # Recreate the one worker at cap 2. The exported UZI_WORKER_TOKEN still sources the
-  # `worker_token` secret, so the recreated container re-reads the same join token.
+  # Recreate the one worker at cap 2. UZI_WORKER_TOKEN reaches this (post-#966) subshell
+  # via phase 13's `provides` round-trip (see `requires: UZI_WORKER_TOKEN` above), so the
+  # force-recreated container re-reads the SAME join token and re-registers into its
+  # existing row; without the provide it would read the --env-file placeholder and 401.
   printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
   # Wait for the NEW worker's registration to actually LAND its advertised cap —
