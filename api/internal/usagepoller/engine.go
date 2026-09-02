@@ -347,8 +347,9 @@ const exhaustionPct = 95
 // A notify error is logged, not fatal, and never before the write.
 func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, notifyEarly bool, next anthropic.Reading) {
 	if !notifyEarly {
-		// Opt-out (or the default): upsert as today, no read, no fire.
-		e.upsert(ctx, userID, secretID, next)
+		// Opt-out (or the default): upsert as today, no read, no fire. The write
+		// result is irrelevant here (nothing downstream depends on it), so ignore it.
+		_ = e.upsert(ctx, userID, secretID, next)
 		return
 	}
 
@@ -364,7 +365,13 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, notify
 	fire, expected := earlyResetFires(prev, hasPrev, next, now)
 
 	// Upsert FIRST, always, then notify (D7: never notify before the write lands).
-	e.upsert(ctx, userID, secretID, next)
+	// SC5: a failed write leaves prev at the OLD epoch, so the moved-epoch edge is not
+	// consumed and the next tick re-evaluates it. Notifying anyway would then re-fire
+	// on every tick until the write finally succeeds, breaking the at-most-once
+	// guarantee — so a failed upsert stays silent.
+	if err := e.upsert(ctx, userID, secretID, next); err != nil {
+		return
+	}
 
 	if !fire {
 		return
@@ -420,7 +427,7 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 
 // upsert overwrites ONE TOKEN's gauge row (PRD #53 D4, repointed by #104 M5).
 // synced_at is stamped now.
-func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, r anthropic.Reading) {
+func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, r anthropic.Reading) error {
 	if err := e.store.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     secretID,
 		UserID:           userID,
@@ -433,7 +440,9 @@ func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, r anthr
 	}); err != nil {
 		// The token id is safe to log — it is a row identifier, never the credential.
 		e.logger.Error("usage poller: upsert", "user", userID.String(), "secret", secretID.String(), "error", err)
+		return err
 	}
+	return nil
 }
 
 // The backoff map is keyed by SECRET id since M5 (it was user id under PRD #53's

@@ -2,6 +2,7 @@ package usagepoller
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -27,10 +28,11 @@ import (
 type fakeStore struct {
 	rows []store.ListAnthropicTokensToPollRow
 
-	mu      sync.Mutex
-	upserts map[uuid.UUID]store.UpsertRateLimitsParams // keyed by user_secret_id
-	prev    map[uuid.UUID]store.AnthropicRateLimit     // keyed by user_secret_id
-	notify  map[uuid.UUID]bool                         // keyed by user id
+	mu        sync.Mutex
+	upserts   map[uuid.UUID]store.UpsertRateLimitsParams // keyed by user_secret_id
+	prev      map[uuid.UUID]store.AnthropicRateLimit     // keyed by user_secret_id
+	notify    map[uuid.UUID]bool                         // keyed by user id
+	upsertErr error                                      // when set, UpsertRateLimits fails (no write)
 }
 
 func newFakeStore(users ...uuid.UUID) *fakeStore {
@@ -69,6 +71,10 @@ func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecret
 func (f *fakeStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.upsertErr != nil {
+		// A failed write records nothing: prev stays at the old epoch (SC5).
+		return f.upsertErr
+	}
 	f.upserts[arg.UserSecretID] = arg
 	// Mirror the write into prev, so a following tick's GetRateLimitsForToken sees the
 	// row this tick just wrote — the once-only edge-consumption property depends on it.
@@ -753,6 +759,39 @@ func TestEarlyResetUpsertBeforeNotify(t *testing.T) {
 	}
 	if !got.SevenDayResetsAt.Valid || !got.SevenDayResetsAt.Time.Equal(moved) {
 		t.Errorf("upserted reset = %v, want the moved epoch %v (write must land before notify)", got.SevenDayResetsAt.Time, moved)
+	}
+}
+
+// TestEarlyResetFailedUpsertDoesNotNotify: SC5. When the gauge write fails, the moved
+// epoch is NOT persisted, so prev still holds the old boundary and the edge is not
+// consumed. Notifying anyway would re-fire on every subsequent tick until the write
+// lands, breaking at-most-once. A failed upsert must therefore stay silent — even
+// though every fire precondition (constrained prior, moved epoch, ≥8h early) holds.
+func TestEarlyResetFailedUpsertDoesNotNotify(t *testing.T) {
+	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	moved := tReset.Add(72 * time.Hour)
+	u := uuid.New()
+	st := newFakeStore(u)
+	st.setNotify(u, true)
+	st.setPrev(u, prevRow(u, u, 99, anthropic.SourceLimitReport, tReset, tReset.Add(-72*time.Hour)))
+	st.upsertErr = errors.New("boom") // the write fails on this tick
+	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) {
+		return readingWithReset(10, anthropic.SourceUsageEndpoint, &moved), nil
+	}}
+	notif := &fakeNotifier{}
+	e, clk := newEngine(t, st, &fakeOpener{}, cl, true)
+	clk.set(tReset.Add(-10 * time.Hour)) // 10h early → well past the 8h threshold
+	e.SetNotifier(notif)
+
+	e.tickAll(context.Background())
+
+	if notif.count() != 0 {
+		t.Fatalf("notify calls = %d, want 0 (a failed upsert must not fire — SC5)", notif.count())
+	}
+	// The write did not land, so the edge was not consumed: a later successful tick
+	// with the same reading can still fire exactly once.
+	if _, ok := st.got(u); ok {
+		t.Error("a failed upsert recorded a write; prev must stay at the old epoch")
 	}
 }
 
