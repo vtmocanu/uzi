@@ -1,7 +1,7 @@
 # PRD #1025: forge driver file splits — `github.go` and `forgejo.go` into per-seam files, `gitlab_pipelines.go` for parity
 
 **GitHub Issue**: [#1025](https://github.com/vtmocanu/uzi/issues/1025)
-**Status**: Planned (created 2026-09-02)
+**Status**: Done (created 2026-09-02, completed 2026-09-02)
 **Priority**: Medium
 **Parent**: epic #915 (Batch 4, P19; decided in the epic's "Maintainer decisions (2026-09-02 evening)" comment after a measurement pass over the four remaining >1000-line Go files). Same-package file moves, the recipe #921 (`workersvc`), #963 (`forgesvc/projectsync.go`), #1008 (`handler/handler.go`) and #1022 (`handler/schedules.go`) use. **File-disjoint from every in-flight PRD**: #1009 is `api/cmd/uzi/**`, #1017 `api/internal/uzicli/**`, #1021 `api/internal/settings/**`, #1022 `api/internal/handler/**`; nothing in flight touches `api/internal/forge/**`. This PRD touches `api/internal/forge/{github.go,forgejo.go,gitlab.go,projectsync.go}` + new files, and the doc repoints listed in M5 (`adr/0238-github-driver.md`, `specs/ai.md`, two `e2e/phases/*.sh` comments).
 **Line refs**: at `6e1e999` (main, 2026-09-02 16:15 Bucharest; the three driver files are byte-identical to `c1026a3`, where the measurements were taken). Implementer re-derives at their base; anchors are identifiers, not offsets.
