@@ -8,7 +8,7 @@
 # provides: J_RUN
 # handoff:  -
 # mutates:  settings:judge_enabled=true,judge_model=haiku; per-user judge opt-in PUT /api/me/judge enabled=true (both restored in-phase at the end)
-# restores: settings:judge_enabled=false + per-user opt-in OFF, in-phase at the end (39-review-row-cap re-disables idempotently as belt-and-braces)
+# restores: settings:judge_enabled=false + per-user opt-in OFF, in-phase at the end (explicit restores + EXIT-trap fail-safe so a mid-phase fail can't leave judge globally enabled; 39-review-row-cap re-disables idempotently as belt-and-braces)
 # =============================================================================
 # PRD #46 — run judge + notifications inbox, end to end. UZI_E2E_EXECUTOR=stub
 # selects the STUB judge queryFn (judge-runner-stub.ts): the judge model call makes
@@ -58,6 +58,12 @@ apiput /api/admin/settings '{"settings":{"judge_enabled":"true","judge_model":"h
   || fail "PRD #46: PUT /api/me/judge did not enable the per-user opt-in"
 pass "judge enabled (global kill-switch + admin opt-in); dummy token present; vault unlocked"
 
+# Fail-safe: a failed assertion below exits this subshell before the explicit
+# restore at the end; without this the fail-soft driver continues with judge
+# globally enabled and later completed runs would re-enqueue judge runs. Dropped
+# with `trap - EXIT` after the explicit restore runs.
+trap 'apiput /api/admin/settings '\''{"settings":{"judge_enabled":"false"}}'\'' >/dev/null 2>&1 || true; apiput /api/me/judge '\''{"enabled":false}'\'' >/dev/null 2>&1 || true' EXIT
+
 # --- the funnel: a finished run is auto-judged; a review + notification land ---
 J_IID="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E judge target","description":"judge e2e — implements prds/46-run-judge-self-improvement.md"}' \
@@ -104,5 +110,6 @@ pass "persist-first: a judge_review inbox notification landed for the reviewed r
 # concurrency capacity math clean regardless of which later phases run.
 apiput /api/admin/settings '{"settings":{"judge_enabled":"false"}}' >/dev/null
 apiput /api/me/judge '{"enabled":false}' >/dev/null
+trap - EXIT  # explicit restore done; drop the fail-safe
 pass "judge disabled again in-phase (global + opt-in); 39 re-disables idempotently"
 

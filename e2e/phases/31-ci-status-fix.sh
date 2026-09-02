@@ -4,10 +4,10 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: -
+# requires: env:E2E_FORGE_POLL_INTERVAL=2s
 # provides: -
 # handoff:  -
-# mutates:  -
+# mutates:  fake pipelines on main + the fix branch (posted via /_e2e/pipelines): main=failed, then success, then a not_code failed; fix-branch=success
 # restores: -
 # =============================================================================
 # PRD #6 — CI status sync, Fix CI (plan-gated ci_fix run), and verification. The

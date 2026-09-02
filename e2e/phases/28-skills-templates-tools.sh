@@ -7,8 +7,8 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  allocates the builtin prd-lifecycle skill (shared) to template TID; flips repo_skills_enabled=true on REPO_ID; creates + allocates a user-scoped template (e2e-mine); sets then clears a tier-1 tool profile on REPO_ID
+# restores: repo_skills_enabled=false on REPO_ID + tool profile cleared to [], both at the end (the builtin/user-template allocations are left in place — no later phase is perturbed by them)
 # =============================================================================
 # PRD #16 — skill delivery + repo-skill opt-in, end to end. The stub executor
 # synthesizes the plugin dir the SAME way the SDK executor does (shared
@@ -123,4 +123,8 @@ wait_status "$RUN_TP" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_D
 pass "tier-1 tool [$PKG] provisioned against the stubbed devbox, run completed"
 # Clear the profile so later scenarios' runs aren't perturbed by provisioning.
 apiput "/api/repos/$REPO_ID/tool-profile" '{"packages":[]}' >/dev/null
+# Restore repo_skills_enabled=false on REPO_ID: no later gitlab-lane phase (29-51) reads
+# this flag, but leaving it true would make the mutation outlive its phase, so undo it to
+# keep the phase self-contained (mirrors the flip-on at the PATCH above).
+apipatch "/api/repos/$REPO_ID" '{"repo_skills_enabled":false}' >/dev/null
 

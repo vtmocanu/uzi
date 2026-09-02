@@ -122,8 +122,8 @@ _capture_artifacts() {
   for svc in api agent forge-fake db; do
     "${COMPOSE[@]}" logs --no-color --since "$since" "$svc" > "$dir/$svc.log" 2>&1 || true
   done
-  db_psql "select id,user_id,status,kind from runs order by created_at" > "$dir/runs.txt" 2>/dev/null || true
-  db_psql "select status,kind,count(*) from runs group by status,kind order by status,kind" \
+  db_psql_rows "select id,user_id,status,kind from runs order by created_at" > "$dir/runs.txt" 2>/dev/null || true
+  db_psql_rows "select status,kind,count(*) from runs group by status,kind order by status,kind" \
     > "$dir/run-counts.txt" 2>/dev/null || true
   [ -f "$RUNROOT/logs/$nn_slug.log" ] && cp "$RUNROOT/logs/$nn_slug.log" "$dir/phase.log" 2>/dev/null || true
   return 0
@@ -137,7 +137,7 @@ _capture_artifacts() {
 # Each recorded LEAK also captures artifacts (D5), keyed on NN_SLUG.
 _quarantine() {
   local nn_slug="$1" slug="$2" handoff="$3" ids id name v held code forced
-  ids="$(db_psql "select id from runs where status not in ('completed','failed','cancelled')" 2>/dev/null)" || return 0
+  ids="$(db_psql_rows "select id from runs where status not in ('completed','failed','cancelled')" 2>/dev/null)" || return 0
   [ -n "$ids" ] || return 0
   held=""
   for name in $handoff; do
@@ -156,7 +156,10 @@ _quarantine() {
       *) db_psql "update runs set status='cancelled' where id='$id'" >/dev/null 2>&1 || true
          forced=" (api cancel refused, forced via DB)" ;;
     esac
-    wait_status "$id" cancelled 10 || true
+    # `fail()` (lib.sh) calls `exit 1`, so a bare `wait_status … || true` cannot
+    # tolerate a timeout: the `exit` would kill the whole driver and skip the results
+    # writers. The subshell contains the `exit 1` so `|| true` can catch it.
+    ( wait_status "$id" cancelled 10 ) || true
     _record "$slug" LEAK 0 "leaked run $id cancelled${forced}" "$slug (quarantine)"
     _capture_artifacts "$nn_slug" 0
   done
@@ -222,10 +225,19 @@ _write_summary() {
     fi
     printf '\n## Leaks\n\n'
     for ((i = 0; i < n; i++)); do
-      [ "${_statuses[$i]}" = LEAK ] && { printf '- %s\n' "${_msgs[$i]}"; any=1; }
+      # The `-` is in the ARGUMENT, not the format: `printf '- %s\n'` makes printf parse
+      # the leading `-` of the format as an option ("printf: - : invalid option", exit 2),
+      # which under the driver's set -e aborts _write_summary on the very first LEAK — the
+      # same abort the return 0 below guards against, one line earlier.
+      [ "${_statuses[$i]}" = LEAK ] && { printf '%s\n' "- ${_msgs[$i]}"; any=1; }
     done
     [ "$any" = 0 ] && printf '_(none)_\n'
   } > "$RUNROOT/summary.md"
+  # Return success UNCONDITIONALLY: when a LEAK exists (any=1) the final compound
+  # `[ "$any" = 0 ] && …` above returns 1, so without this the function returns 1 and
+  # the bare `_write_summary` call under `set -e` aborts the driver before it can
+  # `cat summary.md`, roll-call, and compute the exit code.
+  return 0
 }
 
 _rollcall() {

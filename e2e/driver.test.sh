@@ -39,10 +39,30 @@ fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 db_psql() {
   case "$1" in
     *"status not in"*)
-      # shellcheck disable=SC2086  # deliberate split: one id per line
-      printf '%s\n' ${FAKE_DB_IDS:-} ;;
+      # FUSED, faithfully mimicking real db_psql's `tr -d '\r\n'`: multiple rows come
+      # back as ONE concatenated token with no separator (e.g. "r1r2"). This is the
+      # buggy behaviour the driver must NOT use for the leak sweep — reverting the sweep
+      # to db_psql (the mutation) reddens the two-leak case because both ids fuse into one.
+      # shellcheck disable=SC2086  # deliberate split of the space-separated fixture
+      printf '%s' ${FAKE_DB_IDS:-} ;;
     *"update runs"*)
       printf '%s\n' "$1" >> "${FAKE_DB_LOG:-/dev/null}" ;;
+    *"from runs order by"*)
+      printf 'FAKE_DB_RUNS r1 admin running issue\n' ;;
+    *"group by status"*)
+      printf 'FAKE_DB_COUNTS running issue 1\n' ;;
+  esac
+}
+# db_psql_rows: the row-preserving twin (lib.sh) the driver now uses for the leak
+# sweep and the multi-row artifact dumps. Mirrors db_psql's read cases (there is no
+# write case here — the forced-cancel UPDATE stays on scalar db_psql). The leak-sweep
+# case emits ONE id PER LINE so a multi-id FAKE_DB_IDS ("r1 r2") yields two rows, which
+# is what the row-preservation cases assert on.
+db_psql_rows() {
+  case "$1" in
+    *"status not in"*)
+      # shellcheck disable=SC2086  # deliberate split: one id per line
+      printf '%s\n' ${FAKE_DB_IDS:-} ;;
     *"from runs order by"*)
       printf 'FAKE_DB_RUNS r1 admin running issue\n' ;;
     *"group by status"*)
@@ -483,6 +503,47 @@ run_driver 14
 has_row provEnv PASS || bad "provEnv not PASS (env: provides token crashed the round-trip)"
 has_row consumeEnv PASS || bad "consumeEnv not PASS (shell-var provides did not cross, or env: requires unsatisfied)"
 [ "$RC" -eq 0 ] || bad "exit code should be 0 (got $RC)"
+end
+
+# ============================================================================
+# Case 15 (PRD #966 M1) — a LEAK must not abort the results/roll-call/exit path.
+# _write_summary's final `[ "$any" = 0 ] && …` returns 1 when a LEAK exists (any=1);
+# without the unconditional `return 0`, the bare `_write_summary` call under the
+# driver's `set -e` aborts BEFORE `cat summary.md`, `_rollcall` and the exit-code loop.
+# Mutation: revert _write_summary to end on the bare `[ "$any" = 0 ] && …` -> the
+# roll-call line is absent from the log and the run exits non-zero.
+begin "case15: a LEAK still writes summary + runs roll-call/exit" 15
+export FAKE_DB_IDS="r-leak15" FAKE_CANCEL_CODE=200
+mkphase "$PHASES_DIR/10-leaky.sh" "leaks a run" no "" "" "" <<'BODY'
+pass "left a run behind"
+BODY
+run_driver 15
+has_row leaky LEAK || bad "no LEAK row for leaky"
+[ -f "$RUNROOT/summary.md" ] || bad "summary.md was not written on a leaky run"
+contains "$(cat "$LOG")" "All E2E checks passed." \
+  || bad "roll-call did not run after a LEAK (driver aborted at _write_summary)"
+[ "$RC" -eq 0 ] || bad "a non-strict LEAK run must exit 0 (got $RC — driver aborted mid-way?)"
+end
+
+# ============================================================================
+# Case 16 (PRD #966 M1) — TWO undeclared leaked rows are each cancelled and recorded
+# as a SEPARATE LEAK row. Guards the db_psql -> db_psql_rows switch in the sweep:
+# db_psql collapses newlines (tr -d '\r\n'), fusing 2+ ids into one garbage token, so
+# only db_psql_rows (one row per line) yields two distinct LEAK rows + two cancels.
+# Mutation: switch the sweep query back to db_psql -> the two ids fuse into one LEAK
+# row for a bogus fused id, and only one cancel is attempted.
+begin "case16: two leaked rows record as two separate LEAKs" 16
+export FAKE_DB_IDS="r-leak-a r-leak-b" FAKE_CANCEL_CODE=200
+mkphase "$PHASES_DIR/10-leaky.sh" "leaks two runs" no "" "" "" <<'BODY'
+pass "left two runs behind"
+BODY
+run_driver 16
+leak_n="$(awk -F'\t' '$1=="leaky" && $2=="LEAK"{n++} END{print n+0}' "$TSV")"
+[ "$leak_n" -eq 2 ] || bad "expected 2 separate LEAK rows, got $leak_n (rows fused?)"
+contains "$(cat "$TSV")" "r-leak-a" || bad "LEAK rows do not name r-leak-a (rows fused into one token)"
+contains "$(cat "$TSV")" "r-leak-b" || bad "LEAK rows do not name r-leak-b (rows fused into one token)"
+contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/r-leak-a/inputs" || bad "r-leak-a not cancelled via the API"
+contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/r-leak-b/inputs" || bad "r-leak-b not cancelled via the API"
 end
 
 # ============================================================================

@@ -6,7 +6,7 @@
 # executor: any
 # race-sensitive: yes
 # requires: -
-# provides: -
+# provides: JAR2
 # handoff:  -
 # mutates:  uzi_label/autopilot_label (raced by the concurrent PUTs, restored to defaults below); registers user2 + forge connection CONN2
 # restores: uzi_label/autopilot_label->defaults (admin settings PUT after the race)
@@ -15,7 +15,8 @@
 # collision below (the user2 forge-connection PUT) relies on 29-autopilot-lifecycle having mapped owner-alice.
 # That is DB state (a hardcoded literal 'owner-alice', not a round-tripped shell var),
 # so `requires:` — which only validates shell vars / env lines — cannot express it.
-# user2/JAR2/CONN2 are all set in-phase, so nothing here round-trips either.
+# JAR2 IS provided downstream (34-vault reads it with `-b "$JAR2"`), so it is declared
+# in `provides:` and round-trips; user2/CONN2 stay in-phase (no later phase reads them).
 say "carry-item: concurrent cross-key settings PUT — the FOR UPDATE serialization rejects the equal-label race"
 # Two concurrent single-key PUTs that each pass the cache precheck but together would
 # land uzi_label == autopilot_label (PRD #764). Exactly one commits; the other is

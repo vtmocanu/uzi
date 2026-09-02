@@ -165,6 +165,15 @@ db_psql() {
   [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
   "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | tr -d '\r\n'
 }
+# db_psql_rows SQL — like db_psql but PRESERVES row boundaries (one row per line).
+# db_psql collapses newlines (tr -d '\r\n') for scalar reads; use THIS for any
+# query whose result is enumerated row-by-row (the quarantine id sweep, the
+# multi-row artifact dumps) so 2+ rows don't fuse into one garbage token. It strips
+# only `\r`, keeping `\n` row separators. PGPW is the memoized module var db_psql uses.
+db_psql_rows() {
+  [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
+  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | tr -d '\r'
+}
 # create_run REPO_ID ISSUE_IID — POST a run, tolerating ONLY the transient
 # `404 "issue not found on this repo's board"`. That 404 is a create-then-immediately-use
 # race against the fast (2s) poller the PRD #24 MR-close phase leaves running: a board

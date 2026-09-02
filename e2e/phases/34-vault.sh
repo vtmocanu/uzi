@@ -4,11 +4,11 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: -
+# requires: JAR2
 # provides: -
 # handoff:  -
 # mutates:  re-saves admin anthropic_token (sealed_with=dek, :52); vault lock/unlock cycles; stages a legacy master-sealed user_secrets row for user2 (:94, rewrapped to dek by :118); recreates api (:105)
-# restores: - (admin left unlocked; user2's row ends sealed_with=dek)
+# restores: admin left unlocked (explicit unlock + EXIT-trap fail-safe so a failed queued/create_run assertion after the lock can't strand the admin vault LOCKED for the fail-soft driver); user2's row ends sealed_with=dek
 # =============================================================================
 # PRD #32 — per-user vault (password-wrapped secrets). Proves: the seeded token is
 # DEK-sealed at boot; saving through the handler writes 'dek'; a locked owner's
@@ -55,6 +55,11 @@ pass "PUT /me/secrets/anthropic_token stored sealed_with='dek'"
 
 # 3) Lock → a new run stays queued (the worker gate withholds it) → unlock → it claims.
 apipost /api/vault/lock '' >/dev/null
+# Fail-safe: a failed queued-status assertion or a create_run failure below would exit
+# this subshell before the explicit unlock at the end, stranding the seed admin's vault
+# LOCKED for the fail-soft driver. Unlock on ANY exit; dropped with `trap - EXIT` after
+# the explicit unlock + its confirmation run.
+trap 'apipost /api/vault/unlock "{\"password\":\"$ADMIN_PASS\"}" >/dev/null 2>&1 || true' EXIT
 [ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = false ] || fail "vault should report locked after POST /api/vault/lock"
 IID_V="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E vault gated","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
@@ -66,6 +71,7 @@ pass "vault locked: run $RUN_V stayed queued across several poll cycles"
 
 apipost /api/vault/unlock "{\"password\":\"$ADMIN_PASS\"}" >/dev/null
 [ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = true ] || fail "vault should report unlocked after POST /api/vault/unlock"
+trap - EXIT  # explicit unlock confirmed; drop the fail-safe
 wait_status "$RUN_V" awaiting_approval 30
 pass "after unlock, run $RUN_V claimed and reached the plan gate within a poll cycle"
 apipost "/api/runs/$RUN_V/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
