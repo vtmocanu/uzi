@@ -70,6 +70,16 @@ WSB_TOKEN_VAL="$(apipost "/api/me/cli-tokens" '{"name":"e2e-m1-ws-bearer"}' | jq
 { [ -n "${WSB_TOKEN_VAL:-}" ] && [ "${WSB_TOKEN_VAL#uzc_}" != "$WSB_TOKEN_VAL" ]; } \
   || fail "Leg 3's own uzc_ mint did not produce a usable token (got '${WSB_TOKEN_VAL-<unset>}')"
 
+# The agent reaches the api here (UZI_API_URL), same wire as leg 1. Defined phase-LOCAL,
+# NOT inherited: leg 1 (17-live-ws-cookie.sh) sets its own WS_API but does not `provides:`
+# it, and WS_API is not a driver global, so in this subshell it would otherwise expand
+# empty — making the probe URL the schemeless `/api/ws?...`, which Node's global WebSocket
+# rejects with a synchronous `TypeError: Invalid URL` before any console.log. That crash
+# reads as empty probe output + non-zero exit, which the negative control below would
+# misreport as "the bearer gate is broken/vacuous" (issue #993). Keep it self-contained
+# rather than coupling this leg's success to leg 1 (critical: no) running first.
+WS_API="http://api:8080"
+
 IID_WSB="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E ws bearer","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
 { [ -n "$IID_WSB" ] && [ "$IID_WSB" != null ]; } || fail "could not create the Bearer /api/ws issue"
@@ -88,8 +98,18 @@ wait_status "$RUN_WSB" awaiting_approval
 WSB_NEG_PROBE='const wsurl=process.argv[1];let done=false;const finish=(code,msg)=>{ if(done)return; done=true; console.log(msg); process.exit(code); };const ws=new WebSocket(wsurl,{headers:{Authorization:"Bearer uzc_not-a-real-token"}});ws.addEventListener("open",()=>finish(1,"OPENED_WITH_BOGUS_BEARER"));ws.addEventListener("error",()=>finish(0,"rejected"));setTimeout(()=>finish(2,"NO_REJECTION"),10000);'
 if NEGB_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WSB_NEG_PROBE" "$WS_API/api/ws?run=$RUN_WSB")"; then
   pass "bogus-Bearer /api/ws upgrade is rejected ($NEGB_OUT) — the RequireUser bearer gate is real"
+elif [ -z "${NEGB_OUT:-}" ]; then
+  # Empty output + non-zero exit means the probe CRASHED before its first console.log
+  # (schemeless/invalid WS_API URL — Node's global WebSocket throws TypeError: Invalid
+  # URL synchronously — agent container down, node missing, or a syntax error in the JS),
+  # so `docker compose exec` failed and NOTHING about the bearer gate was tested. This is
+  # NOT evidence the gate accepted a bogus bearer — mirrors the positive leg's `probe:
+  # <none>` diagnosis. (issue #993: an undefined WS_API made this exact case misreport.)
+  fail "bogus-Bearer /api/ws negative control produced NO output and exited non-zero — the probe DID NOT RUN, so the bearer gate was not exercised at all (check WS_API resolves to an absolute ws/http URL, and that the agent container + node are up)"
 else
-  fail "bogus-Bearer /api/ws upgrade was NOT rejected (probe: ${NEGB_OUT:-<none>}) — the bearer auth gate is broken/vacuous"
+  # Non-empty output on the fail path is a genuine gate defect: OPENED_WITH_BOGUS_BEARER =
+  # the socket opened; NO_REJECTION = neither open nor error fired within 10s.
+  fail "bogus-Bearer /api/ws upgrade was NOT rejected (probe: $NEGB_OUT) — the bearer auth gate is broken/vacuous"
 fi
 
 # POSITIVE: subscribe with the uzc_ token and no Origin, approve on open over the same
