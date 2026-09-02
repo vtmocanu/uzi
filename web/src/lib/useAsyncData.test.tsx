@@ -4,26 +4,11 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { useAsyncData } from "./useAsyncData";
 import { ApiError, errorMessage } from "./apiError";
+import { deferred, type Deferred } from "../test-helpers";
 
 afterEach(() => {
   cleanup();
 });
-
-// A promise whose resolution we control, so overlapping loads can be ordered.
-interface Deferred<T> {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (err: unknown) => void;
-}
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (err: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
 
 // A fetcher that hands back a fresh controllable deferred per call, so a test can
 // resolve calls in any order and observe loading between them.
