@@ -543,6 +543,91 @@ func TestDeleteAbsentRefOnFreshRemoteIsNil(t *testing.T) {
 	}
 }
 
+// TestDeleteCASRefusalPreservesSiblingCheckpoint is the PRD #1042 M3 delete-race
+// regression, written failing-first against the OLD unconditional delete: run A
+// published tip T, then a NEWER run B published a DIFFERENT tip B to the SAME
+// checkpoint ref. When run A later reaches terminal and cleans up, its CAS delete binds
+// Old to ITS persisted tip T; origin holds B, so the receive-pack compare-and-swap
+// refuses the delete — a benign nil — and B's checkpoint SURVIVES. Under the pre-fix
+// behaviour (empty ExpectedOldTip → the unconditional list-then-`:ref` push) the delete
+// would have removed B's ref, clobbering run B's fresh checkpoint; that is precisely the
+// race the CAS closes.
+func TestDeleteCASRefusalPreservesSiblingCheckpoint(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+
+	ref := "refs/uzi-checkpoints/main"
+
+	// Run A's tip T (a commit off base), then run B's tip B on a divergent branch, which
+	// run B published to the checkpoint ref — so origin now points the ref at B.
+	tipA := f.commit("b.txt", "one\n", "cA") // T — run A's last-published tip
+	f.git("checkout", "-b", "runB", base)
+	tipB := f.commit("c.txt", "two\n", "cB") // B — run B's tip, currently on the ref
+	f.git("push", "origin", "--force", "runB:"+ref)
+	if got := f.originRef(ref); got != tipB {
+		t.Fatalf("setup: checkpoint = %q, want B %q", got, tipB)
+	}
+
+	// Run A cleans up with a CAS delete against its OWN tip T. Origin holds B ≠ T, so the
+	// CAS refuses: nil (benign), and B's checkpoint is untouched.
+	if err := pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL(), Branch: "main", ExpectedOldTip: tipA,
+	}); err != nil {
+		t.Fatalf("CAS delete against a moved ref = %v; want nil (benign refusal)", err)
+	}
+	if got := f.originRef(ref); got != tipB {
+		t.Fatalf("CAS delete clobbered a sibling checkpoint: ref = %q, want unchanged B %q", got, tipB)
+	}
+}
+
+// TestDeleteCASMatchingTipDeletes pins the happy path: when origin's checkpoint ref
+// still points at exactly the run's persisted tip, the CAS delete removes it.
+func TestDeleteCASMatchingTipDeletes(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	tip := f.commit("b.txt", "one\n", "c1")
+
+	if _, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip, Pack: f.pack(tip, base),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	ref := "refs/uzi-checkpoints/main"
+	if got := f.originRef(ref); got != tip {
+		t.Fatalf("precondition: checkpoint = %q, want tip %q", got, tip)
+	}
+
+	if err := pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL(), Branch: "main", ExpectedOldTip: tip,
+	}); err != nil {
+		t.Fatalf("CAS delete against matching tip = %v; want nil", err)
+	}
+	if got := f.originRef(ref); got != "" {
+		t.Fatalf("CAS delete did not remove the ref: origin = %q, want absent", got)
+	}
+}
+
+// TestDeleteCASAbsentRefIsBenign covers the already-absent case on the CAS path: the
+// checkpoint ref never existed, so the server tip is zero ≠ our non-zero Old and the
+// CAS refuses — which is benign success, and no ref is created.
+func TestDeleteCASAbsentRefIsBenign(t *testing.T) {
+	f := newGitFixture(t)
+	f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+
+	absent := "0123456789abcdef0123456789abcdef01234567"
+	if err := pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL(), Branch: "agent/issue-7", ExpectedOldTip: absent,
+	}); err != nil {
+		t.Fatalf("CAS delete of absent ref = %v; want nil (benign)", err)
+	}
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-7"); got != "" {
+		t.Fatalf("CAS delete created a ref: origin = %q, want absent", got)
+	}
+}
+
 func isNotDescendant(err error) bool { return errors.Is(err, pushbroker.ErrNotDescendant) }
 
 // run executes a command (optionally in dir) and returns stdout, failing the test

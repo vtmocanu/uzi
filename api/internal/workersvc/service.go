@@ -2933,6 +2933,18 @@ func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issue
 			}
 			return
 		}
+		// Skip entirely when this run NEVER published a checkpoint (checkpoint_tip
+		// NULL): it owns no ref, so there is nothing to delete — and an unconditional
+		// delete could clobber a SIBLING run's fresh checkpoint on the same branch. This
+		// is load-bearing, not an optimisation. When set, rc.CheckpointTip.String is the
+		// CAS Old the delete must match (pushbroker.DeleteOptions.ExpectedOldTip), so
+		// origin's ref is removed only while it still points at exactly the tip THIS run
+		// published.
+		if !rc.CheckpointTip.Valid {
+			slog.Debug("checkpoint cleanup: skip (never published)", "run", runID, "branch", branch)
+			return
+		}
+
 		cloneURL := rc.RepoWebUrl + ".git"
 
 		// Same SSRF gate as Publish, BEFORE decrypting the PAT: never point go-git at
@@ -2955,10 +2967,11 @@ func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issue
 		}
 
 		if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
-			CloneURL: cloneURL,
-			Branch:   branch,
-			Username: rc.BotUsername,
-			PAT:      string(botPAT),
+			CloneURL:       cloneURL,
+			Branch:         branch,
+			Username:       rc.BotUsername,
+			PAT:            string(botPAT),
+			ExpectedOldTip: rc.CheckpointTip.String,
 		}); derr != nil {
 			// Scrub any credential-bearing go-git error (its remote URL can carry the
 			// PAT in userinfo) before logging — the same invariant Publish's default arm

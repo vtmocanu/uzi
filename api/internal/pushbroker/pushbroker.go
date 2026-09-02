@@ -348,6 +348,14 @@ type DeleteOptions struct {
 	Branch   string
 	Username string
 	PAT      string
+	// ExpectedOldTip is the tip this run last published to its checkpoint ref (the
+	// persisted runs.checkpoint_tip). When set, Delete takes a compare-and-swap path:
+	// it removes the ref ONLY if origin still points at exactly this tip, and treats a
+	// CAS refusal (the ref advanced since our last publish, or is already absent) as
+	// benign success — so a terminal cleanup can never clobber a SIBLING run's fresh
+	// checkpoint on the same branch. When empty, Delete preserves its legacy
+	// UNCONDITIONAL list-then-delete behaviour (backward-compatible; see Delete).
+	ExpectedOldTip string
 }
 
 // Delete removes refs/uzi-checkpoints/<branch> from the remote, BEST-EFFORT (PRD
@@ -364,7 +372,19 @@ type DeleteOptions struct {
 // It runs through the SAME endpoint/auth/remote setup as Publish (authFor, the origin
 // remote config, the checkpointRefPrefix constant).
 //
-// Deleting a ref that is already absent is SUCCESS, not an error: to make that
+// When o.ExpectedOldTip is SET (the run's persisted checkpoint_tip), Delete takes a
+// COMPARE-AND-SWAP path (casDelete): a manual receive-pack command whose Old binds to
+// that tip and whose New is the zero hash. The remote's CAS on Old refuses the delete
+// unless origin's ref still points at exactly the tip THIS run last published, so a
+// terminal cleanup can never remove a SIBLING run's fresher checkpoint on the same
+// branch (the delete-race PRD #1042 M3 closes). A CAS refusal — the ref advanced since
+// our publish, or is already absent (server tip zero ≠ our Old) — is a BENIGN success:
+// something else now owns the ref and we owned only our own tip, so it returns nil and
+// never retries. Only a genuine transport/session/auth fault returns a wrapped error.
+//
+// When o.ExpectedOldTip is EMPTY (a never-published run has nothing to CAS against, and
+// the legacy call shape), Delete preserves its original UNCONDITIONAL behaviour:
+// deleting a ref that is already absent is SUCCESS, not an error, and to make that
 // deterministic (and idempotent across go-git/forge version drift in how a
 // delete-of-missing is reported) it first LISTS the remote's advertised refs and
 // returns nil when the checkpoint ref is not present, exactly mirroring
@@ -395,9 +415,15 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 	}
 	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
 
-	// List first: a delete of a ref origin does not advertise is a no-op success, and
-	// listing makes that deterministic rather than depending on how a given
-	// go-git/forge pair reports "remote ref does not exist" on the push.
+	// CAS delete: only remove the ref if origin still holds the tip WE published.
+	if o.ExpectedOldTip != "" {
+		return casDelete(ctx, remote, auth, refName, plumbing.NewHash(o.ExpectedOldTip))
+	}
+
+	// Legacy unconditional delete (empty ExpectedOldTip). List first: a delete of a ref
+	// origin does not advertise is a no-op success, and listing makes that deterministic
+	// rather than depending on how a given go-git/forge pair reports "remote ref does not
+	// exist" on the push.
 	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
 	if err != nil {
 		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
@@ -426,6 +452,95 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 		return nil
 	}
 	return fmt.Errorf("pushbroker: delete checkpoint ref: %w", err)
+}
+
+// casDelete removes refName from origin ONLY if origin still points it at expectedOld
+// (the run's persisted checkpoint tip) — a compare-and-swap delete, in TWO agreeing
+// halves exactly as Publish guards its push:
+//
+//   - LOCAL guard (primary): it first LISTS origin's advertised refs and compares the
+//     checkpoint ref's current tip against expectedOld. If the ref is absent, or points
+//     anywhere OTHER than the tip we published (a newer sibling run or a human advanced
+//     it), we own nothing to delete → benign nil, the ref is left untouched. This is the
+//     reliable half and the one the file:// test harness exercises; it mirrors Publish's
+//     local strict-descendant check binding to the FETCHED tip.
+//   - WIRE guard (second): when the local check passes, the delete goes out as a MANUAL
+//     receive-pack command whose Old binds to expectedOld (New = zero, NO packfile — a
+//     delete ships no objects). A real forge's receive-pack compare-and-swap on Old then
+//     refuses the delete if the ref moved in the list→delete window; that refusal is
+//     classified benign (isCASDeleteRefusal, reusing isNonFastForward) → nil, never a
+//     retry. (The go-git internal server behind file:// does not enforce this wire CAS,
+//     which is why the local guard above is the primary one — see Publish's note that the
+//     pure wire race is not reproducible in the harness.)
+//
+// Only a genuine transport/session/auth fault returns a wrapped error, which the caller
+// swallows best-effort (scrubbed of the credential URL).
+func casDelete(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, refName plumbing.ReferenceName, expectedOld plumbing.Hash) error {
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return nil // empty remote: the checkpoint ref cannot exist — nothing to delete
+		}
+		return fmt.Errorf("pushbroker: list: %w", err)
+	}
+	var current plumbing.Hash
+	for _, r := range advertised {
+		if r.Name() == refName {
+			current = r.Hash()
+			break
+		}
+	}
+	if current.IsZero() || current != expectedOld {
+		// Ref already absent, or advanced past the tip WE published: a never-published
+		// run owns nothing, and an advanced ref now belongs to a newer run. Benign — leave
+		// it alone rather than clobber a sibling's fresh checkpoint.
+		return nil
+	}
+
+	// Origin still holds exactly our tip: delete it, binding the wire Old to that tip.
+	urls := remote.Config().URLs
+	if len(urls) == 0 {
+		return fmt.Errorf("pushbroker: remote has no URL")
+	}
+	ep, err := transport.NewEndpoint(urls[0])
+	if err != nil {
+		return fmt.Errorf("pushbroker: endpoint: %w", err)
+	}
+	c, err := client.NewClient(ep)
+	if err != nil {
+		return fmt.Errorf("pushbroker: transport client: %w", err)
+	}
+	sess, err := c.NewReceivePackSession(ep, auth)
+	if err != nil {
+		return fmt.Errorf("pushbroker: receive-pack session: %w", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	ar, err := sess.AdvertisedReferencesContext(ctx)
+	if err != nil {
+		return fmt.Errorf("pushbroker: advertise: %w", err)
+	}
+	req := packp.NewReferenceUpdateRequestFromCapabilities(ar.Capabilities)
+	req.Commands = []*packp.Command{{
+		Name: refName,
+		Old:  expectedOld,
+		New:  plumbing.ZeroHash,
+	}}
+	// No packfile: a delete carries no objects (req.Packfile stays nil).
+
+	// ReceivePack returns report-status AND report.Error() (nil on success, else the
+	// first failing command's "ng <ref> <reason>" text). A wire CAS/old-mismatch refusal
+	// (the ref moved in the list→delete window) is classified benign; only a real fault
+	// is surfaced.
+	_, err = sess.ReceivePack(ctx, req)
+	switch {
+	case err == nil:
+		return nil
+	case isCASDeleteRefusal(err):
+		return nil // ref moved out from under our Old in the list→delete window — benign
+	default:
+		return fmt.Errorf("pushbroker: cas delete checkpoint ref: %w", err)
+	}
 }
 
 // forwardPack ships the worker's (non-thin) packfile to origin through a MANUAL
@@ -796,6 +911,32 @@ func isNonFastForward(err error) bool {
 		strings.Contains(msg, "failed to update ref") ||
 		strings.Contains(msg, "cannot lock ref") ||
 		strings.Contains(msg, "fetch first")
+}
+
+// isCASDeleteRefusal matches a receive-pack report-status that refused a CAS DELETE
+// (casDelete) because origin's checkpoint ref no longer equals the Old we bound to the
+// run's persisted tip — either it advanced past that tip (a newer sibling run or a
+// human moved it) or it is already absent (server tip zero ≠ our non-zero Old). Both
+// are benign: the caller returns nil and never retries.
+//
+// As with isNonFastForward there is no sentinel — ReceivePack surfaces the server's
+// per-command "ng <ref> <reason>" text, so the message is the only discriminator. It
+// reuses isNonFastForward's compare-and-swap / lock-failure forms ("non-fast-forward",
+// "failed to update ref", "cannot lock ref", "fetch first" — a mismatched Old on a
+// delete surfaces as a "cannot lock ref … but expected …" lock failure), and ADDS the
+// delete-of-missing forms a ref-already-absent refusal can take across git versions and
+// services ("does not exist", "reference already exists", "no such ref").
+func isCASDeleteRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isNonFastForward(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "reference already exists") ||
+		strings.Contains(msg, "no such ref")
 }
 
 // isWorkflowScopeRejection matches GitHub's remote rejection of a push whose
