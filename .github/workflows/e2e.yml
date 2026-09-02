@@ -8,9 +8,15 @@
 # (2026-07-18) the compose path is exercised less by hand, so a nightly guards it
 # against silent bit-rot.
 #
+# FORGE-LANE MATRIX (issue #967): run-e2e.sh's UZI_E2E_FORGE selects the forge lane.
+# The gitlab lane is the full byte-identical suite; the forgejo (PRD #65 M9) and github
+# (PRD #238 M8) lanes are focused lifecycle runs that EXIST in run-e2e.sh but had no CI
+# driving them, so they rotted silently. One matrix job per forge fixes that. Lanes are
+# independent (fail-fast: false) so a forgejo break does not mask a gitlab result.
+#
 # FULLY CREDENTIAL-LESS: the stub executor needs no Anthropic token and no real
 # forge (forge-fake stands in), so no `secrets:` beyond the built-in GITHUB_TOKEN,
-# which is used ONLY to open/update a single failure-tracking issue (issues: write).
+# which is used ONLY to open/update a per-lane failure-tracking issue (issues: write).
 # The optional live `sdk` capstone (UZI_E2E_EXECUTOR=sdk) stays manual.
 #
 # Scheduled (deep night, Europe/Bucharest) plus manual dispatch. Deliberately NOT on
@@ -31,15 +37,40 @@ permissions:
   contents: read
   issues: write
 
+# One nightly at a time across all lanes; do NOT cancel an in-flight run (a partial
+# teardown could leak a stack). The matrix runs its lanes in parallel within a run.
 concurrency:
   group: e2e-nightly
   cancel-in-progress: false
 
 jobs:
   compose-e2e:
+    name: compose-e2e (${{ matrix.forge }})
     runs-on: ubuntu-latest
-    # A hung stack must not burn the runner budget; a healthy run is well under this.
-    timeout-minutes: 45
+    # A hung stack must not burn the runner budget. gitlab is the full suite; forgejo
+    # and github are focused lifecycle runs and finish well inside a shorter ceiling.
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - forge: gitlab
+            timeout: 45
+          - forge: forgejo
+            timeout: 25
+          - forge: github
+            timeout: 25
+    env:
+      # UZI_E2E_FORGE / KEEP_RUNDIR are in run-e2e.sh's env -i re-exec allowlist, so
+      # they survive the harness's clean-environment re-exec. E2E_RUN_DIR (also in the
+      # allowlist) needs the `runner` context, which is NOT available in job-level env
+      # -- it is set per-step below.
+      UZI_E2E_FORGE: ${{ matrix.forge }}
+      # A red run already auto-retains its rundir (lib.sh cleanup keeps it when the exit
+      # code is non-zero, PRD #966 M3 D5), which covers the failure-path upload below;
+      # KEEP_RUNDIR=1 makes retention unconditional as belt-and-braces (also covering a
+      # timed-out lane, where the harness may be killed before it can decide to retain).
+      KEEP_RUNDIR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
@@ -52,36 +83,70 @@ jobs:
           check-latest: true
 
       - name: Run compose E2E (stub executor)
+        # Pin the harness rundir to a known path so the upload + issue steps can find
+        # its artifacts (RUNROOT defaults to a $$-suffixed temp dir otherwise).
+        env:
+          E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
         run: ./e2e/run-e2e.sh
 
-      # On failure, keep exactly ONE open issue: comment on the existing one, else open
-      # it. Uses the built-in GITHUB_TOKEN (no PAT). The label is upserted first so the
-      # `gh issue list --label` lookup cannot error on a missing label.
+      # On failure OR a timed-out (cancelled) lane, keep the rundir's evidence:
+      # summary.md (the phase table + wait_* margins + leaks), junit.xml, results.tsv
+      # and the per-phase artifacts/ tree. if-no-files-found: warn, since a harness that
+      # died or was killed before writing results may leave none. Name the artifact per
+      # lane so three parallel lanes do not collide. failure() misses a timeout (the job
+      # is cancelled, not failed), so both cleanup steps gate on failure() || cancelled().
+      - name: Upload E2E rundir on failure
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-rundir-${{ matrix.forge }}
+          path: |
+            ${{ runner.temp }}/e2e-run/summary.md
+            ${{ runner.temp }}/e2e-run/junit.xml
+            ${{ runner.temp }}/e2e-run/results.tsv
+            ${{ runner.temp }}/e2e-run/artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # On failure or a timed-out lane, keep exactly ONE open issue PER LANE: comment on the existing one,
+      # else open it. Uses the built-in GITHUB_TOKEN (no PAT). The label is upserted
+      # first so the `gh issue list --label` lookup cannot error on a missing label.
+      # A per-lane label (nightly-e2e-<forge>) gives each forge its own tracking issue
+      # and avoids a create race between the parallel matrix lanes. The body embeds
+      # summary.md so the tracker shows every failing phase, not just a run URL.
       - name: Open or update failure issue
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORGE_LANE: ${{ matrix.forge }}
+          E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
         run: |
           set -euo pipefail
-          LABEL="nightly-e2e"
+          LABEL="nightly-e2e-${FORGE_LANE}"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          SUMMARY="${E2E_RUN_DIR}/summary.md"
 
           gh label create "$LABEL" \
-            --description "Nightly compose E2E (e2e/run-e2e.sh) failures" \
+            --description "Nightly compose E2E (e2e/run-e2e.sh) failures on the ${FORGE_LANE} forge lane" \
             --color B60205 --force
+
+          # Header line, then the run URL, then summary.md verbatim if the harness
+          # wrote it (it is already markdown: a phase table plus margins and leaks).
+          header="Nightly compose E2E failed on the **${FORGE_LANE}** lane at \`${GITHUB_SHA}\`."
+          if [ -f "$SUMMARY" ]; then
+            body="$(printf '%s\n\nRun: %s\n\n%s\n' "$header" "$RUN_URL" "$(cat "$SUMMARY")")"
+          else
+            body="$(printf '%s\n\nRun: %s\n\n_(no summary.md was produced — the harness likely died before writing results; see the run log.)_\n' "$header" "$RUN_URL")"
+          fi
 
           existing="$(gh issue list --state open --label "$LABEL" \
             --json number --jq '.[0].number // empty')"
 
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" \
-              --body "Nightly compose E2E failed again on \`${GITHUB_SHA}\`. Run: ${RUN_URL}"
+            gh issue comment "$existing" --body "$body"
           else
             gh issue create \
-              --title "Nightly compose E2E (run-e2e.sh) failing" \
+              --title "Nightly compose E2E (run-e2e.sh) failing on the ${FORGE_LANE} lane" \
               --label "$LABEL" \
-              --body "$(printf '%s\n\n%s\n%s\n' \
-                'The nightly compose E2E harness (e2e/run-e2e.sh) failed. This path is not covered by any per-change CI job (see the workflow header).' \
-                "First failing run: ${RUN_URL}" \
-                "Commit: ${GITHUB_SHA}")"
+              --body "$body"
           fi
