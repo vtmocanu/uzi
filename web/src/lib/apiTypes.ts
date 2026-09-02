@@ -3,6 +3,8 @@
 // imported from ./api (that would reintroduce a cycle). ./api re-exports every
 // name here (`export type *`) so the lib/api barrel surface is unchanged.
 
+import type { RunKind } from "./runKind";
+
 export interface User {
   id: string;
   email: string;
@@ -1746,9 +1748,9 @@ export interface Run {
    *  set on the list/detail reads. The web defaults an empty/unknown value to
    *  GitLab's vocabulary. */
   forge_type: string;
-  /** Run kind (PRD #6): "issue" works issue_iid's card; "ci_fix" fixes a failed
-   *  pipeline (pipeline_ref/pipeline_web_url/fix_verdict below); "chat" (PRD #39). */
-  kind: string;
+  /** Run kind (PRD #6): one of the RunKind union in lib/runKind.ts, pinned to
+   *  fixtures/run-kinds/registry.json. */
+  kind: RunKind;
   /** The worked issue for an issue run; null for a ci_fix or chat run (no issue). */
   issue_iid: number | null;
   issue_title: string;
