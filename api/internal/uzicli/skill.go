@@ -10,7 +10,7 @@ import (
 )
 
 // embeddedSkill is the bundled Claude Code skill, compiled into the binary via
-// go:embed. It is the single source of truth for the installed skill: `uzi`
+// the `//go:embed` directive below. It is the single source of truth for the installed skill: `uzi`
 // writes it to ~/.claude/skills/uzi-cli/SKILL.md so agents always know how to
 // drive THIS binary's command surface (skew is structurally impossible — the
 // skill ships inside the CLI). The skill<->cobra-tree drift test asserts every
@@ -175,7 +175,7 @@ func (si *SkillInstaller) Install(force bool) (SkillInstallResult, error) {
 		return res, nil
 	}
 
-	if err := os.MkdirAll(si.dir(), 0o755); err != nil {
+	if err := os.MkdirAll(si.dir(), 0o750); err != nil {
 		return res, err
 	}
 

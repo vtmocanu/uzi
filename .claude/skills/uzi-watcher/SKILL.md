@@ -59,6 +59,17 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
    folded into step 6. Gated, so the lead plans and the
    budget scales to its milestones. Seeded runs get the global default budget, too small for
    a multi-milestone PRD.
+
+   **Never `2>&1` a `uzi … --json` call into `jq`, and never read a piped exit code as
+   uzi's.** The CLI prints its version-skew warning (`uzi: CLI vX is behind server vY`) on
+   stderr; merged into stdout it lands ahead of the JSON, jq fails on line 1 with `Invalid
+   numeric literal`, and jq 1.8 exits **5** on an input parse error, the same number as
+   uzi's conflict exit ("a run is already in progress for this issue"). With `pipefail`
+   off, the pipeline reports jq's 5 as if uzi had refused. Measured 2026-09-02 on #1021: the
+   create had succeeded, the run was live, and the "conflict" cost three sessions a
+   cross-session ownership hunt. Keep stderr out of the pipe (`2>/dev/null` or none), and
+   confirm a suspected conflict with `uzi run list --json` (an existing run's `created_at`
+   within a minute of your own call is your own call).
 3. **Watch to the gate** with the bundled poller (see *Watching*).
 4. **Review the plan, then approve / revise / reject.** Read it from the run log:
 
