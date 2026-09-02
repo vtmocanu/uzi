@@ -186,6 +186,25 @@ func TestReopenIssue(t *testing.T) {
 		}
 	})
 
+	t.Run("idempotent: an already-open issue makes no forge reopen call", func(t *testing.T) {
+		st := &fakeStore{}
+		svc := newTestService(st)
+		f := &fakeForge{}
+		issue := stateIssue(t, "opened", "Planned") // already open
+
+		if _, err := svc.ReopenIssue(context.Background(), f, 7, issue, boardColumns(), "Planned"); err != nil {
+			t.Fatalf("ReopenIssue: %v", err)
+		}
+		// Success criterion 5: no state-changing forge call for an already-open issue,
+		// and no board_position-nulling reopen cache flip (it stays a plain move).
+		if len(f.setStateCalls) != 0 {
+			t.Fatalf("forge SetIssueState was called for an already-open issue: %+v (success criterion 5)", f.setStateCalls)
+		}
+		if len(st.reopens) != 0 {
+			t.Fatalf("reopen cache flip ran for an already-open issue: %+v", st.reopens)
+		}
+	})
+
 	t.Run("move-half failure returns the reopened-but-unmoved row with the error", func(t *testing.T) {
 		st := &fakeStore{}
 		svc := newTestService(st)
