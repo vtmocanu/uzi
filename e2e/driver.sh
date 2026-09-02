@@ -315,7 +315,16 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   ( set -euo pipefail
     [ "${E2E_FAULT_PHASE:-}" = "$slug" ] && fail "injected fault: $slug"
     source "$f"
-    for v in $provides; do declare -p "$v"; done > "$RUNROOT/phase.env.next"
+    # Round-trip only SHELL-VAR provides across the subshell. An `env:KEY=VALUE`
+    # provides token is an ENVFILE fact (declared so `requires: env:…` can name its
+    # producer via _find_producer, same as `mutates:`), NOT a shell variable — a bare
+    # `declare -p "env:KEY=VALUE"` errors ("not found") and, under this subshell's
+    # `set -e`, would redden the phase after its body already passed. Skip it, exactly
+    # as the requires: validation special-cases `env:*`.
+    for v in $provides; do
+      case "$v" in env:*) continue ;; esac
+      declare -p "$v"
+    done > "$RUNROOT/phase.env.next"
   ) > "$RUNROOT/logs/$nn_slug.log" 2>&1
   rc=$?
   set -e

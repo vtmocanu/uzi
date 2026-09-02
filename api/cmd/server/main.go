@@ -545,9 +545,10 @@ func run() error {
 	// the M3 loop-guard ledger. Wired unconditionally — the instance kill-switch is
 	// simply NOT wiring it; the admin kill-switch (settings mr_rework_enabled, default
 	// on), the per-user opt-in (users.mr_rework_enabled, default on), the per-MR cap and
-	// the pipelineMaxRefs>0 gate control activation. The two literals mirror
-	// settings.DefaultMrReworkCap (5, the admin-read fallback used only on a cap-read
-	// error) and the review-landed quiet-period debounce (Decision 6).
+	// the pipelineMaxRefs>0 gate control activation. The literal 5 mirrors
+	// settings.DefaultMrReworkCap (the admin-read fallback used only on a cap-read
+	// error); the review-landed quiet-period debounce (Decision 6) is now the
+	// MR_REVIEW_QUIET_PERIOD knob (cfg.MRReviewQuietPeriod, default 3m; PRD #966 M6).
 	engine.SetMRReviewWatch(poller.NewMRReviewWatch(q, wsvc, notifier, settingsCache, 5, cfg.MRReviewQuietPeriod))
 	// Reverse GitHub Projects v2 sync (PRD #364 M6): a per-tick poller sibling for
 	// GitHub synced repos that reads item Statuses, diffs each against the stored

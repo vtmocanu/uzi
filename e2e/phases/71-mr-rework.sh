@@ -8,7 +8,7 @@
 # provides: env:E2E_FORGE_POLL_INTERVAL=2s
 # handoff:  -
 # mutates:  api:E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2
-# restores: no
+# restores: -
 # =============================================================================
 # PRD #966 M6 — the `mr_rework` run kind had zero wire coverage. The MR review-watcher
 # (poller/mr_review_watch.go, wired unconditionally via engine.SetMRReviewWatch) queues

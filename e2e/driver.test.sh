@@ -461,5 +461,30 @@ contains "$(cat "$PFLOG")" "core.sharedRepository" || bad "preflight FAIL did no
 end
 
 # ============================================================================
+# Case 14 — a phase that declares an `env:KEY=VALUE` provides token (alongside a
+# shell-var provides) is recorded PASS, and the shell-var provides still crosses.
+# An env: token is an ENVFILE fact (for requires: producer lookup), NOT a shell
+# var; the provides round-trip must SKIP it, not `declare -p "env:KEY=VALUE"`
+# (which errors "not found" and, under the phase subshell's set -e, would redden a
+# phase whose body passed — the pre-existing PRD #966 mr-close / mr-rework crash).
+# Mutation: drop the `case env:*) continue` skip in driver.sh's provides loop ->
+# provEnv reddens with a `declare: env:...: not found`.
+begin "case14: env: provides token does not crash the phase" 14
+mkphase "$PHASES_DIR/10-provEnv.sh" "provide env + var" no "" "BAZ env:POLL=2s" "" <<'BODY'
+BAZ=qux
+pass "set BAZ and declared env:POLL=2s"
+BODY
+mkphase "$PHASES_DIR/11-consumeEnv.sh" "consume env + var" no "BAZ env:POLL=2s" "" "" <<'BODY'
+[ "$BAZ" = qux ] || fail "BAZ was not qux (got '${BAZ:-}')"
+pass "saw BAZ=qux and env:POLL=2s satisfied"
+BODY
+printf 'POLL=2s\n' > "$ENVFILE"   # the env: token the provider declares must exist in ENVFILE
+run_driver 14
+has_row provEnv PASS || bad "provEnv not PASS (env: provides token crashed the round-trip)"
+has_row consumeEnv PASS || bad "consumeEnv not PASS (shell-var provides did not cross, or env: requires unsatisfied)"
+[ "$RC" -eq 0 ] || bad "exit code should be 0 (got $RC)"
+end
+
+# ============================================================================
 printf '\ncases=%s passed=%s\n' "$cases" "$passed"
 [ "$cases" -eq "$passed" ] || exit 1

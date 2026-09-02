@@ -775,7 +775,7 @@ const server = https.createServer(
     }
 
     // Append an MR review discussion note (PRD #966 M6). The mr_rework detector
-    // reads these via the discussions route above. Body: {id, body, created_at,
+    // reads these via the discussions route (defined below). Body: {id, body, created_at,
     // author_id, system}. author_id DEFAULTS to 2 (NOT 1) because forge-fake's
     // /api/v4/user returns id 1 (the connection's bot id) and
     // BuildReviewCommentsSnapshot drops notes whose author.id == the bot id — a
