@@ -76,7 +76,11 @@ hgit() { GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" GIT_CONFIG_NOSYSTEM=1 git -
 # credential, 200 with the Basic uzi-bot:PAT) — the same gate phase 20 asserts in-container.
 # Each rung fails in one line naming what broke; #990 leaves FAIL artifact .logs empty, so
 # the fail REASON (recorded in results.tsv) has to carry the diagnosis itself.
-_h_code() { curl -sk -o /dev/null -w '%{http_code}' "$@" || true; }
+# --connect-timeout/--max-time bound the probe: the phase driver has no per-phase timeout,
+# so a wedged forge-fake (TCP accepted, response never sent) would otherwise hang the whole
+# suite here rather than fail the rung. Localhost forge-fake answers in ms, so these ceilings
+# only ever trip on a genuine hang, turning it into a fast, diagnosable rung failure.
+_h_code() { curl -sk --connect-timeout 5 --max-time 20 -o /dev/null -w '%{http_code}' "$@" || true; }
 _refs="$FAKE_BASE/group/repo.git/info/refs?service=git-upload-pack"
 c="$(_h_code "$FAKE_BASE/_e2e/health")"
 [ "$c" = 200 ] || fail "handoff transport: forge-fake not reachable host-side at $FAKE_BASE/_e2e/health (got '$c') — published port ${FAKE_PORT} down or TLS broken"
