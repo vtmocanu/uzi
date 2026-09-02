@@ -48,6 +48,7 @@ import { LabelFilter } from "./judge/LabelFilter";
 import { MultiSelectBar } from "./judge/MultiSelectBar";
 import { GroupRow } from "./judge/GroupRow";
 import { ZeroState } from "./judge/ZeroState";
+import { UndoToast } from "./judge/UndoToast";
 
 // UNDO_CONCURRENCY bounds the parallel DELETEs an Undo issues (PRD #98 review N4). Undo is
 // the one path that re-expands a fan-out the server deliberately collapsed to a SINGLE
@@ -622,39 +623,4 @@ export function Judge() {
 // error AT THE ARRAY, and this validator follows automatically.
 function isBucket(v: string | null): v is JudgeBacklogBucket {
   return v !== null && (JUDGE_BUCKETS as readonly string[]).includes(v);
-}
-
-// UndoToast confirms a bulk action and offers a one-click revert. Undo clears exactly the
-// members the SERVER reported settling (the response's `settled` list), one deleteDisposition
-// each, at bounded concurrency — not the members this page believed were open, which is a
-// staler set and can include coordinates the action never touched (see UndoMember). A
-// role="status" live region so the confirmation is announced.
-function UndoToast({ toast, onUndo, onDismiss }: { toast: Toast; onUndo: () => void; onDismiss: () => void }) {
-  return (
-    <div className="fixed inset-x-0 bottom-20 z-30 flex justify-center px-4">
-      <div
-        role="status"
-        className="flex items-center gap-3 rounded-lg border border-edge-strong bg-surface px-4 py-2.5 text-sm shadow-lg"
-      >
-        <span className="text-fg">{toast.message}</span>
-        {toast.undo.length > 0 && (
-          <button
-            type="button"
-            onClick={onUndo}
-            className="inline-flex min-h-[24px] items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg"
-          >
-            Undo
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={onDismiss}
-          aria-label="Dismiss"
-          className="rounded-md p-0.5 text-faint transition-colors hover:text-fg"
-        >
-          <XIcon />
-        </button>
-      </div>
-    </div>
-  );
 }
