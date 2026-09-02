@@ -16,6 +16,14 @@ import type {
   UserSettings,
   CatalogEntry,
   CliToken,
+  Board,
+  Card,
+  BoardColumn,
+  Skill,
+  SettingsResponse,
+  Branding,
+  Chat,
+  AgentTemplate,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -48,6 +56,22 @@ import catalogEntryZero from "../../../fixtures/api-contract/catalog_entry.zero.
 import catalogEntryFull from "../../../fixtures/api-contract/catalog_entry.full.json";
 import cliTokenZero from "../../../fixtures/api-contract/cli_token.zero.json";
 import cliTokenFull from "../../../fixtures/api-contract/cli_token.full.json";
+import boardZero from "../../../fixtures/api-contract/board.zero.json";
+import boardFull from "../../../fixtures/api-contract/board.full.json";
+import cardZero from "../../../fixtures/api-contract/card.zero.json";
+import cardFull from "../../../fixtures/api-contract/card.full.json";
+import columnZero from "../../../fixtures/api-contract/column.zero.json";
+import columnFull from "../../../fixtures/api-contract/column.full.json";
+import skillZero from "../../../fixtures/api-contract/skill.zero.json";
+import skillFull from "../../../fixtures/api-contract/skill.full.json";
+import settingsZero from "../../../fixtures/api-contract/settings.zero.json";
+import settingsFull from "../../../fixtures/api-contract/settings.full.json";
+import brandingZero from "../../../fixtures/api-contract/branding.zero.json";
+import brandingFull from "../../../fixtures/api-contract/branding.full.json";
+import chatZero from "../../../fixtures/api-contract/chat.zero.json";
+import chatFull from "../../../fixtures/api-contract/chat.full.json";
+import agentTemplateZero from "../../../fixtures/api-contract/agent_template.zero.json";
+import agentTemplateFull from "../../../fixtures/api-contract/agent_template.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -359,6 +383,148 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _cliTokenFull;
 }
 
+// ── Board (M3) ──────────────────────────────────────────────────────────────
+// ZeroOf exemptions: columns, cards — the board mapper (buildBoard) always builds
+// them with make([]columnDTO, 0, …) (handler/board.go:422) / make([]cardDTO, 0, …)
+// (handler/board.go:580), so the wire is [] though boardDTO{} zero-marshals the nil
+// slices to null. TS types both never-null (BoardColumn[] / Card[]). pipeline is
+// typed PipelineStatus|null and bot_forge_user_id is optional-scalar, so neither
+// needs an exemption. No drift: Board's key set matches boardDTO's.
+{
+  const _boardMissing: never = null as unknown as Exclude<keyof Board, keyof typeof boardFull>;
+  const _boardExtra: never = null as unknown as Exclude<keyof typeof boardFull, keyof Board>;
+  const _boardZero: ZeroOf<Board, "columns" | "cards"> = boardZero;
+  // full.json exercises the nested Card shape too (the populator gives cards one element).
+  const _boardFull: Widen<Board> = boardFull;
+  void _boardMissing;
+  void _boardExtra;
+  void _boardZero;
+  void _boardFull;
+}
+
+// ── Card (M3) ───────────────────────────────────────────────────────────────
+// Card is the most-used type in the SPA (268 uses) and the element type of
+// Board.cards; it is checked as its own pair here AND, via board.full.json, as the
+// nested element above. ZeroOf exemptions: labels, assignee_ids — decodeLabels
+// (handler/board.go:519) and decodeAssigneeIDs (handler/board.go:544) each return a
+// non-nil [] (verified: []string{} / []int64{} on nil), so the wire is [] though
+// cardDTO{} zero-marshals the nil slices to null. TS types labels as string[] and
+// assignee_ids as an optional-never-null number[]. author/latest_run/pipeline are
+// typed X|null in TS, so they need no exemption. No drift.
+{
+  const _cardMissing: never = null as unknown as Exclude<keyof Card, keyof typeof cardFull>;
+  const _cardExtra: never = null as unknown as Exclude<keyof typeof cardFull, keyof Card>;
+  const _cardZero: ZeroOf<Card, "labels" | "assignee_ids"> = cardZero;
+  const _cardFull: Widen<Card> = cardFull;
+  void _cardMissing;
+  void _cardExtra;
+  void _cardZero;
+  void _cardFull;
+}
+
+// ── BoardColumn (M3, columnDTO → BoardColumn) ───────────────────────────────
+// All-scalar (label_name, position; declared nullable:false below): its zero.json
+// legitimately carries no null, so the null-presence guard is off and the
+// nullability pin is vacuous — recorded, not a failure. There is no `Column` type;
+// columnDTO maps to BoardColumn, the element type of Board.columns.
+{
+  const _columnMissing: never = null as unknown as Exclude<keyof BoardColumn, keyof typeof columnFull>;
+  const _columnExtra: never = null as unknown as Exclude<keyof typeof columnFull, keyof BoardColumn>;
+  const _columnZero: ZeroOf<BoardColumn> = columnZero;
+  const _columnFull: Widen<BoardColumn> = columnFull;
+  void _columnMissing;
+  void _columnExtra;
+  void _columnZero;
+  void _columnFull;
+}
+
+// ── Skill (M3) ──────────────────────────────────────────────────────────────
+// No ZeroOf exemption — every nullable field (user_id, updated_by) is typed
+// string|null in TS, matching the *string fields on skillDTO. No drift.
+{
+  const _skillMissing: never = null as unknown as Exclude<keyof Skill, keyof typeof skillFull>;
+  const _skillExtra: never = null as unknown as Exclude<keyof typeof skillFull, keyof Skill>;
+  const _skillZero: ZeroOf<Skill> = skillZero;
+  const _skillFull: Widen<Skill> = skillFull;
+  void _skillMissing;
+  void _skillExtra;
+  void _skillZero;
+  void _skillFull;
+}
+
+// ── SettingsResponse (M3, map-vs-struct) ────────────────────────────────────
+// The ENVELOPE key set (settings, secrets, sources, slack_status, oidc_status,
+// oidc_provider_name) matches between Go and TS, so _missing/_extra pin it correctly
+// and stay in the full check. The VALUE-level check is where the map-vs-struct
+// mismatch bites and is handled specially:
+//   • settings — Go is a dynamic map[string]string; the mapper gives the fixture one
+//     entry {"x":"x"}. TS settings is the CLOSED AppSettings interface (~20 fixed
+//     keys), which {"x":"x"} cannot satisfy. This is inherent (a registry map, not a
+//     struct), so settings is Omit-ted from the _zero/_full value assertions. The
+//     ENVELOPE shape IS pinned; AppSettings' inner key contract is registry-driven and
+//     out of this fixture's scope (see README "What this cannot catch").
+//   • secrets, sources — Record<string,…>; Widen<Record<>> accepts {"x":…}, so they
+//     stay in the value check. settingsResponse{} zero-marshals the nil maps to null,
+//     but newSettingsResponse takes them from settings.AdminView, which builds all
+//     three with make(...) (handler/settings.go:49 ← settings.go:1320-1322), so the
+//     real wire is never null → secrets/sources get the ZeroOf NeverNull exemption.
+{
+  const _settingsMissing: never = null as unknown as Exclude<keyof SettingsResponse, keyof typeof settingsFull>;
+  const _settingsExtra: never = null as unknown as Exclude<keyof typeof settingsFull, keyof SettingsResponse>;
+  const _settingsZero: ZeroOf<Omit<SettingsResponse, "settings">, "secrets" | "sources"> = settingsZero;
+  const _settingsFull: Widen<Omit<SettingsResponse, "settings">> = settingsFull;
+  void _settingsMissing;
+  void _settingsExtra;
+  void _settingsZero;
+  void _settingsFull;
+}
+
+// ── Branding (M3) ───────────────────────────────────────────────────────────
+// All-scalar (strings + bools; declared nullable:false below): brandingResponse has
+// no nullable field, so its zero.json legitimately carries no null. No drift.
+{
+  const _brandingMissing: never = null as unknown as Exclude<keyof Branding, keyof typeof brandingFull>;
+  const _brandingExtra: never = null as unknown as Exclude<keyof typeof brandingFull, keyof Branding>;
+  const _brandingZero: ZeroOf<Branding> = brandingZero;
+  const _brandingFull: Widen<Branding> = brandingFull;
+  void _brandingMissing;
+  void _brandingExtra;
+  void _brandingZero;
+  void _brandingFull;
+}
+
+// ── Chat (M3, chatListDTO → Chat) ───────────────────────────────────────────
+// No ZeroOf exemption — every nullable field (title, last_message_at,
+// resume_of_run_id) is typed X|null in TS, matching the *string / *time.Time fields
+// on chatListDTO. No drift.
+{
+  const _chatMissing: never = null as unknown as Exclude<keyof Chat, keyof typeof chatFull>;
+  const _chatExtra: never = null as unknown as Exclude<keyof typeof chatFull, keyof Chat>;
+  const _chatZero: ZeroOf<Chat> = chatZero;
+  const _chatFull: Widen<Chat> = chatFull;
+  void _chatMissing;
+  void _chatExtra;
+  void _chatZero;
+  void _chatFull;
+}
+
+// ── AgentTemplate (M3) ──────────────────────────────────────────────────────
+// No ZeroOf exemption and — checked against the Tools WARNING — NO drift. decodeTools
+// (handler/agent_templates.go:130) returns nil (→ null) for an empty tools column, so
+// agentTemplateDTO.Tools CAN be null on the wire; TS ALREADY types it `tools: string[]
+// | null` (apiTypes.ts:150), so the null is accepted and no exemption or directive is
+// needed. model/user_id/updated_by/origin are all typed X|null in TS too.
+{
+  const _agentTemplateMissing: never = null as unknown as Exclude<keyof AgentTemplate, keyof typeof agentTemplateFull>;
+  const _agentTemplateExtra: never = null as unknown as Exclude<keyof typeof agentTemplateFull, keyof AgentTemplate>;
+  const _agentTemplateZero: ZeroOf<AgentTemplate> = agentTemplateZero;
+  const _agentTemplateFull: Widen<AgentTemplate> = agentTemplateFull;
+  void _agentTemplateMissing;
+  void _agentTemplateExtra;
+  void _agentTemplateZero;
+  void _agentTemplateFull;
+}
+
 // ── Runtime self-checks ─────────────────────────────────────────────────────
 // A contract that passes on a missing fixture, or on a zero.json with no null in
 // it, is the false-green shape this repo documents repeatedly. These fatal
@@ -405,6 +571,16 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "user_settings", nullable: true },
   { stem: "catalog_entry", nullable: true },
   { stem: "cli_token", nullable: true },
+  // M3 — the handler-package hot set.
+  { stem: "board", nullable: true },
+  { stem: "card", nullable: true },
+  { stem: "skill", nullable: true },
+  { stem: "settings", nullable: true },
+  { stem: "chat", nullable: true },
+  { stem: "agent_template", nullable: true },
+  // All-scalar / no nullable Go field: their zero.json legitimately carries no null.
+  { stem: "column", nullable: false },
+  { stem: "branding", nullable: false },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

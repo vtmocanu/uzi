@@ -88,7 +88,7 @@ which the exemption rule says is real drift (not an exemption). They are carried
 directive (on the `_zero` assertion) so `gate:web` stays green, and M4 must reconcile them
 (the directive is unused-on-fix, so tsc forces it). The `@ts-expect-error` masks the whole
 `_zero` line, so any further nullability drift on Worker/Schedule is masked until M4 clears
-the directive — the same same-line caveat M1 documents for `_runExtra`.
+the directive — the same-line caveat M1 documents for `_runExtra`.
 
 | TS type | field | why the wire sends `null` | exact suppressed tsc error |
 |---|---|---|---|
@@ -98,6 +98,71 @@ the directive — the same same-line caveat M1 documents for `_runExtra`.
 M4 reconciliation (type-only): `Worker.docker` → `docker?: boolean | null`; `Schedule.next_fires`
 → `next_fires: string[] | null` (or, out of scope for a type-only PRD, the Go mapper normalizes
 `next_fires` to `[]`).
+
+M3 adds the handler-package hot set (the DTOs are UNEXPORTED, served by cookie-only
+routes, so their Go half is `api/internal/handler/contract_test.go`, an in-package test):
+`boardDTO → Board`, `cardDTO → Card`, `columnDTO → BoardColumn`, `skillDTO → Skill`,
+`settingsResponse → SettingsResponse`, `brandingResponse → Branding`,
+`chatListDTO → Chat`, `agentTemplateDTO → AgentTemplate`. The handler test shares the
+same stdlib-only `apitypestest.Populate` (it reflects on exported FIELDS, so an
+unexported struct TYPE is fine); `TestNoServerDeps` (`api/cmd/uzi/deps_test.go`) was run
+and stayed green (a test-only `apitypestest` import cannot reach the `go list -deps`
+closure over `cmd/uzi`).
+
+### M3 `ZeroOf` exemptions, each cited (Decision 7)
+
+| DTO | field | TS type | mapper guarantee |
+|---|---|---|---|
+| `Board` | `columns` | `columns: BoardColumn[]` | `buildBoard` builds `make([]columnDTO, 0, …)` (`handler/board.go:422`) → always `[]` |
+| `Board` | `cards` | `cards: Card[]` | `buildBoard` builds `make([]cardDTO, 0, …)` (`handler/board.go:580`) → always `[]` |
+| `Card` | `labels` | `labels: string[]` | `decodeLabels` returns non-nil `[]string{}` on nil (`handler/board.go:519`) |
+| `Card` | `assignee_ids` | `assignee_ids?: number[]` | `decodeAssigneeIDs` returns non-nil `[]int64{}` on nil (`handler/board.go:544`) |
+| `SettingsResponse` | `secrets` | `secrets: Record<string, boolean>` | `settings.AdminView` builds it with `make(...)` (`handler/settings.go:49` ← `settings/settings.go:1320-1322`) → never nil |
+| `SettingsResponse` | `sources` | `sources: Record<string, SettingSource>` | same `AdminView` `make(...)` (`settings/settings.go:1320-1322`) → never nil |
+
+DTOs with **no** exemption (every nullable Go field is already typed `X | null` in TS):
+`Skill` (`user_id`, `updated_by`), `Chat` (`title`, `last_message_at`,
+`resume_of_run_id`), `AgentTemplate` (`model`, `tools`, `user_id`, `updated_by`,
+`origin` — all `X | null`). All-scalar / no nullable field (declared `nullable: false`,
+so their legitimately null-free `zero.json` is not flagged vacuous): `BoardColumn`
+(`columnDTO`, `label_name`/`position`), `Branding` (`brandingResponse`, strings+bools).
+
+`Card` is BOTH its own pair AND the element type of `Board.cards`. The populator gives
+an array one element, so `board.full.json` carries a fully-populated `cardDTO` (with its
+nested `latest_run`/`pipeline`), exercising the nested `Card` shape through
+`_boardFull: Widen<Board>`; `Card` also has its own `check` block with its own fixtures.
+
+### 🔴 M3 map-vs-struct: `settingsResponse.settings` (envelope pinned, inner keys out of scope)
+
+`settingsResponse.Settings` is `map[string]string`, `Secrets` is `map[string]bool`,
+`Sources` is `map[string]string` (`handler/settings.go:32-40`). The populator gives each
+map ONE entry `{"x": …}`. The **envelope** key set (`settings, secrets, sources,
+slack_status, oidc_status, oidc_provider_name`) DOES match between Go and TS, so the
+`_settingsMissing`/`_settingsExtra` assertions pin it correctly and stay in place.
+
+The **value-level** check splits:
+
+- **`settings`** is the CLOSED `AppSettings` interface in TS (`apiTypes.ts:688`, ~20
+  fixed keys), but the Go side is a dynamic registry `map`, so the fixture's `{"x":"x"}`
+  cannot satisfy `Widen<AppSettings>` (which requires every key). This is inherent, not
+  drift, so `settings` is **`Omit`-ted** from the `_settingsZero`/`_settingsFull` value
+  assertions. **The envelope shape IS pinned; the inner AppSettings key contract is
+  registry-driven and out of this fixture's scope** — see *What this contract CANNOT
+  catch* below.
+- **`secrets`/`sources`** are `Record<string,…>`; `Widen<Record<>>` accepts `{"x":…}`,
+  so they stay in the value check. `settingsResponse{}` zero-marshals the nil maps to
+  `null`, but `newSettingsResponse` fills them from `settings.AdminView`, which builds all
+  three with `make(...)` (verified non-nil), so they get the `ZeroOf` NeverNull exemption
+  above rather than a false claim of drift.
+
+### M3 discovered drift
+
+**None.** Every M3 pair's key set matches, and every nullable field is either mapper-`[]`
+guaranteed (the exemptions above) or already typed `X | null` in TS. In particular
+`AgentTemplate.tools`: `decodeTools` (`handler/agent_templates.go:130`) returns `nil`
+(→ `null`) for an empty tools column, so the wire CAN send `null` — but TS already types
+it `tools: string[] | null` (`apiTypes.ts:150`), so there is no drift and no
+`@ts-expect-error` directive (the Tools WARNING's REAL-drift branch does not apply here).
 
 ## What the TS half pins (three compile-time assertions per DTO)
 
@@ -237,6 +302,12 @@ one assertion and no more.
 - **Index signatures.** A TS type with `[key: string]: …` makes `keyof` yield
   `string | number`, which would false-red the key-set check. NONE of the hot-set
   types has one; this caveat is here so the next DTO added does not trip on it.
+- **The inner AppSettings key contract.** `settingsResponse.Settings` is a dynamic
+  `map[string]string` on the Go side but the CLOSED `AppSettings` interface on the TS
+  side, so the populator's one-entry `{"x":"x"}` cannot exercise it and `settings` is
+  `Omit`-ted from the `SettingsResponse` value assertions (M3). The ENVELOPE shape (that
+  `settings`/`secrets`/`sources`/… exist and their kinds) IS pinned; whether AppSettings'
+  ~20 inner keys match the registry is registry-driven and out of this fixture's scope.
 
 ## No token-shaped strings
 

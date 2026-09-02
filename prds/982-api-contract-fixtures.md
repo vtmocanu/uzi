@@ -206,7 +206,7 @@ and matters here exactly as `fixtures/run-usage/README.md` explains: the fixture
     /`AdminWorker.docker`** (null for external workers) and **`Schedule.next_fires`** (null
     for a once schedule). Both are carried under `@ts-expect-error #982` on their `_zero`
     assertion; **M4 must also reconcile them** — see the note appended to M4.
-- [ ] **M3 — the handler-package hot set.** `api/internal/handler/contract_test.go`
+- [x] **M3 — the handler-package hot set.** `api/internal/handler/contract_test.go`
   (internal test, the DTOs are unexported) sharing the populator through a tiny
   **stdlib-only** test-support package `api/internal/apitypes/apitypestest` (imports
   `reflect`, `time`, `encoding/json` and nothing from this module — it must NOT import
@@ -221,6 +221,23 @@ and matters here exactly as `fixtures/run-usage/README.md` explains: the fixture
   exemptions here: `Card.labels`, `Card.assignee_ids` (`decodeLabels` /
   `decodeAssigneeIDs` normalize), and `Board.columns` / `Board.cards` if the board mapper
   emits `[]` for an empty board — read the mapper, cite the line.
+  - Landed: 8 DTO rows (Go `handler/contract_test.go`, in-package — the DTOs are
+    unexported) + 8 `check` blocks (`apiContract.test.ts`), 16 fixtures under
+    `fixtures/api-contract/`. `columnDTO` maps to `BoardColumn` (there is no `Column`
+    type). ZeroOf exemptions (mapper-cited in the README): `Board.columns` (board.go:422),
+    `Board.cards` (board.go:580), `Card.labels` (board.go:519), `Card.assignee_ids`
+    (board.go:544), `SettingsResponse.secrets`/`sources` (AdminView `make`,
+    settings.go:1320-1322). All-scalar (`nullable:false`): `BoardColumn` (`columnDTO`),
+    `Branding` (`brandingResponse`). `settingsResponse.settings` (dynamic
+    `map[string]string` vs the closed `AppSettings` interface) uses `Omit<SettingsResponse,
+    "settings">` on the value assertions — the envelope key set is still pinned; the inner
+    AppSettings keys are out of scope (documented in the README). `Card` is checked as its
+    own pair AND as the nested element of `board.full.json`.
+  - **No M3 discovered drift.** Every pair's key set matched. `AgentTemplate.tools` CAN be
+    `null` on the wire (`decodeTools` returns nil for an empty column, agent_templates.go:130),
+    but TS already types it `string[] | null` (apiTypes.ts:150), so NO drift and no directive
+    (the Tools WARNING's real-drift branch did not apply). No `@ts-expect-error` was added in M3.
+  - Gates green: `task gate:api`, `task gate:web`, `task scan:secrets`; `TestNoServerDeps` green.
 - [ ] **M4 — reconcile, type-only.** Add the 7 `Run` fields (doc comments from
   `apitypes/run.go`), `CatalogEntry.selector_kind` and `mr_rework_enabled?: boolean |
   null`, `AdminCliToken extends CliToken` with `user_id`/`owner_email` (and retype the
