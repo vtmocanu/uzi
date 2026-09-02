@@ -1,7 +1,7 @@
 # PRD #1021: settings/settings.go domain file split, the schema to `keys.go`, one file per settings domain
 
 **GitHub Issue**: [#1021](https://github.com/vtmocanu/uzi/issues/1021)
-**Status**: Planned (created 2026-09-02)
+**Status**: Complete (created 2026-09-02, done 2026-09-02)
 **Priority**: Medium
 **Parent**: epic #915 (Batch 4, P17; decided in the epic's "Maintainer decisions (2026-09-02 15:05 Bucharest, the four un-measured >1000-line Go files)"). Same-package file moves, the recipe #921 (`workersvc`), #963 (`forgesvc/projectsync.go`) and #1008/#1009 use. File-disjoint from #1008 (`api/internal/handler/**`), #1009 (`api/cmd/uzi/**`), #1017 (`api/internal/uzicli/**`) and #1022 (`api/internal/handler/**`): this PRD touches `api/internal/settings/**` (non-test files only), `fixtures/api-contract/README.md` and `specs/ai.md`.
 **Line refs**: at `3c03565` (main, 2026-09-02 15:20 Bucharest; `settings.go` is byte-identical to `68ea273`, where the measurements were taken). Implementer re-derives at their base; anchors are identifiers, not offsets.
@@ -44,18 +44,18 @@ Eleven new files. The implementer may fold a domain into its neighbour if the ta
 
 ## Milestones
 
-- [ ] **M1: Baseline proofs, then the schema as the template move.**
+- [x] **M1: Baseline proofs, then the schema as the template move.**
   - Capture the proofs **before** any move, on the branch base: `cd api && go doc -all ./internal/settings > /tmp/godoc.before`; `go test -count=1 -race ./internal/settings/...` green; `task lint:api` 0 issues.
   - Move `:39-374` and `:412-550` into `keys.go` in one commit (the bounds consts at `:374-412` stay behind for M2/M3, each going to its domain). File shape: `package settings`, imports, blank line, two-line header comment. The moved text is byte-identical: `git diff --color-moved=dimmed-zebra origin/main..HEAD -- api/internal/settings/` shows it as one moved block plus the package clause, imports and header (no indentation change here, so no `--color-moved-ws` flag is needed; if the implementer reaches for `-w`, that is the signal something other than a move happened).
   - Verification: `go doc -all ./internal/settings | diff /tmp/godoc.before -` empty; `task gate:api` green; `git diff --stat origin/main..HEAD -- 'api/internal/settings/*_test.go'` empty.
-- [ ] **M2: The four large domains: agent-source, release-check, labels, branding.**
+- [x] **M2: The four large domains: agent-source, release-check, labels, branding.**
   - One move-only commit per file (`settings_agent_source.go`, `settings_release_check.go`, `settings_labels.go`, `settings_branding.go`), each `--color-moved` clean and `go test -count=1 -race ./internal/settings/...` green on its own (the #963 D2 rule: a bisectable history). Each domain's bounds const(s) ride in that domain's commit.
   - Sweep each moved block for positional comments (`above`, `below`, `:NNN`, "this file") that the move makes false and fix them in the same commit, listed in the PR (the #963 recipe). Known one: the `Validate` doc comment and the key-block comments reference validators by name, not position; verify rather than assume.
   - Verification as M1 after the last commit.
-- [ ] **M3: The six small domains: judge (+ the two model keys), health, slack, hosted, mr-rework, docker-allowlist.**
+- [x] **M3: The six small domains: judge (+ the two model keys), health, slack, hosted, mr-rework, docker-allowlist.**
   - Six files per the table, same discipline; adjacent small ones may share a commit. After this, `settings.go` is the doc comment, imports, `Cache` engine, three domainless accessors, the secret/storage helpers, `All`/`AdminView`/`Effective`, `Validate` and the two generic validators: ≈500 lines.
   - Verification as M1; additionally `git grep -c 'case "true"' -- api/internal/settings/settings.go` = 2 (the #921 SC3 invariant: `boolSetting` plus `Branding`'s closure both stay in `settings.go`).
-- [ ] **M4: Doc-sync and design record.**
+- [x] **M4: Doc-sync and design record.**
   - `fixtures/api-contract/README.md:120-121` cite `settings/settings.go:1320-1322` for `AdminView`'s `make(...)`: `AdminView` stays in `settings.go` but its line moves; repoint to the landed line (or to the identifier with no line, the file's own convention elsewhere in that table).
   - `git grep -n -P '(?<![a-z_/])settings\.go' -- specs docs CLAUDE.md ARCHITECTURE.md .claude/rules` (drop the `handler/settings.go` and `uzicli` hits, and the one false positive `docs/security-gate.md:25`, which matches `settings.gosec`): repoint any present-tense sentence that now names a symbol living in a new file; leave past-tense decision records and `prds/**` / `ideas/**` (historical anchors, the #1008 M5 rule).
   - Append the `specs/ai.md` section (`## <N>. PRD #1021 — …`, `Serves human:` first line; number = highest existing section + 1, re-derived at landing across every worktree with `git worktree list`; §597 is the highest at authoring, and #1008, #1009, #1017 and #1022 land around the same time, so expect to renumber at landing).
