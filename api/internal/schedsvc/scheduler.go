@@ -29,6 +29,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -539,7 +540,7 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 	// user-origin row, and composeRunDescription returns the body unchanged when guidance
 	// trims to empty — so the user path stays byte-for-byte identical to before.
 	instruction := composeRunDescription(prompt, guidanceOf(sched))
-	active, err := e.store.HasActiveRunForSchedule(ctx, pgUUID(sched.ID))
+	active, err := e.store.HasActiveRunForSchedule(ctx, pgconv.UUID(sched.ID))
 	if err != nil {
 		return FireOutcome{}, err // transient DB error
 	}
@@ -708,8 +709,8 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out Fi
 			return
 		}
 		if _, err := e.store.AdvanceSchedule(ctx, store.AdvanceScheduleParams{
-			LastFiredAt: pgTime(now),
-			NextFireAt:  pgTime(next),
+			LastFiredAt: pgconv.Time(now),
+			NextFireAt:  pgconv.Time(next),
 			Status:      "active",
 			LastFire:    lastFireJSON,
 			ID:          sched.ID,
@@ -718,7 +719,7 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out Fi
 		}
 	case "once":
 		if _, err := e.store.AdvanceSchedule(ctx, store.AdvanceScheduleParams{
-			LastFiredAt: pgTime(now),
+			LastFiredAt: pgconv.Time(now),
 			NextFireAt:  pgtype.Timestamptz{}, // NULL: a once schedule never fires again
 			Status:      "fired",
 			LastFire:    lastFireJSON,
@@ -941,9 +942,3 @@ func nonBlank(in []string) []string {
 func isNoRows(err error) bool {
 	return errors.Is(err, pgx.ErrNoRows)
 }
-
-// pgTime wraps a known-present time as a valid pgtype.Timestamptz.
-func pgTime(t time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: t, Valid: true} }
-
-// pgUUID wraps a known-present uuid as a valid pgtype.UUID.
-func pgUUID(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true} }

@@ -23,6 +23,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -198,7 +199,7 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	// exists; unmarked rows just get re-offered next cycle.
 	if ids := recIDs(recs); len(ids) > 0 {
 		if _, err := e.store.MarkImproveUziRecommendationsAddressed(ctx, store.MarkImproveUziRecommendationsAddressedParams{
-			AddressedByRunID: pgUUID(run.ID),
+			AddressedByRunID: pgconv.UUID(run.ID),
 			Ids:              ids,
 		}); err != nil {
 			e.logger.Warn("scheduler: self_improve mark backlog addressed", "run", run.ID.String(), "error", err)
