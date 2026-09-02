@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/slack-go/slack"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -177,7 +178,7 @@ func (c *ChatActions) HandleBlockAction(ctx context.Context, a BlockAction) {
 		return
 	}
 
-	user, err := c.store.GetConfirmedUserBySlackID(ctx, pgText(slackID))
+	user, err := c.store.GetConfirmedUserBySlackID(ctx, pgconv.Text(slackID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		c.ephemeral(ctx, a, "This Slack account isn't linked to uzi — open uzi → Settings → Notifications to link it.")
 		return
@@ -305,7 +306,7 @@ func (c *ChatActions) continueChat(ctx context.Context, a BlockAction, userID, r
 			return
 		}
 		if _, aerr := c.store.InsertSlackChatAnchor(ctx, store.InsertSlackChatAnchorParams{
-			RunID: newRunID, ChannelID: a.ChannelID, RootTs: statusTS, StatusTs: pgText(statusTS),
+			RunID: newRunID, ChannelID: a.ChannelID, RootTs: statusTS, StatusTs: pgconv.Text(statusTS),
 		}); aerr != nil {
 			c.logf("anchor continued chat", aerr)
 		}
