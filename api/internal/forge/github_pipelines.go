@@ -119,7 +119,21 @@ func (g *github) latestPipelineFromChecks(ctx context.Context, slug repoSlug, re
 	if err != nil {
 		return Pipeline{}, err
 	}
-	suites, err := g.listCheckSuitesForRef(ctx, slug, checkRef)
+	// Pin the check-suites fetch to ONE commit. On the branch path both fetches key on a
+	// branch NAME, so a push landing between them would have runs describe commit A and
+	// suites commit B, and the synthesized Pipeline (SHA from runs, id from newestSuiteID
+	// over both) would mix the two. Fetch suites by the head SHA the check-runs already
+	// named so both describe one commit; when the check-runs name no SHA (e.g. the list is
+	// empty) fall back to the branch ref, and suites resolve the head SHA below as before.
+	// The MR path is unchanged: headSHA is the already-resolved PR head, so suitesRef is
+	// that SHA and this branch does not run.
+	suitesRef := checkRef
+	if headSHA == "" {
+		if sha := headSHAFromChecks(runs, nil); sha != "" {
+			suitesRef = sha
+		}
+	}
+	suites, err := g.listCheckSuitesForRef(ctx, slug, suitesRef)
 	if err != nil {
 		return Pipeline{}, err
 	}
@@ -134,15 +148,17 @@ func (g *github) latestPipelineFromChecks(ctx context.Context, slug repoSlug, re
 		headSHA = headSHAFromChecks(runs, suites)
 	}
 
-	// ACTIONS-RECOVERY (primary): if any check-run belongs to a GitHub-Actions
-	// check-suite, re-query workflow-runs filtered by that suite id. GitHub lists an
-	// Actions run under check-runs even when the branch/head_sha-filtered workflow-runs
-	// list is (transiently) empty, so this recovers a NATIVE workflow-run pipeline — its
-	// id is a workflow-RUN id, the same space as the normal path, keeping
+	// ACTIONS-RECOVERY (primary): if any check-run belongs to a github-actions
+	// check-suite — or, when no check-run does, the head lists a github-actions
+	// check-SUITE directly (the check-runs list can be empty/unavailable while the suite
+	// is present, issue #1005) — re-query workflow-runs filtered by that suite id. GitHub
+	// lists an Actions run under checks even when the branch/head_sha-filtered
+	// workflow-runs list is (transiently) empty, so this recovers a NATIVE workflow-run
+	// pipeline — its id is a workflow-RUN id, the same space as the normal path, keeping
 	// ListPipelineJobs/JobLogTail working. Pick the newest Actions check-SUITE id so a
 	// re-run's suite wins (that suite id only SELECTS the run to recover; the returned
 	// pipeline's id is the workflow-run id, not the suite id).
-	if suiteID, ok := newestActionsSuiteID(runs); ok {
+	if suiteID, ok := newestActionsSuiteIDFromChecks(runs, suites); ok {
 		opt := &gh.ListWorkflowRunsOptions{
 			CheckSuiteID: suiteID,
 			ListOptions:  gh.ListOptions{PerPage: 1},
@@ -277,6 +293,35 @@ func newestActionsSuiteID(runs []*gh.CheckRun) (int64, bool) {
 			continue
 		}
 		id := r.GetCheckSuite().GetID()
+		if id == 0 {
+			continue
+		}
+		if !found || id > best {
+			best, found = id, true
+		}
+	}
+	return best, found
+}
+
+// newestActionsSuiteIDFromChecks resolves the newest github-actions check-SUITE id from
+// BOTH sources, so ACTIONS-RECOVERY still fires when a head carries a github-actions
+// check-SUITE that no check-RUN surfaced — the check-runs list can be empty or
+// unavailable while the suite is present (issue #1005). Check-runs win first (via
+// newestActionsSuiteID, which reads their embedded suites); only when they name no
+// Actions suite does the suites list contribute — a gh.CheckSuite whose App.Slug ==
+// "github-actions" with a non-zero id, newest id winning. ok is false when neither
+// source names an Actions suite (the external-CI case that falls through to synthesis).
+func newestActionsSuiteIDFromChecks(runs []*gh.CheckRun, suites []*gh.CheckSuite) (int64, bool) {
+	if id, ok := newestActionsSuiteID(runs); ok {
+		return id, true
+	}
+	var best int64
+	var found bool
+	for _, s := range suites {
+		if s.GetApp().GetSlug() != "github-actions" {
+			continue
+		}
+		id := s.GetID()
 		if id == 0 {
 			continue
 		}

@@ -655,6 +655,112 @@ func TestGitHubLatestPipelineBranchSynthesizesFromChecks(t *testing.T) {
 	}
 }
 
+// TestGitHubLatestMRPipelineRecoversActionsRunFromSuiteOnly is the FINDING-2 pin: the
+// head_sha-filtered workflow-runs list is empty AND the head's check-RUNS list is empty,
+// but a github-actions check-SUITE is listed for the head. ACTIONS-RECOVERY must resolve
+// the Actions suite id from the SUITES list (not only from check-runs), re-query
+// workflow-runs by that suite id, and return the NATIVE workflow run — NOT ErrNoPipeline.
+// FAILS on the pre-fix code, which read the suite id from check-runs only, skipped
+// recovery, and returned ErrNoPipeline (len(runs)==0).
+func TestGitHubLatestMRPipelineRecoversActionsRunFromSuiteOnly(t *testing.T) {
+	const headSHA = "suiteonly777"
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"number": 4, "state": "open", "head": map[string]any{"sha": headSHA, "ref": "feature"}})
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("check_suite_id") == "666" {
+				writeJSON(w, map[string]any{"total_count": 1, "workflow_runs": []map[string]any{{
+					"id": 900, "head_branch": "feature", "head_sha": headSHA,
+					"status": "completed", "conclusion": "failure",
+					"html_url": "https://github.com/acme/widgets/actions/runs/900",
+				}}})
+				return
+			}
+			writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+		},
+		// Check-RUNS empty: the recoverable Actions suite is exposed ONLY via check-suites.
+		"/repos/acme/widgets/commits/" + headSHA + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 0, "check_runs": []map[string]any{}})
+		},
+		"/repos/acme/widgets/commits/" + headSHA + "/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 1, "check_suites": []map[string]any{
+				{"id": 666, "head_sha": headSHA, "app": map[string]any{"slug": "github-actions"}},
+			}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	p, err := d.LatestMRPipeline(context.Background(), 7, 4)
+	if err != nil {
+		t.Fatalf("LatestMRPipeline: %v", err)
+	}
+	if p.ID != 900 {
+		t.Errorf("recovery must return the native workflow-run id 900, got %d", p.ID)
+	}
+	if p.SHA != headSHA {
+		t.Errorf("SHA = %q, want %q", p.SHA, headSHA)
+	}
+	if !pipelinestatus.IsFailed(p.Status) {
+		t.Errorf("status %q must classify as failed", p.Status)
+	}
+	if p.WebURL != "https://github.com/acme/widgets/actions/runs/900" {
+		t.Errorf("WebURL = %q, want the native run url", p.WebURL)
+	}
+}
+
+// TestGitHubLatestPipelineBranchPinsSuitesToCheckRunsCommit is the FINDING-1 pin: on the
+// branch path the check-runs and check-suites fetches both key on a branch NAME, so a
+// push landing between them makes check-runs describe commit A and check-suites commit B.
+// The synthesized pipeline must be pinned to the check-RUNS commit — its SHA and suite id
+// come from commit A — and the check-suites request must be made against the RESOLVED
+// SHA, not the branch name. FAILS on the pre-fix code, which fetched suites by the branch
+// ref and let commit B's newer suite id leak into the synthesized pipeline.
+func TestGitHubLatestPipelineBranchPinsSuitesToCheckRunsCommit(t *testing.T) {
+	const commitA = "commitaaaa111" // the commit the check-runs describe
+	const commitB = "commitbbbb222" // the branch head after a mid-fetch push
+	var suitesReqRef string
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}})
+		},
+		// Check-RUNS keyed on the branch ref describe commit A (external CI → synthesis).
+		"/repos/acme/widgets/commits/feature/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"total_count": 1, "check_runs": []map[string]any{
+				checkRun(51, "e2e", "completed", "failure", "u-e2e-failed", "some-ci", 1000, commitA),
+			}})
+		},
+		// Branch-ref check-suites: what the BUGGY code queries — the branch advanced, so
+		// this describes commit B and carries a NEWER suite id (2000).
+		"/repos/acme/widgets/commits/feature/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+			suitesReqRef = "feature"
+			writeJSON(w, map[string]any{"total_count": 1, "check_suites": []map[string]any{
+				{"id": 2000, "head_sha": commitB},
+			}})
+		},
+		// Resolved-SHA check-suites: what the FIXED code queries — commit A's suite (1000).
+		"/repos/acme/widgets/commits/" + commitA + "/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+			suitesReqRef = commitA
+			writeJSON(w, map[string]any{"total_count": 1, "check_suites": []map[string]any{
+				{"id": 1000, "head_sha": commitA},
+			}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	p, err := d.LatestPipeline(context.Background(), 7, "feature")
+	if err != nil {
+		t.Fatalf("LatestPipeline: %v", err)
+	}
+	if suitesReqRef != commitA {
+		t.Errorf("check-suites must be fetched by the resolved SHA %q, got %q", commitA, suitesReqRef)
+	}
+	if p.SHA != commitA {
+		t.Errorf("SHA = %q, want the check-runs commit %q", p.SHA, commitA)
+	}
+	if p.ID != 1000 {
+		t.Errorf("ID = %d, want commit A's suite id 1000 (not commit B's 2000)", p.ID)
+	}
+}
+
 func asStr(v any) string {
 	if v == nil {
 		return "nil"
