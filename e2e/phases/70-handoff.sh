@@ -47,7 +47,11 @@ say "PRD #966 M5: task/handoff run kind via \`uzi handoff\` (+ host-gitconfig tr
 # hgit runs the phase's OWN host git (clone/commit/fetch/ls-remote/remote) — these are
 # NOT uzi_cli, so they need GIT_CONFIG_GLOBAL set explicitly to reach the same host
 # gitconfig the handoff CLI reads (sslVerify=false for the self-signed forge-fake.e2e
-# cert; safe.directory=* trusts the bind-mounted bare on a CI runner).
+# cert; safe.directory=* trusts the bind-mounted bare on a CI runner). They ALSO set
+# GIT_CONFIG_NOSYSTEM=1: GIT_CONFIG_GLOBAL replaces only the GLOBAL scope, so a CI runner's
+# SYSTEM /etc/gitconfig is still read and a URL-scoped key there outranks this file's
+# unscoped sslVerify=false — the #995 clone failure. NOSYSTEM makes the host git hermetic
+# (same as uzi_cli() in lib.sh and the worker's agent/src/git.ts).
 #
 # HANDOFF_URL is a REAL git-over-https URL with embedded Basic creds and the dynamic
 # published port. uzi-bot is the compose FORGE_FAKE_EXPECT_USER literal; DUMMY_FORGE_PAT
@@ -56,10 +60,36 @@ say "PRD #966 M5: task/handoff run kind via \`uzi handoff\` (+ host-gitconfig tr
 # rewrite) to group/repo for resolveHandoffRepo — no insteadOf, no --repo needed.
 WC="$RUNROOT/handoff-wc"
 rm -rf "$WC"
+# FAKE_PORT / DUMMY_FORGE_PAT are run-e2e.sh globals inherited by this subshell; assert
+# they are non-empty so an env-threading regression fails HERE, named, rather than as a
+# malformed clone URL (empty port -> connect error; empty pat -> 401) misread as transport.
+[ -n "${FAKE_PORT:-}" ] || fail "handoff: FAKE_PORT is empty in this phase subshell (run-e2e.sh global not inherited)"
+[ -n "${DUMMY_FORGE_PAT:-}" ] || fail "handoff: DUMMY_FORGE_PAT is empty in this phase subshell (run-e2e.sh global not inherited)"
 HANDOFF_URL="https://uzi-bot:${DUMMY_FORGE_PAT}@127.0.0.1:${FAKE_PORT}/group/repo.git"
-hgit() { GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" git -C "$WC" "$@"; }
-GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" git clone -q "$HANDOFF_URL" "$WC" \
-  || fail "handoff: host-side clone of forge-fake's git endpoint FAILED — the transport is misconfigured. Check \$RUNROOT/host-gitconfig (sslVerify/safe.directory) and that forge-fake is up on 127.0.0.1:${FAKE_PORT} with Basic auth uzi-bot:<pat> (see the lib.sh anchor 'HOST-side CLI's GIT_CONFIG_GLOBAL for \`uzi handoff\`')."
+hgit() { GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" GIT_CONFIG_NOSYSTEM=1 git -C "$WC" "$@"; }
+
+# --- Layered host-side transport probe BEFORE the clone -----------------------
+# forge-fake's git smart-HTTP endpoint is exercised host-side ONLY here (earlier phases
+# reach it in-container, or reach only the /_e2e control port from the host), so a failure
+# must be pinned to a layer rather than blamed generically. Probe up the stack: published-
+# port TLS reachability, then the upload-pack advertisement's auth gate (401 without a
+# credential, 200 with the Basic uzi-bot:PAT) — the same gate phase 20 asserts in-container.
+# Each rung fails in one line naming what broke; #990 leaves FAIL artifact .logs empty, so
+# the fail REASON (recorded in results.tsv) has to carry the diagnosis itself.
+_h_code() { curl -sk -o /dev/null -w '%{http_code}' "$@" || true; }
+_refs="$FAKE_BASE/group/repo.git/info/refs?service=git-upload-pack"
+c="$(_h_code "$FAKE_BASE/_e2e/health")"
+[ "$c" = 200 ] || fail "handoff transport: forge-fake not reachable host-side at $FAKE_BASE/_e2e/health (got '$c') — published port ${FAKE_PORT} down or TLS broken"
+c="$(_h_code "$_refs")"
+[ "$c" = 401 ] || fail "handoff transport: git upload-pack info/refs without a credential should 401 (got '$c') — auth gate not enforced host-side"
+c="$(_h_code -u "uzi-bot:${DUMMY_FORGE_PAT}" "$_refs")"
+[ "$c" = 200 ] || fail "handoff transport: git upload-pack info/refs with the correct Basic uzi-bot:PAT should 200 (got '$c') — credential rejected or git-http-backend erroring host-side"
+pass "transport probe: forge-fake git endpoint reachable host-side (health 200; upload-pack 401 no-auth -> 200 Basic)"
+
+# --- The host-side clone (the operation the probe above localizes on failure) --
+_clone_err="$RUNROOT/handoff-clone.err"
+GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" GIT_CONFIG_NOSYSTEM=1 git clone -q "$HANDOFF_URL" "$WC" 2>"$_clone_err" \
+  || fail "handoff: host-side clone of forge-fake's git endpoint FAILED though the transport probe passed. git said: $(tr '\n' ' ' <"$_clone_err") | forge-fake gitStats: $(fake_state | jq -c '.gitStats' 2>/dev/null). Check \$RUNROOT/host-gitconfig + GIT_CONFIG_NOSYSTEM=1 (see the lib.sh anchor 'HOST-side CLI's GIT_CONFIG_GLOBAL for \`uzi handoff\`')."
 
 # --- Positive control: the real Basic-authed git-over-https transport works ----
 # resolveHandoffRepo (handoff.go:187) reads `git remote get-url origin` and parseRepoPath
