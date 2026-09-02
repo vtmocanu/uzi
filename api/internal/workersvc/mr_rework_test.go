@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -23,14 +24,14 @@ func sampleReviewSnapshot() *ReviewCommentsSnapshot {
 
 func TestCreateAutoMRReworkRunSetsFields(t *testing.T) {
 	user, repo, source := uuid.New(), uuid.New(), uuid.New()
-	fs := &fakeStore{repoRow: aValidRepoRow(), mrReworkRunResult: store.Run{ID: uuid.New(), Kind: RunKindMRRework}}
+	fs := &fakeStore{repoRow: aValidRepoRow(), mrReworkRunResult: store.Run{ID: uuid.New(), Kind: runkind.MRRework}}
 	svc := New(fs, newBox(t), testParams())
 
 	run, err := svc.CreateAutoMRReworkRun(context.Background(), user, repo, "agent/issue-7", 55, source, "Rework MR review", "desc", sampleReviewSnapshot())
 	if err != nil {
 		t.Fatalf("CreateAutoMRReworkRun: %v", err)
 	}
-	if run.Kind != RunKindMRRework {
+	if run.Kind != runkind.MRRework {
 		t.Fatalf("expected an mr_rework run, got kind %q", run.Kind)
 	}
 	if fs.mrReworkRunParams == nil {
@@ -58,7 +59,7 @@ func TestCreateAutoMRReworkRunSetsFields(t *testing.T) {
 }
 
 func TestCreateAutoMRReworkRunNilSnapshotStoresNull(t *testing.T) {
-	fs := &fakeStore{repoRow: aValidRepoRow(), mrReworkRunResult: store.Run{ID: uuid.New(), Kind: RunKindMRRework}}
+	fs := &fakeStore{repoRow: aValidRepoRow(), mrReworkRunResult: store.Run{ID: uuid.New(), Kind: runkind.MRRework}}
 	svc := New(fs, newBox(t), testParams())
 
 	if _, err := svc.CreateAutoMRReworkRun(context.Background(), uuid.New(), uuid.New(), "agent/issue-9", 9, uuid.New(), "t", "d", nil); err != nil {
@@ -126,7 +127,7 @@ func TestMRReworkClaimBranchFromPipelineRef(t *testing.T) {
 		claimRun: store.Run{
 			ID:               uuid.MustParse("44444444-4444-4444-4444-444444444444"),
 			RepoID:           pgconv.UUID(uuid.MustParse("22222222-2222-2222-2222-222222222222")),
-			Kind:             RunKindMRRework,
+			Kind:             runkind.MRRework,
 			IssueTitle:       "Rework MR: address review comments",
 			IssueDescription: "Fold the MR review-comment fixes onto the existing branch.",
 			Status:           "claimed",
@@ -147,7 +148,7 @@ func TestMRReworkClaimBranchFromPipelineRef(t *testing.T) {
 		t.Fatalf("Claim: %v (payload=%v)", err, payload)
 	}
 
-	if payload.Kind != RunKindMRRework {
+	if payload.Kind != runkind.MRRework {
 		t.Fatalf("kind = %q, want mr_rework", payload.Kind)
 	}
 	if payload.IssueIID != nil {

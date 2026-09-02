@@ -13,12 +13,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Run kinds (PRD #6), mirroring the runs.kind CHECK.
-const (
-	RunKindIssue = "issue"
-	RunKindCIFix = "ci_fix"
-)
-
 // clampWireFixVerdict permits ONLY 'not_code' from a worker's completed state
 // report (PRD #6 integrity). verified / fix_failed are stamped server-side by the
 // pipeline sync from the actual post-fix pipeline and are NOT worker-reportable —

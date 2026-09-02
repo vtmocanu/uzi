@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -26,7 +27,7 @@ func TestClaimChatSucceedsWithoutForgeConnection(t *testing.T) {
 	uid := uuid.New()
 	fs := &fakeStore{
 		chatClaimRun: store.Run{
-			ID: uuid.New(), UserID: uid, Kind: RunKindChat, Status: "claimed",
+			ID: uuid.New(), UserID: uid, Kind: runkind.Chat, Status: "claimed",
 			Title:            pgtype.Text{String: "How does the plan gate work?", Valid: true},
 			IssueDescription: "how does the plan-approval gate work?",
 		},
@@ -41,7 +42,7 @@ func TestClaimChatSucceedsWithoutForgeConnection(t *testing.T) {
 	if payload == nil {
 		t.Fatal("expected a chat claim payload for a user with an Anthropic token and no forge connection")
 	}
-	if payload.Kind != RunKindChat {
+	if payload.Kind != runkind.Chat {
 		t.Errorf("Kind = %q, want chat", payload.Kind)
 	}
 	if payload.Secrets.AnthropicOAuthToken != "anthropic-chat-token-abcdef1234567890" {
@@ -60,7 +61,7 @@ func TestClaimChatOmitsDefaultEffortWhenOwnerHasNone(t *testing.T) {
 	sealedTok, _ := box.Seal([]byte("anthropic-chat-effomit-abcdef1234567890"))
 	uid := uuid.New()
 	fs := &fakeStore{
-		chatClaimRun: store.Run{ID: uuid.New(), UserID: uid, Kind: RunKindChat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
+		chatClaimRun: store.Run{ID: uuid.New(), UserID: uid, Kind: runkind.Chat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
 		anthropic:    sealedTok,
 		// defaultEffort left zero ⇒ NULL ⇒ the owner has no per-user default.
 	}
@@ -88,7 +89,7 @@ func TestClaimChatCarriesDefaultEffort(t *testing.T) {
 	sealedTok, _ := box.Seal([]byte("anthropic-chat-effcarry-abcdef1234567890"))
 	uid := uuid.New()
 	fs := &fakeStore{
-		chatClaimRun:  store.Run{ID: uuid.New(), UserID: uid, Kind: RunKindChat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
+		chatClaimRun:  store.Run{ID: uuid.New(), UserID: uid, Kind: runkind.Chat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
 		anthropic:     sealedTok,
 		defaultEffort: pgconv.TextOrNull("max"),
 	}
@@ -111,7 +112,7 @@ func TestClaimChatWireOmitsForgePAT(t *testing.T) {
 	sealedTok, _ := box.Seal([]byte("anthropic-nopat-token-abcdef1234567890"))
 	uid := uuid.New()
 	fs := &fakeStore{
-		chatClaimRun: store.Run{ID: uuid.New(), UserID: uid, Kind: RunKindChat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
+		chatClaimRun: store.Run{ID: uuid.New(), UserID: uid, Kind: runkind.Chat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
 		anthropic:    sealedTok,
 	}
 	svc := New(fs, box, testParams())
@@ -140,7 +141,7 @@ func TestClaimChatUsesChatLane(t *testing.T) {
 	sealedTok, _ := box.Seal([]byte("anthropic-lane-token-abcdef1234567890"))
 	uid := uuid.New()
 	fs := &fakeStore{
-		chatClaimRun: store.Run{ID: uuid.New(), UserID: uid, Kind: RunKindChat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
+		chatClaimRun: store.Run{ID: uuid.New(), UserID: uid, Kind: runkind.Chat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
 		anthropic:    sealedTok,
 	}
 	svc := New(fs, box, testParams())
@@ -171,7 +172,7 @@ func TestClaimChatIdleWhenQueueEmpty(t *testing.T) {
 func TestClaimChatFailsWithoutAnthropicToken(t *testing.T) {
 	runID := uuid.New()
 	fs := &fakeStore{
-		chatClaimRun: store.Run{ID: runID, UserID: uuid.New(), Kind: RunKindChat, Status: "claimed"},
+		chatClaimRun: store.Run{ID: runID, UserID: uuid.New(), Kind: runkind.Chat, Status: "claimed"},
 		anthropicErr: pgx.ErrNoRows, // no token configured
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -192,7 +193,7 @@ func TestClaimChatFailsWithoutAnthropicToken(t *testing.T) {
 // follow_up on the steering wire.
 func TestSubmitChatMessageEnforcesTurnCap(t *testing.T) {
 	uid, runID := uuid.New(), uuid.New()
-	chatRun := store.Run{ID: runID, UserID: uid, Kind: RunKindChat, Status: "running"}
+	chatRun := store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "running"}
 
 	// At the cap → rejected, nothing enqueued.
 	atCap := &fakeStore{runByID: chatRun, followUpCount: 50}
@@ -219,7 +220,7 @@ func TestSubmitChatMessageEnforcesTurnCap(t *testing.T) {
 // (ErrRunTerminal), which the client surfaces as Continue (Decision 11).
 func TestSubmitChatMessageRejectsTerminal(t *testing.T) {
 	uid, runID := uuid.New(), uuid.New()
-	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindChat, Status: "completed"}}
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "completed"}}
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.SubmitChatMessage(context.Background(), uid, runID, "hi"); !errors.Is(err, ErrRunTerminal) {
 		t.Fatalf("terminal chat message err = %v, want ErrRunTerminal", err)
@@ -230,7 +231,7 @@ func TestSubmitChatMessageRejectsTerminal(t *testing.T) {
 // surface (ErrRunNotFound), so /api/chats can never steer an issue/ci_fix run.
 func TestGetChatRunRejectsNonChat(t *testing.T) {
 	uid, runID := uuid.New(), uuid.New()
-	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindIssue, Status: "running"}}
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: runkind.Issue, Status: "running"}}
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.GetChatRun(context.Background(), uid, runID); !errors.Is(err, ErrRunNotFound) {
 		t.Fatalf("GetChatRun on an issue run err = %v, want ErrRunNotFound", err)
@@ -298,25 +299,25 @@ func TestCreateProposalGuards(t *testing.T) {
 	labels := []byte(`[]`)
 
 	// Non-chat target → ErrProposalRunNotChat.
-	nonChat := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindIssue, Status: "running"}}
+	nonChat := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: runkind.Issue, Status: "running"}}
 	if _, err := New(nonChat, newBox(t), testParams()).CreateProposal(context.Background(), wkr, runID, repoID, "t", "d", labels); !errors.Is(err, ErrProposalRunNotChat) {
 		t.Fatalf("non-chat target err = %v, want ErrProposalRunNotChat", err)
 	}
 
 	// Terminal chat → ErrRunTerminal.
-	terminal := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindChat, Status: "completed"}}
+	terminal := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "completed"}}
 	if _, err := New(terminal, newBox(t), testParams()).CreateProposal(context.Background(), wkr, runID, repoID, "t", "d", labels); !errors.Is(err, ErrRunTerminal) {
 		t.Fatalf("terminal chat err = %v, want ErrRunTerminal", err)
 	}
 
 	// At the per-run pending cap → ErrProposalCapReached.
-	capped := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindChat, Status: "running"}, pendingProposalCount: MaxPendingProposalsPerRun}
+	capped := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "running"}, pendingProposalCount: MaxPendingProposalsPerRun}
 	if _, err := New(capped, newBox(t), testParams()).CreateProposal(context.Background(), wkr, runID, repoID, "t", "d", labels); !errors.Is(err, ErrProposalCapReached) {
 		t.Fatalf("capped err = %v, want ErrProposalCapReached", err)
 	}
 
 	// Happy path → a proposal is created.
-	ok := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindChat, Status: "running"}, pendingProposalCount: 2}
+	ok := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: runkind.Chat, Status: "running"}, pendingProposalCount: 2}
 	if _, err := New(ok, newBox(t), testParams()).CreateProposal(context.Background(), wkr, runID, repoID, "t", "d", labels); err != nil {
 		t.Fatalf("valid CreateProposal: %v", err)
 	}

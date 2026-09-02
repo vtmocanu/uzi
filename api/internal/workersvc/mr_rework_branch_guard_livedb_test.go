@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -211,8 +212,8 @@ func TestCreateAutoMRReworkRunSameMRDuplicateIsActiveExistsLiveDB(t *testing.T) 
 	if err != nil {
 		t.Fatalf("first CreateAutoMRReworkRun err = %v, want success", err)
 	}
-	if run.Kind != RunKindMRRework {
-		t.Fatalf("first run.Kind = %q, want %q", run.Kind, RunKindMRRework)
+	if run.Kind != runkind.MRRework {
+		t.Fatalf("first run.Kind = %q, want %q", run.Kind, runkind.MRRework)
 	}
 
 	// Second create for the SAME branch + SAME mr_iid: the narrowed predicate no longer

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -207,7 +208,7 @@ func TestJudgeLoopThrottledByGuards(t *testing.T) {
 	fs.lastJudgeAt = ts(time.Now()) // a judge just went out for this user
 	for i := 0; i < 5; i++ {
 		fs.createdJudgeRun = nil
-		run := store.Run{ID: uuid.New(), UserID: burstUser, Kind: RunKindIssue, Status: "failed"}
+		run := store.Run{ID: uuid.New(), UserID: burstUser, Kind: runkind.Issue, Status: "failed"}
 		svc.maybeEnqueueJudge(context.Background(), run)
 		if fs.createdJudgeRun != nil {
 			t.Fatalf("burst run %d enqueued a judge while the cooldown was warm", i)
@@ -216,7 +217,7 @@ func TestJudgeLoopThrottledByGuards(t *testing.T) {
 	// Window elapsed → the same user's next terminal run judges.
 	fs.createdJudgeRun = nil
 	fs.lastJudgeAt = ts(time.Now().Add(-2 * time.Minute))
-	run := store.Run{ID: uuid.New(), UserID: burstUser, Kind: RunKindIssue, Status: "failed"}
+	run := store.Run{ID: uuid.New(), UserID: burstUser, Kind: runkind.Issue, Status: "failed"}
 	svc.maybeEnqueueJudge(context.Background(), run)
 	if fs.createdJudgeRun == nil {
 		t.Fatal("after the cooldown window elapsed, the next run must judge")
@@ -230,7 +231,7 @@ func TestJudgeLoopThrottledByGuards(t *testing.T) {
 	fs.judgesSince = 3 // this user is already at cap
 	for i := 0; i < 4; i++ {
 		fs.createdJudgeRun = nil
-		run := store.Run{ID: uuid.New(), UserID: budgetUser, Kind: RunKindIssue, Status: "failed"}
+		run := store.Run{ID: uuid.New(), UserID: budgetUser, Kind: runkind.Issue, Status: "failed"}
 		svc.maybeEnqueueJudge(context.Background(), run)
 		if fs.createdJudgeRun != nil {
 			t.Fatalf("run %d enqueued a judge despite the daily budget being reached", i)

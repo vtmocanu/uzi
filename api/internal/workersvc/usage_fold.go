@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -504,7 +505,7 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 	// chat), NOT an allowlist of {issue, ci_fix}, so a future WORK-run kind folds by
 	// default — matching the success criterion "every run started after this shows
 	// tokens" (a new non-work kind would need adding here, the same as chat).
-	if run.Kind == RunKindChat {
+	if run.Kind == runkind.Chat {
 		return nil
 	}
 	var sessionID string

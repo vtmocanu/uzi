@@ -5,6 +5,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
@@ -21,7 +22,7 @@ func clampWireReportOnly(run store.Run, p *bool) bool {
 	if p == nil || !*p {
 		return false
 	}
-	if run.Kind != "issue" {
+	if run.Kind != runkind.Issue {
 		slog.Warn("dropping report_only: not an issue run", "run_id", run.ID, "kind", run.Kind)
 		return false
 	}

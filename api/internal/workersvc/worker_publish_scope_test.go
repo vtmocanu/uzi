@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -27,7 +28,7 @@ func TestPublishWorkflowScopeRejectedSkipsCleanly(t *testing.T) {
 		// A running ISSUE run the worker owns, with its issue iid set but an empty branch
 		// column (the mid-run shape) — the service derives agent/issue-<iid> from the iid.
 		runOwned: store.Run{
-			Kind:     RunKindIssue,
+			Kind:     runkind.Issue,
 			IssueIid: pgtype.Int8{Int64: 456, Valid: true},
 			Branch:   pgtype.Text{},
 		},

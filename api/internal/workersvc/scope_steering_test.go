@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -35,7 +36,7 @@ func scopeRunFixture(t *testing.T) (*fakeStore, *Service, uuid.UUID, uuid.UUID) 
 		runByID: store.Run{
 			ID:                  runID,
 			UserID:              user,
-			Kind:                RunKindIssue,
+			Kind:                runkind.Issue,
 			Status:              "running",
 			MilestonesFrozen:    sixMilestonesFrozen(),
 			MilestonesCompleted: twoCompletedIDs(),
@@ -100,7 +101,7 @@ func TestSubmitInputScopeClampsToWindow(t *testing.T) {
 			if !fs.createdScopeCeiling.ScopeCeiling.Valid || fs.createdScopeCeiling.ScopeCeiling.Int32 != tc.want {
 				t.Fatalf("persisted ceiling = %+v, want %d", fs.createdScopeCeiling.ScopeCeiling, tc.want)
 			}
-			if res.ScopeCeiling == nil || int32(*res.ScopeCeiling) != tc.want {
+			if res.ScopeCeiling == nil || int32(*res.ScopeCeiling) != tc.want { //nolint:gosec // G115: *res.ScopeCeiling is a small bounded scope-ceiling test fixture well within int32 range.
 				t.Fatalf("result ScopeCeiling = %v, want %d", res.ScopeCeiling, tc.want)
 			}
 		})
@@ -133,7 +134,7 @@ func TestSubmitInputScopeRejectedShapes(t *testing.T) {
 		mutate func(r *store.Run)
 	}{
 		{"chat run is not a milestone issue run", func(r *store.Run) {
-			r.Kind = RunKindChat
+			r.Kind = runkind.Chat
 		}},
 		{"issue run with empty frozen list", func(r *store.Run) {
 			r.MilestonesFrozen = nil
@@ -185,7 +186,7 @@ func TestSubmitInputStopRemapsOnMilestoneIssueRun(t *testing.T) {
 // writes no scope ceiling. A chat run is the shape that is neither.
 func TestSubmitInputStopStillRejectedOnNonInteractive(t *testing.T) {
 	fs, svc, user, runID := scopeRunFixture(t)
-	fs.runByID.Kind = RunKindChat // not a milestone issue run, not an interactive task
+	fs.runByID.Kind = runkind.Chat // not a milestone issue run, not an interactive task
 
 	_, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil)
 	if !errors.Is(err, ErrStopNotInteractive) {
@@ -248,7 +249,7 @@ func TestSubmitInputScopeLastWriterWins(t *testing.T) {
 // scope_ceiling, with the completed transition wired to apply (setCompletedRows=1).
 func scopeCappedCompletedFixture(t *testing.T, scopeCeilingValid bool) (*fakeStore, *Service, store.Worker, uuid.UUID) {
 	t.Helper()
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	fs.runOwned.MilestonesFrozen = sixMilestonesFrozen()
 	if scopeCeilingValid {
 		fs.runOwned.ScopeCeiling = pgInt4(2)
@@ -365,7 +366,7 @@ func TestSetStateCompletedNoDirectiveIssuesNoSettle(t *testing.T) {
 // run carries a scope_ceiling — the P2a discriminator for "this run carried a directive".
 func scopeFailedFixture(t *testing.T, scopeCeilingValid bool) (*fakeStore, *Service, store.Worker, uuid.UUID) {
 	t.Helper()
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	fs.runOwned.MilestonesFrozen = sixMilestonesFrozen()
 	if scopeCeilingValid {
 		fs.runOwned.ScopeCeiling = pgInt4(2)
@@ -429,7 +430,7 @@ func TestSetStateFailedNoDirectiveIssuesNoSettle(t *testing.T) {
 func TestSubmitInputServerSideCancelSettlesDeclinedOnScopeDirectedRun(t *testing.T) {
 	user, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{runByID: store.Run{
-		ID: runID, UserID: user, Kind: RunKindIssue, Status: "queued", // queued -> no live poller
+		ID: runID, UserID: user, Kind: runkind.Issue, Status: "queued", // queued -> no live poller
 		MilestonesFrozen: sixMilestonesFrozen(),
 		ScopeCeiling:     pgInt4(2), // the run carried a scope directive
 	}}
@@ -462,7 +463,7 @@ func TestSubmitInputServerSideCancelSettlesDeclinedOnScopeDirectedRun(t *testing
 func TestSubmitInputServerSideCancelNoDirectiveIssuesNoSettle(t *testing.T) {
 	user, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{runByID: store.Run{
-		ID: runID, UserID: user, Kind: RunKindIssue, Status: "queued",
+		ID: runID, UserID: user, Kind: runkind.Issue, Status: "queued",
 		// no ScopeCeiling — the run never carried a directive
 	}}
 	svc := New(fs, newBox(t), testParams())
@@ -487,7 +488,7 @@ func TestSubmitInputServerSideCancelNoDirectiveIssuesNoSettle(t *testing.T) {
 // directive" discriminator for the P2 settle.
 func scopeLimitOptOutFixture(t *testing.T, scopeCeilingValid bool) (*fakeStore, *Service, store.Worker, uuid.UUID) {
 	t.Helper()
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	fs.runOwned.MilestonesFrozen = sixMilestonesFrozen()
 	fs.runOwned.WaitOnLimit = false // opt-out: decideLimitPark returns Park=false
 	if scopeCeilingValid {
@@ -553,7 +554,7 @@ func TestSetStateLimitWaitOptOutNoDirectiveIssuesNoSettle(t *testing.T) {
 // must NEVER settle a scope disposition — settleScopeDisposition stays empty and the
 // settle UPDATE is not issued, even on a run that carries a scope_ceiling.
 func TestSetStateRunningNeverSettlesScope(t *testing.T) {
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	fs.runOwned.MilestonesFrozen = sixMilestonesFrozen()
 	fs.runOwned.ScopeCeiling = pgInt4(2)
 

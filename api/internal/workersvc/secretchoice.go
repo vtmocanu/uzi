@@ -12,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -297,7 +298,7 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 //
 // Judge runs never reach here; they fork to assembleJudgeClaim earlier.
 func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
-	if run.Kind == RunKindSelfImprove {
+	if run.Kind == runkind.SelfImprove {
 		id, err := s.judgeSecretID(ctx, run.UserID)
 		if err != nil {
 			return secretChoice{}, err
