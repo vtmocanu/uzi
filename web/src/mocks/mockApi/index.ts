@@ -38,8 +38,6 @@ import {
   type JudgeOccurrence,
   type JudgeRecommendationGroup,
   type ReviewVerdict,
-  type Notification,
-  type NotificationList,
   type PendingJudge,
   type PrivilegeReport,
   type ProjectSyncOwnerKind,
@@ -96,9 +94,7 @@ import {
   mockAgentSource,
   mockFindings,
   type MockFinding,
-  mockNotifications,
   mockOtherRunOwners,
-  type MockNotification,
   mockRepos,
   mockPendingJudges,
   mockReviews,
@@ -118,6 +114,7 @@ import { appendMessage, getProposal, getRun, nextRunId, patchRun, putProposal, s
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { cliTokensApi } from "./cliTokens";
 import { memoryApi } from "./memory";
+import { notificationsApi } from "./notifications";
 
 // ── Settings persistence (demo build) ────────────────────────────────────────
 // The mock persists ONLY the settings maps to localStorage so a hard reload of
@@ -289,7 +286,6 @@ const loadedSettings = loadSettings();
 
 // Mutable copies of seed collections (CRUD operates on these).
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
-let notifications: MockNotification[] = mockNotifications.map((n) => ({ ...n }));
 // Incidental-findings coordinates (PRD #333 M7). Mutable copy so file/dismiss persist in a
 // demo session; the seed stays pristine so a module reload re-seeds a clean backlog.
 const findings: MockFinding[] = mockFindings.map((f) => ({ ...f, labels: [...f.labels], run_ids: [...f.run_ids] }));
@@ -1663,24 +1659,6 @@ function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
-// notifDTO maps an internal mock notification row to the API shape, attaching the
-// owner block only for the admin all-view (own-scope rows carry no owner), exactly
-// like the server's two query paths.
-function notifDTO(n: MockNotification, includeOwner: boolean): Notification {
-  return {
-    id: n.id,
-    kind: n.kind,
-    payload: n.payload,
-    run_id: n.run_id,
-    review_id: n.review_id,
-    read_at: n.read_at,
-    created_at: n.created_at,
-    ...(includeOwner
-      ? { owner: { id: n.user_id, email: n.owner_email, display_name: n.owner_display_name } }
-      : {}),
-  };
-}
-
 // sessionBody is the auth/session bootstrap payload: the signed-in user, the
 // current instance labels (PRD #19 M2, PRD #764: the single `uzi` label and the
 // autopilot label), and the three resolved theme fields (PRD #21), mirroring the real
@@ -2308,51 +2286,7 @@ export const mockApi = {
     return delay({ user: { ...u } }, 200);
   },
 
-  // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
-  // Own view filters to the session user; { all: true } shows everyone but only
-  // for an admin (else 403, like the server). `unread` is always the caller's own
-  // count. Rows come back newest-first, paginated.
-  listNotifications: async (params?: { all?: boolean; limit?: number; offset?: number }): Promise<NotificationList> => {
-    const me = requireSession();
-    const all = params?.all ?? false;
-    if (all && !me.is_admin) throw new ApiError(403, "admin only");
-    const limit = Math.min(Math.max(params?.limit ?? 30, 1), 100);
-    const offset = Math.max(params?.offset ?? 0, 0);
-    const scope = all ? notifications : notifications.filter((n) => n.user_id === me.id);
-    const sorted = [...scope].sort((a, b) => b.created_at.localeCompare(a.created_at));
-    const page = sorted.slice(offset, offset + limit).map((n) => notifDTO(n, all));
-    const unread = notifications.filter((n) => n.user_id === me.id && !n.read_at).length;
-    return delay({ notifications: page, unread, total: scope.length });
-  },
-  unreadNotificationCount: async () => {
-    const me = requireSession();
-    return delay({ unread: notifications.filter((n) => n.user_id === me.id && !n.read_at).length }, 40);
-  },
-  // Runs-in-progress count for the Runs nav badge (PRD #239). Counted LIVE from the
-  // fixtures the same way the real endpoint counts rows: non-terminal runs, excluding
-  // chat/judge kinds (Decision 1 + Decision 4), so the demo build shows a real number
-  // that moves as runs start and finish rather than a hardcoded constant.
-  runsInProgressCount: async () => {
-    // Other users' runs are excluded exactly as the real /me/runs/in-progress-count
-    // is caller-scoped — the badge counts YOUR queue, not the factory's.
-    const count = [...state.runs.values()].filter(
-      (r) =>
-        !isTerminalRun(r.status) &&
-        r.kind !== "chat" &&
-        r.kind !== "judge" &&
-        !(r.id in mockOtherRunOwners),
-    ).length;
-    return delay({ count }, 40);
-  },
-  markNotificationRead: async (id: string) => {
-    const me = requireSession();
-    // Ownership is the (id, user_id) match — a foreign or unknown id is a 404,
-    // exactly like the server's query.
-    const n = notifications.find((x) => x.id === id && x.user_id === me.id);
-    if (!n) throw new ApiError(404, "notification not found");
-    if (!n.read_at) n.read_at = new Date().toISOString();
-    return delay({ notification: notifDTO(n, false) });
-  },
+  ...notificationsApi,
 
   // ── Secrets ─────────────────────────────────────────────────────────────────
   listSecrets: async () =>
