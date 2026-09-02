@@ -13,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -78,7 +79,7 @@ func (h *Handler) SetRepoGuardrailOverride(w http.ResponseWriter, r *http.Reques
 	repo, err := h.q.SetRepoGuardrailOverride(r.Context(), store.SetRepoGuardrailOverrideParams{
 		ID:                      id,
 		GuardrailOverrideReason: pgtype.Text{String: reason, Valid: true},
-		GuardrailOverrideBy:     pgUUID(user.ID),
+		GuardrailOverrideBy:     pgconv.UUID(user.ID),
 		GuardrailOverrideAt:     pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
 	})
 	if err != nil {

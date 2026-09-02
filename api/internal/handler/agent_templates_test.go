@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -48,7 +49,7 @@ func TestAuthorizeTemplateWrite(t *testing.T) {
 
 	builtin := store.AgentTemplate{Scope: "builtin", IsBuiltin: true}
 	global := store.AgentTemplate{Scope: "global"}
-	mine := store.AgentTemplate{Scope: "user", UserID: pgUUID(owner.ID)}
+	mine := store.AgentTemplate{Scope: "user", UserID: pgconv.UUID(owner.ID)}
 
 	cases := []struct {
 		name       string

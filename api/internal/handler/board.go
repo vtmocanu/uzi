@@ -1118,15 +1118,6 @@ func (h *Handler) repoForRequest(w http.ResponseWriter, r *http.Request) (store.
 	return repo, true
 }
 
-// pgtypeTextOrNull maps an empty string to SQL NULL, a non-empty one to a valid
-// text value.
-func pgtypeTextOrNull(s string) pgtype.Text {
-	if s == "" {
-		return pgtype.Text{}
-	}
-	return pgtype.Text{String: s, Valid: true}
-}
-
 // parseInt64 parses a base-10 int64 path param (issue IID).
 func parseInt64(s string) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)

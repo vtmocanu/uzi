@@ -20,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -421,7 +422,7 @@ func (h *Handler) UpdateConnection(w http.ResponseWriter, r *http.Request) {
 	updated, err := h.q.SetForgeConnectionHumanUsername(r.Context(), store.SetForgeConnectionHumanUsernameParams{
 		ID:            id,
 		UserID:        user.ID,
-		HumanUsername: pgtypeTextOrNull(username),
+		HumanUsername: pgconv.TextOrNull(username),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -545,7 +546,7 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, p := range projects {
-		branch := pgtypeTextOrNull(p.DefaultBranch)
+		branch := pgconv.TextOrNull(p.DefaultBranch)
 		if _, err := h.q.UpsertRepo(r.Context(), store.UpsertRepoParams{
 			ConnectionID:      conn.ID,
 			ForgeProjectID:    p.ForgeProjectID,

@@ -12,6 +12,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -145,13 +146,13 @@ func (h *Handler) SetTemplateSkills(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.MySkillIDs != nil {
-		if err := qtx.DeleteUserAllocations(ctx, store.DeleteUserAllocationsParams{TemplateID: tid, UserID: pgUUID(actor.ID)}); err != nil {
+		if err := qtx.DeleteUserAllocations(ctx, store.DeleteUserAllocationsParams{TemplateID: tid, UserID: pgconv.UUID(actor.ID)}); err != nil {
 			slog.Error("clear user allocations", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 		for _, sid := range myIDs {
-			if err := qtx.InsertUserAllocation(ctx, store.InsertUserAllocationParams{TemplateID: tid, SkillID: sid, UserID: pgUUID(actor.ID)}); err != nil {
+			if err := qtx.InsertUserAllocation(ctx, store.InsertUserAllocationParams{TemplateID: tid, SkillID: sid, UserID: pgconv.UUID(actor.ID)}); err != nil {
 				slog.Error("insert user allocation", "error", err)
 				httpx.Error(w, http.StatusInternalServerError, "internal error")
 				return
@@ -184,7 +185,7 @@ func (h *Handler) templateIDForSkills(w http.ResponseWriter, r *http.Request, ac
 	if _, err := h.q.GetAgentTemplateForViewer(r.Context(), store.GetAgentTemplateForViewerParams{
 		ID:       id,
 		IsAdmin:  actor.IsAdmin,
-		ViewerID: pgUUID(actor.ID),
+		ViewerID: pgconv.UUID(actor.ID),
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			httpx.Error(w, http.StatusNotFound, "template not found")
@@ -234,7 +235,7 @@ func (h *Handler) resolveAllocatable(ctx context.Context, ids []string, allow fu
 func (h *Handler) loadTemplateSkills(w http.ResponseWriter, ctx context.Context, tid, viewerID uuid.UUID) (templateSkillsDTO, bool) {
 	rows, err := h.q.ListAllocationsForTemplateForViewer(ctx, store.ListAllocationsForTemplateForViewerParams{
 		TemplateID: tid,
-		ViewerID:   pgUUID(viewerID),
+		ViewerID:   pgconv.UUID(viewerID),
 	})
 	if err != nil {
 		slog.Error("list template allocations", "error", err)

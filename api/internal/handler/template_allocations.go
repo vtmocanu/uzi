@@ -12,6 +12,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -128,14 +129,14 @@ func (h *Handler) SetTemplateAllocations(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	if req.MyOverrides != nil {
-		if err := qtx.DeleteUserTemplateAllocations(ctx, pgUUID(actor.ID)); err != nil {
+		if err := qtx.DeleteUserTemplateAllocations(ctx, pgconv.UUID(actor.ID)); err != nil {
 			slog.Error("clear user template allocations", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 		for _, o := range overrides {
 			if err := qtx.InsertUserTemplateAllocation(ctx, store.InsertUserTemplateAllocationParams{
-				TemplateID: o.id, UserID: pgUUID(actor.ID), Enabled: o.enabled,
+				TemplateID: o.id, UserID: pgconv.UUID(actor.ID), Enabled: o.enabled,
 			}); err != nil {
 				slog.Error("insert user template allocation", "error", err)
 				httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -222,7 +223,7 @@ func (h *Handler) templateForViewer(ctx context.Context, actor store.User, id uu
 	t, err := h.q.GetAgentTemplateForViewer(ctx, store.GetAgentTemplateForViewerParams{
 		ID:       id,
 		IsAdmin:  actor.IsAdmin,
-		ViewerID: pgUUID(actor.ID),
+		ViewerID: pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -238,7 +239,7 @@ func (h *Handler) templateForViewer(ctx context.Context, actor store.User, id uu
 func (h *Handler) loadTemplateAllocations(w http.ResponseWriter, ctx context.Context, actor store.User) ([]templateAllocationDTO, bool) {
 	rows, err := h.q.ListTemplateAllocationsForViewer(ctx, store.ListTemplateAllocationsForViewerParams{
 		IsAdmin:  actor.IsAdmin,
-		ViewerID: pgUUID(actor.ID),
+		ViewerID: pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		slog.Error("list template allocations", "error", err)

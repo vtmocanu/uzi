@@ -18,6 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -238,7 +239,7 @@ func (h *Handler) settleFiledIssue(ctx context.Context, claimID uuid.UUID, repo 
 		Labels:         labelsJSON,
 		AssigneeIds:    assigneeIDsJSON,
 		WebUrl:         created.WebURL,
-		Author:         pgtypeTextOrNull(created.Author),
+		Author:         pgconv.TextOrNull(created.Author),
 		HasPrdLink:     forgesvc.HasPRDLink(description),
 		ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
 	}); err != nil {

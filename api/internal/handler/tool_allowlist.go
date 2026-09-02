@@ -10,10 +10,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
@@ -21,14 +21,6 @@ import (
 
 // maxToolNoteBytes bounds the optional admin note on an allowlist entry.
 const maxToolNoteBytes = 500
-
-// pgTextOrNull maps "" to a NULL text column and any other string to a value.
-func pgTextOrNull(s string) pgtype.Text {
-	if s == "" {
-		return pgtype.Text{}
-	}
-	return pgtype.Text{String: s, Valid: true}
-}
 
 // toolAllowlistDTO is the JSON view of a tool_allowlist row (PRD #18 M4).
 type toolAllowlistDTO struct {
@@ -146,9 +138,9 @@ func (h *Handler) CreateToolAllowlistEntry(w http.ResponseWriter, r *http.Reques
 	}
 	row, err := h.q.CreateToolAllowlistEntry(r.Context(), store.CreateToolAllowlistEntryParams{
 		Name:          name,
-		PinnedVersion: pgTextOrNull(pinned),
-		Note:          pgTextOrNull(note),
-		UpdatedBy:     pgUUID(actor.ID),
+		PinnedVersion: pgconv.TextOrNull(pinned),
+		Note:          pgconv.TextOrNull(note),
+		UpdatedBy:     pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -190,9 +182,9 @@ func (h *Handler) UpdateToolAllowlistEntry(w http.ResponseWriter, r *http.Reques
 	}
 	row, err := h.q.UpdateToolAllowlistEntry(r.Context(), store.UpdateToolAllowlistEntryParams{
 		ID:            id,
-		PinnedVersion: pgTextOrNull(pinned),
-		Note:          pgTextOrNull(note),
-		UpdatedBy:     pgUUID(actor.ID),
+		PinnedVersion: pgconv.TextOrNull(pinned),
+		Note:          pgconv.TextOrNull(note),
+		UpdatedBy:     pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
