@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  allocates the builtin prd-lifecycle skill (shared) to template TID; flips repo_skills_enabled=true on REPO_ID; creates + allocates a user-scoped template (e2e-mine); sets then clears a tier-1 tool profile on REPO_ID
-# restores: repo_skills_enabled=false on REPO_ID + tool profile cleared to [], both at the end (the builtin/user-template allocations are left in place — no later phase is perturbed by them)
+# restores: repo_skills_enabled=false on REPO_ID + tool profile cleared to [], both at the end (explicit restores + EXIT-trap fail-safe so a mid-phase fail can't leave the flag/profile set for later gitlab-lane phases; the builtin/user-template allocations are left in place — no later phase is perturbed by them)
 # =============================================================================
 # PRD #16 — skill delivery + repo-skill opt-in, end to end. The stub executor
 # synthesizes the plugin dir the SAME way the SDK executor does (shared
@@ -53,6 +53,15 @@ pass "flag OFF: plugin dir has prd-lifecycle, NOT the repo skill ($PS1)"
 apipatch "/api/repos/$REPO_ID" '{"repo_skills_enabled":true}' | jq -e '.repo.repo_skills_enabled == true' >/dev/null \
   || fail "PATCH repo_skills_enabled=true did not stick"
 pass "repo owner enabled repo skills"
+
+# Fail-safe: from here on, a mid-phase fail() exits this ( set -euo pipefail ) subshell
+# before the explicit restores at the end, and the suite-level EXIT trap only tears down
+# the stack — it does not reset these settings. Register an EXIT trap that restores BOTH
+# mutations (flag off + tool profile cleared) so a failed assertion can't leak stale state
+# into later gitlab-lane phases. One trap covers both: clearing an already-empty tool
+# profile before it is set below is an idempotent no-op. Dropped with `trap - EXIT` after
+# the explicit restores run on the clean path.
+trap 'apiput "/api/repos/$REPO_ID/tool-profile" '\''{"packages":[]}'\'' >/dev/null 2>&1 || true; apipatch "/api/repos/$REPO_ID" '\''{"repo_skills_enabled":false}'\'' >/dev/null 2>&1 || true' EXIT
 
 # Repo skills ON: the repo skill now loads too, at lowest precedence, alongside the
 # delivered builtin.
@@ -127,4 +136,5 @@ apiput "/api/repos/$REPO_ID/tool-profile" '{"packages":[]}' >/dev/null
 # this flag, but leaving it true would make the mutation outlive its phase, so undo it to
 # keep the phase self-contained (mirrors the flip-on at the PATCH above).
 apipatch "/api/repos/$REPO_ID" '{"repo_skills_enabled":false}' >/dev/null
+trap - EXIT  # explicit restores done on the clean path; drop the fail-safe
 
