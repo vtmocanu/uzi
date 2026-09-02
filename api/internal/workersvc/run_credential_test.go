@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -47,7 +48,7 @@ func newClaimFixture(t *testing.T) claimFixture {
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:          sealedDefault,
@@ -340,7 +341,7 @@ func TestChatClaimRecordsTheDefault(t *testing.T) {
 	fs := &fakeStore{
 		chatClaimRun: store.Run{
 			ID: runID, UserID: owner, Kind: RunKindChat, Status: "claimed",
-			Title: pgText("a chat"),
+			Title: pgconv.TextOrNull("a chat"),
 		},
 		anthropic:          sealedDefault,
 		defaultSecretLabel: "default",

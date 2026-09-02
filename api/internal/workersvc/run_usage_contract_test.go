@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -80,7 +81,7 @@ type recordedRollup struct {
 // for the live-DB suites, where a suite that ran nothing prints "ok".
 func readFixture(t *testing.T, name string, into any) {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(runUsageFixtureDir, name))
+	b, err := os.ReadFile(filepath.Join(runUsageFixtureDir, name)) //nolint:gosec // G304: test reads a fixture from the fixed runUsageFixtureDir testdata path
 	if err != nil {
 		t.Fatalf("fixture unreadable: %s: %v -- this contract asserts nothing without it, "+
 			"and skipping would look identical to passing", name, err)
@@ -112,7 +113,7 @@ func loadRecordedRollup(t *testing.T) recordedRollup {
 func foldRecordedFrames(t *testing.T, frames []recordedFrame) map[string]store.UpsertRunUsageParams {
 	t.Helper()
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-84b6a933")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("sess-84b6a933")}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := make([]IncomingMessage, 0, len(frames))

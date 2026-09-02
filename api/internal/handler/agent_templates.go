@@ -19,6 +19,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
@@ -362,7 +363,7 @@ func (h *Handler) ListAgentTemplates(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := h.q.ListAgentTemplatesForViewer(r.Context(), store.ListAgentTemplatesForViewerParams{
 		IsAdmin:  actor.IsAdmin,
-		ViewerID: pgUUID(actor.ID),
+		ViewerID: pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		slog.Error("list agent templates", "error", err)
@@ -448,7 +449,7 @@ func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "user":
-		userID = pgUUID(actor.ID)
+		userID = pgconv.UUID(actor.ID)
 	default:
 		httpx.Error(w, http.StatusBadRequest, "scope must be 'global' or 'user'")
 		return
@@ -478,7 +479,7 @@ func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		PromptBody:  fields.promptBody,
 		Scope:       scope,
 		UserID:      userID,
-		UpdatedBy:   pgUUID(actor.ID),
+		UpdatedBy:   pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -536,7 +537,7 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		Model:       fields.model,
 		Tools:       fields.tools,
 		PromptBody:  fields.promptBody,
-		UpdatedBy:   pgUUID(actor.ID),
+		UpdatedBy:   pgconv.UUID(actor.ID),
 		Customized:  updateMarksCustomized(t, fields),
 	})
 	if err != nil {
@@ -612,7 +613,7 @@ func (h *Handler) ResetAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		Model:       model,
 		Tools:       tools,
 		PromptBody:  def.PromptBody,
-		UpdatedBy:   pgUUID(actor.ID),
+		UpdatedBy:   pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		slog.Error("reset agent template", "error", err)
@@ -644,7 +645,7 @@ func (h *Handler) loadTemplateForViewer(w http.ResponseWriter, r *http.Request) 
 	t, err := h.q.GetAgentTemplateForViewer(r.Context(), store.GetAgentTemplateForViewerParams{
 		ID:       id,
 		IsAdmin:  actor.IsAdmin,
-		ViewerID: pgUUID(actor.ID),
+		ViewerID: pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -831,23 +832,6 @@ func hasControlChar(s string) bool {
 		}
 	}
 	return false
-}
-
-// pgUUID wraps a uuid you KNOW IS PRESENT as a valid pgtype.UUID. It sets Valid=true
-// unconditionally — including for uuid.Nil, which becomes the REAL all-zero uuid, not SQL
-// NULL. Do not "fix" that: at call sites that legitimately assume presence, auto-NULLing
-// would turn a loud FK violation into a silent NULL write.
-//
-// The trap is passing uuid.Nil as an "absent" sentinel to a sqlc.narg parameter — the
-// query's `IS NULL` branch never fires, so the filter matches nothing and the endpoint
-// SILENTLY RETURNS NOTHING instead of erroring. For a genuinely optional id, leave the
-// zero pgtype.UUID (Valid:false → NULL) and call this only on the present branch, as the
-// optional-parent paths in this file already do.
-//
-// Two sibling copies exist (workersvc/service.go, selfimprove/engine.go) with the same
-// contract; keep these comments in step.
-func pgUUID(id uuid.UUID) pgtype.UUID {
-	return pgtype.UUID{Bytes: id, Valid: true}
 }
 
 // isUniqueViolation reports whether err is a Postgres unique-constraint failure

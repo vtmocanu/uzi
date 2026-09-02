@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -202,7 +203,7 @@ func (h *Handler) PutBrandingLogo(w http.ResponseWriter, r *http.Request) {
 		Slot:        slot,
 		ContentType: ct,
 		Bytes:       body,
-		UpdatedBy:   pgUUID(actor.ID),
+		UpdatedBy:   pgconv.UUID(actor.ID),
 	}); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to store logo")
 		return

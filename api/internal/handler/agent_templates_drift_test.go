@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -146,7 +147,7 @@ func TestDiffersFromBuiltinIgnoresNonBuiltinScopes(t *testing.T) {
 			Scope:       scope,
 		}
 		if scope == "user" {
-			row.UserID = pgUUID(uuid.New())
+			row.UserID = pgconv.UUID(uuid.New())
 		}
 		return row
 	}
@@ -343,7 +344,7 @@ func TestWriteBuiltinDefinitionStatusMatrix(t *testing.T) {
 	}
 	private := store.AgentTemplate{
 		ID: uuid.New(), Name: "mira-helper", Description: "helps mira.",
-		PromptBody: "x\n", Scope: "user", UserID: pgUUID(owner.ID),
+		PromptBody: "x\n", Scope: "user", UserID: pgconv.UUID(owner.ID),
 	}
 
 	cases := []struct {

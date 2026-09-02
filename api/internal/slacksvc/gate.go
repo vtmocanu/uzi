@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/slack-go/slack"
 )
 
@@ -87,10 +86,6 @@ const (
 // (with headroom for the truncation ellipsis and any partial-entity slack). Applied
 // to the plan-in-thread render (PRD #41 Decision 10); slicing is on a rune boundary.
 const maxSlackSectionRunes = 2900
-
-// pgText wraps a non-empty string as a valid pgtype.Text (an empty string still
-// yields Valid=true; callers pass "" only where they mean a present empty value).
-func pgText(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
 
 // gateBlocks builds the awaiting_approval gate message: a short prompt with NO
 // plan excerpt (content minimization — the plan stays behind the deep link) plus

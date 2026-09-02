@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -133,7 +134,7 @@ func (s *Service) GetRunReviewPanel(ctx context.Context, userID uuid.UUID, isAdm
 // this is a plain by-target lookup, exactly like GetRunReviewForTarget, and carries no
 // scoping of its own.
 func (s *Service) pendingJudgeForTarget(ctx context.Context, targetRunID uuid.UUID) (*PendingJudge, error) {
-	row, err := s.q.GetActiveJudgeRunForTarget(ctx, pgUUID(targetRunID))
+	row, err := s.q.GetActiveJudgeRunForTarget(ctx, pgconv.UUID(targetRunID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil // no judge in flight: the "Run judge" button is legitimately live
 	}
@@ -244,7 +245,7 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 	}
 	judge, err := s.q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 		UserID:           target.UserID,
-		TargetRunID:      pgUUID(target.ID),
+		TargetRunID:      pgconv.UUID(target.ID),
 		IssueTitle:       judgeRunTitle(target),
 		IssueDescription: "",
 		TriggerSource:    "judge_rerun",

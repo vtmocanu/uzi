@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -201,7 +202,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		}
 		cleanBody, _ := stripNUL(body)
 		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
-			RunID: runID, Kind: kind, Body: pgText(cleanBody), StopKind: pgText(stopKindFor(kind)), StopReason: stopReasonParam(body),
+			RunID: runID, Kind: kind, Body: pgconv.TextOrNull(cleanBody), StopKind: pgconv.TextOrNull(stopKindFor(kind)), StopReason: stopReasonParam(body),
 		}); err != nil {
 			return SubmitInputResult{}, err
 		}
@@ -235,7 +236,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 				}
 				reason = truncateRunes(reason, maxFailureReasonRunes)
 				_, err = s.q.RejectRunServerSide(ctx, store.RejectRunServerSideParams{
-					ID: runID, UserID: userID, FailureReason: pgText(reason),
+					ID: runID, UserID: userID, FailureReason: pgconv.TextOrNull(reason),
 				})
 			}
 			if err != nil {
@@ -255,7 +256,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			// Guarded on the run carrying a directive so it is a no-op when there is none.
 			if run.ScopeCeiling.Valid {
 				if _, setErr := s.q.SettleScopeInputDisposition(ctx, store.SettleScopeInputDispositionParams{
-					RunID: runID, Disposition: pgText("declined"),
+					RunID: runID, Disposition: pgconv.TextOrNull("declined"),
 				}); setErr != nil {
 					slog.Warn("settle scope input disposition (server-side cancel/reject)", "run", runID, "error", setErr)
 				}
@@ -283,7 +284,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		// moot if this INSERT never lands). NUL is never meaningful in an operator message.
 		cleanBody, _ := stripNUL(body)
 		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
-			RunID: runID, Kind: kind, Body: pgText(cleanBody), StopKind: pgText(stopKindFor(kind)), StopReason: stopReason,
+			RunID: runID, Kind: kind, Body: pgconv.TextOrNull(cleanBody), StopKind: pgconv.TextOrNull(stopKindFor(kind)), StopReason: stopReason,
 		}); err != nil {
 			return SubmitInputResult{}, err
 		}
@@ -328,7 +329,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// same statement, or the cap stops meaning anything.
 	if kind == "revise_plan" {
 		row, err := s.q.CreateRunReviseInputIfUnderCap(ctx, store.CreateRunReviseInputIfUnderCapParams{
-			RunID: runID, Body: pgText(body), MaxRevisions: int32(s.p.PlanMaxRevisions), //nolint:gosec // G115: PlanMaxRevisions is a small bounded config int (env PLAN_MAX_REVISIONS), never near int32 range
+			RunID: runID, Body: pgconv.TextOrNull(body), MaxRevisions: int32(s.p.PlanMaxRevisions), //nolint:gosec // G115: PlanMaxRevisions is a small bounded config int (env PLAN_MAX_REVISIONS), never near int32 range
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return SubmitInputResult{}, ErrReviseCapReached
@@ -350,7 +351,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 // nil-selection approve_plan path so both go through one enqueue.
 func (s *Service) enqueueRunInput(ctx context.Context, runID uuid.UUID, kind, body string) (SubmitInputResult, error) {
 	row, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
-		RunID: runID, Kind: kind, Body: pgText(body),
+		RunID: runID, Kind: kind, Body: pgconv.TextOrNull(body),
 	})
 	if err != nil {
 		return SubmitInputResult{}, err
@@ -396,7 +397,7 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 		slog.Warn("workersvc: approve-freeze pre-read failed", "run_id", run.ID, "error", beforeErr)
 	}
 	if _, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
-		RunID: run.ID, Body: pgText(string(body)), AgentSource: pgText(sel.Source), AgentExclusions: exclusions,
+		RunID: run.ID, Body: pgconv.TextOrNull(string(body)), AgentSource: pgconv.TextOrNull(sel.Source), AgentExclusions: exclusions,
 		// PRD #122 M2 (Decision 5/5b): the budget-scaling config the freeze reads to derive
 		// this run's effective budget from its frozen milestone count, atomically with the
 		// candidate→frozen copy. IDEMPOTENT via COALESCE — a re-gate resume re-supplies the
@@ -579,7 +580,7 @@ func (s *Service) submitAnswer(ctx context.Context, run store.Run, body string) 
 		return SubmitInputResult{}, fmt.Errorf("encode answer: %w", err)
 	}
 	row, err := s.q.CreateRunAnswerInput(ctx, store.CreateRunAnswerInputParams{
-		RunID: run.ID, Body: pgText(string(encoded)), QuestionID: pgText(qid),
+		RunID: run.ID, Body: pgconv.TextOrNull(string(encoded)), QuestionID: pgconv.TextOrNull(qid),
 	})
 	if err != nil {
 		return SubmitInputResult{}, err
@@ -634,7 +635,7 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 	if _, err := s.q.CreateScopeCeilingInput(ctx, store.CreateScopeCeilingInputParams{
 		RunID:        run.ID,
 		ScopeCeiling: pgtype.Int4{Int32: ceil32, Valid: true},
-		Body:         pgText(cleanBody),
+		Body:         pgconv.TextOrNull(cleanBody),
 	}); err != nil {
 		return SubmitInputResult{}, err
 	}

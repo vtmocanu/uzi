@@ -19,6 +19,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -218,7 +219,7 @@ func TestAgentSourceApplyLiveDB(t *testing.T) {
 	}
 
 	// Apply, bound to the reviewed snapshot's SHA (mandatory expected-sha bind).
-	res, err := f.rec.Apply(ctx, pgUUID(f.admin), "sha-v1")
+	res, err := f.rec.Apply(ctx, pgconv.UUID(f.admin), "sha-v1")
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -236,7 +237,7 @@ func TestAgentSourceApplyLiveDB(t *testing.T) {
 	}
 	// still reset-able to embedded (it remained a builtin with an embedded default).
 	if _, err := f.q.ResetBuiltinAgentTemplate(ctx, store.ResetBuiltinAgentTemplateParams{
-		Description: "coder desc", PromptBody: "old coder body\n", UpdatedBy: pgUUID(f.admin), ID: coderID,
+		Description: "coder desc", PromptBody: "old coder body\n", UpdatedBy: pgconv.UUID(f.admin), ID: coderID,
 	}); err != nil {
 		t.Fatalf("overridden builtin should stay reset-able: %v", err)
 	}
@@ -283,7 +284,7 @@ func TestAgentSourceApplyLiveDB(t *testing.T) {
 	// Applied-tracking: a second apply of the same snapshot is a no-op. The
 	// expected-sha bind still matches (the snapshot did not change), so this is the
 	// genuine already-applied path, not a stale-approval 409.
-	res2, err := f.rec.Apply(ctx, pgUUID(f.admin), "sha-v1")
+	res2, err := f.rec.Apply(ctx, pgconv.UUID(f.admin), "sha-v1")
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
@@ -420,7 +421,7 @@ func TestAgentSourceApplyAbortsOnBadRolesLiveDB(t *testing.T) {
 		t.Fatalf("seed bad-roles staged: %v", err)
 	}
 
-	res, err := f.rec.Apply(ctx, pgUUID(f.admin), "sha-bad-roles")
+	res, err := f.rec.Apply(ctx, pgconv.UUID(f.admin), "sha-bad-roles")
 	if err == nil {
 		t.Fatalf("apply of an undecodable roles blob must error, got result %+v", res)
 	}

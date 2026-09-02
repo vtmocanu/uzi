@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -244,8 +245,8 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 		n, err := s.q.UpsertDispositionsForResolvedCoords(ctx, store.UpsertDispositionsForResolvedCoordsParams{
 			Status: status,
 			// "" → NULL: a 'done' carries no reason (the table CHECK is the backstop).
-			DismissReason:   pgText(reason),
-			SetByUserID:     pgUUID(ownerUserID),
+			DismissReason:   pgconv.TextOrNull(reason),
+			SetByUserID:     pgconv.UUID(ownerUserID),
 			ReviewIds:       reviewIDs,
 			Categories:      writeCategories,
 			Targets:         writeTargets,

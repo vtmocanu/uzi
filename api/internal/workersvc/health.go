@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -202,11 +203,11 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		notifiedAt := pgtype.Timestamptz{}
 		if nudge {
-			notifiedAt = pgTime(now)
+			notifiedAt = pgconv.Time(now)
 		}
 		n, err := s.q.SetRunHealth(ctx, store.SetRunHealthParams{
 			Health:           target,
-			HealthReason:     pgText(reason), // "" → NULL
+			HealthReason:     pgconv.TextOrNull(reason),
 			HealthSince:      healthSince(now, target, r),
 			HealthNotifiedAt: notifiedAt, // NULL → COALESCE preserves the existing stamp
 			ID:               r.ID,
@@ -656,7 +657,7 @@ func (s *Service) verdictUndelivered(ctx context.Context, r store.ListActiveRuns
 func (s *Service) queuedPriorityClass(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) string {
 	class, err := s.q.RunPriorityClassForRun(ctx, store.RunPriorityClassForRunParams{
 		RunID:                 r.ID,
-		BackgroundGraceCutoff: pgTime(now.Add(-s.p.WorkerBackgroundGrace)),
+		BackgroundGraceCutoff: pgconv.Time(now.Add(-s.p.WorkerBackgroundGrace)),
 	})
 	if err != nil {
 		slog.Error("health: read run priority class", "run_id", r.ID, "error", err)
@@ -759,7 +760,7 @@ func healthSince(now time.Time, target string, r store.ListActiveRunsForHealthRo
 	case r.Health == target:
 		return r.HealthSince
 	default:
-		return pgTime(now)
+		return pgconv.Time(now)
 	}
 }
 

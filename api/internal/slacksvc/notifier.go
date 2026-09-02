@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -612,7 +614,7 @@ func (n *Notifier) handleQuestion(ctx context.Context, rc store.GetSlackRunConte
 		return
 	}
 	if _, err := n.store.SetSlackRunQuestion(ctx, store.SetSlackRunQuestionParams{
-		RunID: rc.ID, QuestionID: pgText(q.QuestionID), QuestionTs: pgText(ts),
+		RunID: rc.ID, QuestionID: pgconv.Text(q.QuestionID), QuestionTs: pgconv.Text(ts),
 	}); err != nil {
 		n.logf("record question", err)
 	}
@@ -690,9 +692,17 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 			n.logf("post gate", err)
 			return
 		}
+		// currentGen is a per-run plan-message count (small in practice); clamp before
+		// narrowing so an implausibly large count saturates rather than wrapping to a
+		// negative generation that could suppress a fresh gate. The explicit bound also
+		// makes the cast provable to gosec G115 / CodeQL.
+		gen := currentGen
+		if gen > math.MaxInt32 {
+			gen = math.MaxInt32
+		}
 		if _, err := n.store.SetSlackRunGateGen(ctx, store.SetSlackRunGateGenParams{
-			RunID: rc.ID, GateTs: pgText(ts), GateState: pgText(gateStateOpen),
-			GateGeneration: pgtype.Int4{Int32: int32(currentGen), Valid: true},
+			RunID: rc.ID, GateTs: pgconv.Text(ts), GateState: pgconv.Text(gateStateOpen),
+			GateGeneration: pgtype.Int4{Int32: int32(gen), Valid: true},
 		}); err != nil {
 			n.logf("record gate", err)
 		}
@@ -969,7 +979,7 @@ func (n *Notifier) handleMilestone(ctx context.Context, rc store.GetSlackRunCont
 		return // do not advance the notified count; a later event retries
 	}
 	if _, err := n.store.SetSlackRunMilestoneNotified(ctx, store.SetSlackRunMilestoneNotifiedParams{
-		RunID: rc.ID, Count: pgtype.Int4{Int32: int32(done), Valid: true},
+		RunID: rc.ID, Count: pgtype.Int4{Int32: int32(done), Valid: true}, //nolint:gosec // G115: done is a per-run milestone count, a small bounded value, never near int32 range
 	}); err != nil {
 		n.logf("record milestone notified", err)
 	}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -208,12 +209,8 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 // footprint is one indexed DELETE that matches nothing.
 func (p *EphemeralProvisioner) ReapPass(ctx context.Context) (int64, error) {
 	cutoff := p.now().Add(-p.cfg.ProvisionDeadline)
-	return p.q.ReapEphemeralWorkers(ctx, pgTime(cutoff))
+	return p.q.ReapEphemeralWorkers(ctx, pgconv.Time(cutoff))
 }
-
-// pgTime wraps a known-present time as a valid pgtype.Timestamptz (mirrors the helper in
-// workersvc/usagepoller so ReapPass's cutoff is assignable to the generated param).
-func pgTime(t time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: t, Valid: true} }
 
 // provisionOne runs the provision transaction for a single run, mirroring
 // handler.provisionHostedWorker. It returns (true, nil) when a worker was created,

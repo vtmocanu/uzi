@@ -17,12 +17,13 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // userSkill builds a user-scope skill owned by owner.
 func userSkill(owner uuid.UUID) store.Skill {
-	return store.Skill{Scope: "user", UserID: pgUUID(owner)}
+	return store.Skill{Scope: "user", UserID: pgconv.UUID(owner)}
 }
 
 func TestValidateSkillFields(t *testing.T) {
@@ -369,8 +370,8 @@ func TestGetSkillDTOAllFields(t *testing.T) {
 		Description: "how to deploy the thing",
 		Body:        "# Playbook\n\nstep 1: do it\n",
 		Scope:       "user",
-		UserID:      pgUUID(userID),
-		UpdatedBy:   pgUUID(updatedBy),
+		UserID:      pgconv.UUID(userID),
+		UpdatedBy:   pgconv.UUID(updatedBy),
 		CreatedAt:   pgtype.Timestamptz{Time: created, Valid: true},
 		UpdatedAt:   pgtype.Timestamptz{Time: updated, Valid: true},
 	}

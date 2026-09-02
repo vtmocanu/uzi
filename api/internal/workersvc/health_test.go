@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -181,7 +182,7 @@ func healthSvc(fs Store, st Settings) *Service {
 	return svc
 }
 
-func ago(d time.Duration) pgtype.Timestamptz { return pgTime(t0.Add(-d)) }
+func ago(d time.Duration) pgtype.Timestamptz { return pgconv.Time(t0.Add(-d)) }
 
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
@@ -261,7 +262,7 @@ func TestHealthStalledFlagsThenClearsOnResume(t *testing.T) {
 	// self-clear back to ok.
 	fs.writes = nil
 	r.Health = healthStalled
-	r.HealthReason = pgText(reasonStalled)
+	r.HealthReason = pgconv.TextOrNull(reasonStalled)
 	r.LastActivityAt = ago(30 * time.Second) // fresh
 	fs.active = []store.ListActiveRunsForHealthRow{r}
 
@@ -583,7 +584,7 @@ func TestHealthSkipsUnchanged(t *testing.T) {
 	r.StartedAt = ago(time.Hour)
 	r.LastActivityAt = ago(10 * time.Minute)
 	r.Health = healthStalled // already flagged, same reason
-	r.HealthReason = pgText(reasonStalled)
+	r.HealthReason = pgconv.TextOrNull(reasonStalled)
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc := healthSvc(fs, defaultHealthSettings())
 
@@ -613,7 +614,7 @@ func TestHealthBroadcastsOnChangeNotOnNoop(t *testing.T) {
 	// Second pass with the run already reading stalled → no write, no broadcast.
 	b.healths = nil
 	r.Health = healthStalled
-	r.HealthReason = pgText(reasonStalled)
+	r.HealthReason = pgconv.TextOrNull(reasonStalled)
 	fs.active = []store.ListActiveRunsForHealthRow{r}
 	svc.detectRunHealth(context.Background(), t0)
 	if len(b.healths) != 0 {
@@ -647,7 +648,7 @@ func TestHealthQueuedReasonChangeRewrites(t *testing.T) {
 	r := runRow("queued")
 	r.StatusSince = ago(15 * time.Minute)
 	r.Health = healthWaitingWorker
-	r.HealthReason = pgText(reasonNoWorker)
+	r.HealthReason = pgconv.TextOrNull(reasonNoWorker)
 	r.HealthSince = original
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: 1, freeSlotWorkers: 1}
 	svc := healthSvc(fs, defaultHealthSettings())
@@ -871,7 +872,7 @@ func TestHealthNoNudgeOnFlagChange(t *testing.T) {
 	// ok→flagged transition, so no fresh nudge.
 	r := stalledRunRow()
 	r.Health = healthSlow
-	r.HealthReason = pgText(reasonSlow)
+	r.HealthReason = pgconv.TextOrNull(reasonSlow)
 	_, svc, b := nudgeSvc(t, r, defaultHealthSettings())
 	svc.detectRunHealth(context.Background(), t0)
 
@@ -888,7 +889,7 @@ func TestHealthNoNudgeOnClear(t *testing.T) {
 	r.StartedAt = ago(20 * time.Minute)
 	r.LastActivityAt = ago(30 * time.Second) // fresh → ok
 	r.Health = healthStalled
-	r.HealthReason = pgText(reasonStalled)
+	r.HealthReason = pgconv.TextOrNull(reasonStalled)
 	r.HealthSince = ago(10 * time.Minute)
 	_, svc, b := nudgeSvc(t, r, defaultHealthSettings())
 	svc.detectRunHealth(context.Background(), t0)
@@ -920,7 +921,7 @@ func TestHealthRestartNoDupeNudge(t *testing.T) {
 	// broadcast, no nudge. The persisted health_notified_at is untouched.
 	r := stalledRunRow()
 	r.Health = healthStalled
-	r.HealthReason = pgText(reasonStalled)
+	r.HealthReason = pgconv.TextOrNull(reasonStalled)
 	r.HealthNotifiedAt = ago(1 * time.Minute)
 	fs, svc, b := nudgeSvc(t, r, defaultHealthSettings())
 	svc.detectRunHealth(context.Background(), t0)
@@ -941,7 +942,7 @@ func TestHealthEnumChangeResetsSince(t *testing.T) {
 	r.StartedAt = ago(20 * time.Minute)
 	r.LastActivityAt = ago(10 * time.Minute) // stalled; not slow (20m < 45m)
 	r.Health = healthSlow
-	r.HealthReason = pgText(reasonSlow)
+	r.HealthReason = pgconv.TextOrNull(reasonSlow)
 	r.HealthSince = oldSince
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc := healthSvc(fs, defaultHealthSettings())

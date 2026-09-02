@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -230,7 +231,7 @@ func TestReasonVerdictUndeliveredIsMirroredBySlack(t *testing.T) {
 func TestHealthGateApprovalIdleBecomesWaitingWorkerSilently(t *testing.T) {
 	r := gateRunRow()
 	r.Health = healthApprovalIdle
-	r.HealthReason = pgText(reasonApprovalIdle)
+	r.HealthReason = pgconv.TextOrNull(reasonApprovalIdle)
 	r.HealthSince = ago(30 * time.Minute)
 	r.HealthNotifiedAt = ago(30 * time.Minute)
 	fs, svc := gateSvc(r, true)
@@ -262,7 +263,7 @@ func TestHealthGateApprovalIdleBecomesWaitingWorkerSilently(t *testing.T) {
 func TestHealthGateWaitingWorkerIsStable(t *testing.T) {
 	r := gateRunRow()
 	r.Health = healthWaitingWorker
-	r.HealthReason = pgText(reasonVerdictUndelivered)
+	r.HealthReason = pgconv.TextOrNull(reasonVerdictUndelivered)
 	r.HealthSince = ago(20 * time.Minute)
 	fs, svc := gateSvc(r, true)
 
@@ -285,7 +286,7 @@ func TestHealthGateWaitingWorkerIsStable(t *testing.T) {
 func TestHealthGateUpdatedAtBumpDoesNotDisturbEpisode(t *testing.T) {
 	r := gateRunRow()
 	r.Health = healthWaitingWorker
-	r.HealthReason = pgText(reasonVerdictUndelivered)
+	r.HealthReason = pgconv.TextOrNull(reasonVerdictUndelivered)
 	r.HealthSince = ago(20 * time.Minute)
 	// The incidental bump: still awaiting_approval, status_since unchanged, only updated_at fresh.
 	r.UpdatedAt = ago(1 * time.Minute)

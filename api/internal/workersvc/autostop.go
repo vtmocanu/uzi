@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -272,8 +273,8 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
 			RunID:    c.runID,
 			Kind:     "cancel",
-			Body:     pgText(autoStopBody),
-			StopKind: pgText(stopKindAutoStopped),
+			Body:     pgconv.TextOrNull(autoStopBody),
+			StopKind: pgconv.TextOrNull(stopKindAutoStopped),
 			// PRD #503 M3: NULL — auto-stop carries no operator reason; its
 			// identity is stop_kind='auto_stopped'.
 			StopReason: pgtype.Text{},
@@ -304,7 +305,7 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 func (s *Service) failRunAutoStop(ctx context.Context, run store.Run, c persistFailCandidate, now time.Time, peers int, live bool, action string) bool {
 	rows, err := s.q.FailRunAutoStop(ctx, store.FailRunAutoStopParams{
 		ID:            c.runID,
-		FailureReason: pgText(autoStopReason),
+		FailureReason: pgconv.TextOrNull(autoStopReason),
 	})
 	if err != nil {
 		slog.Error("workersvc: auto-stop could not fail the run", "run_id", c.runID.String(), "error", err)

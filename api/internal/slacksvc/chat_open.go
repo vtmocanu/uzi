@@ -5,8 +5,8 @@ import (
 	"errors"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -102,7 +102,7 @@ func (r *Replier) openChat(ctx context.Context, m MessageReply, user store.User)
 		RunID:     run.ID,
 		ChannelID: m.ChannelID,
 		RootTs:    m.MessageTS,
-		StatusTs:  textOrNull(statusTS),
+		StatusTs:  pgconv.TextOrNull(statusTS),
 	}); err != nil {
 		// Without the anchor a later thread reply resolves to no run and is silently
 		// dropped — so DON'T ack (a ✅ would falsely signal "it landed"). Point the user
@@ -161,13 +161,4 @@ func (r *Replier) postThreadReply(ctx context.Context, m MessageReply, text stri
 	if _, err := r.poster.Post(ctx, m.ChannelID, thread, ScrubSecrets(text)); err != nil {
 		r.logf("post thread reply", err)
 	}
-}
-
-// textOrNull maps "" to a NULL pgtype.Text (an absent status message) and any
-// non-empty ts to a valid one.
-func textOrNull(s string) pgtype.Text {
-	if s == "" {
-		return pgtype.Text{}
-	}
-	return pgtype.Text{String: s, Valid: true}
 }

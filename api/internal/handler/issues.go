@@ -14,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -95,7 +96,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		Labels:         labelsJSON,
 		AssigneeIds:    assigneeIDsJSON,
 		WebUrl:         created.WebURL,
-		Author:         pgtypeTextOrNull(created.Author),
+		Author:         pgconv.TextOrNull(created.Author),
 		HasPrdLink:     forgesvc.HasPRDLink(req.Description),
 		ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
 	})

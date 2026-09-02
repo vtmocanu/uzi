@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -153,7 +154,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// this run. A concurrent duplicate trips the one-active-judge-per-target index.
 	judge, err := s.q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 		UserID:           run.UserID,
-		TargetRunID:      pgUUID(run.ID),
+		TargetRunID:      pgconv.UUID(run.ID),
 		IssueTitle:       judgeRunTitle(run),
 		IssueDescription: "",
 		TriggerSource:    "judge",
@@ -346,7 +347,7 @@ func (s *Service) judgeSpendGuardsAllow(ctx context.Context, run store.Run) bool
 	if budget, err := s.settings.JudgeDailyBudget(ctx); err == nil && budget > 0 {
 		count, cerr := s.q.CountJudgesSince(ctx, store.CountJudgesSinceParams{
 			UserID: run.UserID,
-			Since:  pgTime(time.Now().Add(-24 * time.Hour)),
+			Since:  pgconv.Time(time.Now().Add(-24 * time.Hour)),
 		})
 		if cerr != nil {
 			slog.Warn("judge enqueue: budget lookup failed, proceeding (fail-open)", "run", run.ID, "user", run.UserID, "error", cerr)

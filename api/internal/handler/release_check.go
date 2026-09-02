@@ -10,6 +10,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/releasecheck"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -104,7 +105,7 @@ func (h *Handler) PostReleaseCheckSnooze(w http.ResponseWriter, r *http.Request)
 		// a missing actor stores NULL rather than failing.
 		var updatedBy pgtype.UUID
 		if actor, ok := mw.UserFromContext(ctx); ok {
-			updatedBy = pgUUID(actor.ID)
+			updatedBy = pgconv.UUID(actor.ID)
 		}
 		if _, err := h.q.UpsertAppSetting(ctx, store.UpsertAppSettingParams{
 			Key:       settings.KeyReleaseBannerSnoozeTag,

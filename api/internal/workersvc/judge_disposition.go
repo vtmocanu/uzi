@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -74,9 +75,9 @@ func (s *Service) SetDisposition(ctx context.Context, ownerUserID, runID, recID 
 		Category:      rec.Category,
 		Target:        rec.Target,
 		Status:        status,
-		DismissReason: pgText(reason), // "" → NULL (a 'done' carries no reason)
+		DismissReason: pgconv.TextOrNull(reason),
 		RationaleHash: RationaleHash(rec.RationaleMd),
-		SetByUserID:   pgUUID(ownerUserID),
+		SetByUserID:   pgconv.UUID(ownerUserID),
 	})
 	return err
 }
@@ -142,9 +143,9 @@ func (s *Service) JudgeTriageStats(ctx context.Context, ownerUserID uuid.UUID) (
 func (s *Service) JudgeCategoryStats(ctx context.Context, ownerUserID uuid.UUID, runAnchor uuid.UUID) (apitypes.JudgeCategoryStatsDTO, error) {
 	rows, err := s.q.ListJudgeRecommendationRowsForUser(ctx, store.ListJudgeRecommendationRowsForUserParams{
 		UserID:     ownerUserID,
-		RunAnchor:  nullableUUID(runAnchor), // uuid.Nil → SQL NULL → the anchor predicate is a no-op
-		Categories: nil,                     // facet independence — never filter the counts by category
-		Lim:        0,                       // UNCAPPED — the LIMIT NULLIF(@lim, 0) sentinel means no limit
+		RunAnchor:  pgconv.UUIDOrNull(runAnchor),
+		Categories: nil, // facet independence — never filter the counts by category
+		Lim:        0,   // UNCAPPED — the LIMIT NULLIF(@lim, 0) sentinel means no limit
 	})
 	if err != nil {
 		return apitypes.JudgeCategoryStatsDTO{}, err

@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -124,18 +125,18 @@ func TestMRReworkClaimBranchFromPipelineRef(t *testing.T) {
 	fs := &fakeStore{
 		claimRun: store.Run{
 			ID:               uuid.MustParse("44444444-4444-4444-4444-444444444444"),
-			RepoID:           pgUUID(uuid.MustParse("22222222-2222-2222-2222-222222222222")),
+			RepoID:           pgconv.UUID(uuid.MustParse("22222222-2222-2222-2222-222222222222")),
 			Kind:             RunKindMRRework,
 			IssueTitle:       "Rework MR: address review comments",
 			IssueDescription: "Fold the MR review-comment fixes onto the existing branch.",
 			Status:           "claimed",
 			PlanSource:       planSourceAgent,
 			// mr_rework: no issue iid; the MR branch lives in pipeline_ref, not branch.
-			PipelineRef: pgText("agent/issue-42"),
+			PipelineRef: pgconv.TextOrNull("agent/issue-42"),
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic: sealedTok,

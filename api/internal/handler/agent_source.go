@@ -13,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/agentsource"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
@@ -183,7 +184,7 @@ func (h *Handler) PostAgentSourceApply(w http.ResponseWriter, r *http.Request) {
 	// The authoritative bind is IN the apply transaction: Apply re-reads the staged
 	// snapshot and compares it to expectedSHA, so there is no TOCTOU window between a
 	// handler pre-check and the apply. A mismatch (or nothing staged) is ErrStaleApproval → 409.
-	result, err := h.agentSource.Apply(r.Context(), pgUUID(actor.ID), expectedSHA)
+	result, err := h.agentSource.Apply(r.Context(), pgconv.UUID(actor.ID), expectedSHA)
 	if errors.Is(err, agentsource.ErrStaleApproval) {
 		httpx.Error(w, http.StatusConflict, "the staged snapshot changed since you reviewed it; re-review before applying")
 		return

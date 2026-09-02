@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
@@ -138,7 +139,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// M7): builtin/global defaults ± the owner's overlay + the owner's own
 	// allocated user templates. The reserved-name check (M6) guarantees at most
 	// one lead-matching template can exist, so the payload can never carry two.
-	templates, err := s.q.ListClaimAgentTemplates(ctx, pgUUID(run.UserID))
+	templates, err := s.q.ListClaimAgentTemplates(ctx, pgconv.UUID(run.UserID))
 	if err != nil {
 		return nil, fmt.Errorf("list claim agent templates: %w", err)
 	}
@@ -184,7 +185,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// Re-assembled on every claim, including resume — a skill deleted between claim
 	// and resume simply disappears from the resumed session (accepted; the worker
 	// logs it). All skill content is user data, never a secret.
-	skillRows, err := s.q.ListRunSkillAllocations(ctx, pgUUID(run.UserID))
+	skillRows, err := s.q.ListRunSkillAllocations(ctx, pgconv.UUID(run.UserID))
 	if err != nil {
 		return nil, fmt.Errorf("list run skill allocations: %w", err)
 	}

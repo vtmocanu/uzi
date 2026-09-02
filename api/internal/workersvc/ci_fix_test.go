@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -111,7 +112,7 @@ func TestCreateRunRefusesWhenCIFixActiveOnBranch(t *testing.T) {
 func TestSetStateCompletedCarriesNotCodeVerdict(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Kind: RunKindCIFix, Status: "running"},
+		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: RunKindCIFix, Status: "running"},
 		setCompletedRows: 1,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -130,7 +131,7 @@ func TestSetStateCompletedClampsForgedVerdict(t *testing.T) {
 	for _, forged := range []string{"verified", "fix_failed", "totally_fixed"} {
 		w := worker()
 		fs := &fakeStore{
-			runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Kind: RunKindCIFix, Status: "running"},
+			runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: RunKindCIFix, Status: "running"},
 			setCompletedRows: 1,
 		}
 		svc := New(fs, newBox(t), testParams())
@@ -163,7 +164,7 @@ func ciFixClaimPayload(t *testing.T) ClaimPayload {
 	fs := &fakeStore{
 		claimRun: store.Run{
 			ID:               uuid.MustParse("33333333-3333-3333-3333-333333333333"),
-			RepoID:           pgUUID(uuid.MustParse("22222222-2222-2222-2222-222222222222")),
+			RepoID:           pgconv.UUID(uuid.MustParse("22222222-2222-2222-2222-222222222222")),
 			Kind:             RunKindCIFix,
 			IssueTitle:       "Fix CI: main pipeline #4200",
 			IssueDescription: "Diagnose and fix the failed pipeline for `main`.",
@@ -172,7 +173,7 @@ func ciFixClaimPayload(t *testing.T) ClaimPayload {
 			// 'agent' (the NOT NULL default). Set explicitly so the golden reflects the
 			// real column value rather than an empty string the DB can never hold.
 			PlanSource:      planSourceAgent,
-			PipelineRef:     pgText("main"),
+			PipelineRef:     pgconv.TextOrNull("main"),
 			PipelineID:      pgtype.Int8{Int64: 4200, Valid: true},
 			FailureSnapshot: snapJSON,
 		},
@@ -182,7 +183,7 @@ func ciFixClaimPayload(t *testing.T) ClaimPayload {
 		attributionEnabled: true,
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic: sealedTok,

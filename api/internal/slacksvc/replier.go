@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -150,7 +151,7 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	// Re-resolve the author to their confirmed, ACTIVE uzi user. This single
 	// guarded lookup also enforces deactivation (a deactivated account resolves to
 	// no row, so it cannot act on a run from Slack). Unlinked → coalesced notice.
-	user, err := r.store.GetConfirmedUserBySlackID(ctx, pgText(slackID))
+	user, err := r.store.GetConfirmedUserBySlackID(ctx, pgconv.Text(slackID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		r.coalescedEphemeral(ctx, m, "unlinked",
 			"This Slack account isn't linked to uzi — open uzi → Settings → Notifications to link it.")

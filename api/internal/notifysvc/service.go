@@ -20,8 +20,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -78,7 +78,7 @@ func New(q Store, slack Slacker, cap int, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	c := int32(cap)
+	c := int32(cap) //nolint:gosec // G115: cap is a small per-user retention cap (DefaultUserCap 200), never near int32 range
 	if c <= 0 {
 		c = DefaultUserCap
 	}
@@ -147,8 +147,8 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 		UserID:   n.UserID,
 		Kind:     n.Kind,
 		Payload:  payload,
-		RunID:    optionalUUID(n.RunID),
-		ReviewID: optionalUUID(n.ReviewID),
+		RunID:    pgconv.UUIDPtr(n.RunID),
+		ReviewID: pgconv.UUIDPtr(n.ReviewID),
 	})
 	if err != nil {
 		return store.Notification{}, err
@@ -171,15 +171,6 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 	}
 
 	return row, nil
-}
-
-// optionalUUID maps a *uuid.UUID to the pgtype the generated params expect: a nil
-// pointer becomes an SQL NULL (no anchor), a set pointer a valid uuid.
-func optionalUUID(id *uuid.UUID) pgtype.UUID {
-	if id == nil {
-		return pgtype.UUID{}
-	}
-	return pgtype.UUID{Bytes: *id, Valid: true}
 }
 
 // KindIncidentalFinding is the notifications.kind for a coalesced incidental-finding

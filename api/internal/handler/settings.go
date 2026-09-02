@@ -8,6 +8,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -270,7 +271,7 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		if _, err := qtx.UpsertAppSetting(ctx, store.UpsertAppSettingParams{
 			Key:       key,
 			Value:     toStore,
-			UpdatedBy: pgUUID(actor.ID),
+			UpdatedBy: pgconv.UUID(actor.ID),
 		}); err != nil {
 			// Deliberately omit the key/value from the log: a secret value must never
 			// be logged, and nothing in app_settings should be assumed loggable.

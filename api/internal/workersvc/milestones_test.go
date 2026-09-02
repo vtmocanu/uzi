@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -206,7 +207,7 @@ func TestSetStateRunningPassesBudgetConfig(t *testing.T) {
 func milestonesRunFixture(t *testing.T, kind string) (*fakeStore, *Service, store.Worker, uuid.UUID) {
 	t.Helper()
 	wkrID, runID, userID := uuid.New(), uuid.New(), uuid.New()
-	run := store.Run{ID: runID, UserID: userID, Kind: kind, Status: "running", WorkerID: pgUUID(wkrID)}
+	run := store.Run{ID: runID, UserID: userID, Kind: kind, Status: "running", WorkerID: pgconv.UUID(wkrID)}
 	fs := &fakeStore{runOwned: run, setRunningRows: 1}
 	return fs, New(fs, newBox(t), testParams()), store.Worker{ID: wkrID}, runID
 }

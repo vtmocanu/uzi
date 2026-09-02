@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 )
 
 // wireContractFixture is the single shared golden file both sides validate
@@ -418,7 +420,7 @@ func TestCompletionMrWebURLWireContract(t *testing.T) {
 	if oldReq.MrWebURL != nil {
 		t.Errorf("old worker: expected nil MrWebURL, got %q", *oldReq.MrWebURL)
 	}
-	if p := textParam(oldReq.MrWebURL); p.Valid {
+	if p := pgconv.TextPtrOrNull(oldReq.MrWebURL); p.Valid {
 		t.Errorf("old worker: expected NULL mr_web_url, got %q", p.String)
 	}
 
@@ -432,7 +434,7 @@ func TestCompletionMrWebURLWireContract(t *testing.T) {
 	if newReq.MrWebURL == nil || *newReq.MrWebURL != url {
 		t.Errorf("new worker: expected MrWebURL %q, got %v", url, newReq.MrWebURL)
 	}
-	if p := textParam(newReq.MrWebURL); !p.Valid || p.String != url {
+	if p := pgconv.TextPtrOrNull(newReq.MrWebURL); !p.Valid || p.String != url {
 		t.Errorf("new worker: expected mr_web_url %q, got valid=%v %q", url, p.Valid, p.String)
 	}
 }

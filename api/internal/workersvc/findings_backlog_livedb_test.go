@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -207,7 +208,7 @@ func TestFindingsBacklogLiveDB(t *testing.T) {
 	}
 	byRepoA, _ := svc.FindingsBacklog(ctx, userA, BucketAll, repoA, uuid.Nil)
 	wantOpenA, _ := q.CountOpenFindingsForUser(ctx, store.CountOpenFindingsForUserParams{
-		UserID: userA, RepoID: pgUUID(repoA),
+		UserID: userA, RepoID: pgconv.UUID(repoA),
 	})
 	if int64(byRepoA.OpenCount) != wantOpenA || wantOpenA != 1 {
 		t.Errorf("?repo=repoA open_count = %d, CountOpenFindingsForUser(repoA) = %d, want both 1", byRepoA.OpenCount, wantOpenA)

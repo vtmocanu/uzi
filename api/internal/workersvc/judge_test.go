@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -20,7 +21,7 @@ func judgeRun(userID, targetID uuid.UUID) store.Run {
 		UserID:           userID,
 		Kind:             RunKindJudge,
 		Status:           "claimed",
-		TargetRunID:      pgUUID(targetID),
+		TargetRunID:      pgconv.UUID(targetID),
 		IssueTitle:       "Judge of run " + targetID.String(),
 		IssueDescription: "retrospective",
 	}

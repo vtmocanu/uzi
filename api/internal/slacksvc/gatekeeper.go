@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -133,7 +134,7 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 
 	// Resolve the actor to their exactly-one confirmed uzi user. Unlinked → refuse
 	// with an ephemeral notice, never guess.
-	user, err := g.store.GetConfirmedUserBySlackID(ctx, pgText(slackID))
+	user, err := g.store.GetConfirmedUserBySlackID(ctx, pgconv.Text(slackID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		g.ephemeral(ctx, a, "This Slack account isn't linked to uzi — open uzi → Settings → Notifications to link it.")
 		return
@@ -197,8 +198,8 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 		// message and orphan the live gate (PRD #41 Decision 10d). The threaded reply that
 		// carries the reason is handled by the replier.
 		if _, err := g.store.SetSlackRunGateIf(ctx, store.SetSlackRunGateIfParams{
-			RunID: runID, GateTs: pgText(a.MessageTS), GateState: pgText(gateStateRejectPending),
-			ExpectedGateTs: pgText(a.MessageTS), ExpectedGateState: pgText(gateStateOpen),
+			RunID: runID, GateTs: pgconv.Text(a.MessageTS), GateState: pgconv.Text(gateStateRejectPending),
+			ExpectedGateTs: pgconv.Text(a.MessageTS), ExpectedGateState: pgconv.Text(gateStateOpen),
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				g.ephemeral(ctx, a, "This gate was superseded — scroll down to the latest plan message.")
@@ -222,8 +223,8 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 		// the live gate (PRD #41 Decision 10d). The threaded feedback reply is accepted by
 		// the replier's own compare-and-swap.
 		if _, err := g.store.SetSlackRunGateIf(ctx, store.SetSlackRunGateIfParams{
-			RunID: runID, GateTs: pgText(a.MessageTS), GateState: pgText(gateStateRevisePending),
-			ExpectedGateTs: pgText(a.MessageTS), ExpectedGateState: pgText(gateStateOpen),
+			RunID: runID, GateTs: pgconv.Text(a.MessageTS), GateState: pgconv.Text(gateStateRevisePending),
+			ExpectedGateTs: pgconv.Text(a.MessageTS), ExpectedGateState: pgconv.Text(gateStateOpen),
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				g.ephemeral(ctx, a, "This gate was superseded — scroll down to the latest plan message.")

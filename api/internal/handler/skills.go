@@ -13,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/skilltmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
@@ -174,7 +175,7 @@ func (h *Handler) ListSkills(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := h.q.ListSkillsForViewer(r.Context(), store.ListSkillsForViewerParams{
 		IsAdmin:  actor.IsAdmin,
-		ViewerID: pgUUID(actor.ID),
+		ViewerID: pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		slog.Error("list skills", "error", err)
@@ -203,7 +204,7 @@ func (h *Handler) GetSkill(w http.ResponseWriter, r *http.Request) {
 	s, err := h.q.GetSkillForViewer(r.Context(), store.GetSkillForViewerParams{
 		ID:       id,
 		IsAdmin:  actor.IsAdmin,
-		ViewerID: pgUUID(actor.ID),
+		ViewerID: pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -246,7 +247,7 @@ func (h *Handler) CreateSkill(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "user":
-		userID = pgUUID(actor.ID)
+		userID = pgconv.UUID(actor.ID)
 	default:
 		httpx.Error(w, http.StatusBadRequest, "scope must be 'global' or 'user'")
 		return
@@ -264,7 +265,7 @@ func (h *Handler) CreateSkill(w http.ResponseWriter, r *http.Request) {
 		Body:        fields.body,
 		Scope:       req.Scope,
 		UserID:      userID,
-		UpdatedBy:   pgUUID(actor.ID),
+		UpdatedBy:   pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -304,7 +305,7 @@ func (h *Handler) UpdateSkill(w http.ResponseWriter, r *http.Request) {
 		ID:          s.ID,
 		Description: fields.description,
 		Body:        fields.body,
-		UpdatedBy:   pgUUID(actor.ID),
+		UpdatedBy:   pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		slog.Error("update skill", "error", err)
@@ -361,7 +362,7 @@ func (h *Handler) ResetSkill(w http.ResponseWriter, r *http.Request) {
 		ID:          s.ID,
 		Description: def.Description,
 		Body:        def.Body,
-		UpdatedBy:   pgUUID(actor.ID),
+		UpdatedBy:   pgconv.UUID(actor.ID),
 	})
 	if err != nil {
 		slog.Error("reset skill", "error", err)

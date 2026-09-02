@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -246,7 +247,7 @@ func TestRepoRosterKeepsALeadNamedAgent(t *testing.T) {
 func runningStateFixture(t *testing.T) (*fakeStore, *Service, store.Worker, uuid.UUID) {
 	t.Helper()
 	wkrID, runID, userID := uuid.New(), uuid.New(), uuid.New()
-	run := store.Run{ID: runID, UserID: userID, Status: "running", WorkerID: pgUUID(wkrID)}
+	run := store.Run{ID: runID, UserID: userID, Status: "running", WorkerID: pgconv.UUID(wkrID)}
 	fs := &fakeStore{runOwned: run, setRunningRows: 1}
 	return fs, New(fs, newBox(t), testParams()), store.Worker{ID: wkrID}, runID
 }
@@ -420,10 +421,10 @@ func gatedRun(t *testing.T) (*fakeStore, *Service, uuid.UUID, uuid.UUID) {
 	fixed := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
 		runByID: store.Run{
-			ID: runID, UserID: user, Status: "awaiting_approval", WorkerID: pgUUID(wkrID),
+			ID: runID, UserID: user, Status: "awaiting_approval", WorkerID: pgconv.UUID(wkrID),
 			RepoAgents: repoAgentsJSON(t, twoAgents()),
 		},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 		templates:  []store.AgentTemplate{{Name: "lead"}, {Name: "coder"}, {Name: "tester"}},
 	}
 	svc := New(fs, newBox(t), testParams())

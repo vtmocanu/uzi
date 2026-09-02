@@ -11,6 +11,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -263,9 +264,9 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 		headroom = pgtype.Int2{Int16: *choice.headroom, Valid: true}
 	}
 	n, err := s.q.SetRunAnthropicSecret(ctx, store.SetRunAnthropicSecretParams{
-		AnthropicSecretID:     pgUUID(cred.ID),
-		AnthropicSecretLabel:  pgText(cred.Label),
-		AnthropicSelectReason: pgText(choice.reason),
+		AnthropicSecretID:     pgconv.UUID(cred.ID),
+		AnthropicSecretLabel:  pgconv.TextOrNull(cred.Label),
+		AnthropicSelectReason: pgconv.TextOrNull(choice.reason),
 		AnthropicHeadroomPct:  headroom,
 		ID:                    run.ID,
 		UserID:                run.UserID,

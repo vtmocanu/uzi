@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -1225,18 +1226,18 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, IssueTitle: "Do the thing",
 			IssueDescription: "see prds/4.md", Status: "claimed",
 			LastSeq: 7, IterationCount: 2, RequeueCount: 1,
-			SessionID: pgText("sess-abc"), Branch: pgText(branch),
+			SessionID: pgconv.TextOrNull("sess-abc"), Branch: pgconv.TextOrNull(branch),
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:    sealedTok,
-		defaultModel: pgText("sonnet"),
+		defaultModel: pgconv.TextOrNull("sonnet"),
 		templates: []store.AgentTemplate{
 			{Name: "coder", Description: "writes code", PromptBody: "you code", Tools: []byte(`["Read","Edit"]`)},
-			{Name: "reviewer", Description: "reviews", PromptBody: "you review", Model: pgText("claude-opus-4-8")},
+			{Name: "reviewer", Description: "reviews", PromptBody: "you review", Model: pgconv.TextOrNull("claude-opus-4-8")},
 		},
 	}
 
@@ -1319,13 +1320,13 @@ func TestClaimCarriesTaskOpenMrAndBaseBranch(t *testing.T) {
 		claimRun: store.Run{
 			ID: runID, Kind: "task", Status: "claimed",
 			IssueTitle: "Do the handoff", IssueDescription: "take this and run",
-			Branch:     pgText(taskBranch),
-			BaseBranch: pgText("develop"),
+			Branch:     pgconv.TextOrNull(taskBranch),
+			BaseBranch: pgconv.TextOrNull("develop"),
 			OpenMr:     true,
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic: sealedTok,
@@ -1369,11 +1370,11 @@ func TestClaimCarriesTaskIdleTimeoutForInteractiveRun(t *testing.T) {
 		claimRun: store.Run{
 			ID: runID, Kind: "task", Status: "claimed", Interactive: true,
 			IssueTitle: "Handoff: interactive", IssueDescription: "iterate with me",
-			Branch: pgText("uzi/task/" + runID.String()),
+			Branch: pgconv.TextOrNull("uzi/task/" + runID.String()),
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic: sealedTok,
@@ -1411,7 +1412,7 @@ func TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun(t *testing.T) {
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic: sealedTok,
@@ -1474,11 +1475,11 @@ func TestClaimDerivesStopPending(t *testing.T) {
 					ID: runID, Kind: "task", Status: tc.status, Interactive: tc.interactive,
 					StopKind:   stopKind(tc.stopKind),
 					IssueTitle: "Handoff: interactive", IssueDescription: "iterate with me",
-					Branch: pgText("uzi/task/" + runID.String()),
+					Branch: pgconv.TextOrNull("uzi/task/" + runID.String()),
 				},
 				claimCtx: store.GetRunClaimContextRow{
 					RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
-					DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+					DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 					BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 				},
 				anthropic: sealedTok,
@@ -1570,10 +1571,10 @@ func scheduleModelStore(t *testing.T, runModel, userDefault pgtype.Text) *fakeSt
 // only copies the pin through and the "pin wins over the schedule model" guarantee is
 // entirely worker-side and unchanged here.
 func TestClaimScheduleModelOverridesUserDefault(t *testing.T) {
-	fs := scheduleModelStore(t, pgText("fable"), pgText("sonnet"))
+	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgconv.TextOrNull("sonnet"))
 	fs.templates = []store.AgentTemplate{
 		{Name: "coder", Description: "writes code", PromptBody: "you code", Tools: []byte(`["Read","Edit"]`)},
-		{Name: "reviewer", Description: "reviews", PromptBody: "you review", Model: pgText("claude-opus-4-8")},
+		{Name: "reviewer", Description: "reviews", PromptBody: "you review", Model: pgconv.TextOrNull("claude-opus-4-8")},
 	}
 
 	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
@@ -1595,7 +1596,7 @@ func TestClaimScheduleModelOverridesUserDefault(t *testing.T) {
 // field is true, so the worker knows to apply the run model to every subagent (the
 // behavior itself is M4, worker-side). Read straight off the run row.
 func TestClaimDeliversOverrideSubagentModelWhenFrozenOn(t *testing.T) {
-	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.claimRun.OverrideSubagentModel = true
 
 	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
@@ -1612,7 +1613,7 @@ func TestClaimDeliversOverrideSubagentModelWhenFrozenOn(t *testing.T) {
 // byte-identical to today's wire, so an un-upgraded worker sees the same shape it does
 // now. Mirrors TestClaimOmitsDefaultModelWhenOwnerHasNone's omit-on-the-wire check.
 func TestClaimOmitsOverrideSubagentModelWhenFrozenOff(t *testing.T) {
-	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	// claimRun.OverrideSubagentModel left zero ⇒ the run did not opt in.
 
 	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
@@ -1636,7 +1637,7 @@ func TestClaimOmitsOverrideSubagentModelWhenFrozenOff(t *testing.T) {
 // fresh user's default) ⇒ the claim carries true, so today's Co-Authored-By behavior is
 // unchanged. Mirrors TestClaimDeliversOverrideSubagentModelWhenFrozenOn's seam.
 func TestClaimDeliversAttributionEnabledWhenOwnerOn(t *testing.T) {
-	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = true
 
 	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
@@ -1663,7 +1664,7 @@ func TestClaimDeliversAttributionEnabledWhenOwnerOn(t *testing.T) {
 // TestClaimOmitsOverrideSubagentModelWhenFrozenOff but asserts PRESENCE, not omission,
 // because attribution_enabled is a plain always-present bool.
 func TestClaimDeliversAttributionDisabledWhenOwnerOff(t *testing.T) {
-	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = false
 
 	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
@@ -1689,7 +1690,7 @@ func TestClaimDeliversAttributionDisabledWhenOwnerOff(t *testing.T) {
 // value were instead read from a run-row snapshot, GetUserAttributionEnabled would not be
 // consulted and the second claim would not change, which this test would catch.
 func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
-	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = true
 
 	svc := New(fs, newBox(t), testParams())
@@ -1717,7 +1718,7 @@ func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
 // PRD #300: the override fires regardless of whether the owner has a per-user default —
 // a frozen runs.model with the owner default left NULL still lands on Config.DefaultModel.
 func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {
-	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 
 	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
 	if err != nil {
@@ -1732,7 +1733,7 @@ func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {
 // changes nothing — Config.DefaultModel is the owner's per-user default exactly as
 // before #300, byte-identical on the wire.
 func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
-	fs := scheduleModelStore(t, pgtype.Text{}, pgText("sonnet"))
+	fs := scheduleModelStore(t, pgtype.Text{}, pgconv.TextOrNull("sonnet"))
 
 	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
 	if err != nil {
@@ -1774,7 +1775,7 @@ func TestClaimCarriesSummaryModelFromInstanceDefault(t *testing.T) {
 // default at issue-run claim assembly (user-value-wins, Decision 8).
 func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
-	fs.summaryModel = pgText("opus") // per-user override
+	fs.summaryModel = pgconv.TextOrNull("opus") // per-user override
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
 
@@ -1888,7 +1889,7 @@ func TestClaimCarriesDefaultEffort(t *testing.T) {
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:     sealedTok,
-		defaultEffort: pgText("low"),
+		defaultEffort: pgconv.TextOrNull("low"),
 	}
 
 	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
@@ -2006,7 +2007,7 @@ func TestResolveToolingResolvesAllowedProfilePackages(t *testing.T) {
 		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}, {Name: "jq"}},
 	}
 	svc := New(fs, newBox(t), testParams())
-	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
+	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgconv.UUID(uuid.New())})
 	if err != nil {
 		t.Fatalf("resolveTooling: %v", err)
 	}
@@ -2022,7 +2023,7 @@ func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
 		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}}, // opentofu removed after the profile was saved
 	}
 	svc := New(fs, newBox(t), testParams())
-	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
+	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgconv.UUID(uuid.New())})
 	if !errors.Is(err, errToolPackagesRejected) {
 		t.Fatalf("err = %v, want errToolPackagesRejected", err)
 	}
@@ -2042,7 +2043,7 @@ func TestResolveToolingRejectsAllowlistedButUnbakedPackage(t *testing.T) {
 		toolAllowlist: []store.ToolAllowlist{{Name: "jq"}, {Name: "terraform"}},
 	}
 	svc := New(fs, newBox(t), testParams())
-	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
+	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgconv.UUID(uuid.New())})
 	if !errors.Is(err, errToolPackagesRejected) {
 		t.Fatalf("err = %v, want errToolPackagesRejected", err)
 	}
@@ -2057,7 +2058,7 @@ func TestResolveToolingRejectsAllowlistedButUnbakedPackage(t *testing.T) {
 func TestResolveToolingNoProfileMeansNoProvisioning(t *testing.T) {
 	fs := &fakeStore{toolProfileErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
+	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgconv.UUID(uuid.New())})
 	if err != nil {
 		t.Fatalf("resolveTooling: %v", err)
 	}
@@ -2142,7 +2143,7 @@ func TestClaimPassesAffinityCeiling(t *testing.T) {
 
 func TestAppendMessagesPersistsAndAdvancesLastSeq(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), LastSeq: 0}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{
@@ -2163,7 +2164,7 @@ func TestAppendMessagesPersistsAndAdvancesLastSeq(t *testing.T) {
 
 func TestAppendMessagesRejectsInvalid(t *testing.T) {
 	w := worker()
-	base := store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID)}
+	base := store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID)}
 	bad := [][]IncomingMessage{
 		{{Seq: 0, Kind: "text", Payload: json.RawMessage(`{}`)}},
 		{{Seq: 1, Kind: "", Payload: json.RawMessage(`{}`)}},
@@ -2183,7 +2184,7 @@ func TestAppendMessagesAllOrNothingOnInvalid(t *testing.T) {
 	// A [valid, valid, invalid] batch must persist nothing: the whole batch is
 	// validated before any insert, so the first two are never half-written.
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), LastSeq: 0}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{
@@ -2222,7 +2223,7 @@ func TestAppendMessagesRejectsForeignRun(t *testing.T) {
 // non-result messages in the same batch never fold.
 func TestAppendMessagesFoldsResultUsagePerModel(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-1")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("sess-1")}}
 	svc := New(fs, newBox(t), testParams())
 
 	result := json.RawMessage(`{
@@ -2264,7 +2265,7 @@ func TestAppendMessagesFoldsResultUsagePerModel(t *testing.T) {
 // run and MUST fold (only chat is excluded).
 func TestAppendMessagesFoldsErrorResultUsage(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Kind: RunKindCIFix, SessionID: pgText("sess-err")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: RunKindCIFix, SessionID: pgconv.TextOrNull("sess-err")}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{{Seq: 1, Kind: "error", Agent: "lead", Payload: json.RawMessage(`{
@@ -2283,7 +2284,7 @@ func TestAppendMessagesFoldsErrorResultUsage(t *testing.T) {
 // modelUsage all fold nothing.
 func TestAppendMessagesFoldMalformedIsNoOp(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID)}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID)}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{
@@ -2307,7 +2308,7 @@ func TestAppendMessagesFoldMalformedIsNoOp(t *testing.T) {
 // that idempotent, so this is what makes "re-delivery changes nothing" hold.
 func TestAppendMessagesFoldsOnRedeliveredBatch(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("s")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("s")}}
 	svc := New(fs, newBox(t), testParams())
 
 	batch := []IncomingMessage{{Seq: 1, Kind: "status", Payload: json.RawMessage(
@@ -2341,7 +2342,7 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 	// Every upserted row carries LineageEpoch == 3, and nothing bumps.
 	t.Run("stamps current epoch, no bump", func(t *testing.T) {
 		w := worker()
-		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-1"), LineageEpoch: 3}}
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("sess-1"), LineageEpoch: 3}}
 		svc := New(fs, newBox(t), testParams())
 
 		msgs := []IncomingMessage{{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(
@@ -2367,7 +2368,7 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 	// which follows the break in seq order, is stamped epoch 1 by the per-frame count.
 	t.Run("same-batch bump then stamp", func(t *testing.T) {
 		w := worker()
-		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-b"), LineageEpoch: 0}}
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("sess-b"), LineageEpoch: 0}}
 		svc := New(fs, newBox(t), testParams())
 
 		msgs := []IncomingMessage{
@@ -2399,7 +2400,7 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 	// is covered by the live-DB TestUpsertRunUsageMergeLiveDB.)
 	t.Run("result before break keeps the earlier epoch", func(t *testing.T) {
 		w := worker()
-		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-d"), LineageEpoch: 0}}
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("sess-d"), LineageEpoch: 0}}
 		svc := New(fs, newBox(t), testParams())
 
 		msgs := []IncomingMessage{
@@ -2432,7 +2433,7 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 	// break message alone folds no usage.
 	t.Run("no double bump on re-delivery", func(t *testing.T) {
 		w := worker()
-		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-c"), LineageEpoch: 0}}
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("sess-c"), LineageEpoch: 0}}
 		svc := New(fs, newBox(t), testParams())
 
 		batch := []IncomingMessage{{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(`{"event":"resume_lineage_break"}`)}}
@@ -2463,7 +2464,7 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 		w := worker()
 		fs := &fakeStore{
 			// The run's epoch already reflects the break's bump from the prior batch.
-			runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-e"), LineageEpoch: 1},
+			runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("sess-e"), LineageEpoch: 1},
 			// seq 1 (the break) was delivered in that prior batch, so InsertRunMessage
 			// dedups it here (rows == 0, absent from `inserted`).
 			insertedSeqs: map[int32]bool{1: true},
@@ -2495,7 +2496,7 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 // usage — the fold must skip them entirely, keeping chat spend out of run_usage.
 func TestAppendMessagesFoldSkipsChatRuns(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Kind: RunKindChat, SessionID: pgText("sess-chat")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: RunKindChat, SessionID: pgconv.TextOrNull("sess-chat")}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(
@@ -2518,7 +2519,7 @@ func TestAppendMessagesFoldSkipsChatRuns(t *testing.T) {
 // ceiling and negative token counts clamp to 0 — the append still succeeds.
 func TestAppendMessagesFoldClampsOutOfRangeValues(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("s")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("s")}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{{Seq: 1, Kind: "status", Payload: json.RawMessage(
@@ -2545,7 +2546,7 @@ func TestAppendMessagesFoldClampsOutOfRangeValues(t *testing.T) {
 func TestAppendMessagesFoldDBErrorPropagates(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID)},
+		runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID)},
 		usageErr: errors.New("boom"),
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -2561,7 +2562,7 @@ func TestSetStateAlreadyTerminalIsSuccess(t *testing.T) {
 	// The setter no-ops (0 rows) because the run was cancelled; the re-read
 	// returns the true terminal status, and SetState reports success.
 	fs := &fakeStore{
-		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "cancelled"},
+		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "cancelled"},
 		setCompletedRows: 0,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -2583,7 +2584,7 @@ func TestSetStateAlreadyTerminalIsSuccess(t *testing.T) {
 func TestSetStateAppliedOnLiveRun(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
 		setRunningRows: 1,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -2598,7 +2599,7 @@ func TestSetStateAppliedOnLiveRun(t *testing.T) {
 
 func TestSetStateRejectsUnknownState(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"}}
 	svc := New(fs, newBox(t), testParams())
 	if _, _, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "bogus"}); err != ErrInvalidState {
 		t.Fatalf("err = %v, want ErrInvalidState", err)
@@ -2613,7 +2614,7 @@ func TestSetStateRejectsUnknownState(t *testing.T) {
 func TestSetStateAwaitingFollowupAcceptsInteractiveTask(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned:        store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true},
+		runOwned:        store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true},
 		setFollowupRows: 1,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -2636,7 +2637,7 @@ func TestSetStateAwaitingFollowupAcceptsInteractiveTask(t *testing.T) {
 // clamp is proven by the LiveDB tests; here we prove the SERVICE hands the value across.
 func TestSetStateAwaitingFollowupThreadsOpenFollowupID(t *testing.T) {
 	w := worker()
-	owned := store.Run{WorkerID: pgUUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true}
+	owned := store.Run{WorkerID: pgconv.UUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true}
 
 	t.Run("present value threads as Valid", func(t *testing.T) {
 		owned.ID = uuid.New()
@@ -2688,7 +2689,7 @@ func TestSetStateAwaitingFollowupRejectsNonInteractiveOrNonTask(t *testing.T) {
 	}
 	for name, r := range cases {
 		t.Run(name, func(t *testing.T) {
-			r.ID, r.WorkerID, r.Status = uuid.New(), pgUUID(w.ID), "running"
+			r.ID, r.WorkerID, r.Status = uuid.New(), pgconv.UUID(w.ID), "running"
 			fs := &fakeStore{runOwned: r, setFollowupRows: 1}
 			svc := New(fs, newBox(t), testParams())
 			if _, _, err := svc.SetState(context.Background(), w, r.ID, StateRequest{State: "awaiting_followup"}); !errors.Is(err, ErrInvalidState) {
@@ -2720,7 +2721,7 @@ func TestSetStatePersistsSessionIDWhenSet(t *testing.T) {
 	// transition; the service persists it in the same transition (resume plumbing).
 	w := worker()
 	fs := &fakeStore{
-		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
 		setRunningRows: 1,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -2743,7 +2744,7 @@ func TestSetStateLeavesSessionIDUnsetWhenAbsent(t *testing.T) {
 	// run's existing session_id (never clobbered to empty).
 	w := worker()
 	fs := &fakeStore{
-		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
 		setRunningRows: 1,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -2770,7 +2771,7 @@ func TestSetStateClearsMilestonesOnSeededFromDefault(t *testing.T) {
 	t.Run("seeded_from_default=true clears before the union refills", func(t *testing.T) {
 		w := worker()
 		fs := &fakeStore{
-			runOwned:            store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+			runOwned:            store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
 			setRunningRows:      1,
 			clearMilestonesRows: 1,
 		}
@@ -2787,8 +2788,8 @@ func TestSetStateClearsMilestonesOnSeededFromDefault(t *testing.T) {
 		if fs.clearMilestonesParams.ID != fs.runOwned.ID {
 			t.Fatalf("clear ran against the wrong run: got %v, want %v", fs.clearMilestonesParams.ID, fs.runOwned.ID)
 		}
-		if fs.clearMilestonesParams.WorkerID != pgUUID(w.ID) {
-			t.Fatalf("clear ran with the wrong worker id: got %+v, want %+v", fs.clearMilestonesParams.WorkerID, pgUUID(w.ID))
+		if fs.clearMilestonesParams.WorkerID != pgconv.UUID(w.ID) {
+			t.Fatalf("clear ran with the wrong worker id: got %+v, want %+v", fs.clearMilestonesParams.WorkerID, pgconv.UUID(w.ID))
 		}
 		if !fs.clearBeforeRunning {
 			t.Fatal("the clear MUST run BEFORE SetRunRunning so the union refills from empty (PRD #628 M4)")
@@ -2801,7 +2802,7 @@ func TestSetStateClearsMilestonesOnSeededFromDefault(t *testing.T) {
 	t.Run("absent field does NOT clear", func(t *testing.T) {
 		w := worker()
 		fs := &fakeStore{
-			runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+			runOwned:       store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
 			setRunningRows: 1,
 		}
 		svc := New(fs, newBox(t), testParams())
@@ -2821,7 +2822,7 @@ func TestSetStateClearsMilestonesOnSeededFromDefault(t *testing.T) {
 	t.Run("seeded_from_default=false does NOT clear", func(t *testing.T) {
 		w := worker()
 		fs := &fakeStore{
-			runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+			runOwned:       store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
 			setRunningRows: 1,
 		}
 		svc := New(fs, newBox(t), testParams())
@@ -2845,7 +2846,7 @@ func TestSetStateClearsMilestonesOnSeededFromDefault(t *testing.T) {
 func TestSetStateReconcilesMROnCompletion(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "completed"},
+		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "completed"},
 		setCompletedRows: 1,
 		// The reconcile matched nothing (e.g. SetRunCompleted already COALESCE-wrote the
 		// MR): a 0 rowcount must NOT disturb the completed report's normal return.
@@ -2892,7 +2893,7 @@ func TestSetStateReconcilesMROnCompletion(t *testing.T) {
 func TestSetStateSkipsReconcileWithoutMR(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "failed"},
+		runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "failed"},
 	}
 	svc := New(fs, newBox(t), testParams())
 	if _, _, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
@@ -2919,7 +2920,7 @@ func TestSetStateTearsDownEphemeralWorkerOnCompletion(t *testing.T) {
 		w := worker()
 		w.Ephemeral = true
 		fs := &fakeStore{
-			runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "completed"},
+			runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "completed"},
 			setCompletedRows: 1,
 		}
 		svc := New(fs, newBox(t), testParams())
@@ -2937,7 +2938,7 @@ func TestSetStateTearsDownEphemeralWorkerOnCompletion(t *testing.T) {
 	t.Run("non-ephemeral worker: teardown does not fire", func(t *testing.T) {
 		w := worker() // Ephemeral defaults false
 		fs := &fakeStore{
-			runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "completed"},
+			runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "completed"},
 			setCompletedRows: 1,
 		}
 		svc := New(fs, newBox(t), testParams())
@@ -3176,8 +3177,8 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Status: "running", WorkerID: pgUUID(wkrID)},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+		runByID:    store.Run{ID: runID, UserID: user, Status: "running", WorkerID: pgconv.UUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
@@ -3220,8 +3221,8 @@ func TestSubmitInputLiveCancelStripsNULFromStopReason(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Status: "running", WorkerID: pgUUID(wkrID)},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+		runByID:    store.Run{ID: runID, UserID: user, Status: "running", WorkerID: pgconv.UUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
@@ -3252,8 +3253,8 @@ func TestSubmitInputLiveRejectStampsStopKind(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Status: "awaiting_approval", WorkerID: pgUUID(wkrID)},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+		runByID:    store.Run{ID: runID, UserID: user, Status: "awaiting_approval", WorkerID: pgconv.UUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
@@ -3286,8 +3287,8 @@ func TestSubmitInputRejectServerSideWhenWorkerStale(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Status: "awaiting_approval", WorkerID: pgUUID(wkrID)},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed.Add(-2 * time.Minute))}, // stale (> 45s)
+		runByID:    store.Run{ID: runID, UserID: user, Status: "awaiting_approval", WorkerID: pgconv.UUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed.Add(-2 * time.Minute))},
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
@@ -3318,8 +3319,8 @@ func TestSubmitInputStopEnqueuesOnParkedRun(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgconv.UUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
@@ -3356,8 +3357,8 @@ func TestSubmitInputStopEnqueuesEvenWithoutLivePoller(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed.Add(-2 * time.Minute))}, // stale
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgconv.UUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed.Add(-2 * time.Minute))},
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
@@ -3424,8 +3425,8 @@ func TestSubmitInputStopRejectsNonInteractiveTask(t *testing.T) {
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
 		// A task run, but NOT interactive — no park reads the stop flag.
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: false, Status: "running", WorkerID: pgUUID(wkrID)},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: false, Status: "running", WorkerID: pgconv.UUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
@@ -3449,8 +3450,8 @@ func TestSubmitInputStopRejectsNonTaskRun(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindChat, Interactive: true, Status: "running", WorkerID: pgUUID(wkrID)},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindChat, Interactive: true, Status: "running", WorkerID: pgconv.UUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
@@ -3475,8 +3476,8 @@ func TestSubmitInputStopAcceptsRunningInteractiveTask(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "running", WorkerID: pgUUID(wkrID)},
-		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "running", WorkerID: pgconv.UUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
@@ -3825,7 +3826,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 			claimRun: run,
 			claimCtx: store.GetRunClaimContextRow{
 				RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
-				DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+				DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 				BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 			},
 			anthropic: sealedTok,
@@ -3847,7 +3848,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 	// otherwise hang forever at the plan gate.
 	resume := newFS(store.Run{
 		ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed", AutoApprove: true,
-		Branch: pgText("agent/issue-4"), SessionID: pgText("sess-xyz"), RequeueCount: 1,
+		Branch: pgconv.TextOrNull("agent/issue-4"), SessionID: pgconv.TextOrNull("sess-xyz"), RequeueCount: 1,
 	})
 	p, err = New(resume, box, testParams()).Claim(context.Background(), worker())
 	if err != nil || p == nil {
@@ -4045,7 +4046,7 @@ func (b *fakeBroadcaster) PublishInput(runID uuid.UUID) {
 
 func TestAppendMessagesBroadcastsOnlyNewlyInserted(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), LastSeq: 0}}
 	svc := New(fs, newBox(t), testParams())
 	b := &fakeBroadcaster{}
 	svc.SetBroadcaster(b)
@@ -4081,7 +4082,7 @@ func TestAppendMessagesBroadcastsOnlyNewlyInserted(t *testing.T) {
 func TestSetStateBroadcastsAppliedStatus(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
 		setRunningRows: 1,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -4104,9 +4105,9 @@ func TestConsumeInputsBroadcastsOnFollowUp(t *testing.T) {
 	w := worker()
 	runID := uuid.New()
 	fs := &fakeStore{
-		runOwned: store.Run{ID: runID, WorkerID: pgUUID(w.ID)},
+		runOwned: store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID)},
 		consumeRows: []store.ConsumeRunInputsRow{
-			{ID: 1, Kind: "follow_up", Body: pgText("do the thing")},
+			{ID: 1, Kind: "follow_up", Body: pgconv.TextOrNull("do the thing")},
 		},
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -4128,7 +4129,7 @@ func TestConsumeInputsNoBroadcastWithoutFollowUp(t *testing.T) {
 	w := worker()
 	runID := uuid.New()
 	fs := &fakeStore{
-		runOwned: store.Run{ID: runID, WorkerID: pgUUID(w.ID)},
+		runOwned: store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID)},
 		consumeRows: []store.ConsumeRunInputsRow{
 			{ID: 1, Kind: "approve_plan"},
 		},
@@ -4152,9 +4153,9 @@ func TestConsumeInputsNilBroadcasterFollowUp(t *testing.T) {
 	w := worker()
 	runID := uuid.New()
 	fs := &fakeStore{
-		runOwned: store.Run{ID: runID, WorkerID: pgUUID(w.ID)},
+		runOwned: store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID)},
 		consumeRows: []store.ConsumeRunInputsRow{
-			{ID: 1, Kind: "follow_up", Body: pgText("resume")},
+			{ID: 1, Kind: "follow_up", Body: pgconv.TextOrNull("resume")},
 		},
 	}
 	svc := New(fs, newBox(t), testParams()) // no SetBroadcaster → s.bcast is nil
@@ -4186,7 +4187,7 @@ func (l *fakeLifecycle) Notify(runID uuid.UUID, status string) {
 func TestSetStateNotifiesAppliedStatus(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "completed"},
+		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "completed"},
 		setCompletedRows: 1,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -4210,7 +4211,7 @@ func TestSetStateTerminalRaceDoesNotNotify(t *testing.T) {
 	// card whose real terminal state is elsewhere.
 	w := worker()
 	fs := &fakeStore{
-		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "cancelled"},
+		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "cancelled"},
 		setCompletedRows: 0,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -4350,7 +4351,7 @@ func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		// The by-kind row is the owner's DEFAULT token; the by-id map holds the
@@ -4459,7 +4460,7 @@ func TestClaimBoundToVanishedSecretFailsClosed(t *testing.T) {
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:   sealedDefault,
@@ -4733,7 +4734,7 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/uzi", RepoPath: "g/uzi",
-			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
 		anthropic:   sealedDefault,
@@ -4771,7 +4772,7 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 // runWithRepo builds an owned run whose repo scope is valid, the precondition
 // SaveMemory requires past the repo-less 409 gate.
 func memRunWithRepo(w store.Worker) store.Run {
-	return store.Run{ID: uuid.New(), UserID: w.UserID, WorkerID: pgUUID(w.ID), RepoID: pgUUID(uuid.New())}
+	return store.Run{ID: uuid.New(), UserID: w.UserID, WorkerID: pgconv.UUID(w.ID), RepoID: pgconv.UUID(uuid.New())}
 }
 
 // TestSaveMemoryCapsEvidenceServerSide proves the evidence byte cap is enforced in

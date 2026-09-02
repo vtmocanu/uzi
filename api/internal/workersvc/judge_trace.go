@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -38,8 +39,8 @@ type JudgeTraceResult struct {
 // run" vs "owner mismatch" oracle).
 func (s *Service) authorizeJudgeTrace(ctx context.Context, wkr store.Worker, targetID uuid.UUID) (judge, target store.Run, err error) {
 	judge, err = s.q.GetActiveJudgeRunForWorkerTarget(ctx, store.GetActiveJudgeRunForWorkerTargetParams{
-		WorkerID:    pgUUID(wkr.ID),
-		TargetRunID: pgUUID(targetID),
+		WorkerID:    pgconv.UUID(wkr.ID),
+		TargetRunID: pgconv.UUID(targetID),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
