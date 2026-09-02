@@ -9,6 +9,8 @@ import (
 	"net/url"
 
 	gh "github.com/google/go-github/v90/github"
+
+	"github.com/vtmocanu/uzi/api/internal/pipelinestatus"
 )
 
 // This file holds the GitHub driver's Actions / CI-fix methods (M4, D8). GitHub
@@ -39,10 +41,15 @@ func (g *github) LatestPipeline(ctx context.Context, projectID int64, ref string
 	// A hostile forge could return a null entry in workflow_runs, which decodes to
 	// a nil *WorkflowRun that passes len==0. go-github's Get* accessors are nil-safe,
 	// so toGitHubPipeline would not panic here (unlike the gitlab/forgejo drivers) —
-	// it would return a phantom zero-ID Pipeline the poller then treats as real. Reject
-	// it as "no pipeline".
+	// it would return a phantom zero-ID Pipeline the poller then treats as real.
+	// No usable workflow run: an agent-MR branch whose CI is GitHub Actions is exposed
+	// via CHECK-RUNS, not workflow-runs (issue #1005), so a null pipeline_ref here is
+	// why ci_fix never fired. Recover/synthesize from the head commit's checks before
+	// giving up — the branch path has no SHA in hand, so pass "" and let the helper
+	// resolve the true branch-head SHA from a returned check-run/suite. The helper
+	// still returns ErrNoPipeline when the head genuinely has no checks either.
 	if runs == nil || len(runs.WorkflowRuns) == 0 || runs.WorkflowRuns[0] == nil {
-		return Pipeline{}, ErrNoPipeline
+		return g.latestPipelineFromChecks(ctx, slug, ref, "")
 	}
 	return toGitHubPipeline(runs.WorkflowRuns[0]), nil
 }
@@ -65,6 +72,7 @@ func (g *github) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 	if head == "" {
 		return Pipeline{}, fmt.Errorf("github: latest MR pipeline: pull request %d has no head commit", mrIID)
 	}
+	headRef := pr.GetHead().GetRef() // branch name, for a synthesized pipeline's Ref
 	opt := &gh.ListWorkflowRunsOptions{
 		HeadSHA:     head,
 		ListOptions: gh.ListOptions{PerPage: 1},
@@ -76,12 +84,301 @@ func (g *github) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 	// A hostile forge could return a null entry in workflow_runs, which decodes to
 	// a nil *WorkflowRun that passes len==0. go-github's Get* accessors are nil-safe,
 	// so toGitHubPipeline would not panic here (unlike the gitlab/forgejo drivers) —
-	// it would return a phantom zero-ID Pipeline the poller then treats as real. Reject
-	// it as "no pipeline".
+	// it would return a phantom zero-ID Pipeline the poller then treats as real.
+	// No usable workflow run for the PR head: the reported CI (the `ci` workflow) is
+	// exposed via CHECK-RUNS, not workflow-runs (issue #1005), so recover/synthesize
+	// from the head commit's checks before giving up. The head SHA is already resolved
+	// from the PR, so reuse it (a moved head is picked up). The helper still returns
+	// ErrNoPipeline when that head genuinely has no checks either.
 	if runs == nil || len(runs.WorkflowRuns) == 0 || runs.WorkflowRuns[0] == nil {
-		return Pipeline{}, ErrNoPipeline
+		return g.latestPipelineFromChecks(ctx, slug, headRef, head)
 	}
 	return toGitHubPipeline(runs.WorkflowRuns[0]), nil
+}
+
+// latestPipelineFromChecks derives a pipeline from the head commit's CHECK-RUNS when
+// the workflow-runs query came up empty. GitHub exposes agent-MR CI (e.g. the `ci`
+// workflow's check-runs) via the check-runs API, not workflow-runs (issue #1005), so
+// without this the driver returns a null pipeline_ref and ci_fix never fires. headSHA
+// is the PR head on the MR path; on the branch path it is "" and the true branch-head
+// SHA is resolved from a returned check-run/suite — it MUST be the real head commit
+// (mr_rework GATE 2 keys staleness on the cached pipeline SHA, so a placeholder would
+// break it). ref is the branch ref carried onto a synthesized pipeline.
+func (g *github) latestPipelineFromChecks(ctx context.Context, slug repoSlug, ref, headSHA string) (Pipeline, error) {
+	// The check APIs take a git ref: the head SHA is the most precise (a moved head is
+	// still keyed correctly), and the branch ref is the only key in hand on the branch
+	// path. GitHub's commits/{ref}/check-runs resolves a branch ref to its HEAD commit.
+	checkRef := headSHA
+	if checkRef == "" {
+		checkRef = ref
+	}
+	if checkRef == "" {
+		return Pipeline{}, ErrNoPipeline
+	}
+	runs, err := g.listCheckRunsForRef(ctx, slug, checkRef)
+	if err != nil {
+		return Pipeline{}, err
+	}
+	suites, err := g.listCheckSuitesForRef(ctx, slug, checkRef)
+	if err != nil {
+		return Pipeline{}, err
+	}
+	// No checks of either kind → honest "no CI": preserve the pre-#1005 contract so a
+	// repo genuinely without CI still caches ErrNoPipeline, not a phantom pipeline.
+	if len(runs) == 0 && len(suites) == 0 {
+		return Pipeline{}, ErrNoPipeline
+	}
+	// Resolve the true head SHA on the branch path from a returned check-run/suite. It
+	// MUST be the real head commit (mr_rework staleness gate), never synthesized.
+	if headSHA == "" {
+		headSHA = headSHAFromChecks(runs, suites)
+	}
+
+	// ACTIONS-RECOVERY (primary): if any check-run belongs to a GitHub-Actions
+	// check-suite, re-query workflow-runs filtered by that suite id. GitHub lists an
+	// Actions run under check-runs even when the branch/head_sha-filtered workflow-runs
+	// list is (transiently) empty, so this recovers a NATIVE workflow-run pipeline — its
+	// id is in the same space as the normal path, keeping ListPipelineJobs/JobLogTail
+	// working. Newest suite id (single monotonic id space) so a re-run's suite wins.
+	if suiteID, ok := newestActionsSuiteID(runs); ok {
+		opt := &gh.ListWorkflowRunsOptions{
+			CheckSuiteID: suiteID,
+			ListOptions:  gh.ListOptions{PerPage: 1},
+		}
+		wf, _, err := g.client.Actions.ListRepositoryWorkflowRuns(ctx, slug.owner, slug.repo, opt)
+		if err != nil {
+			return Pipeline{}, g.wrapErr("latest pipeline from checks", err)
+		}
+		if wf != nil && len(wf.WorkflowRuns) > 0 && wf.WorkflowRuns[0] != nil {
+			return toGitHubPipeline(wf.WorkflowRuns[0]), nil
+		}
+	}
+
+	// SYNTHESIS FALLBACK (external / non-Actions CI, detection only): no Actions run is
+	// recoverable, so aggregate the check-runs into a neutral Pipeline. Without any
+	// check-run there is nothing to classify a status from, so treat suites-only as no
+	// CI. ListPipelineJobs/JobLogTail stay Actions-only for a synthesized id (a
+	// documented ci_fix limitation for pure external-CI repos; masking their 404 would
+	// hide a real deleted-run 404 on the normal path).
+	if len(runs) == 0 {
+		return Pipeline{}, ErrNoPipeline
+	}
+	newest := newestCheckRun(runs)
+	// WebURL: a failed check-run's page if any failed (that is where the human looks),
+	// else the newest check-run's; the commit checks page is a last resort only if no
+	// check-run carries an HTMLURL.
+	webURL := failedCheckRunURL(runs)
+	if webURL == "" {
+		webURL = newest.GetHTMLURL()
+	}
+	if webURL == "" {
+		// github.com only (D3), so the web host is fixed; last resort only.
+		webURL = fmt.Sprintf("https://github.com/%s/%s/commit/%s/checks", slug.owner, slug.repo, headSHA)
+	}
+	return Pipeline{
+		// ID is ALWAYS the newest check-suite id (single monotonic id space — never mix
+		// in check-run ids, which would collide with the workflow-run id space).
+		ID:        newestSuiteID(runs, suites),
+		Ref:       ref,
+		SHA:       headSHA,
+		Status:    combineCheckRunStatuses(runs),
+		WebURL:    webURL,
+		CreatedAt: newest.GetStartedAt().Time,   // best-effort; zero if absent
+		UpdatedAt: newest.GetCompletedAt().Time, // best-effort; zero if absent
+	}, nil
+}
+
+// listCheckRunsForRef returns every check-run for a git ref, fully paginated. A 404
+// (ref/commit absent or no checks surface) is treated as an empty list, not an error,
+// so a head genuinely without checks maps to ErrNoPipeline upstream rather than a hard
+// failure — the same "no CI" disposition the empty workflow-runs list already carries.
+func (g *github) listCheckRunsForRef(ctx context.Context, slug repoSlug, ref string) ([]*gh.CheckRun, error) {
+	opt := &gh.ListCheckRunsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
+	wrap := func(e error) error { return g.wrapErr("latest pipeline from checks", e) }
+	return paginate(wrap, func(page int) ([]*gh.CheckRun, int, error) {
+		opt.Page = page
+		res, resp, err := g.client.Checks.ListCheckRunsForRef(ctx, slug.owner, slug.repo, ref, opt)
+		if err != nil {
+			if resp != nil && resp.StatusCode == http.StatusNotFound {
+				return nil, 0, nil
+			}
+			return nil, 0, err
+		}
+		var items []*gh.CheckRun
+		if res != nil {
+			for _, r := range res.CheckRuns {
+				if r == nil {
+					continue // a hostile forge could null an entry; skip it
+				}
+				items = append(items, r)
+			}
+		}
+		next := 0
+		if resp != nil {
+			next = resp.NextPage
+		}
+		return items, next, nil
+	})
+}
+
+// listCheckSuitesForRef returns every check-suite for a git ref, fully paginated. 404
+// is treated as empty for the same reason as listCheckRunsForRef.
+func (g *github) listCheckSuitesForRef(ctx context.Context, slug repoSlug, ref string) ([]*gh.CheckSuite, error) {
+	opt := &gh.ListCheckSuiteOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
+	wrap := func(e error) error { return g.wrapErr("latest pipeline from checks", e) }
+	return paginate(wrap, func(page int) ([]*gh.CheckSuite, int, error) {
+		opt.Page = page
+		res, resp, err := g.client.Checks.ListCheckSuitesForRef(ctx, slug.owner, slug.repo, ref, opt)
+		if err != nil {
+			if resp != nil && resp.StatusCode == http.StatusNotFound {
+				return nil, 0, nil
+			}
+			return nil, 0, err
+		}
+		var items []*gh.CheckSuite
+		if res != nil {
+			for _, s := range res.CheckSuites {
+				if s == nil {
+					continue
+				}
+				items = append(items, s)
+			}
+		}
+		next := 0
+		if resp != nil {
+			next = resp.NextPage
+		}
+		return items, next, nil
+	})
+}
+
+// newestActionsSuiteID returns the highest check-suite id among check-runs that belong
+// to the github-actions app (App.Slug == "github-actions") and carry a suite id, so
+// ACTIONS-RECOVERY re-queries the newest Actions suite. ok is false when no check-run
+// is an Actions run — the external-CI case that falls through to synthesis.
+func newestActionsSuiteID(runs []*gh.CheckRun) (int64, bool) {
+	var best int64
+	var found bool
+	for _, r := range runs {
+		if r.GetApp().GetSlug() != "github-actions" {
+			continue
+		}
+		id := r.GetCheckSuite().GetID()
+		if id == 0 {
+			continue
+		}
+		if !found || id > best {
+			best, found = id, true
+		}
+	}
+	return best, found
+}
+
+// newestSuiteID returns the highest check-suite id across the suites list and the
+// check-runs' embedded suites — the synthesized pipeline's ID (monotonic id space).
+func newestSuiteID(runs []*gh.CheckRun, suites []*gh.CheckSuite) int64 {
+	var best int64
+	for _, s := range suites {
+		if id := s.GetID(); id > best {
+			best = id
+		}
+	}
+	for _, r := range runs {
+		if id := r.GetCheckSuite().GetID(); id > best {
+			best = id
+		}
+	}
+	return best
+}
+
+// headSHAFromChecks resolves the branch-head commit SHA from a returned check-run
+// (its HeadSHA, or its suite's) or a check-suite. All check-runs on a ref share the
+// ref's HEAD commit, so the first non-empty value is the real head — required by the
+// mr_rework staleness gate, never a placeholder.
+func headSHAFromChecks(runs []*gh.CheckRun, suites []*gh.CheckSuite) string {
+	for _, r := range runs {
+		if sha := r.GetHeadSHA(); sha != "" {
+			return sha
+		}
+		if sha := r.GetCheckSuite().GetHeadSHA(); sha != "" {
+			return sha
+		}
+	}
+	for _, s := range suites {
+		if sha := s.GetHeadSHA(); sha != "" {
+			return sha
+		}
+	}
+	return ""
+}
+
+// newestCheckRun returns the check-run with the highest id (monotonic), used for the
+// synthesized pipeline's timestamps and WebURL fallback. Returns nil only for an empty
+// slice, which the caller has already excluded.
+func newestCheckRun(runs []*gh.CheckRun) *gh.CheckRun {
+	var newest *gh.CheckRun
+	for _, r := range runs {
+		if newest == nil || r.GetID() > newest.GetID() {
+			newest = r
+		}
+	}
+	return newest
+}
+
+// failedCheckRunURL returns the HTMLURL of the newest FAILED check-run (collapsed
+// status in the failed set), or "" if none failed — the page a human opens to see why
+// the pipeline is red.
+func failedCheckRunURL(runs []*gh.CheckRun) string {
+	var best *gh.CheckRun
+	for _, r := range runs {
+		if !pipelinestatus.IsFailed(collapseCheckRun(r)) {
+			continue
+		}
+		if best == nil || r.GetID() > best.GetID() {
+			best = r
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return best.GetHTMLURL()
+}
+
+// collapseCheckRun folds a check-run's status/conclusion into the single verbatim
+// value the neutral Pipeline/Job carries, the same D8 collapse the workflow-run path
+// uses (while not completed the value is the status; once completed it is the
+// conclusion).
+func collapseCheckRun(r *gh.CheckRun) string {
+	return githubActionsStatus(r.GetStatus(), r.GetConclusion())
+}
+
+// combineCheckRunStatuses folds a head commit's check-runs into ONE neutral pipeline
+// status, mirroring GitHub's combined-status precedence: any failure wins, else any
+// still-running yields in_progress, else any attention (action_required/stale/
+// cancelled) yields action_required, else success. The strings are stored verbatim so
+// pipelinestatus.IsFailed/IsSuccess classify them exactly as the workflow-run path.
+func combineCheckRunStatuses(runs []*gh.CheckRun) string {
+	var hasFailure, hasPending, hasAttention bool
+	for _, r := range runs {
+		switch collapseCheckRun(r) {
+		case "failure", "timed_out", "startup_failure", "error":
+			hasFailure = true
+		case "queued", "in_progress", "requested", "pending", "waiting":
+			hasPending = true
+		case "action_required", "stale", "cancelled":
+			hasAttention = true
+		}
+	}
+	switch {
+	case hasFailure:
+		return "failure"
+	case hasPending:
+		return "in_progress"
+	case hasAttention:
+		return "action_required"
+	default:
+		return "success"
+	}
 }
 
 // ListPipelineJobs returns a workflow run's jobs. pipelineID is a workflow run id —
