@@ -1,0 +1,17 @@
+{
+  "id": "",
+  "email": "",
+  "display_name": null,
+  "is_admin": false,
+  "is_active": false,
+  "autopilot_enabled": false,
+  "wait_on_limit": false,
+  "judge_enabled": false,
+  "ci_autofix_enabled": false,
+  "attribution_enabled": false,
+  "ephemeral_workers_enabled": false,
+  "judge_anthropic_secret_id": null,
+  "judge_anthropic_secret_label": null,
+  "created_at": "0001-01-01T00:00:00Z",
+  "last_login": null
+}

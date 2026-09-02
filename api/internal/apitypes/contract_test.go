@@ -71,6 +71,22 @@ func contractCases() []contractCase {
 	return []contractCase{
 		newContractCase[RunDTO]("run"),
 		newContractCase[RunListItemDTO]("run_list_item"),
+		// M2 — the rest of the apitypes hot set.
+		newContractCase[RepoDTO]("repo"),
+		newContractCase[MessageDTO]("message"),
+		newContractCase[ScheduleDTO]("schedule"),
+		// ScheduleRequest is a REQUEST body: its full.json round-trips through
+		// DisallowUnknownFields (the runtime-400 class the PRD names) like every other row.
+		newContractCase[ScheduleRequest]("schedule_input"),
+		newContractCase[WorkerDTO]("worker"),
+		newContractCase[AdminWorkerDTO]("admin_worker"),
+		newContractCase[UserDTO]("user"),
+		newContractCase[AgentMemoryDTO]("agent_memory"),
+		newContractCase[SecretDTO]("secret"),
+		newContractCase[UsageDTO]("usage"),
+		newContractCase[UserSettingsDTO]("user_settings"),
+		newContractCase[CatalogEntryDTO]("catalog_entry"),
+		newContractCase[AdminCLITokenDTO]("cli_token"),
 	}
 }
 

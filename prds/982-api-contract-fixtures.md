@@ -185,7 +185,7 @@ and matters here exactly as `fixtures/run-usage/README.md` explains: the fixture
   on `_runExtra`. Each control typechecked before its result was read
   (`.claude/agent-team.md`: TYPECHECK the mutated tree), each restored by copy-aside and
   verified with `git status`.
-- [ ] **M2 — the rest of the apitypes hot set.** One table row and one `check` block per
+- [x] **M2 — the rest of the apitypes hot set.** One table row and one `check` block per
   pair listed above, fixtures recorded, gates green. `ScheduleInput` is a request body:
   its Go half round-trips `full.json` through `DisallowUnknownFields`, which is the
   400-at-runtime class the Problem names. `CatalogEntry` (`selector_kind`,
@@ -194,6 +194,18 @@ and matters here exactly as `fixtures/run-usage/README.md` explains: the fixture
   declared all-scalar (no null-presence guard). Enumerate the `ZeroOf` exemptions per DTO
   from the mappers before recording (every slice a mapper normalizes to `[]` is `null` in
   the raw zero marshal); each gets a mapper citation in the README.
+  - Landed: 13 DTO rows (Go `contract_test.go`) + 13 `check` blocks (`apiContract.test.ts`),
+    26 fixtures under `fixtures/api-contract/`. ZeroOf exemptions (mapper-cited in the
+    README): `Repo.required_capabilities`, `Worker`/`AdminWorker.capabilities`,
+    `Schedule.override_subagent_model`, `UserSettings.sidebar_token_ids`. All-scalar
+    (`nullable:false`): `Memory`, `SecretMeta`, `RunUsage`. `ScheduleInput` (request body)
+    and `Memory` (omitempty `repo_id`/`repo_name`) use `Omit<>` on the zero check, not a
+    false `| null` exemption — see README.
+  - 🔴 **M2 surfaced two UNPLANNED drifts** (in addition to CatalogEntry/CliToken), each a
+    never-null TS field the wire sends `null` on with no mapper `[]`-guarantee: **`Worker`
+    /`AdminWorker.docker`** (null for external workers) and **`Schedule.next_fires`** (null
+    for a once schedule). Both are carried under `@ts-expect-error #982` on their `_zero`
+    assertion; **M4 must also reconcile them** — see the note appended to M4.
 - [ ] **M3 — the handler-package hot set.** `api/internal/handler/contract_test.go`
   (internal test, the DTOs are unexported) sharing the populator through a tiny
   **stdlib-only** test-support package `api/internal/apitypes/apitypestest` (imports
@@ -222,6 +234,13 @@ and matters here exactly as `fixtures/run-usage/README.md` explains: the fixture
   site at `RunView.tsx:1847` is already guarded and the mapper guarantees `[]`, so it is a
   Decision 7 exemption, not a fix). Every TS block green with **zero** `ZeroOf`
   exemptions beyond those a mapper line justifies.
+  - 🔴 **Also reconcile the two drifts M2 surfaced** (type-only): `Worker.docker` →
+    `docker?: boolean | null` (the wire sends null for external workers), and
+    `Schedule.next_fires` → `next_fires: string[] | null` (a once schedule sends null,
+    since the mapper only sets it for recurring+valid-cron; alternatively a Go change
+    normalizes `next_fires` to `[]`, which is out of scope for a type-only PRD). Removing
+    the two `@ts-expect-error #982` directives on the Worker/AdminWorker/Schedule `_zero`
+    assertions is what tsc will insist on once these land.
 - [ ] **M5 — doc-sync.** `ARCHITECTURE.md`'s DTO / apitypes paragraph gains one sentence
   pointing at `fixtures/api-contract/`; `.claude/rules/web.md` and `.claude/rules/go.md`
   each gain the rule "a DTO field change is a THREE-file edit — Go struct, fixture,

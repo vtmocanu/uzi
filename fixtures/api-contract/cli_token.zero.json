@@ -1,0 +1,13 @@
+{
+  "id": "",
+  "user_id": "",
+  "owner_email": "",
+  "name": "",
+  "token_prefix": "",
+  "scope": "",
+  "revoked": false,
+  "created_at": "0001-01-01T00:00:00Z",
+  "last_used_at": null,
+  "last_used_ip": null,
+  "expires_at": null
+}

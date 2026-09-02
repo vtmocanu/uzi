@@ -36,6 +36,69 @@ populator is a separate leaf package.
 
 M1 covers `RunDTO → Run` and `RunListItemDTO → RunListItem`.
 
+M2 adds the rest of the apitypes hot set: `RepoDTO → Repo`, `MessageDTO → RunMessage`,
+`ScheduleDTO → Schedule`, `ScheduleRequest → ScheduleInput` (a request body),
+`WorkerDTO → Worker`, `AdminWorkerDTO → AdminWorker`, `UserDTO → User`,
+`AgentMemoryDTO → Memory`, `SecretDTO → SecretMeta`, `UsageDTO → RunUsage`,
+`UserSettingsDTO → UserSettings`, `CatalogEntryDTO → CatalogEntry` (drift),
+`AdminCLITokenDTO → CliToken` (drift).
+
+### M2 `ZeroOf` exemptions, each cited (Decision 7)
+
+Every exemption below is a field the TS type says never-null while the Go **mapper**
+guarantees `[]`/non-null on the real wire, so the zero-marshal's `null` over-approximates.
+
+| DTO | field | TS type | mapper guarantee |
+|---|---|---|---|
+| `Repo` | `required_capabilities` | `required_capabilities?: string[]` | `capsOrEmpty` (`handler/forge.go:148`) in `repoToDTO` (`handler/forge.go:174`) → `[]` |
+| `Worker` / `AdminWorker` | `capabilities` | `capabilities?: string[]` | pgx yields a non-nil `[]` for the `text[]` column (WorkerDTO.Capabilities doc); passed through at `handler/workers.go:203` / `:252` |
+| `Schedule` | `override_subagent_model` | `override_subagent_model: boolean` | plain bool column the mapper ALWAYS sets (`handler/schedules.go:1598-1600`) |
+| `UserSettings` | `sidebar_token_ids` | `sidebar_token_ids?: string[]` | `uuidStrings` returns a non-nil `[]` (`handler/user_settings.go:65`) |
+
+DTOs with **no** exemption (every nullable Go field is already typed `X | null` in TS):
+`RunMessage`, `User`. All-scalar / no nullable field (declared `nullable: false`, so their
+legitimately null-free `zero.json` is not flagged vacuous): `Memory`, `SecretMeta`,
+`RunUsage`.
+
+`ScheduleInput` is a **request body**: `json.Marshal(ScheduleRequest{})` is not a real wire
+sample (the CLIENT produces the request, and it OMITS a field rather than sending `null`).
+Its tri-state `*bool` / non-omitempty slice fields (`labels`, `auto_approve`, `wait_on_limit`,
+`enabled`, `override_subagent_model`, `sibling_group_id`) are **Omit-ted** from the zero check
+rather than given a false `| null` exemption; the genuinely `X | null` request fields stay
+checked. The contract that bites for a request body is the Go half's `DisallowUnknownFields`
+round-trip.
+
+`Memory`: `repo_id`/`repo_name` are `omitempty` in Go but the `/me/memory` mapper ALWAYS sets
+them (`handler/memory.go:37`), so the real wire carries them and TS is right to require them.
+`json.Marshal(AgentMemoryDTO{})` drops an empty omitempty string, so the zero fixture lacks
+them; they are Omit-ted from the zero-nullability check (their presence is still verified via
+`full.json`, i.e. `_agentMemoryMissing`).
+
+### M2 known drift — carried under `@ts-expect-error #982` until M4
+
+| TS type | missing fields | exact suppressed tsc error |
+|---|---|---|
+| `CatalogEntry` | `selector_kind` (schedule.go:211), `mr_rework_enabled` (schedule.go:221) | `error TS2322: Type '"mr_rework_enabled" \| "selector_kind"' is not assignable to type 'never'.` |
+| `CliToken` | `user_id`, `owner_email` (cli_token.go:24-25) | `error TS2322: Type '"owner_email" \| "user_id"' is not assignable to type 'never'.` |
+
+### 🔴 M2 DISCOVERED drift — not in the original M2 plan, also carried under `@ts-expect-error #982`
+
+Two never-null TS fields receive `null` on the real wire with NO mapper `[]`-normalization,
+which the exemption rule says is real drift (not an exemption). They are carried under a
+directive (on the `_zero` assertion) so `gate:web` stays green, and M4 must reconcile them
+(the directive is unused-on-fix, so tsc forces it). The `@ts-expect-error` masks the whole
+`_zero` line, so any further nullability drift on Worker/Schedule is masked until M4 clears
+the directive — the same same-line caveat M1 documents for `_runExtra`.
+
+| TS type | field | why the wire sends `null` | exact suppressed tsc error |
+|---|---|---|---|
+| `Worker` / `AdminWorker` | `docker?: boolean` | `boolPtrValue(w.DockerEnabled)` is nil for an EXTERNAL worker (`handler/workers.go:201` / `:250`) | `error TS2322: Type '{ … docker: null; … }' is not assignable to type 'ZeroOf<Worker, "capabilities">'. Types of property 'docker' are incompatible.` |
+| `Schedule` | `next_fires: string[]` | the mapper only sets `NextFires` for a recurring+valid-cron schedule (`handler/schedules.go:1612-1614`); a once schedule leaves it nil (→ `null`) | `error TS2322: Type '{ … next_fires: null; … }' is not assignable to type 'ZeroOf<Schedule, "override_subagent_model">'. Types of property 'next_fires' are incompatible.` |
+
+M4 reconciliation (type-only): `Worker.docker` → `docker?: boolean | null`; `Schedule.next_fires`
+→ `next_fires: string[] | null` (or, out of scope for a type-only PRD, the Go mapper normalizes
+`next_fires` to `[]`).
+
 ## What the TS half pins (three compile-time assertions per DTO)
 
 ```ts
