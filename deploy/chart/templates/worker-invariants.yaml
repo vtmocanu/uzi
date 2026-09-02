@@ -238,7 +238,7 @@
   rendered perfectly clean and produced exactly the failure this guard exists to stop.
   Measured: dindDataSize "" + maxPVCStorage 10Gi rendered with no env var at all.
 
-  The literal below MIRRORS dindDataDefaultSize in controller/internal/kube/render.go
+  The literal below MIRRORS dindDataDefaultSize in controller/internal/kube/render_dind.go
   and the two must move together. It is a genuine cross-toolchain duplicate — Helm
   cannot read a Go constant — so it is tied the same way every other one here is: that
   constant's own comment names this file, and TestDinDDataDefaultFitsTheChartsLimitRangeMax

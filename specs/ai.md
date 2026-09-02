@@ -8604,7 +8604,7 @@ docker posture. Extends #58's controller (§264–275), does not fork it.
   `DesiredWorker.Docker` → controller `protocol.DesiredWorker.Docker` (the contract golden +
   `*_contract_test.go` carry the field so drift stays a red build). Preset `Resolve` still keys on
   `(template, size)` for the image — unchanged.
-- **Render (`controller/internal/kube/render.go`), gated on `w.Docker`:** a second container `dind`
+- **Render (gated on `w.Docker` in `controller/internal/kube/render.go`'s `podTemplate`; the container built by `render_dind.go`'s `dindContainer`):** a second container `dind`
   (`docker:28-dind-rootless`, same pin as compose) with `securityContext.privileged: true`; a shared
   `emptyDir` socket volume at the §298 socket path (socket only); the worker container's
   `DOCKER_HOST` set EXPLICITLY (the k8s branch of the resolver — no probe); a `dinddata` volume
@@ -8947,9 +8947,9 @@ Serves human Feature #4 (workers run docker) on a cluster that cannot do rootles
   `uzi-workers-docker` namespace (§303), for nodes lacking unprivileged userns. dev-cluster sets
   `false`; every other cluster keeps the default.
 - **The toggle selects CONTROLLER-RENDERED behavior, not Helm-templated YAML.** The dind sidecar is
-  emitted by `controller/internal/kube/render.go`, so the chart only plumbs the flag to a controller
+  emitted by `controller/internal/kube/render_dind.go`'s `dindContainer`, so the chart only plumbs the flag to a controller
   env var (`UZI_WORKER_DIND_ROOTLESS`), read + validated in `controller/internal/config/config.go`,
-  and `render.go` branches on it. Deliberately NO DB schema/migration, NO wire change, NO api/web/CLI
+  and `render.go`'s `podTemplate` and `render_dind.go`'s `dindContainer` branch on it. Deliberately NO DB schema/migration, NO wire change, NO api/web/CLI
   change, NO agent change: `docker_enabled` stays the per-worker "wants a daemon" bool (§303), and
   posture is pure OPERATOR config the controller owns (#83 Decision 1 — docker is a pod-shape
   dimension, not a template; posture is one more render input, not a per-worker attribute). This
@@ -18850,7 +18850,7 @@ the class of claim this work refuted twice.
   Candidate follow-up; not built.
 - **NO ADR, with the counter recorded because it is genuinely arguable.** The durable facts here are
   **k8s semantics, not a uzi seam**, and the uzi-side decision belongs beside `nixSize`'s and
-  `dindResources`' existing arguments in `render.go`; the five-ADR set is deliberately small. The
+  `dindResources`' existing arguments in `render_dind.go`; the five-ADR set is deliberately small. The
   counter: *"never declare an `ephemeral-storage` limit, and never add an ephemeral key to the
   LimitRange"* is exactly an invariant a future change would silently break, and it spans two
   components. It was judged sufficient that the invariant is **mechanically enforced** — by the
@@ -23753,3 +23753,14 @@ Serves human Feature #218 (park-resume durability). Root cause: run #1009 hit th
 Deferred to follow-up issues: G2 (behind-on-workflows checkpoint durability), G5 (forge checkpoints for non-issue run kinds), the owner-anchor column and its compare-and-delete (#1042), chat-run affinity (`ClaimChatRun`), and cross-worker session/transcript durability (#556).
 
 Cross-refs: `adr/0628-cross-worker-resume-durability.md` (amended: D3a scope, the roll-vs-teardown discriminator, the two-seam affinity change, the 30m→2h `WORKER_AFFINITY_CEILING` correction, and the `ClaimChatRun`-vs-`ClaimRun` universal-predicate correction); PRD #422 D7 (a draining worker claims nothing new); #759 (the `wip(park):` marker adopt-unwrap this subsumes).
+
+## 605. PRD #1048 — controller kube/render.go DinD file split
+
+Serves human: keeps a large source file readable without changing behaviour — a pure same-package motion of the Docker-in-Docker worker seam out of `controller/internal/kube/render.go` (1346→957 lines) into a new `render_dind.go` (~402 lines), so a reader after the pod shape and a reader after the dind daemon's wiring no longer scroll past each other. Same recipe as #921/#963/#1008/#1025/#1026: byte-exact block moves, `go doc -all` unchanged, `--color-moved` proof, zero test edits.
+
+- **D1 — DinD-only, one new file, no finer cut.** The seam is self-contained (only `podTemplate`/`RenderPVCs` call it, gated on `w.Docker`): the dind wiring consts, `dindDataDefaultSize`, `dindDataSize`, `dindResources`/`dindInitResources`, and `dindContainer`/`dockerNodeAntiAffinity`/`dindInitContainer` move whole. No consts-vs-constructors sub-split — it would separate the wiring consts from their only readers.
+- **D2 — the naming seam stays in `render.go`.** A `render_naming.go` (the `*Name` one-liners + `objectLabels` + `IsOurs`) would move symbols the open PRD #837 and ADR-0091 cite "in render.go"; not worth repointing an ADR and an unlanded PRD during the freeze.
+- **D3 — `dindDataPVCName`, `dindDataSuffix` and `dindContainerName`/`dindInitContainerName` stay.** They live in mixed blocks beside non-dind siblings and `materializer.go` calls `dindDataPVCName`; the rule is a mixed block stays whole, only an entirely-dind block moves.
+- **D4 — zero test edits, including comments.** `render_test.go` carries all 24 of the package's (gosec) ratchet findings and `whole-files: true` would gate them the instant it entered the diff, so the test file is untouched (`git diff --stat … -- '**/*_test.go'` empty).
+- **D5 — `go doc -all` (no `-u`) byte-identity is trivially satisfied** because nothing exported moves; the load-bearing proof is the unmodified hash-pinned render tests plus the `--color-moved` pure-motion check, not `go doc` alone.
+- **D6 — the chart mirror comment is repointed, the mirror itself untouched.** `worker-invariants.yaml`'s tie to `dindDataDefaultSize` is repointed to `render_dind.go`; the Helm literal and `TestDinDDataDefaultFitsTheChartsLimitRangeMax` are unaffected. `deploy/README.md` and three other `specs/ai.md` mentions are repointed for the moved `dindWorkdirDir`/`dindContainer`/`dindResources`; every mention of code that stayed is left as-is.
