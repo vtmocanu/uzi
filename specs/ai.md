@@ -22190,7 +22190,7 @@ Terse contract; richer rationale is in PRD #557's Decision Log.
   four live on the optional capability interface, not the neutral `Forge` interface,
   so `gitlab.go`/`forgejo.go` and the six `Forge` fakes are untouched — only the two
   test *syncer* fakes gained stubs.
-- **Typed not-found, not a string match.** `graphqlDo` (`api/internal/forge/github.go`)
+- **Typed not-found, not a string match.** `graphqlDo` (`api/internal/forge/github_graphql.go`)
   now captures the GraphQL error envelope's `type` field and, only when it is
   `NOT_FOUND`, wraps the redacted error with `forge.ErrGitHubUserNotFound` (`errors.Is`-able);
   every other GraphQL error stays a plain redacted error, unchanged for existing
@@ -23717,3 +23717,12 @@ Serves human: "a change to one CLI subcommand should not diff against the whole 
 - **M4 — `newRunCmd`'s 18 inline subcommand literals → per-cluster `newRun<Sub>Cmd` constructors** (extraction, not motion, done last), grouped into `run_lifecycle.go` / `run_steer.go` / `run_get.go` / `run_limits.go` / `run_wait.go`; `newRunCmd` becomes the tree assembly with the same `AddCommand` order and names. `TestCommandTree` and the per-subcommand suites pass unmodified.
 
 Cross-refs: #960 (`pages/adminSettings/` per-directory recipe — the web analogue this mirrors), PRD #1008 (the handler-side same-day sibling split), #963 (the file-shape rule — file comment BELOW the package clause so `go doc` sees no second package doc).
+
+## 602. PRD #1025 — forge driver file splits: `github.go`/`forgejo.go` into per-seam files, `gitlab_pipelines.go` for parity
+
+Serves human: "a change to one forge method group should not diff against the whole 1300-line driver." Pure-motion refactor of `api/internal/forge/` (`package forge`); no behaviour, signature, or exported-API change, zero `*_test.go` edits. Richer rationale is PRD #1025's Decision Log; terse record here. `github.go` (1314 lines) and `forgejo.go` (1242) each carried every `Forge` method group in one file; both already had a `<driver>_pipelines.go` seam, so one seam map fit both, and `gitlab.go` gained `gitlab_pipelines.go` for parity with its two siblings.
+
+- **D1 — completeness proven by `go doc -u -all`, not `go doc -all`.** The driver types (`github`, `forgejo`, `gitLab`) are unexported, so plain `go doc -all` shows none of their methods and is blind to a dropped or altered one; `go doc -u -all ./internal/forge` (1958 lines, ordered by name) is the byte-identity instrument. M1-M4 hold it byte-identical to the pre-move base; M5's single go-doc-visible doc-comment repoint (`ErrGitHubUserNotFound`, naming `graphqlDo`'s new home) is the sole intended delta.
+- **D2 — one seam map, both large drivers.** Each split into `<driver>_auth.go` / `_issues.go` / `_labels.go` / `_access.go` / `_mr.go`, plus a mandatory `github_graphql.go` — the GraphQL transport is shared by `github_mr.go` and `projectsync.go`, so it gets its own file rather than living inside either caller. The constructor, the shared `wrapErr`/`repoSlugFor` helpers and `ListProjects` (repository discovery) stay in the base file.
+- **D3 — cross-driver symbols stay put.** `maxTraceBytes` (declared in `gitlab.go`, read by all three drivers), `type repoSlug` (in `forgejo.go`, returned by `github.repoSlugFor`) and `sameNameSet` (in `forgejo.go`, called by both drivers' `UpdateIssueLabels`) are not hoisted to `forge.go` — a placement decision across drivers, not motion within one; both `_labels.go` files call `sameNameSet` cross-file. `checkForgejoVersion` stays in `forgejo.go` beside `newClient` though its only caller `VerifyToken` moved, keeping five in-repo precedent citations true.
+- **D4 — `gitlab.go` gets the pipelines extraction only.** Under the epic's line bar already; the one move that adds value is parity with the two existing `_pipelines.go` siblings. A full seam split would move `DefaultBranchProtection` and falsify two `gitlab_test.go` comments, forcing a test-file edit the whole-files lint ratchet would then gate — pipelines-only avoids both.

@@ -8,7 +8,7 @@ import (
 
 // ErrGitHubUserNotFound is returned (wrapped) when a GitHub GraphQL operation
 // reports a NOT_FOUND error type — for ResolveUserNodeID this means the login
-// does not resolve to a user. graphqlDo (github.go) wraps its redacted error
+// does not resolve to a user. graphqlDo (github_graphql.go) wraps its redacted error
 // with this sentinel whenever any errors[] entry has type "NOT_FOUND", so
 // callers can errors.Is against it to distinguish a bad username from a
 // permission/transient failure. Every other GraphQL error propagates as a plain
@@ -29,7 +29,7 @@ const (
 
 // projectsync.go defines the OPTIONAL capability interface for GitHub Projects v2
 // Status sync (PRD #364) and the github driver's implementation of it, built on
-// the raw GraphQL helper in github.go (graphqlDo).
+// the raw GraphQL helper in github_graphql.go (graphqlDo).
 //
 // This is deliberately NOT part of the neutral Forge interface (forge.go):
 // GitLab and Forgejo have no Projects v2 equivalent, so only the github driver

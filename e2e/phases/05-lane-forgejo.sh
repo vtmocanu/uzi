@@ -100,7 +100,7 @@ case "$LC" in 2*) fail "forgejo connect against a <16 instance must be refused, 
 # "token verification failed" with the downgrade finding ABSENT would have passed. The
 # driver names the required floor as `Forgejo 16.0.0` in both refusal paths ("below the
 # required Forgejo 16.0.0" for a recognized <16 server, "Forgejo 16.0.0 or newer" for an
-# unparseable one — forgejo.go:179/182, min renders without the leading v).
+# unparseable one — forgejo.go's checkForgejoVersion, min renders without the leading v).
 grep -qE "below the required Forgejo 16\.0\.0|Forgejo 16\.0\.0 or newer" "$FJLOW" \
   || fail "the <16 refusal must state the version-downgrade finding (required Forgejo 16.0.0), got $(cat "$FJLOW")"
 pass "forgejo connect POST refused against a < 16.0.0 instance, naming the required version (save-time gate) ✓"
