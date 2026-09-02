@@ -2894,6 +2894,17 @@ func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issue
 	}
 	branch := agentIssueBranch(issueIid.Int64)
 	s.background(func() {
+		// s.background is a DETACHED goroutine in production, and pushbroker.Delete
+		// drives go-git (ListContext/PushContext), which has nil-deref panic paths on
+		// malformed forge responses. An unrecovered panic in ANY goroutine crashes the
+		// whole api process, so recover FIRST and swallow it — this cleanup is
+		// best-effort, and the failure it prevents (a later not_descendant skip) is
+		// benign. Mirrors forgesvc.ProjectSyncService.launchSeed's recover idiom.
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("checkpoint cleanup: delete panicked", "run", runID, "branch", branch, "panic", r)
+			}
+		}()
 		// Detached from the request/report ctx (which is already returning to the
 		// worker): bind to a fresh context.Background, and let pushbroker.Delete apply
 		// its own bounded timeout on top. A slow/down forge cannot reach the caller.

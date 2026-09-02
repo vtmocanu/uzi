@@ -193,6 +193,44 @@ func TestSetStateCompletedDeleteErrorStillCompletes(t *testing.T) {
 	}
 }
 
+// TestSetStateCompletedDeletePanicRecovered proves the checkpoint-delete closure
+// RECOVERS a panic from the delete seam (pushbroker.Delete drives go-git, which has
+// nil-deref panic paths on hostile forge responses). In production s.background is a
+// DETACHED goroutine, so an unrecovered panic there crashes the whole api process. The
+// test forces the delete seam to PANIC and runs it under the SYNCHRONOUS background seam
+// (fn() inline), so the panic — absent the recover — would propagate out to this test
+// caller and fail it. With the recover in the closure body it is swallowed, the terminal
+// transition still returns success, and the completion is recorded.
+func TestSetStateCompletedDeletePanicRecovered(t *testing.T) {
+	fs := &fakeStore{
+		runOwned: store.Run{
+			Kind:     runkind.Issue,
+			IssueIid: pgtype.Int8{Int64: 42, Valid: true},
+			Status:   "completed",
+		},
+		setCompletedRows: 1,
+	}
+	svc, _ := checkpointDeleteSvc(t, fs, nil)
+	// Override the seam to PANIC, as go-git can on a malformed/hostile forge response.
+	svc.SetDeleteCheckpointFn(func(_ context.Context, _ pushbroker.DeleteOptions) error {
+		panic("go-git nil-deref on hostile forge response")
+	})
+
+	// With the synchronous background seam, a panic that escaped the closure would
+	// propagate here and crash/fail the test. The recover in the closure body must
+	// swallow it.
+	_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("SetState(completed): %v (a panic in the best-effort delete must not fail the terminal report)", err)
+	}
+	if !applied {
+		t.Fatalf("applied = false, want true (completion must be recorded despite the delete panic)")
+	}
+	if fs.setCompleted == nil {
+		t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded regardless of the delete panic")
+	}
+}
+
 // TestServerSideCancelDeletesCheckpoint proves the server-side cancel path (no live
 // poller — the run is committed terminal outside SetState) also deletes the run's
 // checkpoint ref.
