@@ -74,16 +74,16 @@ import {
   type User,
   type UserSettings,
   type UserSettingsPatch,
-} from "../lib/api";
+} from "../../lib/api";
 // ApiError / isTerminalRun are imported from their own leaf modules (not the
 // `../lib/api` barrel) so this mock-mode client introduces no runtime import
 // edge back to lib/api.ts — the api → mockApi → api cycle behind issue #165.
-import { ApiError } from "../lib/apiError";
-import { isTerminalRun } from "../lib/runStatus";
-import { isTheme, resolveTheme } from "../lib/theme";
-import { coordKey, recommendationLabel, verdictLabel } from "../lib/judge";
-import { bodyError, descriptionError, SKILL_NAME_RE } from "../lib/skills";
-import { CAPABILITY_VOCABULARY } from "../lib/capabilityVocabulary";
+import { ApiError } from "../../lib/apiError";
+import { isTerminalRun } from "../../lib/runStatus";
+import { isTheme, resolveTheme } from "../../lib/theme";
+import { coordKey, recommendationLabel, verdictLabel } from "../../lib/judge";
+import { bodyError, descriptionError, SKILL_NAME_RE } from "../../lib/skills";
+import { CAPABILITY_VOCABULARY } from "../../lib/capabilityVocabulary";
 import {
   LIVE_RUN_ID,
   MOCK_CLI_AUTH_REQUEST_ID,
@@ -118,21 +118,12 @@ import {
   mockSkills,
   mockTemplates,
   mockToolAllowlist,
-  mockUsers,
   mockWorkers,
   runListItem,
-} from "./data";
-import { ensureLive, handleInput, scheduleChatReply, startNewRun } from "./engine";
-import { appendMessage, getProposal, getRun, nextRunId, patchRun, putProposal, state } from "./store";
-
-const jitter = () => 90 + Math.random() * 180;
-const delay = <T>(value: T, ms = jitter()): Promise<T> =>
-  new Promise((resolve) => setTimeout(() => resolve(value), ms));
-
-function requireSession(): User {
-  if (!state.session) throw new ApiError(401, "authentication required");
-  return state.session;
-}
+} from "../data";
+import { ensureLive, handleInput, scheduleChatReply, startNewRun } from "../engine";
+import { appendMessage, getProposal, getRun, nextRunId, patchRun, putProposal, state } from "../store";
+import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 
 // ── Settings persistence (demo build) ────────────────────────────────────────
 // The mock persists ONLY the settings maps to localStorage so a hard reload of
@@ -304,7 +295,6 @@ const loadedSettings = loadSettings();
 
 // Mutable copies of seed collections (CRUD operates on these).
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
-let users: User[] = mockUsers.map((u) => ({ ...u }));
 let notifications: MockNotification[] = mockNotifications.map((n) => ({ ...n }));
 // Incidental-findings coordinates (PRD #333 M7). Mutable copy so file/dismiss persist in a
 // demo session; the seed stays pristine so a module reload re-seeds a clean backlog.
@@ -1543,45 +1533,6 @@ function slackLinkResponse(): { slack: SlackLink } {
 }
 
 // settingsResponse builds the admin SettingsResponse from the mock's current
-// mockScenario reads a demo scenario from ?mock= (or the uzi_mock_scenario
-// localStorage key) so MOCK_MODE demo builds and manual QA can reach the PRD #45
-// OIDC UX, which is otherwise hidden (OIDC off / password on). Unknown/absent keeps
-// the original behavior. Wrapped in try/catch for any non-browser context.
-function mockScenario(): string {
-  try {
-    const q = new URLSearchParams(window.location.search).get("mock");
-    if (q) return q;
-    return window.localStorage.getItem("uzi_mock_scenario") ?? "";
-  } catch {
-    return "";
-  }
-}
-
-interface OidcDemo {
-  oidcEnabled: boolean;
-  providerName: string;
-  passwordLoginEnabled: boolean;
-  oidcStatus: string;
-  passwordless: boolean; // has_password === false → the passphrase-create banner shows
-}
-
-// oidcDemo maps the scenario to the OIDC fields the auth-config, session, and
-// settings responses expose. Scenarios: "oidc" (SSO alongside password),
-// "oidc-degraded" (admin status degraded), "sso-only" (SSO only, password form
-// hidden). Default: OIDC off, password on — the original demo behavior.
-function oidcDemo(): OidcDemo {
-  switch (mockScenario()) {
-    case "oidc":
-      return { oidcEnabled: true, providerName: "Keycloak", passwordLoginEnabled: true, oidcStatus: "ok", passwordless: true };
-    case "oidc-degraded":
-      return { oidcEnabled: true, providerName: "Keycloak", passwordLoginEnabled: true, oidcStatus: "degraded", passwordless: true };
-    case "sso-only":
-      return { oidcEnabled: true, providerName: "Keycloak", passwordLoginEnabled: false, oidcStatus: "ok", passwordless: true };
-    default:
-      return { oidcEnabled: false, providerName: "SSO", passwordLoginEnabled: true, oidcStatus: "disabled", passwordless: false };
-  }
-}
-
 // state: readable non-secret values, per-secret configured flags, and per-key
 // sources (all db/default — the demo has no ENV overlay).
 function settingsResponse(): SettingsResponse {
