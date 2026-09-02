@@ -41,11 +41,11 @@ type RunDTO struct {
 	// DTO paths, which never render the MR affordance in a browser; set on the
 	// list/detail reads (ListRuns/AdminListRuns/GetRun) from the run's connection.
 	ForgeType string `json:"forge_type"`
-	// Kind is issue|ci_fix|chat|judge|self_improve|prompt|task (PRD #400 added the
-	// seventh, task). IssueIID is null for the issue-less kinds (ci_fix, chat, judge,
-	// prompt, task) and set for the issue-shaped kinds (issue, self_improve); the ci_fix
-	// fields below carry pipeline context, chat carries Title, and a task (uzi handoff)
-	// carries Branch/BaseBranch/OpenMr set at create.
+	// Kind is issue|ci_fix|chat|judge|self_improve|prompt|task|mr_rework. IssueIID is
+	// null for the issue-less kinds (ci_fix, chat, judge, prompt, task, mr_rework) and
+	// set for the issue-shaped kinds (issue, self_improve); the ci_fix fields below carry
+	// pipeline context, chat carries Title, and a task (uzi handoff) carries
+	// Branch/BaseBranch/OpenMr set at create.
 	Kind             string `json:"kind"`
 	IssueIID         *int64 `json:"issue_iid"`
 	IssueTitle       string `json:"issue_title"`

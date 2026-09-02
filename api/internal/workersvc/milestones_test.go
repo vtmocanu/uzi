@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -92,16 +93,16 @@ func TestProgressParams(t *testing.T) {
 	frozen := frozenThree()
 
 	// Non-issue kind → both dropped regardless of a valid set.
-	if c, ip := progressParams(RunKindCIFix, frozen, strptr("m1"), strptr("m2")); c != nil || ip != nil {
+	if c, ip := progressParams(runkind.CIFix, frozen, strptr("m1"), strptr("m2")); c != nil || ip != nil {
 		t.Fatalf("non-issue kind must drop both, got completed=%q in_progress=%q", c, ip)
 	}
 	// NULL frozen list → nothing to validate against → both dropped.
-	if c, ip := progressParams(RunKindIssue, nil, strptr("m1"), strptr("m2")); c != nil || ip != nil {
+	if c, ip := progressParams(runkind.Issue, nil, strptr("m1"), strptr("m2")); c != nil || ip != nil {
 		t.Fatalf("NULL frozen must drop both, got completed=%q in_progress=%q", c, ip)
 	}
 
 	// A valid subset encodes; completed and in_progress independently.
-	c, ip := progressParams(RunKindIssue, frozen, strptr("m1", "m3"), strptr("m2"))
+	c, ip := progressParams(runkind.Issue, frozen, strptr("m1", "m3"), strptr("m2"))
 	if string(c) != `["m1","m3"]` {
 		t.Fatalf("completed = %q, want [\"m1\",\"m3\"]", c)
 	}
@@ -110,7 +111,7 @@ func TestProgressParams(t *testing.T) {
 	}
 
 	// nil pointer → nil output (not reported), leaving the other set intact.
-	c, ip = progressParams(RunKindIssue, frozen, nil, strptr("m1"))
+	c, ip = progressParams(runkind.Issue, frozen, nil, strptr("m1"))
 	if c != nil {
 		t.Fatalf("absent completed must be nil, got %q", c)
 	}
@@ -119,7 +120,7 @@ func TestProgressParams(t *testing.T) {
 	}
 
 	// An empty (reported) set encodes to `[]` — distinct from nil (not reported).
-	if c, _ := progressParams(RunKindIssue, frozen, strptr(), nil); string(c) != "[]" {
+	if c, _ := progressParams(runkind.Issue, frozen, strptr(), nil); string(c) != "[]" {
 		t.Fatalf("empty completed must encode to [], got %q", c)
 	}
 
@@ -142,7 +143,7 @@ func TestProgressParams(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Put the bad set on completed, a valid one on in_progress, and assert only
 			// completed dropped.
-			c, ip := progressParams(RunKindIssue, frozen, tc.set, strptr("m2"))
+			c, ip := progressParams(runkind.Issue, frozen, tc.set, strptr("m2"))
 			if c != nil {
 				t.Fatalf("bad completed must drop to nil, got %q", c)
 			}
@@ -156,7 +157,7 @@ func TestProgressParams(t *testing.T) {
 // SetState `running` must pass the validated progress params through to the SQL, and a
 // non-member id must never reach the store.
 func TestSetStateRunningPassesProgressParams(t *testing.T) {
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	fs.runOwned.MilestonesFrozen = frozenThree()
 
 	if _, applied, err := svc.SetState(context.Background(), wkr, runID, StateRequest{
@@ -174,7 +175,7 @@ func TestSetStateRunningPassesProgressParams(t *testing.T) {
 	}
 
 	// A non-member completed id is dropped to NULL; the report still applies.
-	fs2, svc2, wkr2, runID2 := milestonesRunFixture(t, RunKindIssue)
+	fs2, svc2, wkr2, runID2 := milestonesRunFixture(t, runkind.Issue)
 	fs2.runOwned.MilestonesFrozen = frozenThree()
 	if _, applied, err := svc2.SetState(context.Background(), wkr2, runID2, StateRequest{
 		State:               "running",
@@ -190,7 +191,7 @@ func TestSetStateRunningPassesProgressParams(t *testing.T) {
 // SetState `running` must always supply the budget-scaling config (harmless on a
 // heartbeat, COALESCE-guarded in SQL).
 func TestSetStateRunningPassesBudgetConfig(t *testing.T) {
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	if _, _, err := svc.SetState(context.Background(), wkr, runID, StateRequest{State: "running"}); err != nil {
 		t.Fatalf("SetState: %v", err)
 	}
@@ -215,7 +216,7 @@ func milestonesRunFixture(t *testing.T, kind string) (*fakeStore, *Service, stor
 // awaiting_approval carries the CANDIDATE list, stored exactly; the frozen column is
 // not touched on this path.
 func TestSetStateAwaitingApprovalPersistsCandidate(t *testing.T) {
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	ms := twoMilestones()
 
 	if _, applied, err := svc.SetState(context.Background(), wkr, runID,
@@ -233,7 +234,7 @@ func TestSetStateAwaitingApprovalPersistsCandidate(t *testing.T) {
 
 // An empty (reported) candidate survives as `[]`, distinct from NULL (never reported).
 func TestSetStateAwaitingApprovalEmptyCandidateIsEmptyArray(t *testing.T) {
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	empty := []Milestone{}
 	if _, _, err := svc.SetState(context.Background(), wkr, runID,
 		StateRequest{State: "awaiting_approval", Milestones: &empty}); err != nil {
@@ -253,7 +254,7 @@ func TestSetStateAwaitingApprovalEmptyCandidateIsEmptyArray(t *testing.T) {
 // feeds it the right param.
 func TestSetStateCompletedReconcilesMilestones(t *testing.T) {
 	// A valid subset of the frozen list reaches SetRunCompleted verbatim.
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	fs.runOwned.MilestonesFrozen = frozenThree()
 	fs.setCompletedRows = 1
 	if _, applied, err := svc.SetState(context.Background(), wkr, runID, StateRequest{
@@ -268,7 +269,7 @@ func TestSetStateCompletedReconcilesMilestones(t *testing.T) {
 	}
 
 	// A non-member id drops the WHOLE set to NULL (the column stays untouched by the SQL).
-	fs2, svc2, wkr2, runID2 := milestonesRunFixture(t, RunKindIssue)
+	fs2, svc2, wkr2, runID2 := milestonesRunFixture(t, runkind.Issue)
 	fs2.runOwned.MilestonesFrozen = frozenThree()
 	fs2.setCompletedRows = 1
 	if _, applied, err := svc2.SetState(context.Background(), wkr2, runID2, StateRequest{
@@ -283,7 +284,7 @@ func TestSetStateCompletedReconcilesMilestones(t *testing.T) {
 	}
 
 	// Additive-absent: a completion that declares nothing carries a nil param.
-	fs3, svc3, wkr3, runID3 := milestonesRunFixture(t, RunKindIssue)
+	fs3, svc3, wkr3, runID3 := milestonesRunFixture(t, runkind.Issue)
 	fs3.runOwned.MilestonesFrozen = frozenThree()
 	fs3.setCompletedRows = 1
 	if _, applied, err := svc3.SetState(context.Background(), wkr3, runID3, StateRequest{
@@ -296,7 +297,7 @@ func TestSetStateCompletedReconcilesMilestones(t *testing.T) {
 	}
 
 	// A non-issue run's declaration is dropped (kind gate): a ci_fix has no frozen list.
-	fs4, svc4, wkr4, runID4 := milestonesRunFixture(t, RunKindCIFix)
+	fs4, svc4, wkr4, runID4 := milestonesRunFixture(t, runkind.CIFix)
 	fs4.setCompletedRows = 1
 	if _, applied, err := svc4.SetState(context.Background(), wkr4, runID4, StateRequest{
 		State: "completed", MilestonesCompleted: strptr("m1"),
@@ -310,7 +311,7 @@ func TestSetStateCompletedReconcilesMilestones(t *testing.T) {
 
 // The autopilot `running` report carries the FROZEN list.
 func TestSetStateRunningPersistsFrozenMilestones(t *testing.T) {
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	ms := twoMilestones()
 
 	if _, applied, err := svc.SetState(context.Background(), wkr, runID,
@@ -345,7 +346,7 @@ func TestSetStateDropsInvalidMilestones(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run("awaiting_approval/"+tc.name, func(t *testing.T) {
-			fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+			fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 			ms := tc.ms
 			_, applied, err := svc.SetState(context.Background(), wkr, runID,
 				StateRequest{State: "awaiting_approval", Milestones: &ms})
@@ -357,7 +358,7 @@ func TestSetStateDropsInvalidMilestones(t *testing.T) {
 			}
 		})
 		t.Run("running/"+tc.name, func(t *testing.T) {
-			fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+			fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 			ms := tc.ms
 			_, applied, err := svc.SetState(context.Background(), wkr, runID,
 				StateRequest{State: "running", Milestones: &ms})
@@ -374,7 +375,7 @@ func TestSetStateDropsInvalidMilestones(t *testing.T) {
 // Decision 13: only an issue run may carry milestones. A list from any other kind is
 // dropped (NULL), never persisted, on BOTH write paths.
 func TestSetStateDropsMilestonesFromNonIssueKind(t *testing.T) {
-	for _, kind := range []string{RunKindCIFix, RunKindSelfImprove} {
+	for _, kind := range []string{runkind.CIFix, runkind.SelfImprove} {
 		t.Run("running/"+kind, func(t *testing.T) {
 			fs, svc, wkr, runID := milestonesRunFixture(t, kind)
 			ms := twoMilestones()
@@ -403,7 +404,7 @@ func TestSetStateDropsMilestonesFromNonIssueKind(t *testing.T) {
 // Back-compat: a report that says nothing about milestones sends a NULL param on
 // both write paths — the columns are untouched, exactly as a pre-feature run.
 func TestSetStateBackCompatNoMilestones(t *testing.T) {
-	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
 	if _, _, err := svc.SetState(context.Background(), wkr, runID, StateRequest{State: "running", IterationCount: 2}); err != nil {
 		t.Fatalf("SetState running: %v", err)
 	}
@@ -433,7 +434,7 @@ func TestClaimServesFrozenMilestones(t *testing.T) {
 	t.Run("frozen list is served", func(t *testing.T) {
 		frozen := []byte(`[{"id":"m1","title":"First"},{"id":"m2","title":"Second"}]`)
 		fs := &fakeStore{
-			claimRun: store.Run{ID: uuid.New(), Kind: RunKindIssue, Status: "claimed",
+			claimRun: store.Run{ID: uuid.New(), Kind: runkind.Issue, Status: "claimed",
 				IssueIid: pgtype.Int8{Int64: 5, Valid: true}, MilestonesFrozen: frozen},
 			claimCtx: claimCtx, anthropic: sealedTok,
 		}
@@ -452,7 +453,7 @@ func TestClaimServesFrozenMilestones(t *testing.T) {
 
 	t.Run("no frozen list omits the key", func(t *testing.T) {
 		fs := &fakeStore{
-			claimRun: store.Run{ID: uuid.New(), Kind: RunKindIssue, Status: "claimed",
+			claimRun: store.Run{ID: uuid.New(), Kind: runkind.Issue, Status: "claimed",
 				IssueIid: pgtype.Int8{Int64: 6, Valid: true}},
 			claimCtx: claimCtx, anthropic: sealedTok,
 		}
@@ -472,7 +473,7 @@ func TestClaimServesFrozenMilestones(t *testing.T) {
 	// persisted columns, falling back to the global default when NULL.
 	t.Run("scaled budget served from the persisted columns", func(t *testing.T) {
 		fs := &fakeStore{
-			claimRun: store.Run{ID: uuid.New(), Kind: RunKindIssue, Status: "claimed",
+			claimRun: store.Run{ID: uuid.New(), Kind: runkind.Issue, Status: "claimed",
 				IssueIid:            pgtype.Int8{Int64: 7, Valid: true},
 				BudgetMaxIterations: pgtype.Int4{Int32: 35, Valid: true},
 				BudgetWallSeconds:   pgtype.Int4{Int32: 28800, Valid: true}},
@@ -491,7 +492,7 @@ func TestClaimServesFrozenMilestones(t *testing.T) {
 	// GLOBAL default — byte-for-byte today.
 	t.Run("null budget serves the global default", func(t *testing.T) {
 		fs := &fakeStore{
-			claimRun: store.Run{ID: uuid.New(), Kind: RunKindIssue, Status: "claimed",
+			claimRun: store.Run{ID: uuid.New(), Kind: runkind.Issue, Status: "claimed",
 				IssueIid: pgtype.Int8{Int64: 8, Valid: true}},
 			claimCtx: claimCtx, anthropic: sealedTok,
 		}

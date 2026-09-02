@@ -10,11 +10,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// runKindChat is the runs.kind of a chat run. Held as a local literal so slacksvc
-// stays free of a workersvc import (the same reason the gate/answer submits route
-// through the adapter in main); it matches workersvc.RunKindChat.
-const runKindChat = "chat"
-
 // Chat-turn sentinels (PRD #191 M2). The adapter in main translates the workersvc
 // turn-cap / terminal sentinels into these so the replier can say which happened
 // without importing workersvc — the same pattern ErrReviseCapReached follows.

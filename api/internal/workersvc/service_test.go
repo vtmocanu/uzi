@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -930,7 +931,7 @@ func (f *fakeStore) CreateJudgeRun(_ context.Context, arg store.CreateJudgeRunPa
 	if f.createJudgeRunErr != nil {
 		return store.Run{}, f.createJudgeRunErr
 	}
-	return store.Run{ID: uuid.New(), Kind: RunKindJudge, UserID: arg.UserID, TargetRunID: arg.TargetRunID}, nil
+	return store.Run{ID: uuid.New(), Kind: runkind.Judge, UserID: arg.UserID, TargetRunID: arg.TargetRunID}, nil
 }
 func (f *fakeStore) GetActiveJudgeRunForWorkerTarget(context.Context, store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error) {
 	return f.activeJudgeRun, f.activeJudgeRunErr
@@ -2265,7 +2266,7 @@ func TestAppendMessagesFoldsResultUsagePerModel(t *testing.T) {
 // run and MUST fold (only chat is excluded).
 func TestAppendMessagesFoldsErrorResultUsage(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: RunKindCIFix, SessionID: pgconv.TextOrNull("sess-err")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: runkind.CIFix, SessionID: pgconv.TextOrNull("sess-err")}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{{Seq: 1, Kind: "error", Agent: "lead", Payload: json.RawMessage(`{
@@ -2496,7 +2497,7 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 // usage — the fold must skip them entirely, keeping chat spend out of run_usage.
 func TestAppendMessagesFoldSkipsChatRuns(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: RunKindChat, SessionID: pgconv.TextOrNull("sess-chat")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: runkind.Chat, SessionID: pgconv.TextOrNull("sess-chat")}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(
@@ -2614,7 +2615,7 @@ func TestSetStateRejectsUnknownState(t *testing.T) {
 func TestSetStateAwaitingFollowupAcceptsInteractiveTask(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned:        store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true},
+		runOwned:        store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running", Kind: runkind.Task, Interactive: true},
 		setFollowupRows: 1,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -2637,7 +2638,7 @@ func TestSetStateAwaitingFollowupAcceptsInteractiveTask(t *testing.T) {
 // clamp is proven by the LiveDB tests; here we prove the SERVICE hands the value across.
 func TestSetStateAwaitingFollowupThreadsOpenFollowupID(t *testing.T) {
 	w := worker()
-	owned := store.Run{WorkerID: pgconv.UUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true}
+	owned := store.Run{WorkerID: pgconv.UUID(w.ID), Status: "running", Kind: runkind.Task, Interactive: true}
 
 	t.Run("present value threads as Valid", func(t *testing.T) {
 		owned.ID = uuid.New()
@@ -2676,16 +2677,16 @@ func TestSetStateAwaitingFollowupThreadsOpenFollowupID(t *testing.T) {
 }
 
 // Each fixture flips exactly ONE of the two guard conditions, so a test that dropped
-// either half of `kind == RunKindTask && interactive` would let one of these through;
+// either half of `kind == runkind.Task && interactive` would let one of these through;
 // a run holding both would satisfy the guard and could not observe the guard at all.
 // The setFollowup==nil assertion is what makes each case non-vacuous: it proves the
 // rejection happened BEFORE the park query, not that the query merely returned 0 rows.
 func TestSetStateAwaitingFollowupRejectsNonInteractiveOrNonTask(t *testing.T) {
 	w := worker()
 	cases := map[string]store.Run{
-		"task but not interactive":   {Kind: RunKindTask, Interactive: false},
-		"interactive but not a task": {Kind: RunKindIssue, Interactive: true},
-		"neither":                    {Kind: RunKindIssue, Interactive: false},
+		"task but not interactive":   {Kind: runkind.Task, Interactive: false},
+		"interactive but not a task": {Kind: runkind.Issue, Interactive: true},
+		"neither":                    {Kind: runkind.Issue, Interactive: false},
 	}
 	for name, r := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -3319,7 +3320,7 @@ func TestSubmitInputStopEnqueuesOnParkedRun(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgconv.UUID(wkrID)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: runkind.Task, Interactive: true, Status: "awaiting_followup", WorkerID: pgconv.UUID(wkrID)},
 		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -3357,7 +3358,7 @@ func TestSubmitInputStopEnqueuesEvenWithoutLivePoller(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgconv.UUID(wkrID)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: runkind.Task, Interactive: true, Status: "awaiting_followup", WorkerID: pgconv.UUID(wkrID)},
 		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed.Add(-2 * time.Minute))},
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -3399,7 +3400,7 @@ func TestSubmitInputStopForeignUserRejected(t *testing.T) {
 func TestSubmitInputStopRejectsTerminalRun(t *testing.T) {
 	user := uuid.New()
 	runID := uuid.New()
-	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Kind: RunKindTask, Status: "completed"}}
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Kind: runkind.Task, Status: "completed"}}
 	svc := New(fs, newBox(t), testParams())
 
 	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrRunTerminal {
@@ -3416,7 +3417,7 @@ func TestSubmitInputStopRejectsTerminalRun(t *testing.T) {
 // stamp a permanent, spurious stop_kind='stopped' and return a misleading success while
 // nothing winds the run down.
 //
-// MUTATION PROOF: remove the `run.Kind != RunKindTask || !run.Interactive` guard and this
+// MUTATION PROOF: remove the `run.Kind != runkind.Task || !run.Interactive` guard and this
 // run's stop is accepted — err becomes nil and fs.createdStopVerdict is stamped 'stopped'.
 func TestSubmitInputStopRejectsNonInteractiveTask(t *testing.T) {
 	user := uuid.New()
@@ -3425,7 +3426,7 @@ func TestSubmitInputStopRejectsNonInteractiveTask(t *testing.T) {
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
 		// A task run, but NOT interactive — no park reads the stop flag.
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: false, Status: "running", WorkerID: pgconv.UUID(wkrID)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: runkind.Task, Interactive: false, Status: "running", WorkerID: pgconv.UUID(wkrID)},
 		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -3442,7 +3443,7 @@ func TestSubmitInputStopRejectsNonInteractiveTask(t *testing.T) {
 // TestSubmitInputStopRejectsNonTaskRun: the same guard rejects a stop on a non-task run
 // (here an interactive-flagged chat run — kind is what fails). Nothing is stamped.
 //
-// MUTATION PROOF: remove the guard's `run.Kind != RunKindTask` conjunct and this stop is
+// MUTATION PROOF: remove the guard's `run.Kind != runkind.Task` conjunct and this stop is
 // accepted and stamped.
 func TestSubmitInputStopRejectsNonTaskRun(t *testing.T) {
 	user := uuid.New()
@@ -3450,7 +3451,7 @@ func TestSubmitInputStopRejectsNonTaskRun(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindChat, Interactive: true, Status: "running", WorkerID: pgconv.UUID(wkrID)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: runkind.Chat, Interactive: true, Status: "running", WorkerID: pgconv.UUID(wkrID)},
 		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -3476,7 +3477,7 @@ func TestSubmitInputStopAcceptsRunningInteractiveTask(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "running", WorkerID: pgconv.UUID(wkrID)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: runkind.Task, Interactive: true, Status: "running", WorkerID: pgconv.UUID(wkrID)},
 		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgconv.Time(fixed)},
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -3523,7 +3524,7 @@ func TestSubmitInputFollowUpAlwaysEnqueues(t *testing.T) {
 func TestSubmitInputChatFollowUpRejected(t *testing.T) {
 	user := uuid.New()
 	runID := uuid.New()
-	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "running", Kind: RunKindChat}}
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "running", Kind: runkind.Chat}}
 	svc := New(fs, newBox(t), testParams())
 
 	_, err := svc.SubmitInput(context.Background(), user, runID, "follow_up", "keep going", nil)
@@ -3540,7 +3541,7 @@ func TestSubmitInputChatFollowUpRejected(t *testing.T) {
 func TestSubmitInputFollowUpIssueRunEnqueues(t *testing.T) {
 	user := uuid.New()
 	runID := uuid.New()
-	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "running", Kind: RunKindIssue}}
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "running", Kind: runkind.Issue}}
 	svc := New(fs, newBox(t), testParams())
 
 	if _, err := svc.SubmitInput(context.Background(), user, runID, "follow_up", "use pgx", nil); err != nil {
@@ -3556,7 +3557,7 @@ func TestSubmitInputFollowUpIssueRunEnqueues(t *testing.T) {
 func TestSubmitInputChatCancelAllowed(t *testing.T) {
 	user := uuid.New()
 	runID := uuid.New()
-	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "queued", Kind: RunKindChat}}
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "queued", Kind: runkind.Chat}}
 	svc := New(fs, newBox(t), testParams())
 
 	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil)
@@ -4499,7 +4500,7 @@ func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
 	owner, consoleID := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		claimRun: store.Run{
-			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			ID: uuid.New(), Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
 		anthropic: sealedDefault,
@@ -4574,7 +4575,7 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 	judgeID, workerBoundID := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		claimRun: store.Run{
-			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			ID: uuid.New(), Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
 		anthropic:   sealedDefault,
@@ -4626,7 +4627,7 @@ func TestJudgeClaimUnboundUsesDefault(t *testing.T) {
 	owner := uuid.New()
 	fs := &fakeStore{
 		claimRun: store.Run{
-			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			ID: uuid.New(), Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
 		anthropic:   sealedDefault,
@@ -4667,7 +4668,7 @@ func TestJudgeBindingLookupErrorFailsClaim(t *testing.T) {
 	sealedDefault, _ := box.Seal([]byte("anthropic-DEFAULT-lookuperr-abcdef12"))
 	fs := &fakeStore{
 		claimRun: store.Run{
-			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			ID: uuid.New(), Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: uuid.New(),
 		},
 		anthropic:      sealedDefault,
@@ -4692,7 +4693,7 @@ func TestJudgeBoundToVanishedSecretFailsClosed(t *testing.T) {
 	owner := uuid.New()
 	fs := &fakeStore{
 		claimRun: store.Run{
-			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			ID: uuid.New(), Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
 		anthropic:   sealedDefault,
@@ -4729,7 +4730,7 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 	judgeID, workerID := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		claimRun: store.Run{
-			ID: uuid.New(), UserID: owner, Kind: RunKindSelfImprove, Status: "claimed",
+			ID: uuid.New(), UserID: owner, Kind: runkind.SelfImprove, Status: "claimed",
 			IssueIid: pgtype.Int8{Int64: 1, Valid: true}, IssueTitle: "improve uzi", IssueDescription: "d",
 		},
 		claimCtx: store.GetRunClaimContextRow{

@@ -53,7 +53,7 @@ type Input struct {
 	ReviewDate time.Time
 
 	// The judged run, for the Context section + the deep link.
-	RunKind   string // "issue" | "ci_fix"
+	RunKind   string // runs.kind of the judged run — only "issue" and "ci_fix" are judge-eligible (runkind.JudgeEligible)
 	RunStatus string
 	RepoPath  string // path_with_namespace of the judged run's repo (forge-controlled)
 	IssueIID  int64  // 0 when the run has no issue iid

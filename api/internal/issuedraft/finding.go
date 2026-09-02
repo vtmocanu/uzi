@@ -17,7 +17,7 @@ type FindingDraftInput struct {
 
 	RepoPath   string // path_with_namespace of the finding's repo (forge-controlled)
 	RunShortID string // short id of the run that reported the finding (server-derived)
-	RunKind    string // "issue" | "ci_fix" | "prompt" | "self_improve"
+	RunKind    string // runs.kind of the run that reported the finding (provenance), e.g. issue, ci_fix, prompt, self_improve
 	IssueIID   int64  // 0 when the reporting run has no issue iid
 }
 

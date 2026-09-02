@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -323,7 +324,7 @@ func TestAutoStopComparisonSetAcceptsAChatNeighbour(t *testing.T) {
 	// The tracker is kind-blind by construction, so this pins the property rather
 	// than a filter that would have to be maintained.
 	f := newAutoStopFixture(t)
-	f.fs.runs[f.peer] = store.Run{ID: f.peer, Kind: RunKindChat, Status: "running"}
+	f.fs.runs[f.peer] = store.Run{ID: f.peer, Kind: runkind.Chat, Status: "running"}
 	if n := f.sweep(t); n != 1 {
 		t.Fatalf("stopped = %d, want 1: a succeeding CHAT neighbour is a valid comparison set", n)
 	}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -42,7 +43,7 @@ func (s *chatStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDFor
 	return store.Run{}, pgx.ErrNoRows
 }
 func (s *chatStore) CreateChatRun(_ context.Context, arg store.CreateChatRunParams) (store.Run, error) {
-	return store.Run{ID: uuid.New(), UserID: arg.UserID, Kind: workersvc.RunKindChat, Status: "queued", IssueTitle: arg.IssueTitle}, nil
+	return store.Run{ID: uuid.New(), UserID: arg.UserID, Kind: runkind.Chat, Status: "queued", IssueTitle: arg.IssueTitle}, nil
 }
 func (s *chatStore) CountChatFollowUps(context.Context, uuid.UUID) (int64, error) {
 	return s.followUps, nil
@@ -85,7 +86,7 @@ func (s *chatStore) MarkProposalDismissed(_ context.Context, id uuid.UUID) (stor
 	return store.IssueProposal{}, nil
 }
 func (s *chatStore) CreateChatContinueRun(_ context.Context, arg store.CreateChatContinueRunParams) (store.Run, error) {
-	return store.Run{ID: uuid.New(), UserID: arg.UserID, Kind: workersvc.RunKindChat, Status: "queued"}, nil
+	return store.Run{ID: uuid.New(), UserID: arg.UserID, Kind: runkind.Chat, Status: "queued"}, nil
 }
 func (s *chatStore) ListChatRunsForUser(_ context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error) {
 	if userID != s.ownerID {
@@ -178,7 +179,7 @@ func TestCreateChatRequiresAuthAndMessage(t *testing.T) {
 func TestPostChatMessageOwnerOnly(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindChat, Status: "running"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Chat, Status: "running"}}
 	h := newChatHandler(st)
 
 	// Owner posts a turn → 202.
@@ -199,7 +200,7 @@ func TestPostChatMessageOwnerOnly(t *testing.T) {
 func TestPostChatMessageTurnCapConflict(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindChat, Status: "running"}, followUps: 50}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Chat, Status: "running"}, followUps: 50}
 	h := newChatHandler(st)
 
 	rec := httptest.NewRecorder()
@@ -212,7 +213,7 @@ func TestPostChatMessageTurnCapConflict(t *testing.T) {
 func TestPostChatMessageTerminalConflict(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindChat, Status: "completed"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Chat, Status: "completed"}}
 	h := newChatHandler(st)
 
 	rec := httptest.NewRecorder()
@@ -230,7 +231,7 @@ func TestContinueChatIsRateLimited(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
 	// A terminal source so ContinueChat proceeds to mint a run (201) rather than 409.
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindChat, Status: "completed"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Chat, Status: "completed"}}
 	h := newChatHandler(st)
 
 	lim := mw.NewLimiter(1, time.Minute, nil)
@@ -257,7 +258,7 @@ func TestContinueChatIsRateLimited(t *testing.T) {
 func TestDismissProposalOwnerOnlyNeverForge(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID, propID := uuid.New(), uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindChat, Status: "running"}, propID: propID}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Chat, Status: "running"}, propID: propID}
 	h := newChatHandler(st)
 
 	// Owner dismiss → 204, and the status-only flip ran (no forge — DismissProposal
@@ -291,7 +292,7 @@ func TestCancelChatRunOwnerCancels(t *testing.T) {
 	runID := uuid.New()
 	// Queued → hasLivePoller is false without a worker lookup, so cancel applies
 	// server-side (CancelRunServerSide), the observable we assert on.
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "queued"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Issue, Status: "queued"}}
 	h := newChatHandler(st)
 
 	rec := httptest.NewRecorder()
@@ -310,7 +311,7 @@ func TestCancelChatRunOwnerCancels(t *testing.T) {
 func TestCancelChatRunForeignRun(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "queued"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Issue, Status: "queued"}}
 	h := newChatHandler(st)
 
 	// A different, valid UUID the fake store does not own → GetRunByIDForUser 0 rows.
@@ -329,7 +330,7 @@ func TestCancelChatRunForeignRun(t *testing.T) {
 func TestCancelChatRunTerminalRun(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "completed"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Issue, Status: "completed"}}
 	h := newChatHandler(st)
 
 	rec := httptest.NewRecorder()
@@ -371,7 +372,7 @@ func TestCancelChatRunBadRequestAndAuth(t *testing.T) {
 func TestSteerChatRunOwnerSteers(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "running"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Issue, Status: "running"}}
 	h := newChatHandler(st)
 
 	rec := httptest.NewRecorder()
@@ -393,7 +394,7 @@ func TestSteerChatRunOwnerSteers(t *testing.T) {
 func TestSteerChatRunChatTarget(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindChat, Status: "running"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Chat, Status: "running"}}
 	h := newChatHandler(st)
 
 	rec := httptest.NewRecorder()
@@ -415,7 +416,7 @@ func TestSteerChatRunChatTarget(t *testing.T) {
 func TestSteerChatRunForeignRun(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "running"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Issue, Status: "running"}}
 	h := newChatHandler(st)
 
 	foreign := uuid.New()
@@ -434,7 +435,7 @@ func TestSteerChatRunForeignRun(t *testing.T) {
 func TestSteerChatRunTerminalRun(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "completed"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Issue, Status: "completed"}}
 	h := newChatHandler(st)
 
 	rec := httptest.NewRecorder()
@@ -453,7 +454,7 @@ func TestSteerChatRunTerminalRun(t *testing.T) {
 func TestSteerChatRunBadRequestAndAuth(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "running"}}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Issue, Status: "running"}}
 	h := newChatHandler(st)
 
 	// Blank message → 400, before any SubmitInput call.

@@ -16,6 +16,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -71,7 +72,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// cap, so reject it here — at the service boundary, before any row is written, so
 	// the guard covers HTTP/CLI/future Slack. Only follow_up is blocked: cancel (which
 	// EndChat rides), reject_plan, approve_plan and answer stay legal on a chat run.
-	if run.Kind == RunKindChat && kind == "follow_up" {
+	if run.Kind == runkind.Chat && kind == "follow_up" {
 		return SubmitInputResult{}, ErrChatInputNotAllowed
 	}
 	if sel != nil && kind != "approve_plan" {
@@ -136,7 +137,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// bound; len(completed) the current floor (already-done milestones can never be un-done).
 	frozen, _ := DecodeMilestones(run.MilestonesFrozen)
 	completed, _ := DecodeMilestoneIDs(run.MilestonesCompleted)
-	milestoneIssueRun := run.Kind == RunKindIssue && len(frozen) > 0
+	milestoneIssueRun := run.Kind == runkind.Issue && len(frozen) > 0
 
 	// A `scope` directive (PRD #634 M2) bounds how many of the run's frozen milestones it may
 	// complete. It writes runs.scope_ceiling (the control the worker honors on its ACK) plus a
@@ -197,7 +198,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		// only — a RUNNING interactive task (not yet parked) is still a legal stop target.
 		// The owner-scope (GetRun→404) and terminal (ErrRunTerminal→409) guards above run
 		// first and are unchanged.
-		if run.Kind != RunKindTask || !run.Interactive {
+		if run.Kind != runkind.Task || !run.Interactive {
 			return SubmitInputResult{}, ErrStopNotInteractive
 		}
 		cleanBody, _ := stripNUL(body)

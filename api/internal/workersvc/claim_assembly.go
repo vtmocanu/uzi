@@ -15,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
@@ -28,7 +29,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
 	// repos → forge_connections and would treat a repo-less judge run as vanished)
 	// and before the bot-PAT open. Its claim carries only the Anthropic token.
-	if run.Kind == RunKindJudge {
+	if run.Kind == runkind.Judge {
 		return s.assembleJudgeClaim(ctx, run)
 	}
 
@@ -208,7 +209,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		issueIID = &v
 	}
 	var pipeline *ClaimPipeline
-	if run.Kind == RunKindCIFix {
+	if run.Kind == runkind.CIFix {
 		pipeline = claimPipelineFromSnapshot(run.FailureSnapshot)
 	}
 
@@ -217,7 +218,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// pipeline_ref, so source the claim's Branch from pipeline_ref there. The
 	// worker still reads it off the already-wired Branch field; no new wire field.
 	branch := run.Branch
-	if run.Kind == RunKindMRRework {
+	if run.Kind == runkind.MRRework {
 		branch = run.PipelineRef
 	}
 
@@ -439,7 +440,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// issue #297: a self_improve run carries the in-flight avoid-set so the picker skips
 	// a recommendation whose fix another active run is already doing. Best-effort and
 	// self_improve-only; every other kind's claim stays byte-identical to today's.
-	if run.Kind == RunKindSelfImprove {
+	if run.Kind == runkind.SelfImprove {
 		payload.InflightTargets = s.inflightTargets(ctx, run)
 		// PRD #686 M10 (D11/D12): the repo's currently-OPEN self-improve MRs' "what was
 		// proposed" text, so the picker chooses a non-overlapping improvement. Best-effort

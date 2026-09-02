@@ -13,12 +13,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// RunKindMRRework is the runs.kind for an MR review-watcher rework run (PRD #700 M3),
-// mirroring the runs_kind_check domain. It is the sibling of RunKindCIFix: a
-// poller-detected, fully-automatic run that folds review-comment fixes onto an
-// existing agent MR branch.
-const RunKindMRRework = "mr_rework"
-
 // ErrActiveMRReworkExists is returned when an mr_rework run already exists for the MR
 // (backed by the uq_runs_one_active_mr_rework partial index on (repo_id, mr_iid)).
 // The detector swallows it and retries next tick; a handler would map it to 409.

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -140,7 +141,7 @@ func TestRegisterEnqueuesJudgeForOrphanFailedRuns(t *testing.T) {
 	orphan := uuid.New()
 	fs := &fakeStore{
 		orphanFailedRuns: []uuid.UUID{orphan},
-		runByIDPlain:     store.Run{ID: orphan, UserID: uuid.New(), Kind: RunKindIssue, Status: "failed"},
+		runByIDPlain:     store.Run{ID: orphan, UserID: uuid.New(), Kind: runkind.Issue, Status: "failed"},
 		userByID:         store.User{JudgeEnabled: true},
 		anthropic:        []byte("sealed"),
 		registerResult:   store.Worker{ID: uuid.New(), Status: "online"},
@@ -173,7 +174,7 @@ func eligibleFixture(t *testing.T) (*fakeStore, *Service, store.Run) {
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
-	run := store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: RunKindIssue, Status: "completed", IssueTitle: "Do X"}
+	run := store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Issue, Status: "completed", IssueTitle: "Do X"}
 	return fs, svc, run
 }
 
@@ -202,9 +203,9 @@ func TestEnqueueJudgeGatesBlock(t *testing.T) {
 		{"no anthropic token", func(fs *fakeStore, svc *Service, run *store.Run) { fs.anthropicErr = pgx.ErrNoRows }},
 		{"cancelled status", func(fs *fakeStore, svc *Service, run *store.Run) { run.Status = "cancelled" }},
 		{"non-terminal status", func(fs *fakeStore, svc *Service, run *store.Run) { run.Status = "running" }},
-		{"chat kind (not eligible)", func(fs *fakeStore, svc *Service, run *store.Run) { run.Kind = RunKindChat }},
-		{"judge kind (no recursion)", func(fs *fakeStore, svc *Service, run *store.Run) { run.Kind = RunKindJudge }},
-		{"self_improve kind (no recursion)", func(fs *fakeStore, svc *Service, run *store.Run) { run.Kind = RunKindSelfImprove }},
+		{"chat kind (not eligible)", func(fs *fakeStore, svc *Service, run *store.Run) { run.Kind = runkind.Chat }},
+		{"judge kind (no recursion)", func(fs *fakeStore, svc *Service, run *store.Run) { run.Kind = runkind.Judge }},
+		{"self_improve kind (no recursion)", func(fs *fakeStore, svc *Service, run *store.Run) { run.Kind = runkind.SelfImprove }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -254,7 +255,7 @@ func TestEnqueueJudgeEnforceAllBypassesOptIn(t *testing.T) {
 
 func TestEnqueueJudgeCiFixIsEligible(t *testing.T) {
 	fs, svc, run := eligibleFixture(t)
-	run.Kind = RunKindCIFix
+	run.Kind = runkind.CIFix
 	run.Status = "failed" // a failed ci_fix is worth judging
 	svc.maybeEnqueueJudge(context.Background(), run)
 	if fs.createdJudgeRun == nil {
@@ -312,8 +313,8 @@ func TestJudgeTraceRejectsWhenNoActiveJudgeRun(t *testing.T) {
 func TestJudgeTraceRejectsOwnerMismatch(t *testing.T) {
 	target := uuid.New()
 	fs := &fakeStore{
-		activeJudgeRun: store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: RunKindJudge}, // judge owner A
-		runByIDPlain:   store.Run{ID: target, UserID: uuid.New()},                         // target owner B (mismatch)
+		activeJudgeRun: store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Judge}, // judge owner A
+		runByIDPlain:   store.Run{ID: target, UserID: uuid.New()},                          // target owner B (mismatch)
 	}
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.JudgeTrace(context.Background(), worker(), target, 0, 0); err != ErrRunNotFound {
@@ -324,8 +325,8 @@ func TestJudgeTraceRejectsOwnerMismatch(t *testing.T) {
 func TestJudgeTraceHappyPath(t *testing.T) {
 	owner, target := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		activeJudgeRun: store.Run{ID: uuid.New(), UserID: owner, Kind: RunKindJudge},
-		runByIDPlain:   store.Run{ID: target, UserID: owner, Kind: RunKindIssue, Status: "completed"},
+		activeJudgeRun: store.Run{ID: uuid.New(), UserID: owner, Kind: runkind.Judge},
+		runByIDPlain:   store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "completed"},
 	}
 	svc := New(fs, newBox(t), testParams())
 	res, err := svc.JudgeTrace(context.Background(), worker(), target, 0, 0)
@@ -341,8 +342,8 @@ func TestPostReviewPersistsVerdictAndRecs(t *testing.T) {
 	owner, target := uuid.New(), uuid.New()
 	judgeID := uuid.New()
 	fs := &fakeStore{
-		activeJudgeRun: store.Run{ID: judgeID, UserID: owner, Kind: RunKindJudge},
-		runByIDPlain:   store.Run{ID: target, UserID: owner, Kind: RunKindIssue, Status: "completed"},
+		activeJudgeRun: store.Run{ID: judgeID, UserID: owner, Kind: runkind.Judge},
+		runByIDPlain:   store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "completed"},
 	}
 	svc := New(fs, newBox(t), testParams())
 	res, err := svc.PostReview(context.Background(), worker(), target, ReviewSubmission{
@@ -379,8 +380,8 @@ func TestPostReviewPersistsVerdictAndRecs(t *testing.T) {
 func TestSubmitInputRejectServerSideEnqueuesJudge(t *testing.T) {
 	user, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},          // GetRun + no worker ⇒ no live poller
-		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: RunKindIssue}, // post-reject reload
+		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},           // GetRun + no worker ⇒ no live poller
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: runkind.Issue}, // post-reject reload
 		userByID:     store.User{JudgeEnabled: true},
 		anthropic:    []byte("sealed"),
 	}
@@ -422,8 +423,8 @@ func TestSubmitInputRejectServerSidePersistsReason(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			user, runID := uuid.New(), uuid.New()
 			fs := &fakeStore{
-				runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},          // GetRun + no worker ⇒ no live poller
-				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: RunKindIssue}, // post-reject reload
+				runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},           // GetRun + no worker ⇒ no live poller
+				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: runkind.Issue}, // post-reject reload
 				userByID:     store.User{JudgeEnabled: true},
 				anthropic:    []byte("sealed"),
 			}
@@ -453,7 +454,7 @@ func TestSubmitInputCancelServerSideDoesNotEnqueueJudge(t *testing.T) {
 	user, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		runByID:      store.Run{ID: runID, UserID: user, Status: "queued"},
-		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: RunKindIssue},
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: runkind.Issue},
 		userByID:     store.User{JudgeEnabled: true},
 		anthropic:    []byte("sealed"),
 	}
@@ -491,7 +492,7 @@ func TestSubmitInputCancelServerSidePersistsStopReason(t *testing.T) {
 			user, runID := uuid.New(), uuid.New()
 			fs := &fakeStore{
 				runByID:      store.Run{ID: runID, UserID: user, Status: "queued"}, // GetRun + no worker ⇒ no live poller
-				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: RunKindIssue},
+				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: runkind.Issue},
 			}
 			svc := New(fs, newBox(t), testParams())
 
@@ -522,7 +523,7 @@ func TestSubmitInputCancelServerSideCapsStopReason(t *testing.T) {
 	user, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		runByID:      store.Run{ID: runID, UserID: user, Status: "queued"}, // GetRun + no worker ⇒ no live poller
-		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: RunKindIssue},
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: runkind.Issue},
 	}
 	svc := New(fs, newBox(t), testParams())
 
@@ -551,8 +552,8 @@ func TestSubmitInputCancelServerSideCapsStopReason(t *testing.T) {
 func TestSubmitInputRejectServerSideCapsReason(t *testing.T) {
 	user, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},          // GetRun + no worker ⇒ no live poller
-		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: RunKindIssue}, // post-reject reload
+		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},           // GetRun + no worker ⇒ no live poller
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: runkind.Issue}, // post-reject reload
 		userByID:     store.User{JudgeEnabled: true},
 		anthropic:    []byte("sealed"),
 	}

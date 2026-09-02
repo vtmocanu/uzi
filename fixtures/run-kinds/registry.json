@@ -1,0 +1,4 @@
+{
+  "kinds": ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework"],
+  "judge_eligible": ["issue", "ci_fix"]
+}

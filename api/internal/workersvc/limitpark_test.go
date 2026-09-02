@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -434,7 +435,7 @@ func TestDecideLimitParkNeverLeaksWorkerText(t *testing.T) {
 // sets the reset it means; every case that does not gets no cross-check and no pool
 // contribution, which is the "each fixture breaks exactly one thing" property.
 func autoselectrowCandidate(id uuid.UUID, headroom int, syncedAt time.Time) autoselect.Candidate {
-	five := int16(100 - headroom)
+	five := int16(100 - headroom) //nolint:gosec // G115: headroom is a small test-fixture percentage (0-100), so 100-headroom always fits int16.
 	seven := int16(0)
 	return autoselect.Candidate{
 		SecretID: id, Label: "tok", AutoEligible: true, HasReading: true,
@@ -952,7 +953,7 @@ func TestPollerCreatedRunsInheritTheOwnerWaitOnLimitDefault(t *testing.T) {
 	optedIn := store.User{ID: owner, WaitOnLimit: true}
 
 	t.Run("ci_fix", func(t *testing.T) {
-		fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: RunKindCIFix}, userByID: optedIn}
+		fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: runkind.CIFix}, userByID: optedIn}
 		svc := New(fs, newBox(t), testParams())
 		if _, err := svc.CreateCIFixRun(context.Background(), owner, uuid.New(), "main", "t", "d", sampleSnapshot(), nil); err != nil {
 			t.Fatalf("CreateCIFixRun: %v", err)

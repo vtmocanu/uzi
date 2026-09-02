@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/settings"
@@ -1960,7 +1961,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// rather than silently persisted. A legitimate park always satisfies both guards
 		// (the interactive opt-in is immutable from create, PRD #517 M1), so this never
 		// rejects a real one.
-		if owned.Kind != RunKindTask || !owned.Interactive {
+		if owned.Kind != runkind.Task || !owned.Interactive {
 			return store.Run{}, false, fmt.Errorf("%w: awaiting_followup requires an interactive task run", ErrInvalidState)
 		}
 		rows, err = s.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
@@ -2694,7 +2695,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// unsupported publish we skip (best-effort) rather than fault. Deriving the
 	// branch from the int-typed iid — exactly the worker's agent/issue-<iid> naming —
 	// also means no worker-controlled string ever flows into the refspec.
-	if owned.Kind != RunKindIssue || !owned.IssueIid.Valid {
+	if owned.Kind != runkind.Issue || !owned.IssueIid.Valid {
 		return PublishResult{Published: false, Ref: "", Skipped: "unsupported"}, nil
 	}
 	branch := agentIssueBranch(owned.IssueIid.Int64)

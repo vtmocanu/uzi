@@ -25,6 +25,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/hub"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -630,7 +631,7 @@ func TestListRunMessagesGzip(t *testing.T) {
 	}
 	newReq := func(acceptGzip bool) *http.Request {
 		req := httptest.NewRequest(http.MethodGet, "/api/runs/"+runID.String()+"/messages", nil)
-		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
 		if acceptGzip {
 			req.Header.Set("Accept-Encoding", "gzip")
 		}
@@ -856,7 +857,7 @@ func TestCreateRunInputRevisePlanCap(t *testing.T) {
 func TestCreateRunInputChatFollowUp409(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
-	st := &runsStore{ownerID: owner.ID, run: store.Run{ID: runID, UserID: owner.ID, Status: "running", Kind: workersvc.RunKindChat}}
+	st := &runsStore{ownerID: owner.ID, run: store.Run{ID: runID, UserID: owner.ID, Status: "running", Kind: runkind.Chat}}
 	h := newRunsHandler(t, st)
 
 	rec := httptest.NewRecorder()

@@ -20,7 +20,7 @@ import (
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
 	RunID string `json:"run_id"`
-	// Kind is the run kind (issue|ci_fix, PRD #6). The worker branches on it: an
+	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`
 	// IssueIID is the worked issue for an issue run, null for a ci_fix run (which

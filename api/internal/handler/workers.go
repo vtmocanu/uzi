@@ -20,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -320,10 +321,11 @@ func int32PtrValue(valid bool, v int32) *int32 {
 // display-only predicate meaningful only while status=="running" (issue #321). A run
 // is planning iff it is a planning-capable kind (chat/judge never plan), is running,
 // has not yet entered the implement loop (iteration_count 0), and has no persisted
-// plan yet (plan_md empty). The kind set matches ListRunsForUser's NOT IN
-// ('chat','judge') filter, so issue/ci_fix/self_improve are planning-capable.
+// plan yet (plan_md empty). Planning-capability delegates to runkind.Listed, which is
+// pinned to ListRunsForUser's NOT IN ('chat','judge') filter by runkind_sql_test.go,
+// so issue/ci_fix/self_improve are planning-capable.
 func isPlanningPhase(kind, status string, iterationCount int32, planMdPresent bool) bool {
-	if kind == "chat" || kind == "judge" {
+	if !runkind.Listed(kind) {
 		return false
 	}
 	return status == "running" && iterationCount == 0 && !planMdPresent
@@ -1185,7 +1187,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	// in-flight review/fix child) or belongs to a task that opened an MR. Owner-scoped query.
 	// FAIL-CLOSED: on a lookup error leave BranchHasActiveRun=true so rm refuses rather than
 	// deletes a branch under uncertainty.
-	if run.Kind == "task" && run.Branch.Valid && run.Branch.String != "" {
+	if run.Kind == runkind.Task && run.Branch.Valid && run.Branch.String != "" {
 		if stats, err := h.q.TaskBranchRmStats(r.Context(), store.TaskBranchRmStatsParams{
 			UserID: run.UserID,
 			Branch: run.Branch,

@@ -17,6 +17,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -778,7 +779,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if len(list) > 0 {
 				if run, err := c.GetRun(cmd.Context(), args[0]); err == nil {
 					status = run.Status
-					if run.Kind == "chat" {
+					if run.Kind == runkind.Chat {
 						// N3: a chat run's queue is every chat turn. Note it only when it
 						// actually applies, so an issue run's output stays clean.
 						_, _ = fmt.Fprintln(env.Stderr, "note: chat run — this queue lists every chat turn as a follow-up (chat has its own web composer, unaffected)")
