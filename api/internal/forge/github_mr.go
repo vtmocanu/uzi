@@ -18,7 +18,11 @@ func (g *github) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (M
 	if err != nil {
 		return MergeRequest{}, err
 	}
-	pr, _, err := g.client.PullRequests.Get(ctx, slug.owner, slug.repo, int(mrIID))
+	num, err := ghNum(mrIID)
+	if err != nil {
+		return MergeRequest{}, g.wrapErr("get merge request", err)
+	}
+	pr, _, err := g.client.PullRequests.Get(ctx, slug.owner, slug.repo, num)
 	if err != nil {
 		return MergeRequest{}, g.wrapErr("get merge request", err)
 	}
@@ -73,7 +77,10 @@ func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 	if err != nil {
 		return nil, err
 	}
-	number := int(mrIID)
+	number, err := ghNum(mrIID)
+	if err != nil {
+		return nil, g.wrapErr("list merge request comments", err)
+	}
 
 	var out []MRComment
 
@@ -410,11 +417,15 @@ func (g *github) ReplyMergeRequestComment(ctx context.Context, projectID, mrIID 
 	if err != nil {
 		return err
 	}
+	num, err := ghNum(mrIID)
+	if err != nil {
+		return g.wrapErr("reply merge request comment", err)
+	}
 	commentID, err := strconv.ParseInt(strings.TrimSpace(replyID), 10, 64)
 	if err != nil {
 		return fmt.Errorf("github: reply merge request comment: invalid reply id %q", replyID)
 	}
-	if _, _, err := g.client.PullRequests.CreateCommentInReplyTo(ctx, slug.owner, slug.repo, int(mrIID), body, commentID); err != nil {
+	if _, _, err := g.client.PullRequests.CreateCommentInReplyTo(ctx, slug.owner, slug.repo, num, body, commentID); err != nil {
 		return g.wrapErr("reply merge request comment", err)
 	}
 	return nil
