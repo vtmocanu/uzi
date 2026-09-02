@@ -27,6 +27,7 @@ import type {
   StateRequest,
 } from "./protocol.js";
 import { resolveAgentSelection } from "./protocol.js";
+import { resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import {
   describeRepoAgentNote,
   detectRepoAgents,
@@ -51,7 +52,6 @@ import {
   flagGuardPaths,
   guardCriticalMrSection,
   runSelfImproveChecks,
-  selfImproveBranch,
   selfImproveMrSection,
   type CheckRunner,
 } from "./self-improve.js";
@@ -857,7 +857,7 @@ export class RunRunner {
     // already returned above, so reaching here on an issue run with a confirmed-empty diff
     // is the ambiguous "forgot to commit / should have set report_only" case — a
     // committed-nothing issue run must not open an empty MR.
-    if ((claim.kind ?? "issue") === "issue") {
+    if (resolveRunKind(claim.kind) === "issue") {
       const changedForGuard = await this.git.changedFiles(barePath, trackingRef);
       // changedFiles returns null on diff-FAILURE (keep pushing — fail open) and [] on a
       // CONFIRMED-empty diff. report_only is the sanctioned zero-diff success — a declared
@@ -2164,7 +2164,7 @@ export class RunRunner {
 
     const ctx: RunContext = {
       runId,
-      kind: claim.kind ?? "issue",
+      kind: resolveRunKind(claim.kind),
       issueIid: claim.issue_iid,
       issueTitle: claim.issue_title,
       issueDescription: claim.issue_description,
@@ -2890,92 +2890,22 @@ export class RunRunner {
     // inherit a dead run's orphan ref. A requeue/resume keeps the same run_id, so a run
     // resuming its OWN parked work matches; every other run does not.
     const runId = claim.run_id;
-    if (claim.kind === "ci_fix" && claim.pipeline) {
-      const defaultBranch = claim.repo.default_branch?.trim();
-      const fixBranch =
-        defaultBranch && claim.pipeline.ref === defaultBranch
-          ? `ci-fix/pipeline-${claim.pipeline.id}`
-          : claim.pipeline.ref;
+    // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
+    // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
+    // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
+    // row that returns undefined — ci_fix with no pipeline, and the issue/chat/judge kinds
+    // that have no cloneBranch — falls through to the issue path below, byte-identically.
+    const cloneBranch = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].cloneBranch?.(
+      claim,
+      runId,
+    );
+    if (cloneBranch)
       return this.git.runnerCloneForBranch(
         barePath,
-        fixBranch,
-        fixBranch.replace(/\//g, "-"),
+        cloneBranch.branch,
+        cloneBranch.slug,
         runId,
       );
-    }
-    if (claim.kind === "self_improve") {
-      // A FRESH-PER-CYCLE branch (PRD #46 Decision 10, #686 M8): each cycle branches
-      // off current main and derives a distinct `uzi/self-improve/<runId>` name, so the
-      // worker's idempotent createMergeRequest opens a NEW merge request each cycle —
-      // no long-lived fixed branch accreting across cycles. This mirrors the prompt
-      // block below: the run_id makes the branch unique and collision-free, and it also
-      // seeds the tracking-ref ownership anchor, so a RESUMED cycle reuses its own
-      // branch while a new cycle gets its own.
-      const selfImproveBranchName = selfImproveBranch(runId);
-      return this.git.runnerCloneForBranch(
-        barePath,
-        selfImproveBranchName,
-        selfImproveBranchName.replace(/\//g, "-"),
-        runId,
-      );
-    }
-    if (claim.kind === "prompt") {
-      // An ad-hoc SCHEDULED prompt run (PRD #241 Decision 10) is repo-ful and
-      // ISSUE-LESS — the ci_fix shape, not self_improve (which carries a tracking
-      // issue, though both now derive a fresh-per-cycle branch from the run id). With
-      // no issue_iid there is no agent/issue-{iid} branch to key on, so derive a stable
-      // branch from the run id. Each fired prompt run is a distinct run, so
-      // `uzi/prompt-{runId}` is unique and collision-free — the worker's idempotent
-      // createMergeRequest opens exactly one MR for it. The run_id also seeds the
-      // tracking-ref ownership anchor above.
-      const promptBranch = `uzi/prompt-${runId}`;
-      return this.git.runnerCloneForBranch(
-        barePath,
-        promptBranch,
-        promptBranch.replace(/\//g, "-"),
-        runId,
-      );
-    }
-    if (claim.kind === "task") {
-      // PRD #400 M2: a handoff task works a PRE-SEEDED, server-named branch. The CLI
-      // (M3) created the run, received the server-assigned `uzi/task/<run-id>` name,
-      // and pushed the user's local HEAD to it with the user's own credentials BEFORE
-      // this claim — so `claim.branch` is authoritative and already exists on origin.
-      // runnerCloneForBranch seeds off `refs/remotes/origin/<branch>` when that ref
-      // exists, so the pre-seeded content is picked up automatically. A task MUST carry
-      // its branch (the destination is never worker-derived, unlike prompt above); a
-      // missing/empty branch is a create-time bug, so fail loudly rather than inventing
-      // a name that would push somewhere the user is not watching.
-      const taskBranch = claim.branch?.trim();
-      if (!taskBranch)
-        throw new Error("task run claim is missing its branch (uzi/task/<run-id>)");
-      return this.git.runnerCloneForBranch(
-        barePath,
-        taskBranch,
-        "task-" + claim.run_id,
-        runId,
-      );
-    }
-    if (claim.kind === "mr_rework") {
-      // PRD #700 / issue #778: an mr_rework run carries issue_iid = NULL and folds its
-      // work onto the MR's EXISTING branch rather than a worker-derived name. The server
-      // populates claim.branch from the run's pipeline_ref for this kind, so the MR branch
-      // (e.g. agent/issue-42) arrives here on claim.branch. runnerCloneForBranch seeds off
-      // `refs/remotes/origin/<branch>` when that branch already exists on origin — which it
-      // does for an MR under review — so the existing MR content is picked up automatically,
-      // the same mechanism the task case above relies on. A missing/empty branch is a
-      // create-time bug (an mr_rework run must carry its MR branch), so fail loudly rather
-      // than fall through to the issue path, which would throw on the NULL issue_iid.
-      const mrBranch = claim.branch?.trim();
-      if (!mrBranch)
-        throw new Error("mr_rework run claim is missing its MR branch (pipeline_ref)");
-      return this.git.runnerCloneForBranch(
-        barePath,
-        mrBranch,
-        mrBranch.replace(/\//g, "-"),
-        runId,
-      );
-    }
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
     return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
@@ -3427,22 +3357,13 @@ function mrTitle(
   const prefix = scopeCapped ? "[partial] " : "";
   const t = claim.issue_title?.trim();
   if (t) return prefix + t;
-  if (claim.kind === "ci_fix" && claim.pipeline)
-    return `Fix CI: pipeline #${claim.pipeline.id} on ${claim.pipeline.ref}`;
-  // An ad-hoc scheduled prompt run (PRD #241) has no issue, so it must never render
-  // `Resolve issue #null`. The scheduler sets issue_title from a derived title so
-  // the trimmed-title branch above almost always wins; this is the empty-title
-  // fallback.
-  if (claim.kind === "prompt") return "Scheduled prompt run";
-  // A handoff task (PRD #400) is ISSUE-LESS: its issue_title is derived from the
-  // inline context's first line, so the trimmed-title branch above almost always
-  // wins; this is the empty-context fallback, never `Resolve issue #null`.
-  if (claim.kind === "task") return "Handoff task";
-  // An mr_rework run (PRD #700 / issue #778) is ISSUE-LESS (issue_iid is NULL): its
-  // issue_title is derived from the reworked MR's title so the trimmed-title branch
-  // above almost always wins; this is the empty-title fallback, never `Resolve issue
-  // #null` on the off-nominal path where a new MR is created.
-  if (claim.kind === "mr_rework") return "MR rework";
+  // PRD #983 M4b: the per-kind empty-title fallbacks (ci_fix's pipeline line, prompt/
+  // task/mr_rework's fixed labels) live in RUN_KIND_PROFILES. A row's undefined — every
+  // issue-shaped kind, and ci_fix with no pipeline — takes the `Resolve issue #<iid>`
+  // fallback below, never `Resolve issue #null` for the issue-less kinds whose derived
+  // issue_title almost always won the trimmed branch above.
+  const kindTitle = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].mrTitle?.(claim);
+  if (kindTitle !== undefined) return kindTitle;
   return `${prefix}Resolve issue #${claim.issue_iid}`;
 }
 
@@ -3472,81 +3393,21 @@ function mrDescription(
             "reviewer — review this change accordingly.",
         ]
       : [];
-  if (claim.kind === "self_improve") {
-    // A self_improve MR references its tracking issue but does NOT `Closes` it — the
-    // issue is a stable container reused across cycles (PRD #46 Decision 10). The
-    // self-improvement section carries the guard-critical flag, the test evidence,
-    // and its own human-merge note.
-    return [
-      "Autonomous self-improvement change (PRD #46). Picks one top improvement per cycle.",
-      "",
-      `Tracking issue: #${claim.issue_iid}`,
-      ...repoMarker,
-      selfImproveSection ?? "",
-    ].join("\n");
-  }
-  if (claim.kind === "ci_fix" && claim.pipeline) {
-    return [
-      `Fixes the failed CI pipeline for \`${claim.pipeline.ref}\`.`,
-      "",
-      `Failing pipeline: ${claim.pipeline.web_url}`,
-      ...repoMarker,
-      "",
-      "---",
-      footer,
-    ].join("\n");
-  }
-  if (claim.kind === "prompt") {
-    // An ad-hoc scheduled prompt run (PRD #241 Decision 10) is ISSUE-LESS: it is
-    // created from a schedule's stored prompt against this repo, with no issue to
-    // reference or close. Modeled on the self_improve branch above (references the
-    // task, does NOT `Closes #…`), never the issue fallback below whose
-    // `Implements/Closes #${issue_iid}` would render `#null`. When the change touched
-    // a guard-critical path, promptGuardSection carries the flag (empty otherwise).
-    return [
-      "Ad-hoc scheduled prompt run (PRD #241 Decision 10). This run was created from a",
-      "schedule's stored prompt against this repository — there is no tracking issue, so",
-      "this MR references the task but closes nothing.",
-      ...repoMarker,
-      promptGuardSection ?? "",
-      "",
-      "---",
-      footer,
-    ].join("\n");
-  }
-  if (claim.kind === "task") {
-    // A handoff task (PRD #400) opens an MR only when the caller passed --mr
-    // (open_mr). Like the prompt/self_improve arms above it is ISSUE-LESS, so it
-    // references the task and `Closes` nothing — the issue fallback below would render
-    // `#null`. When present, base_branch names the source ref the task diverged from,
-    // for the reviewer's context.
-    const base = claim.base_branch?.trim();
-    return [
-      "Handoff task (PRD #400). This run worked inline context on the server-named",
-      `\`${branch}\` branch${base ? ` (branched from \`${base}\`)` : ""} and opened this merge request because it was created with \`--mr\`.`,
-      "There is no tracking issue, so this MR closes nothing.",
-      ...repoMarker,
-      "",
-      "---",
-      footer,
-    ].join("\n");
-  }
-  if (claim.kind === "mr_rework") {
-    // An mr_rework run (PRD #700 / issue #778) FOLDS review-comment fixes onto an MR's
-    // EXISTING branch; createMergeRequest is idempotent, so in the designed flow it
-    // adopts the already-open MR and this body is discarded. Like the prompt/task/
-    // self_improve arms above it is ISSUE-LESS (issue_iid is NULL), so it references the
-    // MR branch and `Closes` nothing — the issue fallback below would render `#null` on
-    // the off-nominal path where the branch exists but no open MR is found.
-    return [
-      "Automated MR rework (PRD #700). This run addressed review feedback on the existing",
-      `\`${branch}\` branch. There is no tracking issue, so this MR closes nothing.`,
-      ...repoMarker,
-      "",
-      "---",
-      footer,
-    ].join("\n");
-  }
+  // PRD #983 M4b: the per-kind MR bodies (self_improve's tracking-issue reference,
+  // ci_fix's pipeline body, prompt/task/mr_rework's issue-less bodies) live in
+  // RUN_KIND_PROFILES.mrBody, each returning its exact array-`.join("\n")` string from
+  // one explicit context bag. A row's undefined — ci_fix with no pipeline, and the
+  // issue/chat/judge kinds that carry no mrBody — falls through to the issue body below
+  // (the scopeCapped / gates / Closes arm), which stays here as the richest arm.
+  const kindBody = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].mrBody?.(claim, {
+    branch,
+    baseBranch: claim.base_branch?.trim(),
+    repoMarker,
+    footer,
+    selfImproveSection,
+    promptGuardSection,
+  });
+  if (kindBody !== undefined) return kindBody;
   // PRD #634 M3: a partial delivery from an operator scope directive does NOT close the
   // issue — it delivered only the approved slice of milestones — so the closing line is
   // replaced with a partial-delivery statement and a scope-note blockquote is inserted.

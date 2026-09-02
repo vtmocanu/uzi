@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 import { RUN_KINDS } from "../src/protocol.js";
+import { RUN_KIND_PROFILES } from "../src/run-kind.js";
 
 // RUN_KINDS in agent/src/protocol.ts is a hand-maintained mirror of the DB
 // `runs_kind_check` CHECK constraint (latest redefinition under
@@ -57,6 +58,16 @@ describe("RUN_KINDS matches the DB runs_kind_check constraint", () => {
     );
     return kinds;
   }
+
+  // PRD #983 M4b: RUN_KIND_PROFILES is a Record<RunKind, …> so its key domain is already
+  // exhaustive at typecheck; this is the runtime belt that its keys set-equal RUN_KINDS,
+  // so a hand-authored row can never silently miss (or over-supply) a kind.
+  it("RUN_KIND_PROFILES keys set-equal RUN_KINDS", () => {
+    assert.deepStrictEqual(
+      Object.keys(RUN_KIND_PROFILES).sort(),
+      [...RUN_KINDS].sort(),
+    );
+  });
 
   it("equals the live migration's runs_kind_check set, both directions", () => {
     const db = new Set<string>(dbRunKinds());
