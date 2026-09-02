@@ -21645,7 +21645,7 @@ surfaced a milestone-structured run's progress; the interactive TUI (`uzi tui`) 
 it. #379 adds it to both TUI surfaces and fixes an unrelated layout gap the work exposed.
 
 - **One shared fold, so three surfaces cannot disagree.** `milestoneProgress(run) → (done,
-  total, reported)` + `milestoneCount` in `api/cmd/uzi/tui_detail.go` are the TUI twin of the
+  total, reported)` + `milestoneCount` in `api/cmd/uzi/tui_detail_rail.go` are the TUI twin of the
   web's `milestoneBadge`. `done` counts frozen MEMBERS present in the completed set (immune to a
   duplicate id and to a completed id naming a milestone dropped after it was ticked). `reported`
   is `MilestonesCompleted != nil`: a nil completed slice (JSON `null`) means nothing was ever
