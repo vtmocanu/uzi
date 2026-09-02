@@ -2374,7 +2374,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // undefined — and `undefined !== null` is true, so every `pendingJudge !== null` guard
   // walks straight into `pendingJudge.state` and throws during render. There is no
   // ErrorBoundary in web/src, so that TypeError unmounts the whole app over a missing
-  // optional field. api/internal/uzicli/client.go handles the same skew on the CLI side.
+  // optional field. api/internal/uzicli/client_runs.go handles the same skew on the CLI side.
   it("treats an absent pending_judge as no pending judge rather than throwing (#119)", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: review() } as unknown as Awaited<
       ReturnType<typeof api.getRunReview>
