@@ -23695,3 +23695,15 @@ Serves human: "adding a CLI verb should not mean scrolling two thousand-line fil
 - **Doc sweep.** `forge/pagination.go`'s "Mirrors ...client.go's maxLogsMessages" and `cmd/uzi/instructions_test.go`'s `statusError` references stay true (both symbols stayed in `client.go`). The two `RunView` skew comments (post-#1007: `runView/JudgePanel.tsx:147` and `RunView.test.tsx:2377`) name `client.go` for `RunReview`'s `pending_judge` decode, which moved to `client_runs.go` — left as a maintainer/web follow-up, since a Go motion PRD must not touch `web/**`.
 
 Cross-refs: #921 (`workersvc`), #963 (`forgesvc/projectsync.go`) and #1009 (`cmd/uzi`) — the same-package file-motion recipe and its `go doc` completeness proof this follows.
+
+## 600. PRD #1021 — settings/settings.go domain file split: the schema to keys.go, one file per settings domain
+
+Serves human: "a 1958-line file holding a dozen unrelated settings domains should read as one file per domain." Pure same-package motion, no exported-API change, no behaviour change, no test edit; the recipe is #921 (`workersvc`) and #963 (`forgesvc/projectsync.go`). Richer rationale is PRD #1021's Decision Log (D1-D6).
+
+- **D1 — the schema is one file, not scattered per domain.** `keys.go` takes the key/default consts, `Defaults`, `SecretKeys`, `IsSecret`, `Known`; `Validate` stays with the `Cache` engine in `settings.go` because it is the one place every key is dispatched.
+- **D2 — domain files are named after the test files that already exist.** `settings_agent_source.go` beside `settings_agent_source_test.go`, and so on; ten `settings_<domain>.go` files, same package, same `settings_` prefix so `ls` groups them.
+- **D3 — bounds consts travel with their validator** (each has exactly one validator reader plus one accessor reader in its own domain), not left behind in the schema file.
+- **D4 — `validateModelAlias` goes to the judge file** (it validates only `judge_model`/`summary_model`); `validateBool`/`validateEnum` stay generic in `settings.go` because keys across five domains use them.
+- **Byte-identity is the proof.** `go doc -all ./internal/settings` is unchanged (906 lines, empty diff base↔head), every commit is `--color-moved` clean, and all `*_test.go` are untouched. Final shape: `settings.go` ≈464 lines (the `Cache` engine, `Validate`, the two generic validators, the three domainless accessors `DefaultTheme`/`GithubProjectSyncEnabled`/`CapabilityAwareScheduling`, and the `secret`/seal/storage helpers); `keys.go` ≈485; no `settings_<domain>.go` over 320 (the largest, `settings_agent_source.go`, is 300).
+
+Cross-refs: epic #915 (Batch 4, P17); #921 and #963 (the same-package pure-motion recipe this repeats).

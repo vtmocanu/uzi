@@ -117,8 +117,8 @@ closure over `cmd/uzi`).
 | `Board` | `cards` | `cards: Card[]` | `buildBoard` builds `make([]cardDTO, 0, …)` (`handler/board.go:580`) → always `[]` |
 | `Card` | `labels` | `labels: string[]` | `decodeLabels` returns non-nil `[]string{}` on nil (`handler/board.go:519`) |
 | `Card` | `assignee_ids` | `assignee_ids?: number[]` | `decodeAssigneeIDs` returns non-nil `[]int64{}` on nil (`handler/board.go:544`) |
-| `SettingsResponse` | `secrets` | `secrets: Record<string, boolean>` | `settings.AdminView` builds it with `make(...)` (`handler/settings.go:49` ← `settings/settings.go:1320-1322`) → never nil |
-| `SettingsResponse` | `sources` | `sources: Record<string, SettingSource>` | same `AdminView` `make(...)` (`settings/settings.go:1320-1322`) → never nil |
+| `SettingsResponse` | `secrets` | `secrets: Record<string, boolean>` | `settings.AdminView` builds it with `make(...)` (`handler/settings.go:49` ← `settings/settings.go:331-333`) → never nil |
+| `SettingsResponse` | `sources` | `sources: Record<string, SettingSource>` | same `AdminView` `make(...)` (`settings/settings.go:331-333`) → never nil |
 
 DTOs with **no** exemption (every nullable Go field is already typed `X | null` in TS):
 `Skill` (`user_id`, `updated_by`), `Chat` (`title`, `last_message_at`,
