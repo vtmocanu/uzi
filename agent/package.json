@@ -25,5 +25,9 @@
     "knip": "6.32.2",
     "oxlint": "1.80.0",
     "typescript": "^7.0.0"
+  },
+  "overrides": {
+    "fast-uri": "^3.1.7",
+    "qs": "^6.16.0"
   }
 }
