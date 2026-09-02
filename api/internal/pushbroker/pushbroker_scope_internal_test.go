@@ -68,3 +68,92 @@ func TestIsWorkflowScopeRejection(t *testing.T) {
 		t.Fatalf("a non-fast-forward error must classify as NFF only, not workflow-scope")
 	}
 }
+
+// TestIsCASDeleteRefusal pins the predicate that is the SOLE arbiter, on a real forge, of
+// a benign CAS-delete refusal (origin's checkpoint ref moved out from under the Old we
+// bound in the list→delete window → nil, no retry) versus a genuine transport/auth fault
+// (→ the wrapped error is surfaced). That wire branch is unreachable in the file:// test
+// harness (the go-git internal server does not enforce the wire CAS — casDelete's local
+// list-and-compare guard short-circuits first), so this unit test is the only coverage of
+// the classification production depends on. It lives in an internal test file (mirroring
+// TestIsWorkflowScopeRejection above) because the predicate is unexported.
+func TestIsCASDeleteRefusal(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error is not a refusal",
+			err:  nil,
+			want: false,
+		},
+		// Benign wire-CAS refusals: origin's ref moved past the Old we bound, surfacing as a
+		// lock-failure / non-fast-forward form (reused from isNonFastForward).
+		{
+			name: "cannot lock ref (mismatched Old) is benign",
+			err:  errors.New("cannot lock ref refs/uzi-checkpoints/agent/issue-7: is at abc123 but expected def456"),
+			want: true,
+		},
+		{
+			name: "non-fast-forward is benign",
+			err:  errors.New("non-fast-forward"),
+			want: true,
+		},
+		{
+			name: "failed to update ref is benign",
+			err:  errors.New("failed to update ref refs/uzi-checkpoints/agent/issue-7"),
+			want: true,
+		},
+		{
+			name: "fetch first is benign",
+			err:  errors.New("! [rejected] agent/issue-7 -> agent/issue-7 (fetch first)"),
+			want: true,
+		},
+		// Delete-of-missing forms: the ref is already absent, so the delete has nothing to do.
+		{
+			name: "does not exist is benign",
+			err:  errors.New("error: unable to delete 'refs/uzi-checkpoints/agent/issue-7': remote ref does not exist"),
+			want: true,
+		},
+		{
+			name: "no such ref is benign",
+			err:  errors.New("remote: no such ref refs/uzi-checkpoints/agent/issue-7"),
+			want: true,
+		},
+		// Genuine faults that MUST NOT be swallowed as benign — a real transport/auth failure
+		// has to return the wrapped error rather than silently classify as a benign refusal.
+		{
+			name: "authentication required is a genuine fault",
+			err:  errors.New("authentication required"),
+			want: false,
+		},
+		{
+			name: "403 forbidden is a genuine fault",
+			err:  errors.New("unexpected client error: unexpected requesting \"...\" status code: 403 forbidden"),
+			want: false,
+		},
+		{
+			name: "authorization failed is a genuine fault",
+			err:  errors.New("authorization failed"),
+			want: false,
+		},
+		{
+			name: "connection refused is a genuine fault",
+			err:  errors.New("dial tcp: connection refused"),
+			want: false,
+		},
+		{
+			name: "context deadline exceeded is a genuine fault",
+			err:  errors.New("context deadline exceeded"),
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCASDeleteRefusal(tc.err); got != tc.want {
+				t.Fatalf("isCASDeleteRefusal(%v) = %t, want %t", tc.err, got, tc.want)
+			}
+		})
+	}
+}

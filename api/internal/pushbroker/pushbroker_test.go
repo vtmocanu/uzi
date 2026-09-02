@@ -547,8 +547,11 @@ func TestDeleteAbsentRefOnFreshRemoteIsNil(t *testing.T) {
 // regression, written failing-first against the OLD unconditional delete: run A
 // published tip T, then a NEWER run B published a DIFFERENT tip B to the SAME
 // checkpoint ref. When run A later reaches terminal and cleans up, its CAS delete binds
-// Old to ITS persisted tip T; origin holds B, so the receive-pack compare-and-swap
-// refuses the delete — a benign nil — and B's checkpoint SURVIVES. Under the pre-fix
+// Old to ITS persisted tip T; origin holds B ≠ T, so casDelete's LOCAL list-and-compare
+// guard (current != expectedOld → nil) short-circuits and refuses the delete — a benign
+// nil — and B's checkpoint SURVIVES. That local guard is what THIS file:// test exercises;
+// the wire receive-pack compare-and-swap covers the same list→delete TOCTOU on a real
+// forge but is not reachable here (the go-git internal server does not enforce it). Under the pre-fix
 // behaviour (empty ExpectedOldTip → the unconditional list-then-`:ref` push) the delete
 // would have removed B's ref, clobbering run B's fresh checkpoint; that is precisely the
 // race the CAS closes.

@@ -925,7 +925,7 @@ func isNonFastForward(err error) bool {
 // "failed to update ref", "cannot lock ref", "fetch first" — a mismatched Old on a
 // delete surfaces as a "cannot lock ref … but expected …" lock failure), and ADDS the
 // delete-of-missing forms a ref-already-absent refusal can take across git versions and
-// services ("does not exist", "reference already exists", "no such ref").
+// services ("does not exist", "no such ref").
 func isCASDeleteRefusal(err error) bool {
 	if err == nil {
 		return false
@@ -935,7 +935,6 @@ func isCASDeleteRefusal(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "does not exist") ||
-		strings.Contains(msg, "reference already exists") ||
 		strings.Contains(msg, "no such ref")
 }
 
