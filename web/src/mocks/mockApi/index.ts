@@ -1114,7 +1114,6 @@ const repoToolProfiles = new Map<string, string[]>(
 );
 let toolEntryCounter = 0;
 
-// ── CLI tokens + browser-login requests (PRD #64 M6) ─────────────────────────
 // Template allocations (PRD #18 M7). Global defaults are seeded for every
 // builtin/global template (no empty-means-all cliff); the per-user overlay maps
 // a template id to a forced on/off decision.

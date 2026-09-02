@@ -3,6 +3,7 @@ import { ApiError } from "../../lib/apiError";
 import { MOCK_CLI_AUTH_REQUEST_ID, mockCliAuthRequest, mockCliTokens } from "../data";
 import { delay, requireSession } from "./shared";
 
+// ── CLI tokens + browser-login requests (PRD #64 M6) ─────────────────────────
 // Tokens are owner-attributed (user_id) so every read/write is scoped to the
 // session user, mirroring the real endpoints (`WHERE user_id=$1`). user_id is
 // mock-internal — stripped before responding, since the wire CliToken has none.
