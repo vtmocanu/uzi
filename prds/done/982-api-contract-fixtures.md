@@ -1,7 +1,7 @@
 # PRD #982: API contract fixtures — differential wire-shape tests for the hot DTOs
 
 **Issue**: #982 · **Epic**: #915 (Best practices & refactoring), finding **X2**, child **P16**
-**Status**: authored 2026-09-02 against `main` `e5fbda1`; every measurement below is at that commit
+**Status**: COMPLETE 2026-09-02 — M1–M5 landed on `agent/issue-982`; `Schedule.next_fires` type widening deliberately deferred to its own filed bug (widening surfaces two unguarded `next_fires[0]` render sites, a behaviour fix needing a regression test). Authored 2026-09-02 against `main` `e5fbda1`; every measurement below is at that commit
 **Route**: hand-driven (Auto mode, mr-rework off), deliberately **not** labeled `refactor`, so tonight's refactor sweep does not double-fire on it
 
 ## Problem
@@ -283,12 +283,20 @@ and matters here exactly as `fixtures/run-usage/README.md` explains: the fixture
     fetch changed and no mock fixture needed editing. The `cli_token` `check` block (its
     fixture is recorded from `AdminCLITokenDTO`) was retyped from `CliToken` to
     `AdminCliToken`, which is what removed its directive.
-- [ ] **M5 — doc-sync.** `ARCHITECTURE.md`'s DTO / apitypes paragraph gains one sentence
-  pointing at `fixtures/api-contract/`; `.claude/rules/web.md` and `.claude/rules/go.md`
-  each gain the rule "a DTO field change is a THREE-file edit — Go struct, fixture,
-  `apiTypes.ts` — and the fixture is the one you re-record from the Go test's
-  print-on-mismatch output"; `specs/ai.md` gets the decision; issue #915's X2 row and
-  Child PRDs list are updated by the maintainer at merge (not by the worker).
+- [x] **M5 — doc-sync.** Landed: `ARCHITECTURE.md`'s `apitypes` stdlib-only-leaf bullet
+  gained a follow-on sentence pointing at `fixtures/api-contract/` and naming the Go/TS
+  halves; `.claude/rules/web.md` and `.claude/rules/go.md` each gained the "a DTO field
+  change is a THREE-file edit — Go struct, fixture, `apiTypes.ts`" rule, with "never
+  hand-author the fixture, re-record from the Go test's print-on-mismatch output"; `go.md`'s
+  stale `-count=1` enumeration ("three such reads now, not one") was also corrected to
+  "four", folding in `fixtures/api-contract/`'s two Go readers (same-module doubly
+  load-bearing `-count=1`, like `internal/workersvc`'s) and the TS reader; `specs/ai.md`
+  gained the decision at §595 (header `# PRD #982 — API contract fixtures (epic #915, X2)`),
+  recording the mechanism, the recorded-from-Go-is-not-a-tautology rationale, the hot-set
+  scope, what M4 reconciled, and the deferred `Schedule.next_fires` exception. No code,
+  `docs/*.md`, or fixture files changed by this milestone — doc/rule/spec files only. Issue
+  #915's X2 row and Child PRDs list are left for the maintainer to update at merge, as
+  planned.
 
 ## Success criteria
 

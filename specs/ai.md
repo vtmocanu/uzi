@@ -23539,7 +23539,8 @@ the exemption table, what the contract cannot catch).
   skip** (measured: deleting `run.full.json` fails the Go test with a named error and fails TS at
   `tsc` — `Cannot find module`).
 - **Scope is the hot set only, not the whole surface.** `apitypes`' 102 exported structs plus the
-  unexported handler DTOs against 153 TS types in `apiTypes.ts` — the maintainer's 2026-09-01
+  unexported handler DTOs against 153 TS types in `apiTypes.ts` (both counts as measured at
+  authoring; M4 itself adds `AdminCliToken`, the 154th) — the maintainer's 2026-09-01
   decision was "the hot DTOs now, codegen spike optional later": `RunDTO`/`RunListItemDTO` (M1); the
   rest of the apitypes hot set — `Repo`, `RunMessage`, `Schedule`/`ScheduleInput` (a request body),
   `Worker`/`AdminWorker`, `User`, `Memory`, `SecretMeta`, `RunUsage`, `UserSettings`, `CatalogEntry`,
