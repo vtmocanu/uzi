@@ -766,6 +766,13 @@ EOF
 # gitconfig documents, and http.sslVerify=false because forge-fake's cert is self-signed
 # for forge-fake.e2e while we connect to 127.0.0.1 (no name match), so the host CLI's git
 # over https must not verify. env -i cannot pass an inline `-c`, hence the file.
+#
+# This file is NOT sufficient on its own: GIT_CONFIG_GLOBAL only replaces the GLOBAL scope,
+# so the runner's SYSTEM /etc/gitconfig is still read and its URL-scoped keys outrank this
+# file's unscoped http.sslVerify=false. Every host-side git call must therefore ALSO set
+# GIT_CONFIG_NOSYSTEM=1 to be hermetic (the uzi_cli() env below, and phase 70's own clone +
+# hgit helper). Relying on /etc/gitconfig being benign is the #995 "passes on a laptop,
+# fails in CI" trap — a dev laptop has no /etc/gitconfig, a CI runner does.
 cat > "$RUNROOT/host-gitconfig" <<EOF
 [safe]
 	directory = *
@@ -804,7 +811,15 @@ EOF
 # GIT_CONFIG_GLOBAL points the CLI's own client-side git (PRD #966 M5 `uzi handoff`
 # push/delete/remote-get-url) at the host-gitconfig above; harmless to the non-git CLI
 # phases (18/60/61/62), which never spawn git so git never consults it.
-uzi_cli() { env -i HOME="$RUNROOT" PATH="$PATH" UZI_URL="$BASE" UZI_TOKEN="$UZI_TOKEN_VAL" GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" UZI_SKILL_AUTO_UPGRADE=0 UZI_VERSION_CHECK=0 "$UZI_BIN" "$@"; }
+#
+# GIT_CONFIG_NOSYSTEM=1 makes those git children HERMETIC: `env -i` clears env vars but
+# NOT files, so without it `uzi handoff`'s git still reads the runner's /etc/gitconfig,
+# whose URL-scoped keys OUTRANK host-gitconfig's unscoped `http.sslVerify=false` (a
+# GIT_CONFIG_GLOBAL can never override a more-specific system key) — the exact "transport
+# misconfigured" clone/push failure #995 hit in CI, where an /etc/gitconfig exists that a
+# dev laptop lacks. This mirrors the worker's own git (agent/src/git.ts sets
+# GIT_CONFIG_NOSYSTEM=1); it is inert for the non-git CLI phases, same as GIT_CONFIG_GLOBAL.
+uzi_cli() { env -i HOME="$RUNROOT" PATH="$PATH" UZI_URL="$BASE" UZI_TOKEN="$UZI_TOKEN_VAL" GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" GIT_CONFIG_NOSYSTEM=1 UZI_SKILL_AUTO_UPGRADE=0 UZI_VERSION_CHECK=0 "$UZI_BIN" "$@"; }
 
 # hoisted from phase 37 (PRD #966 M1): used by multiple phases
 run_printed_instructions() {
