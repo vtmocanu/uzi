@@ -1,7 +1,7 @@
 # PRD #1017: uzicli client file splits — `client.go` and `fake.go` into per-domain files, one file per command tree
 
 **GitHub Issue**: [#1017](https://github.com/vtmocanu/uzi/issues/1017)
-**Status**: Planned (created 2026-09-02)
+**Status**: Done (created 2026-09-02; landed 2026-09-02)
 **Priority**: Medium
 **Parent**: epic #915 (Batch 4, the first PRD past the post-Batch-2 census). Same-package file moves, the recipe #921 (`workersvc`), #963 (`forgesvc/projectsync.go`) and #1009 (`cmd/uzi`) landed with. PRD #1009 D5 measured these two files and left them unscheduled ("different package, different proof surface"); this is that PRD. File-disjoint from #1007 (`web/src/pages/**`, `web/src/lib/apiTypes.ts`, `api/internal/uzicli/skill.go` — **same package, different file**, see Risks), #1008 (`api/internal/handler/**`) and #1009 (`api/cmd/uzi/**`): this PRD touches `api/internal/uzicli/client.go`, `api/internal/uzicli/fake.go`, the new files beside them, and `specs/ai.md` only.
 **Line refs**: at `68ea273` (main, 2026-09-02 14:40 Bucharest). Implementer re-derives at their base; anchors are identifiers, not offsets.
