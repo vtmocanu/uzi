@@ -7,8 +7,8 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  re-saves admin anthropic_token (sealed_with=dek, :52); vault lock/unlock cycles; stages a legacy master-sealed user_secrets row for user2 (:94, rewrapped to dek by :118); recreates api (:105)
+# restores: - (admin left unlocked; user2's row ends sealed_with=dek)
 # =============================================================================
 # PRD #32 — per-user vault (password-wrapped secrets). Proves: the seeded token is
 # DEK-sealed at boot; saving through the handler writes 'dek'; a locked owner's

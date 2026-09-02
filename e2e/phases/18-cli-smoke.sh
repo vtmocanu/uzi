@@ -5,7 +5,7 @@
 # lane:     gitlab
 # executor: any
 # requires: -
-# provides: UZI_BIN UZI_TOKEN_VAL
+# provides: UZI_BIN UZI_TOKEN_VAL RUN_CLI
 # handoff:  -
 # mutates:  -
 # restores: -

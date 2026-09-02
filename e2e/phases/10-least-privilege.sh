@@ -5,7 +5,7 @@
 # lane:     gitlab
 # executor: any
 # requires: -
-# provides: -
+# provides: FRESHJAR
 # handoff:  -
 # mutates:  -
 # restores: -

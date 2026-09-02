@@ -8,9 +8,14 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  uzi_label/autopilot_label (raced at :19-20, restored :31); registers user2 + forge connection CONN2 (:37,:40)
+# restores: uzi_label/autopilot_label->defaults (:31)
 # --- autopilot #4: carry-item e2e (settings race + username collision) -------
+# CROSS-PHASE DEPENDENCY (documented, deliberately NOT a `requires:`): the 409
+# collision below (:45-49) relies on 29-autopilot-lifecycle having mapped owner-alice.
+# That is DB state (a hardcoded literal 'owner-alice', not a round-tripped shell var),
+# so `requires:` — which only validates shell vars / env lines — cannot express it.
+# user2/JAR2/CONN2 are all set in-phase, so nothing here round-trips either.
 say "carry-item: concurrent cross-key settings PUT — the FOR UPDATE serialization rejects the equal-label race"
 # Two concurrent single-key PUTs that each pass the cache precheck but together would
 # land uzi_label == autopilot_label (PRD #764). Exactly one commits; the other is

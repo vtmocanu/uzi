@@ -4,7 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: IID MR_IID
+# requires: IID MR_IID RUN
 # provides: env:E2E_FORGE_POLL_INTERVAL=2s
 # handoff:  -
 # mutates:  api:E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2

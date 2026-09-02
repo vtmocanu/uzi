@@ -7,8 +7,8 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  forge connection human_username=owner-alice (:27, saved-with-warning); owner autopilot_enabled=true (:33); creates autopilot-labelled issues + unattended runs
+# restores: - (autopilot left enabled; the owner-alice mapping is RETAINED — 30-autopilot-carry-item's 409 collision test depends on it as DB state, not a var)
 # =============================================================================
 # PRD #19 — admin settings + autopilot. The poller is already at ~1s and the
 # reconcile cadence at every-2-ticks (both set with the MR-close phase's api

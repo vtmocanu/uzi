@@ -98,9 +98,15 @@ POH="$("${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid runner --regid runner 
   d=$(mktemp -d) || exit 3
   git init -q "$d/src" && git -C "$d/src" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m c || exit 3
   git -C "$d/src" config uploadpack.packObjectsHook "touch $d/FIRED" || exit 3
-  git clone -q --no-local "file://$d/src" "$d/dst" >/dev/null 2>&1 || true
-  if [ -e "$d/FIRED" ]; then echo FIRED; else echo IGNORED; fi
+  if git clone -q --no-local "file://$d/src" "$d/dst" >/dev/null 2>&1; then
+    if [ -e "$d/FIRED" ]; then echo FIRED; else echo IGNORED; fi
+  else
+    echo CLONE_FAILED
+  fi
   rm -rf "$d"' | tr -d '\r' || true)"
-[ "$POH" = IGNORED ] || fail "M6 E7: a runner repo-local uploadpack.packObjectsHook FIRED on the image git (protected-config gate regressed): '$POH'"
+# A clone FAILURE must not be accepted as a pass: the old `|| true` let an errored clone
+# fall through to the else-branch and print IGNORED, so a broken clone read as "hook ignored".
+# CLONE_FAILED is now distinct and fails hard — the boundary is only proven when the clone ran.
+[ "$POH" = IGNORED ] || fail "M6 E7: expected IGNORED (repo-local uploadpack.packObjectsHook ignored on the image git 2.54.0); got '$POH' (FIRED = protected-config gate regressed; CLONE_FAILED = the clone errored, so the boundary was never exercised)"
 pass "M6 E7: repo-local uploadpack.packObjectsHook ignored on the image git 2.54.0 (protected-config gate holds)"
 

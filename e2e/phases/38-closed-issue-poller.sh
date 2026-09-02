@@ -7,8 +7,8 @@
 # requires: F_REVIEW F_IID
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  closes forge issue #$F_IID on the fake (:145); leaves a RETAINED auto-Done disposition (done|issue_close) on install_worker_tool/jq — deliberately not cleaned up (:210), shifts global triage todo by 1
+# restores: - (issue left closed, disposition retained by design)
 # =============================================================================
 # PRD #98 M8b / B6' — the close→Done WIRING leg. THE POLLER ACTUALLY RUNS IT.
 # =============================================================================

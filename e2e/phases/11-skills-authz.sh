@@ -4,7 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: -
+# requires: FRESHJAR
 # provides: -
 # handoff:  -
 # mutates:  -

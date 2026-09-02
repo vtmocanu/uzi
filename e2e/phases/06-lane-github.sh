@@ -7,8 +7,8 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  forge_connections.forge_type gitlab->github (test DB, :41); $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (:50)+recreates api
+# restores: - (github-lane-only; runs instead of the gitlab suite, so the flip is never undone)
 # =============================================================================
 # PRD #238 M8 — the GitHub lane (UZI_E2E_FORGE=github). A FOCUSED lifecycle
 # against the same fake's /api/v3 table, run INSTEAD of the GitLab suite. Skipped

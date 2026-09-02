@@ -7,8 +7,8 @@
 # requires: -
 # provides: J_RUN
 # handoff:  -
-# mutates:  settings:judge_enabled=true
-# restores: -
+# mutates:  settings:judge_enabled=true,judge_model=haiku (:51); per-user judge opt-in PUT /api/me/judge enabled=true (:52)
+# restores: - (judge global + opt-in turned OFF by 39-review-row-cap :362-363, not in-phase — see the header note about the concurrency capacity math)
 # =============================================================================
 # PRD #46 — run judge + notifications inbox, end to end. UZI_E2E_EXECUTOR=stub
 # selects the STUB judge queryFn (judge-runner-stub.ts): the judge model call makes

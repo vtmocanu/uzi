@@ -4,7 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: -
+# requires: env:E2E_FORGE_POLL_INTERVAL=2s
 # provides: -
 # handoff:  -
 # mutates:  -

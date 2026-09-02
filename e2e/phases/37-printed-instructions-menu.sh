@@ -4,7 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: F_REVIEW
+# requires: F_REVIEW RUN_CLI J_RUN
 # provides: -
 # handoff:  -
 # mutates:  -

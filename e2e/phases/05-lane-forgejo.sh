@@ -7,8 +7,8 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  forge_connections.forge_type gitlab->forgejo (test DB, :30); +1 forgejo connection row via connect POST (:82); $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (:162)+recreates api; fake forgejo-version pinned 15.0.4
+# restores: fake forgejo-version->16.0.0 (explicit restores + EXIT-trap fail-safe)
 # PRD #65 M9 — the Forgejo lane (UZI_E2E_FORGE=forgejo). A FOCUSED lifecycle
 # against the same fake's /api/v1 table, run INSTEAD of the GitLab suite. Skipped
 # entirely when FORGE=gitlab, so the GitLab lane below is byte-identical.
@@ -85,6 +85,10 @@ GC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e",
 pass "forgejo connect POST created a connection against a good >=16 instance (VerifyToken + scope gate pass) ✓"
 # b) < 16.0.0 -> refused at VerifyToken's version gate (not created).
 fake_post /_e2e/forgejo-version '{"version":"15.0.4+gitea-1.22.0"}' >/dev/null
+# Fail-safe: a `fail` in this <16 leg (the connect POST at :90, or the version-finding
+# assert at :99) would otherwise strand the fake pinned at 15.0.4 for every later
+# forgejo-lane phase. Restore 16.0.0 on ANY exit; the explicit restore below clears it.
+trap 'fake_post /_e2e/forgejo-version '\''{"version":"16.0.0+gitea-1.22.0"}'\'' >/dev/null 2>&1 || true' EXIT
 FJLOW="$RUNROOT/fj-low.json"
 LC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-good-pat-000000"}' "$FJLOW")"
 case "$LC" in 2*) fail "forgejo connect against a <16 instance must be refused, got $LC ($(cat "$FJLOW"))";; esac
@@ -99,6 +103,7 @@ grep -qE "below the required Forgejo 16\.0\.0|Forgejo 16\.0\.0 or newer" "$FJLOW
   || fail "the <16 refusal must state the version-downgrade finding (required Forgejo 16.0.0), got $(cat "$FJLOW")"
 pass "forgejo connect POST refused against a < 16.0.0 instance, naming the required version (save-time gate) ✓"
 fake_post /_e2e/forgejo-version '{"version":"16.0.0+gitea-1.22.0"}' >/dev/null  # restore
+trap - EXIT  # explicit restore done; drop the fail-safe
 # c) over-privileged token -> 422 + violations (D6b save-time scope block).
 FJOVER="$RUNROOT/fj-over.json"
 OC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-overpriv-pat-0000"}' "$FJOVER")"
