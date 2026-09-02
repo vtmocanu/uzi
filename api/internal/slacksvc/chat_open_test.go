@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -24,7 +25,7 @@ func TestOpenChatCreatesRunAndAnchor(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	runID := uuid.New()
 	fs := &fakeReplierStore{user: user}
-	sub := &fakeSubmitter{createdChat: store.Run{ID: runID, Kind: runKindChat}} // liveChatOK defaults false
+	sub := &fakeSubmitter{createdChat: store.Run{ID: runID, Kind: runkind.Chat}} // liveChatOK defaults false
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
@@ -66,7 +67,7 @@ func TestOpenChatCreatesRunAndAnchor(t *testing.T) {
 func TestOpenChatNoWorkerNamesTheCause(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	fs := &fakeReplierStore{user: user}
-	sub := &fakeSubmitter{createdChat: store.Run{ID: uuid.New(), Kind: runKindChat}} // workerOnline defaults false
+	sub := &fakeSubmitter{createdChat: store.Run{ID: uuid.New(), Kind: runkind.Chat}} // workerOnline defaults false
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
@@ -83,7 +84,7 @@ func TestOpenChatNoWorkerNamesTheCause(t *testing.T) {
 func TestOpenChatAnchorFailureDoesNotAck(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	fs := &fakeReplierStore{user: user, chatAnchorErr: errors.New("db down")}
-	sub := &fakeSubmitter{createdChat: store.Run{ID: uuid.New(), Kind: runKindChat}}
+	sub := &fakeSubmitter{createdChat: store.Run{ID: uuid.New(), Kind: runkind.Chat}}
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
@@ -124,7 +125,7 @@ func TestOpenChatUnlinkedUserCreatesNothing(t *testing.T) {
 func TestOpenChatRefusesSecondWhileLive(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	fs := &fakeReplierStore{user: user}
-	sub := &fakeSubmitter{liveChat: store.Run{ID: uuid.New(), Kind: runKindChat}, liveChatOK: true}
+	sub := &fakeSubmitter{liveChat: store.Run{ID: uuid.New(), Kind: runkind.Chat}, liveChatOK: true}
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
@@ -168,7 +169,7 @@ func TestChatThreadReplySubmitsTurnNotFollowUp(t *testing.T) {
 		user:   user,
 		anchor: store.SlackRunMessage{RunID: runID, ChannelID: "D1", RootTs: "root1"},
 	}
-	sub := &fakeSubmitter{run: store.Run{ID: runID, UserID: user.ID, Kind: runKindChat, Status: "running"}}
+	sub := &fakeSubmitter{run: store.Run{ID: runID, UserID: user.ID, Kind: runkind.Chat, Status: "running"}}
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
@@ -198,7 +199,7 @@ func TestChatThreadReplyTurnCapReached(t *testing.T) {
 		anchor: store.SlackRunMessage{RunID: runID, ChannelID: "D1", RootTs: "root1"},
 	}
 	sub := &fakeSubmitter{
-		run:         store.Run{ID: runID, UserID: user.ID, Kind: runKindChat, Status: "running"},
+		run:         store.Run{ID: runID, UserID: user.ID, Kind: runkind.Chat, Status: "running"},
 		chatTurnErr: ErrChatTurnCapReached,
 	}
 	fp := &fakePoster{}

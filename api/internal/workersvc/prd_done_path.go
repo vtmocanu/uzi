@@ -6,6 +6,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/prdpath"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -36,7 +37,7 @@ func clampWirePRDDonePath(run store.Run, p *string) pgtype.Text {
 	// wrong write: it runs against uzi's own repo, which HAS a prds/ directory, and
 	// its issue is a stable container reused across cycles whose description is the
 	// accumulated improve_uzi backlog. A `ci_fix` run carries no issue at all.
-	if run.Kind != "issue" {
+	if run.Kind != runkind.Issue {
 		slog.Warn("dropping declared PRD path: not an issue run",
 			"run_id", run.ID, "kind", run.Kind, "declared", *p)
 		return pgtype.Text{}

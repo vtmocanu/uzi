@@ -23499,9 +23499,57 @@ here; issue #804 and the query/provisioner code comments carry the richer ration
 Cross-refs: PRD #754 pool-only auto lane + `pool_wait` (§581); PRD #111 D2 opt-in / reserved-console-key
 protection and D7's removed fallback (§581); migration 00087's `auto_eligible` CHECK.
 
+## 595. PRD #983 — a single run-kind registry: one Go source of truth for `runs.kind`, every side pinned to the migrations/fixture rather than to each other
+
+Serves human: the eight `runs.kind` values and their cross-side properties (which kinds the
+judge reviews, which appear on the general Runs list) had drifting per-package copies across
+api/web/agent; consolidate them so a new kind is added in one place and every mirror is
+drift-guarded by a test. Terse contract here; PRD #983's Decision Log carries the fuller rationale.
+
+- **`api/internal/runkind` is the single Go source of truth.** A leaf package (stdlib only, no
+  `internal/` imports, so any consumer depends on it without a cycle) exporting the eight kinds
+  in DB `runs_kind_check` order — `issue, ci_fix, chat, judge, self_improve, prompt, task,
+  mr_rework` — plus `All()`, `JudgeEligible` (the judge allowlist `{issue, ci_fix}`, moved here
+  from workersvc), and `Listed` (all but `chat`/`judge`, mirroring runtime.sql's `kind NOT IN
+  ('chat','judge')` filter — the repo-less meta-runs).
+- **Constants are UNTYPED strings, not a `type Kind string` (Decision D1).** A drop-in
+  replacement for the bare string literals and per-package `RunKind*` constants the rest of api/
+  compared against, so every existing comparison compiles unchanged with no conversions. There is
+  deliberately no `Valid()`: nothing in api/ validates a kind today (create paths assign SQL
+  literals, no handler takes a kind from the wire), so a validator would be deadcode and adding a
+  call site would be a new behaviour (a rejection path); it arrives with its first real caller.
+- **Every side pins to the migrations/fixture, never Go↔TS directly (D2).** Three drift guards:
+  `runkind_migration_test.go` reads the live highest-numbered kind-touching migration
+  (`00167_run_mr_rework_kind.sql`) and fails if the constants/`All()` diverge from the CHECK set
+  in order or membership — this is the link between Go and the DB (D4), the SQL predicates
+  themselves are left untouched; `runkind_sql_test.go` pins runtime.sql's four `kind NOT IN (...)`
+  query blocks to `Listed()`; `runkind_fixture_test.go` pins `All()` + the `JudgeEligible` list
+  to the hand-authored `fixtures/run-kinds/registry.json`.
+- **The cross-side fixture carries ONLY cross-side properties (D3).** `fixtures/run-kinds/
+  registry.json` holds just `kinds` (the ordered list) and `judge_eligible` — the two facts the
+  web must agree on. `web/src/lib/runKind.ts` (new) exports the `RUN_KINDS` union + `RunKind`
+  type, `runKindLabel`, and `isJudgeEligible`, with `web/src/lib/runKindContract.test.ts` pinning
+  them to that same fixture (production web cannot read the repo-root fixture at runtime, so the
+  values are hard-coded and the contract test is the pin). This retired the unpinned
+  `JUDGE_ELIGIBLE_KINDS` copy (now zero web references).
+- **Kind-specific BEHAVIOUR stays as typed-constant branches; only pure per-kind PROPERTIES
+  enter the registry (D6).** The registry records facts (is it judged, is it listed), not logic.
+- **Agent side: `agent/src/run-kind.ts` (new, M4b).** `resolveRunKind` folds the "missing kind
+  ⇒ issue" default from its four former call sites into one function (the api's NOT-NULL column is
+  the authoritative gate; the worker default only has to agree). `RUN_KIND_PROFILES:
+  Record<RunKind, RunKindProfile>` collapses runner.ts's per-kind if-chains (clone-branch, MR
+  title, MR body) into one exhaustiveness-checked table — a new kind fails to compile without a
+  row. Every field is optional; an absent field falls through to the issue arm, which is
+  deliberately never moved into a row so the issue behaviour stays the single richest
+  fall-through (Decision D8). Values are lifted verbatim — a behaviour-preserving refactor.
+
+Cross-refs: judge allowlist origin PRD #46; `mr_rework` kind §580 (PRD #700); prompt kind PRD
+#241; task kind PRD #400; the DB source of truth is `runs_kind_check` (latest redefinition
+migration `00167_run_mr_rework_kind.sql`).
+
 # PRD #982 — API contract fixtures (epic #915, X2)
 
-## 595. PRD #982 — differential wire-shape fixtures pin the hot DTOs across the Go/TS boundary
+## 596. PRD #982 — differential wire-shape fixtures pin the hot DTOs across the Go/TS boundary
 
 Serves human: the JSON wire contract between the api and the SPA was hand-maintained twice (a Go
 DTO struct, a TS type) and checked by nothing that reads both sides — the existing

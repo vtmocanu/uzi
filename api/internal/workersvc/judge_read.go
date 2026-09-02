@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -221,7 +222,7 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 	if target.Status != "completed" && target.Status != "failed" {
 		return store.Run{}, ErrRunNotJudgeable
 	}
-	if !judgeEligibleKinds[target.Kind] {
+	if !runkind.JudgeEligible(target.Kind) {
 		return store.Run{}, ErrRunNotJudgeable
 	}
 	if s.settings == nil {

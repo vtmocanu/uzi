@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -36,7 +37,7 @@ import (
 func TestOpenMRGuardLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store live-DB harness for coverage")
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
 	}
 	ctx := context.Background()
 	if err := store.Migrate(ctx, dsn); err != nil {
@@ -118,8 +119,8 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateRun with a merged prior MR err = %v, want success", err)
 		}
-		if run.Kind != RunKindIssue {
-			t.Fatalf("run.Kind = %q, want %q", run.Kind, RunKindIssue)
+		if run.Kind != runkind.Issue {
+			t.Fatalf("run.Kind = %q, want %q", run.Kind, runkind.Issue)
 		}
 	})
 
@@ -131,8 +132,8 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateRun with force=true err = %v, want success even with an open MR", err)
 		}
-		if run.Kind != RunKindIssue {
-			t.Fatalf("run.Kind = %q, want %q", run.Kind, RunKindIssue)
+		if run.Kind != runkind.Issue {
+			t.Fatalf("run.Kind = %q, want %q", run.Kind, runkind.Issue)
 		}
 	})
 
@@ -146,8 +147,8 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateRun with only a non-issue prior open-MR run err = %v, want success", err)
 		}
-		if run.Kind != RunKindIssue {
-			t.Fatalf("run.Kind = %q, want %q", run.Kind, RunKindIssue)
+		if run.Kind != runkind.Issue {
+			t.Fatalf("run.Kind = %q, want %q", run.Kind, runkind.Issue)
 		}
 	})
 

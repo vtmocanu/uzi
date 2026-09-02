@@ -20,6 +20,7 @@ import type {
   ReviewCommentsSnapshot,
   RunKind,
 } from "./protocol.js";
+import { resolveRunKind } from "./run-kind.js";
 import { reportIncidentalIssueToolName } from "./findings-tools.js";
 import { clampToDirCharset } from "./util.js";
 
@@ -218,8 +219,8 @@ export interface LeadSystemPromptOptions {
   /** The run's kind (PRD #72 M3). The PRD-lifecycle clause is appended for
    *  `issue` only (Decision 13): a `ci_fix` run carries no issue at all, and a
    *  `self_improve` run's issue is a reused backlog container whose description
-   *  must never be rewritten. Absent ⇒ treated as `issue`, matching runner.ts's
-   *  own `kind: claim.kind ?? "issue"` default; the authoritative gate is the
+   *  must never be rewritten. Absent ⇒ treated as `issue` via the shared
+   *  resolveRunKind default (run-kind.ts); the authoritative gate is the
    *  api's, where runs.kind is NOT NULL. */
   kind?: RunKind;
   /** PRD #246: the pre-framed, nonce-fenced repo-instructions block (the clone's
@@ -261,7 +262,7 @@ export function buildLeadSystemPrompt(
   // production worker run always sets `this.client`, so threading a client flag into
   // prompt-building would add coupling for a case that cannot occur.
   parts.push(FINDINGS_NUDGE_APPEND);
-  if ((opts.kind ?? "issue") === "issue") parts.push(PRD_LIFECYCLE_APPEND);
+  if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   // PRD #700 M4: the mr_rework run-lifecycle note. Gated on the kind so an issue/
   // ci_fix/self_improve run's prompt is byte-identical to before.
   if (isMrReworkKind(opts.kind)) parts.push(MR_REWORK_LIFECYCLE_APPEND);

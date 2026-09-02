@@ -4,7 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: -
+# requires: TID
 # provides: -
 # handoff:  -
 # mutates:  allocates the builtin prd-lifecycle skill (shared) to template TID; flips repo_skills_enabled=true on REPO_ID; creates + allocates a user-scoped template (e2e-mine); sets then clears a tier-1 tool profile on REPO_ID

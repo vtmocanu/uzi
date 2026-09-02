@@ -13,14 +13,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
-
-// judgeEligibleKinds is the explicit allowlist of run kinds a judge may review (PRD
-// #46 Decision 2). It is an ALLOWLIST, never a denylist: a future kind must opt in
-// deliberately, and judge/self_improve/chat stay out (no recursion, no self-feeding
-// improvement loop; audit M4).
-var judgeEligibleKinds = map[string]bool{RunKindIssue: true, RunKindCIFix: true}
 
 // preStartInfraFailOrigins is the fail_origin set that means a run failed BEFORE the
 // agent did anything reviewable (PRD #69 M7a Pass B, Decision 12): a
@@ -64,7 +59,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		return
 	}
 	// Gate 1: eligible kind allowlist — never judge/self_improve/chat (no recursion).
-	if !judgeEligibleKinds[run.Kind] {
+	if !runkind.JudgeEligible(run.Kind) {
 		return
 	}
 	// Gate 2: global kill-switch. No settings wired ⇒ feature off (tests / dormant).
@@ -184,7 +179,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 func (s *Service) maybeEnqueueTaskReview(ctx context.Context, run store.Run) {
 	// Gate 0: only a completed task run is reviewed. A failed/cancelled task has no
 	// reviewable end state, and a non-task kind is never a handoff.
-	if run.Status != "completed" || run.Kind != RunKindTask {
+	if run.Status != "completed" || run.Kind != runkind.Task {
 		return
 	}
 	// Gate 1: the owner asked for a review at create (--review).
@@ -228,7 +223,7 @@ func (s *Service) maybeEnqueueTaskReview(ctx context.Context, run store.Run) {
 func (s *Service) maybeEnqueueThenFix(ctx context.Context, reviewRun store.Run) {
 	// Gate 0: only a COMPLETED review run drives a fix. A failed/cancelled review has no
 	// trustworthy findings, and a non-task kind is never a handoff review.
-	if reviewRun.Status != "completed" || reviewRun.Kind != RunKindTask {
+	if reviewRun.Status != "completed" || reviewRun.Kind != runkind.Task {
 		return
 	}
 	// Gate 1: this must BE a review run — a review carries review_target_run_id pointing at

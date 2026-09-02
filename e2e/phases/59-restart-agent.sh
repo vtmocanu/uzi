@@ -4,7 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: -
+# requires: UZI_WORKER_TOKEN
 # provides: SCHED_AGENT_UP
 # handoff:  -
 # mutates:  compose:agent(restarted)

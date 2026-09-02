@@ -4,7 +4,7 @@
 # critical: yes
 # lane:     gitlab
 # executor: any
-# requires: -
+# requires: UZI_WORKER_TOKEN
 # provides: IID RUN MR_IID
 # handoff:  -
 # mutates:  -
@@ -31,8 +31,12 @@ pass "PRD #37: run detected + reported the repo's .claude/agents/ roster (repo-c
 
 say "restart-resilience: down/up (keep volumes) while parked at the gate"
 "${COMPOSE[@]}" down                       # keeps the named volumes (pgdata, agentdata)
-# No token re-delivery: the exported UZI_WORKER_TOKEN re-sources the `worker_token`
-# secret on the next `up`, and the entrypoint re-hardens it 0400 worker (PRD #51 M5).
+# The recreated worker re-registers into its EXISTING row using the same join token:
+# UZI_WORKER_TOKEN reaches this (post-#966) subshell via phase 13's `provides` round-trip
+# (see `requires: UZI_WORKER_TOKEN` above), so the `up` below re-sources the real token
+# into the `worker_token` secret and overrides the --env-file placeholder — the entrypoint
+# re-hardens it 0400 worker (PRD #51 M5). Without the provide the worker would send the
+# placeholder token and the API would 401 it (invalid worker token) — issue #984.
 "${COMPOSE[@]}" up -d --wait db api web forge-fake
 wait_http
 login

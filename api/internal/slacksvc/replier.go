@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -223,7 +224,7 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	// is queued/claimed/running, which would land in the default: arm and submit a raw
 	// follow_up — which the service now REJECTS for a chat run (ErrChatInputNotAllowed).
 	// Route the reply through SubmitChatMessage so it becomes a turn, not a 409.
-	if run.Kind == runKindChat {
+	if run.Kind == runkind.Chat {
 		r.submitChatTurn(ctx, m, user.ID, anchor, text)
 		return
 	}

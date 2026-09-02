@@ -67,6 +67,7 @@ import {
   buildSelfImprovePlanPrompt,
   isNotCodePlan,
 } from "./prompt.js";
+import { resolveRunKind } from "./run-kind.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import {
   buildPreToolUseHook,
@@ -867,11 +868,10 @@ export class SdkExecutor implements Executor {
     // server so neither disturbs the other; the lead sets no `tools` allowlist, so a
     // registered MCP tool is callable, and save_memory is not in disallowedTools.
     // PRD #72 M4: `prd_done_path` is exposed on signal_done for `issue` runs only
-    // (Decision 13). `?? "issue"` matches runner.ts's own `kind: claim.kind ??
-    // "issue"` default; a stricter fail-closed default here would silently break
-    // every test that omits kind, and the AUTHORITATIVE gate is the api's, where
-    // runs.kind is NOT NULL.
-    const isIssueRun = (ctx.kind ?? "issue") === "issue";
+    // (Decision 13). resolveRunKind (run-kind.ts) applies the shared `issue` default;
+    // a stricter fail-closed default here would silently break every test that omits
+    // kind, and the AUTHORITATIVE gate is the api's, where runs.kind is NOT NULL.
+    const isIssueRun = resolveRunKind(ctx.kind) === "issue";
     const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
       [SIGNAL_SERVER_NAME]: buildSignalMcpServer({
         prdDonePath: isIssueRun,

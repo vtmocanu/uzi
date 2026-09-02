@@ -15,26 +15,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 )
 
-const (
-	// RunKindJudge is the run-judge kind (PRD #46 Decision 1): a worker-executed
-	// retrospective of another finished run. It has no repo, no issue, no branch, no
-	// MR — it rides the run machinery only for token delivery and message
-	// persistence, and points at the reviewed run via target_run_id.
-	RunKindJudge = "judge"
-	// RunKindSelfImprove is the self-improvement kind (PRD #46 Decision 10): an
-	// autonomous improvement run against uzi's own repo. It is issue-shaped and flows
-	// through the ordinary repo-ful claim path — no fork needed here.
-	RunKindSelfImprove = "self_improve"
-	// RunKindPrompt is the scheduled-prompt kind (PRD #241): a repo-ful, issue-less
-	// run born from a run_schedules row and keyed to it via schedule_id. It carries a
-	// free-form prompt rather than an issue or pipeline.
-	RunKindPrompt = "prompt"
-	// RunKindTask is the handoff kind (PRD #400): a repo-ful, issue-less run whose branch
-	// is server-named uzi/task/<id> and known at create. A review run is a task too,
-	// distinguished by a non-null review_target_run_id (PRD #400 M4a).
-	RunKindTask = "task"
-)
-
 // Judge scan caps (PRD #46 Decision 4 + audit L1): the command-not-found pre-scan
 // runs off the hot request path (at claim assembly) and bounds what it inspects so a
 // pathological run can't make it expensive.

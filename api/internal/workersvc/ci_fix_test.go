@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -25,14 +26,14 @@ func sampleSnapshot() FailureSnapshot {
 
 func TestCreateCIFixRunSerializesSnapshot(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
-	fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: RunKindCIFix}}
+	fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: runkind.CIFix}}
 	svc := New(fs, newBox(t), testParams())
 
 	run, err := svc.CreateCIFixRun(context.Background(), user, repo, "main", "Fix CI: main", "desc", sampleSnapshot(), []string{".gitlab-ci.yml"})
 	if err != nil {
 		t.Fatalf("CreateCIFixRun: %v", err)
 	}
-	if run.Kind != RunKindCIFix {
+	if run.Kind != runkind.CIFix {
 		t.Fatalf("expected a ci_fix run, got kind %q", run.Kind)
 	}
 	if fs.ciFixRunParams == nil {
@@ -58,14 +59,14 @@ func TestCreateAutoCIFixRunApproves(t *testing.T) {
 	// PRD #71 M4: the automatic sibling threads auto_approve=true through the SAME
 	// query so the worker resolves the plan gate itself.
 	user, repo := uuid.New(), uuid.New()
-	fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: RunKindCIFix}}
+	fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: runkind.CIFix}}
 	svc := New(fs, newBox(t), testParams())
 
 	run, err := svc.CreateAutoCIFixRun(context.Background(), user, repo, "agent/issue-7", "Fix CI: agent/issue-7", "desc", sampleSnapshot(), []string{".gitlab-ci.yml"})
 	if err != nil {
 		t.Fatalf("CreateAutoCIFixRun: %v", err)
 	}
-	if run.Kind != RunKindCIFix {
+	if run.Kind != runkind.CIFix {
 		t.Fatalf("expected a ci_fix run, got kind %q", run.Kind)
 	}
 	if fs.ciFixRunParams == nil || !fs.ciFixRunParams.AutoApprove {
@@ -112,7 +113,7 @@ func TestCreateRunRefusesWhenCIFixActiveOnBranch(t *testing.T) {
 func TestSetStateCompletedCarriesNotCodeVerdict(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{
-		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: RunKindCIFix, Status: "running"},
+		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: runkind.CIFix, Status: "running"},
 		setCompletedRows: 1,
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -131,7 +132,7 @@ func TestSetStateCompletedClampsForgedVerdict(t *testing.T) {
 	for _, forged := range []string{"verified", "fix_failed", "totally_fixed"} {
 		w := worker()
 		fs := &fakeStore{
-			runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: RunKindCIFix, Status: "running"},
+			runOwned:         store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Kind: runkind.CIFix, Status: "running"},
 			setCompletedRows: 1,
 		}
 		svc := New(fs, newBox(t), testParams())
@@ -165,7 +166,7 @@ func ciFixClaimPayload(t *testing.T) ClaimPayload {
 		claimRun: store.Run{
 			ID:               uuid.MustParse("33333333-3333-3333-3333-333333333333"),
 			RepoID:           pgconv.UUID(uuid.MustParse("22222222-2222-2222-2222-222222222222")),
-			Kind:             RunKindCIFix,
+			Kind:             runkind.CIFix,
 			IssueTitle:       "Fix CI: main pipeline #4200",
 			IssueDescription: "Diagnose and fix the failed pipeline for `main`.",
 			Status:           "claimed",
@@ -200,7 +201,7 @@ func TestCIFixClaimWireContract(t *testing.T) {
 	payload := ciFixClaimPayload(t)
 
 	// Shape assertions the worker relies on (belt-and-braces alongside the golden).
-	if payload.Kind != RunKindCIFix {
+	if payload.Kind != runkind.CIFix {
 		t.Fatalf("kind = %q, want ci_fix", payload.Kind)
 	}
 	if payload.IssueIID != nil {

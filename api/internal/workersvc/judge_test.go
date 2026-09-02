@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -19,7 +20,7 @@ func judgeRun(userID, targetID uuid.UUID) store.Run {
 	return store.Run{
 		ID:               uuid.New(),
 		UserID:           userID,
-		Kind:             RunKindJudge,
+		Kind:             runkind.Judge,
 		Status:           "claimed",
 		TargetRunID:      pgconv.UUID(targetID),
 		IssueTitle:       "Judge of run " + targetID.String(),
@@ -55,7 +56,7 @@ func TestClaimJudgeSkipsRepoJoinAndPAT(t *testing.T) {
 	if fs.claimCtxCalled {
 		t.Error("judge assembly must never query the repo/forge join (GetRunClaimContext)")
 	}
-	if payload.Kind != RunKindJudge {
+	if payload.Kind != runkind.Judge {
 		t.Errorf("Kind = %q, want judge", payload.Kind)
 	}
 	if payload.TargetRunID == nil || *payload.TargetRunID != target.String() {

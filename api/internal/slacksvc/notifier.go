@@ -19,6 +19,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -422,7 +423,7 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 	// repo-less and already yields ErrNoRows above; a self_improve run is repo-ful, so
 	// it needs this explicit skip. The judge "review ready" / self-improve "MR opened"
 	// notifications are a SEPARATE notifier event, not this run-state rendering.
-	if rc.Kind == "judge" || rc.Kind == "self_improve" {
+	if rc.Kind == runkind.Judge || rc.Kind == runkind.SelfImprove {
 		return
 	}
 	target, err := n.store.GetSlackDeliveryForUser(ctx, rc.UserID)

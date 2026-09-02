@@ -7,6 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -86,7 +87,7 @@ func steerAccessFor(run apitypes.RunDTO, inputsErr error) steerAccess {
 	// is now rejected at the service boundary (SubmitInput -> ErrChatInputNotAllowed,
 	// #192), and chat turns belong on the guarded, cookie-only /chats path anyway — so
 	// the TUI must not offer the steer affordance at all.
-	if run.Kind == "chat" {
+	if run.Kind == runkind.Chat {
 		return steerChatRun
 	}
 	// A finished run refuses every verb: SubmitInput's SECOND statement is

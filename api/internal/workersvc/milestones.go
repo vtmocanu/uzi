@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 )
 
 // Milestone is one entry of a run's milestone list (PRD #122): a small {id, title}
@@ -97,7 +98,7 @@ func validateMilestones(ms []Milestone) ([]Milestone, bool) {
 // encodeJSONArray, so a reported-but-empty `[]` stays a distinct, meaningful value
 // (as with repo_agents' NULL-vs-`[]`), never JSON null inside the jsonb.
 func milestonesParam(kind string, ms *[]Milestone) []byte {
-	if ms == nil || kind != RunKindIssue {
+	if ms == nil || kind != runkind.Issue {
 		return nil
 	}
 	sanitized, ok := validateMilestones(*ms)
@@ -123,7 +124,7 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 // dropped, not an error. A valid empty list encodes to `[]` (a distinct, meaningful
 // value the SQL union/overwrite handles).
 func progressParams(kind string, frozen []byte, completed, inProgress *[]string) (completedJSON, inProgressJSON []byte) {
-	if kind != RunKindIssue {
+	if kind != runkind.Issue {
 		return nil, nil
 	}
 	ms, err := DecodeMilestones(frozen)

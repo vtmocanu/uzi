@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -30,7 +31,7 @@ func TestGetReviewForTargetVisibility(t *testing.T) {
 
 	t.Run("visible but unjudged", func(t *testing.T) {
 		fs := &fakeStore{
-			runByID:           store.Run{ID: target, UserID: owner, Kind: RunKindIssue, Status: "completed"},
+			runByID:           store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "completed"},
 			reviewByTargetErr: pgx.ErrNoRows, // no review row yet
 		}
 		svc := New(fs, newBox(t), testParams())
@@ -46,7 +47,7 @@ func TestGetReviewForTargetVisibility(t *testing.T) {
 	t.Run("judged returns review + recs", func(t *testing.T) {
 		reviewID := uuid.New()
 		fs := &fakeStore{
-			runByID:        store.Run{ID: target, UserID: owner, Kind: RunKindIssue, Status: "completed"},
+			runByID:        store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "completed"},
 			reviewByTarget: store.RunReview{ID: reviewID, TargetRunID: target, UserID: owner, Verdict: "issues"},
 			recsByReview: []store.ReviewRecommendation{
 				{ID: uuid.New(), ReviewID: reviewID, Category: "install_worker_tool", Target: "jq"},
@@ -65,7 +66,7 @@ func TestGetReviewForTargetVisibility(t *testing.T) {
 	t.Run("admin sees any owner's review", func(t *testing.T) {
 		other := uuid.New()
 		fs := &fakeStore{
-			runByIDPlain:   store.Run{ID: target, UserID: other, Kind: RunKindIssue, Status: "completed"}, // admin GetRunByID path
+			runByIDPlain:   store.Run{ID: target, UserID: other, Kind: runkind.Issue, Status: "completed"}, // admin GetRunByID path
 			reviewByTarget: store.RunReview{ID: uuid.New(), TargetRunID: target, UserID: other, Verdict: "ok"},
 		}
 		svc := New(fs, newBox(t), testParams())
@@ -81,7 +82,7 @@ func TestGetReviewForTargetVisibility(t *testing.T) {
 // dedupe. Each blocked path returns its typed error and never mints a judge run.
 func TestRerunJudgeGates(t *testing.T) {
 	owner, target := uuid.New(), uuid.New()
-	terminal := store.Run{ID: target, UserID: owner, Kind: RunKindIssue, Status: "completed"}
+	terminal := store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "completed"}
 
 	cases := []struct {
 		name    string
@@ -100,20 +101,20 @@ func TestRerunJudgeGates(t *testing.T) {
 		{
 			name: "visible to an admin but not theirs to spend",
 			// admin path loads via GetRunByID (runByIDPlain); the run is another user's.
-			fs:      &fakeStore{runByIDPlain: store.Run{ID: target, UserID: uuid.New(), Kind: RunKindIssue, Status: "completed"}},
+			fs:      &fakeStore{runByIDPlain: store.Run{ID: target, UserID: uuid.New(), Kind: runkind.Issue, Status: "completed"}},
 			isAdmin: true,
 			wire:    func(s *Service) { s.SetSettings(fakeSettings{enabled: true}) },
 			wantErr: ErrNotRunOwner,
 		},
 		{
 			name:    "not terminal",
-			fs:      &fakeStore{runByID: store.Run{ID: target, UserID: owner, Kind: RunKindIssue, Status: "running"}},
+			fs:      &fakeStore{runByID: store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "running"}},
 			wire:    func(s *Service) { s.SetSettings(fakeSettings{enabled: true}) },
 			wantErr: ErrRunNotJudgeable,
 		},
 		{
 			name:    "ineligible kind",
-			fs:      &fakeStore{runByID: store.Run{ID: target, UserID: owner, Kind: RunKindChat, Status: "completed"}},
+			fs:      &fakeStore{runByID: store.Run{ID: target, UserID: owner, Kind: runkind.Chat, Status: "completed"}},
 			wire:    func(s *Service) { s.SetSettings(fakeSettings{enabled: true}) },
 			wantErr: ErrRunNotJudgeable,
 		},
@@ -177,7 +178,7 @@ func TestGetRunReviewPanel(t *testing.T) {
 
 	// visibleRun is what GetRunByIDForUser resolves for the owner in every case below.
 	visibleRun := func() store.Run {
-		return store.Run{ID: target, UserID: owner, Kind: RunKindIssue, Status: "completed"}
+		return store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "completed"}
 	}
 	activeJudge := store.GetActiveJudgeRunForTargetRow{
 		ID:        uuid.New(),
@@ -294,7 +295,7 @@ func TestGetRunReviewPanel(t *testing.T) {
 	t.Run("admin sees another owner's panel", func(t *testing.T) {
 		other := uuid.New()
 		fs := &fakeStore{
-			runByIDPlain:      store.Run{ID: target, UserID: other, Kind: RunKindIssue, Status: "completed"},
+			runByIDPlain:      store.Run{ID: target, UserID: other, Kind: runkind.Issue, Status: "completed"},
 			reviewByTargetErr: pgx.ErrNoRows,
 			pendingJudgeRow:   activeJudge,
 		}
@@ -312,7 +313,7 @@ func TestGetRunReviewPanel(t *testing.T) {
 func TestRerunJudgeHappyPath(t *testing.T) {
 	owner, target := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		runByID:   store.Run{ID: target, UserID: owner, Kind: RunKindIssue, Status: "failed"},
+		runByID:   store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "failed"},
 		anthropic: []byte("sealed"),
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -322,7 +323,7 @@ func TestRerunJudgeHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RerunJudge: %v", err)
 	}
-	if judge.Kind != RunKindJudge || judge.UserID != owner {
+	if judge.Kind != runkind.Judge || judge.UserID != owner {
 		t.Errorf("judge run = %+v, want kind=judge owner=%v", judge, owner)
 	}
 	if fs.createdJudgeRun == nil {

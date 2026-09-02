@@ -15,6 +15,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -259,7 +260,7 @@ func TestNonAutoWorkerNeverRunsTheSelector(t *testing.T) {
 func TestSelfImproveIgnoresTheWorkerBindMode(t *testing.T) {
 	f := newAutoFixture(t)
 	judgeID := uuid.New()
-	f.fs.claimRun.Kind = RunKindSelfImprove
+	f.fs.claimRun.Kind = runkind.SelfImprove
 	f.fs.judgeSecret = pgtype.UUID{Bytes: judgeID, Valid: true}
 	f.fs.byIDSecrets[judgeID] = f.fs.byIDSecrets[f.fullID]
 	f.fs.byIDLabels[judgeID] = "review-key"

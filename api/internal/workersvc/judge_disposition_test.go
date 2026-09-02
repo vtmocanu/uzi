@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -22,7 +23,7 @@ func ownedRecFixture() (*fakeStore, uuid.UUID, uuid.UUID) {
 	reviewID := uuid.New()
 	recID := uuid.New()
 	fs := &fakeStore{
-		runByID:        store.Run{ID: runID, UserID: ownerID, Status: "completed", Kind: RunKindIssue},
+		runByID:        store.Run{ID: runID, UserID: ownerID, Status: "completed", Kind: runkind.Issue},
 		reviewByTarget: store.RunReview{ID: reviewID, TargetRunID: runID, UserID: ownerID},
 		recsByReview: []store.ReviewRecommendation{
 			{ID: recID, ReviewID: reviewID, Category: "improve_uzi", Target: "", RationaleMd: "tidy the thing"},

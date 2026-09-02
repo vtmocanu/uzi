@@ -116,8 +116,16 @@ _record() {
 _capture_artifacts() {
   local nn_slug="$1" secs="${2:-0}" dir svc since
   dir="$RUNROOT/artifacts/$nn_slug"
-  mkdir -p "$dir" 2>/dev/null || true
   touch "$RUNROOT/.keep-rundir" 2>/dev/null || true
+  # First capture wins (#990). On a FAIL+LEAK phase this runs twice for the same slug:
+  # the FAIL path (driver.sh:~366) with a window of secs+30, then the quarantine sweep,
+  # once per leaked run, with secs=0 -> a 30s window. The FAIL window is strictly wider,
+  # so a second pass would OVERWRITE the failing-phase container logs (agent crash, api/db
+  # boot -- all >30s old) with a 30s window that drops them, leaving empty <phase>/*.log
+  # in the uploaded artifacts. If the dir already exists, a richer capture ran first: keep
+  # it. This also collapses the redundant per-leaked-id re-capture in one sweep.
+  [ -d "$dir" ] && return 0
+  mkdir -p "$dir" 2>/dev/null || true
   since="$((secs + 30))s"
   for svc in api agent forge-fake db; do
     "${COMPOSE[@]}" logs --no-color --since "$since" "$svc" > "$dir/$svc.log" 2>&1 || true

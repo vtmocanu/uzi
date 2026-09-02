@@ -607,10 +607,11 @@ WHERE repo_id = $1 AND forge_issue_iid <> ALL(@keep_iids::bigint[]);
 --     Note "there is no issue to patch" does NOT save self_improve: selfimprove.sql
 --     supplies repo_id, kind, issue_iid, issue_title and issue_description, so such
 --     a run is issue-shaped and carries a real iid. Only this predicate excludes it.
---     Written as `= 'issue'`, NEVER as a `<>` exclusion list: RunKind has FOUR
---     values (issue | ci_fix | judge | self_improve) while Decision 13's prose
---     enumerates three, so an exclusion list written from that prose would admit
---     `judge`. A positive predicate is closed by construction against a fifth kind.
+--     Written as `= 'issue'`, NEVER as a `<>` exclusion list: runs.kind has grown
+--     to eight values (issue | ci_fix | chat | judge | self_improve | prompt | task
+--     | mr_rework) while Decision 13's prose enumerates three, so an exclusion list
+--     written from that prose would admit judge (and every kind added since). A
+--     positive predicate is closed by construction against any future kind.
 --
 --   * r.mr_iid IS NOT NULL AND r.issue_iid IS NOT NULL — nothing to read, nothing
 --     to patch.

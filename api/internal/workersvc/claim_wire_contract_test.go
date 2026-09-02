@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 )
 
 // wireContractFixture is the single shared golden file both sides validate
@@ -54,7 +55,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 	anthropicOAuthToken := "ANTHROPIC-OAUTH-PLACEHOLDER" //nolint:gosec // G101: placeholder fixture string (…-PLACEHOLDER), not a real credential
 	return ClaimPayload{
 		RunID:            "11111111-1111-1111-1111-111111111111",
-		Kind:             RunKindIssue,
+		Kind:             runkind.Issue,
 		IssueIID:         i64ptr(42),
 		IssueTitle:       "Extend the pipeline",
 		IssueDescription: "PRD: add a job",

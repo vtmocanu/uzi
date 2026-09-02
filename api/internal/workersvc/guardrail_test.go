@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -277,7 +278,7 @@ func TestClaimJudgeSkipsGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Claim (judge): %v", err)
 	}
-	if payload == nil || payload.Kind != RunKindJudge {
+	if payload == nil || payload.Kind != runkind.Judge {
 		t.Fatalf("expected a judge payload, got %+v", payload)
 	}
 	if guard.called != 0 {

@@ -21,7 +21,7 @@ import (
 func TestCreateFindingLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store live-DB harness for coverage")
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
 	}
 	ctx := context.Background()
 	if err := store.Migrate(ctx, dsn); err != nil {

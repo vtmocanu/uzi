@@ -19,6 +19,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -37,7 +38,7 @@ func selfImproveClaimFixture(t *testing.T, selfRunID uuid.UUID, repoID uuid.UUID
 	judgeID, workerID := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		claimRun: store.Run{
-			ID: selfRunID, UserID: owner, Kind: RunKindSelfImprove, Status: "claimed",
+			ID: selfRunID, UserID: owner, Kind: runkind.SelfImprove, Status: "claimed",
 			RepoID:   pgconv.UUID(repoID),
 			IssueIid: pgtype.Int8{Int64: 1, Valid: true}, IssueTitle: "improve uzi", IssueDescription: "d",
 		},
@@ -90,7 +91,7 @@ func TestSelfImproveClaimCarriesInflightTargets(t *testing.T) {
 		}},
 		// (b) the self_improve run itself — same id as claimRun, must be excluded.
 		{Run: store.Run{
-			ID: selfRunID, RepoID: pgconv.UUID(repoID), Kind: RunKindSelfImprove, Status: "claimed",
+			ID: selfRunID, RepoID: pgconv.UUID(repoID), Kind: runkind.SelfImprove, Status: "claimed",
 		}},
 		// (c) a run on a DIFFERENT repo — must be excluded.
 		{Run: store.Run{

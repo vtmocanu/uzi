@@ -13,15 +13,10 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
-
-// RunKindChat is the third run kind (PRD #39): a conversational session with the
-// in-app uzi agent. It rides the run machinery for token delivery, message
-// persistence/replay, liveness, and vault gating, but has no repo, issue, or
-// branch (runs_kind_shape enforces repo_id/issue_iid/branch all NULL).
-const RunKindChat = "chat"
 
 // MaxChatMessageBytes bounds a single chat message (create prompt or follow-up).
 // Generous for a conversational turn, tight enough to bound abuse; the whole-body
@@ -319,7 +314,7 @@ func (s *Service) GetChatRun(ctx context.Context, userID, runID uuid.UUID) (stor
 		}
 		return store.Run{}, err
 	}
-	if run.Kind != RunKindChat {
+	if run.Kind != runkind.Chat {
 		return store.Run{}, ErrRunNotFound
 	}
 	return run, nil
@@ -508,7 +503,7 @@ func (s *Service) CreateProposal(ctx context.Context, wkr store.Worker, runID, r
 		}
 		return store.IssueProposal{}, err
 	}
-	if run.Kind != RunKindChat {
+	if run.Kind != runkind.Chat {
 		return store.IssueProposal{}, ErrProposalRunNotChat
 	}
 	if terminalStatuses[run.Status] {

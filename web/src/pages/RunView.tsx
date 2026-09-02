@@ -33,6 +33,7 @@ import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
 import { canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
+import { isJudgeEligible } from "../lib/runKind";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import { useAsyncData } from "../lib/useAsyncData";
@@ -2145,10 +2146,6 @@ export function AgentRosterSummary({ run }: { run: Run }) {
   );
 }
 
-// Only issue / ci_fix runs are judged (the enqueue allowlist); a chat/judge/
-// self_improve run never has a review, so the panel is hidden for those kinds.
-const JUDGE_ELIGIBLE_KINDS = new Set(["issue", "ci_fix"]);
-
 // JUDGE_STAT_K is the tile label class, mirroring RunUsage.tsx's K_CLASS so the judge
 // strip reads identically to the run's own usage strip.
 const JUDGE_STAT_K = "text-[10.5px] font-semibold uppercase tracking-[0.07em] text-faint";
@@ -2237,7 +2234,9 @@ export function JudgePanel({
   // old, already-displayed verdict as newly landed.
   const baselineUpdatedAt = useRef<string | null>(null);
 
-  const eligible = JUDGE_ELIGIBLE_KINDS.has(run.kind);
+  // Only issue / ci_fix runs are judged (the enqueue allowlist, via isJudgeEligible);
+  // a chat/judge/self_improve run never has a review, so the panel is hidden for those.
+  const eligible = isJudgeEligible(run.kind);
 
   // The mount load, via useAsyncData: enabled:eligible reproduces the old effect's
   // `if (!eligible) { setLoading(false); return; }` (eligible is derived from run.kind,

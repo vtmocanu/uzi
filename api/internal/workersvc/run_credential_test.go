@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -294,7 +295,7 @@ func TestJudgeClaimRecordsItsBinding(t *testing.T) {
 	owner, judgeID, runID := uuid.New(), uuid.New(), uuid.New()
 	fs := &fakeStore{
 		claimRun: store.Run{
-			ID: runID, Kind: RunKindJudge, Status: "claimed",
+			ID: runID, Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
 		anthropic:   sealedDefault,
@@ -340,7 +341,7 @@ func TestChatClaimRecordsTheDefault(t *testing.T) {
 	owner, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		chatClaimRun: store.Run{
-			ID: runID, UserID: owner, Kind: RunKindChat, Status: "claimed",
+			ID: runID, UserID: owner, Kind: runkind.Chat, Status: "claimed",
 			Title: pgconv.TextOrNull("a chat"),
 		},
 		anthropic:          sealedDefault,

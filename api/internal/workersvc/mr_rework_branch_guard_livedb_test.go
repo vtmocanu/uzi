@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -43,7 +44,7 @@ import (
 func TestMRReworkBranchGuardForcedInterleaveLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store live-DB harness for coverage")
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
 	}
 	ctx := context.Background()
 	if err := store.Migrate(ctx, dsn); err != nil {
@@ -167,7 +168,7 @@ func TestMRReworkBranchGuardForcedInterleaveLiveDB(t *testing.T) {
 func TestCreateAutoMRReworkRunSameMRDuplicateIsActiveExistsLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store live-DB harness for coverage")
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
 	}
 	ctx := context.Background()
 	if err := store.Migrate(ctx, dsn); err != nil {
@@ -211,8 +212,8 @@ func TestCreateAutoMRReworkRunSameMRDuplicateIsActiveExistsLiveDB(t *testing.T) 
 	if err != nil {
 		t.Fatalf("first CreateAutoMRReworkRun err = %v, want success", err)
 	}
-	if run.Kind != RunKindMRRework {
-		t.Fatalf("first run.Kind = %q, want %q", run.Kind, RunKindMRRework)
+	if run.Kind != runkind.MRRework {
+		t.Fatalf("first run.Kind = %q, want %q", run.Kind, runkind.MRRework)
 	}
 
 	// Second create for the SAME branch + SAME mr_iid: the narrowed predicate no longer
