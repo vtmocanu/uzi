@@ -12,9 +12,11 @@
 #     quota that lets four workers through here.
 #
 # Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
-# real goose migrations, seeds fixtures, and runs every store integration test
-# (the *LiveDB set). Isolated: unique container + published loopback port, torn
-# down on exit; never touches the user's own stacks or DBs.
+# real goose migrations, seeds fixtures, and runs every *LiveDB test in the five
+# packages that carry one (store, handler, forgesvc, schedsvc, workersvc -- the
+# list on the `go test` line below, mirrored in .github/workflows/ci.yml).
+# Isolated: unique container + published loopback port, torn down on exit; never
+# touches the user's own stacks or DBs.
 #
 # Run standalone, or alongside ./e2e/run-e2e.sh as the full store-SQL E2E gate.
 set -euo pipefail
@@ -94,15 +96,32 @@ cd "$ROOT/api"
 # filters by name, so only the *LiveDB tests run here — the rest of the handler
 # suite stays in `go test ./...`.
 #
+# ./internal/forgesvc/... ./internal/schedsvc/... ./internal/workersvc/... joined
+# 2026-09-02: 17 *LiveDB tests in those three packages were swept by NOTHING -- not
+# here, not by ci.yml -- while their own skip messages named this script. A *LiveDB
+# test in a package this line does not list never runs anywhere, and `go test
+# ./...` prints `ok` for it all the same. When a *LiveDB test lands in a new
+# package, add the package HERE and in ci.yml's "LiveDB tests" step, in the same
+# commit.
+#
 # -p 1 IS LOAD-BEARING, NOT A SPEED KNOB — do not drop it to parallelize the run.
-# go test runs PACKAGE binaries concurrently by default, and these two packages
-# share one database (there is exactly one throwaway Postgres above). Concurrently:
-# both call store.Migrate, and goose races itself into "relation already exists";
+# go test runs PACKAGE binaries concurrently by default, and these packages share
+# one database (there is exactly one throwaway Postgres above). Concurrently: they
+# all call store.Migrate, and goose races itself into "relation already exists";
 # worse, the handler suite's resetUsers() TRUNCATEs users mid-flight under the store
 # suite's fixtures, failing tests that have nothing to do with the change being
 # made. Both were observed the first time this line swept two packages. -p 1
 # serializes the binaries; tests within a package are already sequential.
+#
+# The shared database also means fixtures must not reuse literal UNIQUE values
+# across packages: nothing truncates `workers` between binaries, so a worker row
+# inserted with a fixed token_hash by one package's test is still there when the
+# next package's test inserts the same literal (measured 2026-09-02: handler's
+# denied_cli_dismiss and workersvc's task_review both used `[]byte{0x2}`, and the
+# second one failed on the UNIQUE constraint). Derive token hashes from a fresh
+# uuid, the way handler/hosted_provision_livedb_test.go documents.
 UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
-  -run 'LiveDB$' ./internal/store/... ./internal/handler/...
+  -run 'LiveDB$' ./internal/store/... ./internal/handler/... \
+  ./internal/forgesvc/... ./internal/schedsvc/... ./internal/workersvc/...
 
 printf '\n\033[32mStore integration tests passed.\033[0m\n'

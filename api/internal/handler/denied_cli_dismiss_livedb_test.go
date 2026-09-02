@@ -66,9 +66,13 @@ func TestPostReviewAutoDismissesDeniedCLILiveDB(t *testing.T) {
 	mustExecT(ctx, t, pool,
 		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
 		 VALUES ($1, $2, $3, 42, 'Do X', 'd', 'completed', 'issue')`, targetID, owner, repoID)
+	// token_hash is UNIQUE and shared across every package the live-DB sweep runs
+	// (nothing truncates workers between package binaries), so derive it from a fresh
+	// uuid rather than a fixed literal — see hosted_provision_livedb_test.go.
+	workerTokenHash := uuid.New()
 	mustExecT(ctx, t, pool,
 		`INSERT INTO workers (id, user_id, name, token_hash, status) VALUES ($1, $2, 'judge-worker', $3, 'online')`,
-		workerID, owner, []byte{0x2})
+		workerID, owner, workerTokenHash[:])
 	mustExecT(ctx, t, pool,
 		`INSERT INTO runs (id, user_id, kind, target_run_id, worker_id, issue_title, issue_description, status)
 		 VALUES ($1, $2, 'judge', $3, $4, '', '', 'running')`, judgeID, owner, targetID, workerID)

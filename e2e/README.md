@@ -104,6 +104,13 @@ The Go test (`api/internal/store/mr_watch_integration_test.go`) skips cleanly un
 a plain `go test ./...` when `UZI_TEST_DATABASE_URL` is unset. The full PRD #24 gate
 is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
 
+The script has since grown past that one query: it sweeps **every `*LiveDB` test in
+the five packages that carry one**, `store`, `handler`, `forgesvc`, `schedsvc` and
+`workersvc`, serially (`-p 1`, one shared database). CI's `test-api-store-it` job runs
+the same list. A `*LiveDB` test in a package neither list names runs nowhere and still
+prints `ok`, so a new live-DB test in a sixth package must add that package to both
+the script and `.github/workflows/ci.yml` in the same commit.
+
 ## Phase registry (what it asserts)
 
 The suite is now a **phase registry**: each assertion group lives in its own file
