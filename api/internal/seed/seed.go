@@ -12,10 +12,10 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -152,7 +152,7 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 			ForgeProjectID:    p.ForgeProjectID,
 			PathWithNamespace: p.PathWithNamespace,
 			WebUrl:            p.WebURL,
-			DefaultBranch:     pgtypeTextOrNull(p.DefaultBranch),
+			DefaultBranch:     pgconv.TextOrNull(p.DefaultBranch),
 		})
 		if err != nil {
 			return fmt.Errorf("seed forge: upsert repo %q: %w", p.PathWithNamespace, err)
@@ -186,13 +186,4 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 		"bot_username", identity.Username, "projects", len(projects),
 		"repos_enabled", enabled, "repos_requested", len(cfg.SeedForgeRepos))
 	return nil
-}
-
-// pgtypeTextOrNull maps an empty string to SQL NULL, a non-empty one to a valid
-// text value (same mapping as the handler's repo upsert).
-func pgtypeTextOrNull(s string) pgtype.Text {
-	if s == "" {
-		return pgtype.Text{}
-	}
-	return pgtype.Text{String: s, Valid: true}
 }
