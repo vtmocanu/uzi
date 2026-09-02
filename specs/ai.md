@@ -1783,7 +1783,7 @@ Serves human: "the board must show that runs happened / are happening — badges
 
 Serves human: "the board must update itself (no manual Refresh)"; card badge/MR-link signal.
 
-- **Badge taxonomy** (`Board.tsx` IssueCard): queued (neutral, instant feedback);
+- **Badge taxonomy** (`board/IssueCard.tsx`): queued (neutral, instant feedback);
   running (pulsing + elapsed + worker name); awaiting_approval (amber, loudest card);
   failed (rose + failure_reason tooltip); stopped (neutral, never rose — see §74);
   completed → MR chip `!{mr_iid}` linking the MR, or a plain "completed" badge when
@@ -1844,7 +1844,7 @@ start-run action); GitLab reachable via an explicit icon".
   non-column label chips, author, description rendered as markdown (**mandatory** — it
   carries the PRD link and is the run-decision basis), full run history (status, started,
   duration, worker, MR link, → run view), gated Start run, explicit GitLab link.
-- **Card interaction** (`Board.tsx`): the title becomes an in-app `<Link
+- **Card interaction** (`board/IssueCard.tsx`): the title becomes an in-app `<Link
   draggable={false}>` (a native `<a>` is draggable and hijacks the card's HTML5 drag
   payload — a real bug, not cosmetic); a small GitLab glyph keeps the forge one click
   away. RunView gains a breadcrumb back to its issue + board.
@@ -21235,7 +21235,7 @@ identity-authz §145, notifier §146).
 
 ## 543. PRD #318 — the COLUMNS editor reorders by grip-drag, and the ↑/↓ arrows are DROPPED (owner override), taking the keyboard/touch path with them
 
-The board Settings → **COLUMNS** editor (`ColumnSettings` in `web/src/pages/Board.tsx`)
+The board Settings → **COLUMNS** editor (`ColumnSettings` in `web/src/pages/board/ColumnSettings.tsx`)
 reorders by dragging a **6-dot grip handle**, replacing the per-row **↑/↓ arrow buttons**.
 
 - **Reuses the board cards' hand-rolled DnD idiom verbatim, no new dependency.** Payload
@@ -21254,7 +21254,7 @@ reorders by dragging a **6-dot grip handle**, replacing the per-row **↑/↓ ar
   pointer-only (no keyboard initiation in mainstream browsers, does not fire from touch),
   so column reordering now **requires a mouse** — a deliberate **WCAG 2.1.1 (Keyboard)**
   regression scoped to the column editor. This DIVERGES from the board **cards**, which
-  keep an ↑/↓ keyboard/touch fallback for exactly this reason (§443; `Board.tsx` ~1796-1824);
+  keep an ↑/↓ keyboard/touch fallback for exactly this reason (§443; `board/IssueCard.tsx`);
   the divergence is intentional, at the owner's direction. No aria-live announcement was
   added — the editor had none, and with reorder now mouse-only there is no keyboard trigger
   for one; a future keyboard-path PRD would add both.
@@ -23622,3 +23622,16 @@ Cross-refs: `fixtures/run-usage`/`fixtures/judge-fidelity` precedent for the dif
 and the "recorded, not authored, no `-update` flag" house rule (`.claude/rules/go.md`); PRD #700 MR
 review watcher (§580) for the `mr_rework` context `CatalogEntry.mr_rework_enabled` surfaces; issue #960
 (moved `apiTypes.ts` out of `api.ts`), which this PRD waited for.
+
+## 597. PRD #1007 — page component extraction: Judge/Plan clusters out of RunView.tsx, IssueCard/form/filter/settings out of Board.tsx
+
+Serves human: "every change to a panel should not diff against the whole page." Pure motion, no behaviour change; the richer rationale is PRD #1007's Decision Log (D1-D9). Two 3000/2300-line page files each carried whole sub-features beside the page container; each cluster moved into its own file under a per-page directory (`pages/runView/`, `pages/board/`), the `pages/adminSettings/` convention #960 established.
+
+- **D1 — re-export from the page file; importers and tests stay byte-identical.** `RunView.tsx` re-exports `PlanPanel`/`SeededPlanPanel`/`derivePlanRevision` (from `runView/PlanPanel.tsx`) and `JudgePanel`/`JUDGE_POLL_MAX_TRIES`/`TriageSummary` (from `runView/JudgePanel.tsx`); `Board.tsx` re-exports `IssueCard` (from `board/IssueCard.tsx`). So `Judge.tsx`, `RunView.test.tsx` and `Board.test.tsx` are untouched — zero `*.test.*` changes, and each milestone reviews as `--color-moved` motion.
+- **D2 — one file per cluster.** The Judge file stays over the ~1000-line soft target rather than export today-private symbols (`RecommendationFiler`, `DispositionControls`, `JustFiled`, `resolvedAgo`, `JudgeStat`); no-new-export (#960 D6) wins over the size target.
+- **D3/D4/D6 — minimal visibility change.** Only four declarations gain `export`: `CreateIssueForm`/`IssuesFilter`/`ColumnSettings` (consumed by `Board.tsx`) and `COLUMN_ACCENTS` (the one const both `Board()` and `ColumnSettings` read, moved to `board/shared.ts` — a leaf, never a `Board.tsx` back-edge). `Highlighted` stays unexported beside its sole caller `IssueCard`.
+- **No back-edge.** No file under `runView/` or `board/` imports from `../RunView`/`../Board`; measured that neither moved cluster references a page-body symbol in code.
+- **D8 — W10 rides along untouched.** The judge-verdict `setInterval` poll moved inside `JudgePanel` verbatim; visibility-gating it stays parked, and pure motion is the proof this PRD did not touch it.
+- **D9 leftovers, own commits (different toolchains).** `Run.kind: string` narrowed to the `RunKind` union (`lib/runKind.ts`, #983) — `apiContract.test.ts`'s `Widen<T>` widens it back to `string`, so the contract test and the `run.*.json` fixtures are unchanged (the `Run.status: RunStatus` precedent). And `uzicli/skill.go:13`'s prose no longer opens `// go:embed` (staticcheck SA9009); the whole-files lint ratchet dragged in gosec G301, resolved by tightening `os.MkdirAll` from `0o755` to `0o750` (the user's own `~/.claude/skills/uzi-cli`), never a `//nolint`.
+
+Cross-refs: #960 (the `pages/adminSettings/` per-page-directory recipe this follows) and #983 (the `RunKind` registry M4 narrows to); the 1452-line `Board()` and `RunView()` containers themselves stay put, deferred to a later characterization-first PRD.
