@@ -26,7 +26,7 @@
 # prefix), and the base_url is unchanged. Test state only — no api/seed change.
 #
 # SCOPE (deliberate): this lane exercises the api-side GitHub DRIVER end to end
-# (github.go / github_pipelines.go) — VerifyToken + TokenInfo (X-OAuth-Scopes),
+# (github_auth.go) — VerifyToken + TokenInfo (X-OAuth-Scopes),
 # ProjectRole + branch-protection rulesets (D6), issue create + R4 PR filter, the
 # Actions two-field status/conclusion collapse (D8), and the CI-fix trigger gate.
 # It does NOT drive a worker run: the worker's GitHubClient (agent/src/forge.ts) IS
