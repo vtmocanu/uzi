@@ -97,21 +97,47 @@ uzi_cli schedule get "$SID" --json | jq -e '.last_fire == null' >/dev/null \
   || fail "run-now must NOT persist last_fire (Decision 3): schedule get shows a non-null last_fire"
 pass "Decision 3 positive control: schedule get after run-now shows last_fire=null (tallies come from the run-now response)"
 
-# --- relabel B eligible, verify the cache changed, re-fire -------------------
-# Add uzi to B via the product UpdateIssue route on the fake (PUT .../issues/:iid with
-# add_labels) — the harness stand-in for a human relabelling. resolveProject falls back
-# to the single project for any id, so project id "1" resolves it. The /_e2e
-# label-events mutator only appends an EVENT and does NOT touch issue.labels, so it is
-# the wrong tool here; this route is what SETS the cached label array.
+# --- A left the Planned lane when its run ran (issue #994 mechanism pin) ------
+# "Planned" is a board COLUMN label (forgesvc.DefaultColumns: Planned, In Progress, Human
+# Review, Later), so A's swept run moved its card OUT of Planned — queued→In Progress at
+# start, then →Human Review once its MR opened — and each move strips every OTHER column
+# label (board.PlanLabelMove, applied forge-first then to the cache). So A no longer carries
+# "Planned" and, left as-is, would silently drop out of the sweep's candidate set on the 2nd
+# fire (ListSweepCandidateIssues matches labels @> ["Planned"]): it would be neither started
+# nor skipped, and the open-MR guard we mean to exercise below would never be reached. The
+# lifecycle move is async/best-effort, so wait for it to settle rather than racing it.
+wait_card_column "$IID_A" "Human Review"
+pass "A #$IID_A left the Planned lane for Human Review after its run (board-column automation)"
+
+# --- re-queue A into Planned, relabel B eligible, verify the cache, re-fire ---
+# Both edits go through the product UpdateIssue route on the fake (PUT .../issues/:iid with
+# add_labels/remove_labels) — the harness stand-in for a human relabelling. resolveProject
+# falls back to the single project for any id, so project id "1" resolves it. The /_e2e
+# label-events mutator only appends an EVENT and does NOT touch issue.labels, so it is the
+# wrong tool here; this route is what SETS the cached label array.
+#
+# A: re-add "Planned" (dropping the Human Review column it moved into) so the 2nd fire
+# re-examines it. This is the exact scenario the create-time open-MR guard defends: an issue
+# that still carries the sweep selector yet already has a completed run owning an OPEN MR —
+# a human re-queues it, or a non-column selector like the assigned/bug sweeps (never stripped
+# by a board move) matches it. Without this A is simply not a candidate and the guard is moot.
+curl -fsSk -X PUT "$FAKE_BASE/api/v4/projects/1/issues/$IID_A" \
+  -H 'Content-Type: application/json' -d '{"add_labels":["Planned"],"remove_labels":["Human Review"]}' >/dev/null \
+  || fail "could not re-queue A #$IID_A into Planned on the fake"
+# B: add uzi so it clears the uzi-eligibility gate at the run-creation seam on the 2nd fire.
 curl -fsSk -X PUT "$FAKE_BASE/api/v4/projects/1/issues/$IID_B" \
   -H 'Content-Type: application/json' -d '{"add_labels":["uzi"]}' >/dev/null \
   || fail "could not add the uzi label to B #$IID_B on the fake"
 apipost "/api/repos/$REPO_ID/sync" '' >/dev/null
-# Positive control: B's cached labels now include uzi (else the re-fire would prove nothing).
+# Positive controls: A's cached labels include Planned again and B's include uzi (else the
+# re-fire would prove nothing — A absent from the candidate set, or B still gated).
+apiget "/api/repos/$REPO_ID/board" | jq -e --argjson iid "$IID_A" \
+  'any(.board.cards[]; .iid == $iid and ((.labels // []) | index("Planned")))' >/dev/null \
+  || fail "A #$IID_A cached labels do not include Planned after re-queue+sync (positive control failed)"
 apiget "/api/repos/$REPO_ID/board" | jq -e --argjson iid "$IID_B" \
   'any(.board.cards[]; .iid == $iid and ((.labels // []) | index("uzi")))' >/dev/null \
   || fail "B #$IID_B cached labels do not include uzi after relabel+sync (positive control failed)"
-pass "relabelled B #$IID_B to include uzi; cached labels reflect it"
+pass "re-queued A #$IID_A into Planned and relabelled B #$IID_B to include uzi; cache reflects both"
 
 RN2="$(uzi_cli schedule run-now "$SID" --json)" || fail "schedule run-now (2nd fire) failed (exit $?)"
 echo "$RN2" | jq -e --argjson b "$IID_B" \
