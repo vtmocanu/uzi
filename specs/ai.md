@@ -23498,3 +23498,78 @@ here; issue #804 and the query/provisioner code comments carry the richer ration
 
 Cross-refs: PRD #754 pool-only auto lane + `pool_wait` (§581); PRD #111 D2 opt-in / reserved-console-key
 protection and D7's removed fallback (§581); migration 00087's `auto_eligible` CHECK.
+
+# PRD #982 — API contract fixtures (epic #915, X2)
+
+## 595. PRD #982 — differential wire-shape fixtures pin the hot DTOs across the Go/TS boundary
+
+Serves human: the JSON wire contract between the api and the SPA was hand-maintained twice (a Go
+DTO struct, a TS type) and checked by nothing that reads both sides — the existing
+`apitypes/wire_test.go` pins the Go key set against a list inlined in Go, so it catches a Go rename
+and is blind to TS drift entirely. Terse contract here; PRD #982's Decision Log (1-8) is the richer
+rationale, and `fixtures/api-contract/README.md` is the worked reference (the six mutation controls,
+the exemption table, what the contract cannot catch).
+
+- **The mechanism is `fixtures/run-usage`'s shape, applied to shape rather than behaviour.** Per hot
+  DTO, two files under `fixtures/api-contract/`: `<dto>.zero.json` (`json.Marshal(T{})`, pins
+  nullability) and `<dto>.full.json` (`json.Marshal(populate(T{}))`, a stdlib-only reflection
+  populator that sets every field non-zero so `omitempty` fields are present — pins key-set equality
+  and value kinds). Both are **recorded from the Go test's print-on-mismatch output, never
+  hand-authored, and there is deliberately no `-update` flag** — a golden any run can rewrite is a
+  snapshot, and a snapshot of a regression is green.
+- **Recorded-from-Go is not the tautology the run-usage README warns about, because Go and TS are not
+  computing the same quantity.** A golden derived from an implementation locks in that
+  implementation's blind spots only when both readers compute the same thing; here Go is the
+  **producer** of the wire and TS the **consumer**, so recording the fixture from Go records the
+  truth the client has to agree with, and the TS half is the side genuinely under test. A Go-side
+  change reddens the Go half first (fixture stale); the TS half then stays red until `apiTypes.ts`
+  follows — that lag is the ratchet.
+- **Two Go readers, one TS reader, each checking its own production definition.**
+  `api/internal/apitypes/contract_test.go` (package `apitypes`, exported DTOs) and
+  `api/internal/handler/contract_test.go` (package `handler`, the **unexported** DTOs behind
+  cookie-only routes — `boardDTO`/`cardDTO`/`columnDTO`, `skillDTO`, `settingsResponse`,
+  `brandingResponse`, `chatListDTO`, `agentTemplateDTO`) each byte-check `MarshalIndent` of the zero
+  and populated values against the two fixtures, and round-trip `full.json` through
+  `DisallowUnknownFields` (the request-body / runtime-400 direction). `web/src/lib/apiContract.test.ts`
+  checks `apiTypes.ts` with three compile-time assertions per DTO — `keyof` set-equality in both
+  directions, and literal-widened (`Widen`/`ZeroOf`) nullability/kind checks over the same fixtures,
+  imported via `resolveJsonModule` (fixtures sit above `web/`, at the repo root, owned by neither
+  runtime, same as `fixtures/run-usage`). `tsc --noEmit` is a `gate:web` step, so TS drift reddens
+  that gate, not just a vitest run. A missing or unreadable fixture is **fatal on both sides, never a
+  skip** (measured: deleting `run.full.json` fails the Go test with a named error and fails TS at
+  `tsc` — `Cannot find module`).
+- **Scope is the hot set only, not the whole surface.** `apitypes`' 102 exported structs plus the
+  unexported handler DTOs against 153 TS types in `apiTypes.ts` — the maintainer's 2026-09-01
+  decision was "the hot DTOs now, codegen spike optional later": `RunDTO`/`RunListItemDTO` (M1); the
+  rest of the apitypes hot set — `Repo`, `RunMessage`, `Schedule`/`ScheduleInput` (a request body),
+  `Worker`/`AdminWorker`, `User`, `Memory`, `SecretMeta`, `RunUsage`, `UserSettings`, `CatalogEntry`,
+  `CliToken` (M2); and the handler-package hot set — `Board`/`Card`/`BoardColumn` (`Card` is the
+  single most-used TS type in the SPA at 268 uses), `Skill`, `SettingsResponse`, `Branding`, `Chat`,
+  `AgentTemplate` (M3). Everything else (the CLI's `Forge*DTO` family, one-field request bodies, admin
+  usage rows) stays out; adding a DTO later is one Go table row plus one TS `check` block and two
+  fixture files (demonstrated by M2/M3's diff shape).
+- **M4 reconciled the surfaced drift, type-only, no production Go changed.** Added 7 optional `Run`
+  fields (`scope_ceiling?`, `base_branch?`, `open_mr?`, `interactive?`, `dispatched_at?`,
+  `branch_has_active_run?`, `branch_has_open_mr?`, inherited by `RunListItem`), `CatalogEntry`
+  `selector_kind?`/`mr_rework_enabled?: boolean | null`, widened `Worker`/`AdminWorker.docker?` from
+  `boolean` to `boolean | null` (the wire sends `null` for an external worker), and added a new
+  `AdminCliToken extends CliToken { user_id; owner_email }` type for the admin fixture (the web SPA
+  never fetches the admin CLI-token list — that route is CLI-only — so no production fetch was
+  retyped). A field-anchored grep over `web/src` found **zero** consumer hits for the 7 `Run` fields
+  and `selector_kind`, so the reconciliation is purely additive; the two `docker` consumers already
+  read `w.docker === true`, which is null-safe. Every `@ts-expect-error #982` directive this landed
+  is now gone except one.
+- **`Schedule.next_fires` is the one directive left, deliberately deferred, not reconciled.** The wire
+  sends `null` for a once/invalid-cron schedule (the mapper only sets `NextFires` for
+  recurring+valid-cron), so the TS type is drifted the same way `docker` was — but widening
+  `next_fires: string[]` to `string[] | null` surfaces two **unguarded** `next_fires[0]` index sites
+  (`DefaultJobs.tsx:383`, `Schedules.tsx:855`) as a red gate: a latent crash-on-once-schedule. That is
+  a **behaviour** fix needing its own regression test, out of scope for a type-only PRD, so it was
+  filed as its own bug and the directive stays, its reason rewritten to name the deferral rather than
+  "reconciled in M4". Do not read this PRD as having closed `next_fires` — it is the one documented
+  exception.
+
+Cross-refs: `fixtures/run-usage`/`fixtures/judge-fidelity` precedent for the differential-fixture shape
+and the "recorded, not authored, no `-update` flag" house rule (`.claude/rules/go.md`); PRD #700 MR
+review watcher (§580) for the `mr_rework` context `CatalogEntry.mr_rework_enabled` surfaces; issue #960
+(moved `apiTypes.ts` out of `api.ts`), which this PRD waited for.

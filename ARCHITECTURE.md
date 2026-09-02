@@ -1304,7 +1304,13 @@ or scope change; authority is still the token's server-enforced scope. See
   imports handler DTOs through it rather than `internal/handler` directly,
   so the binary never drags in `chi`/`pgx`. Enforced mechanically, not by
   convention: a test runs `go list -deps ./cmd/uzi` and fails if `pgx` or
-  `chi` appears in the dependency graph.
+  `chi` appears in the dependency graph. The api↔web JSON wire contract for
+  the hot DTOs is pinned the same mechanical way: `fixtures/api-contract/`
+  holds a Go-recorded `zero.json`/`full.json` per DTO, checked by a Go half
+  (byte-equal marshal + `DisallowUnknownFields` round-trip) and a TS half
+  (`web/src/lib/apiContract.test.ts`, keyof set-equality + literal-widened
+  nullability via `resolveJsonModule`), so a Go-side or TS-side drift
+  reddens exactly that side's gate.
 - **Browser login is poll-based, not a loopback listener.** `uzi login`
   generates a PKCE verifier locally, sends only its challenge to
   `POST /api/auth/cli/start`, prints a `user_code` plus a `/cli-auth?request=`
