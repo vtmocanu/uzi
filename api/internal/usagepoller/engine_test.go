@@ -72,16 +72,7 @@ func (f *fakeStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimi
 	f.upserts[arg.UserSecretID] = arg
 	// Mirror the write into prev, so a following tick's GetRateLimitsForToken sees the
 	// row this tick just wrote — the once-only edge-consumption property depends on it.
-	f.prev[arg.UserSecretID] = store.AnthropicRateLimit{
-		UserSecretID:     arg.UserSecretID,
-		UserID:           arg.UserID,
-		FiveHourPct:      arg.FiveHourPct,
-		FiveHourResetsAt: arg.FiveHourResetsAt,
-		SevenDayPct:      arg.SevenDayPct,
-		SevenDayResetsAt: arg.SevenDayResetsAt,
-		Source:           arg.Source,
-		SyncedAt:         arg.SyncedAt,
-	}
+	f.prev[arg.UserSecretID] = store.AnthropicRateLimit(arg)
 	return nil
 }
 func (f *fakeStore) GetRateLimitsForToken(_ context.Context, secretID uuid.UUID) (store.AnthropicRateLimit, error) {
@@ -448,16 +439,7 @@ func (m *multiTokenStore) UpsertRateLimits(_ context.Context, arg store.UpsertRa
 	defer m.mu.Unlock()
 	m.upserts[arg.UserSecretID] = arg
 	if m.prev != nil {
-		m.prev[arg.UserSecretID] = store.AnthropicRateLimit{
-			UserSecretID:     arg.UserSecretID,
-			UserID:           arg.UserID,
-			FiveHourPct:      arg.FiveHourPct,
-			FiveHourResetsAt: arg.FiveHourResetsAt,
-			SevenDayPct:      arg.SevenDayPct,
-			SevenDayResetsAt: arg.SevenDayResetsAt,
-			Source:           arg.Source,
-			SyncedAt:         arg.SyncedAt,
-		}
+		m.prev[arg.UserSecretID] = store.AnthropicRateLimit(arg)
 	}
 	return nil
 }
@@ -613,11 +595,11 @@ func (f *fakeNotifier) last() (earlyResetCall, bool) {
 // reported reset T, syncedAt when it was observed. A pending, limiting prior window
 // (the "was constrained" precondition) is prevRow with syncedAt < resetsAt and either
 // source=limit_report or sevenPct >= exhaustionPct.
-func prevRow(userID, secretID uuid.UUID, sevenPct int, source string, resetsAt, syncedAt time.Time) store.AnthropicRateLimit {
+func prevRow(userID, secretID uuid.UUID, sevenPct int16, source string, resetsAt, syncedAt time.Time) store.AnthropicRateLimit {
 	return store.AnthropicRateLimit{
 		UserSecretID:     secretID,
 		UserID:           userID,
-		SevenDayPct:      pgtype.Int2{Int16: int16(sevenPct), Valid: true},
+		SevenDayPct:      pgtype.Int2{Int16: sevenPct, Valid: true},
 		SevenDayResetsAt: pgtype.Timestamptz{Time: resetsAt, Valid: true},
 		Source:           pgtype.Text{String: source, Valid: true},
 		SyncedAt:         pgtype.Timestamptz{Time: syncedAt, Valid: true},
@@ -645,7 +627,7 @@ func TestEarlyResetDetection(t *testing.T) {
 
 	cases := []struct {
 		name       string
-		prevPct    int
+		prevPct    int16
 		prevSource string
 		nextResets *time.Time
 		nextPct    int
