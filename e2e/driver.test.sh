@@ -79,8 +79,19 @@ wait_status() { :; }
 # 00-preflight's leg 4 takes the deferred-note path). COMPOSE=(fake_docker) is set in
 # the parent test shell and inherited by run_driver's subshell.
 fake_docker() {
+  local n
   case "$1" in
-    logs) printf 'FAKE_DOCKER_LOGS %s\n' "$*" ;;
+    logs)
+      # When FAKE_DOCKER_SEQ names a file, stamp a monotonic call number into each log
+      # line so a test can tell a FIRST capture from a later OVERWRITING one (#990,
+      # case17). Unset (every other case) -> byte-identical to the original output.
+      if [ -n "${FAKE_DOCKER_SEQ:-}" ]; then
+        n=$(( $(cat "$FAKE_DOCKER_SEQ" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$n" > "$FAKE_DOCKER_SEQ"
+        printf 'FAKE_DOCKER_LOGS seq=%s %s\n' "$n" "$*"
+      else
+        printf 'FAKE_DOCKER_LOGS %s\n' "$*"
+      fi ;;
     ps)   ;;   # no running services
     *)    ;;
   esac
@@ -125,7 +136,7 @@ begin() { cur="$1"; case_fail=0
   FAKE_API_LOG="$TMP/api-$2.log"; FAKE_DB_LOG="$TMP/db-$2.log"; TSV="$RUNROOT/results.tsv"
   rm -rf "$RUNROOT" "$PHASES_DIR"; mkdir -p "$RUNROOT" "$PHASES_DIR"
   : > "$ENVFILE"; : > "$FAKE_API_LOG"; : > "$FAKE_DB_LOG"
-  unset E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE FAKE_DB_IDS FAKE_CANCEL_CODE 2>/dev/null || true
+  unset E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE FAKE_DB_IDS FAKE_CANCEL_CODE FAKE_DOCKER_SEQ 2>/dev/null || true
 }
 bad() { printf '  - %s\n' "$1"; case_fail=1; }
 contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
@@ -544,6 +555,32 @@ contains "$(cat "$TSV")" "r-leak-a" || bad "LEAK rows do not name r-leak-a (rows
 contains "$(cat "$TSV")" "r-leak-b" || bad "LEAK rows do not name r-leak-b (rows fused into one token)"
 contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/r-leak-a/inputs" || bad "r-leak-a not cancelled via the API"
 contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/r-leak-b/inputs" || bad "r-leak-b not cancelled via the API"
+end
+
+# ============================================================================
+# Case 17 (#990) — a FAIL+LEAK phase captures artifacts TWICE for the same slug (the
+# FAIL path, then the quarantine sweep with secs=0 -> a 30s window). The FAIL capture's
+# window is strictly wider, so the second pass must NOT overwrite the failing-phase
+# container logs. FAKE_DOCKER_SEQ stamps a monotonic call number: the FAIL capture is
+# seq 1-4 (api,agent,forge-fake,db), a would-be LEAK re-capture seq 5-8. api.log must
+# keep the FIRST capture (seq=1), never the overwriting one (seq=5).
+# Mutation: revert driver.sh's `[ -d "$dir" ] && return 0` guard -> api.log becomes
+# seq=5 (the 30s LEAK window that dropped the failing-phase logs in the real bug).
+begin "case17: FAIL+LEAK capture is not overwritten by the leak sweep" 17
+export FAKE_DB_IDS="r-leak17" FAKE_CANCEL_CODE=200 FAKE_DOCKER_SEQ="$TMP/dseq-17"
+rm -f "$FAKE_DOCKER_SEQ"
+mkphase "$PHASES_DIR/10-failleak.sh" "fail and leak" no "" "" "" <<'BODY'
+fail "boom and leak"
+BODY
+run_driver 17
+adir="$RUNROOT/artifacts/10-failleak"
+has_row failleak FAIL || bad "failleak not FAIL"
+has_row failleak LEAK || bad "no LEAK row — the double-capture scenario did not reproduce"
+[ -f "$adir/api.log" ] || bad "api.log not captured"
+contains "$(cat "$adir/api.log" 2>/dev/null)" "seq=1" \
+  || bad "api.log is not the FAIL-path (first) capture: $(cat "$adir/api.log" 2>/dev/null)"
+contains "$(cat "$adir/api.log" 2>/dev/null)" "seq=5" \
+  && bad "api.log was OVERWRITTEN by the leak-sweep re-capture (#990): $(cat "$adir/api.log" 2>/dev/null)"
 end
 
 # ============================================================================
