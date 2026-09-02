@@ -10752,7 +10752,8 @@ nothing forcing them to agree. One channel, two clients.
 
 **D2 — the move, stated precisely.** `/ws` left the cookie-only `RequireAuth` tail
 and now sits in its own `RequireUser` group mounted with the run READS
-(`handler/handler.go:735-748`, route at `:746`). `websocket.Accept`'s options were
+(`handler/handler.go`; both `/ws` and `/runs/*` deliberately stay inline there per
+PRD #1008 D5). `websocket.Accept`'s options were
 **not** touched: no `InsecureSkipVerify`, no `OriginPatterns` widening, and **no
 auth-type branch inside `ServeWS`** — such a branch would be a second copy of
 `RequireUser`'s dispatch predicate, free to drift from it. Per-run authz is the same
@@ -19348,7 +19349,7 @@ in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-s
 
 - **Endpoint: `GET /api/me/runs/in-progress-count` → `{ "count": <int> }`, on `RequireUser`.**
   Handler `RunsInProgressCount` (`api/internal/handler/runs_in_progress_count.go`); mounted under a
-  `/me/runs` route with `RequireUser` (`handler.go`), mirroring `/me/judge/stats` and
+  `/me/runs` route with `RequireUser` (`routes_me.go`), mirroring `/me/judge/stats` and
   `/me/workers/upgrade-summary` so a user-scoped CLI token can read it, not only a session cookie.
   Owner-scoped in the DB by the query's `user_id = @user_id` filter (not a service check). Its OWN
   lightweight endpoint rather than deriving the badge from the Runs page's data: AppShell owns the
@@ -22207,7 +22208,7 @@ Terse contract; richer rationale is in PRD #557's Decision Log.
   `ProjectNodeID` (`GetGithubProjectLinkByRepo`), reusing #364/#534's plumbing rather than
   adding new preflight logic.
 - **Four routes**, all on #534's per-repo `RequireAuth` owner-or-admin group
-  (`api/internal/handler/handler.go`): `GET`/`PUT /repos/{id}/github-project-sync/visibility`
+  (`api/internal/handler/routes_repos.go`): `GET`/`PUT /repos/{id}/github-project-sync/visibility`
   (`{"public": bool}` in/out) and `POST`/`DELETE /repos/{id}/github-project-sync/collaborators`
   (`{"username": string}`, grant/revoke Reader, 204). Same owner-or-admin preflight,
   existence-hiding 404, and instance-flag gate as #534's four routes;
@@ -23636,7 +23637,66 @@ Serves human: "every change to a panel should not diff against the whole page." 
 
 Cross-refs: #960 (the `pages/adminSettings/` per-page-directory recipe this follows) and #983 (the `RunKind` registry M4 narrows to); the 1452-line `Board()` and `RunView()` containers themselves stay put, deferred to a later characterization-first PRD.
 
-## 598. PRD #1021 — settings/settings.go domain file split: the schema to keys.go, one file per settings domain
+## 598. PRD #1008 — the handler route table split: `Routes()` into per-domain mount methods
+
+Serves human: `api/internal/handler/handler.go`'s `Routes()` was one ~906-line method registering
+every `/api` route group inline, so every route change diffed against all of them and answering "which
+guard protects `/repos/{id}/board`" meant reading 900 lines. The precedents that made this a move, not
+a design — `mountWorkerRoutes`/`mountControllerRoutes` — were already same-package methods. Terse
+record here; PRD #1008's Decision Log (D1-D6) is the richer rationale.
+
+- **Pure motion, same package.** Each domain's `r.Route`/`r.Group` block moved verbatim (dedented one
+  level) out of `Routes()` into an unexported `mount<Domain>Routes(r chi.Router, <only the limiters it
+  uses>)` in a per-domain `routes_<domain>.go`; `Routes()` keeps the root router, the four public GETs
+  (`/health`, `/version`, `/branding`, `/branding/logo/{slot}`) and an ordered list of mount calls.
+  Thirteen new methods: `mountAuthRoutes`, `mountMeRoutes`, `mountSlackRoutes`, `mountVaultRoutes`,
+  `mountNotificationRoutes`, `mountSchedulesRoutes`, `mountJudgeRoutes`, `mountAgentRoutes`,
+  `mountAdminRoutes`, `mountForgeRoutes`, `mountRepoRoutes`, `mountWorkersRoutes`, `mountChatRoutes`.
+- **`Routes()`' nine-limiter signature is unchanged; each mount takes only the limiters it uses (D2).**
+  Three tests pin `Routes()`' parameter names/order and the `cmd/server/main.go` call site; the new
+  mounts are unpinned, so they take the minimum (zero, one or two limiters).
+- **`/runs/*` and `/ws` deliberately stay inline in `handler.go` (D5).** Nine test-file sentences and
+  one runtime error string name `handler.go` as their mount site; repointing them would drag two
+  gosec-laden test files (`ws_route_guard_test.go`, `cli_auth_livedb_test.go`) into golangci's
+  `whole-files: true` ratchet and redden `task lint:api`. Leaving both in place keeps the test diff
+  empty. Maintainer follow-up: repoint those references, clear the two files' gosec findings, then
+  extract `mountRunRoutes(r, forgeLimiter, judgeLimiter)`.
+- **`mountJudgeRoutes` MUST be called before `mountMeRoutes` — a real counterexample to "reordering is
+  free".** The `/me/judge` stats subrouter (`r.Route("/me/judge")`, in `mountJudgeRoutes`) and the
+  `/me/judge` consent PUT (`r.Put("/me/judge")`, in `mountMeRoutes`) register on the exact same chi
+  node; chi's `Mount` installs an `mALL` stub there, so the Route must register BEFORE the Put or it
+  clobbers `PUT /api/me/judge` (the inline order was Route-then-Put). The limiter-mount live-router
+  test (`route_limiter_mounts_test.go`'s `wantRouteMounts`, a set lookup over the built router — not an
+  ordered list, so don't quote its row count, which the file's own comments already have stale)
+  reddened on the flip and is the net. `/me/judge` is the only such collision, verified by an exhaustive
+  exact-path pair scan across every mount method AND by the live-router tests passing (they enumerate
+  the built router, so any real Mount-stub clobber would fail them).
+- **The nets are the live-router tests, not the layout.** `route_limiter_mounts_test.go`'s
+  `wantRouteMounts` table (a set lookup) and `route_auth_boundary_test.go`'s `chi.Walk` derive routes
+  from the built router, so any changed path/guard/limiter fails on the first `go test`; `go doc -all`
+  byte-identity (the mounts are unexported, so an empty diff proves nothing exported moved) is the
+  second net for the extraction. Zero `*_test.go` edits.
+
+Cross-refs: `mountWorkerRoutes`/`mountControllerRoutes` (the same-package mount-method precedent this
+generalises); PRD #963 (`forgesvc/projectsync.go`) for the file-shape rule (file comment BELOW the
+package clause so `go doc` sees no second package doc) and the bisectable-per-file discipline; issue
+#873 (`route_auth_boundary_test.go`'s `chi.Walk` bearer-only walk) for the behavioural net.
+
+## 599. PRD #1017 — uzicli client file splits: one command tree per file, real/fake pairs side by side
+
+Serves human: "adding a CLI verb should not mean scrolling two thousand-line files." Pure motion, no behaviour change; the richer rationale is PRD #1017's Decision Log (D1-D7). `api/internal/uzicli/client.go` (1655 lines) held the `Client` interface, the `HTTPClient` transport core and all 63 verb methods for every command tree; `fake.go` (1073) mirrored 64 on `FakeClient`. The verb methods moved into six `client_<domain>.go` files (runs, review+findings, schedules, admin, account, repos+workers), and `fake.go` split the same way (`fake_<domain>.go`) so each real/fake pair sits side by side. After the split `client.go` is 760 lines and `fake.go` 390; no new file exceeds 300.
+
+- **D1 — `go doc -u -all ./internal/uzicli` byte-identical is the completeness proof.** `go/doc` lists funcs, types, methods, consts and vars sorted by name across all files, so a same-package move is invisible to it while a dropped, duplicated or re-documented symbol shows as a diff line. `-u` is mandatory: the two unexported helpers that move (`dispositionPath`, `pollStatusField`) are invisible to plain `-all`. Verified empty from branch base to tip across all six moves; captured once before any move and re-diffed after each commit.
+- **D2 — new-file headers go BELOW the `package uzicli` clause.** The package doc comment lives only in `output.go`; a comment above `package` in any new file becomes a second package doc that `go doc` concatenates, reddening the proof for a reason that is not a lost symbol. The #963 rule, twelve new files being twelve chances to get it wrong.
+- **D3 — no const/var moves; the `Client` interface stays whole in `client.go`.** The interface is one 412-line declaration whose method order is the contract's reading order (`go doc` prints an interface body verbatim); the two consts (`maxRespBytes`, `logsPageSize`), the `maxLogsMessages` var (a var, not a const, so a backstop test can lower the cap), `ErrNoDisposition`, the `ProjectSyncStatus` DTO and both `var _ Client` assertions stay put. Kept as a scoping rule (not a proof need — `go/doc` name-sorts consts and vars alike) so the residue is a fixed list: "verb methods and their verb-local helpers/types move; everything else stays."
+- **D4 — verb-local helpers and types travel with their one domain.** `dispositionPath` (disposition verbs) plus the two review-filing types → `client_review.go`; `pollStatusField` → `client_account.go` with `PollCLIAuth`; `CreateRunSeed` → `client_runs.go`. `ProjectSyncStatus` stayed with the consts (a DTO used by the repos verbs, but moving it is optional and the simple rule wins).
+- **D5 — mirror the domain map on both sides.** A `fake_<domain>.go` beside every `client_<domain>.go`, so a reviewer adding a verb touches the interface, one small real file and one small fake file with the same suffix. `fake_runs.go` carries `StreamRun` (fake-side only; the live one is in `stream.go`), so it holds one method with no client twin — expected, not a leak. Verb totals: 63 across the six `client_*.go`, 64 across the six `fake_*.go`, 1 (`StreamRun`) in `stream.go`.
+- **A pre-existing misattributed doc comment rode the motion verbatim.** A `// StreamRun replays...` block binds by adjacency (no blank line) to `FakeClient.ListSchedules`, not to `StreamRun`; it moved with `ListSchedules` into `fake_schedules.go` so go-doc output is unchanged. Not corrected here — re-binding it would be a doc-content change, out of scope for a motion PRD (and would redden D1's proof).
+- **Doc sweep.** `forge/pagination.go`'s "Mirrors ...client.go's maxLogsMessages" and `cmd/uzi/instructions_test.go`'s `statusError` references stay true (both symbols stayed in `client.go`). The two `RunView` skew comments (post-#1007: `runView/JudgePanel.tsx:147` and `RunView.test.tsx:2377`) name `client.go` for `RunReview`'s `pending_judge` decode, which moved to `client_runs.go` — left as a maintainer/web follow-up, since a Go motion PRD must not touch `web/**`.
+
+Cross-refs: #921 (`workersvc`), #963 (`forgesvc/projectsync.go`) and #1009 (`cmd/uzi`) — the same-package file-motion recipe and its `go doc` completeness proof this follows.
+
+## 600. PRD #1021 — settings/settings.go domain file split: the schema to keys.go, one file per settings domain
 
 Serves human: "a 1958-line file holding a dozen unrelated settings domains should read as one file per domain." Pure same-package motion, no exported-API change, no behaviour change, no test edit; the recipe is #921 (`workersvc`) and #963 (`forgesvc/projectsync.go`). Richer rationale is PRD #1021's Decision Log (D1-D6).
 
