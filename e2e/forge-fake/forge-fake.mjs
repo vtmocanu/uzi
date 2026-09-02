@@ -584,6 +584,17 @@ function handleGit(req, res, url) {
       CONTENT_LENGTH: req.headers["content-length"] || "",
       REMOTE_USER: EXPECT_USER || "anon",
       REMOTE_ADDR: req.socket.remoteAddress || "127.0.0.1",
+      // git gzips the git-upload-pack REQUEST body once the want-list crosses a size
+      // threshold (a clone of a many-ref bare does; a tiny one does not, which is why
+      // this only bit CI's fuller bare and passed a laptop repro). git-http-backend
+      // inflates that body ONLY when HTTP_CONTENT_ENCODING is present; without it,
+      // `git upload-pack` reads the gzip magic (1f 8b) as a pktline and dies with
+      // "protocol error: bad line length character", surfacing client-side as
+      // "the remote end hung up unexpectedly". receive-pack (push) bodies are never
+      // gzipped, so phase 20 never hit this. Also forward Git-Protocol so a protocol-v2
+      // clone negotiates v2 rather than silently degrading to v0.
+      HTTP_CONTENT_ENCODING: req.headers["content-encoding"] || "",
+      GIT_PROTOCOL: req.headers["git-protocol"] || "",
     },
   });
   req.pipe(cgi.stdin);
