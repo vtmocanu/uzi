@@ -209,11 +209,21 @@ jobs:
         working-directory: api
         run: |
           set -euo pipefail
-          # -run filters to the *LiveDB tests; -p 1 is load-bearing (the two packages
-          # share one database and race goose without it). The trailing check is the
+          # -run filters to the *LiveDB tests; -p 1 is load-bearing (the packages
+          # share one database and race goose without it). The package list mirrors
+          # e2e/run-store-it.sh and must stay in sync with it: a *LiveDB test in a
+          # package neither lists never runs anywhere (17 such tests were found on
+          # 2026-09-02; this job had never executed one of them). The trailing check is the
           # gate on the gate: a rename, a lost DSN or an unreachable service silently
           # turns this back into a green no-op.
-          go test -count=1 -v -race -p 1 -run 'LiveDB$' ./internal/store/... ./internal/handler/... 2>&1 | tee livedb.log
+          PKGS=(
+            ./internal/store/...
+            ./internal/handler/...
+            ./internal/forgesvc/...
+            ./internal/schedsvc/...
+            ./internal/workersvc/...
+          )
+          go test -count=1 -v -race -p 1 -run 'LiveDB$' "${PKGS[@]}" 2>&1 | tee livedb.log
           ran=$(grep -c '^--- PASS' livedb.log || true)
           skipped=$(grep -c '^--- SKIP' livedb.log || true)
           echo "LiveDB: $ran passed, $skipped skipped"
@@ -223,6 +233,17 @@ jobs:
             echo "prints ok -- so this job would be green while testing nothing."
             exit 1
           fi
+          # Per package: a listed package that contributes zero *LiveDB tests prints
+          # `ok <pkg> 0.01s [no tests to run]`, which the aggregate count above cannot
+          # see. Each root package must have a plain `ok <pkg> <N>s` line.
+          for p in "${PKGS[@]}"; do
+            root="github.com/vtmocanu/uzi/api/${p#./}"
+            root="${root%/...}"
+            if ! grep -qE "^ok[[:space:]]+${root}[[:space:]]+[0-9.]+s$" livedb.log; then
+              echo "FAIL: ${root} reported no LiveDB test run (no plain 'ok <pkg> <N>s' line)."
+              exit 1
+            fi
+          done
 
   # --------------------------------------------------------- Go controller ----
   validate-controller:

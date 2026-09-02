@@ -27,7 +27,7 @@ import (
 func TestTaskReviewLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store live-DB harness for coverage")
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
 	}
 	ctx := context.Background()
 	if err := store.Migrate(ctx, dsn); err != nil {
@@ -103,8 +103,13 @@ func TestTaskReviewLiveDB(t *testing.T) {
 	// ── (b) PostTaskReview (worker-authorized) → GetTaskReviewPanel round-trips findings. ──
 	// The worker must OWN the active review run (worker_id set, non-terminal status) for
 	// authorizeTaskReviewTarget to admit the POST.
+	// token_hash is UNIQUE and the live-DB sweep shares one database across packages
+	// (nothing truncates workers between package binaries), so a fixed literal here
+	// collides with whichever earlier package's test inserted the same one — measured
+	// against handler's denied_cli_dismiss fixture. Derive it from a fresh uuid.
 	wkr := store.Worker{ID: uuid.New(), UserID: userID}
-	exec(`INSERT INTO workers (id, user_id, name, token_hash) VALUES ($1, $2, 'w', $3)`, wkr.ID, userID, []byte{0x2})
+	tokenHash := uuid.New()
+	exec(`INSERT INTO workers (id, user_id, name, token_hash) VALUES ($1, $2, 'w', $3)`, wkr.ID, userID, tokenHash[:])
 	exec(`UPDATE runs SET worker_id = $1, status = 'running' WHERE id = $2`, wkr.ID, reviewID)
 
 	sub := TaskReviewSubmission{
