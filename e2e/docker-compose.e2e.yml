@@ -114,10 +114,24 @@ services:
       # the mr_rework detector waits after the newest review comment before queuing a
       # rework. Shrunk from the shipped 3m default so phase 71 can inject a note and
       # observe the rework fire inside the suite's runtime budget. Overlay-only; the
-      # production default (config.go) is untouched. CI_WATCH_MAX_REFS is deliberately
-      # left unset here so it takes its >0 default — it gates the whole pipeline/MR
-      # detector and mr_rework never fires with it at 0.
+      # production default (config.go) is untouched.
       MR_REVIEW_QUIET_PERIOD: 2s
+      # Pipeline-watch ref cap (PRD #6): how many agent run branches the poller keeps in
+      # the CI-badge / mr_rework pipeline-status cache, NEWEST FIRST (ListWatchedRunRefsForRepo
+      # `ORDER BY created_at DESC LIMIT`, api/internal/store/queries/pipeline_statuses.sql).
+      # The shipped default is 20 (config.go CI_WATCH_MAX_REFS). That is a >0 GATE — it must
+      # stay above 0 or the whole pipeline/MR detector (and thus mr_rework) never fires — but
+      # it is ALSO a cap, and 20 is too small for this suite: the single long-lived e2e stack
+      # accumulates ~25-30 watched agent branches across its phases, and phase 71 (which runs
+      # LAST) reuses the OLDEST one — agent/issue-2 from phase 15 — for its card #2 pipeline
+      # badge (wait_card_pipeline) AND the mr_rework detector's green-head-pipeline GATE 1. At
+      # the default cap that ancient branch is evicted from the newest-20 window, its pipeline
+      # is never synced, and card #2 stays 'none' (issue #996). Raise it well above the suite's
+      # total branch count so no phase's branch ages out. The sync's per-tick cost is bounded
+      # by the number of branches that ACTUALLY exist (~30), not by this ceiling, so a generous
+      # value is free; 500 leaves ample headroom for suite growth. Overlay-only; production
+      # keeps the 20 default.
+      CI_WATCH_MAX_REFS: "500"
       # Point the SSRF allowlist + the boot seed at the fake forge.
       FORGE_ALLOWED_BASE_URLS: https://forge-fake.e2e
       # Poll rarely by DEFAULT: the harness drives issues/runs directly, and a long

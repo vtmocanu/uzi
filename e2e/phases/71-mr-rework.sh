@@ -25,6 +25,15 @@
 # The forge-fake note author defaults to id 2 (a reviewer): forge-fake's /api/v4/user
 # returns id 1 (the bot), and BuildReviewCommentsSnapshot drops notes authored by the bot
 # id, so a bot-authored note is a SILENT no-fire. Every injected note passes author_id=2.
+#
+# WATCHED-REF CAP (issue #996): card #$IID (agent/issue-$IID) is the OLDEST agent branch in
+# the suite — it is the phase-15 happy-path branch and this phase runs last. Both GATE 1's
+# card-pipeline badge below AND the mr_rework detector read the pipeline-status cache, which
+# the poller fills NEWEST-FIRST up to CI_WATCH_MAX_REFS (ListWatchedRunRefsForRepo). At the
+# shipped default of 20 this ancient branch is evicted from the watched set, its pipeline is
+# never synced, and card #$IID's badge stays 'none' — so the overlay raises CI_WATCH_MAX_REFS
+# well above the suite's branch count (docker-compose.e2e.yml). Do not reuse an old branch
+# here without keeping that cap high enough to still watch it.
 say "PRD #966 M6: mr_rework run kind (review-landed rework on a settled MR)"
 
 AGENTBRANCH="agent/issue-$IID"
