@@ -33,8 +33,9 @@ const forgejoPerPage = 50
 // forgejoDefaultLabelColor is used when EnsureLabels is handed a label with no
 // color. uzi's callers always pin one (board columns, PromoteLabelColor), but
 // Forgejo's CreateLabel rejects an empty color outright (its client-side
-// validator requires a 6-hex value), where GitLab lets the server assign one —
-// so the driver supplies a neutral default rather than fail a label create.
+// validator requires a 6-hex value). GitLab's label-create API likewise requires
+// a color, so all three drivers supply a neutral default rather than fail a
+// label create.
 const forgejoDefaultLabelColor = "#ededed"
 
 // forgejo is the Forgejo REST driver, built on code.gitea.io/sdk/gitea (D5):

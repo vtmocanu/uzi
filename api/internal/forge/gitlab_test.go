@@ -289,6 +289,62 @@ func TestEnsureLabelsCreatesOnlyMissing(t *testing.T) {
 	}
 }
 
+// TestEnsureLabelsDefaultsColor pins the GitLab bug fix: a label with no color
+// must still create successfully (GitLab's API rejects a missing color), and an
+// explicitly-pinned color must pass through untouched.
+func TestEnsureLabelsDefaultsColor(t *testing.T) {
+	newColorMock := func(t *testing.T, recorded map[string]string) *mockGitLab {
+		t.Helper()
+		return newMockGitLab(t, map[string]http.HandlerFunc{
+			"/api/v4/projects/7/labels": func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					w.Header().Set("X-Next-Page", "")
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
+				case http.MethodPost:
+					var body struct {
+						Name  string `json:"name"`
+						Color string `json:"color"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					if body.Color == "" {
+						// Reproduce real GitLab: a create with no color is a 400.
+						w.WriteHeader(http.StatusBadRequest)
+						_ = json.NewEncoder(w).Encode(map[string]any{"message": "color is missing"})
+						return
+					}
+					recorded[body.Name] = body.Color
+					_ = json.NewEncoder(w).Encode(map[string]any{"name": body.Name, "color": body.Color})
+				}
+			},
+		})
+	}
+
+	// 1. Empty-color label (the finding-marker shape) must default and succeed.
+	recorded := map[string]string{}
+	m := newColorMock(t, recorded)
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+	if err := d.EnsureLabels(context.Background(), 7, []Label{{Name: "agent-found"}}); err != nil {
+		t.Fatalf("EnsureLabels with empty color: %v", err)
+	}
+	if got := recorded["agent-found"]; got == "" {
+		t.Error("expected a non-empty default color to be sent for an empty-color label")
+	} else if got != gitlabDefaultLabelColor {
+		t.Errorf("expected default color %q, got %q", gitlabDefaultLabelColor, got)
+	}
+
+	// 2. A caller-pinned color must pass through unchanged (default must not clobber it).
+	recorded2 := map[string]string{}
+	m2 := newColorMock(t, recorded2)
+	d2 := newTestDriver(t, m2, "glpat-abcdefabcdef")
+	if err := d2.EnsureLabels(context.Background(), 7, []Label{{Name: "custom", Color: "#6e49cb"}}); err != nil {
+		t.Fatalf("EnsureLabels with explicit color: %v", err)
+	}
+	if got := recorded2["custom"]; got != "#6e49cb" {
+		t.Errorf("explicit color should pass through unchanged, got %q", got)
+	}
+}
+
 func TestUserExistsByUsername(t *testing.T) {
 	var gotUsername string
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
@@ -470,7 +526,7 @@ func TestCreateIssueNoteSendsBody(t *testing.T) {
 // token below is a fake, long enough for the redactor to act on (it ignores
 // secrets under 8 chars); its exact shape is irrelevant to what redaction proves.
 func TestNewMethodsRedactErrors(t *testing.T) {
-	const token = "fake-pat-redaction-probe-0123456789"
+	const token = "fake-pat-redaction-probe-0123456789" //nolint:gosec // G101 false positive: fake redaction-probe fixture, never a real secret //gitleaks:allow
 	leak := func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{"message": "boom " + token})
@@ -523,7 +579,7 @@ func TestGetMergeRequestReturnsState(t *testing.T) {
 }
 
 func TestGetMergeRequestRedactsError(t *testing.T) {
-	const token = "glpat-supersecret-mrtoken-XYZ" //gitleaks:allow // fake PAT fixture: proves GetMergeRequest redacts, never a real secret
+	const token = "glpat-supersecret-mrtoken-XYZ" //nolint:gosec //gitleaks:allow // fake PAT fixture: proves GetMergeRequest redacts, never a real secret
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		"/api/v4/projects/7/merge_requests/13": func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -837,7 +893,7 @@ func TestDefaultBranchProtectionUnprotectedIsNotSafe(t *testing.T) {
 func TestNewMethodErrorsAreRedacted(t *testing.T) {
 	// A non-glpat, low-entropy literal (the redactor scrubs any secret >= 8 chars,
 	// not just real PAT formats) so this fixture carries no scanner-tripping token.
-	const token = "uzi-redaction-test-token-not-real"
+	const token = "uzi-redaction-test-token-not-real" //nolint:gosec // G101 false positive: fake redaction-test fixture, never a real secret //gitleaks:allow
 	// 403 (not 5xx/429) so the client-go retryable transport does not back off and
 	// retry — the driver still builds a redacted error from the echoed body.
 	leak := func(w http.ResponseWriter, _ *http.Request) {
@@ -991,7 +1047,7 @@ func TestGitLabListMethodsSkipNullElements(t *testing.T) {
 }
 
 func TestErrorsAreRedacted(t *testing.T) {
-	const token = "glpat-supersecret-eviltoken-XYZ" //gitleaks:allow // fake PAT fixture: the mock server echoes it back so the driver's redactor is proven to strip it, never a real secret
+	const token = "glpat-supersecret-eviltoken-XYZ" //nolint:gosec //gitleaks:allow // fake PAT fixture: the mock server echoes it back so the driver's redactor is proven to strip it, never a real secret
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		// Echo the token back inside the error body — worst case: the server
 		// itself leaks it. The driver must still not surface it.

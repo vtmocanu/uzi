@@ -104,8 +104,8 @@ func missingLabels(existing []forge.Label, requested []string) []string {
 
 // ensureRepoLabels ensures the requested labels exist on the forge project and returns the
 // deduped, non-blank set it ensured. It hands EnsureLabels the requested labels directly
-// (EnsureLabels skips any that already exist), with an empty color so each driver applies
-// its own default — mirroring findings_file.go's `forge.Label{{Name: marker}}`. An empty
+// (EnsureLabels skips any that already exist), with an empty color so each of the three
+// drivers applies its own neutral default — mirroring findings_file.go's `forge.Label{{Name: marker}}`. An empty
 // request is a no-op (no forge call). Split out as a package function taking a forge.Forge
 // so the WARN/CONFIRM logic is unit-testable against a fake forge without a DB.
 func ensureRepoLabels(ctx context.Context, f forge.Forge, projectID int64, requested []string) ([]string, error) {
