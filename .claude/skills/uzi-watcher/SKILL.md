@@ -59,6 +59,17 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
    folded into step 6. Gated, so the lead plans and the
    budget scales to its milestones. Seeded runs get the global default budget, too small for
    a multi-milestone PRD.
+
+   **Never `2>&1` a `uzi … --json` call into `jq`, and never read a piped exit code as
+   uzi's.** The CLI prints its version-skew warning (`uzi: CLI vX is behind server vY`) on
+   stderr; merged into stdout it lands ahead of the JSON, jq fails on line 1 with `Invalid
+   numeric literal`, and jq 1.8 exits **5** on an input parse error, the same number as
+   uzi's conflict exit ("a run is already in progress for this issue"). With `pipefail`
+   off, the pipeline reports jq's 5 as if uzi had refused. Measured 2026-09-02 on #1021: the
+   create had succeeded, the run was live, and the "conflict" cost three sessions a
+   cross-session ownership hunt. Keep stderr out of the pipe (`2>/dev/null` or none), and
+   confirm a suspected conflict with `uzi run list --json` (an existing run's `created_at`
+   within a minute of your own call is your own call).
 3. **Watch to the gate** with the bundled poller (see *Watching*).
 4. **Review the plan, then approve / revise / reject.** Read it from the run log:
 
@@ -757,6 +768,22 @@ It exits **0** when every run for the SHA is `success`, **1** on a real red
 (`failure`/`timed_out`/`startup_failure`), **2** when the runs were only `cancelled`
 (supersession — see below), and **3** when no run ever appeared or they never settled.
 The underlying query, if you need it inline:
+
+**Exit 0 means "every run that EXISTS for the SHA is green" — NOT "the full expected
+workflow set ran."** Measured 2026-09-02 (a docs-only fix commit to `main`, `f015f1f`): only
+the `CodeQL` run existed for the SHA, and `ci.yml`/`kind-smoke.yml` never dispatched, so
+`watch-ci.sh` saw one green run and exited 0 — a *partial* dispatch read as a full green. A
+`[skip ci]` commit landing on top can also leave the current HEAD with no full CI run at all.
+So a green `watch-ci.sh` on a **prds/docs-only or `[skip ci]`-adjacent** push does **not**
+prove `validate-web`/`validate-api` ran. When you pushed a fix whose whole point is a gate
+(e.g. a `check-docs` fix), confirm it another way: run the gate locally (`task check-docs:web`
+etc.), OR wait for the next real code-change dispatch (the fix rides into a following PR's
+merged-with-base CI) to be the authoritative green. The reliable authority for merge-readiness
+stays the PR's OWN checks (`watch-pr.sh`), which run `pull_request`-triggered full CI; a bare
+green `main` badge can be a subset. *(A future `watch-ci.sh` improvement, suggested by the
+session that caught this: derive the EXPECTED workflow set from the last known-good `main`
+commit's runs and fail-closed — exit 3, "expected run absent" — until each expected workflow
+has a completed run for the target SHA, rather than exit-0 on a partial set.)*
 
 ```
 gh run list --repo OWNER/REPO --branch main --limit 8 \

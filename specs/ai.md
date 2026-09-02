@@ -10752,7 +10752,8 @@ nothing forcing them to agree. One channel, two clients.
 
 **D2 — the move, stated precisely.** `/ws` left the cookie-only `RequireAuth` tail
 and now sits in its own `RequireUser` group mounted with the run READS
-(`handler/handler.go:735-748`, route at `:746`). `websocket.Accept`'s options were
+(`handler/handler.go`; both `/ws` and `/runs/*` deliberately stay inline there per
+PRD #1008 D5). `websocket.Accept`'s options were
 **not** touched: no `InsecureSkipVerify`, no `OriginPatterns` widening, and **no
 auth-type branch inside `ServeWS`** — such a branch would be a second copy of
 `RequireUser`'s dispatch predicate, free to drift from it. Per-run authz is the same
@@ -19348,7 +19349,7 @@ in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-s
 
 - **Endpoint: `GET /api/me/runs/in-progress-count` → `{ "count": <int> }`, on `RequireUser`.**
   Handler `RunsInProgressCount` (`api/internal/handler/runs_in_progress_count.go`); mounted under a
-  `/me/runs` route with `RequireUser` (`handler.go`), mirroring `/me/judge/stats` and
+  `/me/runs` route with `RequireUser` (`routes_me.go`), mirroring `/me/judge/stats` and
   `/me/workers/upgrade-summary` so a user-scoped CLI token can read it, not only a session cookie.
   Owner-scoped in the DB by the query's `user_id = @user_id` filter (not a service check). Its OWN
   lightweight endpoint rather than deriving the badge from the Runs page's data: AppShell owns the
@@ -22207,7 +22208,7 @@ Terse contract; richer rationale is in PRD #557's Decision Log.
   `ProjectNodeID` (`GetGithubProjectLinkByRepo`), reusing #364/#534's plumbing rather than
   adding new preflight logic.
 - **Four routes**, all on #534's per-repo `RequireAuth` owner-or-admin group
-  (`api/internal/handler/handler.go`): `GET`/`PUT /repos/{id}/github-project-sync/visibility`
+  (`api/internal/handler/routes_repos.go`): `GET`/`PUT /repos/{id}/github-project-sync/visibility`
   (`{"public": bool}` in/out) and `POST`/`DELETE /repos/{id}/github-project-sync/collaborators`
   (`{"username": string}`, grant/revoke Reader, 204). Same owner-or-admin preflight,
   existence-hiding 404, and instance-flag gate as #534's four routes;
@@ -23636,7 +23637,52 @@ Serves human: "every change to a panel should not diff against the whole page." 
 
 Cross-refs: #960 (the `pages/adminSettings/` per-page-directory recipe this follows) and #983 (the `RunKind` registry M4 narrows to); the 1452-line `Board()` and `RunView()` containers themselves stay put, deferred to a later characterization-first PRD.
 
-## 598. PRD #1017 — uzicli client file splits: one command tree per file, real/fake pairs side by side
+## 598. PRD #1008 — the handler route table split: `Routes()` into per-domain mount methods
+
+Serves human: `api/internal/handler/handler.go`'s `Routes()` was one ~906-line method registering
+every `/api` route group inline, so every route change diffed against all of them and answering "which
+guard protects `/repos/{id}/board`" meant reading 900 lines. The precedents that made this a move, not
+a design — `mountWorkerRoutes`/`mountControllerRoutes` — were already same-package methods. Terse
+record here; PRD #1008's Decision Log (D1-D6) is the richer rationale.
+
+- **Pure motion, same package.** Each domain's `r.Route`/`r.Group` block moved verbatim (dedented one
+  level) out of `Routes()` into an unexported `mount<Domain>Routes(r chi.Router, <only the limiters it
+  uses>)` in a per-domain `routes_<domain>.go`; `Routes()` keeps the root router, the four public GETs
+  (`/health`, `/version`, `/branding`, `/branding/logo/{slot}`) and an ordered list of mount calls.
+  Thirteen new methods: `mountAuthRoutes`, `mountMeRoutes`, `mountSlackRoutes`, `mountVaultRoutes`,
+  `mountNotificationRoutes`, `mountSchedulesRoutes`, `mountJudgeRoutes`, `mountAgentRoutes`,
+  `mountAdminRoutes`, `mountForgeRoutes`, `mountRepoRoutes`, `mountWorkersRoutes`, `mountChatRoutes`.
+- **`Routes()`' nine-limiter signature is unchanged; each mount takes only the limiters it uses (D2).**
+  Three tests pin `Routes()`' parameter names/order and the `cmd/server/main.go` call site; the new
+  mounts are unpinned, so they take the minimum (zero, one or two limiters).
+- **`/runs/*` and `/ws` deliberately stay inline in `handler.go` (D5).** Nine test-file sentences and
+  one runtime error string name `handler.go` as their mount site; repointing them would drag two
+  gosec-laden test files (`ws_route_guard_test.go`, `cli_auth_livedb_test.go`) into golangci's
+  `whole-files: true` ratchet and redden `task lint:api`. Leaving both in place keeps the test diff
+  empty. Maintainer follow-up: repoint those references, clear the two files' gosec findings, then
+  extract `mountRunRoutes(r, forgeLimiter, judgeLimiter)`.
+- **`mountJudgeRoutes` MUST be called before `mountMeRoutes` — a real counterexample to "reordering is
+  free".** The `/me/judge` stats subrouter (`r.Route("/me/judge")`, in `mountJudgeRoutes`) and the
+  `/me/judge` consent PUT (`r.Put("/me/judge")`, in `mountMeRoutes`) register on the exact same chi
+  node; chi's `Mount` installs an `mALL` stub there, so the Route must register BEFORE the Put or it
+  clobbers `PUT /api/me/judge` (the inline order was Route-then-Put). The limiter-mount live-router
+  test (`route_limiter_mounts_test.go`'s `wantRouteMounts`, a set lookup over the built router — not an
+  ordered list, so don't quote its row count, which the file's own comments already have stale)
+  reddened on the flip and is the net. `/me/judge` is the only such collision, verified by an exhaustive
+  exact-path pair scan across every mount method AND by the live-router tests passing (they enumerate
+  the built router, so any real Mount-stub clobber would fail them).
+- **The nets are the live-router tests, not the layout.** `route_limiter_mounts_test.go`'s
+  `wantRouteMounts` table (a set lookup) and `route_auth_boundary_test.go`'s `chi.Walk` derive routes
+  from the built router, so any changed path/guard/limiter fails on the first `go test`; `go doc -all`
+  byte-identity (the mounts are unexported, so an empty diff proves nothing exported moved) is the
+  second net for the extraction. Zero `*_test.go` edits.
+
+Cross-refs: `mountWorkerRoutes`/`mountControllerRoutes` (the same-package mount-method precedent this
+generalises); PRD #963 (`forgesvc/projectsync.go`) for the file-shape rule (file comment BELOW the
+package clause so `go doc` sees no second package doc) and the bisectable-per-file discipline; issue
+#873 (`route_auth_boundary_test.go`'s `chi.Walk` bearer-only walk) for the behavioural net.
+
+## 599. PRD #1017 — uzicli client file splits: one command tree per file, real/fake pairs side by side
 
 Serves human: "adding a CLI verb should not mean scrolling two thousand-line files." Pure motion, no behaviour change; the richer rationale is PRD #1017's Decision Log (D1-D7). `api/internal/uzicli/client.go` (1655 lines) held the `Client` interface, the `HTTPClient` transport core and all 63 verb methods for every command tree; `fake.go` (1073) mirrored 64 on `FakeClient`. The verb methods moved into six `client_<domain>.go` files (runs, review+findings, schedules, admin, account, repos+workers), and `fake.go` split the same way (`fake_<domain>.go`) so each real/fake pair sits side by side. After the split `client.go` is 760 lines and `fake.go` 390; no new file exceeds 300.
 

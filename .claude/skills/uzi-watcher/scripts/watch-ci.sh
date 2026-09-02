@@ -15,12 +15,18 @@
 #   max-polls  give up after this many (default: 60 → ~1h at the default interval)
 #
 # Exit codes (branch on these, not on the text):
-#   0  every run for the SHA concluded `success`
+#   0  every run for the SHA concluded green — `success`, or the values GitHub treats
+#      as passing for a completed check (`skipped` / `neutral`)
 #   1  at least one run concluded `failure` / `timed_out` / `startup_failure` (REAL red)
 #   2  runs concluded only `cancelled` (concurrency supersession, NOT a failure):
 #      a newer commit superseded this one — `git fetch origin <branch>` and
 #      re-watch the CURRENT HEAD, whose run exercises this change plus the newer one
-#   3  no run ever appeared, or they never settled within max-polls
+#   3  no run ever appeared, they never settled within max-polls, OR a run concluded a
+#      value that is neither green, red, nor cancelled (`action_required` / `stale`):
+#      fail closed and inspect, never merge on it. (Exit 0 means every run that
+#      EXISTS is green, NOT that the full expected workflow set ran — a partial
+#      dispatch, e.g. a docs-only or `[skip ci]`-adjacent push, can show one green
+#      run; confirm the gate another way. See SKILL.md "Post-merge CI".)
 #
 # A repo push to main sometimes spawns NO run at all (measured 2026-08-23 on a
 # docs-only commit with no [skip ci] marker); that surfaces here as exit 3 with a
@@ -49,6 +55,12 @@ while [ "$i" -lt "$MAX" ]; do
   if [ "$n" -gt 0 ] && [ "$pending" = "0" ]; then
     fails="$(printf '%s' "$runs" | jq '[.[] | select(.c=="failure" or .c=="timed_out" or .c=="startup_failure")] | length')"
     cancels="$(printf '%s' "$runs" | jq '[.[] | select(.c=="cancelled")] | length')"
+    # GitHub treats success/skipped/neutral as PASSING for a completed check; every
+    # OTHER completed conclusion (action_required, stale, and any value GitHub adds
+    # later) is NOT green. Count the green set explicitly and require EVERY run to be
+    # in it — the old `else → success` branch reported success for anything that was
+    # merely not-failure-and-not-cancelled, so an action_required/stale run read green.
+    greens="$(printf '%s' "$runs" | jq '[.[] | select(.c=="success" or .c=="skipped" or .c=="neutral")] | length')"
     printf 'ALL-COMPLETED\n%s\n' "$runs"
     if [ "$fails" -gt 0 ]; then
       echo "RESULT=failure"
@@ -58,8 +70,15 @@ while [ "$i" -lt "$MAX" ]; do
       echo "RESULT=cancelled (supersession: re-point at current origin/$BRANCH HEAD)"
       exit 2
     fi
-    echo "RESULT=success"
-    exit 0
+    if [ "$greens" -eq "$n" ]; then
+      echo "RESULT=success"
+      exit 0
+    fi
+    # A completed run concluded neither green (success/skipped/neutral), red
+    # (failure/timed_out/startup_failure) nor cancelled — e.g. action_required or
+    # stale. Fail closed: do NOT report success; surface it for inspection.
+    echo "RESULT=indeterminate (a run's conclusion is not in success/skipped/neutral — inspect, do not merge on this: $runs)"
+    exit 3
   fi
   i=$((i + 1))
   sleep "$INT"
