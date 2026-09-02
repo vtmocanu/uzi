@@ -1,6 +1,10 @@
 package usagepoller
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+)
 
 // TestUsagepollerPgTextValidEmpty is a characterization pin. usagepoller's
 // pgText (engine.go) maps ""→VALID empty — like slacksvc's and opposite to
@@ -10,10 +14,10 @@ import "testing"
 // site passes a literal "" here, so this cannot gate the migration; it records
 // which behavior the site was built on for the review-gated mapping.
 func TestUsagepollerPgTextValidEmpty(t *testing.T) {
-	if got := pgText(""); !got.Valid || got.String != "" {
+	if got := pgconv.Text(""); !got.Valid || got.String != "" {
 		t.Errorf("pgText(\"\"): got {Valid=%v String=%q}, want {Valid=true String=\"\"} — usagepoller pgText is valid-empty (→ pgconv.Text)", got.Valid, got.String)
 	}
-	if got := pgText("x"); !got.Valid || got.String != "x" {
+	if got := pgconv.Text("x"); !got.Valid || got.String != "x" {
 		t.Errorf("pgText(\"x\"): got {Valid=%v String=%q}, want {Valid=true String=\"x\"}", got.Valid, got.String)
 	}
 }

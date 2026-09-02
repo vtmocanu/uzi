@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -296,11 +297,11 @@ func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, r anthr
 		UserSecretID:     secretID,
 		UserID:           userID,
 		FiveHourPct:      pgInt2(r.FiveHour.Pct),
-		FiveHourResetsAt: pgTimePtr(r.FiveHour.ResetsAt),
+		FiveHourResetsAt: pgconv.TimePtr(r.FiveHour.ResetsAt),
 		SevenDayPct:      pgInt2(r.SevenDay.Pct),
-		SevenDayResetsAt: pgTimePtr(r.SevenDay.ResetsAt),
-		Source:           pgText(r.Source),
-		SyncedAt:         pgTime(e.now().UTC()),
+		SevenDayResetsAt: pgconv.TimePtr(r.SevenDay.ResetsAt),
+		Source:           pgconv.Text(r.Source),
+		SyncedAt:         pgconv.Time(e.now().UTC()),
 	}); err != nil {
 		// The token id is safe to log — it is a row identifier, never the credential.
 		e.logger.Error("usage poller: upsert", "user", userID.String(), "secret", secretID.String(), "error", err)
@@ -329,16 +330,7 @@ func (e *Engine) clearBackoff(secretID uuid.UUID) {
 	delete(e.backoff, secretID)
 }
 
-func pgInt2(v int) pgtype.Int2              { return pgtype.Int2{Int16: int16(v), Valid: true} }
-func pgTime(t time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: t, Valid: true} }
-func pgText(s string) pgtype.Text           { return pgtype.Text{String: s, Valid: true} }
-
-func pgTimePtr(t *time.Time) pgtype.Timestamptz {
-	if t == nil {
-		return pgtype.Timestamptz{}
-	}
-	return pgtype.Timestamptz{Time: *t, Valid: true}
-}
+func pgInt2(v int) pgtype.Int2 { return pgtype.Int2{Int16: int16(v), Valid: true} } //nolint:gosec // G115: v is a rate-limit percentage (0-100), far within int16 range
 
 // wipe best-effort zeroizes the token after use (matching the vault's own hygiene;
 // Go gives no guarantee the bytes weren't already copied by the runtime).
