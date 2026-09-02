@@ -758,6 +758,22 @@ It exits **0** when every run for the SHA is `success`, **1** on a real red
 (supersession — see below), and **3** when no run ever appeared or they never settled.
 The underlying query, if you need it inline:
 
+**Exit 0 means "every run that EXISTS for the SHA is green" — NOT "the full expected
+workflow set ran."** Measured 2026-09-02 (a docs-only fix commit to `main`, `f015f1f`): only
+the `CodeQL` run existed for the SHA, and `ci.yml`/`kind-smoke.yml` never dispatched, so
+`watch-ci.sh` saw one green run and exited 0 — a *partial* dispatch read as a full green. A
+`[skip ci]` commit landing on top can also leave the current HEAD with no full CI run at all.
+So a green `watch-ci.sh` on a **prds/docs-only or `[skip ci]`-adjacent** push does **not**
+prove `validate-web`/`validate-api` ran. When you pushed a fix whose whole point is a gate
+(e.g. a `check-docs` fix), confirm it another way: run the gate locally (`task check-docs:web`
+etc.), OR wait for the next real code-change dispatch (the fix rides into a following PR's
+merged-with-base CI) to be the authoritative green. The reliable authority for merge-readiness
+stays the PR's OWN checks (`watch-pr.sh`), which run `pull_request`-triggered full CI; a bare
+green `main` badge can be a subset. *(A future `watch-ci.sh` improvement, suggested by the
+session that caught this: derive the EXPECTED workflow set from the last known-good `main`
+commit's runs and fail-closed — exit 3, "expected run absent" — until each expected workflow
+has a completed run for the target SHA, rather than exit-0 on a partial set.)*
+
 ```
 gh run list --repo OWNER/REPO --branch main --limit 8 \
   --json databaseId,headSha,status,conclusion \
