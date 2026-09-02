@@ -633,6 +633,53 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     expect(screen.queryByRole("button", { name: /Move issue #99/ })).toBeNull();
   });
 
+  // PRD #1034 M4 — the Closed lane is a real drag target. These assert the EMITTED
+  // PAYLOAD (what wire string move() sends), not just DOM: close/reopen route through
+  // move()/moveIssue ALONE and must never freeze the lane (never call reorderBoard).
+  const dropOn = (lane: HTMLElement, iid: number) =>
+    fireEvent.drop(lane, { dataTransfer: { getData: () => String(iid) } });
+
+  it("closes an open card dragged onto the Closed lane", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    // Card 1 is open in Backlog. Dropping it on Closed sends the wire "closed".
+    dropOn(laneFor("Closed"), 1);
+    await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledTimes(1));
+    expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 1, "closed");
+    // A close is a state change, not a reorder — the lane never freezes.
+    expect(mockApi.reorderBoard).not.toHaveBeenCalled();
+  });
+
+  it("reopens a closed card dragged onto a real column", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    // Card 99 is closed. Dropping it on Planned sends that column's label; the server
+    // reads a reopen from the already-closed card and lands it at the bottom.
+    dropOn(laneFor("Planned"), 99);
+    await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledTimes(1));
+    expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 99, "Planned");
+    expect(mockApi.reorderBoard).not.toHaveBeenCalled();
+  });
+
+  it("reopens a closed card dragged onto Backlog with the wire string open", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    dropOn(laneFor("Backlog"), 99);
+    await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledTimes(1));
+    expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 99, "open");
+    expect(mockApi.reorderBoard).not.toHaveBeenCalled();
+  });
+
+  it("no-ops a closed card dropped back onto the Closed lane", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    dropOn(laneFor("Closed"), 99);
+    // Closed → Closed is a no-op: nothing is sent to the forge at all.
+    await Promise.resolve();
+    expect(mockApi.moveIssue).not.toHaveBeenCalled();
+    expect(mockApi.reorderBoard).not.toHaveBeenCalled();
+  });
+
   // C2 — the mode flip, both directions.
   it("switches the board to Manual after a successful reorder and persists it", async () => {
     renderBoard();
