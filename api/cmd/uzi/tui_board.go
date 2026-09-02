@@ -844,33 +844,6 @@ func (m tuiModel) boardEmptyState() string {
 	return m.pal.faint.Render(" No runs yet. Start one from the web board or the command line.") + "\n"
 }
 
-// paintSeg styles one row segment with an optional foreground and (for a selected row) the warm
-// selection background. Applying the bg to EVERY segment — text and padding alike — is what
-// keeps it continuous across the row: wrapping pre-styled fg spans in an outer bg would be
-// dropped by their inner resets (the documented lipgloss gotcha), so each span carries its own.
-func paintSeg(fg, bg color.Color, bold bool, s string) string {
-	st := lipgloss.NewStyle()
-	if fg != nil {
-		st = st.Foreground(fg)
-	}
-	if bg != nil {
-		st = st.Background(bg)
-	}
-	if bold {
-		st = st.Bold(true)
-	}
-	return st.Render(s)
-}
-
-// padSeg right-pads s to n visual columns with background-carrying spaces, so a selected row's
-// warm bar reaches the padded width rather than stopping at the last glyph.
-func padSeg(s string, n int, bg color.Color) string {
-	if w := visualWidth(s); w < n {
-		return s + paintSeg(nil, bg, false, strings.Repeat(" ", n-w))
-	}
-	return s
-}
-
 // boardRow renders one run: the per-row ▌ andon strip and state glyph (state colour), the id,
 // the owner on the admin board, the status WORD (state colour, not a filled chip), AGE, the
 // milestone micro-bar, and the title, with an own-board-only judge marker flushed right. A
@@ -1126,25 +1099,4 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 	}
 	return paintSeg(fillC, bg, false, strings.Repeat("▰", done)) +
 		paintSeg(m.pal.faintC, bg, false, strings.Repeat("▱", total-done))
-}
-
-// shortRunID is the board's id cell: the first 8 of a UUID, which is the rule
-// shortRecID already uses for random UUIDs (unlike an SDK tool-use id, a run id has no
-// constant prefix, so a head is the right end to take).
-func shortRunID(id string) string {
-	r := []rune(id)
-	if len(r) <= 8 {
-		return id
-	}
-	return string(r[:8])
-}
-
-// padCell right-pads to n RUNES. Rune-based to match capCell, so a multibyte title
-// does not shift the column.
-func padCell(s string, n int) string {
-	c := capCell(s, n)
-	if pad := n - len([]rune(c)); pad > 0 {
-		return c + strings.Repeat(" ", pad)
-	}
-	return c
 }
