@@ -6,7 +6,8 @@
 // cached. Plus the runKindLabel mapping.
 import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { RunIssueRef, runKindLabel } from "./RunIssueRef";
+import { RunIssueRef } from "./RunIssueRef";
+import { runKindLabel } from "../lib/runKind";
 import { mockRuns } from "../mocks/data";
 
 afterEach(cleanup);
