@@ -350,7 +350,7 @@ func (w *mrkdwnWalker) emitLink(n *ast.Link) {
 // The scheme is extracted by hand (not net/url) precisely BECAUSE a hostile
 // destination may contain < > |: those make net/url.Parse reject strings we still
 // want to accept-and-sanitise, and a bare-string scheme check is enough to enforce
-// the https-only rule (aligning with isHTTPSURL, notifier.go, which guards trusted
+// the https-only rule (aligning with isHTTPSURL, notifier_state.go, which guards trusted
 // forge URLs and is intentionally left case-sensitive there).
 func sanitizeHTTPSURL(dest string) (string, bool) {
 	if !hasHTTPSScheme(dest) {

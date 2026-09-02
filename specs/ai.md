@@ -5926,7 +5926,7 @@ with the review/audit findings folded in.
   (implementation note 5): judge runs are structurally suppressed — `GetSlackRunContext`'s INNER JOIN on repos
   returns `ErrNoRows` for a repo-less judge run before any suppression logic runs; self_improve runs are repo-ful
   and would otherwise get a "run completed" DM, so they need an **explicit** `rc.Kind == "judge" || rc.Kind ==
-  "self_improve"` guard in `Notifier.handle` (`api/internal/slacksvc/notifier.go`). Judge/self_improve
+  "self_improve"` guard in `Notifier.handle` (`api/internal/slacksvc/notifier_state.go`). Judge/self_improve
   notifications instead ride the new generic notifications inbox + a new notifier event variant (§218), not the
   run-state DM path.
 
@@ -8281,7 +8281,7 @@ Serves human Feature #2 (board), #6 (CI status), #12 (MR link on card), D2 (per-
   `gitlab → "Merge Request"`, `forgejo → "Pull Request"`, everything else/empty/null →
   "Merge Request" (safe default). Sibling helpers `forgeNounLower`/`forgeNounSentence`/
   `forgePlatform`/`mrAbbrev`/`mrRefSymbol`. Acceptance: exactly one non-test hit for
-  `"Merge Request"` in `web/src`. **`slacksvc/notifier.go` carries the same mapping in Go** —
+  `"Merge Request"` in `web/src`. **`slacksvc/notifier_state.go` carries the same mapping in Go** —
   an unavoidable second copy across the language boundary. **Shared/forge-less chrome names
   both ("merge request / pull request") or restructures past the noun — never defaults to one
   forge's word** (that would reintroduce GitLab's term wearing a neutral label).
@@ -23718,7 +23718,18 @@ Serves human: "a change to one CLI subcommand should not diff against the whole 
 
 Cross-refs: #960 (`pages/adminSettings/` per-directory recipe — the web analogue this mirrors), PRD #1008 (the handler-side same-day sibling split), #963 (the file-shape rule — file comment BELOW the package clause so `go doc` sees no second package doc).
 
-## 602. PRD #1025 — forge driver file splits: `github.go`/`forgejo.go` into per-seam files, `gitlab_pipelines.go` for parity
+## 602. PRD #1026 — slacksvc/notifier.go file split: notify, chat, health and run-state seams out of the engine
+
+Serves human: "a 1325-line file holding the notifier engine and four unrelated rendering concerns should read as one concern per file." Pure same-package motion, no exported-API change, no behaviour change, no test edit; the recipe is #921 (`workersvc`), #963 (`forgesvc/projectsync.go`), #1008 (`handler/handler.go`) and #1022 (`handler/schedules.go`). Richer rationale is PRD #1026's Decision Log (D1-D5).
+
+- **D1 — four seams, one per originating PRD, not one file per handler.** `notifier_notify.go` (the generic inbox DM, PRD #46: `handleNotify`, `notifyFactMarkupStripper`, `notificationBlocks`, `notificationFallback`); `notifier_chat.go` (the chat status line, PRD #191 M2b: `handleChat`, `renderChatStatus`, distinct from `chatpost.go`'s `handleChatMsg` message stream); `notifier_health.go` (the run-health thread, PRD #47: `handleHealth`, `ensureRoot`); `notifier_state.go` (the run-state DM, PRDs #25/#122/#268: `handle`, `handleQuestion`, `handleGate`, `handleMilestone` and the renderers `rootBlocks`/`renderThreadBlocks`/`statusGlyph`/`isHTTPSURL`/`forgeMrAbbrev`/`forgeMrRef`/… — one tightly-interwoven concern kept together, no dispatch/render sub-cut).
+- **D2 — package-wide helpers stay in `notifier.go`.** `runURL`, `runLink`, `boundReason` (+`maxFailureReason`), `threadSectionBlock`, `threadMrkdwnElem` and `logf` serve several seams (called from `chatactions.go`/`gate.go`/`question.go`/`health.go`/`chatpost.go`); the #963 rule keeps a multi-seam helper in the base file rather than a fifth `render_shared.go`.
+- **Byte-identity is the proof.** `go doc -all` (837 lines) and `go doc -u -all` (2519 lines) both unchanged base↔head (empty diff); every commit is `--color-moved` clean; all `*_test.go` untouched (`notifier_test.go`/`notifier_notify_test.go` pin behaviour, not layout). Final shape: `notifier.go` 315 lines (the two interfaces, queue consts, `Notifier`, event types, `NewNotifier`, five `Publish*`, `Run`, `logf`, six package-wide helpers); `notifier_state.go` 730 is the largest new file; none in the package over 750.
+- **The one stale body comment fixed in-move:** `handle`'s "after the render/handleChat below" (M2) — `handleChat` moved to `notifier_chat.go`, so "below" → "call" (body comment, `go doc` unaffected). Present-tense doc anchors repointed to the new files (`adr/0065`, `ARCHITECTURE.md`, `specs/ai.md`, `mrkdwn.go`, `notifysvc/run_failure_notifier.go`, `web/src/lib/forgeNoun.ts` — also fixing its stale `forgeMrNoun` symbol — and the held PRD #1020's `handleNotify`/`notificationBlocks` cites).
+
+Cross-refs: epic #915 (Batch 4, P20); #921, #963, #1008, #1022 (the same-package pure-motion recipe this repeats).
+
+## 603. PRD #1025 — forge driver file splits: `github.go`/`forgejo.go` into per-seam files, `gitlab_pipelines.go` for parity
 
 Serves human: "a change to one forge method group should not diff against the whole 1300-line driver." Pure-motion refactor of `api/internal/forge/` (`package forge`); no behaviour, signature, or exported-API change, zero `*_test.go` edits. Richer rationale is PRD #1025's Decision Log; terse record here. `github.go` (1314 lines) and `forgejo.go` (1242) each carried every `Forge` method group in one file; both already had a `<driver>_pipelines.go` seam, so one seam map fit both, and `gitlab.go` gained `gitlab_pipelines.go` for parity with its two siblings.
 
