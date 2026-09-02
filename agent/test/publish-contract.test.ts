@@ -22,6 +22,7 @@ describe("PublishResponse wire contract (PRD #122 M8)", () => {
       "no_ref",
       "not_descendant",
       "unsupported",
+      "workflow_scope",
     ];
     for (const skipped of reasons) {
       const skip: PublishResponse = {

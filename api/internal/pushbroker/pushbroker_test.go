@@ -72,7 +72,7 @@ func (f *gitFixture) pushMain() {
 func (f *gitFixture) pack(tip, base string) []byte {
 	f.t.Helper()
 	revs := run(f.t, f.work, "git", "rev-list", tip, "^"+base, "--objects")
-	cmd := exec.Command("git", "-C", f.work, "pack-objects", "--stdout")
+	cmd := exec.Command("git", "-C", f.work, "pack-objects", "--stdout") //nolint:gosec // G204: test helper invoking the real git against a test-owned temp repo path, not attacker input.
 	cmd.Stdin = strings.NewReader(revs)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
@@ -86,8 +86,8 @@ func (f *gitFixture) pack(tip, base string) []byte {
 // originRef returns the sha origin has for a ref, or "" if absent.
 func (f *gitFixture) originRef(ref string) string {
 	f.t.Helper()
-	cmd := exec.Command("git", "-C", f.bare, "rev-parse", "--verify", "--quiet", ref)
-	out, _ := cmd.Output() // non-zero exit on a missing ref is expected → ""
+	cmd := exec.Command("git", "-C", f.bare, "rev-parse", "--verify", "--quiet", ref) //nolint:gosec // G204: test helper invoking the real git against a test-owned temp repo path, not attacker input.
+	out, _ := cmd.Output()                                                            // non-zero exit on a missing ref is expected → ""
 	return strings.TrimSpace(string(out))
 }
 
@@ -152,6 +152,57 @@ func TestPublishFirstCheckpointOnNeverPushedBranch(t *testing.T) {
 	// origin's heads must be untouched: the feature branch was NEVER pushed to heads.
 	if got := f.originRef("refs/heads/agent/issue-7"); got != "" {
 		t.Fatalf("publish wrote refs/heads/agent/issue-7 = %q; it must only touch the checkpoint ns", got)
+	}
+}
+
+// TestPublishFirstCheckpointAfterDefaultAdvanced is the issue-#1009 regression: the
+// agent's branch was NEVER pushed to refs/heads, AND origin's default branch has
+// advanced since the worker cloned. The worker's non-thin pack excludes everything
+// reachable from the branch-point (base == D_old), but origin's main now points at
+// D_new, so a depth-1 fetch pulls only D_new's snapshot — D_old is absent from the
+// broker's storer. remote.PushContext recomputes its send-set by walking from the tip
+// and excluding D_new, hits the branch-point's excluded parent D_old (not in the
+// storer), and fails LOCALLY with "object not found" before any bytes leave — even
+// though the REMOTE holds D_old and could resolve the pack. The manual receive-pack
+// forward ships the pack verbatim and lets the remote do reachability, so the
+// checkpoint is created.
+func TestPublishFirstCheckpointAfterDefaultAdvanced(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base") // D_old — the pack's exclude boundary
+	f.pushMain()
+
+	// Work on a feature branch off base and build the worker's non-thin pack (^base),
+	// but never push the branch to heads.
+	f.git("checkout", "-b", "agent/issue-9", base)
+	tip := f.commit("b.txt", "one\n", "c1")
+	pack := f.pack(tip, base)
+
+	// Origin's default advances to D_new on a DIFFERENT path than the feature branch
+	// touched, so D_new descends D_old (D_old stays reachable on origin) but the
+	// feature tip does not descend D_new.
+	f.git("checkout", "main")
+	f.commit("main-only.txt", "advanced\n", "main advance")
+	f.pushMain() // origin main = D_new != D_old = base
+
+	res, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL:      f.cloneURL(),
+		Branch:        "agent/issue-9",
+		DefaultBranch: "main",
+		DeclaredTip:   tip,
+		Pack:          pack,
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if res.Ref != "refs/uzi-checkpoints/agent/issue-9" {
+		t.Fatalf("ref = %q, want refs/uzi-checkpoints/agent/issue-9", res.Ref)
+	}
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-9"); got != tip {
+		t.Fatalf("origin checkpoint = %q, want tip %q", got, tip)
+	}
+	// origin's heads must be untouched: the feature branch was NEVER pushed to heads.
+	if got := f.originRef("refs/heads/agent/issue-9"); got != "" {
+		t.Fatalf("publish wrote refs/heads/agent/issue-9 = %q; it must only touch the checkpoint ns", got)
 	}
 }
 
@@ -341,7 +392,7 @@ func isNotDescendant(err error) bool { return errors.Is(err, pushbroker.ErrNotDe
 // on a non-zero exit with stderr attached.
 func run(t *testing.T, dir, name string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(name, args...)
+	cmd := exec.Command(name, args...) //nolint:gosec // G204: generic test command runner; name/args are test-controlled constants, not attacker input.
 	if dir != "" {
 		cmd.Dir = dir
 	}

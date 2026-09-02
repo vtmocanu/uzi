@@ -91,7 +91,7 @@ function spyPublish(opts: { throws?: boolean } = {}): {
     const objectCount = bytes.length >= 12 ? bytes.readUInt32BE(8) : -1;
     calls.push({ runId, tipOid, objectCount });
     if (opts.throws) throw new Error("boom publish");
-    return { published: true, ref: `refs/uzi-checkpoints/agent/issue-x` };
+    return { ok: true, body: { published: true, ref: `refs/uzi-checkpoints/agent/issue-x` } };
   };
   return {
     calls,
@@ -139,6 +139,32 @@ function parkFactory(
 
 const parked = (runId: string) =>
   api.states.some((s) => s.runId === runId && s.body.status === "limit_wait");
+
+/** The `status`-kind feed lines the worker emitted for a run. */
+const statusTexts = (runId: string): string[] =>
+  api
+    .messages(runId)
+    .filter((m) => m.kind === "status")
+    .map((m) => String(m.payload.text));
+
+/** Spy on client.publishCheckpoint that drains the pack then returns a non-2xx PublishResult
+ *  (issue #1030), to drive the park-publish FAILURE feed line. Returns [restore]. */
+function spyPublishHttpError(httpStatus: number): { restore: () => void } {
+  const orig = client.publishCheckpoint.bind(client);
+  (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+    _runId: string,
+    _tipOid: string,
+    pack: Readable,
+  ) => {
+    await drain(pack);
+    return { ok: false, httpStatus };
+  };
+  return {
+    restore: () => {
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
+    },
+  };
+}
 
 describe("RunRunner — checkpoint on the limit-park path (PRD #628 M2)", () => {
   it("publishes a checkpoint carrying the committed work when a park has new commits", async () => {
@@ -243,6 +269,60 @@ describe("RunRunner — checkpoint on the limit-park path (PRD #628 M2)", () => 
         calls.length,
         0,
         `no tracking ref ⇒ checkpointPack null ⇒ no publish RPC, got ${JSON.stringify(calls)}`,
+      );
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // ── issue #1030: the park-publish result is EXPLICIT on the feed ────────────
+  it("states 'park checkpoint published to origin' on the feed when the publish lands", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1030-park-ok-"));
+    const { restore } = spyPublish(); // returns { ok: true, body: { published: true, … } }
+    try {
+      const { factory } = parkFactory(homeRoot, "WORK.txt");
+      const claim = gitlabClaim(605, { wait_on_limit: true });
+      await runnerWithGit(factory, gitlab).execute(claim);
+
+      assert.ok(parked(claim.run_id), "the run must have parked (else this is vacuous)");
+      const feed = statusTexts(claim.run_id);
+      assert.ok(
+        feed.includes("park checkpoint published to origin"),
+        `expected the park-published feed line, got ${JSON.stringify(feed)}`,
+      );
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("warns on the feed that a resume restarts from default when the park publish fails, and still parks", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1030-park-fail-"));
+    const { restore } = spyPublishHttpError(500);
+    try {
+      const { factory } = parkFactory(homeRoot, "WORK.txt");
+      const claim = gitlabClaim(606, { wait_on_limit: true });
+      await runnerWithGit(factory, gitlab).execute(claim);
+
+      assert.ok(
+        parked(claim.run_id),
+        "a failed checkpoint publish must not change the limit_wait outcome (best-effort)",
+      );
+      const feed = statusTexts(claim.run_id);
+      assert.ok(
+        feed.some((t) =>
+          t.includes(
+            "park checkpoint NOT published — a resume on another worker will restart from the default branch",
+          ),
+        ),
+        `expected the park-not-published consequence line, got ${JSON.stringify(feed)}`,
+      );
+      assert.ok(
+        feed.some((t) => t.includes("checkpoint publish failed: HTTP 500")),
+        `expected the generic HTTP-status line naming the cause, got ${JSON.stringify(feed)}`,
       );
     } finally {
       restore();

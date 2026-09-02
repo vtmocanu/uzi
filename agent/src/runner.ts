@@ -282,6 +282,11 @@ interface RunFlight {
   preserveSession: boolean;
   lastPublish: number;
   lastPublishedTip: string | undefined;
+  /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
+   *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
+   *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
+   *  not spam the feed. */
+  reportedPublishOutcomes: Set<string>;
   runnerClone: RunnerClone | undefined;
   ciFixHumanApproved: boolean;
   result: ExecutorResult | undefined;
@@ -503,7 +508,8 @@ export class RunRunner {
         // not. Only when the run actually parked (a resume is coming) and a clone
         // existed to fetch from. Best-effort: a park that fails is worse than a park
         // that loses work (D4), so a failed fetch-back must not undo the park.
-        if (flight.parked && flight.barePath && flight.worktreePath && flight.branch) {
+        if (flight.parked) {
+          if (flight.barePath && flight.worktreePath && flight.branch) {
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
           const branch = flight.branch;
@@ -535,12 +541,37 @@ export class RunRunner {
           // nothing to origin (verified 2026-08-23); either way no spurious tree is
           // published. It runs AFTER the fetch-back so the tracking ref checkpointPack reads
           // is current. Best-effort
-          // (publishCheckpointBestEffort swallows/logs every failure — null pack, non-2xx,
-          // thrown error — and never throws): a publish failure must never undo the park,
-          // exactly as the fetch-back above must not (D4). The publish stays on the
+          // (publishCheckpointBestEffort swallows/logs/surfaces every failure — null pack,
+          // non-2xx, thrown error — and never throws): a publish failure must never undo the
+          // park, exactly as the fetch-back above must not (D4). The publish stays on the
           // join-token seam (checkpointPack local read → client.publishCheckpoint), never a
           // git push / PAT (ADR-628 guardrail invariants).
-          await this.publishCheckpointBestEffort(barePath, branch, runId, runLog);
+          //
+          // issue #1030: the park-publish result is now EXPLICIT on the feed rather than
+          // ignored — a success line, and a failure line that names the durability
+          // consequence (a resume on another worker restarts from the default branch). The
+          // `false` case covers a real publish failure AND an empty park (null pack / no
+          // committed work): in both, nothing landed on refs/uzi-checkpoints/<branch>, so a
+          // cross-worker resume does restart from default, which the line states truthfully.
+          // publishCheckpointBestEffort ALSO emits the specific HTTP/skip outcome (deduped),
+          // so a failure shows both the cause and this consequence. This batcher.emit lands
+          // because handleLimitReached now FLUSHES (not closes) the batcher on the park
+          // branch, leaving it open until the close just below.
+          const parkPublished = await this.publishCheckpointBestEffort(flight, barePath, branch);
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: parkPublished
+                ? "park checkpoint published to origin"
+                : "park checkpoint NOT published — a resume on another worker will restart from the default branch",
+            },
+          });
+          }
+          // Close the batcher on the park path (handleLimitReached deferred the close so the
+          // checkpoint-publish outcome above could reach the feed). Closed exactly once here
+          // for every parked run, including the edge where the paths above were absent.
+          await batcher.close().catch(() => undefined);
         }
       } else if (flight.active?.shuttingDown) {
         // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
@@ -1712,6 +1743,8 @@ export class RunRunner {
       // work" test keys on `lastPublishedTip`, NOT the fetch-skip below.
       lastPublish: this.now(),
       lastPublishedTip: undefined,
+      // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
+      reportedPublishOutcomes: new Set<string>(),
       // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
       // catch can name it. `runnerClone` is declared inside the try and there is no
       // `result` on those paths, so `runnerClone.branch` is the source of truth and it is
@@ -2521,10 +2554,9 @@ export class RunRunner {
         let published = false;
         if (hasNewWork && (opts.reap || timeGateOpen)) {
           published = await this.publishCheckpointBestEffort(
+            flight,
             barePath,
             runnerClone.branch,
-            runId,
-            runLog,
           );
           // Advance the time-gate on every ATTEMPT (not just success): this bounds broker
           // retry cadence to <= 1 publish/interval/run even under a persistent broker
@@ -2659,30 +2691,64 @@ export class RunRunner {
    * to the api's publish RPC, which lands it at `refs/uzi-checkpoints/<branch>` for another
    * worker to recover cross-worker. Fired on BOTH the milestone (reap:true) checkpoint and
    * the PRD #267 time-gated (reap:false) checkpoint, always AFTER the fetch-back updated the
-   * tracking ref checkpointPack reads. Every failure — a null pack, a non-2xx (returned as
-   * null by the client), a thrown error — is swallowed with a warn so a publish NEVER fails
-   * the run.
+   * tracking ref checkpointPack reads. Every non-success — a null pack (nothing to publish),
+   * a non-2xx ({@link PublishResult} `ok: false`), a best-effort skip, or a thrown error — is
+   * swallowed (never fails the run) but, since issue #1030, is also SURFACED: a non-2xx,
+   * skip, or thrown error emits a deduped run-feed line (see {@link reportPublishOutcome}); a
+   * null pack stays silent because there was genuinely nothing to publish.
    *
-   * Returns `true` IFF the publish confirmably LANDED (a non-null publish response), so the
-   * caller can advance `lastPublishedTip` only on confirmed success (PRD #267 Fix 1): a
-   * swallowed failure returns `false`, leaving the tip un-advanced so `hasNewWork` stays
-   * true and the time-gate retries at the next interval boundary.
+   * Returns `true` IFF the publish confirmably LANDED (a 2xx whose body reports
+   * `published: true`), so the caller can advance `lastPublishedTip` only on confirmed
+   * success (PRD #267 Fix 1): a swallowed failure returns `false`, leaving the tip
+   * un-advanced so `hasNewWork` stays true and the time-gate retries at the next interval
+   * boundary.
+   *
+   * issue #1030: a failure or a best-effort SKIP is no longer swallowed silently. A non-2xx
+   * (HTTP <code>), a 2xx `{ published: false, skipped: <reason> }`, or a thrown error each
+   * emits a `status` line onto the run feed and a `runLog.warn`, deduped per distinct
+   * outcome per run (see {@link reportPublishOutcome}). A null pack (nothing to publish —
+   * an absent tracking ref or an unmoved tip) is NOT a failure and stays silent.
    */
   private async publishCheckpointBestEffort(
+    flight: RunFlight,
     barePath: string,
     branch: string,
-    runId: string,
-    runLog: Logger,
   ): Promise<boolean> {
     try {
       const packed = await this.git.checkpointPack(barePath, branch);
-      if (!packed) return false;
-      const res = await this.client.publishCheckpoint(runId, packed.tipOid, packed.pack);
-      return res !== null; // client returns null on any non-2xx / empty body
+      if (!packed) return false; // nothing to publish — not a failure, stay silent
+      const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack);
+      if (res.ok && res.body.published === true) return true;
+      if (res.ok) {
+        // A 2xx that did NOT publish: a best-effort server-side skip. Name the reason.
+        const reason = res.body.skipped ?? "unknown";
+        this.reportPublishOutcome(flight, `skip:${reason}`, `checkpoint publish skipped: ${reason}`);
+      } else {
+        this.reportPublishOutcome(
+          flight,
+          `http:${res.httpStatus}`,
+          `checkpoint publish failed: HTTP ${res.httpStatus}`,
+        );
+      }
+      return false;
     } catch (e) {
-      runLog.warn("checkpoint publish failed", { error: errMessage(e) });
+      this.reportPublishOutcome(flight, "error", `checkpoint publish failed: ${errMessage(e)}`);
       return false;
     }
+  }
+
+  /**
+   * issue #1030: make a checkpoint-publish failure or skip VISIBLE. Always `runLog.warn`s
+   * the outcome; emits a run-feed `status` line at most ONCE per distinct outcome key per
+   * run, so the ~20-min time-gated retry of a persistently-failing publish does not spam the
+   * feed. Reuses the same `batcher.emit({ kind: "status", agent: "worker", … })` mechanism
+   * every other worker-authored status line uses.
+   */
+  private reportPublishOutcome(flight: RunFlight, key: string, text: string): void {
+    flight.runLog.warn(text, { run_id: flight.runId });
+    if (flight.reportedPublishOutcomes.has(key)) return;
+    flight.reportedPublishOutcomes.add(key);
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
   }
 
   /**
@@ -2795,7 +2861,13 @@ export class RunRunner {
       agent: "worker",
       payload: { ...feedPayload },
     });
-    await batcher.close().catch(() => undefined);
+    // issue #1030: FLUSH (not close) here so the limit_wait feed line lands before the state
+    // report, exactly as the prior close did — but leave the batcher OPEN so the park
+    // durability block in execute() can emit the checkpoint-publish outcome onto the feed.
+    // execute()'s park block closes the batcher once, on every parked run. The two
+    // non-park returns below still CLOSE it themselves, since execute() emits nothing more
+    // on those paths.
+    await batcher.flush().catch(() => undefined);
 
     let ack: StateAck;
     try {
@@ -2807,6 +2879,7 @@ export class RunRunner {
         "could not report the park; cleaning up as an unparked run",
         { error: errMessage(e) },
       );
+      await batcher.close().catch(() => undefined);
       return false;
     }
 
@@ -2815,6 +2888,7 @@ export class RunRunner {
         applied: ack.applied,
         server_status: ack.status ?? "unknown",
       });
+      await batcher.close().catch(() => undefined);
       return false;
     }
     return true;

@@ -3,6 +3,7 @@ import type { Logger } from "./log.js";
 import {
   WORKER_API_PREFIX,
   type PublishResponse,
+  type PublishResult,
   type ChatClaimResponse,
   type ClaimResponse,
   type CreateProposalRequest,
@@ -241,18 +242,23 @@ export class WorkerClient {
    * required by undici for a streamed request body), and the checkpoint tip OID rides the
    * `X-Uzi-Checkpoint-Tip` header rather than a JSON field.
    *
-   * Best-effort by contract: a publish must NEVER fail the run, so ANY non-2xx
-   * (404/413/400/500) returns null rather than throwing, and a 2xx with an empty body reads
-   * as null too. The caller (runner.ts publishCheckpointBestEffort) additionally wraps this
-   * in a warn-and-swallow. The bearer/version header assembly mirrors fetchRaw; the same
+   * Best-effort by contract: a publish must NEVER fail the run. But the OUTCOME is no
+   * longer discarded (issue #1030): rather than collapse every non-2xx to an
+   * indistinguishable `null`, this returns a {@link PublishResult} discriminated union so
+   * the caller (runner.ts publishCheckpointBestEffort) can name the HTTP status on the run
+   * feed. ANY non-2xx (404/413/400/500) returns `{ ok: false, httpStatus: res.status }`
+   * rather than throwing, and a 2xx with an empty body returns `{ ok: false, httpStatus }`
+   * too (the publish could not be confirmed). A 2xx with a parseable body returns
+   * `{ ok: true, body }` — which the caller further inspects for a best-effort skip
+   * (`published: false`). The bearer/version header assembly mirrors fetchRaw; the same
    * per-request timeout is used — generous enough for a real pack, and an abort is just
-   * another best-effort miss.
+   * another best-effort miss (it throws, caught by the caller's warn-and-swallow).
    */
   async publishCheckpoint(
     runId: string,
     tipOid: string,
     pack: Readable,
-  ): Promise<PublishResponse | null> {
+  ): Promise<PublishResult> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/publish`;
     const init: RequestInit = {
       method: "POST",
@@ -269,9 +275,12 @@ export class WorkerClient {
       signal: AbortSignal.timeout(this.httpTimeoutMs),
     };
     const res = await fetch(this.baseUrl + path, init);
-    if (res.status < 200 || res.status >= 300) return null;
+    if (res.status < 200 || res.status >= 300) return { ok: false, httpStatus: res.status };
     const text = await res.text();
-    return text ? (JSON.parse(text) as PublishResponse) : null;
+    // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
+    // outcome carrying the 2xx code rather than fabricating a body.
+    if (!text) return { ok: false, httpStatus: res.status };
+    return { ok: true, body: JSON.parse(text) as PublishResponse };
   }
 
   async getInputs(runId: string): Promise<UserInput[]> {
