@@ -965,7 +965,7 @@ chain in the diagram above, with no intervening `running`.
   misleading `[]`, so the `milestones_completed` column stays `null` on a run that
   truly never reported and the neutral `M–/N` render is what that run actually
   shows. The CLI's `uzi run get` now renders that same neutral `–/N` numerator for
-  a never-reported run (PRD #390 D5/M4, `api/cmd/uzi/run.go`), bringing it to
+  a never-reported run (PRD #390 D5/M4, `api/cmd/uzi/run_render.go`), bringing it to
   display parity with the web badge and the TUI rail.
 - **Operator scope steering** (PRD #634, [ADR-634](adr/0634-run-scope-steering.md)) —
   a mid-run `uzi run stop` or `uzi run scope --through N` on a

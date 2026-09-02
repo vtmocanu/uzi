@@ -78,7 +78,7 @@ kind-gates the flag (drop-and-warn, never error on the terminal report); `clampW
 stores the text ONLY when report_only was accepted, control/format-char stripped, bounded to
 `ReviewSummaryMaxBytes` (8KB), then `secretscrub.Scrub`ed — sanitize-then-scrub, so the
 scrubber sees whole runes. On render, web (`web/src/pages/RunView.tsx`) and CLI
-(`api/cmd/uzi/run.go`) show `report_md` as ESCAPED plain text, never through `<Markdown>` —
+(`api/cmd/uzi/run_render.go`) show `report_md` as ESCAPED plain text, never through `<Markdown>` —
 the same rule the judge summary follows, because the ingest scrub does not cover
 markdown/link injection.
 

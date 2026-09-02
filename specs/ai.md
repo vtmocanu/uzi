@@ -7924,7 +7924,7 @@ line, recorded per the phase-2 follow-ups.
   exactly this), server-validated, with no roster fetch and no allow-list (the product has none).
   - Why the flags rather than `--agents`: `--agents` implied an additive allow-list the wire model does
     not have; the two faithful flags map exactly to `{source, exclusions}`. Realized on `run approve`
-    (`api/cmd/uzi/run.go`). `--exclude-agents` without `--agent-source` is a **usage error** (exit 2),
+    (`api/cmd/uzi/run_lifecycle.go`). `--exclude-agents` without `--agent-source` is a **usage error** (exit 2),
     since without a fetch the CLI cannot know the source's roster.
   - **The skill↔cobra-tree drift test enforces this**: a SKILL.md that still says `--agents` fails the
     test (§284).
@@ -9432,7 +9432,7 @@ rule (Feature #64). PRD #95 Decisions 9 + 10, chat caveat N3.
   file, and hoists the queue into its own card lifted to `useRunStream` (§328 B1). After the
   seam, M2 (crew/scroll: `ActivityFeed.tsx` + the follow-scroll hook) and M3 (delivery:
   hub/workersvc/`ConsumeInputs` + the queue card + `useRunStream`) touch disjoint files.
-- **CLI parity: `uzi run inputs <run-id>`** (`api/cmd/uzi/run.go` → `RunInputs` client →
+- **CLI parity: `uzi run inputs <run-id>`** (`api/cmd/uzi/run_steer.go` → `RunInputs` client →
   `GET /runs/{id}/inputs`) prints each follow-up with its delivery state (`queued`/
   `delivered`) + relative age, `--json` for the raw DTO. Owner-scoped, so a `uzc_` or
   read-only `uza_` token reads its own and 404s on another owner's.
@@ -16289,7 +16289,7 @@ is one new read plus one normalization, and each has exactly one correctness pro
   said, and `pendingJudgeToDTO` applies the mapping — so a second consumer cannot invent
   a third spelling, and the closed union is a server promise the clients may lean on
   rather than a convention each re-derives. The CLI's own phrase mapper
-  (`pendingJudgePhrase`, `cmd/uzi/run.go`) defaults in the same direction for a different
+  (`pendingJudgePhrase`, `cmd/uzi/review_render.go`) defaults in the same direction for a different
   reason: an old CLI against a new server is the deployment order this repo ships in, and
   the failure to avoid is a blank phrase in `run r1: judge `.
 
@@ -19367,7 +19367,7 @@ in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-s
   reserved for the Workers attention badge.
 
 - **CLI: deliberately NO new command (recorded as out-of-scope, not an oversight).** `uzi run list`
-  already prints `ID KIND STATUS TITLE` and supports `--json` (`api/cmd/uzi/run.go`), so an agent or
+  already prints `ID KIND STATUS TITLE` and supports `--json` (`api/cmd/uzi/run_get.go`), so an agent or
   script derives an in-progress tally client-side from `ListRuns`. A dedicated count subcommand would
   duplicate the badge's purely-ambient-UI purpose with no headless capability the list verb lacks, so
   none was added.
@@ -20619,7 +20619,7 @@ only bites once the agent image is current (see Decision 2).
   also to agents" toggle under the Model control (first-class on Inherit) plus a "model on all agents"
   run-detail badge; CLI `uzi schedule create/edit --apply-model-to-agents`, a `schedule get` detail
   row, and `uzi run get --field override_subagent_model` (auto-derived from `RunDTO`). A pre-existing
-  bug was fixed in passing: `buildScheduleEditRequest` (`api/cmd/uzi/schedule.go`) did not restate the
+  bug was fixed in passing: `buildScheduleEditRequest` (`api/cmd/uzi/schedule_request.go`) did not restate the
   replace-semantics `model` field, so a partial `schedule edit` silently wiped a schedule's stored
   model — it now restates BOTH `model` and `override_subagent_model`.
 - **Verification.** agent/ both-rosters unit matrix calibrated on PINNED subagents
@@ -21645,7 +21645,7 @@ surfaced a milestone-structured run's progress; the interactive TUI (`uzi tui`) 
 it. #379 adds it to both TUI surfaces and fixes an unrelated layout gap the work exposed.
 
 - **One shared fold, so three surfaces cannot disagree.** `milestoneProgress(run) → (done,
-  total, reported)` + `milestoneCount` in `api/cmd/uzi/tui_detail.go` are the TUI twin of the
+  total, reported)` + `milestoneCount` in `api/cmd/uzi/tui_detail_rail.go` are the TUI twin of the
   web's `milestoneBadge`. `done` counts frozen MEMBERS present in the completed set (immune to a
   duplicate id and to a completed id naming a milestone dropped after it was ticked). `reported`
   is `MilestonesCompleted != nil`: a nil completed slice (JSON `null`) means nothing was ever
@@ -22001,7 +22001,7 @@ Decision Log; this is the terse contract.
 
 - **Surfacing.** The run DTO (`api/internal/apitypes/run.go`) carries
   `required_capabilities`/`required_tools`/`size_class`; the web plan-gate readiness summary renders
-  them with an override button; the CLI (`api/cmd/uzi/run.go`, `uzi run get`) shows them in its rows.
+  them with an override button; the CLI (`api/cmd/uzi/run_render.go`, `uzi run get`) shows them in its rows.
 
 ## 566. PRD #517 — interactive, long-lived task runs: opt-in park at a new `awaiting_followup`, `run stop` wind-down, worker-side idle backstop
 
@@ -23707,3 +23707,13 @@ Serves human: "a 1958-line file holding a dozen unrelated settings domains shoul
 - **Byte-identity is the proof.** `go doc -all ./internal/settings` is unchanged (906 lines, empty diff base↔head), every commit is `--color-moved` clean, and all `*_test.go` are untouched. Final shape: `settings.go` ≈464 lines (the `Cache` engine, `Validate`, the two generic validators, the three domainless accessors `DefaultTheme`/`GithubProjectSyncEnabled`/`CapabilityAwareScheduling`, and the `secret`/seal/storage helpers); `keys.go` ≈485; no `settings_<domain>.go` over 320 (the largest, `settings_agent_source.go`, is 300).
 
 Cross-refs: epic #915 (Batch 4, P17); #921 and #963 (the same-package pure-motion recipe this repeats).
+## 601. PRD #1009 — CLI file splits: the four oversized `api/cmd/uzi` files split along measured seams
+
+Serves human: "a change to one CLI subcommand should not diff against the whole 2500-line file." Pure-motion refactor of `api/cmd/uzi/` (`package main`); no behaviour, flag, or output change, zero `*_test.go` edits. The richer rationale is PRD #1009's Decision Log; terse record here. The four files that held most of the package — `run.go` (2525 lines), `schedule.go`, `tui_detail.go`, `tui_board.go` — split along their measured seams.
+
+- **D1 — completeness proven by `go doc -u -all`, not `go doc -all`.** The package is `package main` (only `Main`/`Env` exported), so plain `go doc -all` is blind to a dropped unexported helper; `go doc -u -all ./cmd/uzi` yields ~4595 layout-independent lines (ordered by name). M1-M3 hold it byte-identical to the base; M4 (extraction) is additions-only — the new `func newRun<Sub>Cmd` constructors, zero removals.
+- **D2 — consolidate the shared render helpers, don't scatter them.** `run.go` was a de-facto render library for the TUI/schedule/review/admin trees; moving each helper next to its first consumer would put `cellText` in a TUI file. Instead the package-wide cell helpers (`cellText`, `compactText`, `relAge`, `capCell`, `shortRecID`, `effectiveRunStatus`, `sanitizeTTY`) went to the existing `render.go` (`shortInstanceID` stayed in `run.go`, beside the run-detail cluster that is its only consumer); review rendering to its own `review_render.go` beside `review.go`; `renderRunDetail` + its row/steer helpers (`limitWaitLine`, `resumesIn`, `fmtUntil`, `milestoneRows`, `summaryRows`, …) to `run_render.go`; three cross-tree non-render helpers (`readPlanFile`, `resolveMessage`, `mrReworkFlag`) to `run_shared.go`. A shared helper is never duplicated; a single-tree helper stays with its tree.
+- **M2-M3 — schedule + TUI by concern.** `schedule.go` → `schedule_catalog.go` / `schedule_render.go` / `schedule_request.go` (the third file keeps `schedule.go` under the 1000-line cap); `tui_detail.go` and `tui_board.go` split by section (`tui_detail_rail.go` / `_meters.go` / `_transcript.go`, `tui_board_rows.go`), with shared visual/duration helpers in `tui_text.go`. Every TUI-derived file keeps the `tui_` prefix — the `tui_d7_guard_test.go` glob silently drops a file that loses it, and its only vacuity check fires at zero files.
+- **M4 — `newRunCmd`'s 18 inline subcommand literals → per-cluster `newRun<Sub>Cmd` constructors** (extraction, not motion, done last), grouped into `run_lifecycle.go` / `run_steer.go` / `run_get.go` / `run_limits.go` / `run_wait.go`; `newRunCmd` becomes the tree assembly with the same `AddCommand` order and names. `TestCommandTree` and the per-subcommand suites pass unmodified.
+
+Cross-refs: #960 (`pages/adminSettings/` per-directory recipe — the web analogue this mirrors), PRD #1008 (the handler-side same-day sibling split), #963 (the file-shape rule — file comment BELOW the package clause so `go doc` sees no second package doc).
