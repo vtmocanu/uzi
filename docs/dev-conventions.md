@@ -647,7 +647,7 @@ mechanical checks, each narrower than it sounds — worded here exactly so
 - **The issue #195 divergence invariant — a test on named fixtures
   (PRD #311 M3).** `web/src/mocks/data.realism.test.ts` pins that the
   result frames the cost/usage surfaces actually read
-  (`mockDoneMessages`, `mockFailedMessages` in `src/mocks/data.ts`, and
+  (`mockDoneMessages`, `mockFailedMessages` in `src/mocks/data/runHistories.ts`, and
   `PLAN_RESULT_FRAME` / `RUN_RESULT_FRAME` in `src/mocks/engine.ts`)
   carry more than one model key and a `modelUsage` that diverges from
   the frame's top-level `usage`, in the real under-reading direction.
