@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -240,10 +241,10 @@ func parseNotifPage(r *http.Request) (lim, off int32, err error) {
 	}
 	if s := r.URL.Query().Get("offset"); s != "" {
 		v, e := strconv.Atoi(s)
-		if e != nil || v < 0 {
+		if e != nil || v < 0 || v > math.MaxInt32 {
 			return 0, 0, errors.New("invalid offset")
 		}
-		off = int32(v) //nolint:gosec // G109: pagination offset, validated non-negative; a pathological value causes a query error, not unsafe behavior
+		off = int32(v) //nolint:gosec // G109: v is bounded to [0, math.MaxInt32] just above; the explicit upper bound clears CodeQL's range check, this nolint only silences gosec's syntactic one
 	}
 	return lim, off, nil
 }
