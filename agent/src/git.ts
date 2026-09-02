@@ -594,8 +594,13 @@ export class GitCache {
           // server persists the tip on EVERY publish (M2), so the persisted tip advanced with
           // the checkpoint and still equals it (trap #5). When the tip is NULL/empty (a
           // never-published run) or does NOT match (a foreign/prior run's checkpoint), do NOT
-          // adopt: fall through to the origin/default floor set just above, and say so LOUDLY
-          // so the feed shows why prior work was not re-treaded.
+          // adopt: fall through to the origin/default floor set just above, and log LOUDLY
+          // (structured warn, not a run-feed status) so an operator can see why a present
+          // checkpoint was set aside. This path deliberately does NOT set checkpointSetAside:
+          // that flag drives the foreign-WIP cherry-pick recovery, which would re-import the
+          // very prior-run work this guard exists to keep out. Surfacing an owner-anchor
+          // set-aside in the run feed (a dedicated status, not this flag) is a possible
+          // follow-up; today it is operator-visible in structured logs only.
           const checkpointSha = (
             await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${checkpointRef}^{commit}`])
           ).trim();
