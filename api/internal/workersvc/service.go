@@ -1250,14 +1250,19 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		return nil, nil // idle: owner locked
 	}
 
-	// Drain gate (PRD #422 M3): a cordoned worker finishes its in-flight runs but
-	// claims nothing new, so the controller can roll it once idle. Like the vault
-	// gate this reports idle (nil,nil), not an error — the worker keeps heartbeating
-	// and reporting its running runs; only NEW claims are refused. draining_since is
-	// cleared on the worker's next register (after its roll), which re-enables claims.
-	if wkr.DrainingSince.Valid {
-		return nil, nil // idle: worker draining/cordoned
-	}
+	// Drain gate (PRD #422 M3, narrowed by PRD #1030 M2): a cordoned worker claims
+	// nothing NEW, so the controller can roll it once idle — but it MUST still be able
+	// to re-claim its OWN promoted run so a run parked (limit_wait→queued, worker_id
+	// retained for affinity) while its owner was cordoned for a roll resumes in place
+	// on the same worker/PVC instead of being stolen cold by a live peer (run #1009).
+	// So we no longer short-circuit here; instead ClaimRun is told the claimant is
+	// draining (ClaimantDraining below), and its `NOT @claimant_draining OR
+	// r.worker_id = @worker_id` clause scopes a draining claimant to its own runs.
+	// draining_since is cleared on the worker's next register (after its roll), which
+	// re-enables new claims. (This replaces the old `if wkr.DrainingSince.Valid {
+	// return nil, nil }` early return; nothing downstream of Claim assumed a draining
+	// worker never reaches ClaimRun — the vault gate above still fires, and the claim
+	// assembly / recovery paths below are indifferent to the owner's drain state.)
 
 	// Docker-worker repo allowlist (PRD #89 M-allow): a docker-enabled worker may
 	// claim ONLY runs whose repo is on the trusted allowlist. Repo-less JUDGE runs are
@@ -1321,6 +1326,10 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		SpreadCutoff:          pgconv.Time(s.now().Add(-s.p.WorkerSpreadGrace)),
 		BackgroundGraceCutoff: pgconv.Time(s.now().Add(-s.p.WorkerBackgroundGrace)),
 		HeartbeatCutoff:       pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale)),
+		// PRD #1030 M2: a draining claimant is scoped to its own promoted run (see the
+		// drain gate above and the `NOT @claimant_draining OR r.worker_id = @worker_id`
+		// clause in ClaimRun). A non-draining worker passes false — a no-op.
+		ClaimantDraining: wkr.DrainingSince.Valid,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

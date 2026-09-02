@@ -267,31 +267,47 @@ WHERE id = (
       AND r.status = 'queued'
       AND (r.worker_id IS NULL
            OR r.worker_id = $1
-           -- Fall open the moment the run's OWN worker stops being a live, non-draining
-           -- claim target: a dead (heartbeat-stale) or draining owner will never resume it
-           -- (PRD #628 / ADR-628 D3a). Mirrors the fleet-spread peer-liveness test (ADR-216
-           -- D6, the ` + "`" + `last_heartbeat_at >= @heartbeat_cutoff AND draining_since IS NULL` + "`" + `
-           -- block later in this same ClaimRun subquery); reuses that @heartbeat_cutoff param.
+           -- Hold the pin whenever the run's OWN worker ROW still exists AND it can
+           -- still resume the run — i.e. it is either DRAINING (cordoned for an image
+           -- roll: same worker row, same PVC, new pod on the far side) OR its heartbeat
+           -- is fresh. Fall open ONLY when the row is GONE (teardown — DeleteWorkerForUser
+           -- / ReapEphemeralWorkers delete the row API-side BEFORE the controller's kube
+           -- teardown, so ` + "`" + `teardown ⟺ row absent` + "`" + `) or the owner is heartbeat-STALE AND
+           -- NOT draining (death/hang — ADR-628 D3a's protected case). This is PRD #1030
+           -- M2: the roll-vs-teardown discriminator with no new column. The old rule
+           -- required ` + "`" + `draining_since IS NULL` + "`" + ` in the EXISTS, so a roll-cordoned owner
+           -- (draining) failed the test → NOT EXISTS became TRUE → a parked run fell open
+           -- and a live peer stole it cold across the roll (run #1009). We deliberately
+           -- hold on ` + "`" + `draining regardless of heartbeat` + "`" + ` because the ~2 min pod-swap edge
+           -- exceeds the 45s @heartbeat_cutoff, so a heartbeat-gated hold would wrongly
+           -- fall open mid-swap (accepted tradeoff D7: a draining+dead owner then holds
+           -- until the @affinity_cutoff ceiling).
            OR NOT EXISTS (
                SELECT 1 FROM workers ow
                WHERE ow.id = r.worker_id
-                 AND ow.last_heartbeat_at IS NOT NULL
-                 AND ow.last_heartbeat_at >= $3
-                 AND ow.draining_since IS NULL)
+                 AND (ow.draining_since IS NOT NULL
+                      OR (ow.last_heartbeat_at IS NOT NULL
+                          AND ow.last_heartbeat_at >= $3)))
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
            -- now now() - WORKER_AFFINITY_CEILING (default 2h), NOT the 2-min grace.
            OR r.updated_at < $4)
+      -- PRD #1030 M2 / PRD #422 Decision 7: a DRAINING claimant claims NOTHING NEW. It
+      -- reaches ClaimRun now (the workersvc early return that made it claim nothing was
+      -- removed so it can re-claim its OWN promoted run through a roll), but it must be
+      -- scoped to runs it already owns — never a new/unclaimed/fallen-open run. When the
+      -- claimant is not draining this is a no-op; when it is, only its own runs qualify.
+      AND (NOT $5::boolean OR r.worker_id = $1)
       -- PRD #216 D5: claiming-worker eligibility via the shared expression.
       -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
-      AND fn_worker_can_claim($5::boolean, $6::uuid[], r.repo_id, r.kind, $7::text[], r.required_capabilities, $8::boolean)
+      AND fn_worker_can_claim($6::boolean, $7::uuid[], r.repo_id, r.kind, $8::text[], r.required_capabilities, $9::boolean)
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
       -- ephemeral claimant (@is_ephemeral) matches ONLY its bound run
       -- (@ephemeral_run_id); a non-ephemeral worker short-circuits true and the
       -- (NULL) run id is never compared.
-      AND (NOT $9::boolean OR r.id = $10::uuid)
+      AND (NOT $10::boolean OR r.id = $11::uuid)
       -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
       -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
       -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
@@ -309,7 +325,7 @@ WHERE id = (
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
       AND (
           r.worker_id = $1
-          OR r.updated_at < $11
+          OR r.updated_at < $12
           OR NOT EXISTS (
               SELECT 1
               FROM workers p
@@ -336,7 +352,7 @@ WHERE id = (
                 -- not a bare AND NOT p.ephemeral.
                 AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id)
                 AND p.max_concurrent_runs IS NOT NULL
-                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $6::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $8::boolean)
+                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $7::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $9::boolean)
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = $1)
                     < (SELECT count(*) FROM runs mr
@@ -355,7 +371,7 @@ WHERE id = (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $1, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $12) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $13) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -368,6 +384,7 @@ type ClaimRunParams struct {
 	UserID                uuid.UUID          `json:"user_id"`
 	HeartbeatCutoff       pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	AffinityCutoff        pgtype.Timestamptz `json:"affinity_cutoff"`
+	ClaimantDraining      bool               `json:"claimant_draining"`
 	IsDockerWorker        bool               `json:"is_docker_worker"`
 	DockerRepoAllowlist   []uuid.UUID        `json:"docker_repo_allowlist"`
 	WorkerCaps            []string           `json:"worker_caps"`
@@ -410,6 +427,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.UserID,
 		arg.HeartbeatCutoff,
 		arg.AffinityCutoff,
+		arg.ClaimantDraining,
 		arg.IsDockerWorker,
 		arg.DockerRepoAllowlist,
 		arg.WorkerCaps,
