@@ -49,6 +49,11 @@ a window is genuinely close to its cap. The **reset countdown** ("resets
 in 1h 23m") counts down to when that window clears, independent of the
 other one.
 
+That countdown is Anthropic's advertised reset time, and the 7-day window
+occasionally clears earlier than it advertised — see [the early-reset Slack
+alert](run-limit-wait.md#alert-when-the-7-day-window-resets-early) for how
+uzi tells you when that happens.
+
 ## Reading the forecast
 
 The bar tells you how much of a window is gone; a lighter **ghost** extending

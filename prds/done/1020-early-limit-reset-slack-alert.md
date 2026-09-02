@@ -1,9 +1,23 @@
 # PRD #1020 — Slack DM alert on early Anthropic 7-day rate-limit reset
 
 **Issue**: [#1020](https://github.com/vtmocanu/uzi/issues/1020)
-**Status**: Draft (held — see Dependencies)
+**Status**: Complete — shipped on `agent/issue-1020` (M1–M5 + M7; M6 dropped, see below).
 **Priority**: Medium
 **Standalone feature.** NOT an epic #915 refactor child; it adds behavior, it does not preserve it.
+
+## Implementation status (as built)
+
+All three refactor dependencies had already landed by the time this shipped (#1008 handler route-table split `3973d551`; #1009 CLI file splits `12edae9e`; #1026 slacksvc split, the branch base), so the whole feature landed in one branch.
+
+- **M1 — done.** Migration `00184_notify_early_limit_reset.sql` (users column, default true); `SetUserNotifyEarlyReset :one`; `GetRateLimitsForToken :one`; `ListAnthropicTokensToPoll` now JOINs users for the flag; `UserDTO` field + `toDTO` + api-contract fixtures + wire-tag guard + web `User` type.
+- **M2 — done.** Detection lives inside `pollToken`'s sole upsert path (`observe()`), so a poke-triggered poll cannot silently consume the moved-epoch edge; the poke path reads the owner opt-in via `GetUserByID`. Predicate per D8; upsert-then-notify (D7); `earlyResetThreshold = 8h`, `exhaustionPct = 95`. `SetNotifier` wired in `api/cmd/server/main.go`. Mutation-checked table tests.
+- **M3 — done, with one design correction.** slacksvc has **no per-Kind render dispatch** — the generic `notificationBlocks` renders whatever `SlackRender` the caller builds. So the loud alert is a distinctive `SlackRender` (🚨 header, hours-early + observed/expected `<!date^…>` facts) built in `notifysvc.NotifyEarlyReset`; **no slacksvc file was edited**. Facts are built from trusted numeric `time.Time` values (mention-inert without escaping).
+- **M4 — done.** `PUT /api/me/notify-early-reset` in its own handler file, registered in `mountMeRoutes`; fake-DB handler tests (session-scoped toggle, smuggled-id rejection, auth-required).
+- **M5 — done.** `api.setNotifyEarlyReset` (+ mock parity), a default-on toggle on the RunDefaults "Anthropic usage limits" card, and an `early_limit_reset` inbox renderer entry (fixed title, no link — account-level kind). Renderer + toggle tests.
+- **M6 — DROPPED (decision D9).** The sibling `wait_on_limit` *user setting* has no CLI verb to mirror (only the per-run/per-schedule `--wait-on-limit` flag has one), so adding a user-setting CLI verb would be net-new surface, not parity restoration. Omitting it creates no CLI-vs-web parity gap. Approved at the plan gate.
+- **M7 — done.** `docs/run-limit-wait.md` (+ `docs/rate-limits.md` cross-ref) and the regenerated `uzidocs` embed mirror; `CHANGELOG.md` `[Unreleased]` entry.
+
+Gates green: `task gate:api` and `task gate:web` (exit 0). Every unit reviewed clean per-commit.
 
 ## Problem
 
@@ -131,3 +145,4 @@ Mirror the `wait_on_limit` setting end to end — and note this is a **gate-enfo
 - **D6 — Per-token detection, per-token alert.** v1 does not coalesce across a user's multiple credentials.
 - **D7 — At-most-once via upsert-then-notify; no dedupe column.** Order is compute → upsert `next` → notify. A crash between upsert and notify drops the alert (acceptable for an advisory) rather than duplicating on restart. A `seven_day_early_notified_at` column would give at-least-once but is not worth it. The notify-then-crash window is not exercisable by the two-tick test, so this is a reasoned decision, not a test outcome.
 - **D8 — The moved reset epoch is the only reset signal.** `next.seven_day_resets_at > prev.seven_day_resets_at` is authoritative; a lone `seven_day_pct` drop (with `resets_at` unchanged) is poll jitter and must not fire. The "was constrained" baseline uses `>= exhaustionPct` (<100) or `source=='limit_report'`, never `== 100` exact (a sync floors 100→99).
+- **D9 — No CLI toggle (M6 dropped).** The analogous `wait_on_limit` *user-default* setting has no CLI verb (only the per-run/per-schedule `--wait-on-limit` flag does), so there is nothing to mirror and no CLI-vs-web parity gap is created by omitting one. Adding a user-setting CLI verb would be net-new surface beyond parity. Approved at the plan-approval gate.
