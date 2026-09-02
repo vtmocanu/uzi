@@ -114,6 +114,25 @@ func (g *github) UpdateIssueDescription(ctx context.Context, projectID, issueIID
 	return nil
 }
 
+// SetIssueState closes or reopens an issue. go-github's UpdateIssueRequest
+// leaves Title/Body nil (unchanged) and Labels/Assignees omitzero (unchanged)
+// when only State and StateReason are set, so this sends the state ALONE and
+// nothing else is clobbered. GitHub's mutate vocabulary is state open/closed
+// (the same words the list filter uses, minus its "all" fallback) plus a
+// state_reason: "completed" on close, "reopened" on reopen.
+func (g *github) SetIssueState(ctx context.Context, projectID, issueIID int64, state IssueState) error {
+	slug, err := g.repoSlugFor(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	st, reason := githubIssueStateMutation(state)
+	req := gh.UpdateIssueRequest{State: &st, StateReason: &reason}
+	if _, _, err := g.client.Issues.Update(ctx, slug.owner, slug.repo, int(issueIID), req); err != nil {
+		return g.wrapErr("set issue state", err)
+	}
+	return nil
+}
+
 func (g *github) UserExists(ctx context.Context, username string) (bool, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {
@@ -234,4 +253,17 @@ func githubIssueStateParam(s IssueState) string {
 	default:
 		return "all"
 	}
+}
+
+// githubIssueStateMutation maps the neutral state onto GitHub's MUTATE
+// vocabulary: the state open/closed word plus its state_reason. This mirrors
+// githubIssueStateParam's open/closed words but has NO "all" fallback — "all" is
+// a valid list FILTER, never a state a mutate can set. StateClosed closes with
+// reason "completed"; anything else (StateOpened, or a caller-bug value) reopens
+// with reason "reopened", the safe direction.
+func githubIssueStateMutation(s IssueState) (state, reason string) {
+	if s == StateClosed {
+		return "closed", "completed"
+	}
+	return "open", "reopened"
 }
