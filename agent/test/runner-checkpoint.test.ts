@@ -6,6 +6,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { type Executor } from "../src/executor.js";
 import type { Logger } from "../src/log.js";
+import type { PublishResult } from "../src/protocol.js";
 import {
   api,
   client,
@@ -52,10 +53,10 @@ function spyFetch(events: string[]): () => void {
 
 /** Spy on client.publishCheckpoint (PRD #122 M8), recording a "publish" event. Drains the
  *  real pack stream so pack-objects can exit, and optionally throws to prove a publish
- *  failure never fails the run. `nullFirst` returns null (the client's non-2xx / empty-body
- *  contract, an UNCONFIRMED publish) for the first N calls before succeeding, so a test can
- *  drive a fail-once-then-succeed broker without throwing (PRD #267 Fix 1). Returns a
- *  restore fn (call it in a finally). */
+ *  failure never fails the run. `nullFirst` returns a non-2xx PublishResult (the client's
+ *  `{ ok: false, httpStatus }` contract for an UNCONFIRMED publish, issue #1030) for the
+ *  first N calls before succeeding, so a test can drive a fail-once-then-succeed broker
+ *  without throwing (PRD #267 Fix 1). Returns a restore fn (call it in a finally). */
 function spyPublish(
   events: string[],
   opts: { throws?: boolean; nullFirst?: number } = {},
@@ -69,9 +70,9 @@ function spyPublish(
     (args[2] as Readable | undefined)?.resume(); // drain the pack so the git child can exit
     if (opts.throws) throw new Error("boom publish");
     calls += 1;
-    // null models a non-2xx / empty body: the publish did NOT confirmably land.
-    if (opts.nullFirst && calls <= opts.nullFirst) return null;
-    return { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" };
+    // A non-2xx result models an UNCONFIRMED publish: it did NOT confirmably land.
+    if (opts.nullFirst && calls <= opts.nullFirst) return { ok: false, httpStatus: 500 };
+    return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" } };
   };
   return () => {
     (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
@@ -594,8 +595,9 @@ describe("RunRunner — time-based checkpoint (PRD #267)", () => {
     let fakeNow = 0;
     const now = () => fakeNow;
     const restoreFetch = spyFetch(events);
-    // The FIRST publish returns null (the client's non-2xx contract — an UNCONFIRMED
-    // publish); every later publish succeeds. A failed publish must NOT advance
+    // The FIRST publish returns a non-2xx PublishResult (the client's { ok: false,
+    // httpStatus } contract — an UNCONFIRMED publish); every later publish succeeds. A
+    // failed publish must NOT advance
     // lastPublishedTip, so the SAME tip stays publish-eligible next interval.
     const restorePublish = spyPublish(events, { nullFirst: 1 });
     const publishesAtEachStage: number[] = [];
@@ -672,6 +674,132 @@ describe("RunRunner — time-based checkpoint (PRD #267)", () => {
     }
     assert.deepStrictEqual(idleEvents, [], "a pure-idle checkpoint neither fetches nor publishes");
     assert.equal(idleReportDelta, 0, "a pure-idle checkpoint emits no running report");
+  });
+});
+
+// issue #1030: a checkpoint-publish failure or best-effort SKIP must be VISIBLE on the run
+// feed rather than silently swallowed. These drive the mid-run (reap:true milestone) publish
+// through a spy returning a FIXED PublishResult, then assert the emitted status feed lines,
+// the deduping, and that a non-published outcome leaves the tip publish-eligible (so the next
+// checkpoint retries — the interval-retry behaviour, exercised here by a second checkpoint).
+describe("RunRunner — checkpoint-publish outcome is visible on the feed (issue #1030)", () => {
+  /** Spy on client.publishCheckpoint returning a FIXED PublishResult, draining the pack so
+   *  the git child exits and counting calls. Returns [restore, count]. */
+  function spyPublishResult(result: PublishResult): { restore: () => void; count: () => number } {
+    const orig = client.publishCheckpoint.bind(client);
+    let calls = 0;
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      ...args: unknown[]
+    ) => {
+      calls += 1;
+      (args[2] as Readable | undefined)?.resume(); // drain the pack so pack-objects can exit
+      return result;
+    };
+    return {
+      restore: () => {
+        (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
+      },
+      count: () => calls,
+    };
+  }
+
+  const statusTexts = (runId: string): string[] =>
+    api
+      .messages(runId)
+      .filter((m) => m.kind === "status")
+      .map((m) => String(m.payload.text));
+
+  it("a 2xx {published:false, skipped:workflow_scope} does not advance the tip and emits ONE deduped skip line", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(90);
+    const { restore, count } = spyPublishResult({
+      ok: true,
+      body: { published: false, ref: "", skipped: "workflow_scope" },
+    });
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        // First milestone checkpoint publishes; the server SKIPS (workflow_scope), so the
+        // tip is NOT marked published.
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        // No new commit. Because the skip left lastPublishedTip un-advanced, the SAME tip is
+        // still "new work", so the next checkpoint RE-ATTEMPTS the publish — the mid-run proxy
+        // for the ~20-min interval retry.
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => {},
+    };
+    try {
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      restore();
+    }
+    assert.equal(count(), 2, "the skip left the tip publish-eligible, so the second checkpoint retried");
+    const skips = statusTexts(claim.run_id).filter((t) =>
+      t.includes("checkpoint publish skipped: workflow_scope"),
+    );
+    assert.equal(
+      skips.length,
+      1,
+      `exactly one deduped skip feed line across two identical attempts, got ${JSON.stringify(statusTexts(claim.run_id))}`,
+    );
+  });
+
+  it("a non-2xx (HTTP 500) does not advance the tip and emits ONE deduped feed line naming the status", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(91);
+    const { restore, count } = spyPublishResult({ ok: false, httpStatus: 500 });
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        // Two identical failing attempts on the same tip (the HTTP 500 does not advance it).
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => {},
+    };
+    try {
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      restore();
+    }
+    assert.equal(count(), 2, "the HTTP 500 left the tip publish-eligible, so the second checkpoint retried");
+    const failures = statusTexts(claim.run_id).filter((t) =>
+      t.includes("checkpoint publish failed: HTTP 500"),
+    );
+    assert.equal(
+      failures.length,
+      1,
+      `two identical failing attempts produce exactly one feed line, got ${JSON.stringify(statusTexts(claim.run_id))}`,
+    );
+  });
+
+  it("a successful publish emits NO failure/skip feed line", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(92);
+    const { restore } = spyPublishResult({
+      ok: true,
+      body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" },
+    });
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => {},
+    };
+    try {
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      restore();
+    }
+    assert.ok(
+      !statusTexts(claim.run_id).some((t) => /checkpoint publish (failed|skipped)/.test(t)),
+      "a confirmed publish is silent on the failure/skip channel",
+    );
   });
 });
 

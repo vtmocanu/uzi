@@ -8,11 +8,14 @@
 // The security contract lives one layer up in workersvc.Publish (which derives
 // every field of Options from the run row, never from the worker). This package's
 // single job is the mechanical one, and its single security-relevant invariant is
-// NEVER FORCED: the push to refs/uzi-checkpoints/<branch> uses a non-forced
-// refspec, and before pushing it verifies the declared tip strictly descends
-// origin's current tip. A remote non-fast-forward rejection is mapped to
-// ErrNotDescendant — a legitimate "origin moved" outcome the caller turns into a
-// 200 skip, never a 5xx.
+// NEVER FORCED: the push to refs/uzi-checkpoints/<branch> forwards the worker's pack
+// through a MANUAL git-receive-pack session (not remote.PushContext — see forwardPack
+// / issue #1009) whose single command carries the checkpoint tip AS FETCHED as its
+// Old. That gives the invariant two agreeing guards: locally, the declared tip is
+// verified to strictly descend origin's current tip before the wire; on the wire, the
+// remote's compare-and-swap on that fetched Old refuses any update that would move the
+// ref off it. A non-fast-forward / CAS-mismatch rejection is mapped to ErrNotDescendant
+// — a legitimate "origin moved" outcome the caller turns into a 200 skip, never a 5xx.
 package pushbroker
 
 import (
@@ -29,7 +32,9 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v5/plumbing/transport"
+	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
 )
@@ -132,6 +137,13 @@ const (
 	maxPackObjects = 50000 // object-count ceiling
 )
 
+// maxDeleteDuration is a hard wall-clock ceiling on ONE best-effort checkpoint-ref
+// delete (PRD #1030 M4). The delete is a single list + a tiny (packless) reference
+// update, so it is far cheaper than a Publish; the ceiling exists only so a slow or
+// down forge can never delay or wedge the caller (a worker's terminal-state report),
+// which swallows the outcome regardless. Deliberately shorter than maxPublishDuration.
+const maxDeleteDuration = 30 * time.Second
+
 // maxPublishDuration is a hard wall-clock ceiling on ONE brokered publish — the
 // untrusted-pack budget scan (single-core zlib inflation), the origin fetch, and the
 // non-forced push combined. /publish carries no request timeout of its own, and a
@@ -215,6 +227,24 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	branchTip := resolveHash(repo, branchRef)
 	checkpointTip := resolveHash(repo, checkpointRef)
 
+	// Already up to date: origin's checkpoint ref ALREADY points at exactly the declared
+	// tip. This is a genuine SUCCESS — "the checkpoint ref already reflects your tip" — so
+	// it returns (result, nil), which the caller maps to Published=true, advances
+	// lastPublishedTip on, and stops re-attempting. This is the resume scenario PRD #1030
+	// M1 targets: a run resumed on a cold worker with lastPublishedTip reset and no new
+	// commits re-declares the tip origin already holds.
+	//
+	// The check MUST sit BEFORE the strict-descendant check (step 5): there base ==
+	// checkpointTip == the declared tip, and strictDescends returns (false, nil) for
+	// base == declared.Hash, which would otherwise misreport an already-current tip as
+	// ErrNotDescendant (a "skipped: not_descendant" feed line every interval). No pack
+	// apply or tip-presence check is needed first: origin already holds the tip AT the
+	// checkpoint ref, so its presence is proven and there is nothing to advance. tipHash
+	// is non-zero (guarded above), so this fires only for a real, matching checkpoint ref.
+	if checkpointTip == tipHash {
+		return result, nil
+	}
+
 	// Step 3: apply the received pack into the SAME storer, from a FRESH reader (the
 	// budget pre-pass consumed its own reader). The base objects from step 2 provide
 	// the parent chain for the worker's (non-thin) delta pack.
@@ -260,32 +290,195 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 		}
 	}
 
-	// Step 6: set the local checkpoint ref and push it NON-FORCED. No leading '+',
-	// no push-options.
+	// Step 6: set the local checkpoint ref (parity with the storer view) and forward the
+	// worker's pack to origin via a MANUAL receive-pack session.
+	//
+	// We deliberately do NOT use remote.PushContext here. PushContext recomputes its own
+	// send-set with revlist.Objects, walking from the declared tip and EXCLUDING origin's
+	// advertised default. Our storer holds only a depth-1 SNAPSHOT of that default
+	// (D_new), so when origin's default advanced since the worker cloned, the
+	// branch-point's parent (D_old) is absent from the storer and the walk raises
+	// plumbing.ErrObjectNotFound ("push: object not found") LOCALLY, before any bytes
+	// leave (issue #1009). The worker's pack is already non-thin (built with ^D_old) and
+	// the REMOTE still holds D_old (it is reachable from D_new), so forwarding the pack
+	// verbatim and letting the remote resolve reachability is correct.
 	if err := repo.Storer.SetReference(plumbing.NewHashReference(checkpointRef, tipHash)); err != nil {
 		return Result{}, fmt.Errorf("pushbroker: set local ref: %w", err)
 	}
-	pushErr := remote.PushContext(ctx, &git.PushOptions{
-		RemoteName: "origin",
-		RefSpecs:   []config.RefSpec{pushRefSpec(ref)},
-		Auth:       auth,
-	})
+
+	// The receive-pack command's Old binds to the checkpoint tip AS FETCHED by
+	// fetchBaseRefs (checkpointTip) — the exact SHA the strict-descendant checks above
+	// ran against, and plumbing.ZeroHash when the ref did not exist at fetch time (a
+	// create). It is DELIBERATELY not read from the receive-pack advertisement: binding
+	// Old to the fetched value keeps the local fast-forward check and the server-side
+	// compare-and-swap in agreement, so a refs/uzi-checkpoints/* ref — which is NOT under
+	// refs/heads and so is NOT protected by the remote's denyNonFastForwards — can never
+	// be force-moved by a mismatch between the two advertisements.
+	// The already-up-to-date case (checkpointTip == tipHash) returned success far above,
+	// before the pack apply and ancestry checks, so by here the declared tip strictly
+	// descends the fetched checkpoint tip and there is a real update to forward.
+	pushErr := forwardPack(ctx, remote, auth, checkpointRef, checkpointTip, tipHash, o.Pack)
 	switch {
-	case pushErr == nil, errors.Is(pushErr, git.NoErrAlreadyUpToDate):
+	case pushErr == nil:
 		return result, nil
-	case isNonFastForward(pushErr):
-		// origin advanced its checkpoint between our fetch and our push. The
-		// non-forced push refused it — exactly the protocol-level guarantee we want.
-		return Result{}, ErrNotDescendant
 	case isWorkflowScopeRejection(pushErr):
 		// The branch is behind on .github/workflows/** relative to the default branch
 		// and the bot PAT lacks the `workflow` scope. Not an infra fault — the caller
-		// skips the checkpoint cleanly (best-effort; PRD #456 M4). Must be checked
-		// before the default arm so it does not surface as a 5xx.
+		// skips the checkpoint cleanly (best-effort; PRD #456 M4). Checked BEFORE the
+		// non-fast-forward arm so a rejection carrying both signals routes to the scope
+		// sentinel, and so it never surfaces as a 5xx.
 		return Result{}, ErrWorkflowScopeRejected
+	case isNonFastForward(pushErr):
+		// origin advanced its checkpoint (or a human moved the branch) between our fetch
+		// and our push, so the receive-pack compare-and-swap on the fetched Old refused
+		// the update — exactly the protocol-level guarantee the non-forced invariant wants.
+		return Result{}, ErrNotDescendant
 	default:
 		return Result{}, fmt.Errorf("pushbroker: push: %w", pushErr)
 	}
+}
+
+// DeleteOptions carries the connection inputs a checkpoint-ref delete needs. Like
+// Options, every field is derived by the caller (workersvc) from the run row — the
+// worker never names the repo, branch or credential. It is a focused subset of
+// Options: a delete ships no pack and declares no tip, so it needs only enough to
+// reach the remote and name the checkpoint ref.
+type DeleteOptions struct {
+	CloneURL string
+	Branch   string
+	Username string
+	PAT      string
+}
+
+// Delete removes refs/uzi-checkpoints/<branch> from the remote, BEST-EFFORT (PRD
+// #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
+// a terminal state it is stale, and a stale ref left behind later blocks a NEW run on
+// the same branch with a not_descendant skip (the new run's tip does not descend the
+// dead run's checkpoint). The caller invokes this on every terminal transition and
+// SWALLOWS the returned error — it must never block or fail the worker's terminal
+// report — so this carries its OWN short wall-clock timeout rather than inheriting an
+// unbounded ctx.
+//
+// The delete goes out as a go-git delete refspec (":<ref>" — empty source, the ref as
+// destination), the pure-Go equivalent of `git push origin :refs/uzi-checkpoints/…`.
+// It runs through the SAME endpoint/auth/remote setup as Publish (authFor, the origin
+// remote config, the checkpointRefPrefix constant).
+//
+// Deleting a ref that is already absent is SUCCESS, not an error: to make that
+// deterministic (and idempotent across go-git/forge version drift in how a
+// delete-of-missing is reported) it first LISTS the remote's advertised refs and
+// returns nil when the checkpoint ref is not present, exactly mirroring
+// fetchBaseRefs's list-first defensiveness. An empty remote is likewise nil. On any
+// other transport/remote fault it returns a wrapped error — which the caller swallows,
+// but the wrap is scrubbed of the credential-bearing URL by the caller's
+// secretscrub.Scrub path (the same invariant Publish's default arm keeps), so a
+// go-git error embedding the PAT in its remote URL never reaches a log in the clear.
+func Delete(ctx context.Context, o DeleteOptions) error {
+	// Bound the whole delete by a hard wall-clock ceiling so a slow/down forge can
+	// never delay the caller's terminal report (which swallows this outcome anyway).
+	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
+	defer cancel()
+
+	ref := checkpointRefPrefix + o.Branch
+	refName := plumbing.ReferenceName(ref)
+
+	repo, err := git.Init(memory.NewStorage(), nil)
+	if err != nil {
+		return fmt.Errorf("pushbroker: init: %w", err)
+	}
+	remote, err := repo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{o.CloneURL},
+	})
+	if err != nil {
+		return fmt.Errorf("pushbroker: create remote: %w", err)
+	}
+	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
+
+	// List first: a delete of a ref origin does not advertise is a no-op success, and
+	// listing makes that deterministic rather than depending on how a given
+	// go-git/forge pair reports "remote ref does not exist" on the push.
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return nil // empty remote: the checkpoint ref cannot exist
+		}
+		return fmt.Errorf("pushbroker: list: %w", err)
+	}
+	present := false
+	for _, r := range advertised {
+		if r.Name() == refName {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return nil // ref already absent — deleting a non-existent ref is success
+	}
+
+	// A delete refspec has an EMPTY source and the ref as destination.
+	err = remote.PushContext(ctx, &git.PushOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{config.RefSpec(":" + ref)},
+		Auth:       auth,
+	})
+	if err == nil || errors.Is(err, git.NoErrAlreadyUpToDate) {
+		return nil
+	}
+	return fmt.Errorf("pushbroker: delete checkpoint ref: %w", err)
+}
+
+// forwardPack ships the worker's (non-thin) packfile to origin through a MANUAL
+// git-receive-pack session and returns the outcome. Unlike remote.PushContext it does
+// NOT recompute a send-set — it forwards `pack` verbatim and lets the remote resolve
+// reachability against ITS objects, which is what fixes the "object not found" the
+// send-set walk raised locally once origin's default advanced past the pack's
+// exclude boundary (issue #1009). The single command carries the caller-supplied Old
+// (the checkpoint tip as fetched) and New (the declared tip); the remote's
+// compare-and-swap on Old is the wire-level half of the never-forced invariant.
+//
+// The endpoint is derived from the SAME URL the remote uses (its config URL — the
+// value fetchBaseRefs listed and PushContext would have dialed), so the receive-pack
+// session talks to the identical host over the identical transport. The receive-pack
+// session does its OWN reference advertisement (AdvertisedReferencesContext); the
+// earlier upload-pack List from fetchBaseRefs is a different service and is not reusable.
+func forwardPack(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, oldHash, newHash plumbing.Hash, pack []byte) error {
+	urls := remote.Config().URLs
+	if len(urls) == 0 {
+		return fmt.Errorf("pushbroker: remote has no URL")
+	}
+	ep, err := transport.NewEndpoint(urls[0])
+	if err != nil {
+		return fmt.Errorf("pushbroker: endpoint: %w", err)
+	}
+	c, err := client.NewClient(ep)
+	if err != nil {
+		return fmt.Errorf("pushbroker: transport client: %w", err)
+	}
+	sess, err := c.NewReceivePackSession(ep, auth)
+	if err != nil {
+		return fmt.Errorf("pushbroker: receive-pack session: %w", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	ar, err := sess.AdvertisedReferencesContext(ctx)
+	if err != nil {
+		return fmt.Errorf("pushbroker: advertise: %w", err)
+	}
+	req := packp.NewReferenceUpdateRequestFromCapabilities(ar.Capabilities)
+	req.Commands = []*packp.Command{{
+		Name: ref,
+		Old:  oldHash,
+		New:  newHash,
+	}}
+	if len(pack) > 0 {
+		req.Packfile = io.NopCloser(bytes.NewReader(pack))
+	}
+	// ReceivePack returns the report-status AND report.Error() (nil on success, else the
+	// first failing command's "ng <ref> <reason>" text or the unpack error). The caller
+	// classifies on that error's text via isWorkflowScopeRejection / isNonFastForward.
+	_, err = sess.ReceivePack(ctx, req)
+	return err
 }
 
 // scanPackBudget walks the pack and rejects it (ErrPackTooLarge) the instant any
@@ -513,11 +706,12 @@ func fetchBaseRefs(ctx context.Context, remote *git.Remote, auth transport.AuthM
 	return nil
 }
 
-// pushRefSpec builds the checkpoint push refspec. It is DELIBERATELY NON-FORCED —
-// no leading '+' — which is the wire-level half of the never-forced invariant (the
-// upstream strict-descendant check is only a local guard). Factored out so
-// TestPushRefSpecNotForced can assert the literal refspec carries no '+', catching a
-// forced-push regression that would otherwise stay green behind the local check.
+// pushRefSpec builds the checkpoint refspec in its DELIBERATELY NON-FORCED form —
+// no leading '+'. Since issue #1009 the actual push no longer goes through a refspec
+// at all (forwardPack ships the pack via a receive-pack Command whose Old is the
+// wire-level guard); this remains as the canonical non-forced form and is exercised
+// only by TestPushRefSpecNotForced, which asserts the literal refspec carries no '+'
+// so the never-forced intent stays pinned even though the push mechanism moved.
 func pushRefSpec(ref string) config.RefSpec {
 	return config.RefSpec(ref + ":" + ref)
 }
@@ -564,17 +758,44 @@ func descendsOrEqual(repo *git.Repository, base plumbing.Hash, declared *object.
 		}
 		return false, err
 	}
-	return baseCommit.IsAncestor(declared)
+	ok, err := baseCommit.IsAncestor(declared)
+	if err != nil {
+		// IsAncestor walks preorder from `declared` toward its parents, stopping the
+		// instant it reaches base. A genuine descendant therefore never walks BELOW base,
+		// so it never needs an object the depth-1 base fetch left out. But a genuine
+		// NON-descendant walk finds no stop point and runs off the end of the pack into
+		// the branch-point's excluded parent (D_old, absent from the storer), surfacing
+		// plumbing.ErrObjectNotFound. That is a non-descendant, not a fault: map it to
+		// (false, nil) so the caller returns ErrNotDescendant (a 200 skip) rather than a
+		// 5xx "ancestry" error (issue #1009). Mirrors the GetCommit(base) handling above.
+		if errors.Is(err, plumbing.ErrObjectNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return ok, nil
 }
 
-// isNonFastForward matches go-git's push-time non-fast-forward rejection. go-git
-// returns a formatted error ("non-fast-forward update: <ref>") rather than a
-// sentinel at the push layer, so the message text is the only discriminator.
+// isNonFastForward matches a receive-pack report-status that rejected the checkpoint
+// update because origin's ref moved out from under our fetched Old — the wire-level
+// half of the never-forced invariant. There is no sentinel: ReceivePack surfaces the
+// server's per-command "ng <ref> <reason>" text (and PushContext, still exercised by
+// TestPushRefSpecNotForced's sibling, formatted "non-fast-forward update: <ref>"), so
+// the message text is the only discriminator. It matches the several reasons a
+// compare-and-swap / fast-forward refusal takes across git versions and services:
+// "non-fast-forward", plus the CAS-mismatch forms "failed to update ref", "cannot lock
+// ref", and "fetch first". All map to ErrNotDescendant (a 200 skip). None of these
+// substrings appear in GitHub's workflow-scope rejection, and the switch checks
+// isWorkflowScopeRejection first regardless, so the two predicates never collide.
 func isNonFastForward(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "non-fast-forward")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "non-fast-forward") ||
+		strings.Contains(msg, "failed to update ref") ||
+		strings.Contains(msg, "cannot lock ref") ||
+		strings.Contains(msg, "fetch first")
 }
 
 // isWorkflowScopeRejection matches GitHub's remote rejection of a push whose

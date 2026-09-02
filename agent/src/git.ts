@@ -391,8 +391,8 @@ export class GitCache {
    * bare's refs/remotes/origin/<branch>), the clone's branch is based off that fresh
    * tip so successive runs build on prior work; else off the repo's default branch.
    */
-  async createOrAttachRunnerClone(barePath: string, issueIid: number, runId?: string): Promise<RunnerClone> {
-    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId);
+  async createOrAttachRunnerClone(barePath: string, issueIid: number, runId?: string, resume = false): Promise<RunnerClone> {
+    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId, resume);
   }
 
   /**
@@ -438,6 +438,17 @@ export class GitCache {
    * `claim.run_id`; nothing here knows about sessions. `runId` undefined ⇒ never owned ⇒
    * today's behaviour, which keeps the no-runId test call sites compiling.
    *
+   * PRD #1030 M3 — `resume` is a SEPARATE additional signal the runner threads from
+   * `claim.session_id != null` (a resume, not a fresh first attempt). It is NOT the runId
+   * ownership anchor and does not affect the ownedHere legs. It relaxes ONLY the
+   * cross-worker checkpoint-adoption rule on the not-ownedHere leg: on a resume with NO
+   * `origin/<branch>` (an unpushed branch), a mirrored checkpoint that shares history with
+   * the default is adopted using the disjoint-history guard only — no strict-descendant
+   * test against the current default, which would wrongly discard a valid checkpoint when
+   * `main` advanced during the park. The strict test is KEPT when `origin/<branch>` exists
+   * (genuinely competing published work) and for every fresh (non-resume) run. `resume`
+   * defaults false ⇒ today's behaviour, which keeps the existing test call sites compiling.
+   *
    * The seed is a LOCAL `clone --shared` from the worker bare: fast (objects are
    * referenced read-only from the bare via the clone's objects/info/alternates — the
    * runner cannot corrupt worker-bare objects through it), and the runner's own new
@@ -446,7 +457,7 @@ export class GitCache {
    * the untrusted direction (worker fetching BACK from the runner clone) is the one
    * forced onto the pack transport in fetchAgentBranch (B2 invariant 3).
    */
-  async runnerCloneForBranch(barePath: string, branch: string, key: string, runId?: string): Promise<RunnerClone> {
+  async runnerCloneForBranch(barePath: string, branch: string, key: string, runId?: string, resume = false): Promise<RunnerClone> {
     return this.withLock(barePath, async () => {
       const repoDir = path.basename(barePath).replace(/\.git$/, "");
       const clonePath = path.join(this.runnerRoot, repoDir, key);
@@ -545,7 +556,25 @@ export class GitCache {
         const floorFrom: RunnerClone["seededFrom"] = originExists ? "origin" : "default";
         baseRef = floorRef;
         seededFrom = floorFrom;
-        if (checkpointExists) {
+        if (checkpointExists && resume && !originExists) {
+          // PRD #1030 M3 — RESUME with an UNPUSHED branch. `main` advancing during a
+          // rate-limit park diverges an otherwise-valid mirrored checkpoint from the moved
+          // default, and the strict-descendant test below would wrongly set it aside and
+          // cold-start the run, losing the committed milestones (the #1009 incident). On a
+          // resume with no competing published `origin/<branch>`, adopt the checkpoint using
+          // the DISJOINT-HISTORY guard ONLY — `checkpointExists` already encodes
+          // `sharesHistory(checkpointRef, default)` (a disjoint checkpoint was treated as
+          // absent up front), so reaching here means it shares history and is safe to adopt.
+          // No ancestry test against the current default, mirroring the ownedHere first-park
+          // leg's rule and rationale. Adopting even a checkpoint that merely equals the floor
+          // is harmless (same commit, priorCommits 0). The adopt-time wip(park) marker unwrap
+          // (adoptedMarker / willRecoverMarker below) still runs on this adopted base because
+          // seededFrom is "checkpoint", so a marker tip is reset --soft'd exactly as on the
+          // strict-descendant leg. The strict test is KEPT when origin/<branch> exists
+          // (competing published work) and for every fresh run — see the else-if below.
+          baseRef = checkpointRef;
+          seededFrom = "checkpoint";
+        } else if (checkpointExists) {
           // isAncestor (merge-base --is-ancestor) is TRUE at EQUALITY, so an ancestor test
           // alone would seed a checkpoint that EQUALS the floor as "checkpoint" though nothing
           // was recovered. Require a STRICT descendant: reachable from the floor AND a

@@ -596,20 +596,36 @@ WHERE id = (
       AND r.status = 'queued'
       AND (r.worker_id IS NULL
            OR r.worker_id = @worker_id
-           -- Fall open the moment the run's OWN worker stops being a live, non-draining
-           -- claim target: a dead (heartbeat-stale) or draining owner will never resume it
-           -- (PRD #628 / ADR-628 D3a). Mirrors the fleet-spread peer-liveness test (ADR-216
-           -- D6, the `last_heartbeat_at >= @heartbeat_cutoff AND draining_since IS NULL`
-           -- block later in this same ClaimRun subquery); reuses that @heartbeat_cutoff param.
+           -- Hold the pin whenever the run's OWN worker ROW still exists AND it can
+           -- still resume the run — i.e. it is either DRAINING (cordoned for an image
+           -- roll: same worker row, same PVC, new pod on the far side) OR its heartbeat
+           -- is fresh. Fall open ONLY when the row is GONE (teardown — DeleteWorkerForUser
+           -- / ReapEphemeralWorkers delete the row API-side BEFORE the controller's kube
+           -- teardown, so `teardown ⟺ row absent`) or the owner is heartbeat-STALE AND
+           -- NOT draining (death/hang — ADR-628 D3a's protected case). This is PRD #1030
+           -- M2: the roll-vs-teardown discriminator with no new column. The old rule
+           -- required `draining_since IS NULL` in the EXISTS, so a roll-cordoned owner
+           -- (draining) failed the test → NOT EXISTS became TRUE → a parked run fell open
+           -- and a live peer stole it cold across the roll (run #1009). We deliberately
+           -- hold on `draining regardless of heartbeat` because the ~2 min pod-swap edge
+           -- exceeds the 45s @heartbeat_cutoff, so a heartbeat-gated hold would wrongly
+           -- fall open mid-swap (accepted tradeoff D7: a draining+dead owner then holds
+           -- until the @affinity_cutoff ceiling).
            OR NOT EXISTS (
                SELECT 1 FROM workers ow
                WHERE ow.id = r.worker_id
-                 AND ow.last_heartbeat_at IS NOT NULL
-                 AND ow.last_heartbeat_at >= @heartbeat_cutoff
-                 AND ow.draining_since IS NULL)
+                 AND (ow.draining_since IS NOT NULL
+                      OR (ow.last_heartbeat_at IS NOT NULL
+                          AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
            -- now now() - WORKER_AFFINITY_CEILING (default 2h), NOT the 2-min grace.
            OR r.updated_at < @affinity_cutoff)
+      -- PRD #1030 M2 / PRD #422 Decision 7: a DRAINING claimant claims NOTHING NEW. It
+      -- reaches ClaimRun now (the workersvc early return that made it claim nothing was
+      -- removed so it can re-claim its OWN promoted run through a roll), but it must be
+      -- scoped to runs it already owns — never a new/unclaimed/fallen-open run. When the
+      -- claimant is not draining this is a no-op; when it is, only its own runs qualify.
+      AND (NOT @claimant_draining::boolean OR r.worker_id = @worker_id)
       -- PRD #216 D5: claiming-worker eligibility via the shared expression.
       -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.

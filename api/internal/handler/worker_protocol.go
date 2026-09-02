@@ -824,12 +824,40 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 			return
 		}
-		slog.Error("worker run publish", "error", err)
+		// A genuine 5xx from the broker (transport/non-sentinel fault; the benign
+		// "origin moved / unsupported" outcomes come back with err==nil and a res.Skipped
+		// reason, logged below). Carry run_id + worker_id so an operator can pin the log
+		// line to a run without a second lookup, and a static `reason` ("internal") that
+		// distinguishes this outcome the same way a metric label would — matching the
+		// repo's log-based observability idiom (there is no metrics surface in the api;
+		// see internal/workersvc/autostop.go). NOTE: the checkpoint branch is derived
+		// server-side inside workersvc.Publish (from the run's issue iid) and is NOT
+		// returned on this error path, so it cannot be attached here — run_id is the
+		// correlation key. The error is already PAT-scrubbed by workersvc
+		// (secretscrub.Scrub) before it reaches this line.
+		slog.Error("worker run publish",
+			"run_id", runID.String(),
+			"worker_id", wkr.ID.String(),
+			"reason", "internal",
+			"error", err,
+		)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	out := map[string]any{"published": res.Published, "ref": res.Ref}
 	if res.Skipped != "" {
+		// A benign non-publish outcome (origin moved / workflow-scope / unsupported /
+		// no-ref): a 200, not a fault. Log it at INFO with the mapped skip reason so the
+		// distribution of publish outcomes is observable by `reason` — the same label a
+		// checkpoint_publish_failures_total counter would carry — without adding a metrics
+		// dependency the api does not have (see the error arm above). INFO, not WARN:
+		// not_descendant is the common "origin advanced" case and must not read as an
+		// operator alert.
+		slog.Info("worker run publish skipped",
+			"run_id", runID.String(),
+			"worker_id", wkr.ID.String(),
+			"reason", res.Skipped,
+		)
 		out["skipped"] = res.Skipped
 	}
 	httpx.JSON(w, http.StatusOK, out)

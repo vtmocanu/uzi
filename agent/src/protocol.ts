@@ -1374,8 +1374,24 @@ export function resolveAgentSelection(
 export interface PublishResponse {
   published: boolean;
   ref: string;
-  skipped?: "no_ref" | "not_descendant" | "unsupported";
+  skipped?: "no_ref" | "not_descendant" | "unsupported" | "workflow_scope";
 }
+
+/**
+ * The worker-side outcome of {@link WorkerClient.publishCheckpoint} (issue #1030). A
+ * discriminated union so a non-2xx no longer collapses to an indistinguishable `null`:
+ * the caller (runner.ts `publishCheckpointBestEffort`) reports the HTTP status on the run
+ * feed instead of silently swallowing it.
+ *   - `{ ok: true, body }`  — a 2xx with a parseable body. The body may itself be a
+ *      best-effort SKIP (`published: false` + `skipped: <reason>`), which the caller
+ *      surfaces distinctly from a hard error.
+ *   - `{ ok: false, httpStatus }` — a non-2xx (`httpStatus` is `res.status`), OR a 2xx
+ *      with an empty/unparseable body (`httpStatus` is that 2xx code): either way the
+ *      publish was NOT confirmed, so the caller must not advance the published tip.
+ */
+export type PublishResult =
+  | { ok: true; body: PublishResponse }
+  | { ok: false; httpStatus: number };
 
 export interface StateRequest {
   status: RunState;

@@ -15,13 +15,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Drain-aware resume affinity (PRD #628 M1 / ADR-628 D3a) against a REAL Postgres.
-// ClaimRun's affinity leg no longer pins a promoted run to its prior worker W for a
-// fixed 2-minute window. It now pins ONLY while W is a live, non-draining claim target
-// (the NOT EXISTS worker-liveness leg, reusing the same @heartbeat_cutoff the fleet
-// spread uses), and a generous ceiling (@affinity_cutoff = now-WORKER_AFFINITY_CEILING,
-// whose config default is 2h) bounds the one live-but-wedged pathology a pure liveness
-// test would strand.
+// Drain-aware resume affinity (PRD #628 M1 / ADR-628 D3a, as refined by PRD #1030 M2)
+// against a REAL Postgres. ClaimRun's affinity leg no longer pins a promoted run to its
+// prior worker W for a fixed 2-minute window. It pins whenever W's worker ROW still exists
+// AND W can still resume the run — i.e. W is DRAINING (cordoned for an image roll: row +
+// PVC survive; PRD #1030 M2 case (c) below) OR its heartbeat is fresh — reusing the same
+// @heartbeat_cutoff the fleet spread uses; it falls open only when the row is GONE
+// (teardown) or W is heartbeat-stale AND not draining (death/hang). A generous ceiling
+// (@affinity_cutoff = now-WORKER_AFFINITY_CEILING, config default 2h) bounds the one
+// live-but-wedged pathology a pure liveness test would strand.
 //
 // The four cases below drive their OWN self-consistent cutoff as a model of "a ceiling":
 // @affinity_cutoff = now-30m (a chosen cutoff, independent of the production default,
@@ -164,21 +166,31 @@ func TestClaimRunFallsOpenWhenOwnerHeartbeatStaleLiveDB(t *testing.T) {
 	}
 }
 
-// (c) Falls open when the owner is draining: W is heartbeat-fresh but draining_since is set,
-// so it will never resume the run. The liveness leg releases the pin (a draining worker is
-// excluded from the NOT EXISTS), so peer P claims.
-func TestClaimRunFallsOpenWhenOwnerDrainingLiveDB(t *testing.T) {
+// (c) HOLDS the pin when the owner is draining (PRD #1030 M2 — supersedes the original
+// ADR-628 D3a fall-open-on-drain). A draining owner is cordoned for an image ROLL: its
+// worker ROW and PVC survive and it WILL resume the run in place, so the affinity NOT EXISTS
+// now treats a draining owner (row present) as "can still resume" and HOLDS the pin instead
+// of releasing it. So a live peer P must NOT steal it; the owner W re-claims its own run via
+// resume affinity. (The full roll-vs-teardown coverage, including the draining+heartbeat-
+// stale pod-swap edge and the @claimant_draining scoping, lives in
+// claim_roll_affinity_livedb_test.go.)
+func TestClaimRunHoldsPinWhenOwnerDrainingLiveDB(t *testing.T) {
 	fx := newDrainAffinityFixture(t)
-	w := fx.worker("W", 0, true) // heartbeat-fresh but draining
+	w := fx.worker("W", 0, true) // heartbeat-fresh and draining (cordoned for a roll)
 	p := fx.worker("P", 0, false)
-	run := fx.pinnedRun(w, 0) // updated_at recent: only the draining state can release it
+	run := fx.pinnedRun(w, 0) // updated_at recent: within the ceiling
 
-	c, err := fx.claim(p)
+	// A live peer must be refused — the pin holds because W's row exists and is draining.
+	if _, err := fx.claim(p); err != pgx.ErrNoRows {
+		t.Fatalf("a run whose owner is draining (roll cordon) must HOLD the pin, not fall open to a peer; got %v, want pgx.ErrNoRows", err)
+	}
+	// Positive control: the owner W re-claims its own pinned run via resume affinity.
+	c, err := fx.claim(w)
 	if err != nil {
-		t.Fatalf("a run whose owner is draining must fall open to a peer (draining owner excluded from the liveness leg): %v", err)
+		t.Fatalf("the draining owner W must re-claim its own pinned run: %v", err)
 	}
 	if c.ID != run {
-		t.Fatalf("peer P claimed %s, want %s", c.ID, run)
+		t.Fatalf("W claimed %s, want %s", c.ID, run)
 	}
 }
 

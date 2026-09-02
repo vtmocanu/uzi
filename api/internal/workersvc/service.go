@@ -1022,6 +1022,18 @@ type Service struct {
 	// the whole Publish path is exercised without a real forge. Injected as a seam
 	// rather than called directly so pushbroker stays the ONE place go-git lives.
 	publishFn func(ctx context.Context, o pushbroker.Options) (pushbroker.Result, error)
+	// deleteCheckpointFn is the go-git checkpoint-ref DELETER (PRD #1030 M4), the
+	// cleanup counterpart of publishFn. Defaults to pushbroker.Delete (set in New); a
+	// setter lets tests stub it so the terminal-transition cleanup is exercised (and
+	// error-injected) without a real forge. Same seam discipline as publishFn:
+	// pushbroker stays the ONE place go-git lives.
+	deleteCheckpointFn func(ctx context.Context, o pushbroker.DeleteOptions) error
+	// background dispatches a best-effort forge side-effect off the request/report
+	// goroutine so a slow/down forge can never delay or wedge the caller (PRD #1030
+	// M4's checkpoint delete). Defaults to `go fn()` (set in New); tests override it
+	// with a synchronous runner so the async side-effect is observed DETERMINISTICALLY,
+	// matching forgesvc's ProjectSyncService.background idiom.
+	background func(func())
 	// forges builds a forge driver from a stored connection (PRD #191 Decision 8): the
 	// seam the composite forge-write operations lifted out of the handlers
 	// (ConfirmProposalForUser, StartRunForUser) reach the forge through. Optional
@@ -1102,6 +1114,19 @@ func (s *Service) SetPublishFn(fn func(ctx context.Context, o pushbroker.Options
 	s.publishFn = fn
 }
 
+// SetDeleteCheckpointFn overrides the go-git checkpoint-ref deleter (PRD #1030 M4).
+// Production leaves the pushbroker.Delete default New installs; tests stub it to
+// exercise the terminal-transition cleanup — and inject a delete error to prove the
+// terminal state is still recorded regardless of the delete outcome.
+func (s *Service) SetDeleteCheckpointFn(fn func(ctx context.Context, o pushbroker.DeleteOptions) error) {
+	s.deleteCheckpointFn = fn
+}
+
+// SetBackground overrides the best-effort side-effect dispatcher (PRD #1030 M4).
+// Production leaves the `go fn()` default New installs; tests set a synchronous
+// runner so the async checkpoint delete is observed deterministically.
+func (s *Service) SetBackground(fn func(func())) { s.background = fn }
+
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.
 func (s *Service) notify(runID uuid.UUID, status string) {
@@ -1118,7 +1143,12 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	if p.ClaimGrace <= 0 {
 		p.ClaimGrace = defaultClaimGrace
 	}
-	return &Service{q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), publishFn: pushbroker.Publish}
+	return &Service{
+		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(),
+		publishFn:          pushbroker.Publish,
+		deleteCheckpointFn: pushbroker.Delete,
+		background:         func(fn func()) { go fn() },
+	}
 }
 
 // -------------------------------------------------------------------------
@@ -1250,14 +1280,19 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		return nil, nil // idle: owner locked
 	}
 
-	// Drain gate (PRD #422 M3): a cordoned worker finishes its in-flight runs but
-	// claims nothing new, so the controller can roll it once idle. Like the vault
-	// gate this reports idle (nil,nil), not an error — the worker keeps heartbeating
-	// and reporting its running runs; only NEW claims are refused. draining_since is
-	// cleared on the worker's next register (after its roll), which re-enables claims.
-	if wkr.DrainingSince.Valid {
-		return nil, nil // idle: worker draining/cordoned
-	}
+	// Drain gate (PRD #422 M3, narrowed by PRD #1030 M2): a cordoned worker claims
+	// nothing NEW, so the controller can roll it once idle — but it MUST still be able
+	// to re-claim its OWN promoted run so a run parked (limit_wait→queued, worker_id
+	// retained for affinity) while its owner was cordoned for a roll resumes in place
+	// on the same worker/PVC instead of being stolen cold by a live peer (run #1009).
+	// So we no longer short-circuit here; instead ClaimRun is told the claimant is
+	// draining (ClaimantDraining below), and its `NOT @claimant_draining OR
+	// r.worker_id = @worker_id` clause scopes a draining claimant to its own runs.
+	// draining_since is cleared on the worker's next register (after its roll), which
+	// re-enables new claims. (This replaces the old `if wkr.DrainingSince.Valid {
+	// return nil, nil }` early return; nothing downstream of Claim assumed a draining
+	// worker never reaches ClaimRun — the vault gate above still fires, and the claim
+	// assembly / recovery paths below are indifferent to the owner's drain state.)
 
 	// Docker-worker repo allowlist (PRD #89 M-allow): a docker-enabled worker may
 	// claim ONLY runs whose repo is on the trusted allowlist. Repo-less JUDGE runs are
@@ -1321,6 +1356,10 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		SpreadCutoff:          pgconv.Time(s.now().Add(-s.p.WorkerSpreadGrace)),
 		BackgroundGraceCutoff: pgconv.Time(s.now().Add(-s.p.WorkerBackgroundGrace)),
 		HeartbeatCutoff:       pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale)),
+		// PRD #1030 M2: a draining claimant is scoped to its own promoted run (see the
+		// drain gate above and the `NOT @claimant_draining OR r.worker_id = @worker_id`
+		// clause in ClaimRun). A non-draining worker passes false — a no-op.
+		ClaimantDraining: wkr.DrainingSince.Valid,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2157,6 +2196,18 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// committed transition; guarded on wkr.Ephemeral and busy-checked in-query so a
 		// normal run's completion is a no-op. Best-effort — never fails the report.
 		s.maybeTeardownEphemeral(ctx, wkr, run)
+		// PRD #1030 M4: on a COMMITTED terminal transition (completed, or a
+		// failed→cancelled/stopped/plan-reject/agent-failure route through the switch
+		// above), delete the run's now-stale checkpoint ref so it cannot later block a
+		// new run on the same branch with a not_descendant skip. Best-effort and
+		// dispatched OFF this goroutine — it must never delay or fail the worker's
+		// terminal report, and it runs AFTER the terminal state is durably recorded. The
+		// terminal guard keeps it off `running`/`awaiting_*` transitions; the helper
+		// kind-gates it to checkpoint-eligible issue runs. `failed` is terminal and NOT
+		// requeued, so deleting here cannot race a requeue-resume (PRD #1030 M4).
+		if terminalStatuses[run.Status] {
+			s.deleteCheckpointBestEffort(runID, run.Kind, run.IssueIid)
+		}
 	}
 	return run, rows > 0, err
 }
@@ -2805,6 +2856,102 @@ func forgeHostFromURL(raw string) (string, error) {
 		return "", fmt.Errorf("clone URL %q must be https with a host", raw)
 	}
 	return "https://" + strings.ToLower(u.Host), nil
+}
+
+// deleteCheckpointBestEffort removes a run's stale checkpoint ref
+// (refs/uzi-checkpoints/<branch>) from the forge on a TERMINAL transition (PRD #1030
+// M4). Once a run is terminal its checkpoint ref is stale scratch state; leaving it
+// behind later blocks a NEW run on the same branch with a not_descendant skip, so
+// every terminal path calls this.
+//
+// It is BEST-EFFORT and must NEVER block or fail the caller's terminal transition:
+// the terminal DB write has already committed by the time this runs, and the whole
+// forge round-trip is dispatched on s.background (a detached goroutine in production;
+// tests run it inline) under pushbroker.Delete's own short wall-clock timeout. Any
+// failure is logged and swallowed — a surviving stale ref only re-blocks a later run
+// with a benign skip, never corrupts anything, and the PVC refs/uzi-runner/* remains
+// the primary recovery path.
+//
+// It is gated to the SAME run kinds Publish supports: only an issue run with a valid
+// issue iid ever published a checkpoint ref (Publish returns "unsupported" for any
+// other kind — the agent gates the checkpoint tool to kind==="issue"), so any other
+// kind is a no-op with no forge call. The branch, repo connection and PAT are derived
+// SERVER-SIDE exactly as Publish derives them (agent/issue-<iid>, GetRunClaimContext,
+// the SSRF gate, box.Open), never from the worker.
+func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issueIid pgtype.Int8) {
+	// Kind-gate identically to Publish: a run that never had a checkpoint ref has
+	// nothing to delete. Do this BEFORE dispatching so an ineligible kind makes no
+	// goroutine and no forge call.
+	if kind != runkind.Issue || !issueIid.Valid {
+		return
+	}
+	// A deployment that never wired the delete seam or the SSRF gate, or a service
+	// built without a secretbox (some tests), cannot broker the delete — skip rather
+	// than dispatch a goroutine that would only fail. (publishFn/box/forgeBaseURLAllowed
+	// nil-checks mirror Publish's own guards.)
+	if s.deleteCheckpointFn == nil || s.forgeBaseURLAllowed == nil || s.box == nil || s.background == nil {
+		return
+	}
+	branch := agentIssueBranch(issueIid.Int64)
+	s.background(func() {
+		// s.background is a DETACHED goroutine in production, and pushbroker.Delete
+		// drives go-git (ListContext/PushContext), which has nil-deref panic paths on
+		// malformed forge responses. An unrecovered panic in ANY goroutine crashes the
+		// whole api process, so recover FIRST and swallow it — this cleanup is
+		// best-effort, and the failure it prevents (a later not_descendant skip) is
+		// benign. Mirrors forgesvc.ProjectSyncService.launchSeed's recover idiom.
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("checkpoint cleanup: delete panicked", "run", runID, "branch", branch, "panic", secretscrub.Scrub(fmt.Sprint(r)))
+			}
+		}()
+		// Detached from the request/report ctx (which is already returning to the
+		// worker): bind to a fresh context.Background, and let pushbroker.Delete apply
+		// its own bounded timeout on top. A slow/down forge cannot reach the caller.
+		ctx := context.Background()
+
+		rc, err := s.q.GetRunClaimContext(ctx, runID)
+		if err != nil {
+			// No repo/forge connection (a repo-less run) or the row vanished: there is
+			// nothing to delete. Benign.
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Warn("checkpoint cleanup: claim context", "run", runID, "error", err)
+			}
+			return
+		}
+		cloneURL := rc.RepoWebUrl + ".git"
+
+		// Same SSRF gate as Publish, BEFORE decrypting the PAT: never point go-git at
+		// an un-allowlisted host. A misconfigured gate is a skip here (best-effort),
+		// not the loud 500 Publish raises — this path must never fail a terminal report.
+		if !s.forgeBaseURLAllowed(rc.BaseUrl) {
+			slog.Warn("checkpoint cleanup: base URL not allowlisted", "run", runID)
+			return
+		}
+		cloneHost, err := forgeHostFromURL(cloneURL)
+		if err != nil || !s.forgeBaseURLAllowed(cloneHost) {
+			slog.Warn("checkpoint cleanup: clone host not allowlisted", "run", runID)
+			return
+		}
+
+		botPAT, err := s.box.Open(rc.TokenCiphertext)
+		if err != nil {
+			slog.Warn("checkpoint cleanup: bot PAT could not be decrypted", "run", runID)
+			return
+		}
+
+		if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
+			CloneURL: cloneURL,
+			Branch:   branch,
+			Username: rc.BotUsername,
+			PAT:      string(botPAT),
+		}); derr != nil {
+			// Scrub any credential-bearing go-git error (its remote URL can carry the
+			// PAT in userinfo) before logging — the same invariant Publish's default arm
+			// keeps. Best-effort: the error is logged and swallowed, never surfaced.
+			slog.Warn("checkpoint cleanup: delete ref", "run", runID, "branch", branch, "error", secretscrub.Scrub(derr.Error()))
+		}
+	})
 }
 
 // -------------------------------------------------------------------------

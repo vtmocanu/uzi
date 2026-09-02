@@ -4,6 +4,14 @@
 **Priority**: High
 **Parent incident**: run #1009 (`e4d60edb`) `resume_lineage_break`, 2026-09-02
 
+## Status (2026-09-02)
+
+M1-M5 are implemented on branch `agent/issue-1030` (commits `59929a9d..2b54a34b`). See
+the per-criterion table under *Success criteria* below for what each one covers and the
+two items left to a maintainer (not worker-gated). The `## Deferred` section below is
+unchanged — none of G2, G5, the owner-anchor column, chat-run affinity, or #556 were
+implemented here; they remain filed, not built.
+
 > This PRD is written to be implemented by an offline uzi worker (restricted egress: forge + `*.anthropic.com` + package caches, no open web). Every external fact is a live measurement from this deployment, baked in below. All code anchors are `path:line @ main 8079f6b`; symbols are given so they survive line drift — **re-derive each anchor at implementation time** (`grep` the symbol), do not trust the line number blind. Two mechanism claims below were verified by a throwaway probe against the pinned go-git v5.19.2; those are marked "verified by probe".
 
 ## Problem
@@ -128,14 +136,14 @@ Two seams edited **together** (either alone is incorrect):
 - Check `api/cmd/uzi/` for any CLI surface reporting resume/checkpoint/worker-drain state; update if a field changed (repo convention). None is expected — confirm.
 
 ## Success criteria (all worker-gated unless marked)
-1. `pushbroker.Publish` no longer fails `object not found` for a run whose `main` advanced mid-run; the new `file://` regression test is red on the unfixed code and green after the fix, and every existing pushbroker test stays green.
-2. A publish skip or error is visible in the run feed; a skip does not advance `lastPublishedTip`; `PublishResponse.skipped` includes `"workflow_scope"`; the park-path publish result is stated on the feed.
-3. A run parked while its owner worker is cordoned for a roll is re-claimed by **that same worker** (no `resume_lineage_break`), including across the draining+heartbeat-stale pod-swap edge; a run whose owner is **killed** or whose **row is deleted** still falls open to a peer immediately; a draining worker never claims a new run. (All by test.)
-4. A **resume** adopts a checkpoint that diverged from a moved default (committed milestones not set aside); a **fresh** run does not inherit a prior run's checkpoint. (Note the residual in D8: a resumed run that never published its own checkpoint can still adopt a prior run's checkpoint on the same branch until the owner-anchor lands.)
-5. Graceful shutdown publishes a final checkpoint; every terminal transition deletes the run's checkpoint ref (by test). **Maintainer follow-up (not worker-gated)**: the 24 existing orphan refs are swept once.
-6. `task gate:api`, `task gate:controller`, and `task gate:agent` green (lint 0 issues, deadcode unchanged, tests pass with `-race`).
-7. No `.github/workflows/**` in the branch diff (implementation or validation).
-8. `adr/0628` and the docs reflect the new behavior truthfully (incl. the 30m→2h and universal-predicate corrections); `specs/ai.md` section added with a landing-assigned number.
+1. **MET.** `pushbroker.Publish` no longer fails `object not found` for a run whose `main` advanced mid-run; the new `file://` regression test is red on the unfixed code and green after the fix, and every existing pushbroker test stays green — `TestPublishFirstCheckpointAfterDefaultAdvanced` (`api/internal/pushbroker/pushbroker_test.go`). **Maintainer follow-up (not worker-gated):** a real-forge confirmation ("a long run whose `main` moved lands a checkpoint ref, visible via `git ls-remote`") is manual, per the PRD's own M1 Validation note — not something this branch's test suite can prove.
+2. **MET.** A publish skip or error is visible in the run feed; a skip does not advance `lastPublishedTip`; `PublishResponse.skipped` includes `"workflow_scope"`; the park-path publish result is stated on the feed — `agent/src/client.ts`, `agent/src/runner.ts`, `agent/src/protocol.ts`.
+3. **MET.** A run parked while its owner worker is cordoned for a roll is re-claimed by **that same worker** (no `resume_lineage_break`), including across the draining+heartbeat-stale pod-swap edge; a run whose owner is **killed** or whose **row is deleted** still falls open to a peer immediately; a draining worker never claims a new run — `TestClaimRunRollCordonHoldsPinLiveDB`, `TestClaimRunDrainingStaleHoldsPinLiveDB`, `TestClaimRunTeardownFallsOpenLiveDB`, `TestClaimRunDrainingClaimantClaimsNothingNewLiveDB` (`api/internal/store/claim_roll_affinity_livedb_test.go`).
+4. **MET.** A **resume** adopts a checkpoint that diverged from a moved default (committed milestones not set aside); a **fresh** run does not inherit a prior run's checkpoint — `agent/src/git.ts` `runnerCloneForBranch`, tested in `agent/test/git-cross-worker-recovery.test.ts`. (Note the residual in D8: a resumed run that never published its own checkpoint can still adopt a prior run's checkpoint on the same branch until the owner-anchor lands — deferred, see below.)
+5. **MET** for the code path. Graceful shutdown publishes a final checkpoint; every terminal transition deletes the run's checkpoint ref (by test) — `agent/src/runner.ts` shutdown branch; `TestSetStateCompletedDeletesCheckpoint`, `TestSetStateFailedCancelledDeletesCheckpoint`, `TestServerSideCancelDeletesCheckpoint`, `TestSetStateCompletedDeletePanicRecovered` (`api/internal/workersvc/worker_checkpoint_delete_test.go`). **Maintainer follow-up (not worker-gated):** the one-off sweep of the 24 pre-existing orphan refs (needs network + PAT) is not part of this branch and is not worker-gated.
+6. **MET for `gate:api` and `gate:agent`** (green per each milestone's own commit history). `gate:controller` is **unaffected/untouched** — the branch diff touches no file under `controller/` (verified here: `git diff --name-only 59929a9d~1..2b54a34b -- controller/` is empty), so there is nothing for that gate to regress.
+7. **MET.** No `.github/workflows/**` in the branch diff (implementation or validation) — verified empty.
+8. **MET.** `adr/0628` and the docs reflect the new behavior truthfully (incl. the 30m→2h and universal-predicate corrections — see the amendment in `adr/0628-cross-worker-resume-durability.md`); `specs/ai.md` section added with a landing-assigned number (section 602, added alongside this PRD's M5 by the repo's spec-keeper convention).
 
 ## Deferred (separate follow-up issues — file, do not implement here)
 - **G2 — behind-on-workflows checkpoint durability**: a broker-side `.github` overlay wrapper commit. Riskiest change (go-git object synthesis in the secrets-holding api); its own PRD. Until then, M1's loud skip makes the gap visible.
