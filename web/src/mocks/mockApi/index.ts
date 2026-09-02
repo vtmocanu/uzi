@@ -41,7 +41,6 @@ import {
   type JudgeOccurrence,
   type JudgeRecommendationGroup,
   type ReviewVerdict,
-  type Memory,
   type Notification,
   type NotificationList,
   type PendingJudge,
@@ -96,7 +95,6 @@ import {
   daysAgo,
   mockCliAuthRequest,
   mockCliTokens,
-  mockMemories,
   mockConnection,
   mockForgeConfig,
   mockMyRateLimitsByUser,
@@ -124,6 +122,7 @@ import {
 import { ensureLive, handleInput, scheduleChatReply, startNewRun } from "../engine";
 import { appendMessage, getProposal, getRun, nextRunId, patchRun, putProposal, state } from "../store";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
+import { memoryApi } from "./memory";
 
 // ── Settings persistence (demo build) ────────────────────────────────────────
 // The mock persists ONLY the settings maps to localStorage so a hard reload of
@@ -1579,11 +1578,6 @@ let cliTokens: OwnedCliToken[] = mockCliTokens.map((t) => ({ ...t }));
 let cliTokenCounter = 0;
 const stripOwner = ({ user_id: _user_id, ...t }: OwnedCliToken): CliToken => t;
 
-// Agent memory (PRD #90). user_id is mock-internal (the wire Memory carries none —
-// the server owner-scopes it), stripped before responding.
-type OwnedMemory = Memory & { user_id: string };
-let memories: OwnedMemory[] = mockMemories.map((m) => ({ ...m }));
-const stripMemoryOwner = ({ user_id: _user_id, ...m }: OwnedMemory): Memory => m;
 // The seeded consent request; approve/deny flip its status in place.
 const cliAuthRequests = new Map<string, CliAuthRequestMeta & { user_code: string }>([
   [MOCK_CLI_AUTH_REQUEST_ID, { ...mockCliAuthRequest }],
@@ -4517,25 +4511,7 @@ export const mockApi = {
     return delay({ status: "denied" });
   },
 
-  // ── Agent memory (PRD #90 M6) ──────────────────────────────────────────────
-  // list is owner-scoped + newest-first (the real endpoint filters `WHERE
-  // user_id=$1 ORDER BY created_at DESC`); delete is an owner-scoped purge.
-  listMemory: async () => {
-    const me = requireSession();
-    const mine = memories
-      .filter((m) => m.user_id === me.id)
-      .sort((a, b) => b.created_at.localeCompare(a.created_at))
-      .map(stripMemoryOwner);
-    return delay({ memories: mine });
-  },
-  deleteMemory: async (id: string) => {
-    const me = requireSession();
-    // Owner-scoped: a foreign id is a 404, exactly like the server.
-    const m = memories.find((x) => x.id === id && x.user_id === me.id);
-    if (!m) throw new ApiError(404, "memory not found");
-    memories = memories.filter((x) => x.id !== id);
-    return delay(null);
-  },
+  ...memoryApi,
 
   // ── Scheduled runs (PRD #241) ──────────────────────────────────────────────
   listSchedules: async () => {
