@@ -476,6 +476,73 @@ func TestPublishTipMissingFromPack(t *testing.T) {
 	}
 }
 
+// TestDeleteRemovesCheckpointRef pins PRD #1030 M4's cleanup: after a checkpoint ref
+// exists on origin, Delete removes it; deleting again is idempotent (nil, ref stays
+// absent); and origin's heads are never touched. A stale checkpoint ref left behind
+// would later block a new run on the same branch with a not_descendant skip, which is
+// exactly what this cleanup prevents.
+func TestDeleteRemovesCheckpointRef(t *testing.T) {
+	f := newGitFixture(t)
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	tip := f.commit("b.txt", "one\n", "c1")
+
+	// Publish a checkpoint so origin holds refs/uzi-checkpoints/main.
+	if _, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip, Pack: f.pack(tip, base),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	ref := "refs/uzi-checkpoints/main"
+	if got := f.originRef(ref); got != tip {
+		t.Fatalf("precondition: checkpoint = %q, want tip %q", got, tip)
+	}
+	mainBefore := f.originRef("refs/heads/main")
+
+	// Delete removes it.
+	if err := pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL(), Branch: "main",
+	}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got := f.originRef(ref); got != "" {
+		t.Fatalf("checkpoint ref not deleted: origin = %q, want absent", got)
+	}
+
+	// Idempotent: deleting an already-absent ref is success, not an error.
+	if err := pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL(), Branch: "main",
+	}); err != nil {
+		t.Fatalf("second Delete of absent ref = %v; want nil (idempotent)", err)
+	}
+	if got := f.originRef(ref); got != "" {
+		t.Fatalf("checkpoint ref reappeared: origin = %q, want absent", got)
+	}
+
+	// origin's heads are untouched — Delete only ever touches the checkpoint namespace.
+	if got := f.originRef("refs/heads/main"); got != mainBefore {
+		t.Fatalf("Delete moved refs/heads/main: got %q, want unchanged %q", got, mainBefore)
+	}
+}
+
+// TestDeleteAbsentRefOnFreshRemoteIsNil covers the never-published case: a run that
+// never landed a checkpoint (or a branch that never had one) must still delete
+// cleanly. Origin carries only main; the checkpoint ref never existed.
+func TestDeleteAbsentRefOnFreshRemoteIsNil(t *testing.T) {
+	f := newGitFixture(t)
+	f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+
+	if err := pushbroker.Delete(context.Background(), pushbroker.DeleteOptions{
+		CloneURL: f.cloneURL(), Branch: "agent/issue-7",
+	}); err != nil {
+		t.Fatalf("Delete of never-existing ref = %v; want nil", err)
+	}
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-7"); got != "" {
+		t.Fatalf("delete created a ref: origin = %q, want absent", got)
+	}
+}
+
 func isNotDescendant(err error) bool { return errors.Is(err, pushbroker.ErrNotDescendant) }
 
 // run executes a command (optionally in dir) and returns stdout, failing the test

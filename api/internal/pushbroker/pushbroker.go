@@ -137,6 +137,13 @@ const (
 	maxPackObjects = 50000 // object-count ceiling
 )
 
+// maxDeleteDuration is a hard wall-clock ceiling on ONE best-effort checkpoint-ref
+// delete (PRD #1030 M4). The delete is a single list + a tiny (packless) reference
+// update, so it is far cheaper than a Publish; the ceiling exists only so a slow or
+// down forge can never delay or wedge the caller (a worker's terminal-state report),
+// which swallows the outcome regardless. Deliberately shorter than maxPublishDuration.
+const maxDeleteDuration = 30 * time.Second
+
 // maxPublishDuration is a hard wall-clock ceiling on ONE brokered publish — the
 // untrusted-pack budget scan (single-core zlib inflation), the origin fetch, and the
 // non-forced push combined. /publish carries no request timeout of its own, and a
@@ -329,6 +336,96 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	default:
 		return Result{}, fmt.Errorf("pushbroker: push: %w", pushErr)
 	}
+}
+
+// DeleteOptions carries the connection inputs a checkpoint-ref delete needs. Like
+// Options, every field is derived by the caller (workersvc) from the run row — the
+// worker never names the repo, branch or credential. It is a focused subset of
+// Options: a delete ships no pack and declares no tip, so it needs only enough to
+// reach the remote and name the checkpoint ref.
+type DeleteOptions struct {
+	CloneURL string
+	Branch   string
+	Username string
+	PAT      string
+}
+
+// Delete removes refs/uzi-checkpoints/<branch> from the remote, BEST-EFFORT (PRD
+// #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
+// a terminal state it is stale, and a stale ref left behind later blocks a NEW run on
+// the same branch with a not_descendant skip (the new run's tip does not descend the
+// dead run's checkpoint). The caller invokes this on every terminal transition and
+// SWALLOWS the returned error — it must never block or fail the worker's terminal
+// report — so this carries its OWN short wall-clock timeout rather than inheriting an
+// unbounded ctx.
+//
+// The delete goes out as a go-git delete refspec (":<ref>" — empty source, the ref as
+// destination), the pure-Go equivalent of `git push origin :refs/uzi-checkpoints/…`.
+// It runs through the SAME endpoint/auth/remote setup as Publish (authFor, the origin
+// remote config, the checkpointRefPrefix constant).
+//
+// Deleting a ref that is already absent is SUCCESS, not an error: to make that
+// deterministic (and idempotent across go-git/forge version drift in how a
+// delete-of-missing is reported) it first LISTS the remote's advertised refs and
+// returns nil when the checkpoint ref is not present, exactly mirroring
+// fetchBaseRefs's list-first defensiveness. An empty remote is likewise nil. On any
+// other transport/remote fault it returns a wrapped error — which the caller swallows,
+// but the wrap is scrubbed of the credential-bearing URL by the caller's
+// secretscrub.Scrub path (the same invariant Publish's default arm keeps), so a
+// go-git error embedding the PAT in its remote URL never reaches a log in the clear.
+func Delete(ctx context.Context, o DeleteOptions) error {
+	// Bound the whole delete by a hard wall-clock ceiling so a slow/down forge can
+	// never delay the caller's terminal report (which swallows this outcome anyway).
+	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
+	defer cancel()
+
+	ref := checkpointRefPrefix + o.Branch
+	refName := plumbing.ReferenceName(ref)
+
+	repo, err := git.Init(memory.NewStorage(), nil)
+	if err != nil {
+		return fmt.Errorf("pushbroker: init: %w", err)
+	}
+	remote, err := repo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{o.CloneURL},
+	})
+	if err != nil {
+		return fmt.Errorf("pushbroker: create remote: %w", err)
+	}
+	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
+
+	// List first: a delete of a ref origin does not advertise is a no-op success, and
+	// listing makes that deterministic rather than depending on how a given
+	// go-git/forge pair reports "remote ref does not exist" on the push.
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return nil // empty remote: the checkpoint ref cannot exist
+		}
+		return fmt.Errorf("pushbroker: list: %w", err)
+	}
+	present := false
+	for _, r := range advertised {
+		if r.Name() == refName {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return nil // ref already absent — deleting a non-existent ref is success
+	}
+
+	// A delete refspec has an EMPTY source and the ref as destination.
+	err = remote.PushContext(ctx, &git.PushOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{config.RefSpec(":" + ref)},
+		Auth:       auth,
+	})
+	if err == nil || errors.Is(err, git.NoErrAlreadyUpToDate) {
+		return nil
+	}
+	return fmt.Errorf("pushbroker: delete checkpoint ref: %w", err)
 }
 
 // forwardPack ships the worker's (non-thin) packfile to origin through a MANUAL

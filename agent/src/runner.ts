@@ -317,6 +317,12 @@ export interface RunnerOptions {
   /** PRD #267: min interval between time-based origin checkpoint publishes on the
    *  reap:false path; 0 disables. Default 20m. */
   checkpointIntervalMs?: number;
+  /** PRD #1030 M4: CLIENT-side cap (ms) on the graceful-shutdown durability sequence
+   *  (WIP-marker commit + fetch-back + checkpoint publish) so a slow/unreachable forge
+   *  cannot hang the shutdown past the k8s termination grace. Default 15s — see the
+   *  budget note at the shutdown branch. Injectable so a test can drive the timeout
+   *  deterministically against a hanging publish. */
+  shutdownPublishTimeoutMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
   /** Injectable answer-deadline timer for tests; defaults to setTimeout (unref'd)
@@ -359,6 +365,8 @@ export class RunRunner {
   /** PRD #267: min interval between time-based origin checkpoint publishes on the
    *  reap:false path; 0 disables. */
   private readonly checkpointIntervalMs: number;
+  /** PRD #1030 M4: client-side cap (ms) on the graceful-shutdown durability sequence. */
+  private readonly shutdownPublishTimeoutMs: number;
   /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable.
    *  Also feeds the PRD #88 answer-deadline math (askUser), so that budget is testable
    *  on the same clock. */
@@ -432,6 +440,7 @@ export class RunRunner {
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
     this.checkRunner = opts.checkRunner;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
+    this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.now = opts.now ?? (() => Date.now());
     this.setTimer =
       opts.setTimer ??
@@ -586,7 +595,63 @@ export class RunRunner {
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
           const branch = flight.branch;
-          await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+          // PRD #1030 M4: publish a FINAL checkpoint on graceful shutdown, mirroring the
+          // park path's ordering (commitWipMarker → fetchBackBestEffort → publishCheckpoint).
+          // Before M4 this branch was fetch-back ONLY, so a roll-while-running / eviction /
+          // OOM / node-drain lost up to a whole ~20-min checkpoint interval of committed
+          // work AND any uncommitted mid-milestone edits. Now:
+          //   1. commitWipMarker captures uncommitted work into a throwaway `wip(park):`
+          //      marker commit (best-effort; the .catch is belt-and-braces so nothing here
+          //      undoes the requeue), exactly as the park path does — the shutdown branch
+          //      previously did NOT do this, so uncommitted work was lost even from the marker.
+          //   2. fetchBackBestEffort moves that tip to the local tracking ref.
+          //   3. publishCheckpointBestEffort brokers the delta to refs/uzi-checkpoints/<branch>
+          //      AFTER the fetch-back (so checkpointPack reads the current tip), one-shot and
+          //      unconditional on the join-token seam (never a git push / PAT), same signature
+          //      the park path uses. So a DIFFERENT worker re-claiming this requeued run
+          //      recovers the committed tree instead of cold-starting from the default branch.
+          //
+          // BUDGET (issue #1030 M4 / PRD #1030): this whole best-effort sequence runs inside
+          // the k8s termination grace. No terminationGracePeriodSeconds is set on the worker
+          // pod (confirmed in controller/internal/kube/materializer.go), so the default 30s
+          // applies: after SIGTERM the process must exit before SIGKILL at 30s. The local git
+          // steps (marker, fetch-back) are sub-second; the ONLY step that can hang is the
+          // publish RPC to the api, and the server-side maxPublishDuration is 60s — longer
+          // than the entire grace — so the CLIENT must not simply await it. We cap the whole
+          // sequence with a Promise.race against shutdownPublishTimeoutMs (default 15s): that
+          // leaves ~15s of the 30s grace for the runtime's own SIGTERM teardown and for the
+          // concurrently-aborted sibling runs' sequences (shutdown() aborts every active run
+          // at once; their catch branches race the same wall clock, so the cost is the slowest
+          // plus contention, not the sum). 15s is generous for a healthy publish yet caps a
+          // hung/unreachable forge well short of both the 30s SIGKILL and the 60s server cap.
+          const durability = (async (): Promise<boolean> => {
+            await this.git.commitWipMarker(worktreePath).catch(() => false);
+            await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+            return this.publishCheckpointBestEffort(flight, barePath, branch);
+          })();
+          // undefined ⇒ the budget elapsed before the sequence finished: nothing confirmably
+          // landed, so a cross-worker resume does restart from default — the same truthful
+          // consequence as an outright publish failure. `=== true` folds false + undefined
+          // into the NOT-published line. The orphaned durability promise (on a timeout) is
+          // best-effort and never rejects, so leaving it running past this point is safe.
+          const published = await this.raceShutdownBudget(
+            durability,
+            this.shutdownPublishTimeoutMs,
+          );
+          // issue #1030 M4: surface the outcome on the feed the same way the park path does,
+          // reusing the batcher emit + the reportPublishOutcome dedupe from M1. This lands
+          // because it is emitted BEFORE the single batcher.close() below — the shutdown
+          // branch closes the batcher exactly once, further down, never here.
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text:
+                published === true
+                  ? "shutdown checkpoint published to origin"
+                  : "shutdown checkpoint NOT published — a resume on another worker will restart from the default branch",
+            },
+          });
         }
         // PRD #556 M1: a shutdown interrupt now preserves the same two filesystem dirs a
         // park does (the sibling skills plugin dir and the per-run HOME holding the
@@ -2670,6 +2735,30 @@ export class RunRunner {
    * with a warn (D4): a fetch-back that fails must not undo the park or block the
    * requeue.
    */
+  /**
+   * PRD #1030 M4: bound a best-effort promise by a client-side budget, resolving to
+   * `undefined` when the budget elapses first (never rejecting). Used to cap the
+   * graceful-shutdown durability sequence so a slow/unreachable forge cannot hang the
+   * shutdown past the k8s termination grace — see the budget note at the shutdown branch.
+   * The timer is armed through `this.setTimer` (unref'd) so a pending budget never keeps
+   * the event loop alive, and is cancelled the moment `work` settles so a completed
+   * publish leaves no dangling timer.
+   */
+  private async raceShutdownBudget<T>(
+    work: Promise<T>,
+    budgetMs: number,
+  ): Promise<T | undefined> {
+    let cancelTimer: (() => void) | undefined;
+    const timeout = new Promise<undefined>((resolve) => {
+      cancelTimer = this.setTimer(() => resolve(undefined), budgetMs);
+    });
+    try {
+      return await Promise.race([work, timeout]);
+    } finally {
+      cancelTimer?.();
+    }
+  }
+
   private async fetchBackBestEffort(
     barePath: string,
     worktreePath: string,

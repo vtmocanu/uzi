@@ -262,6 +262,12 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 					slog.Warn("settle scope input disposition (server-side cancel/reject)", "run", runID, "error", setErr)
 				}
 			}
+			// PRD #1030 M4: a server-side cancel/reject commits the run terminal OUTSIDE
+			// SetState (no live worker to route the cleanup through the state report), so
+			// delete the now-stale checkpoint ref here too. Best-effort and dispatched off
+			// this goroutine after the terminal write committed — never delays or fails the
+			// operator's cancel. Kind-gated to checkpoint-eligible issue runs in the helper.
+			s.deleteCheckpointBestEffort(runID, run.Kind, run.IssueIid)
 			return SubmitInputResult{ServerSide: true}, nil
 		}
 		// Live poller: the worker will consume this verdict. Enqueue it AND stamp the
