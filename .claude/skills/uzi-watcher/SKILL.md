@@ -523,8 +523,21 @@ deliberate / mock-only** label, and a one-line recommendation. For each, the use
   CodeRabbit findings ITSELF* above); on a default-enabled instance it usually is, and a
   local amend then collides with its push. Defer to it, review its fix, and reserve the
   local amend for the cases it cannot handle.
-- **Skip** — record the reason (deliberate behavior, inherited code, not worth it). A skip is
-  a legitimate outcome, not a failure.
+- **Skip** — record the reason (deliberate behavior, a false positive, a base-realignment
+  artifact, not worth it). A skip is a legitimate outcome, not a failure. **But a
+  pre-existing / inherited finding that is a REAL bug is NOT a free skip:** fix it (in the PR
+  when that keeps the diff clean, or a separate PR when the PR is pure-motion and an inline
+  fix would break that contract), or **at minimum file it** as a tracked follow-up issue — do
+  not skip a real bug just because it predates the diff. "Inherited, so not the PR's to fix"
+  is true only for base-realignment artifacts (a workflow file already on `main`) and false
+  positives; it does NOT cover a genuine defect the review happened to surface in code the PR
+  merely moved or touched. Verify it against the current code first (a mock-only divergence
+  where the real backend is correct is still a real finding; a CodeQL/analyzer alert on demo
+  data with no actual sensitive value is a false positive). Instance (2026-09-02, PR #1011,
+  a pure-motion mockApi split): three CodeRabbit "Major" findings were real mock↔backend
+  divergences moved verbatim from the old file — filed as follow-up #1013 rather than skipped,
+  keeping the split pure — while the HIGH CodeQL "clear-text storage" alert beside them was a
+  true false positive (non-secret demo settings in `localStorage`), dismissed not fixed.
 - **Send back to uzi** — as a follow-up **issue** (a full gated run → a *separate* PR to
   review/merge/CI-watch; right for a substantial change) or a **handoff task**
   (`uzi handoff`). Know the tradeoffs before recommending it: a handoff pushes to a throwaway
