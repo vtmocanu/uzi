@@ -4,11 +4,11 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: -
+# requires: REPO_ID ADMIN_ID ADMIN_SECRET_ID
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  worker anthropic_bind_mode(auto); secret auto_eligible pool flags; anthropic_rate_limits gauge rows; a spare anthropic_token
+# restores: worker bind mode->default; spare token deleted; default gauge->55/12; pool left empty
 # ---------------------------------------------------------------------------
 # PRD #111 M6: auto-selection, end to end through the REAL claim path.
 #

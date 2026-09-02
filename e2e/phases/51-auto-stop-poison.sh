@@ -5,7 +5,7 @@
 # lane:     gitlab
 # executor: any
 # race-sensitive: yes
-# requires: -
+# requires: REPO_ID UZI_BIN UZI_TOKEN_VAL
 # provides: -
 # handoff:  -
 # mutates:  -

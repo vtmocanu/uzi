@@ -62,6 +62,9 @@ proposal_count() { apiget "/api/runs/$1/messages" | jq '[.messages[] | select(.k
 newest_proposal_id() { apiget "/api/runs/$1/messages" | jq -r '[.messages[] | select(.kind=="proposal")] | last | .payload.id'; }
 
 say "PRD #39: in-app chat agent (stub) — create -> read(red-team) -> propose -> confirm -> dismiss -> idle -> continue"
+if [ "$EXECUTOR" != stub ]; then
+  say "PRD #39 chat-agent: SKIPPED (stub-only — UZI_STUB_READ/PROPOSE + canned reply are stub sentinels; executor=$EXECUTOR)"
+else
 login   # fresh admin session re-unlocks the vault; the chat claim needs the decrypted Anthropic token
 
 # --- concurrency (Success Criterion + Decision 4): a chat runs while an issue run is
@@ -226,4 +229,5 @@ pass "continued chat claimed on the chat lane and answered a new turn"
 apipost "/api/chats/$CONT/end" '' | jq -e 'has("server_side")' >/dev/null || fail "end chat was not acked"
 wait_status "$CONT" completed 30
 pass "continued chat ended via End chat -> completed"
+fi
 

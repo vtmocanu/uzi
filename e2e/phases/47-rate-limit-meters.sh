@@ -5,7 +5,7 @@
 # lane:     gitlab
 # executor: any
 # requires: -
-# provides: -
+# provides: ADMIN_ID ADMIN_SECRET_ID
 # handoff:  -
 # mutates:  -
 # restores: -

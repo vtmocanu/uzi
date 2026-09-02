@@ -4,11 +4,11 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: -
+# requires: REPO_ID DUMMY_ANTHROPIC
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  compose:agent(stopped) (:40, never restarted in-phase); a spare anthropic_token(console-key, deleted); a binding-test worker; runs created then cancelled
+# restores: - (agent restarted by 59-restart-agent)
 # ---------------------------------------------------------------------------
 # PRD #104: a worker's token binding reaches the CLAIM PAYLOAD, and a rebind takes
 # effect on the very next claim with no restart.

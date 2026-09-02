@@ -7,7 +7,7 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  -
+# mutates:  $ENVFILE+=UZI_DIND_SOCKET (:104); starts dind sidecar + recreates agent (agent-docker profile only, self-skips when DOCKER_PROFILE empty)
 # restores: -
 # ── PRD #83 M2: docker-capable worker (rootless DinD sidecar) ────────────────────────
 # Runs ONLY under `--profile agent-docker` (so the default suite is untouched). Two
