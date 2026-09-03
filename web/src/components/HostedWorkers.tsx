@@ -10,7 +10,7 @@
 // The whole card is hidden — never disabled-with-explanation — when hosting is off.
 // A user on an instance without hosting has no use for the concept (Decision 12).
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api, type HostedConfig, type Worker } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAuth } from "../auth/AuthContext";
@@ -21,6 +21,8 @@ import { DEFAULT_WORKER_SIZE, WORKER_SIZES, sizeOptionLabel } from "../lib/worke
 export function HostedWorkers({
   hostedCount,
   onProvisioned,
+  onShowWorkers,
+  onAvailability,
 }: {
   /** How many hosted workers the user already holds, counted from the fleet list the
    *  page polls. There is no count endpoint and none is wanted. */
@@ -29,6 +31,20 @@ export function HostedWorkers({
    *  be able to replace a provision's message, and deletes are the page's) and the
    *  fleet refresh. */
   onProvisioned: (worker: Worker) => void | Promise<void>;
+  /** Cross the tabs back to Your workers so the user can delete a hosted worker; the
+   *  page selects that tab and focuses the first hosted row. Fired by the at-quota
+   *  "delete one to provision another" link (D10). */
+  onShowWorkers: () => void;
+  /** Tell the page whether MANUAL hosted provisioning is available, so its empty state
+   *  can lead with a hosted CTA (D8). It is fired FROM the config-fetch effect below,
+   *  exactly once per mount, and BEFORE the render-time early `return null` gates: the
+   *  effect runs on mount whatever those gates render, so the page learns hosting is off
+   *  (or on) even while this component's own card renders nothing and even while the add
+   *  panel is `hidden` — which works only because D4 keeps this component mounted. Lifting
+   *  the fetch into the page was rejected (D8) to keep the one-shot fetch where its tests
+   *  pin it; this callback is the one-prop alternative. `manual = enabled && quota > 0`;
+   *  `{ manual: false }` when hosting is disabled, quota is 0, or the config read rejects. */
+  onAvailability?: (a: { manual: boolean }) => void;
 }) {
   const { user, refresh } = useAuth();
   const [config, setConfig] = useState<HostedConfig | null>(null);
@@ -47,6 +63,12 @@ export function HostedWorkers({
   // manual form's alert at the top (likely off-screen). Kept separate from `error` so
   // the two surfaces never clobber each other.
   const [ephemeralError, setEphemeralError] = useState("");
+  // Read the latest onAvailability via a ref so the fetch effect can stay `[]`-deps (a
+  // one-shot fetch its tests pin) without an inline callback re-running it. The latch ref
+  // makes onAvailability fire exactly once per mount, even under a StrictMode double-invoke.
+  const onAvailabilityRef = useRef(onAvailability);
+  onAvailabilityRef.current = onAvailability;
+  const availabilityReported = useRef(false);
 
   // Fetched once, on mount, and never polled: enabled/quota are operator-set POLICY,
   // which changes on a deploy or an admin edit, not on the 10s liveness rhythm the
@@ -56,13 +78,24 @@ export function HostedWorkers({
   // user may not even have, on every blip.
   useEffect(() => {
     let live = true;
+    // Report availability from INSIDE this effect (D8), so it fires before the render-time
+    // `return null` gates below and the page learns hosting is off even while this card
+    // renders nothing. Guarded to exactly once per mount.
+    const reportAvailability = (manual: boolean) => {
+      if (availabilityReported.current) return;
+      availabilityReported.current = true;
+      onAvailabilityRef.current?.({ manual });
+    };
     api
       .hostedConfig()
       .then((cfg) => {
         if (live) setConfig(cfg);
+        // manual = enabled AND self-service quota left; anything else is { manual: false }.
+        reportAvailability(!!cfg.enabled && cfg.quota > 0);
       })
       .catch(() => {
-        // Fail closed; see above.
+        // Fail closed; see above. The page still learns hosting is unavailable.
+        reportAvailability(false);
       });
     return () => {
       live = false;
@@ -155,6 +188,10 @@ export function HostedWorkers({
             <div className="min-w-[10rem]">
               <Field label="Template">
                 <Select
+                  // Stable id so the page can move focus here across the component boundary
+                  // (D10): the header "Add a worker" button and the empty-state "Provision a
+                  // hosted worker" CTA focus this select as the add panel's first control.
+                  id="hosted-worker-template"
                   aria-label="Hosted worker template"
                   value={template}
                   onChange={(e) => setTemplate(e.target.value)}
@@ -205,13 +242,30 @@ export function HostedWorkers({
             </Button>
             <span className="pb-2 text-xs text-muted">
               {hostedCount} of {config.quota} used
-              {atQuota && " — delete one to provision another"}
+              {atQuota && (
+                <>
+                  {" — "}
+                  {/* A link-styled button, not plain text (D "At quota"): it crosses the
+                      tabs back to Your workers so the user can delete a hosted worker. The
+                      styling mirrors the inline link-buttons elsewhere (e.g. JudgePanel's
+                      Undo): the surrounding muted colour, underlined, brightening to text-fg
+                      on hover — no new palette class. */}
+                  <button
+                    type="button"
+                    onClick={onShowWorkers}
+                    className="text-muted underline underline-offset-2 transition-colors hover:text-fg"
+                  >
+                    delete one to provision another
+                  </button>
+                </>
+              )}
             </span>
           </form>
           <p className="text-xs text-muted">
             A hosted worker runs in the cluster, not on your machine: there is no join token to
-            copy and no container to start. It appears below and comes online on its own, and you
-            delete it there like any other worker. Tick <em>Docker-capable</em> to give its agent
+            copy and no container to start. It shows up under <strong>Your workers</strong> and
+            comes online on its own, and you delete it there like any other worker. Tick{" "}
+            <em>Docker-capable</em> to give its agent
             a rootless, isolated Docker daemon (for docker and docker&nbsp;compose); it costs extra
             CPU and storage and needs an instance that offers the docker tier.
           </p>
