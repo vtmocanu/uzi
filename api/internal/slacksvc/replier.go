@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -570,14 +571,11 @@ func boundReply(s string) string {
 	return s
 }
 
-// isTerminalStatus reports whether a run status accepts no further steering input.
+// isTerminalStatus reports whether a run status accepts no further steering input. It
+// delegates to apitypes.IsTerminalRunStatus so slacksvc shares the ONE server-side
+// terminal-status predicate rather than re-spelling the set (byte-identical behaviour).
 func isTerminalStatus(status string) bool {
-	switch status {
-	case "completed", "failed", "cancelled":
-		return true
-	default:
-		return false
-	}
+	return apitypes.IsTerminalRunStatus(status)
 }
 
 // ensure *Replier satisfies MessageHandler at compile time.

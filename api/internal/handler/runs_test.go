@@ -1095,7 +1095,25 @@ func (s *runsStore) ListPlanRevisionStateForRuns(_ context.Context, runIds []uui
 // is no rows — no tool_use frame, so every run reads a null current_activity and every
 // pre-existing run-list/get test keeps its meaning; latestToolUseRows lets a test script
 // the newest tool_use per run, latestToolUseArg captures the (non-terminal) ids passed.
+//
+// It mirrors the real query's `WHERE run_id = ANY($1)` predicate: only rows whose RunID
+// is in the requested set are returned. That faithfulness is load-bearing for the
+// terminal-filter assertion — a terminal run's id is never passed (the handler excludes
+// it), so its scripted row must not leak back into the activity map.
 func (s *runsStore) LatestToolUseForRuns(_ context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error) {
 	s.latestToolUseArg = runIds
-	return s.latestToolUseRows, s.latestToolUseErr
+	if s.latestToolUseErr != nil {
+		return nil, s.latestToolUseErr
+	}
+	want := make(map[uuid.UUID]bool, len(runIds))
+	for _, id := range runIds {
+		want[id] = true
+	}
+	out := make([]store.LatestToolUseForRunsRow, 0, len(s.latestToolUseRows))
+	for _, row := range s.latestToolUseRows {
+		if want[row.RunID] {
+			out = append(out, row)
+		}
+	}
+	return out, nil
 }
