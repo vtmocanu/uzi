@@ -582,6 +582,18 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 // TestCoderParallelModeContract pins the coder's parallel-mode contract (PRD #43
 // M1): the hard file-scope boundary, stop-and-report on out-of-scope or shared
 // files, no commit in parallel mode, and gate only what it exclusively owns.
+//
+// The phrases are pinned to the upstream library body VERBATIM (the coder builtin
+// is `product-agents/coder.md` byte-for-byte, so a future library sync re-applies
+// itself instead of re-forking these sentences). Each pin quotes one sentence of
+// the shipped body, so removing that sentence reds exactly the behaviour it names.
+//
+// One behaviour the older body carried is deliberately UNPINNED here: the terse
+// b5288fd body has no standalone "dispatched as one of several coders working in
+// parallel" sentence — the parallel-mode framing now rides on the "In parallel
+// mode do not run `git commit`" bullet, which IS pinned. There is nothing to
+// assert for the dropped sentence, so pinning it would red on a body that never
+// carried it.
 func TestCoderParallelModeContract(t *testing.T) {
 	coder, ok := BuiltinByName("coder")
 	if !ok {
@@ -593,13 +605,12 @@ func TestCoderParallelModeContract(t *testing.T) {
 		behavior string
 		phrase   string
 	}{
-		{"may run as one of several parallel coders", "dispatched as one of several coders working in parallel"},
-		{"assigned file scope is a hard boundary", "treat it as a hard boundary"},
-		{"stop and report on out-of-scope need", "stop and report that instead of editing it"},
-		{"shared files are called out as out-of-scope", "including shared files like go.mod, lockfiles, generated code, or wiring and registration files"},
+		{"assigned file scope is a hard boundary", "A file scope in your delegation prompt is a hard boundary"},
+		{"stop and report on out-of-scope need", "stop and report instead of editing"},
+		{"shared files are called out as out-of-scope", "including shared files like lockfiles, generated code or wiring and registration files"},
 		{"no git commit in parallel mode", "In parallel mode do not run `git commit`"},
-		{"no gate/build/test unless it covers only exclusively-owned code", "do not run gate, build, or test commands unless they cover only code you exclusively own"},
-		{"lead integrates, commits, and runs the repo-wide gate", "the lead integrates, commits, and runs the repo-wide gate"},
+		{"no gate/build/test unless it covers only exclusively-owned code", "run gate, build or test commands only if they cover code you exclusively own"},
+		{"lead integrates, commits, and gates after parallel units land", "the lead integrates, commits and gates once all units land"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(body, c.phrase) {

@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Builtin agent-team role templates re-synced to the upstream skills library ([#1080](https://github.com/vtmocanu/uzi/issues/1080)).**
+  The eleven library-derived builtins under `api/internal/agenttmpl/builtins/` were ported to the terser upstream bodies with new version stamps and the library's model choices (`researcher` moves to `sonnet`), keeping uzi's `main`-recipient wording and `fact-checker`'s forge tools; `lead` gains the run-economy rules and the vendored role manifest is refreshed to `b5288fd`.
+
 ## [0.77.0] - 2026-09-03
 
 ### Added
