@@ -152,84 +152,69 @@ agent can play: name, description, an optional model override, an optional
 tools allowlist, and a prompt body. It is not itself an agent; it is the
 recipe a later release renders into a running one.
 
-- **`builtins/` is the single source of truth.** Twelve builtin roles — the
-  `lead` orchestrator (`model: opus`) plus eleven subagents (`coder`,
-  `reviewer`, `auditor`, `tester`, `architect`, `documenter`, `fact-checker`,
-  `spec-keeper`, `researcher`, `ux-designer`, `web-ux`) — are Go-embedded from `api/internal/agenttmpl/builtins/*.md`,
-  parsed at package `init()`. This directory is independent of this repo's own
-  `.claude/agents/*.md` dev-team roster (PRD #17): that roster is free to
-  drift and product changes never touch it. At every boot,
-  `store.ReconcileBuiltinTemplates` inserts any builtin row missing from the
-  DB and never touches one that already exists, so an admin's edits to a
-  builtin survive restarts, and future releases can add or upgrade builtins
-  without a SQL seed that can't be re-run; a boot-time warning is logged if a
-  non-builtin row already occupies a builtin's name (e.g. a custom `lead`
-  template blocks the seed).
+- **`builtins/` is the single source of truth.** Twelve builtin roles, the
+  `lead` orchestrator (`model: opus`) plus eleven subagents (`coder`, `reviewer`,
+  `auditor`, `tester`, `architect`, `documenter`, `fact-checker`, `spec-keeper`,
+  `researcher`, `ux-designer`, `web-ux`), are Go-embedded from
+  `api/internal/agenttmpl/builtins/*.md`, parsed at package `init()`. This is
+  independent of the repo's own `.claude/agents/*.md` dev-team roster (PRD #17),
+  which is free to drift and never touched by product changes. At every boot
+  `store.ReconcileBuiltinTemplates` inserts any missing builtin and never touches
+  an existing one, so admin edits survive restarts and future releases add or
+  upgrade builtins without a non-re-runnable SQL seed; a boot warning is logged if
+  a non-builtin row already occupies a builtin's name.
 - **The `lead` is the main thread, not a subagent.** The worker
-  (`agent/src/agents.ts`) partitions templates by name (`LEAD_NAME_RE`,
-  matching `lead`/`orchestrator`) and routes the matched template's
-  `prompt_body`/`model` into the run's main SDK thread instead of registering
-  it as an invokable subagent. Model precedence for that main thread: the run
-  owner's per-user default model (`users.default_model`, set from Settings,
-  carried through the claim payload) → the `lead` template's `model` → the
-  SDK/Anthropic-account default. A subagent's own template `model`, when set,
-  always wins for that subagent; unset, it inherits the resolved main-thread
-  model. See [docs/worker-model.md](docs/worker-model.md). The same claim
-  also carries the owner's per-user **reasoning effort**
-  (`users.default_effort`, PRD #617): when set it is applied to the SDK's
-  top-level effort for the main thread and inherited by its subagents;
-  unset omits the key so the SDK default (`high`) applies. See
-  [docs/worker-effort.md](docs/worker-effort.md).
+  (`agent/src/agents.ts`) partitions templates by name (`LEAD_NAME_RE`, matching
+  `lead`/`orchestrator`) and routes the matched template's `prompt_body`/`model`
+  into the run's main SDK thread rather than an invokable subagent. Main-thread
+  model precedence: the owner's per-user default (`users.default_model`) → the
+  `lead` template's `model` → the SDK/account default. A subagent's own `model`
+  wins for it when set, else inherits the resolved main-thread model. See
+  [docs/worker-model.md](docs/worker-model.md). The same claim carries the owner's
+  per-user **reasoning effort** (`users.default_effort`, PRD #617): set, it applies
+  to the SDK top-level effort for the main thread and its subagents; unset, the SDK
+  default (`high`) applies. See [docs/worker-effort.md](docs/worker-effort.md).
 - **Scopes + per-user ownership (PRD #18).** Each template has a `scope`
-  (`builtin`/`global`/`user`) and, for user scope, a `user_id`, mirroring the
-  skills model. Builtin and global are visible to everyone and admin-managed; a
-  `user` template is visible to and editable by only its owner. Reads and
-  writes are scope-authorized per row (not a blanket `RequireAdmin`): any user
-  creates/edits/deletes their own templates, builtin/global management stays
-  admin-only, and a non-owner never learns a private template exists (404, not
-  403). `is_builtin` is retained as a compat column a CHECK ties to
-  `scope='builtin'`. Two partial-unique name indexes (shared names unique
-  across builtin+global; per-user names unique) let a user own a name that
-  collides with a shared one; `lead`/`orchestrator` are reserved so no
-  API-created template (global or user) can take a lead name — the invariant
-  behind the worker's "a claim never carries two lead-matching templates" pin.
-  This still closes the hole where any user could rewrite the shared prompts.
-- **Allocation + claim filtering (PRD #18).** `agent_template_allocations`
-  decides which templates ride each run: a global-default layer (admin,
-  `user_id NULL`, always enabled) plus a per-user `enabled` overlay. Seeded
-  with no empty-means-all cliff — every builtin/global gets an explicit default
-  row (at migration, on the reconciler's first insert of a builtin, and on a
-  global's creation), so absence of a row is always a deliberate removal. A
-  claim delivers only the run owner's **resolved** set (`ListClaimAgentTemplates`:
-  the overlay wins, else the global default, else dropped) — builtin∪global
-  defaults ± the owner's overlay + the owner's own allocated user templates,
-  never another user's rows. A user template whose name collides with a
-  builtin/global is dropped from the claim (**shared precedence**), so the
-  worker's name-keyed subagent map never has the curated builtin displaced (a
-  deliberate divergence from skills' body-precedence; surfaced in the UI as a
-  `shadowed` badge). The lead is a normal template in the set — a user may
-  disable it, and the worker degrades to its hardcoded guardrail lead prompt.
-- **Renderer.** `api/internal/agenttmpl/render.go` turns a template into
-  Claude Code's subagent Markdown (fixed-order YAML frontmatter, `tools` as an
-  inline comma-separated string, `tools`/`model` omitted when they inherit).
-  It is a pure function with no DB dependency; parse/validity tests (not a
-  byte-match against `.claude/agents/`, dropped with the source-of-truth
-  split above) guard the embedded builtins directly. `GET
-  /api/agent-templates/:id/rendered` serves this Markdown directly; nothing
-  in this release writes it to a filesystem or spawns anything from it (that
-  is a later release's job). See
+  (`builtin`/`global`/`user`) and, for user scope, a `user_id`, mirroring skills.
+  Builtin and global are visible to everyone and admin-managed; a `user` template
+  is visible to and editable by only its owner. Reads and writes are
+  scope-authorized per row (not blanket `RequireAdmin`): any user manages their own
+  templates, builtin/global stays admin-only, and a non-owner never learns a
+  private template exists (404, not 403). `is_builtin` is a compat column a CHECK
+  ties to `scope='builtin'`. Two partial-unique name indexes (shared names unique
+  across builtin+global; per-user names unique) let a user own a name colliding
+  with a shared one; `lead`/`orchestrator` are reserved so no API-created template
+  can take a lead name, the invariant behind the worker's "a claim never carries
+  two lead-matching templates" pin.
+- **Allocation + claim filtering (PRD #18).** `agent_template_allocations` decides
+  which templates ride each run: a global-default layer (admin, `user_id NULL`,
+  always enabled) plus a per-user `enabled` overlay. Every builtin/global gets an
+  explicit default row (at migration, at first insert, at global creation), so
+  there is no empty-means-all cliff and absence of a row is a deliberate removal. A
+  claim delivers only the owner's **resolved** set (`ListClaimAgentTemplates`:
+  overlay wins, else global default, else dropped), never another user's rows. A
+  user template whose name collides with a builtin/global is dropped (**shared
+  precedence**, a deliberate divergence from skills' body-precedence, surfaced as a
+  `shadowed` badge) so the worker's name-keyed subagent map never displaces the
+  curated builtin. The lead is a normal template: a user may disable it, and the
+  worker degrades to its hardcoded guardrail lead prompt.
+- **Renderer.** `api/internal/agenttmpl/render.go` turns a template into Claude
+  Code's subagent Markdown (fixed-order YAML frontmatter, `tools` as an inline
+  comma-separated string, `tools`/`model` omitted when they inherit). It is a pure
+  function with no DB dependency; parse/validity tests guard the embedded builtins
+  directly. `GET /api/agent-templates/:id/rendered` serves this Markdown; nothing
+  in this release writes it to a filesystem or spawns from it. See
   [docs/agent-templates.md](docs/agent-templates.md).
-- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique
-  within its scope namespace (the two partial-unique indexes above), not a
-  reserved lead name for an API create, and immutable after creation (it is the
-  subagent's filename and identity; renaming means creating a new template and
-  deleting the old one; builtins are never renamed). `description` and `prompt_body` are required and
-  non-empty; `description`, `model`, and each tool name must not contain a
-  newline, carriage return, or other control character (they each render on
-  a single frontmatter line). A template is rejected if its description or
-  prompt body contains what looks like a complete Anthropic token (a
-  high-confidence `sk-ant-...` match); the UI separately warns, without
-  blocking, on looser patterns so legitimate text stays savable.
+- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique within
+  its scope namespace, not a reserved lead name for an API create, and immutable
+  after creation (it is the subagent's filename; renaming means create-new +
+  delete-old; builtins are never renamed). `description` and `prompt_body` are
+  required and non-empty; `description`, `model`, and each tool name must contain
+  no newline, carriage return, or control character (each renders on one
+  frontmatter line). A template is rejected if its description or prompt body
+  contains a high-confidence complete Anthropic token (`sk-ant-...`); the UI
+  separately warns without blocking on looser patterns so legitimate text stays
+  savable.
 - **API surface.** All endpoints require authentication (session + CSRF);
   writes are scope-authorized per row (PRD #18), not blanket-admin: `GET
   /api/agent-templates` (list, viewer-scoped), `GET /api/agent-templates/:id`
@@ -239,9 +224,9 @@ recipe a later release renders into a running one.
   /api/agent-templates` (create; `scope` global⇒admin or user⇒owner, blank⇒global
   for back-compat; a reserved lead name is rejected), `PUT .../:id` (update; name
   and scope are ignored, immutable), `DELETE .../:id` (409 on a builtin), `POST
-  .../:id/reset` (400 on a non-builtin). Edits are last-write-wins — no
-  optimistic-concurrency check in this release — but every row records
-  `updated_by` and `updated_at` so concurrent edits are at least attributable.
+  .../:id/reset` (400 on a non-builtin). Edits are last-write-wins (no
+  optimistic-concurrency check), but every row records `updated_by`/`updated_at`
+  for attribution.
 - **Agent source (PRD #602).** `api/internal/agentsource` layers an
   admin-configurable, opt-in runtime sync additively over the builtins: a
   `go-git` clone-and-read of a pinned ref parses each `.md` role file (a
@@ -264,92 +249,79 @@ in `prds/done/16-agent-skills.md` (Solution Overview, Technical Design, Trust
 model); this section is the map. User-facing usage is
 [docs/skills.md](docs/skills.md).
 
-- **Storage.** `skills` (`scope` ∈ `builtin`/`global`/`user`; `name` is
-  kebab-case and immutable; `body` is the raw SKILL.md content below the
-  frontmatter, which is synthesized at delivery, never stored) and
-  `agent_skill_allocations` (`user_id NULL` for a shared/admin-managed
-  allocation, non-`NULL` for a specific user's private overlay; unique on
-  `(template_id, skill_id, COALESCE(user_id, sentinel))`, so a shared
-  allocation and a user's overlay allocation of the same skill to the same
-  template coexist as two distinct rows, no surrogate PK needed).
-  `repos.repo_skills_enabled` is the opt-in flag for repo-borne skills,
-  below. Builtins are seeded/repaired by the same reconciler pattern as agent
-  templates (editable, resettable, never deletable), Go-embedded from
-  `api/internal/skilltmpl/builtins/` (no `.claude/skills/` mirror, per the
-  builtins convention above) — `prd-lifecycle`.
-- **Default allocations** (PRD #72 M2). A builtin with no allocation row
-  reaches *nobody* — not its scoped subagents and not the lead either, since
-  the union `ListRunSkillAllocations` builds is what the lead receives. So
-  each builtin carries a default target list (a Go-side map in `skilltmpl`
-  keyed by skill name, deliberately not frontmatter: `skilltmpl.Parse`
-  rejects every unknown key and that strictness is worth keeping), seeded in
-  the **same transaction** as the insert and **only** on the boot that
-  inserts the skill — `ReconcileBuiltinTemplates`' `n > 0` rule, for its
-  reason: a default an admin later removes stays removed. The targets are
-  agent-template *names*, so the template reconciler must run first (see
-  [Startup](#startup-and-migrations)), and a zero-row seed warns rather than
-  failing silently.
+- **Storage.** `skills` (`scope` ∈ `builtin`/`global`/`user`; `name` kebab-case and
+  immutable; `body` is the raw SKILL.md content below the frontmatter, which is
+  synthesized at delivery, never stored) and `agent_skill_allocations` (`user_id
+  NULL` for a shared/admin allocation, non-`NULL` for a user's private overlay;
+  unique on `(template_id, skill_id, COALESCE(user_id, sentinel))`, so a shared
+  allocation and a user's overlay of the same skill to the same template coexist as
+  two rows, no surrogate PK). `repos.repo_skills_enabled` is the opt-in flag for
+  repo skills, below. Builtins are seeded/repaired by the same reconciler pattern as
+  agent templates (editable, resettable, never deletable), Go-embedded from
+  `api/internal/skilltmpl/builtins/` (no `.claude/skills/` mirror), currently
+  `prd-lifecycle`.
+- **Default allocations** (PRD #72 M2). A builtin with no allocation row reaches
+  *nobody*, not its scoped subagents and not the lead (the union
+  `ListRunSkillAllocations` builds is what the lead receives). So each builtin
+  carries a default target list (a Go-side map in `skilltmpl` keyed by skill name,
+  deliberately not frontmatter, since `skilltmpl.Parse` rejects every unknown key),
+  seeded in the **same transaction** as the insert and **only** on the boot that
+  inserts the skill (`ReconcileBuiltinTemplates`' `n > 0` rule: a default an admin
+  later removes stays removed). The targets are agent-template *names*, so the
+  template reconciler must run first (see [Startup](#startup-and-migrations)), and a
+  zero-row seed warns rather than failing silently.
 - **Read authz is deliberately not the agent-templates pattern.** Templates
   are all-shared; skills are not. Every read (`GET /api/skills*`) returns
   builtin ∪ global ∪ the caller's own user skills; admins additionally see
   other users' private skills (they can read the DB anyway). Allocation reads
   follow the same rule: a template's shared allocations plus only the
   caller's own overlay, never another user's.
-- **Claim payload delta** (`api/internal/workersvc/claim.go`): `ClaimPayload.skills` is
-  the run's deduplicated skill union (`{name, description, body}`), assembled
-  server-side per the claiming user (shared allocations ∪ that user's
-  overlay, across every template, since every template ships in every
-  claim); `ClaimPayload.skills_dropped` carries assembly-time drops
-  (`{name, reason}` — `shadowed` or `over_limit`). Each `ClaimAgent.skills`
-  is that template's allocated skill names. `ClaimRepo.skills_enabled` mirrors
-  `repos.repo_skills_enabled`. `ClaimConfig.skill_max_bytes` /
-  `skills_max_per_run` carry the server's configured caps
-  (`SKILL_MAX_BYTES`/`SKILLS_MAX_PER_RUN`) so the worker enforces the same
-  limits the server assembled against, with no hardcoded drift. Name-collision
-  precedence at assembly is user > global > builtin; the loser is dropped as
-  `shadowed`. The server never writes `run_messages` for these drops — it
-  hands the worker the list, and the worker (which owns the gapless per-run
-  `seq`) logs each one as a run message.
-- **Worker delivery** (`agent/src/skills-plugin.ts`,
-  `agent/src/sdk-executor.ts`). Every claim (including a resume) rebuilds a
-  local SDK plugin directory **outside the clone**, a sibling of the
-  worktree: `.claude-plugin/plugin.json` plus `skills/<name>/SKILL.md` per
-  surviving skill, with `name`/`description` frontmatter synthesized as
-  quoted, fully-escaped YAML scalars (a frontmatter-injection guard covering
-  every YAML metacharacter class, not just newlines). The SDK's top-level
-  `skills` option is always sent as an explicit list — omitting it is not
-  "skills off" — set to the run's full plugin-qualified union; the `lead`
-  template runs on the main thread (not a subagent), so this union is also
-  its only allocation surface. On an **own-template** run each subagent's
-  `AgentDefinition.skills` scopes it to its own allocated skills, re-filtered
-  to what actually survived materialization. On a **repo-source** run
-  (`agent/src/agents.ts` `subagentsFromTemplates`, PRD #72) there are no
-  template rows to allocate against, so every repo subagent receives the run's
-  whole surviving set instead — the same all-templates rule repo skills follow.
-- **Repo skills** (`agent/src/repo-skills.ts`), opt-in and default off. Only
-  when `ClaimRepo.skills_enabled`, the worker enumerates
-  `<clone>/.claude/skills/*/SKILL.md` after checkout, keeping only the `name`
-  and `description` frontmatter keys (every other key, e.g. `allowed-tools`,
-  is stripped — that is the security point) and re-synthesizing them through
-  the same escaped-YAML materializer as delivered skills. Repo skills carry
-  no allocation, so a surviving one attaches to **every** template in the
-  run; they rank at the lowest precedence (a name collision with any
-  delivered skill drops the repo skill) and are the first evicted if the
-  combined set exceeds `skills_max_per_run`. This is the **only** clone-borne
-  configuration the worker ever reads — no hooks, no settings, no commands,
-  no `CLAUDE.md` — and it is why the toggle exists per repo: a repo's
-  `.claude/` is exactly the config class `settingSources: []` (see Guardrail
-  layers, below) is built to keep closed, so loading even this much requires
-  the repo owner (or an admin) to vouch for that repo's review discipline.
-- **Trust boundary.** `settingSources: []` stays `[]` in every configuration,
-  with or without repo skills enabled — the plugin channel
-  (`plugins: [{type: 'local', ...}]`) is a separate SDK option, independent
-  of `settingSources`, so this delivery mechanism never has to loosen that
-  isolation. A hostile repo skill still cannot push code (the worker alone
-  holds the PAT), still hits the `PreToolUse` deny-hook, and still cannot
-  load hooks, settings, or commands from the repo — only its own SKILL.md
-  bodies, stripped to name + description, at the bottom of the precedence
-  order.
+- **Claim payload delta** (`api/internal/workersvc/claim.go`): `ClaimPayload.skills`
+  is the run's deduplicated skill union (`{name, description, body}`), assembled
+  server-side per claiming user (shared allocations ∪ that user's overlay, across
+  every template since every template ships in every claim); `ClaimPayload.skills_dropped`
+  carries assembly-time drops (`{name, reason}`, `shadowed` or `over_limit`). Each
+  `ClaimAgent.skills` is that template's allocated names, `ClaimRepo.skills_enabled`
+  mirrors `repos.repo_skills_enabled`, and `ClaimConfig.skill_max_bytes`/`skills_max_per_run`
+  carry the server caps (`SKILL_MAX_BYTES`/`SKILLS_MAX_PER_RUN`) so the worker
+  enforces the same limits with no hardcoded drift. Name-collision precedence at
+  assembly is user > global > builtin; the loser is dropped as `shadowed`. The
+  server never writes `run_messages` for these drops; it hands the worker the list
+  and the worker (owning the gapless `seq`) logs each.
+- **Worker delivery** (`agent/src/skills-plugin.ts`, `agent/src/sdk-executor.ts`).
+  Every claim (including a resume) rebuilds a local SDK plugin directory **outside
+  the clone**, a sibling of the worktree: `.claude-plugin/plugin.json` plus
+  `skills/<name>/SKILL.md` per surviving skill, with `name`/`description`
+  frontmatter synthesized as quoted, fully-escaped YAML scalars (a
+  frontmatter-injection guard covering every YAML metacharacter class). The SDK's
+  top-level `skills` option is always sent as an explicit list (omitting it is not
+  "skills off") set to the run's full plugin-qualified union; the `lead` runs on
+  the main thread, so this union is also its only allocation surface. On an
+  **own-template** run each subagent's `AgentDefinition.skills` scopes it to its own
+  allocated skills, re-filtered to what survived materialization. On a
+  **repo-source** run (`agent/src/agents.ts` `subagentsFromTemplates`, PRD #72)
+  there are no template rows, so every repo subagent receives the whole surviving
+  set.
+- **Repo skills** (`agent/src/repo-skills.ts`), opt-in and default off. Only when
+  `ClaimRepo.skills_enabled`, the worker enumerates
+  `<clone>/.claude/skills/*/SKILL.md` after checkout, keeping only the `name` and
+  `description` frontmatter keys (every other key, e.g. `allowed-tools`, is
+  stripped, the security point) and re-synthesizing through the same escaped-YAML
+  materializer. Repo skills carry no allocation, so a surviving one attaches to
+  **every** template; they rank lowest (a name collision with any delivered skill
+  drops the repo skill) and are first evicted if the set exceeds
+  `skills_max_per_run`. This is the **only** clone-borne configuration the worker
+  reads (no hooks, settings, commands, or `CLAUDE.md`), which is why the toggle is
+  per repo: a repo's `.claude/` is exactly the config class `settingSources: []`
+  keeps closed, so loading even this much requires the repo owner or an admin to
+  vouch for that repo's review discipline.
+- **Trust boundary.** `settingSources: []` stays `[]` with or without repo skills
+  enabled; the plugin channel (`plugins: [{type: 'local', ...}]`) is a separate SDK
+  option, so this delivery never loosens that isolation. A hostile repo skill still
+  cannot push code (the worker alone holds the PAT), still hits the `PreToolUse`
+  deny-hook, and still cannot load hooks, settings, or commands from the repo, only
+  its own SKILL.md bodies stripped to name + description at the bottom of the
+  precedence order.
 
 ## Secrets: per-user credentials at rest
 
@@ -1151,114 +1123,102 @@ usage is [docs/findings.md](docs/findings.md).
 uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slacksvc`, PRD #25): per-user run DMs, plan-approval buttons, reply-from-Slack steering, and — since PRD #191 — a conversational chat surface (a top-level DM to the bot opens a `kind='chat'` run streamed back into a thread, with `start_run`/`cancel_run`/`steer_run` tools and issue-proposal cards, the run-control trio added by PRD #322). It adds no new service and no new inbound port — the trust posture below is why. Full design rationale lives in the PRD (`prds/done/25-slack-integration.md`, especially its Security posture and Decision Log; the conversational surface in `prds/done/191-slack-chat-surface.md`); user-facing setup is [docs/slack.md](docs/slack.md).
 
 - **Outbound-only, no inbound surface.** The manager (`slacksvc.Manager`) opens a Socket Mode WebSocket *out* to Slack and polls it live; there is no public URL, no signing-secret HTTP endpoint, and no new port on `api`. This holds the same "only `web` publishes a port" boundary above unchanged — Slack is a second *outbound* relationship, the same shape as the forge integration, not a new inbound one. The honest caveat: enabling Slack does export run *status metadata* off-box to Slack's cloud — and, since PRD #41, gated plan bodies too, and since PRD #191 chat message content for `kind='chat'` runs (see Content minimization, below).
-- **`api` is the sole custodian of both Slack tokens.** The bot (`xoxb-`) and app-level (`xapp-`) tokens are settings values, sealed with the same `secretbox` key as every other secret at rest, and structurally excluded from every value-producing settings read (`settings.SecretKeys`, kept out of `Defaults` so `All()`/`Effective()` cannot emit them by construction — the same "cannot forget to redact" pattern used for the Anthropic token above). They are readable only through slacksvc's own decrypt accessors. A dedicated `slacksvc.Redact` additionally scrubs `xoxb-`/`xapp-` patterns *and* the Socket Mode connection URL's `?ticket=` query — a live-session credential the token-shape redaction alone would miss — from every log line. Neither token, nor the ticket URL, is ever sent to a worker or agent.
-- **Identity mapping is the authz primitive for every inbound action.** `users.slack_resolved_id` (the manual override, or a cached `users.lookupByEmail` match) has a partial unique index (`users_slack_resolved_id_key`, `WHERE slack_resolved_id IS NOT NULL`), so at most one uzi user can ever resolve from a given Slack id. Every inbound handler (the Gatekeeper's Approve/Reject, the Replier's thread replies) re-resolves the Slack-authenticated envelope actor through `GetConfirmedUserBySlackID`, which additionally requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true` — an unconfirmed link or a deactivated account resolves to no row and the action is refused with an ephemeral notice, never guessed at. Content flows only after the user completes a link-confirmation DM round-trip; since uzi emails are unverified at registration, that confirmation click — not the email match itself — is what makes the mapping trustworthy against account-squatting. Approve/Reject, follow-up and clarification-answer submissions then ride `workersvc.SubmitInput`'s own ownership check (`GetRunByIDForUser`) as a second, independent gate. A Slack answer additionally carries no id of its own, which makes *which question it answers* a derivation rather than a fact (PRD #88 M3). Web and CLI echo back the id they were shown; a free-text reply cannot, and the tempting derivation — "whichever question is open when it arrives" — is an **arrival-time key wearing identity's clothes**: a reply written against Q1 that lands after Q2 opened would be stamped with Q2's id *by the server*, and would then satisfy every downstream equality check precisely because the server supplied it, re-opening the race identity keying exists to close. So the reply is instead bound to the question it **follows**, by ordering its `ts` against the `ts` of the question message the notifier posted (`slack_run_messages.question_id` + `question_ts`); a reply predating the current card is refused as answering a superseded question, and an unorderable pair fails closed. That survives a requeue for free, because a re-park re-uses the question id, the notifier's identity dedupe therefore does not re-post, and the recorded `ts` still points at the original card. The body produced is the same `{question_id, answers}` shape (`workersvc.AnswerBody`, marshalled by the `gateSubmitter` adapter in `cmd/server`, so the wire shape is declared exactly once), and the server re-checks the id against `runs.open_question_id` — keeping the two facts independent: Slack says what the user answered, `workersvc` says whether that is still open.
-- **Content minimization — with four deliberate exceptions: the plan gate, the clarification question, milestone titles, and (PRD #191) chat message content.** Slack messages otherwise carry status, repository path, issue number and title, MR link, and failure reason only — diff content never leaves `api`. Every dynamic field that could carry forge- or worker-controlled text (issue title, repo path, failure reason, a linked account's label) is mrkdwn-escaped (`EscapeMrkdwn`) before interpolation, so it can't smuggle a clickable link or an `@mention` into a message that also carries trusted deep-link markup, and a separate outbound scrub (`ScrubSecrets`) strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string as defense in depth. **The plan body is the one exception** (user-approved 2026-07-10, reversing this minimization for `plan_md` only — [PRD #41](prds/done/41-plan-revision-gate.md) Decision 10): every gated plan, and each revision a Request-changes round produces, is posted into the run's Slack thread — `ScrubSecrets`, then whole-blob CommonMark→mrkdwn rendering (`SlackMrkdwn`, not the per-field `EscapeMrkdwn` rule above, since the blob carries no trusted markup of its own to preserve — PRD #292, see below), then a rune-safe truncate to Slack's 3000-char block limit, with the deep link appended as trusted markup outside the truncated region. This genuinely widens what leaves the box: plan bodies quote source/issue content, and no layer here catches a secret a model happens to quote verbatim into a plan — only the four known token *patterns* above are stripped. Gate posts still land only in the owner's own 1:1 DM, so the added exposure is Slack's cloud (retention, admin export, e-discovery) plus that workspace's own admin boundary, not other members; the deep link (`UZI_PUBLIC_BASE_URL`/`public_base_url`) stays the canonical, untruncated rendering. **The clarification question is the second exception, on the same terms** ([PRD #88](prds/done/88-ask-user-clarification.md) Decision 9): when a run parks at `awaiting_input`, the question body — headers, question text, and any suggested option labels and descriptions — is posted into the same 1:1 DM thread through the *same* pipeline (`ScrubSecrets` → whole-blob `SlackMrkdwn` rendering (PRD #292) → rune-safe truncate → deep link as a separate block, `slacksvc.questionThreadBlocks`). It widens exposure the same way and for the same reason, and the same limit applies: question text is model-authored from repo and issue content, and only the four known token *patterns* are stripped, so a secret quoted verbatim into a question is not caught by any layer. Two things are specific to it. First, the text is **attacker-influenceable in a directed way** — an injected repo file can steer what the lead asks — so the question is treated as untrusted at every sink, and the lead's prompt forbids asking for a credential, token or password (D-G). Second, the widening runs in **both directions**: a question invites a human to type an answer back, and that answer is `ScrubSecrets`-ed and length-bounded in `workersvc.SubmitInput` so every surface inherits the scrub, not just the Slack one that always had it. **Milestone titles are the third**, a narrower one ([PRD #122](prds/done/122-milestone-structured-runs.md) M4): a `✓ N/M · working <title>` progress line carries a plan-authored milestone title, `EscapeMrkdwn`-escaped like the status fields but genuinely model-authored, so it shades from status metadata into content — which is part of why the count is four, not two. **Chat message content is the fourth, default-on wherever Slack is on** ([PRD #191](prds/done/191-slack-chat-surface.md) Decision 10): a `kind='chat'` run opened from a Slack DM streams its turns back into that DM's thread, each turn's `text` frames coalesced into one edited message through the *same* pipeline (`ScrubSecrets` → whole-blob `SlackMrkdwn` rendering (PRD #292) → rune-safe truncate → deep link outside the truncated region, `slacksvc/chatpost.go`); it widens exposure the same way and for the same reason, with the same limit (only the four known token *patterns* are stripped, so a secret the model quotes verbatim into an answer is not caught). Two things are specific to it. First — the **second-order exposure** — the exposure is broader than the run-state DM lanes it rides beside: the chat agent's read tools (`list_runs`/`get_run`/`get_run_messages`) are user-scoped but **not** kind-scoped, so a Slack chat can be asked to quote an **`issue` run's** message content — plan bodies, diffs, tool output — into Slack. The run-state notification lanes for the five non-chat kinds (`issue`, `ci_fix`, `judge`, `self_improve`, `prompt`) stay byte-identical to before; what changed is that run *content* now has a route to Slack, through chat, that it did not have. Second, the write direction is human-gated the same way the web Chat page is: the `start_run` tool and `propose_issue` emit **cards** whose Create/Start button — not the tool call — performs the forge write / run start, through the presser's own connection, so a repo that says "start a run on #42" produces at most a card. The same gate covers run control (PRD #322): `cancel_run` and `steer_run` likewise only emit cards — a danger Cancel button (confirm-gated) and a Steer button that, on press, arms a one-shot pending steer and asks the presser to reply in the thread with their instruction — and it is that button press (cancel) or in-thread reply (steer), not the tool call, that reaches `SubmitInput`.
-- **Untrusted bodies render, they no longer just escape** ([PRD #292](prds/done/292-slack-mrkdwn-rendering.md)). The four sites above that post whole-blob model-authored text — the chat answer, the plan/gate body, the clarification question, and (new here) the judge review / self-improvement / schedule-paused notification body — now run that text through `SlackMrkdwn` (`api/internal/slacksvc/mrkdwn.go`), a goldmark-AST CommonMark→Slack-mrkdwn renderer, in place of the old whole-blob `EscapeMrkdwn`. It is at least as safe as the escape it replaces: every text/code/raw-HTML node's content still goes through the same `slackutilsx.EscapeMessage` `EscapeMrkdwn` wraps, so an injected `<@U123>` mention or a `<https://evil|Open>` payload still parses as inert text, not live markup; a clickable `<url|label>` is only ever emitted from an `https://` link node, with both the URL and label sanitized so neither can re-open Slack's link grammar; and anything the renderer doesn't understand (tables, images, raw HTML) degrades to escaped plain text rather than a parse error. The trusted per-field chrome around these bodies — repo path, titles, agent names, verdict/category chips, deep links — is untouched by this change and stays on the per-field `EscapeMrkdwn` used everywhere else in this section, since that text carries intentional uzi-authored markup rather than being an untrusted blob.
-- **Inbound rate limits, at two layers.** The Socket Mode receive loop ACKs every envelope before processing (Slack retries an un-ACKed one in ~3s), and a per-Slack-user flood window bounds thread-reply volume. Separately, the two `/me/slack` endpoints that trigger an outbound DM to a caller-supplied Slack id (`PUT .../override`, `POST .../test-dm`) sit behind a dedicated, tighter per-user `mw.Limiter` (`SLACK_DM_RATE_LIMIT_MAX`/`_WINDOW`, distinct from the forge limiter above) plus a 30-second per-target DM cooldown in `slacksvc.Linker` — together bounding both an arbitrary-member DM-spam primitive and a member-id enumeration oracle.
+- **`api` is the sole custodian of both Slack tokens.** The bot (`xoxb-`) and app-level (`xapp-`) tokens are settings values sealed with the same `secretbox` key as every secret at rest, and structurally excluded from every value-producing settings read (`settings.SecretKeys`, kept out of `Defaults` so `All()`/`Effective()` cannot emit them). They are readable only through slacksvc's decrypt accessors. A dedicated `slacksvc.Redact` also scrubs `xoxb-`/`xapp-` patterns and the Socket Mode URL's `?ticket=` query (a live-session credential the token-shape redaction would miss) from every log line. Neither token nor the ticket URL is ever sent to a worker or agent.
+- **Identity mapping is the authz primitive for every inbound action.** `users.slack_resolved_id` (manual override or a cached `users.lookupByEmail` match) has a partial unique index (`users_slack_resolved_id_key WHERE slack_resolved_id IS NOT NULL`), so at most one uzi user resolves from a given Slack id. Every inbound handler re-resolves the Slack-authenticated actor through `GetConfirmedUserBySlackID`, which also requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true`, so an unconfirmed link or deactivated account resolves to no row and the action is refused. Since uzi emails are unverified at registration, the link-confirmation DM click, not the email match, is what makes the mapping trustworthy against account-squatting. Approve/reject and answer submissions then ride `workersvc.SubmitInput`'s own ownership check (`GetRunByIDForUser`) as a second gate. A Slack answer carries no id of its own (PRD #88 M3), so *which question it answers* is a derivation, not a fact: binding it to "whichever question is open on arrival" would be an **arrival-time key wearing identity's clothes** (a reply written against Q1 that lands after Q2 opened would be mis-stamped Q2 by the server, re-opening the race). It is instead bound to the question it **follows**, ordering its `ts` against the question message's `ts` (`slack_run_messages.question_id` + `question_ts`); a reply predating the current card is refused, an unorderable pair fails closed, and a requeue re-uses the question id so the recorded `ts` still points at the original card. The body is the `{question_id, answers}` shape (`workersvc.AnswerBody`, marshalled by the `gateSubmitter` adapter in `cmd/server`), and the server re-checks the id against `runs.open_question_id`.
+- **Content minimization, with four deliberate exceptions: the plan gate, the clarification question, milestone titles, and (PRD #191) chat message content.** Slack messages otherwise carry status, repo path, issue number and title, MR link, and failure reason only; diff content never leaves `api`. Every dynamic forge- or worker-controlled field (issue title, repo path, failure reason, a linked account's label) is `EscapeMrkdwn`-escaped before interpolation so it cannot smuggle a link or `@mention` into trusted deep-link markup, and a separate `ScrubSecrets` strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string. The four exceptions all post whole-blob model-authored text into the owner's own 1:1 DM through the **same pipeline** (`ScrubSecrets` → whole-blob `SlackMrkdwn` render (PRD #292) → rune-safe truncate to Slack's 3000-char block limit → deep link, `UZI_PUBLIC_BASE_URL`/`public_base_url`, appended as trusted markup outside the truncated region) and carry the **same limit**: only the four token *patterns* are stripped, so a secret a model quotes verbatim is not caught. The added exposure is Slack's cloud (retention, admin export, e-discovery) and that workspace's admin boundary, not other members.
+  - **The plan body** (user-approved 2026-07-10, [PRD #41](prds/done/41-plan-revision-gate.md) Decision 10): every gated plan and each Request-changes revision, posted into the run's thread.
+  - **The clarification question** ([PRD #88](prds/done/88-ask-user-clarification.md) Decision 9, `slacksvc.questionThreadBlocks`): headers, question text, and any suggested option labels/descriptions. Two specifics: the text is **attacker-influenceable in a directed way** (an injected repo file can steer what the lead asks), so the lead's prompt forbids asking for a credential (D-G); and the widening runs **both directions**, so the typed answer is `ScrubSecrets`-ed and length-bounded in `workersvc.SubmitInput` for every surface.
+  - **Milestone titles** ([PRD #122](prds/done/122-milestone-structured-runs.md) M4): a `✓ N/M · working <title>` line carries a plan-authored, model-authored title, `EscapeMrkdwn`-escaped like the status fields, so it shades from metadata into content (part of why the count is four, not two).
+  - **Chat message content**, default-on wherever Slack is on ([PRD #191](prds/done/191-slack-chat-surface.md) Decision 10, `slacksvc/chatpost.go`): a `kind='chat'` run's turns stream back into the DM thread. Two specifics: the **second-order exposure** is broader than the run-state lanes, since the chat agent's read tools (`list_runs`/`get_run`/`get_run_messages`) are user-scoped but **not** kind-scoped, so a chat can be asked to quote an **`issue` run's** content (plans, diffs, tool output) into Slack (the run-state lanes for the five non-chat kinds stay byte-identical); and the write direction is human-gated like the web Chat page, `start_run`/`propose_issue`/`cancel_run`/`steer_run` emitting **cards** whose button press (or Steer thread-reply), not the tool call, reaches `SubmitInput` through the presser's own connection (PRD #322).
+- **Untrusted bodies render, not just escape** ([PRD #292](prds/done/292-slack-mrkdwn-rendering.md)). The whole-blob sites above (plus the judge/self-improve/schedule-paused notification body) run through `SlackMrkdwn` (`api/internal/slacksvc/mrkdwn.go`), a goldmark-AST CommonMark→mrkdwn renderer, in place of whole-blob `EscapeMrkdwn`. It is at least as safe: every text/code/raw-HTML node still passes through the same `slackutilsx.EscapeMessage` (so an injected `<@U123>` or `<https://evil|Open>` stays inert), a clickable `<url|label>` is emitted only from an `https://` link node with URL and label sanitized, and anything unrecognized (tables, images, raw HTML) degrades to escaped plain text. The trusted per-field chrome (repo path, titles, agent names, chips, deep links) stays on per-field `EscapeMrkdwn`.
+- **Inbound rate limits, at two layers.** The Socket Mode receive loop ACKs every envelope before processing (Slack retries an un-ACKed one in ~3s), and a per-Slack-user flood window bounds thread-reply volume. Separately, the two `/me/slack` endpoints that trigger an outbound DM to a caller-supplied Slack id (`PUT .../override`, `POST .../test-dm`) sit behind a dedicated per-user `mw.Limiter` (`SLACK_DM_RATE_LIMIT_MAX`/`_WINDOW`) plus a 30-second per-target DM cooldown in `slacksvc.Linker`, bounding both a DM-spam primitive and a member-id enumeration oracle.
 - **The primary directive is unaffected.** Slack can only approve, reject, request changes to (feeding text back into the same planning session), or otherwise thread-steer a plan gate — a latency/authorization control, not a `main`-write capability. A wrongful approval can at worst produce a branch + MR, same as an approval from the web UI, and every one of the [four guardrail layers](#guardrail-layers-the-primary-directive) is untouched by this integration: Slack never holds a forge credential, never talks to a worker, and never reaches the agent's own context.
 - **Fails safe when unconfigured.** With Slack disabled (the default) or either token absent, the manager idles and every other surface behaves exactly as before — nothing here is a hard dependency of the run lifecycle.
 
 ## Chat with uzi (the fifth surface)
 
-uzi's fifth surface is a conversational one: a **Chat** page — and, since PRD #191, a **Slack DM** to the bot (see the Slack section above) — where a user talks to an agent that knows uzi's own source, can investigate the user's runs, and can draft GitLab issues or start runs the user confirms. It adds **no new service and no new trust boundary** — chat rides the existing worker/run machinery as a third run **kind** (`runs.kind = 'chat'`), the same way `ci_fix` did as a second kind. Full design rationale is in the PRD (`prds/done/39-chat-agent.md`, especially its Decision Log and the review-corrected decisions); user-facing usage is [docs/chat.md](docs/chat.md). The short map:
+uzi's fifth surface is a conversational one: a **Chat** page, and since PRD #191 a **Slack DM** to the bot (see the Slack section above), where a user talks to an agent that knows uzi's own source, can investigate the user's runs, and can draft forge issues or start runs the user confirms. It adds **no new service and no new trust boundary**: chat rides the existing worker/run machinery as a third run **kind** (`runs.kind = 'chat'`), the same way `ci_fix` did as a second kind. Full design rationale is in the PRD (`prds/done/39-chat-agent.md`); user-facing usage is [docs/chat.md](docs/chat.md). The short map:
 
 - **Chat is a run kind, not a new service.** A conversation is one `chat` run: `repo_id`/`issue_iid`/`branch` all NULL (`runs.repo_id` was made nullable, with `runs_kind_shape` enforcing the all-NULL shape for chat and the existing NOT-NULL shape for every other kind). The first user message and every follow-up are ordinary `run_user_inputs` (`kind='follow_up'`) rows — the initial message is atomically seeded into `run_user_inputs` by `CreateChatRun` so a chat can never exist without its first message — and the whole conversation streams through the same persisted-first `run_messages` → `/api/ws` pipeline (with REST replay) as any run. Chat runs are excluded from the board, the runs list, and the admin runs list (they have no repo/issue), but an individual chat is still openable owner-or-admin via the run view (`GET /api/runs/:id`).
-- **A dedicated claim lane, narrower credentials.** The worker polls a second, independent claim lane (`POST /api/worker/runs/claim?lane=chat`) alongside its run slot, so a chat is served concurrently with an executing run (up to `WORKER_CHAT_SESSIONS`, default 1) without queueing behind a long run. Chat is cheap to hold — no clone, no worktree, no provisioning. The chat claim payload is a **separate `ChatClaimPayload` that structurally cannot carry a forge PAT** — the `ForgePAT` field does not exist on it, one tier narrower than a run claim (which carries the PAT for the worker's git operations). A chat needs no repo and no forge connection at all: a user with only an Anthropic token can still chat.
-- **`ChatRunner`, not `RunRunner`.** Chat has its own slim runner (claim → session loop → complete) with no git/clone/push/MR spine. The `ChatExecutor` runs the SDK session with `cwd` at the baked source and a **deny-by-default tool surface**: the SDK `tools` option is restricted to `Read`/`Grep`/`Glob` plus the uzi MCP tools (not `allowedTools`, which does not confine under `bypassPermissions`), with `disallowedTools`, `settingSources: []`, the Bash deny-hook, and the **path-guard hook rooted at `/opt/uzi-src`** (with the worker join-token path in `extraSecretPaths` as defense-in-depth; the load-bearing protection is the outside-root deny, since the token file lives outside the baked root, plus the `/proc` deny that closes the one non-Bash egress for `CLAUDE_CODE_OAUTH_TOKEN`). No Bash, no Write/Edit, no WebFetch/WebSearch, no subagents. Lifecycle is idle-bounded + per-turn wall-clocked + turn-capped (server-enforced from persisted inputs, not worker-trusted); an idle sweep replaces the 2h `RUN_TIMEOUT` for chat. An idle-ended conversation is resumable via **Continue** (a new chat run carrying `resume_of_run_id`, resuming the persisted SDK session when the worker's disk still holds it).
-- **Baked source, never a clone.** uzi's own source is copied into the worker image at build time to `/opt/uzi-src` (read-only, root-owned) with a `BUILD_INFO` stamp, so the agent's answers match the *deployed* version exactly and need no PAT and no network — the same bundle-at-build discipline the docs section uses. This required moving the agent image's build context to the repo root with a per-Dockerfile ignore that hard-excludes `.env*`, `.git`, `inspiration/`, and `node_modules` (committed history is never baked).
-- **uzi tools are an in-worker MCP server** (`agent/src/uzi-tools.ts`, the `signals.ts` precedent): `list_runs` / `get_run` / `get_run_messages` read the worker's **own user's** runs (new user-scoped worker endpoints, `GET /api/worker/chat/runs*`, that filter by the authenticated worker's `user_id` — never a bare run id, so a foreign id is a 404), and `propose_issue` drafts an issue on the **current** chat run only (closure-scoped, no injectable run id) and **never writes the forge**. All forge- and model-derived text returned by the read tools (titles, failure reasons, messages, plans) is wrapped in an **untrusted-evidence fence** with a per-call CSPRNG nonce in the closing sentinel, so attacker-authored evidence cannot forge a close tag and break out to become an instruction — the same posture `ci_fix` uses for job logs. `start_run`, and — since PRD #322 — `cancel_run` and `steer_run`, are the run-control analogue of the next point: each emits a card only (`run_request` / `cancel_request` / `steer_request`) and makes **no mutating call** from the tool handler, so the run write happens on the human's Create/Start/Cancel click or Steer thread-reply, through the presser's own connection, resolved against the existing owner-scoped `SubmitInput` (`cancel`/`follow_up`) — no new endpoint, no new run kind, no migration.
-- **Issue creation is structurally human-gated.** `propose_issue` persists a `pending` `issue_proposals` row and emits a `proposal`-kind run_message rendered as a card by the browser (and, PRD #191, as a Block Kit card in Slack); only a human Create click — the browser's session+CSRF `POST /api/chats/:id/proposals/:pid/confirm`, or the Slack card's button routed through the same lifted `ConfirmProposalForUser` — executes `Forge.CreateIssue` via the user's own connection (forge-first, PAT-redacted, per-user forge-rate-limited). Confirm is **claim-first** (atomic `pending → confirming` before the forge call, revert on failure) so a double-confirm creates exactly one issue; a stuck-`confirming` row is swept back to `pending`, and a boot-time clamp keeps the sweep timeout safely above the forge HTTP timeout so a slow-but-alive confirm is never reaped into a duplicate. The proposal write path simply does not exist without the human click.
+- **A dedicated claim lane, narrower credentials.** The worker polls a second, independent claim lane (`POST /api/worker/runs/claim?lane=chat`) alongside its run slot, so a chat is served concurrently with an executing run (up to `WORKER_CHAT_SESSIONS`, default 1) without queueing behind a long run. Chat is cheap to hold (no clone, worktree, or provisioning). The chat claim payload is a **separate `ChatClaimPayload` that structurally cannot carry a forge PAT** (the `ForgePAT` field does not exist on it), one tier narrower than a run claim. A chat needs no repo and no forge connection: a user with only an Anthropic token can still chat.
+- **`ChatRunner`, not `RunRunner`.** Chat has its own slim runner (claim → session loop → complete) with no git/clone/push/MR spine. The `ChatExecutor` runs the SDK session at the baked source under a **deny-by-default tool surface**: `tools` restricted to `Read`/`Grep`/`Glob` plus the uzi MCP tools (not `allowedTools`, which does not confine under `bypassPermissions`), with `disallowedTools`, `settingSources: []`, the Bash deny-hook, and the **path-guard hook rooted at `/opt/uzi-src`** (the load-bearing protection is the outside-root deny, since the token file lives outside the baked root, plus the `/proc` deny closing the one non-Bash egress for `CLAUDE_CODE_OAUTH_TOKEN`). No Bash, Write/Edit, WebFetch/WebSearch, or subagents. Lifecycle is idle-bounded + per-turn wall-clocked + turn-capped (server-enforced from persisted inputs); an idle sweep replaces the 2h `RUN_TIMEOUT`. An idle-ended conversation is resumable via **Continue** (a new chat run carrying `resume_of_run_id`).
+- **Baked source, never a clone.** uzi's own source is copied into the worker image at build time to `/opt/uzi-src` (read-only, root-owned) with a `BUILD_INFO` stamp, so the agent's answers match the *deployed* version exactly and need no PAT and no network, the same bundle-at-build discipline the docs section uses. This moved the agent image's build context to the repo root with a per-Dockerfile ignore that hard-excludes `.env*`, `.git`, `inspiration/`, and `node_modules` (committed history is never baked).
+- **uzi tools are an in-worker MCP server** (`agent/src/uzi-tools.ts`, the `signals.ts` precedent): `list_runs`/`get_run`/`get_run_messages` read the worker's **own user's** runs (user-scoped worker endpoints `GET /api/worker/chat/runs*` filtering by the authenticated worker's `user_id`, never a bare run id, so a foreign id is a 404), and `propose_issue` drafts on the **current** chat run only (closure-scoped) and **never writes the forge**. All forge- and model-derived text the read tools return is wrapped in an **untrusted-evidence fence** with a per-call CSPRNG nonce in the closing sentinel, the same posture `ci_fix` uses for job logs. `start_run` and, since PRD #322, `cancel_run`/`steer_run` each emit a **card only** (`run_request`/`cancel_request`/`steer_request`) and make no mutating call, so the run write happens on the human's click or Steer thread-reply through the presser's own connection, resolved against the owner-scoped `SubmitInput` (no new endpoint, run kind, or migration).
+- **Issue creation is structurally human-gated.** `propose_issue` persists a `pending` `issue_proposals` row and emits a `proposal` run_message rendered as a card (browser, and PRD #191 a Block Kit card in Slack); only a human Create click (`POST /api/chats/:id/proposals/:pid/confirm`, or the Slack button through the lifted `ConfirmProposalForUser`) executes `Forge.CreateIssue` via the user's own connection (forge-first, PAT-redacted, forge-rate-limited). Confirm is **claim-first** (atomic `pending → confirming`, revert on failure) so a double-confirm creates one issue; a stuck-`confirming` row is swept back to `pending`, with a boot-time clamp keeping the sweep timeout above the forge HTTP timeout so a slow confirm is never reaped into a duplicate.
 - **The primary directive is unaffected.** Chat holds no forge credential and has no git access; the worst it can do is draft an issue the user must click to file. Every guardrail layer is intact — `settingSources` stays `[]`, the deny-hooks still fire, and no PAT is ever in reach of the chat agent. Named residual (unchanged from the run surface): `CLAUDE_CODE_OAUTH_TOKEN` is in the agent's env, but chat's no-Bash/no-network/no-`/proc` surface is strictly stronger than a run's, so a prompt-injected chat has no egress channel for it.
-- **Slack is a second entry point to the same chat** (PRD #191). A top-level DM to the bot opens a `kind='chat'` run through the identical service verbs the web uses; nothing kind-scoped forks (no new run kind, no new claim lane, no new credential — the chat claim still carries no forge PAT). The composite operations the web did in its *handlers* — proposal confirm and run start — were lifted into `workersvc` (`ConfirmProposalForUser`, `StartRunForUser`) so both surfaces share one claim-first, ownership-scoped, PRD-gated path; the `start_run` tool lands in web chat in the same change. Turns stream back into the DM thread (content-widened per Decision 10, above); issue proposals and start-run requests render as Block Kit cards in a third `slack_chat_*` action namespace (not the plan gatekeeper's), whose Create/Start click performs the write through the presser's own connection. The per-user chat spend limiter is shared across web and Slack (one budget bounds the person, not the surface), and the run-affecting verbs keep riding `workersvc`'s ownership checks, so a forged card value can only ever act on the confirmed presser's own runs.
+- **Slack is a second entry point to the same chat** (PRD #191). A top-level DM opens a `kind='chat'` run through the identical service verbs the web uses; nothing kind-scoped forks (no new run kind, claim lane, or credential). The composite web-handler operations (proposal confirm, run start) were lifted into `workersvc` (`ConfirmProposalForUser`, `StartRunForUser`) so both surfaces share one claim-first, ownership-scoped, PRD-gated path; the `start_run` tool lands in web chat in the same change. Turns stream back into the DM thread (content-widened per the Slack section); proposals and start-run requests render as Block Kit cards in a `slack_chat_*` action namespace whose Create/Start click performs the write through the presser's own connection. The per-user chat spend limiter is shared across web and Slack, and the run-affecting verbs keep riding `workersvc`'s ownership checks, so a forged card value can only act on the presser's own runs.
 
 ## The uzi CLI: a second API consumer
 
 Until PRD #64, `web` (browser + session cookie) was the API's only caller.
 The `uzi` CLI (`api/cmd/uzi/`, same module as `api`) is a second one, driven
-identically by humans and agents — it talks to the same JSON API `web` does,
-over a different credential. It adds **no new service and no new inbound
-port**: the CLI is an outbound-only client of the existing `api`, the same
-way a browser is. User-facing usage is [docs/cli.md](docs/cli.md); full
-design rationale — including the security audit that found and closed the
-scope-ceiling gap below — is in the PRD (`prds/done/64-uzi-cli.md`, especially its
-Decision Log).
+identically by humans and agents over a different credential against the same
+JSON API. It adds **no new service and no new inbound port**: it is an
+outbound-only client of `api`, like a browser. Usage is
+[docs/cli.md](docs/cli.md); full rationale, including the security audit that
+closed the scope-ceiling gap below, is in the PRD (`prds/done/64-uzi-cli.md`).
 
 `uzi tui` (PRD #112, `api/cmd/uzi/tui_*.go`) is a full-screen view over that same
-client — a live runs board, a run-detail split with a per-agent lane rail and
-transcript, and run-level steering. It adds **no endpoint and no service**: every
+client (live runs board, run-detail split with a per-agent lane rail and
+transcript, run-level steering). It adds **no endpoint and no service**: every
 read and write is a call the plain CLI already makes. Its one new capability is a
-Bearer-authenticated subscription to the existing `/api/ws` hub, which required
-moving that route from the cookie-only group into `RequireUser` — a route move with
-`websocket.Accept`'s options untouched (see the ws section above for why the
-same-origin rule still covers both credential paths). It lives in `package main`
-rather than a `tui/` subpackage because Go forbids importing a main package, and the
-sanitize and render helpers it must reuse live there; that trade is recorded in
-[prds/done/112-uzi-tui.md](prds/done/112-uzi-tui.md). User-facing usage is
-[docs/cli.md](docs/cli.md); the plain `--json` verbs remain the agent-facing surface
-and are unchanged.
+Bearer-authenticated subscription to `/api/ws`, which required moving that route
+from the cookie-only group into `RequireUser` with `websocket.Accept`'s options
+untouched (see the ws section for why the same-origin rule still covers both
+credential paths). It lives in `package main` because Go forbids importing a main
+package and the sanitize/render helpers it reuses live there
+([prds/done/112-uzi-tui.md](prds/done/112-uzi-tui.md)). The plain `--json` verbs
+remain the agent-facing surface, unchanged.
 
-The CLI can also hold several credentials at once as **named contexts**
-(`uzi context …`, PRD #427) and switch which one a command uses via a flag, an
-env var, or a sticky default. This is purely client-side credential selection —
-which already-stored `{URL, token}` pair a command sends — with no server, API,
-or scope change; authority is still the token's server-enforced scope. See
-[Config and credentials](docs/cli.md#config-and-credentials) for the mechanics.
+The CLI can hold several credentials as **named contexts** (`uzi context …`,
+PRD #427), switching which one a command uses via a flag, env var, or sticky
+default. This is purely client-side selection of which stored `{URL, token}` pair
+a command sends, with no server, API, or scope change; authority is still the
+token's server-enforced scope. See
+[Config and credentials](docs/cli.md#config-and-credentials).
 
 - **One new credential, one new middleware.** A `cli_tokens` row (`uzc_`
   user-scoped / `uza_` admin-scoped, sha256 at rest, mirroring the worker
   join-token posture) is presented as `Authorization: Bearer …`.
   `mw.RequireUser` dispatches on whether that header **parses** as
-  `Bearer <non-empty>` — never on bare presence, and never "try cookie, fall
-  back to Bearer" — so a request takes exactly one path: a parsing Bearer
-  header goes CLI-token-only (no CSRF), anything else goes through the
-  existing `RequireAuth` cookie path, CSRF-enforced, byte-identical to
-  before. Both populate the same `userKey` every handler already reads, so
-  no handler needed to change to gain a CLI-reachable route.
-- **The route swap is enumerated per route, not per group.** Only the routes
-  a v1 CLI verb needs were moved onto `RequireUser` (`GET /api/auth/me`,
-  the `/api/runs` read+input routes including `/review`, `GET /api/repos` +
-  `POST /api/repos/{id}/runs`, `GET/DELETE /api/workers`, the 9 admin GETs).
-  Everything else — `POST /api/workers` (mints a plaintext join token that
-  can read decrypted secrets), `/api/me/cli-tokens` itself, `/api/vault/*`,
-  `/api/forge/*`, `/api/me/secrets/*`, and every admin write — stayed
-  cookie-only. Swapping whole route groups would have hit endpoints no v1
-  command needs and materially widened what a stolen CLI token could do; see
-  the PRD's route-disposition table for the full per-route reasoning.
-- **`scope` is a ceiling, enforced in the middleware, not just at
-  `/api/admin/*`.** `RequireAdminRO` is a plain `user.IsAdmin` check — the
-  real control is upstream, in `RequireUser`: a CLI token whose `scope !=
-  'admin_ro'` gets a **copy** of the user row with `IsAdmin=false` installed
-  in the request context. Every owner-or-admin handler outside
+  `Bearer <non-empty>`, never on bare presence and never "try cookie, fall back
+  to Bearer", so a request takes exactly one path: a parsing Bearer header goes
+  CLI-token-only (no CSRF), anything else goes through `RequireAuth` cookie+CSRF,
+  byte-identical to before. Both populate the same `userKey`, so no handler
+  changed to gain a CLI-reachable route.
+- **The route swap is enumerated per route, not per group.** Only the routes a v1
+  CLI verb needs were moved onto `RequireUser` (`GET /api/auth/me`, the
+  `/api/runs` read+input routes including `/review`, `GET /api/repos` + `POST
+  /api/repos/{id}/runs`, `GET/DELETE /api/workers`, the 9 admin GETs). Everything
+  else (`POST /api/workers`, `/api/me/cli-tokens`, `/api/vault/*`, `/api/forge/*`,
+  `/api/me/secrets/*`, every admin write) stayed cookie-only, since swapping whole
+  groups would have widened what a stolen CLI token could do. See the PRD's
+  route-disposition table.
+- **`scope` is a ceiling, enforced in the middleware, not just at `/api/admin/*`.**
+  `RequireAdminRO` is a plain `user.IsAdmin` check; the real control is upstream in
+  `RequireUser`, which gives a CLI token whose `scope != 'admin_ro'` a **copy** of
+  the user row with `IsAdmin=false`. Every owner-or-admin handler outside
   `/api/admin/*` that reads admin-ness live (`GetRunForViewer`,
-  `ListRunMessagesForViewer`, `GetReviewForTarget` — three run-visibility
-  checks an admin's default `uzc_` would otherwise widen to "any user's
-  run") degrades to owner-only **for free**, with no handler change. This is
-  the fix a security audit added mid-design: an earlier draft checked scope
-  only under `/api/admin/*` and would have shipped an admin's everyday
-  token able to read every user's run transcripts.
-- **`apitypes` (`api/internal/apitypes/`) is a stdlib-only leaf.** The CLI
-  imports handler DTOs through it rather than `internal/handler` directly,
-  so the binary never drags in `chi`/`pgx`. Enforced mechanically, not by
-  convention: a test runs `go list -deps ./cmd/uzi` and fails if `pgx` or
-  `chi` appears in the dependency graph. The api↔web JSON wire contract for
-  the hot DTOs is pinned the same mechanical way: `fixtures/api-contract/`
-  holds a Go-recorded `zero.json`/`full.json` per DTO, checked by a Go half
-  (byte-equal marshal + `DisallowUnknownFields` round-trip) and a TS half
-  (`web/src/lib/apiContract.test.ts`, keyof set-equality + literal-widened
-  nullability via `resolveJsonModule`), so a Go-side or TS-side drift
-  reddens exactly that side's gate.
-- **Browser login is poll-based, not a loopback listener.** `uzi login`
-  generates a PKCE verifier locally, sends only its challenge to
-  `POST /api/auth/cli/start`, prints a `user_code` plus a `/cli-auth?request=`
-  URL, and polls `POST /api/auth/cli/poll` until a human — in an
-  already-authenticated browser tab, via whatever this instance's login
-  method is (password or OIDC) — types the code and approves. No token is
+  `ListRunMessagesForViewer`, `GetReviewForTarget`) degrades to owner-only for
+  free. This is the fix a security audit added mid-design: an earlier draft checked
+  scope only under `/api/admin/*` and would have shipped an admin's everyday token
+  able to read every user's run transcripts.
+- **`apitypes` (`api/internal/apitypes/`) is a stdlib-only leaf.** The CLI imports
+  handler DTOs through it rather than `internal/handler`, so the binary never drags
+  in `chi`/`pgx`; a test runs `go list -deps ./cmd/uzi` and fails if either
+  appears. The api↔web JSON wire contract for the hot DTOs is pinned the same way:
+  `fixtures/api-contract/` holds a Go-recorded `zero.json`/`full.json` per DTO,
+  checked by a Go half (byte-equal marshal + `DisallowUnknownFields`) and a TS half
+  (`web/src/lib/apiContract.test.ts`), so a drift reddens exactly that side's gate.
+- **Browser login is poll-based, not a loopback listener.** `uzi login` generates
+  a PKCE verifier locally, sends only its challenge to `POST /api/auth/cli/start`,
+  prints a `user_code` plus a `/cli-auth?request=` URL, and polls
+  `POST /api/auth/cli/poll` until a human approves in an already-authenticated
+  browser tab (via this instance's login method, password or OIDC). No token is
   minted at approve; the poll mints it, claim-first (`UPDATE … WHERE
-  status='approved' … RETURNING`) so two racing polls can't both mint from
-  one approval. This deliberately avoids a loopback-listener design (a
-  session JWT in a URL, SSH-hostile, LAN-exposed binding heuristics) — see
-  the PRD's inspiration-check table.
+  status='approved' … RETURNING`) so two racing polls can't both mint from one
+  approval. This avoids a loopback-listener design (a session JWT in a URL,
+  SSH-hostile, LAN-exposed binding heuristics).
 
 ## Docs
 
@@ -1289,8 +1249,9 @@ rationale.
 - **Link rewriting.** A relative link to another in-app-routable page becomes an
   in-app route (`/docs/:slug`) — `user` pages for everyone, `operator` pages for
   admins (`rewriteHref(href, isAdmin)`); a link to a repo-only file (`../plan.md`,
-  a `design`/`contributor` doc) rewrites to the pinned GitLab blob URL instead.
-  `#anchor` fragments are preserved either way.
+  a `design`/`contributor` doc) rewrites to the pinned GitHub blob URL instead
+  (`REPO_BLOB_BASE`, `web/src/lib/docs.ts`). `#anchor` fragments are preserved
+  either way.
 - **Build-time validation gate.** `web/scripts/check-docs.mjs` runs ahead of
   `npm run build` and fails on missing/invalid frontmatter, a missing or
   duplicate `order` among `user` or `operator` pages (each its own namespace), a
@@ -1395,61 +1356,43 @@ Shipped in the chart but **off by default** (`workers.enabled: false`); see
 and [deploy/README.md](deploy/README.md#hosted-workers-prd-58) for turning it
 on.
 
-- **Scoped to two empty namespaces, one of them privileged.** Its
-  ServiceAccount carries a `Role` bound to the dedicated `uzi-workers`
-  (**restricted**-tier) namespace containing nothing but hosted worker
-  objects — no CNPG, no other app's Secrets, no privileged ServiceAccounts —
-  plus, when the docker tier is enabled, a second `Role`+`RoleBinding` into a
-  dedicated `uzi-workers-docker` namespace running
-  `pod-security.kubernetes.io/enforce: privileged` (PRD #83 M3). The
-  privileged tier is a recorded deviation from the PRD's original
-  `baseline`-namespace intent: the cluster's k8s and containerd versions
-  are below what pod user namespaces need, so a flagless-rootless DinD
-  sidecar is infeasible there, and the userns remap inside the
-  `docker:dind-rootless` image is the security property instead. Isolating
-  that privileged tier in its own namespace is what still bounds a
-  compromised controller — a `Role` that can create pods in a namespace can
-  mount any Secret and impersonate any ServiceAccount already there, so the
-  emptiness (not the RBAC verbs alone) is the real fence, exactly as the
-  restricted namespace already relied on — plus its own default-deny
-  `NetworkPolicy` (in-cluster lateral egress denied; external egress is the
-  named [PRD #50](prds/50-llm-egress-proxy.md) residual, not closed here).
-  **The two tiers' external egress is OPPOSITE, and a probe that does not name
-  the tier is uninterpretable:** the **restricted** tier enforces the FQDN
-  allowlist (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml`
-  default-deny floor — only `cache.nixos.org`, the forge (as of
-  [PRD #808](prds/done/808-worker-egress-single-source.md), derived from
-  `FORGE_ALLOWED_BASE_URLS` — one chart value, `forge.allowedBaseURLs`, feeds
-  both the api's SSRF allowlist and the restricted-tier FQDN list, so the two
-  can no longer drift apart), `*.anthropic.com`, `search.devbox.sh` (also
-  added by PRD #808 — a deliberate egress **widening** so the devbox package
-  resolver is reachable on this tier, backstopped by the server-side tier-1
-  admin allowlist rather than by egress being locked), `api.github.com`
-  (re-added by #818 as a devbox/nixpkgs host — `devbox install` resolves the
-  floating `nixpkgs-unstable` ref through it, forge-independent — distinct from
-  the CNPG use #285 removed), and, as of #285, the CNPG chart's OCI pair
-  (`ghcr.io` + `pkg-containers.githubusercontent.com`, replacing four
-  GitHub-ish hosts as the CNPG-fetch route). A host that stays **off**-allowlist
-  on this tier is `codeload.github.com` (the nixpkgs source tarball —
-  **TIMEOUT**, measured #818), while the **docker** tier reaches arbitrary
-  internet hosts by design (`0.0.0.0/0`-except-in-cluster by CIDR,
-  `worker-docker-networkpolicy.yaml`: `codeload.github.com` **301** completes
-  there) — [PRD #50](prds/50-llm-egress-proxy.md)'s
-  residual, not a broken control. A docker-tier reading looks exactly like a
-  broken standard-tier allowlist; two false alarms have resulted (an operator
-  during #123, and a closed #283 on 2026-08-09), so **check `uzi admin workers`
-  → `docker:` (true = docker tier = broad egress) before concluding anything
-  about egress enforcement, and re-measure on the restricted tier.** A
-  build-time completeness guard (`scripts/assert-chart-render.sh`, run inside
-  the `helm-chart` CI job) fails the render, naming the missing host, if any
+- **Scoped to two empty namespaces, one of them privileged.** Its ServiceAccount
+  carries a `Role` bound to the dedicated `uzi-workers` (**restricted**-tier)
+  namespace holding nothing but hosted worker objects, plus, when the docker tier
+  is enabled, a second `Role`+`RoleBinding` into a dedicated `uzi-workers-docker`
+  namespace running `pod-security.kubernetes.io/enforce: privileged` (PRD #83 M3).
+  The privileged tier is a recorded deviation from the PRD's `baseline`-namespace
+  intent: the cluster's k8s/containerd versions are below what pod user namespaces
+  need, so the userns remap inside the `docker:dind-rootless` image is the security
+  property instead. Isolating that tier in its own empty namespace is what bounds a
+  compromised controller (a `Role` that can create pods can mount any Secret and
+  impersonate any ServiceAccount already there, so the emptiness, not the RBAC
+  verbs alone, is the fence), plus its own default-deny `NetworkPolicy` (external
+  egress is the named [PRD #50](prds/50-llm-egress-proxy.md) residual).
+  **The two tiers' external egress is OPPOSITE, and a probe that does not name the
+  tier is uninterpretable:** the **restricted** tier enforces an FQDN allowlist
+  (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml` default-deny
+  floor) reaching only `cache.nixos.org`, the forge (derived from
+  `FORGE_ALLOWED_BASE_URLS` through one chart value `forge.allowedBaseURLs`, since
+  [PRD #808](prds/done/808-worker-egress-single-source.md), so the SSRF allowlist
+  and the FQDN list cannot drift), `*.anthropic.com`, `search.devbox.sh`,
+  `api.github.com` (the devbox/nixpkgs resolver host), and the CNPG chart's OCI pair
+  (`ghcr.io` + `pkg-containers.githubusercontent.com`); `codeload.github.com` stays
+  **off**-allowlist there (**TIMEOUT**). The **docker** tier reaches arbitrary
+  internet hosts by design (`0.0.0.0/0`-except-in-cluster, `worker-docker-networkpolicy.yaml`),
+  [PRD #50](prds/50-llm-egress-proxy.md)'s residual, not a broken control. A
+  docker-tier reading looks exactly like a broken restricted-tier allowlist, so
+  **check `uzi admin workers` → `docker:` (true = docker tier = broad egress)
+  before concluding anything about egress enforcement, and re-measure on the
+  restricted tier.** A build-time completeness guard (`scripts/assert-chart-render.sh`,
+  in the `helm-chart` CI job) fails the render, naming the missing host, if any
   canonical worker destination is absent from the rendered restricted-tier
-  allow-list — turning "the tight tier silently can't reach X" into a red gate
-  instead of a hung run.
-  Both namespaces' Roles carry the same pinned-minimal verbs: Deployments/PVCs
-  create/list/patch(Deployments only)/delete; Secrets **create/delete
-  only** — no `get`/`list`, so the controller writes each worker's join
-  token once and can never read any token back, including one it didn't
-  create. No pod access at all, in either namespace.
+  allow-list. Both namespaces' Roles carry the same pinned-minimal verbs:
+  Deployments/PVCs create/list/patch(Deployments only)/delete; Secrets
+  **create/delete only** (no `get`/`list`, so the controller writes each join token
+  once and can never read one back). No pod access, in either namespace. See
+  [ADR-285](adr/0285-worker-egress-tier-trust-model.md) for the two-tier egress
+  trust model.
 - **Outbound-only, like a worker.** The controller authenticates to `api`
   with its own bearer credential and polls a controller-facing endpoint for
   desired state; there is no inbound port on the controller and `api` never
@@ -1561,7 +1504,6 @@ open (a CLI drain verb, live-cluster validation) are in
 
 ## Not yet in scope
 
-Auto-starting a run from a GitLab label, a CI-status watching/fixing agent,
 WS wakeup for idle workers (a 3s poll is the MVP), **wiring PRD #84's
 capability-aware readiness pass into PRD #88's `ask_user` path** (#84's own
 infra-readiness scope — declare, match, gate — has shipped; see
