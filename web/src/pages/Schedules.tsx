@@ -89,6 +89,12 @@ export function Schedules() {
   // Failed expiry re-reads in the current streak (drives the 60s retry backoff in the
   // expiry effect below); reset to 0 whenever a new pause state is applied.
   const [pauseRefreshAttempt, setPauseRefreshAttempt] = useState(0);
+  // Revision of the pause state as seen by READS. Every mutation bumps it synchronously
+  // before its request starts; a read (the initial load, a reload, the expiry re-read)
+  // captures it at start and applies its result only if it is unchanged. The effect's
+  // cancellation flag alone is not enough: it flips at commit, so a stale read and a
+  // mutation resolving in ONE React batch would still let the read land last.
+  const pauseRev = useRef(0);
   // Which sibling groups are expanded in My schedules (keyed by sibling_group_id), the
   // same Set<string> disclosure pattern DefaultJobs uses for its catalog slugs. Lives in
   // the parent so "add another repo" can auto-expand the group its new sibling landed in.
@@ -125,6 +131,7 @@ export function Schedules() {
   // renders the skeleton the same as the old code did with catalog still null.
   const { error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
+      const rev = pauseRev.current;
       const [rows, cat, repoList, pauseState] = await Promise.all([
         api.listSchedules(),
         api.listScheduleCatalog(),
@@ -135,7 +142,8 @@ export function Schedules() {
       setSchedules(rows);
       setCatalog(cat);
       setRepos(repoList);
-      setPause(pauseState);
+      // A pause mutation that started after this read began owns the newer state.
+      if (rev === pauseRev.current) setPause(pauseState);
     },
     [],
     { fallback: "Could not load schedules", onFetchStart: () => setError("") },
@@ -308,6 +316,7 @@ export function Schedules() {
     setPauseBusy(true);
     setError("");
     try {
+      pauseRev.current += 1; // invalidate every read started before this mutation
       const next = await api.putSchedulePause(until);
       setPauseRefreshAttempt(0); // a fresh state gets a fresh (immediate) expiry refresh
       setPause(next);
@@ -325,6 +334,7 @@ export function Schedules() {
     setPauseBusy(true);
     setError("");
     try {
+      pauseRev.current += 1; // invalidate every read started before this mutation
       const next = await api.deleteSchedulePause();
       setPauseRefreshAttempt(0);
       setPause(next);
@@ -370,15 +380,16 @@ export function Schedules() {
     const remaining = new Date(pause.until).getTime() - Date.now();
     const delay = remaining > 0 ? Math.min(remaining, 2_147_483_647) : pauseRefreshAttempt > 0 ? 60_000 : 0;
     const id = setTimeout(() => {
+      const rev = pauseRev.current;
       api
         .getSchedulePause()
         .then((next) => {
-          if (cancelled) return;
+          if (cancelled || rev !== pauseRev.current) return;
           setPauseRefreshAttempt(0); // the backoff is per failure streak, not per page
           setPause(next);
         })
         .catch(() => {
-          if (!cancelled) setPauseRefreshAttempt((n) => n + 1);
+          if (!cancelled && rev === pauseRev.current) setPauseRefreshAttempt((n) => n + 1);
         });
     }, delay);
     return () => {

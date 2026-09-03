@@ -1018,6 +1018,40 @@ describe("Schedules — pause all (PRD #1093)", () => {
     expect(screen.queryByText(/All schedules paused/)).toBeNull();
   });
 
+  it("a stale expiry re-read resolving in the SAME batch as the Resume response is dropped (revision guard)", async () => {
+    // Both continuations land in one React batch: the effect's cancellation flag has not
+    // flipped yet (it does at commit), so only the mutation-start revision bump can keep
+    // the stale read from landing last and winning.
+    const soon = new Date(Date.now() + 60).toISOString();
+    let resolveStale: (v: { paused: boolean; until: string | null }) => void = () => {};
+    let resolveDelete: (v: { paused: boolean; until: string | null }) => void = () => {};
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockReturnValueOnce(
+        new Promise<{ paused: boolean; until: string | null }>((r) => {
+          resolveStale = r;
+        }),
+      );
+    mockApi.deleteSchedulePause.mockReturnValue(
+      new Promise<{ paused: boolean; until: string | null }>((r) => {
+        resolveDelete = r;
+      }),
+    );
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resume now" })).toBeTruthy());
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+    await waitFor(() => expect(mockApi.deleteSchedulePause).toHaveBeenCalledTimes(1));
+    // Resolve the mutation FIRST and the stale read SECOND inside one act: without the
+    // revision guard the stale "still paused" answer is the last setPause of the batch.
+    await act(async () => {
+      resolveDelete({ paused: false, until: null });
+      resolveStale({ paused: true, until: soon });
+    });
+    expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy();
+    expect(screen.queryByText(/All schedules paused/)).toBeNull();
+  });
+
   it("Resume now triggers deleteSchedulePause", async () => {
     const future = new Date(Date.now() + 6 * 3_600_000).toISOString();
     mockApi.getSchedulePause.mockResolvedValue({ paused: true, until: future });
