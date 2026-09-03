@@ -132,6 +132,16 @@ COPY agent/devbox-global/assert-toolchain.sh /tmp/assert-toolchain.sh
 RUN bash /tmp/assert-toolchain.sh /tmp/toolchain-guard.tsv \
     && rm -f /tmp/assert-toolchain.sh /tmp/toolchain-guard.tsv
 
+# PRD #974 M2: bake the pinned gitleaks so the finalize pre-push secret scan needs NO run-time
+# module fetch (the restricted worker tier blocks proxy.golang.org). `go` resolves via the
+# toolchain ENV above; GOBIN=/usr/local/bin puts the binary on the image PATH (agent-browser is
+# installed there too and used). GOFLAGS=-buildvcs=false avoids VCS stamping. The trailing
+# `gitleaks version` is a fail-closed BUILD-time check (mirrors the toolchain guard idiom) so a
+# broken install fails the BUILD, not every run. Pinned to v8.30.1 to match the repo's gate:repo
+# scan (Taskfile.yml:913 / scripts/scan-secrets.sh). CI-verified: this image build cannot run in
+# the worker itself. MIRRORED from templates/base (jvm is NOT `FROM base`) — keep in lockstep.
+RUN GOFLAGS=-buildvcs=false GOBIN=/usr/local/bin go install github.com/zricethezav/gitleaks/v8@v8.30.1 && gitleaks version
+
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.
 # The build context is the REPO ROOT (PRD #39 Decision 5), so the worker's own

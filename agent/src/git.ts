@@ -1,11 +1,20 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { withForgeRetry } from "./forge-retry.js";
+import {
+  commitsScannedFromStderr,
+  gitleaksArgs,
+  parseGitleaksReport,
+  scanIsTrustworthy,
+  type SecretFinding,
+} from "./secret-scan-guard.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -121,6 +130,12 @@ const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold cache
 // diff is truncated at this size with a marker. 512 KiB is generous for a task-run diff
 // while staying an order of magnitude under runGit's 64 MiB maxBuffer.
 const REVIEW_DIFF_MAX_BYTES = 512 * 1024;
+
+// PRD #974 M2 — cap the gitleaks JSON report read in secretScanRange. The report grows with
+// the finding COUNT over attacker-authored commits, so an adversarial repo could inflate it
+// past memory; an over-cap report is treated as an untrusted scan (fail open to the GH013
+// backstop) rather than read into memory. 16 MiB holds far more findings than any honest push.
+const SECRET_SCAN_REPORT_MAX_BYTES = 16 * 1024 * 1024;
 
 // PRD #51 M3 — (b) separate-runner-clone: the worker-side tracking-ref namespace the
 // worker's fetch-back writes the agent branch into. Deliberately NOT refs/heads/* (B2
@@ -1381,6 +1396,140 @@ export class GitCache {
   }
 
   /**
+   * PRD #974 M2 (load-bearing security) — scan the commit range the finalize push would carry
+   * for secrets with the repo's pinned gitleaks, GitLeaks' three silencers DISABLED, and
+   * return whether the scan is TRUSTWORTHY plus any findings.
+   *
+   * Range: `base..head` (TWO-dot — the commits ON the branch and NOT on the default branch,
+   * exactly what a push carries), base = defaultBranchRef, head = trackingRef. An empty range
+   * (0 commits) is the nothing-to-scan case and returns trusted with no findings so the normal
+   * push proceeds.
+   *
+   * WHY the BARE, and why the silencers are disabled: GitHub Push Protection (GH013) ignores
+   * `.gitleaks.toml`, `.gitleaksignore` and inline `//gitleaks:allow`, so a scan that honored
+   * any of them would go green on a secret GitHub still rejects (a vacuous fix). We disable all
+   * three: (1) scanning the worker BARE (no working tree) means a repo-shipped `.gitleaks.toml`
+   * / `.gitleaksignore` cannot be auto-discovered from disk; (2) an EXPLICIT `-c` config forces
+   * gitleaks' embedded default ruleset and skips `.gitleaks.toml` auto-discovery; (3)
+   * `--ignore-gitleaks-allow` disables inline allow comments. Proven against all three silencers
+   * (issue #974 step 5). The bare's git config is WORKER-authored (not attacker-controlled), so
+   * gitleaks' internal `git log -p` cannot fire an attacker-chosen diff driver.
+   *
+   * TRUST: gitleaks prints "no leaks found" rc 0 on an unresolved/empty range, so a clean
+   * verdict is meaningless unless the scan actually walked the range. scanIsTrustworthy is that
+   * liveness gate (exec ok, no error token on stderr, the "N commits scanned" line present AND
+   * equal to the range length). The caller acts on findings ONLY when trusted; when untrusted it
+   * fails OPEN and relies on the GH013 remote backstop.
+   *
+   * The temp config + JSON report live under os.tmpdir() (worker-writable; the runner's 0700 tmp
+   * is not) and are removed in a finally. gitleaks runs under `--exit-code 0`, so a finding is
+   * still exit 0 and any nonzero exit is an INSTRUMENT failure (execOk = !error).
+   */
+  async secretScanRange(
+    barePath: string,
+    trackingRef: string,
+  ): Promise<{ trusted: boolean; findings: SecretFinding[] }> {
+    // Resolve the range base INSIDE the fail-open envelope: defaultBranchRef throws when no
+    // default ref resolves, and an uncaught throw here would escape to the generic catch and
+    // report `failed` with NO preserved_patch — the exact work-loss this feature prevents. So
+    // it fails open like every other setup step below (the sibling changedFiles guards the
+    // identical call the same way).
+    let base: string;
+    try {
+      base = await this.defaultBranchRef(barePath);
+    } catch {
+      this.log.warn("finalize secret scan: could not resolve the default branch; failing open", {
+        barePath,
+      });
+      return { trusted: false, findings: [] };
+    }
+    const logRange = `${base}..${trackingRef}`;
+    let expectedCommits = 0;
+    try {
+      const out = await this.runGit(barePath, ["rev-list", "--count", logRange]);
+      expectedCommits = Number.parseInt(out.trim(), 10);
+      if (Number.isNaN(expectedCommits)) expectedCommits = 0;
+    } catch {
+      // A failed count is an untrusted scan setup — do NOT block; fail open to the backstop.
+      this.log.warn("finalize secret scan: could not count the push range; failing open", {
+        barePath,
+      });
+      return { trusted: false, findings: [] };
+    }
+    if (expectedCommits === 0) {
+      // Nothing to scan (the push carries no new commit); the normal push proceeds.
+      return { trusted: true, findings: [] };
+    }
+
+    const scratch = os.tmpdir();
+    const configPath = path.join(scratch, `uzi-gl-config-${randomUUID()}.toml`);
+    const reportPath = path.join(scratch, `uzi-gl-report-${randomUUID()}.json`);
+    try {
+      // `[extend] useDefault=true` forces gitleaks' embedded default ruleset and, being an
+      // explicit `-c`, skips auto-discovery of the target repo's `.gitleaks.toml`.
+      await fs.writeFile(configPath, "[extend]\nuseDefault = true\n", "utf8");
+      const args = gitleaksArgs({ sourcePath: barePath, logRange, configPath, reportPath });
+      // gitleaks (baked on PATH by the worker image, see agent/templates/*/Dockerfile). Do NOT
+      // throw on a nonzero exit: under --exit-code 0 a finding is exit 0, so any nonzero is an
+      // instrument failure captured as `error` and folded into the trust gate.
+      let execOk = true;
+      let stderr = "";
+      try {
+        const res = await execFileAsync("gitleaks", args, {
+          maxBuffer: 64 * 1024 * 1024,
+          timeout: GIT_TIMEOUT_MS,
+        });
+        stderr = res.stderr ?? "";
+      } catch (err) {
+        execOk = false;
+        stderr = typeof (err as { stderr?: unknown }).stderr === "string"
+          ? (err as { stderr: string }).stderr
+          : gitErrorMessage(err);
+      }
+
+      // Read + parse the report; a failed read/parse (fs error, truncated file) is UNTRUSTED —
+      // return trusted:false rather than a clean verdict on an unreadable report. SIZE-CAP the
+      // read first: the report is O(findings) over ATTACKER-authored commits, so a committed
+      // file of millions of secret-shaped lines could balloon it to multiple GB and OOM the
+      // worker. An over-cap report is an untrusted scan (fail open to the GH013 backstop), never
+      // an OOM. parseGitleaksReport additionally caps the number of findings it materialises.
+      let findings: SecretFinding[];
+      try {
+        const st = await fs.stat(reportPath);
+        if (st.size > SECRET_SCAN_REPORT_MAX_BYTES) {
+          this.log.warn(
+            "finalize secret scan: gitleaks report exceeds the size cap; failing open",
+            { barePath, bytes: st.size, cap: SECRET_SCAN_REPORT_MAX_BYTES },
+          );
+          return { trusted: false, findings: [] };
+        }
+        const raw = await fs.readFile(reportPath, "utf8");
+        findings = parseGitleaksReport(raw);
+      } catch {
+        this.log.warn("finalize secret scan: could not read the gitleaks report; failing open", {
+          barePath,
+        });
+        return { trusted: false, findings: [] };
+      }
+
+      const scannedCommits = commitsScannedFromStderr(stderr);
+      const trusted = scanIsTrustworthy({ stderr, scannedCommits, expectedCommits, execOk });
+      this.log.debug("finalize secret scan complete", {
+        barePath,
+        expectedCommits,
+        scannedCommits,
+        execOk,
+        trusted,
+        findings: findings.length,
+      });
+      return { trusted, findings };
+    } finally {
+      await fs.rm(configPath, { force: true }).catch(() => undefined);
+      await fs.rm(reportPath, { force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
    * PRD #456 M1 — fetch the CURRENT default-branch tip from origin into the worker bare
    * and return its SHA. This is a WORKER-uid AUTHENTICATED op (mirrors `fetch` at the top
    * of this class): the worker owns the bare and holds the PAT, and the agent never has a
@@ -2129,6 +2278,31 @@ export function gitBasicCredential(pat: string, username?: string): string {
 export function isWorkflowScopeRejection(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   return msg.includes("workflow scope");
+}
+
+/**
+ * PRD #974 M2 — true when a push error is GitHub Push Protection's secret rejection: the
+ * remote refuses the push because a commit in it carries a secret Push Protection detected.
+ * GitHub's rejection reads `remote: … GH013 … Push cannot contain secrets` (with a per-secret
+ * detail block), so this matches any of the stable tokens `gh013`, `push cannot contain
+ * secrets`, `push protection`, or `secret detected` (case-insensitive). Mirrors
+ * isWorkflowScopeRejection's shape.
+ *
+ * This is the remote BACKSTOP for the case the pre-push gitleaks scan (default ruleset) misses
+ * a secret GitHub's own scanner catches — GitHub's pattern set is broader than gitleaks' and
+ * the two are not identical, so a clean pre-push scan does not guarantee GitHub accepts the
+ * push. Routing this rejection to the same typed `push_secret_blocked` fail_origin preserves
+ * the diff and gives an actionable failure instead of GitHub's opaque remote reject discarding
+ * the committed work.
+ */
+export function isPushProtectionRejection(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes("gh013") ||
+    msg.includes("push cannot contain secrets") ||
+    msg.includes("push protection") ||
+    msg.includes("secret detected")
+  );
 }
 
 /**
