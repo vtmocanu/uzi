@@ -497,6 +497,20 @@ WHERE run_id = ANY(@run_ids::uuid[])
   AND kind IN ('plan', 'plan_revising')
 ORDER BY run_id, seq;
 
+-- name: LatestToolUseForRuns :many
+-- The newest tool_use frame per run for a page of runs (PRD #1064 D3, current_activity):
+-- DISTINCT ON (run_id) with ORDER BY run_id, seq DESC yields exactly one row per run —
+-- its greatest-seq tool_use — which runactivity.FromFrame folds into the "now" line. A
+-- run with no tool_use frame returns no row (⇒ null current_activity). Backed by the
+-- partial index idx_run_messages_tool_use_seq (run_id, seq DESC) WHERE kind = 'tool_use'
+-- (migration 00186), so the per-run first row is one index seek rather than a walk back
+-- over the trailing non-tool_use frames the UNIQUE (run_id, seq) index would force.
+SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_label, payload, created_at
+FROM run_messages
+WHERE run_id = ANY(@run_ids::uuid[])
+  AND kind = 'tool_use'
+ORDER BY run_id, seq DESC;
+
 -- name: ListActiveRunsAll :many
 -- Admin Agents-status: every non-terminal run across all users, with repo path,
 -- worker name, and owner email for the admin overview.

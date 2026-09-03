@@ -78,5 +78,6 @@
   "required_capabilities": null,
   "required_tools": null,
   "size_class": "",
-  "plan_changed_files": null
+  "plan_changed_files": null,
+  "current_activity": null
 }

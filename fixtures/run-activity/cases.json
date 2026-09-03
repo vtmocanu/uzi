@@ -1,0 +1,496 @@
+{
+  "_comment": "PRD #1064 D3 golden fixture: run-activity selection AND fold, asserted from BOTH api/internal/runactivity (Go) and web/src/lib/runActivity (TS, M3). Language-neutral: a frame is {kind,agent,agent_label,payload,created_at,seq} (agent/agent_label null when absent); expected is a RunActivity object or null. This file is the SPEC, not a recording: change it deliberately, never regenerate to match code.",
+  "cases": [
+    {
+      "name": "newest_of_several_tool_use_wins",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "task one",
+          "payload": {
+            "name": "Read",
+            "input": {
+              "file_path": "api/a.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        },
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "task one",
+          "payload": {
+            "name": "Edit",
+            "input": {
+              "file_path": "api/b.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:02Z",
+          "seq": 2
+        },
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "task one",
+          "payload": {
+            "name": "Write",
+            "input": {
+              "file_path": "api/c.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:03Z",
+          "seq": 3
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "task one",
+        "tool": "Write",
+        "detail": "api/c.go",
+        "at": "2026-09-03T12:00:03Z",
+        "seq": 3
+      }
+    },
+    {
+      "name": "newer_tool_result_skipped",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "task",
+          "payload": {
+            "name": "Edit",
+            "input": {
+              "file_path": "api/x.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        },
+        {
+          "kind": "tool_result",
+          "agent": "coder",
+          "agent_label": "task",
+          "payload": {
+            "tool_use_id": "t1",
+            "content": "ok"
+          },
+          "created_at": "2026-09-03T12:00:02Z",
+          "seq": 2
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "task",
+        "tool": "Edit",
+        "detail": "api/x.go",
+        "at": "2026-09-03T12:00:01Z",
+        "seq": 1
+      }
+    },
+    {
+      "name": "newer_status_and_text_skipped",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "reviewer",
+          "agent_label": "review",
+          "payload": {
+            "name": "Read",
+            "input": {
+              "file_path": "api/y.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        },
+        {
+          "kind": "status",
+          "agent": "worker",
+          "agent_label": null,
+          "payload": {
+            "phase": "review iteration 2"
+          },
+          "created_at": "2026-09-03T12:00:02Z",
+          "seq": 2
+        },
+        {
+          "kind": "text",
+          "agent": "reviewer",
+          "agent_label": "review",
+          "payload": {
+            "text": "looks good"
+          },
+          "created_at": "2026-09-03T12:00:03Z",
+          "seq": 3
+        }
+      ],
+      "expected": {
+        "agent": "reviewer",
+        "agent_label": "review",
+        "tool": "Read",
+        "detail": "api/y.go",
+        "at": "2026-09-03T12:00:01Z",
+        "seq": 1
+      }
+    },
+    {
+      "name": "subagent_with_label_beats_lead_no_label",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "lead",
+          "agent_label": null,
+          "payload": {
+            "name": "Read",
+            "input": {
+              "file_path": "prds/1064.md"
+            }
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        },
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "Decouple detectors",
+          "payload": {
+            "name": "Edit",
+            "input": {
+              "file_path": "api/poller/ci_autofix.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:02Z",
+          "seq": 2
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "Decouple detectors",
+        "tool": "Edit",
+        "detail": "api/poller/ci_autofix.go",
+        "at": "2026-09-03T12:00:02Z",
+        "seq": 2
+      }
+    },
+    {
+      "name": "lead_alone_no_label",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "lead",
+          "agent_label": null,
+          "payload": {
+            "name": "Read",
+            "input": {
+              "file_path": "api/poller/mr_rework.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        }
+      ],
+      "expected": {
+        "agent": "lead",
+        "agent_label": "",
+        "tool": "Read",
+        "detail": "api/poller/mr_rework.go",
+        "at": "2026-09-03T12:00:01Z",
+        "seq": 1
+      }
+    },
+    {
+      "name": "lead_agent_dispatch_uses_subagent_type_and_description",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "lead",
+          "agent_label": null,
+          "payload": {
+            "name": "Agent",
+            "input": {
+              "subagent_type": "coder",
+              "description": "Decouple ci_fix detector from branch naming"
+            }
+          },
+          "created_at": "2026-09-03T12:00:05Z",
+          "seq": 5
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "Decouple ci_fix detector from branch naming",
+        "tool": "Agent",
+        "detail": "Decouple ci_fix detector from branch naming",
+        "at": "2026-09-03T12:00:05Z",
+        "seq": 5
+      }
+    },
+    {
+      "name": "agent_dispatch_falls_back_to_frame_agent",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "lead",
+          "agent_label": null,
+          "payload": {
+            "name": "Agent",
+            "input": {
+              "description": "do a thing"
+            }
+          },
+          "created_at": "2026-09-03T12:00:02Z",
+          "seq": 2
+        }
+      ],
+      "expected": {
+        "agent": "lead",
+        "agent_label": "do a thing",
+        "tool": "Agent",
+        "detail": "do a thing",
+        "at": "2026-09-03T12:00:02Z",
+        "seq": 2
+      }
+    },
+    {
+      "name": "bash_detail_is_description_never_command",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "run tests",
+          "payload": {
+            "name": "Bash",
+            "input": {
+              "command": "rm -rf / --secret",
+              "description": "Run the api gate"
+            }
+          },
+          "created_at": "2026-09-03T12:00:03Z",
+          "seq": 3
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "run tests",
+        "tool": "Bash",
+        "detail": "Run the api gate",
+        "at": "2026-09-03T12:00:03Z",
+        "seq": 3
+      }
+    },
+    {
+      "name": "bash_without_description_empty_detail",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "build",
+          "payload": {
+            "name": "Bash",
+            "input": {
+              "command": "go build ./..."
+            }
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "build",
+        "tool": "Bash",
+        "detail": "",
+        "at": "2026-09-03T12:00:01Z",
+        "seq": 1
+      }
+    },
+    {
+      "name": "read_edit_detail_is_file_path",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "read then edit",
+          "payload": {
+            "name": "Read",
+            "input": {
+              "file_path": "api/internal/store/queries/runtime.sql"
+            }
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        },
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "read then edit",
+          "payload": {
+            "name": "Edit",
+            "input": {
+              "file_path": "api/internal/handler/runs.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:02Z",
+          "seq": 2
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "read then edit",
+        "tool": "Edit",
+        "detail": "api/internal/handler/runs.go",
+        "at": "2026-09-03T12:00:02Z",
+        "seq": 2
+      }
+    },
+    {
+      "name": "other_tool_empty_detail",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "search",
+          "payload": {
+            "name": "Grep",
+            "input": {
+              "pattern": "TODO",
+              "path": "api"
+            }
+          },
+          "created_at": "2026-09-03T12:00:04Z",
+          "seq": 4
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "search",
+        "tool": "Grep",
+        "detail": "",
+        "at": "2026-09-03T12:00:04Z",
+        "seq": 4
+      }
+    },
+    {
+      "name": "two_subagents_interleaved_newest_seq_wins",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "coder task",
+          "payload": {
+            "name": "Edit",
+            "input": {
+              "file_path": "api/a.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:10Z",
+          "seq": 10
+        },
+        {
+          "kind": "tool_use",
+          "agent": "reviewer",
+          "agent_label": "review task",
+          "payload": {
+            "name": "Read",
+            "input": {
+              "file_path": "api/b.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:12Z",
+          "seq": 12
+        },
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "coder task",
+          "payload": {
+            "name": "Write",
+            "input": {
+              "file_path": "api/c.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:11Z",
+          "seq": 11
+        }
+      ],
+      "expected": {
+        "agent": "reviewer",
+        "agent_label": "review task",
+        "tool": "Read",
+        "detail": "api/b.go",
+        "at": "2026-09-03T12:00:12Z",
+        "seq": 12
+      }
+    },
+    {
+      "name": "hostile_label_and_path_stripped_and_capped",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "danger\u0007\u202ezzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+          "payload": {
+            "name": "Read",
+            "input": {
+              "file_path": "api/\u0007pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "dangerzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "tool": "Read",
+        "detail": "api/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+        "at": "2026-09-03T12:00:01Z",
+        "seq": 1
+      }
+    },
+    {
+      "name": "no_tool_use_yields_null",
+      "frames": [
+        {
+          "kind": "status",
+          "agent": "worker",
+          "agent_label": null,
+          "payload": {
+            "phase": "implement iteration 1"
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        },
+        {
+          "kind": "text",
+          "agent": "lead",
+          "agent_label": null,
+          "payload": {
+            "text": "thinking about the plan"
+          },
+          "created_at": "2026-09-03T12:00:02Z",
+          "seq": 2
+        },
+        {
+          "kind": "tool_result",
+          "agent": "coder",
+          "agent_label": "task",
+          "payload": {
+            "tool_use_id": "t1"
+          },
+          "created_at": "2026-09-03T12:00:03Z",
+          "seq": 3
+        }
+      ],
+      "expected": null
+    },
+    {
+      "name": "empty_frames_yield_null",
+      "frames": [],
+      "expected": null
+    }
+  ]
+}

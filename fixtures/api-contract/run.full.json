@@ -122,5 +122,13 @@
   "size_class": "x",
   "plan_changed_files": [
     "x"
-  ]
+  ],
+  "current_activity": {
+    "agent": "x",
+    "agent_label": "x",
+    "tool": "x",
+    "detail": "x",
+    "at": "2020-01-02T03:04:05Z",
+    "seq": 1
+  }
 }

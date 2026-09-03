@@ -2060,6 +2060,40 @@ export interface Run {
    *  forcing mock-object updates. */
   branch_has_active_run?: boolean;
   branch_has_open_mr?: boolean;
+  /** PRD #1064 M2: the server-derived "now" line — the run's newest tool_use frame folded
+   *  into {agent, agent_label, tool, detail, at, seq} by api/internal/runactivity, mirrored
+   *  in TS by lib/runActivity.ts (M3) and pinned across the two by fixtures/run-activity.
+   *  `null` for a terminal run (a finished run has no "now") and for a run with no tool_use
+   *  frame, so a pre-feature run and a run that never ran a tool both read null and every
+   *  surface renders exactly as before. On both the list rows and the detail read, via the
+   *  RunListItemDTO embed. `agent_label`/`detail` are UNTRUSTED model-authored text —
+   *  server-stripped and capped, but still render as escaped plain text (stripUnsafeChars),
+   *  never <Markdown> or a URL sink. OPTIONAL here for the SAME api/web rollout skew as
+   *  plan_source (a mid-deploy api pod predating the field omits the key). */
+  current_activity?: RunActivity | null;
+}
+
+// RunActivity is the server-derived "now" line for a run (PRD #1064 D3): who is acting,
+// on what, right now, derived from the run's newest tool_use frame. See Run.current_activity
+// for the nullability and trust rules; lib/runActivity.ts (M3) mirrors the selection+fold
+// for the run view off the live WS frames.
+export interface RunActivity {
+  /** The acting lane's role: a subagent's role, "lead" for the orchestrator, or an Agent
+   *  dispatch's subagent_type. */
+  agent: string;
+  /** The lane's task description (the dispatch's description); "" for a bare lead frame.
+   *  UNTRUSTED model-authored text — render escaped, never <Markdown>. */
+  agent_label: string;
+  /** The tool name (Read, Edit, Bash, Agent, …). */
+  tool: string;
+  /** The tool's most identifying argument: the repo-relative file_path for a file tool, the
+   *  description for Agent/Bash, "" otherwise — NEVER a Bash command. UNTRUSTED, render
+   *  escaped. */
+  detail: string;
+  /** The frame's created_at (ISO-8601), from which surfaces compute a client-side age. */
+  at: string;
+  /** The frame's per-run seq — the deterministic tiebreak across interleaved subagents. */
+  seq: number;
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW

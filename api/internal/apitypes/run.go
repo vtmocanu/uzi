@@ -29,6 +29,45 @@ type RunSummaryDelta struct {
 	Text string `json:"text"`
 }
 
+// RunActivity is the server-derived "now" line for a run (PRD #1064 D3): the run's
+// newest tool_use frame folded into a single {who, what} shape the board, run view,
+// TUI and CLI all render. It is computed from the persisted run_messages, never
+// stored — the rule lives in api/internal/runactivity, mirrored in TS by
+// web/src/lib/runActivity.ts and pinned across the two by fixtures/run-activity.
+//
+// Agent is the acting lane's role (a subagent's role, "lead" for the orchestrator,
+// or an Agent dispatch's subagent_type); AgentLabel its task description (the
+// dispatch's description, empty for a bare lead frame). Tool is the tool name and
+// Detail the tool's most identifying argument — the repo-relative file_path for a
+// file tool, the description for Agent/Bash, empty otherwise, and NEVER a Bash
+// command. AgentLabel and Detail are UNTRUSTED, model-authored display text; the
+// server strips terminal-unsafe runes and caps them (200 runes) before they land
+// here, and every renderer still applies its own terminal-safety fold. At is the
+// frame's created_at and Seq its per-run seq (the deterministic tiebreak).
+type RunActivity struct {
+	Agent      string    `json:"agent"`
+	AgentLabel string    `json:"agent_label"`
+	Tool       string    `json:"tool"`
+	Detail     string    `json:"detail"`
+	At         time.Time `json:"at"`
+	Seq        int32     `json:"seq"`
+}
+
+// IsTerminalRunStatus reports whether a run status is one a run never leaves — the
+// server's own terminal set (completed/failed/cancelled). It lives here, alongside
+// the run-status wire shapes, so the handler and other server packages share ONE
+// predicate rather than re-spelling the set (uzicli.IsTerminalRunStatus is the CLI's
+// copy over a different, stream-oriented status set; the handler must not import the
+// CLI package for it).
+func IsTerminalRunStatus(status string) bool {
+	switch status {
+	case "completed", "failed", "cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
 // RunDTO is the web view of a run. session_id and last_seq are intentionally
 // omitted — they are worker-internal (resume plumbing), not browser state.
 type RunDTO struct {
@@ -429,6 +468,14 @@ type RunDTO struct {
 	// [] (never omitempty) like required_tools: a pre-#212 run's NULL column and a clean
 	// plan turn both map to []; renderers show the section only when non-empty.
 	PlanChangedFiles []string `json:"plan_changed_files"`
+	// CurrentActivity is the server-derived "now" line (PRD #1064 D3): the run's
+	// newest tool_use frame folded via runactivity.Latest. null for a terminal run (a
+	// finished run has no "now") and for a run with no tool_use frame — the back-compat
+	// contract, so a pre-feature run and a run that never ran a tool both read null and
+	// every surface renders exactly as today. Populated in runToDTO's callers (the GET
+	// path and both list builders) from a batched per-page lookup, not in runToDTO
+	// itself, which stays a pure function of its row.
+	CurrentActivity *RunActivity `json:"current_activity"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status
