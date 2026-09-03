@@ -19,8 +19,9 @@ default** for every opted-in user, which is also the default — see
 
 On the same poll tick that already watches a repo's merge requests and
 pipelines, uzi checks every open MR belonging to one of your completed
-issue runs. When all of the following are true, it queues a new
-`mr_rework` run, auto-approved so it starts working right away:
+agent runs — an issue run, or a [scheduled run](./scheduling.md) (an ad-hoc
+`prompt` job or the self-improvement job). When all of the following are true,
+it queues a new `mr_rework` run, auto-approved so it starts working right away:
 
 - the MR's head pipeline is **green**,
 - the review has **settled** (the newest comment is a few minutes old and
@@ -111,7 +112,7 @@ one-time snapshot taken when the run started; there's no live
 per-schedule re-evaluation afterward for reset to fall back to.
 
 One thing worth knowing: the per-run toggle (both the checkbox and the
-CLI verb) always targets a branch's newest issue run, so if a branch gets
+CLI verb) always targets a branch's newest run, so if a branch gets
 reused by a re-run, it's that newest run's setting that decides whether
 the branch's MR gets auto-reworked.
 
@@ -124,9 +125,11 @@ out in Settings.
 
 A merge request can't be reworked forever. uzi tracks, per MR, how many
 automatic rework cycles it has spent and stops after a cap — **5 by
-default**, admin-configurable (`mr_rework_cap`). Past the cap, uzi posts
-one comment on the issue naming the limit and lands an in-app notification,
-then stops trying automatically; it doesn't retry on its own. Addressing
+default**, admin-configurable (`mr_rework_cap`). Past the cap, uzi lands an
+in-app notification and, on an issue-run MR, also posts one comment on the
+issue naming the limit; a scheduled prompt MR has no backing issue, so it gets
+the in-app notification only. uzi then stops trying automatically; it doesn't
+retry on its own. Addressing
 the remaining comments yourself (or pushing more changes to the branch) is
 the escape hatch from there.
 

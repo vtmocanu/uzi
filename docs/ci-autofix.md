@@ -25,11 +25,14 @@ user from **Admin → Users**, the same pattern as the [run judge](./judge.md).
 ## What triggers it
 
 On the same poll tick that refreshes a repo's pipeline status, uzi checks
-every watched **agent-owned MR branch** (`agent/issue-N`, the branch one of
-your issue runs pushed to). When that branch's latest pipeline is failed and
-you have the toggle on and an Anthropic token configured, uzi queues the
-same `ci_fix` run the **Fix CI** button would — auto-approved, so it skips
-the plan-approval step and starts working right away.
+every watched **agent-owned MR branch** — the branch one of your agent runs
+pushed to: an issue run's `agent/issue-N`, or a [scheduled
+run](./scheduling.md)'s `uzi/prompt-<id>` (an ad-hoc prompt job) or
+`uzi/self-improve/<id>` (self-improvement). When that branch's latest pipeline
+is failed and you have the toggle on and an Anthropic token configured, uzi
+queues the same `ci_fix` run the **Fix CI** button would — auto-approved, so it
+skips the plan-approval step and starts working right away. A scheduled run
+inherits your account-wide opt-in; there is no separate per-schedule switch.
 
 `main`, the repo's default branch, and any non-MR ref are never auto-touched
 — only a branch that is itself the product of one of your agent runs. And
@@ -46,10 +49,11 @@ A persistently red pipeline can't loop forever:
   *same* failure signature as the attempt before it, uzi halts early rather
   than spending a second identical attempt.
 
-Either way, uzi posts one comment on the backing issue (worded differently
-for "hit the attempt limit" than for "no progress") and lands an in-app
-notification, then stops trying automatically — **it does not retry on its
-own**. The manual **Fix CI** button is still there as your escape hatch any
+Either way, uzi lands an in-app notification and, on an issue-run branch, also
+posts one comment on the backing issue (worded differently for "hit the attempt
+limit" than for "no progress"); a scheduled prompt MR has no backing issue, so
+it gets the in-app notification only. uzi then stops trying automatically — **it
+does not retry on its own**. The manual **Fix CI** button is still there as your escape hatch any
 time. The attempt counter only resets once the branch's pipeline actually
 goes green.
 
@@ -71,11 +75,12 @@ hand — the manual button, or an approved CI-config plan — pushes normally.
 ## Notifications
 
 You get an in-app notification when an automatic fix starts, when it halts,
-and when a fix lands (its pipeline goes green and the run is verified). The
-start and halt notifications also post a comment on the backing
-`agent/issue-N` issue. These are in-app and issue-comment only — automatic
-CI-fix events don't currently go out as Slack DMs, unlike some other run
-notifications.
+and when a fix lands (its pipeline goes green and the run is verified). On an
+issue-run branch (`agent/issue-N`) the start and halt notifications also post a
+comment on the backing issue; a scheduled-run branch (`uzi/prompt-<id>`,
+`uzi/self-improve/<id>`) has no such issue, so those events are in-app only.
+These are in-app and issue-comment only — automatic CI-fix events don't
+currently go out as Slack DMs, unlike some other run notifications.
 
 ## Forge support
 
