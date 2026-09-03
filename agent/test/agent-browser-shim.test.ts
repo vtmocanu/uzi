@@ -230,12 +230,15 @@ describe("agent-browser crash-close shim (PRD #87 M1)", () => {
 // would, and a fake glibc `ldd` on PATH — the exact shadowing condition.
 describe("agent-browser shim native-binary selection (issue #1082)", () => {
   const NAMES = ["agent-browser-linux-musl-x64", "agent-browser-linux-musl-arm64", "agent-browser-linux-x64", "agent-browser-linux-arm64"];
-  const LOADERS: Record<string, string> = {
-    "musl-x64": "lib/ld-musl-x86_64.so.1",
-    "musl-arm64": "lib/ld-musl-aarch64.so.1",
-    "glibc-x64": "lib64/ld-linux-x86-64.so.2",
-    "glibc-arm64": "lib/ld-linux-aarch64.so.1",
-    none: "",
+  const LOADERS: Record<string, string[]> = {
+    "musl-x64": ["lib/ld-musl-x86_64.so.1"],
+    "musl-arm64": ["lib/ld-musl-aarch64.so.1"],
+    "glibc-x64": ["lib64/ld-linux-x86-64.so.2"],
+    "glibc-arm64": ["lib/ld-linux-aarch64.so.1"],
+    // Both x64 loaders on one sysroot (musl-tools on a glibc box): the musl build is static,
+    // so it must win — a reordered elif chain would keep every single-loader case green.
+    "both-x64": ["lib/ld-musl-x86_64.so.1", "lib64/ld-linux-x86-64.so.2"],
+    none: [],
   };
   let nativeDir: string;
   let chosen: string; // written by whichever exec target ran: its name, then its argv one per line
@@ -252,10 +255,10 @@ describe("agent-browser shim native-binary selection (issue #1082)", () => {
     fakeGlibcBin = path.join(tmp, "fake-glibc-bin");
     fs.mkdirSync(fakeGlibcBin);
     writeExec(path.join(fakeGlibcBin, "ldd"), '#!/bin/sh\necho "ldd (GNU libc) 2.42"\n');
-    for (const [k, rel] of Object.entries(LOADERS)) {
+    for (const [k, rels] of Object.entries(LOADERS)) {
       const root = path.join(tmp, `sysroot-${k}`);
       fs.mkdirSync(root);
-      if (rel !== "") {
+      for (const rel of rels) {
         fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
         fs.writeFileSync(path.join(root, rel), "");
       }
@@ -283,6 +286,8 @@ describe("agent-browser shim native-binary selection (issue #1082)", () => {
     return root;
   }
 
+  // The arch seam stands in for `uname -m` so every case runs identically on an arm64 laptop,
+  // an x64 CI runner and the worker image (and so the x64 cases can run on arm64 at all).
   it("picks the musl binary by the loader on disk even with a glibc `ldd` first on PATH (the run-time bug), args verbatim", async () => {
     const res = await runShim(["open", "about:blank"], {
       PATH: fakeGlibcBin,
@@ -290,6 +295,7 @@ describe("agent-browser shim native-binary selection (issue #1082)", () => {
       AGENT_BROWSER_SHIM_TARGET: recorder,
       AGENT_BROWSER_SHIM_NATIVE_DIR: nativeDir,
       AGENT_BROWSER_SHIM_SYSROOT: sysroot("musl-x64"),
+      AGENT_BROWSER_SHIM_ARCH: "x86_64",
     });
     assert.equal(res.code, 0);
     assert.deepEqual(
@@ -299,31 +305,63 @@ describe("agent-browser shim native-binary selection (issue #1082)", () => {
     );
   });
 
-  for (const [k, expected] of [
-    ["musl-arm64", "agent-browser-linux-musl-arm64"],
-    ["glibc-x64", "agent-browser-linux-x64"],
-    ["glibc-arm64", "agent-browser-linux-arm64"],
+  for (const [k, arch, expected] of [
+    ["musl-arm64", "aarch64", "agent-browser-linux-musl-arm64"],
+    ["glibc-x64", "x86_64", "agent-browser-linux-x64"],
+    ["glibc-arm64", "arm64", "agent-browser-linux-arm64"],
+    ["both-x64", "x86_64", "agent-browser-linux-musl-x64"],
   ] as const) {
-    it(`maps the ${k} loader to ${expected}`, async () => {
+    it(`maps the ${k} loader(s) on a ${arch} host to ${expected}`, async () => {
       const res = await runShim(["--version"], {
         PATH: emptyBin,
         AGENT_BROWSER_EXECUTABLE_PATH: stubExec,
         AGENT_BROWSER_SHIM_TARGET: recorder,
         AGENT_BROWSER_SHIM_NATIVE_DIR: nativeDir,
         AGENT_BROWSER_SHIM_SYSROOT: sysroot(k),
+        AGENT_BROWSER_SHIM_ARCH: arch,
       });
       assert.equal(res.code, 0);
       assert.deepEqual(chosenLines(), [expected, "--version"]);
     });
   }
 
-  it("falls back to the JS launcher when no known loader is present (a laptop / odd arch)", async () => {
+  it("never picks a foreign-arch binary from a cross-arch loader (exec would be unrecoverable): falls back to the launcher", async () => {
+    // An x64 musl loader on an arm64 host (cross toolchain, qemu binfmt). The exec replaces
+    // the shim, so an `exec format error` could never reach the launcher fallback — the arch
+    // gate must decline the pick up front.
+    const res = await runShim(["--version"], {
+      PATH: emptyBin,
+      AGENT_BROWSER_EXECUTABLE_PATH: stubExec,
+      AGENT_BROWSER_SHIM_TARGET: recorder,
+      AGENT_BROWSER_SHIM_NATIVE_DIR: nativeDir,
+      AGENT_BROWSER_SHIM_SYSROOT: sysroot("musl-x64"),
+      AGENT_BROWSER_SHIM_ARCH: "aarch64",
+    });
+    assert.equal(res.code, 0);
+    assert.deepEqual(chosenLines(), ["JS-LAUNCHER"], "a loader for another arch must not select that arch's binary");
+  });
+
+  it("falls back to the JS launcher on an unknown arch even with a loader present", async () => {
+    const res = await runShim(["--version"], {
+      PATH: emptyBin,
+      AGENT_BROWSER_EXECUTABLE_PATH: stubExec,
+      AGENT_BROWSER_SHIM_TARGET: recorder,
+      AGENT_BROWSER_SHIM_NATIVE_DIR: nativeDir,
+      AGENT_BROWSER_SHIM_SYSROOT: sysroot("musl-x64"),
+      AGENT_BROWSER_SHIM_ARCH: "riscv64",
+    });
+    assert.equal(res.code, 0);
+    assert.deepEqual(chosenLines(), ["JS-LAUNCHER"]);
+  });
+
+  it("falls back to the JS launcher when no known loader is present (a laptop)", async () => {
     const res = await runShim(["--version"], {
       PATH: emptyBin,
       AGENT_BROWSER_EXECUTABLE_PATH: stubExec,
       AGENT_BROWSER_SHIM_TARGET: recorder,
       AGENT_BROWSER_SHIM_NATIVE_DIR: nativeDir,
       AGENT_BROWSER_SHIM_SYSROOT: sysroot("none"),
+      AGENT_BROWSER_SHIM_ARCH: "x86_64",
     });
     assert.equal(res.code, 0);
     assert.deepEqual(chosenLines(), ["JS-LAUNCHER"], "with no loader to key on, the launcher's own pick is the best available");
@@ -336,6 +374,7 @@ describe("agent-browser shim native-binary selection (issue #1082)", () => {
       AGENT_BROWSER_SHIM_TARGET: recorder,
       AGENT_BROWSER_SHIM_NATIVE_DIR: emptyBin,
       AGENT_BROWSER_SHIM_SYSROOT: sysroot("musl-x64"),
+      AGENT_BROWSER_SHIM_ARCH: "x86_64",
     });
     assert.equal(res.code, 0);
     assert.deepEqual(chosenLines(), ["JS-LAUNCHER"], "a missing native file must not turn into a silent no-op; hand over to the launcher");

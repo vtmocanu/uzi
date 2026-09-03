@@ -248,11 +248,33 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       // condition a provisioned nix glibc.bin creates at run time, which the plain image PATH
       // (musl `ldd`) can never reproduce and which made the npm launcher spawn the glibc binary —
       // and one `open about:blank` must go THROUGH the shim (CLI→daemon→Chromium end to end).
-      assert.match(text, /ldd \(GNU libc\)/, `${name}/Dockerfile build guard must run agent-browser behind a fake glibc ldd on PATH (issue #1082)`);
+      assert.match(text, /ldd \(GNU libc\)/, `${name}/Dockerfile build guard must create a fake glibc ldd (issue #1082)`);
+      assert.match(
+        text,
+        /PATH="[^"]*fake-glibc[^"]*:\$PATH"\s+timeout \d+ agent-browser --version/,
+        `${name}/Dockerfile build guard must RUN agent-browser with the fake glibc ldd FIRST on PATH, not merely create it (issue #1082)`,
+      );
       assert.match(
         text,
         /timeout \d+ agent-browser --session \S+ open about:blank/,
         `${name}/Dockerfile build guard must open about:blank THROUGH the shim, exit-bounded (issue #1082)`,
+      );
+      assert.match(
+        text,
+        /timeout \d+ agent-browser --session \S+ close/,
+        `${name}/Dockerfile build guard must close the session it opened (issue #1082)`,
+      );
+      // The daemon outlives `close` (idle timeout), so the pair runs under a throwaway HOME with
+      // a short timeout and the guard must ASSERT nothing was baked, not merely `rm` and hope.
+      assert.match(
+        text,
+        /HOME=\/tmp\/uzi-ab-home AGENT_BROWSER_IDLE_TIMEOUT_MS=\d+ \\\n\s+timeout \d+ agent-browser --session \S+ open about:blank/,
+        `${name}/Dockerfile build guard must run the open under a throwaway HOME and a short idle timeout (issue #1082)`,
+      );
+      assert.match(
+        text,
+        /\[ ! -e "\$HOME\/\.agent-browser" \]/,
+        `${name}/Dockerfile build guard must assert no root-owned agent-browser state was baked under HOME (issue #1082)`,
       );
 
       // BUG 1 (issue #114): the build guard launches chromium AS ROOT, which creates its

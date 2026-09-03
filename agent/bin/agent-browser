@@ -133,19 +133,31 @@ browser_reachable() {
 # Preferring musl when its loader is present is safe on any host: the musl build is
 # statically linked, so it runs on a glibc system too. If no known loader resolves, or the
 # selected native file is absent (a laptop, or an odd arch), fall through to the launcher
-# exactly as before. The two SHIM_* vars are seams set ONLY by the unit test.
+# exactly as before. The three SHIM_* vars are seams set ONLY by the unit test.
+#
+# The ARCHITECTURE comes from `uname -m`, and only the libc from the loader probe: a loader
+# file alone does not prove the host arch (a cross musl toolchain or qemu binfmt can put
+# ld-musl-x86_64 on an arm64 box), and a wrong pick is NOT recoverable — the exec below
+# replaces this process, so an `exec format error` never reaches the launcher fallback.
+# An unknown or unreadable arch yields no pick, hence the fallback.
 NATIVE_DIR="${AGENT_BROWSER_SHIM_NATIVE_DIR:-/app/node_modules/agent-browser/bin}"
 SYSROOT="${AGENT_BROWSER_SHIM_SYSROOT:-}"
+ARCH="${AGENT_BROWSER_SHIM_ARCH:-$(uname -m 2>/dev/null || true)}"
 native_binary() {
-  if [ -e "$SYSROOT/lib/ld-musl-x86_64.so.1" ]; then
-    echo agent-browser-linux-musl-x64
-  elif [ -e "$SYSROOT/lib/ld-musl-aarch64.so.1" ]; then
-    echo agent-browser-linux-musl-arm64
-  elif [ -e "$SYSROOT/lib64/ld-linux-x86-64.so.2" ]; then
-    echo agent-browser-linux-x64
-  elif [ -e "$SYSROOT/lib/ld-linux-aarch64.so.1" ]; then
-    echo agent-browser-linux-arm64
-  fi
+  case "$ARCH" in
+    x86_64|amd64)
+      if [ -e "$SYSROOT/lib/ld-musl-x86_64.so.1" ]; then
+        echo agent-browser-linux-musl-x64
+      elif [ -e "$SYSROOT/lib64/ld-linux-x86-64.so.2" ]; then
+        echo agent-browser-linux-x64
+      fi ;;
+    aarch64|arm64)
+      if [ -e "$SYSROOT/lib/ld-musl-aarch64.so.1" ]; then
+        echo agent-browser-linux-musl-arm64
+      elif [ -e "$SYSROOT/lib/ld-linux-aarch64.so.1" ]; then
+        echo agent-browser-linux-arm64
+      fi ;;
+  esac
 }
 
 if browser_reachable "$@"; then

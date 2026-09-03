@@ -279,11 +279,14 @@ COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
 # which is why this guard stayed green while runs were broken. (b) One headless
 # `open about:blank` THROUGH the shim, then `close`: the CLI→daemon→Chromium path end to end,
 # not only the CLI (`--version`) and Chromium (`--dump-dom`) separately. Session-scoped so the
-# close is exact. The uid-0 XDG state the shim creates and the daemon's state dir are removed
-# so nothing root-owned is baked: measured on node:24-alpine (agent-browser 0.35.1), `close`
-# leaves `$HOME/.agent-browser/<session>.sock` behind, and HOME here is /home/worker — a
-# root-owned `.agent-browser` there would block the runtime uid's daemon from creating its
-# socket, i.e. the guard would bake the very failure it exists to catch.
+# close is exact. Nothing root-owned may be baked, and the daemon OUTLIVES `close` (it exits on
+# its idle timeout, 60s by default), so the pair runs under a THROWAWAY HOME with a 2s idle
+# timeout and the cleanup waits for the daemon to be gone before removing that HOME — a plain
+# `rm` right after `close` races a live daemon that recreates `$HOME/.agent-browser`, and HOME
+# here is /home/worker, where a root-owned `.agent-browser` would block the runtime uid's daemon
+# from creating its socket, i.e. bake the very failure this guard exists to catch. Measured on
+# node:24-alpine (agent-browser 0.35.1): the daemon is still alive right after `close` and gone
+# 4s later under a 2s timeout; the trailing assertion makes the "not baked" claim fail-closed.
 RUN command -v agent-browser \
     && command -v chromium \
     && [ -x /app/node_modules/.bin/agent-browser ] \
@@ -295,9 +298,13 @@ RUN command -v agent-browser \
     && timeout 90 "$AGENT_BROWSER_EXECUTABLE_PATH" \
         --headless --no-sandbox --disable-dev-shm-usage \
         --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
-    && timeout 90 agent-browser --session uzi-buildcheck open about:blank >/dev/null \
-    && timeout 30 agent-browser --session uzi-buildcheck close >/dev/null \
-    && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-agent-browser-0 "$HOME/.agent-browser"
+    && HOME=/tmp/uzi-ab-home AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
+        timeout 90 agent-browser --session uzi-buildcheck open about:blank >/dev/null \
+    && HOME=/tmp/uzi-ab-home AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
+        timeout 30 agent-browser --session uzi-buildcheck close >/dev/null \
+    && sleep 4 \
+    && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-agent-browser-0 /tmp/uzi-ab-home \
+    && [ ! -e "$HOME/.agent-browser" ] && [ ! -e /tmp/uzi-ab-home ]
 
 # BUG 1 (issue #114) store-perm normalization — MUST run AFTER the build guard above, not
 # after the earlier `chown -R worker:runner /nix`. Root cause: the guard's `--dump-dom`

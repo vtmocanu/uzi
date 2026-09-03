@@ -212,7 +212,9 @@ COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
 # Issue #1082 (MIRRORED from base — read the account there): (a) the `--version` step is
 # repeated behind a fake glibc `ldd` first on PATH, the condition a provisioned nix glibc.bin
 # creates at run time and the plain image PATH (musl `ldd`) can never reproduce; (b) one
-# `open about:blank` THROUGH the shim, then `close`, with the root-owned build state removed.
+# `open about:blank` THROUGH the shim, then `close`, under a throwaway HOME and a 2s idle timeout
+# so the daemon (which outlives `close`) is gone before the root-owned build state is removed,
+# with a trailing assertion that nothing was baked.
 RUN command -v agent-browser \
     && command -v chromium \
     && [ -x /app/node_modules/.bin/agent-browser ] \
@@ -224,9 +226,13 @@ RUN command -v agent-browser \
     && timeout 90 "$AGENT_BROWSER_EXECUTABLE_PATH" \
         --headless --no-sandbox --disable-dev-shm-usage \
         --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
-    && timeout 90 agent-browser --session uzi-buildcheck open about:blank >/dev/null \
-    && timeout 30 agent-browser --session uzi-buildcheck close >/dev/null \
-    && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-agent-browser-0 "$HOME/.agent-browser"
+    && HOME=/tmp/uzi-ab-home AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
+        timeout 90 agent-browser --session uzi-buildcheck open about:blank >/dev/null \
+    && HOME=/tmp/uzi-ab-home AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
+        timeout 30 agent-browser --session uzi-buildcheck close >/dev/null \
+    && sleep 4 \
+    && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-agent-browser-0 /tmp/uzi-ab-home \
+    && [ ! -e "$HOME/.agent-browser" ] && [ ! -e /tmp/uzi-ab-home ]
 
 # BUG 1 (issue #114) store-perm normalization — MIRRORED from templates/base (jvm is NOT
 # `FROM base`; keep in lockstep). MUST run AFTER the build guard above, not after the earlier
