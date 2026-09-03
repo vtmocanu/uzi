@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
@@ -410,6 +411,34 @@ func (s *fakeStore) SettlePRDLinkPatch(_ context.Context, id uuid.UUID) (int64, 
 	}
 	s.prdCandidates = kept
 	return n, nil
+}
+
+// fakeReworkCanceller is a ReworkCanceller (forgesvc/service.go) stand-in for the
+// scheduled MR-state recorder tests (PRD #908): it records the mrIIDs it was asked to
+// cancel, in order, and can be forced to fail (err) to exercise the leave-unadvanced
+// retry contract on the opened->closed / ->merged cancel path.
+type fakeReworkCanceller struct {
+	calls []int64 // mrIIDs cancelled, in order
+	err   error   // when non-nil, forces every CancelReworkForMR to fail
+}
+
+func (c *fakeReworkCanceller) CancelReworkForMR(_ context.Context, _ uuid.UUID, mrIID int64, _ string) error {
+	c.calls = append(c.calls, mrIID)
+	return c.err
+}
+
+// scheduledCand builds a ListScheduledMRStateWatchCandidates row for the board-free
+// recorder tests (PRD #908). stored==nil models a NULL mr_state (Valid=false, the
+// bootstrap case); a non-nil pointer models a stored value.
+func scheduledCand(runID uuid.UUID, mrIID int64, stored *string) store.ListScheduledMRStateWatchCandidatesRow {
+	row := store.ListScheduledMRStateWatchCandidatesRow{
+		ID:    runID,
+		MrIid: pgtype.Int8{Int64: mrIID, Valid: true},
+	}
+	if stored != nil {
+		row.MrState = pgtype.Text{String: *stored, Valid: true}
+	}
+	return row
 }
 
 // fakeLabels is a fixed LabelConfig for the sync tests.

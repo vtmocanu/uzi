@@ -650,6 +650,49 @@ func TestTickThreadsScheduleMrReworkEnabled(t *testing.T) {
 			t.Fatalf("a schedule with a NULL mr_rework column must thread nil (inherit), got %v", *got)
 		}
 	})
+	// The self_improve seam (CreateSelfImproveRun) is the fourth scheduled path that
+	// threads scheduleMrRework (self_improve.go). PRD #908 M1 wired it; these pin the
+	// same three-state contract as the issue/prompt seams above.
+	t.Run("self_improve explicit false", func(t *testing.T) {
+		h := newHarness()
+		s := h.selfImproveSchedule()
+		s.MrReworkEnabled = pgtype.Bool{Bool: false, Valid: true}
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.selfImprove) != 1 {
+			t.Fatalf("CreateSelfImproveRun calls = %d, want 1", len(h.runs.selfImprove))
+		}
+		got := h.runs.selfImprove[0].mrReworkEnabled
+		if got == nil || *got {
+			t.Fatalf("self_improve run threaded mr_rework = %v, want an explicit false", got)
+		}
+	})
+	t.Run("self_improve explicit true", func(t *testing.T) {
+		h := newHarness()
+		s := h.selfImproveSchedule()
+		s.MrReworkEnabled = pgtype.Bool{Bool: true, Valid: true}
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.selfImprove) != 1 {
+			t.Fatalf("CreateSelfImproveRun calls = %d, want 1", len(h.runs.selfImprove))
+		}
+		got := h.runs.selfImprove[0].mrReworkEnabled
+		if got == nil || !*got {
+			t.Fatalf("self_improve run threaded mr_rework = %v, want an explicit true", got)
+		}
+	})
+	t.Run("self_improve nil override inherits", func(t *testing.T) {
+		h := newHarness()
+		s := h.selfImproveSchedule() // MrReworkEnabled zero-value = NULL
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.selfImprove) != 1 {
+			t.Fatalf("CreateSelfImproveRun calls = %d, want 1", len(h.runs.selfImprove))
+		}
+		if got := h.runs.selfImprove[0].mrReworkEnabled; got != nil {
+			t.Fatalf("a self_improve schedule with a NULL mr_rework column must thread nil (inherit), got %v", *got)
+		}
+	})
 }
 
 // TestTickNonAutoIssueScheduleUsesTheScheduledSeam pins the M4-review fix: a

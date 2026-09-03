@@ -492,22 +492,75 @@ func TestCIAutofixBranchInUseSwallows(t *testing.T) {
 	}
 }
 
-func TestCIAutofixUnparseableRefSkipped(t *testing.T) {
-	// The candidate query only yields agent/issue-N branches, but the detector guards
-	// against a ref it cannot attribute to an issue: skip it entirely, with no forge or
-	// store writes (not even a GetCIAutofixAttempt-driven record).
+func TestCIAutofixIssuelessBranchFiresNoComment(t *testing.T) {
+	// PRD #908 M2: a scheduled-run branch (`uzi/prompt-…`, `uzi/self-improve/…`) does not
+	// parse to an issue iid, and the detector now PROCESSES it — the ci_fix run still fires;
+	// only the issue comment (CreateIssueNote) is suppressed, since there is no issue to
+	// comment on. The started notification still fires. (The old test asserted the OPPOSITE
+	// — that an unparseable ref was skipped entirely — which M2 made semantically wrong.)
 	cand := cfCand(9001)
-	cand.Ref = pgtype.Text{String: "feature/not-an-issue", Valid: true}
+	cand.Ref = pgtype.Text{String: "uzi/prompt-" + uuid.NewString(), Valid: true}
 	st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{cand}}
+	runs := &cfRuns{}
+	notifier := &cfNotifier{}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "panic: boom\nexit 1"}
+
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+
+	// The ci_fix run IS created for the issueless branch.
+	if len(runs.calls) != 1 {
+		t.Fatalf("issueless branch must still fire the ci_fix run, got %d creates", len(runs.calls))
+	}
+	if runs.calls[0].ref != cand.Ref.String {
+		t.Fatalf("run created for ref %q, want %q", runs.calls[0].ref, cand.Ref.String)
+	}
+	if len(st.upserts) != 1 {
+		t.Fatalf("expected the attempt ledger to advance once, got %d upserts", len(st.upserts))
+	}
+	// NO issue comment: there is no issue to comment on.
+	if len(f.notes) != 0 {
+		t.Fatalf("an issueless branch must post NO issue comment, got %+v", f.notes)
+	}
+	// The started notification still fires (issue iid 0 in the payload).
+	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_started" || notifier.calls[0].runID == nil {
+		t.Fatalf("expected one started notification anchored to the run, got %+v", notifier.calls)
+	}
+	if notifier.calls[0].payload.IssueIID != 0 {
+		t.Fatalf("issueless branch notification IssueIID = %d, want 0", notifier.calls[0].payload.IssueIID)
+	}
+}
+
+func TestCIAutofixIssuelessBranchCapHaltsNoComment(t *testing.T) {
+	// PRD #908 M2 halt side: an issueless branch that reaches the cap halts WITHOUT an
+	// issue comment (nothing to comment on), but the halt notification still fires with no
+	// run anchor. count == maxAttempts (2) → capped; the fresh pipeline (9010) is not deduped.
+	cand := cfCand(9010)
+	cand.Ref = pgtype.Text{String: "uzi/self-improve/" + uuid.NewString(), Valid: true}
+	st := &cfStore{
+		candidates: []store.ListCIAutofixCandidateRefsRow{cand},
+		attempts: map[string]store.CiAutofixAttempt{
+			cand.Ref.String: {Ref: cand.Ref.String, AttemptCount: 2, LastPipelineID: pgtype.Int8{Int64: 9001, Valid: true}},
+		},
+	}
 	runs := &cfRuns{}
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
 	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
 
-	if len(runs.calls) != 0 || len(st.upserts) != 0 || len(st.records) != 0 || len(st.haltSets) != 0 || len(f.notes) != 0 || len(notifier.calls) != 0 {
-		t.Fatalf("unparseable ref must be skipped with no writes: runs=%d upserts=%d records=%d halts=%d notes=%d notifs=%d",
-			len(runs.calls), len(st.upserts), len(st.records), len(st.haltSets), len(f.notes), len(notifier.calls))
+	if len(runs.calls) != 0 {
+		t.Fatalf("capped halt must not start a run, got %d", len(runs.calls))
+	}
+	if len(st.haltSets) != 1 || st.haltSets[0].LastPipelineID.Int64 != 9010 {
+		t.Fatalf("expected SetCIAutofixHaltNotified stamping 9010, got %+v", st.haltSets)
+	}
+	// NO issue comment for an issueless branch.
+	if len(f.notes) != 0 {
+		t.Fatalf("an issueless cap-halt must post NO issue comment, got %+v", f.notes)
+	}
+	// The halt notification still fires, with no run anchor.
+	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_halted" || notifier.calls[0].runID != nil {
+		t.Fatalf("expected one halted notification with no run anchor, got %+v", notifier.calls)
 	}
 }
 
