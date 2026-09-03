@@ -13,7 +13,7 @@ import (
 )
 
 // TestRunCheckpointTipLiveDB is the live-DB gate for the new nullable runs.checkpoint_tip
-// column (migration 00184) and its single writer SetRunCheckpointTip, plus the read-back
+// column (migration 00185) and its single writer SetRunCheckpointTip, plus the read-back
 // path the terminal delete goroutine relies on (GetRunClaimContext now projects
 // r.checkpoint_tip). It exercises what a fake store structurally cannot: that the generated
 // UPDATE actually runs against a real Postgres, lands the tip on the row, and ADVANCES it on

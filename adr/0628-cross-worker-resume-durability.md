@@ -183,7 +183,7 @@ The #1030 amendment above closed the affinity/pushbroker gap but left one residu
 still adopt a *prior* run's diverged checkpoint on the same branch, because adoption keyed
 only on ancestry (strictly-descends-the-floor), not on ownership. Issue #1042 closes it.
 
-**Decision: one nullable `runs.checkpoint_tip TEXT` column (migration 00184, additive, no
+**Decision: one nullable `runs.checkpoint_tip TEXT` column (migration 00185, additive, no
 backfill) closes both halves; `checkpoint_run_id` decided against.** The PRD's Deferred
 entry floated `runs.checkpoint_tip`/`checkpoint_run_id` as a pair. Only the tip column
 shipped: `Service.Publish` writes the just-published tip to `runs.checkpoint_tip` on every
