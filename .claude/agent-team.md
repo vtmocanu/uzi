@@ -1726,15 +1726,14 @@ still reused. See `.claude/rules/go.md` for the full measurement.
   with its own jobs) + `helm lint`/`template` + buildx `--no-push` image validation builds on
   every PR and `main`; `v*` tags additionally publish the images + OCI chart to
   GHCR. Since PRD #103 M1 each **per-toolchain** gate job invokes the same `task`
-  target you run locally (`test:api-store-it` invokes none, by design). **The compose e2e harness (`./e2e/run-e2e.sh`) is deliberately NOT in
-  CI** (it needs docker compose on the runner), so it stays a purely local
-  pre-merge gate. **`./scripts/smoke.sh` is a different case and the old wording
-  here collapsed them:** `.github/workflows/kind-smoke.yml` stands up a KinD cluster, installs the
-  chart and runs it — but only on PROTECTED refs (`main` and tags), never on an MR
-  pipeline. So smoke is a POST-merge gate in CI and a pre-merge gate only locally.
-  Run both locally before merging; a green MR pipeline is not smoke having passed.
-  Remote is GitLab (`gitlab.example.com:vtmocanu/uzi`,
-  use `glab`, never `gh`/`tea`)
+  target you run locally (`test:api-store-it` invokes none, by design). **The compose e2e harness (`./e2e/run-e2e.sh`) runs in CI only
+  nightly** (`.github/workflows/e2e.yml`, schedule + workflow_dispatch, never on a PR), so
+  pre-merge it stays a local gate. **`./scripts/smoke.sh` is different:** `.github/workflows/kind-smoke.yml`
+  stands up a KinD cluster, installs the chart and runs it on push to `main`, on `v*` tags, and on
+  PRs that touch chart/deploy paths (path-filtered). Run both locally before merging a change
+  outside those paths; a green PR pipeline is not e2e having passed.
+  Remote is GitHub (`github.com/vtmocanu/uzi`; derive the CLI from
+  `git remote get-url origin`: `gh`, never `glab`/`tea`)
 - MVP shape: local laptop demo via docker-compose, PostgreSQL DB, persistent
   storage (per plan.md)
 - Slash commands the orchestrator may invoke between delegations: none
