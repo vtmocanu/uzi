@@ -7,7 +7,9 @@ human) can regenerate the images and Read the PNGs to critique the visuals. It a
 
 The redesign that this lab was built to develop (PRD #325, the "factory shift board") is now
 **the shipped TUI**. There is no separate prototype any more: the demo and the screenshots
-both drive the real `tuiModel`, so what you see here is what users get.
+both drive the real `tuiModel`, so what you see here is what users get. The one deliberate,
+gated exception is the throwaway **sketch harness** for previewing a feature that does not
+exist yet — see "Prototyping a new TUI feature (sketches)" below.
 
 ## Run the TUI live (no server)
 
@@ -84,10 +86,52 @@ Every scene is rendered from the SHIPPED model, `-dark` and `-light`.
 
 | Path | What |
 |---|---|
-| `../uxlab_gen_test.go` | the screenshot generator: drives the shipped `tuiModel` into every scene |
+| `../uxlab_gen_test.go` | the screenshot generator: drives the shipped `tuiModel` into every scene (and, per sketch, `sketches`) |
 | `../demo.go` | the `uzi tui --demo` showcase (shipped model + fake client + live ticker) |
+| `../sketch.go` | the sketch harness: the `sketches` registry, its lipgloss primitives, and the Tier-A frame host |
 | `gen.sh` / `render.sh` | regenerate ANSI frames / render them to PNG |
 | `devbox.json` | pins `freeze`; scripts `demo`, `gen`, `render`, `build` |
+
+## Prototyping a new TUI feature (sketches)
+
+Everything above renders the **shipped** TUI — the `scenes` map and `--demo` both drive the
+real `tuiModel`, so they can only show a view that already exists. A **sketch** is for the
+step before that: previewing a feature whose render code does not exist yet, to answer "does
+it look right, does it feel right to drive" before you build it for real.
+
+Two rungs, pick the cheaper one first:
+
+- **Tier A — static frames (the common case).** Supply a `frames func(dark bool) []string`
+  that builds a few frames from the shared lipgloss primitives (`header`/`pane`/`statusbar`)
+  and the shipped palette (`newPalette(dark)`). A generic host renders them fullscreen with
+  paging (`n`/`p` or `←`/`→`), a light/dark toggle (`t`), help (`?`), and quit (`q`/esc) — no
+  per-sketch UI code. This covers look, states, and both palettes in ~20 lines.
+- **Tier B — a real `tea.Model` (opt-in).** Supply a `model func() tea.Model` for key-driven
+  feel that static frames can't show. Use it only when the interaction itself is the thing
+  you're prototyping.
+
+**How to add one.** Add an entry to the `sketches` registry in `../sketch.go` — copy the
+permanent `template` entry as a starting point, and build its `frames` only from the
+`header`/`pane`/`statusbar` primitives plus `newPalette(dark)` so it inherits the shipped
+palette rather than drifting into ad-hoc colours. Then:
+
+```sh
+cd api && go run ./cmd/uzi tui --sketch <name>   # live preview, no server
+```
+
+A bare `uzi tui --sketch` (or `--sketch list`, or an unknown name) prints the registered
+sketch names. `devbox run build` picks up any Tier-A sketch automatically — no generator
+edit needed — and produces its `sketch-<name>-<frameIndex>-<theme>.png` alongside the shipped
+scenes; a Tier-B-only sketch (no `frames`) is live-preview-only and isn't screenshotted.
+
+**The point of a sketch is to be deleted.** A sketch is passed no `uzicli.Client` by
+construction — wiring the real API into one defeats the purpose and is not supported. Once a
+sketch has answered the "should we build this" question, lift its keepable lipgloss `View`
+shape into the real `tuiModel` and **delete the sketch** rather than maintaining it. Feature
+sketches are branch-local throwaways that should not merge to `main`: the harness ships
+exactly one permanent entry, `template`, as the copyable example. This discipline is what
+keeps the harness from becoming a second maintained TUI, the fate of the retired
+`factoryui` prototype.
 
 ## Adding a state
 
