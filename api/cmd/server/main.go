@@ -772,7 +772,7 @@ func run() error {
 		slog.Info("vault-lock notice disabled (UZI_VAULT_LOCK_NOTICE_ENABLED=false)")
 	}
 
-	// History usage refold (PRD #1079 M3): the 00187 migration marked every pre-migration
+	// History usage refold (PRD #1079 M3): the 00188 migration marked every pre-migration
 	// non-chat run usage_refolded=false, because those runs' run_usage rows were collapsed
 	// by the old MAX-per-model key. This boot one-shot re-folds each such TERMINAL run
 	// through the SAME foldUsageFrames the incremental path uses (over its full status/error

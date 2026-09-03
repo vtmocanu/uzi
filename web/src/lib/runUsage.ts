@@ -72,12 +72,18 @@
 // THREE THINGS FLOOR A NEGATIVE, AND THEY ARE NOT REDUNDANT — they cover different
 // OUTPUT SURFACES, which is why every attempt to state this as a count has been wrong:
 //
-//   tokens() at read   floors the VALUE  → protects both surfaces, so removing it
-//                                          alone is unobservable
-//   the m₀ = 0 seed    floors the MARK   → protects `modelTotals`, via mergeMax
-//   clampDelta         floors the DELTA  → protects `total` and the phase rows
+//   tokens() at read      floors the VALUE  → protects both surfaces, so removing it
+//                                             alone is unobservable
+//   the `modelSums` seed  floors the SUM    → protects `modelTotals`: #1079 derives
+//                                             `modelTotals` from `modelSums`, so its
+//                                             `?? ZERO_MODEL` start is the floor — NOT the
+//                                             mark's m₀ = 0 seed and NOT `mergeMax`, which
+//                                             defend the MARK (the within-leg high-water
+//                                             identity), not `modelTotals`
+//   clampDelta            floors the DELTA  → protects `total` and the phase rows
 //
-// Measured on one frame carrying `inputTokens: -5`, all four variants:
+// Measured on one frame carrying `inputTokens: -5`, all four variants (the `?? cur` here
+// is the `modelSums` seed — the `?? ZERO_MODEL` that feeds `modelTotals`, not the mark's):
 //
 //   baseline                      total.fresh 0   modelTotals.input  0
 //   tokens() floor removed        total.fresh 0   modelTotals.input  0

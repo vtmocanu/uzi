@@ -12,7 +12,7 @@ import (
 )
 
 // TestRefoldRunUsageLiveDB proves M3's history refold against a REAL Postgres (PRD
-// #1079). It seeds a pre-migration terminal run exactly as the 00187 migration would
+// #1079). It seeds a pre-migration terminal run exactly as the 00188 migration would
 // leave it — the eight 02854d5e fixture frames in run_messages, ONE collapsed
 // epoch-0 run_usage row per model shaped like the shipped MAX-per-model fold (the
 // 77.185539 rollup that IS the bug), and usage_refolded=false — then runs
@@ -72,7 +72,7 @@ func TestRefoldRunUsageLiveDB(t *testing.T) {
 	runID := insertIssueRun("completed", false)
 
 	// Decoys the pending selector must EXCLUDE.
-	// A chat run: repo_id/issue_iid NULL per runs_kind_shape; born refolded (00187 never
+	// A chat run: repo_id/issue_iid NULL per runs_kind_shape; born refolded (00188 never
 	// set chat rows false), so it is excluded by the usage_refolded marker.
 	chatRunID := uuid.New()
 	exec(`INSERT INTO runs (id, user_id, issue_title, issue_description, status, kind, session_id, usage_refolded)

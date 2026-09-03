@@ -2251,7 +2251,7 @@ ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
 -- query() call (agent/src/sdk-messages.ts, the system/subtype-init branch — NOT mapResult,
 -- which maps the result frame), so this counts the legs that preceded the frame. It is a pure function of
 -- (run_id, seq): a re-delivered frame recomputes the same value and lands in the same
--- run_usage row whatever else has landed since. Backed by idx_run_messages_init (00187),
+-- run_usage row whatever else has landed since. Backed by idx_run_messages_init (00188),
 -- so it is O(legs), not O(messages).
 SELECT COUNT(*) FROM run_messages
 WHERE run_id = @run_id AND kind = 'status'
@@ -2346,7 +2346,7 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 -- A boot one-shot re-folds every PRE-MIGRATION terminal non-chat run through the
 -- SAME foldUsageFrames the incremental path uses, replacing the collapsed
 -- (run, session, model) rows the old MAX-per-model key produced with correct
--- per-leg rows. 00187 added runs.usage_refolded (DEFAULT true, set false for every
+-- per-leg rows. 00188 added runs.usage_refolded (DEFAULT true, set false for every
 -- non-chat row that existed at migration time), which scopes the job to history and
 -- makes it converge: a post-migration run is born refolded and never selected here.
 
@@ -2363,7 +2363,7 @@ ORDER BY seq ASC;
 
 -- name: ListRunsPendingUsageRefold :many
 -- One batch of TERMINAL pre-migration runs still awaiting refold, oldest first. Chat
--- rows were never set usage_refolded=false (00187), so no kind filter is needed here;
+-- rows were never set usage_refolded=false (00188), so no kind filter is needed here;
 -- restricting to terminal statuses keeps the refold from racing an in-flight fold (a
 -- straggler re-delivery after a refold is a GREATEST no-op at the position-absolute
 -- epoch, but only terminal runs are ever folded here). A run that is pre-migration and

@@ -284,7 +284,7 @@ type Config struct {
 	// pre-migration terminal non-chat run's run_usage per SDK query() leg, replacing the
 	// collapsed MAX-per-model rows. It is a true one-off — a post-migration run is born
 	// refolded and never touched — so this switch only matters on the first boots after
-	// the 00187 migration. Like RegistrationEnabled it is a control switch, so a
+	// the 00188 migration. Like RegistrationEnabled it is a control switch, so a
 	// set-but-malformed value aborts boot rather than silently defaulting.
 	UsageRefoldEnabled bool
 	// UsageRefoldBatch is how many pending runs the boot refold processes per batch

@@ -15,7 +15,7 @@ import (
 // M1's foldUsageFrames verbatim over the run's FULL persisted status/error history,
 // so the refold and the incremental path are the same computation and cannot disagree
 // about a frame's leg — both read the epoch from run_messages via
-// CountRunInitFramesBefore, backed by 00187's idx_run_messages_init.
+// CountRunInitFramesBefore, backed by 00188's idx_run_messages_init.
 //
 // It is a PACKAGE-LEVEL function, not a Service method, because foldUsageFrames is
 // unexported (so the caller must live in this package) while workersvc.Service holds
@@ -62,7 +62,7 @@ func RefoldRunUsage(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, r
 
 	// The same fold body the incremental path runs, writing through the tx-bound
 	// querier. Chat runs are skipped inside foldUsageFrames, but the refold never
-	// selects one anyway (00187 left chat rows usage_refolded=true).
+	// selects one anyway (00188 left chat rows usage_refolded=true).
 	if err := foldUsageFrames(ctx, qtx, run, frames); err != nil {
 		return fmt.Errorf("refold usage (run %s): fold frames: %w", run.ID, err)
 	}
