@@ -653,6 +653,51 @@ func TestRenderRunDetailNowRowSanitized(t *testing.T) {
 	}
 }
 
+// TestRenderRunDetailNowRowAgentToolWidthCapped pins the ONE guarantee the sibling
+// TestRenderRunDetailNowRowSanitized cannot: that nowRow's own cellText — not the
+// defense-in-depth CellText that Printer.Table runs over every cell — width-caps the
+// Agent and Tool parts.
+//
+// Two facts make this its own case rather than another line in the Sanitized test:
+//   - The width cap (200 runes) lives ONLY in nowRow's cellText. uzicli.Printer.Table →
+//     termsafe.CellText independently strips bidi/CSI/newline/tab (so the Sanitized
+//     test's other assertions survive cellText being dropped) but deliberately does NOT
+//     truncate. So the cap is the sole property that reddens if cellText leaves the
+//     agent/tool render lines.
+//   - The Sanitized test puts its oversized payload in Detail, which the SERVER already
+//     caps to 200 — so it is NOT a load-bearing width guard for the fields nowRow's
+//     cellText is genuinely the sole cap for. Agent and Tool ship UNSANITIZED on the
+//     wire (D7, and the run_render.go comment says so), so an over-long Agent/Tool value
+//     reaches the terminal uncapped the instant cellText is dropped from those lines.
+//
+// Distinct sentinels ('A' for Agent, 'T' for Tool) so a regression on either line is
+// named unambiguously; both are 250 runes, past cellText's 200-rune cap.
+func TestRenderRunDetailNowRowAgentToolWidthCapped(t *testing.T) {
+	longAgent := strings.Repeat("A", 250)
+	longTool := strings.Repeat("T", 250)
+	r := milestoneRun()
+	r.CurrentActivity = &apitypes.RunActivity{
+		Agent:      longAgent,
+		AgentLabel: "dispatch",
+		Tool:       longTool,
+		Detail:     "x.go",
+		At:         time.Now().Add(-45 * time.Second),
+	}
+	out := renderDetail(t, r)
+	if !strings.Contains(out, "NOW") {
+		t.Fatalf("a non-terminal run with an activity must render a NOW row, got:\n%s", out)
+	}
+	// The load-bearing assertions: neither the 250-rune Agent nor the 250-rune Tool may
+	// reach the terminal whole. Each reddens iff cellText is dropped from its render line
+	// (Printer.Table's CellText does not truncate, so it cannot mask a missing cap).
+	if strings.Contains(out, longAgent) {
+		t.Errorf("an oversized activity AGENT reached the terminal uncapped, got:\n%q", out)
+	}
+	if strings.Contains(out, longTool) {
+		t.Errorf("an oversized activity TOOL reached the terminal uncapped, got:\n%q", out)
+	}
+}
+
 // ---- PRD #362 M5: plain-English run summaries -------------------------------
 
 // TestRenderRunDetailSummaries pins `uzi run get`'s intent/plan/deltas block (PRD #362
