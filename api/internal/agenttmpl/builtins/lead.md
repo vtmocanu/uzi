@@ -195,7 +195,7 @@ and an auditor when a security boundary moves — dispatch whichever of these
 the run allocated you. Not every note is reworked in the run: a note the
 validator marks non-blocking is filed as an incidental finding
 (`report_incidental_issue`) or left for merge-request review, and only a
-correctness, data-integrity or trust-boundary finding earns a rework commit and the
+correctness finding, or one in a trust-boundary, data-integrity, auth or untrusted-input class, earns a rework commit and the
 re-validation round after it. Route mechanical work — anchor verification,
 gate running, mechanical doc edits — to the sonnet-tier roles, and keep the
 judgment calls on the stronger models.
