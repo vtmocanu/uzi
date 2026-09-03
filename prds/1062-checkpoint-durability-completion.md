@@ -15,7 +15,10 @@ open-web lookup.
 
 ## Status
 
-- **M1 (#1059)** — ready to implement. Adopt-seam unification; agent-side only.
+- **M1 (#1059)** — DONE (2026-09-03, branch `agent/issue-1059`). Adopt-seam unified on
+  the owner anchor across BOTH not-ownedHere legs; agent-side only (`agent/src/git.ts`
+  + `agent/test/git-cross-worker-recovery.test.ts` + `agent/test/git.test.ts`), no
+  server/schema/migration change. `adr/0628` amended, `specs/ai.md` §609 added.
 - **M2 (#1036)** — approach NOT finalized: an open design fork (broker-side overlay
   synthesis vs reusing ADR-0456's `alignBranchWithDefault`) must be settled before
   implementation — see M2. Held until M1 merges regardless (edits the same `git.ts`
