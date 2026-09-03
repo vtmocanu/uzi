@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Pause every schedule at once, with an optional auto-resume ([#1093](https://github.com/vtmocanu/uzi/issues/1093)).**
+  A new user-level kill switch pauses every schedule you own, catalog defaults and your own alike, on every repo, with an optional `until` that auto-resumes on its own with no background job; a recurring schedule due while paused records a benign `schedules_paused` skip and keeps advancing its cadence so nothing replays on resume, a one-time schedule instead waits and fires once the pause lifts, `Run now` still bypasses the switch, and runs already in flight are untouched. It's reachable from the Schedules page (a "Pause all" control, an inline picker, and a paused banner), the CLI (`uzi schedule pause-all --until <when>` / `resume-all` / `pause-status`), and a paused fire's Last fire record.
+
 ## [0.77.0] - 2026-09-03
 
 ### Added

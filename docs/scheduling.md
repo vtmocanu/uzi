@@ -166,6 +166,38 @@ grouped siblings as the web multi-select; `uzi schedule add-repo <id> --repo
 <id>` is the CLI twin of "Add another repo" — see [the CLI
 reference](./cli.md#commands) for the full flag list.
 
+### Pausing everything at once
+
+A single **user-level** switch pauses every schedule you own, on every
+repo, catalog defaults and your own alike — the "tonight I want nothing to
+run" case, without hand-pausing each row and remembering which ones were on
+when you resume. It takes an optional **auto-resume instant**: pass
+`--until` (a preset in the web picker, or the CLI flag) and the pause lifts
+itself at that time with no manual action and no background job — an
+expired `until` simply reads as not-paused the next time anything checks
+it. Omit an end time (`--until never`, or the "Until I resume" preset) to
+stay paused until you resume by hand.
+
+A **recurring** schedule due while paused records a benign
+[`schedules_paused` skip](#fire-outcomes) and **advances its cadence
+normally**, exactly as if it had fired — so resuming never replays a burst
+of missed fires, and its `Last run` shows why nothing started instead of
+looking dead. A **one-time** schedule due while paused is left alone: it
+stays overdue and fires once, on the first tick after the pause ends, the
+same as a [restart-missed one-time schedule](#restarts-and-missed-fires).
+**`Run now` bypasses the switch** — a manual fire is an explicit act, not
+an unattended one — and a run already in flight when you pause is never
+touched. Pausing and resuming never write any schedule's own `enabled`
+value, so resuming restores the **exact** set of schedules that were on
+before.
+
+Three surfaces read and drive the same state: the **Schedules** page (a
+"Pause all" control, an inline picker for the presets, and a paused banner
+while it's active), the **CLI** (`uzi schedule pause-all --until <when>` /
+`resume-all` / `pause-status` — see [the CLI
+reference](./cli.md#commands)), and a paused fire's **Last fire** record,
+which carries the `schedules_paused` skip reason.
+
 ## Fire outcomes
 
 A schedule can fire right on time and still start **zero** runs — every
@@ -196,6 +228,11 @@ exceed `max_issues` once backfill walks past a skip), which ones
   next tick with nothing recorded; on a **sweep**, one bad candidate
   can't stall the rest of the fan-out, so that candidate is bucketed
   `fetch_failed` and the sweep continues.
+- `schedules_paused` — the owner's user-level [pause
+  all](#pausing-everything-at-once) was active when this recurring fire
+  came due, so nothing started. It's benign and self-resolving: the
+  schedule's cadence advances normally and re-fires on schedule next time,
+  and nothing replays on resume.
 
 `examined == started + skipped` always holds — every candidate the fire
 reaches lands in exactly one bucket, so the tally never silently drops one.
@@ -402,6 +439,10 @@ not held in memory. A fire missed while the process was down (or a slow
 tick) still fires **once**, promptly, on the next wake — never a backfill of
 every cadence missed. A one-time schedule left overdue by a restart fires
 once, the same way, then goes terminal.
+
+A user-level [pause all](#pausing-everything-at-once) leaves a one-time
+schedule overdue in the same way a restart does: it fires once, on the
+first tick after the pause ends.
 
 ## Auto-provisioning a worker for an unmet capability
 

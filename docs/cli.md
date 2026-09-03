@@ -104,6 +104,7 @@ uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--la
                     [--max-issues <n>] [--guidance <text>]
                     [--model <alias|id>] [--apply-model-to-agents[=false]]
 uzi schedule list | get <id> | pause <id> | resume <id> | run-now <id> | delete <id>
+uzi schedule pause-all --until <when> | resume-all | pause-status
 uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--prompt <text> | --label <l> ... [--create-missing-labels]]
                    [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -342,6 +343,28 @@ A few worth knowing:
   --max-issues` hint for `not eligible`) — or `no run started` when a benign
   dedup fired none; `--json` dumps the raw response (`created`, `run_ids`,
   `matched`, `capped`, `started`, `skips`).
+- **`schedule pause-all` / `resume-all` / `pause-status`** work on **every
+  schedule you own, on every repo** — a user-level kill switch, distinct
+  from the per-schedule `pause <id>`/`resume <id>` above, which toggles one
+  row. `pause-all` requires `--until <when>`, so a bare `pause-all` is a
+  usage error (exit 2) rather than silently meaning forever; `--until`
+  accepts an RFC3339 timestamp, a Go duration (`24h`), `tomorrow[ HH:MM]`
+  (bare `tomorrow` defaults to `09:00`), a weekday name (`monday`, `Mon`)
+  `[ HH:MM]` defaulting to `09:00` and resolving to its next occurrence, or
+  `never` for an indefinite pause — every relative form is resolved
+  **client-side, in your local timezone**, and sent to the server as a
+  plain RFC3339 stamp (or `null` for `never`). While paused, no schedule you
+  own fires unattended on any repo: a recurring schedule due in the meantime
+  records a benign `schedules_paused` skip and its cadence still advances,
+  a one-time schedule waits and fires once the pause lifts, `run-now` still
+  bypasses the switch, and no per-schedule `pause <id>`/`resume <id>` state
+  is ever touched — `resume-all` (or an auto-resume `--until`) restores the
+  exact set of schedules that were on before. `pause-status` prints the
+  current state (paused, and until when, or not paused); `schedule list`'s
+  `NEXT` column reads `paused (all)` (with the resume stamp, if any) for
+  every row while a pause-all is active. `--json` works on all three,
+  returning the same `{paused, until}` shape. See [Pausing everything at
+  once](./scheduling.md#pausing-everything-at-once) for the full behaviour.
 - **Default scheduled jobs (`schedule catalog`).** uzi ships a small catalog of
   builtin default schedules (docs hygiene, bug triage, a planned-work sweep, and
   so on). `schedule catalog list` shows them as a table (`SLUG`, `TARGET`, `CRON`,
