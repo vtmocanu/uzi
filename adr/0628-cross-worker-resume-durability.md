@@ -192,6 +192,20 @@ publish) and never on a benign skip. Both the delete-side and adoption-side guar
 key on tip-equality alone; an identical-tip coincidence across two different runs is
 harmless, so the extra `checkpoint_run_id` discriminator buys nothing and was dropped.
 
+**A failed or missed tip-write degrades SAFELY — no outbox or acknowledged-write
+protocol is needed.** The persist is deliberately not part of the publish's acknowledged
+contract, because both guards are constructed to fail closed on an unproven tip. If the
+first write fails the tip stays `NULL`; if a later write fails it stays at an earlier
+(stale) SHA. In either case: the delete-side skips on `NULL`, and on a stale tip the wire
+compare-and-swap (`Old=tip`) is refused by the remote once the real checkpoint has moved
+past it — so cleanup leaves the ref for a later run rather than ever deleting the wrong
+one. The adoption-side sees a tip that does not equal the mirrored checkpoint's SHA and
+declines, seeding off the origin/default floor rather than adopting a checkpoint it cannot
+prove is its own. The only cost of a dropped tip-write is a lingering checkpoint ref and a
+missed (not a wrong) recovery — the conservative direction. The invariant is "delete or
+adopt ONLY on a proven tip match"; an unproven tip is treated as not-ours, which is why a
+best-effort write is sufficient and a durable outbox would buy no additional safety.
+
 **Delete half — api-only, live the moment api deploys.** The terminal
 `deleteCheckpointBestEffort` cleanup now skips the delete entirely when `checkpoint_tip` is
 NULL — a never-published run owns nothing, which is the root cause of the clobber this
