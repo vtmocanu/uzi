@@ -235,9 +235,12 @@ NOT itself modify a workflow file (`changedFiles` filtered to `.github/workflows
 mirroring `runner.ts:1240`); gate fails ⇒ ship `realTip` unchanged (→ clean skip; #377
 owns a workflow-modifying branch at finalize). Synthesize via temp index (no worktree, no
 filter drivers): `GIT_INDEX_FILE=<tmp> git read-tree <realTip>`; `git rm --cached -r
---ignore-unmatch .github/workflows`; if default has a workflows tree, `git read-tree
---prefix=.github/workflows <defaultTip>:.github/workflows` (empty ⇒ rm-only, the #627
-deleted-workflows edge); `newRoot = git write-tree`; if `newRoot == realTip^{tree}` ⇒ not
+--ignore-unmatch .github/workflows` (**`--ignore-unmatch` is load-bearing, not cosmetic**:
+against a temp index with no worktree, `git rm --cached` exits non-zero when no path
+matches, so without it the no-`.github` / already-deleted-workflows edges would ERROR
+instead of being no-ops — same flag `alignBranchWithDefault` carries at `git.ts:1530`); if
+default has a workflows tree, `git read-tree --prefix=.github/workflows
+<defaultTip>:.github/workflows` (empty ⇒ rm-only, the #627 deleted-workflows edge); `newRoot = git write-tree`; if `newRoot == realTip^{tree}` ⇒ not
 behind ⇒ ship `realTip`; else `O_ov = git commit-tree newRoot -p realTip [-p prevOverlay]
 -m "ckpt(overlay): …"` with **DETERMINISTIC identity + committer date** (= realTip's,
 fixed identity, `gpgsign=false`) so a no-new-work rebuild yields the same OID and the
