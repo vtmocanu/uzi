@@ -1,7 +1,7 @@
 # PRD #1022: handler/schedules.go and handler/workers.go file splits, five schedule seams, and the run handlers out of the misnamed workers.go
 
 **GitHub Issue**: [#1022](https://github.com/vtmocanu/uzi/issues/1022)
-**Status**: Planned (created 2026-09-02)
+**Status**: Complete (created 2026-09-02; completed 2026-09-03)
 **Priority**: Medium
 **Parent**: epic #915 (Batch 4, P18; decided in the epic's "Maintainer decisions (2026-09-02 15:05 Bucharest, the four un-measured >1000-line Go files)"). Same-package file moves, the recipe #921 (`workersvc`), #963 (`forgesvc/projectsync.go`) and #1008 (`handler/handler.go`) use. **File-disjoint from #1008 by construction**: #1008 edits `handler.go` and creates `routes_<domain>.go` files (including `routes_schedules.go` and `routes_workers.go`); this PRD never touches `handler.go` or any `routes_*.go`, and its new files use the plural `schedules_` stem and the `runs_` stem. Also disjoint from #1009 (`api/cmd/uzi/**`, which creates a singular `schedule_request.go` there), #1017 (`api/internal/uzicli/**`) and #1021 (`api/internal/settings/**`). This PRD touches `api/internal/handler/{schedules.go,workers.go,runs.go,chat.go}` + new files, two test-file **comments**, `fixtures/api-contract/README.md` and `specs/ai.md`.
 **Line refs**: at `3c03565` (main, 2026-09-02 15:20 Bucharest; `schedules.go`, `workers.go`, `runs.go` are byte-identical to `68ea273`, where the measurements were taken). Implementer re-derives at their base; anchors are identifiers, not offsets.
@@ -46,20 +46,20 @@ Seven new files. The implementer may fold `schedules_dto.go` into `schedules.go`
 
 ## Milestones
 
-- [ ] **M1: Baseline proofs, then the two leaf files out of `workers.go`: `pgptr.go` and `runs_dto.go`.**
+- [x] **M1: Baseline proofs, then the two leaf files out of `workers.go`: `pgptr.go` and `runs_dto.go`.**
   - Capture the proofs **before** any move, on the branch base: `cd api && go doc -all ./internal/handler > /tmp/godoc.before`; `go test -count=1 -race ./internal/handler/...` green; `task lint:api` 0 issues.
   - Commit 1: the eight pointer helpers (`:32-100`, `:313-327`) into `pgptr.go`. Commit 2: the run DTO cluster (`:327-606`, `:1470-1487`) into `runs_dto.go`. File shape: `package handler`, imports, blank line, two-line header. No indentation changes in either (top-level declarations move to top level), so plain `git diff --color-moved=dimmed-zebra origin/main..HEAD -- api/internal/handler/` must show each as a moved block; reaching for `-w` or `--color-moved-ws` here is the signal something other than a move happened.
   - Verification: `go doc -all ./internal/handler | diff /tmp/godoc.before -` empty; `task gate:api` green; `git diff --stat origin/main..HEAD -- 'api/internal/handler/*_test.go'` empty.
-- [ ] **M2: The run lifecycle out of `workers.go`, and `AdminListWorkers` in.**
+- [x] **M2: The run lifecycle out of `workers.go`, and `AdminListWorkers` in.**
   - Commit 3: `runInputKinds` (`:103-136`), the handlers and the guard-role cluster (`:847-1470`) and `ListRunInputs` (`:1487-1512`) into `runs_lifecycle.go`. Commit 4: `AdminListWorkers` (`runs.go:136-151`, with its doc comment) into `workers.go`, placed after `ListWorkers`. After this, `workers.go` holds only worker handlers and worker DTO builders (≈470 lines) and `runs.go` only the two run listings.
   - Sweep each moved block for positional comments (`above`, `below`, `:NNN`, "this file") that the move makes false and fix them in the same commit, listed in the PR (the #963 recipe).
   - Verification as M1.
-- [ ] **M3: `schedules_request.go` and `schedules_dto.go`.**
+- [x] **M3: `schedules_request.go` and `schedules_dto.go`.**
   - Commit 5: the request-to-row helpers (`:67-190`, `:1243-1509`, `:1735-1746`) into `schedules_request.go`. Commit 6: `repoPathFor` + `scheduleDTO` (`:1509-1622`) into `schedules_dto.go`. Each commit `--color-moved` clean and `go test -count=1 -race ./internal/handler/...` green on its own (the #963 D2 rule: a bisectable history).
-- [ ] **M4: `schedules_catalog.go` and `schedules_clone.go`.**
+- [x] **M4: `schedules_catalog.go` and `schedules_clone.go`.**
   - Commit 7: the catalog surface (`:579-764`, `:1037-1220`, `:1645-1735`) into `schedules_catalog.go`. Commit 8: `CloneSchedule`, `AddScheduleRepo`, `cloneNextFire` (`:764-1037`) into `schedules_clone.go`. After this, `schedules.go` is the const block, the seven CRUD/preview/run-now handlers, `runNowResponse`, `scheduleParam` and the two label codec helpers: ≈500 lines. The three `//nolint:gosec // G115 …` directives now sit in `schedules_request.go` (`maxIssuesColumn`) and `schedules_catalog.go` (`catalogMaxIssues`, `defaultEditableDiverges`); `nolintlint` still sees them as used.
   - Verification as M1.
-- [ ] **M5: Comment and doc repoints, design record.**
+- [x] **M5: Comment and doc repoints, design record.**
   - One commit, clearly labelled as comment-only: `chat.go:243`, `:294` ("CreateRunInput (workers.go)" → `runs_lifecycle.go`); `guard_role_notify_test.go:149-150` ("the production glue in workers.go" → `runs_lifecycle.go`); `runs_test.go:219` (`workers.go:166` → `runs_dto.go`, identifier only, no line number) and `:533` ("the clamp block in workers.go" → `runs_lifecycle.go`). These are the only two test files touched and the diff in them is comment lines only (SC1); both carry 0 lint findings, so the whole-files ratchet adds nothing.
   - `fixtures/api-contract/README.md:243-249`: `handler/workers.go:360` → `handler/runs_dto.go` (and the three `:44x` mapper lines → identifiers or the landed lines, the table's own convention). Also `:55` and `:96` (`handler/schedules.go:1598-1600` / `:1612-1614` → `handler/schedules_dto.go`, `scheduleDTO`) and `:54` / `:95` (`handler/workers.go:201` / `:250` → the landed lines in `workers.go`).
   - `specs/ai.md`: repoint the present-tense sentences that now name a moved symbol: `:4646` (`runToDTO` → `handler/runs_dto.go`), `:9398` (`ListRunInputs` → `handler/runs_lifecycle.go`), `:20398` (`writeStartRunError` → `handler/runs_lifecycle.go`), `:20611` (`mergeSchedule` → `handler/schedules_request.go`); read `:6202`, `:19549`, `:20922` and repoint only if the symbol they name moved (`:19549` names the worker DTO builders, which stay). Leave past-tense decision records; leave `prds/**` and `ideas/**` (the #1008 M5 rule).
