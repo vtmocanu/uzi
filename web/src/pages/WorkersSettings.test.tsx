@@ -1363,3 +1363,98 @@ describe("WorkersSettings \u2014 two tabs (PRD #1063 M1)", () => {
     ).toBeTruthy();
   });
 });
+
+// ── Header action + hosted-first empty-state CTAs (PRD #1063 M2) ────────────────
+describe("WorkersSettings — header button + empty-state CTAs (PRD #1063 M2)", () => {
+  const selected = (name: RegExp) =>
+    screen.getByRole("tab", { name }).getAttribute("aria-selected");
+  const hostedTemplate = () => document.getElementById("hosted-worker-template");
+  const registerName = () => document.getElementById("register-worker-name");
+
+  it("header button selects the add tab and focuses the hosted Template select when hosting is on", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 5, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] }); // non-empty → lands on Your workers
+    renderPage();
+    await screen.findByText("laptop");
+    // The hosted select existing implies the config resolved and onAvailability fired, so
+    // hostedManual is set true (both happen in the same fetch .then).
+    await waitFor(() => expect(hostedTemplate()).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Add a worker$/ }));
+    expect(selected(/^Add a worker$/)).toBe("true");
+    await waitFor(() => expect(document.activeElement).toBe(hostedTemplate()));
+  });
+
+  it("header button focuses the register Name input when hosting is off", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: false, quota: 0, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    renderPage();
+    await screen.findByText("laptop");
+    await waitFor(() => expect(mockApi.hostedConfig).toHaveBeenCalled());
+    // Hosting off: no hosted select renders anywhere.
+    expect(hostedTemplate()).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Add a worker$/ }));
+    expect(selected(/^Add a worker$/)).toBe("true");
+    await waitFor(() => expect(document.activeElement).toBe(registerName()));
+  });
+
+  it("header button focuses the register Name input when the config read rejects (fail closed)", async () => {
+    mockApi.hostedConfig.mockRejectedValue(new Error("boom"));
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    renderPage();
+    await screen.findByText("laptop");
+    await waitFor(() => expect(mockApi.hostedConfig).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Add a worker$/ }));
+    expect(selected(/^Add a worker$/)).toBe("true");
+    await waitFor(() => expect(document.activeElement).toBe(registerName()));
+  });
+
+  it("empty state leads with the hosted CTA when hosting is on; the hosted CTA focuses the Template select", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 5, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [] }); // empty → lands on add tab (D11)
+    renderPage();
+    // Config resolved → hostedManual true, so the empty state renders the hosted CTA.
+    await waitFor(() => expect(hostedTemplate()).toBeTruthy());
+    openWorkersTab(); // the empty state lives on the Your workers panel
+
+    const provisionCta = await screen.findByRole("button", { name: "Provision a hosted worker" });
+    expect(screen.getByRole("button", { name: "Register your own" })).toBeTruthy();
+    // The hosting-off single-button copy is absent when hosting is on.
+    expect(screen.queryByRole("button", { name: "Register a worker" })).toBeNull();
+
+    fireEvent.click(provisionCta);
+    expect(selected(/^Add a worker$/)).toBe("true");
+    await waitFor(() => expect(document.activeElement).toBe(hostedTemplate()));
+  });
+
+  it("the Register your own CTA selects the add tab and focuses the register Name input", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 5, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    renderPage();
+    await waitFor(() => expect(hostedTemplate()).toBeTruthy());
+    openWorkersTab();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Register your own" }));
+    expect(selected(/^Add a worker$/)).toBe("true");
+    await waitFor(() => expect(document.activeElement).toBe(registerName()));
+  });
+
+  it("empty state shows only Register a worker (no hosted CTA) when hosting is off, and it focuses the Name input", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: false, quota: 0, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [] }); // empty → add tab
+    renderPage();
+    await screen.findByText(/No workers yet/); // text queries see the hidden Your-workers panel
+    await waitFor(() => expect(mockApi.hostedConfig).toHaveBeenCalled());
+    openWorkersTab();
+
+    expect(await screen.findByRole("button", { name: "Register a worker" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Provision a hosted worker" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Register your own" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Register a worker" }));
+    expect(selected(/^Add a worker$/)).toBe("true");
+    await waitFor(() => expect(document.activeElement).toBe(registerName()));
+  });
+});

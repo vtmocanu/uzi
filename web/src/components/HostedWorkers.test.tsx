@@ -122,6 +122,54 @@ describe("HostedWorkers visibility (the card is hidden, never disabled-with-excu
   });
 });
 
+describe("HostedWorkers onAvailability (D8 — tells the page whether the hosted path is on)", () => {
+  it("fires once with { manual: true } when hosting is enabled and quota > 0", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    const onAvailability = vi.fn();
+    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    await waitFor(() => expect(onAvailability).toHaveBeenCalledWith({ manual: true }));
+    expect(onAvailability).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires with { manual: false } when enabled but the quota is 0", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 0, ephemeral_enabled: true });
+    const onAvailability = vi.fn();
+    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    await waitFor(() => expect(onAvailability).toHaveBeenCalledWith({ manual: false }));
+    expect(onAvailability).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires with { manual: false } when hosting is disabled", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: false, quota: 5, ephemeral_enabled: false });
+    const onAvailability = vi.fn();
+    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    await waitFor(() => expect(onAvailability).toHaveBeenCalledWith({ manual: false }));
+    expect(onAvailability).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires with { manual: false } when the config read rejects (fail closed)", async () => {
+    mockApi.hostedConfig.mockRejectedValue(new ApiError(500, "internal error"));
+    const onAvailability = vi.fn();
+    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    await waitFor(() => expect(onAvailability).toHaveBeenCalledWith({ manual: false }));
+    expect(onAvailability).toHaveBeenCalledTimes(1);
+  });
+
+  it("never re-fires on a rerender (exactly once per mount)", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    const onAvailability = vi.fn();
+    const { rerender } = render(
+      <HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />,
+    );
+    await waitFor(() => expect(onAvailability).toHaveBeenCalledTimes(1));
+    // Force a rerender (a new prop identity) — the one-shot fetch effect must not re-run and
+    // the latch must hold, so the count stays 1.
+    rerender(<HostedWorkers hostedCount={1} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    await Promise.resolve();
+    expect(onAvailability).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("HostedWorkers quota states", () => {
   it("counts the user's hosted workers against the quota and allows a provision", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });

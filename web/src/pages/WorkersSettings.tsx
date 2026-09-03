@@ -11,7 +11,7 @@ import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton, cx } from "../components/ui";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
 import { useAppVersion } from "../components/AppShell";
-import { ServerIcon } from "../components/icons";
+import { PlusIcon, ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
 import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
@@ -133,6 +133,21 @@ export function WorkersSettings() {
   // even before load, since it is explicit.
   const [searchParams, setSearchParams] = useSearchParams();
   const [tab, setTab] = useState<Tab | null>(null);
+  // Whether MANUAL hosted provisioning is available, learned from HostedWorkers via its
+  // onAvailability callback (D8) — the page cannot see the hosting config itself, since
+  // HostedWorkers fetches it and renders nothing when it is off. Drives the empty state's
+  // hosted-first CTA (D10). Starts false: until the callback fires we assume no hosted
+  // path, which is the safe copy (register only).
+  const [hostedManual, setHostedManual] = useState(false);
+  const onHostedAvailability = useCallback((a: { manual: boolean }) => {
+    setHostedManual(a.manual);
+  }, []);
+  // A pending focus request into the add panel (D10). Set alongside a selectTab("add") so
+  // the panel un-hides in the SAME commit; the effect below then focuses the target AFTER
+  // that commit — a synchronous .focus() in the click handler would fire while the panel is
+  // still hidden and silently no-op. "hosted" → the Hosted card's Template select; "register"
+  // → the Register card's Name input.
+  const [pendingFocus, setPendingFocus] = useState<"hosted" | "register" | null>(null);
   // Refs to the tab buttons so the arrow-key handler moves focus with selection (APG
   // tabs, automatic activation): Left/Right wrap, Home/End jump to the ends.
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
@@ -152,6 +167,28 @@ export function WorkersSettings() {
     },
     [searchParams, setSearchParams],
   );
+  // Select the add tab and queue focus on the named form's first control (D9/D10). The
+  // focus itself happens in the effect below, after the panel un-hides.
+  const goToAdd = useCallback(
+    (focus: "hosted" | "register") => {
+      selectTab("add");
+      setPendingFocus(focus);
+    },
+    [selectTab],
+  );
+  // Perform a queued add-panel focus AFTER the render that un-hides the panel (D10). The
+  // hosted Template select carries a stable id from HostedWorkers; the register Name input
+  // carries one below. `getElementById` returns null for the hosted target when the hosted
+  // card is not rendered (hosting off), so a "hosted" request then falls back to the Name
+  // input — the register form is the only add path in that case.
+  useEffect(() => {
+    if (!pendingFocus) return;
+    const target =
+      (pendingFocus === "hosted" ? document.getElementById("hosted-worker-template") : null) ??
+      document.getElementById("register-worker-name");
+    target?.focus();
+    setPendingFocus(null);
+  }, [pendingFocus]);
   const onTabKeyDown = (e: React.KeyboardEvent) => {
     if (tab === null) return;
     const idx = TAB_ORDER.indexOf(tab);
@@ -375,6 +412,14 @@ export function WorkersSettings() {
             <DocLink slug={DOC_WORKER_SETUP}>worker setup</DocLink> guide.
           </>
         }
+        // The Schedules "New schedule" shape (D9): the label matches the tab name exactly, it
+        // selects the add tab and focuses its first control (the hosted Template select when
+        // hosting is on, else the register Name input), and it stays visible on both tabs.
+        actions={
+          <Button onClick={() => goToAdd(hostedManual ? "hosted" : "register")}>
+            <PlusIcon /> Add a worker
+          </Button>
+        }
       />
       {/* The page-level error alert stays ABOVE the tabs (D-unchanged). */}
       {(error || loadError) && <Alert message={error || loadError} />}
@@ -465,7 +510,27 @@ export function WorkersSettings() {
           <EmptyState
             icon={<ServerIcon />}
             title="No workers yet"
-            description="Generate a join token above, then start the uzi-agent container with it — the worker shows up here when it heartbeats."
+            // Hosted-first when hosting is available (D10): the zero-effort path leads, and the
+            // description drops the hosted clause entirely when it is not. hostedManual comes
+            // from HostedWorkers' onAvailability, which reaches the page even while the add panel
+            // is hidden (D4/D8), so the empty state on this tab knows what the add tab offers.
+            description={
+              hostedManual
+                ? "Provision a hosted worker and it comes online on its own, or register your own machine with a join token."
+                : "Register your own machine with a join token."
+            }
+            action={
+              hostedManual ? (
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  <Button onClick={() => goToAdd("hosted")}>Provision a hosted worker</Button>
+                  <Button variant="secondary" onClick={() => goToAdd("register")}>
+                    Register your own
+                  </Button>
+                </div>
+              ) : (
+                <Button onClick={() => goToAdd("register")}>Register a worker</Button>
+              )
+            }
           />
         ) : (
           <>
@@ -867,6 +932,7 @@ export function WorkersSettings() {
                 announce(`Provisioned ${worker.name} — it appears in your workers below.`);
                 await reload();
               }}
+              onAvailability={onHostedAvailability}
             />
 
             <Card className="space-y-4">
@@ -875,6 +941,10 @@ export function WorkersSettings() {
                 <div className="min-w-[16rem] flex-1">
                   <Field label="Name">
                     <Input
+                      // Stable id so the page can focus this input as the add panel's first
+                      // control (D10): the header button and the register-oriented empty-state
+                      // CTAs land here (and the hosted CTA falls back here when hosting is off).
+                      id="register-worker-name"
                       placeholder="e.g. laptop, ci-runner-1"
                       value={name}
                       onChange={(e) => setName(e.target.value)}
