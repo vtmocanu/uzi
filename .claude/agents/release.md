@@ -60,7 +60,7 @@ NOT modify source code.
 
 ## For this repo (uzi)
 
-**The uzi release is driven inline by the lead** via the `uzi-release` skill's `release-cut.sh` / `release-watch.sh` / `release-verify.sh`, not by dispatching this agent. This section is the mechanics reference those scripts follow; "you" = the lead cutting the release. The lead carries the new `X.Y.Z`, the previous `v*` tag and a drafted `## [X.Y.Z]` CHANGELOG section, and is authorized to land the bump direct-to-`main` and tag it. `release-cut.sh` applies the handed draft, or folds `[Unreleased]` into a dated `## [X.Y.Z]` section if none (keep an empty `[Unreleased]` on top, Keep-a-Changelog subsections, no em dashes), and verifies it with the oracle before you tag.
+**The uzi release is driven inline by the lead** via the `uzi-release` skill's `release-cut.sh` / `release-watch.sh` / `release-verify.sh`, not by dispatching this agent (if you are dispatched for one anyway, the mechanics below still apply; prefer the scripts). This section is the mechanics reference those scripts follow; "you" = the lead cutting the release. The lead carries the new `X.Y.Z`, the previous `v*` tag and a drafted `## [X.Y.Z]` CHANGELOG section, and is authorized to land the bump direct-to-`main` and tag it. `release-cut.sh` applies the handed draft, or folds `[Unreleased]` into a dated `## [X.Y.Z]` section if none (keep an empty `[Unreleased]` on top, Keep-a-Changelog subsections, no em dashes), and verifies it with the oracle before you tag.
 
 **Remote is GitHub** (`github.com/vtmocanu/uzi`), use `gh`, never `glab`/`tea`. `deploy/README.md` is still GitLab-worded and is NOT the publish authority; trust `.github/workflows/release.yml`.
 
