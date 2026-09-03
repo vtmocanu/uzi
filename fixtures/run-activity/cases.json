@@ -452,6 +452,33 @@
       }
     },
     {
+      "name": "newline_and_tab_stripped_matching_go",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "lead",
+          "agent_label": null,
+          "payload": {
+            "name": "Agent",
+            "input": {
+              "subagent_type": "coder",
+              "description": "line one\nline two\ttabbed"
+            }
+          },
+          "created_at": "2026-09-03T12:00:07Z",
+          "seq": 7
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_label": "line oneline twotabbed",
+        "tool": "Agent",
+        "detail": "line oneline twotabbed",
+        "at": "2026-09-03T12:00:07Z",
+        "seq": 7
+      }
+    },
+    {
       "name": "no_tool_use_yields_null",
       "frames": [
         {

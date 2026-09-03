@@ -21,6 +21,7 @@ import {
   mockLaneMessages,
   mockLaneRuns,
   mockLimitWaitMessages,
+  mockLiveMessages,
   mockLiveTokensMessages,
   mockOtherUserRuns,
   mockProposals,
@@ -101,7 +102,11 @@ function seed(): MockState {
   // usage-limit feed rows (it is not a usage-limit park), and an empty log opens the
   // run view without a 404 (getRunMessages 404s an unseeded id).
   messages.set("run-pool-wait", []);
-  messages.set("run-live", []);
+  // PRD #1064 M3: run-live opens on an in-progress milestone (milestones_in_progress:
+  // ["hb-2"]); seed ONE tool_use frame so the run view's client-side latestActivity is
+  // non-null and the "now" strip renders at open, not just the board/list current_activity
+  // DTO. Copied so the script's appends never mutate the shared fixture.
+  messages.set("run-live", mockLiveMessages.map((m) => ({ ...m })));
   messages.set("run-cancelled", []);
   // The never-judged control fixture (PRD #119): a terminal run with no review AND no
   // pending judge, so the run page's unchanged "hasn't been judged yet" empty state and
@@ -272,14 +277,33 @@ function syncCards(runId: string, patch: Partial<Run>): void {
   }
 }
 
+// Fields whose change asks the run view to RE-READ the run over REST, exactly as a real
+// run-updated WS frame does (a "state" frame carries no authoritative data — it only
+// triggers refreshRun; runStream.ts). A status change already qualifies; PRD #1064 M3
+// adds the milestone + current_activity fields, because the run view's MilestoneChecklist
+// (and its "now" strip) render from run.milestones / milestones_in_progress, which the
+// mid-implement freeze mutates WITHOUT a status change. Without this broadcast that freeze
+// updated the store but never reached the run view, so the strip never appeared live.
+const RUN_VIEW_REFRESH_FIELDS: readonly (keyof Run)[] = [
+  "status",
+  "milestones",
+  "milestones_completed",
+  "milestones_in_progress",
+  "current_activity",
+];
+
 export function patchRun(runId: string, patch: Partial<Run>): Run | undefined {
   const run = state.runs.get(runId);
   if (!run) return undefined;
   const next = { ...run, ...patch, updated_at: new Date().toISOString() };
   state.runs.set(runId, next);
   syncCards(runId, patch);
-  if (patch.status && patch.status !== run.status) {
-    broadcast(runId, { type: "state", status: patch.status as RunStatus });
+  // Broadcast a "state" frame when any refresh-worthy field actually changed. The frame
+  // carries the CURRENT status (its value is ignored by the client, which re-reads over
+  // REST) so a milestone-only patch still triggers the run view's refreshRun.
+  const changed = RUN_VIEW_REFRESH_FIELDS.some((k) => k in patch && patch[k] !== run[k]);
+  if (changed) {
+    broadcast(runId, { type: "state", status: next.status as RunStatus });
   }
   return next;
 }

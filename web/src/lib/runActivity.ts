@@ -21,11 +21,19 @@ import { stripUnsafeChars } from "./safeText";
 const DETAIL_CAP_RUNES = 200;
 
 // sanitize strips the terminal-unsafe characters and then caps at DETAIL_CAP_RUNES
-// code points — the same strip-then-cap order the Go sanitize applies. stripUnsafeChars
-// is the shared web copy of the termsafe/sanitizeTTY predicate (safeText.ts), so the
-// stripped set matches what the server strips.
+// code points — the same strip-then-cap order the Go sanitize applies.
+//
+// The stripped set is ALMOST the shared stripUnsafeChars (safeText.ts, the web copy of
+// the termsafe/sanitizeTTY predicate) but NOT identical: stripUnsafeChars deliberately
+// SPARES `\n` and `\t` for the multi-line pre-wrap render surfaces it serves, whereas the
+// Go runactivity.sanitize strips ALL control runes (unicode.IsControl covers `\n` U+000A
+// and `\t` U+0009). The now line is a single-line element, so to match Go — the intended
+// behaviour, the fixture pins it — this fold ADDITIONALLY drops `\n`/`\t` after the shared
+// strip. This extra drop is fold-local: it must NOT move into stripUnsafeChars, which
+// stays multi-line-preserving for its other callers.
 function sanitize(s: string): string {
-  return Array.from(stripUnsafeChars(s)).slice(0, DETAIL_CAP_RUNES).join("");
+  const stripped = stripUnsafeChars(s).replace(/[\n\t]/g, "");
+  return Array.from(stripped).slice(0, DETAIL_CAP_RUNES).join("");
 }
 
 // asRecord coerces an unknown payload/input to a plain object for keyed access; a
