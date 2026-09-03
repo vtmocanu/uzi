@@ -935,6 +935,74 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(2));
   });
 
+  // PRD #1034 / PR #1051 finding B. The reorderRef lock is ONE synchronous lock across
+  // ALL board mutations, not reorders alone: a close/reopen and a reorder must serialize
+  // in both directions, or a late reorderBoard response setBoard(fresh) overwrites a
+  // newer state transition (and symmetrically). M5-2 above covers reorder-vs-reorder;
+  // these two cover the cross-mutation directions the fix added. The refusal is SURFACED
+  // (the exact "Still saving…" copy) and the refused call never reaches the API — the
+  // buttons are deliberately NOT disabled during a mutation (the B1 focus fix), so the
+  // reorder click below genuinely reaches applyDrop and the reorderRef guard, not a
+  // disabled attribute, is what refuses it.
+  const LOCK_ERROR = "Still saving the previous move — try again in a moment.";
+
+  it("refuses a close while a reorder's reorderBoard is still in flight", async () => {
+    let releaseReorder: (v: { board: BoardData }) => void = () => {};
+    mockApi.reorderBoard.mockImplementation(
+      () => new Promise<{ board: BoardData }>((res) => { releaseReorder = res; }),
+    );
+    renderBoard();
+    await screen.findByText("Backlog");
+
+    // Start a within-lane reorder (keyboard path, columnChanged=false so it never calls
+    // move()) and leave its reorderBoard hanging — the lock is now held.
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+
+    // Dragging an OPEN card onto Closed must be REFUSED: no close crosses the wire, and
+    // the refusal is surfaced verbatim rather than swallowed.
+    dropOn(laneFor("Closed"), 2);
+    // Refused synchronously (reorderRef checked before the state-move branch), so no
+    // close crosses the wire...
+    expect(mockApi.moveIssue).not.toHaveBeenCalled();
+    // ...and the refusal is surfaced verbatim.
+    expect((await screen.findByText(LOCK_ERROR)).textContent).toBe(LOCK_ERROR);
+
+    // Releasing the reorder settles it (mode flips to manual). The refused close was
+    // REFUSED, not queued — it stays un-sent even after the lock frees.
+    releaseReorder({ board: aBoard() });
+    await waitFor(() => expect(store.get("uzi.board.repo-1.sortMode")).toBe('"manual"'));
+    expect(mockApi.moveIssue).not.toHaveBeenCalled();
+  });
+
+  it("refuses a reorder while a close's moveIssue is still in flight", async () => {
+    let releaseMove: (v: { card: Card }) => void = () => {};
+    mockApi.moveIssue.mockImplementation(
+      () => new Promise<{ card: Card }>((res) => { releaseMove = res; }),
+    );
+    renderBoard();
+    await screen.findByText("Backlog");
+
+    // Start a close (drag open card 1 onto Closed) and leave its moveIssue hanging — the
+    // close now holds the SAME lock during its forge write.
+    dropOn(laneFor("Closed"), 1);
+    await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledTimes(1));
+    expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 1, "closed");
+
+    // A reorder attempted now must be REFUSED: reorderBoard is never called, and the
+    // refusal is surfaced verbatim.
+    fireEvent.click(moveBtn(2, "down"));
+    // Refused synchronously (the close holds the lock), so no reorder crosses the wire...
+    expect(mockApi.reorderBoard).not.toHaveBeenCalled();
+    // ...and the refusal is surfaced verbatim.
+    expect((await screen.findByText(LOCK_ERROR)).textContent).toBe(LOCK_ERROR);
+
+    // Releasing the close settles it; the refused reorder was not queued.
+    releaseMove({ card: aCard({ iid: 1, column: "", closed: true }) });
+    await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledTimes(1));
+    expect(mockApi.reorderBoard).not.toHaveBeenCalled();
+  });
+
   // B1 (browser pass). Disabling a focused button blurs it, so every keyboard reorder
   // dropped focus to <body> and never restored it. At 38 Tab presses to reach the first
   // move button, that made the affordance single-use — defeating the WCAG 2.1.1 reason
