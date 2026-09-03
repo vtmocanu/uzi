@@ -565,7 +565,7 @@ the M-workdir Decision-3 amendment) into both the worker and the dind sidecar at
 the same path, so `docker run -v`/compose bind mounts under the run's checkout
 (uzi's own e2e included) resolve in the daemon instead of hitting an empty dir.
 The path mirrors `agent/src/git.ts`'s `runnerRoot` — if that root ever moves,
-`controller/internal/kube/render.go`'s render must move with it.
+`controller/internal/kube/render_dind.go`'s `dindWorkdirDir` (mounted by `render.go`'s `podTemplate`) must move with it.
 
 ### M4/M5 runbook: known items before go-live
 
