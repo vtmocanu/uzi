@@ -711,7 +711,15 @@ export class GitCache {
       // under an overlay is still soft-reset on the peeled tip. Order: overlay = discard-by-
       // reparent (outer) → wip-park = keep-by-soft-reset (inner). Best-effort: if the peel can't
       // resolve the parent, leave baseSha as-is and warn (never crash a reseed over the wrapper).
-      if (await this.isOverlayMarker(barePath, baseSha)) {
+      //
+      // PROVENANCE GATE (issue #1036 review): peel ONLY when seededFrom === "checkpoint" — the
+      // worker-built, api-brokered ref the agent CANNOT push to. An overlay is only ever
+      // synthesised by checkpointPack for that ref; a `ckpt(overlay):` subject on any other base
+      // (a tracking/origin/default tip the agent controls) is a FORGERY, and peeling it would
+      // DISCARD the agent's real commit (this peel throws the tip's tree away — unlike the
+      // wip-park soft-reset, which keeps it). A subject prefix is not provenance across the agent
+      // trust boundary; seededFrom is.
+      if (seededFrom === "checkpoint" && (await this.isOverlayMarker(barePath, baseSha))) {
         const overlaySha = baseSha;
         // The real tip is the LAST parent. Count parents (`rev-list --parents -n 1` prints
         // "<commit> <p1> [<p2> …]"), then read `<sha>^<n>` where n = parent count.

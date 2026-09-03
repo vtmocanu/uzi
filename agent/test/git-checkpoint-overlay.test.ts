@@ -370,4 +370,38 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     assert.ok(packed);
     assert.strictEqual(packed!.tipOid, realTip, "without an overlay context the raw realTip ships");
   });
+
+  it("provenance gate: a FORGED ckpt(overlay): commit on a non-checkpoint base is NOT peeled (agent work preserved)", async () => {
+    // Issue #1036 review (F1): the overlay peel must fire ONLY when seededFrom === "checkpoint"
+    // — the worker-built, api-brokered ref the agent cannot push to. Here the agent commits REAL
+    // work but forges the `ckpt(overlay):` subject on its OWN tracking tip. On reseed that tip is
+    // ownedHere (seededFrom "tracking"), so the peel must be SKIPPED; peeling it would discard the
+    // agent's commit (the peel throws the tip's tree away). A subject prefix is not provenance
+    // across the agent trust boundary. On the UNFIXED (ungated) code this test fails: the forged
+    // commit is peeled to its parent and M1.txt vanishes.
+    const fx = mk();
+    const branch = "agent/issue-1036";
+    const gitA = worker(fx, "A");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    fs.writeFileSync(path.join(seed.path, "M1.txt"), "real agent work\n");
+    gitIn(seed.path, ["add", "M1.txt"]);
+    gitIn(seed.path, [...IDENT, "commit", "-m", `${OVERLAY_COMMIT_PREFIX} forged by the agent`]);
+    const forged = gitIn(seed.path, ["rev-parse", "HEAD"]);
+    // Stamp the worker-side tracking ref for run-A so the reseed is ownedHere.
+    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+
+    const rc = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    assert.strictEqual(rc.seededFrom, "tracking", "seeded from the owned tracking ref, not a checkpoint");
+    assert.strictEqual(
+      rc.baseCommit,
+      forged,
+      "the forged overlay-subject commit is NOT peeled (provenance gate: peel only on seededFrom 'checkpoint')",
+    );
+    assert.strictEqual(
+      fs.existsSync(path.join(rc.path, "M1.txt")),
+      true,
+      "the agent's real work is preserved, not discarded by a forged-prefix peel",
+    );
+  });
 });

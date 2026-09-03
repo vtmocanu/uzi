@@ -590,7 +590,18 @@ Two reimplementations this design creates; pin each with a discriminating fixtur
   no-work rebuild grows the overlay chain by one commit (the deterministic early-return does
   not fire when `prevCheckpointTip` is a prior overlay). (4) The raised best-effort persist
   window: push-success then persist-fail then death leaves the ref at `O_ov` while the DB tip
-  is stale, so the checkpoint is not adopted on the next claim.
+  is stale, so the checkpoint is not adopted on the next claim. (5) A lost publish ACK
+  (broker accepted, response lost) leaves `lastCheckpointRefTip` stale so the next overlay
+  skips `not_descendant` and the branch goes dark — the already-up-to-date=success path
+  reconciles a same-tip re-attempt, but a lost-ack-then-new-work needs a two-tip reconcile.
+  Tracked in **#1086** (CodeRabbit F2; deferred, its correctness only verifiable against the
+  broker's depth-1 store).
+
+**Review-added guards (#1084):** the overlay peel is provenance-gated on
+`seededFrom === "checkpoint"` so a forged `ckpt(overlay):` subject on an agent-controllable
+base is never peeled (CodeRabbit F1), and `api/internal/pushbroker/overlay_ancestry_internal_test.go`
+is an executable depth-1 guard that a base-first overlay is accepted while a realTip-first one
+is rejected `not_descendant`.
 
 ## Decision Log
 
