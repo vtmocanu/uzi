@@ -99,6 +99,47 @@ func TestSketchHostRendersAndClamps(t *testing.T) {
 	press(keyHelp)
 }
 
+// The paging clamp and the theme re-clamp are pinned here against a sketch whose two
+// themes return DIFFERENT frame counts (dark→3, light→1). Asserting on the host's
+// frameIdx STATE — not the rendered content — is what makes these branches
+// falsifiable: View() clamps the index defensively before rendering, so a rendered
+// frame stays valid even if handleKey's clamps were removed; only the state exposes
+// the regression. (template has 2 frames in both themes and cannot exercise this.)
+func TestSketchHostPagingAndThemeReclamp(t *testing.T) {
+	asym := func(dark bool) []string {
+		if dark {
+			return []string{"dark-0", "dark-1", "dark-2"}
+		}
+		return []string{"light-0"}
+	}
+	h := newSketchHost(asym) // defaults dark → 3 frames
+
+	step := func(k string) {
+		t.Helper()
+		next, _ := h.handleKey(k)
+		h = next.(sketchHost)
+	}
+
+	// Over-page: 5×"n" on a 3-frame slice must clamp frameIdx at len-1 == 2.
+	// (Drop handleKey's "n" clamp and frameIdx would run to 5 here.)
+	for i := 0; i < 5; i++ {
+		step("n")
+	}
+	if h.frameIdx != 2 {
+		t.Fatalf("after over-paging, frameIdx = %d, want 2 (clamped at len-1)", h.frameIdx)
+	}
+
+	// Toggle to the light theme (1 frame). frameIdx was 2 and must re-clamp to 0.
+	// (Drop the "t" re-clamp and frameIdx would stay 2 with only 1 frame present.)
+	step("t")
+	if h.frameIdx != 0 {
+		t.Fatalf("after theme toggle to a 1-frame theme, frameIdx = %d, want 0 (re-clamped)", h.frameIdx)
+	}
+	if got := content(h.View()); got != "light-0" {
+		t.Fatalf("after re-clamp, View() = %q, want the sole light frame %q", got, "light-0")
+	}
+}
+
 // stubSketchModel is a minimal tea.Model used to prove the Tier-B dispatch path.
 type stubSketchModel struct{}
 
