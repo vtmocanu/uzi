@@ -1,7 +1,7 @@
 # PRD #1049: `web/src/pages/Judge.tsx` component extraction — the page's five render-only components into `pages/judge/`
 
 **GitHub Issue**: [#1049](https://github.com/vtmocanu/uzi/issues/1049)
-**Status**: Planned (created 2026-09-02)
+**Status**: Done (created 2026-09-02, completed 2026-09-03) — extraction landed on `agent/issue-1049`; M3 design record at `specs/ai.md` §605.
 **Priority**: Medium
 **Parent**: epic #915 (P22; the first of the "web component extractions, one PRD each, the P14 (#1007) recipe" the epic's post-freeze plan lists, pulled forward to fill a free sweep slot). Prerequisite #1007 (P14, PR #1018) is merged: it established `pages/<page>/` directories (`pages/runView/`, `pages/board/`) beside `pages/adminSettings/` (#960). **File-disjoint by construction from everything in flight**: #1022 (`api/internal/handler/**`), #1034 (`web/src/{lib/api.ts,lib/boardOrder.ts,mocks/mockApi/boards.ts,pages/Board.tsx}` + `api/**`), #1042 (`api/internal/workersvc/**`, `agent/src/git.ts`) and #1048 (`controller/**`, `deploy/**`). This PRD touches `web/src/pages/Judge.tsx`, six new files under `web/src/pages/judge/`, and `specs/ai.md`.
 **Line refs**: at `d6f39a0` (main, 2026-09-02 22:19 Bucharest). Implementer re-derives at their base; anchors are identifiers, not offsets.
