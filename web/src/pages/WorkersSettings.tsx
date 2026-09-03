@@ -416,7 +416,13 @@ export function WorkersSettings() {
         // selects the add tab and focuses its first control (the hosted Template select when
         // hosting is on, else the register Name input), and it stays visible on both tabs.
         actions={
-          <Button onClick={() => goToAdd(hostedManual ? "hosted" : "register")}>
+          /* Always request the "hosted" focus target: the pendingFocus effect resolves it
+             at commit time via getElementById and falls back to the register Name input
+             when the hosted card is not rendered (hosting off, or config not yet loaded).
+             Deciding here from `hostedManual` instead would misfocus on the sub-second
+             window before the mount-time hostedConfig fetch resolves on a hosting-enabled
+             instance. The self-resolving request has no such race. */
+          <Button onClick={() => goToAdd("hosted")}>
             <PlusIcon /> Add a worker
           </Button>
         }
