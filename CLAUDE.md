@@ -44,7 +44,7 @@ go install github.com/go-task/task/v3/cmd/task@v3.51.1   # pinned, sumdb-verifie
 ### Gate targets
 
 - **`Taskfile.yml` at the repo root is the only place a gate recipe is written.** `task --list` enumerates them.
-- `task gate` runs everything, `gate:repo` first (shellcheck, yamllint, Homebrew formula, migration numbering: checks with no component of their own). `gate:repo` / `gate:api` / `gate:controller` / `gate:web` / `gate:agent` run one slice each.
+- `task gate` runs everything, `gate:repo` first: the checks with no component of their own (shellcheck, yamllint, GitHub Actions lint incl. embedded scripts, the Homebrew formula, migration numbering and additivity, spec numbering, no-binary-text, `scan:secrets` with gitleaks, `sast:semgrep`). `task --dry gate:repo` lists them. `gate:repo` / `gate:api` / `gate:controller` / `gate:web` / `gate:agent` run one slice each.
 - `.github/workflows/ci.yml` invokes the same targets, mostly per-toolchain (`validate:*`, `lint:api`, `lint:controller`, `test:*`) plus repo-wide `lint:repo`, so local and CI cannot drift. `test:api-store-it` invokes none by design: its ran/skipped assertion is CI-specific.
 - Every load-bearing flag lives in `Taskfile.yml` with its reason. Task echoes each command, so `-race`, `-count=1` and `--test-timeout=120000` stay visible; that echo is how you notice one going missing.
 - **Component gates run serially, deliberately.** CPU contention is a measured flake source, and interleaved output defeats reading the named failing test.
@@ -91,6 +91,7 @@ Per-component detail loads on demand: Claude Code includes a `.claude/rules/*.md
 | `.claude/rules/web.md` | `web/**` | `task gate:web`, mock mode, the live-stack `vite preview` hazard, the blind browser instruments, vacuous negative assertions |
 | `.claude/rules/agent.md` | `agent/**` | `task gate:agent`, `--test-timeout`, the `agent-browser` symlink clobber, the `node --test` tally trap |
 | `.claude/rules/stack.md` | `docker-compose.yml`, `e2e/**`, `scripts/**`, `deploy/**`, `.github/workflows/**` | isolating a test stack, the `.env` mechanism, `run-e2e.sh` / `smoke.sh` and the `smoke.sh` recipe, CI, the Helm `-}}` object-deleting trap. It does not restate the destructive rules: `-p uzi` / `down -v` and throwaway-container naming live in *Destructive operations* above, always loaded |
+| `.claude/rules/tui.md` | `api/cmd/uzi/tui_*.go`, `api/cmd/uzi/sketch.go`, `api/cmd/uzi/uxlab/**` | the TUI and the uxlab render harness: D7 untrusted-field rendering through `renderer.Plain`, the colorprofile downgrade check, sketch work never lands on `main` |
 | `.claude/rules/prds.md` | `prds/**` | the workflow-scope constraint on PRD authoring: a PRD sent to uzi must keep `.github/workflows/**` out of both implementation and validation (the worker PAT lacks `workflow` scope, so any workflow-file touch in the branch diff is an atomic push rejection losing the whole branch). Split a needed workflow edit into a separate maintainer/local-only issue, or do it in-session; cross-refs the `uzi-watcher` skill's guardrail |
 
 - **A rule fires on a file READ.** Running a gate without opening a file in that component does not pull its rule in: open the file, or read the rule directly.
@@ -196,3 +197,5 @@ Read `.claude/agent-team.md` before PRD work: it defines the orchestrator/teamma
 - *Two negative results from instruments that share an assumption are ONE negative result*, *An instrument that cannot produce the disconfirming answer is not evidence*: the general form of the blind browser instruments (`.claude/rules/web.md`) and the `PASS=0` traps (`.claude/rules/go.md`).
 - *TYPECHECK the mutated tree before reading the test result*, *Mutate at the CALL SITE, not in the shared helper*, *An assertion defines its CHANNEL*: the mutation-testing discipline that the `sqlc` and `git checkout --` entries in `.claude/rules/go.md` instantiate.
 - *A claim about what would happen if you removed it is not readable from the code*, *A rule nobody is keeping is a different failure from a rule that is wrong*, *Sweep per FACT after the last behavioural commit*; plus *Quality gates*, *Project signals* and *Standing rules*.
+
+Before writing "verified" or "green" in a report, read that file's section on why you might be wrong.
