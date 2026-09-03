@@ -214,7 +214,7 @@ re-seeds it. A headless browser against `VITE_UZI_MOCK=1 npm run dev` does work 
 read computed styles, which is what makes a visual criterion here genuinely verifiable
 rather than hand-waved.
 
-**On a hosted worker, `agent-browser` needs the musl binary and an explicit browser path (issue #1082).** `/usr/local/bin/agent-browser` execs the glibc build, which fails with `ld-linux-x86-64.so.2: No such file`. Do not debug it; write this wrapper once and use it for every call:
+**On a hosted worker, run `agent-browser --version` once before anything else.** If it works, use `agent-browser` from `PATH` and skip the rest of this paragraph. If it fails with `ld-linux-x86-64.so.2: No such file`, the image predates the #1082 fix (PR #1085: the launcher picked the glibc build because a provisioned nix profile put a GNU `ldd` ahead of the musl one); do not debug it, write this wrapper once and use it for every call:
 
 ```sh
 cat > /tmp/ab.sh <<'SH'
@@ -228,4 +228,4 @@ SH
 chmod +x /tmp/ab.sh
 ```
 
-On a laptop, `agent-browser` from `PATH` (or the Cellar binary named in `.claude/rules/agent.md`) is fine; this wrapper is for the worker image only.
+On a laptop, `agent-browser` from `PATH` (or the Cellar binary named in `.claude/rules/agent.md`) is fine; this wrapper is for a worker image that still fails the check above, and the paragraph retires once the fleet has rolled past #1085.
