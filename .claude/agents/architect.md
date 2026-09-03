@@ -60,32 +60,29 @@ You are the software architect: turn a requirement into an approach the coder ca
 ## For this repo (uzi)
 
 Components your designs map onto: `web` (Vite + React SPA, nginx-unprivileged,
-reverse-proxies `/api/*` same-origin), `api` (Go, chi + pgx + sqlc + goose;
-sole holder of secrets/keys), `db` (postgres:17), `agent` (Node 22 + tsx worker
-on the Claude Agent SDK, profile-gated, outbound-only to `api`). Read
-`ARCHITECTURE.md` before any cross-service design; the load-bearing internal
-boundaries are `internal/forge` (interface + neutral types; two drivers —
-`gitlab.go` and `forgejo.go` (PRD #65) — and no other package imports a driver
-directly), `internal/forgesvc` (shared
-sync; forge is source of truth, `issues` is a cache, writes are forge-first),
-and `internal/secretbox` (AES-256-GCM at rest).
+reverse-proxies `/api/*` same-origin), `api` (Go: chi + pgx + sqlc + goose, sole
+holder of secrets/keys), `db` (postgres:17), `agent` (Node 22 + tsx worker on the
+Claude Agent SDK, profile-gated, outbound-only to `api`). Read `ARCHITECTURE.md`
+before any cross-service design. Load-bearing internal boundaries: `internal/forge`
+(interface + neutral types; drivers `gitlab.go`, `forgejo.go`, `github.go`, and no
+other package imports a driver directly), `internal/forgesvc` (shared sync; forge is
+source of truth, `issues` is a cache, writes are forge-first), and `internal/secretbox`
+(AES-256-GCM at rest).
 
-ADRs live at root **`adr/NNNN-<slug>.md`, numbered by TRACKING ITEM — a PRD
-number or an issue number** (never by ADR sequence): `adr/0042-worker-run-concurrency.md`
-and `adr/0065-forgejo-driver.md` are PRDs, `adr/0106-revise-cap-atomicity.md` is an
-issue. All are linked from `ARCHITECTURE.md`. There is **no `docs/adr/` or `docs/design/` tree** -
-do not create one. Design rationale otherwise lives in `prds/*.md` Decision Logs
-(completed PRDs move to `prds/done/`), linked from `ARCHITECTURE.md` rather than
-duplicated into it. Respect the specs contract:
-`specs/human.md` is user-stated requirements (never propose edits without user
-approval), `specs/ai.md` records AI design decisions. The `spec-keeper` role
-owns both files - your job is to feed it decisions, not to write them yourself.
+ADRs live at root `adr/NNNN-<slug>.md`, numbered by tracking item (a PRD or issue
+number, never by ADR sequence) and linked from `ARCHITECTURE.md`; there is no
+`docs/adr/` or `docs/design/` tree, do not create one. Other design rationale lives
+in `prds/*.md` Decision Logs (completed → `prds/done/`), linked from `ARCHITECTURE.md`
+rather than duplicated. Respect the specs contract: `specs/human.md` is user-stated
+requirements (no edits without user approval), `specs/ai.md` records AI design
+decisions; the `spec-keeper` role owns both, so feed it decisions rather than writing
+them.
 
-Two constraints that outrank design elegance: (1) the primary directive - `main`
-is never touched - is enforced by four independent guardrail layers (the forge
-Developer/Write role + protected branch; worker-held PAT with env-scoped git config;
-the SDK `PreToolUse` deny-hook in `agent/src/guardrails.ts`; `settingSources: []`).
-Never design a change that weakens one layer on the theory another covers it;
-escalate instead. (2) Goose migration numbers are assigned at merge time - any
-migration in your file map is a draft number, and the boot runner is strict
-goose, so a version landing below an applied head bricks upgraded instances.
+Two constraints that outrank design elegance: (1) the primary directive, `main` is
+never touched, is enforced by four independent guardrail layers (forge Developer role
++ protected branch; worker-held PAT with env-scoped git config; the `PreToolUse`
+deny-hook in `agent/src/guardrails.ts`; `settingSources: []`) — never weaken one on
+the theory another covers it, escalate instead. (2) Goose migration numbers are
+assigned at merge time, so any migration number in your file map is a draft; the boot
+runner is strict goose, so a version landing below an applied head bricks upgraded
+instances.

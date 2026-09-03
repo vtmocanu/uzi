@@ -116,52 +116,37 @@ unsupported, over-asserted or could-be-sharper is Non-blocking.
 
 ## For this repo (uzi)
 
-**Prune your fold worktrees, or the tree-evidence check reads a ghost.** When you
-fold a non-vacuity mutation in a detached throwaway worktree (`git worktree add
---detach <tmp> <sha>`), remove it with `git worktree remove <tmp>` when you finish,
-and `git worktree prune` if the directory is already gone. A leftover
-directory-gone entry lingers in `git worktree list` — the same command the
-tree-evidence step above reads — so a stale entry reads as a live worktree and
-costs turns to rule out as contamination (measured on PRD #290).
+**Prune your fold worktrees, or the tree-evidence check reads a ghost.** After folding a
+mutation in a detached throwaway worktree (`git worktree add --detach <tmp> <sha>`), `git
+worktree remove <tmp>` when done, and `git worktree prune` if the directory is already gone
+— a lingering directory-gone entry in `git worktree list` reads as a live worktree.
 
-Dead-code slot: **`task deadcode`** — run it, and read what it does *not* cover
-before you conclude anything from a green. Three tools sit in this slot now:
-`golangci-lint unused` (M3, unused **unexported** symbols **within** a Go
-package, inside `task lint:api` / `lint:controller`), `deadcode` (M4,
-cross-package reachability per Go module), and `knip` (M4, unused TS exports,
-files and dependencies). The deletion lens is no longer mostly hand-grep, and
-knip's export/type tier has since been promoted from `warn` to `error` and
-burned to zero (issue #596/#597, 2026-08-29), so a NEW unused export/type
-reddens `task deadcode:web` / `deadcode:agent` naming it — a green there now
-does mean "no new unused export", not merely "no gating tier fired" (DTO and
-contract types kept exported are covered by `ignoreExportsUsedInFile`, not a
-blanket suppression). Two holes remain, each a different shape:
-- **`unused` is ratcheted** (`new-from-merge-base: origin/main` in
-  `.golangci.yml`), so it will not surface pre-existing dead code in files the
-  MR does not touch. `deadcode` is **not** ratcheted: its baselines are
-  committed and EMPTY, so both Go modules are held at zero outright.
-- **Dead *branches* are invisible to all three** — a `case` arm nothing reaches
-  inside a live function is seen by no tool in this slot. No known live instance
-  today: the long-cited `"Task"` case in `web/src/components/RunEvent.tsx` was
-  reclassified 2026-09-01 (grouped with `case "Agent"` and documented in-file as
-  intentional rendering for historical run frames, i.e. reachable). That half of
-  the lens is still yours.
+Dead-code slot: **`task deadcode`** — read what it does *not* cover before concluding
+anything from a green. Three tools sit in this slot: `golangci-lint unused` (unused
+**unexported** symbols within a Go package, inside `task lint:api` / `lint:controller`),
+`deadcode` (cross-package reachability per Go module), and `knip` (unused TS exports, files
+and dependencies). knip's export/type tier gates at `error` and is burned to zero, so a NEW
+unused export/type reddens `task deadcode:web` / `deadcode:agent` naming it — a green there
+means "no new unused export" (DTO and contract types kept exported are covered by
+`ignoreExportsUsedInFile`, not a blanket suppression). Two holes remain:
+- **`unused` is ratcheted** (`new-from-merge-base: origin/main` in `.golangci.yml`), so it
+  will not surface pre-existing dead code in files the MR does not touch. `deadcode` is
+  **not** ratcheted: its baselines are committed and EMPTY, so both Go modules are held at
+  zero outright.
+- **Dead *branches* are invisible to all three** — a `case` arm nothing reaches inside a
+  live function is seen by no tool in this slot. That half of the lens is still yours.
 
-One more thing worth knowing when a change deletes a caller: **the gating Go
-invocation carries `-test`, so a function whose only remaining caller is a test
-is LIVE to it** and `unused` misses it too if it is exported.
-`task deadcode:api:all` / `deadcode:controller:all` drop `-test` and print that
-class (43 and 4, re-derived 2026-08-03 at `1076b133`) — they always exit 0, so
-read the output, not the status. *(PRD #103 M4, 2026-08-02: this paragraph opened "Dead-code slot:
-`none (gap)`", which M4 made false. M3 had already had to correct this same file
-on this same point.)*
+The gating Go invocation carries `-test`, so a function whose only remaining caller is a
+test is LIVE to it, and `unused` misses it too if it is exported. `task deadcode:api:all` /
+`deadcode:controller:all` drop `-test` and print that class; they always exit 0, so read
+the output, not the status.
 
 Authoring rules to enforce: root `CLAUDE.md` and `ARCHITECTURE.md` (read it for any
-cross-service review). Load-bearing invariants to check against: `main` is never touched
-(four independent guardrail layers — don't let a change weaken one); the forge is the
-source of truth and `issues` is a cache (writes are forge-first, failed move = snap-back);
-no package imports a forge driver directly — only through `internal/forge` (drivers:
-`gitlab.go`, `forgejo.go`); goose migrations are strict (no allow-missing) so a version
+cross-service review). Invariants to check against: `main` is never touched (four
+independent guardrail layers — don't let a change weaken one); the forge is the source of
+truth and `issues` is a cache (writes are forge-first, failed move = snap-back); no package
+imports a forge driver directly, only through `internal/forge` (drivers `gitlab.go`,
+`forgejo.go`, `github.go`); goose migrations are strict (no allow-missing) so a version
 below the applied head bricks boot; builtin agent templates in
 `api/internal/agenttmpl/builtins/` are decoupled from `.claude/agents/`, and no test may
 assert on the `.claude/agents/` roster shape. A route/DTO/behavior change that only touches

@@ -80,24 +80,20 @@ not just what you changed.
 
 ## For this repo (uzi)
 
-Docs are plain markdown under `docs/*.md` with leading frontmatter (`title`,
-`order`, `audience`); only `audience: user` pages render in-app at `/docs/:slug`,
-and `web/scripts/check-docs.mjs` (runs in `npm run build`) fails on bad frontmatter,
-duplicate `order`, or broken relative links — see `docs/README.md`. `ARCHITECTURE.md`
-exists at root and is the cross-service map; keep it current when a change moves a
-boundary, and link the PRD/ADR rather than duplicating rationale. Design rationale
-lives in `prds/*.md` (Decision Logs; completed → `prds/done/`) and root
-`adr/NNNN-<slug>.md` numbered by PRD number. **`CHANGELOG.md` EXISTS at the root and is actively maintained** — `[Unreleased]`
-collects everything since the last tag, and `.github/workflows/release.yml` **gates the release tag on
-it describing the release** (`chore/changelog-coverage-gate`, `c2847d82`), so an entry is
-not optional bookkeeping. *(Corrected 2026-07-27: this line read "There is no
-`CHANGELOG.md`: releases are `v*` tags — do not create one unless the user asks", which
-the judge flagged twice and which would have had a release run skip or contradict the
-`[Unreleased]` section. `.claude/agents/release.md` carried the same claim.)*
+Docs are plain markdown under `docs/*.md` with leading frontmatter (`title`, `order`,
+`audience`); only `audience: user` pages render in-app at `/docs/:slug`, and
+`web/scripts/check-docs.mjs` (runs in `npm run build`) fails on bad frontmatter, duplicate
+`order`, or broken relative links — see `docs/README.md`. `ARCHITECTURE.md` is the
+cross-service map; keep it current when a change moves a boundary, and link the PRD/ADR
+rather than duplicating rationale. Design rationale lives in `prds/*.md` (Decision Logs;
+completed → `prds/done/`) and root `adr/NNNN-<slug>.md` numbered by PRD number.
 
-**Its style is NOT the library's terse one-liner.** Entries here are a **bold lead
-sentence stating the user-visible outcome, followed by a paragraph** giving the mechanism,
-the trade-off, or the caveat a reader would otherwise rediscover — with the issue number
-in parentheses. Match the file, not the generic guidance: read the existing `[Unreleased]`
+**`CHANGELOG.md` exists at the root and is actively maintained.** `[Unreleased]` collects
+everything since the last tag, and `.github/workflows/release.yml` gates the release tag on
+the CHANGELOG describing the release, so an entry is not optional bookkeeping. Its style is
+NOT the library's terse one-liner: a **bold lead sentence stating the user-visible outcome,
+followed by a paragraph** giving the mechanism, trade-off, or caveat a reader would
+otherwise rediscover, with the issue number in parentheses. Read the existing `[Unreleased]`
 entries before writing. Releases are `v*` tags (CI publishes the images + Helm chart) and
-the releaser folds `[Unreleased]` into the cut version. New CLI-facing behavior may need a matching `docs/cli.md` + `api/cmd/uzi/` update.
+the releaser folds `[Unreleased]` into the cut version. New CLI-facing behavior may need a
+matching `docs/cli.md` + `api/cmd/uzi/` update.

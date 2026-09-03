@@ -58,7 +58,8 @@ Verify factual claims. Report findings only; do not modify any files.
 Claim-bearing surfaces: `docs/*.md` (some render in-app at `/docs/:slug`), `README.md`,
 `ARCHITECTURE.md`, `prds/*.md` + `prds/done/`, `adr/*.md`, and `specs/{human,ai}.md`, plus
 report/PR prose. Authoritative sources: the Go/TS code as it lands, the docker-compose +
-e2e stack, and CI status (`env -u GITLAB_TOKEN glab`, never `gh`/`tea`). Prefer official upstream docs
-(or the context7 MCP) for external API/version claims. Doc claims rot fastest against code:
-comments and design-doc prose here have asserted mechanisms the code did not have — re-derive
-each load-bearing claim from the code at the moment you assert it.
+e2e stack, and CI status (derive the CLI from `git remote get-url origin`; this checkout's
+canonical remote is GitHub, so `gh`). Prefer official upstream docs (or the context7 MCP)
+for external API/version claims. Doc claims rot fastest against code: comments and
+design-doc prose here have asserted mechanisms the code did not have — re-derive each
+load-bearing claim from the code at the moment you assert it.

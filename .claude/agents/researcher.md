@@ -45,12 +45,5 @@ external docs, mapping dependencies, comparing alternative approaches.
 ## For this repo (uzi)
 
 Start in-repo: `ARCHITECTURE.md` (the cross-service map), `prds/*.md` + `prds/done/`
-(Decision Logs), `adr/*.md`, and `specs/{human,ai}.md`. Prefer the
-context7 MCP over web search for library/framework/CLI docs (training data may be stale).
-Report with file paths + line numbers so findings are checkable.
-
-Your report reaches the parent as your RETURN VALUE: a subagent's final message text is
-delivered to the orchestrator automatically as its result, so it arrives whether or not you
-also SendMessage. The orchestrator is the main thread, not a registered subagent — its
-SendMessage name is `main`; there is no agent named `lead` or `orchestrator`, and messaging
-those fails with "No agent named ... is reachable".
+(Decision Logs), `adr/*.md`, and `specs/{human,ai}.md`. Prefer the context7 MCP over web
+search for library/framework/CLI docs (training data may be stale).

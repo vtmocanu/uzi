@@ -120,53 +120,45 @@ real browser, not by reading code. Report findings only; never modify code.
 
 ## For this repo
 
-The SPA lives in `web/` (Vite/React/Tailwind, ember design tokens as CSS
-variables in `web/src/index.css` — flag hardcoded palette classes as token
-violations).
+The SPA lives in `web/` (Vite/React/Tailwind, ember design tokens as CSS variables in
+`web/src/index.css` — flag hardcoded palette classes as token violations).
 
-**The app is deliberately dark-only** — "a dark factory", declared in
-`web/src/index.css`. There is no light mode, so a dispatch framing a change as a
-"light + dark" pass is wrong on its face; do not open by reorienting around it,
-just validate the dark UI. It ships TWO dark themes selected by a `[data-theme]`
-attribute: the default **ember** (molten-orange on near-black) and **mission**
-(an ops-console blue set), both `color-scheme: dark`. Check appearance against
-those two themes, never against a light/dark split.
+**The app is deliberately dark-only** — "a dark factory", declared in `web/src/index.css`.
+There is no light mode, so a dispatch framing a change as a "light + dark" pass is wrong on
+its face; do not reorient around it, just validate the dark UI. It ships TWO dark themes
+selected by a `[data-theme]` attribute: the default **ember** (molten-orange on near-black)
+and **mission** (an ops-console blue set), both `color-scheme: dark`. Check appearance
+against those two themes, never against a light/dark split.
 
-**Chromium in the worker needs `--no-sandbox`.** Launches abort on the SUID
-sandbox otherwise. The launcher shim usually injects the flag, but if a browser
-launch fails that way, pass `--no-sandbox` explicitly instead of rediscovering
-it each run.
+**Chromium in the worker needs `--no-sandbox`** or launches abort on the SUID sandbox. The
+launcher shim usually injects the flag; if a browser launch fails that way, pass
+`--no-sandbox` explicitly rather than rediscovering it each run.
 
-**A zero-backend demo build exists: `VITE_UZI_MOCK=1`, servable via
-`web/Dockerfile.mock`.** It needs no database, no API and no compose stack, which
-makes it the default way to validate this repo's UI. The real stack serves on a
-per-checkout compose project (ask the lead for the URL). Never run a bare
-`docker compose up` with the repo's real `.env` — see the never-glob-`uzi-` rule
-in CLAUDE.md.
+**A zero-backend demo build exists: `VITE_UZI_MOCK=1`, servable via `web/Dockerfile.mock`.**
+It needs no database, API or compose stack, which makes it the default way to validate this
+repo's UI. The real stack serves on a per-checkout compose project (ask the lead for the
+URL). Never run a bare `docker compose up` with the repo's real `.env` (see the
+never-glob-`uzi-` rule in `CLAUDE.md`). **"No reachable instance" is usually false here** —
+if a dispatch says no instance is available, check for the mock above before accepting it.
 
-**"No reachable instance" is the reason this role most often goes undispatched
-here, and it is usually false.** On 2026-07-21 a PRD that built an entire new page
-(M3) and changed a notification journey (M5) shipped with no browser pass at all,
-because the lead judged that web-ux needed a running stack — while the mock build
-named two paragraphs above sat in this very file. If a dispatch tells you no
-instance is available, check for the mock before accepting it.
+**Screenshots/a11y dumps: write them to a scratch dir OUTSIDE the repo worktree** (the
+session scratchpad, or `/tmp`) so the tree you're validating stays clean. You run on the
+host here with no worker file-access guardrail, so the generic "prefer outside the worktree"
+guidance applies directly — the "never `/tmp`" constraint is the *product worker's* (see
+`api/internal/agenttmpl/builtins/web-ux.md`) and does not bind this dev-team file.
 
-**Screenshots/a11y dumps: write them to a scratch dir OUTSIDE the repo worktree**
-(the session scratchpad, or `/tmp`) so the tree you're validating stays clean. You
-run on the host here, with no worker file-access guardrail, so the generic "prefer
-outside the worktree" guidance above applies directly — the "never `/tmp`"
-constraint is the *product worker's* (see `api/internal/agenttmpl/builtins/web-ux.md`),
-and does not bind this dev-team file.
+**Reaching the onboarding card in the mock.** The mock seeds all four dashboard onboarding
+preconditions as already satisfied, so the "Get the factory running" card is hidden by
+default. To exercise it, mutate state through the UI to un-satisfy a precondition — never by
+editing the URL or reloading, which resets the in-memory mock and re-seeds it. A headless
+browser against `VITE_UZI_MOCK=1 npm run dev` works and can read computed styles, which
+makes a visual criterion here genuinely verifiable rather than hand-waved.
 
-**Reaching the onboarding card in the mock.** The mock seeds all four dashboard
-onboarding preconditions as already satisfied, so the "Get the factory running" card is
-hidden by default. To exercise it, mutate state through the UI to un-satisfy a
-precondition — never by editing the URL or reloading, which resets the in-memory mock and
-re-seeds it. A headless browser against `VITE_UZI_MOCK=1 npm run dev` does work and can
-read computed styles, which is what makes a visual criterion here genuinely verifiable
-rather than hand-waved.
-
-**On a hosted worker, run `agent-browser --version` once before anything else.** If it works, use `agent-browser` from `PATH` and skip the rest of this paragraph. If it fails with `ld-linux-x86-64.so.2: No such file`, the image predates the #1082 fix (PR #1085: the launcher picked the glibc build because a provisioned nix profile put a GNU `ldd` ahead of the musl one); do not debug it, write this wrapper once and use it for every call:
+**On a hosted worker, run `agent-browser --version` once before anything else.** If it
+works, use `agent-browser` from `PATH` and skip the rest of this paragraph. If it fails with
+`ld-linux-x86-64.so.2: No such file`, the image predates the #1082 fix (PR #1085: the
+launcher picked the glibc build because a provisioned nix profile put a GNU `ldd` ahead of
+the musl one); do not debug it, write this wrapper once and use it for every call:
 
 ```sh
 cat > /tmp/ab.sh <<'SH'
@@ -182,4 +174,6 @@ SH
 chmod +x /tmp/ab.sh
 ```
 
-On a laptop, `agent-browser` from `PATH` (or the Cellar binary named in `.claude/rules/agent.md`) is fine; this wrapper is for a worker image that still fails the check above, and the paragraph retires once the fleet has rolled past #1085.
+On a laptop, `agent-browser` from `PATH` (or the Cellar binary named in
+`.claude/rules/agent.md`) is fine; this wrapper is for a worker image that still fails the
+check above, and the paragraph retires once the fleet has rolled past #1085.

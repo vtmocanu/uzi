@@ -79,22 +79,21 @@ a read-only UX reviewer, you decide and you ship.
   dispatch, surface that rather than guessing.
 
 ## For this repo
-- Product: uzi (Uzinele Întunecate), an AI dark factory. React SPA in `web/`
-  (Vite + Tailwind + TypeScript), Go API in `api/`. Read `ARCHITECTURE.md` for
-  the five product surfaces (board/web, forge, worker/run lane, Slack, chat) and
-  `CLAUDE.md` + `.claude/rules/web.md` before UI work.
-- The `frontend-design` skill lives at `.claude/skills/frontend-design/` —
-  invoke it via the Skill tool.
-- Run the UI in mock mode (no backend) to design and drive-test:
-  `cd web && VITE_UZI_MOCK=1 npm run dev -- --port <port>`; mock scenarios and
-  fixtures live under `web/src/mocks/`. Drive it with agent-browser. Read
-  `.claude/rules/web.md` for the live-stack `vite preview` hazard and the
-  blind-browser-instrument pitfalls.
-- Gate before reporting done: `task gate:web` (deps/lint/deadcode/check-docs/
-  typecheck/vitest). Design tokens/styles live in `web/src/index.css` + the
-  Tailwind config; shared UI primitives in `web/src/components/ui.tsx` and
-  `icons.tsx`.
-- Product IA constraints the user has stated (keep unless told otherwise):
-  boards stay visible in the sidebar. Destructive-op guardrails in `CLAUDE.md`
-  apply: never `docker compose down`, never glob `uzi-` containers, name any
-  throwaway outside the `uzi-` namespace.
+- Product: uzi (Uzinele Întunecate), an AI dark factory. React SPA in `web/` (Vite +
+  Tailwind + TypeScript), Go API in `api/`. Read `ARCHITECTURE.md` for the five product
+  surfaces (board/web, forge, worker/run lane, Slack, chat) and `CLAUDE.md` +
+  `.claude/rules/web.md` before UI work.
+- The `frontend-design` skill lives at `.claude/skills/frontend-design/` — invoke it via
+  the Skill tool.
+- Run the UI in mock mode (no backend) to design and drive-test: `cd web && VITE_UZI_MOCK=1
+  npm run dev -- --port <port>`; mock scenarios and fixtures live under `web/src/mocks/`.
+  Drive it with agent-browser. Read `.claude/rules/web.md` for the live-stack `vite preview`
+  hazard and the blind-browser-instrument pitfalls.
+- Gate before reporting done: `task gate:web`
+  (deps/lint/deadcode/check-docs/typecheck/vitest). Design tokens/styles live in
+  `web/src/index.css` + the Tailwind config; shared UI primitives in
+  `web/src/components/ui.tsx` and `icons.tsx`.
+- Product IA constraints the user has stated (keep unless told otherwise): boards stay
+  visible in the sidebar. Destructive-op guardrails in `CLAUDE.md` apply: never `docker
+  compose down`, never glob `uzi-` containers, name any throwaway outside the `uzi-`
+  namespace.

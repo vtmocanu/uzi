@@ -93,40 +93,37 @@ rendered, not by reading code. Report findings only; never modify code.
 
 ## For this repo
 
-uzi's TUI is the `uzi` CLI (`api/cmd/uzi/tui_*.go`): **bubbletea v2 + lipgloss
-v2**, with glamour for markdown. The board, detail, review, lanes and steer
-views are `tui_board.go` / `tui_detail.go` / `tui_review.go` / `tui_lanes.go` /
-`tui_steer.go`; the shared palette + render primitives are `tui_render.go`.
+uzi's TUI is the `uzi` CLI (`api/cmd/uzi/tui_*.go`): **bubbletea v2 + lipgloss v2**, with
+glamour for markdown. The board, detail, review, lanes and steer views are `tui_board.go` /
+`tui_detail.go` / `tui_review.go` / `tui_lanes.go` / `tui_steer.go`; the shared palette +
+render primitives are `tui_render.go`.
 
-**Render harness (this is how you SEE it):** `cd api/cmd/uzi/uxlab && devbox run
-build` regenerates the ANSI frames (an env-gated `uxlab_gen_test.go` drives the
-REAL shipped `tuiModel` offline, no server/PTY) AND the PNGs (charmbracelet/
-freeze, light + dark, ~19 scenes) under `uxlab/png/`. Read `png/<scene>-dark.png`
-and `png/<scene>-light.png`. `devbox run gen` / `render` are the two halves;
-after a code change run the FULL `devbox run build` and confirm the PNG mtimes
-are newer than the frames (a timed-out render leaves stale PNGs). Interactive
-drive-testing: `cd api && go run ./cmd/uzi tui --demo` (a hidden flag that runs
+**Render harness (this is how you SEE it):** `cd api/cmd/uzi/uxlab && devbox run build`
+regenerates the ANSI frames (an env-gated `uxlab_gen_test.go` drives the REAL shipped
+`tuiModel` offline, no server/PTY) AND the PNGs (charmbracelet/freeze, light + dark, ~19
+scenes) under `uxlab/png/`. Read `png/<scene>-dark.png` and `png/<scene>-light.png`. `devbox
+run gen` / `render` are the two halves; after a code change run the FULL `devbox run build`
+and confirm the PNG mtimes are newer than the frames (a timed-out render leaves stale PNGs).
+Interactive drive-testing: `cd api && go run ./cmd/uzi tui --demo` (a hidden flag that runs
 the real model over seeded fixtures + a fake stream, no server).
 
-**The control-byte (terminal-injection) lens is live here and load-bearing.**
-Untrusted cells are drawn through `m.renderer.Plain` (= `capCell(cellText(s))`;
-`cellText` is the control-byte stripper, a bare `capCell` is NOT enough). The
-guard is the `d7UntrustedFields` set (`tui_d7_guard_test.go`) plus a
-hostile-value render test (`tui_model_test.go`, e.g.
-`TestTUIViewsStripControlBytesFromUntrustedText`). A new untrusted board/detail
-field drawn without going through `Plain` and without being added to that guard
-is a Blocking finding — a clean-fixture screenshot cannot catch it.
+**The control-byte (terminal-injection) lens is live here and load-bearing.** Untrusted
+cells are drawn through `m.renderer.Plain` (= `capCell(cellText(s))`; `cellText` is the
+control-byte stripper, a bare `capCell` is NOT enough). The guard is the `d7UntrustedFields`
+set (`tui_d7_guard_test.go`) plus a hostile-value render test (`tui_model_test.go`, e.g.
+`TestTUIViewsStripControlBytesFromUntrustedText`). A new untrusted board/detail field drawn
+without going through `Plain` and without being added to that guard is a Blocking finding —
+a clean-fixture screenshot cannot catch it.
 
-**NO_COLOR:** the status spine carries a per-status glyph (● running, ! awaiting,
-~ limit_wait, ✓ completed, ✗ failed, · pending) so the signal survives when
-lipgloss strips the fill; verify by rendering through the colorprofile Ascii/
-NoTTY path, not the truecolor frame.
+**NO_COLOR:** the status spine carries a per-status glyph (● running, ! awaiting, ~
+limit_wait, ✓ completed, ✗ failed, · pending) so the signal survives when lipgloss strips
+the fill; verify by rendering through the colorprofile Ascii/NoTTY path, not the truecolor
+frame.
 
-**Automatable seam:** `tui_render_test.go` / `tui_model_test.go` drive the
-`Update→msg` / `View()→string` seam with substring and SGR-escape assertions —
-that is the deterministic CI check for a colour/layout/banner property (a
-screenshot cannot gate). Point the coder there for anything your review found.
+**Automatable seam:** `tui_render_test.go` / `tui_model_test.go` drive the `Update→msg` /
+`View()→string` seam with substring and SGR-escape assertions — the deterministic CI check
+for a colour/layout/banner property (a screenshot cannot gate). Point the coder there.
 
-Never `docker compose down` anything and never glob `uzi-` containers (root
-`CLAUDE.md` Destructive operations); see `.claude/rules/tui.md` for the harness
-pointer and `.claude/rules/go.md` for the Go gate.
+Never `docker compose down` anything and never glob `uzi-` containers (root `CLAUDE.md`
+Destructive operations); see `.claude/rules/tui.md` for the harness pointer and
+`.claude/rules/go.md` for the Go gate.

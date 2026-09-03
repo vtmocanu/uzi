@@ -106,65 +106,42 @@ top-10 class issues. Report findings only; do not modify code.
 
 ## For this repo (uzi)
 
-**Prune your fold worktrees, or the tree-evidence check reads a ghost.** When you
-fold a non-vacuity mutation in a detached throwaway worktree (`git worktree add
---detach <tmp> <sha>`), remove it with `git worktree remove <tmp>` when you finish,
-and `git worktree prune` if the directory is already gone. A leftover
-directory-gone entry lingers in `git worktree list` — the same command the
-tree-evidence step above reads — so a stale entry reads as a live worktree and
-costs turns to rule out as contamination (measured on PRD #290).
+**Prune your fold worktrees, or the tree-evidence check reads a ghost.** After folding
+a mutation in a detached throwaway worktree (`git worktree add --detach <tmp> <sha>`),
+`git worktree remove <tmp>` when done, and `git worktree prune` if the directory is
+already gone — a lingering directory-gone entry in `git worktree list` reads as a live
+worktree.
 
-Security-scan slot: **secrets AND dependency vulnerabilities are both covered as
-of PRD #103 M5 — MR-B for secrets, MR-C (`fce6a06d`) for dependencies.**
-`task scan:secrets` (gitleaks) runs inside
-`gate:repo`, inside `task gate`, wrapped in `scripts/scan-secrets.sh` — which
-plants its own canary tokens and exits 2 if either goes undetected, so a
-disarmed or misconfigured scanner fails loud rather than reporting a false
-clean. **It is now the tester's slot, not yours**: it runs on every `task gate`
-the tester already runs, unlike the general case above where a scanner exists
-but nothing else invokes it.
+Secrets and dependency vulnerabilities are both covered. `task scan:secrets` (gitleaks)
+runs inside `gate:repo`, inside `task gate`, wrapped in `scripts/scan-secrets.sh`, which
+plants its own canary tokens and exits 2 if either goes undetected — so a disarmed
+scanner fails loud. **It is the tester's slot, not yours**: it runs on every `task gate`
+the tester already runs.
 
-**`govulncheck` and `npm audit` now exist too** (`fce6a06d`), as
-`scripts/govulncheck-gate.sh` and `scripts/npm-audit-gate.sh`, invoked from
-`Taskfile.yml` targets that CI calls as extra script lines on
-`validate:{api,controller,web,agent}`. **They are deliberately NOT in `task gate`
-or any `gate:*`** — their verdict is a function of a remote mutable database
-rather than of the tree, so a contributor's gate would answer differently on two
-runs of one commit. Run them explicitly when auditing. **Neither has a canary**,
-unlike gitleaks: `npm audit` has no in-band observation separating an armed run
-from a disarmed one, so both scripts instead *refuse* the environment variables
-that shrink their view (`GOPACKAGESDRIVER`, `GOFLAGS=-tags`, and
-`--include=dev` outranking `NPM_CONFIG_OMIT`). A refusal exits **2**, never 1.
+`govulncheck` and `npm audit` exist as `scripts/govulncheck-gate.sh` and
+`scripts/npm-audit-gate.sh`, invoked from `Taskfile.yml` targets CI calls on
+`validate:{api,controller,web,agent}`. They are deliberately **NOT in `task gate` or any
+`gate:*`** — their verdict is a function of a remote mutable database, not the tree — so
+run them explicitly when auditing. Neither has a canary; instead both *refuse* the
+environment variables that shrink their view (`GOPACKAGESDRIVER`, `GOFLAGS=-tags`, and
+`--include=dev` outranking `NPM_CONFIG_OMIT`), a refusal exiting **2**, never 1. **Do not
+report either as a gap.** The one real residual is two **moderate** react-router
+advisories in `web`'s runtime dependency, deliberately ungating under `--audit-level=high`
+and filed as their own issue (no patched 6.x exists). Their reachability was audited: the
+constructor-injection advisory is structurally unreachable here (no
+`createBrowserRouter`/`createHashRouter`/`RouterProvider`, no SSR), and both open-redirect
+ones are blocked at the only attacker-controlled sink by `safeNextPath`, which rejects the
+backslash vector and is tested.
 
-**Do not report either half as a gap.** The one real residual is two
-**moderate** react-router advisories in `web`'s runtime dependency, deliberately
-ungating under `--audit-level=high` and filed as their own issue — no patched
-6.x exists, so clearing them needs a router major. Their reachability was
-audited: the constructor-injection advisory is structurally unreachable here (no
-`createBrowserRouter`/`createHashRouter`/`RouterProvider` anywhere, no SSR) and
-both open-redirect ones are blocked at the only attacker-controlled sink by
-`safeNextPath`, which rejects the backslash vector specifically and is tested.
-
-*(This paragraph previously said the two tools "still do not exist" and that
-**Success Criterion 5 — which names gitleaks *and* `govulncheck` *and*
-`npm audit` in one sentence — is not yet met**. The first half went stale with
-`fce6a06d`. The second half was never true of the criterion's text: SC5 reads
-only "`.claude/agents/auditor.md` no longer documents the absence of a secret
-scanner, because one runs", and the whole Success Criteria section contains zero
-occurrences of any of the three tool names. The three-tool reading was repeated
-in five documents including this one; the PRD is being amended to make it true
-rather than the five restatements amended to match.)* One thing worth knowing before you read a gate log rather
-than a report: gitleaks does not honour `.gitignore`, so in an agent worktree
-it prints an untracked, non-gating NOTE for `.entire/…/full.jsonl` (the
-harness's own session transcript) — that is not a finding, see
-`docs/dev-conventions.md`. Public GitHub repo; CI (`.github/workflows/ci.yml`) runs
-validate/test/build across api/controller/web/agent. Hot spots: secrets reach processes via
-env only (never argv/images/committed files); `api/internal/secretbox` seals forge PATs +
-per-user Anthropic tokens (AES-256-GCM keyed by `UZI_SECRET_KEY`, refuse-to-start on a
-placeholder key); every forge error passes a PAT-scrubbing redactor; outbound base URLs
-are allowlisted (`FORGE_ALLOWED_BASE_URLS`, https-only SSRF guard); nginx overwrites
-`X-Forwarded-For` and `api` trusts it only from `TRUSTED_PROXIES`; worker join tokens are
-sha256-at-rest, Bearer-only, with no cookies/CSRF on `/api/worker/*`. The primary directive
-is `main` is never touched — four independent guardrail layers (see `ARCHITECTURE.md`);
-flag anything that weakens one on the theory another covers it. For this AI/agent system,
-watch prompt/tool-output injection from untrusted repo content into model instructions.
+gitleaks does not honour `.gitignore`, so in an agent worktree it prints an untracked,
+non-gating NOTE for `.entire/…/full.jsonl` (the harness's own session transcript) — not a
+finding, see `docs/dev-conventions.md`. Public GitHub repo; CI (`.github/workflows/ci.yml`)
+runs validate/test/build across api/controller/web/agent. Hot spots: secrets reach
+processes via env only (never argv/images/committed files); `api/internal/secretbox` seals
+forge PATs + per-user Anthropic tokens (AES-256-GCM keyed by `UZI_SECRET_KEY`,
+refuse-to-start on a placeholder key); every forge error passes a PAT-scrubbing redactor;
+outbound base URLs are allowlisted (`FORGE_ALLOWED_BASE_URLS`, https-only SSRF guard);
+nginx overwrites `X-Forwarded-For` and `api` trusts it only from `TRUSTED_PROXIES`; worker
+join tokens are sha256-at-rest, Bearer-only, no cookies/CSRF on `/api/worker/*`; `main` is
+never touched (four independent guardrail layers, see `ARCHITECTURE.md`); watch prompt/
+tool-output injection from untrusted repo content into model instructions.

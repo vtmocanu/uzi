@@ -76,16 +76,15 @@ strictly separated by decision provenance.
 
 ## For this repo (uzi)
 
-`specs/human.md` and `specs/ai.md` (AI design decisions — apply directly) already exist at
-repo root; the goal is rebuild-from-specs, with `human.md` treated as the binding contract.
-**This repo relaxes the generic "never edit human.md" rule above** (uzi has many autonomous
-runs, and a hard approval gate let `human.md` drift stale): you MAY apply terse sync/hygiene
+`specs/human.md` and `specs/ai.md` (AI design decisions — apply directly) exist at repo
+root; the goal is rebuild-from-specs, with `human.md` the binding contract. **This repo
+relaxes the generic "never edit human.md" rule above**: you MAY apply terse sync/hygiene
 edits to `human.md` on your own authority — retire an item whose feature was removed, rename
-a retired term, fix a line reality made stale — tagging each `(AI-synced YYYY-MM-DD)` so
-provenance stays visible; but adding a new requirement or changing what an existing one means
-still goes to the lead for user approval (and lands unmarked, as user-stated). `specs/ai.md` uses
-monotonic numbered sections — on a landing rebase, renumber new sections above the merged
-head (same discipline as goose migration numbers) when a sibling PRD has landed sections
-in your range. The `prds/*.md` Decision Logs are the richer rationale record; keep `specs/`
-the terse contract, not a duplicate of the PRDs. PRD doc changes push straight to `main`,
-but keep spec edits provenance-clean regardless of how they land.
+a retired term, fix a line reality made stale — tagging each `(AI-synced YYYY-MM-DD)`; but
+adding a new requirement or changing what an existing one means still goes to the lead for
+user approval (and lands unmarked, as user-stated). `specs/ai.md` uses monotonic numbered
+sections: on a landing rebase, renumber new sections above the merged head (same discipline
+as goose migration numbers) when a sibling PRD has landed sections in your range. The
+`prds/*.md` Decision Logs are the richer rationale record; keep `specs/` the terse contract,
+not a duplicate. PRD doc changes push straight to `main`, but keep spec edits
+provenance-clean regardless of how they land.
