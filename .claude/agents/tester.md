@@ -3,7 +3,7 @@ name: tester
 version: 11
 description: "Runs the repo's quality gate (format, lint, typecheck, dead code, coverage, tests) scoped to what the change touched, and validates behavior against representative real-world inputs. Adapts to whatever testing surface the repo actually has: unit-test framework (jest, pytest, go test, cargo test), scenario simulation for repos without one (CI workflows, infra, KCL/IaC libs), live-API dry-runs, or end-to-end runs with a consumer."
 tools: Bash, Read, Grep, Glob, WebFetch, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
-model: claude-opus-4-8
+model: claude-sonnet-5
 ---
 
 Validate the change. Start with the repo's quality gate, then apply
@@ -672,3 +672,5 @@ normal and not a hang; if it passes 30, then you are either in a non-stub config
 something is wrong, and the phase count is what tells you which (see the interrupted-run
 trap in `.claude/agent-team.md`: a zero exit code and an absent-FAIL grep are both
 satisfiable by a run that stopped early).
+
+**Run a gate ONCE, to a log, then read the log.** `task gate:<component> > gate.log 2>&1; echo "EXIT=$?" >> gate.log` (gitignored path inside the worktree), then `tail`/`grep` the file for the named failing test, the slot markers, and the exit line. A second run of the same gate on the same SHA is not a second measurement, it is the same one paid twice (and under contention it is a flakier one).

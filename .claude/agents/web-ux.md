@@ -213,3 +213,19 @@ precondition — never by editing the URL or reloading, which resets the in-memo
 re-seeds it. A headless browser against `VITE_UZI_MOCK=1 npm run dev` does work and can
 read computed styles, which is what makes a visual criterion here genuinely verifiable
 rather than hand-waved.
+
+**On a hosted worker, `agent-browser` needs the musl binary and an explicit browser path (issue #1082).** `/usr/local/bin/agent-browser` execs the glibc build, which fails with `ld-linux-x86-64.so.2: No such file`. Do not debug it; write this wrapper once and use it for every call:
+
+```sh
+cat > /tmp/ab.sh <<'SH'
+#!/bin/sh
+export AGENT_BROWSER_EXECUTABLE_PATH="${AGENT_BROWSER_EXECUTABLE_PATH:-/opt/uzi-toolchain/bin/chromium}"
+export AGENT_BROWSER_ARGS="${AGENT_BROWSER_ARGS:---no-sandbox,--disable-dev-shm-usage}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/ab-$(id -u)/config}"; export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/ab-$(id -u)/cache}"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+exec /app/node_modules/agent-browser/bin/agent-browser-linux-musl-x64 "$@"
+SH
+chmod +x /tmp/ab.sh
+```
+
+On a laptop, `agent-browser` from `PATH` (or the Cellar binary named in `.claude/rules/agent.md`) is fine; this wrapper is for the worker image only.

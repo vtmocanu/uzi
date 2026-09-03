@@ -3,7 +3,7 @@ name: researcher
 version: 4
 description: Investigates the codebase or external sources to gather context. Reports findings only.
 tools: Bash, Read, Grep, Glob, WebFetch, WebSearch, SendMessage, TaskUpdate, TaskList, TaskGet
-model: claude-opus-4-8
+model: claude-sonnet-5
 ---
 
 Investigate and report findings only. Do not modify any files.

@@ -262,3 +262,5 @@ When a uzi worker runs this repo it installs the JS deps (`web/`, `agent/`) in t
 background as the run starts, so do not run your own `npm ci` / `npm install` (`npm ci`
 deletes `node_modules` before reinstalling, and either races that install); if a targeted
 test fails on a missing module, report it rather than installing.
+
+**Run a gate ONCE, to a log, then read the log.** `task gate:<component> > gate.log 2>&1; echo "EXIT=$?" >> gate.log` (gitignored path inside the worktree), then `tail`/`grep` the file. Never run the same gate a second time just to read its output differently: on run `02854d5e` coders ran `gate:api` back-to-back four times (`| tail -40`, then `> log` to grep), ~2 min and a full context re-read each. One run, one file, every read from it.
