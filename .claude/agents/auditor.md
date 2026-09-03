@@ -115,8 +115,8 @@ worktree.
 Secrets and dependency vulnerabilities are both covered. `task scan:secrets` (gitleaks)
 runs inside `gate:repo`, inside `task gate`, wrapped in `scripts/scan-secrets.sh`, which
 plants its own canary tokens and exits 2 if either goes undetected — so a disarmed
-scanner fails loud. **It is the tester's slot, not yours**: it runs on every `task gate`
-the tester already runs.
+scanner fails loud. **The slot is yours**: run `task scan:secrets` and report the "canaries DETECTED" line, not just rc=0. `gate:repo` runs it on every `task gate`
+the tester already runs, so a green there covers the tree, but that green is not your report.
 
 `govulncheck` and `npm audit` exist as `scripts/govulncheck-gate.sh` and
 `scripts/npm-audit-gate.sh`, behind the `vulncheck:{api,controller,web,agent}` targets in
