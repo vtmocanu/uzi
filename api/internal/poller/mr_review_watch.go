@@ -156,14 +156,14 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	ref := cand.Ref.String
 	mrIID := cand.MrIid.Int64
 
-	// The candidate query only yields agent/issue-N branches, but the halt comment
-	// targets the ISSUE (there is no MR-note write in the interface), so a ref that
-	// does not parse to an issue iid is skipped entirely (defensive).
+	// Scheduled-run branches (`uzi/prompt-…`, `uzi/self-improve/…`) do not parse to an
+	// issue iid, and that is now EXPECTED (PRD #908): the rework still fires for them —
+	// only the halt ISSUE COMMENT is suppressed, since there is no issue to comment on
+	// and the Forge interface has no MR-note write. The inbox notification carries the
+	// halt instead (notifyHalt fires for both branch shapes). When !ok, issueIID is 0,
+	// which is fine for the notification payload. For an `agent/issue-N` branch the parse
+	// still succeeds and the halt comment still posts (issue-run behavior unchanged).
 	issueIID, ok := issueIIDFromBranch(ref)
-	if !ok {
-		slog.Warn("poller: mr-rework unparseable ref", "repo", r.PathWithNamespace, "ref", ref)
-		return
-	}
 
 	// GATE 1 — GREEN HEAD PIPELINE. The head pipeline for the branch (from the cache
 	// SyncPipelines wrote this tick) must be green. A red, absent, or in-flight
@@ -247,9 +247,11 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 				slog.Error("poller: mr-rework set halt-notified", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 				return
 			}
-			if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, issueIID, mrReworkHaltCommentBody(capLimit, mrIID)); err != nil {
-				// Already PAT-redacted; the latch is set, so the comment is lost, not retried.
-				slog.Warn("poller: mr-rework halt comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+			if ok {
+				if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, issueIID, mrReworkHaltCommentBody(capLimit, mrIID)); err != nil {
+					// Already PAT-redacted; the latch is set, so the comment is lost, not retried.
+					slog.Warn("poller: mr-rework halt comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+				}
 			}
 			d.notifyHalt(ctx, cand, issueIID, capLimit)
 		}

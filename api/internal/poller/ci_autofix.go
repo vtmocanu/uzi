@@ -114,14 +114,14 @@ func (d *CIAutoFix) detect(ctx context.Context, r store.ListEnabledReposWithConn
 func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge, cand store.ListCIAutofixCandidateRefsRow) {
 	ref := cand.Ref.String
 
-	// The candidate query already guarantees an agent MR branch, but never post on a
-	// ref that does not parse to an issue iid (defensive — the issue comment target is
-	// derived from it). An unparseable ref is skipped entirely.
+	// Scheduled-run branches (`uzi/prompt-…`, `uzi/self-improve/…`) do not parse to an
+	// issue iid, and are now PROCESSED normally (PRD #908): the ci_fix still fires — only
+	// the issue comments (start + halt) are suppressed, since there is no issue to comment
+	// on. The inbox notifications (notifyStarted / notifyHalt) still fire for both branch
+	// shapes. When !ok, iid is 0, which is fine for the notification payload. For an
+	// `agent/issue-N` branch the parse still succeeds and the comments still post
+	// (issue-run behavior unchanged).
 	iid, ok := issueIIDFromBranch(ref)
-	if !ok {
-		slog.Warn("poller: ci-autofix unparseable ref", "repo", r.PathWithNamespace, "ref", ref)
-		return
-	}
 
 	// 1. Attempt state. CARRY-FORWARD FROM M4: GetCIAutofixAttempt returns a row with
 	// attempt_count=0 for a ref that was only ever RecordCIAutofixPipeline'd (the
@@ -221,9 +221,11 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 				return
 			}
 			// The issue comment is the primary outward halt signal (best-effort).
-			if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, haltCommentBody(reason, d.maxAttempts, cand.MrIid)); err != nil {
-				// Already PAT-redacted by the driver; the latch is set, so the comment is lost, not retried.
-				slog.Warn("poller: ci-autofix halt comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+			if ok {
+				if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, haltCommentBody(reason, d.maxAttempts, cand.MrIid)); err != nil {
+					// Already PAT-redacted by the driver; the latch is set, so the comment is lost, not retried.
+					slog.Warn("poller: ci-autofix halt comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+				}
 			}
 			d.notifyHalt(ctx, cand, iid, haltReasonPayload(reason, d.maxAttempts))
 		} else {
@@ -265,8 +267,10 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 			slog.Error("poller: ci-autofix upsert attempt", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 			return
 		}
-		if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, startCommentBody(ref, cand.PipelineWebUrl)); err != nil {
-			slog.Warn("poller: ci-autofix start comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+		if ok {
+			if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, startCommentBody(ref, cand.PipelineWebUrl)); err != nil {
+				slog.Warn("poller: ci-autofix start comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+			}
 		}
 		d.notifyStarted(ctx, cand, iid, run.ID)
 	case errors.Is(err, workersvc.ErrActiveFixExists), errors.Is(err, workersvc.ErrBranchInUse):
