@@ -51,8 +51,8 @@ guarantees `[]`/non-null on the real wire, so the zero-marshal's `null` over-app
 | DTO | field | TS type | mapper guarantee |
 |---|---|---|---|
 | `Repo` | `required_capabilities` | `required_capabilities?: string[]` | `capsOrEmpty` (`handler/forge.go:148`) in `repoToDTO` (`handler/forge.go:174`) → `[]` |
-| `Worker` / `AdminWorker` | `capabilities` | `capabilities?: string[]` | pgx yields a non-nil `[]` for the `text[]` column (WorkerDTO.Capabilities doc); passed through at `handler/workers.go:203` / `:252` |
-| `Schedule` | `override_subagent_model` | `override_subagent_model: boolean` | plain bool column the mapper ALWAYS sets (`handler/schedules.go:1598-1600`) |
+| `Worker` / `AdminWorker` | `capabilities` | `capabilities?: string[]` | pgx yields a non-nil `[]` for the `text[]` column (WorkerDTO.Capabilities doc); passed through at `handler/workers.go:122` / `:171` |
+| `Schedule` | `override_subagent_model` | `override_subagent_model: boolean` | plain bool column the mapper ALWAYS sets (`handler/schedules_dto.go:111-112`) |
 | `UserSettings` | `sidebar_token_ids` | `sidebar_token_ids?: string[]` | `uuidStrings` returns a non-nil `[]` (`handler/user_settings.go:65`) |
 
 DTOs with **no** exemption (every nullable Go field is already typed `X | null` in TS):
@@ -92,8 +92,8 @@ the directive — the same-line caveat M1 documents for `_runExtra`.
 
 | TS type | field | why the wire sends `null` | exact suppressed tsc error |
 |---|---|---|---|
-| `Worker` / `AdminWorker` | `docker?: boolean` | `boolPtrValue(w.DockerEnabled)` is nil for an EXTERNAL worker (`handler/workers.go:201` / `:250`) | `error TS2322: Type '{ … docker: null; … }' is not assignable to type 'ZeroOf<Worker, "capabilities">'. Types of property 'docker' are incompatible.` |
-| `Schedule` | `next_fires: string[]` | the mapper only sets `NextFires` for a recurring+valid-cron schedule (`handler/schedules.go:1612-1614`); a once schedule leaves it nil (→ `null`) | `error TS2322: Type '{ … next_fires: null; … }' is not assignable to type 'ZeroOf<Schedule, "override_subagent_model">'. Types of property 'next_fires' are incompatible.` |
+| `Worker` / `AdminWorker` | `docker?: boolean` | `boolPtrValue(w.DockerEnabled)` is nil for an EXTERNAL worker (`handler/workers.go:120` / `:169`) | `error TS2322: Type '{ … docker: null; … }' is not assignable to type 'ZeroOf<Worker, "capabilities">'. Types of property 'docker' are incompatible.` |
+| `Schedule` | `next_fires: string[]` | the mapper only sets `NextFires` for a recurring+valid-cron schedule (`handler/schedules_dto.go:125-126`); a once schedule leaves it nil (→ `null`) | `error TS2322: Type '{ … next_fires: null; … }' is not assignable to type 'ZeroOf<Schedule, "override_subagent_model">'. Types of property 'next_fires' are incompatible.` |
 
 M4 reconciliation (type-only): `Worker.docker` → `docker?: boolean | null`; `Schedule.next_fires`
 → `next_fires: string[] | null` (or, out of scope for a type-only PRD, the Go mapper normalizes
@@ -240,13 +240,13 @@ pointer field the TS type already accepts `null`, so no exemption is needed
 `repo_agents`, `own_agents`, `agent_exclusions` are all typed nullable — verified —
 so NO exemption). The three that DO need one, all normalized by `capsOrEmpty`
 (`api/internal/handler/forge.go:148`, returns `[]string{}` for a nil slice) inside
-`runToDTO` (`api/internal/handler/workers.go:360`):
+`runToDTO` (`api/internal/handler/runs_dto.go:63`):
 
 | field | TS type | mapper line |
 |---|---|---|
-| `plan_changed_files` | `plan_changed_files?: string[]` (optional, never-null) | `handler/workers.go:448` |
-| `required_capabilities` | `required_capabilities?: string[]` | `handler/workers.go:442` |
-| `required_tools` | `required_tools?: string[]` | `handler/workers.go:443` |
+| `plan_changed_files` | `plan_changed_files?: string[]` (optional, never-null) | `handler/runs_dto.go:151` |
+| `required_capabilities` | `required_capabilities?: string[]` | `handler/runs_dto.go:145` |
+| `required_tools` | `required_tools?: string[]` | `handler/runs_dto.go:146` |
 
 `RunListItem extends Run`, so its `_runListItemZero` inherits the same three.
 

@@ -4643,7 +4643,7 @@ Serves human: Feature #12 board card MR signal; Feature #14 unified surfaces. Re
   MR-chip surfaces (board card, issue-view run history, runs list, dashboard, run view)
   so no surface ever renders a raw forge state string.
 - **Plumbing**: `mr_state` added to the latest-run DTO (`handler/board.go`) and the
-  per-run DTO (`runToDTO`, `handler/workers.go`), sourced from the run-returning queries
+  per-run DTO (`runToDTO`, `handler/runs_dto.go`), sourced from the run-returning queries
   (sqlc regenerated) and mirrored into the web `LatestRun` / run-row types. Store
   unchanged — the column already exists (migration `00029`).
 
@@ -9395,7 +9395,7 @@ lifted into `useRunStream`.
 ## 329. `GET /runs/{id}/inputs` is `RequireUser`, owner-only — a non-owner (incl. `admin_ro`) 404s, and the client hides the surface
 
 Serves human Feature #95 + the read-only-admin ceiling (Feature #64). PRD #95
-Decision 8, richer write S2, degradation N2. `ListRunInputs` (`handler/workers.go`)
+Decision 8, richer write S2, degradation N2. `ListRunInputs` (`handler/runs_lifecycle.go`)
 + `canSteer` (`useRunStream.ts`).
 
 - **The read matches the write's authz exactly.** The follow-up **write** (`CreateRunInput`
@@ -20396,7 +20396,7 @@ not a control.
   small dependency-free content check) runs inside the shared `createRun` on the seeded path
   only, on the **secret-scrubbed** body, **after** the empty-check and **before** the run is
   persisted. A match ⇒ new sentinel `workersvc.ErrPlanUnsafe` ⇒ HTTP 422
-  (`handler/workers.go` `writeStartRunError`), whose message names the matched category (a fixed
+  (`handler/runs_lifecycle.go` `writeStartRunError`), whose message names the matched category (a fixed
   planpolicy string, never plan text or a secret) and redirects the caller to the ordinary gated
   flow. The run is never created.
 - **Why a create-time REJECT, not the alternatives.** A reject is a control; forcing the gate on
@@ -20609,7 +20609,7 @@ only bites once the agent image is current (see Decision 2).
   assembly from `run.OverrideSubagentModel` (`service.go`, beside `DefaultModel`). `omitempty` keeps a
   flag-off claim byte-identical to today's wire.
 - **Boolean, not tri-state (Decision 5).** `*bool` DTO under replace-semantics (absent ≡ false),
-  simpler than model's NULL=inherit tri-state. `mergeSchedule` (`api/internal/handler/schedules.go`)
+  simpler than model's NULL=inherit tri-state. `mergeSchedule` (`api/internal/handler/schedules_request.go`)
   takes the request value directly (`m.OverrideSubagentModel = req.OverrideSubagentModel`);
   `req.OverrideSubagentModel == nil` was added to `onlyEnabled` so an
   `{enabled, override_subagent_model}` patch is not misrouted to the enabled-only short-circuit (the
@@ -20920,7 +20920,7 @@ call is ALLOWED iff it has ≥1 positional argument AND EVERY positional is in t
 When a run owner APPROVES a plan whose agent selection explicitly excludes a guard role (the extensible `guardRoles`
 set — `spec-keeper` today), the approve path emits exactly one owner notification naming the dropped role, reusing the
 existing `notifysvc` (in-app inbox row + best-effort Slack DM). New notification kind `guard_role_excluded`. Wired across
-`api/internal/workersvc/{agent_selection.go,service.go}` and `api/internal/handler/workers.go`.
+`api/internal/workersvc/{agent_selection.go,service.go}` and `api/internal/handler/runs_lifecycle.go`.
 
 - **Fires on ACTIVE exclusion only.** The role must appear in `sel.Exclusions` (D4) — a role merely ABSENT from a
   roster never fires. It fires only AFTER `validateSelection` accepts the selection, and only to the run OWNER.
@@ -23753,3 +23753,7 @@ Serves human Feature #218 (park-resume durability). Root cause: run #1009 hit th
 Deferred to follow-up issues: G2 (behind-on-workflows checkpoint durability), G5 (forge checkpoints for non-issue run kinds), the owner-anchor column and its compare-and-delete (#1042), chat-run affinity (`ClaimChatRun`), and cross-worker session/transcript durability (#556).
 
 Cross-refs: `adr/0628-cross-worker-resume-durability.md` (amended: D3a scope, the roll-vs-teardown discriminator, the two-seam affinity change, the 30m→2h `WORKER_AFFINITY_CEILING` correction, and the `ClaimChatRun`-vs-`ClaimRun` universal-predicate correction); PRD #422 D7 (a draining worker claims nothing new); #759 (the `wip(park):` marker adopt-unwrap this subsumes).
+
+## 605. PRD #1022 — handler/schedules.go + workers.go file splits: five schedule seams and the run handlers out of the misnamed workers.go
+
+Serves human: "two of the handler package's largest files each carry more than one concern, and one carries the wrong name — each should read as one concern per file." Pure same-package motion, no exported-API change, no behaviour change, no test-code edit (comment-only repoints in two test files); the recipe is #921 (`workersvc`), #963 (`forgesvc/projectsync.go`) and #1008 (`handler/handler.go`). `schedules.go` (1746 lines) split into `schedules_request.go` (request-to-row mapping), `schedules_dto.go` (`scheduleDTO`), `schedules_catalog.go` (default-schedule catalog surface) and `schedules_clone.go` (clone/add-repo), with the CRUD/preview/run-now handlers and shared label/param helpers staying in `schedules.go`. `workers.go` (1512 lines, misnamed) split into `runs_lifecycle.go` (run create/dispatch/get/messages/input + guard-role glue), `runs_dto.go` (`runToDTO` and the message/DTO mappers) and `pgptr.go` (the pgtype-to-pointer read helpers), leaving only the worker handlers and worker DTO builders; `AdminListWorkers` moved in from `runs.go`. Exported surface byte-identical (`go doc -all` unchanged). Richer rationale is PRD #1022's Decision Log (D1-D6).
