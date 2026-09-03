@@ -261,6 +261,10 @@ tasks:
       # like them it fail-open SKIPs when its tools are absent on a laptop and is
       # forced (UZI_LINT_ACTIONS_REQUIRED) in the lint-repo CI job.
       - task: lint:actions
+      # Composite-action embedded-shell linting (issue #948): shellchecks the `run:`
+      # blocks of .github/actions/**/action.yml, the one class lint:shell and
+      # lint:actions both miss. Same fail-open/REQUIRED contract, same UZI_LINT_ACTIONS_REQUIRED.
+      - task: lint:actions:embedded
       # hermetic (~instant): a fake `docker` on PATH, no daemon touched. It guards
       # the destructive e2e leaked-project reclaim's selection contract so a future
       # edit that would tear down the wrong project reddens here instead of on a host.
@@ -726,6 +730,24 @@ tasks:
       # High-confidence findings -- unpinned-uses + High template-injection). The
       # workflows dir is the argument because a scope change is the thing to see here.
       - ./scripts/lint-actions.sh .github/workflows
+
+  lint:actions:embedded:
+    desc: shellcheck the embedded run scripts of composite actions (.github/actions/**/action.yml)
+    cmds:
+      # THE ONE CLASS lint:shell AND lint:actions BOTH MISS (issue #948): a composite
+      # action's `run:` block is bash but lives in .github/actions/**/action.yml, which
+      # is neither a tracked `*.sh` file (lint:shell's scope) nor a workflow
+      # (lint:actions' scope), so it was gated by NOTHING. This extracts each composite
+      # `run:` script and feeds it to the SAME pinned shellcheck at the SAME severity as
+      # lint:shell, so a shell construct is judged identically wherever it sits. The
+      # severity and version are ARGUMENTS for the same reason lint:shell passes them:
+      # this file's echo is how a load-bearing flag going missing becomes visible, and
+      # the version is an EXACT pin the script asserts (0.10.0 and 0.11.0 are different
+      # instruments). The per-step `shell:` is honored inside the script (a `shell: sh`
+      # step is judged by sh rules, not bash), and yq (the YAML reader) is unpinned for
+      # the same reason lint:yaml leaves yamllint unpinned -- it only reads YAML.
+      # renovate: datasource=github-releases depName=koalaman/shellcheck
+      - ./scripts/lint-actions-embedded.sh warning 0.11.0
 
   lint:formula:
     desc: ruby -c over the Homebrew formula (syntax only; needs ruby >= 3.1)
