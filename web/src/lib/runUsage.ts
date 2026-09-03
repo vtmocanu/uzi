@@ -612,14 +612,16 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
   // frame is only 58% of it; "drops the entire first frame" is the narrower claim this
   // sentence's own mechanism refutes, and it read that way here until 2026-08-02.
   //
-  // THE CHEAPEST GUARD ON THIS SEED IS `tsc`, NOT A TEST. Removing it removes the
-  // last reference to ZERO_MODEL, so `?? cur` fails typecheck outright — `TS6133:
-  // 'ZERO_MODEL' is declared but its value is never read` — and in a real gate run
-  // the mutation never reaches vitest at all. (esbuild does not enforce
-  // `noUnusedLocals`, so a vitest-only run still executes; forcing it past tsc with
-  // a `void ZERO_MODEL;` is what makes the behavioural measurement below possible.)
+  // THIS SEED IS GUARDED BEHAVIOURALLY, BY THE TESTS — not by `tsc`. Until PRD #1079
+  // it was tsc-guarded: `ZERO_MODEL` had a single reference here, so `?? cur` removed
+  // the last one and failed typecheck (`TS6133: 'ZERO_MODEL' is declared but its value
+  // is never read`), and the mutation never reached vitest. #1079 added a SECOND
+  // reference — the `modelSums` seed below (`?? ZERO_MODEL`) — so removing this one
+  // alone no longer trips TS6133: the mutation now compiles and DOES reach vitest,
+  // where the contract/unit tests below redden. So the guard is the test suite now,
+  // and the measurement below no longer needs a `void ZERO_MODEL;` to be reachable.
   //
-  // Forced past that, the discriminator is cited as a SHAPE rather than a tally,
+  // The discriminator is cited as a SHAPE rather than a tally,
   // because a count of reddened tests goes stale silently every time this file gains
   // one — three people measured 13, 14 and 15 for this same mutation, each correct
   // for their own tree and run scope. Under `?? cur`: the CONTRACT FIXTURE reddens on

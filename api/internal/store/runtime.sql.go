@@ -862,9 +862,10 @@ type CountRunInitFramesBeforeParams struct {
 }
 
 // The leg index of a result frame (PRD #1079): the position-absolute count of persisted
-// `init` status frames of this run with a lower seq. mapResult persists the SDK's
+// `init` status frames of this run with a lower seq. The worker persists the SDK's
 // system/init message as a status frame with payload.event='init' at the start of EVERY
-// query() call, so this counts the legs that preceded the frame. It is a pure function of
+// query() call (agent/src/sdk-messages.ts, the system/subtype-init branch — NOT mapResult,
+// which maps the result frame), so this counts the legs that preceded the frame. It is a pure function of
 // (run_id, seq): a re-delivered frame recomputes the same value and lands in the same
 // run_usage row whatever else has landed since. Backed by idx_run_messages_init (00187),
 // so it is O(legs), not O(messages).
