@@ -563,7 +563,16 @@ WITH latest AS (
     SELECT DISTINCT ON (r.issue_iid)
            r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state, r.created_at
     FROM runs r
+    -- Scheduled-lane runs are excluded HERE, before the per-issue collapse, so this
+    -- board-coupled watcher never owns their MR-state transitions (PRD #908 R1). A
+    -- prompt run is issue-less and already dropped by the JOIN below, but a self_improve
+    -- run carries a real tracking-issue iid whose completed run parks the card in Human
+    -- Review (runlifecycle) — so without this filter it satisfies Lane A and syncOneMRState
+    -- would move the shared tracking-issue card on an MR close/reopen edge, defeating the
+    -- board-free contract. Scheduled kinds have their own tracking-issue iids (never a real
+    -- PRD issue's), so excluding them cannot mask an issue-lane rework in the DISTINCT ON.
     WHERE r.repo_id = @repo_id
+      AND r.kind NOT IN ('prompt', 'self_improve')
     ORDER BY r.issue_iid, r.created_at DESC
 )
 SELECT l.id, l.issue_iid, l.mr_iid, l.mr_state

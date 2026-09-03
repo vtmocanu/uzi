@@ -71,25 +71,25 @@ func (s *Service) recordScheduledMRState(ctx context.Context, repoID uuid.UUID, 
 	if observed == stored {
 		return // no transition
 	}
-	switch {
-	case stored == forge.MRStateOpened && observed == forge.MRStateClosed:
-		// close-edge: a confirmed close means an in-flight rework can never land -> abort it
-		// (issue #853). No board move (board-free). On cancel failure leave mr_state
+	switch observed {
+	case forge.MRStateClosed, forge.MRStateMerged:
+		// terminal edge from a valid non-terminal stored state (opened OR locked): a
+		// confirmed close/merge means an in-flight rework can never land -> abort it
+		// (issue #853). This MUST fire for stored=='locked' too — a locked->closed (or
+		// ->merged) transition is still a terminal edge. The earlier stored=='opened'-only
+		// close arm leaked a rework when the MR passed through `locked` before closing
+		// (review finding, PRD #908): `locked`->`closed` fell to the default arm, which
+		// records `closed` (self-evicting the run from the candidate set) without ever
+		// cancelling. No board move (board-free). On cancel failure leave mr_state
 		// unadvanced so the next tick re-observes the edge and retries.
 		if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
-			slog.Warn("forgesvc: cancel scheduled rework on MR close failed, will retry", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "error", err)
+			slog.Warn("forgesvc: cancel scheduled rework on MR terminal state failed, will retry", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "state", observed, "error", err)
 			return
 		}
 		s.recordMRState(ctx, c.ID, observed)
 	default:
-		// KNOWN non-edge transition (merged / locked). A merge means the branch is gone ->
-		// abort any in-flight rework (issue #853); locked is transient -> no cancel.
-		if observed == forge.MRStateMerged {
-			if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
-				slog.Warn("forgesvc: cancel scheduled rework on MR merge failed, will retry", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "error", err)
-				return
-			}
-		}
+		// KNOWN non-terminal transition: `locked` (transient during merge processing) or a
+		// `locked`->`opened` settle. Record, never cancel — the gate stays open.
 		s.recordMRState(ctx, c.ID, observed)
 	}
 }

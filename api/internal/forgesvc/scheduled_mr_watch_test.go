@@ -96,14 +96,19 @@ func TestSyncScheduledMRStatesDifferential(t *testing.T) {
 			wantCancel: 1,
 		},
 		{
-			// The close edge cancels only from 'opened' (default arm cancels only on merged),
-			// so a locked->closed records the terminal state WITHOUT cancelling — exact parity
-			// with the issue-lane syncOneMRState. Pinned intentionally.
+			// locked->closed is a TERMINAL edge, so it MUST cancel an in-flight rework
+			// (issue #853): a confirmed close means the rework can never land. The earlier
+			// version pinned wantCancel:0 (close cancelled only from 'opened'), which leaked
+			// the rework whenever the MR passed through 'locked' before closing — the run
+			// then self-evicted at mr_state='closed' with the rework still spending. Fixed by
+			// cancelling on any transition INTO closed/merged from a valid non-terminal state.
+			// (The issue-lane syncOneMRState still has the analogous latent leak; tracked
+			// separately as a follow-up.)
 			name:       "locked->closed",
 			stored:     strptr(forge.MRStateLocked),
 			observed:   forge.MRStateClosed,
 			wantRecord: strptr(forge.MRStateClosed),
-			wantCancel: 0,
+			wantCancel: 1,
 		},
 		{
 			name:       "unknown-state",
@@ -177,12 +182,17 @@ func TestSyncScheduledMRStatesDifferential(t *testing.T) {
 	}
 }
 
-// TestR1SelfImproveClosedNoBoardMove exercises the OTHER watcher (SyncMRStates, not the
-// board-free recorder) over a self_improve run whose stored mr_state='closed' with a
-// CACHED, open tracking issue. observed==stored='closed' is a no-transition, so no board
-// move is planned — proving the R1 entanglement (a self_improve run satisfying both
-// candidate queries) is benign: the board machinery is a no-op for the un-promoted
-// tracking issue.
+// TestR1SelfImproveClosedNoBoardMove is a defense-in-depth unit check on the OTHER watcher
+// (SyncMRStates, not the board-free recorder). The PRIMARY R1 guard is at the query level:
+// ListMRWatchCandidates now excludes kind IN ('prompt','self_improve') in its CTE, so a
+// self_improve run is never fed to syncOneMRState in production at all — proven live by
+// TestListMRWatchCandidatesLiveDB case 112 (a completed self_improve run whose OPEN tracking
+// issue is parked in Human Review with an open MR is NOT a candidate). That query exclusion,
+// not a no-transition, is what makes R1 benign — an earlier version of this test asserted the
+// opposite (that a cached, Human-Review-promoted tracking issue was safe merely because
+// observed==stored), which was vacuous for the dangerous opened->closed edge that WOULD have
+// moved the shared card. This test remains only to pin that even if a self_improve candidate
+// were somehow handed to syncOneMRState directly, a closed->closed no-transition plans no move.
 func TestR1SelfImproveClosedNoBoardMove(t *testing.T) {
 	runID, repoID := uuid.New(), uuid.New()
 	st := &fakeStore{
