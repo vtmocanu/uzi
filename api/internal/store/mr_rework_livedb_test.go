@@ -82,6 +82,53 @@ func TestMRReworkLiveDB(t *testing.T) {
 		return id
 	}
 
+	// seedScheduledRun inserts a completed scheduled-lane run (kind='prompt' or
+	// 'self_improve') with an MR on the given branch (PRD #908 widened the candidate kind
+	// filter to include these). It stamps the WATCHER-OWNED runs.mr_state (nil ⇒ SQL NULL,
+	// the pre-recorder bootstrap state) and the per-run mr_rework_enabled override (nil ⇒
+	// SQL NULL). Per the runs_kind_shape CHECK, prompt carries issue_iid NULL and
+	// self_improve a non-null issue_iid, so issueIID is threaded through as *int64. A green
+	// head pipeline is seeded so the branch is fully realistic; the candidate query LEFT
+	// JOINs it, so it is not what gates admission — runs.mr_state is.
+	seedScheduledRun := func(owner uuid.UUID, kind, branch string, mrIID int64, mrState *string, mrRework *bool, issueIID *int64) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, mr_iid, mr_state, status, mr_rework_enabled)
+		      VALUES ($1, $2, $3, $4, $5, 't', 'd', $6, $7, $8, 'completed', $9)`,
+			id, owner, repoID, kind, issueIID, branch, mrIID, mrState, mrRework)
+		exec(`INSERT INTO pipeline_statuses (repo_id, ref, pipeline_id, sha, status, web_url, synced_at)
+		      VALUES ($1, $2, $3, $4, 'success', 'https://forge.e2e/p', now())`, repoID, branch, mrIID*100, "sha-"+branch)
+		return id
+	}
+	sp := func(s string) *string { return &s }
+	bp := func(b bool) *bool { return &b }
+	ip := func(n int64) *int64 { return &n }
+
+	// PRD #908 scheduled-lane candidates (owned by the opted-in inUser, opened MR, token
+	// present, no opt-out anywhere) — both must surface, proving the kind filter widened
+	// beyond issue.
+	promptCandBranch := "uzi/prompt-" + uuid.New().String()
+	srcPrompt := seedScheduledRun(inUser, "prompt", promptCandBranch, 7010, sp("opened"), nil, nil)
+	selfImpCandBranch := "uzi/self-improve/" + uuid.New().String()
+	srcSelfImp := seedScheduledRun(inUser, "self_improve", selfImpCandBranch, 7020, sp("opened"), nil, ip(7021))
+
+	// Opt-out excludes, both layers of the COALESCE(per-run, owner) chain:
+	//   - per-RUN override false (owner inUser defaults ON) → excluded.
+	promptRunOptOutBranch := "uzi/prompt-" + uuid.New().String()
+	seedScheduledRun(inUser, "prompt", promptRunOptOutBranch, 7030, sp("opened"), bp(false), nil)
+	//   - OWNER default false with a NULL run column (outUser) → excluded.
+	selfImpOwnerOptOutBranch := "uzi/self-improve/" + uuid.New().String()
+	seedScheduledRun(outUser, "self_improve", selfImpOwnerOptOutBranch, 7040, sp("opened"), nil, ip(7041))
+
+	// mr_state gate: a non-'opened' watcher-owned state must be excluded, proving the M3
+	// recorder gate matters (the scheduled lane is eligible only while its MR is opened).
+	//   - 'merged' (terminal) → excluded.
+	promptMergedBranch := "uzi/prompt-" + uuid.New().String()
+	seedScheduledRun(inUser, "prompt", promptMergedBranch, 7050, sp("merged"), nil, nil)
+	//   - NULL (pre-recorder bootstrap, mr_state = 'opened' is false for NULL) → excluded.
+	promptNullStateBranch := "uzi/prompt-" + uuid.New().String()
+	seedScheduledRun(inUser, "prompt", promptNullStateBranch, 7060, nil, nil, nil)
+
 	// Opted-in, opened MR, green pipeline → a candidate.
 	src7 := seedIssueRun(inUser, 7, "opened", "sha7")
 	// Opted-in, but the MR is CLOSED → excluded (stop-on-close, Decision 10).
@@ -95,12 +142,39 @@ func TestMRReworkLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListMRReworkCandidates: %v", err)
 	}
-	if len(cands) != 1 {
-		t.Fatalf("expected exactly one candidate (opted-in + opened MR), got %d: %+v", len(cands), cands)
+	// The exact candidate SET, keyed by branch → source_run_id. Precise (not a bare count):
+	// the issue-lane candidate PLUS the two scheduled-lane candidates survive; every opt-out
+	// and non-opened-state seed is absent. A stray candidate or a missing one both fail.
+	bySrc := map[string]uuid.UUID{}
+	byRow := map[string]store.ListMRReworkCandidatesRow{}
+	for _, cand := range cands {
+		bySrc[cand.Ref.String] = cand.SourceRunID
+		byRow[cand.Ref.String] = cand
 	}
-	c := cands[0]
-	if c.Ref.String != "agent/issue-7" || c.MrIid.Int64 != 70 || c.SourceRunID != src7 {
-		t.Fatalf("candidate row wrong: %+v", c)
+	wantCands := map[string]uuid.UUID{
+		"agent/issue-7":   src7,
+		promptCandBranch:  srcPrompt,
+		selfImpCandBranch: srcSelfImp,
+	}
+	if len(cands) != len(wantCands) {
+		t.Fatalf("expected exactly %d candidates (issue-7 + prompt + self_improve), got %d: %+v", len(wantCands), len(cands), cands)
+	}
+	for ref, wantSrc := range wantCands {
+		if bySrc[ref] != wantSrc {
+			t.Errorf("candidate %q must surface via source_run_id %s, got %s (set %+v)", ref, wantSrc, bySrc[ref], bySrc)
+		}
+	}
+	for _, excluded := range []string{promptRunOptOutBranch, selfImpOwnerOptOutBranch, promptMergedBranch, promptNullStateBranch} {
+		if _, ok := bySrc[excluded]; ok {
+			t.Errorf("branch %q must be excluded (opt-out or non-opened mr_state), but it surfaced", excluded)
+		}
+	}
+
+	// The issue-lane candidate still carries its mr_iid, bot_forge_user_id, and green head
+	// pipeline — the scheduled-lane widening must not disturb it.
+	c := byRow["agent/issue-7"]
+	if c.MrIid.Int64 != 70 || c.SourceRunID != src7 {
+		t.Fatalf("issue-7 candidate row wrong: %+v", c)
 	}
 	if c.BotForgeUserID != 777 {
 		t.Fatalf("bot_forge_user_id not projected: %d", c.BotForgeUserID)

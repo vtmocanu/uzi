@@ -35,10 +35,13 @@
 -- default at claim assembly) and the "apply model also to agents" opt-in
 -- (@override_subagent_model, a plain bool). The bespoke engine passes nil/false, freezing
 -- NULL/false onto its run exactly as before this column pair was threaded through.
+-- mr_rework_enabled (PRD #908 M1): the schedule-driven fire path threads the schedule's
+-- per-schedule mr_rework override the same way (sqlc.narg('mr_rework_enabled'), nil =>
+-- inherit the owner default live at read time). The bespoke engine passes nil, freezing NULL.
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, override_subagent_model, required_capabilities, trigger_source
+    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, override_subagent_model, mr_rework_enabled, required_capabilities, trigger_source
 ) VALUES (
-    @user_id, @repo_id::uuid, 'self_improve', @issue_iid, @issue_title, @issue_description, true, @wait_on_limit, sqlc.narg('model'), @override_subagent_model,
+    @user_id, @repo_id::uuid, 'self_improve', @issue_iid, @issue_title, @issue_description, true, @wait_on_limit, sqlc.narg('model'), @override_subagent_model, sqlc.narg('mr_rework_enabled'),
     -- required_capabilities (PRD #84 M2, issue #512 M1): a self_improve run is REPO-BEARING
     -- (it targets uzi's own repo, the likeliest to require docker to build/test), so it must
     -- inherit the repo's capability hint like every other repo-bearing path — else with

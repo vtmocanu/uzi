@@ -288,10 +288,23 @@ The fixture form that satisfies both scanners, and why `//gitleaks:allow` is not
 is the authoring-side rule in `.claude/rules/prds.md` (*A PRD whose tests need
 secret-SHAPED strings*); it is not repeated here.
 
-All of this is a per-incident stopgap. The mechanism-level fix — a pre-push range scan in
-the worker's finalize path with a typed `fail_origin`, mirroring the workflow-scope guard in
-`agent/src/ci-config-guard.ts` — is issue #974; until it lands, this subsection is the
-whole remedy, and `uzi run get` reports the class only as free-text `failure_reason`.
+**Issue #974 has landed**, so the diagnosis now keys on a stable typed field instead of
+matching GitHub's free-text message. At finalize the worker scans the push range
+(`base..HEAD`) with the pinned gitleaks, its three silencers (`.gitleaks.toml`,
+`.gitleaksignore`, inline `//gitleaks:allow`) forced OFF — GitHub Push Protection honours
+none of them, so a scan that did would clear a range GitHub still rejects. A finding fails
+the run early, typed `fail_origin = "push_secret_blocked"`, with the diff preserved; a GH013
+remote rejection that slips past the pre-push scan is parsed to the SAME typed origin. So
+`uzi run get RUN --json | jq -r .fail_origin` returns `push_secret_blocked` for this whole
+class — no more matching free-text `failure_reason`. **The pre-push scan does not catch
+everything** — GitHub's pattern set is broader than gitleaks' default ruleset, which is
+exactly why the GH013 remote parse remains the backstop, not a redundant belt. The manual
+recovery above (history edit + range verify) is still how a human RESOLVES it once diagnosed;
+the pre-push scan only makes the failure fast and typed instead of surfacing after every
+milestone at the doomed push. The mechanism mirrors the workflow-scope guard in
+`agent/src/runner.ts`'s finalize path (`agent/src/ci-config-guard.ts` is that guard's
+path-matcher, not this one); the secret-scan logic itself lives in `agent/src/git.ts`
+(`secretScanRange`) and `agent/src/secret-scan-guard.ts`.
 
 ### Proactive backups (before anything goes wrong)
 
@@ -829,11 +842,17 @@ as supersession.
 
 ## When a run fails
 
-Read the reason: `uzi run get RUN --json | jq '{status, failure_reason, health_reason}'`.
-Common causes: the workflow-scope push rejection above; a GitHub Push Protection
-rejection (`GH013 … Push cannot contain secrets` — see *Push protection* under the PVC
-recovery section: recoverable, but the fix must be folded into the introducing commit);
-a `limit_wait` that never cleared; a genuine gate failure.
+Read the reason: `uzi run get RUN --json | jq '{status, fail_origin, failure_reason, health_reason}'`.
+`fail_origin == "push_secret_blocked"` identifies the SECRET push-protection class on its
+own, without parsing `failure_reason`'s free text: the branch carries a secret that the
+pre-push gitleaks scan or GitHub Push Protection (`GH013 … Push cannot contain secrets`)
+rejected. The fix is to scrub the secret from the branch's history and re-push — see *Push
+protection* under the PVC recovery section (fold the fix into the introducing commit; a later
+commit that merely removes the literal still ships the one that added it). Do NOT reach for
+secret-history rewriting on the OTHER failures, which have their own `fail_origin`: the
+behind-on-workflows rejection is `workflow_scope_missing`, a base-align conflict is
+`finalize_base_align_conflict`, and a generic gate/agent failure is `agent_failure`;
+`limit_wait` is a separate parked status, not a `fail_origin`, and clears on its own.
 Report the `failure_reason` verbatim and decide re-run vs. revise vs. hand back to the user.
 
 ## Cross-session handoff

@@ -65,7 +65,7 @@ func TestCoerceFailOrigin(t *testing.T) {
 // parses the migration rather than restating the list, because a second hand-typed copy
 // is exactly the drift it prevents.
 func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
-	const path = "../store/migrations/00139_run_finalize_base_align_conflict.sql"
+	const path = "../store/migrations/00186_run_push_secret_blocked.sql"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)

@@ -4,14 +4,14 @@
 // (fleet status, upgrade rolls, the sidebar attention badge), not a preference.
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { api, type BindMode, type Worker } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton, cx } from "../components/ui";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
 import { useAppVersion } from "../components/AppShell";
-import { ServerIcon } from "../components/icons";
+import { PlusIcon, ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
 import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
@@ -27,6 +27,15 @@ import { DOC_WORKER_SETUP } from "../lib/doclinks";
 // Stable per-row ids: the delete button is a focus target after a dismissed confirm,
 // and the warning is the confirm group's aria-description (PRD #58).
 const deleteButtonId = (workerId: string) => `worker-delete-${workerId}`;
+// Stable per-row id, mirroring deleteButtonId. The row <li> carries this plus
+// tabIndex={-1} so the at-quota "delete one to provision another" jump can focus the
+// first hosted row's CONTAINER after crossing tabs (D10) — never a Delete button.
+const rowId = (workerId: string) => `worker-row-${workerId}`;
+// Stable id for the row's worker-name <span>, mirroring rowId/deleteButtonId. The row
+// <li> points aria-labelledby here so a screen reader announces the worker's name when
+// the at-quota jump programmatically focuses the row — an aria-label would suppress the
+// badges, so the name span is labelled instead.
+const rowNameId = (workerId: string) => `worker-name-${workerId}`;
 // The picker's <option> values encode the MODE, not just a label, because since
 // PRD #111 M3 there are three kinds of choice and only one of them names a token.
 // AUTO_OPTION is a sentinel rather than a label, and deliberately a string no label
@@ -39,6 +48,21 @@ const deleteButtonId = (workerId: string) => `worker-delete-${workerId}`;
 const AUTO_OPTION = "\u0000auto";
 
 const deleteWarningId = (workerId: string) => `worker-delete-warning-${workerId}`;
+
+// Two-tab page (PRD #1063): "Your workers" (the fleet) and "Add a worker" (the forms).
+// The tab recipe is COPIED from Schedules.tsx, not extracted into a shared primitive
+// (D6): Schedules is in another PRD's diff and the other tabbed pages carry their own
+// inline classes, so a shared Tabs component is a multi-page migration filed as a
+// follow-up. TAB_ORDER drives the APG roving-tabindex arrow-key handler; the TAB_*
+// class constants are copied verbatim from Schedules.tsx:65-68.
+type Tab = "workers" | "add";
+const TAB_ORDER: Tab[] = ["workers", "add"];
+const tabId = (t: Tab) => `workers-tab-${t}`;
+const panelId = (t: Tab) => `workers-panel-${t}`;
+const TAB_BASE =
+  "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors";
+const TAB_ACTIVE = "border-brand text-fg";
+const TAB_INACTIVE = "border-transparent text-muted hover:border-edge-strong hover:text-fg";
 
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -110,6 +134,105 @@ export function WorkersSettings() {
   const announce = useCallback((text: string, tone: "success" | "warning" = "success") => {
     setNotice({ text, tone });
   }, []);
+
+  // Two-tab state (PRD #1063). `tab` is null until the landing tab is decided ONCE,
+  // after the first workers load resolves (D11) — so the page renders the tablist with
+  // no tab selected and a skeleton in place of both panels, and never flashes the wrong
+  // tab. A valid `?tab=` deep link (D7) beats the count default and selects immediately,
+  // even before load, since it is explicit.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [tab, setTab] = useState<Tab | null>(null);
+  // Whether MANUAL hosted provisioning is available, learned from HostedWorkers via its
+  // onAvailability callback (D8) — the page cannot see the hosting config itself, since
+  // HostedWorkers fetches it and renders nothing when it is off. Drives the empty state's
+  // hosted-first CTA (D10). Starts false: until the callback fires we assume no hosted
+  // path, which is the safe copy (register only).
+  const [hostedManual, setHostedManual] = useState(false);
+  const onHostedAvailability = useCallback((a: { manual: boolean }) => {
+    setHostedManual(a.manual);
+  }, []);
+  // A pending focus request into the add panel (D10). Set alongside a selectTab("add") so
+  // the panel un-hides in the SAME commit; the effect below then focuses the target AFTER
+  // that commit — a synchronous .focus() in the click handler would fire while the panel is
+  // still hidden and silently no-op. "hosted" → the Hosted card's Template select; "register"
+  // → the Register card's Name input.
+  const [pendingFocus, setPendingFocus] = useState<"hosted" | "register" | null>(null);
+  // Refs to the tab buttons so the arrow-key handler moves focus with selection (APG
+  // tabs, automatic activation): Left/Right wrap, Home/End jump to the ends.
+  const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
+  // Latch: the landing tab is applied exactly once. Deleting the last worker must not
+  // move the selection off Your workers, and a first worker arriving via the 10s poll
+  // must not yank the user off Add a worker mid-copy of a join token — so this is a
+  // one-shot flag, not a value derived on every render.
+  const initialTabApplied = useRef(false);
+  // Selecting a tab also writes the URL param (replace: true), so the tab is shareable
+  // without polluting history (D7, the Findings precedent). No other state goes in the URL.
+  const selectTab = useCallback(
+    (t: Tab) => {
+      setTab(t);
+      const next = new URLSearchParams(searchParams);
+      next.set("tab", t);
+      setSearchParams(next, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
+  // Select the add tab and queue focus on the named form's first control (D9/D10). The
+  // focus itself happens in the effect below, after the panel un-hides.
+  const goToAdd = useCallback(
+    (focus: "hosted" | "register") => {
+      selectTab("add");
+      setPendingFocus(focus);
+    },
+    [selectTab],
+  );
+  // Perform a queued add-panel focus AFTER the render that un-hides the panel (D10). The
+  // hosted Template select carries a stable id from HostedWorkers; the register Name input
+  // carries one below. `getElementById` returns null for the hosted target when the hosted
+  // card is not rendered (hosting off), so a "hosted" request then falls back to the Name
+  // input — the register form is the only add path in that case.
+  useEffect(() => {
+    if (!pendingFocus) return;
+    const target =
+      (pendingFocus === "hosted" ? document.getElementById("hosted-worker-template") : null) ??
+      document.getElementById("register-worker-name");
+    target?.focus();
+    setPendingFocus(null);
+  }, [pendingFocus]);
+  // A pending focus onto a worker ROW's <li> (D10), the parallel of pendingFocus for the
+  // at-quota jump: the HostedWorkers "delete one to provision another" link crosses to the
+  // Your workers tab, and focus must land on the first hosted row AFTER that panel un-hides.
+  // Same effect-after-commit reason as pendingFocus — a synchronous .focus() would fire
+  // while the workers panel is still hidden and silently no-op. If the row is gone (the poll
+  // dropped it), <body> is the honest answer, so no crash.
+  const [pendingRowFocus, setPendingRowFocus] = useState<string | null>(null);
+  useEffect(() => {
+    if (!pendingRowFocus) return;
+    document.getElementById(rowId(pendingRowFocus))?.focus();
+    setPendingRowFocus(null);
+  }, [pendingRowFocus]);
+  // Cross the tabs back to Your workers and focus the first HOSTED row's container so the
+  // user can delete one and free quota (D10). Never a Delete button — the focus rule below
+  // stands. If there is no hosted worker (shouldn't happen at quota), just switch tabs and
+  // let focus fall to <body>.
+  const onShowWorkers = useCallback(() => {
+    selectTab("workers");
+    const firstHosted = workers.find((w) => w.kind === "hosted");
+    if (firstHosted) setPendingRowFocus(firstHosted.id);
+  }, [selectTab, workers]);
+  const onTabKeyDown = (e: React.KeyboardEvent) => {
+    if (tab === null) return;
+    const idx = TAB_ORDER.indexOf(tab);
+    let next = idx;
+    if (e.key === "ArrowRight") next = (idx + 1) % TAB_ORDER.length;
+    else if (e.key === "ArrowLeft") next = (idx - 1 + TAB_ORDER.length) % TAB_ORDER.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = TAB_ORDER.length - 1;
+    else return;
+    e.preventDefault();
+    const target = TAB_ORDER[next];
+    selectTab(target);
+    tabRefs.current[target]?.focus();
+  };
 
   // rebind points one worker at a named token, or clears the binding when the
   // picker returns to "default token". The change lands on the worker's NEXT
@@ -228,6 +351,27 @@ export function WorkersSettings() {
     }
   };
 
+  // Decide the landing tab once (D11): a valid `?tab=` deep link wins and applies
+  // immediately (even before the load resolves), otherwise the count default is applied
+  // exactly once, at the first load-resolved render — `workers.length === 0` → Add a
+  // worker, otherwise Your workers. Count EVERY worker the list returns, whatever its
+  // state (offline/upgrading/cordoned/draining/…): those are exactly the ones the owner
+  // opened the page to look at, so raw `workers.length`, never a health/online filter.
+  // The latch guarantees the selection never moves on its own afterwards.
+  useEffect(() => {
+    if (initialTabApplied.current) return;
+    const param = searchParams.get("tab");
+    if (param === "add" || param === "workers") {
+      initialTabApplied.current = true;
+      setTab(param);
+      return;
+    }
+    if (!loading) {
+      initialTabApplied.current = true;
+      setTab(workers.length === 0 ? "add" : "workers");
+    }
+  }, [loading, workers.length, searchParams]);
+
   // Move focus to whatever we just announced. Deleting destroys the control the user
   // acted through — the row and its button both go — so focus would otherwise land on
   // <body>, and delete→provision is a LOOP: the user deletes in order to provision, so
@@ -298,114 +442,101 @@ export function WorkersSettings() {
             <DocLink slug={DOC_WORKER_SETUP}>worker setup</DocLink> guide.
           </>
         }
+        // The Schedules "New schedule" shape (D9): the label matches the tab name exactly, it
+        // selects the add tab and focuses its first control (the hosted Template select when
+        // hosting is on, else the register Name input), and it stays visible on both tabs.
+        actions={
+          /* Always request the "hosted" focus target: the pendingFocus effect resolves it
+             at commit time via getElementById and falls back to the register Name input
+             when the hosted card is not rendered (hosting off, or config not yet loaded).
+             Deciding here from `hostedManual` instead would misfocus on the sub-second
+             window before the mount-time hostedConfig fetch resolves on a hosting-enabled
+             instance. The self-resolving request has no such race. */
+          <Button onClick={() => goToAdd("hosted")}>
+            <PlusIcon /> Add a worker
+          </Button>
+        }
       />
+      {/* The page-level error alert stays ABOVE the tabs (D-unchanged). */}
       {(error || loadError) && <Alert message={error || loadError} />}
 
-      {newToken && (
-        <Card className="space-y-3 border-ok/40">
-          {/* stripUnsafeChars here too, converged with the other three worker.name
-              sites in this file; the reason it is LOW rather than the same severity as
-              the list: this name is the one the user typed into the create form seconds
-              ago, in the same session — a user can only spoof their own immediate echo,
-              with no cross-tenant path and nothing stored-then-surprising. The worker
-              LIST renders names created at any time, and the admin view renders other
-              people's. Fixed anyway because it is the same class and the same one-word
-              fix.
+      {/* Tab bar (PRD #1063), the Schedules recipe copied verbatim (D6): a role=tablist
+          with two role=tab buttons carrying ids, aria-selected, aria-controls, a roving
+          tabIndex and the arrow/Home/End handler. Both tabs are always rendered (a
+          one-tab tablist is an a11y smell). `Your workers · N` carries the live count. */}
+      <div className="flex gap-1 overflow-x-auto border-b border-edge" role="tablist" aria-label="Workers">
+        <button
+          type="button"
+          role="tab"
+          id={tabId("workers")}
+          aria-selected={tab === "workers"}
+          aria-controls={panelId("workers")}
+          tabIndex={tab === "workers" ? 0 : -1}
+          ref={(el) => {
+            tabRefs.current.workers = el;
+          }}
+          onKeyDown={onTabKeyDown}
+          onClick={() => selectTab("workers")}
+          className={cx(TAB_BASE, tab === "workers" ? TAB_ACTIVE : TAB_INACTIVE)}
+        >
+          Your workers{workers.length > 0 ? ` · ${workers.length}` : ""}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id={tabId("add")}
+          aria-selected={tab === "add"}
+          aria-controls={panelId("add")}
+          tabIndex={tab === "add" ? 0 : -1}
+          ref={(el) => {
+            tabRefs.current.add = el;
+          }}
+          onKeyDown={onTabKeyDown}
+          onClick={() => selectTab("add")}
+          className={cx(TAB_BASE, tab === "add" ? TAB_ACTIVE : TAB_INACTIVE)}
+        >
+          Add a worker
+        </button>
+      </div>
 
-              The announce() strings are escaped and injection-free; the
-              rebind/provisioning ones lean on their visible list counterpart being
-              sanitized. The delete-success announcement (#173) was the ONE where that
-              lean did not hold — by construction, the row it names is already deleted, so
-              no visible counterpart survives — so it is now itself passed through
-              stripUnsafeChars (remove(), above). Recorded so nobody re-derives it. */}
-          <SectionTitle className="text-ok">Join token for “{stripUnsafeChars(newToken.worker)}”</SectionTitle>
-          <p className="text-sm text-muted">
-            Copy it now — it is shown once and never again (only its hash is stored). Set it as{" "}
-            <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_WORKER_TOKEN</code> on the
-            worker container.
-          </p>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 overflow-x-auto rounded-lg border border-edge bg-ink px-3 py-2 font-mono text-sm text-ok">
-              {newToken.token}
-            </code>
-            <Button variant="secondary" onClick={copy}>
-              {copied ? "Copied" : "Copy"}
-            </Button>
-          </div>
-          <div>
-            <Button variant="ghost" onClick={() => setNewToken(null)}>
-              Done
-            </Button>
+      {tab === null ? (
+        /* Before the first load resolves: no tab is selected and neither panel is shown,
+           so the page never flashes the wrong tab (D11). The Your workers skeleton stands
+           in until the landing tab is latched. */
+        <Card className="space-y-3">
+          <SectionTitle>Your workers</SectionTitle>
+          <div className="space-y-2">
+            <Skeleton className="h-12" />
+            <Skeleton className="h-12" />
           </div>
         </Card>
-      )}
+      ) : (
+        <>
+          {/* Your workers panel — both panels are always mounted; the inactive one carries
+              the real `hidden` attribute (D4), which removes it from getByRole and the a11y
+              tree (NOT a CSS class). */}
+          <div
+            role="tabpanel"
+            id={panelId("workers")}
+            aria-labelledby={tabId("workers")}
+            hidden={tab !== "workers"}
+            className="space-y-6"
+          >
+            {/* The announcement slot lives at the TOP of this panel: every announcement
+                describes the list, and its focus behaviour is unchanged (the effect keys on
+                `notice`). Each announcement replaces the last, so nothing here can outlive
+                its truth — which is why there is no dismiss. (The token card in the add
+                panel has a Done button for a different reason: it holds a SECRET that should
+                not linger on screen.) */}
+            {notice && (
+              // tabIndex -1: focusable programmatically, never a tab stop of its own.
+              <div ref={noticeRef} tabIndex={-1} className="outline-hidden">
+                <Alert tone={notice.tone} message={notice.text} />
+              </div>
+            )}
 
-      <Card className="space-y-4">
-        <SectionTitle>Register a worker</SectionTitle>
-        <form onSubmit={create} className="flex flex-wrap items-end gap-3">
-          <div className="min-w-[16rem] flex-1">
-            <Field label="Name">
-              <Input
-                placeholder="e.g. laptop, ci-runner-1"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-              />
-            </Field>
-          </div>
-          <div className="min-w-[10rem]">
-            <Field label="Template">
-              <Select
-                aria-label="Worker template"
-                value={template}
-                onChange={(e) => setTemplate(e.target.value)}
-              >
-                {WORKER_TEMPLATES.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
-                ))}
-              </Select>
-            </Field>
-          </div>
-          <Button type="submit" disabled={busy || name.trim() === ""}>
-            {busy ? "Creating…" : "Generate join token"}
-          </Button>
-        </form>
-        <p className="text-xs text-muted">
-          The template is the worker image to build (<code className="rounded bg-raised px-1 py-0.5 text-fg">base</code> plus
-          heavy-dependency variants like <code className="rounded bg-raised px-1 py-0.5 text-fg">jvm</code>). Build the
-          worker with a matching{" "}
-          <code className="rounded bg-raised px-1 py-0.5 text-fg">WORKER_TEMPLATE</code>; if the worker reports a different
-          one it is flagged below, never rejected.
-        </p>
-      </Card>
-
-      {/* Hosted workers (PRD #58): renders itself only when the instance has hosting
-          on and self-service quota left. One list below, not two — a hosted worker is
-          an ordinary worker whose container the controller runs, so it keeps the same
-          status, gauges, run badge and delete rule, and only its origin differs. */}
-      <HostedWorkers
-        hostedCount={workers.filter((w) => w.kind === "hosted").length}
-        onProvisioned={async (worker) => {
-          announce(`Provisioned ${worker.name} — it appears in your workers below.`);
-          await reload();
-        }}
-      />
-
-      {/* Between the forms and the list: it is what the forms just did and where the
-          list just changed, and the delete→provision loop wants the user near both.
-          Each announcement replaces the last, so nothing here can outlive its truth —
-          which is why there is no dismiss. (The token card above has a Done button for
-          a different reason: it holds a SECRET that should not linger on screen.) */}
-      {notice && (
-        // tabIndex -1: focusable programmatically, never a tab stop of its own.
-        <div ref={noticeRef} tabIndex={-1} className="outline-hidden">
-          <Alert tone={notice.tone} message={notice.text} />
-        </div>
-      )}
-
-      <Card className="space-y-3">
-        <SectionTitle>Your workers</SectionTitle>
+            <Card className="space-y-3">
+              <SectionTitle>Your workers</SectionTitle>
         {loading ? (
           <div className="space-y-2">
             <Skeleton className="h-12" />
@@ -415,7 +546,27 @@ export function WorkersSettings() {
           <EmptyState
             icon={<ServerIcon />}
             title="No workers yet"
-            description="Generate a join token above, then start the uzi-agent container with it — the worker shows up here when it heartbeats."
+            // Hosted-first when hosting is available (D10): the zero-effort path leads, and the
+            // description drops the hosted clause entirely when it is not. hostedManual comes
+            // from HostedWorkers' onAvailability, which reaches the page even while the add panel
+            // is hidden (D4/D8), so the empty state on this tab knows what the add tab offers.
+            description={
+              hostedManual
+                ? "Provision a hosted worker and it comes online on its own, or register your own machine with a join token."
+                : "Register your own machine with a join token."
+            }
+            action={
+              hostedManual ? (
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  <Button onClick={() => goToAdd("hosted")}>Provision a hosted worker</Button>
+                  <Button variant="secondary" onClick={() => goToAdd("register")}>
+                    Register your own
+                  </Button>
+                </div>
+              ) : (
+                <Button onClick={() => goToAdd("register")}>Register a worker</Button>
+              )
+            }
           />
         ) : (
           <>
@@ -424,7 +575,20 @@ export function WorkersSettings() {
             {workers.map((w) => (
               <li
                 key={w.id}
-                className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm"
+                // Stable id + programmatically-focusable (tabIndex -1, never a tab stop):
+                // the at-quota "delete one to provision another" jump focuses the first
+                // hosted row's container here (D10). Harmless on every row.
+                id={rowId(w.id)}
+                tabIndex={-1}
+                // Named by its worker-name <span> (below) so a screen reader announces the
+                // worker when the at-quota jump focuses this row. aria-label would suppress
+                // the badges; aria-labelledby names the row without hiding them.
+                aria-labelledby={rowNameId(w.id)}
+                // A visible focus ring for the programmatic at-quota jump. The global
+                // focus-ring rule (index.css) excludes [tabindex="-1"], and this row is ONLY
+                // ever focused programmatically (never a tab stop), so a plain :focus ring —
+                // the app's ring convention — is safe: it can only appear right after the jump.
+                className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-ink"
               >
                 <div>
                   {/* Row 1 — identity | badges. min-w-0 + break-words lets a long name
@@ -455,7 +619,7 @@ export function WorkersSettings() {
                           unchanged, and the reason is now the stronger one: rows stored
                           before that validator landed cannot be cleaned retroactively, so
                           this strip still has real work to do. */}
-                      <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
+                      <span id={rowNameId(w.id)} className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                       <span className="ml-2 align-middle">
                         <WorkerUpgradeBadge worker={w} />
                       </span>
@@ -753,7 +917,129 @@ export function WorkersSettings() {
             </ul>
           </>
         )}
-      </Card>
+            </Card>
+          </div>
+
+          {/* Add a worker panel — always mounted while hidden (D4): the one-time
+              join-token card must not vanish on a tab switch, and HostedWorkers keeps its
+              one-shot config fetch on mount. Hosted first (D3): it is the primary,
+              zero-effort worker path on k8s deployments, so it leads; the register card
+              follows, retitled to make the contrast read. */}
+          <div
+            role="tabpanel"
+            id={panelId("add")}
+            aria-labelledby={tabId("add")}
+            hidden={tab !== "add"}
+            className="space-y-6"
+          >
+            {newToken && (
+              <Card className="space-y-3 border-ok/40">
+                {/* stripUnsafeChars here too, converged with the other three worker.name
+                    sites in this file; the reason it is LOW rather than the same severity as
+                    the list: this name is the one the user typed into the create form seconds
+                    ago, in the same session — a user can only spoof their own immediate echo,
+                    with no cross-tenant path and nothing stored-then-surprising. The worker
+                    LIST renders names created at any time, and the admin view renders other
+                    people's. Fixed anyway because it is the same class and the same one-word
+                    fix.
+
+                    The announce() strings are escaped and injection-free; the
+                    rebind/provisioning ones lean on their visible list counterpart being
+                    sanitized. The delete-success announcement (#173) was the ONE where that
+                    lean did not hold — by construction, the row it names is already deleted, so
+                    no visible counterpart survives — so it is now itself passed through
+                    stripUnsafeChars (remove(), above). Recorded so nobody re-derives it. */}
+                <SectionTitle className="text-ok">Join token for “{stripUnsafeChars(newToken.worker)}”</SectionTitle>
+                <p className="text-sm text-muted">
+                  Copy it now — it is shown once and never again (only its hash is stored). Set it as{" "}
+                  <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_WORKER_TOKEN</code> on the
+                  worker container.
+                </p>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 overflow-x-auto rounded-lg border border-edge bg-ink px-3 py-2 font-mono text-sm text-ok">
+                    {newToken.token}
+                  </code>
+                  <Button variant="secondary" onClick={copy}>
+                    {copied ? "Copied" : "Copy"}
+                  </Button>
+                </div>
+                <div>
+                  <Button variant="ghost" onClick={() => setNewToken(null)}>
+                    Done
+                  </Button>
+                </div>
+              </Card>
+            )}
+
+            {/* Hosted workers (PRD #58): renders itself only when the instance has hosting
+                on and self-service quota left. One list below, not two — a hosted worker is
+                an ordinary worker whose container the controller runs, so it keeps the same
+                status, gauges, run badge and delete rule, and only its origin differs. */}
+            <HostedWorkers
+              hostedCount={workers.filter((w) => w.kind === "hosted").length}
+              onProvisioned={async (worker) => {
+                // Switch to Your workers AND announce in the SAME synchronous batch, both before
+                // any await (D "After a provision"). Both are plain state updates, so React
+                // batches them into ONE commit: by the time the [notice] focus effect runs, `tab`
+                // is already "workers" and the panel is un-hidden, so .focus() lands — a focus on
+                // an element inside a `hidden` panel silently no-ops. The two are order-independent
+                // (batched together); what is load-bearing is that BOTH run before the await —
+                // don't move `announce` after `await reload()`, and don't drop the `selectTab`.
+                // The notice sits at the top of that panel, so it is visible and takes focus.
+                selectTab("workers");
+                announce(`Provisioned ${worker.name} — it is listed below and comes online on its own.`);
+                await reload();
+              }}
+              onShowWorkers={onShowWorkers}
+              onAvailability={onHostedAvailability}
+            />
+
+            <Card className="space-y-4">
+              <SectionTitle>Register your own worker</SectionTitle>
+              <form onSubmit={create} className="flex flex-wrap items-end gap-3">
+                <div className="min-w-[16rem] flex-1">
+                  <Field label="Name">
+                    <Input
+                      // Stable id so the page can focus this input as the add panel's first
+                      // control (D10): the header button and the register-oriented empty-state
+                      // CTAs land here (and the hosted CTA falls back here when hosting is off).
+                      id="register-worker-name"
+                      placeholder="e.g. laptop, ci-runner-1"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                    />
+                  </Field>
+                </div>
+                <div className="min-w-[10rem]">
+                  <Field label="Template">
+                    <Select
+                      aria-label="Worker template"
+                      value={template}
+                      onChange={(e) => setTemplate(e.target.value)}
+                    >
+                      {WORKER_TEMPLATES.map((t) => (
+                        <option key={t} value={t}>
+                          {t}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                </div>
+                <Button type="submit" disabled={busy || name.trim() === ""}>
+                  {busy ? "Creating…" : "Generate join token"}
+                </Button>
+              </form>
+              <p className="text-xs text-muted">
+                The template is the worker image to build (<code className="rounded bg-raised px-1 py-0.5 text-fg">base</code> plus
+                heavy-dependency variants like <code className="rounded bg-raised px-1 py-0.5 text-fg">jvm</code>). Build the
+                worker with a matching{" "}
+                <code className="rounded bg-raised px-1 py-0.5 text-fg">WORKER_TEMPLATE</code>; if the worker reports a different
+                one it is flagged under Your workers, never rejected.
+              </p>
+            </Card>
+          </div>
+        </>
+      )}
     </div>
   );
 }

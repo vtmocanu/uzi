@@ -1859,6 +1859,10 @@ export interface Run {
    *  UNTRUSTED worker-authored text — render as escaped plain text through stripUnsafeChars,
    *  never <Markdown>, exactly like report_md/failure_reason. */
   preserved_patch?: string | null;
+  /** issue #974: the run's typed `fail_origin` (already coerced/allowlisted server-side at
+   *  write time), surfaced read-only so a diagnosis can key on a stable typed field instead
+   *  of matching a forge's free-text rejection message. Null when the run never set one. */
+  fail_origin?: string | null;
   /** issue #150: the repo-relative path the run declared it moved a completed PRD to
    *  (e.g. `prds/done/72-x.md`), and the RFC3339 instant its PRD-completion patch settled.
    *  Both null on a run that moved no PRD. OPTIONAL for the SAME api/web rollout skew as

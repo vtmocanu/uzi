@@ -276,6 +276,11 @@ type RunDTO struct {
 	// so the work is surfaced here for a human to land instead of being discarded. Null on
 	// every other run (the column is nullable, set only on that failed path).
 	PreservedPatch *string `json:"preserved_patch"`
+	// FailOrigin is a read-only surfacing of runs.fail_origin (already coerced and
+	// allowlisted server-side at write time, see workersvc.CoerceFailOrigin), so a
+	// diagnosis can key on a stable typed field instead of matching a forge's free-text
+	// rejection message. Null when the run never set one.
+	FailOrigin *string `json:"fail_origin"`
 	// PrdDonePath is the repo-relative path the run declared it moved a PRD to when it
 	// archived a completed PRD (e.g. prds/done/72-x.md), null for a run that moved none.
 	// Read-only surfacing of the runs.prd_done_path column so the issue's PRD link can be

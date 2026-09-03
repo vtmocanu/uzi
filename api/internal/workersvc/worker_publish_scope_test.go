@@ -68,6 +68,98 @@ func TestPublishWorkflowScopeRejectedSkipsCleanly(t *testing.T) {
 	}
 }
 
+// TestPublishSelfImproveDerivesRunIDBranch pins PRD #1062 M3: a self_improve run (which
+// also carries a valid issue_iid, its stable tracking issue) checkpoints to a
+// run-uuid-keyed branch uzi/self-improve/<runID>, NOT the issue branch — proving the
+// server-side gate dispatches on kind FIRST. It would FAIL against the old issue-only gate
+// (which returned Skipped:"unsupported" for any non-issue kind). The captured
+// pushbroker.Options.Branch, the returned Ref, and the persisted tip are all asserted.
+func TestPublishSelfImproveDerivesRunIDBranch(t *testing.T) {
+	box := newBox(t)
+	sealed, err := box.Seal([]byte("pat"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	fs := &fakeStore{
+		// A running SELF_IMPROVE run the worker owns. It carries a valid issue_iid (the
+		// stable tracking issue), which the server MUST ignore in favour of the run uuid.
+		runOwned: store.Run{
+			Kind:     runkind.SelfImprove,
+			IssueIid: pgtype.Int8{Int64: 7, Valid: true},
+			Branch:   pgtype.Text{},
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl:      "https://gitlab.example.com/team/repo",
+			DefaultBranch:   pgtype.Text{String: "main", Valid: true},
+			BaseUrl:         "https://gitlab.example.com",
+			BotUsername:     "uzi-bot",
+			TokenCiphertext: sealed,
+		},
+	}
+	svc := New(fs, box, testParams())
+	svc.SetForgeBaseURLAllowed(func(u string) bool { return u == "https://gitlab.example.com" })
+	var captured pushbroker.Options
+	svc.SetPublishFn(func(_ context.Context, o pushbroker.Options) (pushbroker.Result, error) {
+		captured = o
+		return pushbroker.Result{}, nil
+	})
+
+	runID := uuid.New()
+	wantBranch := "uzi/self-improve/" + runID.String()
+	res, err := svc.Publish(context.Background(), worker(), runID, "0123456789abcdef0123456789abcdef01234567", []byte("pack"))
+	if err != nil {
+		t.Fatalf("Publish(self_improve): %v", err)
+	}
+	if !res.Published {
+		t.Errorf("Published = false, want true (a self_improve run is checkpoint-eligible)")
+	}
+	if res.Skipped != "" {
+		t.Errorf("Skipped = %q, want \"\" (self_improve must not be an unsupported skip)", res.Skipped)
+	}
+	if captured.Branch != wantBranch {
+		t.Errorf("pushbroker Branch = %q, want %q (run-uuid-keyed, NOT the issue branch)", captured.Branch, wantBranch)
+	}
+	if res.Ref != "refs/uzi-checkpoints/"+wantBranch {
+		t.Errorf("Ref = %q, want %q", res.Ref, "refs/uzi-checkpoints/"+wantBranch)
+	}
+	if len(fs.checkpointTips) != 1 {
+		t.Errorf("SetRunCheckpointTip called %d time(s), want 1 (a successful publish persists the tip)", len(fs.checkpointTips))
+	}
+}
+
+// TestPublishIneligibleKindSkipsUnsupported pins that an ineligible kind (chat) is a
+// benign unsupported skip — no publish, no tip persisted — under the new checkpoint-eligible
+// gate, exactly as before M3.
+func TestPublishIneligibleKindSkipsUnsupported(t *testing.T) {
+	box := newBox(t)
+	fs := &fakeStore{
+		runOwned: store.Run{
+			Kind:   runkind.Chat,
+			Branch: pgtype.Text{},
+		},
+	}
+	svc := New(fs, box, testParams())
+	svc.SetForgeBaseURLAllowed(func(u string) bool { return u == "https://gitlab.example.com" })
+	svc.SetPublishFn(func(context.Context, pushbroker.Options) (pushbroker.Result, error) {
+		t.Fatal("publishFn must not be called for an ineligible kind")
+		return pushbroker.Result{}, nil
+	})
+
+	res, err := svc.Publish(context.Background(), worker(), uuid.New(), "0123456789abcdef0123456789abcdef01234567", []byte("pack"))
+	if err != nil {
+		t.Fatalf("Publish(chat): %v", err)
+	}
+	if res.Published {
+		t.Errorf("Published = true, want false (chat is not checkpoint-eligible)")
+	}
+	if res.Skipped != "unsupported" {
+		t.Errorf("Skipped = %q, want %q", res.Skipped, "unsupported")
+	}
+	if len(fs.checkpointTips) != 0 {
+		t.Errorf("SetRunCheckpointTip called %d time(s), want 0 (an unsupported skip persists nothing)", len(fs.checkpointTips))
+	}
+}
+
 // TestPublishPersistsTipOnEverySuccessAndNotOnSkip pins PRD #1042 M2: a CAS-accepted
 // advance (err == nil) persists the just-published tip to runs.checkpoint_tip on EVERY
 // success — so the tip ADVANCES across multiple publishes, not first-only — while a

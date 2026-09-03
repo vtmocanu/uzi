@@ -135,6 +135,10 @@ var runDTOKeys = []string{
 	// (the branch touched .github/workflows/** the bot PAT cannot push). Nullable, set
 	// only on that failed path, but the key is always on the wire.
 	"preserved_patch",
+	// issue #974: the run's typed fail_origin, surfaced read-only so a diagnosis keys on
+	// a stable field instead of failure_reason free text. Null unless the run set one, but
+	// the key is always on the wire.
+	"fail_origin",
 	// PRD-link reconciliation (read-only): the path the run declared it archived a PRD
 	// to, and when that patch lifecycle settled (null while pending). Both always on the
 	// wire — prd_done_path null for a run that moved no PRD, prd_patch_settled_at null

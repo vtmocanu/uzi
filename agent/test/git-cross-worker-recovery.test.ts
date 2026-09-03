@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 
 // PRD #628 M3 — the cross-worker checkpoint recovery regression test (SC#2).
@@ -17,9 +17,11 @@ import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 // and reseeds. It proves the three links the ADR (D3b) leaves for M3 to verify end to
 // end: (1) fetch()'s `+refs/uzi-checkpoints/*` refspec materialises the brokered ref in a
 // fresh worker's bare — the one link that, if broken, makes a correct publish invisible;
-// (2) the reseed then PREFERS that mirrored checkpoint; (3) the strict-descendant guard
-// (git.ts:479) is load-bearing — a checkpoint that merely equals the floor is NOT seeded
-// as a recovery, so the positive assertion is non-vacuous.
+// (2) the reseed then PREFERS that mirrored checkpoint (owner-anchored: since issue #1059 M1
+// adoption requires the mirrored checkpoint to be THIS run's own, so the positive reseed models
+// production by passing resume=true + this run's own matching checkpoint tip); (3) the
+// strict-descendant guard is load-bearing — a checkpoint that merely equals the floor is NOT
+// seeded as a recovery, so the positive assertion is non-vacuous.
 
 const GIT_ENV = {
   ...process.env,
@@ -70,6 +72,57 @@ function worker(name: string): GitCache {
   const dataDir = path.join(fx.dataDir, name);
   fs.mkdirSync(dataDir, { recursive: true });
   return new GitCache(dataDir, nullLogger());
+}
+
+/** A worker whose GitCache captures every emitted log record into `lines`, so an
+ *  issue-#1059 true-negative can assert the LOUD owner-anchor set-aside warn fired. */
+function loggingWorker(name: string): { git: GitCache; lines: unknown[] } {
+  const dataDir = path.join(fx.dataDir, name);
+  fs.mkdirSync(dataDir, { recursive: true });
+  const { logger, lines } = recordingLogger();
+  return { git: new GitCache(dataDir, logger), lines };
+}
+
+/** True when `lines` holds a level:"warn" record whose msg names the owner-anchor guard and
+ *  which carries the expected_checkpoint_tip + checkpoint_sha diagnostic fields. */
+function sawOwnerAnchorWarn(lines: unknown[]): boolean {
+  return lines.some((l) => {
+    const r = l as { level?: string; msg?: string } & Record<string, unknown>;
+    return (
+      r.level === "warn" &&
+      typeof r.msg === "string" &&
+      r.msg.includes("owner-anchor guard") &&
+      "expected_checkpoint_tip" in r &&
+      "checkpoint_sha" in r
+    );
+  });
+}
+
+/** Create refs/heads/<branch> in the fixture origin at a NEW commit that descends `parent`
+ *  and adds a single `file` — a line that DIVERGES from any sibling built off the same
+ *  parent (e.g. a wip(park) marker). Uses a throwaway index + plumbing so the origin's
+ *  working tree and checked-out branch are untouched. Worker B's ensureClone then mirrors
+ *  it as refs/remotes/origin/<branch>, so originExists=true on the reseed and the floor is
+ *  this published branch — the shape leg #4 needs under the issue-#1059 owner-anchor predicate. */
+function makeOriginBranch(branch: string, parent: string, file: string, content: string): string {
+  const idx = path.join(fx.originPath, ".git", `tmp-index-${branch.replace(/[^a-zA-Z0-9]/g, "_")}`);
+  const env = { ...GIT_ENV, GIT_INDEX_FILE: idx };
+  execFileSync("git", ["-C", fx.originPath, "read-tree", parent], { env });
+  const blob = execFileSync("git", ["-C", fx.originPath, "hash-object", "-w", "--stdin"], {
+    env: GIT_ENV,
+    input: content,
+    encoding: "utf8",
+  }).trim();
+  execFileSync("git", ["-C", fx.originPath, "update-index", "--add", "--cacheinfo", `100644,${blob},${file}`], { env });
+  const tree = execFileSync("git", ["-C", fx.originPath, "write-tree"], { env, encoding: "utf8" }).trim();
+  const sha = execFileSync(
+    "git",
+    ["-C", fx.originPath, ...IDENT, "commit-tree", tree, "-p", parent, "-m", `origin work ${file}`],
+    { env: GIT_ENV, encoding: "utf8" },
+  ).trim();
+  gitIn(fx.originPath, ["update-ref", `refs/heads/${branch}`, sha]);
+  fs.rmSync(idx, { force: true });
+  return sha;
 }
 
 /** Build a commit object directly in the bare (no worktree) and return its sha. `parents`
@@ -187,9 +240,11 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
       "…at worker A's checkpoint tip",
     );
 
-    // THE RESEED: worker B seeds a fresh cross-worker run (no local tracking ref → NOT
-    // ownedHere) off the mirrored checkpoint.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 628, "run-B");
+    // THE RESEED: worker B seeds a cross-worker run (no local tracking ref → NOT ownedHere)
+    // off the mirrored checkpoint. Models production: resume=true and THIS run's own persisted
+    // checkpoint tip (== the mirrored checkpoint's SHA), so the issue-#1059 owner anchor admits
+    // the adopt. With no origin/<branch> this is the Path-A resume-adopt leg.
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 628, "run-B", true /*resume*/, cpTip /*matching own tip*/);
 
     // SC#2 NON-VACUITY GUARD — all of these must hold, else the assertion would pass on a
     // checkpoint that merely equals the floor and prove nothing.
@@ -233,9 +288,10 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
 
     const rc = await gitB.createOrAttachRunnerClone(bareB, 629, "run-B");
 
-    // git.ts:479's strict-descendant condition is LOAD-BEARING: an equal checkpoint
-    // recovers nothing, so the reseed must fall through to the default floor rather than
-    // seed "checkpoint". This is the guard that makes the positive test above non-vacuous.
+    // The reseed must fall through to the default floor rather than seed "checkpoint": under
+    // issue #1059 M1 this fresh run (no resume, no own-checkpoint tip) fails the owner anchor,
+    // so it never adopts regardless of ancestry — and even had the tip matched, the equal
+    // checkpoint recovers nothing (the strict-descendant guard). Either way, "default".
     assert.notStrictEqual(rc.seededFrom, "checkpoint", "an equal checkpoint must NOT be seeded as a recovery");
     assert.strictEqual(rc.seededFrom, "default", "falls through to the default floor");
     assert.strictEqual(rc.priorCommits, 0);
@@ -318,49 +374,55 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     );
   });
 
-  it("recovers a DIVERGED wip(park) checkpoint onto the advanced floor as an uncommitted change (cross-worker, PRD #759 M4 leg #4)", async () => {
-    // Leg #4: `main` advanced DURING the park, so the mirrored checkpoint (a wip(park)
-    // marker over the OLD floor) is not a strict descendant of the new floor and the
-    // strict-descendant guard set it aside. The marker's parent is the pre-park floor, an
-    // ancestor of the advanced floor, and the WIP touches a file disjoint from main's
-    // advance — so the WIP delta cherry-picks CLEAN onto the new floor and is recovered as
-    // an uncommitted change. This is the leg that shipped DOA (M2 cherry-picked the ref
-    // NAME, absent from the `--shared --no-checkout` clone) — see the pre-fix note below.
+  it("recovers a DIVERGED wip(park) checkpoint onto a divergent published origin as an uncommitted change (cross-worker, PRD #759 M4 leg #4)", async () => {
+    // Leg #4, under the issue-#1059 M1 owner-anchor predicate: leg #4 (checkpointSetAside →
+    // cherry-pick) is now reachable ONLY when the checkpoint is THIS run's OWN (matching
+    // expectedCheckpointTip), origin/<branch> EXISTS as the floor, and the checkpoint DIVERGES
+    // from it. So the fixture publishes origin/<branch> off the pre-park floor on a line
+    // DISJOINT from the WIP: it becomes the floor, the checkpoint marker (over the same pre-park
+    // floor) diverges from it → the strict-descendant guard sets it aside, and the marker's
+    // parent (the pre-park floor) is an ancestor of the origin floor, so the WIP delta
+    // cherry-picks CLEAN. (This is also the leg that once shipped DOA — M2 cherry-picked the ref
+    // NAME, absent from the `--shared --no-checkout` clone — so the #759 guard is preserved here.)
     const branch = "agent/issue-760";
     const gitA = worker("workerA");
-    const bareA = await gitA.ensureClone(fx.originPath); // origin/main = the OLD floor (C0)
+    const bareA = await gitA.ensureClone(fx.originPath); // origin/main = the pre-park floor (C0)
+    const floor0 = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
     const { marker, parent } = await publishWipParkCheckpoint(
       gitA, bareA, 760, branch, "WIP.txt", "diverged in-progress work\n",
     );
+    assert.strictEqual(parent, floor0, "the marker's parent is the pre-park floor");
 
-    // main ADVANCES during the park, on a file DISJOINT from the WIP (so the pick is clean).
-    const advancedFloor = advanceOriginMain("MAIN_ADVANCE.txt", "landed while parked\n");
-    assert.notStrictEqual(advancedFloor, parent, "the floor genuinely advanced past the fork point");
+    // A published origin/<branch> off the pre-park floor, on a file DISJOINT from the WIP → it
+    // is the floor and the checkpoint marker diverges from it (so the WIP delta picks clean).
+    const originTip = makeOriginBranch(branch, floor0, "ORIGIN_WORK.txt", "published divergent origin work\n");
 
-    // Worker B: a fresh bare that fetches the advanced floor AND the (now diverged) checkpoint.
+    // Worker B: a fresh bare that fetches the origin branch AND the (diverged) checkpoint.
     const gitB = worker("workerB");
     const bareB = await gitB.ensureClone(fx.originPath);
-    const floorSha = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
-    assert.strictEqual(floorSha, advancedFloor, "worker B's floor is the advanced main");
+    const floorSha = gitIn(bareB, ["rev-parse", `refs/remotes/origin/${branch}`]);
+    assert.strictEqual(floorSha, originTip, "worker B's floor is the published origin branch");
     assert.strictEqual(
       refInBare(bareB, `refs/uzi-checkpoints/${branch}`) && gitIn(bareB, ["rev-parse", `refs/uzi-checkpoints/${branch}`]),
       marker,
       "the diverged checkpoint mirrored in at the wip(park) marker",
     );
-    // The checkpoint is genuinely DIVERGED — not reachable from the floor — else this is not leg #4.
+    // The checkpoint is genuinely DIVERGED from the origin floor — else this is not leg #4.
     assert.throws(
       () => gitIn(bareB, ["merge-base", "--is-ancestor", floorSha, marker]),
-      "the checkpoint does NOT descend the advanced floor (it is diverged, set aside)",
+      "the checkpoint does NOT descend the origin floor (it is diverged, set aside)",
     );
     // …and the marker's parent (fork point) IS an ancestor of the floor — the recoverable shape.
     assert.doesNotThrow(
       () => gitIn(bareB, ["merge-base", "--is-ancestor", parent, floorSha]),
-      "the marker's parent is an ancestor of the advanced floor (no committed work below the marker)",
+      "the marker's parent is an ancestor of the origin floor (no committed work below the marker)",
     );
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 760, "run-B");
+    // RESUME with THIS run's own matching tip (== the marker) so the owner anchor admits it;
+    // origin/<branch> exists → Path B; diverged → set aside → leg #4 fires.
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 760, "run-B", true /*resume*/, marker /*matching own tip*/);
 
-    // (a) the WIP content is recovered as an UNCOMMITTED change on the advanced floor.
+    // (a) the WIP content is recovered as an UNCOMMITTED change on the origin floor.
     //     PRE-FIX this FAILS: M2 cherry-picked `refs/uzi-checkpoints/<branch>` by NAME, but a
     //     `git clone --shared --no-checkout` copies no custom refs, so the pick hit `fatal:
     //     bad revision` and the leg always safe-failed → WIP.txt absent, wipRecovered false,
@@ -373,14 +435,14 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     );
     const porcelain = gitIn(rc.path, ["status", "--porcelain"]);
     assert.ok(/WIP\.txt/.test(porcelain), `WIP.txt shows as an uncommitted change, got: ${JSON.stringify(porcelain)}`);
-    // The advanced floor is present too (we sit ON the new floor, not the old one).
-    assert.strictEqual(fs.existsSync(path.join(rc.path, "MAIN_ADVANCE.txt")), true, "the advanced-main file is on the floor");
+    // The published origin work is present too (we sit ON the origin floor, not the checkpoint).
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "ORIGIN_WORK.txt")), true, "the origin-floor file is present");
 
     // (b) the recovery is surfaced and set-aside is cleared; no wip(park) marker in history.
     assert.strictEqual(rc.wipRecovered, true, "wipRecovered signals the diverged-WIP recovery");
     assert.notStrictEqual(rc.checkpointSetAside, true, "a recovered checkpoint is no longer set aside");
-    assert.strictEqual(rc.baseCommit, floorSha, "the base is the advanced floor (priorCommits stays 0, no committed work recovered)");
-    assert.strictEqual(rc.priorCommits, 0, "no committed work was recovered — only the uncommitted WIP");
+    assert.strictEqual(rc.baseCommit, floorSha, "the base is the origin floor (no committed checkpoint work recovered)");
+    assert.strictEqual(rc.priorCommits, 1, "only the origin floor's own published commit ahead of default — no checkpoint commit recovered");
     const subjects = gitIn(rc.path, ["log", "--format=%s"]).split("\n");
     assert.ok(
       subjects.every((s) => !s.startsWith(WIP_PARK_COMMIT_PREFIX)),
@@ -388,81 +450,87 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     );
   });
 
-  it("SAFE-FAILS a diverged wip(park) checkpoint whose WIP conflicts with main's advance, leaving a pristine floor (leg #4)", async () => {
+  it("SAFE-FAILS a diverged wip(park) checkpoint whose WIP conflicts with the published origin, leaving a pristine floor (leg #4)", async () => {
     // The recoverable shape (marker parent is a floor ancestor) but the WIP touches the SAME
-    // file main moved after the park, so the cherry-pick CONFLICTS. Required safe failure
-    // (SC#1(b)): abort the half-applied pick, hard-reset to the floor, report failure —
+    // file the published origin/<branch> holds, so the cherry-pick CONFLICTS. Required safe
+    // failure (SC#1(b)): abort the half-applied pick, hard-reset to the floor, report failure —
     // never a half-merged tree, never a silent drop.
     const branch = "agent/issue-761";
     const gitA = worker("workerA");
     const bareA = await gitA.ensureClone(fx.originPath);
+    const floor0 = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
     const { marker, parent } = await publishWipParkCheckpoint(
       gitA, bareA, 761, branch, "CONTESTED.txt", "the parked worker's edit\n",
     );
+    assert.strictEqual(parent, floor0, "the marker's parent is the pre-park floor");
 
-    // main advances by touching the VERY SAME file, with different content → add/add conflict.
-    const advancedFloor = advanceOriginMain("CONTESTED.txt", "main's landed edit\n");
+    // origin/<branch> off the pre-park floor touches the VERY SAME file as the WIP, with
+    // different content → add/add conflict when the WIP delta is picked onto it.
+    const originTip = makeOriginBranch(branch, floor0, "CONTESTED.txt", "origin's published edit\n");
     assert.doesNotThrow(
-      () => gitIn(fx.originPath, ["merge-base", "--is-ancestor", parent, advancedFloor]),
+      () => gitIn(fx.originPath, ["merge-base", "--is-ancestor", parent, originTip]),
       "the fork point is still an ancestor of the floor (so the guard admits the pick; the conflict is the WIP itself)",
     );
 
     const gitB = worker("workerB");
     const bareB = await gitB.ensureClone(fx.originPath);
-    const floorSha = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    const floorSha = gitIn(bareB, ["rev-parse", `refs/remotes/origin/${branch}`]);
+    assert.strictEqual(floorSha, originTip, "worker B's floor is the published origin branch");
     assert.throws(
       () => gitIn(bareB, ["merge-base", "--is-ancestor", floorSha, marker]),
       "the checkpoint is diverged (set aside)",
     );
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 761, "run-B");
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 761, "run-B", true /*resume*/, marker /*matching own tip*/);
 
     // Recovery FAILED — set aside, not recovered.
     assert.notStrictEqual(rc.wipRecovered, true, "a conflicting WIP is not recovered");
     assert.strictEqual(rc.checkpointSetAside, true, "the checkpoint stays SET ASIDE (loud notice preserved)");
-    assert.strictEqual(rc.baseCommit, floorSha, "the base is the pristine advanced floor");
+    assert.strictEqual(rc.baseCommit, floorSha, "the base is the pristine origin floor");
 
-    // The clone tree is a PRISTINE floor: main's version of the file, no conflict markers, no
+    // The clone tree is a PRISTINE floor: origin's version of the file, no conflict markers, no
     // staged WIP.
     const contested = fs.readFileSync(path.join(rc.path, "CONTESTED.txt"), "utf8");
-    assert.strictEqual(contested, "main's landed edit\n", "the floor's content is intact (WIP was not force-applied)");
+    assert.strictEqual(contested, "origin's published edit\n", "the floor's content is intact (WIP was not force-applied)");
     assert.ok(!/^<{7}|^={7}|^>{7}/m.test(contested), "no conflict markers left in the tree");
     assert.strictEqual(gitIn(rc.path, ["status", "--porcelain"]), "", "no staged/uncommitted residue — a clean floor");
   });
 
   it("LEAVES SET ASIDE a diverged checkpoint with a committed milestone BELOW the marker — no cherry-pick (Defect 2 guard, leg #4)", async () => {
-    // `fork → m1(committed) → wip-marker`, with m1 NOT on the advanced floor. Cherry-picking
-    // only the marker tip would apply the WIP delta cleanly (it is disjoint from main's
-    // advance) and flip checkpointSetAside=false — silently dropping m1 AND suppressing the
-    // set-aside notice. The Defect-2 guard (marker PARENT must be an ancestor of the floor)
-    // bites here: m1 is not an ancestor of the floor, so leg #4 must NOT cherry-pick and must
-    // keep the checkpoint set aside for a human.
+    // `floor → m1(committed) → wip-marker`, with m1 NOT on the published origin floor.
+    // Cherry-picking only the marker tip would apply the WIP delta cleanly (it is disjoint from
+    // the origin work) and flip checkpointSetAside=false — silently dropping m1 AND suppressing
+    // the set-aside notice. The Defect-2 guard (marker PARENT must be an ancestor of the floor)
+    // bites here: m1 is not an ancestor of the origin floor, so leg #4 must NOT cherry-pick and
+    // must keep the checkpoint set aside for a human.
     const branch = "agent/issue-762";
     const gitA = worker("workerA");
     const bareA = await gitA.ensureClone(fx.originPath);
+    const floor0 = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
     const { marker, parent } = await publishWipParkCheckpoint(
       gitA, bareA, 762, branch, "WIP.txt", "in-progress over a committed milestone\n",
       ["M1.txt"], // one committed-but-unpushed milestone below the marker
     );
+    assert.notStrictEqual(parent, floor0, "the marker's parent is the committed milestone m1, not the floor");
 
-    // main advances on a DISJOINT file — so absent the guard the WIP delta would pick clean
-    // and the silent drop of M1 would occur. The guard is what prevents it.
-    const advancedFloor = advanceOriginMain("MAIN_ADVANCE.txt", "landed while parked\n");
-    // The marker's parent is m1, which is NOT an ancestor of the advanced floor.
+    // origin/<branch> off the pre-park floor on a DISJOINT file — the marker's parent (m1) is
+    // NOT an ancestor of this floor, so the Defect-2 guard must leave the checkpoint set aside.
+    const originTip = makeOriginBranch(branch, floor0, "ORIGIN_WORK.txt", "published divergent origin work\n");
     assert.throws(
-      () => gitIn(fx.originPath, ["merge-base", "--is-ancestor", parent, advancedFloor]),
-      "the marker's parent (m1) is NOT an ancestor of the floor — committed divergence below the marker",
+      () => gitIn(fx.originPath, ["merge-base", "--is-ancestor", parent, originTip]),
+      "the marker's parent (m1) is NOT an ancestor of the origin floor — committed divergence below the marker",
     );
 
     const gitB = worker("workerB");
     const bareB = await gitB.ensureClone(fx.originPath);
-    const floorSha = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    const floorSha = gitIn(bareB, ["rev-parse", `refs/remotes/origin/${branch}`]);
+    assert.strictEqual(floorSha, originTip, "worker B's floor is the published origin branch");
     assert.throws(
       () => gitIn(bareB, ["merge-base", "--is-ancestor", floorSha, marker]),
       "the checkpoint is diverged (set aside)",
     );
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 762, "run-B");
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 762, "run-B", true /*resume*/, marker /*matching own tip*/);
 
     // The guard left it set aside: NO cherry-pick, NO flip, NO silent milestone drop.
     assert.strictEqual(rc.checkpointSetAside, true, "committed divergence below the marker stays SET ASIDE");
@@ -567,7 +635,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     );
   });
 
-  it("FRESH run (resume=false) does NOT inherit a diverged checkpoint — strict/floor behaviour unchanged (set aside)", async () => {
+  it("FRESH run (resume=false, no own-checkpoint tip) does NOT inherit a diverged checkpoint and does NOT set it aside (issue #1059 true-negative)", async () => {
     const branch = "agent/issue-10302";
     const gitA = worker("workerA");
     const bareA = await gitA.ensureClone(fx.originPath);
@@ -584,15 +652,16 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
       "precondition: the checkpoint is diverged",
     );
 
-    // A FRESH run (resume=false — session_id == null): the strict-descendant test applies,
-    // so the diverged checkpoint is set aside and the run cold-starts from the default floor.
-    // The owner-anchor tip is irrelevant here (the resume-adopt leg is not reached); pass it
-    // anyway to prove a matching tip does NOT override the fresh-run strict behaviour.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10302, "run-B", false, cpTip);
+    // A genuine FRESH run: resume=false AND no own-checkpoint tip (session_id == null, never
+    // published). issue #1059 M1 — the checkpoint is a FOREIGN/prior run's work (ownerMatch
+    // false), so it is neither adopted NOR set aside (setting aside would drive the #759
+    // cherry-pick, re-importing the very foreign work the owner anchor keeps out). The run
+    // cold-starts from the default floor, quietly-loudly (a warn, no checkpointSetAside flag).
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10302, "run-B", false /*fresh*/, undefined /*no own tip*/);
 
     assert.strictEqual(rc.seededFrom, "default", "a fresh run falls through to the default floor");
     assert.strictEqual(rc.baseCommit, floorSha, "the base is the advanced default floor");
-    assert.strictEqual(rc.checkpointSetAside, true, "the diverged checkpoint is set aside for a fresh run");
+    assert.notStrictEqual(rc.checkpointSetAside, true, "a foreign/fresh checkpoint is NOT set aside (no #759 cherry-pick)");
     assert.strictEqual(rc.priorCommits, 0, "nothing recovered on a fresh cold start");
     assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), false, "a fresh run does NOT inherit the prior checkpoint's work");
     assert.strictEqual(fs.existsSync(path.join(rc.path, "M2.txt")), false, "…nor its second milestone");
@@ -706,6 +775,76 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     assert.ok(rc.priorCommits > 0, `priorCommits must be > 0 (own milestones adopted), got ${rc.priorCommits}`);
     assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), true, "milestone M1 adopted onto the branch");
     assert.strictEqual(fs.existsSync(path.join(rc.path, "M2.txt")), true, "milestone M2 adopted onto the branch");
+  });
+
+  // issue #1059 M1 — the OWNER-ANCHOR true-negatives for a genuine FRESH run (resume=false AND
+  // no own-checkpoint tip). Before #1059 the strict-descendant leg (Path B) adopted ANY
+  // mirrored checkpoint that strictly descended the floor and set aside a diverged one — with
+  // NO owner check — so a fresh cross-worker run would re-tread a prior/foreign run's work. The
+  // single owner-gated predicate now refuses both shapes: no adoption, no set-aside (the latter
+  // would drive the #759 cherry-pick and re-import the very foreign work), just a LOUD warn.
+
+  it("FRESH run does NOT adopt a strictly-DESCENDING foreign checkpoint — the headline #1059 AC (old Path B WOULD have adopted it)", async () => {
+    const branch = "agent/issue-10307";
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    // A prior/foreign run's checkpoint that STRICTLY DESCENDS the floor (main NOT advanced), so
+    // ONLY the owner anchor — not the disjoint/strict test — can keep it from being adopted.
+    const cpTip = await publishCommittedCheckpoint(gitA, bareA, 10307, branch, ["M1.txt", "M2.txt"]);
+
+    const { git: gitB, lines } = loggingWorker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const floorSha = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    assert.doesNotThrow(
+      () => gitIn(bareB, ["merge-base", "--is-ancestor", floorSha, cpTip]),
+      "precondition: the checkpoint STRICTLY descends the floor (old Path B would have adopted it)",
+    );
+
+    // A genuine FRESH run: resume=false, no own-checkpoint tip.
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10307, "run-B", false /*fresh*/, undefined /*no own tip*/);
+
+    assert.notStrictEqual(rc.seededFrom, "checkpoint", "a strictly-descending FOREIGN checkpoint is refused (the #1059 fix)");
+    assert.strictEqual(rc.seededFrom, "default", "the fresh run seeds off the default floor");
+    assert.strictEqual(rc.baseCommit, floorSha, "the base is the default floor, not the foreign checkpoint");
+    assert.notStrictEqual(rc.checkpointSetAside, true, "not set aside either — no #759 cherry-pick of foreign work");
+    assert.strictEqual(rc.priorCommits, 0, "no prior/foreign committed work re-treaded");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), false, "the foreign checkpoint's work was NOT adopted");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M2.txt")), false, "…nor its second milestone");
+    assert.ok(
+      sawOwnerAnchorWarn(lines),
+      `the LOUD owner-anchor set-aside warn must be emitted, got: ${JSON.stringify(lines)}`,
+    );
+  });
+
+  it("FRESH run does NOT adopt or set aside a DIVERGED foreign checkpoint — emits the loud owner-anchor warn (issue #1059 true-negative)", async () => {
+    const branch = "agent/issue-10308";
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    const cpTip = await publishCommittedCheckpoint(gitA, bareA, 10308, branch, ["M1.txt", "M2.txt"]);
+
+    // main advances during the park → the foreign checkpoint DIVERGES from the new floor.
+    const advancedFloor = advanceOriginMain("MAIN_ADVANCE.txt", "landed while parked\n");
+
+    const { git: gitB, lines } = loggingWorker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const floorSha = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    assert.strictEqual(floorSha, advancedFloor, "worker B's floor is the advanced main");
+    assert.throws(
+      () => gitIn(bareB, ["merge-base", "--is-ancestor", floorSha, cpTip]),
+      "precondition: the checkpoint is diverged (old Path B would have SET IT ASIDE)",
+    );
+
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10308, "run-B", false /*fresh*/, undefined /*no own tip*/);
+
+    assert.strictEqual(rc.seededFrom, "default", "the fresh run seeds off the default floor");
+    assert.strictEqual(rc.baseCommit, floorSha, "the base is the advanced default floor");
+    assert.notStrictEqual(rc.checkpointSetAside, true, "a diverged FOREIGN checkpoint is NOT set aside — no #759 cherry-pick");
+    assert.strictEqual(rc.priorCommits, 0, "nothing recovered");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), false, "the foreign checkpoint's work was NOT adopted");
+    assert.ok(
+      sawOwnerAnchorWarn(lines),
+      `the LOUD owner-anchor set-aside warn must be emitted, got: ${JSON.stringify(lines)}`,
+    );
   });
 });
 

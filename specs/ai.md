@@ -19087,6 +19087,19 @@ session_id gate**: a design-wave counterexample showed a session-keyed gate let 
 *different* dead run's orphan ref (same session lineage, different run), i.e. false provenance.
 Anchoring to the run id closes that.
 
+*issue #887/#909 — stamp encoding and the read-fallback.* The stamp is authoritatively written and
+cleared under the #887 **subsection** form `uzi-trackowner.<branch>.owner` (branch verbatim in the
+subsection, so distinct branches never collide). During the rollout window a persistent bare may
+still carry a stamp under the **pre-#887 flattened** form `uzi-trackowner.<flattened>`
+(`/`,`.`->`-`, 2-part, no `.owner`); a reader that consulted only the new key would read empty and
+redo a stable branch's unpushed work. So the reader (#909) ALSO falls back to the flattened form,
+**read-only** and **collision-guarded** — the flat key is not branch-injective, so it is consulted
+only when no other live `refs/uzi-runner/<branch>` flattens to the same key — and still gated by the
+run-id-equality check above. The clear path likewise unsets the flattened key, skipping it when a
+distinct live sibling shares it. Nothing ever WRITES the flat form, so once any run re-stamps under
+the subsection key the READ heals (the subsection key now takes precedence); the stale flat entry
+itself persists as dead config the reader ignores, cleared only if it later D/F-blocks a fetch.
+
 **Decision 4: shutdown durability (shape B), abort in-flight runs on SIGTERM, then fetch back.**
 `Runner.shutdown()` plus a per-run registry aborts each in-flight run's controller on SIGTERM
 (`agent/src/runner.ts`; the worker's existing SIGTERM/SIGINT handler in `agent/src/main.ts` drives
@@ -23796,7 +23809,47 @@ Byte-identity is the proof: every commit is `git diff --color-moved=dimmed-zebra
 
 Cross-refs: epic #915 (P22, the first post-freeze web component extraction); #1007 (the `pages/<page>/` recipe), #960 (`adminSettings/` precedent), #963 (positional-comment sweep on a move).
 
-## 609. PRD #1064 — Live milestone progress: push `report_progress` on observation, transition frames in the worker's words, a server-derived "now" line, and a blinking in-progress cell
+## 609. PRD #1062 M1 (#1059) — the checkpoint owner-anchor covers ALL adoption on the not-ownedHere path, not just resume-adopt
+
+Serves human Feature #218 (park-resume durability). #1042 M4 (§604 D7(c)) owner-anchored only the resume-adopt leg; the strict-descendant leg was left ungated, so a fresh cross-worker run could seed off — or, on divergence, cherry-pick (§582 leg #4) from — a PRIOR or FOREIGN run's mirrored checkpoint whenever a prior terminal CAS-delete had failed to remove it. This M1 extends the SAME owner anchor to every checkpoint adoption on the not-ownedHere path. Agent-side only (`agent/src/git.ts` `runnerCloneForBranch`): no server, schema, or migration change (reuses #1042's `runs.checkpoint_tip`, threaded in as `expectedCheckpointTip` from `claim.checkpoint_tip`); no `.github/workflows` touch. M2 (#1036) and M3 (#1037) of PRD #1062 remain open follow-ups.
+
+- **One hoisted predicate gates the whole `checkpointExists` block.** `ownerMatch = expectedCheckpointTip is non-empty AND === checkpointSha` (the mirrored checkpoint's current SHA). It is computed once and governs both adoption legs; before this, only Path A (resume-adopt) consulted the tip while Path B (strict-descendant) adopted any mirrored checkpoint reachable from the floor with no owner check at all.
+- **`ownerMatch` false → NEVER adopt, NEVER set `checkpointSetAside`, seed off the floor, log LOUDLY.** A foreign/prior checkpoint, or a fresh run's NULL/empty tip, falls straight through to the origin/default floor. The set-aside flag is deliberately left false because it is what drives the #759 wip(park) cherry-pick (leg #4), which would otherwise re-import the very foreign work this guard keeps out. A structured `warn` (not a run-feed status) records why a present checkpoint was set aside, folding the two prior warns (the #1042 resume-mismatch warn and the implicit fresh-adopt path) into one.
+- **`ownerMatch` true → unchanged prior behaviour, now owner-gated.** Path A (`resume && !originExists`) is #1030 M3 resume-adopt under the disjoint-history guard, untouched. Path B (else) is the strict-descendant leg: equal-to-floor falls through to the floor with `checkpointSetAside` staying false (equality is not divergence), and diverged sets `checkpointSetAside` (→ the #759 leg-#4 cherry-pick).
+- **Consequence: the #759 leg-#4 cherry-pick is now production-reachable only via `ownerMatch && originExists && diverged`.** The classic UNPUSHED #759 incident is served by Path A plus the adopt-time wip(park) `reset --soft`, not by leg #4. This narrows leg #4's reachability but is not a regression versus pre-#1059 — the paths that legitimately recovered this run's own work still do.
+
+Cross-refs: §604 (PRD #1030→#1042, the owner-anchor column `runs.checkpoint_tip` and its compare-and-delete this leg reuses); §582 (PRD #759, the wip(park) marker and the leg-#4 cherry-pick this guard keeps foreign work out of).
+
+## 610. PRD #1063 — Workers page split into "Your workers" and "Add a worker" tabs, hosted-first
+
+Serves human: "the fleet a user opens the page to check sat under two one-time forms, and the wrong form (self-hosted registration) led on a k8s deployment where hosted is the primary path." `web/src/pages/WorkersSettings.tsx` gains a two-tab `role="tablist"` (the `web/src/pages/Schedules.tsx` recipe, copied not extracted) — **Your workers · N** and **Add a worker** — with the hosted (`web/src/components/HostedWorkers.tsx`) card moved ahead of the register card on the add tab. Web-only composition and copy: same components, same API calls, same DTOs, no route/handler/CLI change (`api/cmd/uzi/` untouched).
+
+- **D1 — tabs, not a modal/drawer**, because `web/` has no modal primitive (specs/ai.md:7457, PRD #58) and a drawer risks losing the one-time join token on outside-click.
+- **D2 — names `Your workers · N` / `Add a worker`**, the Schedules `· count` convention.
+- **D3 — hosted card first on the add tab**, register card retitled **Register your own worker**, matching hosted's status as the primary path on k8s.
+- **D4 — both panels stay mounted, the inactive one `hidden`** (not unmounted like Schedules): keeps the join-token card alive across a switch, keeps `HostedWorkers`' one-shot config fetch running so `onAvailability` can reach the page from a hidden panel.
+- **D5 — Auto-provision on demand stays inside the hosted card**, not promoted to a fleet-level control.
+- **D6 — the Schedules tab markup is copied, not extracted into a shared `Tabs` primitive** (a three-page migration deferred to a follow-up issue).
+- **D7 — deep link `?tab=add` / `?tab=workers`** via `useSearchParams` (the `Findings` precedent), written with `{ replace: true }`.
+- **D8 — hosting availability reaches the page via an `onAvailability` callback**, not by lifting `HostedWorkers`' config fetch into the page (would move 24 pinned tests).
+- **D9 — the header's Add worker button stays visible on both tabs** rather than hiding on the add tab.
+- **D10 — explicit focus targets** for the header button, empty-state CTAs, and the at-quota "delete one" link — never a Delete button.
+- **D11 — the landing tab is decided once, after the first fleet load**: empty fleet → Add a worker, non-empty (any state, including all-unhealthy) → Your workers; a URL param overrides; the count never re-steers the tab after that.
+
+Cross-refs: `web/src/pages/Schedules.tsx` (tab recipe source); `web/src/pages/Findings.tsx` (`useSearchParams` precedent); PRD #58 (the no-modal precedent, unaffected — tabs are not a modal).
+
+## 611. PRD #1062 M3 (#1037) — forge checkpointing extended to self_improve runs, server-only
+
+Serves human Feature #218 (park-resume durability). Before M3 forge checkpointing was issue-runs-only: `Publish` and `deleteCheckpointBestEffort` in `api/internal/workersvc/service.go` gated on `kind == runkind.Issue`, returning `Skipped:"unsupported"` / a no-op for every other kind, so a `self_improve` run (long, and the run kind most worth durably checkpointing on a graceful interrupt — park / drain / cordon-roll) lost its work if its worker died. M3 extends checkpointing to the checkpoint-eligible SET (issue + self_improve), server-only: no schema/migration (reuses `runs.checkpoint_tip`), no worker edit (the worker already threads `checkpoint_tip`+`resume` for all kinds and derives `uzi/self-improve/<runId>` itself — §M1's plumbing), no `.github/workflows` touch. File-disjoint from M2 (#1036) under Option B.
+
+- **The issue-only gate is replaced by a checkpoint-eligible gate that dispatches on KIND FIRST.** New `api/internal/workersvc/checkpoint_branch.go` adds `checkpointBranch(kind, runID, issueIid) (string, ok)`, derived ENTIRELY from validated run-row fields — never a worker-supplied string. It switches on kind: `issue` → `agent/issue-<iid>` (ok=false if the iid is missing), `self_improve` → `uzi/self-improve/<runID>` (the new `selfImproveBranch` mirror), every other kind → ok=false (the benign `unsupported` skip / no-op). Both `Publish` and `deleteCheckpointBestEffort` now call it in place of their inline `agentIssueBranch` + kind check.
+- **Kind-first is load-bearing, not stylistic.** A `self_improve` run ALSO carries a valid `issue_iid` (its stable tracking-issue container, reused across cycles — §604/PRD #46 D10), so gating on `issueIid.Valid` alone would misroute it to `agent/issue-<iid>`. Dispatching on kind first keys the self_improve checkpoint on the run uuid (fresh per cycle), matching the worker's `agent/src/self-improve.ts selfImproveBranch` byte-for-byte (worker `runId == claim.run_id == server runID.String()`, both canonical lowercase-hyphenated).
+- **A Contract A cross-language differential test pins the two derivations.** `fixtures/checkpoint-branch/cases.json` is the hand-authored source of truth; the Go half (`checkpoint_branch_contract_test.go`) asserts each eligible case's branch plus a drift guard (the fixture's eligible kinds EXACTLY equal the kinds `checkpointBranch` returns ok=true for, iterating `runkind.All()` — catching a newly-enabled kind the fixture forgot), and the TS half (`agent/test/checkpoint-branch-contract.test.ts`) folds the worker's actual per-kind derivation. Neither reads the other; the fixture sits above `api/`, so the Go half needs `-count=1` (§609-style asymmetry).
+- **Scope: graceful-interrupt residual only.** M3 covers the checkpoint published on park/drain/cordon-roll (the `checkpoint` tool + the shutdown publish). The HARD-KILL residual (a node death with no chance to publish) stays deferred — for self_improve as for every other kind, the PVC `refs/uzi-runner/*` remains the primary recovery path.
+
+Cross-refs: §604 (PRD #1030→#1042, the `Publish`/`deleteCheckpointBestEffort` seams and `runs.checkpoint_tip` this milestone extends); §609 (PRD #1062 M1, the sibling owner-anchor milestone); the M1-era worker plumbing (`RUN_KIND_PROFILES.self_improve.cloneBranch`) that already derives the self_improve branch this server side mirrors.
+
+## 612. PRD #1064 — Live milestone progress: push `report_progress` on observation, transition frames in the worker's words, a server-derived "now" line, and a blinking in-progress cell
 
 Serves human Feature #95 ("glance at the pane and see each agent's state") atop PRD #122's milestone columns: all three surfaces already render `milestones_in_progress`, but it never lit up because the worker persisted `report_progress` only at turn boundaries — where the prompt has just cleared `in_progress`. This feature makes the already-declared in-progress milestone and the active lane visible within one turn, on web, TUI and CLI. It ADDS visibility of an existing column; it introduces no new user-stated requirement (human.md unchanged). Richer rationale is PRD #1064's Decision Log; terse contract here.
 

@@ -2743,19 +2743,21 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		return PublishResult{}, err
 	}
 
-	// 2. Branch is derived SERVER-SIDE from the run's issue iid — never from the
-	// worker, and never from owned.Branch. runs.branch is written ONLY at completion
-	// (SetRunCompleted), so it is NULL/empty for a `running` run; a checkpoint
-	// publish fires MID-RUN, so reading it would make the whole feature inert.
-	// Checkpoints only ever fire for issue runs (the agent gates the tool to
-	// kind==="issue"), so any other kind, or a run missing its issue iid, is an
-	// unsupported publish we skip (best-effort) rather than fault. Deriving the
-	// branch from the int-typed iid — exactly the worker's agent/issue-<iid> naming —
-	// also means no worker-controlled string ever flows into the refspec.
-	if owned.Kind != runkind.Issue || !owned.IssueIid.Valid {
+	// 2. Branch is derived SERVER-SIDE from validated run-row fields (kind, the run's
+	// uuid, the issue iid) — never from the worker, and never from owned.Branch.
+	// runs.branch is written ONLY at completion (SetRunCompleted), so it is NULL/empty
+	// for a `running` run; a checkpoint publish fires MID-RUN, so reading it would make
+	// the whole feature inert. Checkpoints fire for the checkpoint-eligible set — an
+	// issue run (agent/issue-<iid>) and a self_improve run (uzi/self-improve/<runID>,
+	// PRD #1062 M3) — so any other kind, or an issue run missing its iid, is an
+	// unsupported publish we skip (best-effort) rather than fault. checkpointBranch
+	// dispatches on kind FIRST (a self_improve run also carries a valid issue_iid, its
+	// stable tracking issue), and derives the branch only from run-row fields, so no
+	// worker-controlled string ever flows into the refspec.
+	branch, ok := checkpointBranch(owned.Kind, runID, owned.IssueIid)
+	if !ok {
 		return PublishResult{Published: false, Ref: "", Skipped: "unsupported"}, nil
 	}
-	branch := agentIssueBranch(owned.IssueIid.Int64)
 	ref := "refs/uzi-checkpoints/" + branch
 
 	// 3. Repo + connection facts (clone URL, base URL, default branch, bot username,
@@ -2889,17 +2891,18 @@ func forgeHostFromURL(raw string) (string, error) {
 // with a benign skip, never corrupts anything, and the PVC refs/uzi-runner/* remains
 // the primary recovery path.
 //
-// It is gated to the SAME run kinds Publish supports: only an issue run with a valid
-// issue iid ever published a checkpoint ref (Publish returns "unsupported" for any
-// other kind — the agent gates the checkpoint tool to kind==="issue"), so any other
-// kind is a no-op with no forge call. The branch, repo connection and PAT are derived
-// SERVER-SIDE exactly as Publish derives them (agent/issue-<iid>, GetRunClaimContext,
-// the SSRF gate, box.Open), never from the worker.
+// It is gated to the SAME checkpoint-eligible set Publish supports (an issue run with a
+// valid issue iid, or a self_improve run — PRD #1062 M3): only these ever published a
+// checkpoint ref, so any other kind is a no-op with no forge call. The branch, repo
+// connection and PAT are derived SERVER-SIDE exactly as Publish derives them (via
+// checkpointBranch from run-row fields, GetRunClaimContext, the SSRF gate, box.Open),
+// never from the worker.
 func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issueIid pgtype.Int8) {
-	// Kind-gate identically to Publish: a run that never had a checkpoint ref has
-	// nothing to delete. Do this BEFORE dispatching so an ineligible kind makes no
-	// goroutine and no forge call.
-	if kind != runkind.Issue || !issueIid.Valid {
+	// Kind-gate identically to Publish (dispatch on kind first): a run that never had a
+	// checkpoint ref has nothing to delete. Do this BEFORE dispatching so an ineligible
+	// kind makes no goroutine and no forge call.
+	branch, ok := checkpointBranch(kind, runID, issueIid)
+	if !ok {
 		return
 	}
 	// A deployment that never wired the delete seam or the SSRF gate, or a service
@@ -2909,7 +2912,6 @@ func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issue
 	if s.deleteCheckpointFn == nil || s.forgeBaseURLAllowed == nil || s.box == nil || s.background == nil {
 		return
 	}
-	branch := agentIssueBranch(issueIid.Int64)
 	s.background(func() {
 		// s.background is a DETACHED goroutine in production, and pushbroker.Delete
 		// drives go-git (ListContext/PushContext), which has nil-deref panic paths on

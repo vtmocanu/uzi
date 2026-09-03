@@ -70,6 +70,7 @@
   "report_only": true,
   "report_md": "x",
   "preserved_patch": "x",
+  "fail_origin": "x",
   "prd_done_path": "x",
   "prd_patch_settled_at": "2020-01-02T03:04:05Z",
   "claimed_at": "2020-01-02T03:04:05Z",
