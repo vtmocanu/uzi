@@ -86,6 +86,9 @@ export function Schedules() {
   const [pause, setPause] = useState<SchedulePauseDTO | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pauseBusy, setPauseBusy] = useState(false);
+  // Failed expiry re-reads in the current streak (drives the 60s retry backoff in the
+  // expiry effect below); reset to 0 whenever a new pause state is applied.
+  const [pauseRefreshAttempt, setPauseRefreshAttempt] = useState(0);
   // Which sibling groups are expanded in My schedules (keyed by sibling_group_id), the
   // same Set<string> disclosure pattern DefaultJobs uses for its catalog slugs. Lives in
   // the parent so "add another repo" can auto-expand the group its new sibling landed in.
@@ -306,6 +309,7 @@ export function Schedules() {
     setError("");
     try {
       const next = await api.putSchedulePause(until);
+      setPauseRefreshAttempt(0); // a fresh state gets a fresh (immediate) expiry refresh
       setPause(next);
       setPickerOpen(false);
     } catch (err) {
@@ -322,6 +326,7 @@ export function Schedules() {
     setError("");
     try {
       const next = await api.deleteSchedulePause();
+      setPauseRefreshAttempt(0);
       setPause(next);
       setPickerOpen(false);
     } catch (err) {
@@ -359,7 +364,6 @@ export function Schedules() {
   // re-read applies only while it is still current: any mutation (Resume now, Change…)
   // sets `pause`, which re-runs this effect and cancels the in-flight read, so a stale
   // GET can never overwrite the mutation's own response.
-  const [pauseRefreshAttempt, setPauseRefreshAttempt] = useState(0);
   useEffect(() => {
     if (!pause?.paused || !pause.until) return;
     let cancelled = false;
@@ -369,7 +373,9 @@ export function Schedules() {
       api
         .getSchedulePause()
         .then((next) => {
-          if (!cancelled) setPause(next);
+          if (cancelled) return;
+          setPauseRefreshAttempt(0); // the backoff is per failure streak, not per page
+          setPause(next);
         })
         .catch(() => {
           if (!cancelled) setPauseRefreshAttempt((n) => n + 1);

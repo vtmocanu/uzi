@@ -962,6 +962,33 @@ describe("Schedules — pause all (PRD #1093)", () => {
     }
   });
 
+  it("a new pause applied after a failed re-read gets an immediate expiry refresh (retry backoff resets)", async () => {
+    // Failure streak: the first expiry re-read rejects (attempt = 1). Then the user sets
+    // a new pause via Change… → Until I resume; the (mocked) server answers with an
+    // until that has ALREADY passed, so the effect's next delay is decided by the
+    // counter: 0 when reset (this test), 60s when the stale count leaks through.
+    const soon = new Date(Date.now() + 60).toISOString();
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValue({ paused: false, until: null });
+    mockApi.putSchedulePause.mockImplementation(async () => ({
+      paused: true,
+      until: new Date(Date.now() - 1).toISOString(),
+    }));
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Change…" })).toBeTruthy());
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Change…" }));
+    fireEvent.click(await screen.findByRole("radio", { name: /Until I resume/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Pause all indefinitely$/ }));
+    await waitFor(() => expect(mockApi.putSchedulePause).toHaveBeenCalledTimes(1));
+    // The fresh state's expiry refresh fires at once (not after a 60s backoff), and the
+    // server's normalized answer clears the banner.
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy());
+  });
+
   it("a stale expiry re-read never overwrites a newer Resume response (mutation wins)", async () => {
     // Controlled ordering: the expiry GET is left pending, the user resumes meanwhile
     // (DELETE resolves not-paused), and only THEN the stale GET resolves "still paused".
