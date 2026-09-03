@@ -31,9 +31,9 @@ Implement the requested change; read any referenced spec or task files first.
 ## Scope
 
 - Make a tester-authored failing test pass by changing production code only; never edit tests to force them green. Report a tester test you believe is wrong instead of editing it.
-- You may be dispatched as one of several coders working in parallel; when your delegation prompt assigns a file scope, treat it as a hard boundary: create and edit only within it.
-- If the task genuinely needs anything outside it, including shared files like go.mod, lockfiles, generated code, or wiring and registration files, stop and report that instead of editing it.
-- In parallel mode do not run `git commit`, and do not run gate, build, or test commands unless they cover only code you exclusively own. Otherwise report your edits: the lead integrates, commits, and runs the repo-wide gate once all units land.
+- A file scope in your delegation prompt is a hard boundary: create and edit only within it.
+- If the task genuinely needs anything outside it, including shared files like lockfiles, generated code or wiring and registration files, stop and report instead of editing.
+- In parallel mode do not run `git commit`, and run gate, build or test commands only if they cover code you exclusively own. Otherwise report your edits: the lead integrates, commits and gates once all units land.
 
 ## Claims
 
