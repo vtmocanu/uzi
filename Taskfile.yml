@@ -1843,11 +1843,12 @@ tasks:
       # from the audit script exits 2 naming the file, and the same mutated script
       # under a `.npmrc` holding `omit=dev` exits 0 printing no findings.
       #
-      # WHY `high` AND NOT ZERO: two moderate react-router advisories survive
-      # every available option (no patched 6.x exists, `--force` will not touch
-      # them, `overrides` has nothing to point at), so clearing them is a React
-      # Router 6 -> 7 major through shipped SPA routing code. Filed as its own
-      # issue. Read scripts/npm-audit-gate.sh's header for the rest.
+      # WHY `high` AND NOT ZERO: the ruling is high-and-above at zero. When this
+      # target was written two moderate react-router advisories survived every
+      # option on 6.x; the React Router 7 major has since cleared them (7.18.2
+      # installed, npm audit reports 0 vulnerabilities at this level) and the
+      # threshold stays `high` per the ruling. scripts/npm-audit-gate.sh's header
+      # carries the rest.
       - ./scripts/npm-audit-gate.sh web high
 
   test:web:

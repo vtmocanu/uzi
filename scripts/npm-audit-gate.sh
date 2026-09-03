@@ -55,14 +55,11 @@
 # its version. For this check the threshold IS the gate.
 #
 # WHY `high` AND NOT ZERO. User ruling 1 is "the full tree, fixed first, at zero",
-# and "at zero" means high-and-above at zero: two MODERATE advisories survive every
-# option on `web` (`react-router` and `react-router-dom`, GHSA-wrjc-x8rr-h8h6 and
-# GHSA-337j-9hxr-rhxg). Both are patched only at 7.18.0, the installed 6.30.4 is
-# the newest 6.x that exists, the whole 6.x line sits inside the advisory range,
-# `overrides` has nothing patched to point at, and `npm audit fix --force`
-# emits no react-router entry at all. Clearing them is a React Router 6 -> 7 major
-# through shipped SPA routing code, which is filed as its own issue rather than
-# pulled into a quality-gates milestone.
+# and "at zero" means high-and-above at zero. When this gate was written two MODERATE
+# advisories survived every option on `web` (`react-router` / `react-router-dom`,
+# GHSA-wrjc-x8rr-h8h6 and GHSA-337j-9hxr-rhxg, patched only at 7.18.0 while 6.x was
+# installed); the React Router 7 major has since cleared them (7.18.2 installed, npm
+# audit reports 0 vulnerabilities). The threshold stays `high` per the ruling.
 #
 # NOT DELEGATED TO A `package.json` SCRIPT THE WAY EVERY OTHER npm TARGET IS, AND
 # THAT IS DELIBERATE: it IS delegated, but through this file rather than around it.
