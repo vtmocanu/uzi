@@ -686,8 +686,15 @@ also the TUI's own fallback when the live channel is unreachable (below).
   between AGE and TITLE (one `▰` per
   reported-complete milestone, `▱` for the rest, or `–/N` text when nothing
   has been reported complete yet); the micro-bar is hidden on a narrow
-  terminal, and the full breakdown is on the run detail view. On your own
-  board only, a right-aligned **COST** cell follows the micro-bar: `$N` in
+  terminal, and the full breakdown is on the run detail view. **The
+  in-progress milestone's cell blinks** `▰`/`▱` in the wait colour on a
+  half-second tick — a static `▱` frame renders instead when the terminal
+  isn't interactive (a piped or offline render) or with `UZI_TUI_NO_BLINK=1`
+  set (a reduced-motion opt-out, read once at startup). The **selected row**
+  additionally gains a second line naming the active lane's role, task
+  label and age — the run's current activity, the same information [the run
+  activity docs](./run-activity.md#milestones-and-the-now-line) describe for
+  web and CLI. On your own board only, a right-aligned **COST** cell follows the micro-bar: `$N` in
   whole dollars (no cents, to keep the column width stable), `<$1` for a
   real sub-dollar cost, `—` for a subscription-auth run the SDK prices at
   $0, and a blank cell for a run with no recorded usage; it too is hidden on
@@ -721,9 +728,15 @@ also the TUI's own fallback when the live channel is unreachable (below).
   the SDK prices at $0, and nothing shown for a run with no recorded usage.
   For a milestone-structured run the rail also shows a
   `MILESTONES {done}/{total}` block below the lanes, one row per approved
-  milestone in order, marked `✓` reported complete, `◐` in progress, or `○`
-  not started. The count reads "reported complete", not verified: uzi shows
-  what the run reported and does not itself check the work. Directly above
+  milestone in order, marked `✓` reported complete, `○` not started, or —
+  for the milestone in progress — the same blinking `▰`/`▱` cell the board's
+  micro-bar carries (static `▱` under `UZI_TUI_NO_BLINK=1` or a non-tty
+  render). The count reads "reported complete", not verified: uzi shows
+  what the run reported and does not itself check the work. The
+  in-progress row also carries a **now line** beneath it — `↳ <role> ·
+  <age>` plus its task label — the crew rail's own current-activity read;
+  see [Milestones and the now line](./run-activity.md#milestones-and-the-now-line)
+  for what feeds it. Directly above
   the ACCOUNTS block, a **SPEND** block shows the run's total cost (same
   cents formatting) over a token breakdown — `in` (input plus
   cache-creation tokens), `out` (output tokens), and a `cache` line with the
@@ -1148,8 +1161,8 @@ you *do* parse `--json`, use `printf '%s'` (never `echo`) or write it to a file.
 A `null` or absent field prints an empty line (so a nil array field is an empty
 line, not an error). An unknown field, or a **non-scalar** one that is populated
 — any array or object field (e.g. `milestones`, `own_agents`, `agent_exclusions`,
-`usage`), which you read with `--json` — is a usage error (exit 2). `--field` and
-`--json` are mutually exclusive (two output modes).
+`usage`, `current_activity`), which you read with `--json` — is a usage error
+(exit 2). `--field` and `--json` are mutually exclusive (two output modes).
 
 The model a schedule froze onto a run is readable this way too:
 `uzi run get <id> --field model` (the model alias/id, an empty line when the
@@ -1173,6 +1186,17 @@ the PRD-link patch lifecycle has settled, an empty line while still
 pending). Both are emit-only-when-set on the human view too — `run get`
 prints them as `PRD_MOVE` and `PRD_PATCH_SETTLED_AT` rows only when the run
 has declared a move — and appear the same way under `--json`.
+
+`run get` also prints a `NOW` row right after the `MILESTONES` block: the
+run's server-derived current activity, folded to
+`<agent> · <agent_label> · <tool> <detail> · <age> ago` — the CLI twin of
+the web run view's now line and the TUI's crew-rail/board second line (see
+[Milestones and the now line](./run-activity.md#milestones-and-the-now-line)).
+It's emit-only-when-set: absent for a terminal run or one with no recorded
+activity, so a finished run and any pre-#1064 run print no such row.
+`--json` carries the full `current_activity` object; `current_activity` is
+an object, so `--field current_activity` is the documented usage error
+above (exit 2) even when the run has one — read it with `--json` instead.
 
 `run get` also prints the [run summaries](./run-summaries.md), when they've
 landed: an `INTENT` row (what the run will implement), a `PLAN SUMMARY` row
