@@ -53,6 +53,24 @@ type UsageRow = {
 const frames: Frame[] = (JSON.parse(read("result-frames-84b6a933.json")) as { frames: Frame[] }).frames;
 const rows: UsageRow[] = (JSON.parse(read("run-usage-84b6a933.json")) as { rows: UsageRow[] }).rows;
 
+// PRD #1079: the second recorded case, mirror of the Go half's. Its frames carry all
+// four `init` frames AND all four `result` frames of run 02854d5e in seq order, so the
+// per-leg fold (marks reset at every init) is exercised end to end; its expected rollup
+// is authored (D9: the pre-#1079 server output IS the bug, so it cannot be the golden)
+// with one row per (model, lineage_epoch) and per-column totals SUMMED across those rows.
+type EpochRow = UsageRow & { lineage_epoch: number };
+type Totals = {
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+};
+const frames1079: Frame[] = (JSON.parse(read("result-frames-02854d5e.json")) as { frames: Frame[] }).frames;
+const parsed1079 = JSON.parse(read("run-usage-02854d5e.json")) as { rows: EpochRow[]; totals: Totals };
+const rows1079: EpochRow[] = parsed1079.rows;
+const totals1079: Totals = parsed1079.totals;
+
 function fatal(msg: string): never {
   throw new Error(msg);
 }
@@ -252,5 +270,161 @@ describe("deriveRunUsage matches the server's run_usage fold", () => {
     const d = deriveRunUsage(messages());
     expect(d.total.fresh).not.toBe(topLevel);
     expect(d.total.fresh).toBeGreaterThan(topLevel);
+  });
+});
+
+// ── PRD #1079: the per-leg case. The frames are four SDK query() legs (planning + three
+// implement iterations), each preceded by its own `init` frame; the correct run total is
+// the SUM of the legs, and the pre-#1079 fold (a cumulative MAX per model) under-counts
+// it by ~2x. This mirrors the Go half over the same two fixture files.
+
+/** The 8 recorded frames (init + result, in seq order) as the run page receives them. */
+function messages1079(): RunMessage[] {
+  return frames1079.map((f) => ({
+    seq: f.seq,
+    kind: f.kind,
+    agent: "lead",
+    agent_instance: null,
+    agent_label: null,
+    payload: f.payload,
+    created_at: "2026-09-03T00:00:00Z",
+  }));
+}
+
+/** The authored rollup grouped per model — the client's `modelTotals`, which collapses
+ *  the per-(model, epoch) rows to one SUM per model. */
+function serverModelSums1079(): Map<string, { input: number; cacheRead: number; cacheCreation: number; out: number; cost: number }> {
+  const m = new Map<string, { input: number; cacheRead: number; cacheCreation: number; out: number; cost: number }>();
+  for (const r of rows1079) {
+    const s = m.get(r.model) ?? { input: 0, cacheRead: 0, cacheCreation: 0, out: 0, cost: 0 };
+    s.input += r.input_tokens;
+    s.cacheRead += r.cache_read_tokens;
+    s.cacheCreation += r.cache_creation_tokens;
+    s.out += r.output_tokens;
+    s.cost += r.cost_usd;
+    m.set(r.model, s);
+  }
+  return m;
+}
+
+/** The authored rollup grouped per lineage_epoch, ascending — one entry per leg, so the
+ *  derived per-phase figures can be checked leg for leg. */
+function serverEpochPhases1079(): { epoch: number; fresh: number; cached: number; out: number; cost: number }[] {
+  const byEpoch = new Map<number, { fresh: number; cached: number; out: number; cost: number }>();
+  for (const r of rows1079) {
+    const p = byEpoch.get(r.lineage_epoch) ?? { fresh: 0, cached: 0, out: 0, cost: 0 };
+    p.fresh += r.input_tokens + r.cache_creation_tokens;
+    p.cached += r.cache_read_tokens;
+    p.out += r.output_tokens;
+    p.cost += r.cost_usd;
+    byEpoch.set(r.lineage_epoch, p);
+  }
+  return [...byEpoch.entries()].sort((a, b) => a[0] - b[0]).map(([epoch, v]) => ({ epoch, ...v }));
+}
+
+describe("run-usage-02854d5e fixture discriminates a per-leg SUM from a cumulative MAX", () => {
+  it("has four init frames and four result frames, in interleaved seq order", () => {
+    const inits = frames1079.filter((f) => f.kind === "status" && f.payload["event"] === "init");
+    const results = frames1079.filter((f) => f.kind === "status" && f.payload["event"] === "result");
+    if (inits.length !== 4 || results.length !== 4) {
+      fatal(`fixture broken: expected 4 init + 4 result frames, got ${inits.length} + ${results.length}`);
+    }
+    // Each result must be preceded by its own init, or the leg boundary vanishes.
+    const seqs = frames1079.map((f) => `${f.payload["event"]}`);
+    if (seqs.join(",") !== "init,result,init,result,init,result,init,result") {
+      fatal(`fixture broken: frames are not init/result interleaved in seq order: ${seqs.join(",")}`);
+    }
+  });
+
+  it("the pre-#1079 cumulative MAX fold under-counts the SUM (77.185539 / 514572, not 153.582776 / 1021240)", () => {
+    // The negative control, computed here over the same frames: a single running MAX per
+    // model with NO per-init reset — exactly the pre-#1079 fold. It must reach the known
+    // collapsed answer AND fall short of the fixture totals, or this case pins nothing.
+    const q = (v: number) => Math.round(Math.min(Math.max(0, v), 999999.999999) * 1e6) / 1e6;
+    const marks = new Map<string, { out: number; cost: number }>();
+    let maxOut = 0;
+    let maxCost = 0;
+    for (const f of frames1079) {
+      if (f.payload["event"] !== "result") continue;
+      const mu = (f.payload["modelUsage"] ?? {}) as Record<string, Record<string, number>>;
+      for (const [model, e] of Object.entries(mu)) {
+        const prev = marks.get(model) ?? { out: 0, cost: 0 };
+        const curOut = Math.max(0, e["outputTokens"] ?? 0);
+        const curCost = q(e["costUSD"] ?? 0);
+        maxOut += Math.max(0, curOut - prev.out);
+        maxCost += Math.max(0, curCost - prev.cost);
+        marks.set(model, { out: Math.max(prev.out, curOut), cost: Math.max(prev.cost, curCost) });
+      }
+    }
+    expect(maxOut).toBe(514572);
+    expect(maxCost).toBeCloseTo(77.185539, 6);
+    // And that collapsed answer is NOT the fixture's — so the run-total assertion below
+    // is genuinely red on the pre-fix fold.
+    expect(maxOut).not.toBe(totals1079.output_tokens);
+    expect(maxCost).not.toBeCloseTo(totals1079.cost_usd, 3);
+  });
+
+  it("leg 4 is smaller than leg 3 for opus on every column (why cumulative-MAX is wrong)", () => {
+    const opus = (epoch: number) => rows1079.find((r) => r.model === "claude-opus-4-8" && r.lineage_epoch === epoch);
+    const l3 = opus(3);
+    const l4 = opus(4);
+    if (!l3 || !l4) fatal("fixture broken: opus is missing an epoch-3 or epoch-4 row");
+    expect(l4.input_tokens).toBeLessThan(l3.input_tokens);
+    expect(l4.cache_read_tokens).toBeLessThan(l3.cache_read_tokens);
+    expect(l4.cache_creation_tokens).toBeLessThan(l3.cache_creation_tokens);
+    expect(l4.output_tokens).toBeLessThan(l3.output_tokens);
+    expect(l4.cost_usd).toBeLessThan(l3.cost_usd);
+  });
+});
+
+describe("deriveRunUsage matches the per-leg run_usage fold (02854d5e)", () => {
+  it("agrees per model on all five columns, summed across legs", () => {
+    const got = new Map(deriveRunUsage(messages1079()).modelTotals.map((t) => [t.model, t]));
+    const want = serverModelSums1079();
+    expect([...got.keys()].sort()).toEqual([...want.keys()].sort());
+    for (const [model, w] of want) {
+      const g = got.get(model);
+      if (!g) fatal(`deriveRunUsage produced no row for model ${model}`);
+      expect(g.input, `${model} input_tokens`).toBe(w.input);
+      expect(g.cacheCreation, `${model} cache_creation_tokens`).toBe(w.cacheCreation);
+      expect(g.cached, `${model} cache_read_tokens`).toBe(w.cacheRead);
+      expect(g.out, `${model} output_tokens`).toBe(w.out);
+      // Per-model cost is a SUM of per-(model, epoch) microdollar-quantized costs on both
+      // sides, so only float-summation noise separates them; the per-row values are exact.
+      expect(g.costUsd, `${model} cost_usd`).toBeCloseTo(w.cost, 6);
+    }
+  });
+
+  it("agrees on the run total: three token aggregates and cost (the ~2x under-count fixed)", () => {
+    const d = deriveRunUsage(messages1079());
+    expect(d.hasConfirmed).toBe(true);
+    // Four legs → four phases (one result frame each).
+    expect(d.phases).toHaveLength(4);
+    // fresh = input + cache_creation; the fixture keeps them as separate total columns.
+    expect(d.total.fresh, "input+cache_creation").toBe(totals1079.input_tokens + totals1079.cache_creation_tokens);
+    expect(d.total.cached, "cache_read").toBe(totals1079.cache_read_tokens);
+    expect(d.total.out, "output — RED (514572) on the pre-#1079 cumulative-MAX fold").toBe(totals1079.output_tokens);
+    // Run cost is the SUM of per-model per-leg quantized costs; float noise only.
+    expect(
+      Math.abs(d.total.costUsd - totals1079.cost_usd),
+      `cost — RED (77.185539) on the pre-#1079 fold: client ${d.total.costUsd}, want ${totals1079.cost_usd}`,
+    ).toBeLessThanOrEqual(rows1079.length * 5e-7 + 1e-9);
+  });
+
+  it("agrees per phase too: each phase equals its leg's fixture rows", () => {
+    const d = deriveRunUsage(messages1079());
+    const want = serverEpochPhases1079();
+    expect(d.phases).toHaveLength(want.length);
+    expect(d.phases.map((p) => p.label)).toEqual(["Plan", "Implement · iteration 1", "Implement · iteration 2", "Implement · iteration 3"]);
+    d.phases.forEach((p, i) => {
+      const w = want[i];
+      expect(p.fresh, `leg ${w.epoch} fresh`).toBe(w.fresh);
+      expect(p.cached, `leg ${w.epoch} cached`).toBe(w.cached);
+      expect(p.out, `leg ${w.epoch} out`).toBe(w.out);
+      expect(p.costUsd, `leg ${w.epoch} cost`).toBeCloseTo(w.cost, 6);
+    });
+    // Phases still sum to the run total (the table and the strip cannot drift apart).
+    const sum = d.phases.reduce((t, p) => t + p.out, 0);
+    expect(sum).toBe(d.total.out);
   });
 });

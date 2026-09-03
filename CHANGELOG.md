@@ -31,6 +31,8 @@ through `[0.52.0]`.)
 
 - **Hosted worker: `agent-browser` starts out of the box on the musl image ([#1082](https://github.com/vtmocanu/uzi/issues/1082)).**
   The shim now picks the native binary by the dynamic loader on disk instead of letting the npm launcher sniff `ldd --version` off the PATH, where a provisioned nix glibc (uzi's own `ruby@4.0.6`) shadowed musl's `ldd` and made it spawn the glibc build; the image build guard repeats the check behind a fake glibc `ldd` and opens `about:blank` through the shim, so a regression reddens the build rather than costing a subagent ~15 tool calls mid-run.
+- **Run cost was under-counted on every multi-iteration run, by as much as 3.8x ([#1079](https://github.com/vtmocanu/uzi/issues/1079)).**
+  `run_usage` assumed each SDK result frame reported a cumulative session total and kept only the largest one (a 3-iteration run read $77.19 against a true $153.58, a 7-iteration run read $26.70 against a true $100.63); it now keys each row by the SDK `query()` leg that produced it and sums the legs, and every pre-existing run's totals were automatically re-folded from history on first boot after the fix.
 
 ## [0.76.0] - 2026-09-03
 

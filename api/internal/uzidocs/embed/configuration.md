@@ -393,3 +393,19 @@ conjunction, so a token at 10% of its 5-hour allowance and 98% of its 7-day one 
 | `UZI_AUTOSELECT_HEADROOM_TIE_PCT` | `5` | Tokens within this many points of the emptiest are treated as tied, and the tie is broken by whichever replenishes soonest. `0` means only an exact tie counts. |
 | `UZI_AUTOSELECT_MAX_STALENESS` | `3 × UZI_USAGE_POLL_INTERVAL` | How old a usage reading may be and still steer a choice — steering on numbers Anthropic has moved past is worse than not steering. The default **tracks** the poll interval and matches what the meters already call stale, so the two agree; overriding it re-opens that divergence. **With the poller disabled (`UZI_USAGE_POLL_INTERVAL=0`) this computes to `0`, nothing is ever fresh, and auto-selection degrades to the worker's ordinary binding** — the correct outcome for a gauge nothing updates. |
 | `UZI_AUTOSELECT_INFLIGHT_PENALTY` | `3` | Points subtracted from a token's ranking score per run currently spending it, so several claims inside one poll interval do not all pile onto the same emptiest credential. `0` disables the bias. |
+
+## Run-usage history refold (PRD #1079)
+
+Each Claude Agent SDK `query()` call reports only its own leg's cost, not a session
+total. Before PRD #1079 the per-run token/cost ledger keyed every leg by the same
+`(run, session, model)` and kept only the largest, under-counting a multi-iteration
+run's cost 2x–3.8x. The fix keys each leg by its position in the run's `init`-frame
+history; a one-off boot pass re-folds every run that existed before the migration so
+its stored total becomes the sum of its legs. The pass is self-scoping — a run created
+after the upgrade is born refolded and is never touched — so these knobs only matter on
+the first boots after upgrading.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_USAGE_REFOLD_ENABLED` | `true` | Kill-switch for the boot-time history refold. `false` skips it entirely (the incremental fold still keeps new runs correct; pre-migration runs keep their under-counted totals until a boot with this enabled). Like the other control switches, a set-but-unparseable value **aborts boot** rather than silently defaulting to on. |
+| `UZI_USAGE_REFOLD_BATCH` | `50` | How many pending runs the refold processes per batch (each run is its own transaction, so this bounds outstanding rewrites, not one query's size). A per-run failure marks nothing and is retried on the next pass. A set-but-malformed or non-positive value **aborts boot** rather than silently defaulting, so a tuning typo is loud. |

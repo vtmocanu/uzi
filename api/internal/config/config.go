@@ -279,6 +279,20 @@ type Config struct {
 	// means "fire the one-shot immediately" — and is NOT clamped; the call site
 	// guards the timer for a zero/negative value.
 	VaultLockNoticeGraceDelay time.Duration
+	// UsageRefoldEnabled is the kill-switch for the boot-time one-off history refold
+	// (PRD #1079 M3, UZI_USAGE_REFOLD_ENABLED, default true). The refold re-folds every
+	// pre-migration terminal non-chat run's run_usage per SDK query() leg, replacing the
+	// collapsed MAX-per-model rows. It is a true one-off — a post-migration run is born
+	// refolded and never touched — so this switch only matters on the first boots after
+	// the 00188 migration. Like RegistrationEnabled it is a control switch, so a
+	// set-but-malformed value aborts boot rather than silently defaulting.
+	UsageRefoldEnabled bool
+	// UsageRefoldBatch is how many pending runs the boot refold processes per batch
+	// (PRD #1079 M3, UZI_USAGE_REFOLD_BATCH, default 50). Each run is one transaction, so
+	// this bounds how many run_usage rewrites are outstanding at once, not a single
+	// query's size. A set-but-malformed or non-positive value aborts boot rather than
+	// silently defaulting, so an operator tuning it learns of a typo loudly.
+	UsageRefoldBatch int
 	// SeedEmail/SeedPassword/SeedName optionally provision an admin at startup.
 	// Empty SeedEmail disables seeding. Validated at boot (see Load).
 	SeedEmail    string
@@ -760,6 +774,21 @@ func Load() (Config, error) {
 	// The boot one-shot grace delay. Not clamped: a non-positive value legitimately
 	// means "fire the one-shot immediately", and the call site guards the timer.
 	cfg.VaultLockNoticeGraceDelay = parseNonNegDuration("UZI_VAULT_LOCK_NOTICE_GRACE", 30*time.Second)
+
+	// History usage refold (PRD #1079 M3). The kill-switch is a control, so — same
+	// loud-on-misconfig stance as the vault-lock switch above — a set-but-malformed
+	// value aborts boot rather than silently defaulting to on.
+	usageRefold, err := parseBool("UZI_USAGE_REFOLD_ENABLED", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.UsageRefoldEnabled = usageRefold
+	// The batch size is loud-on-misconfig too (a set-but-malformed or non-positive
+	// value aborts boot), so a tuning typo cannot silently fall back to the default.
+	cfg.UsageRefoldBatch, err = parsePositiveInt("UZI_USAGE_REFOLD_BATCH", 50)
+	if err != nil {
+		return Config{}, err
+	}
 
 	// Per-user Claude rate-limit poller (PRD #53). parseNonNegDuration (not
 	// parseDuration): 0 is legitimate — it disables the engine. A nonzero value
@@ -1685,6 +1714,23 @@ func parseBool(key string, def bool) (bool, error) {
 		return false, fmt.Errorf("%s must be a boolean (true/false), got %q", key, raw)
 	}
 	return v, nil
+}
+
+// parsePositiveInt parses a strictly-positive integer env var. Empty/unset returns
+// def. Unlike parseInt (which silently falls back to def on any bad value), a
+// set-but-malformed or non-positive value is an error, so a control-flavoured knob
+// (e.g. UZI_USAGE_REFOLD_BATCH) fails boot loudly on a typo instead of silently
+// taking the default.
+func parsePositiveInt(key string, def int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer, got %q", key, raw)
+	}
+	return n, nil
 }
 
 // parseNonNegDuration is parseDuration but accepts 0 (a legitimate value for a

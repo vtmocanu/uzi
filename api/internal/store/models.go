@@ -463,6 +463,7 @@ type Run struct {
 	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
 	TriggerSource         string             `json:"trigger_source"`
 	CheckpointTip         pgtype.Text        `json:"checkpoint_tip"`
+	UsageRefolded         bool               `json:"usage_refolded"`
 }
 
 type RunMessage struct {

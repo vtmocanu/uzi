@@ -18,8 +18,14 @@ the two "cannot diverge"; its verification (M4/M5) was deferred for want of cred
 ```
 fixtures/run-usage/result-frames-84b6a933.json   both real result frames of one run
 fixtures/run-usage/run-usage-84b6a933.json       the run_usage rows the server folded from them
+fixtures/run-usage/result-frames-02854d5e.json   four init + four result frames of one run (PRD #1079)
+fixtures/run-usage/run-usage-02854d5e.json       the per-leg rows an independent jq reduction folds from them
 fixtures/run-usage/README.md                     this file
 ```
+
+The 84b6a933 pair pins the vanished-model property (below); the 02854d5e pair pins a
+different, independent bug and is documented in its own section, ["The `02854d5e`
+pair"](#the-02854d5e-pair-per-leg-sum-vs-cumulative-max), further down.
 
 Repo root, **owned by neither runtime** — same placement and the same reason as
 `fixtures/judge-fidelity/`. Not `api/internal/workersvc/testdata/`, which is where a
@@ -204,3 +210,74 @@ difference, which is why those pins are synthetic unit tests rather than fixture
 - **`+Infinity` in `costUSD`.** The client's `num` drops every non-finite value to 0
   where `numericUSD` clamps `+Inf` to the column ceiling. Documented at `quantizeCost`
   rather than coded, since no SDK emits it.
+
+## The `02854d5e` pair: per-leg SUM vs cumulative MAX (issue #1079)
+
+`result-frames-02854d5e.json` / `run-usage-02854d5e.json` is a second, independent
+contract pair, added for PRD #1079. It pins a **different** bug from the 84b6a933 pair
+above: not which field each reader consumes, but whether a result frame's `modelUsage`
+is cumulative over the resumed session (the assumption `run_usage` shipped with) or
+reports only its own SDK `query()` call (what the Agent SDK's own docs say, and what
+this fixture proves). Both readers must now fold **per leg and SUM the legs**, where a
+leg is one `query()` call marked by its own persisted `init` frame.
+
+### What it pins
+
+`result-frames-02854d5e.json` holds all four `init` + four `result` frames of run
+`02854d5e` (plan turn + three implement iterations), verbatim, in seq order.
+`run-usage-02854d5e.json` holds six rows, one per `(model, lineage_epoch)` — haiku@1,
+opus@1..4, sonnet@4 — and the run totals: input 12785, cache_read 187880173,
+cache_creation 5500712, output 1021240, cost_usd 153.582776.
+
+The discriminator: the pre-fix, MAX-collapsed reading of these same eight frames
+answers **77.185539** USD / **514572** output tokens — the exact numbers the shipped
+(buggy) server stored for this run before the fix. A fold that regresses to
+cumulative-MAX reproduces that pair exactly, so both contract test files assert the
+correct totals **and** assert that a MAX-per-model fold of the same frames lands on
+77.185539 / 514572, not merely that the correct numbers differ from *something*.
+
+### Why its rollup is AUTHORED, not recorded (D9)
+
+The 84b6a933 pair above is recorded from the live database on both sides — frames and
+rollup — because a golden derived from an implementation locks in that implementation's
+blind spots, and 84b6a933 exists precisely to catch a blind spot neither implementation
+had noticed yet. That reasoning does not apply here: for 02854d5e, **the shipped
+server's own collapsed output (77.185539 / 514572) is the defect being fixed**, so it
+cannot be the golden — recording "what the server answered" would pin the bug. Instead:
+
+- `result-frames-02854d5e.json`'s frames are verbatim, recorded from the dev-cluster run
+  (same as 84b6a933's frames).
+- `run-usage-02854d5e.json`'s `rows` and `totals` are **authored** — an independent jq
+  reduction over the frames (one row per `(model, lineage_epoch)`, tokens floored at 0,
+  cost quantized to microdollars exactly as `numericUSD` does), not read back off either
+  production fold. The file's own `note` field documents the reduction rule.
+
+Both production folds (`foldRunUsage` in Go, `deriveRunUsage` in TS) must reproduce this
+authored rollup from the frames; if either doesn't, one of the two folds has drifted
+from the specified per-leg rule, not from each other.
+
+### Do not tidy
+
+- **All four legs must stay.** Three legs (or fewer) can't rule out "the last frame is
+  cumulative and the fix only needed a bigger buffer" — four legs, with a non-monotonic
+  transition between two of them (below), are what make the per-leg reading provable
+  from the fixture's own shape.
+- **Leg 4 must stay strictly SMALLER than leg 3 for opus, in every column.** That
+  inversion (input 438 < 1285, output 158427 < 488268, cache_read 25620187 < 96109126,
+  cache_creation 1285948 < 2223283, cost 25.955935 < 75.029070) is what makes a
+  cumulative reading of these frames structurally impossible — a running total cannot
+  shrink absent a break event, and none is present between legs 3 and 4. Rounding leg 4
+  up, dropping it, or reordering the frames destroys that proof.
+- **`run-usage-02854d5e.json`'s costs are the DB's `numeric(12,6)` microdollar
+  quantization** (`75.02907`, not a longer float), mirroring the 84b6a933 pair's
+  precision rule above — do not "restore precision" from the frames.
+
+### The Go half needs `-count=1`
+
+Same rule as the 84b6a933 pair, for the same reason (this directory is outside the `api`
+Go module, so a fixture-only edit is invisible to `go test`'s cache key):
+
+```sh
+cd api && go test -count=1 ./internal/workersvc/
+cd web && npx vitest run src/lib/runUsageContract.test.ts
+```

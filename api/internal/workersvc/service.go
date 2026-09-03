@@ -577,10 +577,10 @@ type Store interface {
 	// UpsertRunUsage folds a delivered result frame's per-model usage into
 	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
 	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
-	// BumpRunLineageEpoch increments a run's lineage-epoch counter by one (PRD
-	// #632), called once per newly-inserted resume_lineage_break status event so a
-	// fresh SDK leg's run_usage rows are stamped with a higher epoch than the prior.
-	BumpRunLineageEpoch(ctx context.Context, id uuid.UUID) error
+	// CountRunInitFramesBefore returns a result frame's leg index (PRD #1079): the
+	// count of persisted `init` status frames of the run with a lower seq. The fold
+	// reads it once per result frame to key run_usage per SDK query() leg.
+	CountRunInitFramesBefore(ctx context.Context, arg store.CountRunInitFramesBeforeParams) (int64, error)
 	// Usage read rollups (PRD #40 M3), all over the run_usage_totals view.
 	GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error)
 	SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error)
@@ -1662,13 +1662,6 @@ type resultModelUsage struct {
 	CacheReadInputTokens     int64   `json:"cacheReadInputTokens"`
 	CacheCreationInputTokens int64   `json:"cacheCreationInputTokens"`
 	CostUSD                  float64 `json:"costUSD"`
-}
-
-// statusEventPayload is the minimal shape appendMessages reads off a `status`
-// message to detect a resume_lineage_break (dropped-resume signal #334, PRD #632).
-// Only `event` is inspected; a malformed payload simply isn't a break.
-type statusEventPayload struct {
-	Event string `json:"event"`
 }
 
 // run_usage's PK is (run_id, session_id, model). run_id is a uuid (16 bytes in

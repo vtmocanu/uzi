@@ -520,6 +520,14 @@ func (f *persistFakeStore) UpdateRunLastSeq(_ context.Context, arg store.UpdateR
 	return 1, nil
 }
 
+// CountRunInitFramesBefore answers the fold's per-frame leg-index read (PRD #1079).
+// These persistfail/autostop fakes don't model init frames — no leg has one before it
+// — so it reports 0 (epoch 0), which is enough for the fold to reach UpsertRunUsage.
+// Without it the embedded (nil) Store panics when the fold makes this read.
+func (f *persistFakeStore) CountRunInitFramesBefore(context.Context, store.CountRunInitFramesBeforeParams) (int64, error) {
+	return 0, nil
+}
+
 func unstorableErr() error { return classifyStoreError(&pgconn.PgError{Code: "22P05"}) }
 
 func msg(seq int32) IncomingMessage {
