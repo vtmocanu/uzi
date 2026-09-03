@@ -1,7 +1,7 @@
 # PRD #1049: `web/src/pages/Judge.tsx` component extraction — the page's five render-only components into `pages/judge/`
 
 **GitHub Issue**: [#1049](https://github.com/vtmocanu/uzi/issues/1049)
-**Status**: Planned (created 2026-09-02)
+**Status**: Done (created 2026-09-02, completed 2026-09-03) — extraction landed on `agent/issue-1049`; M3 design record at `specs/ai.md` §605.
 **Priority**: Medium
 **Parent**: epic #915 (P22; the first of the "web component extractions, one PRD each, the P14 (#1007) recipe" the epic's post-freeze plan lists, pulled forward to fill a free sweep slot). Prerequisite #1007 (P14, PR #1018) is merged: it established `pages/<page>/` directories (`pages/runView/`, `pages/board/`) beside `pages/adminSettings/` (#960). **File-disjoint by construction from everything in flight**: #1022 (`api/internal/handler/**`), #1034 (`web/src/{lib/api.ts,lib/boardOrder.ts,mocks/mockApi/boards.ts,pages/Board.tsx}` + `api/**`), #1042 (`api/internal/workersvc/**`, `agent/src/git.ts`) and #1048 (`controller/**`, `deploy/**`). This PRD touches `web/src/pages/Judge.tsx`, six new files under `web/src/pages/judge/`, and `specs/ai.md`.
 **Line refs**: at `d6f39a0` (main, 2026-09-02 22:19 Bucharest). Implementer re-derives at their base; anchors are identifiers, not offsets.
@@ -59,18 +59,18 @@ No `index.ts` barrel (`adminSettings/`, `runView/`, `board/` have none; the page
 
 ## Milestones
 
-- [ ] **M1 — `judge/shared.ts`, then the two single-component files: `LabelFilter.tsx`, `MultiSelectBar.tsx`.**
+- [x] **M1 — `judge/shared.ts`, then the two single-component files: `LabelFilter.tsx`, `MultiSelectBar.tsx`.**
   - Commit 1: `Judge.tsx:61-80` (the `UndoMember` doc comment `:61-72`, `type UndoMember` `:73`, `type Toast` `:75-80`; `:58-60` are the last import lines and a blank and stay) verbatim into `judge/shared.ts`; only `Toast` gains `export` (`UndoMember` has no cross-file code consumer — `Judge.tsx` names it only in comments at `:363`, and importing it would be a TS6133 under `noUnusedLocals`). `Judge.tsx` imports it with `import type { Toast } from "./judge/shared"` (type-only import, so `isolatedModules` is satisfied and nothing runtime is added). `UNDO_CONCURRENCY` (`:81-88`) stays in place.
   - Commit 2: `:657-751` into `judge/LabelFilter.tsx`, `LabelFilter` gaining `export`. Commit 3: `:1057-1150` into `judge/MultiSelectBar.tsx`, `MultiSelectBar` gaining `export`; it needs nothing from `./shared` (its props are `count`/`onClear`/`onDispose`).
   - `Judge.tsx` imports each component from `./judge/<File>`. Imports used only by the moved code leave with it; shared imports are duplicated into the new file. **Do not hand-curate the lists** — let `tsc` + `noUnusedLocals` produce the exact per-file import set (#960 M1, #1007 M1). Relative paths deepen by one level (`../lib/x` → `../../lib/x`, `../components/x` → `../../components/x`).
   - Verification after each commit: `task gate:web` green; `git diff --color-moved=dimmed-zebra origin/main..HEAD -- web/src/pages/Judge.tsx web/src/pages/judge/` shows each block as moved plus the scaffolding named above; `git diff --stat origin/main..HEAD -- 'web/src/**/*.test.ts' 'web/src/**/*.test.tsx' web/src/App.tsx` empty.
-- [ ] **M2 — The two cluster files: `GroupRow.tsx`, `ZeroState.tsx`; then `UndoToast.tsx`.**
+- [x] **M2 — The two cluster files: `GroupRow.tsx`, `ZeroState.tsx`; then `UndoToast.tsx`.**
   - Commit 4: `:753-1055` (`GroupRow` through `isHttpsUrl`) verbatim into `judge/GroupRow.tsx`; only `GroupRow` gains `export`. `GroupDisposeControls`, `OccurrenceRow`, `OccurrenceVerdictBadge`, `OccurrenceBucketChip` and `isHttpsUrl` **stay unexported** — their only callers are inside this file, and exporting any of them reddens knip's `exports: error` (`ignoreExportsUsedInFile` covers only `interface`/`type`; #1007 D4).
   - Commit 5: `:1187-1295` (`ZeroState` + `VerdictCount`) into `judge/ZeroState.tsx`; `ZeroState` gains `export`, `VerdictCount` stays private.
   - Commit 6: `:1152-1185` into `judge/UndoToast.tsx`; `UndoToast` gains `export`; it imports `type Toast` from `./shared`.
   - After this, `Judge.tsx` ends with `isBucket` (`:635-655` today) and is ≈ 640 lines. Sweep each moved block for positional comments (`above`, `below`, `this file`, `:NNN`) that the move makes false and fix them in the same commit, listed in the PR (the #963 recipe; `LabelFilter`'s header comment says "The Clear control is always mounted" and describes behaviour, not location — expected zero edits).
   - Verification as M1; additionally `cd web && VITE_UZI_MOCK=1 npm run build` succeeds (bundler resolution of the new directory; `task gate:web` excludes `vite build`, `.claude/rules/web.md`).
-- [ ] **M3 — Design record + final proofs.**
+- [x] **M3 — Design record + final proofs.**
   - Append the `specs/ai.md` section (`## <N>. PRD #1049 — Judge page component extraction`, `Serves human:` first line, the decisions below one line each). Number = highest existing section + 1, re-derived at landing **across every worktree** (`git worktree list`); §604 is the highest at authoring, and #1022, #1034, #1042 and #1048 land around the same time, so expect to renumber at landing.
   - Final sweeps, read every hit: `git grep -n -E 'pages/Judge\.tsx|Judge\.tsx' -- CLAUDE.md ARCHITECTURE.md 'docs/*.md' .claude specs web/src` (the four sites named in Problem stay true; everything else past-tense or in `prds/done/**`); `git grep -n -F '?raw' -- web/src` unchanged from `origin/main`; `git grep -n -E 'from "\.\./Judge"' -- web/src/pages/judge` → 0.
   - PR description enumerates the non-moved residue per commit (the #955/#960/#1007 precedent): import lines in `Judge.tsx` and in each new file, the `export` keyword on `LabelFilter`/`GroupRow`/`MultiSelectBar`/`UndoToast`/`ZeroState`, `export type` on `Toast`, and any positional-comment fix.
