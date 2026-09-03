@@ -1733,8 +1733,8 @@ still reused. See `.claude/rules/go.md` for the full measurement.
   chart and runs it — but only on PROTECTED refs (`main` and tags), never on an MR
   pipeline. So smoke is a POST-merge gate in CI and a pre-merge gate only locally.
   Run both locally before merging; a green MR pipeline is not smoke having passed.
-  Remote is GitLab (`gitlab.example.com:vtmocanu/uzi`,
-  use `glab`, never `gh`/`tea`)
+  Remote is GitHub (`github.com/vtmocanu/uzi`; derive the CLI from
+  `git remote get-url origin`: `gh`, never `glab`/`tea`)
 - MVP shape: local laptop demo via docker-compose, PostgreSQL DB, persistent
   storage (per plan.md)
 - Slash commands the orchestrator may invoke between delegations: none
