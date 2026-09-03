@@ -107,6 +107,10 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		ReportMd:      textPtrValue(r.ReportMd.Valid, r.ReportMd.String),
 		// PRD #377 M1: the preserved agent diff on a workflow_scope_missing failed run.
 		PreservedPatch: textPtrValue(r.PreservedPatch.Valid, r.PreservedPatch.String),
+		// issue #974: the run's typed fail_origin (already coerced/allowlisted at write
+		// time), surfaced read-only so a diagnosis keys on it instead of failure_reason
+		// free text. Null when the run never set one.
+		FailOrigin: textPtrValue(r.FailOrigin.Valid, r.FailOrigin.String),
 		// PRD-link reconciliation (read-only): the path the run declared it archived a
 		// completed PRD to, and when that patch lifecycle settled (null = still pending).
 		PrdDonePath:       textPtrValue(r.PrdDonePath.Valid, r.PrdDonePath.String),
