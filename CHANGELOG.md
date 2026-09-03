@@ -18,10 +18,26 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.76.0] - 2026-09-03
+
 ### Added
 
-- **Slack DM alert when your Anthropic 7-day rate limit resets early ([#1020](https://github.com/vtmocanu/uzi/issues/1020)).**
+- **Close or reopen an issue straight from the board ([#1051](https://github.com/vtmocanu/uzi/pull/1051)).**
+  The **Closed** column is now a drop target on every forge (GitHub, GitLab, Forgejo): drag an open card into it to close the issue, drag a closed card back onto any open lane to reopen it and move it in the same drag. Closing leaves the card's column labels untouched, so it is the forge open/closed state that puts it there, not a label; a reopened card lands at the bottom of its destination lane. The write is forge-first, so a failed close or reopen snaps the card back. Closed issues also sync to a linked project board's Done status where one is available. No new lane is added: the board still reads Backlog, Planned, In Progress, Human Review, Later, Closed.
+- **Slack DM alert when your Anthropic 7-day rate limit resets early ([#1020](https://github.com/vtmocanu/uzi/pull/1020)).**
   A new opt-out setting (on by default) fires a loud Slack DM, plus a durable inbox notification, when uzi's usage poller sees your weekly window reopen more than 8 hours before its previously expected reset; it only notifies and does not resume parked runs early.
+
+### Changed
+
+- **Worker resume durability.** A run now carries an owner-anchored checkpoint tip (`runs.checkpoint_tip`) with a CAS-delete and adoption guard ([#1053](https://github.com/vtmocanu/uzi/pull/1053)), and holds worker affinity through a fleet roll with reliable forge checkpoints, so a resumed run keeps its lineage instead of breaking it ([#1041](https://github.com/vtmocanu/uzi/pull/1041)).
+- **Dependency and security bumps.** api `golang.org/x/crypto` CVE fix ([#1050](https://github.com/vtmocanu/uzi/pull/1050)) and the Kubernetes `client-go` monorepo for the controller ([#1039](https://github.com/vtmocanu/uzi/pull/1039)).
+- **Internal refactor sweep (epic #915): large source files split into per-seam files, with no behavior change.** forge drivers ([#1040](https://github.com/vtmocanu/uzi/pull/1040)), the slacksvc notifier ([#1038](https://github.com/vtmocanu/uzi/pull/1038)), the handler route table ([#1023](https://github.com/vtmocanu/uzi/pull/1023)) and the schedules and workers handlers ([#1056](https://github.com/vtmocanu/uzi/pull/1056)), the settings domain ([#1029](https://github.com/vtmocanu/uzi/pull/1029)), the uzicli client ([#1027](https://github.com/vtmocanu/uzi/pull/1027)), the `api/cmd/uzi` CLI ([#1028](https://github.com/vtmocanu/uzi/pull/1028)), the controller `render.go` DinD renderer ([#1054](https://github.com/vtmocanu/uzi/pull/1054)), and web page component extraction from RunView and Board ([#1018](https://github.com/vtmocanu/uzi/pull/1018)) plus Judge.tsx into `pages/judge/` ([#1055](https://github.com/vtmocanu/uzi/pull/1055)).
+
+### Fixed
+
+- GitHub integer conversion in the forge driver ([#1052](https://github.com/vtmocanu/uzi/pull/1052)).
+- Default an empty label color on GitLab `EnsureLabels` ([#1035](https://github.com/vtmocanu/uzi/pull/1035)).
+- Bound the notification page offset so an out-of-range value returns 400 instead of a bad query (CodeQL alert 28, #1019).
 
 ## [0.75.1] - 2026-09-02
 
@@ -3720,7 +3736,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.75.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.76.0...HEAD
+[0.76.0]: https://github.com/vtmocanu/uzi/compare/v0.75.1...v0.76.0
 [0.75.1]: https://github.com/vtmocanu/uzi/compare/v0.75.0...v0.75.1
 [0.75.0]: https://github.com/vtmocanu/uzi/compare/v0.74.0...v0.75.0
 [0.74.0]: https://github.com/vtmocanu/uzi/compare/v0.73.0...v0.74.0

@@ -8,8 +8,8 @@ type: application
 # version. api.image.tag / web.image.tag are left unset in values so the pod image
 # follows appVersion. Bump both per release; the cluster's ArgoCD auto-tracks the chart
 # (targetRevision `0.*`), so no per-release argo bump there (see deploy/README.md).
-version: 0.75.1
-appVersion: "0.75.1"
+version: 0.76.0
+appVersion: "0.76.0"
 
 # Links this chart's OCI package to the repository (GHCR reads
 # org.opencontainers.image.source from the pushed artifact's annotations).
