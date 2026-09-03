@@ -279,8 +279,8 @@ func activityLabel(act *apitypes.RunActivity) string {
 
 // renderMilestones is the crew rail's milestone progress block (the TUI twin of the web's
 // MilestoneChecklist and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
-// summary and one glyph-marked row per milestone in FROZEN order — done ✓, in progress ◐,
-// not started ○.
+// summary and one row per milestone in FROZEN order — done ✓, not started ○, and the
+// in-progress milestone as the blinking ▰/▱ wait-colour cell (PRD #1064 M4; no ◐ glyph).
 //
 // Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run's
 // rail is byte-for-byte unchanged — the same back-compat contract the nil Milestones slice

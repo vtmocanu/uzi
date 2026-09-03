@@ -272,10 +272,11 @@ tells you whether it *fired*.
 ## Milestones and the now line
 
 On a milestone-structured issue run (see [Stopping or narrowing a
-run](#stopping-or-narrowing-a-run) below), the web run view and `uzi run
-get` mark each approved milestone `✓` reported complete, `◐` reported in
-progress, or `○` not started. **"Reported complete" is exactly what it
-says** — uzi shows what the worker reported and hasn't itself verified
+run](#stopping-or-narrowing-a-run) below), the web run view marks each
+approved milestone `✓` reported complete, `◐` reported in progress, or
+`○` not started; `uzi run get` shows the same three states as text
+(`done` / `in progress` / `left`). **"Reported complete" is exactly what
+it says** — uzi shows what the worker reported and hasn't itself verified
 the work, so the wording never says "done" or "verified".
 
 The in-progress milestone is also where the **now line** attaches: the
