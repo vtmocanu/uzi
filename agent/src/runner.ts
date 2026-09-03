@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import type { GitCache, RunnerClone } from "./git.js";
+import type { GitCache, RunnerClone, CheckpointOverlayContext } from "./git.js";
 import {
   gitBasicCredential,
   isNonFastForwardRejection,
@@ -340,6 +340,12 @@ interface RunFlight {
   preserveSession: boolean;
   lastPublish: number;
   lastPublishedTip: string | undefined;
+  /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<branch>` as this run last
+   *  knows it — seeded from `claim.checkpoint_tip`, advanced to the declared overlay/real tip on
+   *  every CONFIRMED publish. Fed to `checkpointPack` as the overlay's `prevCheckpointTip` so a
+   *  second sequential overlay carries the prior tip as parent[0] (base-first) and the broker
+   *  accepts it as a fast-forward. */
+  lastCheckpointRefTip: string | undefined;
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -624,7 +630,11 @@ export class RunRunner {
           // so a failure shows both the cause and this consequence. This batcher.emit lands
           // because handleLimitReached now FLUSHES (not closes) the batcher on the park
           // branch, leaving it open until the close just below.
-          const parkPublished = await this.publishCheckpointBestEffort(flight, barePath, branch);
+          // PRD #1062 M2 (#1036): the park path is reaped (the agent tree is dead by the time
+          // the catch runs), so a PAT git op is permitted — build the overlay so a branch behind
+          // `main` on `.github/workflows` still checkpoints durably instead of skipping.
+          const parkOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
+          const parkPublished = await this.publishCheckpointBestEffort(flight, barePath, branch, parkOverlay);
           batcher.emit({
             kind: "status",
             agent: "worker",
@@ -685,7 +695,11 @@ export class RunRunner {
           const durability = (async (): Promise<boolean> => {
             await this.git.commitWipMarker(worktreePath).catch(() => false);
             await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
-            return this.publishCheckpointBestEffort(flight, barePath, branch);
+            // PRD #1062 M2 (#1036): the graceful-shutdown path already reaped the agent tree
+            // (killAgentTree above), so the overlay's PAT default-fetch is permitted here — a
+            // behind-on-workflows branch checkpoints durably instead of skipping.
+            const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
+            return this.publishCheckpointBestEffort(flight, barePath, branch, shutdownOverlay);
           })();
           // undefined ⇒ the budget elapsed before the sequence finished: nothing confirmably
           // landed, so a cross-worker resume does restart from default — the same truthful
@@ -1999,6 +2013,10 @@ export class RunRunner {
       // work" test keys on `lastPublishedTip`, NOT the fetch-skip below.
       lastPublish: this.now(),
       lastPublishedTip: undefined,
+      // PRD #1062 M2 (#1036): the checkpoint ref tip this run last knows, for the overlay's
+      // prevCheckpointTip. Seeded from the persisted tip on the claim (a resume already has an
+      // overlay on the ref), advanced on every confirmed publish.
+      lastCheckpointRefTip: claim.checkpoint_tip ?? undefined,
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
@@ -2818,17 +2836,21 @@ export class RunRunner {
         const tipUnmovedSinceFetch =
           trackTip !== null && cloneTip !== null && trackTip === cloneTip;
 
-        // Skip ONLY the fetch (and reap) when there is nothing new to fetch — do NOT return,
-        // so the origin-publish gate below still runs (Decision 9: a commit fetched at an
-        // earlier iteration can become publish-eligible on a later tip-unmoved iteration once
-        // the interval opens). Reap-before-git is preserved: we reap only on the fetch path,
-        // strictly before the credential-free fetch-back.
+        // Reap on EVERY model-cooperative checkpoint (Decision 10b), STRICTLY before ANY git
+        // below — both the credential-free fetch-back and the #1036 overlay's PAT-bearing
+        // fetchDefaultTip. The reap is tied to opts.reap (the real "safe to reap" signal: the
+        // agent's turn has ALREADY ENDED), NOT to the fetch: the fetch-back is credential-free
+        // but the M2 overlay is not, so REAP-BEFORE-GIT requires the reap precede it here,
+        // regardless of tip movement. The fallback (reap:false) must NOT reap: a backgrounded
+        // dev server the lead means to reuse next iteration must survive. The done path
+        // likewise reaps before its fetch-back.
+        if (opts.reap) executor.killAgentTree?.();
+
+        // Skip ONLY the fetch when there is nothing new to fetch — do NOT return, so the
+        // origin-publish gate below still runs (Decision 9: a commit fetched at an earlier
+        // iteration can become publish-eligible on a later tip-unmoved iteration once the
+        // interval opens).
         if (!tipUnmovedSinceFetch) {
-          // Reap ONLY on the model-cooperative checkpoint (Decision 10b), STRICTLY before
-          // any CREDENTIALED git — the done path likewise reaps before its fetch-back. The
-          // fallback (reap:false) must NOT reap: a backgrounded dev server the lead means to
-          // reuse next iteration must survive.
-          if (opts.reap) executor.killAgentTree?.();
           // Fetch back, credential-free (#218's helper): brings the committed work into
           // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
           await this.fetchBackBestEffort(
@@ -2865,10 +2887,20 @@ export class RunRunner {
           this.now() - flight.lastPublish >= this.checkpointIntervalMs;
         let published = false;
         if (hasNewWork && (opts.reap || timeGateOpen)) {
+          // PRD #1062 M2 (#1036): attempt the `.github/workflows` overlay ONLY on the reap:true
+          // (milestone) path. On that path the agent tree was ALREADY reaped unconditionally
+          // above (opts.reap ⇒ killAgentTree, hoisted before both fetch paths), so the overlay's
+          // default-tip fetch — a PAT git op — runs with no live agent, satisfying REAP-BEFORE-GIT
+          // (~:2745). The overlay is FORBIDDEN on the reap:false path where the agent is still
+          // ALIVE. So reap:false publishes with NO overlay (undefined) — byte-behaviourally unchanged.
+          const midRunOverlay = opts.reap
+            ? await this.buildCheckpointOverlay(claim, flight, barePath)
+            : undefined;
           published = await this.publishCheckpointBestEffort(
             flight,
             barePath,
             runnerClone.branch,
+            midRunOverlay,
           );
           // Advance the time-gate on every ATTEMPT (not just success): this bounds broker
           // retry cadence to <= 1 publish/interval/run even under a persistent broker
@@ -3068,16 +3100,50 @@ export class RunRunner {
    * outcome per run (see {@link reportPublishOutcome}). A null pack (nothing to publish —
    * an absent tracking ref or an unmoved tip) is NOT a failure and stays silent.
    */
+  /**
+   * PRD #1062 M2 (#1036): build the `.github/workflows` overlay context for a checkpoint publish,
+   * or undefined when no overlay must be attempted. Undefined for every non-GitHub forge (the
+   * overlay closes a GitHub-only `workflow` scope gap) — so `checkpointPack` behaves exactly as
+   * today off GitHub. `defaultBranch` is resolved the way the finalize align resolves it. Callers
+   * pass the result ONLY on paths where the agent tree is already reaped: the overlay's default
+   * fetch is a PAT git op, forbidden while the agent is alive (the REAP-BEFORE-GIT invariant).
+   */
+  private async buildCheckpointOverlay(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    barePath: string,
+  ): Promise<CheckpointOverlayContext | undefined> {
+    if (claim.repo.forge_type !== "github") return undefined;
+    const defaultBranch =
+      claim.repo.default_branch?.trim() ||
+      (await this.git.defaultBranchName(barePath)) ||
+      "main";
+    return {
+      defaultBranch,
+      pat: claim.secrets.forge_pat,
+      cloneUrl: claim.repo.clone_url,
+      username: claim.secrets.forge_username,
+      prevCheckpointTip: flight.lastCheckpointRefTip,
+    };
+  }
+
   private async publishCheckpointBestEffort(
     flight: RunFlight,
     barePath: string,
     branch: string,
+    overlay?: CheckpointOverlayContext,
   ): Promise<boolean> {
     try {
-      const packed = await this.git.checkpointPack(barePath, branch);
+      const packed = await this.git.checkpointPack(barePath, branch, overlay);
       if (!packed) return false; // nothing to publish — not a failure, stay silent
       const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack);
-      if (res.ok && res.body.published === true) return true;
+      if (res.ok && res.body.published === true) {
+        // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the
+        // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
+        // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.
+        flight.lastCheckpointRefTip = packed.tipOid;
+        return true;
+      }
       if (res.ok) {
         // A 2xx that did NOT publish: a best-effort server-side skip. Name the reason.
         const reason = res.body.skipped ?? "unknown";

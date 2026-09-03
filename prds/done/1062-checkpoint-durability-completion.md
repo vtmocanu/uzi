@@ -15,13 +15,24 @@ open-web lookup.
 
 ## Status
 
+**COMPLETE 2026-09-03 — moved to `prds/done/`.** All three milestones landed: M1 (#1059)
+and M3 (#1037) merged to `main`; M2 (#1036) implemented on `agent/issue-1036` and carried by
+this MR (the PRD completes when it lands). The items under *Deferred* are intentional
+follow-ups tracked as their own issues, not deliverables of this PRD.
+
 - **M1 (#1059)** — **MERGED** 2026-09-03 (PR #1068 → main `92fba2e1`). Adopt-seam unified
   on the owner anchor across BOTH not-ownedHere legs; agent-side only (`agent/src/git.ts`
   + `agent/test/git-cross-worker-recovery.test.ts` + `agent/test/git.test.ts`), no
   server/schema/migration change. `adr/0628` amended, `specs/ai.md` §609 added.
-- **M2 (#1036)** — design FINALIZED (D7 resolved: Option B, worker-side temp-index
-  `.github/workflows` overlay; `agent/src/git.ts`-only, broker untouched). Ready to
-  implement now that M1 merged. Rebases on M1's adopt block.
+- **M2 (#1036)** — **IMPLEMENTED** (this branch `agent/issue-1036`), agent-side only
+  (`agent/src/git.ts` + `agent/src/runner.ts` + `agent/test/git-checkpoint-overlay.test.ts`
+  + `agent/test/runner-checkpoint.test.ts`). Worker-side temp-index `.github/workflows`
+  overlay (Option B); `pushbroker.go` and `service.go` `Publish` byte-untouched; no
+  schema/migration. New `adr/1036-checkpoint-workflow-overlay.md`; the M2 MR also adds
+  the `specs/ai.md` entry. Not yet merged. **Correction on the design as first written:**
+  the overlay's `commit-tree` parent order is base-FIRST/realTip-LAST (D8), not the
+  `-p realTip [-p prevOverlay]` the drafts below described — see §2a, D8, and Success
+  Criterion #3.
 - **M3 (#1037)** — **IMPLEMENTED** (this MR), server-only. `Publish` and
   `deleteCheckpointBestEffort` in `api/internal/workersvc/service.go` now gate on a
   checkpoint-eligible SET (issue + self_improve) via a new kind-first
@@ -246,21 +257,35 @@ against a temp index with no worktree, `git rm --cached` exits non-zero when no 
 matches, so without it the no-`.github` / already-deleted-workflows edges would ERROR
 instead of being no-ops — same flag `alignBranchWithDefault` carries at `git.ts:1530`); if
 default has a workflows tree, `git read-tree --prefix=.github/workflows
-<defaultTip>:.github/workflows` (empty ⇒ rm-only, the #627 deleted-workflows edge); `newRoot = git write-tree`; if `newRoot == realTip^{tree}` ⇒ not
-behind ⇒ ship `realTip`; else `O_ov = git commit-tree newRoot -p realTip [-p prevOverlay]
--m "ckpt(overlay): …"` with **DETERMINISTIC identity + committer date** (= realTip's,
-fixed identity, `gpgsign=false`) so a no-new-work rebuild yields the same OID and the
-broker's "already up to date" early-return still fires. **Parent chaining:** read the
-current `refs/uzi-checkpoints/<branch>` tip; if it exists and is NOT an ancestor of
-`realTip` (a prior overlay sibling), add it as `parent[1]`, so `O_ov` strictly descends
-the current ref and the broker's existing `strictDescends`/wire-CAS accept it as a FF with
-**zero broker changes**. Return `{ tipOid: O_ov, pack }` (pack = `O_ov ^floor`; default's
-workflow blobs excluded, already at origin).
+<defaultTip>:.github/workflows` **with a throwaway empty `GIT_WORK_TREE`** (that one op
+refuses in a bare repo, so a work-tree must be set; passed WITHOUT `-u`, so nothing is
+checked out and no `.gitattributes` filter/smudge driver fires — a security property, and
+why the "no worktree" phrasing above is inexact for this single step) (empty ⇒ rm-only, the
+#627 deleted-workflows edge); `newRoot = git write-tree`; if `newRoot == realTip^{tree}` ⇒ not
+behind ⇒ ship `realTip`; else **`O_ov = git commit-tree newRoot -p <prevCheckpointTip> -p
+<realTip>` — the prior checkpoint tip is parent[0] (base-FIRST) and realTip is the LAST
+parent** (single parent `-p realTip` when there is no prior checkpoint), with
+**DETERMINISTIC identity + committer date** (= realTip's, `AGENT_GIT_IDENTITY`,
+`gpgsign=false`) so a no-new-work rebuild yields the same OID and the broker's "already up to
+date" early-return still fires. **🔴 The base-first order is load-bearing (corrected — this
+draft originally had `-p realTip` first):** the api broker's strict-descendant check
+(`api/internal/pushbroker/pushbroker.go` `strictDescends`/`descendsOrEqual`) runs go-git
+`IsAncestor` as a **parent[0]-first preorder DFS over the broker's depth-1 store**; with
+realTip as parent[0] that walk descends realTip's chain to the branch fork and errors on the
+depth-1-EXCLUDED old default `D_old` before reaching the base, so a sequential overlay is
+falsely rejected `not_descendant`; base-first makes `IsAncestor` find the base immediately →
+accepted as a fast-forward with **zero broker changes** (full rationale in D8).
+`prevCheckpointTip` is the checkpoint ref tip this run last knows
+(`flight.lastCheckpointRefTip`, seeded from `claim.checkpoint_tip`), added only when it is a
+40-hex SHA. Return `{ tipOid: O_ov, pack }` (pack = `O_ov ^floor`; default's workflow blobs
+excluded, already at origin).
 
 *2b — peel the overlay at adoption (`runnerCloneForBranch`, composes with M1).* After
 `baseSha` resolves and BEFORE `adoptedMarker` (`git.ts:669`): if `baseSha`'s subject
 starts `ckpt(overlay):` (a new `isOverlayMarker` mirroring `isWipParkMarker` `git.ts:1832`),
-re-point `baseSha = baseSha^1` (its underlying real tip — **DISCARD** the overlay tree; it
+re-point `baseSha` to the overlay's **LAST parent** (= realTip, by construction — base-first/
+realTip-last; NOT `^1`, NOT "the first non-overlay parent"; its underlying real tip —
+**DISCARD** the overlay tree; it
 is a transport wrapper, never branch content). Then the EXISTING `adoptedMarker` / wip-park
 `reset --soft` logic runs on the peeled `baseSha`, so a `wip(park)` marker under an overlay
 is still handled. **Order: overlay (outermost) → wip-park (inner); and the tree semantics
@@ -395,8 +420,9 @@ contract. Superseded by the Option-B ADR below.
 
 **ADR**: a new ADR keyed `1036` for the **worker-side transport-wrapper contract** — the
 checkpoint ref may carry `ckpt(overlay):` commits; the worker builds them via a temp index
-in `checkpointPack`; adoption peels them (discard the overlay tree, re-point to `O^1`)
-before the wip-park soft-reset; the broker is deliberately NOT involved. Cross-links
+in `checkpointPack`; adoption peels them (discard the overlay tree, re-point to the overlay's
+last parent — `= realTip` by the base-FIRST/realTip-LAST order, D8, NOT `^1`) before the
+wip-park soft-reset; the broker is deliberately NOT involved. Cross-links
 ADR-0456 (its #627 finalize sibling), ADR-0122, and ADR-0628. Written by the M2
 implementation run in its own MR.
 
@@ -502,10 +528,13 @@ seam, not because of broker blast radius (which no longer applies under Option B
    `.github/workflows` tree equals the default's — via a temp index, and the **unchanged
    broker** pushes it (no `skipped:"workflow_scope"`). `runs.checkpoint_tip` = the declared
    `O_ov` (a real, mirrored, deterministically re-derivable commit), so M1's owner-anchor
-   matches on resume; adoption **discards** the overlay tree (re-point to `O_ov^1`) then
+   matches on resume; adoption **discards** the overlay tree (re-point to the overlay's LAST
+   parent = `realTip` by the base-FIRST/realTip-LAST order — D8, NOT `O_ov^1`) then
    soft-resets any wip-park marker, landing on `realTip` with **no staged `.github` diff**.
-   A **second sequential overlay** carries `parent[1] = O_ov_prev`, so it is a genuine FF
-   descendant the broker accepts (NOT skipped `not_descendant`). A branch that MODIFIED
+   A **second sequential overlay** carries the prior checkpoint tip as **parent[0]**
+   (base-FIRST) and realTip as the last parent, so the **unchanged** broker's parent[0]-first
+   depth-1 DFS accepts it as a genuine FF descendant (NOT skipped `not_descendant`). A branch
+   that MODIFIED
    workflows, or a still-rejected push, **skips cleanly** (`skipped:"workflow_scope"`, never
    5xx/failed) — the no-single-bet fallback. `pushbroker.go` and `service.go` are proven
    byte-unchanged. Proven by the agent fixture set (Contract B).
@@ -532,14 +561,15 @@ Two reimplementations this design creates; pin each with a discriminating fixtur
   broker is untouched). A golden snapshot from only the "behind" case would lock in the
   blind spot, so author all of, asserting each exercises its branch:
   - **behind, not workflow-modified** ⇒ `O_ov` built, its `.github/workflows` tree ==
-    default's, `parent[0]` == realTip; adoption peels to `realTip` with no staged diff;
+    default's, its **single parent** == realTip (no prior checkpoint); adoption peels to
+    realTip (the LAST parent) with no staged diff;
   - **not-behind** (discriminating negative) ⇒ no overlay, ships `realTip`;
   - **workflow-MODIFIED** ⇒ no overlay, clean skip (the gate holds);
   - **stacked** (a `wip(park)` tip also behind) ⇒ peel overlay (discard) then soft-reset
     the marker, landing on `realParent` with the WIP uncommitted;
-  - **second sequential overlay** ⇒ `O_ov2` with `parent[1] = O_ov_prev` is a FF descendant
-    the (unchanged) broker accepts — NOT skipped `not_descendant`; the single-publish
-    fixtures miss this;
+  - **second sequential overlay** ⇒ `O_ov2` with `parent[0] = O_ov_prev` (base-FIRST) and
+    realTip as its last parent is a FF descendant the (unchanged) broker's parent[0]-first
+    depth-1 DFS accepts — NOT skipped `not_descendant`; the single-publish fixtures miss this;
   - **edge** (default deleted its workflows; realTip has no `.github`) ⇒ rm-only / ship
     `realTip`, never throw.
 
@@ -551,6 +581,27 @@ Two reimplementations this design creates; pin each with a discriminating fixtur
 - **`ci_fix` / `mr_rework` / `prompt` checkpoints** — see the per-kind table; each has
   a caveat (same-branch sharing, origin-exists, low value) that warrants its own
   evaluation.
+- **M2 overlay residuals (Option B, GitHub-only).** (1) A between-milestone `reap:false`
+  hard-kill on a behind-on-workflows branch is uncovered — the overlay's PAT default-fetch
+  is forbidden while the agent is alive, so only park, graceful shutdown, and the `reap:true`
+  milestone build it (the dominant hosted case). (2) A plain checkpoint shipped after an
+  overlay (the branch is no longer behind while a prior overlay is on the ref) skips
+  `not_descendant` until the next overlay chains and lands — self-healing. (3) A cold-resume
+  no-work rebuild grows the overlay chain by one commit (the deterministic early-return does
+  not fire when `prevCheckpointTip` is a prior overlay). (4) The raised best-effort persist
+  window: push-success then persist-fail then death leaves the ref at `O_ov` while the DB tip
+  is stale, so the checkpoint is not adopted on the next claim. (5) A lost publish ACK
+  (broker accepted, response lost) leaves `lastCheckpointRefTip` stale so the next overlay
+  skips `not_descendant` and the branch goes dark — the already-up-to-date=success path
+  reconciles a same-tip re-attempt, but a lost-ack-then-new-work needs a two-tip reconcile.
+  Tracked in **#1086** (CodeRabbit F2; deferred, its correctness only verifiable against the
+  broker's depth-1 store).
+
+**Review-added guards (#1084):** the overlay peel is provenance-gated on
+`seededFrom === "checkpoint"` so a forged `ckpt(overlay):` subject on an agent-controllable
+base is never peeled (CodeRabbit F1), and `api/internal/pushbroker/overlay_ancestry_internal_test.go`
+is an executable depth-1 guard that a base-first overlay is accepted while a realTip-first one
+is rejected `not_descendant`.
 
 ## Decision Log
 
@@ -595,3 +646,19 @@ Two reimplementations this design creates; pin each with a discriminating fixtur
   owner-anchor; merge is a needless commit) — only the conflict-free FF overlay; a
   workflow-MODIFIED branch or a still-rejected push skips cleanly (ADR-0456 D2's
   no-single-bet stance). This makes D2 void, D3 `.github/workflows`, and M2 ‖ M3 parallel.
+- **D8 — RESOLVED at implementation (Option-1 parent flip): overlay parents are base-FIRST,
+  realTip-LAST; adoption peels to the LAST parent.** The overlay is
+  `commit-tree newRoot -p <prevCheckpointTip> -p <realTip>` (single parent `-p realTip` with
+  no prior checkpoint), and the adoption peel re-points to the overlay's LAST parent (=
+  realTip). The PRD's original `-p realTip [-p prevOverlay]` order is **rejected by the
+  broker**: `strictDescends`/`descendsOrEqual` in `api/internal/pushbroker/pushbroker.go` runs
+  go-git `IsAncestor` as a parent[0]-first preorder DFS over the broker's depth-1 store, so
+  with realTip at parent[0] a sequential overlay's walk runs off the depth-1 pack into the
+  excluded old default `D_old` before reaching the base and is falsely rejected
+  `not_descendant`; putting the base at parent[0] makes `IsAncestor` stop immediately →
+  accepted as a fast-forward, broker byte-unchanged. Also settled here: the overlay's default
+  fetch is PAT-bearing, so it runs ONLY on reaped paths (park, graceful shutdown, `reap:true`
+  milestone — the reap fires strictly before the fetch); the `reap:false` mid-run time-gate
+  runs with the agent ALIVE and passes NO overlay (REAP-BEFORE-GIT). **Supersedes the §2a
+  parent-order text, §2b's peel target, and Success Criterion #3 as originally written** (all
+  corrected in place above).
