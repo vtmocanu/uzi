@@ -447,6 +447,53 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 	if dim {
 		fillC = m.pal.faintC
 	}
-	return paintSeg(fillC, bg, false, strings.Repeat("▰", done)) +
-		paintSeg(m.pal.faintC, bg, false, strings.Repeat("▱", total-done))
+	// The in-progress cell (first frozen id in progress, D4) takes the cell right after the
+	// done fill and blinks ▰/▱ in the wait colour. Not on a DONE (terminal) row — its
+	// in-progress snapshot is stale and the row is faint end to end.
+	ipID, _ := milestoneInProgress(r.RunDTO)
+	blink := ipID != "" && done < total && !dim
+	out := paintSeg(fillC, bg, false, strings.Repeat("▰", done))
+	empty := total - done
+	if blink {
+		out += m.milestoneCell(bg)
+		empty--
+	}
+	return out + paintSeg(m.pal.faintC, bg, false, strings.Repeat("▱", empty))
+}
+
+// boardShowSecondLine reports whether the SELECTED row gets its second "now" line (PRD #1064
+// D4): a non-terminal run with a server-derived current_activity. It has no milestone
+// precondition (D5) — the board reads current_activity directly. Used both by the row window
+// math (which must reserve a physical line for it) and by renderBoard.
+func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
+	return r.CurrentActivity != nil && !terminalRunStatuses[r.Status]
+}
+
+// boardSecondLine is the selected row's second line (PRD #1064 D4): `▸ <id> <title> · <role>
+// <label> · <age>` from RunDTO.CurrentActivity, riding the warm selection bar like the crew
+// rail's lane-label line. The `<id> <title>` prefix is the first in-progress milestone (D4) and
+// is dropped when nothing is declared in progress; role/label/age come from the activity. Role
+// and label are UNTRUSTED, model-authored text and go through renderer.Plain (D7). Clamped and
+// padded to the full width so the selection bar spans the row.
+func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
+	act := r.CurrentActivity
+	if act == nil || terminalRunStatuses[r.Status] {
+		return ""
+	}
+	bg := m.pal.selBg
+	var b strings.Builder
+	b.WriteString(paintSeg(m.pal.tungsten, bg, false, "  ▸ "))
+	if id, title := milestoneInProgress(r.RunDTO); id != "" {
+		b.WriteString(paintSeg(m.pal.wait, bg, false, m.renderer.Plain(id, 12)))
+		if title != "" {
+			b.WriteString(paintSeg(nil, bg, false, " "+m.renderer.Plain(title, 40)))
+		}
+		b.WriteString(paintSeg(m.pal.faintC, bg, false, " · "))
+	}
+	b.WriteString(paintSeg(m.pal.sage, bg, false, m.renderer.Plain(act.Agent, 16)))
+	if lbl := activityLabel(act); lbl != "" {
+		b.WriteString(paintSeg(nil, bg, false, "  "+m.renderer.Plain(lbl, 48)))
+	}
+	b.WriteString(paintSeg(m.pal.faintC, bg, false, " · "+relAge(act.At)))
+	return padSeg(clampVisual(b.String(), m.width), m.width, bg)
 }

@@ -11,6 +11,7 @@ import (
 	lipgloss "charm.land/lipgloss/v2"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runactivity"
 )
 
 func (m tuiModel) renderLaneRail() string {
@@ -204,6 +205,78 @@ func milestoneCount(done, total int, reported bool) string {
 	return itoa(done) + "/" + itoa(total)
 }
 
+// milestoneInProgress returns the FIRST frozen milestone (by frozen order) that is in the run's
+// in-progress set and not already completed — the D4 selection rule: the one id that blinks,
+// carries the `· <id>` eyebrow suffix and is named on the board second line. Completed ids are
+// excluded so a stale in-progress snapshot cannot double-count a ticked milestone. Returns
+// ("", "") when nothing is declared in progress.
+func milestoneInProgress(run apitypes.RunDTO) (id, title string) {
+	if len(run.MilestonesInProgress) == 0 || len(run.Milestones) == 0 {
+		return "", ""
+	}
+	inProg := make(map[string]bool, len(run.MilestonesInProgress))
+	for _, mid := range run.MilestonesInProgress {
+		inProg[mid] = true
+	}
+	completed := make(map[string]bool, len(run.MilestonesCompleted))
+	for _, mid := range run.MilestonesCompleted {
+		completed[mid] = true
+	}
+	for _, mi := range run.Milestones {
+		if inProg[mi.ID] && !completed[mi.ID] {
+			return mi.ID, mi.Title
+		}
+	}
+	return "", ""
+}
+
+// milestoneCell renders the blinking in-progress milestone cell (PRD #1064 D4): ▰ when the
+// model's blink phase is on, ▱ when off, in the wait colour. The alternation is SHAPE-based
+// (▰ vs ▱), so it still reads under an Ascii/NO_COLOR profile that strips the tint; the initial
+// phase is ▱ (the static frame). bg carries a selection background when the cell rides one.
+func (m tuiModel) milestoneCell(bg color.Color) string {
+	g := "▱"
+	if m.blinkOn {
+		g = "▰"
+	}
+	return paintSeg(m.pal.wait, bg, false, g)
+}
+
+// railActivity folds the crew rail's OWN frames into the run's "now" line via runactivity.Latest
+// — the SAME rule the server runs for RunDTO.CurrentActivity — so the board DTO and the rail can
+// never disagree on what is happening now (D3). Returns nil when no tool_use frame exists.
+func railActivity(frames []laneFrame) *apitypes.RunActivity {
+	ra := make([]runactivity.Frame, 0, len(frames))
+	for i := range frames {
+		f := &frames[i]
+		var agent, label *string
+		if f.Agent != "" {
+			a := f.Agent
+			agent = &a
+		}
+		if f.AgentLabel != "" {
+			l := f.AgentLabel
+			label = &l
+		}
+		ra = append(ra, runactivity.Frame{
+			Kind: f.Kind, Agent: agent, AgentLabel: label,
+			Payload: f.Payload, CreatedAt: f.CreatedAt, Seq: f.Seq,
+		})
+	}
+	return runactivity.Latest(ra)
+}
+
+// activityLabel is the model-authored task label a now line shows: the dispatch/label first
+// (agentLane.Label's analog), the tool detail (a file path, an Agent/Bash description) as a
+// fallback so a lead frame with no label still says what it is doing. Both are UNTRUSTED and
+// must be drawn through renderer.Plain by the caller.
+func activityLabel(act *apitypes.RunActivity) string {
+	if act.AgentLabel != "" {
+		return act.AgentLabel
+	}
+	return act.Detail
+}
+
 // renderMilestones is the crew rail's milestone progress block (the TUI twin of the web's
 // MilestoneChecklist and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
 // summary and one glyph-marked row per milestone in FROZEN order — done ✓, in progress ◐,
@@ -237,17 +310,52 @@ func (m tuiModel) renderMilestones() string {
 		inProgress[id] = true
 	}
 	done, total, reported := milestoneProgress(m.detail.run)
+	terminal := terminalRunStatuses[m.detail.run.Status]
+
+	// The FIRST in-progress id (frozen order, D4) is the one that blinks, carries the `· <id>`
+	// eyebrow suffix and hosts the now line. A terminal run's in-progress snapshot is stale, so
+	// nothing blinks there.
+	ipID, _ := milestoneInProgress(m.detail.run)
+	blink := ipID != "" && done < total && !terminal
+	// The rail's "now" line comes from the crew rail's OWN frames via the same runactivity rule
+	// the server runs, so the DTO and the rail cannot disagree (D3). No now line on a terminal
+	// run — a finished run has no "now".
+	var act *apitypes.RunActivity
+	if !terminal {
+		act = railActivity(m.detail.frames)
+	}
+	// The static wait cell (▱, wait colour) for a non-selected in-progress milestone: the
+	// selected one blinks, the others carry today's in-progress mark (D4).
+	waitCell := paintSeg(m.pal.wait, nil, false, "▱")
 
 	var sb strings.Builder
 	// The eyebrow gets a milestone micro-bar (▰ done / ▱ remaining) beside the count, the rail
-	// twin of the board's micro-bar. Dropped for a very long list, where the per-milestone rows
-	// below carry the detail anyway.
+	// twin of the board's micro-bar, with the in-progress cell blinking in the wait colour.
+	// Dropped for a very long list, where the per-milestone rows below carry the detail anyway.
 	bar := ""
 	if reported && total <= boardMileCap {
+		empty := total - done
+		mid := ""
+		if blink {
+			mid = m.milestoneCell(nil)
+			empty--
+		}
 		bar = lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(strings.Repeat("▰", done)) +
-			m.pal.faint.Render(strings.Repeat("▱", total-done)) + " "
+			mid + m.pal.faint.Render(strings.Repeat("▱", empty)) + " "
 	}
-	sb.WriteString(m.pal.faint.Render("MILESTONES") + " " + bar + m.pal.faint.Render(milestoneCount(done, total, reported)) + "\n")
+	eyebrow := m.pal.faint.Render("MILESTONES") + " " + bar + m.pal.faint.Render(milestoneCount(done, total, reported))
+	if ipID != "" {
+		// `· <id>` names the milestone the crew is on, carrying the state without motion for a
+		// static/non-tty frame. The id is a validated frozen key, sanitized defensively.
+		eyebrow += m.pal.faint.Render(" · " + m.renderer.Plain(ipID, 12))
+	}
+	sb.WriteString(eyebrow + "\n")
+	// Nothing declared in progress but there IS activity: an unattached now line directly under
+	// the eyebrow (PRD #1064 mock; #390 D7 — declared, not inferred, so the milestone stays
+	// unmarked).
+	if ipID == "" && act != nil {
+		sb.WriteString(m.railNowLines(act, " ", "   "))
+	}
 	for _, mi := range ms {
 		glyph := m.pal.faint.Render("○") // not started
 		style := m.pal.faint
@@ -258,10 +366,37 @@ func (m tuiModel) renderMilestones() string {
 			// strikethrough (which lipgloss emits per-rune, bloating the frame for no signal).
 			style = m.pal.faint
 		case inProgress[mi.ID]:
-			glyph = m.pal.state(crewWaiting).Render("◐")
+			// The selected in-progress row's mark is the blinking cell (D4); the others (a run
+			// with several ids in progress) carry the static in-progress mark.
+			if mi.ID == ipID && blink {
+				glyph = m.milestoneCell(nil)
+			} else {
+				glyph = waitCell
+			}
 			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
 		}
 		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
+		// The now line rides beneath the in-progress milestone it belongs to.
+		if mi.ID == ipID && act != nil {
+			sb.WriteString(m.railNowLines(act, "   ", "     "))
+		}
 	}
 	return strings.TrimRight(sb.String(), "\n")
+}
+
+// railNowLines renders the crew rail's "now" line beneath the in-progress milestone (or
+// unattached under the eyebrow): a `↳ <role> · <age>` line and, when the activity carries one,
+// an italic task-label line — the laneRow second-line precedent. arrowIndent/labelIndent are
+// the leading spaces that place it under its owner. Role and label are UNTRUSTED, model-authored
+// text and go through renderer.Plain (D7).
+func (m tuiModel) railNowLines(act *apitypes.RunActivity, arrowIndent, labelIndent string) string {
+	var sb strings.Builder
+	role := m.pal.state(crewWorking).Render(m.renderer.Plain(act.Agent, 14))
+	sb.WriteString(arrowIndent + m.pal.faint.Render("↳ ") + role +
+		m.pal.faint.Render(" · "+relAge(act.At)) + "\n")
+	if lbl := activityLabel(act); lbl != "" {
+		lst := lipgloss.NewStyle().Foreground(m.pal.faintC).Italic(true)
+		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(lbl, milestoneTitleCap)) + "\n")
+	}
+	return sb.String()
 }
