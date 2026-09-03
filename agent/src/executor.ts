@@ -182,6 +182,13 @@ export interface RunContext {
   selfImproveDogfood?: boolean;
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
+  /** PRD #1064 M1 (Decision 2, resumed runs): the run's FROZEN milestone list as carried
+   *  on the claim (`ClaimResponse.milestones`). The implement loop assigns its own
+   *  `frozenMilestones` at the plan gate, but that stays undefined on a PRE-APPROVED RESUME
+   *  (no gate runs there), so the transition-frame closure falls back to THIS list for the
+   *  `<title>` on a re-claimed run. Absent/null ⇒ a titleless frame (`milestone m2 started`)
+   *  rather than a skip. Never load-bearing — a milestone with no title still emits a frame. */
+  frozenMilestones?: Milestone[] | null;
   /** SDK session to resume; null/absent for a fresh run. The runner clears this when
    *  the named transcript is not on THIS worker's disk (issue #105) — the SDK resolves
    *  a resume locally, so passing an unresolvable id fails the whole run before the
@@ -311,6 +318,21 @@ export interface RunContext {
     iteration: number,
     progress?: MilestoneProgress,
   ): Promise<IterationBudget | undefined> | void;
+  /**
+   * PRD #1064 M1 (Decision 1): push the lead's live milestone `progress` to the server
+   * the MOMENT the scan loop observes a `report_progress` signal, rather than waiting for
+   * the next turn-boundary `reportIteration`. It sends the same `running` report the
+   * checkpoint closure does (milestone fields, NO `iteration_count`).
+   *
+   * FIRE-AND-FORGET, and it must NEVER block the scan loop: the runner's implementation
+   * ENQUEUES the report onto the per-run running-report chain (serializing it with the
+   * turn-boundary `reportIteration` and the checkpoint report so a late push can never
+   * overtake the next turn's snapshot) and returns IMMEDIATELY. A failed push is logged
+   * (`could not report progress`) and swallowed — an informational field never fails a run
+   * (#122 additive-optional). Absent on the stub/test executors, in which case the executor
+   * still folds the value into `latestProgress` and the turn-boundary report carries it.
+   */
+  reportProgress?(progress: MilestoneProgress): Promise<void>;
   /**
    * PRD #122 M6: durably checkpoint the run's committed work at a milestone boundary.
    * The executor calls it from the implement loop when a milestone completes.

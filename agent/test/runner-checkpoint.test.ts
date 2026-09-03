@@ -205,6 +205,79 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
     );
   });
 
+  it("ctx.reportProgress sends an immediate running report (milestone fields, no iteration_count) and serializes BEFORE the next reportIteration (PRD #1064 M1)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(90);
+    const exec: Executor = {
+      run: async (ctx) => {
+        // The immediate push (fire-and-forget, enqueued on the per-run chain).
+        await ctx.reportProgress!({ completed: ["m1"], in_progress: ["m2"] });
+        // The turn-boundary report AWAITS the per-run chain, so once it resolves the push
+        // above has landed on the api — that ordering is the resurrection guard (Decision 1).
+        await ctx.reportIteration!(1, { completed: ["m1"], in_progress: [] });
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => {},
+    };
+    await runner(exec, gitlab).execute(claim);
+
+    const bodies = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    const pushIdx = bodies.findIndex(
+      (b) =>
+        b.status === "running" &&
+        !("iteration_count" in b) &&
+        Array.isArray(b.milestones_in_progress) &&
+        b.milestones_in_progress.includes("m2"),
+    );
+    assert.ok(pushIdx >= 0, "an immediate running report carried in_progress [m2] and omitted iteration_count");
+    assert.deepStrictEqual(bodies[pushIdx]!.milestones_completed, ["m1"]);
+    // The turn-boundary report (iteration_count present, in_progress cleared) comes AFTER
+    // the push on the wire — a late push can never overtake the next snapshot.
+    const iterIdx = bodies.findIndex(
+      (b) => b.status === "running" && b.iteration_count === 1,
+    );
+    assert.ok(iterIdx >= 0, "the turn-boundary report was sent");
+    assert.ok(pushIdx < iterIdx, "the immediate push reached the api before the turn-boundary report");
+  });
+
+  it("a reportProgress push whose reportState rejects does not fail the run (PRD #1064 M1)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(91);
+    // Make the NEXT reportState call (the immediate push) reject once, proving the runner's
+    // reportProgress swallows it. reportState has bounded retries in production; here we
+    // force a hard reject to exercise the log-and-continue path.
+    const origReportState = client.reportState.bind(client);
+    let failNext = false;
+    (client as unknown as { reportState: unknown }).reportState = async (
+      ...args: unknown[]
+    ) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("reportState boom");
+      }
+      return (origReportState as (...a: unknown[]) => Promise<unknown>)(...args);
+    };
+    try {
+      let reachedEnd = false;
+      const exec: Executor = {
+        run: async (ctx) => {
+          failNext = true;
+          await ctx.reportProgress!({ completed: [], in_progress: ["m2"] });
+          // Drain the chain so the (rejecting) push has run before we finish.
+          await ctx.reportIteration!(1, undefined);
+          reachedEnd = true;
+          return { branch: ctx.branch };
+        },
+        killAgentTree: () => {},
+      };
+      // execute() returns void; a rejected push must not throw out of it.
+      await assert.doesNotReject(runner(exec, gitlab).execute(claim));
+      assert.ok(reachedEnd, "the executor ran to the end despite the rejected push");
+    } finally {
+      (client as unknown as { reportState: unknown }).reportState = origReportState;
+    }
+  });
+
   it("reap:true brokers the checkpoint pack to origin, strictly AFTER the reap and fetch-back (PRD #122 M8)", async () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(64);

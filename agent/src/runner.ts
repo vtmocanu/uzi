@@ -2260,6 +2260,30 @@ export class RunRunner {
       !seeded && // the D4-row-3 dropped-session case
       !(humanApproved && recoveryFailed); // re-gate a human-approved run that lost its tree
 
+    // PRD #1064 M1 (Decision 1): ONE per-run promise chain serializing EVERY `running`
+    // report of the run — the immediate `reportProgress` pushes, the turn-boundary
+    // `reportIteration`, and the checkpoint report. `reportState` has bounded retries, so a
+    // late immediate push (`in_progress: [m2]`) can sit in its retry loop while the next
+    // turn's `reportIteration` (`in_progress: []`) is issued; without serialization the two
+    // reads could reach the api out of order and resurrect a finished milestone as
+    // in-progress. Chaining every report through this single variable makes the reports
+    // reach the api in the order they were made. The chain itself NEVER rejects (each link
+    // is isolated below) so one failed report cannot break the ordering of later ones.
+    let runningReportChain: Promise<unknown> = Promise.resolve();
+    const enqueueRunningReport = <T>(task: () => Promise<T>): Promise<T> => {
+      // Run `task` after the current tail settles, regardless of its outcome (pass the same
+      // handler to both arms — the tail never rejects, but this is belt-and-braces). The
+      // returned promise carries THIS task's result (and rejection) for a caller that awaits
+      // it; the tail we keep is made non-rejecting so the next enqueue never inherits a
+      // rejection from this one.
+      const run = runningReportChain.then(task, task);
+      runningReportChain = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    };
+
     const ctx: RunContext = {
       runId,
       kind: resolveRunKind(claim.kind),
@@ -2313,6 +2337,9 @@ export class RunRunner {
       // PRD #686 M4: dogfood flag (absent ⇒ generic; older server never sets it).
       selfImproveDogfood: claim.self_improve_dogfood,
       config: claim.config,
+      // PRD #1064 M1 (Decision 2): the claim's FROZEN milestone list, the transition-frame
+      // title fallback on a pre-approved resume whose loop-scope frozen list is undefined.
+      frozenMilestones: claim.milestones,
       // Preflighted above: the claim's id, or undefined when its transcript is not
       // on this worker (issue #105).
       sessionId,
@@ -2506,18 +2533,24 @@ export class RunRunner {
       // failed report returns undefined ("no budget update") rather than failing the run.
       reportIteration: async (iteration, progress) => {
         try {
-          const ack = await reportState({
-            status: "running",
-            iteration_count: iteration,
-            // Omit the fields entirely when the lead has reported no progress, so the
-            // wire shape matches an old worker's (additive-optional, never null/[]).
-            ...(progress
-              ? {
-                  milestones_completed: progress.completed,
-                  milestones_in_progress: progress.in_progress,
-                }
-              : {}),
-          });
+          // PRD #1064 M1: enqueue onto the per-run chain so any still-in-flight immediate
+          // push (from the prior turn's scan loop) is sent BEFORE this turn-boundary report
+          // — awaiting the chain here is what guarantees a pending push is never dropped and
+          // never overtakes this snapshot.
+          const ack = await enqueueRunningReport(() =>
+            reportState({
+              status: "running",
+              iteration_count: iteration,
+              // Omit the fields entirely when the lead has reported no progress, so the
+              // wire shape matches an old worker's (additive-optional, never null/[]).
+              ...(progress
+                ? {
+                    milestones_completed: progress.completed,
+                    milestones_in_progress: progress.in_progress,
+                  }
+                : {}),
+            }),
+          );
           const b: IterationBudget = {};
           if (typeof ack.budgetMaxIterations === "number")
             b.maxIterations = ack.budgetMaxIterations;
@@ -2545,6 +2578,29 @@ export class RunRunner {
           runLog.warn("could not report iteration", { error: errMessage(e) });
           return undefined;
         }
+      },
+      // PRD #1064 M1 (Decision 1): push the observed milestone progress to the server the
+      // MOMENT the scan loop sees a `report_progress` signal — a `running` report carrying
+      // the milestone fields and NO `iteration_count`, exactly the shape the checkpoint
+      // closure below already sends mid-run (Resolved facts: `SetRunRunning` only RAISES
+      // `iteration_count` via GREATEST and its WHERE guard makes a late push a no-op on a
+      // parked/cancelled/finished run, so this is safe).
+      //
+      // ENQUEUE-AND-RETURN: the report is chained onto the per-run running-report chain (so
+      // it serializes with the turn-boundary `reportIteration` and the checkpoint report)
+      // and this returns IMMEDIATELY — the scan loop must never block on a network report.
+      // A failure is logged and swallowed; an informational field never fails a run.
+      reportProgress: (progress) => {
+        void enqueueRunningReport(() =>
+          reportState({
+            status: "running",
+            milestones_completed: progress.completed,
+            milestones_in_progress: progress.in_progress,
+          }),
+        ).catch((e) =>
+          runLog.warn("could not report progress", { error: errMessage(e) }),
+        );
+        return Promise.resolve();
       },
       // PRD #122 M6: durably checkpoint the run's committed milestone work MID-RUN
       // (Decisions 6, 7, 10, 10b). It is the SAME credential-free fetch-back the done and
@@ -2657,15 +2713,19 @@ export class RunRunner {
         // nothing published) stay silent, restoring the pre-M1 early-return behaviour while
         // still signalling a time-based publish of an idle tip ("work is now safe on origin").
         if (!tipUnmovedSinceFetch || published) {
-          await reportState({
-            status: "running",
-            ...(opts.progress
-              ? {
-                  milestones_completed: opts.progress.completed,
-                  milestones_in_progress: opts.progress.in_progress,
-                }
-              : {}),
-          }).catch((e) =>
+          // PRD #1064 M1: enqueue onto the per-run chain so this checkpoint report stays
+          // ordered behind any pending immediate `reportProgress` push.
+          await enqueueRunningReport(() =>
+            reportState({
+              status: "running",
+              ...(opts.progress
+                ? {
+                    milestones_completed: opts.progress.completed,
+                    milestones_in_progress: opts.progress.in_progress,
+                  }
+                : {}),
+            }),
+          ).catch((e) =>
             runLog.warn("could not report checkpoint progress", {
               error: errMessage(e),
             }),
