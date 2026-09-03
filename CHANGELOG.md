@@ -18,6 +18,8 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.78.0] - 2026-09-03
+
 ### Added
 
 - **Pause every schedule at once, with an optional auto-resume ([#1093](https://github.com/vtmocanu/uzi/issues/1093)).**
@@ -25,7 +27,7 @@ through `[0.52.0]`.)
 
 ### Changed
 
-- **Agent roles re-synced to skills ff87616: fact-checker v9, architect v8 ([#1080](https://github.com/vtmocanu/uzi/issues/1080)).**
+- **Agent roles re-synced to skills ff87616: fact-checker v9, architect v8 ([#1080](https://github.com/vtmocanu/uzi/issues/1080), [#1095](https://github.com/vtmocanu/uzi/pull/1095)).**
   Both `.claude/agents/` and the shipped builtins pick up vtmocanu/skills#41: the fact-checker's defect fold runs in a detached throwaway worktree and its description says so, the architect's write surface is the design-doc directory its tail names and never `specs/`; the vendored role manifest moves to ff87616. `CLAUDE.md`'s run-economy rework rule now names every high-risk class (trust-boundary, data-integrity, auth, untrusted-input), matching the lead builtin.
 
 - **Builtin agent-team role templates re-synced to the upstream skills library ([#1080](https://github.com/vtmocanu/uzi/issues/1080)).**
@@ -3787,7 +3789,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.77.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.78.0...HEAD
+[0.78.0]: https://github.com/vtmocanu/uzi/compare/v0.77.0...v0.78.0
 [0.77.0]: https://github.com/vtmocanu/uzi/compare/v0.76.0...v0.77.0
 [0.76.0]: https://github.com/vtmocanu/uzi/compare/v0.75.1...v0.76.0
 [0.75.1]: https://github.com/vtmocanu/uzi/compare/v0.75.0...v0.75.1
