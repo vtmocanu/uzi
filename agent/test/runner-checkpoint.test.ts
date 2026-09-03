@@ -278,6 +278,80 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
     }
   });
 
+  it("drains the per-run chain BEFORE the terminal report, so a milestone completion in a final-frame reportProgress push is not lost (PRD #1064 M1, CodeRabbit)", async () => {
+    // Regression for the ordering gap: the final SDK frame can carry BOTH report_progress
+    // (a milestone newly completed) AND signal_done. reportProgress is fire-and-forget, so
+    // without the drain in phasePreflightHandoff the terminal `completed` report can land
+    // FIRST; the queued `running` push then no-ops against the finished run (SetRunRunning's
+    // WHERE guard) and the m2 completion — reported only via report_progress — is lost.
+    //
+    // The test is deterministic, not timing-based: the m2 push's reportState blocks on a
+    // `completedSeen` gate that the terminal `completed` report resolves. WITHOUT the drain
+    // the completed report runs first, resolves the gate, and the push records AFTER it —
+    // the assertion fails. WITH the drain, execute() cannot reach phasePublish until the
+    // chain settles, so `completedSeen` never resolves there; a self-release timeout lets
+    // the push proceed, it records FIRST, and only then does `completed` land. The timeout
+    // elapses ONLY on the fixed path, so the un-fixed path fails immediately.
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(92);
+    let releaseCompletedSeen!: () => void;
+    const completedSeen = new Promise<void>((r) => {
+      releaseCompletedSeen = r;
+    });
+    const origReportState = client.reportState.bind(client);
+    (client as unknown as { reportState: unknown }).reportState = async (...args: unknown[]) => {
+      const body = args[1] as {
+        status?: string;
+        iteration_count?: number;
+        milestones_completed?: unknown;
+      };
+      const isM2Push =
+        body?.status === "running" &&
+        !("iteration_count" in body) &&
+        Array.isArray(body.milestones_completed) &&
+        (body.milestones_completed as string[]).includes("m2");
+      if (isM2Push) {
+        // Hold the push until the terminal report has landed (un-fixed path) or a self-release
+        // timeout fires (fixed path, where completed is gated behind the chain). Either way the
+        // push resolves on its own — a gate the fix cannot deadlock on.
+        await Promise.race([completedSeen, new Promise((r) => setTimeout(r, 1000))]);
+      }
+      const out = await (origReportState as (...a: unknown[]) => Promise<unknown>)(...args);
+      if (body?.status === "completed") releaseCompletedSeen();
+      return out;
+    };
+    try {
+      const exec: Executor = {
+        run: async (ctx) => {
+          commitInClone(ctx.worktreePath, "NEW.txt");
+          // Final-frame shape: the milestone completion arrives ONLY as a fire-and-forget
+          // push (no following awaited reportIteration carries it), then the run ends.
+          await ctx.reportProgress!({ completed: ["m2"], in_progress: [] });
+          return { branch: ctx.branch };
+        },
+        killAgentTree: () => {},
+      };
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      (client as unknown as { reportState: unknown }).reportState = origReportState;
+    }
+    const bodies = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    const pushIdx = bodies.findIndex(
+      (b) =>
+        b.status === "running" &&
+        !("iteration_count" in b) &&
+        Array.isArray(b.milestones_completed) &&
+        b.milestones_completed.includes("m2"),
+    );
+    const completedIdx = bodies.findIndex((b) => b.status === "completed");
+    assert.ok(pushIdx >= 0, "the m2-completed push reached the api");
+    assert.ok(completedIdx >= 0, "the run reported completed");
+    assert.ok(
+      pushIdx < completedIdx,
+      "the fire-and-forget m2 push landed BEFORE the terminal completed (the drain enforced ordering)",
+    );
+  });
+
   it("reap:true brokers the checkpoint pack to origin, strictly AFTER the reap and fetch-back (PRD #122 M8)", async () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(64);
