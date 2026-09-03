@@ -721,6 +721,25 @@ chain in the diagram above, with no intervening `running`.
   amendment for the roll-vs-teardown discriminator and the pushbroker mechanism in
   full.
 
+- **The checkpoint net now survives a branch behind `main` on `.github/workflows`
+  ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), the completion of
+  #1030's residuals).** M1 (#1059) unified checkpoint adoption on the owner anchor and
+  M3 (#1037) extended checkpointing to `self_improve` runs; M2 (#1036) closes the case
+  where the broker PAT (which lacks `workflow` scope) had every checkpoint on a
+  behind-on-workflows GitHub branch rejected `skipped:"workflow_scope"`. The worker now
+  synthesizes a `ckpt(overlay):` wrapper commit — the real tip's tree with
+  `.github/workflows` swapped to the current default's, built in a throwaway index so no
+  working tree is populated and no `.gitattributes` filter driver fires — and declares it
+  as the checkpoint tip; the wrapper's workflow tree byte-matches the default so the
+  **byte-unchanged** [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as an
+  ordinary fast-forward, and adoption peels it back to the real tip so the branch never
+  carries the swapped tree. The wrapper's parents are **base-first, real-tip-last** so the
+  broker's parent[0]-first depth-1 ancestry walk accepts a sequential overlay, and the
+  PAT-bearing default fetch it needs is confined to already-reaped paths (park, shutdown,
+  `reap:true` milestone) to keep REAP-BEFORE-GIT. GitHub-only; the mid-run sibling of
+  ADR-456's #627 finalize `workflow-subtree` overlay. See
+  [ADR-1036](adr/1036-checkpoint-workflow-overlay.md) for the transport-wrapper contract.
+
 - **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
   oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),
   or the caller's own re-queued run if it is still inside its **affinity
