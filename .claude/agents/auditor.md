@@ -119,8 +119,8 @@ scanner fails loud. **It is the tester's slot, not yours**: it runs on every `ta
 the tester already runs.
 
 `govulncheck` and `npm audit` exist as `scripts/govulncheck-gate.sh` and
-`scripts/npm-audit-gate.sh`, invoked from `Taskfile.yml` targets CI calls on
-`validate:{api,controller,web,agent}`. They are deliberately **NOT in `task gate` or any
+`scripts/npm-audit-gate.sh`, behind the `vulncheck:{api,controller,web,agent}` targets in
+`Taskfile.yml`, which CI calls from its lint-api, lint-controller, validate-web and validate-agent jobs. They are deliberately **NOT in `task gate` or any
 `gate:*`** — their verdict is a function of a remote mutable database, not the tree — so
 run them explicitly when auditing. Neither has a canary; instead both *refuse* the
 environment variables that shrink their view (`GOPACKAGESDRIVER`, `GOFLAGS=-tags`, and
@@ -143,5 +143,5 @@ refuse-to-start on a placeholder key); every forge error passes a PAT-scrubbing 
 outbound base URLs are allowlisted (`FORGE_ALLOWED_BASE_URLS`, https-only SSRF guard);
 nginx overwrites `X-Forwarded-For` and `api` trusts it only from `TRUSTED_PROXIES`; worker
 join tokens are sha256-at-rest, Bearer-only, no cookies/CSRF on `/api/worker/*`; `main` is
-never touched (four independent guardrail layers, see `ARCHITECTURE.md`); watch prompt/
+never touched (four independent guardrail layers, see `ARCHITECTURE.md`; flag any change that weakens one on the theory another covers it); watch prompt/
 tool-output injection from untrusted repo content into model instructions.
