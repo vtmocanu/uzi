@@ -4,12 +4,19 @@
 // Full replay is unbounded, so this reduction is complete even for a failed or
 // cancelled run whose frames landed before it died.
 //
-// TWO data paths, deliberately different (Decision 3 verdict b + Decision 11):
-//   • Result frames (kind status/error, payload.event === "result") carry
-//     CUMULATIVE-across-resume usage, so per-phase figures are DELTAS against a
-//     running high-water mark and the run total is the sum of those clamped deltas.
-//     duration_ms / num_turns are PER-INVOCATION (they read different CLI state),
-//     so they are taken raw per phase and summed for the total.
+// TWO data paths, deliberately different (Decision 3 verdict b + PRD #1079):
+//   • Result frames (kind status/error, payload.event === "result") each report ONE
+//     SDK query() leg and carry only THAT leg's usage — NOT a cumulative session total.
+//     The worker runs one resumed query() per turn (planning, then each implement
+//     iteration) and the SDK's cost is per-query-call, not session-level (Agent SDK
+//     cost-tracking docs). Each leg is marked by its own persisted `init` frame, so this
+//     fold RESETS the per-model high-water marks at every `init` (PRD #1079): each phase
+//     reports its own leg's figures and the run total is the SUM of the legs. Within a
+//     single leg that emits several result frames the marks are a running high-water and
+//     the per-phase figures are clamped DELTAS against it — mirroring the server's
+//     GREATEST within one (run_id, session_id, model, lineage_epoch) key.
+//     duration_ms / num_turns are PER-INVOCATION (they read different CLI state), so
+//     they are taken raw per phase and summed for the total.
 //   • Assistant frames carry the API call's PER-CALL message.usage, attached by the
 //     worker to exactly one emitted message per SDK frame. Those SUM directly, per
 //     agent. This is a PURE reduction over the seq-deduped message list, recomputed
@@ -34,27 +41,33 @@
 // (web/src/lib/runUsageContract.test.ts + api/internal/workersvc/run_usage_contract_test.go).
 //
 // WHAT THE SERVER'S TOTAL ACTUALLY IS, since everything below is defined against it.
-// `UpsertRunUsage` stores GREATEST per (run_id, session_id, model), and
-// `00063_run_usage_totals_view.sql` then reads MAX over the SESSIONS per model and
-// SUMs across models — its own comment: "a plain SUM over run_usage would multiply
-// the snapshots whenever session_id evolves". So, per column:
+// Post-PRD #1079 `UpsertRunUsage` stores GREATEST per (run_id, session_id, model,
+// lineage_epoch), where lineage_epoch = the number of persisted `init` frames before
+// the result frame — i.e. one row per SDK query() leg — and `run_usage_totals` takes
+// MAX within (run_id, model, lineage_epoch), then SUMs across epochs and models. So,
+// per column:
 //
-//     server run total = Σ over models of  MAX over ALL frames of nonNegTokens(value)
+//     server run total = Σ over (model, leg) of  MAX within the leg of nonNegTokens(v)
+//                       = Σ over legs of that leg's per-model figure
 //
-// PER-MODEL STATE IS THE LOAD-BEARING PART, and summing `modelUsage` per frame is
-// NOT enough. `modelUsage` is not a model-stable map across frames: a model present
-// in an earlier frame can be ABSENT from a later one (measured: haiku appears in
-// 84b6a933's first result frame and is gone from its last, and 17 live runs show the
-// shape). A per-frame sum telescopes to the LAST frame's models only and silently
-// loses every vanished one. So cumulative state is kept PER MODEL and PER COLUMN.
+// This fold reproduces it by resetting the per-model marks at every `init`, so each
+// leg's clamped deltas telescope to that leg's own MAX and the legs SUM (`modelSums`).
 //
-// THE MARK IS A RUNNING MAX, NOT THE LAST-SEEN VALUE, and that distinction is the
-// whole parity claim. With mᵢ = max(mᵢ₋₁, vᵢ) and m₀ = 0, the clamped delta
-// max(0, vᵢ − mᵢ₋₁) is IDENTICALLY mᵢ − mᵢ₋₁, so the phase deltas telescope to
-// max(0, max vᵢ) — the same expression the server computes, not an approximation of
-// it. The equality holds for NON-MONOTONIC sequences too, so there is no
-// monotonicity caveat to state. Last-seen does not: on [5000, 1000, 3000] it reports
-// 7000 where the server holds 5000.
+// PER-MODEL STATE IS THE LOAD-BEARING PART WITHIN A LEG, and summing `modelUsage` per
+// frame is NOT enough. `modelUsage` is not a model-stable map across frames: a model
+// present in an earlier frame can be ABSENT from a later one (measured: haiku appears
+// in 84b6a933's first result frame and is gone from its last, and 17 live runs show
+// the shape). A per-frame sum telescopes to the LAST frame's models only and silently
+// loses every vanished one. So state is kept PER MODEL and PER COLUMN, both for the
+// within-leg mark and for the run-wide `modelSums`.
+//
+// THE MARK IS A RUNNING MAX WITHIN A LEG, NOT THE LAST-SEEN VALUE, and that distinction
+// is the whole within-leg parity claim. With mᵢ = max(mᵢ₋₁, vᵢ) and m₀ = 0, the clamped
+// delta max(0, vᵢ − mᵢ₋₁) is IDENTICALLY mᵢ − mᵢ₋₁, so a leg's phase deltas telescope to
+// max(0, max vᵢ) — the same expression the server's GREATEST computes within the leg,
+// not an approximation of it. The equality holds for NON-MONOTONIC sequences too, so
+// there is no monotonicity caveat to state. Last-seen does not: on [5000, 1000, 3000]
+// delivered as one leg it reports 7000 where the server holds 5000.
 //
 // THREE THINGS FLOOR A NEGATIVE, AND THEY ARE NOT REDUNDANT — they cover different
 // OUTPUT SURFACES, which is why every attempt to state this as a count has been wrong:
@@ -84,12 +97,14 @@
 // `modelTotals` — a surface this change itself added — so the earlier "the seed is not
 // a negative clamp" was true of the only output that existed when it was written.
 //
-// THE PRICE, which parity cannot settle and which is user-visible: a phase that does
-// not exceed the previous high-water mark renders 0 tokens ALONGSIDE nonzero turns
-// and duration. On [5000, 1000, 3000] the third phase reads 0, not 2000. The server
-// has no per-phase view, so neither reading is "correct" there — this is a deliberate
-// choice that the run TOTAL is the number every other surface shows and a post-reset
-// phase row may read 0. Stated here rather than left to be discovered.
+// THE WITHIN-LEG PRICE, now confined to the rare shape where ONE SDK query() leg emits
+// several result frames before the next `init`: a later frame that does not exceed the
+// leg's running high-water renders 0 tokens ALONGSIDE nonzero turns and duration. On
+// [5000, 1000, 3000] delivered as ONE leg (no `init` between them) the second and third
+// phases read 0. Across legs this does NOT happen — the mark resets at each `init`, so
+// each iteration's phase shows its own leg's figures exactly, and the run TOTAL is their
+// SUM (the number every other surface now shows). Stated here rather than left to be
+// discovered.
 //
 // A result frame with NO `modelUsage` (or an empty one) is SKIPPED ENTIRELY: no
 // phase row, nothing counted. That mirrors foldRunUsage's `len(p.ModelUsage) == 0`
@@ -127,11 +142,12 @@ export interface PhaseUsage {
   /** Per-invocation, taken raw from the frame (not cumulative). */
   turns: number;
   durationMs: number;
-  /** Per-phase DELTAS: Σ over the frame's `modelUsage` models, per COLUMN, of (this
-   *  frame's cumulative − that model's running HIGH-WATER MARK), each clamped at 0.
-   *  Not a whole-frame difference, and not a difference against the previous frame:
-   *  see the header for why the high-water mark is what makes the run total equal the
-   *  server's, and for the per-phase cost that buys (a post-reset phase reads 0). */
+  /** Per-phase figures: Σ over the frame's `modelUsage` models, per COLUMN, of (this
+   *  frame's value − that model's running HIGH-WATER MARK WITHIN THE LEG), each clamped
+   *  at 0. The mark resets at every `init` frame (PRD #1079), so for the common case of
+   *  one result frame per leg this is just that leg's own figures; within a multi-frame
+   *  leg it is a clamped delta. See the header for how the legs SUM to the run total the
+   *  server stores, and for the within-leg price a repeated frame buys (it reads 0). */
   fresh: number; // Δ inputTokens + Δ cacheCreationInputTokens, differenced apart
   cached: number; // cacheReadInputTokens
   out: number; // outputTokens
@@ -166,10 +182,11 @@ export interface RunUsage {
   hasConfirmed: boolean;
   phases: PhaseUsage[];
   /** One row per model, five columns each — the client's copy of this run's
-   *  `run_usage` rows, which is the granularity the server actually stores. `total`
-   *  below exposes only THREE token aggregates (it folds input and cache_creation
-   *  into `fresh`), so this is the only surface at which all four token columns and
-   *  a per-model cost can be compared against the server. Sorted by model id.
+   *  `run_usage` rows collapsed to one per model. The server keys each row on
+   *  (model, lineage_epoch) and this is their per-model SUM across legs (PRD #1079).
+   *  `total` below exposes only THREE token aggregates (it folds input and
+   *  cache_creation into `fresh`), so this is the only surface at which all four token
+   *  columns and a per-model cost can be compared against the server. Sorted by model id.
    *
    *  NO PRODUCTION READER YET, deliberately — it exists so the cross-language
    *  contract can assert at the server's own granularity, which no aggregate can.
@@ -576,11 +593,13 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
   const liveByAgentMap = new Map<string, { fresh: number; cached: number }>();
   const liveByModelMap = new Map<string, { fresh: number; cached: number }>();
 
-  // Each model's RUNNING HIGH-WATER MARK, per column, to difference into per-phase
-  // deltas. Not the last-seen value: see the header for why the two are not the same
-  // fold, and why only this one equals the server's. Entries are only ever added or
-  // raised, never removed, so a model absent from a frame contributes a 0 delta and
-  // keeps its mark (issue #195).
+  // Each model's RUNNING HIGH-WATER MARK WITHIN THE CURRENT LEG, per column, to
+  // difference into per-phase deltas. Not the last-seen value: see the header for why
+  // the two are not the same fold, and why only this one equals the server's. Within a
+  // leg entries are only ever added or raised, so a model absent from a frame
+  // contributes a 0 delta and keeps its mark (issue #195); the WHOLE map is cleared at
+  // every `init` frame (PRD #1079) so each SDK query() leg starts from a fresh baseline
+  // and reports its own figures. `modelSums` below outlives that reset.
   //
   // ZERO_MODEL is the seed because the identity `Σ max(0, vᵢ − mᵢ₋₁) = max(0, max vᵢ)`
   // needs m₀ = 0. It also floors the MARK (see the header's surface table). Seeding
@@ -609,14 +628,29 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
   // and the NEGATIVE-CLAMP test stays GREEN. That last one is what shows the seed is
   // not what defends `total` against a negative; it defends the MARK.
   const prevByModel = new Map<string, ModelFigures>();
+  // The run-wide per-model SUM of clamped deltas, per column — the client's copy of
+  // this run's `run_usage` rows collapsed to one row per model (the server keys each
+  // row on (model, lineage_epoch); this sums them per model). It SURVIVES the per-leg
+  // reset of `prevByModel`, so a model that appears only in an early leg keeps its
+  // contribution here (PRD #1079). `modelTotals` is derived from this map.
+  const modelSums = new Map<string, ModelFigures>();
   let implIteration = 0;
 
   for (const m of messages) {
     const payload = rec(m.payload);
 
-    // Model heartbeat (system init frame).
-    if (m.kind === "status" && payload?.["event"] === "init" && model === null) {
-      model = str(payload["model"]) ?? null;
+    // Model heartbeat + per-leg boundary (system init frame). One `init` frame is
+    // persisted at the start of EVERY SDK query() call (planning, then each implement
+    // iteration), so it marks the boundary between legs. PRD #1079: reset the per-model
+    // high-water marks here so the next result frame's clamped deltas are its own leg's
+    // figures and the run total SUMS legs — mirroring the server, whose row key now
+    // carries lineage_epoch = the count of `init` frames before the result frame. The
+    // model-name latch stays a ONE-SHOT (first init only); only the mark reset fires on
+    // every init. `modelSums` is deliberately NOT reset here — it survives the leg
+    // boundary to accumulate the per-model SUM across legs (see its declaration).
+    if (m.kind === "status" && payload?.["event"] === "init") {
+      if (model === null) model = str(payload["model"]) ?? null;
+      prevByModel.clear();
     }
 
     if (isResultFrame(m)) {
@@ -658,11 +692,30 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
         const prev = prevByModel.get(modelID) ?? ZERO_MODEL;
         // input and cacheCreation are differenced APART and only then added into the
         // phase's `fresh`, because the server maxes them as two independent columns.
-        fresh += clampDelta(cur.input, prev.input) + clampDelta(cur.cacheCreation, prev.cacheCreation);
-        cached += clampDelta(cur.cached, prev.cached);
-        out += clampDelta(cur.out, prev.out);
-        costUsd += clampDelta(cur.costUsd, prev.costUsd);
+        const dInput = clampDelta(cur.input, prev.input);
+        const dCacheCreation = clampDelta(cur.cacheCreation, prev.cacheCreation);
+        const dCached = clampDelta(cur.cached, prev.cached);
+        const dOut = clampDelta(cur.out, prev.out);
+        const dCostUsd = clampDelta(cur.costUsd, prev.costUsd);
+        fresh += dInput + dCacheCreation;
+        cached += dCached;
+        out += dOut;
+        costUsd += dCostUsd;
         prevByModel.set(modelID, mergeMax(prev, cur));
+        // PRD #1079: fold this leg's clamped deltas into the run-wide per-model SUM,
+        // which SURVIVES the per-`init` reset of `prevByModel`. Within one leg the
+        // clamped deltas telescope to that leg's high-water figure, so a model's total
+        // is Σ over legs of its per-leg MAX — exactly the server's SUM over
+        // (model, lineage_epoch) rows. `modelTotals` is derived from this, NOT from
+        // `prevByModel` (which now holds only the LAST leg's marks).
+        const sum = modelSums.get(modelID) ?? ZERO_MODEL;
+        modelSums.set(modelID, {
+          input: sum.input + dInput,
+          cacheCreation: sum.cacheCreation + dCacheCreation,
+          cached: sum.cached + dCached,
+          out: sum.out + dOut,
+          costUsd: sum.costUsd + dCostUsd,
+        });
       }
       const phase: PhaseUsage = {
         seq: m.seq,
@@ -767,10 +820,14 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
   );
   // Run-wide distinct models: every model any agent was seen on, not just primaries.
   const agentModels = [...new Set(agents.flatMap((a) => Object.keys(a.modelCounts)))].sort();
-  // The final high-water marks ARE the client's copy of the run's run_usage rows —
-  // one per model, five columns each. Sorted by model id so the order is deterministic
-  // rather than insertion-ordered off the wire.
-  const modelTotals: ModelTotal[] = [...prevByModel.entries()]
+  // The per-model SUMS ARE the client's copy of the run's run_usage rows, collapsed to
+  // one row per model — one per model, five columns each. The server stores one row per
+  // (model, lineage_epoch) and rolls them up as MAX-within-a-leg then SUM across legs;
+  // `modelSums` is that SUM (each leg contributed its own clamped-delta high-water),
+  // which is why it is read here and NOT `prevByModel` (which holds only the last leg's
+  // marks). Sorted by model id so the order is deterministic rather than insertion-
+  // ordered off the wire.
+  const modelTotals: ModelTotal[] = [...modelSums.entries()]
     .map(([m, f]) => ({ model: m, ...f }))
     .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
 
