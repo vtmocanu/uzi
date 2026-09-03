@@ -146,7 +146,7 @@ func TestGuardRoleExcludedEmitDecision(t *testing.T) {
 }
 
 // TestCreateRunInputApproveExcludingGuardRoleNotifies drives the REAL CreateRunInput
-// approve path (PRD #319 M3) and asserts the production glue in workers.go — the
+// approve path (PRD #319 M3) and asserts the production glue in runs_lifecycle.go — the
 // `if len(res.ExcludedGuardRoles) > 0 { h.notifyGuardRoleExcluded(...) }` block — fires
 // exactly when the approved selection explicitly excludes a guard role, and stays silent
 // otherwise. This covers the wiring (right path, right run id, right owner) and the

@@ -130,22 +130,3 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})
 }
-
-// AdminListWorkers returns every worker with its owner email and busy status
-// (admin-only, gated by RequireAdmin on the route).
-func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.wsvc.ListAllWorkers(r.Context())
-	if err != nil {
-		slog.Error("admin list workers", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	out := make([]apitypes.AdminWorkerDTO, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, apitypes.AdminWorkerDTO{
-			WorkerDTO:  workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
-			OwnerEmail: row.OwnerEmail,
-		})
-	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
-}
