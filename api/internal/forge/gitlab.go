@@ -395,6 +395,19 @@ func (g *gitLab) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 	return nil
 }
 
+// SetIssueState closes or reopens an issue via GitLab's state_event verb.
+// gitlab.UpdateIssueOptions.StateEvent is a *string with `omitempty` and takes
+// the MUTATE vocabulary "close"/"reopen" (not the query-filter opened/closed the
+// GitLab list lane uses), so state travels alone and nothing else is clobbered.
+func (g *gitLab) SetIssueState(ctx context.Context, projectID, issueIID int64, state IssueState) error {
+	ev := gitlabIssueStateEvent(state)
+	opt := &gitlab.UpdateIssueOptions{StateEvent: &ev}
+	if _, _, err := g.client.Issues.UpdateIssue(projectID, issueIID, opt, gitlab.WithContext(ctx)); err != nil {
+		return g.wrapErr("set issue state", err)
+	}
+	return nil
+}
+
 // UpdateIssueDescription sends only the description (PRD #72 M5).
 // gitlab.UpdateIssueOptions.Description is a *string with `omitempty`, so no other
 // field of the issue is transmitted and nothing else can be clobbered.
@@ -667,4 +680,17 @@ func gitlabIssueStateParam(s IssueState) string {
 	default:
 		return "all"
 	}
+}
+
+// gitlabIssueStateEvent maps the neutral state onto GitLab's state_event MUTATE
+// verb, which is a distinct vocabulary from the state query filter above:
+// closing an issue is state_event="close", reopening it is "reopen". This is
+// deliberately NOT gitlabIssueStateParam — that returns the filter word
+// (opened/closed) the API would reject as a state_event. StateClosed closes;
+// anything else (StateOpened, or a caller-bug value) reopens, the safe direction.
+func gitlabIssueStateEvent(s IssueState) string {
+	if s == StateClosed {
+		return "close"
+	}
+	return "reopen"
 }

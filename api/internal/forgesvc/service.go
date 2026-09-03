@@ -107,6 +107,12 @@ type IssueStore interface {
 	// SetIssueLabel: it omits assignee_ids so a racing label mutation cannot clobber
 	// the forge-synced assignees with a stale in-memory snapshot (PRD #767).
 	UpsertIssueLabels(ctx context.Context, arg store.UpsertIssueLabelsParams) (store.Issue, error)
+	// UpdateIssueState / ReopenIssueState are the narrow state-only cache flips behind
+	// CloseIssue / ReopenIssue (PRD #1034 M2). UpdateIssueState touches only `state`
+	// (a bare close); ReopenIssueState flips state back to 'opened' AND nulls
+	// board_position so a reopened card lands at the bottom of its lane.
+	UpdateIssueState(ctx context.Context, arg store.UpdateIssueStateParams) (store.Issue, error)
+	ReopenIssueState(ctx context.Context, arg store.ReopenIssueStateParams) (store.Issue, error)
 	DeleteIssuesNotIn(ctx context.Context, arg store.DeleteIssuesNotInParams) (int64, error)
 	// Used by the MR-close watcher (mr_watch.go).
 	ListMRWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListMRWatchCandidatesRow, error)

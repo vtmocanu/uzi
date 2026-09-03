@@ -132,6 +132,42 @@ func (f *forgejo) UpdateIssueDescription(ctx context.Context, projectID, issueII
 	return nil
 }
 
+// SetIssueState closes or reopens an issue.
+//
+// THE INTERNAL READ IS NOT OPTIONAL, for the same reason UpdateIssueDescription
+// above reads first: EditIssueOption.Title is a plain `string` with no
+// `omitempty`, so a naive edit PATCHes `"title": ""` and can wipe the issue's
+// title. So read the issue first and send its current title back unchanged
+// alongside the state. EditIssueOption.State is a *gitea.StateType, mapped from
+// the neutral state by forgejoIssueStateMutation (the MUTATE mapper, NOT the
+// list-filter forgejoIssueStateParam whose default is StateAll): StateClosed
+// closes, anything else reopens — reopening being the safe direction for a
+// caller bug, matching the GitLab and GitHub drivers.
+func (f *forgejo) SetIssueState(ctx context.Context, projectID, issueIID int64, state IssueState) error {
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return err
+	}
+	slug, err := f.repoSlugFor(c, projectID)
+	if err != nil {
+		return err
+	}
+	cur, _, err := c.GetIssue(slug.owner, slug.repo, issueIID)
+	if err != nil {
+		// Redaction is per-method and not automatic, so the INTERNAL read's error
+		// needs wrapping too — it carries the same client and the same PAT.
+		return f.wrapErr("set issue state: read current issue", err)
+	}
+	st := forgejoIssueStateMutation(state)
+	if _, _, err := c.EditIssue(slug.owner, slug.repo, issueIID, gitea.EditIssueOption{
+		Title: cur.Title,
+		State: &st,
+	}); err != nil {
+		return f.wrapErr("set issue state", err)
+	}
+	return nil
+}
+
 func (f *forgejo) CreateIssue(ctx context.Context, projectID int64, title, description string, labels []string) (Issue, error) {
 	c, err := f.newClient(ctx)
 	if err != nil {
@@ -231,6 +267,18 @@ func forgejoIssueStateParam(s IssueState) gitea.StateType {
 	default:
 		return gitea.StateAll
 	}
+}
+
+// forgejoIssueStateMutation maps the neutral mutate target onto Forgejo's
+// request state. Unlike the list-filter forgejoIssueStateParam (whose default is
+// StateAll), a mutate is always a close or a reopen: StateClosed closes, and
+// every other value reopens (the safe direction for a caller bug), matching
+// gitlabIssueStateEvent / githubIssueStateMutation.
+func forgejoIssueStateMutation(s IssueState) gitea.StateType {
+	if s == StateClosed {
+		return gitea.StateClosed
+	}
+	return gitea.StateOpen
 }
 
 // forgejoIssueState maps Forgejo's issue state onto the neutral "opened"/"closed"

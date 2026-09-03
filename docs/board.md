@@ -26,8 +26,9 @@ a manual reload.
 - One column per configured label, seeded on first open in this order:
   `Planned`, `In Progress`, `Human Review`, `Later`. Reconfigure any time
   from the board's column settings.
-- **Closed** (implicit): the issue's GitLab state, not a label; cards here
-  aren't draggable.
+- **Closed** (implicit): the issue's open/closed state on the forge, not a
+  label. Cards here are draggable too: drag a card in to close the issue,
+  drag one out to reopen it — see [Move a card](#move-a-card).
 
 A fresh board therefore reads **Backlog · Planned · In Progress · Human
 Review · Later · Closed**, left to right in the order work moves: nobody has
@@ -65,6 +66,17 @@ Drag a card to another column. uzi writes the label change to GitLab first
 confirms it: a failed write snaps the card back rather than showing a move
 that didn't really happen. The same change is visible in GitLab's own issue
 and board views.
+
+Dragging a card into **Closed** closes the issue on the forge instead of
+changing a label — its column labels are left untouched, so it's the state,
+not the labels, that puts it there. Dragging a closed card back out onto any
+open lane reopens it on the forge and moves it there in the same drag:
+dropping it on a configured column applies that column's label, dropping it
+on Backlog clears them, exactly like a normal move. Either way it's the same
+forge-first write: a failed close or reopen snaps the card back, just like
+any other move. A reopened card always lands at the **bottom** of its
+destination lane rather than wherever you dropped it — see
+[Ordering and sorting](#ordering-and-sorting).
 
 ![Dragging a card between board columns, relabeling the underlying GitLab issue](img/board-move-card.png)
 
@@ -136,7 +148,11 @@ Two consequences worth knowing:
   themselves.
 - Closed issues drop out of the recorded order the next time you reorder
   anything, so an issue that reopens after that comes back at the bottom of its
-  column. Reopened before then, it returns to the place it used to hold.
+  column. Reopened before then, it returns to the place it used to hold — this
+  is the case for an issue reopened on the forge itself. Reopening it by
+  dragging it out of **Closed** on the board (see [Move a
+  card](#move-a-card)) always sends it to the bottom of its new lane, whether
+  or not you've reordered since it closed.
 
 ## Search
 

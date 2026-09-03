@@ -1846,6 +1846,62 @@ func TestForwardMoveForgeErrorSwallowed(t *testing.T) {
 	}
 }
 
+// (g) Drag-to-Closed (PRD #1034 M3): a "closed" target drives the board's reserved
+// Done option. The item currently sits at opt_ip on the board, so the live guard sees
+// live(opt_ip) != target(opt_done) and issues the Set to the Done option; the marker
+// advances to it.
+func TestForwardMoveClosedDrivesDone(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	syncer.liveStatus = map[string]string{"item7": "opt_ip"}
+	link := forwardLink(t, map[string]string{"In Progress": "opt_ip"})
+	link.DoneOptionID = "opt_done"
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: link,
+		item: store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7",
+			LastStatusOptionID: optionMarker("opt_ip")},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, "closed"); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if len(syncer.setCalls) != 1 || syncer.setCalls[0].itemID != "item7" || syncer.setCalls[0].optionID != "opt_done" {
+		t.Fatalf("want one set item7->opt_done, got %v", syncer.setCalls)
+	}
+	if len(st.markerSets) != 1 || !st.markerSets[0].LastStatusOptionID.Valid || st.markerSets[0].LastStatusOptionID.String != "opt_done" {
+		t.Errorf("want marker advanced to opt_done, got %+v", st.markerSets)
+	}
+}
+
+// (g2) Drag-to-Closed on a board with NO Done option is a no-op: nothing to project
+// to, so leave the Status untouched (mirror the unmapped-column no-op) and return nil.
+func TestForwardMoveClosedNoDoneOptionNoop(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	link := forwardLink(t, map[string]string{"In Progress": "opt_ip"}) // DoneOptionID == ""
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: link,
+		item: store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7"},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, "closed"); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if len(syncer.setCalls) != 0 {
+		t.Errorf("no Done option must make no Set call, got %v", syncer.setCalls)
+	}
+	if len(st.markerSets) != 0 {
+		t.Errorf("no Done option must not touch the marker, got %v", st.markerSets)
+	}
+	if len(st.linkErrs) != 0 {
+		t.Errorf("a benign no-op must not stamp last_error, got %v", st.linkErrs)
+	}
+}
+
 // --- Board access: visibility + sharing (PRD #557 M2) ------------------------
 
 // boardAccessSyncer builds a ProjectBoardSyncer fake with the project scope so the

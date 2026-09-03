@@ -41,9 +41,10 @@ type ClaimPayload struct {
 	// it under a per-prompt nonce fence (M4).
 	ReviewComments *ReviewCommentsSnapshot `json:"review_comments,omitempty"`
 	Status         string                  `json:"status"`
-	Branch         *string                 `json:"branch"`     // resume: attach existing branch
-	SessionID      *string                 `json:"session_id"` // resume: continue SDK session
-	LastSeq        int32                   `json:"last_seq"`   // resume: continue message numbering
+	Branch         *string                 `json:"branch"`                   // resume: attach existing branch
+	SessionID      *string                 `json:"session_id"`               // resume: continue SDK session
+	CheckpointTip  *string                 `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
+	LastSeq        int32                   `json:"last_seq"`                 // resume: continue message numbering
 	IterationCount int32                   `json:"iteration_count"`
 	RequeueCount   int32                   `json:"requeue_count"`
 	PlanMd         *string                 `json:"plan_md"` // resume: plan already captured
