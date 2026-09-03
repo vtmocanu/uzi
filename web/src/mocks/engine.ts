@@ -265,6 +265,16 @@ function implementScript(runId: string): Timed[] {
           milestones_candidate: null,
           milestones_completed: ["hb-1", "hb-2"],
           milestones_in_progress: ["hb-3"],
+          // PRD #1064 M3: advance the "now" line alongside the milestone transition, so
+          // the board card / runs-list line tracks the in-progress lane in the live demo.
+          current_activity: {
+            agent: "coder",
+            agent_label: "Wire the collector to the worker registry",
+            tool: "Write",
+            detail: "api/internal/handler/routes.go",
+            at: new Date().toISOString(),
+            seq: 40,
+          },
         }),
     },
     ...say(
@@ -293,6 +303,10 @@ function implementScript(runId: string): Timed[] {
           milestones: HEARTBEAT_MILESTONES,
           milestones_completed: HEARTBEAT_MILESTONES.map((m) => m.id),
           milestones_in_progress: [],
+          // PRD #1064 M3: a terminal run has no "now" — clear it so the completed hero
+          // reads exactly as a finished run should (the surfaces also hide it on terminal
+          // status, so this is belt-and-braces with that guard).
+          current_activity: null,
           finished_at: new Date().toISOString(),
         });
       },

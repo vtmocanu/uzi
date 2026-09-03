@@ -9,7 +9,15 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, type Worker } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
-import { effectiveRunStatus, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
+import {
+  effectiveRunStatus,
+  firstInProgressMilestoneId,
+  milestoneBadge,
+  milestoneBadgeText,
+  mrChipState,
+} from "../lib/runBadge";
+import { activityAge } from "../lib/runActivity";
+import { useNow } from "../lib/useNow";
 import { MrChip } from "../components/MrChip";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
@@ -170,6 +178,9 @@ export function Dashboard() {
     }
   }, []);
   usePollWhileVisible(poll, 10000);
+  // PRD #1064 M3: a slow clock to age the board cards' "now" line client-side. Declared
+  // with the other hooks, above the early return, so the hook order is stable.
+  const now = useNow(30_000);
 
   if (!user) return null;
 
@@ -346,8 +357,19 @@ export function Dashboard() {
             {recent.map((r) => {
               const mrState = mrChipState(r.mr_state);
               // PRD #122: compact milestone progress; null for a non-milestone run.
+              // PRD #1064 M3: the badge gains a ◐ suffix while a milestone is in progress.
               const ms = milestoneBadge(r);
-              const msBadge = ms ? milestoneBadgeText(ms) : null;
+              const msBadge = ms
+                ? milestoneBadgeText(ms, (r.milestones_in_progress?.length ?? 0) > 0)
+                : null;
+              // PRD #1064 M3: the "now" line under the title, for ANY non-terminal run
+              // that has a current_activity (the DTO field, present on the RunListItem).
+              // Hidden when null or terminal — a pre-feature run and a finished run read
+              // exactly as before (D5). The activity's untrusted fields render escaped
+              // through stripUnsafeChars.
+              const activity = r.current_activity;
+              const showNow = activity != null && !isTerminalRun(r.status);
+              const nowMilestone = firstInProgressMilestoneId(r);
               return (
               // Issue #485 NB1: RunIssueRef renders a real forge <a>, which cannot nest
               // inside the row's navigational <Link> (also an <a> — invalid HTML). The
@@ -372,6 +394,19 @@ export function Dashboard() {
                   <div className="min-w-0 flex-1">
                     {/* Issue #124: forge-supplied issue title, untrusted (see RunsList). */}
                     <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(r.issue_title)}</p>
+                    {showNow && activity && (
+                      <p className="mt-0.5 flex items-center gap-1.5 text-xs text-faint">
+                        <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok animate-pulse" />
+                        <span className="shrink-0 font-medium text-ok">{stripUnsafeChars(activity.agent)}</span>
+                        {nowMilestone && <span className="shrink-0 font-mono text-faint">{nowMilestone}</span>}
+                        <span className="min-w-0 truncate italic text-muted">
+                          {stripUnsafeChars(activity.agent_label || activity.detail || activity.tool)}
+                        </span>
+                        <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
+                          {activityAge(activity.at, now)}
+                        </span>
+                      </p>
+                    )}
                     <p className="flex flex-wrap items-center gap-x-1 text-xs text-faint">
                       {maskRepoPath(r.repo_path, demo)}{" "}
                       <RunIssueRef
