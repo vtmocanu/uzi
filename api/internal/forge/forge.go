@@ -480,6 +480,12 @@ type Forge interface {
 	// primitive. A driver may additionally need its own internal read to satisfy its
 	// forge's API shape; that is the driver's business, not the interface's.
 	UpdateIssueDescription(ctx context.Context, projectID, issueIID int64, description string) error
+	// SetIssueState closes or reopens an issue, forge-first. state must be
+	// StateOpened or StateClosed (the two live states); other values are a caller
+	// bug. Each driver translates the neutral state into its own mutate vocabulary
+	// (GitLab's state_event close/reopen, GitHub's state+state_reason, Forgejo's
+	// state), sending state alone so nothing else on the issue is clobbered.
+	SetIssueState(ctx context.Context, projectID, issueIID int64, state IssueState) error
 	// UserExists reports whether a user with the given username exists on the
 	// forge. It backs the best-effort verification of a user's self-declared
 	// human_username (PRD #19 M3): a false — or an error — downgrades a save to

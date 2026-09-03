@@ -64,6 +64,13 @@ type fakeForge struct {
 	ensureErr   error           // makes SetIssueLabel's EnsureLabels fail
 	ensureCalls [][]forge.Label // one entry per EnsureLabels call, for the apply path
 
+	// SetIssueState (PRD #1034 M2) scripting + capture. setStateErr forces the forge
+	// close/reopen to fail (the snap-back tests); setStateCalls records every call BY
+	// IDENTITY (iid + target state) so a test can assert the forge was called with the
+	// right state, or NOT called at all (the idempotency tests).
+	setStateErr   error
+	setStateCalls []setStateCall
+
 	// PRD link patch (PRD #72 M5) scripting + capture. issueByIID is what GetIssue
 	// returns (the LIVE description, deliberately distinct from the run's queue-time
 	// snapshot so a test can tell which one the watcher read); getIssueErrByIID
@@ -105,6 +112,19 @@ func (f *fakeForge) UpdateIssueDescription(_ context.Context, projectID, issueII
 func (f *fakeForge) EnsureLabels(_ context.Context, _ int64, labels []forge.Label) error {
 	f.ensureCalls = append(f.ensureCalls, labels)
 	return f.ensureErr
+}
+
+// setStateCall records one SetIssueState invocation whole, so close/reopen tests can
+// assert WHICH issue was flipped to WHICH state — a bare tally would pass on the wrong
+// state being sent the right number of times.
+type setStateCall struct {
+	issueIID int64
+	state    forge.IssueState
+}
+
+func (f *fakeForge) SetIssueState(_ context.Context, _ int64, issueIID int64, state forge.IssueState) error {
+	f.setStateCalls = append(f.setStateCalls, setStateCall{issueIID: issueIID, state: state})
+	return f.setStateErr
 }
 func (f *fakeForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	f.listCalls = append(f.listCalls, opts)
@@ -208,6 +228,17 @@ type fakeStore struct {
 	labelUpserts []store.UpsertIssueLabelsParams // AutoMove / SetIssueLabel writes (PRD #767)
 	deleteCalls  []store.DeleteIssuesNotInParams
 
+	// Close/reopen state flips (PRD #1034 M2). stateUpdates records UpdateIssueState
+	// (bare close) calls, reopens records ReopenIssueState calls — each by identity so a
+	// test can assert the cache flip happened (or did not, the snap-back tests).
+	// reopenLabels is the Labels JSON the ReopenIssueState fake echoes on its returned
+	// row: the real query leaves labels untouched, so a reopen-to-Backlog test sets this
+	// to a column label to prove the subsequent AutoMove clears it. Empty (default) mimics
+	// a card that carried no column label while closed.
+	stateUpdates []store.UpdateIssueStateParams
+	reopens      []store.ReopenIssueStateParams
+	reopenLabels []byte
+
 	// MR-close watcher (PRD #24) scripting + capture.
 	candidates    []store.ListMRWatchCandidatesRow
 	candidatesErr error
@@ -270,6 +301,19 @@ func (s *fakeStore) UpsertIssueLabels(_ context.Context, arg store.UpsertIssueLa
 	s.labelUpserts = append(s.labelUpserts, arg)
 	// Echo the labels back so AutoMove / SetIssueLabel's re-cache returns the moved row.
 	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: arg.State, Labels: arg.Labels}, nil
+}
+func (s *fakeStore) UpdateIssueState(_ context.Context, arg store.UpdateIssueStateParams) (store.Issue, error) {
+	s.stateUpdates = append(s.stateUpdates, arg)
+	// Echo the flip back so CloseIssue's returned row reflects the new state.
+	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: arg.State}, nil
+}
+func (s *fakeStore) ReopenIssueState(_ context.Context, arg store.ReopenIssueStateParams) (store.Issue, error) {
+	s.reopens = append(s.reopens, arg)
+	// Echo an opened row with board_position nulled (the query's contract), so AutoMove
+	// runs against a struct whose State is "opened" — the clobber-regression depends on
+	// this being the row the service threads into AutoMove. Labels come from reopenLabels
+	// (the real query leaves them untouched); default empty mimics a card with no column.
+	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: string(forge.StateOpened), Labels: s.reopenLabels}, nil
 }
 func (s *fakeStore) DeleteIssuesNotIn(_ context.Context, arg store.DeleteIssuesNotInParams) (int64, error) {
 	s.deleteCalls = append(s.deleteCalls, arg)
