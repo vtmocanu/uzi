@@ -843,12 +843,16 @@ as supersession.
 ## When a run fails
 
 Read the reason: `uzi run get RUN --json | jq '{status, fail_origin, failure_reason, health_reason}'`.
-`fail_origin == "push_secret_blocked"` identifies the push-protection class on its own,
-without parsing `failure_reason`'s free text. Common causes: the workflow-scope push
-rejection above; a GitHub Push Protection rejection (`GH013 … Push cannot contain secrets`
-— see *Push protection* under the PVC recovery section: recoverable, but the fix must be
-folded into the introducing commit); a `limit_wait` that never cleared; a genuine gate
-failure.
+`fail_origin == "push_secret_blocked"` identifies the SECRET push-protection class on its
+own, without parsing `failure_reason`'s free text: the branch carries a secret that the
+pre-push gitleaks scan or GitHub Push Protection (`GH013 … Push cannot contain secrets`)
+rejected. The fix is to scrub the secret from the branch's history and re-push — see *Push
+protection* under the PVC recovery section (fold the fix into the introducing commit; a later
+commit that merely removes the literal still ships the one that added it). Do NOT reach for
+secret-history rewriting on the OTHER failures, which have their own `fail_origin`: the
+behind-on-workflows rejection is `workflow_scope_missing`, a base-align conflict is
+`finalize_base_align_conflict`, and a generic gate/agent failure is `agent_failure`;
+`limit_wait` is a separate parked status, not a `fail_origin`, and clears on its own.
 Report the `failure_reason` verbatim and decide re-run vs. revise vs. hand back to the user.
 
 ## Cross-session handoff

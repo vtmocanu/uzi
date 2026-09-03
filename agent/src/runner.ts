@@ -1342,10 +1342,13 @@ export class RunRunner {
       const scan = await this.git.secretScanRange(scanBarePath, trackingRef);
       if (scan.trusted && scan.findings.length > 0) {
         const reason = composePushSecretBlockedReason(scan.findings);
-        // Preserve the agent's diff (redactText scrubs the run's secrets before it leaves the
-        // worker; a null best-effort diff just omits the patch — the typed failure still lands).
-        const rawPatch = await this.git.workflowScopeDiff(scanBarePath, trackingRef);
-        const patch = rawPatch === null ? undefined : redactText(rawPatch);
+        // Do NOT preserve the diff on a secret block. redactText only scrubs the run's OWN
+        // secrets (forge PAT / Anthropic / join token / gitBasic); a gitleaks finding is by
+        // definition a DIFFERENT secret whose value we do not even have here (the report is
+        // `--redact`'d to file/line/rule only), so a preserved patch would persist the detected
+        // secret into runs.preserved_patch and render it in RunView — the exact leak this feature
+        // exists to prevent. The committed work stays recoverable from the worker branch/PVC, and
+        // the failure_reason names each offending commit+path.
         batcher.emit({
           kind: "status",
           agent: "worker",
@@ -1369,7 +1372,7 @@ export class RunRunner {
           status: "failed",
           failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
           fail_origin: "push_secret_blocked",
-          preserved_patch: patch,
+          preserved_patch: undefined,
         });
         return;
       }
@@ -1407,27 +1410,25 @@ export class RunRunner {
     // PRD #974 M2 — the GH013 remote backstop. When a finalize push (the normal path OR an
     // align-path push) is rejected by GitHub Push Protection for a secret the pre-push gitleaks
     // scan missed (GitHub's pattern set is broader than gitleaks', and the two are not
-    // identical), route it to the SAME typed push_secret_blocked failure with the diff preserved,
-    // instead of losing the committed work to the generic catch (raw message, no preserved_patch,
-    // defaulted fail_origin). `patchBaseRef` is the ref to diff for the preserved patch — the
-    // agent tip (`trackingRef` on the normal path; the pre-align `originalAgentTip` on the align
-    // path, so the patch is exactly the human-landable agent work, not the aligning changes).
-    // The reason is a fixed capped message: at the backstop there are no gitleaks findings to
-    // name (gitleaks did not catch it), so it cannot use composePushSecretBlockedReason.
-    const failPushSecretBlocked = async (patchBaseRef: string) => {
-      const rawPatch = await this.git.workflowScopeDiff(finalizeBarePath, patchBaseRef);
-      const patch = rawPatch === null ? undefined : redactText(rawPatch);
+    // identical), route it to the SAME typed push_secret_blocked failure instead of losing the
+    // typing to the generic catch (raw message, defaulted fail_origin).
+    // Do NOT preserve the diff: the push carries a secret, and at the backstop there are no
+    // finding spans at all, so a preserved patch would persist the secret into
+    // runs.preserved_patch / RunView — the exact leak this feature prevents. The committed work
+    // stays recoverable from the run's branch/PVC; the fixed capped reason points a human there
+    // (the backstop has no gitleaks findings to name, so it cannot use composePushSecretBlockedReason).
+    const failPushSecretBlocked = async () => {
       const reason =
         "the push was rejected by GitHub Push Protection (GH013): it carries a secret. " +
-        "Diff preserved.";
+        "The committed work is on the run's branch — scrub the secret from its history and re-push.";
       batcher.emit({
         kind: "status",
         agent: "worker",
         payload: {
-          text: "push rejected by GitHub Push Protection (GH013); failing and preserving the diff for a human to scrub and land",
+          text: "push rejected by GitHub Push Protection (GH013); failing (work is on the run branch — scrub the secret and re-push)",
         },
       });
-      runLog.info("run failed: push rejected by GitHub Push Protection (GH013); preserving diff", {
+      runLog.info("run failed: push rejected by GitHub Push Protection (GH013)", {
         run_id: runId,
       });
       await batcher.close();
@@ -1435,7 +1436,7 @@ export class RunRunner {
         status: "failed",
         failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
         fail_origin: "push_secret_blocked",
-        preserved_patch: patch,
+        preserved_patch: undefined,
       });
     };
 
@@ -1591,7 +1592,7 @@ export class RunRunner {
                   "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
                   { run_id: runId },
                 );
-                await failPushSecretBlocked(originalAgentTip);
+                await failPushSecretBlocked();
                 return true;
               }
               const nonFf = isNonFastForwardRejection(e);
@@ -1682,7 +1683,7 @@ export class RunRunner {
                     "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
                     { run_id: runId },
                   );
-                  await failPushSecretBlocked(originalAgentTip);
+                  await failPushSecretBlocked();
                   return;
                 }
                 if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
@@ -1712,7 +1713,7 @@ export class RunRunner {
                     "finalize base-align: merge push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
                     { run_id: runId },
                   );
-                  await failPushSecretBlocked(originalAgentTip);
+                  await failPushSecretBlocked();
                   return;
                 }
                 if (isNonFastForwardRejection(e)) {
@@ -1797,7 +1798,7 @@ export class RunRunner {
         // the pre-push gitleaks scan missed — route it to the typed preserve-and-fail rather than
         // the generic catch. Any OTHER push error rethrows (unchanged behavior).
         if (isPushProtectionRejection(e)) {
-          await failPushSecretBlocked(trackingRef);
+          await failPushSecretBlocked();
           return;
         }
         throw e;

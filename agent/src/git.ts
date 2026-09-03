@@ -1493,6 +1493,12 @@ export class GitCache {
       let stderr = "";
       try {
         const res = await execFileAsync("gitleaks", args, {
+          // gitEnv(): the hardened REPLACEMENT env (no join token / API URL, plus the
+          // core.hooksPath / GIT_CONFIG_NOSYSTEM / global=/dev/null pins), so gitleaks'
+          // internal `git -C … log -p` runs WITHOUT worker credentials in its environment and
+          // cannot fire a planted hook or read a system/global config as the worker uid. gitEnv
+          // carries PATH+HOME (+TMPDIR), so gitleaks itself still runs; it needs no secret env.
+          env: gitEnv(),
           maxBuffer: 64 * 1024 * 1024,
           timeout: GIT_TIMEOUT_MS,
         });

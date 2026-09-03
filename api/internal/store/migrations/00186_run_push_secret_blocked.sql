@@ -47,11 +47,12 @@ ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
 -- +goose Down
 
 -- Narrow back to the eleven-value set (00139's Up). Any `push_secret_blocked` rows
--- written while this migration was applied would violate the narrower CHECK, so drop
--- them first — a down-migration undoing this feature cannot keep values the restored
--- domain forbids. Do NOT drop preserved_patch here: 00137 owns that column and it
--- stays in use for workflow_scope_missing.
-DELETE FROM runs WHERE fail_origin = 'push_secret_blocked';
+-- written while this migration was applied would violate the narrower CHECK, so clear
+-- the now-forbidden value first. NULL it (fail_origin is nullable) rather than DELETE the
+-- rows — a down-migration undoing this FEATURE must not destroy whole run records; the
+-- human-readable failure_reason on those runs is untouched. Do NOT drop preserved_patch
+-- here: 00137 owns that column and it stays in use for workflow_scope_missing.
+UPDATE runs SET fail_origin = NULL WHERE fail_origin = 'push_secret_blocked';
 ALTER TABLE runs DROP CONSTRAINT runs_fail_origin_check;
 ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
     CHECK (fail_origin IN (
