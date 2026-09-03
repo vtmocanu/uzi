@@ -660,6 +660,7 @@ func (m tuiModel) renderHelp() string {
 // newTUICmd wires `uzi tui [run-id]`.
 func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 	var demo bool
+	var sketch string
 	cmd := &cobra.Command{
 		Use:   "tui [run-id]",
 		Short: "Watch runs live in a full-screen terminal UI",
@@ -679,6 +680,12 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			// M7): a hidden showcase that drives the SHIPPED views, so it cannot drift.
 			if demo {
 				return runTUIDemo(cmd.Context(), env)
+			}
+			// --sketch previews a throwaway TUI sketch by name with no server (PRD #1061),
+			// a hidden discovery-friendly flag parallel to --demo. Changed() so a bare or
+			// valued --sketch triggers it while a plain `uzi tui` is unaffected.
+			if cmd.Flags().Changed("sketch") {
+				return runTUISketch(cmd.Context(), env, sketch)
 			}
 			c, err := env.client(gf)
 			if err != nil {
@@ -707,6 +714,9 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&demo, "demo", false, "run a self-contained demo over seeded fixtures (no server)")
 	_ = cmd.Flags().MarkHidden("demo")
+	cmd.Flags().StringVar(&sketch, "sketch", "", "preview a throwaway TUI sketch by name (no server); bare --sketch lists them")
+	cmd.Flags().Lookup("sketch").NoOptDefVal = "list" // bare --sketch => the "list" sentinel, not a cobra "flag needs an argument" error
+	_ = cmd.Flags().MarkHidden("sketch")
 	return cmd
 }
 

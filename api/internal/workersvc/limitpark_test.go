@@ -968,7 +968,7 @@ func TestPollerCreatedRunsInheritTheOwnerWaitOnLimitDefault(t *testing.T) {
 	t.Run("self_improve", func(t *testing.T) {
 		fs := &fakeStore{userByID: optedIn}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateSelfImproveRun(context.Background(), owner, uuid.New(), 7, "t", "d", nil, false); err != nil {
+		if _, err := svc.CreateSelfImproveRun(context.Background(), owner, uuid.New(), 7, "t", "d", nil, nil, false); err != nil {
 			t.Fatalf("CreateSelfImproveRun: %v", err)
 		}
 		if fs.selfImproveParams == nil || !fs.selfImproveParams.WaitOnLimit {

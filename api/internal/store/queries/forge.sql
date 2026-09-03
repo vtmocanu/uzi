@@ -556,11 +556,23 @@ LIMIT 1;
 -- merged/locked transition are move-free, and the edge paths skip a closed issue),
 -- so it only backfills historical merged PRs and decays as each run settles to a
 -- terminal state. The Go ResolveColumn check remains authoritative for board moves.
+--
+-- Scheduled-lane runs (prompt/self_improve) are watched separately, board-free, by
+-- ListScheduledMRStateWatchCandidates (PRD #908) — they have no board card.
 WITH latest AS (
     SELECT DISTINCT ON (r.issue_iid)
            r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state, r.created_at
     FROM runs r
+    -- Scheduled-lane runs are excluded HERE, before the per-issue collapse, so this
+    -- board-coupled watcher never owns their MR-state transitions (PRD #908 R1). A
+    -- prompt run is issue-less and already dropped by the JOIN below, but a self_improve
+    -- run carries a real tracking-issue iid whose completed run parks the card in Human
+    -- Review (runlifecycle) — so without this filter it satisfies Lane A and syncOneMRState
+    -- would move the shared tracking-issue card on an MR close/reopen edge, defeating the
+    -- board-free contract. Scheduled kinds have their own tracking-issue iids (never a real
+    -- PRD issue's), so excluding them cannot mask an issue-lane rework in the DISTINCT ON.
     WHERE r.repo_id = @repo_id
+      AND r.kind NOT IN ('prompt', 'self_improve')
     ORDER BY r.issue_iid, r.created_at DESC
 )
 SELECT l.id, l.issue_iid, l.mr_iid, l.mr_state
@@ -590,6 +602,27 @@ WHERE l.status = 'completed'
 -- rationale ABOVE the statement — a comment trailing after the `;` is grabbed by
 -- sqlc as the leading doc of the NEXT query.
 ORDER BY (i.state = 'opened') DESC, l.created_at DESC
+LIMIT 100;
+
+-- name: ListScheduledMRStateWatchCandidates :many
+-- Board-FREE MR-state watch for the scheduled lanes (prompt, self_improve) — PRD #908.
+-- Sibling of ListMRWatchCandidates but with NO issues JOIN and NO DISTINCT ON (issue_iid):
+-- prompt runs are issue-less and self_improve runs share one tracking issue, so neither the
+-- board-move machinery nor the per-issue collapse applies. Keyed on the run/branch. Populates
+-- runs.mr_state via forgesvc.SyncScheduledMRStates so ListMRReworkCandidates' mr_state='opened'
+-- gate, the mr_rework ledger eviction, and stop-on-close cancellation all work for these lanes.
+-- Self-bounding like Lane B: poll a run only until its mr_state reaches a terminal value
+-- (merged/closed), then it drops out of this set. LIMIT 100 is a hardcoded burst bound (mirrors
+-- ListMRWatchCandidates), not a sqlc param, so zero Go signature change. Keep this rationale
+-- ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
+SELECT id, branch, mr_iid, mr_state
+FROM runs
+WHERE repo_id = @repo_id::uuid
+  AND kind IN ('prompt', 'self_improve')
+  AND status = 'completed'
+  AND mr_iid IS NOT NULL
+  AND (mr_state IS NULL OR mr_state IN ('opened', 'locked'))
+ORDER BY created_at DESC
 LIMIT 100;
 
 -- name: GetIssueByIID :one

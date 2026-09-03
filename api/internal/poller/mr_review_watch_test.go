@@ -507,6 +507,69 @@ func TestMRReworkStopEvictsStaleLedger(t *testing.T) {
 	}
 }
 
+func TestMRReworkIssuelessBranchDecoupled(t *testing.T) {
+	// PRD #908 M2: an mr_rework candidate on a scheduled (self_improve) branch does not
+	// parse to an issue iid. The rework still fires below the cap, and at the cap the halt
+	// still notifies once — only the halt ISSUE COMMENT is suppressed (nothing to comment
+	// on). The existing agent/issue-N cap-halt test (TestMRReworkAtCapHaltsOnceThenSilent)
+	// remains the control that the comment DOES post for an issue branch.
+	issuelessRef := "uzi/self-improve/" + uuid.NewString()
+	issuelessCand := func() store.ListMRReworkCandidatesRow {
+		c := mrwCand("success")
+		c.Ref = pgtype.Text{String: issuelessRef, Valid: true}
+		return c
+	}
+
+	t.Run("below cap fires without a comment", func(t *testing.T) {
+		st := &mrwStore{candidates: []store.ListMRReworkCandidatesRow{issuelessCand()}}
+		runs := &mrwRuns{}
+		notifier := &mrwNotifier{}
+		// One kept comment, id 120 > high_water 0 → fire.
+		f := landedForge(mrwComment(120, landed(), mrwHeadSHA))
+
+		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+
+		if len(runs.calls) != 1 {
+			t.Fatalf("an issueless branch below cap must still fire the rework, got %d runs", len(runs.calls))
+		}
+		if runs.calls[0].ref != issuelessRef {
+			t.Fatalf("rework created for ref %q, want %q", runs.calls[0].ref, issuelessRef)
+		}
+		if len(st.upserts) != 1 || st.upserts[0].HighWater != 120 {
+			t.Fatalf("expected one ledger upsert advancing high_water to 120, got %+v", st.upserts)
+		}
+		if len(f.notes) != 0 {
+			t.Fatalf("an issueless branch must post NO issue comment, got %+v", f.notes)
+		}
+	})
+
+	t.Run("at cap halts once, no comment, still notifies", func(t *testing.T) {
+		st := &mrwStore{
+			candidates: []store.ListMRReworkCandidatesRow{issuelessCand()},
+			ledgers:    map[string]store.MrReworkLedger{issuelessRef: {Ref: issuelessRef, AttemptCount: 5, HighWater: 120}},
+		}
+		runs := &mrwRuns{}
+		notifier := &mrwNotifier{}
+		// A new comment (id 200 > high_water 120) reaches the cap gate.
+		f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
+
+		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+
+		if len(runs.calls) != 0 {
+			t.Fatalf("a capped issueless MR must not start a run, got %d", len(runs.calls))
+		}
+		if len(st.haltSets) != 1 {
+			t.Fatalf("expected one SetMRReworkHaltNotified latch, got %d", len(st.haltSets))
+		}
+		if len(f.notes) != 0 {
+			t.Fatalf("an issueless cap-halt must post NO issue comment, got %+v", f.notes)
+		}
+		if len(notifier.calls) != 1 || notifier.calls[0].kind != "mr_rework_halted" || notifier.calls[0].runID != nil {
+			t.Fatalf("expected one halted notification with no run anchor, got %+v", notifier.calls)
+		}
+	})
+}
+
 func TestMRReworkBotOnlyCommentsNoFire(t *testing.T) {
 	// The only comment is uzi's OWN bot note (author == bot id): the snapshot filter
 	// drops it, leaving nothing → no fire.
