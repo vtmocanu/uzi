@@ -572,6 +572,39 @@ describe("WorkersSettings hosted quota is escapable (the primary journey)", () =
       expect(document.activeElement).not.toBe(b);
     }
   });
+
+  it("keeps the at-quota focus parked on the row across a 10s poll tick with an unchanged fleet (M3, Risks)", async () => {
+    // Fake timers so the 10s liveness poll can be driven deterministically; the afterEach
+    // restores real timers. Loads/config are flushed with advanceTimersByTimeAsync(0), so
+    // this test uses getBy/queryBy after each flush rather than findBy (which needs real
+    // timers).
+    vi.useFakeTimers();
+    const h1 = aWorker({ id: "w-h1", name: "base (S)", kind: "hosted", hosted_size: "s" });
+    const h2 = aWorker({ id: "w-h2", name: "base (M)", kind: "hosted", hosted_size: "m" });
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [h1, h2] });
+    renderPage();
+
+    // Flush the full async chain: the Promise.all initial load, the landing-tab latch
+    // effect, and HostedWorkers' separate one-shot config fetch — each resolves on its own
+    // microtask/effect turn, so pump several 0ms ticks until the page settles.
+    const flush = async () => {
+      for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(0);
+    };
+    await flush(); // initial load + landing-tab latch (2 workers → Your workers) + config fetch
+    openAddTab();
+    await flush(); // un-hide the add panel; the at-quota button now renders
+    fireEvent.click(screen.getByRole("button", { name: "delete one to provision another" }));
+    await flush(); // pendingRowFocus effect runs after the panel un-hides
+    expect(document.activeElement).toBe(document.getElementById("worker-row-w-h1"));
+
+    // The 10s liveness poll re-fetches the SAME fleet and re-renders the rows. Rows are
+    // keyed by id (reconciled in place) and pendingRowFocus was cleared after the jump, so
+    // the focus effect does not re-fire and focus must stay on the row the user landed on —
+    // never yanked to <body> by the poll (M3 Risks: "focus survives one poll tick").
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(document.activeElement).toBe(document.getElementById("worker-row-w-h1"));
+  });
 });
 
 describe("WorkersSettings hosted delete confirms; external delete does not (PRD #58)", () => {
