@@ -1,6 +1,7 @@
 # ADR-632: A defaulted `lineage_epoch` marker fixes the broken-resume undercount by SUMming independent legs while still MAX-collapsing within-lineage snapshots
 
-**Status**: Accepted (implemented, issue #632)
+**Status**: Superseded by ADR-1079 (`adr/1079-run-usage-per-leg-fold.md`)
+**Status (as accepted)**: Accepted (implemented, issue #632)
 **Date**: 2026-08-29
 **Deciders**: lead (design + integration), coder (implementation), reviewer + auditor + tester (independent validation passes, findings addressed).
 **Issue**: [vtmocanu/uzi#632](https://github.com/vtmocanu/uzi/issues/632) — supersedes #332, the design tracker. #332's "ADR (Option B)" is a pinned GitHub issue comment, **not** a committed file; there is deliberately no `adr/0332`. The PRD [`prds/done/632-run-usage-lineage-epoch.md`](../prds/done/632-run-usage-lineage-epoch.md) is the design of record; this ADR restates the load-bearing shipped contract so a future reader needs no external fetch.

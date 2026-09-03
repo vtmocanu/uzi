@@ -22,6 +22,22 @@ names them, then asks the harder question: is the cheaper run as good?
 > SDK exposes a window for the main-loop session, not for subagents, so
 > there's no context-fill number to add to a subagent's cost row.
 
+## How a run's cost is counted
+
+A run's lead makes one SDK `query()` call per turn — the planning turn, then
+each implement/review iteration, each resumed on the previous turn's session
+id. The Agent SDK reports cost **per `query()` call, not cumulatively over
+the resumed session**, so every one of those turns is its own leg and its
+`result` frame reports only that leg's tokens and cost. The run's stored
+total (`run_usage`, and every rollup that reads it — the board, `uzi run
+list`, `/api/usage`, `/api/admin/usage`) is the SUM of every leg, and the run
+page's per-phase table shows each leg's figures exactly, not a running total
+telescoped down to whichever leg happened to be largest. Historical runs
+that predate this fold were re-folded once, automatically, from their still-
+persisted message history on the first boot after the fix landed — no
+action needed on a self-hosted instance. See [ADR-1079](../adr/1079-run-usage-per-leg-fold.md)
+for the full design and the measured under-count this replaced.
+
 ## The model tier is not the difference
 
 `override_subagent_model` (added by migration `00119_schedule_run_override_subagent_model.sql`,
