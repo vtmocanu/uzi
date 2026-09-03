@@ -636,6 +636,15 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		if name == "" {
 			continue
 		}
+		// "closed" is the reserved close sentinel: MoveIssue canonicalizes a
+		// case-insensitive "closed" target to the literal and routes it to CloseIssue
+		// rather than a column move, so a user column named "closed" could never
+		// receive a card (a drop onto it would close the issue). Reject it at
+		// configuration time rather than create a silently unreachable column.
+		if strings.EqualFold(name, "closed") {
+			httpx.Error(w, http.StatusBadRequest, `"closed" is a reserved column name (it is the close action); choose another name`)
+			return
+		}
 		if _, dup := seen[name]; dup {
 			continue
 		}

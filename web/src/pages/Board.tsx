@@ -919,16 +919,37 @@ export function Board() {
       const draggedCard = payloadCards.find((c) => c.iid === dragIid);
       if (!draggedCard) return false;
       const toClosed = destKey === CLOSED_KEY;
-      if (toClosed && draggedCard.closed) return false; // Closed → Closed: no-op
-      if (toClosed) return move(CLOSED_KEY, dragIid); // open → Closed: close (state only)
-      if (draggedCard.closed) return move(destKey, dragIid); // closed → open lane: reopen + move; lands at bottom
+      if (toClosed && draggedCard.closed) return false; // Closed → Closed: no-op, no mutation
+
+      // ONE synchronous lock across ALL board mutations — state moves (close/reopen) AND
+      // reorders. reorderRef must be checked BEFORE the state-move branches below: a
+      // close/reopen that ran while a reorder's reorderBoard() was still in flight could
+      // have the older reorder response resolve last and setBoard(fresh) overwrite the
+      // newer state-transition card with stale board data (and, symmetrically, a reorder
+      // starting under a pending close/reopen). Refusing a re-entrant mutation beats
+      // losing one, and silence is not the trade-off — every other rejection here speaks
+      // (move() surfaces a forge error, a failed reorder sets "Could not save the new
+      // order"), so on a slow link a user who drags twice is told, not left guessing.
       if (reorderRef.current) {
-        // S8. Refusing beats losing the move, but silence is not the trade-off — every
-        // other rejection here speaks (move() surfaces a forge error, a failed reorder
-        // sets "Could not save the new order"). On a slow link a user who drags twice
-        // would otherwise conclude the drag is broken.
         setError("Still saving the previous move — try again in a moment.");
         return false;
+      }
+
+      // State changes (close/reopen) route through move() alone — there is no position to
+      // compute (a close leaves the card in place; a reopen lands at the bottom of its new
+      // lane because the server nulls board_position, ORDER BY board_position ASC NULLS
+      // LAST) — but they still hold the SAME lock so a reorder cannot interleave with the
+      // pending forge write. dropIntent's own `dragged.closed` bail stays a safety net.
+      if (toClosed || draggedCard.closed) {
+        reorderRef.current = true;
+        setReordering(true);
+        try {
+          // open → Closed = close (state only); closed → open lane = reopen + move (bottom).
+          return await move(toClosed ? CLOSED_KEY : destKey, dragIid);
+        } finally {
+          reorderRef.current = false;
+          setReordering(false);
+        }
       }
       const intent = dropIntent({
         payloadCards, // UNFILTERED — the payload-set rule (Decision 7b)
