@@ -292,6 +292,55 @@ func TestTUIBoardSecondLineTopAndBottom(t *testing.T) {
 	fits("bottom")
 }
 
+// PRD #1064 D4: with the window FORCED (many runs, small height) and the BOTTOM row selected,
+// boardCapacity's `chrome++` reservation for the selected row's second line is load-bearing —
+// it shrinks the row window by one so the selected row PLUS its second physical line both fit
+// without pushing the footer off the terminal. Unlike TestTUIBoardSecondLineTopAndBottom (6
+// rows at height 16, where every item fits and the window is never engaged), this forces
+// n > capacity so the reservation actually binds: delete the `chrome++` in boardCapacity and
+// this test goes RED (frame is height+1 lines).
+func TestTUIBoardSecondLineWindowReservesLine(t *testing.T) {
+	now := time.Now()
+	var runs []apitypes.RunListItemDTO
+	// 20 running rows at height 16 forces windowing (21 display items incl. the band eyebrow,
+	// far more than the ~12 that fit), and every row carries a milestone in progress + activity.
+	for i := 0; i < 20; i++ {
+		r := milestoneRunItem("aaaaaaaa-"+itoa(i), "running", 1, "m2")
+		r.CurrentActivity = activityFor("coder", "task-"+itoa(i), now)
+		runs = append(runs, r)
+	}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.width, m.height = 120, 16
+	next, _ := m.Update(boardRunsMsg{runs: runs})
+	m = next.(tuiModel)
+
+	// Select the BOTTOM row, whose second line rides the very bottom of the window — exactly the
+	// row for which the reservation must have shrunk the window or the footer is pushed off.
+	for i := 0; i < len(runs)-1; i++ {
+		m = press(t, m, "j")
+	}
+	sel, ok := m.board.selected()
+	if !ok || sel.ID != "aaaaaaaa-19" {
+		t.Fatalf("expected the bottom row (aaaaaaaa-19) selected, got %q ok=%v", sel.ID, ok)
+	}
+
+	out := m.View().Content
+	// The frame never overflows the terminal height: the window reserved one line for the
+	// selected row's second line rather than letting it push the footer off screen.
+	if rows := strings.Split(out, "\n"); len(rows) > m.height {
+		t.Fatalf("board rendered %d physical lines at height %d — the reserved second line overflowed\n%s",
+			len(rows), m.height, out)
+	}
+	// The selected bottom row AND its second line are both visible: the window shrank by one to
+	// keep them on screen, not by dropping the second line.
+	if !strings.Contains(out, "task-19") {
+		t.Fatalf("selected bottom row's second line (task-19) not in the frame\n%s", out)
+	}
+	if n := strings.Count(stripANSI(out), " ▸ "); n != 1 {
+		t.Fatalf("expected exactly one selected-row second line, got %d\n%s", n, stripANSI(out))
+	}
+}
+
 // The selection can move across a run that GAINS or LOSES its activity between 2s polls: the
 // second line appears/disappears and the window math stays sound (D4).
 func TestTUIBoardSecondLineGainsAndLosesActivity(t *testing.T) {
