@@ -1,5 +1,8 @@
 # PRD #914: CI autofix on by default (mirror mr_rework — admin global + per-user tri-state)
 
+> Anchors re-verified against main at fcfd8aa on 2026-09-03, after the epic #915 file splits.
+> **Precondition status 2026-09-03: #908 is NOT on main** (`forgesvc/scheduled_mr_watch.go` absent; `ListCIAutofixCandidateRefs` still filters `r.kind IN ('issue','ci_fix')`). This PRD was pulled from the nightly sweep (`uzi` label removed) until #908 merges.
+
 **Issue**: #914
 **Status**: Draft — ready for implementation
 **Priority**: Medium
@@ -33,7 +36,7 @@ Only when **both** checks pass may you proceed with the milestones below.
 CI autofix (`kind='ci_fix'`, `api/internal/poller/ci_autofix.go`) pushes a fix when an agent-MR
 head pipeline fails. Its enablement is a single user-level boolean,
 `users.ci_autofix_enabled BOOLEAN NOT NULL DEFAULT false` (migration 00115), gated in the candidate
-query `ListCIAutofixCandidateRefs` (`ci_autofix.sql:67`, `AND u.ci_autofix_enabled`). There is
+query `ListCIAutofixCandidateRefs` (`ci_autofix.sql:76`, `AND u.ci_autofix_enabled`). There is
 **no admin global** and the default is **off**, so most users never get automatic CI fixes.
 
 The sibling lane, MR rework (`kind='mr_rework'`, PRD #700/#841), already has the model we want: an
@@ -73,31 +76,35 @@ The current column is `NOT NULL`, so history cannot distinguish "opted out" from
 
 mr_rework is the template, but ci_autofix differs in ways that make this more than a copy:
 
-1. **No admin global exists for ci_autofix** — `settings.go` has zero `ci_autofix` refs. The key
-   const, default, `Defaults` map entry, accessor (~settings.go:870), and `validateBool` case
-   (~settings.go:1439) are all NEW.
+1. **No admin global exists for ci_autofix** — `settings.go` (package `settings`) has zero
+   `ci_autofix` refs. The key const, default, and `Defaults` map entry belong in
+   `api/internal/settings/keys.go` (mirroring `KeyMrReworkEnabled` at `:224`,
+   `DefaultMrReworkEnabled` at `:339`, and its `Defaults` entry at `:449`); the accessor belongs
+   in a new `api/internal/settings/settings_ci_autofix.go`, mirroring `MrReworkEnabled` in
+   `settings_mr_rework.go:35`; and the `validateBool` case is added to the dispatch switch in
+   `settings.go` at `:377-380` (`validateBool` itself at `:442`). All NEW.
 2. **The detector has no settings dependency** — `CIAutoFix` (`ci_autofix.go:59-60`) has only `q
    ciAutofixStore`, no `set`; `ciAutofixStore` (`:25-26`) has no settings accessor; `NewCIAutoFix`
    (`:74`) + its `cmd/server/main.go:541` wiring take no `settings.Cache`. All NEW, to add the
    fail-closed global read (mirror `mr_review_watch.go:105-112`, whose accessor genuinely
    propagates the store error / fails closed).
-3. **The per-user gate is in SQL, not Go** — `ci_autofix.sql:67` (generated `ci_autofix.sql.go:142`).
+3. **The per-user gate is in SQL, not Go** — `ci_autofix.sql:76` (generated `ci_autofix.sql.go:143`).
    The `IS NOT FALSE` edit has no mr_rework analog. **No second gate exists**: the only other
    `ci_fix` create path is the manual "Fix CI" button (`handler/ci_fix.go` → `CreateCIFixRun`), which
    does not read `ci_autofix_enabled` at all (human-approved by design), so changing only the SQL is
    sufficient.
-4. **Different API/UI surface** — ci_autofix is on the `User` DTO (`apitypes/user.go:32`) with
-   dedicated endpoints (`handler/ci_autofix_toggle.go`, `PUT /me/ci-autofix` `handler.go:935`,
-   `PUT /admin/users/{id}/ci-autofix` `handler.go:1182`), not `PUT /me/settings`. Both handler
+4. **Different API/UI surface** — ci_autofix is on the `User` DTO (`apitypes/user.go:36`) with
+   dedicated endpoints (`handler/ci_autofix_toggle.go`, `PUT /me/ci-autofix` `routes_me.go:125`,
+   `PUT /admin/users/{id}/ci-autofix` `routes_admin.go:99`), not `PUT /me/settings`. Both handler
    methods call the single store query `SetUserCIAutofixEnabled` (one param struct to flip). The
    `setCIAutofixRequest{Enabled bool}` and web `(enabled: boolean)` signatures have no inherit/clear
    value today. **No CLI surface** (`api/cmd/uzi` has none — correct to omit).
 5. **SET-query return shape** — `SetUserCIAutofixEnabled` returns `RETURNING *` (full `User` →
    `toDTO`); its param flips `bool → pgtype.Bool`.
-6. **`bool → pgtype.Bool` ripple** — `store.User.CiAutofixEnabled` is `bool` (`models.go:638`); the
-   one hand-written reader is `handler/handler.go:476` (`toDTO`; it is display-only, but a naive
+6. **`bool → pgtype.Bool` ripple** — `store.User.CiAutofixEnabled` is `bool` (`models.go:639`); the
+   one hand-written reader is `handler/handler.go:477` (`toDTO`; it is display-only, but a naive
    `.Bool` there would show "Off" for a default-on NULL user, so resolve inherit→true). The two
-   hand-written writers are `handler/ci_autofix_toggle.go:39` and `:68`. Plus ~16 sqlc-generated
+   hand-written writers are `handler/ci_autofix_toggle.go:37` and `:65`. Plus ~16 sqlc-generated
    scan sites (15 in `users.sql.go` + `slack.sql.go:98`) that regenerate automatically — the
    compiler catches every bare-bool use.
 7. **No web admin card** — even mr_rework's global has no typed web admin field; it round-trips
@@ -109,16 +116,20 @@ mr_rework is the template, but ci_autofix differs in ways that make this more th
 `web/`.
 
 - [ ] **M1 — Admin global `ci_autofix_enabled` setting + detector fail-closed read.** *(Offline)*
-  In `settings.go` add (all NEW): `KeyCiAutofixEnabled = "ci_autofix_enabled"`, `DefaultCiAutofixEnabled
-  = "true"`, the `Defaults` map entry, a three-state error-propagating accessor mirroring
-  `MrReworkEnabled` (~:870), and the `validateBool` case (~:1439). Wire `settings.Cache` into the
-  `CIAutoFix` detector (struct field + `ciAutofixStore` interface + `NewCIAutoFix` + `cmd/server/main.go:541`)
-  and add the fail-closed read at the top of `detect`, mirroring `mr_review_watch.go:105-112`.
-  **Also fix the now-stale comment at `cmd/server/main.go:538-540`** ("per-user ci_autofix_enabled
+  In `api/internal/settings/keys.go` add (all NEW): `KeyCiAutofixEnabled = "ci_autofix_enabled"`,
+  `DefaultCiAutofixEnabled = "true"`, and the `Defaults` map entry (mirroring `KeyMrReworkEnabled`
+  `:224`, `DefaultMrReworkEnabled` `:339`, `Defaults` entry `:449`). In a new
+  `api/internal/settings/settings_ci_autofix.go` add a three-state error-propagating accessor
+  mirroring `MrReworkEnabled` (`settings_mr_rework.go:35`). In `settings.go` add the
+  `validateBool` case to the dispatch switch at `:377-380` (`validateBool` itself at `:442`). Wire
+  `settings.Cache` into the `CIAutoFix` detector (struct field + `ciAutofixStore` interface +
+  `NewCIAutoFix` + `cmd/server/main.go:541`) and add the fail-closed read at the top of `detect`,
+  mirroring `mr_review_watch.go:105-112`.
+  **Also fix the now-stale comment at `cmd/server/main.go:538-539`** ("per-user ci_autofix_enabled
   (default-OFF)" and "kill-switch is simply NOT wiring it") — both become false once the global exists.
 
 - [ ] **M2 — User column → nullable tri-state + candidate gate + Go-type ripple.** *(Offline + LiveDB)*
-  New migration (number at merge time; live head 00181):
+  New migration (number at merge time; live head 00185, so this lands at 00186):
   - Up: `ALTER TABLE users ALTER COLUMN ci_autofix_enabled DROP NOT NULL, DROP DEFAULT;` then
     `UPDATE users SET ci_autofix_enabled = NULL WHERE ci_autofix_enabled = false;` (existing `true`
     preserved).
@@ -129,20 +140,24 @@ mr_rework is the template, but ci_autofix differs in ways that make this more th
     because 00165 *added* a nullable column — this ALTERs an existing NOT-NULL one, so the template's
     Down does not transfer.)
 
-  Change `ci_autofix.sql:67` `AND u.ci_autofix_enabled` → `AND u.ci_autofix_enabled IS NOT FALSE`.
-  Regenerate sqlc; `store.User.CiAutofixEnabled` flips `bool` → `pgtype.Bool` — fix `handler/handler.go:476`
+  Change `ci_autofix.sql:76` `AND u.ci_autofix_enabled` → `AND u.ci_autofix_enabled IS NOT FALSE`.
+  Regenerate sqlc; `store.User.CiAutofixEnabled` flips `bool` → `pgtype.Bool` — fix `handler/handler.go:477`
   (`toDTO`, resolve inherit→true) and the `SetUserCIAutofixEnabled` param.
 
 - [ ] **M3 — Tri-state over the API + web toggles.** *(Offline; web)*
   Retrofit the dedicated endpoints to carry inherit/clear: `handler/ci_autofix_toggle.go`
   (`setCIAutofixRequest`, both handler methods → the single `SetUserCIAutofixEnabled` param as
-  `pgtype.Bool`), the DTO `apitypes/user.go:32` + web `api.ts:34` `User.ci_autofix_enabled` →
+  `pgtype.Bool`), the DTO `apitypes/user.go:36` + web `apiTypes.ts:23` `User.ci_autofix_enabled` →
   `boolean | null`. Update the web toggles to tri-state, mirroring RunDefaults' mr_rework checkbox
   (`checked={x !== false}`): `web/src/pages/RunDefaults.tsx` (self, incl. the "Off by default." copy at
-  `:513`) and `web/src/pages/AdminUsers.tsx` (admin). **Do not miss these ripple sites** (review-found):
-  the two web API client methods `web/src/lib/api.ts:3067` + `:3125` `(enabled: boolean)` →
-  `boolean | null`; both mock setters `web/src/mocks/mockApi.ts:2356-2367`; and the fixtures that
-  hardcode `ci_autofix_enabled: false` (`web/src/mocks/data.ts` ×6 + ~10 web test files) — update the
+  `:577` — **the file has FOUR "Off by default." lines, at `:360`/`:391`/`:449`/`:577`; only `:577`
+  is the ci_autofix card**, checkbox `checked={user?.ci_autofix_enabled ?? false}` at `:587`) and
+  `web/src/pages/AdminUsers.tsx` (admin). **Do not miss these ripple sites** (review-found): the two
+  web API client methods `web/src/lib/api.ts:369-370` (`setUserCIAutofixEnabled`) + `:427-428`
+  (`setCIAutofixEnabled`) `(enabled: boolean)` → `boolean | null`; both mock setters
+  `web/src/mocks/mockApi/settings.ts:679-688` (`setCIAutofixEnabled` `:679`, `setUserCIAutofixEnabled`
+  `:685`); and the fixtures that hardcode `ci_autofix_enabled: false`
+  (`web/src/mocks/data/users.ts` ×6, lines 16/37/59/77/97/115, + ~10 web test files) — update the
   ones M4's positive-control tests assert on so they don't assert "off" for a default-on user.
 
 - [ ] **M4 — Tests + docs.** *(Offline + LiveDB)*

@@ -1,5 +1,7 @@
 # PRD #908: Autofix (MR rework + CI autofix) for scheduled runs
 
+> Anchors re-verified against main at fcfd8aa on 2026-09-03, after the epic #915 file splits and the pgconv consolidation.
+
 **Issue**: #908
 **Status**: Draft — ready for implementation
 **Priority**: Medium
@@ -45,7 +47,7 @@ Three code facts make this larger than a one-line filter change (all verified at
 
 3. **The self_improve create path never stamps the per-schedule `mr_rework_enabled` toggle.**
    The prompt path does (`workersvc/prompt.go:61`); `CreateSelfImproveRun`
-   (`workersvc/self_improve.go:30`, `selfimprove.sql`) has no such column, so a self_improve run
+   (`workersvc/self_improve.go:31`, `selfimprove.sql`) has no such column, so a self_improve run
    would honor only the per-user default, ignoring its schedule's own toggle.
 
 **CI autofix, by contrast, needs no open-MR recorder.** Its candidate query
@@ -83,12 +85,12 @@ invariant reasoning are in the companion §1.
 
 **No new migration** — every column already exists (`users.mr_rework_enabled` 00165;
 `runs`/`run_schedules.mr_rework_enabled` 00179; `users.ci_autofix_enabled` 00115). Live head is
-00181.
+00185.
 
 ### Resolved decisions
 
 - **D1 — Halt/start comments for issueless runs: inbox-only, no new Forge method.** The Forge
-  interface has only `CreateIssueNote` (`forge.go:506`); there is no MR-note write, and adding one
+  interface has only `CreateIssueNote` (`forge.go:512`); there is no MR-note write, and adding one
   touches all three drivers + six fakes. For a branch that parses to an issue IID, keep the
   current issue comments; for an issueless (prompt/self_improve) branch, **skip the issue
   comment** and rely on the existing inbox notification (mr_rework cap-halt already has
@@ -115,9 +117,9 @@ Dependency-ordered. **Offline** = unit-testable with in-memory fakes. **LiveDB**
 - [ ] **M1 — Thread the per-schedule mr-rework toggle through self_improve.** *(Offline; mr_rework)*
   Add an `mrReworkEnabled *bool` param to `CreateSelfImproveRun` (`workersvc/self_improve.go`),
   add `mr_rework_enabled = sqlc.narg('mr_rework_enabled')` to the `selfimprove.sql` INSERT, extend
-  the `schedsvc` interface signature (`scheduler.go:126`) and its test fake
+  the `schedsvc` interface signature (`scheduler.go:127`) and its test fake
   (`scheduler_test.go:343`), and pass `scheduleMrRework(sched)` at the fire site
-  (`schedsvc/self_improve.go:188`) — mirroring the prompt path. Regenerate sqlc.
+  (`schedsvc/self_improve.go:189`) — mirroring the prompt path. Regenerate sqlc.
 
 - [ ] **M2 — Decouple both detectors from `agent/issue-N`.** *(Offline; both lanes)*
   In `poller/mr_review_watch.go` and `poller/ci_autofix.go`, stop returning early when

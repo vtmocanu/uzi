@@ -1,5 +1,7 @@
 # PRD #908 — Design: MR rework for scheduled runs (prompt + self_improve)
 
+> Anchors re-verified against main at fcfd8aa on 2026-09-03, after the epic #915 file splits and the pgconv consolidation.
+
 **Status**: Proposed (design for review) — companion to `prds/908-mr-rework-scheduled-runs.md`
 **Author**: architect
 **Scope**: `api/` + `docs/` only. **No `agent/` change, no `web/` code change, no new migration.**
@@ -38,8 +40,13 @@ recommendation in §7 stands on other grounds, not on #887.
 **Confirmed — the agent side needs no change at all.** An `mr_rework` run resolves its
 fold-onto branch from `claim.branch` (populated server-side from `runs.pipeline_ref`)
 and seeds off `refs/remotes/origin/<branch>` for *any* branch name — see
-`agent/src/runner.ts` `if (claim.kind === "mr_rework")` (search that string; the clone
-call is `runnerCloneForBranch(barePath, mrBranch, mrBranch.replace(/\//g, "-"), runId)`).
+`agent/src/runner.ts` `RUN_KIND_PROFILES[resolveRunKind(claim.kind)].cloneBranch?.(claim,
+runId)` (`runner.ts:3077`), with the clone at `this.git.runnerCloneForBranch(barePath,
+cloneBranch.branch, cloneBranch.slug, runId, resume, expectedCheckpointTip)`
+(`runner.ts:3082`) — the per-kind branch derivation landed via PRD #983 M4's run-kind
+registry, replacing the old inline `claim.kind === "mr_rework"` branch. D3's conclusion
+("no agent change needed") still holds because the profile table already carries the
+prompt/self_improve/mr_rework branch derivations.
 `uzi/prompt-<id>` and `uzi/self-improve/<id>` slug to `uzi-prompt-<id>` /
 `uzi-self-improve-<id>` with no special-casing. The review-comment snapshot builder is keyed on the MR, not the
 branch or kind: `BuildReviewCommentsSnapshot(comments, botForgeUserID)`
@@ -122,8 +129,8 @@ if any query **other than `SetRunMRState`** writes `mr_state` (mr_state_test.go,
 that `mr_state` now has **two Go callers** in forgesvc (`SyncMRStates` for issue runs,
 `SyncScheduledMRStates` for scheduled runs) over **disjoint run sets** (issue vs
 prompt/self_improve). The doc comment on `SetRunMRState`
-(`api/internal/store/queries/runtime.sql`, search `sole writer of runs.mr_state`) and on
-`recordMRState` (mr_watch.go) must be updated to say "written only by forgesvc MR-state
+(`api/internal/store/queries/runtime.sql:2756`, search `ONLY writer of runs.mr_state`) and on
+`recordMRState` (`mr_watch.go:228`, search `sole writer of runs.mr_state`) must be updated to say "written only by forgesvc MR-state
 sync, over disjoint run sets," not "the MR-close watcher." This is a deliberate, recorded
 widening of the invariant's wording, not a break of its mechanism.
 
@@ -179,7 +186,10 @@ cost than reinventing two correctness paths that must not regress on the unatten
 - `api/internal/store/queries/selfimprove.sql` — `CreateSelfImproveRun`: add
   `mr_rework_enabled = sqlc.narg('mr_rework_enabled')` to the INSERT column list.
 - Regenerate: `cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate`
-  (`api/internal/store/*.sql.go` consts + params move — confirm they did).
+  (`api/internal/store/*.sql.go` consts + params move — confirm they did). CI regenerates
+  with the same version via a pinned, sha256-verified release binary rather than this
+  `go run` form (`.github/workflows/ci.yml`) — the version pin is the equivalence check;
+  the invocation form differs.
 
 **Modify — api (services / poller)**
 - `api/internal/poller/poller.go` — after the `SyncMRStates` call in `runPollOnce`
@@ -190,7 +200,7 @@ cost than reinventing two correctness paths that must not regress on the unatten
   (post `CreateIssueNote` only when the branch parses to an issue iid; otherwise inbox-only)
   and make `notifyHalt` tolerate a zero issue iid.
 - `api/internal/workersvc/self_improve.go` — `CreateSelfImproveRun`: add an
-  `mrReworkEnabled *bool` parameter and pass `pgBoolPtr(mrReworkEnabled)` into
+  `mrReworkEnabled *bool` parameter and pass `pgconv.BoolPtr(mrReworkEnabled)` into
   `CreateSelfImproveRunParams`.
 - `api/internal/schedsvc/scheduler.go` — extend the `CreateSelfImproveRun` interface
   signature (search `CreateSelfImproveRun(ctx context.Context, userID, repoID`) with the
@@ -286,7 +296,7 @@ The four-layer opt-out (admin `settings.mr_rework_enabled` → `users.mr_rework_
 `runs.mr_rework_enabled` → `run_schedules.mr_rework_enabled`) is **unchanged**. The
 candidate query already resolves `COALESCE(per_branch.mr_rework_enabled, u.mr_rework_enabled)
 IS NOT FALSE`; prompt already stamps `runs.mr_rework_enabled` from the schedule
-(`prompt.go`, search `MrReworkEnabled: pgBoolPtr`), and this design adds the same stamp to
+(`prompt.go`, search `MrReworkEnabled: pgconv.BoolPtr`), and this design adds the same stamp to
 self_improve. No migration: columns `users.mr_rework_enabled` (00165),
 `runs.mr_rework_enabled` and `run_schedules.mr_rework_enabled` (00179) exist (verified in
 the migration files) and `store.models.go` already carries the `MrReworkEnabled pgtype.Bool`
