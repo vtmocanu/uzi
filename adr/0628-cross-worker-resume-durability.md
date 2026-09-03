@@ -228,6 +228,78 @@ own checkpoint advanced still adopts, because its persisted tip moved with it (P
 persists on every publish, not just the first). An old worker ignores the new claim field
 and keeps today's (pre-#1042) adoption behavior until its image rolls.
 
+## Amendment — issue #1059 (M1 of PRD #1062): owner anchor over ALL checkpoint adoption (2026-09-03)
+
+The #1042 amendment above owner-anchored **only** the resume-adopt leg (Path A). #1059 M1
+extends the **same** owner anchor to **every** checkpoint adoption on the not-ownedHere
+path, via a single hoisted predicate. The gap #1042 left open: the strict-descendant leg
+(Path B) previously adopted **any** mirrored checkpoint strictly descending the floor — and
+set a diverged one aside (→ the #759 leg-#4 cherry-pick) — with **no** owner check. So when a
+prior run's terminal CAS-delete had failed and left its checkpoint ref on the branch, a
+fresh cross-worker run could seed off, or cherry-pick from, a **prior/foreign** run's
+checkpoint (possibly plan-rejected work) — re-opening the wrong-work class #1030/#1042 exist
+to close.
+
+**The unified predicate (verified in `agent/src/git.ts` `runnerCloneForBranch`, the
+not-ownedHere `else` block).** `ownerMatch` is now computed **once**, above the leg split:
+`expectedCheckpointTip` (threaded from `claim.checkpoint_tip`, the tip THIS run last
+published to its own per-branch checkpoint ref) is a **non-empty string AND `===
+checkpointSha`** (the mirrored checkpoint's rev-parsed SHA). The whole `if (checkpointExists)`
+block is gated on it:
+
+- **`checkpointExists && ownerMatch`** splits exactly as before, now under one owner gate:
+  - **Path A** (`resume && !originExists`) — the unchanged #1030 M3 resume-adopt: disjoint-history
+    guard only (`checkpointExists` already encodes `sharesHistory` with default), no ancestry
+    test, adopt (`seededFrom = "checkpoint"`).
+  - **Path B** (else) — the strict-descendant test: adopt on **strict** descent
+    (`isAncestor(floor, checkpoint)` AND `checkpointSha !== floorSha`); on **divergence** set
+    `checkpointSetAside = true` (drives the #759 leg-#4 cherry-pick); on **equality** fall through
+    to the floor, `checkpointSetAside` staying false.
+- **`!ownerMatch`** (a foreign/prior checkpoint, or a fresh run's NULL/empty tip) — **never
+  adopt and never set `checkpointSetAside`.** That flag drives the #759 cherry-pick, which
+  would re-import the very foreign work the anchor keeps out, so leaving it false is
+  load-bearing, not incidental. Seed off the origin/default floor and log a single LOUD
+  structured warn (this folds the two prior warns — the #1042 resume-mismatch warn and the
+  implicit fresh-adopt path — into one).
+
+**Production reachability of the #759 leg-#4 cherry-pick, now that Path B is owner-gated**
+(a precision the PRD's SC framing left implicit). `checkpointSetAside = true` is now reachable
+only via `ownerMatch && originExists && diverged`. Two eliminations: a **fresh** run has a
+NULL tip ⟹ `!ownerMatch`, so `!resume && ownerMatch` does not occur in production (a run that
+never resumed never persisted a tip); and `!originExists && resume && ownerMatch` routes to
+**Path A** (adopt), not the diverged arm. So the **classic** unpushed #759 incident (a parked
+run on an unpushed branch) is served by **Path A + the adopt-time `wip(park)` `reset --soft`
+(leg #3)** landing on the marker's parent — **not** by leg-#4. Leg-#4's only production
+trigger is the narrower case: a **resume of a PUSHED branch** whose own `wip(park)` checkpoint
+diverges from `origin/<branch>`. This is not a regression versus pre-#1059 (an unpushed resume
+already took the resume-adopt leg), but it narrows leg-#4's reachable shape, and the M1 tests
+pin it against the pushed-diverged case accordingly.
+
+**The one assumption the reachability reduction rests on** (recorded explicitly, not as
+guaranteed): `ownerMatch ⟹ resume` holds only because the server never persists
+`runs.checkpoint_tip` before a `session_id` is on the run row. The session is set at
+`SetRunning` early in execution; the tip is persisted by `Service.Publish` only on the
+CAS-accepted arm (`SetRunCheckpointTip`, verified `api/internal/workersvc/service.go#Publish`),
+which runs at park/shutdown/mid-run — i.e. after the SDK session exists. This is an **ordering
+invariant of the normal flow, NOT a DB-enforced constraint**. If a future change persisted a
+tip on a session-less row, a `!resume && ownerMatch` state would become reachable and route
+through Path B — worth a one-line guard note for anyone touching `Publish`'s persist ordering.
+
+**Invariant preserved: leg-#3 (`willRecoverMarker`) vs leg-#4 (`checkpointSetAside`) mutual
+exclusivity still holds.** `checkpointSetAside` is set only inside the owner-matched Path-B
+diverged arm, which reassigns neither `baseRef` nor `seededFrom`, so `seededFrom` stays ∈
+{origin, default} — disjoint from the {tracking, checkpoint} that `adoptedMarker` requires. At
+most one of the two recovery legs can fire.
+
+**Scope: agent-side only.** No server/schema/migration change — this reuses #1042's
+`runs.checkpoint_tip` column and the claim-payload threading. No `.github/workflows` touch. An
+old worker keeps pre-#1059 behavior until its image rolls; the anchor is additive-optional, the
+same shape as #1042's adoption half.
+
+**ARCHITECTURE.md:** no new link is warranted — ADR-628 is already linked from ARCHITECTURE.md
+(the Run lifecycle section, alongside the `limit_wait`/affinity and PRD #1030 references), and
+per the existing convention amendments do not each add their own link. Nothing to discharge.
+
 ## Consequences
 
 - **A `limit_wait` park whose original worker survives** now resumes **on that worker** — recovering both session and tree with zero new git machinery — for a park lasting far beyond 2 minutes, because the liveness leg keeps it pinned while the worker heartbeats and is non-draining. This is the common multi-hour-park case.

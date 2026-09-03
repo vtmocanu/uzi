@@ -738,8 +738,11 @@ describe("checkpoint reseed candidate (PRD #122 M8)", () => {
     gitIn(bare, ["update-ref", "-d", "refs/uzi-runner/agent/issue-700"]);
     await git.removeRunnerClone(seed.path);
 
-    // A fresh cross-worker run (different runId, no origin branch) seeds off the checkpoint.
-    const rc = await git.createOrAttachRunnerClone(bare, 700, "run-B");
+    // A cross-worker run (different runId, no origin branch) seeds off the checkpoint. Models
+    // production per issue #1059 M1: resume=true and THIS run's own persisted checkpoint tip
+    // (== the mirrored checkpoint's SHA), so the owner anchor admits the adopt; with no
+    // origin/<branch> this is the Path-A resume-adopt leg.
+    const rc = await git.createOrAttachRunnerClone(bare, 700, "run-B", true /*resume*/, cpSha /*matching own tip*/);
     assert.strictEqual(rc.seededFrom, "checkpoint");
     assert.strictEqual(rc.baseCommit, cpSha, "baseCommit is the checkpoint tip");
     assert.strictEqual(fs.existsSync(path.join(rc.path, "CP.txt")), true, "checkpointed work checked out");
@@ -766,7 +769,11 @@ describe("checkpoint reseed candidate (PRD #122 M8)", () => {
     await git.removeRunnerClone(sib.path);
 
     // Reseed issue-701 as a DIFFERENT run: origin exists and the checkpoint diverged from it.
-    const rc = await git.createOrAttachRunnerClone(bare, 701, "run-2");
+    // issue #1059 M1: adoption/set-aside is owner-gated, so model production by passing
+    // resume=true + THIS run's own persisted checkpoint tip (== cpxSha). ownerMatch holds and,
+    // because origin/<branch> exists, this is the Path-B strict-descendant leg: the checkpoint
+    // diverges from the origin floor → origin wins and the checkpoint is set aside LOUDLY.
+    const rc = await git.createOrAttachRunnerClone(bare, 701, "run-2", true /*resume*/, cpxSha /*matching own tip*/);
     assert.strictEqual(rc.seededFrom, "origin", "origin wins on divergence");
     assert.strictEqual(rc.baseCommit, shaA);
     assert.strictEqual(rc.checkpointSetAside, true, "the diverged checkpoint is flagged, not dropped silently");
@@ -809,6 +816,31 @@ describe("checkpoint reseed candidate (PRD #122 M8)", () => {
     assert.strictEqual(rc.seededFrom, "default", "falls through to the default floor");
     assert.strictEqual(rc.baseCommit, floorSha);
     assert.notStrictEqual(rc.checkpointSetAside, true, "equality is not divergence");
+  });
+
+  it("(f) a FRESH run (no resume, no own-checkpoint tip) does NOT adopt a strictly-descending foreign checkpoint — issue #1059 owner-anchor true-negative", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    // Build a checkpoint that STRICTLY DESCENDS the default floor (as test (a) does), so only
+    // the owner anchor — not the strict-descendant guard — can keep it from being adopted.
+    const seed = await git.createOrAttachRunnerClone(bare, 704, "run-A");
+    const cpSha = commit(seed.path, "CP.txt");
+    await git.fetchAgentBranch(bare, seed.path, "agent/issue-704", "run-A");
+    gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-704", cpSha]);
+    gitIn(bare, ["update-ref", "-d", "refs/uzi-runner/agent/issue-704"]); // a DIFFERENT worker
+    await git.removeRunnerClone(seed.path);
+    const floorSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/HEAD"]);
+    assert.doesNotThrow(
+      () => gitIn(bare, ["merge-base", "--is-ancestor", floorSha, cpSha]),
+      "precondition: the checkpoint strictly descends the floor (old Leg B would have adopted it)",
+    );
+
+    // A genuine FRESH run: resume=false (default), no own-checkpoint tip → ownerMatch false.
+    const rc = await git.createOrAttachRunnerClone(bare, 704, "run-B");
+    assert.strictEqual(rc.seededFrom, "default", "a foreign checkpoint is refused; the fresh run seeds off the floor");
+    assert.strictEqual(rc.baseCommit, floorSha, "the base is the default floor, not the foreign checkpoint");
+    assert.strictEqual(rc.priorCommits, 0, "no foreign committed work re-treaded");
+    assert.notStrictEqual(rc.checkpointSetAside, true, "not set aside either — no #759 cherry-pick of foreign work");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "CP.txt")), false, "the foreign checkpoint's work was NOT adopted");
   });
 });
 
