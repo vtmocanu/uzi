@@ -221,6 +221,8 @@ cat > /tmp/ab.sh <<'SH'
 #!/bin/sh
 export AGENT_BROWSER_EXECUTABLE_PATH="${AGENT_BROWSER_EXECUTABLE_PATH:-/opt/uzi-toolchain/bin/chromium}"
 export AGENT_BROWSER_ARGS="${AGENT_BROWSER_ARGS:---no-sandbox,--disable-dev-shm-usage}"
+export AGENT_BROWSER_IDLE_TIMEOUT_MS="${AGENT_BROWSER_IDLE_TIMEOUT_MS:-60000}"
+export FONTCONFIG_FILE="${FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/ab-$(id -u)/config}"; export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/ab-$(id -u)/cache}"
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
 exec /app/node_modules/agent-browser/bin/agent-browser-linux-musl-x64 "$@"
