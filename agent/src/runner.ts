@@ -7,8 +7,10 @@ import type { GitCache, RunnerClone } from "./git.js";
 import {
   gitBasicCredential,
   isNonFastForwardRejection,
+  isPushProtectionRejection,
   isWorkflowScopeRejection,
 } from "./git.js";
+import type { SecretFinding } from "./secret-scan-guard.js";
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
@@ -117,6 +119,62 @@ export function composeWorkflowScopeReason(paths: string[]): string {
       // Pathological: even one path overflows the budget (a single very long path). Keep a
       // hard-truncated first entry so the fixed suffix — and its doc link — still fits.
       list = paths[0]!.slice(0, Math.max(0, budget - 1)) + "…";
+    }
+  }
+  return prefix + list + suffix;
+}
+
+/**
+ * PRD #974 M2 — compose the actionable, capped `failure_reason` for a GitHub run whose branch
+ * carries a secret GitHub Push Protection (GH013) would reject at push. It NAMES the offending
+ * commit + path(s) (the first finding, plus an "and N more" tail like composeWorkflowScopeReason)
+ * so a human knows exactly what to scrub, says the branch could not be pushed, and points out
+ * that the diff is preserved for a human to scrub-and-land.
+ *
+ * The variable part (the finding list) is truncated to fit MAX_FAILURE_REASON_LEN against the
+ * budget left after the fixed prefix + suffix — the "diff is preserved" pointer in the suffix is
+ * NEVER cut. The truncation math is done BEFORE assembly (mirroring composeWorkflowScopeReason),
+ * not by slicing the whole string at the end. Exported for a direct cap unit test; the caller
+ * still applies `.slice(0, MAX_FAILURE_REASON_LEN)` as a belt-and-braces net.
+ */
+export function composePushSecretBlockedReason(findings: SecretFinding[]): string {
+  const prefix =
+    "This run's branch could not be pushed: it carries a secret GitHub Push Protection blocks " +
+    "(GH013). Offending: ";
+  const suffix =
+    ". The change is otherwise valid; a human can scrub the secret from the commit(s) and land " +
+    "it. Your diff is preserved below.";
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
+  // One human-readable label per finding: `<short-commit> <path> (<rule>)`. The file path (and
+  // rule id) come from gitleaks' report of ATTACKER-authored repo content, so a committed
+  // filename can carry control bytes (ESC, newline) that would forge rows / inject ANSI when this
+  // failure_reason is later rendered in a CLI/TUI terminal. Strip the C0 control range + DEL at
+  // this WRITE site so the stored reason cannot carry them (the render boundary is defense in
+  // depth, not the only guard).
+  // eslint-disable-next-line no-control-regex
+  const stripControl = (s: string): string => s.replace(/[\u0000-\u001f\u007f]/g, "");
+  const labels = findings.map((f) => {
+    const shortCommit = f.commit ? stripControl(f.commit.slice(0, 8)) : "?";
+    const rule = f.ruleId ? ` (${stripControl(f.ruleId)})` : "";
+    return `${shortCommit} ${stripControl(f.file)}:${f.startLine}${rule}`;
+  });
+  let list = labels.join("; ");
+  if (list.length > budget) {
+    // Drop trailing labels (replaced by an "and N more" tail) until the list fits the budget.
+    let shown = labels.length;
+    for (; shown > 0; shown--) {
+      const more = labels.length - shown;
+      const candidate =
+        labels.slice(0, shown).join("; ") + (more > 0 ? `; and ${more} more` : "");
+      if (candidate.length <= budget) {
+        list = candidate;
+        break;
+      }
+    }
+    if (shown === 0) {
+      // Pathological: even one label overflows the budget. Keep a hard-truncated first label so
+      // the fixed suffix (and its "diff is preserved" pointer) still fits.
+      list = (labels[0] ?? "").slice(0, Math.max(0, budget - 1)) + "…";
     }
   }
   return prefix + list + suffix;
@@ -1271,6 +1329,61 @@ export class RunRunner {
       }
     }
 
+    // PRD #974 M2 (load-bearing security): a GitHub run's committed range is scanned for secrets
+    // with the pinned gitleaks (default ruleset, all three silencers GitHub Push Protection
+    // ignores DISABLED — see git.secretScanRange) BEFORE the doomed push, mirroring the #377
+    // workflow-scope guard above. On a TRUSTWORTHY scan with a real finding, fail the run early
+    // and typed with the diff preserved — instead of face-planting into GitHub's opaque GH013
+    // rejection and discarding the committed work. An UNTRUSTWORTHY scan (broken/empty) fails
+    // OPEN: it does NOT block the run, and the GH013 remote backstop at the push below covers a
+    // real secret. GitHub-only: GitLab/Forgejo have no equivalent push-side secret rejection.
+    if (claim.repo.forge_type === "github") {
+      const scanBarePath = barePath;
+      const scan = await this.git.secretScanRange(scanBarePath, trackingRef);
+      if (scan.trusted && scan.findings.length > 0) {
+        const reason = composePushSecretBlockedReason(scan.findings);
+        // Do NOT preserve the diff on a secret block. redactText only scrubs the run's OWN
+        // secrets (forge PAT / Anthropic / join token / gitBasic); a gitleaks finding is by
+        // definition a DIFFERENT secret whose value we do not even have here (the report is
+        // `--redact`'d to file/line/rule only), so a preserved patch would persist the detected
+        // secret into runs.preserved_patch and render it in RunView — the exact leak this feature
+        // exists to prevent. The committed work stays recoverable from the worker branch/PVC, and
+        // the failure_reason names each offending commit+path.
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "branch carries a secret GitHub Push Protection would reject; failing early and preserving the diff",
+          },
+        });
+        runLog.info(
+          "run failed: branch carries a secret GitHub Push Protection would reject (GH013); preserving diff",
+          {
+            run_id: runId,
+            findings: scan.findings.map((f) => ({
+              commit: f.commit,
+              file: f.file,
+              rule: f.ruleId,
+            })),
+          },
+        );
+        await batcher.close();
+        await reportState({
+          status: "failed",
+          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+          fail_origin: "push_secret_blocked",
+          preserved_patch: undefined,
+        });
+        return;
+      }
+      if (!scan.trusted) {
+        runLog.warn(
+          "finalize secret scan: not trustworthy (broken/empty scan); pushing and relying on the GH013 remote backstop",
+          { run_id: runId },
+        );
+      }
+    }
+
     // The single authenticated finalize push (PAT-bearing, worker-owned; the agent never
     // has a credential). Captured once as a closure so the align path (below) and the
     // normal path push through EXACTLY ONE code path — the run must never push twice.
@@ -1293,6 +1406,39 @@ export class RunRunner {
           ),
         { log: runLog },
       );
+
+    // PRD #974 M2 — the GH013 remote backstop. When a finalize push (the normal path OR an
+    // align-path push) is rejected by GitHub Push Protection for a secret the pre-push gitleaks
+    // scan missed (GitHub's pattern set is broader than gitleaks', and the two are not
+    // identical), route it to the SAME typed push_secret_blocked failure instead of losing the
+    // typing to the generic catch (raw message, defaulted fail_origin).
+    // Do NOT preserve the diff: the push carries a secret, and at the backstop there are no
+    // finding spans at all, so a preserved patch would persist the secret into
+    // runs.preserved_patch / RunView — the exact leak this feature prevents. The committed work
+    // stays recoverable from the run's branch/PVC; the fixed capped reason points a human there
+    // (the backstop has no gitleaks findings to name, so it cannot use composePushSecretBlockedReason).
+    const failPushSecretBlocked = async () => {
+      const reason =
+        "the push was rejected by GitHub Push Protection (GH013): it carries a secret. " +
+        "The committed work is on the run's branch — scrub the secret from its history and re-push.";
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "push rejected by GitHub Push Protection (GH013); failing (work is on the run branch — scrub the secret and re-push)",
+        },
+      });
+      runLog.info("run failed: push rejected by GitHub Push Protection (GH013)", {
+        run_id: runId,
+      });
+      await batcher.close();
+      await reportState({
+        status: "failed",
+        failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+        fail_origin: "push_secret_blocked",
+        preserved_patch: undefined,
+      });
+    };
 
     // PRD #456 M1: a GitHub run can be merely BEHIND the default branch on
     // .github/workflows/** (main advanced those files after this run's clone base) WITHOUT
@@ -1437,6 +1583,18 @@ export class RunRunner {
               await fetchAndPush();
               return false;
             } catch (e) {
+              // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
+              // secret the pre-push gitleaks scan missed — route it to the typed
+              // push_secret_blocked preserve-and-fail (diffing the pre-align agent tip) rather
+              // than the base-align-conflict path or the generic catch.
+              if (isPushProtectionRejection(e)) {
+                runLog.info(
+                  "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
+                  { run_id: runId },
+                );
+                await failPushSecretBlocked();
+                return true;
+              }
               const nonFf = isNonFastForwardRejection(e);
               if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
               // Record WHICH cause fired so an operator reading logs can tell the two apart:
@@ -1517,6 +1675,17 @@ export class RunRunner {
                 await fetchAndPush(); // sets alignPushed = true on success
                 overlayHandled = true;
               } catch (e) {
+                // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
+                // secret gitleaks missed — typed preserve-and-fail, not a fall-back to
+                // merge/rebase (which cannot clear a secret) nor the generic catch.
+                if (isPushProtectionRejection(e)) {
+                  runLog.info(
+                    "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
+                    { run_id: runId },
+                  );
+                  await failPushSecretBlocked();
+                  return;
+                }
                 if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
                 // (c) the overlay pushed but was STILL rejected (workflow-scope: the default
                 // moved again during our align; or non-fast-forward: a resumed/rewritten
@@ -1536,6 +1705,17 @@ export class RunRunner {
               try {
                 await fetchAndPush();
               } catch (e) {
+                // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
+                // gitleaks missed — typed preserve-and-fail, not the rebase fallback (which cannot
+                // clear a secret) nor the generic catch.
+                if (isPushProtectionRejection(e)) {
+                  runLog.info(
+                    "finalize base-align: merge push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
+                    { run_id: runId },
+                  );
+                  await failPushSecretBlocked();
+                  return;
+                }
                 if (isNonFastForwardRejection(e)) {
                   // Issue #631: a non-fast-forward rejection (an already-published branch — a resume, or
                   // the self_improve fixed branch — whose merge push cannot fast-forward) can't be cleared
@@ -1611,7 +1791,18 @@ export class RunRunner {
     // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
     // successful align-push and the normal push converge here without ever double-pushing.
     if (!alignPushed) {
-      await pushToOrigin();
+      try {
+        await pushToOrigin();
+      } catch (e) {
+        // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
+        // the pre-push gitleaks scan missed — route it to the typed preserve-and-fail rather than
+        // the generic catch. Any OTHER push error rethrows (unchanged behavior).
+        if (isPushProtectionRejection(e)) {
+          await failPushSecretBlocked();
+          return;
+        }
+        throw e;
+      }
     }
 
     // PRD #400 M2: a no-MR task completes HERE — the branch is pushed, there is
