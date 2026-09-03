@@ -1,0 +1,66 @@
+{
+  "note": "Authored (NOT recorded from the server: the pre-#1079 server output is the bug) for PRD #1079 from result-frames-02854d5e.json with an independent jq reduction on 2026-09-03: one row per (model, lineage_epoch), where lineage_epoch = the number of init frames with a lower seq than the result frame (planning = 1, iterations = 2..4), values = that frame's modelUsage verbatim with tokens floored at 0 and cost_usd quantized to microdollars (round half away from zero), exactly foldRunUsage's numericUSD. totals = SUM over rows per column, which is what run_usage_totals must answer for this run after the fix. Both contract halves (Go foldRunUsage, TS deriveRunUsage) must reproduce these rows and totals from the frames.",
+  "rows": [
+    {
+      "model": "claude-haiku-4-5-20251001",
+      "lineage_epoch": 1,
+      "input_tokens": 10051,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 12,
+      "cost_usd": 0.010111
+    },
+    {
+      "model": "claude-opus-4-8",
+      "lineage_epoch": 1,
+      "input_tokens": 124,
+      "cache_read_tokens": 4064430,
+      "cache_creation_tokens": 392550,
+      "output_tokens": 59190,
+      "cost_usd": 6.321193
+    },
+    {
+      "model": "claude-opus-4-8",
+      "lineage_epoch": 2,
+      "input_tokens": 768,
+      "cache_read_tokens": 54746628,
+      "cache_creation_tokens": 1432835,
+      "output_tokens": 289051,
+      "cost_usd": 44.120109
+    },
+    {
+      "model": "claude-opus-4-8",
+      "lineage_epoch": 3,
+      "input_tokens": 1285,
+      "cache_read_tokens": 96109126,
+      "cache_creation_tokens": 2223283,
+      "output_tokens": 488268,
+      "cost_usd": 75.02907
+    },
+    {
+      "model": "claude-opus-4-8",
+      "lineage_epoch": 4,
+      "input_tokens": 438,
+      "cache_read_tokens": 25620187,
+      "cache_creation_tokens": 1285948,
+      "output_tokens": 158427,
+      "cost_usd": 25.955935
+    },
+    {
+      "model": "claude-sonnet-5",
+      "lineage_epoch": 4,
+      "input_tokens": 119,
+      "cache_read_tokens": 7339802,
+      "cache_creation_tokens": 166096,
+      "output_tokens": 26292,
+      "cost_usd": 2.146358
+    }
+  ],
+  "totals": {
+    "input_tokens": 12785,
+    "cache_read_tokens": 187880173,
+    "cache_creation_tokens": 5500712,
+    "output_tokens": 1021240,
+    "cost_usd": 153.582776
+  }
+}
