@@ -2943,18 +2943,26 @@ export class RunRunner {
       },
     };
 
-    const result = await executor.run(ctx);
-
-    // PRD #1064 M1: drain the per-run running-report chain before this phase returns, so any
-    // still-in-flight immediate `reportProgress` push reaches the api BEFORE phasePublish
-    // sends the terminal report. A final SDK frame can carry both `report_progress` and
-    // `signal_done`: the scan loop fires reportProgress FIRE-AND-FORGET (not awaited by the
-    // executor), so without this drain the terminal `completed` can land first and the queued
-    // `running` push then no-ops against the finished run (SetRunRunning's WHERE guard),
-    // losing a milestone completion reported only via report_progress. The chain never rejects
-    // (each link is isolated) and each `reportState` has bounded retries, so this await is
-    // bounded and cannot reject — it only enforces the ordering D1 already promises.
-    await runningReportChain;
+    // PRD #1064 M1: drain the per-run running-report chain before this phase yields control,
+    // so any still-in-flight immediate `reportProgress` push reaches the api BEFORE the
+    // terminal report. A final SDK frame can carry both `report_progress` and `signal_done`:
+    // the scan loop fires reportProgress FIRE-AND-FORGET (not awaited by the executor), so
+    // without this drain the terminal report can land first and the queued `running` push then
+    // no-ops against the finished run (SetRunRunning's WHERE guard), losing a milestone
+    // completion reported only via report_progress. The chain never rejects (each link is
+    // isolated) and each `reportState` has bounded retries, so this await is bounded and cannot
+    // reject — it only enforces the ordering D1 already promises.
+    //
+    // It runs in a `finally` so BOTH terminal paths are covered: on success phasePublish sends
+    // `completed` next; on a reject the catch in execute() sends `failed` (or takes the
+    // park/requeue branch). Draining on the reject path keeps a late push from no-oping against
+    // that terminal report too — the original success-only drain left this leg exposed.
+    let result: ExecutorResult;
+    try {
+      result = await executor.run(ctx);
+    } finally {
+      await runningReportChain;
+    }
 
     // Reap any agent-backgrounded subprocess BEFORE the PAT touches a git child
     // env — otherwise a survivor could read the PAT from that child's

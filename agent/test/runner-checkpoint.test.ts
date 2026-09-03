@@ -352,6 +352,70 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
     );
   });
 
+  it("drains the per-run chain when executor.run REJECTS, so a final-frame reportProgress push is not lost against the terminal failed report (PRD #1064 M1, CodeRabbit)", async () => {
+    // The reject-path twin of the test above: the success-only drain left the throw leg
+    // exposed. When executor.run rejects, the catch in execute() reports `failed`; a queued
+    // fire-and-forget reportProgress push must still reach the api first, or it no-ops against
+    // the finished run. The drain lives in a `finally`, so it covers this path too. Same
+    // deterministic gate: the m2 push blocks on `failedSeen` (resolved by the terminal `failed`
+    // report), raced against a self-release timeout so the fixed path cannot deadlock.
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(93);
+    let releaseFailedSeen!: () => void;
+    const failedSeen = new Promise<void>((r) => {
+      releaseFailedSeen = r;
+    });
+    const origReportState = client.reportState.bind(client);
+    (client as unknown as { reportState: unknown }).reportState = async (...args: unknown[]) => {
+      const body = args[1] as {
+        status?: string;
+        iteration_count?: number;
+        milestones_completed?: unknown;
+      };
+      const isM2Push =
+        body?.status === "running" &&
+        !("iteration_count" in body) &&
+        Array.isArray(body.milestones_completed) &&
+        (body.milestones_completed as string[]).includes("m2");
+      if (isM2Push) {
+        await Promise.race([failedSeen, new Promise((r) => setTimeout(r, 1000))]);
+      }
+      const out = await (origReportState as (...a: unknown[]) => Promise<unknown>)(...args);
+      if (body?.status === "failed") releaseFailedSeen();
+      return out;
+    };
+    try {
+      const exec: Executor = {
+        run: async (ctx) => {
+          // Report a milestone completion as a fire-and-forget push, then FAIL the run before
+          // any turn-boundary report carries it — the reject-path shape of the loss.
+          await ctx.reportProgress!({ completed: ["m2"], in_progress: [] });
+          throw new Error("boom after reporting m2 complete");
+        },
+        killAgentTree: () => {},
+      };
+      // execute() swallows the failure into a `failed` report; it must not throw out.
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      (client as unknown as { reportState: unknown }).reportState = origReportState;
+    }
+    const bodies = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    const pushIdx = bodies.findIndex(
+      (b) =>
+        b.status === "running" &&
+        !("iteration_count" in b) &&
+        Array.isArray(b.milestones_completed) &&
+        b.milestones_completed.includes("m2"),
+    );
+    const failedIdx = bodies.findIndex((b) => b.status === "failed");
+    assert.ok(pushIdx >= 0, "the m2-completed push reached the api");
+    assert.ok(failedIdx >= 0, "the run reported failed");
+    assert.ok(
+      pushIdx < failedIdx,
+      "the fire-and-forget m2 push landed BEFORE the terminal failed report (the finally drain covers the reject path)",
+    );
+  });
+
   it("reap:true brokers the checkpoint pack to origin, strictly AFTER the reap and fetch-back (PRD #122 M8)", async () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(64);
