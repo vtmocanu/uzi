@@ -244,6 +244,17 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       assert.match(text, /--headless\b/, `${name}/Dockerfile build guard must launch Chromium headless (M3)`);
       assert.match(text, /--dump-dom/, `${name}/Dockerfile build guard must actually launch Chromium (--dump-dom), not a bare --version`);
 
+      // Issue #1082: the shim must ALSO be run behind a fake glibc `ldd` first on PATH — the
+      // condition a provisioned nix glibc.bin creates at run time, which the plain image PATH
+      // (musl `ldd`) can never reproduce and which made the npm launcher spawn the glibc binary —
+      // and one `open about:blank` must go THROUGH the shim (CLI→daemon→Chromium end to end).
+      assert.match(text, /ldd \(GNU libc\)/, `${name}/Dockerfile build guard must run agent-browser behind a fake glibc ldd on PATH (issue #1082)`);
+      assert.match(
+        text,
+        /timeout \d+ agent-browser --session \S+ open about:blank/,
+        `${name}/Dockerfile build guard must open about:blank THROUGH the shim, exit-bounded (issue #1082)`,
+      );
+
       // BUG 1 (issue #114): the build guard launches chromium AS ROOT, which creates its
       // bundled `libexec/chromium/extensions` dir root:root 0700 inside the read-only nix
       // store — AFTER `chown -R worker:runner /nix` — and the non-root (uid 10001) seed-nix

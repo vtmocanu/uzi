@@ -269,14 +269,35 @@ COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
 # --version). CAVEAT: this runs in the BUILDER (root, no cap_drop, builder /dev), so it
 # validates the binary + shared libs, NOT the runtime hardening posture — only M7 does that.
 # MIRRORED in jvm.
+#
+# Issue #1082 adds two steps. (a) The `--version` step is REPEATED behind a fake glibc `ldd`
+# first on PATH: that is exactly what a run sees when its repo devbox.json provisions a nix
+# package dragging glibc.bin ahead of /usr/bin (uzi's own `ruby@4.0.6` does), and it made the
+# npm JS launcher's PATH-based isMusl() spawn the glibc binary on this musl image. The shim now
+# picks the native binary by the loader on disk; this step reddens the build if that pick ever
+# becomes PATH-dependent again. The plain image PATH can NOT catch it — its `ldd` IS musl's,
+# which is why this guard stayed green while runs were broken. (b) One headless
+# `open about:blank` THROUGH the shim, then `close`: the CLI→daemon→Chromium path end to end,
+# not only the CLI (`--version`) and Chromium (`--dump-dom`) separately. Session-scoped so the
+# close is exact. The uid-0 XDG state the shim creates and the daemon's state dir are removed
+# so nothing root-owned is baked: measured on node:24-alpine (agent-browser 0.35.1), `close`
+# leaves `$HOME/.agent-browser/<session>.sock` behind, and HOME here is /home/worker — a
+# root-owned `.agent-browser` there would block the runtime uid's daemon from creating its
+# socket, i.e. the guard would bake the very failure it exists to catch.
 RUN command -v agent-browser \
     && command -v chromium \
     && [ -x /app/node_modules/.bin/agent-browser ] \
     && timeout 30 agent-browser --version >/dev/null \
+    && mkdir -p /tmp/uzi-ab-fake-glibc \
+    && printf '#!/bin/sh\necho "ldd (GNU libc) 2.42"\n' > /tmp/uzi-ab-fake-glibc/ldd \
+    && chmod 0755 /tmp/uzi-ab-fake-glibc/ldd \
+    && PATH="/tmp/uzi-ab-fake-glibc:$PATH" timeout 30 agent-browser --version >/dev/null \
     && timeout 90 "$AGENT_BROWSER_EXECUTABLE_PATH" \
         --headless --no-sandbox --disable-dev-shm-usage \
         --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
-    && rm -rf /tmp/uzi-chromium-buildcheck
+    && timeout 90 agent-browser --session uzi-buildcheck open about:blank >/dev/null \
+    && timeout 30 agent-browser --session uzi-buildcheck close >/dev/null \
+    && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-agent-browser-0 "$HOME/.agent-browser"
 
 # BUG 1 (issue #114) store-perm normalization — MUST run AFTER the build guard above, not
 # after the earlier `chown -R worker:runner /nix`. Root cause: the guard's `--dump-dom`

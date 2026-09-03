@@ -63,8 +63,9 @@
 #  deliberately-minimal agent env, and needs no change to sdk-env.ts.
 set -eu
 
-# The baked real CLI. AGENT_BROWSER_SHIM_TARGET is set ONLY by this shim's own unit test;
-# production images never set it, so the target is fixed to the npm bin.
+# The baked npm JS launcher — since issue #1082 the FALLBACK exec target, behind the direct
+# native-binary pick below. AGENT_BROWSER_SHIM_TARGET is set ONLY by this shim's own unit
+# test; production images never set it, so the target is fixed to the npm bin.
 REAL="${AGENT_BROWSER_SHIM_TARGET:-/app/node_modules/.bin/agent-browser}"
 
 # M4 launch config as defaults (image constants; a raw /nix/store path would roll per
@@ -118,7 +119,40 @@ browser_reachable() {
   return 1
 }
 
+# Issue #1082 — pick the NATIVE binary here, by a filesystem libc probe, instead of letting
+# the npm JS launcher ($REAL) pick it. The launcher's isMusl() runs `ldd --version` off the
+# PATH and treats any answer without "musl" as glibc (its existsSync fallback is dead code:
+# the `|| true` in that execSync means it never throws). On the image PATH `ldd` is musl's
+# and the build guard passes; but a run whose repo devbox.json provisions a nix package
+# dragging glibc.bin (uzi's own `ruby@4.0.6` does — glibc-2.42-bin in the worker's store)
+# gets that glibc `ldd` FIRST on the agent PATH, `ldd --version` answers `ldd (GNU libc)`,
+# and the launcher spawns agent-browser-linux-x64, which cannot run on musl (ENOENT on
+# /lib64/ld-linux-x86-64.so.2). Measured on run 02854d5e (2026-09-03): web-ux burned ~15
+# tool calls discovering this. The dynamic loader that EXISTS on the filesystem is the
+# ground truth the PATH cannot shadow, and it is the same probe the launcher meant to use.
+# Preferring musl when its loader is present is safe on any host: the musl build is
+# statically linked, so it runs on a glibc system too. If no known loader resolves, or the
+# selected native file is absent (a laptop, or an odd arch), fall through to the launcher
+# exactly as before. The two SHIM_* vars are seams set ONLY by the unit test.
+NATIVE_DIR="${AGENT_BROWSER_SHIM_NATIVE_DIR:-/app/node_modules/agent-browser/bin}"
+SYSROOT="${AGENT_BROWSER_SHIM_SYSROOT:-}"
+native_binary() {
+  if [ -e "$SYSROOT/lib/ld-musl-x86_64.so.1" ]; then
+    echo agent-browser-linux-musl-x64
+  elif [ -e "$SYSROOT/lib/ld-musl-aarch64.so.1" ]; then
+    echo agent-browser-linux-musl-arm64
+  elif [ -e "$SYSROOT/lib64/ld-linux-x86-64.so.2" ]; then
+    echo agent-browser-linux-x64
+  elif [ -e "$SYSROOT/lib/ld-linux-aarch64.so.1" ]; then
+    echo agent-browser-linux-arm64
+  fi
+}
+
 if browser_reachable "$@"; then
+  nb="$(native_binary)"
+  if [ -n "$nb" ] && [ -f "$NATIVE_DIR/$nb" ] && [ -x "$NATIVE_DIR/$nb" ]; then
+    exec "$NATIVE_DIR/$nb" "$@"
+  fi
   if [ -x "$REAL" ]; then
     exec "$REAL" "$@"
   fi
