@@ -1052,6 +1052,27 @@ describe("Schedules — pause all (PRD #1093)", () => {
     expect(screen.queryByText(/All schedules paused/)).toBeNull();
   });
 
+  it("a failed Resume re-reads the pause state, so an expiry read discarded by the mutation is replaced (auto-resume still lands)", async () => {
+    // The expiry re-read is in flight (pending) when the user resumes; the mutation bump
+    // discards it, then the DELETE fails. Without a fresh read nothing would ever clear
+    // the banner even though the server has auto-resumed; the catch path must re-read.
+    const soon = new Date(Date.now() + 60).toISOString();
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockReturnValueOnce(new Promise<{ paused: boolean; until: string | null }>(() => {}))
+      .mockResolvedValue({ paused: false, until: null });
+    mockApi.deleteSchedulePause.mockRejectedValue(new Error("network down"));
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resume now" })).toBeTruthy());
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+    await waitFor(() => expect(screen.getByText(/Could not resume your schedules/)).toBeTruthy());
+    // The failure triggered a fresh read (third call), whose normalized answer clears the banner.
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy());
+    expect(screen.queryByText(/All schedules paused/)).toBeNull();
+  });
+
   it("Resume now triggers deleteSchedulePause", async () => {
     const future = new Date(Date.now() + 6 * 3_600_000).toISOString();
     mockApi.getSchedulePause.mockResolvedValue({ paused: true, until: future });

@@ -310,6 +310,24 @@ export function Schedules() {
     }
   };
 
+  // After a FAILED mutation the page holds its pre-mutation state, but the mutation's
+  // revision bump discarded any expiry re-read that was in flight, and nothing else
+  // would schedule another one. Re-read the server state now (revision-guarded); on a
+  // failed re-read, bump the attempt counter so the expiry effect re-arms its retry.
+  const revalidatePause = () => {
+    const rev = pauseRev.current;
+    api
+      .getSchedulePause()
+      .then((next) => {
+        if (rev !== pauseRev.current) return;
+        setPauseRefreshAttempt(0);
+        setPause(next);
+      })
+      .catch(() => {
+        if (rev === pauseRev.current) setPauseRefreshAttempt((n) => n + 1);
+      });
+  };
+
   // Pause every schedule until `until` (RFC3339, or null for indefinite). PUT then adopt
   // the returned normalized state and close the picker.
   const submitPause = async (until: string | null) => {
@@ -323,6 +341,7 @@ export function Schedules() {
       setPickerOpen(false);
     } catch (err) {
       setError(errorMessage(err, "Could not pause your schedules"));
+      revalidatePause();
     } finally {
       setPauseBusy(false);
     }
@@ -341,6 +360,7 @@ export function Schedules() {
       setPickerOpen(false);
     } catch (err) {
       setError(errorMessage(err, "Could not resume your schedules"));
+      revalidatePause();
     } finally {
       setPauseBusy(false);
     }
