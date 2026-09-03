@@ -16,7 +16,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -178,6 +180,12 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 // no migration; the value is the coalescing key alongside (user_id, run_id).
 const KindIncidentalFinding = "incidental_finding"
 
+// KindEarlyLimitReset is the notifications.kind for a LOUD alert that the Anthropic
+// 7-day rate limit reset EARLIER than its expected window (PRD #1020 M3). kind is a
+// generic text column with no CHECK, so this needs no migration. The web renderer
+// (M5) keys off this kind and reads the payload's title.
+const KindEarlyLimitReset = "early_limit_reset"
+
 // maxCoalescedFindingIDs caps the finding_ids the coalesced payload accumulates so a
 // noisy run cannot grow one inbox row's jsonb without bound. The count keeps climbing past
 // the cap (it is the badge/headline number); only the id list stops appending. The per-run
@@ -273,4 +281,55 @@ func (s *Service) NotifyIncidentalFinding(ctx context.Context, in IncidentalFind
 		})
 		return uerr
 	}
+}
+
+// EarlyResetPayload is the jsonb the inbox renders for an early_limit_reset notification
+// (PRD #1020 M3). title is the fixed headline the web renderer (M5) shows; expected/observed
+// are RFC3339 timestamps for the reset window we projected vs. the one we saw; hours_early is
+// the whole-hour display figure. Every field is server-derived from trusted time.Time values —
+// no untrusted text rides in here.
+type EarlyResetPayload struct {
+	Title      string `json:"title"`
+	Expected   string `json:"expected"`
+	Observed   string `json:"observed"`
+	HoursEarly int    `json:"hours_early"`
+}
+
+// NotifyEarlyReset fires a LOUD Slack DM (and the durable inbox row) when the Anthropic
+// 7-day rate limit reset EARLIER than expected (PRD #1020 M3). It builds a distinctive
+// SlackRender — the "loud" alert is produced entirely here, since slacksvc flattens every
+// notification through one generic render with no per-kind dispatch — and delivers it via
+// the existing persist-first Notify seam (persist row, prune, best-effort Slack).
+//
+// The two Facts carrying timestamps use Slack's <!date^unix^{time}|utc-fallback> markup so
+// they render in the READER's timezone with a UTC fallback; Facts pass through ScrubSecrets
+// but NOT mrkdwn-escaping in slacksvc, so the markup survives. Both times are built from
+// trusted numeric time.Time values, so no field can carry a <@…> mention.
+//
+// Wording is "observed": the reset is seen on the next poll tick, so this understates true
+// earliness by up to one poll interval — it does not claim an exact reset instant.
+func (s *Service) NotifyEarlyReset(ctx context.Context, userID uuid.UUID, expected, observed time.Time) (store.Notification, error) {
+	hoursEarly := expected.Sub(observed)
+	hoursEarlyInt := int(hoursEarly.Round(time.Hour).Hours())
+
+	return s.Notify(ctx, Notification{
+		UserID: userID,
+		Kind:   KindEarlyLimitReset,
+		Payload: EarlyResetPayload{
+			Title:      "7-day rate limit reset early",
+			Expected:   expected.Format(time.RFC3339),
+			Observed:   observed.Format(time.RFC3339),
+			HoursEarly: hoursEarlyInt,
+		},
+		Slack: &SlackRender{
+			Emoji: "🚨",
+			Title: "7-DAY RATE LIMIT RESET EARLY",
+			Body:  "Parked runs can resume now.",
+			Facts: []string{
+				fmt.Sprintf("reset ~%dh early", hoursEarlyInt),
+				fmt.Sprintf("observed <!date^%d^{time}|%s>", observed.Unix(), observed.UTC().Format("15:04 MST")),
+				fmt.Sprintf("expected <!date^%d^{time}|%s>", expected.Unix(), expected.UTC().Format("15:04 MST")),
+			},
+		},
+	})
 }

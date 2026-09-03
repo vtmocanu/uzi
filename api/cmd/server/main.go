@@ -782,6 +782,7 @@ func run() error {
 	if cfg.UsagePollInterval > 0 {
 		anthropicClient := anthropic.New(&http.Client{Timeout: cfg.AnthropicHTTPTimeout})
 		usageEngine = usagepoller.New(q, secretopen.NewOpener(q, vlt, box), anthropicClient, cfg.UsagePollInterval, cfg.UsageProbe, slog.Default())
+		usageEngine.SetNotifier(notifier) // PRD #1020 M2: deliver the loud early-reset DM
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()

@@ -41,6 +41,10 @@ export interface User {
    *  creation and overridable on the run view — so the two disagreeing is the normal
    *  state of a user who overrode one run, not a sync bug to fix. */
   wait_on_limit: boolean;
+  /** PRD #1020: this user's opt-in to an alert when the poller observes their
+   *  Anthropic usage window has reset earlier than its previously reported reset
+   *  time. Default true; toggled from their own Settings. */
+  notify_early_limit_reset: boolean;
   // Which Anthropic credential this user's RETROSPECTIVES spend (PRD #104 M4),
   // independent of what their runs spend — the point of the feature. Both null ⇒
   // unbound ⇒ their default token. The label, never the value.

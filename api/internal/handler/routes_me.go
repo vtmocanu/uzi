@@ -138,6 +138,11 @@ func (h *Handler) mountMeRoutes(r chi.Router) {
 		// to uzi holding an issue lock and a worker's disk for up to RUN_LIMIT_MAX_PARK
 		// on the caller's behalf, which a stolen CLI token must not be able to switch on.
 		r.Put("/me/wait-on-limit", h.SetUserWaitOnLimit)
+		// Current-user early-limit-reset notification opt-in (PRD #1020): per-user
+		// consent to be alerted when the poller observes the caller's Anthropic usage
+		// window reset earlier than previously reported. Cookie-only with its
+		// neighbours here; the identity is the session user, never the body.
+		r.Put("/me/notify-early-reset", h.SetUserNotifyEarlyReset)
 	})
 
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d

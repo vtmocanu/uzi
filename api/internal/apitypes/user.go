@@ -22,6 +22,10 @@ type UserDTO struct {
 	// otherwise) exactly as they are. A client rendering this as "runs will wait"
 	// should say "new runs", or it will misdescribe the switch.
 	WaitOnLimit bool `json:"wait_on_limit"`
+	// NotifyEarlyLimitReset is the user's per-user opt-in to an alert when the poller
+	// observes their Anthropic usage window has reset earlier than its previously
+	// reported reset time (PRD #1020). Default true; toggled from their own Settings.
+	NotifyEarlyLimitReset bool `json:"notify_early_limit_reset"`
 	// JudgeEnabled is the user's per-user opt-in to run retrospectives (PRD #46
 	// Decision 7). Default false; the user toggles their own from Settings, and an
 	// admin can force-toggle any user's from the admin users surface.

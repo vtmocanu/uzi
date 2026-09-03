@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -223,5 +226,100 @@ func TestNotifyPruneUsesConfiguredCap(t *testing.T) {
 	}
 	if fs2.pruned.Keep != DefaultUserCap {
 		t.Fatalf("prune keep = %d, want DefaultUserCap %d", fs2.pruned.Keep, DefaultUserCap)
+	}
+}
+
+func TestNotifyEarlyResetBuildsLoudSlackDM(t *testing.T) {
+	fs := &fakeStore{}
+	slk := &fakeSlacker{order: &fs.order}
+	svc := New(fs, slk, 0, nil)
+
+	user := uuid.New()
+	// expected 5h after observed ⇒ a 5-hour-early reset.
+	observed := time.Date(2026, 9, 2, 8, 0, 0, 0, time.UTC)
+	expected := observed.Add(5 * time.Hour)
+
+	if _, err := svc.NotifyEarlyReset(context.Background(), user, expected, observed); err != nil {
+		t.Fatalf("NotifyEarlyReset: %v", err)
+	}
+
+	// The durable inbox row is written (persist-first) with the new kind.
+	if !fs.insertCalled {
+		t.Fatalf("early-reset notification must persist a durable inbox row")
+	}
+	if fs.inserted.UserID != user || fs.inserted.Kind != KindEarlyLimitReset {
+		t.Fatalf("inserted = user=%s kind=%q, want user=%s kind=%s", fs.inserted.UserID, fs.inserted.Kind, user, KindEarlyLimitReset)
+	}
+	var payload EarlyResetPayload
+	if err := json.Unmarshal(fs.inserted.Payload, &payload); err != nil {
+		t.Fatalf("payload not valid EarlyResetPayload json: %v (%s)", err, fs.inserted.Payload)
+	}
+	if payload.Title == "" {
+		t.Fatalf("payload title must be set for the M5 web renderer, got %+v", payload)
+	}
+	if payload.HoursEarly != 5 {
+		t.Fatalf("payload hours_early = %d, want 5", payload.HoursEarly)
+	}
+	if payload.Expected != expected.Format(time.RFC3339) || payload.Observed != observed.Format(time.RFC3339) {
+		t.Fatalf("payload timestamps = %+v, want RFC3339 expected/observed", payload)
+	}
+
+	// The LOUD Slack render is captured.
+	if slk.calls != 1 {
+		t.Fatalf("slack call = %d, want exactly one loud DM", slk.calls)
+	}
+	r := slk.lastRender
+	if r.Emoji != "🚨" {
+		t.Fatalf("slack emoji = %q, want the 🚨 alarm glyph", r.Emoji)
+	}
+	if len(r.Facts) != 3 {
+		t.Fatalf("slack facts = %v, want three (hours-early, observed, expected)", r.Facts)
+	}
+	// The hours-early figure rides the first fact.
+	if r.Facts[0] != "reset ~5h early" {
+		t.Fatalf("facts[0] = %q, want the 5h-early figure", r.Facts[0])
+	}
+	// Both timestamps carry the reader-timezone <!date^unix^{time}|utc-fallback> markup.
+	wantObserved := fmt.Sprintf("<!date^%d^{time}|%s>", observed.Unix(), observed.UTC().Format("15:04 MST"))
+	wantExpected := fmt.Sprintf("<!date^%d^{time}|%s>", expected.Unix(), expected.UTC().Format("15:04 MST"))
+	if !strings.Contains(r.Facts[1], wantObserved) {
+		t.Fatalf("facts[1] = %q, want observed date markup %q", r.Facts[1], wantObserved)
+	}
+	if !strings.Contains(r.Facts[2], wantExpected) {
+		t.Fatalf("facts[2] = %q, want expected date markup %q", r.Facts[2], wantExpected)
+	}
+
+	// Defensive mention-inertness: no field of the built render carries a raw <@ mention
+	// sequence. The safety is not runtime escaping (notificationBlocks does NOT escape
+	// Facts) — it is that every fact is built from trusted numeric time.Time unix stamps
+	// and formatted times, which cannot contain <@…>.
+	for _, field := range append([]string{r.Title, r.Body, r.Link, r.Emoji}, r.Facts...) {
+		if strings.Contains(field, "<@") {
+			t.Fatalf("render field %q contains a raw <@ mention sequence", field)
+		}
+	}
+}
+
+func TestNotifyEarlyResetRoundsHoursEarly(t *testing.T) {
+	fs := &fakeStore{}
+	slk := &fakeSlacker{order: &fs.order}
+	svc := New(fs, slk, 0, nil)
+
+	// 2h50m early rounds to a whole 3h for display.
+	observed := time.Date(2026, 9, 2, 8, 0, 0, 0, time.UTC)
+	expected := observed.Add(2*time.Hour + 50*time.Minute)
+
+	if _, err := svc.NotifyEarlyReset(context.Background(), uuid.New(), expected, observed); err != nil {
+		t.Fatalf("NotifyEarlyReset: %v", err)
+	}
+	var payload EarlyResetPayload
+	if err := json.Unmarshal(fs.inserted.Payload, &payload); err != nil {
+		t.Fatalf("payload not valid json: %v", err)
+	}
+	if payload.HoursEarly != 3 {
+		t.Fatalf("hours_early = %d, want 3 (2h50m rounded to whole hours)", payload.HoursEarly)
+	}
+	if slk.lastRender.Facts[0] != "reset ~3h early" {
+		t.Fatalf("facts[0] = %q, want the rounded 3h figure", slk.lastRender.Facts[0])
 	}
 }

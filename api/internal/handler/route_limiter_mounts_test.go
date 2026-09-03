@@ -558,6 +558,12 @@ var wantRouteMounts = []routeMount{
 	// and mints nothing — none of the three things the per-user limiters exist to
 	// bound. Cookie+CSRF already gates it, matching /me/autopilot beside it.
 	{"PUT", "/api/me/wait-on-limit", noLimiter},
+	// PRD #1020: the early-limit-reset alert consent toggle
+	// (SetUserNotifyEarlyReset). Same shape as /me/wait-on-limit above: a single
+	// boolean UPDATE on the caller's own users row. It spends no Anthropic token,
+	// makes no forge call, sends no DM at toggle time, and mints nothing — none of
+	// the three things the per-user limiters exist to bound. Cookie+CSRF gates it.
+	{"PUT", "/api/me/notify-early-reset", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route

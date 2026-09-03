@@ -472,6 +472,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		IsActive:                u.IsActive,
 		AutopilotEnabled:        u.AutopilotEnabled,
 		WaitOnLimit:             u.WaitOnLimit,
+		NotifyEarlyLimitReset:   u.NotifyEarlyLimitReset,
 		JudgeEnabled:            u.JudgeEnabled,
 		CIAutofixEnabled:        u.CiAutofixEnabled,
 		AttributionEnabled:      u.AttributionEnabled,

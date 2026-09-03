@@ -644,6 +644,7 @@ type User struct {
 	DefaultEffort           pgtype.Text        `json:"default_effort"`
 	MrReworkEnabled         pgtype.Bool        `json:"mr_rework_enabled"`
 	AttributionEnabled      bool               `json:"attribution_enabled"`
+	NotifyEarlyLimitReset   bool               `json:"notify_early_limit_reset"`
 }
 
 type UserSecret struct {
