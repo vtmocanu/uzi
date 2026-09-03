@@ -100,6 +100,13 @@ func TestCheckpointBranchContract(t *testing.T) {
 			t.Errorf("checkpointBranch(%q, ...) ok=true (branch %q), want ok=false for an ineligible kind", kind, branch)
 		}
 	}
+
+	// The ELIGIBLE issue kind with a MISSING iid must still be unsupported — the
+	// `if !issueIid.Valid` guard in checkpointBranch. Without this assertion a regressed
+	// guard would hand an iid-less issue run a checkpoint branch (issue #1037 review).
+	if branch, ok := checkpointBranch(runkind.Issue, fixedID, pgtype.Int8{}); ok || branch != "" {
+		t.Errorf("checkpointBranch(issue, missing iid) = (%q, %t), want (\"\", false)", branch, ok)
+	}
 }
 
 func stringSetEqual(a, b map[string]bool) bool {
