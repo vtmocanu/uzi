@@ -713,6 +713,18 @@ Redesigns the shipped `uzi tui` (PRD #112). TUI/CLI-only.
 - Keep the health words visible on the board (not colour-only). [user]
 - The interactive demo is rebuilt on the shipped views (not retired, not a separate prototype). [user, D1]
 
+## Feature #1093 — Pause all schedules
+
+Tracked as GitHub issue vtmocanu/uzi#1093; PRD at `prds/done/1093-pause-all-schedules.md`.
+
+- A user-level switch pauses every schedule the user owns, on every repo, catalog defaults and user-authored alike, with an optional auto-resume instant. [user]
+- An expired auto-resume time resumes on its own, with no background job. [user]
+- While paused: a recurring schedule keeps its cadence and records a "paused" skip, so nothing replays on resume. [user]
+- While paused: a one-time schedule that came due waits and fires once after the pause ends. [user]
+- `Run now` still works while paused; runs already in flight are not stopped. [user]
+- Per-schedule toggles are left untouched, so resuming restores the exact prior set. [user]
+- Reachable from the Schedules page, the CLI (`uzi schedule pause-all --until <when>` / `resume-all` / `pause-status`), and shown in the schedule's last-fire record. [user]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

@@ -113,6 +113,7 @@ var skipReasonLabels = map[string]string{
 	"already_running":       "already running",
 	"description_too_large": "description too large",
 	"fetch_failed":          "fetch failed",
+	"schedules_paused":      "all schedules paused",
 }
 
 // skipReasonLabel renders a skip reason as its human label, falling back to the raw wire

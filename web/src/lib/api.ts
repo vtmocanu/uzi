@@ -81,6 +81,7 @@ import type {
   Schedule,
   ScheduleCatalog,
   ScheduleInput,
+  SchedulePauseDTO,
   SchedulePreviewInput,
   SecretMeta,
   SelfUsage,
@@ -1350,6 +1351,18 @@ const realApi = {
   // scheduler fires on, so the modal always matches server truth (Decision 6).
   previewSchedule: (input: SchedulePreviewInput) =>
     request<{ fires: string[] }>("POST", "/schedules/preview", input),
+
+  // ── Pause all schedules (PRD #1093 D7) — the user-level kill switch ─────────
+  // A singleton resource under the RequireUser schedules group (CLI-reachable). GET
+  // reads the NORMALIZED live state (an expired `until` reads paused:false, until:null);
+  // PUT pauses (body { until } — a null until is indefinite, a past until 422s); DELETE
+  // resumes idempotently. All three return the state. Per-row `enabled` is never touched.
+  getSchedulePause: () =>
+    request<SchedulePauseDTO>("GET", "/schedules/pause"),
+  putSchedulePause: (until: string | null) =>
+    request<SchedulePauseDTO>("PUT", "/schedules/pause", { until }),
+  deleteSchedulePause: () =>
+    request<SchedulePauseDTO>("DELETE", "/schedules/pause"),
 
   // ── Default scheduled jobs (PRD #589) — owner-scoped ───────────────────────
   // The catalog view: the builtin default jobs plus the caller's per-repo

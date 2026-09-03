@@ -33,6 +33,10 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   // issue #856: a prior completed run's MR is still open, so a fresh run is refused. Benign
   // and self-resolving like already_running — the cadence re-fires once the MR merges/closes.
   open_mr_exists: "neutral",
+  // PRD #1093: the owner's user-level "pause all schedules" switch was on when this fire
+  // came due. Benign and self-resolving — the cadence advanced as normal and re-fires on
+  // resume, nothing replays (the explanatory detail-row copy is added in M4).
+  schedules_paused: "neutral",
 };
 
 // LastRunOutcome is the enriched "Last run" cell for a schedule that has a
@@ -115,6 +119,14 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
   const { uziLabel } = useAuth();
   const good = fire.started.length > 0;
   const skippedOnly = fire.started.length === 0 && fire.skips.length > 0;
+  // A pause-all fire (PRD #1093): the owner's user-level switch was on when this fire came
+  // due, so the fire matched but started nothing and its only skip(s) carry the
+  // schedules_paused reason. It gets one explanatory row instead of a per-candidate list —
+  // there is no candidate a run could have started for; the cadence just advanced.
+  const pausedFire =
+    fire.started.length === 0 &&
+    fire.skips.length > 0 &&
+    fire.skips.every((sk) => sk.reason === "schedules_paused");
   // The hint that is the whole point of Goal 2: a capped fire that reached only the
   // oldest candidate(s) and started nothing — raising the cap or labelling the head
   // candidate is the fix. Rendered ONLY under exactly that condition.
@@ -159,7 +171,18 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
         />
       </div>
 
-      {(fire.started.length > 0 || fire.skips.length > 0) && (
+      {pausedFire ? (
+        // The single explanatory row for a paused fire — no candidate list (PRD #1093 §3).
+        <div className="flex items-start gap-2.5 rounded-lg border border-edge bg-raised/50 px-3 py-2.5 text-[12.5px] text-muted">
+          <span aria-hidden="true" className="shrink-0 font-bold text-warn">
+            ⏸
+          </span>
+          <div>
+            <span className="font-semibold text-fg">All your schedules were paused</span> when this
+            fire came due. The cadence advanced as normal; nothing replays on resume.
+          </div>
+        </div>
+      ) : (fire.started.length > 0 || fire.skips.length > 0) && (
         <div className="flex flex-col gap-2">
           {fire.started.map((r) => (
             <div

@@ -1239,7 +1239,8 @@ export type ScheduleSkipReason =
   | "fetch_failed"
   | "vault_locked"
   | "self_improve_mr_cap_reached"
-  | "open_mr_exists";
+  | "open_mr_exists"
+  | "schedules_paused";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {
@@ -1363,6 +1364,16 @@ export interface Schedule {
 
 // A schedule's provenance (PRD #589): owner-authored vs enabled from the catalog.
 export type ScheduleOrigin = "user" | "default";
+
+// SchedulePauseDTO (apitypes.SchedulePauseDTO, PRD #1093 D7): the user-level pause-all
+// state returned by GET/PUT/DELETE /api/schedules/pause. `paused` is the NORMALIZED live
+// decision (an expired `until` reads false). `until` is the auto-resume instant, or null
+// for an indefinite pause ("until I resume") — nullable, NOT optional (the zero-marshal
+// check flags an optional field, since the Go DTO always emits the key).
+export interface SchedulePauseDTO {
+  paused: boolean;
+  until: string | null;
+}
 
 // CatalogEntry is one builtin default scheduled job (apitypes.CatalogEntryDTO, PRD
 // #589): its shipped, read-only shape so the web can render the enable-a-default UI.

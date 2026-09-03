@@ -20,6 +20,14 @@ func (h *Handler) mountSchedulesRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 	r.Route("/schedules", func(r chi.Router) {
 		r.Use(mw.RequireUser(h.q, h.cfg))
 		r.Post("/preview", h.PreviewSchedule)
+		// The user-level pause-all singleton (PRD #1093 D7): a dedicated resource under
+		// this RequireUser group so a uzc_ CLI token reaches it (PUT /me/settings is
+		// cookie-only). Static /pause coexists with /{id} the way /preview does: chi's
+		// radix router prefers a static node over a param node regardless of
+		// registration order, and scheduleParam would reject "pause" as a non-UUID anyway.
+		r.Get("/pause", h.GetSchedulePause)
+		r.Put("/pause", h.PutSchedulePause)
+		r.Delete("/pause", h.DeleteSchedulePause)
 		r.Get("/{id}", h.GetSchedule)
 		r.Patch("/{id}", h.PatchSchedule)
 		r.Delete("/{id}", h.DeleteSchedule)

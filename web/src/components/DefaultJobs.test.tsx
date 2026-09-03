@@ -129,6 +129,7 @@ function renderTab(props: Partial<Parameters<typeof DefaultJobs>[0]> = {}) {
         onClone={noop}
         onRemove={noop}
         onEdit={noop}
+        pauseNote={props.pauseNote ?? null}
         notice=""
         error=""
       />
@@ -405,5 +406,31 @@ describe("DefaultJobs — sweep-warn after enabling", () => {
     act(() => setDemoMode(true));
     expect(await screen.findByText(/exist on demo\/atlas-api/)).toBeTruthy();
     expect(screen.queryByText(/exist on vtmocanu\/atlas-api/)).toBeNull();
+  });
+});
+
+describe("DefaultJobs — pause-all Next-run note (PRD #1093)", () => {
+  it("shows a warn 'paused until' line in the summary Next-run cell while paused", () => {
+    renderTab({ schedules: [defRow({ enabled: true })], pauseNote: "paused until Wed 09:00" });
+    // The green "N repos" pill is still shown; the paused line sits under it.
+    expect(screen.getByText("1 repo")).toBeTruthy();
+    expect(screen.getByText("paused until Wed 09:00")).toBeTruthy();
+  });
+
+  it("shows no paused line when the job is enabled on no repo (nothing would fire)", () => {
+    renderTab({ pauseNote: "paused until Wed 09:00" });
+    expect(screen.getByText("not enabled")).toBeTruthy();
+    expect(screen.queryByText("paused until Wed 09:00")).toBeNull();
+  });
+
+  it("shows no paused line when every enabled row is itself paused (nothing would fire)", () => {
+    renderTab({ schedules: [defRow({ enabled: false })], pauseNote: "paused until Wed 09:00" });
+    expect(screen.getByText("1 repo")).toBeTruthy();
+    expect(screen.queryByText("paused until Wed 09:00")).toBeNull();
+  });
+
+  it("shows no paused line when not paused (control)", () => {
+    renderTab({ schedules: [defRow({ enabled: true })] });
+    expect(screen.queryByText(/paused until/)).toBeNull();
   });
 });

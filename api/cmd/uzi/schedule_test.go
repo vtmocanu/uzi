@@ -572,6 +572,139 @@ func TestSchedulePauseResume(t *testing.T) {
 	}
 }
 
+// TestSchedulePauseAllUntilDuration: pause-all --until 24h resolves client-side and
+// sends a non-nil until ~24h ahead of now.
+func TestSchedulePauseAllUntilDuration(t *testing.T) {
+	until := time.Now().Add(24 * time.Hour)
+	fc := &uzicli.FakeClient{PauseState: apitypes.SchedulePauseDTO{Paused: true, Until: &until}}
+	before := time.Now()
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "pause-all", "--until", "24h")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !fc.LastPauseSet {
+		t.Fatalf("SetSchedulePause was not called")
+	}
+	if fc.LastPauseUntil == nil {
+		t.Fatalf("pause-all --until 24h sent a nil until, want a non-nil absolute instant")
+	}
+	// The resolver added 24h to time.Now() at the call site; allow a small execution window.
+	d := fc.LastPauseUntil.Sub(before)
+	if d < 23*time.Hour+59*time.Minute || d > 24*time.Hour+time.Minute {
+		t.Errorf("until is %v ahead of now, want ~24h", d)
+	}
+	if !strings.Contains(out, "All schedules paused until") {
+		t.Errorf("output missing confirmation line\n%s", out)
+	}
+	// The confirmation names the resume verb (the RUNTIME instruction registered in
+	// instructions_test.go); assert it is emitted so that entry's execution claim holds.
+	if !strings.Contains(out, "resume early with `uzi schedule resume-all`") {
+		t.Errorf("output missing the resume-all remedy\n%s", out)
+	}
+}
+
+// TestSchedulePauseAllRequiresUntil: a bare pause-all with no --until is a usage error
+// (exit 2) and never reaches SetSchedulePause.
+func TestSchedulePauseAllRequiresUntil(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "pause-all")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d; stderr=%q", code, uzicli.ExitUsage, errOut)
+	}
+	if fc.LastPauseSet {
+		t.Errorf("SetSchedulePause should not have been called without --until")
+	}
+}
+
+// TestSchedulePauseAllNever: --until never sends a nil until (indefinite) and renders
+// the indefinite copy.
+func TestSchedulePauseAllNever(t *testing.T) {
+	fc := &uzicli.FakeClient{PauseState: apitypes.SchedulePauseDTO{Paused: true, Until: nil}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "pause-all", "--until", "never")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !fc.LastPauseSet {
+		t.Fatalf("SetSchedulePause was not called")
+	}
+	if fc.LastPauseUntil != nil {
+		t.Errorf("pause-all --until never sent %v, want nil (indefinite)", *fc.LastPauseUntil)
+	}
+	if !strings.Contains(out, "paused indefinitely") {
+		t.Errorf("output missing indefinite copy\n%s", out)
+	}
+}
+
+// TestScheduleResumeAll: resume-all calls ClearSchedulePause and confirms.
+func TestScheduleResumeAll(t *testing.T) {
+	fc := &uzicli.FakeClient{PauseState: apitypes.SchedulePauseDTO{Paused: false}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "resume-all")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !fc.PauseCleared {
+		t.Errorf("resume-all did not reach ClearSchedulePause")
+	}
+	if !strings.Contains(out, "All schedules resumed.") {
+		t.Errorf("output missing resume confirmation\n%s", out)
+	}
+}
+
+// TestSchedulePauseStatusJSON: pause-status --json emits the DTO; the human form renders
+// the three states.
+func TestSchedulePauseStatusJSON(t *testing.T) {
+	until := time.Now().Add(12 * time.Hour)
+	fc := &uzicli.FakeClient{PauseState: apitypes.SchedulePauseDTO{Paused: true, Until: &until}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "pause-status", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var got apitypes.SchedulePauseDTO
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	if !got.Paused || got.Until == nil {
+		t.Errorf("decoded = %+v, want paused with a non-nil until", got)
+	}
+
+	// Human form, not paused.
+	fcNot := &uzicli.FakeClient{PauseState: apitypes.SchedulePauseDTO{Paused: false}}
+	outNot, _, _ := runCLI(t, fakeEnv(fcNot), "schedule", "pause-status")
+	if !strings.Contains(outNot, "not paused") {
+		t.Errorf("not-paused status = %q, want 'not paused'", outNot)
+	}
+}
+
+// TestScheduleListPausedAll: while pause-all is active the NEXT column reads
+// "paused (all) …" for every row; when not paused it shows the normal next fire.
+func TestScheduleListPausedAll(t *testing.T) {
+	next := time.Now().Add(6 * time.Hour)
+	scheds := []apitypes.ScheduleDTO{
+		{ID: "sch_a", Target: "sweep", Labels: []string{"bug"}, RepoPath: "vtmocanu/uzi", Timing: "recurring", CronExpr: "0 9 * * 1", NextFireAt: &next, Enabled: true},
+	}
+	until := time.Now().Add(20 * time.Hour)
+
+	// Paused: NEXT reads "paused (all) …" and NOT the normal "in …" cell.
+	fcPaused := &uzicli.FakeClient{Schedules: scheds, PauseState: apitypes.SchedulePauseDTO{Paused: true, Until: &until}}
+	out, _, code := runCLI(t, fakeEnv(fcPaused), "schedule", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "paused (all)") {
+		t.Errorf("paused list NEXT missing 'paused (all)'\n%s", out)
+	}
+
+	// Not paused: NEXT shows the normal forward-looking next fire.
+	fcOpen := &uzicli.FakeClient{Schedules: scheds, PauseState: apitypes.SchedulePauseDTO{Paused: false}}
+	outOpen, _, _ := runCLI(t, fakeEnv(fcOpen), "schedule", "list")
+	if strings.Contains(outOpen, "paused (all)") {
+		t.Errorf("unpaused list should not show 'paused (all)'\n%s", outOpen)
+	}
+	if !strings.Contains(outOpen, "in ") {
+		t.Errorf("unpaused list NEXT missing the normal next-fire cell\n%s", outOpen)
+	}
+}
+
 // TestScheduleRunNow: prints the created run id(s); --json dumps RunNowResponse.
 func TestScheduleRunNow(t *testing.T) {
 	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{Created: 1, RunIDs: []string{"run_c81a"}}}
@@ -1648,3 +1781,51 @@ func TestScheduleRunNowNoneStarted(t *testing.T) {
 }
 
 func ptrInt64(n int64) *int64 { return &n }
+
+// TestScheduleListPausedAllKeepsDashForRowsThatWouldNotFire: while pause-all is active,
+// a row whose own switch is off (or with no next fire) keeps scheduleNext's "—" instead
+// of "paused (all) …", so the column never claims that resuming would fire it.
+func TestScheduleListPausedAllKeepsDashForRowsThatWouldNotFire(t *testing.T) {
+	next := time.Now().Add(6 * time.Hour)
+	until := time.Now().Add(20 * time.Hour)
+	fc := &uzicli.FakeClient{
+		Schedules: []apitypes.ScheduleDTO{
+			{ID: "sch_off", Target: "sweep", Labels: []string{"bug"}, RepoPath: "vtmocanu/uzi", Timing: "recurring", CronExpr: "0 9 * * 1", NextFireAt: &next, Enabled: false},
+		},
+		PauseState: apitypes.SchedulePauseDTO{Paused: true, Until: &until},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out, "paused (all)") {
+		t.Errorf("a disabled row must keep '—', not 'paused (all)'\n%s", out)
+	}
+	if !strings.Contains(out, "—") {
+		t.Errorf("disabled row NEXT missing '—'\n%s", out)
+	}
+}
+
+// TestScheduleListDegradesWhenPauseReadFails: the pause-all read decorates the list, it
+// does not gate it. When only that read fails (an older server without the route, a
+// transient error), the table still renders from the schedules alone, exit 0, with a
+// WARNING on stderr and the ordinary NEXT cell.
+func TestScheduleListDegradesWhenPauseReadFails(t *testing.T) {
+	next := time.Now().Add(6 * time.Hour)
+	fc := &uzicli.FakeClient{
+		Schedules: []apitypes.ScheduleDTO{
+			{ID: "sch_a", Target: "sweep", Labels: []string{"bug"}, RepoPath: "vtmocanu/uzi", Timing: "recurring", CronExpr: "0 9 * * 1", NextFireAt: &next, Enabled: true},
+		},
+		PauseErr: uzicli.Exitf(uzicli.ExitNotFound, "not found"),
+	}
+	out, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (the list must render without the pause state)", code)
+	}
+	if !strings.Contains(out, "sch_a") || !strings.Contains(out, "in ") {
+		t.Errorf("list must still render the row and its normal NEXT\n%s", out)
+	}
+	if !strings.Contains(errOut, "WARNING") {
+		t.Errorf("stderr = %q, want a WARNING about the pause-all read", errOut)
+	}
+}

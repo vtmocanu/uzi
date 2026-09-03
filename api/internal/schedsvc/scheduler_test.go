@@ -83,6 +83,20 @@ type fakeStore struct {
 	vaultClaimErr       error
 	vaultClearedUsers   []uuid.UUID
 	vaultClearErr       error
+
+	// Pause-all-schedules state (PRD #1093 M1). schedulePause maps a user id to the RAW
+	// row GetUserSchedulePause returns; an unconfigured user resolves per
+	// schedulePauseNoRows: false (the default) returns a not-paused row, true returns
+	// pgx.ErrNoRows so the scheduler's fail-open branch is exercised. getSchedulePauseCalls
+	// counts every call and getSchedulePauseUsers records the user ids, so a test can prove
+	// the per-tick memoization (N due rows of one owner ⇒ exactly one call).
+	schedulePause       map[uuid.UUID]store.GetUserSchedulePauseRow
+	schedulePauseNoRows bool
+	// schedulePauseErr, when set, is returned from GetUserSchedulePause for every user
+	// (a transient DB error), exercising the hold-this-tick branch.
+	schedulePauseErr      error
+	getSchedulePauseCalls int
+	getSchedulePauseUsers []uuid.UUID
 }
 
 func (f *fakeStore) ListUsersNeedingVaultLockNotice(context.Context) ([]store.ListUsersNeedingVaultLockNoticeRow, error) {
@@ -123,6 +137,21 @@ func (f *fakeStore) ClearVaultLockNotice(_ context.Context, userID uuid.UUID) er
 		delete(f.vaultClaimed, userID)
 	}
 	return nil
+}
+
+func (f *fakeStore) GetUserSchedulePause(_ context.Context, userID uuid.UUID) (store.GetUserSchedulePauseRow, error) {
+	f.getSchedulePauseCalls++
+	f.getSchedulePauseUsers = append(f.getSchedulePauseUsers, userID)
+	if f.schedulePauseErr != nil {
+		return store.GetUserSchedulePauseRow{}, f.schedulePauseErr
+	}
+	if row, ok := f.schedulePause[userID]; ok {
+		return row, nil
+	}
+	if f.schedulePauseNoRows {
+		return store.GetUserSchedulePauseRow{}, pgx.ErrNoRows
+	}
+	return store.GetUserSchedulePauseRow{SchedulesPaused: false}, nil
 }
 
 func (f *fakeStore) ClaimDueSchedules(context.Context) ([]store.RunSchedule, error) {
@@ -1075,9 +1104,9 @@ func TestSkipReasonForErr(t *testing.T) {
 	}
 	// AllSkipReasons enumerates the full closed set (PRD #590 M1 added vault_locked;
 	// PRD #686 D10 added self_improve_mr_cap_reached; PRD #764 retired not_eligible;
-	// issue #856 added open_mr_exists).
-	if len(AllSkipReasons) != 7 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 7", len(AllSkipReasons))
+	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused).
+	if len(AllSkipReasons) != 8 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 8", len(AllSkipReasons))
 	}
 }
 
@@ -1712,6 +1741,243 @@ func TestTickBenignSkipPersistsLastFire(t *testing.T) {
 	}
 	if rec.Skips[0].Reason != string(SkipAlreadyRunning) {
 		t.Fatalf("last_fire skip reason = %q, want %q", rec.Skips[0].Reason, SkipAlreadyRunning)
+	}
+}
+
+// ── PRD #1093: pause all schedules ───────────────────────────────────────────
+
+// runsCreated totals every run-creation seam call across all targets, so a "no run was
+// started" assertion cannot be defeated by a fire routing through a different bucket.
+func (h *harness) runsCreated() int {
+	return len(h.runs.autopilot) + len(h.runs.runs) + len(h.runs.prompts) + len(h.runs.selfImprove)
+}
+
+// pauseOwner marks the harness owner's schedules paused (PRD #1093), optionally until an
+// auto-resume instant (nil = indefinite).
+func (h *harness) pauseOwner(until *time.Time) {
+	row := store.GetUserSchedulePauseRow{SchedulesPaused: true}
+	if until != nil {
+		row.SchedulesPausedUntil = pgtype.Timestamptz{Time: *until, Valid: true}
+	}
+	if h.st.schedulePause == nil {
+		h.st.schedulePause = map[uuid.UUID]store.GetUserSchedulePauseRow{}
+	}
+	h.st.schedulePause[h.owner] = row
+}
+
+// TestTickPausedRecurringSkipsAndAdvances pins the recurring-while-paused path (PRD #1093
+// D3): a due recurring row of a paused owner starts NO run, records a benign
+// schedules_paused skip, and advances to a FUTURE cron occurrence so nothing replays on
+// resume. Mutation: delete the pause guard in process → the row fires (a run is created)
+// and the skip is not recorded.
+func TestTickPausedRecurringSkipsAndAdvances(t *testing.T) {
+	h := newHarness()
+	h.pauseOwner(nil) // paused indefinitely
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if h.runsCreated() != 0 {
+		t.Fatalf("paused recurring fire must start NO run, got %d", h.runsCreated())
+	}
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("paused recurring fire must advance exactly once, got %d", len(h.st.advanceCalls))
+	}
+	adv := h.st.advanceCalls[0]
+	if adv.Status != "active" {
+		t.Fatalf("paused recurring advance status = %q, want active", adv.Status)
+	}
+	if !adv.NextFireAt.Valid || !adv.NextFireAt.Time.After(h.now) {
+		t.Fatalf("paused recurring next_fire_at = %+v, want a bumped future instant", adv.NextFireAt)
+	}
+	if adv.LastFire == nil {
+		t.Fatalf("paused recurring fire must persist a last_fire, got nil")
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(adv.LastFire, &rec); err != nil {
+		t.Fatalf("last_fire is not valid JSON: %v (%s)", err, adv.LastFire)
+	}
+	if rec.Matched != 1 || len(rec.Started) != 0 || len(rec.Skips) != 1 {
+		t.Fatalf("last_fire = %+v, want matched:1 started:0 skips:1", rec)
+	}
+	if rec.Skips[0].Reason != string(SkipSchedulesPaused) {
+		t.Fatalf("last_fire skip reason = %q, want %q", rec.Skips[0].Reason, SkipSchedulesPaused)
+	}
+}
+
+// TestTickPausedOnceHeldThenFiresOnResume pins the once-while-paused path (PRD #1093 D3):
+// a due once row of a paused owner is neither advanced nor written (it stays overdue),
+// and no run starts; once the owner is unpaused, the next tick fires it. Mutation: let the
+// once branch advance → the first block's advance-calls assertion fails.
+func TestTickPausedOnceHeldThenFiresOnResume(t *testing.T) {
+	h := newHarness()
+	h.pauseOwner(nil)
+	s := h.issueSchedule()
+	s.Timing = "once"
+	h.st.due = []store.RunSchedule{s}
+
+	h.sched.Boot(context.Background())
+
+	if h.runsCreated() != 0 {
+		t.Fatalf("paused once fire must start NO run, got %d", h.runsCreated())
+	}
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("paused once fire must NOT advance (stays overdue), got %d", len(h.st.advanceCalls))
+	}
+	if len(h.st.statusCalls) != 0 {
+		t.Fatalf("paused once fire must NOT park/park-status, got %d", len(h.st.statusCalls))
+	}
+
+	// Resume: the same overdue once row is re-claimed on the next tick and now fires.
+	h.st.schedulePause[h.owner] = store.GetUserSchedulePauseRow{SchedulesPaused: false}
+	h.sched.Boot(context.Background())
+
+	if h.runsCreated() != 1 {
+		t.Fatalf("after resume the held once row must fire exactly once, got %d", h.runsCreated())
+	}
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("after resume the once row must advance exactly once, got %d", len(h.st.advanceCalls))
+	}
+	if h.st.advanceCalls[0].Status != "fired" {
+		t.Fatalf("resumed once advance status = %q, want fired", h.st.advanceCalls[0].Status)
+	}
+}
+
+// TestTickPausedExpiredUntilFiresNormally pins auto-resume (PRD #1093 D2): a paused switch
+// whose schedules_paused_until is in the past reads as NOT paused, so the row fires
+// normally. Mutation: ignore expiry in pauseCache.paused (drop the .Time.After(now) test)
+// → the row is treated as paused and does not fire.
+func TestTickPausedExpiredUntilFiresNormally(t *testing.T) {
+	h := newHarness()
+	past := h.now.Add(-time.Hour)
+	h.pauseOwner(&past)
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("expired until must fire normally: autopilot calls = %d, want 1", len(h.runs.autopilot))
+	}
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("expired until fire must advance once, got %d", len(h.st.advanceCalls))
+	}
+	// A normal fire records no schedules_paused skip.
+	var rec lastFireRecord
+	if err := json.Unmarshal(h.st.advanceCalls[0].LastFire, &rec); err != nil {
+		t.Fatalf("last_fire is not valid JSON: %v", err)
+	}
+	for _, s := range rec.Skips {
+		if s.Reason == string(SkipSchedulesPaused) {
+			t.Fatalf("expired until must not record a schedules_paused skip, got %+v", rec.Skips)
+		}
+	}
+}
+
+// TestTickUnpausedOwnerFiresNormally pins the negative direction (PRD #1093): an unpaused
+// owner's due row fires normally and records no schedules_paused skip. Mutation: make the
+// resolver always report paused → this fails (no run) and the recurring test's guard is not
+// vacuous.
+func TestTickUnpausedOwnerFiresNormally(t *testing.T) {
+	h := newHarness()
+	// Owner unconfigured ⇒ fakeStore returns a not-paused row.
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("unpaused owner must fire normally: autopilot calls = %d, want 1", len(h.runs.autopilot))
+	}
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("unpaused owner fire must advance once, got %d", len(h.st.advanceCalls))
+	}
+}
+
+// TestTickFailOpenWhenPauseLookupErrors pins the fail-open contract (PRD #1093 M1): a
+// missing owner row (ErrNoRows) resolves to NOT paused, so the tick never wedges and the
+// row fires normally.
+func TestTickFailOpenWhenPauseLookupErrors(t *testing.T) {
+	h := newHarness()
+	h.st.schedulePauseNoRows = true // GetUserSchedulePause returns pgx.ErrNoRows
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("ErrNoRows must fail open (fire): autopilot calls = %d, want 1", len(h.runs.autopilot))
+	}
+}
+
+// TestTickPauseLookupErrorHoldsRowThisTick pins the fail-CLOSED contract for a transient
+// lookup error (PR #1096 review): a kill switch must not fire the very runs it exists to
+// stop because the DB blipped. The due row is neither fired, advanced nor parked this
+// tick; it stays due and fires on the next tick once the lookup works again. Mutation:
+// map the default error branch back to "not paused" → the row fires on the first Boot.
+func TestTickPauseLookupErrorHoldsRowThisTick(t *testing.T) {
+	h := newHarness()
+	h.st.schedulePauseErr = errors.New("db: connection reset")
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if h.runsCreated() != 0 {
+		t.Fatalf("lookup error must hold the row (no fire), got %d runs", h.runsCreated())
+	}
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("lookup error must NOT advance the row, got %d advances", len(h.st.advanceCalls))
+	}
+	if len(h.st.statusCalls) != 0 {
+		t.Fatalf("lookup error must NOT park the row, got %d status writes", len(h.st.statusCalls))
+	}
+
+	// The blip clears: the still-due row fires on the next tick.
+	h.st.schedulePauseErr = nil
+	h.sched.Boot(context.Background())
+
+	if h.runsCreated() != 1 {
+		t.Fatalf("after the lookup recovers the held row must fire exactly once, got %d", h.runsCreated())
+	}
+}
+
+// TestTickPauseLookupMemoizedPerTick pins the per-tick memoization (PRD #1093 D3): N due
+// rows of ONE owner resolve the pause state with exactly ONE GetUserSchedulePause call.
+// Mutation: resolve pause per row instead of caching → the call count becomes N.
+func TestTickPauseLookupMemoizedPerTick(t *testing.T) {
+	h := newHarness()
+	h.pauseOwner(nil)
+	// Three due rows, same owner.
+	h.st.due = []store.RunSchedule{h.issueSchedule(), h.issueSchedule(), h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if h.st.getSchedulePauseCalls != 1 {
+		t.Fatalf("pause lookup must be memoized per tick: GetUserSchedulePause calls = %d, want 1", h.st.getSchedulePauseCalls)
+	}
+	if len(h.st.advanceCalls) != 3 {
+		t.Fatalf("all three paused rows must skip-and-advance, got %d advances", len(h.st.advanceCalls))
+	}
+}
+
+// TestRunNowBypassesPause is a REGRESSION GUARD, not mutation-provable today: RunNow does
+// not consult the pause switch (it never reaches process), so a manual fire of a paused
+// owner's schedule still starts a run. It guards a future maintainer from adding a pause
+// check to the RunNow path (PRD #1093 D5).
+func TestRunNowBypassesPause(t *testing.T) {
+	h := newHarness()
+	h.pauseOwner(nil)
+
+	out, err := h.sched.RunNow(context.Background(), h.issueSchedule())
+	if err != nil {
+		t.Fatalf("RunNow while paused must not error: %v", err)
+	}
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("RunNow must fire while paused: autopilot calls = %d, want 1", len(h.runs.autopilot))
+	}
+	if out.Matched != 1 {
+		t.Fatalf("RunNow outcome matched = %d, want 1", out.Matched)
+	}
+	// RunNow never advances (Decision 5): the cadence is untouched.
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("RunNow must NOT advance, got %d", len(h.st.advanceCalls))
 	}
 }
 

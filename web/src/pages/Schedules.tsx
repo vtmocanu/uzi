@@ -5,7 +5,7 @@
 // a fired `once` row shows as terminal; a status='error' (parked) row is called out
 // distinctly. The "New schedule" button and the per-row ✎ open the shared modal.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -13,7 +13,9 @@ import {
   type Repo,
   type Schedule,
   type ScheduleCatalog,
+  type SchedulePauseDTO,
 } from "../lib/api";
+import { PauseAllButton, PausePanel, PausedBanner } from "../components/SchedulePauseControl";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { relativeFromNow, ScheduleModal } from "../components/ScheduleModal";
@@ -77,6 +79,22 @@ export function Schedules() {
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<Schedule | null>(null);
   const [busyId, setBusyId] = useState<string>("");
+  // The user-level "pause all schedules" switch (PRD #1093). `pause` is the loaded,
+  // NORMALIZED state (an expired `until` reads paused:false); `pickerOpen` drives the
+  // inline preset panel; `pauseBusy` gates the pause/resume writes. Nothing on this path
+  // ever writes a per-row `enabled`, so resuming restores exactly the prior set (D4).
+  const [pause, setPause] = useState<SchedulePauseDTO | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pauseBusy, setPauseBusy] = useState(false);
+  // Failed expiry re-reads in the current streak (drives the 60s retry backoff in the
+  // expiry effect below); reset to 0 whenever a new pause state is applied.
+  const [pauseRefreshAttempt, setPauseRefreshAttempt] = useState(0);
+  // Revision of the pause state as seen by READS. Every mutation bumps it synchronously
+  // before its request starts; a read (the initial load, a reload, the expiry re-read)
+  // captures it at start and applies its result only if it is unchanged. The effect's
+  // cancellation flag alone is not enough: it flips at commit, so a stale read and a
+  // mutation resolving in ONE React batch would still let the read land last.
+  const pauseRev = useRef(0);
   // Which sibling groups are expanded in My schedules (keyed by sibling_group_id), the
   // same Set<string> disclosure pattern DefaultJobs uses for its catalog slugs. Lives in
   // the parent so "add another repo" can auto-expand the group its new sibling landed in.
@@ -113,15 +131,19 @@ export function Schedules() {
   // renders the skeleton the same as the old code did with catalog still null.
   const { error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
-      const [rows, cat, repoList] = await Promise.all([
+      const rev = pauseRev.current;
+      const [rows, cat, repoList, pauseState] = await Promise.all([
         api.listSchedules(),
         api.listScheduleCatalog(),
         api.listRepos().then((r) => r.repos),
+        api.getSchedulePause(),
       ]);
       if (!isCurrent()) return;
       setSchedules(rows);
       setCatalog(cat);
       setRepos(repoList);
+      // A pause mutation that started after this read began owns the newer state.
+      if (rev === pauseRev.current) setPause(pauseState);
     },
     [],
     { fallback: "Could not load schedules", onFetchStart: () => setError("") },
@@ -288,6 +310,62 @@ export function Schedules() {
     }
   };
 
+  // After a FAILED mutation the page holds its pre-mutation state, but the mutation's
+  // revision bump discarded any expiry re-read that was in flight, and nothing else
+  // would schedule another one. Re-read the server state now (revision-guarded); on a
+  // failed re-read, bump the attempt counter so the expiry effect re-arms its retry.
+  const revalidatePause = () => {
+    const rev = pauseRev.current;
+    api
+      .getSchedulePause()
+      .then((next) => {
+        if (rev !== pauseRev.current) return;
+        setPauseRefreshAttempt(0);
+        setPause(next);
+      })
+      .catch(() => {
+        if (rev === pauseRev.current) setPauseRefreshAttempt((n) => n + 1);
+      });
+  };
+
+  // Pause every schedule until `until` (RFC3339, or null for indefinite). PUT then adopt
+  // the returned normalized state and close the picker.
+  const submitPause = async (until: string | null) => {
+    setPauseBusy(true);
+    setError("");
+    try {
+      pauseRev.current += 1; // invalidate every read started before this mutation
+      const next = await api.putSchedulePause(until);
+      setPauseRefreshAttempt(0); // a fresh state gets a fresh (immediate) expiry refresh
+      setPause(next);
+      setPickerOpen(false);
+    } catch (err) {
+      setError(errorMessage(err, "Could not pause your schedules"));
+      revalidatePause();
+    } finally {
+      setPauseBusy(false);
+    }
+  };
+
+  // Resume (idempotent DELETE). Per-row `enabled` is never touched by the switch, so the
+  // rows read exactly as they did before the pause.
+  const resumePause = async () => {
+    setPauseBusy(true);
+    setError("");
+    try {
+      pauseRev.current += 1; // invalidate every read started before this mutation
+      const next = await api.deleteSchedulePause();
+      setPauseRefreshAttempt(0);
+      setPause(next);
+      setPickerOpen(false);
+    } catch (err) {
+      setError(errorMessage(err, "Could not resume your schedules"));
+      revalidatePause();
+    } finally {
+      setPauseBusy(false);
+    }
+  };
+
   const onSaved = () => {
     setCreating(false);
     setEditing(null);
@@ -302,6 +380,49 @@ export function Schedules() {
   const total = mine.length;
   const enabledDefaults = (schedules ?? []).filter((s) => s.origin === "default" && s.enabled).length;
 
+  // The pre-formatted "paused until <stamp>" line every Next-run cell shows while the
+  // switch is on (warn-coloured at the render site); null when not paused. Computed once
+  // here so the row components stay dump — they only render the string when present.
+  const pauseActive = pause?.paused ?? false;
+  // The server normalizes an expired `until` on every read, but an open page does not
+  // re-read on its own: arm one timer for the auto-resume instant and re-fetch then, so
+  // the banner and the row notes clear at the moment the scheduler stops honouring the
+  // pause. Re-armed whenever the state changes; cleared on unmount. setTimeout's delay
+  // is a 32-bit signed int, so a far-off until is clamped and re-armed on fire. A failed
+  // re-read keeps the LAST KNOWN state (the server may still be honouring the pause) and
+  // retries a minute later via pauseRefreshAttempt; it never guesses "not paused". The
+  // re-read applies only while it is still current: any mutation (Resume now, Change…)
+  // sets `pause`, which re-runs this effect and cancels the in-flight read, so a stale
+  // GET can never overwrite the mutation's own response.
+  useEffect(() => {
+    if (!pause?.paused || !pause.until) return;
+    let cancelled = false;
+    const remaining = new Date(pause.until).getTime() - Date.now();
+    const delay = remaining > 0 ? Math.min(remaining, 2_147_483_647) : pauseRefreshAttempt > 0 ? 60_000 : 0;
+    const id = setTimeout(() => {
+      const rev = pauseRev.current;
+      api
+        .getSchedulePause()
+        .then((next) => {
+          if (cancelled || rev !== pauseRev.current) return;
+          setPauseRefreshAttempt(0); // the backoff is per failure streak, not per page
+          setPause(next);
+        })
+        .catch(() => {
+          if (!cancelled && rev === pauseRev.current) setPauseRefreshAttempt((n) => n + 1);
+        });
+    }, delay);
+    return () => {
+      cancelled = true;
+      clearTimeout(id);
+    };
+  }, [pause, pauseRefreshAttempt]);
+  const pauseNote = pauseActive
+    ? pause?.until
+      ? `paused until ${formatStamp(pause.until)}`
+      : "paused until you resume"
+    : null;
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -314,8 +435,23 @@ export function Schedules() {
         }
       />
 
+      {/* Pause-all slot (PRD #1093 D9): the inline preset picker or the paused banner
+          lives here, between the header and the tab row, so it covers nothing on the
+          page (a dropdown would have hidden the "Enable a default" card). One control
+          per state: while paused the tab-row button yields to the banner. */}
+      {pickerOpen ? (
+        <PausePanel onSubmit={submitPause} onCancel={() => setPickerOpen(false)} busy={pauseBusy} />
+      ) : pauseActive && pause ? (
+        <PausedBanner
+          pause={pause}
+          onChange={() => setPickerOpen(true)}
+          onResume={resumePause}
+          busy={pauseBusy}
+        />
+      ) : null}
+
       {/* Two tabs, same table shape (PRD #589 M6): shipped defaults vs the owner's own. */}
-      <div className="flex gap-1 overflow-x-auto border-b border-edge" role="tablist" aria-label="Schedules">
+      <div className="flex items-center gap-1 overflow-x-auto border-b border-edge" role="tablist" aria-label="Schedules">
         <button
           type="button"
           role="tab"
@@ -348,6 +484,15 @@ export function Schedules() {
         >
           My schedules{total > 0 ? ` · ${total}` : ""}
         </button>
+        {/* Running state only: the button sits at the right end of the tab row (ml-auto),
+            directly under "New schedule", so no header height is added. It disappears
+            while paused (the banner above carries Resume) or while the picker is open,
+            and it does not render until the pause state has LOADED (pause !== null):
+            an unresolved read must not offer a control that could overwrite a pause the
+            server already holds. */}
+        {pause !== null && !pauseActive && !pickerOpen && (
+          <PauseAllButton onClick={() => setPickerOpen(true)} disabled={pauseBusy} />
+        )}
       </div>
 
       {/* One tabpanel per tab, each labelled by its tab; the inactive one is unmounted,
@@ -371,6 +516,7 @@ export function Schedules() {
             onClone={cloneSchedule}
             onRemove={removeSchedule}
             onEdit={setEditing}
+            pauseNote={pauseNote}
             notice={notice}
             error={error || loadError}
           />
@@ -428,6 +574,7 @@ export function Schedules() {
                         busy={busyId === row.schedule.id}
                         addBusy={busyId !== ""}
                         clonedFrom={clonedFrom[row.schedule.id]}
+                        pauseNote={pauseNote}
                         repos={repos}
                         onToggle={() => toggleEnabled(row.schedule)}
                         onRunNow={() => runNow(row.schedule)}
@@ -441,6 +588,7 @@ export function Schedules() {
                         groupId={row.groupId}
                         members={row.members}
                         repos={repos}
+                        pauseNote={pauseNote}
                         busyId={busyId}
                         expanded={expandedGroups.has(row.groupId)}
                         onToggleExpand={() => toggleGroupExpand(row.groupId)}
@@ -487,6 +635,7 @@ function ScheduleRow({
   busy,
   addBusy,
   clonedFrom,
+  pauseNote,
   repos,
   onToggle,
   onRunNow,
@@ -503,6 +652,9 @@ function ScheduleRow({
   addBusy: boolean;
   // The source name when this row was cloned this session (session-scoped label).
   clonedFrom?: string;
+  // While pause-all is active, the pre-formatted "paused until <stamp>" line (warn) shown
+  // under the Next-run pill; null when not paused. Per-row `enabled` is unchanged.
+  pauseNote: string | null;
   // The owner's repos, for the "add another repo" picker (excludes this row's own repo).
   repos: Repo[];
   onToggle: () => void;
@@ -593,6 +745,7 @@ function ScheduleRow({
         ) : (
           <span className="text-faint">—</span>
         )}
+        {pauseNote && <div className="mt-0.5 text-[11px] text-warn">{pauseNote}</div>}
       </td>
 
       {/* Last run */}
@@ -766,6 +919,7 @@ function MyScheduleGroup({
   groupId,
   members,
   repos,
+  pauseNote,
   busyId,
   expanded,
   onToggleExpand,
@@ -778,6 +932,8 @@ function MyScheduleGroup({
   groupId: string;
   members: Schedule[];
   repos: Repo[];
+  // The "paused until <stamp>" sub-row line while pause-all is active; null when not paused.
+  pauseNote: string | null;
   busyId: string;
   expanded: boolean;
   onToggleExpand: () => void;
@@ -811,6 +967,7 @@ function MyScheduleGroup({
           key={s.id}
           s={s}
           busy={busyId === s.id}
+          pauseNote={pauseNote}
           onToggle={() => onToggle(s)}
           onRunNow={() => onRunNow(s)}
           onEdit={() => onEdit(s)}
@@ -838,6 +995,7 @@ function MyScheduleGroup({
 function MyScheduleSubRow({
   s,
   busy,
+  pauseNote,
   onToggle,
   onRunNow,
   onEdit,
@@ -845,6 +1003,7 @@ function MyScheduleSubRow({
 }: {
   s: Schedule;
   busy: boolean;
+  pauseNote: string | null;
   onToggle: () => void;
   onRunNow: () => void;
   onEdit: () => void;
@@ -861,6 +1020,7 @@ function MyScheduleSubRow({
       enabled={s.enabled}
       cronExpr={s.cron_expr}
       nextFire={nextFire}
+      pausedNote={pauseNote}
       panelId={panelId}
       // Per-repo last-run parity with the standalone ScheduleRow (issue #690): the same
       // three-way fallback (outcome badge / bare stamp / never-fired), and the expandable

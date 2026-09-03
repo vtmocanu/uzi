@@ -49,6 +49,7 @@ export function DefaultJobs({
   onClone,
   onRemove,
   onEdit,
+  pauseNote,
   notice,
   error,
 }: {
@@ -65,6 +66,9 @@ export function DefaultJobs({
   onClone: (s: Schedule) => void;
   onRemove: (s: Schedule) => void;
   onEdit: (s: Schedule) => void;
+  // While the user-level pause-all switch is on (PRD #1093), the pre-formatted "paused
+  // until <stamp>" line each Next-run cell shows (warn); null when not paused.
+  pauseNote: string | null;
   notice: string;
   error: string;
 }) {
@@ -176,6 +180,7 @@ export function DefaultJobs({
                 onToggleExpand={() => toggleExpand(entry.slug)}
                 onEnableSelected={(ids) => enable(entry, ids)}
                 onEnableRepo={(repoId) => enable(entry, [repoId])}
+                pauseNote={pauseNote}
                 onTogglePause={onTogglePause}
                 onRunNow={onRunNow}
                 onReset={onReset}
@@ -201,6 +206,7 @@ function CatalogRow({
   onToggleExpand,
   onEnableSelected,
   onEnableRepo,
+  pauseNote,
   onTogglePause,
   onRunNow,
   onReset,
@@ -217,6 +223,8 @@ function CatalogRow({
   onToggleExpand: () => void;
   onEnableSelected: (repoIds: string[]) => void;
   onEnableRepo: (repoId: string) => void;
+  // The "paused until <stamp>" line (warn) while pause-all is active; null when not paused.
+  pauseNote: string | null;
   onTogglePause: (s: Schedule) => void;
   onRunNow: (s: Schedule) => void;
   onReset: (s: Schedule) => void;
@@ -300,6 +308,11 @@ function CatalogRow({
             {activeCount < enabledCount && (
               <span className="text-[11px] text-faint">{enabledCount - activeCount} paused</span>
             )}
+            {/* Only a job with at least one active row would fire, so only then does
+                the pause-all note apply; "not enabled" + "paused until" contradict. */}
+            {pauseNote && activeCount > 0 && (
+              <span className="text-[11px] text-warn">{pauseNote}</span>
+            )}
           </div>
         )
       }
@@ -336,6 +349,7 @@ function CatalogRow({
           s={s}
           entry={entry}
           busy={busyId === s.id}
+          pauseNote={pauseNote}
           onTogglePause={() => onTogglePause(s)}
           onRunNow={() => onRunNow(s)}
           onReset={() => onReset(s)}
@@ -361,6 +375,7 @@ function SubRow({
   s,
   entry,
   busy,
+  pauseNote,
   onTogglePause,
   onRunNow,
   onReset,
@@ -371,6 +386,8 @@ function SubRow({
   s: Schedule;
   entry: CatalogEntry;
   busy: boolean;
+  // The "paused until <stamp>" line shown in place of "· next …" while pause-all is on.
+  pauseNote: string | null;
   onTogglePause: () => void;
   onRunNow: () => void;
   onReset: () => void;
@@ -389,6 +406,7 @@ function SubRow({
       enabled={s.enabled}
       cronExpr={s.cron_expr}
       nextFire={nextFire}
+      pausedNote={pauseNote}
       panelId={panelId}
       // Per-repo last-run parity with the standalone row (issue #690): the same three-way
       // fallback (outcome badge / bare stamp / never-fired), and the expandable detail

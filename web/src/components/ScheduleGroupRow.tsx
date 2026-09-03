@@ -151,6 +151,7 @@ export function ScheduleSubRow({
   badges,
   cronExpr,
   nextFire,
+  pausedNote,
   lastRun,
   lastRunDetail,
   panelId,
@@ -165,6 +166,10 @@ export function ScheduleSubRow({
   cronExpr: string;
   // The next fire instant for the enabled row; falsy hides the "next …" span.
   nextFire?: string | null;
+  // While the user-level pause-all switch is on (PRD #1093), the warn-coloured "paused
+  // until <stamp>" line shown IN PLACE OF the "· next …" span; null when not paused. The
+  // per-row toggle stays as-is (this is a user-wide overlay, not a per-row pause).
+  pausedNote?: string | null;
   // The per-repo last-run outcome badge + disclosure, rendered inline in the flex row
   // between the info block and the leading action; omitted when absent.
   lastRun?: ReactNode;
@@ -194,7 +199,16 @@ export function ScheduleSubRow({
           </div>
           <div className="mt-0.5 font-mono text-[11.5px] text-faint">
             {cronExpr} · {humanizeCron(cronExpr)}
-            {enabled && nextFire && <span> · next {relativeFromNow(nextFire)}</span>}
+            {/* The pause-all note replaces "next …" only where a next fire would have
+                shown: a row whose own switch is off, or with no next fire, never
+                promises that resuming will fire it. */}
+            {enabled &&
+              nextFire &&
+              (pausedNote ? (
+                <span className="text-warn"> · {pausedNote}</span>
+              ) : (
+                <span> · next {relativeFromNow(nextFire)}</span>
+              ))}
           </div>
         </div>
 

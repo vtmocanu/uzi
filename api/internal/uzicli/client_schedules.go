@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -129,6 +130,37 @@ func (c *HTTPClient) AddScheduleRepo(ctx context.Context, id, repoID string) (ap
 	body := apitypes.AddScheduleRepoRequest{RepoID: strings.TrimSpace(repoID)}
 	if err := c.postJSON(ctx, "/api/schedules/"+url.PathEscape(id)+"/add-repo", body, &out); err != nil {
 		return apitypes.ScheduleDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) GetSchedulePause(ctx context.Context) (apitypes.SchedulePauseDTO, error) {
+	var out apitypes.SchedulePauseDTO
+	if err := c.get(ctx, "/api/schedules/pause", &out); err != nil {
+		return apitypes.SchedulePauseDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) SetSchedulePause(ctx context.Context, until *time.Time) (apitypes.SchedulePauseDTO, error) {
+	// The wire body is {"until": <RFC3339>|null}: an anonymous struct with a nil-able
+	// pointer, so a nil `until` (the indefinite "until I resume" pause) marshals as
+	// `null` rather than being omitted — the server distinguishes the two.
+	reqBody := struct {
+		Until *time.Time `json:"until"`
+	}{until}
+	var out apitypes.SchedulePauseDTO
+	if err := c.put(ctx, "/api/schedules/pause", reqBody, &out); err != nil {
+		return apitypes.SchedulePauseDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) ClearSchedulePause(ctx context.Context) (apitypes.SchedulePauseDTO, error) {
+	// delRead (not del): this DELETE returns the resulting state body, which del discards.
+	var out apitypes.SchedulePauseDTO
+	if err := c.delRead(ctx, "/api/schedules/pause", &out); err != nil {
+		return apitypes.SchedulePauseDTO{}, err
 	}
 	return out, nil
 }

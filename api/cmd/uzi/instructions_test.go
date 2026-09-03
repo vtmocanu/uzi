@@ -430,6 +430,28 @@ var knownInstructions = []knownInstruction{
 			"which asserts exit ExitUsage AND that no PATCH was sent AND that the message names " +
 			"clone. Not executed against a booted API.",
 	},
+	{
+		command:  "uzi schedule resume-all",
+		evidence: evidenceGoTest,
+		where:    "TestSchedulePauseAllUntilDuration",
+		// ARRIVED WITH PRD #1093 M3. `uzi schedule pause-all`'s confirmation line names the
+		// verb that lifts the user-level pause early — `uzi schedule resume-all` — so an
+		// operator who paused everything knows how to undo it before the auto-resume instant.
+		//
+		// RUNTIME, derived: the span sits inside a Printf argument in newSchedulePauseAllCmd
+		// (schedule.go), which classifyKind reads as an emitter (STDOUT). The entry is a claim
+		// that the emitting path was EXECUTED and its outcome asserted, which is what
+		// TestSchedulePauseAllUntilDuration does: it drives the real cobra parse of `schedule
+		// pause-all --until 24h` against a fake client and asserts the emitted confirmation
+		// contains the literal "resume early with `uzi schedule resume-all`".
+		//
+		// Its honest limit: executed against a FAKE client, so it proves the emitted remedy and
+		// its argv shape, not that `uzi schedule resume-all` itself succeeds against a booted API.
+		note: "RUNTIME: `uzi schedule pause-all`'s confirmation (schedule.go) names the resume-all " +
+			"verb that lifts the user-level pause early, through Printf (STDOUT). EXECUTED by " +
+			"TestSchedulePauseAllUntilDuration, which drives the real parse and asserts the emitted " +
+			"line carries the resume-all remedy verbatim. Not executed against a booted API.",
+	},
 
 	{
 		command:  "uzi review undo",

@@ -24,6 +24,7 @@ import type {
   Branding,
   Chat,
   AgentTemplate,
+  SchedulePauseDTO,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -72,6 +73,8 @@ import chatZero from "../../../fixtures/api-contract/chat.zero.json";
 import chatFull from "../../../fixtures/api-contract/chat.full.json";
 import agentTemplateZero from "../../../fixtures/api-contract/agent_template.zero.json";
 import agentTemplateFull from "../../../fixtures/api-contract/agent_template.full.json";
+import schedulePauseZero from "../../../fixtures/api-contract/schedule_pause.zero.json";
+import schedulePauseFull from "../../../fixtures/api-contract/schedule_pause.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -527,6 +530,21 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _agentTemplateFull;
 }
 
+// ── SchedulePauseDTO (M2, PRD #1093) ────────────────────────────────────────
+// No ZeroOf exemption — `until` is legitimately nullable (string|null, matching the
+// Go *time.Time), so the zero value's until:null is accepted directly. `paused` is a
+// plain bool. No drift: the key set matches SchedulePauseDTO exactly.
+{
+  const _schedulePauseMissing: never = null as unknown as Exclude<keyof SchedulePauseDTO, keyof typeof schedulePauseFull>;
+  const _schedulePauseExtra: never = null as unknown as Exclude<keyof typeof schedulePauseFull, keyof SchedulePauseDTO>;
+  const _schedulePauseZero: ZeroOf<SchedulePauseDTO> = schedulePauseZero;
+  const _schedulePauseFull: Widen<SchedulePauseDTO> = schedulePauseFull;
+  void _schedulePauseMissing;
+  void _schedulePauseExtra;
+  void _schedulePauseZero;
+  void _schedulePauseFull;
+}
+
 // ── Runtime self-checks ─────────────────────────────────────────────────────
 // A contract that passes on a missing fixture, or on a zero.json with no null in
 // it, is the false-green shape this repo documents repeatedly. These fatal
@@ -580,6 +598,8 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "settings", nullable: true },
   { stem: "chat", nullable: true },
   { stem: "agent_template", nullable: true },
+  // M2 (PRD #1093): the pause-all singleton. `until` is nullable, so zero.json carries a null.
+  { stem: "schedule_pause", nullable: true },
   // All-scalar / no nullable Go field: their zero.json legitimately carries no null.
   { stem: "column", nullable: false },
   { stem: "branding", nullable: false },
