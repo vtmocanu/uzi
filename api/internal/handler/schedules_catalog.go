@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -423,8 +424,11 @@ func catalogTimezone(j schedtmpl.DefaultJob) string {
 // catalogMaxIssues maps a job's max_issues to the nullable store column: set only for a
 // sweep with a positive value, NULL (unlimited) otherwise — mirroring maxIssuesColumn.
 func catalogMaxIssues(j schedtmpl.DefaultJob) pgtype.Int4 {
-	if j.Target == "sweep" && j.MaxIssues > 0 {
-		return pgtype.Int4{Int32: int32(j.MaxIssues), Valid: true} //nolint:gosec // G115: MaxIssues from the built-in DefaultJob catalog, a small compile-time constant
+	// MaxIssues is bounded to (0, math.MaxInt32] just above so the int32 narrowing is
+	// provably in range for both integer-conversion analyzers (gosec G115 / CodeQL
+	// go/incorrect-integer-conversion); no nolint is needed once the bound is explicit.
+	if j.Target == "sweep" && j.MaxIssues > 0 && j.MaxIssues <= math.MaxInt32 {
+		return pgtype.Int4{Int32: int32(j.MaxIssues), Valid: true}
 	}
 	return pgtype.Int4{}
 }
@@ -471,8 +475,10 @@ func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pg
 		return true
 	}
 	jMax := int32(0)
-	if job.Target == "sweep" && job.MaxIssues > 0 {
-		jMax = int32(job.MaxIssues) //nolint:gosec // G115: MaxIssues from the built-in DefaultJob catalog, a small compile-time constant
+	// Bounded to (0, math.MaxInt32] so the int32 narrowing is provably in range for both
+	// integer-conversion analyzers (gosec G115 / CodeQL go/incorrect-integer-conversion).
+	if job.Target == "sweep" && job.MaxIssues > 0 && job.MaxIssues <= math.MaxInt32 {
+		jMax = int32(job.MaxIssues)
 	}
 	rMax := int32(0)
 	if maxIssues.Valid {
