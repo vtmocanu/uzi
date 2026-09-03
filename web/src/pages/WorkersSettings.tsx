@@ -965,12 +965,13 @@ export function WorkersSettings() {
             <HostedWorkers
               hostedCount={workers.filter((w) => w.kind === "hosted").length}
               onProvisioned={async (worker) => {
-                // Switch to Your workers BEFORE announcing, both before any await (D "After a
-                // provision"). The load-bearing invariant is the ORDER, not the batch: because
-                // `selectTab("workers")` is sequenced ahead of `announce(...)`, `tab` is already
-                // "workers" by the time `notice` changes, so the [notice] focus effect runs
-                // against an un-hidden panel and .focus() lands — a focus on an element inside a
-                // `hidden` panel silently no-ops. Do not reorder these or drop the selectTab.
+                // Switch to Your workers AND announce in the SAME synchronous batch, both before
+                // any await (D "After a provision"). Both are plain state updates, so React
+                // batches them into ONE commit: by the time the [notice] focus effect runs, `tab`
+                // is already "workers" and the panel is un-hidden, so .focus() lands — a focus on
+                // an element inside a `hidden` panel silently no-ops. The two are order-independent
+                // (batched together); what is load-bearing is that BOTH run before the await —
+                // don't move `announce` after `await reload()`, and don't drop the `selectTab`.
                 // The notice sits at the top of that panel, so it is visible and takes focus.
                 selectTab("workers");
                 announce(`Provisioned ${worker.name} — it is listed below and comes online on its own.`);

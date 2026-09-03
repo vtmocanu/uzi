@@ -598,10 +598,11 @@ describe("WorkersSettings hosted quota is escapable (the primary journey)", () =
     await flush(); // pendingRowFocus effect runs after the panel un-hides
     expect(document.activeElement).toBe(document.getElementById("worker-row-w-h1"));
 
-    // The 10s liveness poll re-fetches the SAME fleet and re-renders the rows. Rows are
-    // keyed by id (reconciled in place) and pendingRowFocus was cleared after the jump, so
-    // the focus effect does not re-fire and focus must stay on the row the user landed on —
-    // never yanked to <body> by the poll (M3 Risks: "focus survives one poll tick").
+    // The 10s liveness poll re-fetches the SAME fleet and re-renders the rows. This guards
+    // that the poll does NOT remount the row subtree and drop the parked focus (rows are
+    // keyed by w.id and pendingRowFocus was cleared after the jump, so the focus effect does
+    // not re-fire) — focus must stay on the row the user landed on, never yanked to <body>
+    // (M3 Risks: "focus survives one poll tick"). A random-key remount fails this test.
     await vi.advanceTimersByTimeAsync(10000);
     expect(document.activeElement).toBe(document.getElementById("worker-row-w-h1"));
   });
