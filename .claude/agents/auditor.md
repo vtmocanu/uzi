@@ -125,13 +125,11 @@ the tester already runs.
 run them explicitly when auditing. Neither has a canary; instead both *refuse* the
 environment variables that shrink their view (`GOPACKAGESDRIVER`, `GOFLAGS=-tags`, and
 `--include=dev` outranking `NPM_CONFIG_OMIT`), a refusal exiting **2**, never 1. **Do not
-report either as a gap.** The one real residual is two **moderate** react-router
-advisories in `web`'s runtime dependency, deliberately ungating under `--audit-level=high`
-and filed as their own issue (no patched 6.x exists). Their reachability was audited: the
-constructor-injection advisory is structurally unreachable here (no
-`createBrowserRouter`/`createHashRouter`/`RouterProvider`, no SSR), and both open-redirect
-ones are blocked at the only attacker-controlled sink by `safeNextPath`, which rejects the
-backslash vector and is tested.
+report either as a gap.** `web` is clean at `--audit-level=high` (npm audit reports 0
+vulnerabilities; the two moderate react-router advisories that once survived on 6.x were
+cleared by the React Router 7 major: react-router 7.18.2 installed, patched at 7.18.0).
+`safeNextPath` still guards the only attacker-controlled redirect sink, rejects the
+backslash vector, and is tested.
 
 gitleaks does not honour `.gitignore`, so in an agent worktree it prints an untracked,
 non-gating NOTE for `.entire/…/full.jsonl` (the harness's own session transcript) — not a
