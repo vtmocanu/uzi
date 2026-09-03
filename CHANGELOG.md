@@ -20,6 +20,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Agent roles re-synced to skills ff87616: fact-checker v9, architect v8 ([#1080](https://github.com/vtmocanu/uzi/issues/1080)).**
+  Both `.claude/agents/` and the shipped builtins pick up vtmocanu/skills#41: the fact-checker's defect fold runs in a detached throwaway worktree and its description says so, the architect's write surface is the design-doc directory its tail names and never `specs/`; the vendored role manifest moves to ff87616. `CLAUDE.md`'s run-economy rework rule now names every high-risk class (trust-boundary, data-integrity, auth, untrusted-input), matching the lead builtin.
+
 - **Builtin agent-team role templates re-synced to the upstream skills library ([#1080](https://github.com/vtmocanu/uzi/issues/1080)).**
   The eleven library-derived builtins under `api/internal/agenttmpl/builtins/` were ported to the terser upstream bodies with new version stamps and the library's model choices (`researcher` moves to `sonnet`), keeping uzi's `main`-recipient wording and `fact-checker`'s forge tools; `lead` gains the run-economy rules and the vendored role manifest is refreshed to `b5288fd`.
 
