@@ -355,19 +355,30 @@ export function Schedules() {
   // pause. Re-armed whenever the state changes; cleared on unmount. setTimeout's delay
   // is a 32-bit signed int, so a far-off until is clamped and re-armed on fire. A failed
   // re-read keeps the LAST KNOWN state (the server may still be honouring the pause) and
-  // retries a minute later via pauseRefreshAttempt; it never guesses "not paused".
+  // retries a minute later via pauseRefreshAttempt; it never guesses "not paused". The
+  // re-read applies only while it is still current: any mutation (Resume now, Change…)
+  // sets `pause`, which re-runs this effect and cancels the in-flight read, so a stale
+  // GET can never overwrite the mutation's own response.
   const [pauseRefreshAttempt, setPauseRefreshAttempt] = useState(0);
   useEffect(() => {
     if (!pause?.paused || !pause.until) return;
+    let cancelled = false;
     const remaining = new Date(pause.until).getTime() - Date.now();
     const delay = remaining > 0 ? Math.min(remaining, 2_147_483_647) : pauseRefreshAttempt > 0 ? 60_000 : 0;
     const id = setTimeout(() => {
       api
         .getSchedulePause()
-        .then(setPause)
-        .catch(() => setPauseRefreshAttempt((n) => n + 1));
+        .then((next) => {
+          if (!cancelled) setPause(next);
+        })
+        .catch(() => {
+          if (!cancelled) setPauseRefreshAttempt((n) => n + 1);
+        });
     }, delay);
-    return () => clearTimeout(id);
+    return () => {
+      cancelled = true;
+      clearTimeout(id);
+    };
   }, [pause, pauseRefreshAttempt]);
   const pauseNote = pauseActive
     ? pause?.until

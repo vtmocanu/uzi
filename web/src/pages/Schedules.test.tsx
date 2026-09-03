@@ -3,7 +3,7 @@
 // Schedules list page (PRD #241 M5, mock §1): rows render per target/timing, and the
 // per-row enable toggle PATCHes { enabled } and adopts the server's returned row.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Schedules } from "./Schedules";
 import { api, type LastFire, type Schedule } from "../lib/api";
@@ -960,6 +960,35 @@ describe("Schedules — pause all (PRD #1093)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("a stale expiry re-read never overwrites a newer Resume response (mutation wins)", async () => {
+    // Controlled ordering: the expiry GET is left pending, the user resumes meanwhile
+    // (DELETE resolves not-paused), and only THEN the stale GET resolves "still paused".
+    // The mutation's answer must stand; the effect cancels the in-flight read on change.
+    const soon = new Date(Date.now() + 60).toISOString();
+    let resolveStale: (v: { paused: boolean; until: string | null }) => void = () => {};
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockReturnValueOnce(
+        new Promise<{ paused: boolean; until: string | null }>((r) => {
+          resolveStale = r;
+        }),
+      );
+    mockApi.deleteSchedulePause.mockResolvedValue({ paused: false, until: null });
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resume now" })).toBeTruthy());
+    // The timer fired: the expiry re-read is in flight (pending).
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy());
+    // Now the stale read lands, claiming the pause is still on.
+    await act(async () => {
+      resolveStale({ paused: true, until: soon });
+    });
+    // The newer mutation result stands: still running, no banner.
+    expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy();
+    expect(screen.queryByText(/All schedules paused/)).toBeNull();
   });
 
   it("Resume now triggers deleteSchedulePause", async () => {
