@@ -2,7 +2,7 @@
 
 **Issue**: #1061
 **Priority**: Medium (developer velocity / internal tooling)
-**Status**: Draft
+**Status**: Implemented — M1–M5 landed on branch `agent/issue-1061` (2026-09-03), `task gate:api` green. SC2–SC6 are covered by `api/cmd/uzi/sketch_test.go` (registry frames property, the Tier-A host render + paging/theme clamps pinned by an asymmetric-frame mutation test, the Tier-B dispatch via a stub model, the CLI list affordance on a TTY, and the non-TTY `ExitUsage` guard) plus the generator/screenshot wiring in `uxlab_gen_test.go`. SC1 (the interactive `uzi tui --sketch template` session) is the documented manual/pty acceptance, not a gate unit test — matching the untested `--demo` precedent. The `devbox run build` PNG-render step is CI/local-devbox-only (freeze cannot be fetched in the uzi worker); the `.ansi` frame emission is proven and `render.sh` is unchanged.
 
 ## Problem
 

@@ -70,7 +70,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 	}
 
 	outDir := filepath.Join("uxlab", "frames")
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
+	if err := os.MkdirAll(outDir, 0o755); err != nil { //nolint:gosec // G301: dev-tool frame output dir holds non-sensitive generated artifacts; 0755 keeps it browsable
 		t.Fatal(err)
 	}
 
@@ -117,10 +117,43 @@ func TestGenerateUXLabFrames(t *testing.T) {
 			}
 			body := scenes[name](dark)
 			path := filepath.Join(outDir, fmt.Sprintf("%s-%s.ansi", name, theme))
-			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil { //nolint:gosec // G306: generated ANSI frame is non-sensitive; 0644 keeps it readable by render.sh/freeze
 				t.Fatalf("write %s: %v", path, err)
 			}
 			t.Logf("wrote %s (%d bytes)", path, len(body))
+		}
+	}
+
+	// Screenshot every Tier-A sketch from the shared registry (sketch.go), so a sketch
+	// authored once is previewable live AND rendered to static frames with no per-sketch
+	// generator code here. A Tier-B-only sketch (frames == nil) is live-preview-only and
+	// has no static frame to render, so it is skipped; a Tier-B sketch that ALSO supplies
+	// frames IS screenshotted. Filenames are sketch-<name>-<frameIndex>-<theme>.ansi —
+	// theme LAST so render.sh's *-light detection works, frameIndex before it because a
+	// Tier-A sketch has many frames per theme (unlike a scene, which is one string).
+	sketchKeys := make([]string, 0, len(sketches))
+	for name := range sketches {
+		sketchKeys = append(sketchKeys, name)
+	}
+	sort.Strings(sketchKeys)
+
+	for _, name := range sketchKeys {
+		sk := sketches[name]
+		if sk.frames == nil {
+			continue // Tier-B-only: live preview only, no static frame to render.
+		}
+		for _, dark := range []bool{true, false} {
+			theme := "dark"
+			if !dark {
+				theme = "light"
+			}
+			for i, body := range sk.frames(dark) {
+				path := filepath.Join(outDir, fmt.Sprintf("sketch-%s-%d-%s.ansi", name, i, theme))
+				if err := os.WriteFile(path, []byte(body), 0o644); err != nil { //nolint:gosec // G306: generated ANSI frame is non-sensitive; 0644 keeps it readable by render.sh/freeze
+					t.Fatalf("write %s: %v", path, err)
+				}
+				t.Logf("wrote %s (%d bytes)", path, len(body))
+			}
 		}
 	}
 }

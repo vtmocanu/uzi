@@ -1,6 +1,7 @@
 ---
 paths:
   - api/cmd/uzi/tui_*.go
+  - api/cmd/uzi/sketch.go
   - api/cmd/uzi/uxlab/**
 ---
 
@@ -28,6 +29,14 @@ screenshot lies silently.
 **One source of truth.** The demo, the screenshots, and the shipped views all run
 the same `tuiModel` (the factoryui prototype was retired at PRD #325 M7), so
 changing a view moves both. Do not reintroduce a parallel mock model.
+
+**Exception: the sketch harness (`api/cmd/uzi/sketch.go`, PRD #1061), gated and throwaway.**
+For previewing a feature that does not render yet, hand-built frames (Tier A) or a
+local-state `tea.Model` (Tier B) are allowed via `uzi tui --sketch <name>`, passed
+NO client. It is delete-when-done, not maintained: only the permanent `template`
+sketch ships on `main`; every other sketch is branch-local and gets deleted once
+its keepable `View` shape is lifted into the real `tuiModel`. Do not wire a real
+client into a sketch, and do not let a feature sketch merge to `main`.
 
 **Terminal-injection guard (D7).** Untrusted cells (titles, owner email, agent
 output) MUST be drawn through `m.renderer.Plain` (= `capCell(cellText(s))`;
