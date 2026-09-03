@@ -391,8 +391,8 @@ export class GitCache {
    * bare's refs/remotes/origin/<branch>), the clone's branch is based off that fresh
    * tip so successive runs build on prior work; else off the repo's default branch.
    */
-  async createOrAttachRunnerClone(barePath: string, issueIid: number, runId?: string, resume = false): Promise<RunnerClone> {
-    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId, resume);
+  async createOrAttachRunnerClone(barePath: string, issueIid: number, runId?: string, resume = false, expectedCheckpointTip?: string): Promise<RunnerClone> {
+    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId, resume, expectedCheckpointTip);
   }
 
   /**
@@ -443,11 +443,23 @@ export class GitCache {
    * ownership anchor and does not affect the ownedHere legs. It relaxes ONLY the
    * cross-worker checkpoint-adoption rule on the not-ownedHere leg: on a resume with NO
    * `origin/<branch>` (an unpushed branch), a mirrored checkpoint that shares history with
-   * the default is adopted using the disjoint-history guard only — no strict-descendant
-   * test against the current default, which would wrongly discard a valid checkpoint when
-   * `main` advanced during the park. The strict test is KEPT when `origin/<branch>` exists
-   * (genuinely competing published work) and for every fresh (non-resume) run. `resume`
-   * defaults false ⇒ today's behaviour, which keeps the existing test call sites compiling.
+   * the default is adopted with no strict-descendant test against the current default, which
+   * would wrongly discard a valid checkpoint when `main` advanced during the park. The strict
+   * test is KEPT when `origin/<branch>` exists (genuinely competing published work) and for
+   * every fresh (non-resume) run. `resume` defaults false ⇒ today's behaviour, which keeps
+   * the existing test call sites compiling.
+   *
+   * issue #1042 M4 — that resume-adopt is additionally gated on an OWNER ANCHOR:
+   * `expectedCheckpointTip` (threaded from `claim.checkpoint_tip`, the tip THIS run last
+   * published to its own checkpoint ref, persisted server-side on every publish — M2). A
+   * checkpoint ref is per-BRANCH, so sharing history with the default is not enough — the
+   * mirrored checkpoint might be a PRIOR (possibly plan-rejected) run's work. Adopt ONLY when
+   * `expectedCheckpointTip` is a non-empty string AND equals the mirrored checkpoint's current
+   * SHA; a NULL/empty tip (a run that never published) or a mismatch (a foreign checkpoint)
+   * falls through to the origin/default floor, LOUDLY. A same-run legitimate resume still
+   * adopts, because its persisted tip advanced with its own checkpoint and still matches.
+   * `expectedCheckpointTip` defaults undefined ⇒ no adoption ⇒ keeps existing test call sites
+   * conservative.
    *
    * The seed is a LOCAL `clone --shared` from the worker bare: fast (objects are
    * referenced read-only from the bare via the clone's objects/info/alternates — the
@@ -457,7 +469,7 @@ export class GitCache {
    * the untrusted direction (worker fetching BACK from the runner clone) is the one
    * forced onto the pack transport in fetchAgentBranch (B2 invariant 3).
    */
-  async runnerCloneForBranch(barePath: string, branch: string, key: string, runId?: string, resume = false): Promise<RunnerClone> {
+  async runnerCloneForBranch(barePath: string, branch: string, key: string, runId?: string, resume = false, expectedCheckpointTip?: string): Promise<RunnerClone> {
     return this.withLock(barePath, async () => {
       const repoDir = path.basename(barePath).replace(/\.git$/, "");
       const clonePath = path.join(this.runnerRoot, repoDir, key);
@@ -564,16 +576,54 @@ export class GitCache {
           // resume with no competing published `origin/<branch>`, adopt the checkpoint using
           // the DISJOINT-HISTORY guard ONLY — `checkpointExists` already encodes
           // `sharesHistory(checkpointRef, default)` (a disjoint checkpoint was treated as
-          // absent up front), so reaching here means it shares history and is safe to adopt.
+          // absent up front), so reaching here means it shares history.
           // No ancestry test against the current default, mirroring the ownedHere first-park
-          // leg's rule and rationale. Adopting even a checkpoint that merely equals the floor
-          // is harmless (same commit, priorCommits 0). The adopt-time wip(park) marker unwrap
+          // leg's rule and rationale. The adopt-time wip(park) marker unwrap
           // (adoptedMarker / willRecoverMarker below) still runs on this adopted base because
           // seededFrom is "checkpoint", so a marker tip is reset --soft'd exactly as on the
           // strict-descendant leg. The strict test is KEPT when origin/<branch> exists
           // (competing published work) and for every fresh run — see the else-if below.
-          baseRef = checkpointRef;
-          seededFrom = "checkpoint";
+          //
+          // issue #1042 M4 — OWNER-ANCHOR guard. Sharing history with the default is not
+          // enough: a checkpoint ref is a per-BRANCH ref, so a resumed run that never
+          // published its OWN checkpoint would otherwise seed off whatever PRIOR run last
+          // wrote refs/uzi-checkpoints/<branch> — re-treading possibly plan-rejected work.
+          // Adopt ONLY when this run's persisted own-checkpoint tip (`expectedCheckpointTip`,
+          // threaded from claim.checkpoint_tip) is a non-empty string AND equals the mirrored
+          // checkpoint's current SHA. A same-run legitimate resume still adopts, because the
+          // server persists the tip on EVERY publish (M2), so the persisted tip advanced with
+          // the checkpoint and still equals it (trap #5). When the tip is NULL/empty (a
+          // never-published run) or does NOT match (a foreign/prior run's checkpoint), do NOT
+          // adopt: fall through to the origin/default floor set just above, and log LOUDLY
+          // (structured warn, not a run-feed status) so an operator can see why a present
+          // checkpoint was set aside. This path deliberately does NOT set checkpointSetAside:
+          // that flag drives the foreign-WIP cherry-pick recovery, which would re-import the
+          // very prior-run work this guard exists to keep out. Surfacing an owner-anchor
+          // set-aside in the run feed (a dedicated status, not this flag) is a possible
+          // follow-up; today it is operator-visible in structured logs only.
+          const checkpointSha = (
+            await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${checkpointRef}^{commit}`])
+          ).trim();
+          if (
+            expectedCheckpointTip !== undefined &&
+            expectedCheckpointTip !== null &&
+            expectedCheckpointTip !== "" &&
+            expectedCheckpointTip === checkpointSha
+          ) {
+            baseRef = checkpointRef;
+            seededFrom = "checkpoint";
+          } else {
+            this.log.warn(
+              "runner clone: resume checkpoint set aside LOUDLY — mirrored checkpoint tip does not match this run's own persisted checkpoint (owner-anchor guard, issue #1042 M4); seeding off the origin/default floor, NOT a prior run's checkpoint",
+              {
+                branch,
+                checkpointRef,
+                checkpoint_sha: checkpointSha,
+                expected_checkpoint_tip: expectedCheckpointTip ?? null,
+                seeded_from: seededFrom,
+              },
+            );
+          }
         } else if (checkpointExists) {
           // isAncestor (merge-base --is-ancestor) is TRUE at EQUALITY, so an ancestor test
           // alone would seed a checkpoint that EQUALS the floor as "checkpoint" though nothing

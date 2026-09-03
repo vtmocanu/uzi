@@ -549,7 +549,9 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     );
 
     // THE RESUME (resume=true, no origin/<branch>): adopt the checkpoint despite divergence.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10301, "run-B", true);
+    // issue #1042 M4: adoption is now gated on the owner anchor — pass THIS run's own persisted
+    // checkpoint tip (== the mirrored checkpoint's SHA) so the legitimate same-run resume adopts.
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10301, "run-B", true, cpTip);
 
     assert.strictEqual(rc.seededFrom, "checkpoint", "resume adopts the diverged checkpoint, not the default floor");
     assert.strictEqual(rc.baseCommit, cpTip, "the base is the checkpoint tip (committed milestones preserved)");
@@ -584,7 +586,9 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
 
     // A FRESH run (resume=false — session_id == null): the strict-descendant test applies,
     // so the diverged checkpoint is set aside and the run cold-starts from the default floor.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10302, "run-B", false);
+    // The owner-anchor tip is irrelevant here (the resume-adopt leg is not reached); pass it
+    // anyway to prove a matching tip does NOT override the fresh-run strict behaviour.
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10302, "run-B", false, cpTip);
 
     assert.strictEqual(rc.seededFrom, "default", "a fresh run falls through to the default floor");
     assert.strictEqual(rc.baseCommit, floorSha, "the base is the advanced default floor");
@@ -622,12 +626,86 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
 
     // RESUME, but origin/<branch> EXISTS → the strict-descendant test is KEPT: the published
     // origin branch is the floor and wins; the checkpoint is set aside, not blindly adopted.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10303, "run-B", true);
+    // A matching owner-anchor tip does NOT relax this (the resume-adopt leg requires !originExists).
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10303, "run-B", true, cpTip);
 
     assert.strictEqual(rc.seededFrom, "origin", "the published origin branch is the floor even on resume");
     assert.strictEqual(rc.baseCommit, originBranchTip, "the base is the origin branch tip, NOT the checkpoint");
     assert.strictEqual(rc.checkpointSetAside, true, "the diverged checkpoint is set aside — the strict test still bites");
     assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), false, "the checkpoint's work was NOT blindly adopted over published origin");
+  });
+
+  // issue #1042 M4 — the OWNER-ANCHOR guard. A resume adopts the mirrored checkpoint ONLY
+  // when THIS run's own persisted checkpoint tip (claim.checkpoint_tip, threaded as
+  // expectedCheckpointTip) is non-empty AND equals the checkpoint's current SHA. NULL (never
+  // published) or a mismatch (a prior/foreign run's checkpoint) → do NOT adopt, fall through
+  // to the origin/default floor, even though the checkpoint exists and shares history.
+
+  it("RESUME with a NULL own-checkpoint tip does NOT adopt — a never-published run seeds off the floor, not a prior run's checkpoint", async () => {
+    const branch = "agent/issue-10304";
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    // A PRIOR run's checkpoint sits at refs/uzi-checkpoints/<branch>, sharing history with the
+    // floor and (main not advanced) even strictly descending it — so ONLY the owner-anchor
+    // guard, not the disjoint/strict test, can keep it from being adopted.
+    const cpTip = await publishCommittedCheckpoint(gitA, bareA, 10304, branch, ["M1.txt", "M2.txt"]);
+
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const floorSha = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    assert.doesNotThrow(
+      () => gitIn(bareB, ["merge-base", "--is-ancestor", floorSha, cpTip]),
+      "precondition: the checkpoint strictly descends the floor (so nothing BUT the tip guard blocks adoption)",
+    );
+
+    // THE RESUME with NO own-checkpoint tip (a run that never published its own checkpoint).
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10304, "run-B", true /* resume */, undefined /* no own tip */);
+
+    assert.strictEqual(rc.seededFrom, "default", "a never-published resume seeds off the default floor, NOT the checkpoint");
+    assert.strictEqual(rc.baseCommit, floorSha, "the base is the default floor");
+    assert.strictEqual(rc.priorCommits, 0, "nothing adopted — no prior run's committed work re-treaded");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), false, "the prior checkpoint's work was NOT adopted");
+  });
+
+  it("RESUME with an own-checkpoint tip that MISMATCHES the mirrored checkpoint does NOT adopt — a foreign checkpoint is left aside", async () => {
+    const branch = "agent/issue-10305";
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    const cpTip = await publishCommittedCheckpoint(gitA, bareA, 10305, branch, ["M1.txt", "M2.txt"]);
+
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const floorSha = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
+    // A DIFFERENT tip than the mirrored checkpoint's SHA — the floor sha stands in for "this
+    // run's own persisted tip pointing somewhere other than the foreign checkpoint".
+    assert.notStrictEqual(floorSha, cpTip, "precondition: the run's own tip differs from the mirrored checkpoint tip");
+
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10305, "run-B", true /* resume */, floorSha /* mismatching own tip */);
+
+    assert.strictEqual(rc.seededFrom, "default", "a mismatching own tip means the foreign checkpoint is NOT adopted");
+    assert.strictEqual(rc.baseCommit, floorSha, "the base is the default floor, not the foreign checkpoint");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), false, "the foreign checkpoint's work was NOT adopted");
+  });
+
+  it("RESUME whose own-checkpoint tip EQUALS the mirrored checkpoint STILL adopts (trap #5 — same-run legitimate resume)", async () => {
+    const branch = "agent/issue-10306";
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    // The server persists checkpoint_tip on EVERY publish (M2), so a same-run resume's own tip
+    // equals its own checkpoint's current SHA — adoption must still fire.
+    const cpTip = await publishCommittedCheckpoint(gitA, bareA, 10306, branch, ["M1.txt", "M2.txt"]);
+
+    const gitB = worker("workerB");
+    const bareB = await gitB.ensureClone(fx.originPath);
+
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10306, "run-B", true /* resume */, cpTip /* own tip == checkpoint */);
+
+    assert.strictEqual(rc.seededFrom, "checkpoint", "a matching own tip adopts the checkpoint (same-run legitimate resume)");
+    assert.strictEqual(rc.baseCommit, cpTip, "the base is the checkpoint tip — the run's own committed milestones");
+    assert.notStrictEqual(rc.checkpointSetAside, true, "a matched checkpoint is NOT set aside");
+    assert.ok(rc.priorCommits > 0, `priorCommits must be > 0 (own milestones adopted), got ${rc.priorCommits}`);
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), true, "milestone M1 adopted onto the branch");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M2.txt")), true, "milestone M2 adopted onto the branch");
   });
 });
 

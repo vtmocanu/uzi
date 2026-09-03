@@ -167,6 +167,12 @@ type fakeStore struct {
 	// Ownership + messages + state.
 	runOwned    store.Run
 	runOwnedErr error
+	// checkpointTips records every SetRunCheckpointTip write (PRD #1042 M2) in order,
+	// so a Publish test can prove the tip is persisted on each successful publish and
+	// NOT on a benign-skip publish. checkpointTipErr forces the best-effort write to
+	// fail (proving a persist failure does not fail the publish).
+	checkpointTips   []store.SetRunCheckpointTipParams
+	checkpointTipErr error
 	// Agent-memory write path (PRD #90/#266): memRunCount is the per-run write count
 	// CountAgentMemoryForRun returns; memInsertParams captures the InsertAgentMemory
 	// arg so a test can assert what was actually persisted after sanitize/normalize;
@@ -692,6 +698,13 @@ func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnt
 	}
 	if f.recordCredRows != nil {
 		return *f.recordCredRows, nil
+	}
+	return 1, nil
+}
+func (f *fakeStore) SetRunCheckpointTip(_ context.Context, arg store.SetRunCheckpointTipParams) (int64, error) {
+	f.checkpointTips = append(f.checkpointTips, arg)
+	if f.checkpointTipErr != nil {
+		return 0, f.checkpointTipErr
 	}
 	return 1, nil
 }

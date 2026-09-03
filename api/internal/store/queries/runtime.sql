@@ -756,7 +756,8 @@ RETURNING *;
 -- plan_md's provenance, and the seeded run's plan_approved is sound for the same
 -- structural reason the other two are: it is true only while plan_md is the reviewed
 -- (here: create-time-supplied) text.
-SELECT rp.web_url             AS repo_web_url,
+SELECT r.checkpoint_tip,
+       rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.forge_project_id,
        rp.default_branch,
@@ -2758,6 +2759,14 @@ WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid AND move_pending_since
 -- updated_at) only.
 UPDATE runs SET mr_state = @mr_state, updated_at = now()
 WHERE id = @id;
+
+-- name: SetRunCheckpointTip :execrows
+-- Record the branch tip the worker last checkpoint-published for this run. Unlike
+-- SetRunMRState this deliberately does NOT bump updated_at: checkpoint_tip is
+-- internal bookkeeping written on every publish, and perturbing updated_at would
+-- disturb the claim-affinity ordering (ClaimRun reads r.updated_at for queued rows)
+-- for a value no user ever sees.
+UPDATE runs SET checkpoint_tip = @checkpoint_tip WHERE id = @id;
 
 -- Run health detector (PRD #47) ----------------------------------------------
 
