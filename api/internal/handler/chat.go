@@ -240,7 +240,7 @@ func (h *Handler) CancelChatRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "run_id is required")
 		return
 	}
-	// Map errors like CreateRunInput (workers.go), NOT writeStartRunError: a stale/forged
+	// Map errors like CreateRunInput (runs_lifecycle.go), NOT writeStartRunError: a stale/forged
 	// card must degrade to a clear 404/409, never a 500.
 	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, runID, "cancel", "", nil)
 	if err != nil {
@@ -291,7 +291,7 @@ func (h *Handler) SteerChatRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "message must not be empty")
 		return
 	}
-	// Map errors like CreateRunInput (workers.go), NOT writeStartRunError: a stale/forged
+	// Map errors like CreateRunInput (runs_lifecycle.go), NOT writeStartRunError: a stale/forged
 	// card or a chat-run target must degrade to a clear 404/409, never a 500.
 	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, runID, "follow_up", req.Message, nil)
 	if err != nil {

@@ -216,7 +216,7 @@ func inputReq(user store.User, runID uuid.UUID, body string) *http.Request {
 // The e2e leg was NOT redundant with the citation the PRD gave: store/stop_kind_integration_test.go
 // proves the COLUMN is stamped, apitypes/wire_test.go pins the JSON KEY (shape only), and
 // board_latestrun_test.go asserts a stop_kind VALUE — but through mapLatestRun, a different
-// DTO built by a different call site. Nothing covered runToDTO's own mapping (workers.go:166).
+// DTO built by a different call site. Nothing covered runToDTO's own mapping (runs_dto.go).
 //
 // Both directions, so the test can discriminate: a stamped value surfaces, and an unstamped
 // (NULL) column becomes nil rather than the empty string a naive `.String` read would yield.
@@ -530,7 +530,7 @@ func TestListRunMessagesLimit(t *testing.T) {
 	// The 5-message fixture can't distinguish clamped from unclamped by response size, so
 	// this asserts on the Lim the handler actually forwarded to the store: the handler
 	// must have reduced maxRunMessagesPage+50 to exactly maxRunMessagesPage. Deleting the
-	// clamp block in workers.go reddens this assertion (the fake would record the raw
+	// clamp block in runs_lifecycle.go reddens this assertion (the fake would record the raw
 	// over-max Lim), which is what gives the subcase its gating power.
 	rec = httptest.NewRecorder()
 	h.ListRunMessages(rec, runReqQuery(owner, runID, fmt.Sprintf("limit=%d", maxRunMessagesPage+50)))
