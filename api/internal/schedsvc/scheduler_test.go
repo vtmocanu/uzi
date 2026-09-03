@@ -336,15 +336,16 @@ type selfImproveCall struct {
 	userID, repoID        uuid.UUID
 	issueIID              int64
 	title, description    string
+	mrReworkEnabled       *bool
 	model                 *string
 	overrideSubagentModel bool
 }
 
-func (f *fakeRuns) CreateSelfImproveRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreateSelfImproveRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.selfImprove = append(f.selfImprove, selfImproveCall{userID, repoID, issueIID, title, description, model, overrideSubagentModel})
+	f.selfImprove = append(f.selfImprove, selfImproveCall{userID, repoID, issueIID, title, description, mrReworkEnabled, model, overrideSubagentModel})
 	if f.selfImproveRun.ID == (uuid.UUID{}) {
 		f.selfImproveRun = store.Run{ID: uuid.New()}
 	}
