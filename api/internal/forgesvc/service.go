@@ -116,6 +116,8 @@ type IssueStore interface {
 	DeleteIssuesNotIn(ctx context.Context, arg store.DeleteIssuesNotInParams) (int64, error)
 	// Used by the MR-close watcher (mr_watch.go).
 	ListMRWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListMRWatchCandidatesRow, error)
+	// Used by the board-free scheduled MR-state recorder (scheduled_mr_watch.go, PRD #908).
+	ListScheduledMRStateWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListScheduledMRStateWatchCandidatesRow, error)
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	SetRunMRState(ctx context.Context, arg store.SetRunMRStateParams) (int64, error)

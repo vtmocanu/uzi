@@ -2,7 +2,7 @@
 
 > Anchors re-verified against main at fcfd8aa on 2026-09-03, after the epic #915 file splits and the pgconv consolidation.
 
-**Status**: Proposed (design for review) — companion to `prds/908-mr-rework-scheduled-runs.md`
+**Status**: Implemented — companion to `prds/done/908-mr-rework-scheduled-runs.md`
 **Author**: architect
 **Scope**: `api/` + `docs/` only. **No `agent/` change, no `web/` code change, no new migration.**
 

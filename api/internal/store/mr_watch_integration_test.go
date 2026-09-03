@@ -162,6 +162,21 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	issue(111, "closed", hr)
 	run(111, 211, "completed", "closed", 1*time.Minute)
 
+	// 112 — PRD #908 R1 board-free guard: a completed SELF_IMPROVE run whose shared
+	// tracking issue (112) is OPEN and parked in Human Review by runlifecycle, with an
+	// OPEN MR. This is the exact reachable state that made the scheduled lane leak onto
+	// the board: without the `kind NOT IN ('prompt','self_improve')` filter in the CTE it
+	// satisfies Lane A (opened + Human Review) and the board-coupled syncOneMRState would
+	// move the SHARED tracking-issue card on the MR close/reopen edge — the R1 violation.
+	// The kind filter drops it here; ListScheduledMRStateWatchCandidates owns it board-free
+	// instead. Designed to FAIL on the pre-fix query (112 would appear as a 6th candidate);
+	// its exclusion plus the exact count of 5 below is the non-vacuous proof.
+	issue(112, "opened", hr)
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, status, mr_iid, mr_state, created_at)
+		 VALUES ($1, $2, 'self_improve', $3, 't', 'd', $4, 'completed', $5, 'opened', $6)`,
+		userID, repoID, int64(112), "uzi/self-improve/"+uuid.New().String(), int64(212), base.Add(1*time.Minute))
+
 	rows, err := q.ListMRWatchCandidates(ctx, repoID)
 	if err != nil {
 		t.Fatalf("ListMRWatchCandidates: %v", err)
@@ -183,6 +198,7 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 		107: "completed run has NULL mr_iid",
 		110: "Lane B decay: closed issue but mr_state already terminal (merged)",
 		111: "Lane B decay: closed issue, mr_state terminal (closed)",
+		112: "PRD #908 R1: self_improve run excluded from the board-coupled watcher by the CTE kind filter",
 	}
 	for iid, why := range absent {
 		if _, ok := got[iid]; ok {

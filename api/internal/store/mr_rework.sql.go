@@ -45,7 +45,8 @@ type CreateAutoMRReworkRunParams struct {
 
 // Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). issue_iid stays
 // NULL (kind='mr_rework'); issue_title/issue_description carry the synthesized human
-// summary. pipeline_ref = agent/issue-N is written AT INSERT so the cross-kind branch
+// summary. pipeline_ref = the agent branch (agent/issue-N, uzi/prompt-…, or
+// uzi/self-improve/… — PRD #908) is written AT INSERT so the cross-kind branch
 // guard is never create-time-NULL (Decision 6). target_run_id points at the source
 // completed run whose MR is watched (mirroring judge). mr_iid is the MR the rework
 // folds onto. review_comments carries the MR review snapshot the detector built
@@ -58,7 +59,7 @@ type CreateAutoMRReworkRunParams struct {
 // The create-time CROSS-KIND branch guard (Decision 6, the most severe review finding)
 // is this query's own single atomic INSERT … WHERE NOT EXISTS. The WHERE NOT EXISTS
 // predicate is narrowed to the CROSS-KIND case only — an active ci_fix run whose
-// pipeline_ref equals the branch (agent/issue-N) means the branch is occupied by the
+// pipeline_ref equals the branch (any agent branch) means the branch is occupied by the
 // other kind. ci_fix writes pipeline_ref AT INSERT, so — unlike the old runs.branch
 // count (NULL for a run's whole active life) — a freshly-created cross-kind sibling is
 // seen. A committed ci_fix → zero rows inserted → pgx.ErrNoRows, which the caller maps
@@ -204,8 +205,9 @@ type DeleteMRReworkLedgerNotInParams struct {
 // set (a merged/closed MR, or a run branch that aged out), mirroring
 // DeleteCIAutofixAttemptsNotIn with the same keep-set semantics. This is ALSO the
 // stop-on-merge / stop-on-close cleanup: an mr_state that leaves 'opened' drops the
-// ref from the candidate set, so its ledger row evicts here and a reused agent/issue-N
-// branch never inherits a stale count. An empty keep-set clears the repo's ledger.
+// ref from the candidate set, so its ledger row evicts here and a reused agent branch
+// (agent/issue-N, uzi/prompt-…, uzi/self-improve/…) never inherits a stale count. An
+// empty keep-set clears the repo's ledger.
 func (q *Queries) DeleteMRReworkLedgerNotIn(ctx context.Context, arg DeleteMRReworkLedgerNotInParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteMRReworkLedgerNotIn, arg.RepoID, arg.KeepRefs)
 	if err != nil {
@@ -250,7 +252,7 @@ WITH per_branch AS (
            r.branch, r.mr_iid, r.user_id, r.id AS source_run_id, r.mr_rework_enabled
     FROM runs r
     WHERE r.repo_id = $1::uuid
-      AND r.kind = 'issue'
+      AND r.kind IN ('issue', 'prompt', 'self_improve')
       AND r.status = 'completed'
       AND r.branch IS NOT NULL AND r.branch <> ''
       AND r.mr_iid IS NOT NULL
@@ -298,10 +300,16 @@ type ListMRReworkCandidatesRow struct {
 // single atomic INSERT … WHERE NOT EXISTS is itself the create-time cross-kind
 // branch guard. Detection lives in the poller, never in forgesvc — forgesvc's
 // sync methods are shared with the manual board Refresh and must never spawn runs.
-// The completed issue runs in a repo whose OPEN MR is eligible for an automatic
-// mr_rework, one row per branch. Gates (Decision 9/10):
-//  1. Only issue runs open an MR review loop (chat/judge/self_improve are out of
-//     scope, Decision 9), so kind = 'issue'. DISTINCT ON (r.branch) picks the
+// The completed issue/prompt/self_improve runs in a repo whose OPEN MR is eligible
+// for an automatic mr_rework, one row per branch. Gates (Decision 9/10):
+//  1. issue runs plus the scheduled lanes open an MR review loop: kind IN
+//     ('issue','prompt','self_improve') (PRD #908 widened this from issue-only —
+//     chat/judge still out of scope). For the scheduled lanes runs.mr_state is made
+//     reliable by forgesvc.SyncScheduledMRStates (PRD #908 M3); prompt runs are
+//     issue-less (so the board-coupled ListMRWatchCandidates, which JOINs issues,
+//     never watched them) and self_improve shares one tracking issue (so that watcher
+//     recorded mr_state only for the newest cycle via DISTINCT ON (issue_iid) — and
+//     only when the tracking issue is cached). DISTINCT ON (r.branch) picks the
 //     NEWEST such run per branch (mirroring ListCIAutofixCandidateRefs).
 //  2. The run is completed and carries an mr_iid, and the WATCHER-OWNED mr_state is
 //     'opened' (Decision 10 — gate on runs.mr_state, which SyncMRStates set FIRST

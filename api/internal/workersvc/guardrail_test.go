@@ -122,7 +122,7 @@ func TestCreateSelfImproveRunGuardrailBlocksBeforeInsert(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	_, err := svc.CreateSelfImproveRun(context.Background(), user, repo, 7, "t", "d", nil, false)
+	_, err := svc.CreateSelfImproveRun(context.Background(), user, repo, 7, "t", "d", nil, nil, false)
 	assertGuardrailBlocked(t, err, wantMsgs)
 	if guard.called != 1 {
 		t.Fatalf("guard called %d times, want 1", guard.called)

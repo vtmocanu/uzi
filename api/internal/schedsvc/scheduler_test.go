@@ -336,15 +336,16 @@ type selfImproveCall struct {
 	userID, repoID        uuid.UUID
 	issueIID              int64
 	title, description    string
+	mrReworkEnabled       *bool
 	model                 *string
 	overrideSubagentModel bool
 }
 
-func (f *fakeRuns) CreateSelfImproveRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreateSelfImproveRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.selfImprove = append(f.selfImprove, selfImproveCall{userID, repoID, issueIID, title, description, model, overrideSubagentModel})
+	f.selfImprove = append(f.selfImprove, selfImproveCall{userID, repoID, issueIID, title, description, mrReworkEnabled, model, overrideSubagentModel})
 	if f.selfImproveRun.ID == (uuid.UUID{}) {
 		f.selfImproveRun = store.Run{ID: uuid.New()}
 	}
@@ -647,6 +648,49 @@ func TestTickThreadsScheduleMrReworkEnabled(t *testing.T) {
 		}
 		if got := h.runs.autopilot[0].mrReworkEnabled; got != nil {
 			t.Fatalf("a schedule with a NULL mr_rework column must thread nil (inherit), got %v", *got)
+		}
+	})
+	// The self_improve seam (CreateSelfImproveRun) is the fourth scheduled path that
+	// threads scheduleMrRework (self_improve.go). PRD #908 M1 wired it; these pin the
+	// same three-state contract as the issue/prompt seams above.
+	t.Run("self_improve explicit false", func(t *testing.T) {
+		h := newHarness()
+		s := h.selfImproveSchedule()
+		s.MrReworkEnabled = pgtype.Bool{Bool: false, Valid: true}
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.selfImprove) != 1 {
+			t.Fatalf("CreateSelfImproveRun calls = %d, want 1", len(h.runs.selfImprove))
+		}
+		got := h.runs.selfImprove[0].mrReworkEnabled
+		if got == nil || *got {
+			t.Fatalf("self_improve run threaded mr_rework = %v, want an explicit false", got)
+		}
+	})
+	t.Run("self_improve explicit true", func(t *testing.T) {
+		h := newHarness()
+		s := h.selfImproveSchedule()
+		s.MrReworkEnabled = pgtype.Bool{Bool: true, Valid: true}
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.selfImprove) != 1 {
+			t.Fatalf("CreateSelfImproveRun calls = %d, want 1", len(h.runs.selfImprove))
+		}
+		got := h.runs.selfImprove[0].mrReworkEnabled
+		if got == nil || !*got {
+			t.Fatalf("self_improve run threaded mr_rework = %v, want an explicit true", got)
+		}
+	})
+	t.Run("self_improve nil override inherits", func(t *testing.T) {
+		h := newHarness()
+		s := h.selfImproveSchedule() // MrReworkEnabled zero-value = NULL
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.selfImprove) != 1 {
+			t.Fatalf("CreateSelfImproveRun calls = %d, want 1", len(h.runs.selfImprove))
+		}
+		if got := h.runs.selfImprove[0].mrReworkEnabled; got != nil {
+			t.Fatalf("a self_improve schedule with a NULL mr_rework column must thread nil (inherit), got %v", *got)
 		}
 	})
 }
