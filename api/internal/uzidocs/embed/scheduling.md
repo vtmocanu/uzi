@@ -390,10 +390,10 @@ issue runs open:
 
 Both lanes act only on a **still-open** MR and spend the schedule owner's own
 Anthropic token, the same as any other run. A prompt schedule's MR has no
-backing issue, so the start/halt notices these lanes would post as an issue
-comment on an issue-run MR arrive as an **in-app notification only** for a
-prompt MR; a self-improvement MR's shared tracking issue is likewise left
-untouched.
+backing issue, so the notices these lanes post as an issue comment on an
+issue-run MR (ci_autofix's start and halt; mr_rework's per-MR cap halt) arrive
+as an **in-app notification only** for a prompt MR; a self-improvement MR's
+shared tracking issue is likewise left untouched.
 
 ## Restarts and missed fires
 

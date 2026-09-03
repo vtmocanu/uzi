@@ -25,6 +25,11 @@ import (
 //     once (issue #853) then records 'merged'.
 //   - opened->closed            → the close edge cancels exactly once then records 'closed'.
 //   - opened->locked            → locked is transient: record, NO cancel.
+//   - locked->opened            → the transient state settles back to opened: record, NO cancel.
+//   - locked->merged            → merge from the transient state still cancels exactly once.
+//   - locked->closed            → records 'closed' but does NOT cancel — the close edge only
+//     cancels from 'opened' (default arm cancels only on merged), exact parity with the
+//     issue-lane syncOneMRState. Pinned so the parity gap is intentional, not an accident.
 //   - unknown-state             → an unrecognized forge state writes nothing and cancels
 //     nothing (the baseline is preserved so a later real state still fires).
 //   - no-transition             → observed==stored: no write, no cancel.
@@ -74,6 +79,30 @@ func TestSyncScheduledMRStatesDifferential(t *testing.T) {
 			stored:     strptr(forge.MRStateOpened),
 			observed:   forge.MRStateLocked,
 			wantRecord: strptr(forge.MRStateLocked),
+			wantCancel: 0,
+		},
+		{
+			name:       "locked->opened",
+			stored:     strptr(forge.MRStateLocked),
+			observed:   forge.MRStateOpened,
+			wantRecord: strptr(forge.MRStateOpened),
+			wantCancel: 0,
+		},
+		{
+			name:       "locked->merged",
+			stored:     strptr(forge.MRStateLocked),
+			observed:   forge.MRStateMerged,
+			wantRecord: strptr(forge.MRStateMerged),
+			wantCancel: 1,
+		},
+		{
+			// The close edge cancels only from 'opened' (default arm cancels only on merged),
+			// so a locked->closed records the terminal state WITHOUT cancelling — exact parity
+			// with the issue-lane syncOneMRState. Pinned intentionally.
+			name:       "locked->closed",
+			stored:     strptr(forge.MRStateLocked),
+			observed:   forge.MRStateClosed,
+			wantRecord: strptr(forge.MRStateClosed),
 			wantCancel: 0,
 		},
 		{

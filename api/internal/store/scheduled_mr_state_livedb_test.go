@@ -174,8 +174,9 @@ func TestScheduledBranchConcurrencyGuardsLiveDB(t *testing.T) {
 		srcOccupied, owner, repoID, occupiedBranch, occupiedMR)
 
 	// ── CROSS-KIND branch guard ──
-	// An active ci_fix run occupies the scheduled branch. Its distinct mr_iid=99 means the
-	// ONLY thing blocking the mr_rework insert is the occupied branch, not the same-MR index.
+	// An active ci_fix run occupies the scheduled branch. It carries NO mr_iid (NULL, distinct
+	// from the mr_rework's occupiedMR), so the ONLY thing blocking the mr_rework insert is the
+	// occupied branch (the cross-kind WHERE NOT EXISTS), not the same-MR uniqueness index.
 	mustExec(ctx, t, pool,
 		`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, pipeline_id, pipeline_ref, status)
 		 VALUES ($1, $2, $3, 'ci_fix', 't', 'd', 4242, $4, 'running')`,
