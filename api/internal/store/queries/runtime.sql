@@ -2753,10 +2753,13 @@ WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid AND move_pending_since
 
 -- name: SetRunMRState :execrows
 -- Record the merge-request state the watcher just observed for this run. This is
--- the ONLY writer of runs.mr_state (the watcher-owned invariant, review finding
--- 11): no run-status path writes it. The run itself stays terminal — closing an
--- MR is review feedback, not a run-status event — so this touches mr_state (and
--- updated_at) only.
+-- the ONLY SQL statement that writes runs.mr_state (the watcher-owned invariant,
+-- review finding 11): no run-status path writes it. It now has TWO Go callers over
+-- DISJOINT run sets — SyncMRStates (issue runs, board-coupled) and
+-- SyncScheduledMRStates (prompt/self_improve runs, board-free) — PRD #908; each
+-- records the state for its own lane through this one statement. The run itself
+-- stays terminal — closing an MR is review feedback, not a run-status event — so
+-- this touches mr_state (and updated_at) only.
 UPDATE runs SET mr_state = @mr_state, updated_at = now()
 WHERE id = @id;
 

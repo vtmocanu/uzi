@@ -242,11 +242,14 @@ type fakeStore struct {
 	// MR-close watcher (PRD #24) scripting + capture.
 	candidates    []store.ListMRWatchCandidatesRow
 	candidatesErr error
-	issue         store.Issue
-	issueErr      error
-	columns       []store.BoardColumn
-	columnsErr    error
-	mrStateWrites []store.SetRunMRStateParams
+
+	scheduledCandidates    []store.ListScheduledMRStateWatchCandidatesRow
+	scheduledCandidatesErr error
+	issue                  store.Issue
+	issueErr               error
+	columns                []store.BoardColumn
+	columnsErr             error
+	mrStateWrites          []store.SetRunMRStateParams
 
 	// Pipeline sync (PRD #6) scripting + capture.
 	watchedRefs      []store.ListWatchedRunRefsForRepoRow
@@ -321,6 +324,9 @@ func (s *fakeStore) DeleteIssuesNotIn(_ context.Context, arg store.DeleteIssuesN
 }
 func (s *fakeStore) ListMRWatchCandidates(context.Context, uuid.UUID) ([]store.ListMRWatchCandidatesRow, error) {
 	return s.candidates, s.candidatesErr
+}
+func (s *fakeStore) ListScheduledMRStateWatchCandidates(context.Context, uuid.UUID) ([]store.ListScheduledMRStateWatchCandidatesRow, error) {
+	return s.scheduledCandidates, s.scheduledCandidatesErr
 }
 func (s *fakeStore) GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error) {
 	return s.issue, s.issueErr

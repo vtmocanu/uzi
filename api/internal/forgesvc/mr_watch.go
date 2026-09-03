@@ -225,8 +225,10 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 	return moveApplied
 }
 
-// recordMRState persists the observed MR state (SetRunMRState is the sole writer
-// of runs.mr_state). Best-effort: a write failure only means the same edge is
+// recordMRState persists the observed MR state (runs.mr_state is written only by
+// forgesvc MR-state sync — SyncMRStates and SyncScheduledMRStates, over disjoint
+// run sets, PRD #908 — both through the single SetRunMRState statement).
+// Best-effort: a write failure only means the same edge is
 // re-observed next tick, and the guards make the retry a no-op if the card has
 // already moved.
 func (s *Service) recordMRState(ctx context.Context, runID uuid.UUID, state string) {
