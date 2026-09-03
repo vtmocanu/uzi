@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **A milestone shows as in progress the moment the worker reports it, instead of only at the next turn boundary ([#1064](https://github.com/vtmocanu/uzi/issues/1064)).**
   The worker now pushes a `running` state report the instant it observes a `report_progress` signal, rather than waiting for the next iteration or checkpoint report to carry it, and emits a feed line per transition ("milestone m2 started — <title>" / "milestone m1 reported complete — <title>"). Wording always says "reported complete", never "done" or "verified" — uzi shows what the worker reported and has not itself checked the work.
 
+### Fixed
+
+- **Hosted worker: `agent-browser` starts out of the box on the musl image ([#1082](https://github.com/vtmocanu/uzi/issues/1082)).**
+  The shim now picks the native binary by the dynamic loader on disk instead of letting the npm launcher sniff `ldd --version` off the PATH, where a provisioned nix glibc (uzi's own `ruby@4.0.6`) shadowed musl's `ldd` and made it spawn the glibc build; the image build guard repeats the check behind a fake glibc `ldd` and opens `about:blank` through the shim, so a regression reddens the build rather than costing a subagent ~15 tool calls mid-run.
+
 ## [0.76.0] - 2026-09-03
 
 ### Added
