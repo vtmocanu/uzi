@@ -362,6 +362,25 @@ type Client interface {
 	// (ExitConflict), which the CLI treats as an idempotent no-op. Returns the new sibling DTO.
 	AddScheduleRepo(ctx context.Context, id, repoID string) (apitypes.ScheduleDTO, error)
 
+	// GetSchedulePause reads the caller's user-level pause-all state (PRD #1093 D7/D8):
+	// GET /api/schedules/pause, RequireUser so a uzc_ token reaches it. The reply is a
+	// bare SchedulePauseDTO whose Paused is the server-NORMALIZED live decision (an
+	// expired Until reads paused:false, until:null), so the CLI renders it as-is and
+	// never re-derives expiry client-side.
+	GetSchedulePause(ctx context.Context) (apitypes.SchedulePauseDTO, error)
+	// SetSchedulePause pauses every schedule the caller owns until `until` (PRD #1093):
+	// PUT /api/schedules/pause with body {"until": <RFC3339>|null}. A nil until is the
+	// "until I resume" indefinite pause (sent as null); a non-nil one is the auto-resume
+	// instant, already resolved to an absolute time client-side (the relative `--until`
+	// forms are interpreted in the CLI's local timezone, D8). An until in the past is a
+	// 422 → ExitUsage. Returns the resulting (normalized) state.
+	SetSchedulePause(ctx context.Context, until *time.Time) (apitypes.SchedulePauseDTO, error)
+	// ClearSchedulePause resumes all of the caller's schedules (PRD #1093): DELETE
+	// /api/schedules/pause, idempotent (resuming when not paused is a clean no-op).
+	// Unlike DeleteSchedule this route RETURNS the resulting state body, so the CLI can
+	// confirm the resumed state from the same call.
+	ClearSchedulePause(ctx context.Context) (apitypes.SchedulePauseDTO, error)
+
 	// CheckRepoLabels reports which of the given selector labels do NOT exist on a repo the
 	// caller owns (PRD #589 M4): POST /api/repos/{id}/labels/check. It is the sweep-label
 	// WARN primitive — the caller resolves the selector (a sweep default's catalog labels,
@@ -672,6 +691,18 @@ func (c *HTTPClient) del(ctx context.Context, path string) error {
 	return decode2xx(resp, body, path, nil)
 }
 
+// delRead executes a DELETE and, on a 2xx, decodes the response body into out
+// (out may be nil to discard). It mirrors del but is for a DELETE that RETURNS a
+// body — the schedules pause-all resume route answers 200 with the resulting state,
+// where the ordinary del discards it. Non-2xx maps to the documented exit code.
+func (c *HTTPClient) delRead(ctx context.Context, path string, out any) error {
+	resp, body, err := c.doJSONRead(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return err
+	}
+	return decode2xx(resp, body, path, out)
+}
+
 // decode2xx maps a non-2xx status to an *ExitError and otherwise decodes the body
 // into out (nil to discard). Shared by get and postJSON so success/error handling
 // is identical across verbs.
@@ -705,6 +736,14 @@ func statusError(status int, body []byte) *ExitError {
 	case status == http.StatusBadRequest:
 		if msg == "" {
 			msg = "bad request"
+		}
+		return Exitf(ExitUsage, "%s", msg)
+	case status == http.StatusUnprocessableEntity:
+		// A 422 is the server rejecting the request's CONTENT (a past `until`, an
+		// issue-target schedule repointed to another repo): a usage error like a 400,
+		// so it exits 2 and the message names the offending value.
+		if msg == "" {
+			msg = "unprocessable request"
 		}
 		return Exitf(ExitUsage, "%s", msg)
 	case status == http.StatusUnauthorized:

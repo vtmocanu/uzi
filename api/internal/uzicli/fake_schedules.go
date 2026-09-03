@@ -2,6 +2,7 @@ package uzicli
 
 import (
 	"context"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -121,6 +122,39 @@ func (f *FakeClient) AddScheduleRepo(_ context.Context, id, repoID string) (apit
 		return apitypes.ScheduleDTO{}, f.Err
 	}
 	return f.AddRepoSchedule, nil
+}
+
+// GetSchedulePause returns the canned PauseState (the server-normalized pause-all
+// state). Returns f.Err when set, like the other read verbs.
+func (f *FakeClient) GetSchedulePause(context.Context) (apitypes.SchedulePauseDTO, error) {
+	if f.PauseErr != nil {
+		return apitypes.SchedulePauseDTO{}, f.PauseErr
+	}
+	if f.Err != nil {
+		return apitypes.SchedulePauseDTO{}, f.Err
+	}
+	return f.PauseState, nil
+}
+
+// SetSchedulePause records the forwarded until pointer (nil = indefinite) and that a
+// pause write was reached, then returns the canned PauseState.
+func (f *FakeClient) SetSchedulePause(_ context.Context, until *time.Time) (apitypes.SchedulePauseDTO, error) {
+	f.LastPauseUntil = until
+	f.LastPauseSet = true
+	if f.Err != nil {
+		return apitypes.SchedulePauseDTO{}, f.Err
+	}
+	return f.PauseState, nil
+}
+
+// ClearSchedulePause records that resume-all reached the clear write and returns the
+// canned PauseState (a resumed DTO).
+func (f *FakeClient) ClearSchedulePause(context.Context) (apitypes.SchedulePauseDTO, error) {
+	f.PauseCleared = true
+	if f.Err != nil {
+		return apitypes.SchedulePauseDTO{}, f.Err
+	}
+	return f.PauseState, nil
 }
 
 // CheckRepoLabels records the (repo, labels) it was asked about and returns the canned

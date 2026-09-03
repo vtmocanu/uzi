@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 173 as of this commit (PRD #836 M6 added POST /api/admin/release-check/snooze — the
+// 176 as of this commit (PRD #1093 M2 added GET, PUT and DELETE /api/schedules/pause —
+// the user-level pause-all-schedules singleton: read the normalized state, pause with an
+// optional auto-resume until, and resume. All three carry noLimiter.)
+// It was 173 until then (PRD #836 M6 added POST /api/admin/release-check/snooze — the
 // admin escalation-banner server-side snooze, keyed to the current release tag).
 // It was 172 until then (PRD #836 M3 added GET /api/admin/release-check and POST
 // /api/admin/release-check — the admin Updates-card read plus the "Check now" trigger).
@@ -284,6 +287,13 @@ var wantRouteMounts = []routeMount{
 	// Schedule list/get (PRD #241 M4): owner-scoped reads, no forge → noLimiter.
 	{"GET", "/api/me/schedules/", noLimiter},
 	{"GET", "/api/schedules/{id}", noLimiter},
+	// Pause-all singleton (PRD #1093 M2, D7): the user-level kill switch. All three are
+	// owner-scoped writes/reads on the caller's own users row — a boolean + nullable
+	// timestamp, no forge call, no token spend, mints nothing → noLimiter, matching the
+	// other schedule reads/writes and the /me/* toggles.
+	{"GET", "/api/schedules/pause", noLimiter},
+	{"PUT", "/api/schedules/pause", noLimiter},
+	{"DELETE", "/api/schedules/pause", noLimiter},
 	{"GET", "/api/me/memory/", noLimiter},
 	{"GET", "/api/me/rate-limits", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},

@@ -78,6 +78,9 @@ func contractCases() []contractCase {
 		// ScheduleRequest is a REQUEST body: its full.json round-trips through
 		// DisallowUnknownFields (the runtime-400 class the PRD names) like every other row.
 		newContractCase[ScheduleRequest]("schedule_input"),
+		// The pause-all singleton response (PRD #1093 M2): an exported DTO on a
+		// RequireUser route (GET/PUT/DELETE /api/schedules/pause).
+		newContractCase[SchedulePauseDTO]("schedule_pause"),
 		newContractCase[WorkerDTO]("worker"),
 		newContractCase[AdminWorkerDTO]("admin_worker"),
 		newContractCase[UserDTO]("user"),

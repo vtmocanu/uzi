@@ -29,6 +29,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       enableCatalogSchedule: vi.fn(),
       deleteSchedule: vi.fn(),
       addScheduleRepo: vi.fn(),
+      // PRD #1093: the page fetches the pause state alongside the list.
+      getSchedulePause: vi.fn(),
     },
   };
 });
@@ -90,6 +92,7 @@ function sched(over: Partial<Schedule>): Schedule {
 beforeEach(() => {
   mockApi.listScheduleCatalog.mockResolvedValue(EMPTY_CATALOG);
   mockApi.listRepos.mockResolvedValue({ repos: [] } as Awaited<ReturnType<typeof api.listRepos>>);
+  mockApi.getSchedulePause.mockResolvedValue({ paused: false, until: null });
 });
 afterEach(() => {
   cleanup();

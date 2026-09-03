@@ -56,6 +56,11 @@ cd web && VITE_UZI_MOCK=1 npm run dev   # mock mode — no backend, no network a
 - `agent-browser snapshot` prints the tooltip element's accessible NAME, not the describing element's DESCRIPTION, and the two disagree; use `Accessibility.getPartialAXTree` on the describing element.
 - A blind instrument is exposed by a control (an empty, untitled row), never by a re-run.
 
+## Selecting focus and status regions in a test
+
+- Assert focus by IDENTITY, not text: `expect(document.activeElement?.textContent).toMatch(…)` is vacuous, since on `<body>` `textContent` is the whole page and matches anything. Use `toBe(el)` (the codebase convention); identity gives a false negative when a selector drifts and text a false positive, so their disagreement is the signal.
+- `getByRole("status")` / `querySelector("[role=status]")` is ambiguous here: several regions carry `role="status"`, including the app-wide, always-present, usually-empty `RateLimitAnnouncer` (`RateLimitMeters.tsx`, rendered in `AppShell.tsx`), which a test that mounts the shell grabs first. Scope the query to the surface under test, or select by a more specific handle.
+
 ## Copy changes disarm negative assertions
 
 - Retiring a string makes every negative assertion about it vacuous: `expect(queryByText(/old copy/)).toBeNull()` passes forever once nothing can render that string, while a positive assertion goes red. Only negatives rot, and review-by-reading misses them.

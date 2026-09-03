@@ -3,11 +3,14 @@
 // Schedules list page (PRD #241 M5, mock §1): rows render per target/timing, and the
 // per-row enable toggle PATCHes { enabled } and adopts the server's returned row.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Schedules } from "./Schedules";
 import { api, type LastFire, type Schedule } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+import { formatStamp } from "../components/LastRun";
+import { resolvePreset } from "../lib/schedulePausePresets";
+import { schedulesApi } from "../mocks/mockApi/schedules";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -24,6 +27,11 @@ vi.mock("../lib/api", async (importOriginal) => {
       enableCatalogSchedule: vi.fn(),
       deleteSchedule: vi.fn(),
       addScheduleRepo: vi.fn(),
+      // PRD #1093: the page fetches the user-level pause state alongside the list, and the
+      // picker/banner drive PUT/DELETE.
+      getSchedulePause: vi.fn(),
+      putSchedulePause: vi.fn(),
+      deleteSchedulePause: vi.fn(),
       // The clone flow opens the edit modal on the new row, which mounts ScheduleModal;
       // stub its preview + checkRepoLabels so the modal's effects don't hit undefined.
       previewSchedule: vi.fn(),
@@ -85,6 +93,8 @@ beforeEach(() => {
   mockApi.listRepos.mockResolvedValue({ repos: [] } as Awaited<ReturnType<typeof api.listRepos>>);
   mockApi.previewSchedule.mockResolvedValue({ fires: [] });
   mockApi.checkRepoLabels.mockResolvedValue({ missing: [] });
+  // Default: not paused. Individual tests override to drive the paused / picker states.
+  mockApi.getSchedulePause.mockResolvedValue({ paused: false, until: null });
   vi.mocked(useAuth).mockReturnValue({ prdLabel: "PRD", uziLabel: "uzi" } as unknown as ReturnType<typeof useAuth>);
 });
 afterEach(() => {
@@ -817,5 +827,299 @@ describe("Schedules — issue-target add-repo gating + sub-row badges (issue #63
     expect(within(uziRow).getByText("self-improve")).toBeTruthy();
     const atlasRow = screen.getByText("vtmocanu/atlas").closest<HTMLElement>("div.rounded-lg")!;
     expect(within(atlasRow).getByText("self-improve")).toBeTruthy();
+  });
+});
+
+// ── PRD #1093 M4: the "Pause all schedules" switch (button / picker / banner) ───
+describe("Schedules — pause all (PRD #1093)", () => {
+  function renderRoot() {
+    return render(
+      <MemoryRouter>
+        <Schedules />
+      </MemoryRouter>,
+    );
+  }
+
+  it("shows the Pause all button while not paused and no paused banner (running state)", async () => {
+    mockApi.getSchedulePause.mockResolvedValue({ paused: false, until: null });
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Pause all/ })).toBeTruthy());
+    // Positive control that the page loaded, so the banner-absent check below is meaningful.
+    expect(screen.getByRole("tab", { name: /Default jobs/ })).toBeTruthy();
+    expect(screen.queryByText(/All schedules paused/)).toBeNull();
+  });
+
+  it("hides the Pause all button and shows the paused banner while paused (both directions)", async () => {
+    const future = new Date(Date.now() + 6 * 3_600_000).toISOString();
+    mockApi.getSchedulePause.mockResolvedValue({ paused: true, until: future });
+    renderRoot();
+    // The banner appears, carrying the auto-resume stamp.
+    await waitFor(() => expect(screen.getByText(/All schedules paused until/)).toBeTruthy());
+    // The tab-row button is gone (one control per state).
+    expect(screen.queryByRole("button", { name: /^Pause all$/ })).toBeNull();
+    // Resume now is present.
+    expect(screen.getByRole("button", { name: "Resume now" })).toBeTruthy();
+  });
+
+  it("an indefinite pause reads 'until you resume them' in the banner", async () => {
+    mockApi.getSchedulePause.mockResolvedValue({ paused: true, until: null });
+    renderRoot();
+    await waitFor(() => expect(screen.getByText(/until you resume them/)).toBeTruthy());
+  });
+
+  it("an expired until (GET normalized to paused:false) renders the running state, not a banner", async () => {
+    // The server normalizes an expired `until` to paused:false/until:null on GET; a mock
+    // returning that shape (even with a past until echoed) must render the running state.
+    const past = new Date(Date.now() - 3_600_000).toISOString();
+    mockApi.getSchedulePause.mockResolvedValue({ paused: false, until: past });
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Pause all/ })).toBeTruthy());
+    expect(screen.queryByText(/All schedules paused/)).toBeNull();
+  });
+
+  it("re-reads the pause state when `until` passes on an open page, clearing the banner (auto-resume transition)", async () => {
+    // Real timers on purpose: the page arms one setTimeout for the auto-resume instant and
+    // re-fetches then. A short until makes that fire within the test; the second read is
+    // the server's normalized "not paused" answer, so the banner must give way to the button.
+    const soon = new Date(Date.now() + 60).toISOString();
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockResolvedValue({ paused: false, until: null });
+    renderRoot();
+    await waitFor(() => expect(screen.getByText(/All schedules paused until/)).toBeTruthy());
+    await waitFor(() => expect(screen.queryByText(/All schedules paused/)).toBeNull());
+    expect(screen.getByRole("button", { name: /Pause all/ })).toBeTruthy();
+    // The re-read happened (initial load + the timer's refresh), not a local guess.
+    expect(mockApi.getSchedulePause.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("keeps the last known paused state when the expiry re-read fails (never guesses 'not paused')", async () => {
+    const soon = new Date(Date.now() + 60).toISOString();
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockRejectedValue(new Error("network down"));
+    renderRoot();
+    await waitFor(() => expect(screen.getByText(/All schedules paused until/)).toBeTruthy());
+    // The timer fired and the re-read was attempted (and rejected).
+    await waitFor(() => expect(mockApi.getSchedulePause.mock.calls.length).toBeGreaterThanOrEqual(2));
+    // Positive control for the negative below: the page is still rendered.
+    expect(screen.getByRole("tab", { name: /Default jobs/ })).toBeTruthy();
+    // The banner stays and the running control does not appear on an unknown state.
+    expect(screen.getByText(/All schedules paused until/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Pause all$/ })).toBeNull();
+  });
+
+  it("the picker opens with 'Until tomorrow 09:00' as the default preset and correct resolved stamps (fixed clock)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    // A fixed instant so the resolved preset stamps are deterministic.
+    const now = new Date("2026-09-02T12:00:00Z");
+    vi.setSystemTime(now);
+    try {
+      mockApi.getSchedulePause.mockResolvedValue({ paused: false, until: null });
+      renderRoot();
+      await waitFor(() => expect(screen.getByRole("button", { name: /Pause all/ })).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: /Pause all/ }));
+
+      // The default preset is selected.
+      const tomorrow = screen.getByRole("radio", { name: /Until tomorrow 09:00/ }) as HTMLInputElement;
+      expect(tomorrow.checked).toBe(true);
+      // And its resolved stamp is shown (computed by the same pure helper).
+      const tomorrowStamp = formatStamp(resolvePreset("tomorrow", now)!.toISOString());
+      expect(screen.getAllByText(tomorrowStamp).length).toBeGreaterThan(0);
+      // The Monday preset resolves to the next Monday 09:00 strictly after now.
+      const mondayStamp = formatStamp(resolvePreset("monday", now)!.toISOString());
+      expect(screen.getAllByText(mondayStamp).length).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("submits the resolved until for each preset (and null for 'Until I resume')", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const now = new Date("2026-09-02T12:00:00Z");
+    vi.setSystemTime(now);
+    try {
+      const cases: { radio: RegExp; expected: string | null }[] = [
+        { radio: /Until tomorrow 09:00/, expected: resolvePreset("tomorrow", now)!.toISOString() },
+        { radio: /For 24 hours/, expected: resolvePreset("24h", now)!.toISOString() },
+        { radio: /Until Monday 09:00/, expected: resolvePreset("monday", now)!.toISOString() },
+        { radio: /Until I resume/, expected: null },
+      ];
+      for (const c of cases) {
+        mockApi.getSchedulePause.mockResolvedValue({ paused: false, until: null });
+        mockApi.putSchedulePause.mockResolvedValue({ paused: true, until: c.expected });
+        renderRoot();
+        await waitFor(() => expect(screen.getByRole("button", { name: /Pause all/ })).toBeTruthy());
+        fireEvent.click(screen.getByRole("button", { name: /Pause all/ }));
+        fireEvent.click(screen.getByRole("radio", { name: c.radio }));
+        fireEvent.click(screen.getByRole("button", { name: /^Pause all/ }));
+        await waitFor(() => expect(mockApi.putSchedulePause).toHaveBeenCalledWith(c.expected));
+        mockApi.putSchedulePause.mockClear();
+        cleanup();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a new pause applied after a failed re-read gets an immediate expiry refresh (retry backoff resets)", async () => {
+    // Failure streak: the first expiry re-read rejects (attempt = 1). Then the user sets
+    // a new pause via Change… → Until I resume; the (mocked) server answers with an
+    // until that has ALREADY passed, so the effect's next delay is decided by the
+    // counter: 0 when reset (this test), 60s when the stale count leaks through.
+    const soon = new Date(Date.now() + 60).toISOString();
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValue({ paused: false, until: null });
+    mockApi.putSchedulePause.mockImplementation(async () => ({
+      paused: true,
+      until: new Date(Date.now() - 1).toISOString(),
+    }));
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Change…" })).toBeTruthy());
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Change…" }));
+    fireEvent.click(await screen.findByRole("radio", { name: /Until I resume/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Pause all indefinitely$/ }));
+    await waitFor(() => expect(mockApi.putSchedulePause).toHaveBeenCalledTimes(1));
+    // The fresh state's expiry refresh fires at once (not after a 60s backoff), and the
+    // server's normalized answer clears the banner.
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy());
+  });
+
+  it("a stale expiry re-read never overwrites a newer Resume response (mutation wins)", async () => {
+    // Controlled ordering: the expiry GET is left pending, the user resumes meanwhile
+    // (DELETE resolves not-paused), and only THEN the stale GET resolves "still paused".
+    // The mutation's answer must stand; the effect cancels the in-flight read on change.
+    const soon = new Date(Date.now() + 60).toISOString();
+    let resolveStale: (v: { paused: boolean; until: string | null }) => void = () => {};
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockReturnValueOnce(
+        new Promise<{ paused: boolean; until: string | null }>((r) => {
+          resolveStale = r;
+        }),
+      );
+    mockApi.deleteSchedulePause.mockResolvedValue({ paused: false, until: null });
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resume now" })).toBeTruthy());
+    // The timer fired: the expiry re-read is in flight (pending).
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy());
+    // Now the stale read lands, claiming the pause is still on.
+    await act(async () => {
+      resolveStale({ paused: true, until: soon });
+    });
+    // The newer mutation result stands: still running, no banner.
+    expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy();
+    expect(screen.queryByText(/All schedules paused/)).toBeNull();
+  });
+
+  it("a stale expiry re-read resolving in the SAME batch as the Resume response is dropped (revision guard)", async () => {
+    // Both continuations land in one React batch: the effect's cancellation flag has not
+    // flipped yet (it does at commit), so only the mutation-start revision bump can keep
+    // the stale read from landing last and winning.
+    const soon = new Date(Date.now() + 60).toISOString();
+    let resolveStale: (v: { paused: boolean; until: string | null }) => void = () => {};
+    let resolveDelete: (v: { paused: boolean; until: string | null }) => void = () => {};
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockReturnValueOnce(
+        new Promise<{ paused: boolean; until: string | null }>((r) => {
+          resolveStale = r;
+        }),
+      );
+    mockApi.deleteSchedulePause.mockReturnValue(
+      new Promise<{ paused: boolean; until: string | null }>((r) => {
+        resolveDelete = r;
+      }),
+    );
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resume now" })).toBeTruthy());
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+    await waitFor(() => expect(mockApi.deleteSchedulePause).toHaveBeenCalledTimes(1));
+    // Resolve the mutation FIRST and the stale read SECOND inside one act: without the
+    // revision guard the stale "still paused" answer is the last setPause of the batch.
+    await act(async () => {
+      resolveDelete({ paused: false, until: null });
+      resolveStale({ paused: true, until: soon });
+    });
+    expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy();
+    expect(screen.queryByText(/All schedules paused/)).toBeNull();
+  });
+
+  it("a failed Resume re-reads the pause state, so an expiry read discarded by the mutation is replaced (auto-resume still lands)", async () => {
+    // The expiry re-read is in flight (pending) when the user resumes; the mutation bump
+    // discards it, then the DELETE fails. Without a fresh read nothing would ever clear
+    // the banner even though the server has auto-resumed; the catch path must re-read.
+    const soon = new Date(Date.now() + 60).toISOString();
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockReturnValueOnce(new Promise<{ paused: boolean; until: string | null }>(() => {}))
+      .mockResolvedValue({ paused: false, until: null });
+    mockApi.deleteSchedulePause.mockRejectedValue(new Error("network down"));
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resume now" })).toBeTruthy());
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+    await waitFor(() => expect(screen.getByText(/Could not resume your schedules/)).toBeTruthy());
+    // The failure triggered a fresh read (third call), whose normalized answer clears the banner.
+    await waitFor(() => expect(mockApi.getSchedulePause).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy());
+    expect(screen.queryByText(/All schedules paused/)).toBeNull();
+  });
+
+  it("Resume now triggers deleteSchedulePause", async () => {
+    const future = new Date(Date.now() + 6 * 3_600_000).toISOString();
+    mockApi.getSchedulePause.mockResolvedValue({ paused: true, until: future });
+    mockApi.deleteSchedulePause.mockResolvedValue({ paused: false, until: null });
+    renderRoot();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resume now" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+    await waitFor(() => expect(mockApi.deleteSchedulePause).toHaveBeenCalledTimes(1));
+    // After resume the running-state button returns.
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Pause all$/ })).toBeTruthy());
+  });
+
+  it("every Next-run cell shows a warn 'paused until <stamp>' line while paused", async () => {
+    const future = new Date(Date.now() + 6 * 3_600_000).toISOString();
+    mockApi.getSchedulePause.mockResolvedValue({ paused: true, until: future });
+    mockApi.listSchedules.mockResolvedValue([sched({ id: "s1", target: "sweep", enabled: true })]);
+    render(
+      <MemoryRouter>
+        <Schedules />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /My schedules/ }));
+    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
+    // The row's Next-run cell carries the paused note (the banner uses different copy:
+    // "All schedules paused until …"), so match the cell's "paused until <stamp>" form.
+    expect(screen.getByText(`paused until ${formatStamp(future)}`)).toBeTruthy();
+  });
+
+  // D4: pause-all / resume-all never write a per-row `enabled`, so resuming restores the
+  // exact prior set. This is observable only against the mock's in-memory state, so drive
+  // schedulesApi directly (bypassing the api mock above).
+  it("resume restores the exact prior per-row enabled set (D4, mock in-memory state)", async () => {
+    await schedulesApi.deleteSchedulePause();
+    const snapshot = async () =>
+      (await schedulesApi.listSchedules()).map((s) => [s.id, s.enabled] as const);
+    const before = await snapshot();
+    // The seed set has both enabled and disabled rows, so the equality below is discriminating.
+    expect(before.some(([, e]) => e === true)).toBe(true);
+    expect(before.some(([, e]) => e === false)).toBe(true);
+
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    expect((await schedulesApi.putSchedulePause(future)).paused).toBe(true);
+    // Pausing touched no per-row enabled flag.
+    expect(await snapshot()).toEqual(before);
+
+    expect((await schedulesApi.deleteSchedulePause()).paused).toBe(false);
+    // And resuming restores exactly the prior set.
+    expect(await snapshot()).toEqual(before);
   });
 });
