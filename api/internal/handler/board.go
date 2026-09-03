@@ -636,13 +636,16 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		if name == "" {
 			continue
 		}
-		// "closed" is the reserved close sentinel: MoveIssue canonicalizes a
-		// case-insensitive "closed" target to the literal and routes it to CloseIssue
-		// rather than a column move, so a user column named "closed" could never
-		// receive a card (a drop onto it would close the issue). Reject it at
-		// configuration time rather than create a silently unreachable column.
-		if strings.EqualFold(name, "closed") {
-			httpx.Error(w, http.StatusBadRequest, `"closed" is a reserved column name (it is the close action); choose another name`)
+		// Two reserved close sentinels: "closed" (MoveIssue canonicalizes a
+		// case-insensitive "closed" target to the literal and routes it to CloseIssue)
+		// and "__closed__" (the web's CLOSED_KEY for the synthetic Closed lane, which
+		// Board.tsx maps to the wire value "closed" — web/src/pages/Board.tsx). A user
+		// column named either could never receive a card (a drop onto it closes the
+		// issue), and "__closed__" additionally collides with the synthetic lane's key
+		// in the board's column map. Reject both at configuration time rather than
+		// create a silently unreachable, issue-closing column.
+		if strings.EqualFold(name, "closed") || strings.EqualFold(name, "__closed__") {
+			httpx.Error(w, http.StatusBadRequest, `"closed" and "__closed__" are reserved column names (the close action and the board's internal Closed lane); choose another name`)
 			return
 		}
 		if _, dup := seen[name]; dup {

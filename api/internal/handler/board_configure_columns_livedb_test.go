@@ -43,10 +43,13 @@ func TestConfigureColumnsRejectsReservedClosedLiveDB(t *testing.T) {
 	stub := &boardWriterStub{}
 	f := newBoardWriterFixture(ctx, t, stub)
 
-	// Both "closed" and "CLOSED" must be refused at 400, before any forge
-	// (EnsureLabels) or store (InsertBoardColumn) write — the reject is EqualFold, so it
-	// is case-insensitive, matching MoveIssue's case-insensitive canonicalization.
-	for _, name := range []string{"closed", "CLOSED"} {
+	// "closed"/"CLOSED" and the web CLOSED_KEY sentinel "__closed__" must all be refused
+	// at 400, before any forge (EnsureLabels) or store (InsertBoardColumn) write — the
+	// reject is EqualFold, so it is case-insensitive, matching MoveIssue's
+	// case-insensitive canonicalization. "__closed__" is the web's synthetic Closed-lane
+	// key (Board.tsx maps it to the wire value "closed"), so a column named it would both
+	// close issues on drop and collide with the synthetic lane (PR #1051 finding).
+	for _, name := range []string{"closed", "CLOSED", "__closed__"} {
 		t.Run("reject "+name, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			body := fmt.Sprintf(`{"columns":[{"label_name":%q}]}`, name)
