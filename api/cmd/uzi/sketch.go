@@ -187,6 +187,15 @@ func (h sketchHost) View() tea.View {
 
 // ---- dispatch --------------------------------------------------------------
 
+// sketchModel returns the tea.Model to run for a sketch: its own Tier-B model when
+// one is supplied, otherwise the generic Tier-A frame host over its frames.
+func sketchModel(sk sketch) tea.Model {
+	if sk.model != nil {
+		return sk.model()
+	}
+	return newSketchHost(sk.frames)
+}
+
 // runTUISketch runs the named sketch, or — for the "list" sentinel, an empty name, or an
 // unknown key — prints the registered sketch names and returns nil (a discovery
 // affordance, not an error). Sketches are passed NO uzicli.Client.
@@ -196,12 +205,7 @@ func runTUISketch(ctx context.Context, env Env, name string) error {
 		printSketchList(env)
 		return nil
 	}
-	var m tea.Model
-	if sk.model != nil {
-		m = sk.model()
-	} else {
-		m = newSketchHost(sk.frames)
-	}
+	m := sketchModel(sk)
 	p := tea.NewProgram(m, tea.WithContext(ctx), tea.WithInput(env.Stdin), tea.WithOutput(env.Stdout))
 	if _, err := p.Run(); err != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric, "tui sketch: %v", err)
