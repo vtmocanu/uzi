@@ -51,6 +51,14 @@ const (
 	// the sweep skips this candidate and advances, and the cadence re-fires once the MR is
 	// merged or closed.
 	SkipOpenMRExists SkipReason = "open_mr_exists"
+
+	// SkipSchedulesPaused ← the user-level "pause all schedules" kill switch (PRD #1093):
+	// the owner has paused every schedule they own (optionally until an auto-resume instant),
+	// so a fire that comes due while paused starts no run. Benign for a recurring row: the
+	// schedule advances normally, the cadence re-fires on resume, and nothing replays (the
+	// #396 property). A once row is different — it is held un-advanced in process() so it
+	// fires on the first tick after the pause ends — and so never records this skip.
+	SkipSchedulesPaused SkipReason = "schedules_paused"
 )
 
 // AllSkipReasons lists every SkipReason in the closed set. The cross-language contract
@@ -63,6 +71,7 @@ var AllSkipReasons = []SkipReason{
 	SkipVaultLocked,
 	SkipSelfImproveMRCapReached,
 	SkipOpenMRExists,
+	SkipSchedulesPaused,
 }
 
 // skipReasonForErr maps the benign run-creation seam sentinels to their SkipReason.

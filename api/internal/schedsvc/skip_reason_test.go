@@ -9,8 +9,8 @@ import (
 
 // TestSkipReasonEnumIsHonest pins the Go side of the SkipReason contract internally
 // consistent (PRD #308 M3; PRD #590 M1 added vault_locked; PRD #764 retired the link-less skip;
-// issue #856 added open_mr_exists):
-// the closed set has exactly the seven expected members with no duplicates, every benign seam
+// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused):
+// the closed set has exactly the eight expected members with no duplicates, every benign seam
 // sentinel maps into that set, an unrelated error maps to no reason, and the reasons the
 // seam does not map (fetch_failed is recorded at the sweep site, already_running also at the
 // prompt site, vault_locked at the self_improve site) are still enumerated. The
@@ -26,6 +26,7 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		SkipVaultLocked:             true,
 		SkipSelfImproveMRCapReached: true,
 		SkipOpenMRExists:            true,
+		SkipSchedulesPaused:         true,
 	}
 
 	if len(AllSkipReasons) != len(want) {

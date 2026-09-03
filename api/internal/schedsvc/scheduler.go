@@ -103,6 +103,10 @@ type Store interface {
 	ListUsersNeedingVaultLockNotice(ctx context.Context) ([]store.ListUsersNeedingVaultLockNoticeRow, error)
 	ClaimVaultLockNotice(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
 	ClearVaultLockNotice(ctx context.Context, userID uuid.UUID) error
+	// GetUserSchedulePause reads the owner's user-level pause-all-schedules state (PRD
+	// #1093), RAW: expiry is computed in Go against e.now() at fire time, not by SQL.
+	// ErrNoRows resolves to not paused (fail-open).
+	GetUserSchedulePause(ctx context.Context, userID uuid.UUID) (store.GetUserSchedulePauseRow, error)
 }
 
 // RunCreator is the shared run-creation seam the scheduler fires through — the SAME
@@ -229,19 +233,64 @@ func (e *Scheduler) tick(ctx context.Context) {
 		e.logger.Error("scheduler: claim due schedules", "error", err)
 		return
 	}
+	pc := &pauseCache{e: e, seen: make(map[uuid.UUID]bool)}
 	for _, sched := range scheds {
-		e.process(ctx, sched)
+		e.process(ctx, sched, pc)
 	}
+}
+
+// pauseCache resolves an owner's user-level "pause all schedules" state (PRD #1093)
+// once per distinct UserID per tick. Expiry is computed in Go against e.now() (never SQL
+// now()), so the test's fake clock drives auto-resume. A missing owner row (ErrNoRows) or
+// any lookup error resolves fail-open to "not paused": a pause must never wedge the tick.
+type pauseCache struct {
+	e    *Scheduler
+	seen map[uuid.UUID]bool
+}
+
+// paused reports whether the owner has paused all their schedules right now, memoizing
+// the per-user answer for the lifetime of this tick's cache.
+func (c *pauseCache) paused(ctx context.Context, userID uuid.UUID) bool {
+	if v, ok := c.seen[userID]; ok {
+		return v
+	}
+	row, err := c.e.store.GetUserSchedulePause(ctx, userID)
+	v := false
+	switch {
+	case err == nil:
+		v = row.SchedulesPaused && (!row.SchedulesPausedUntil.Valid || row.SchedulesPausedUntil.Time.After(c.e.now()))
+	case isNoRows(err):
+		v = false // fail-open: no owner row ⇒ not paused
+	default:
+		c.e.logger.Warn("scheduler: resolve pause state", "user", userID.String(), "error", err)
+		v = false // fail-open: never wedge the tick
+	}
+	c.seen[userID] = v
+	return v
 }
 
 // process fires one schedule and advances it, isolating panics so a single bad
 // schedule cannot abort the tick.
-func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule) {
+func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pauseCache) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.logger.Error("scheduler: panic firing schedule", "schedule", sched.ID.String(), "panic", r)
 		}
 	}()
+	// PRD #1093: enforce the owner's pause-all switch at fire time, before fireOne. A
+	// paused recurring row records a benign schedules_paused skip and advances (the
+	// vault-lock precedent, self_improve.go): the cadence keeps ticking and nothing
+	// replays on resume. A paused once row is left un-advanced and unwritten so it stays
+	// overdue and fires on the first tick after the pause ends — NOT routed through
+	// advance's transient branch, which would Warn every tick for the length of the pause.
+	if pc.paused(ctx, sched.UserID) {
+		if sched.Timing == "once" {
+			e.logger.Debug("scheduler: owner paused, holding once schedule", "schedule", sched.ID.String())
+			return
+		}
+		e.advance(ctx, sched, FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipSchedulesPaused}}}, nil)
+		return
+	}
 	// The tick path threads the FireOutcome into advance, which persists it into
 	// last_fire on the success/benign path (PRD #308 M2). RunNow does NOT reach here, so
 	// a manual fire never persists a last_fire (Decision 3).

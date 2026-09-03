@@ -199,6 +199,22 @@ RETURNING summary_model;
 -- (PRD #700 M5) rides it too; NULL there means the default-ON per-user opt-in.
 SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled FROM users WHERE id = $1;
 
+-- name: GetUserSchedulePause :one
+-- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch
+-- and the optional auto-resume instant, unnormalized. Expiry ("is this until still in
+-- the future?") is computed by the caller in Go, at fire time with the scheduler's own
+-- clock and on read for the API/CLI, so this query never consults SQL now(). Own-user
+-- only; the caller passes the target user's id.
+SELECT schedules_paused, schedules_paused_until FROM users WHERE id = $1;
+
+-- name: SetUserSchedulePause :one
+-- Sets the current user's pause-all-schedules state (PRD #1093): the switch and the
+-- optional auto-resume instant (@schedules_paused_until NULL = "until I resume"). Own-
+-- user only; the caller passes the session user's id. Never touches any per-row
+-- run_schedules.enabled, so resuming restores the exact prior set.
+UPDATE users SET schedules_paused = @schedules_paused, schedules_paused_until = @schedules_paused_until WHERE id = @id
+RETURNING schedules_paused, schedules_paused_until;
+
 -- name: SetUserTheme :one
 -- Sets (or clears, when @theme is NULL) the current user's theme override.
 -- NULL falls the user back to the instance default. Own-user only.

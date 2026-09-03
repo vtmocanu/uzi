@@ -646,6 +646,8 @@ type User struct {
 	MrReworkEnabled         pgtype.Bool        `json:"mr_rework_enabled"`
 	AttributionEnabled      bool               `json:"attribution_enabled"`
 	NotifyEarlyLimitReset   bool               `json:"notify_early_limit_reset"`
+	SchedulesPaused         bool               `json:"schedules_paused"`
+	SchedulesPausedUntil    pgtype.Timestamptz `json:"schedules_paused_until"`
 }
 
 type UserSecret struct {

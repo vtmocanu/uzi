@@ -16,6 +16,7 @@ export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
   vault_locked: "vault locked",
   self_improve_mr_cap_reached: "self-improve MR cap reached",
   open_mr_exists: "issue already has an open MR",
+  schedules_paused: "all schedules paused",
 };
 
 export function scheduleSkipReasonLabel(reason: ScheduleSkipReason): string {
