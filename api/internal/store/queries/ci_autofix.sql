@@ -9,10 +9,13 @@
 -- one row per branch. Three independent gates decide eligibility, and all three are
 -- expressed here so the detector cannot skip one:
 --
---   1. KIND-AWARENESS. Only issue/ci_fix runs own an agent MR branch
---      (agent/issue-N); chat/judge/self_improve/prompt runs never do. The per_branch
---      CTE therefore filters `r.kind IN ('issue','ci_fix')` before it picks the
---      NEWEST run per branch (DISTINCT ON (r.branch) … ORDER BY r.branch,
+--   1. KIND-AWARENESS. issue/ci_fix runs own an agent/issue-N branch, and the
+--      scheduled lanes own uzi/prompt-… / uzi/self-improve/… branches; chat/judge
+--      runs never open one. The per_branch CTE therefore filters `r.kind IN
+--      ('issue','ci_fix','prompt','self_improve')` (PRD #908 added the two scheduled
+--      lanes — ci_autofix is pipeline-driven with NO mr_state gate, so scheduled
+--      branches already get pipeline_statuses rows and need no recorder) before it
+--      picks the NEWEST run per branch (DISTINCT ON (r.branch) … ORDER BY r.branch,
 --      r.created_at DESC, mirroring ListWatchedRunRefsForRepo). A branch with no
 --      such run produces no candidate — autofix never acts on a branch uzi does not
 --      own by construction. Cancelled runs are also excluded here (issue #329) so a
@@ -42,7 +45,7 @@ WITH per_branch AS (
     WHERE r.repo_id = @repo_id::uuid
       AND r.branch IS NOT NULL AND r.branch <> ''
       AND r.mr_iid IS NOT NULL
-      AND r.kind IN ('issue', 'ci_fix')
+      AND r.kind IN ('issue', 'ci_fix', 'prompt', 'self_improve')
       -- issue #329: a cancelled run must never seed autofix. Before #329, mr_iid was
       -- written only by SetRunCompleted (completed-only), so a cancelled run never had
       -- one and was excluded here by construction. ReconcileRunMR now records mr_iid on
