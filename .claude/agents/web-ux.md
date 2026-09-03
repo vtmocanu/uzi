@@ -154,26 +154,9 @@ editing the URL or reloading, which resets the in-memory mock and re-seeds it. A
 browser against `VITE_UZI_MOCK=1 npm run dev` works and can read computed styles, which
 makes a visual criterion here genuinely verifiable rather than hand-waved.
 
-**On a hosted worker, run `agent-browser --version` once before anything else.** If it
-works, use `agent-browser` from `PATH` and skip the rest of this paragraph. If it fails with
-`ld-linux-x86-64.so.2: No such file`, the image predates the #1082 fix (PR #1085: the
-launcher picked the glibc build because a provisioned nix profile put a GNU `ldd` ahead of
-the musl one); do not debug it, write this wrapper once and use it for every call:
-
-```sh
-cat > /tmp/ab.sh <<'SH'
-#!/bin/sh
-export AGENT_BROWSER_EXECUTABLE_PATH="${AGENT_BROWSER_EXECUTABLE_PATH:-/opt/uzi-toolchain/bin/chromium}"
-export AGENT_BROWSER_ARGS="${AGENT_BROWSER_ARGS:---no-sandbox,--disable-dev-shm-usage}"
-export AGENT_BROWSER_IDLE_TIMEOUT_MS="${AGENT_BROWSER_IDLE_TIMEOUT_MS:-60000}"
-export FONTCONFIG_FILE="${FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
-export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/ab-$(id -u)/config}"; export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/ab-$(id -u)/cache}"
-mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
-exec /app/node_modules/agent-browser/bin/agent-browser-linux-musl-x64 "$@"
-SH
-chmod +x /tmp/ab.sh
-```
-
-On a laptop, `agent-browser` from `PATH` (or the Cellar binary named in
-`.claude/rules/agent.md`) is fine; this wrapper is for a worker image that still fails the
-check above, and the paragraph retires once the fleet has rolled past #1085.
+**Hosted workers ship `agent-browser` behind a shim that picks the musl binary itself**
+(uzi #1082, worker images from 0.77.0; measured on a rolled pod: `--version` and
+`open about:blank` succeed even with a glibc `ldd` first on `PATH`). On a laptop use
+`agent-browser` from `PATH` or the Cellar binary named in `.claude/rules/agent.md`. A
+launch failure is the environment finding the generic rule above describes; do not write
+a wrapper.
