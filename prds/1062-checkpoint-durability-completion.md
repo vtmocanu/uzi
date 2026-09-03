@@ -15,17 +15,16 @@ open-web lookup.
 
 ## Status
 
-- **M1 (#1059)** — DONE (2026-09-03, branch `agent/issue-1059`). Adopt-seam unified on
-  the owner anchor across BOTH not-ownedHere legs; agent-side only (`agent/src/git.ts`
+- **M1 (#1059)** — **MERGED** 2026-09-03 (PR #1068 → main `92fba2e1`). Adopt-seam unified
+  on the owner anchor across BOTH not-ownedHere legs; agent-side only (`agent/src/git.ts`
   + `agent/test/git-cross-worker-recovery.test.ts` + `agent/test/git.test.ts`), no
   server/schema/migration change. `adr/0628` amended, `specs/ai.md` §609 added.
-- **M2 (#1036)** — approach NOT finalized: an open design fork (broker-side overlay
-  synthesis vs reusing ADR-0456's `alignBranchWithDefault`) must be settled before
-  implementation — see M2. Held until M1 merges regardless (edits the same `git.ts`
-  adopt block).
-- **M3 (#1037)** — designed, server-only (worker adoption plumbing already threads
-  `checkpoint_tip`+`resume` for all kinds — see M3). Held for blast-radius isolation
-  behind M2.
+- **M2 (#1036)** — design FINALIZED (D7 resolved: Option B, worker-side temp-index
+  `.github/workflows` overlay; `agent/src/git.ts`-only, broker untouched). Ready to
+  implement now that M1 merged. Rebases on M1's adopt block.
+- **M3 (#1037)** — designed, server-only (`service.go`; worker adoption plumbing already
+  threads `checkpoint_tip`+`resume` for all kinds — see M3). File-disjoint from M2 under
+  Option B, so **M2 ‖ M3 can run in parallel** after M1.
 
 ## Problem
 
@@ -177,62 +176,99 @@ shipped tradeoff.
 
 ### M2 — #1036: mid-run checkpoint durability for branches behind on workflows
 
-**Files** (overlay path): `api/internal/pushbroker/pushbroker.go` (+ tests),
-`api/internal/workersvc/service.go` (persist the pushed SHA), `agent/src/git.ts`
-(overlay unwrap, composing with M1's predicate). **Highest blast radius (go-git
-object synthesis in the secrets-holding api, plus the #1009-reproducing seam) — its
-own MR.** No schema change.
+**Files**: **`agent/src/git.ts` only** (overlay synthesis in `checkpointPack` + overlay
+peel in `runnerCloneForBranch`) + agent tests. **No api/broker/schema change** —
+`pushbroker.go` and `service.go` `Publish` are byte-untouched. Own MR (edits the
+just-settled M1 adopt seam). No schema change.
 
 **Prior art — ADR-0456 is the authority on this gap and must be read first.**
 `adr/0456-rebase-before-finalize-push.md` already: (a) confirms M2's premise (the
 rejection is a tip-vs-default `.github/workflows/` tree comparison, not per-commit);
 (b) explicitly names *this* problem — mid-run checkpoint coverage for a
-behind-on-workflows branch — as its own **deferred** follow-up (its D5: "a
-behind-on-workflows run gets no mid-run checkpoint coverage … deferred"); and (c)
-already built `alignBranchWithDefault` (SHA-preserving merge first, rebase fallback)
-for the *finalize* path, plus `isWorkflowScopeRejection` detection and the
-`pushbroker.ErrWorkflowScopeRejected` → benign-skip mapping. M2 closes 0456's
-deferred gap.
+behind-on-workflows branch — as its own **deferred** follow-up (its D5); and (c) its
+**#627 amendment already ships a `.github/workflows` subtree overlay** for the
+*finalize* path: `alignBranchWithDefault(…, "workflow-subtree")` (`git.ts:1498/1516`,
+the narrow primary strategy described at `git.ts:1493`), gated by `workflowTreeDiffers`
+(`git.ts:1443`) with `fetchDefaultTip` (`git.ts:1394`), plus `isWorkflowScopeRejection`
+and the `pushbroker.ErrWorkflowScopeRejected` → benign-skip mapping. M2 is the mid-run
+sibling of that finalize overlay, and closes 0456's deferred D5 gap.
 
-**⚠️ OPEN DESIGN FORK — settle before implementing M2 (architect follow-up).** Two
-mechanisms close the gap; the PRD does not pre-commit:
+**Decision (D7, resolved 2026-09-03): Option B — a worker-side `.github/workflows`
+subtree overlay built via a TEMP INDEX (no worktree), producing a genuine fast-forward
+commit the UNCHANGED broker pushes and adoption peels as a transport wrapper.** Rejected:
+Option A (broker-side go-git synthesis) — it added object synthesis AND a
+strict-descendant/never-forced rework to the secrets-holding `pushbroker`, the exact
+#1009 guard. Also rejected: the throwaway-*worktree* form of Option B — `alignBranchWithDefault`
+runs working-tree ops (`checkout`/`reset --hard`/`clean`/`checkout <ref> -- …`) which,
+worker-side, would fire attacker-chosen `.gitattributes` filter/smudge drivers **as the
+PAT holder** (the code-exec vector the bare-only invariant at `git.ts:36-50` closes) and,
+in the live clone, `reset --hard` away the agent's in-flight work. The temp-index
+plumbing (`read-tree`/`rm --cached`/`read-tree --prefix`/`write-tree`/`commit-tree`) is
+pure object-DB work: it never populates a working tree, fires no filter drivers, and
+never touches the live runner clone — so it matches Option A's perturbation-freedom while
+leaving the broker and its never-forced invariant byte-untouched. See D7 for the full
+rationale (blast radius / #1009 surface / reuse / perturbation).
 
-- **Option A — broker-side overlay synthesis** (the original #1036 proposal, detailed
-  below). Runs entirely server-side in the broker from objects it already holds; needs
-  no worktree and never perturbs the live runner clone. Cost: go-git object synthesis
-  in the secrets-holding api, a `checkpoint_tip`=O stored-SHA contract, a two-level
-  adoption unwrap, and a pushbroker strict-descendant rework (see below) — the largest
-  new surface of the three milestones.
-- **Option B — reuse `alignBranchWithDefault` mid-run.** Align the tip to the
-  default's workflows with the existing, proven tooling and checkpoint the *real*
-  aligned tip: no synthesis, no O-vs-realTip contract, no two-level unwrap, no
-  #1009-reproduction surface. Cost: `alignBranchWithDefault` needs a **worktree**, and
-  ADR-0456 D5 records that the broker has **none** (and its deep-fetch was removed for
-  OOM safety), so the align must run **worker-side** in a throwaway worktree at
-  checkpoint time (not the live runner clone the agent is working in — that
-  perturbation is the hazard Option A avoids), and a merge-align still leaves a merge
-  commit / rebase-align rewrites SHAs, either of which must then compose with the
-  owner-anchor `checkpoint_tip`.
+**No merge or rebase mid-run.** Rebase rewrites SHAs → diverges the checkpoint from
+`refs/uzi-runner/<branch>` and the live session → fails M1's owner-anchor and orphans the
+tracking ref (ADR-0456 D2's SHA-rewrite hazards). Merge FF-composes but adds a needless
+merge commit to a transport wrapper. Only the **conflict-free overlay** is used: it is a
+fast-forward, so `checkpoint_tip` = the declared overlay tip (a real commit) and M1's
+`ownerMatch` (`git.ts:592-596`) matches it trivially on resume; adoption peels the
+wrapper.
 
-The perturbation-free, server-side property is Option A's genuine advantage;
-Option B's is that it reuses proven, lower-risk machinery and creates no new on-forge
-object contract. This fork is a required Decision-Log entry (D7) before M2 is built.
+**No-single-bet fallback (inherited from ADR-0456 D2).** A branch that itself MODIFIED
+`.github/workflows/**` fails the overlay gate and is doomed at finalize regardless (#377),
+so mid-run it **skips cleanly** (`skipped:"workflow_scope"`, today's behaviour) — never a
+merge/rebase, never a 5xx, never a failed run. "Swapping the workflows subtree satisfies
+the check" is the expected case, not a guarantee; a still-rejected push falls back to the
+clean skip.
 
-**Whichever option is chosen, M2 MUST NOT bet on a single GitHub rule.** ADR-0456
-deliberately refused to (its D2: "we cannot settle GitHub's exact rule from inside an
-offline worker … robust to either mechanism"). So M2 inherits `isWorkflowScopeRejection`
-and, if the aligned/overlaid push is *still* rejected, falls back to the clean skip
-that is today's behaviour (`ErrWorkflowScopeRejected` → `skipped:"workflow_scope"`) —
-never a 5xx, never a failed run. The claim "swapping `.github` necessarily satisfies
-the check" is the expected case, not a guarantee.
+**Overlay mechanics (Option B, all in `agent/src/git.ts`).** Unused legacy paragraph
+retained below only for contrast; the authoritative mechanics are §2a/§2b here:
 
----
+*2a — build the overlay in `checkpointPack` (`git.ts:1144`), worker bare, temp index.*
+Before packing `<branch>`: resolve `realTip` (tracking tip, `git.ts:1113`) and `defaultTip`
+(`fetchDefaultTip`, `git.ts:1394`). **Gate (reuse #627's exactly):** overlay only when
+`workflowTreeDiffers(realTip, defaultTip)` (`git.ts:1443`) is TRUE **and** the branch did
+NOT itself modify a workflow file (`changedFiles` filtered to `.github/workflows/**`,
+mirroring `runner.ts:1240`); gate fails ⇒ ship `realTip` unchanged (→ clean skip; #377
+owns a workflow-modifying branch at finalize). Synthesize via temp index (no worktree, no
+filter drivers): `GIT_INDEX_FILE=<tmp> git read-tree <realTip>`; `git rm --cached -r
+--ignore-unmatch .github/workflows`; if default has a workflows tree, `git read-tree
+--prefix=.github/workflows <defaultTip>:.github/workflows` (empty ⇒ rm-only, the #627
+deleted-workflows edge); `newRoot = git write-tree`; if `newRoot == realTip^{tree}` ⇒ not
+behind ⇒ ship `realTip`; else `O_ov = git commit-tree newRoot -p realTip [-p prevOverlay]
+-m "ckpt(overlay): …"` with **DETERMINISTIC identity + committer date** (= realTip's,
+fixed identity, `gpgsign=false`) so a no-new-work rebuild yields the same OID and the
+broker's "already up to date" early-return still fires. **Parent chaining:** read the
+current `refs/uzi-checkpoints/<branch>` tip; if it exists and is NOT an ancestor of
+`realTip` (a prior overlay sibling), add it as `parent[1]`, so `O_ov` strictly descends
+the current ref and the broker's existing `strictDescends`/wire-CAS accept it as a FF with
+**zero broker changes**. Return `{ tipOid: O_ov, pack }` (pack = `O_ov ^floor`; default's
+workflow blobs excluded, already at origin).
 
-The remainder of this section details **Option A** (the overlay), so the design is
-complete if that fork is chosen. If Option B is chosen, D2/D3 below do not apply and
-M2's Decision Log records Option B's align-composition instead.
+*2b — peel the overlay at adoption (`runnerCloneForBranch`, composes with M1).* After
+`baseSha` resolves and BEFORE `adoptedMarker` (`git.ts:669`): if `baseSha`'s subject
+starts `ckpt(overlay):` (a new `isOverlayMarker` mirroring `isWipParkMarker` `git.ts:1832`),
+re-point `baseSha = baseSha^1` (its underlying real tip — **DISCARD** the overlay tree; it
+is a transport wrapper, never branch content). Then the EXISTING `adoptedMarker` / wip-park
+`reset --soft` logic runs on the peeled `baseSha`, so a `wip(park)` marker under an overlay
+is still handled. **Order: overlay (outermost) → wip-park (inner); and the tree semantics
+DIFFER and that is the whole point — overlay = discard (re-point base), wip-park = keep
+(soft-reset).** A naive "two identical peels" keeps `O_ov`'s swapped `.github` staged and
+re-triggers workflow-scope at finalize (breaking #377's "agent branch never contains the
+wrapper"). `checkpoint_tip` = `O_ov` matches the mirrored ref so M1's `ownerMatch` adopts
+it; the peel lands the agent on `realTip` exactly where it parked.
 
-**Overlay mechanics (Option A).** When the tip's `.github` tree entry differs from the
+*2c — what does NOT change:* `pushbroker.go` (O_ov is a genuine FF descendant; all
+invariants hold), `service.go` `Publish` (persists the declared `tipOid` = O_ov via
+`SetRunCheckpointTip` as today — no `Result.Tip`), CAS-delete (`ExpectedOldTip` =
+`checkpoint_tip` = O_ov = origin's ref).
+
+<details><summary>Superseded Option-A mechanics (kept for contrast; NOT the chosen design)</summary>
+
+**Overlay mechanics (Option A — REJECTED).** When the tip's `.github` tree entry differs from the
 depth-1-fetched default's, synthesise an in-memory commit **O**:
 
 - tree = the tip's root tree with the `.github` entry hash swapped to the default's;
@@ -343,10 +379,17 @@ successful publish re-persists O_next, and permanently orphaned if the run dies
 in-window. The window is one checkpoint interval, not one line — name it as a raised
 residual, not #1042's tradeoff.
 
-**ADR**: a new ADR keyed `1036` for the overlay object contract (Option A) —
-`checkpoint_tip` stores O; adoption discards the overlay tree (rebase to `O^1`) then
-soft-resets any wip-park marker; the owner-anchor and CAS-delete compare against O; the
-broker unwraps O_prev for the ancestry base while the wire CAS keeps Old = O_prev.
+**ADR (Option A — REJECTED)**: would have keyed `1036` for a broker-side overlay object
+contract. Superseded by the Option-B ADR below.
+
+</details>
+
+**ADR**: a new ADR keyed `1036` for the **worker-side transport-wrapper contract** — the
+checkpoint ref may carry `ckpt(overlay):` commits; the worker builds them via a temp index
+in `checkpointPack`; adoption peels them (discard the overlay tree, re-point to `O^1`)
+before the wip-park soft-reset; the broker is deliberately NOT involved. Cross-links
+ADR-0456 (its #627 finalize sibling), ADR-0122, and ADR-0628. Written by the M2
+implementation run in its own MR.
 
 ### M3 — #1037: checkpoint `self_improve` runs on graceful interrupt
 
@@ -420,20 +463,21 @@ docs milestone would double-book the ADR work already assigned to M1 and M2:
 
 ## Sequencing
 
-**M1 → M2 → M3**, sequential:
+**M1 first; then M2 and M3 in PARALLEL** (Option B made them file-disjoint):
 
-- M1 settles the adopt predicate in `git.ts`; M2's overlay unwrap (Option A) edits the
-  same adopt block, so M2 rebases on M1. Real dependency.
-- M2 → M3 is **blast-radius isolation, not a merge conflict.** M2 (the persist line)
-  and M3 (the kind gate) edit `service.go` `Publish` ~70 lines apart in separate hunks,
-  so they would not textually conflict; M3 sequences after M2 because M2 is the
-  dangerous milestone (go-git synthesis in the secrets holder + the #1009 seam) and
-  should land and bake alone.
-- Genuine parallel opportunity: M3's per-kind branch-derivation helper and its
-  differential test are file-disjoint from M1/M2 and can be authored in parallel; only
-  wiring them into `Publish` waits for M2.
+- **M1 → M2** is a real dependency: M2's overlay peel edits the same `git.ts` adopt block
+  M1 just settled, so M2 rebases on M1 (merged).
+- **M2 ‖ M3** — under Option B, M2 is `git.ts`-only (overlay synthesis in `checkpointPack`
+  + peel in `runnerCloneForBranch`) and M3 is `service.go`-only (kind gate + branch
+  derivation, plus optional `sdk-executor.ts`). No shared file, no shared surface, so they
+  can run concurrently after M1. The old "both edit `service.go` `Publish`" coupling is
+  gone (M2 no longer touches the broker or `Publish`), and M2 is no longer "the dangerous
+  milestone" — its blast radius is now the just-settled adopt seam, not the secrets holder.
+- M3's per-kind branch-derivation helper and its differential test are independently
+  authorable at any time (file-disjoint from M1/M2).
 
-Each milestone is a separate MR. M2 MUST be its own MR for blast-radius reasons.
+Each milestone is a separate MR. M2 is still its own MR because it edits the delicate adopt
+seam, not because of broker blast radius (which no longer applies under Option B).
 
 ## Success criteria
 
@@ -444,16 +488,18 @@ Each milestone is a separate MR. M2 MUST be its own MR for blast-radius reasons.
 2. **M1.** A legitimate same-run resume still adopts (tip matches). #759 foreign-WIP
    cherry-pick recovery and #1030 M3 resume recovery are proven intact by the rewritten
    tests.
-3. **M2.** A checkpoint publish on a branch behind `main` on `.github/workflows`
-   succeeds (no `skipped:"workflow_scope"`) via the chosen mechanism; if that push is
-   still rejected the run skips cleanly (`skipped:"workflow_scope"`, never 5xx, never a
-   failed run) — the no-single-bet fallback. On Option A additionally: `runs.checkpoint_tip`
-   stores O; a resume discards the overlay tree (rebase to `O^1`) then soft-resets any
-   wip-park marker, landing on `realTip` with **no staged `.github` diff**; a **second
-   sequential publish over an existing overlay** is NOT skipped as `not_descendant`; the
-   no-overlay path is byte-unchanged (persisted SHA == `realTip`). Proven by a pushbroker
-   fixture set (behind, not-behind negative, stacked wip+overlay, second-sequential-publish,
-   and the malformed/edge tips that must fail soft).
+3. **M2 (Option B).** On a branch behind `main` on `.github/workflows` (and that did NOT
+   itself modify a workflow file), the worker builds `O_ov` — a FF commit whose
+   `.github/workflows` tree equals the default's — via a temp index, and the **unchanged
+   broker** pushes it (no `skipped:"workflow_scope"`). `runs.checkpoint_tip` = the declared
+   `O_ov` (a real, mirrored, deterministically re-derivable commit), so M1's owner-anchor
+   matches on resume; adoption **discards** the overlay tree (re-point to `O_ov^1`) then
+   soft-resets any wip-park marker, landing on `realTip` with **no staged `.github` diff**.
+   A **second sequential overlay** carries `parent[1] = O_ov_prev`, so it is a genuine FF
+   descendant the broker accepts (NOT skipped `not_descendant`). A branch that MODIFIED
+   workflows, or a still-rejected push, **skips cleanly** (`skipped:"workflow_scope"`, never
+   5xx/failed) — the no-single-bet fallback. `pushbroker.go` and `service.go` are proven
+   byte-unchanged. Proven by the agent fixture set (Contract B).
 4. **M3.** A `self_improve` run's un-pushed work is checkpointed to
    `refs/uzi-checkpoints/uzi/self-improve/<runId>` on a graceful interrupt and adopted
    on resume; the server derives the branch from run-row fields only. The worker
@@ -472,21 +518,21 @@ Two reimplementations this design creates; pin each with a discriminating fixtur
   with a cross-language fixture (`fixtures/api-contract` pattern):
   `{kind, claim-inputs} → expected branch`, asserted by BOTH a Go and a TS test, with
   one case per enabled kind and an assertion that each enabled kind is exercised.
-- **Contract B (M2, Option A only): the overlay object shape.** Pin with a pushbroker
-  fixture set — a golden snapshot from only the "behind" case would lock in the blind
-  spot, so author all of:
-  - **behind** ⇒ O.tree.`.github` == default's, O.parent[0] == realTip,
-    returned/persisted SHA == O;
-  - **not-behind** (discriminating negative) ⇒ no overlay, persisted == realTip;
-  - **stacked** (a `wip(park)` tip also behind) ⇒ O over the marker ⇒ `git.ts` discards
-    O's tree (rebase to `O^1`) then soft-resets the marker to its parent, landing on
-    `realParent` with no staged `.github` diff;
-  - **second sequential publish over an existing overlay** ⇒ `realTip_next` (which
-    descends `realTip_prev`, not `O_prev`) is NOT skipped as `not_descendant`; `O_next`
-    carries `parent[1] = O_prev` so the wire CAS (Old = `O_prev`) accepts. This is the
-    case that catches the ancestry-base-unwrap bug — the single-publish fixtures miss it;
-  - **edge / malformed tips** (default has no `.github`; tip removed
-    `.github/workflows`; unreadable tree) ⇒ fail soft to pushing `realTip`, never panic.
+- **Contract B (M2, Option B): the overlay object shape.** An **agent** differential/fixture
+  test (real git, the existing cross-worker harness — NOT a pushbroker fixture, since the
+  broker is untouched). A golden snapshot from only the "behind" case would lock in the
+  blind spot, so author all of, asserting each exercises its branch:
+  - **behind, not workflow-modified** ⇒ `O_ov` built, its `.github/workflows` tree ==
+    default's, `parent[0]` == realTip; adoption peels to `realTip` with no staged diff;
+  - **not-behind** (discriminating negative) ⇒ no overlay, ships `realTip`;
+  - **workflow-MODIFIED** ⇒ no overlay, clean skip (the gate holds);
+  - **stacked** (a `wip(park)` tip also behind) ⇒ peel overlay (discard) then soft-reset
+    the marker, landing on `realParent` with the WIP uncommitted;
+  - **second sequential overlay** ⇒ `O_ov2` with `parent[1] = O_ov_prev` is a FF descendant
+    the (unchanged) broker accepts — NOT skipped `not_descendant`; the single-publish
+    fixtures miss this;
+  - **edge** (default deleted its workflows; realTip has no `.github`) ⇒ rm-only / ship
+    `realTip`, never throw.
 
 ## Deferred (documented residuals, not implemented here)
 
@@ -504,33 +550,39 @@ Two reimplementations this design creates; pin each with a discriminating fixtur
   (NULL tip) never adopts and never sets `checkpointSetAside`. Chosen over a narrower
   fresh-run-only guard because a single predicate is auditable and cannot drift between
   legs.
-- **D2 — `runs.checkpoint_tip` stores O, the overlay wrapper SHA (M2, Option A only).**
-  ⚠️ Load-bearing: storing `realTip` while the ref holds O reproduces the #1009
-  total-loss. The stored value is consumed at exactly **two** DB sites, both needing O:
-  the adopt guard and the terminal CAS-delete's `ExpectedOldTip`. The publish-time wire
-  CAS reads the freshly-fetched ref (already O), not the DB, so it is not a third site —
-  earlier drafts double-counted it. The broker returns the pushed SHA; `Publish`
-  persists that. **Conditional on choosing Option A** (see D7); void under Option B.
-  (Gated with the user 2026-09-03.)
-- **D3 — overlay swaps at `.github`, not `.github/workflows` (M2, Option A only).**
-  Coarser but uses only trees already in the pack, and the reseed discards O's tree so
-  the coarse tree never reaches the agent. Cosmetic cost only. Conditional on Option A.
+- **D2 — VOID under Option B (superseded by D7).** Under the chosen Option B the
+  checkpoint ref carries a real, worker-declared `O_ov` commit, so `runs.checkpoint_tip`
+  stores the declared tip exactly as today; the owner-anchor and CAS-delete compare against
+  it unchanged, and adoption peels it. There is no broker `Result.Tip`/persist change and
+  no realTip-vs-O contract, so the #1009-reproduction risk D2 guarded against does not
+  arise (the broker is untouched). *(D2 was gated with the user 2026-09-03 assuming the
+  Option-A overlay; the better Option-B design makes it moot.)*
+- **D3 — overlay swaps at `.github/workflows` (M2, Option B).** Matches #627's finalize
+  overlay exactly, via a temp-index `read-tree --prefix`, worker-side (not the coarser
+  `.github` the rejected Option-A draft chose, and not broker-side). Uses only trees the
+  worker/default fetch already hold.
 - **D4 — M3 ships `self_improve` only; hard-kill cadence is a residual.** Server
   enablement covers graceful interrupts (park/drain/cordon-roll), the dominant hosted
   case. (Gated with the user 2026-09-03.)
-- **D5 — ADRs: extend `adr/0628` for M1; new ADR `1036` for M2's overlay contract; none
-  for M3.** (Gated with the user 2026-09-03.)
-- **D6 — three separate MRs, sequential M1 → M2 → M3.** Blast radius (M2's go-git
-  synthesis in the secrets holder) and shared-file coupling (`git.ts`, `service.go`)
-  make one monolithic MR the wrong risk profile for the code that guards #1009.
-- **D7 — M2 mechanism is an OPEN fork, to be settled by an architect pass before M2 is
-  implemented (surfaced by PRD review 2026-09-03, not yet gated).** Option A
-  (broker-side overlay synthesis) vs Option B (reuse ADR-0456's `alignBranchWithDefault`
-  worker-side at checkpoint time). ADR-0456 is the authority on this gap and was NOT
-  cited in the first draft; it already built the align tooling for the finalize path and
-  deferred exactly this mid-run case (its D5). Option A's edge: server-side,
-  worktree-free, never perturbs the live runner clone. Option B's edge: proven
-  lower-risk machinery, no new on-forge object contract, no #1009-reproduction surface.
-  D2/D3 apply only if Option A is chosen. Independent of the fork, M2 inherits ADR-0456's
-  "do not bet on a single GitHub rule" stance (its D2): `isWorkflowScopeRejection` +
-  clean-skip fallback if the aligned/overlaid push is still rejected.
+- **D5 — ADRs: extend `adr/0628` for M1; new ADR `1036` for M2's worker-side
+  transport-wrapper contract; none for M3.** (Gated with the user 2026-09-03; the `1036`
+  content changed from a broker-overlay contract to the worker-side one per D7.)
+- **D6 — separate MRs; M1 first, then M2 ‖ M3.** Under Option B M2 (`git.ts`-only) and M3
+  (`service.go`-only) are file-disjoint and run in parallel after M1. Each is its own MR;
+  M2's is isolated because it edits the delicate adopt seam, no longer because of broker
+  blast radius (which Option B removes).
+- **D7 — RESOLVED 2026-09-03: Option B (worker-side temp-index `.github/workflows`
+  overlay).** Decided by an architect pass after the initial fork. The worker builds a
+  legitimate FF overlay commit via a temp index (`read-tree`/`rm --cached`/`read-tree
+  --prefix`/`write-tree`/`commit-tree` — no worktree, no filter drivers, never touches the
+  live runner clone), the UNCHANGED broker pushes it, and adoption peels it as a transport
+  wrapper. Chosen over **Option A** (broker-side go-git synthesis) — which added synthesis
+  AND a strict-descendant/never-forced rework to the secrets-holding `pushbroker`, the exact
+  #1009 guard — on all four axes (blast radius, #1009 surface, reuse of #627's shipped
+  `workflow-subtree` overlay, perturbation-neutral). Also rejected: the throwaway-*worktree*
+  form of Option B — working-tree ops fire attacker-chosen `.gitattributes` filter drivers
+  as the PAT holder (the `git.ts:36-50` bare-only invariant) and would `reset --hard` the
+  live clone. Composition: NO merge/rebase mid-run (rebase rewrites SHAs → fails the M1
+  owner-anchor; merge is a needless commit) — only the conflict-free FF overlay; a
+  workflow-MODIFIED branch or a still-rejected push skips cleanly (ADR-0456 D2's
+  no-single-bet stance). This makes D2 void, D3 `.github/workflows`, and M2 ‖ M3 parallel.
