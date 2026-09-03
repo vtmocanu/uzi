@@ -673,4 +673,4 @@ something is wrong, and the phase count is what tells you which (see the interru
 trap in `.claude/agent-team.md`: a zero exit code and an absent-FAIL grep are both
 satisfiable by a run that stopped early).
 
-**Run a gate ONCE, to a log, then read the log.** `task gate:<component> > gate.log 2>&1; echo "EXIT=$?" >> gate.log` (gitignored path inside the worktree), then `tail`/`grep` the file for the named failing test, the slot markers, and the exit line. A second run of the same gate on the same SHA is not a second measurement, it is the same one paid twice (and under contention it is a flakier one).
+**Run a gate ONCE, to a log, then read the log.** `task gate:<component> > gate.log 2>&1; rc=$?; echo "EXIT=$rc" >> gate.log; test "$rc" -eq 0` (gitignored path inside the worktree), then `tail`/`grep` the file for the named failing test, the slot markers, and the exit line. A second run of the same gate on the same SHA is not a second measurement, it is the same one paid twice (and under contention it is a flakier one).

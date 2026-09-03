@@ -30,6 +30,6 @@ Loaded when you touch a PRD file. The repo-wide map, and PRD lifecycle (active i
 When a PRD touches `secretscrub`, `snapshotSecretPatterns`, a redaction test, or any
 test feeding a credential-shaped value through a scrubber:
 
-1. **Build the fixture from parts**, never as one literal: `const fake = "glpat-" + "notAReal" + "0123456789"` (or `strings.Repeat`), with a comment saying why. The scrub sees the joined value at runtime; the source never carries a token shape.
+1. **Build the fixture from parts**, never as one literal: `const fake = "glpat-" + "notAReal" + "012345678901"` (or `strings.Repeat`), with a comment saying why. The scrub sees the joined value at runtime; the source never carries a token shape.
 2. **Put `task scan:secrets` in the PRD's per-milestone gate line**, beside the component gate, and require the canaries-detected line in the run's evidence.
 3. **`//gitleaks:allow` with a written justification** is the in-repo precedent for a literal that must stay literal (`slacksvc/chatactions_test.go`), and it silences only gitleaks. Push Protection has no in-file allow directive, only an out-of-band bypass URL, so runtime assembly is the only form that satisfies both scanners.

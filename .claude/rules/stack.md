@@ -59,11 +59,16 @@ services:
 ```
 
 ```sh
-# dummy.env  (JWT_SECRET and UZI_SECRET_KEY use DIFFERENT generators)
+# Write dummy.env with the values already expanded: Compose reads --env-file as
+# literal key=value pairs and never runs $(...), so an unexpanded generator would
+# hand the api the string "$(openssl ...)" and secretbox would refuse to boot.
+# JWT_SECRET and UZI_SECRET_KEY use DIFFERENT generators.
+cat > dummy.env <<EOF
 SMOKE_WEB_PORT=27072
 JWT_SECRET=$(openssl rand -hex 64)
 UZI_SECRET_KEY=$(openssl rand -base64 32)
 POSTGRES_PASSWORD=$(openssl rand -hex 16)
+EOF
 # UZI_SEED_* deliberately ABSENT: smoke.sh needs no seeded admin
 ```
 
