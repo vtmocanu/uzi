@@ -2,6 +2,7 @@ import {
   type CatalogEntry,
   type Schedule,
   type ScheduleInput,
+  type SchedulePauseDTO,
   type SchedulePreviewInput,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
@@ -440,6 +441,25 @@ const repoLabels: Record<string, string[]> = {
   "repo-payments": ["PRD"],
 };
 
+// ── Pause all schedules (PRD #1093) in-memory state ────────────────────────
+// The user-level kill switch, module-level so it persists across calls within a mock
+// session (default: not paused). Mirrors the server's two-column model: a raw
+// `paused` boolean plus an optional `until`. Note NOTHING here writes any schedule's
+// `enabled` flag — pause-all and resume-all leave the per-row set untouched, which is
+// the observable proof of D4 (resume restores exactly the prior enabled set).
+let pauseState: { paused: boolean; until: string | null } = { paused: false, until: null };
+
+// normalizedPause mirrors the server's read-time normalization: an expired `until`
+// reads as not-paused (paused:false, until:null), so the web renders the running state
+// for a lapsed auto-resume without any background job clearing the columns.
+function normalizedPause(): SchedulePauseDTO {
+  if (!pauseState.paused) return { paused: false, until: null };
+  if (pauseState.until != null && new Date(pauseState.until).getTime() <= Date.now()) {
+    return { paused: false, until: null };
+  }
+  return { paused: true, until: pauseState.until };
+}
+
 export const schedulesApi = {
   // ── Scheduled runs (PRD #241) ──────────────────────────────────────────────
   listSchedules: async () => {
@@ -655,6 +675,28 @@ export const schedulesApi = {
       return delay({ fires }, 80);
     }
     return delay({ fires: mockScheduleFires(input.cron_expr ?? "", n) }, 80);
+  },
+
+  // ── Pause all schedules (PRD #1093) ────────────────────────────────────────
+  getSchedulePause: async () => {
+    requireSession();
+    return delay(normalizedPause());
+  },
+  putSchedulePause: async (until: string | null) => {
+    requireSession();
+    // A past `until` is a 422 (the CLI/browser resolve relative forms; the server only
+    // validates the one shape). A null `until` is an indefinite pause ("until I resume").
+    if (until != null && new Date(until).getTime() <= Date.now()) {
+      throw new ApiError(422, "until must be in the future");
+    }
+    pauseState = { paused: true, until };
+    return delay(normalizedPause(), 150);
+  },
+  deleteSchedulePause: async () => {
+    requireSession();
+    // Idempotent resume: clears the switch WITHOUT touching any per-row `enabled`.
+    pauseState = { paused: false, until: null };
+    return delay(normalizedPause(), 150);
   },
 
   // ── Default scheduled jobs (PRD #589) ──────────────────────────────────────
