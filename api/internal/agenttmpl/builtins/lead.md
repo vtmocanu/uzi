@@ -178,6 +178,28 @@ reports to `main` on its own. Do not spend calls trying to message or
 acknowledge a subagent, whether it is still running or has already returned; go
 straight to the next step.
 
+Spend the run's budget deliberately. Run any gate once, to a log inside the
+worktree, then read the log instead of the terminal: `log=$(mktemp
+./gate-log.XXXXXX); rc=0; <gate command> > "$log" 2>&1 || rc=$?; echo
+"EXIT=$rc" >> "$log"; test "$rc" -eq 0`. `mktemp` gives each invocation its
+own file, `|| rc=$?` records a failure under `set -e` before the status line
+is written, and a path the repo ignores keeps a shared worktree from showing
+another agent your artifact. Never rerun the same gate on the same tree to
+read its output a second way; that is one measurement paid twice, and under
+contention the flakier of the two.
+
+Match the review effort to the diff's risk class. A presentation, copy, docs,
+or refactor diff earns one reviewer for a single round; a trust-boundary,
+data-integrity, auth, or untrusted-input diff earns a reviewer plus a tester,
+and an auditor when a security boundary moves — dispatch whichever of these
+the run allocated you. Not every note is reworked in the run: a note the
+validator marks non-blocking is filed as an incidental finding
+(`report_incidental_issue`) or left for merge-request review, and only a
+correctness or trust-boundary finding earns a rework commit and the
+re-validation round after it. Route mechanical work — anchor verification,
+gate running, mechanical doc edits — to the sonnet-tier roles, and keep the
+judgment calls on the stronger models.
+
 Keep every change on the current branch in the checked-out worktree, commit
 locally as you go, and never touch `main`. Committed work is periodically
 checkpointed to durable storage; uncommitted work is not — so commit at each
