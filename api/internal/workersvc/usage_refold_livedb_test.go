@@ -121,7 +121,7 @@ func TestRefoldRunUsageLiveDB(t *testing.T) {
 	}
 
 	// --- Selection: only the terminal pre-migration run is pending; the decoys are not.
-	pending, err := q.ListRunsPendingUsageRefold(ctx, 50)
+	pending, err := q.ListRunsPendingUsageRefold(ctx, store.ListRunsPendingUsageRefoldParams{Lim: 50})
 	if err != nil {
 		t.Fatalf("ListRunsPendingUsageRefold: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestRefoldRunUsageLiveDB(t *testing.T) {
 	if awaiting < 1 {
 		t.Fatalf("awaiting = %d, want >= 1 (the still-running pre-migration run is not yet refolded)", awaiting)
 	}
-	stillPending, err := q.ListRunsPendingUsageRefold(ctx, 50)
+	stillPending, err := q.ListRunsPendingUsageRefold(ctx, store.ListRunsPendingUsageRefoldParams{Lim: 50})
 	if err != nil {
 		t.Fatalf("ListRunsPendingUsageRefold (after): %v", err)
 	}
@@ -247,5 +247,94 @@ func TestRefoldRunUsageLiveDB(t *testing.T) {
 		if r.ID == runID {
 			t.Fatal("the refolded run must no longer be pending")
 		}
+	}
+}
+
+// TestListRunsPendingUsageRefoldExclusion pins the query-level exclusion the boot
+// refold loop's head-of-line-starvation fix relies on (PRD #1079 M3 hardening): a
+// per-run refold failure adds the run to a per-cycle skip-set passed as ExcludeIds so
+// the drain advances PAST a poison row instead of re-listing the identical oldest
+// batch forever, while an EMPTY exclusion list (id <> ALL('{}'::uuid[]) is TRUE for
+// every row) excludes nothing. Seed three terminal pending runs; excluding two returns
+// only the third; excluding none returns all three.
+//
+// MUTATION-VERIFY: drop the `AND id <> ALL(@exclude_ids::uuid[])` clause from
+// ListRunsPendingUsageRefold and this test FAILS (the two "excluded" runs come back).
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres, same harness as
+// TestRefoldRunUsageLiveDB.
+func TestListRunsPendingUsageRefoldExclusion(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("refold-excl-%s@e2e", userID))
+	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	      VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	const sess = "sess-refold-excl"
+	// Three terminal pre-migration runs, all pending refold (usage_refolded=false).
+	insert := func() uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		exec(`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, session_id, usage_refolded)
+		      VALUES ($1, $2, $3, 1, 't', 'd', 'completed', 'issue', $4, false)`,
+			id, userID, repoID, sess)
+		return id
+	}
+	a, b, c := insert(), insert(), insert()
+
+	seen := func(exclude []uuid.UUID) map[uuid.UUID]bool {
+		t.Helper()
+		rows, err := q.ListRunsPendingUsageRefold(ctx, store.ListRunsPendingUsageRefoldParams{
+			ExcludeIds: exclude,
+			Lim:        50,
+		})
+		if err != nil {
+			t.Fatalf("ListRunsPendingUsageRefold: %v", err)
+		}
+		m := map[uuid.UUID]bool{}
+		for _, r := range rows {
+			m[r.ID] = true
+		}
+		return m
+	}
+
+	// Excluding two of the three returns only the third.
+	got := seen([]uuid.UUID{a, b})
+	if got[a] || got[b] {
+		t.Fatalf("excluded runs a/b must NOT be returned; got a=%v b=%v", got[a], got[b])
+	}
+	if !got[c] {
+		t.Fatal("the non-excluded run c must be returned")
+	}
+
+	// Empty exclusion list excludes nothing: all three come back. Use a non-nil empty
+	// slice, exactly as drainPending builds it (make([]uuid.UUID, 0, ...)).
+	all := seen([]uuid.UUID{})
+	if !all[a] || !all[b] || !all[c] {
+		t.Fatalf("empty ExcludeIds must exclude nothing; got a=%v b=%v c=%v", all[a], all[b], all[c])
 	}
 }

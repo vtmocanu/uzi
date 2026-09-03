@@ -801,17 +801,33 @@ func run() error {
 		go func() {
 			defer bgWG.Done()
 			// drainPending refolds terminal pending runs one batch at a time until the
-			// pending list empties. A per-run failure marks nothing, is logged, and is
-			// retried on a later tick (its row stays usage_refolded=false); it does NOT
-			// abort the batch or the job. A whole batch that refolds nothing (every run
-			// in it errored) returns so the caller falls back to the ticker rather than
-			// re-listing the same runs forever.
+			// pending list — minus the runs that failed to refold THIS cycle — empties.
+			// A per-run failure marks nothing and is logged; the run is added to a
+			// per-cycle skip-set (failed) and excluded from every subsequent list in this
+			// same drainPending call so the batch advances PAST it rather than re-listing
+			// the identical oldest rows forever. The skip-set is reset at the top of each
+			// drainPending call, so a later ticker cycle RETRIES a previously-failed run
+			// (transient DB errors clear). Termination is len(runs) == 0: once every
+			// non-failed pending run is drained, the exclusion makes the list return empty
+			// and the loop returns. A fully-poison DB walks its whole pending set once per
+			// cycle, failing each — bounded and acceptable. There is deliberately no
+			// give-up-and-exit here: per D10 the caller's ticker keeps running for the
+			// process lifetime so a pre-migration run still RUNNING at boot is refolded
+			// once it turns terminal.
 			drainPending := func() {
+				failed := make(map[uuid.UUID]struct{})
 				for {
 					if ctx.Err() != nil {
 						return
 					}
-					runs, err := q.ListRunsPendingUsageRefold(ctx, refoldBatch)
+					exclude := make([]uuid.UUID, 0, len(failed))
+					for id := range failed {
+						exclude = append(exclude, id)
+					}
+					runs, err := q.ListRunsPendingUsageRefold(ctx, store.ListRunsPendingUsageRefoldParams{
+						ExcludeIds: exclude,
+						Lim:        refoldBatch,
+					})
 					if err != nil {
 						slog.Error("usage refold: list pending runs failed", "err", err)
 						return
@@ -827,6 +843,7 @@ func run() error {
 						if err := workersvc.RefoldRunUsage(ctx, pool, q, runs[i]); err != nil {
 							slog.Error("usage refold: run failed (retried on next tick)",
 								"run_id", runs[i].ID.String(), "err", err)
+							failed[runs[i].ID] = struct{}{}
 							continue
 						}
 						refolded++
@@ -836,12 +853,8 @@ func run() error {
 						slog.Error("usage refold: count awaiting failed", "err", err)
 						awaiting = -1
 					}
-					slog.Info("usage refold", "refolded", refolded, "awaiting", awaiting)
-					if refolded == 0 {
-						// No progress this batch (every run errored). Stop draining and let
-						// the ticker retry, instead of spinning on the same poison batch.
-						return
-					}
+					slog.Info("usage refold", "refolded", refolded, "awaiting", awaiting,
+						"failed_this_cycle", len(failed))
 				}
 			}
 

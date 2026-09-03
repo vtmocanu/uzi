@@ -2369,8 +2369,16 @@ ORDER BY seq ASC;
 -- epoch, but only terminal runs are ever folded here). A run that is pre-migration and
 -- still RUNNING at boot is deliberately NOT selected until it finishes — the awaiting
 -- count below is what keeps the one-shot alive to catch it in-process.
+-- @exclude_ids lets the caller skip runs that already failed to refold within the
+-- current drain cycle so the batch advances past a poison row; id <> ALL('{}'::uuid[])
+-- is TRUE for every row, so an empty exclusion list excludes nothing. The COALESCE
+-- makes a NULL param behave as the empty array: pgx encodes a nil []uuid.UUID slice as
+-- SQL NULL, and id <> ALL(NULL) is NULL (not TRUE), which would silently drop EVERY
+-- pending run — so guard against a nil caller here rather than trust every call site to
+-- pass a non-nil slice.
 SELECT * FROM runs
 WHERE NOT usage_refolded AND status IN ('completed', 'failed', 'cancelled')
+  AND id <> ALL(COALESCE(@exclude_ids::uuid[], '{}'::uuid[]))
 ORDER BY created_at
 LIMIT @lim;
 
