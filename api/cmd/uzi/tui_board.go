@@ -307,7 +307,16 @@ func (m tuiModel) renderBoard() string {
 			case biEyebrow:
 				sb.WriteString(m.boardEyebrow(it) + "\n")
 			case biRow:
-				sb.WriteString(m.boardRow(rows[it.runIdx], it.runIdx == m.board.cursor, mc) + "\n")
+				r := rows[it.runIdx]
+				sel := it.runIdx == m.board.cursor
+				sb.WriteString(m.boardRow(r, sel, mc) + "\n")
+				// The selected row gains a variable-height second "now" line (D4). The window
+				// math reserves its physical line via boardCapacity, so this never overflows.
+				if sel {
+					if sl := m.boardSecondLine(r); sl != "" {
+						sb.WriteString(sl + "\n")
+					}
+				}
 			default:
 				sb.WriteString("\n")
 			}
@@ -560,6 +569,12 @@ func (m tuiModel) boardCapacity() int {
 	// The rate-limit strip, when present, adds one line between the wordmark and the blank
 	// below it. Recomputed here (cheap) so the row-window math matches renderBoard's layout.
 	if m.boardRateLimitStrip(time.Now()) != "" {
+		chrome++
+	}
+	// The selected row's variable-height second "now" line (D4) reserves one physical line, so
+	// the row window shows one fewer item and the extra line never pushes the footer off screen.
+	// This is the ONE variable-height row the board's selection/scroll math must tolerate.
+	if r, ok := m.board.selected(); ok && m.boardShowSecondLine(r) {
 		chrome++
 	}
 	c := m.height - chrome

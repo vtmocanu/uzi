@@ -3,7 +3,7 @@ import type {
   RunMessage,
   SteerInput,
 } from "../../lib/api";
-import { minsAgo } from "./time";
+import { minsAgo, secsAgo } from "./time";
 import { LIVE_RUN_ID } from "./boards";
 
 // ── Crew-roster demo runs (PRD #95 M2) ───────────────────────────────────────
@@ -210,6 +210,28 @@ export const mockBusyMessages: RunMessage[] = [
   // so the `tester ×2` chip rolls up as `waiting` while X's lane pulses.
   bm("tool_use", "tester", "toolu_01testY", "unit: RunEvent", { id: "b-7", name: "Bash", input: { command: "npx vitest run src/components/RunEvent.test.tsx" } }, 0.4),
   bm("tool_use", "tester", "toolu_01testX", "e2e: approval gate", { id: "b-8", name: "Bash", input: { command: "./e2e/run-e2e.sh" } }, 0.1),
+];
+
+// mockLiveMessages seeds run-live's transcript with ONE tool_use frame so the run VIEW
+// can demonstrate the PRD #1064 "now" strip while a milestone is in progress. The run
+// view derives its now line CLIENT-SIDE from the live frames (latestActivity(messages),
+// D6) — NOT from run.current_activity, which only the board card and runs-list row read —
+// so an empty transcript left latestActivity null and the strip could never render on the
+// run view even though milestones_in_progress was non-empty at seed (the two preconditions
+// never coincided). This frame folds to the SAME activity the seeded current_activity DTO
+// carries (agent/label/tool/detail), so the run view and the board/list agree. engine.ts's
+// script appends newer frames on top once the demo advances; this seed covers the initial
+// in-progress snapshot (hb-2) the checklist opens on.
+export const mockLiveMessages: RunMessage[] = [
+  {
+    seq: 1,
+    kind: "tool_use",
+    agent: "coder",
+    agent_instance: "toolu_01mockLiveCoder",
+    agent_label: "Expose heartbeat freshness gauge",
+    payload: { id: "hb-live-1", name: "Edit", input: { file_path: "api/internal/handler/metrics.go" } },
+    created_at: secsAgo(40),
+  },
 ];
 
 // mockSeededMessages backs the PRD #209 seeded-plan demo run (run-seeded). A seeded run

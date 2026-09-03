@@ -1853,6 +1853,16 @@ tasks:
   test:web:
     desc: web unit tests (vitest)
     dir: web
+    env:
+      # Pin the test runner to UTC so any snapshot/assertion over a rendered
+      # `toLocaleString()` is deterministic regardless of the contributor's
+      # timezone. The product renders each user their OWN local time (correct
+      # UX); this only fixes the TEST environment. CI runners default to UTC, so
+      # local dev in a non-UTC zone would otherwise disagree with a committed
+      # snapshot (RunsList.nowline D5's `updated_at` cell, PRD #1064) — this makes
+      # local == CI. Setting it here (not in .github/workflows) keeps the worker
+      # PAT able to push it and keeps CI/local on one source of truth.
+      TZ: UTC
     cmds:
       # No cache flag needed: vitest has no result cache of the kind Go's test
       # cache is, and the same fixture mutation reddens it with no flag at all.

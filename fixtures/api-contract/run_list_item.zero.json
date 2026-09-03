@@ -80,6 +80,7 @@
   "required_tools": null,
   "size_class": "",
   "plan_changed_files": null,
+  "current_activity": null,
   "repo_path": "",
   "worker_name": null,
   "judge_verdict": null,

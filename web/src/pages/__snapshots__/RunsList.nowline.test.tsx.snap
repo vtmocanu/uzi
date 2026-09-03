@@ -1,0 +1,70 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activity run renders with no now line and no ◐ (snapshot) 1`] = `
+<div>
+  <li
+    class="group relative"
+  >
+    <a
+      aria-label="Open run for issue #7: A run"
+      class="absolute inset-0 rounded-lg"
+      data-discover="true"
+      href="/runs/run-1"
+    />
+    <div
+      class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors group-hover:border-edge-strong group-hover:bg-raised/70"
+    >
+      <div
+        class="w-full min-w-0 sm:w-auto sm:flex-1"
+      >
+        <p
+          class="truncate text-sm font-medium text-fg"
+        >
+          A run
+        </p>
+        <p
+          class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint"
+        >
+          <span
+            class="inline-flex items-center gap-1"
+          >
+            grp/proj
+             
+            <span>
+              #
+              7
+            </span>
+          </span>
+          <span>
+            · 
+            w1
+          </span>
+          <span>
+            · 
+            7/5/2026, 12:00:00 PM
+          </span>
+          <span
+            class="font-mono tabular-nums"
+          >
+            · 
+            running 40s
+          </span>
+        </p>
+      </div>
+      <div
+        class="relative z-10 flex flex-wrap items-center gap-2"
+      >
+        <span
+          class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium border-info/40 bg-info/10 text-info"
+        >
+          <span
+            aria-hidden="true"
+            class="h-1.5 w-1.5 rounded-full bg-current animate-pulse"
+          />
+          running
+        </span>
+      </div>
+    </div>
+  </li>
+</div>
+`;

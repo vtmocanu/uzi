@@ -188,6 +188,9 @@ var runDTOKeys = []string{
 	// PRD #212: the git-status list surfaced at the approval gate, non-nil ([] over null)
 	// via capsOrEmpty like required_tools. On both list and detail via the RunListItemDTO embed.
 	"plan_changed_files",
+	// PRD #1064 M2: the server-derived "now" line (RunActivity object or null). On both
+	// list and detail via the RunListItemDTO embed.
+	"current_activity",
 }
 
 func TestRunDTOTags(t *testing.T) {

@@ -325,6 +325,18 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := runToDTO(run, h.runPriorityClass(r.Context(), run))
+	// PRD #1064 M2: the server-derived "now" line. runToDTO stays pure, so the field is
+	// set here in the caller from the batched lookup (one run this time). null for a
+	// terminal run (no "now") and, via the batched query, for a run with no tool_use
+	// frame. Best-effort: a lookup error leaves current_activity null rather than failing
+	// the read of an otherwise-fine run.
+	if !apitypes.IsTerminalRunStatus(run.Status) {
+		if activity, err := h.wsvc.CurrentActivityForRuns(r.Context(), []uuid.UUID{run.ID}); err != nil {
+			slog.Error("current activity", "run_id", run.ID, "error", err)
+		} else {
+			dto.CurrentActivity = activity[run.ID]
+		}
+	}
 	// PRD #65 D2: stamp the run's forge for the run-view MR/PR noun. Best-effort and
 	// only for a repo-ful run (chat runs have no repo, hence no MR affordance): a
 	// lookup error leaves forge_type "" (the web defaults to GitLab's noun), never

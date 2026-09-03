@@ -269,6 +269,40 @@ This closes the gap the note above names for a plain follow-up: where
 "Delivered" only tells you the worker *saw* it, a scope directive's chip
 tells you whether it *fired*.
 
+## Milestones and the now line
+
+On a milestone-structured issue run (see [Stopping or narrowing a
+run](#stopping-or-narrowing-a-run) below), the web run view marks each
+approved milestone `✓` reported complete, `◐` reported in progress, or
+`○` not started; `uzi run get` shows the same three states as text
+(`done` / `in progress` / `left`). **"Reported complete" is exactly what
+it says** — uzi shows what the worker reported and hasn't itself verified
+the work, so the wording never says "done" or "verified".
+
+The in-progress milestone is also where the **now line** attaches: the
+active lane's role, its task label, its last tool, and how long ago it
+last spoke — e.g. `● coder  Decouple ci_fix detector from branch naming ·
+Edit api/internal/poller/ci_autofix.go  40s ago`. Those words come from the
+run's newest `tool_use` frame, never from raw tool input: a file path for
+`Read`/`Edit`/`Write`/`MultiEdit`, the dispatch description for `Agent` or
+`Bash` — a `Bash` command itself is never shown. When several milestones
+are in progress at once, the now line attaches to the first by the
+approved order; the rest still show their plain in-progress mark. A run
+with activity but nothing declared in progress shows an unattached now
+line under the milestone header instead.
+
+**On the TUI**, there's no `◐` glyph — the in-progress milestone is a cell
+that blinks `▰`/`▱` in the wait colour on a half-second tick instead, on
+both the board's micro-bar and the crew rail (any other milestones also in
+progress show a static `▱` in the same colour). A static `▱` frame renders
+for the blinking one too when the terminal isn't interactive (a piped or
+offline render) or when blink is turned off. Set `UZI_TUI_NO_BLINK=1` to
+pin the static frame yourself, a reduced-motion opt-out. The crew rail
+carries its own now line under the in-progress row (`↳ <role> · <age>`,
+with the task label beneath it), and the board's selected row gains a
+second line with the same information. `uzi run get` shows the same now
+line as a `NOW` row — see [the CLI docs](./cli.md#commands).
+
 ## Stopping or narrowing a run
 
 On a milestone-structured issue run, two operator actions bound how far the

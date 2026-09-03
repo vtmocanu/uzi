@@ -554,10 +554,37 @@ export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null 
 // so the board (Dashboard/RunsList) and the run header stay in lockstep (PRD #265 M2). A
 // reported run shows `M{done}/{total}`; an unreported one shows an en-dash numerator and
 // says so in the tooltip, never a `0/N` that reads as failure on a done run.
-export function milestoneBadgeText(p: MilestoneProgress): { label: string; title: string } {
-  return p.reported
-    ? { label: `M${p.done}/${p.total}`, title: "Milestones reported complete of the approved plan" }
-    : { label: `M–/${p.total}`, title: "No milestone completion reported for this run" };
+//
+// PRD #1064 M3: `inProgress` appends a `◐` in-progress marker to the label when the run
+// has at least one milestone in progress — the same "something is happening now" signal
+// the run-view checklist header and the TUI carry. It defaults to false so every existing
+// caller (and the not-in-progress case) renders exactly the pre-#1064 label.
+export function milestoneBadgeText(
+  p: MilestoneProgress,
+  inProgress = false,
+): { label: string; title: string } {
+  const base = p.reported ? `M${p.done}/${p.total}` : `M–/${p.total}`;
+  const title = p.reported
+    ? "Milestones reported complete of the approved plan"
+    : "No milestone completion reported for this run";
+  return { label: inProgress ? `${base} ◐` : base, title };
+}
+
+// firstInProgressMilestoneId returns the FIRST frozen milestone id that is in progress,
+// by frozen order — the D4 selection rule shared by every surface: when several ids are
+// in progress only the first by frozen order is the one named / marked / attached to the
+// "now" strip. null when nothing is in progress (or the run carries no frozen list). The
+// frozen list is the source of order; milestones_in_progress is only a membership set.
+export function firstInProgressMilestoneId(run: {
+  milestones?: Milestone[] | null;
+  milestones_in_progress?: string[] | null;
+}): string | null {
+  const frozen = run.milestones ?? [];
+  const inProgress = new Set(run.milestones_in_progress ?? []);
+  for (const m of frozen) {
+    if (inProgress.has(m.id)) return m.id;
+  }
+  return null;
 }
 
 // hasActiveRun reports whether a card's latest run is still non-terminal. The

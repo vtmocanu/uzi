@@ -16,6 +16,7 @@ import {
   isTerminalRun,
   type Repo,
   type Run,
+  type RunActivity,
   type RunMessage,
   type Worker,
 } from "../lib/api";
@@ -26,6 +27,7 @@ import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import {
   effectiveRunStatus,
+  firstInProgressMilestoneId,
   formatElapsed,
   healthFlagLabel,
   isStoppedRun,
@@ -36,6 +38,7 @@ import {
   mrChipTitle,
   shouldShowHealthFlag,
 } from "../lib/runBadge";
+import { activityAge, latestActivity } from "../lib/runActivity";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
@@ -187,6 +190,56 @@ function MilestoneMark({ state }: { state: "done" | "in_progress" | "left" }) {
   return <span className="text-faint" aria-label="not started">○</span>;
 }
 
+// MilestoneNowStrip is the "now" line (PRD #1064 M3, D3/D5): a left-bordered strip that
+// names the lane acting RIGHT NOW under the in-progress milestone (or unattached under
+// the header when a milestone run has activity but nothing declared). Three variants:
+//   - active   — a milestone is in progress: ok-green border + pulsing dot, the role and
+//                its task, its last tool, and a client-side age (R7: a stalled lane reads
+//                its real age, not a lie).
+//   - waiting  — the run is parked on a rate/pool limit (limit_wait/pool_wait): a warn
+//                border + "waiting on rate limit · <age>", so the strip does not pretend
+//                the lane is working while it is blocked.
+//   - unattached — activity exists but no milestone is declared in progress: a faint
+//                border, sitting directly under the header.
+//
+// 🔴 ALL FOUR display fields (agent, agent_label, tool, detail) are folded through
+// stripUnsafeChars here (defense-in-depth): the server caps/strips only detail and
+// agent_label, so agent and tool arrive UNSANITIZED on the wire — an auditor note. The
+// pulsing dot uses animate-pulse, which index.css neutralizes under prefers-reduced-motion.
+function MilestoneNowStrip({
+  activity,
+  status,
+  now,
+  variant,
+}: {
+  activity: RunActivity;
+  status: string;
+  now: number;
+  variant: "active" | "unattached";
+}) {
+  const waiting = status === "limit_wait" || status === "pool_wait";
+  const age = activityAge(activity.at, now);
+  const role = stripUnsafeChars(activity.agent);
+  const label = stripUnsafeChars(activity.agent_label);
+  const tool = stripUnsafeChars(activity.tool);
+  const detail = stripUnsafeChars(activity.detail);
+  const toolText = tool ? (detail ? `${tool} ${detail}` : tool) : detail;
+  const border = waiting ? "border-warning" : variant === "unattached" ? "border-faint" : "border-ok/50";
+  const accent = waiting ? "text-warning" : "text-ok";
+  const dotBg = waiting ? "bg-warning" : "bg-ok";
+  return (
+    <div className={cx("mt-1.5 flex items-center gap-2 border-l-2 py-1 pl-3 text-xs", border)}>
+      <span aria-hidden className={cx("h-1.5 w-1.5 shrink-0 rounded-full animate-pulse", dotBg)} />
+      <span className={cx("shrink-0 font-medium", accent)}>{role}</span>
+      {label && <span className="min-w-0 flex-1 truncate italic text-muted">{label}</span>}
+      {toolText && <span className="min-w-0 shrink truncate font-mono text-faint">{toolText}</span>}
+      <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
+        {waiting ? `waiting on rate limit${age ? ` · ${age}` : ""}` : age ? `${age} ago` : ""}
+      </span>
+    </div>
+  );
+}
+
 // MilestoneChecklist renders a milestone-structured run's progress (PRD #122): every
 // approved milestone with a done / in-progress / left indicator, driven by the frozen
 // list + the reported-complete and in-progress id sets.
@@ -196,7 +249,18 @@ function MilestoneMark({ state }: { state: "done" | "in_progress" | "left" }) {
 // has. Titles are REPO/agent-authored UNTRUSTED text, rendered as PLAIN JSX through
 // stripUnsafeChars — never <Markdown>, the same rule repo_agents follow. Renders nothing
 // for a run with no frozen milestone list. Exported for a direct render test.
-export function MilestoneChecklist({ run }: { run: Run }) {
+//
+// PRD #1064 M3: `activity` (the run's newest tool_use folded by latestActivity, computed
+// in RunView off the live frames) drives the "now" line and the header's `◐ <id>` marker.
+// It is OPTIONAL and defaults to null, so every pre-#1064 caller (and a run with no
+// tool_use frame) renders EXACTLY as before — the D5 back-compat contract. D4 selection:
+// the FIRST in-progress id by frozen order is the one the header names and the strip
+// attaches under; other in-progress ids render as today's ◐ mark.
+export function MilestoneChecklist({ run, activity = null }: { run: Run; activity?: RunActivity | null }) {
+  // useNow ages the "now" line's client-side elapsed token; called before the early
+  // return so the hook order is stable (rules of hooks). A slow cadence is enough — the
+  // strip shows a coarse "40s"/"6m" token, not a live countdown.
+  const now = useNow(30_000);
   const milestones = run.milestones ?? [];
   if (milestones.length === 0) return null;
   const completed = new Set(run.milestones_completed ?? []);
@@ -210,32 +274,55 @@ export function MilestoneChecklist({ run }: { run: Run }) {
   // 0/N that reads as failure. The rows below already render every milestone as ○
   // (not-started) in that case, which is honest; only the header count changes.
   const reported = progress?.reported ?? false;
+  // D4: the first in-progress id by frozen order is the one the header names and the
+  // strip attaches under. null when nothing is declared in progress.
+  const firstInProgress = firstInProgressMilestoneId(run);
   return (
     <Card className="p-4">
       <div className="mb-3 flex items-center justify-between gap-2">
         <h2 className="text-sm font-semibold text-fg">Milestones (reported complete)</h2>
         <span
-          className="font-mono text-xs tabular-nums text-faint"
+          className="flex items-center gap-1.5 font-mono text-xs tabular-nums text-faint"
           title={reported ? undefined : "No milestone completion reported for this run"}
         >
-          {reported ? `${doneCount}/${milestones.length}` : `–/${milestones.length}`}
+          <span>{reported ? `${doneCount}/${milestones.length}` : `–/${milestones.length}`}</span>
+          {/* PRD #1064 M3: the in-progress marker names the first in-progress id by frozen
+              order (D4). Present only while a milestone is in progress. */}
+          {firstInProgress && (
+            <span className="text-info" title={`${firstInProgress} in progress`}>
+              ◐ {firstInProgress}
+            </span>
+          )}
         </span>
       </div>
-      <ul className="space-y-1.5">
+      {/* Unattached strip: a milestone run with activity but nothing declared in progress
+          shows the "now" line directly under the header (D5's "nothing declared" variant). */}
+      {!firstInProgress && activity && (
+        <MilestoneNowStrip activity={activity} status={run.status} now={now} variant="unattached" />
+      )}
+      <ul className="mt-2 space-y-1.5">
         {milestones.map((m) => {
           const state = completed.has(m.id) ? "done" : inProgress.has(m.id) ? "in_progress" : "left";
           return (
-            <li key={m.id} className="flex items-center gap-2 text-sm">
-              <MilestoneMark state={state} />
-              <span
-                title={stripUnsafeChars(m.title)}
-                className={cx(
-                  "min-w-0 truncate",
-                  state === "done" ? "text-muted line-through" : state === "in_progress" ? "text-fg" : "text-faint",
-                )}
-              >
-                {stripUnsafeChars(m.title)}
-              </span>
+            <li key={m.id} className="text-sm">
+              <div className="flex items-center gap-2">
+                <MilestoneMark state={state} />
+                <span
+                  title={stripUnsafeChars(m.title)}
+                  className={cx(
+                    "min-w-0 truncate",
+                    state === "done" ? "text-muted line-through" : state === "in_progress" ? "text-fg" : "text-faint",
+                  )}
+                >
+                  {stripUnsafeChars(m.title)}
+                </span>
+              </div>
+              {/* Attached strip: the "now" line sits under the FIRST in-progress row only
+                  (D4), so a second in-progress milestone keeps its ◐ mark and carries no
+                  strip. */}
+              {activity && m.id === firstInProgress && (
+                <MilestoneNowStrip activity={activity} status={run.status} now={now} variant="active" />
+              )}
             </li>
           );
         })}
@@ -827,6 +914,15 @@ export function RunView() {
   // accumulator. Feeds the usage panel + the per-phase finish lines in the feed.
   const usage = useMemo(() => deriveRunUsage(messages), [messages]);
 
+  // PRD #1064 M3 (D6): the "now" line for the milestone checklist, derived CLIENT-SIDE
+  // from the live WS frames rather than the DTO, so it tracks the transcript without a
+  // DTO re-read (the fold re-runs as messages grow, the same shape as `usage` above).
+  // null for a terminal run: a finished run has no "now".
+  const activity = useMemo(
+    () => (run == null || isTerminalRun(run.status) ? null : latestActivity(messages)),
+    [messages, run],
+  );
+
   // PRD #88: the open clarification question, derived from the feed by seq exactly as
   // derivePlanRevision derives the gate state — there is NO DTO field for it (D-L), so
   // web, Slack and the CLI all read the same rule off the same messages.
@@ -1389,7 +1485,7 @@ export function RunView() {
       {/* PRD #122: the milestone checklist — done / in-progress / left, driven by the
           frozen list + the reported-complete/in-progress id sets. Renders nothing for a
           run with no milestones. */}
-      <MilestoneChecklist run={run} />
+      <MilestoneChecklist run={run} activity={activity} />
 
       {(usage.hasLiveTokens || usage.hasConfirmed) && (
         <Card className="p-4">
