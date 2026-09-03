@@ -18,6 +18,8 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.77.0] - 2026-09-03
+
 ### Added
 
 - **The board, run view and crew rail now show what your crew is doing right now, not just which milestone is "done" ([#1064](https://github.com/vtmocanu/uzi/issues/1064)).**
@@ -26,11 +28,33 @@ through `[0.52.0]`.)
   The board's micro-bar and the crew rail's milestone row alternate `▰`/`▱` in the wait colour on a half-second tick. A piped or offline render, or `UZI_TUI_NO_BLINK=1` (a reduced-motion opt-out), pins the static `▱` frame instead of blinking.
 - **A milestone shows as in progress the moment the worker reports it, instead of only at the next turn boundary ([#1064](https://github.com/vtmocanu/uzi/issues/1064)).**
   The worker now pushes a `running` state report the instant it observes a `report_progress` signal, rather than waiting for the next iteration or checkpoint report to carry it, and emits a feed line per transition ("milestone m2 started — <title>" / "milestone m1 reported complete — <title>"). Wording always says "reported complete", never "done" or "verified" — uzi shows what the worker reported and has not itself checked the work.
+- **The Workers page is split into "Your workers" and "Add a worker" tabs, hosted-first ([#1063](https://github.com/vtmocanu/uzi/issues/1063)).**
+  The page leads with your running fleet and moves the join/enrol flow onto its own tab, so managing existing workers and adding a new one are no longer crammed into one screen.
+- **Scheduled runs can now fix their own MRs and CI ([#1069](https://github.com/vtmocanu/uzi/pull/1069)).**
+  Autofix (MR rework and CI autofix) now covers the scheduled `prompt` and `self_improve` run kinds, not just interactive issue runs, so a scheduled run that opens an MR can rework it on review feedback and repair its own red pipeline.
+- **A throwaway TUI sketch harness for previewing a new TUI feature before building it ([#1061](https://github.com/vtmocanu/uzi/issues/1061)).**
+  `uzi tui --sketch` renders a preview surface on the uxlab harness so a TUI change can be seen and iterated on before it is implemented; it is a development aid and never lands on `main` as product behaviour.
+
+### Changed
+
+- **Forge checkpoints now cover the non-issue run kinds ([#1037](https://github.com/vtmocanu/uzi/pull/1037)).**
+  `self_improve`, `chat`, `prompt`, `mr_rework` and `ci_fix` runs now publish forge checkpoints like issue runs do, so a parked or interrupted run of any kind can resume from its last checkpoint instead of losing work.
+- **The worker runs a pre-push secret scan at finalize and reports a typed failure origin for GitHub push protection ([#1076](https://github.com/vtmocanu/uzi/pull/1076)).**
+  Before pushing a finished branch the worker scans the whole push range for secret-shaped strings, and a GitHub push-protection rejection (GH013) now surfaces as a typed `fail_origin` with the finished work preserved, instead of an opaque push failure.
+- **Dependency: bump `gitlab.com/gitlab-org/api/client-go` to v2 ([#1067](https://github.com/vtmocanu/uzi/pull/1067)).**
 
 ### Fixed
 
 - **Hosted worker: `agent-browser` starts out of the box on the musl image ([#1082](https://github.com/vtmocanu/uzi/issues/1082)).**
   The shim now picks the native binary by the dynamic loader on disk instead of letting the npm launcher sniff `ldd --version` off the PATH, where a provisioned nix glibc (uzi's own `ruby@4.0.6`) shadowed musl's `ldd` and made it spawn the glibc build; the image build guard repeats the check behind a fake glibc `ldd` and opens `about:blank` through the shim, so a regression reddens the build rather than costing a subagent ~15 tool calls mid-run.
+- **Run cost was under-counted on every multi-iteration run, by as much as 3.8x ([#1079](https://github.com/vtmocanu/uzi/issues/1079)).**
+  `run_usage` assumed each SDK result frame reported a cumulative session total and kept only the largest one (a 3-iteration run read $77.19 against a true $153.58, a 7-iteration run read $26.70 against a true $100.63); it now keys each row by the SDK `query()` leg that produced it and sums the legs, and every pre-existing run's totals were automatically re-folded from history on first boot after the fix.
+- **A branch behind `main` only on `.github/workflows` no longer loses work at checkpoint time ([#1036](https://github.com/vtmocanu/uzi/pull/1036)).**
+  The broker PAT lacks the `workflow` scope, so a checkpoint of a branch that is behind on workflow files was skipped and a run that then died lost its work; the worker now synthesizes a wrapper commit whose workflow subtree matches the current default so the unchanged broker can push it, and adoption peels the wrapper back off.
+- **Checkpoint adoption unified on the owner anchor ([#1059](https://github.com/vtmocanu/uzi/pull/1059)).**
+  A resumed run now adopts its checkpoint tip through a single owner-anchored path, closing the residual work-loss gaps from the earlier checkpoint machinery so a resumed run keeps its lineage instead of breaking it.
+- **`self_improve` owner-key reader missed pre-#774 flattened tracking-owner stamps ([#887](https://github.com/vtmocanu/uzi/issues/887)).**
+  Across the #774 rollout window the owner-key reader could miss the older flattened tracking-owner stamp form, so a `self_improve` run could fail to recognise its own prior work; it now reads both stamp shapes.
 
 ## [0.76.0] - 2026-09-03
 
@@ -3750,7 +3774,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.76.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.77.0...HEAD
+[0.77.0]: https://github.com/vtmocanu/uzi/compare/v0.76.0...v0.77.0
 [0.76.0]: https://github.com/vtmocanu/uzi/compare/v0.75.1...v0.76.0
 [0.75.1]: https://github.com/vtmocanu/uzi/compare/v0.75.0...v0.75.1
 [0.75.0]: https://github.com/vtmocanu/uzi/compare/v0.74.0...v0.75.0

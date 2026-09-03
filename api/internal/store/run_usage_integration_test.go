@@ -2,15 +2,20 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TestUpsertRunUsageMergeLiveDB proves the run_usage fold's SQL contract against a
@@ -118,71 +123,74 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 		t.Fatal("re-delivered lower cost must not regress the row")
 	}
 
-	// A DISTINCT evolved session id, and a DISTINCT epoch (leg 2 of a broken lineage):
-	// the dropped-resume fresh leg lands under its own (run, session) row. Two session
-	// rows now exist for the model, carrying epochs 0 and 1.
-	fold("sess-2", 1, 2500, 800, 120, 1100, 0.033)
+	// --- PRD #1079: two LEGS under the SAME session_id and model, keyed apart by epoch.
+	//
+	// The pre-#1079 defect: the worker reports session_id once and every query() leg
+	// shares it, so two legs collapsed at the (run_id, session_id, model) key and
+	// GREATEST kept only the largest. With lineage_epoch in the primary key each leg is
+	// its own row, and the run_usage_totals view (MAX within (run, model, epoch), SUM
+	// across) returns their SUM. A SECOND run isolates this from the sess-1 rows above.
+	runID2 := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+		 VALUES ($1, $2, $3, 2, 't', 'd', 'running')`, runID2, userID, repoID)
 
-	// A late re-fold of leg 1 carries the CURRENT epoch (1) — e.g. a crash-retry that
-	// re-delivers a leg-1 frame after the break already bumped the run. UpsertRunUsage
-	// pins lineage_epoch on first insert (omitted from DO UPDATE SET), so sess-1's
-	// stored epoch must stay 0. Without the pin this would rewrite sess-1 to epoch 1,
-	// and the view's MAX-within-epoch would re-collapse the two legs across the same
-	// epoch — the exact regression PRD #632 guards against. Same token/cost values, so
-	// GREATEST leaves sess-1's magnitudes untouched; only the epoch pin is under test.
-	fold("sess-1", 1, 1800, 500, 90, 700, 0.019)
-
-	// The (b) rollup is latest/MAX per (run_id, model) — NEVER a SUM across session
-	// rows, which would over-count the cumulative snapshots. This is the rule M3 must
-	// use for run/user/factory totals.
-	var maxIn, sumIn int64
-	if err := pool.QueryRow(ctx,
-		`SELECT COALESCE(MAX(input_tokens),0), COALESCE(SUM(input_tokens),0) FROM run_usage WHERE run_id=$1 AND model=$2`,
-		runID, model).Scan(&maxIn, &sumIn); err != nil {
-		t.Fatalf("rollup read: %v", err)
-	}
-	if maxIn != 2500 {
-		t.Fatalf("latest/MAX-per-model rollup should be the final cumulative 2500, got %d", maxIn)
-	}
-	if sumIn <= maxIn {
-		t.Fatalf("test setup bug: SUM (%d) should exceed MAX (%d) so the over-count is demonstrable", sumIn, maxIn)
-	}
-
-	// Row-splitter precondition (PRD #632): the two legs MUST persist as SEPARATE
-	// run_usage rows under distinct session_ids — that separation comes from
-	// session_id (the conflict key is (run_id, session_id, model), NOT lineage_epoch),
-	// and it is what lets the view SUM the legs instead of GREATEST-collapsing them at
-	// the row level. Assert exactly two rows for this (run, model), keyed {sess-1,
-	// sess-2}, and that each carries its expected epoch (sess-1 → 0, sess-2 → 1). This
-	// guards the row-splitter, not merely the epoch stamp: a future change to the
-	// onSessionId latch or the SetRunRunning COALESCE that collapsed the legs onto one
-	// session_id would fail HERE even if the epoch stamp still worked.
-	epochBySession := map[string]int32{}
-	rows2, err := pool.Query(ctx,
-		`SELECT session_id, lineage_epoch FROM run_usage WHERE run_id=$1 AND model=$2`, runID, model)
-	if err != nil {
-		t.Fatalf("read legs: %v", err)
-	}
-	defer rows2.Close()
-	for rows2.Next() {
-		var sess string
-		var epoch int32
-		if err := rows2.Scan(&sess, &epoch); err != nil {
-			t.Fatalf("scan leg: %v", err)
+	const legModel = "claude-fable-legs"
+	const legSession = "sess-shared" // SAME session for both legs — the collapse trap.
+	foldLeg := func(epoch int32, in, cacheR, cacheC, out int64, cost float64) {
+		t.Helper()
+		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
+			RunID: runID2, SessionID: legSession, Model: legModel, LineageEpoch: epoch,
+			InputTokens: in, CacheReadTokens: cacheR, CacheCreationTokens: cacheC, OutputTokens: out,
+			CostUsd: numericFromMicros(cost),
+		}); err != nil {
+			t.Fatalf("UpsertRunUsage(leg %d): %v", epoch, err)
 		}
-		epochBySession[sess] = epoch
 	}
-	if err := rows2.Err(); err != nil {
-		t.Fatalf("iterate legs: %v", err)
+	// Leg 1 (epoch 1) is LARGER than leg 2 (epoch 2) in every column, exactly the
+	// 02854d5e shape where a later leg reports less. Under the OLD three-column key the
+	// smaller leg 2 is absorbed by GREATEST and the run total is leg 1 alone; the fix
+	// keeps both, so the total is the SUM.
+	foldLeg(1, 1000, 400, 60, 700, 0.030)
+	foldLeg(2, 200, 90, 15, 150, 0.007)
+
+	legTotal, err := q.GetRunUsageTotal(ctx, runID2)
+	if err != nil {
+		t.Fatalf("GetRunUsageTotal(runID2): %v", err)
 	}
-	if len(epochBySession) != 2 {
-		t.Fatalf("the two legs must persist as 2 distinct-session rows, got %d: %+v", len(epochBySession), epochBySession)
+	// SUM of the two legs, per column. On c415789 (old three-column key) leg 2 is
+	// absorbed and this reads leg 1 alone (1000/700) — the assertion is RED there.
+	if legTotal.InputTokens != 1200 || legTotal.OutputTokens != 850 ||
+		legTotal.CacheReadTokens != 490 || legTotal.CacheCreationTokens != 75 {
+		t.Fatalf("two-leg run total = in %d/out %d/cr %d/cw %d, want the SUM 1200/850/490/75 "+
+			"(the old (run,session,model) key would absorb leg 2 by GREATEST and read leg 1 alone 1000/700)",
+			legTotal.InputTokens, legTotal.OutputTokens, legTotal.CacheReadTokens, legTotal.CacheCreationTokens)
 	}
-	if e, ok := epochBySession["sess-1"]; !ok || e != 0 {
-		t.Fatalf("leg 1 must be session sess-1 at epoch 0, got %+v", epochBySession)
+	if legTotal.InputTokens == 1000 {
+		t.Fatal("two-leg input == 1000 means leg 2 was absorbed at the key — lineage_epoch is not splitting the rows")
 	}
-	if e, ok := epochBySession["sess-2"]; !ok || e != 1 {
-		t.Fatalf("leg 2 must be session sess-2 at epoch 1, got %+v", epochBySession)
+
+	// Two distinct run_usage rows now exist for this (run, session, model), one per epoch.
+	var legRows int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM run_usage WHERE run_id=$1 AND session_id=$2 AND model=$3`,
+		runID2, legSession, legModel).Scan(&legRows); err != nil {
+		t.Fatalf("count leg rows: %v", err)
+	}
+	if legRows != 2 {
+		t.Fatalf("two legs under one session must persist as 2 rows keyed by epoch, got %d", legRows)
+	}
+
+	// Re-delivering EITHER frame verbatim changes nothing — GREATEST within a leg key is
+	// idempotent, so at-least-once delivery converges.
+	foldLeg(1, 1000, 400, 60, 700, 0.030)
+	foldLeg(2, 200, 90, 15, 150, 0.007)
+	legTotal2, err := q.GetRunUsageTotal(ctx, runID2)
+	if err != nil {
+		t.Fatalf("GetRunUsageTotal(runID2) after replay: %v", err)
+	}
+	if legTotal2.InputTokens != 1200 || legTotal2.OutputTokens != 850 {
+		t.Fatalf("re-delivering both legs must not change the total: got in %d/out %d, want 1200/850", legTotal2.InputTokens, legTotal2.OutputTokens)
 	}
 }
 
@@ -374,5 +382,148 @@ func TestUsageRollupsLiveDB(t *testing.T) {
 	}
 	if r := byID[a3]; r.UsageInputTokens.Valid {
 		t.Fatalf("A3 (no usage) must have NULL usage columns, got %+v", r.UsageInputTokens)
+	}
+}
+
+// TestRunUsagePerLegFoldEndToEndLiveDB drives the PRODUCTION fold (workersvc.AppendMessages)
+// over the eight recorded frames of run 02854d5e — four init frames interleaved with four
+// result-frame legs — through a REAL Postgres, and proves the run total is the SUM of the
+// four legs (PRD #1079 Success Criterion 5). Feeding one frame per batch exercises the
+// cross-batch epoch read (a result frame's epoch is counted off the init frames already
+// committed to run_messages); replaying every batch in a SCRAMBLED order proves the
+// position-absolute epoch is order-independent — the total is unchanged after replay.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func TestRunUsagePerLegFoldEndToEndLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store integration runner for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	// Read the fixture (the SAME file the Go and TS contract halves read; it sits above
+	// the api module, so this reads it by relative path).
+	type fixtureFrame struct {
+		Seq     int32           `json:"seq"`
+		Kind    string          `json:"kind"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	var fixture struct {
+		Frames []fixtureFrame `json:"frames"`
+	}
+	b, err := os.ReadFile(filepath.Join("..", "..", "..", "fixtures", "run-usage", "result-frames-02854d5e.json"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if err := json.Unmarshal(b, &fixture); err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	if len(fixture.Frames) != 8 {
+		t.Fatalf("fixture must carry 8 frames (4 init + 4 result), got %d", len(fixture.Frames))
+	}
+
+	// Seed a user, connection, repo, worker and a running run the worker owns.
+	userID, connID, repoID, runID, workerID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("perleg-%s@e2e", userID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+	mustExec(ctx, t, pool,
+		`INSERT INTO workers (id, user_id, name, token_hash, max_concurrent_runs)
+		 VALUES ($1, $2, 'w', $3, 4)`, workerID, userID, fmt.Sprintf("hash-%s", workerID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, worker_id, issue_iid, issue_title, issue_description, status, session_id)
+		 VALUES ($1, $2, $3, $4, 1, 't', 'd', 'running', 'sess-02854d5e')`, runID, userID, repoID, workerID)
+
+	box, err := secretbox.New(make([]byte, secretbox.KeySize))
+	if err != nil {
+		t.Fatalf("secretbox: %v", err)
+	}
+	svc := workersvc.New(q, box, workersvc.Params{})
+	wkr := store.Worker{ID: workerID}
+
+	batchOf := func(f fixtureFrame) []workersvc.IncomingMessage {
+		return []workersvc.IncomingMessage{{Seq: f.Seq, Kind: f.Kind, Payload: f.Payload}}
+	}
+	// Pass 1: one frame per batch, in seq order (init before its result).
+	for _, f := range fixture.Frames {
+		if err := svc.AppendMessages(ctx, wkr, runID, batchOf(f)); err != nil {
+			t.Fatalf("AppendMessages(seq %d): %v", f.Seq, err)
+		}
+	}
+
+	// The authored per-leg SUM (fixtures/run-usage/run-usage-02854d5e.json totals).
+	assertTotal := func(when string) {
+		t.Helper()
+		total, err := q.GetRunUsageTotal(ctx, runID)
+		if err != nil {
+			t.Fatalf("GetRunUsageTotal (%s): %v", when, err)
+		}
+		if total.InputTokens != 12785 || total.CacheReadTokens != 187880173 ||
+			total.CacheCreationTokens != 5500712 || total.OutputTokens != 1021240 {
+			t.Fatalf("run total (%s) = in %d/cr %d/cw %d/out %d, want the per-leg SUM 12785/187880173/5500712/1021240",
+				when, total.InputTokens, total.CacheReadTokens, total.CacheCreationTokens, total.OutputTokens)
+		}
+		// cost_usd compared via SQL numeric equality to avoid float→numeric ambiguity.
+		var costOK bool
+		if err := pool.QueryRow(ctx,
+			`SELECT cost_usd = 153.582776::numeric FROM run_usage_totals WHERE run_id = $1`, runID).Scan(&costOK); err != nil {
+			t.Fatalf("read view cost (%s): %v", when, err)
+		}
+		if !costOK {
+			t.Fatalf("run total cost (%s) must be the per-leg SUM 153.582776 USD", when)
+		}
+		// Guard the discriminator: 77.185539 is the pre-#1079 MAX-per-model under-count.
+		var isUndercount bool
+		if err := pool.QueryRow(ctx,
+			`SELECT cost_usd = 77.185539::numeric FROM run_usage_totals WHERE run_id = $1`, runID).Scan(&isUndercount); err != nil {
+			t.Fatalf("read view cost undercount (%s): %v", when, err)
+		}
+		if isUndercount {
+			t.Fatalf("run total (%s) collapsed to the MAX-per-model under-count 77.185539 — legs were not kept apart", when)
+		}
+		// Six per-(model, epoch) rows: haiku@1, opus@1..4, sonnet@4.
+		var rows int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM run_usage WHERE run_id = $1`, runID).Scan(&rows); err != nil {
+			t.Fatalf("count rows (%s): %v", when, err)
+		}
+		if rows != 6 {
+			t.Fatalf("expected 6 per-(model, epoch) rows (%s), got %d", when, rows)
+		}
+	}
+	assertTotal("first pass")
+
+	// Pass 2: replay every batch in a SCRAMBLED order. All frames are already persisted,
+	// so each result frame's epoch is recomputed off the same committed init frames,
+	// independent of delivery order — the total must be identical.
+	scramble := []int{7, 3, 5, 1, 6, 0, 4, 2}
+	if len(scramble) != len(fixture.Frames) {
+		t.Fatalf("scramble permutation must cover all %d frames", len(fixture.Frames))
+	}
+	for _, idx := range scramble {
+		f := fixture.Frames[idx]
+		if err := svc.AppendMessages(ctx, wkr, runID, batchOf(f)); err != nil {
+			t.Fatalf("replay AppendMessages(seq %d): %v", f.Seq, err)
+		}
+	}
+	assertTotal("after scrambled replay")
+
+	// A tautology guard so the assertions above cannot be vacuously green: the true SUM
+	// and the under-count must differ (they do: 153.58 vs 77.19).
+	if math.Abs(153.582776-77.185539) < 1 {
+		t.Fatal("the per-leg SUM and the MAX-per-model under-count must differ for this test to discriminate")
 	}
 }

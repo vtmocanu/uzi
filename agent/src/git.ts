@@ -8,6 +8,7 @@ import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { withForgeRetry } from "./forge-retry.js";
+import { flagCIConfigPaths } from "./ci-config-guard.js";
 import {
   commitsScannedFromStderr,
   gitleaksArgs,
@@ -177,6 +178,27 @@ function runnerTrackingOwnerKey(branch: string): string {
 // through readTrackingOwner()'s collision guard plus the caller's runId-equality gate.
 function legacyFlatTrackingOwnerKey(branch: string): string {
   return `uzi-trackowner.${branch.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
+
+/**
+ * PRD #1062 M2 (#1036) — the optional context `checkpointPack` needs to build the
+ * `.github/workflows` overlay wrapper commit. Supplied by the runner ONLY on GitHub and ONLY
+ * on a path where the agent tree is already reaped (a PAT git op — `fetchDefaultTip` — runs
+ * here). Undefined ⇒ `checkpointPack` ships the raw tracking tip, byte-for-byte as before.
+ */
+export interface CheckpointOverlayContext {
+  /** The default branch name (already resolved the way the finalize align resolves it). */
+  defaultBranch: string;
+  /** The forge PAT for the authenticated default-tip fetch. */
+  pat?: string;
+  /** The repo clone URL, used to scope the PAT's HTTP header. */
+  cloneUrl?: string;
+  /** The forge bot username for HTTP Basic auth. */
+  username?: string;
+  /** The current tip of `refs/uzi-checkpoints/<branch>` as the run last knows it. When a
+   *  40-hex value, it becomes the overlay's FIRST parent (base-first) so a second sequential
+   *  overlay strictly descends the prior one and the broker accepts it as a fast-forward. */
+  prevCheckpointTip?: string;
 }
 
 export interface RunnerClone {
@@ -678,7 +700,84 @@ export class GitCache {
           }
         }
       }
-      const baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
+      let baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
+      // PRD #1062 M2 (#1036) — peel a `.github/workflows` overlay transport wrapper. When the
+      // adopted base is a `ckpt(overlay):` commit (built by checkpointPack for a branch behind
+      // `main` on workflows, pushed UNCHANGED by the broker), its swapped `.github/workflows`
+      // tree is NOT branch content — it exists only to satisfy GitHub's tip-vs-default
+      // workflow-scope check on the push. DISCARD it by re-pointing `baseSha` to the overlay's
+      // LAST parent (= realTip, by construction: checkpointPack builds base-FIRST/realTip-LAST).
+      // This runs BEFORE the wip-park adoptedMarker logic below, so a `wip(park)` marker stacked
+      // under an overlay is still soft-reset on the peeled tip. Order: overlay = discard-by-
+      // reparent (outer) → wip-park = keep-by-soft-reset (inner). Best-effort: if the peel can't
+      // resolve the parent, leave baseSha as-is and warn (never crash a reseed over the wrapper).
+      //
+      // PROVENANCE GATE (issue #1036 review): peel ONLY when seededFrom === "checkpoint" — the
+      // worker-built, api-brokered ref the agent CANNOT push to. An overlay is only ever
+      // synthesised by checkpointPack for that ref; a `ckpt(overlay):` subject on any other base
+      // (a tracking/origin/default tip the agent controls) is a FORGERY, and peeling it would
+      // DISCARD the agent's real commit (this peel throws the tip's tree away — unlike the
+      // wip-park soft-reset, which keeps it). A subject prefix is not provenance across the agent
+      // trust boundary; seededFrom is.
+      if (seededFrom === "checkpoint" && (await this.isOverlayMarker(barePath, baseSha))) {
+        const overlaySha = baseSha;
+        // The real tip is the LAST parent. Count parents (`rev-list --parents -n 1` prints
+        // "<commit> <p1> [<p2> …]"), then read `<sha>^<n>` where n = parent count.
+        const parentLine = (
+          await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", `${overlaySha}^{commit}`])
+        ).trim();
+        const nParents = parentLine === "" ? 0 : parentLine.split(/\s+/).length - 1;
+        const realTip =
+          nParents > 0
+            ? (
+                await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${overlaySha}^${nParents}`])
+              ).trim()
+            : "";
+        // PROVENANCE, part 2 (issue #1036 review F1): the subject prefix + the seededFrom gate
+        // are necessary but NOT sufficient. An agent can commit its OWN realTip with a forged
+        // `ckpt(overlay):` subject; if that tip ships as a PLAIN checkpoint (not behind on
+        // workflows, so checkpointPack builds no overlay) it lands on the worker-built checkpoint
+        // ref, so seededFrom is "checkpoint" too — and peeling it would DISCARD the agent's commit.
+        // Structural distinction: a genuine overlay differs from its realTip parent ONLY under
+        // `.github/workflows/` (all checkpointPack swaps), and non-trivially; a forged work commit
+        // differs in real files. Peel ONLY when the diff realTip..overlay is NON-EMPTY and wholly
+        // under `.github/workflows/`. This is the unforgeable check: an agent cannot make a commit
+        // carrying real work look like a workflow-only swap of its own parent.
+        const changed =
+          /^[0-9a-f]{40}$/.test(realTip)
+            ? (await this.tryGitStdout(barePath, ["diff", "--name-only", realTip, overlaySha])).trim()
+            : "";
+        const changedPaths = changed === "" ? [] : changed.split("\n");
+        const isOverlayStructure =
+          changedPaths.length > 0 && changedPaths.every((p) => p.startsWith(".github/workflows/"));
+        if (/^[0-9a-f]{40}$/.test(realTip) && isOverlayStructure) {
+          baseSha = realTip;
+          this.log.info("runner clone: peeled .github/workflows overlay wrapper to its realTip", {
+            branch,
+            overlay_sha: overlaySha,
+            real_tip: realTip,
+            seeded_from: seededFrom,
+          });
+        } else if (/^[0-9a-f]{40}$/.test(realTip)) {
+          this.log.warn(
+            "runner clone: `ckpt(overlay):` subject but the diff to its last parent is NOT confined to .github/workflows — NOT peeling (forged or non-overlay tip), preserving the checkpoint tip as branch content",
+            {
+              branch,
+              overlay_sha: overlaySha,
+              real_tip: realTip,
+              changed_paths: changedPaths.length,
+              seeded_from: seededFrom,
+            },
+          );
+        } else {
+          this.log.warn("runner clone: overlay marker present but its realTip parent did not resolve — not peeling", {
+            branch,
+            overlay_sha: overlaySha,
+            parents: nParents,
+            seeded_from: seededFrom,
+          });
+        }
+      }
       // PRD #759 M2 — same-worker + cross-worker-clean recovery. On the tracking leg
       // (same-worker) and the checkpoint leg (cross-worker strict-descendant), `baseSha`
       // itself is the adopted tip, and that tip may be a `wip(park):` marker M1 planted:
@@ -1183,22 +1282,184 @@ export class GitCache {
   async checkpointPack(
     barePath: string,
     branch: string,
+    overlay?: CheckpointOverlayContext,
   ): Promise<{ tipOid: string; pack: Readable } | null> {
-    const tipOid = await this.trackingTip(barePath, branch);
-    if (!tipOid) return null;
+    const realTip = await this.trackingTip(barePath, branch);
+    if (!realTip) return null;
     const originRef = `refs/remotes/origin/${branch}`;
     const excludeRef = (await this.refExists(barePath, originRef))
       ? originRef
       : await this.defaultBranchRef(barePath);
     const trackingRef = runnerTrackingRef(branch);
+
+    // PRD #1062 M2 (#1036) — the `.github/workflows` overlay. When an overlay context is
+    // supplied (GitHub, agent already reaped — see runner.ts), attempt to build a genuine
+    // fast-forward wrapper commit `O_ov` whose `.github/workflows` tree equals the default's,
+    // and pack THAT instead of the raw tracking tip, so a branch behind `main` on those files
+    // is no longer rejected `workflow_scope` and checkpoints durably. FAIL-SOFT: on ANY error
+    // or gate-miss `buildWorkflowOverlay` returns null and we ship `realTip` — today's exact
+    // behaviour (→ the clean workflow-scope skip; #377 owns a workflow-MODIFYING branch at
+    // finalize). This method never throws for an overlay reason. When `overlay` is undefined
+    // the block is skipped and `realTip` ships, byte-for-byte as before.
+    let wantRev = realTip;
+    if (overlay) {
+      const ov = await this.buildWorkflowOverlay(barePath, branch, realTip, overlay);
+      if (ov) wantRev = ov;
+    }
+
     // pack-objects reads the wanted/excluded revs on stdin (one ref per line, `^` excludes)
-    // and writes the packfile to stdout.
+    // and writes the packfile to stdout. The wanted rev is `realTip` on the no-overlay path
+    // (via `trackingRef`'s tip) and `O_ov` when an overlay was built; `^excludeRef` is the
+    // same floor either way, so the default's workflow blobs (reachable from the floor on the
+    // not-pushed leg) are not re-shipped.
+    const wanted = wantRev === realTip ? trackingRef : wantRev;
     const { stdout } = this.spawnGit(
       barePath,
       ["pack-objects", "--revs", "--stdout"],
-      `${trackingRef}\n^${excludeRef}\n`,
+      `${wanted}\n^${excludeRef}\n`,
     );
-    return { tipOid, pack: stdout };
+    return { tipOid: wantRev, pack: stdout };
+  }
+
+  /**
+   * PRD #1062 M2 (#1036) — build the `.github/workflows` overlay wrapper commit `O_ov` for a
+   * checkpoint, or return null to ship the raw `realTip` (today's behaviour). ALL work is
+   * FAIL-SOFT: every error resolves to null so `checkpointPack` never throws for an overlay
+   * reason, and every gate-miss ships `realTip`.
+   *
+   * The overlay is a transport wrapper the broker pushes UNCHANGED and adoption peels
+   * (`runnerCloneForBranch`, `isOverlayMarker`): its `.github/workflows` subtree is swapped to
+   * the default's so GitHub's tip-vs-default workflow-scope check passes, while the real branch
+   * content lives on its LAST parent (`realTip`). The base (a prior overlay tip) goes FIRST and
+   * `realTip` LAST so the api broker's parent[0]-first strict-descendant DFS over its depth-1
+   * store accepts it (see the PRD's broker note — the broker stays byte-unchanged).
+   *
+   * Synthesis is pure object-DB work via a TEMP INDEX (no live worktree, no filter drivers, no
+   * runner-clone perturbation): `read-tree` the real tip, `rm --cached` the workflow set,
+   * `read-tree --prefix` the default's subtree back (only when the default HAS one), `write-tree`,
+   * then `commit-tree` with a DETERMINISTIC identity + committer date so a no-new-work rebuild
+   * yields the same OID. Runs worker-uid on the base git env with NO PAT (the local reads), the
+   * PAT is used only by `fetchDefaultTip`.
+   */
+  private async buildWorkflowOverlay(
+    barePath: string,
+    branch: string,
+    realTip: string,
+    overlay: CheckpointOverlayContext,
+  ): Promise<string | null> {
+    const trackingRef = runnerTrackingRef(branch);
+    // GATE 1 — the default tip must resolve (a fresh authenticated fetch). A failure ships
+    // realTip: overlay durability is best-effort and never blocks the checkpoint.
+    let defaultTip: string;
+    try {
+      defaultTip = await this.fetchDefaultTip(
+        barePath,
+        overlay.defaultBranch,
+        overlay.pat,
+        overlay.cloneUrl,
+        overlay.username,
+      );
+    } catch (e) {
+      this.log.warn("checkpoint overlay: could not resolve the default tip — shipping realTip", {
+        branch,
+        error: gitErrorMessage(e),
+      });
+      return null;
+    }
+    // GATE 2 — only a branch actually behind on `.github/workflows` needs an overlay (reuse
+    // #627's exact trigger). Not behind ⇒ ship realTip (the broker accepts the raw tip).
+    if (!(await this.workflowTreeDiffers(barePath, trackingRef, defaultTip))) return null;
+    // GATE 3 — the branch must NOT itself have modified a workflow file. `changedFiles` returns
+    // null when the diff can't be computed: FAIL-SAFE (cannot verify ⇒ ship realTip, never
+    // synthesise a tree that might hide a branch's own workflow edit). A non-empty workflow hit
+    // set means #377 owns this branch at finalize; ship realTip → the clean workflow-scope skip.
+    const changed = await this.changedFiles(barePath, trackingRef);
+    if (changed === null) return null;
+    if (flagCIConfigPaths(changed, [".github/workflows/**"]).length > 0) return null;
+
+    // Temp index + empty throwaway work-tree, both cleaned up in the finally. The work-tree is
+    // required ONLY by `read-tree --prefix` (it refuses in a bare repo); WITHOUT `-u` nothing is
+    // checked out into it, so no `.gitattributes` filter/smudge driver ever fires — a security
+    // property (do NOT add `-u`).
+    const tmpIdx = path.join(os.tmpdir(), `uzi-ckpt-idx-${randomUUID()}`);
+    const tmpWork = path.join(os.tmpdir(), `uzi-ckpt-work-${randomUUID()}`);
+    try {
+      await fs.mkdir(tmpWork, { recursive: true });
+      const idxEnv: NodeJS.ProcessEnv = { GIT_INDEX_FILE: tmpIdx };
+      await this.runGitWithEnv(barePath, ["read-tree", realTip], idxEnv);
+      // `--ignore-unmatch` is load-bearing: against a temp index a `git rm --cached` with no
+      // match exits non-zero, so this flag makes the no-`.github`/already-deleted edges no-ops
+      // (the same flag `alignBranchWithDefault` carries).
+      await this.runGitWithEnv(
+        barePath,
+        ["rm", "--cached", "-r", "--ignore-unmatch", ".github/workflows"],
+        idxEnv,
+      );
+      // Restore the default's workflow subtree ONLY when the default actually has one; an empty
+      // ls-tree means the default deleted its whole `.github/workflows/`, and the rm above
+      // already equalised to "none" (the #627 deleted-workflows edge).
+      const defaultWfTree = (
+        await this.runGit(barePath, ["ls-tree", defaultTip, "--", ".github/workflows"])
+      ).trim();
+      if (defaultWfTree.length > 0) {
+        await this.runGitWithEnv(
+          barePath,
+          ["read-tree", "--prefix=.github/workflows", `${defaultTip}:.github/workflows`],
+          { ...idxEnv, GIT_WORK_TREE: tmpWork },
+        );
+      }
+      const newRoot = (await this.runGitWithEnv(barePath, ["write-tree"], idxEnv)).trim();
+      if (!/^[0-9a-f]{40}$/.test(newRoot)) return null;
+      // If the synthesised root equals realTip's own tree the branch is not actually behind
+      // (e.g. realTip has no `.github` and the default has none) ⇒ ship realTip.
+      const realTipTree = (await this.runGit(barePath, ["rev-parse", `${realTip}^{tree}`])).trim();
+      if (newRoot === realTipTree) return null;
+      // Deterministic committer date = realTip's own, so a no-new-work rebuild is byte-identical.
+      const committerDate = (
+        await this.runGit(barePath, ["show", "-s", "--format=%cI", realTip])
+      ).trim();
+      // Parent order: base (a prior overlay tip) FIRST, realTip LAST — see the method doc and
+      // the PRD's broker note. A missing / non-40-hex prevCheckpointTip ⇒ single parent realTip.
+      const parents: string[] = [];
+      const prev = overlay.prevCheckpointTip;
+      if (prev && /^[0-9a-f]{40}$/.test(prev)) parents.push(prev);
+      parents.push(realTip);
+      const commitArgs = ["-c", "commit.gpgsign=false", "commit-tree", newRoot];
+      for (const p of parents) commitArgs.push("-p", p);
+      commitArgs.push(
+        "-m",
+        `${OVERLAY_COMMIT_PREFIX} align .github/workflows with ${defaultTip} (realTip ${realTip.slice(0, 12)})`,
+      );
+      const ovSha = (
+        await this.runGitWithEnv(barePath, commitArgs, {
+          ...idxEnv,
+          GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name,
+          GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+          GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name,
+          GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+          GIT_AUTHOR_DATE: committerDate,
+          GIT_COMMITTER_DATE: committerDate,
+        })
+      ).trim();
+      if (!/^[0-9a-f]{40}$/.test(ovSha)) return null;
+      this.log.info("checkpoint overlay built (.github/workflows aligned to default)", {
+        branch,
+        real_tip: realTip,
+        default_tip: defaultTip,
+        overlay_sha: ovSha,
+        parents: parents.length,
+      });
+      return ovSha;
+    } catch (e) {
+      this.log.warn("checkpoint overlay synthesis failed — shipping realTip", {
+        branch,
+        error: gitErrorMessage(e),
+      });
+      return null;
+    } finally {
+      await fs.rm(tmpIdx, { force: true }).catch(() => undefined);
+      await fs.rm(tmpWork, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
@@ -2013,12 +2274,49 @@ export class GitCache {
     return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
   }
 
+  /** PRD #1062 M2 (#1036) — is the commit `sha` a `ckpt(overlay):` transport wrapper
+   *  (OVERLAY_COMMIT_PREFIX)? Mirrors isWipParkMarker: a read-only worker-uid subject read,
+   *  best-effort (any failure ⇒ false, so a bad read never routes adoption onto the overlay
+   *  peel). Adoption peels an overlay by DISCARDING its swapped `.github/workflows` tree and
+   *  re-pointing the base to its LAST parent (the real tip) — see runnerCloneForBranch. */
+  private async isOverlayMarker(barePath: string, sha: string): Promise<boolean> {
+    const subject = await this.tryGitStdout(barePath, ["log", "-1", "--format=%s", `${sha}^{commit}`]);
+    return subject.startsWith(OVERLAY_COMMIT_PREFIX);
+  }
+
   // --- git subprocess plumbing -------------------------------------------------
 
   private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string> {
     const env = gitEnv(pat, scope, username);
     // Log args only; the PAT lives in env (GIT_CONFIG_VALUE_n), never in args.
     this.log.debug("git", { cwd, args });
+    try {
+      const { stdout } = await execFileAsync("git", withDir(cwd, args), {
+        env,
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      return stdout;
+    } catch (err) {
+      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+    }
+  }
+
+  /**
+   * PRD #1062 M2 (#1036) — a worker-uid git that carries EXTRA environment on top of the base
+   * `gitEnv()` (no PAT): `GIT_INDEX_FILE` for a temp-index synthesis, `GIT_WORK_TREE` for the
+   * one op (`read-tree --prefix`) that refuses in a bare repo, and the deterministic
+   * `GIT_AUTHOR_*`/`GIT_COMMITTER_*`/`*_DATE` identity for the overlay `commit-tree`. The extra
+   * pairs are merged AFTER `gitEnv()` so the security config pins (safe.directory / hooksPath /
+   * code-exec-key pins) are never displaced. Same 64 MiB cap + timeout as `runGit`.
+   */
+  private async runGitWithEnv(
+    cwd: string | undefined,
+    args: string[],
+    extraEnv: NodeJS.ProcessEnv,
+  ): Promise<string> {
+    const env = { ...gitEnv(), ...extraEnv };
+    this.log.debug("git (env)", { cwd, args });
     try {
       const { stdout } = await execFileAsync("git", withDir(cwd, args), {
         env,
@@ -2184,6 +2482,16 @@ export const AGENT_GIT_IDENTITY = { name: "uzi-agent", email: "uzi-agent@uzi.loc
  * for, mirroring protocol.ts's @public wire DTOs).
  */
 export const WIP_PARK_COMMIT_PREFIX = "wip(park):" as const;
+
+/**
+ * PRD #1062 M2 (#1036) — the commit-subject prefix that marks a `.github/workflows` overlay
+ * transport wrapper on `refs/uzi-checkpoints/<branch>`. `checkpointPack` prefixes the synthetic
+ * wrapper's subject with it; adoption (`runnerCloneForBranch` via `isOverlayMarker`) recognises
+ * it and peels the wrapper (discard its swapped `.github` tree, re-point to its last parent =
+ * realTip) BEFORE the wip-park soft-reset. Exported so the agent Contract-B tests reference the
+ * one definition rather than re-inlining the literal (knip's zero-unused-export gate).
+ */
+export const OVERLAY_COMMIT_PREFIX = "ckpt(overlay):" as const;
 
 /**
  * git subprocess env. safe.directory=* trusts the daemon-managed dirs

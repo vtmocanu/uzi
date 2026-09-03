@@ -862,6 +862,93 @@ describe("deriveRunUsage", () => {
   });
 });
 
+// ── PRD #1079: each result frame is one SDK query() leg reporting only that leg, and
+// the per-model high-water marks reset at EVERY `init` frame. So the run total SUMS the
+// legs (it no longer collapses to the largest), while WITHIN a single leg the running
+// MAX + clamped delta is preserved. Every case here is red on the pre-#1079 fold, which
+// reset the marks only once and telescoped multiple legs to their maximum.
+
+function initFrame(model = "m"): RunMessage {
+  return msg("status", "lead", { event: "init", model });
+}
+
+describe("deriveRunUsage per-leg fold (PRD #1079)", () => {
+  it("sums legs when each result frame follows its own init (5000/1000/3000 → 9000)", () => {
+    beforeEachReset();
+    // Three legs, each with its own `init`. Pre-#1079 (reset once) telescopes them to
+    // the max and reports total 5000 with phases [5000, 0, 0]; the fix resets at every
+    // init, so each phase is its own leg and the run total is their SUM.
+    const d = deriveRunUsage([
+      initFrame(),
+      modelResultFrame("lead", { m: { input: 5_000, output: 0, cost: 0 } }, { turns: 3, durationMs: 10 }),
+      initFrame(),
+      modelResultFrame("lead", { m: { input: 1_000, output: 0, cost: 0 } }, { turns: 4, durationMs: 20 }),
+      initFrame(),
+      modelResultFrame("lead", { m: { input: 3_000, output: 0, cost: 0 } }, { turns: 5, durationMs: 30 }),
+    ]);
+    expect(d.phases.map((p) => p.label)).toEqual(["Plan", "Implement · iteration 1", "Implement · iteration 2"]);
+    expect(d.phases.map((p) => p.fresh)).toEqual([5_000, 1_000, 3_000]);
+    expect(d.total.fresh).toBe(9_000);
+    expect(d.modelTotals).toEqual([{ model: "m", input: 9_000, cacheCreation: 0, cached: 0, out: 0, costUsd: 0 }]);
+  });
+
+  it("preserves within-leg MAX when several result frames share ONE init (5000/0/0 → 5000)", () => {
+    beforeEachReset();
+    // One `init`, then three result frames in the same leg. The marks are NOT reset
+    // between them, so the running-MAX identity holds exactly as the pre-#1079 fold did
+    // within a lineage: phases [5000, 0, 0], run total 5000.
+    const d = deriveRunUsage([
+      initFrame(),
+      modelResultFrame("lead", { m: { input: 5_000, output: 0, cost: 0 } }, { turns: 3, durationMs: 10 }),
+      modelResultFrame("lead", { m: { input: 1_000, output: 0, cost: 0 } }, { turns: 4, durationMs: 20 }),
+      modelResultFrame("lead", { m: { input: 3_000, output: 0, cost: 0 } }, { turns: 5, durationMs: 30 }),
+    ]);
+    expect(d.phases.map((p) => p.fresh)).toEqual([5_000, 0, 0]);
+    expect(d.total.fresh).toBe(5_000);
+    expect(d.modelTotals).toEqual([{ model: "m", input: 5_000, cacheCreation: 0, cached: 0, out: 0, costUsd: 0 }]);
+  });
+
+  it("keeps a model's leg-1 contribution in the total AND modelTotals when it is absent from leg 2", () => {
+    beforeEachReset();
+    // The reset clears the MARKS, not the accumulated per-model SUM. y appears only in
+    // leg 1; its 50/5/0.5 must survive into the run total and modelTotals even though
+    // leg 2 carries only x. And because the marks reset, x's leg-2 delta is its full 300
+    // (not 300 − 100 = 200), so the run total is the SUM of the legs, not their max.
+    const d = deriveRunUsage([
+      initFrame("x"),
+      modelResultFrame(
+        "lead",
+        { x: { input: 100, output: 10, cost: 1 }, y: { input: 50, output: 5, cost: 0.5 } },
+        { turns: 1, durationMs: 1 },
+      ),
+      initFrame("x"),
+      modelResultFrame("lead", { x: { input: 300, output: 40, cost: 3 } }, { turns: 1, durationMs: 1 }),
+    ]);
+    // Pre-#1079 (no reset): fresh 350, out 55, x input 300. The fix: fresh 450, x 400.
+    expect(d.total.fresh).toBe(450);
+    expect(d.total.out).toBe(55);
+    expect(d.total.costUsd).toBeCloseTo(4.5, 6);
+    expect(d.modelTotals).toEqual([
+      { model: "x", input: 400, cacheCreation: 0, cached: 0, out: 50, costUsd: 4 },
+      { model: "y", input: 50, cacheCreation: 0, cached: 0, out: 5, costUsd: 0.5 },
+    ]);
+  });
+
+  it("still latches the run model from the FIRST init only, resetting marks on the rest", () => {
+    beforeEachReset();
+    // The model-name latch is one-shot; the mark reset is per-init. A second init with a
+    // different model must not change `d.model`, but its reset must still SUM the legs.
+    const d = deriveRunUsage([
+      initFrame("first-model"),
+      modelResultFrame("lead", { m: { input: 5_000, output: 0, cost: 0 } }, { turns: 1, durationMs: 1 }),
+      initFrame("second-model"),
+      modelResultFrame("lead", { m: { input: 4_000, output: 0, cost: 0 } }, { turns: 1, durationMs: 1 }),
+    ]);
+    expect(d.model).toBe("first-model");
+    expect(d.total.fresh).toBe(9_000);
+  });
+});
+
 // ── The cache-percentage display invariant (issue #195 web-ux follow-up) ───────
 
 describe("cacheDisplayPct", () => {

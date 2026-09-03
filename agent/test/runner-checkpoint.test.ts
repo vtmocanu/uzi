@@ -10,7 +10,9 @@ import type { PublishResult } from "../src/protocol.js";
 import {
   api,
   client,
+  fakeGitHub,
   fakeGitlab,
+  fx,
   git,
   gitlabClaim,
   installHarness,
@@ -148,7 +150,7 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
     assert.deepStrictEqual(afterCheckpoint, ["fetch"]);
   });
 
-  it("skips the fetch when the branch tip is unmoved since the last checkpoint (Decision 6 no-op)", async () => {
+  it("skips the FETCH (not the reap) when the branch tip is unmoved since the last checkpoint (Decision 6 no-op)", async () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(62);
     const events: string[] = [];
@@ -160,7 +162,7 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
         // First checkpoint fetches and writes the tracking ref.
         await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
         const beforeSecond = events.length;
-        // Second checkpoint with NO new commit: the tip is unmoved, so it is a no-op.
+        // Second checkpoint with NO new commit: the tip is unmoved, so the FETCH is skipped.
         await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
         afterSecond = events.slice(beforeSecond);
         return { branch: ctx.branch };
@@ -172,8 +174,11 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
     } finally {
       restore();
     }
-    // The no-op check runs BEFORE the reap, so an unmoved tip does neither: no kill, no fetch.
-    assert.deepStrictEqual(afterSecond, []);
+    // #1036 fix: the reap is tied to opts.reap (the real "safe to reap" signal), NOT to the
+    // fetch — it now fires on EVERY reap:true checkpoint, STRICTLY before any git below,
+    // because the #1036 overlay adds a credentialed op the reap must precede. So an unmoved
+    // tip still skips the fetch, but reap:true still reaps.
+    assert.deepStrictEqual(afterSecond, ["kill"]);
   });
 
   it("reports the checkpointed milestone as a running report (no iteration_count)", async () => {
@@ -1052,5 +1057,92 @@ describe("RunRunner — report_only after a checkpoint is refused (issue #299)",
     );
     assert.strictEqual(completed, undefined, "the run FAILED, it did not complete report-only");
     assert.strictEqual(calls.length, 0, "no MR opened after the guarded report-only run");
+  });
+});
+
+// PRD #1062 M2 (#1036): the mid-run overlay's default-tip fetch (git.fetchDefaultTip) is a
+// PAT-bearing git op. REAP-BEFORE-GIT requires the agent tree be killed BEFORE it runs, so a
+// survivor cannot read the PAT from the git child's /proc/<pid>/environ. The bug this pins:
+// the reap was nested under `!tipUnmovedSinceFetch`, but the overlay is gated on opts.reap —
+// so on the reachable state `tipUnmovedSinceFetch && hasNewWork && opts.reap` (a reap:false
+// iteration fetched-but-didn't-publish with the gate closed, then a reap:true milestone fires
+// with the tip unmoved) the reap was SKIPPED yet the overlay's PAT fetch still ran, agent alive.
+describe("RunRunner — reap precedes the #1036 overlay's credentialed fetch (REAP-BEFORE-GIT, #1036)", () => {
+  /** Spy on git.fetchDefaultTip (the overlay's ONLY PAT-bearing op), recording a
+   *  "fetch-default-tip" event and then throwing so buildWorkflowOverlay fail-softs to realTip
+   *  (GATE 1) — the event is what we assert on. Returns a restore fn (call it in a finally). */
+  function spyFetchDefaultTip(events: string[]): () => void {
+    const orig = git.fetchDefaultTip.bind(git);
+    (git as unknown as { fetchDefaultTip: unknown }).fetchDefaultTip = async () => {
+      events.push("fetch-default-tip");
+      throw new Error("stub: credentialed default-tip fetch — recorded for ordering");
+    };
+    return () => {
+      (git as unknown as { fetchDefaultTip: unknown }).fetchDefaultTip = orig;
+    };
+  }
+
+  it("kills the agent tree BEFORE the overlay's PAT fetch on the reap:true + tip-unmoved + new-work path", async () => {
+    const { github } = fakeGitHub();
+    const { gitlab } = fakeGitlab();
+    // GitHub forge so buildCheckpointOverlay yields a real overlay context (undefined off GitHub).
+    const claim = gitlabClaim(93, {
+      repo: {
+        id: "r1",
+        url: "https://github.com/org/repo",
+        clone_url: fx.originPath,
+        forge_type: "github",
+      },
+    });
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const restoreDefaultTip = spyFetchDefaultTip(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        // 1) reap:false with the time-gate CLOSED (now=0, interval=1000): fetches back (writes
+        //    the tracking ref → tip now "unmoved") but does NOT publish, so lastPublishedTip
+        //    stays undefined and the committed tip is still "new work".
+        await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: ["m1"] } });
+        // 2) reap:true milestone, tip unmoved since (1): tipUnmovedSinceFetch === true AND
+        //    hasNewWork === true — the exact state where the overlay's PAT fetch runs. The reap
+        //    MUST have fired first.
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, {
+        github,
+        checkpointIntervalMs: 1000,
+        now,
+      }).execute(claim);
+    } finally {
+      restoreDefaultTip();
+      restorePublish();
+      restoreFetch();
+    }
+    const killIdx = afterCheckpoint.indexOf("kill");
+    const patFetchIdx = afterCheckpoint.indexOf("fetch-default-tip");
+    assert.ok(
+      patFetchIdx >= 0,
+      `the overlay's credentialed PAT fetch ran on this path; got ${JSON.stringify(afterCheckpoint)}`,
+    );
+    // On the UNFIXED structure (reap nested under !tipUnmovedSinceFetch) the reap is SKIPPED on
+    // this tip-unmoved path, so killAgentTree is never called (killIdx === -1) and this fails.
+    assert.ok(
+      killIdx >= 0,
+      `killAgentTree fired on the reap:true checkpoint; got ${JSON.stringify(afterCheckpoint)}`,
+    );
+    assert.ok(
+      killIdx < patFetchIdx,
+      `the reap ran BEFORE the overlay's credentialed fetch; got ${JSON.stringify(afterCheckpoint)}`,
+    );
   });
 });

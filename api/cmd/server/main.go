@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -769,6 +770,131 @@ func run() error {
 		}()
 	} else {
 		slog.Info("vault-lock notice disabled (UZI_VAULT_LOCK_NOTICE_ENABLED=false)")
+	}
+
+	// History usage refold (PRD #1079 M3): the 00188 migration marked every pre-migration
+	// non-chat run usage_refolded=false, because those runs' run_usage rows were collapsed
+	// by the old MAX-per-model key. This boot one-shot re-folds each such TERMINAL run
+	// through the SAME foldUsageFrames the incremental path uses (over its full status/error
+	// history), replacing the collapsed rows with correct per-leg rows. Wired like the
+	// vault-lock reconciler: a grace-delayed boot pass that drains batches until the pending
+	// list empties, then a SLOW own-ticker whose stop condition is CountRunsAwaitingUsageRefold
+	// == 0 — NOT the terminal-only pending list emptying — so a pre-migration run still
+	// RUNNING at boot (usage_refolded=false but not yet terminal) is caught when it finishes,
+	// in THIS process, rather than waiting for the next boot. A post-migration run is born
+	// refolded (DEFAULT true) so the incremental fold stays the only writer for live runs and
+	// the job is a true one-off. The grace/interval are code constants (PRD keeps to the two
+	// documented env knobs UZI_USAGE_REFOLD_ENABLED / UZI_USAGE_REFOLD_BATCH).
+	if cfg.UsageRefoldEnabled {
+		const (
+			usageRefoldGraceDelay   = 45 * time.Second
+			usageRefoldRecheckEvery = 5 * time.Minute
+		)
+		// parsePositiveInt guarantees UsageRefoldBatch >= 1; bound the int32 cast
+		// explicitly (a batch beyond int32 is nonsensical) so the conversion is
+		// provably in range, mirroring usage_fold.go's legCount guard for gosec G115.
+		var refoldBatch int32 = math.MaxInt32
+		if b := cfg.UsageRefoldBatch; b >= 1 && b <= math.MaxInt32 {
+			refoldBatch = int32(b)
+		}
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			// drainPending refolds terminal pending runs one batch at a time until the
+			// pending list — minus the runs that failed to refold THIS cycle — empties.
+			// A per-run failure marks nothing and is logged; the run is added to a
+			// per-cycle skip-set (failed) and excluded from every subsequent list in this
+			// same drainPending call so the batch advances PAST it rather than re-listing
+			// the identical oldest rows forever. The skip-set is reset at the top of each
+			// drainPending call, so a later ticker cycle RETRIES a previously-failed run
+			// (transient DB errors clear). Termination is len(runs) == 0: once every
+			// non-failed pending run is drained, the exclusion makes the list return empty
+			// and the loop returns. A fully-poison DB walks its whole pending set once per
+			// cycle, failing each — bounded and acceptable. There is deliberately no
+			// give-up-and-exit here: per D10 the caller's ticker keeps running for the
+			// process lifetime so a pre-migration run still RUNNING at boot is refolded
+			// once it turns terminal.
+			drainPending := func() {
+				failed := make(map[uuid.UUID]struct{})
+				for {
+					if ctx.Err() != nil {
+						return
+					}
+					exclude := make([]uuid.UUID, 0, len(failed))
+					for id := range failed {
+						exclude = append(exclude, id)
+					}
+					runs, err := q.ListRunsPendingUsageRefold(ctx, store.ListRunsPendingUsageRefoldParams{
+						ExcludeIds: exclude,
+						Lim:        refoldBatch,
+					})
+					if err != nil {
+						slog.Error("usage refold: list pending runs failed", "err", err)
+						return
+					}
+					if len(runs) == 0 {
+						return
+					}
+					refolded := 0
+					for i := range runs {
+						if ctx.Err() != nil {
+							return
+						}
+						if err := workersvc.RefoldRunUsage(ctx, pool, q, runs[i]); err != nil {
+							slog.Error("usage refold: run failed (retried on next tick)",
+								"run_id", runs[i].ID.String(), "err", err)
+							failed[runs[i].ID] = struct{}{}
+							continue
+						}
+						refolded++
+					}
+					awaiting, err := q.CountRunsAwaitingUsageRefold(ctx)
+					if err != nil {
+						slog.Error("usage refold: count awaiting failed", "err", err)
+						awaiting = -1
+					}
+					slog.Info("usage refold", "refolded", refolded, "awaiting", awaiting,
+						"failed_this_cycle", len(failed))
+				}
+			}
+
+			// Grace-delayed boot pass (honour ctx cancellation during the wait).
+			if usageRefoldGraceDelay > 0 {
+				t := time.NewTimer(usageRefoldGraceDelay)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return
+				case <-t.C:
+				}
+			}
+			drainPending()
+
+			// Slow own-ticker re-check: a pre-migration run still running at boot becomes
+			// terminal later and must then be refolded in-process. Stop only once NOTHING
+			// is awaiting (terminal or not), which the pending list alone cannot tell us.
+			tick := time.NewTicker(usageRefoldRecheckEvery)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					awaiting, err := q.CountRunsAwaitingUsageRefold(ctx)
+					if err != nil {
+						slog.Error("usage refold: count awaiting failed", "err", err)
+						continue
+					}
+					if awaiting == 0 {
+						slog.Info("usage refold complete; nothing awaiting")
+						return
+					}
+					drainPending()
+				}
+			}
+		}()
+	} else {
+		slog.Info("usage refold disabled (UZI_USAGE_REFOLD_ENABLED=false)")
 	}
 
 	// Per-user Claude rate-limit poller (PRD #53): each tick it polls every
