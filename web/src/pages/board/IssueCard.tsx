@@ -150,9 +150,12 @@ export function IssueCard({
   // bury the run badges. The remainder is not dropped — it rides the "+N" title.
   const demo = useDemoMode();
   const { shown: shownChips, overflow: chipOverflow, hidden: hiddenChips } = boundedChips(chips, maxChips);
-  // Closed cards are not movable (move-to-Closed is unsupported; close/reopen
-  // stays on the forge), so they are not draggable.
-  const draggable = !card.closed;
+  // Every card is draggable (PRD #1034 M4). A closed card is now dragged OUT of the
+  // Closed lane to reopen it (dropping it on an open lane), and an open card is dragged
+  // INTO Closed to close it — so "draggable" no longer means "open". Keyboard reorder
+  // still stays disabled for closed cards, gated separately via canMoveUp/canMoveDown
+  // (Board.tsx passes `!card.closed` for both), since the Closed lane has no order.
+  const draggable = true;
   const run = card.latest_run;
   const badge = run ? runBadge(run, Date.now()) : null;
   // Uniform per-card duration token (issue #256 M4, Decision 4): a faint mono span

@@ -462,6 +462,7 @@ type Run struct {
 	LineageEpoch          int32              `json:"lineage_epoch"`
 	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
 	TriggerSource         string             `json:"trigger_source"`
+	CheckpointTip         pgtype.Text        `json:"checkpoint_tip"`
 }
 
 type RunMessage struct {

@@ -1,7 +1,7 @@
 # PRD #1034 — Close/reopen an issue from the board (all forges)
 
 **Issue**: [#1034](https://github.com/vtmocanu/uzi/issues/1034)
-**Status**: Ready for implementation (see Sequencing — must land after #1025)
+**Status**: Implemented (M1–M5 landed on branch `agent/issue-1034`; #1025 merged first)
 **Priority**: Medium
 **Route**: uzi (Auto)
 

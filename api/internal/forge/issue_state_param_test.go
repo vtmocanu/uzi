@@ -78,6 +78,43 @@ func TestTheTwoDriversDisagreeOnTheWordForOpen(t *testing.T) {
 	}
 }
 
+// The MUTATE mappers are a separate family from the list-filter mappers above
+// (PRD #1034 M1). A close/reopen write is never a filter: there are only two
+// outcomes, and every non-StateClosed value must REOPEN — including the zero
+// value StateAll ("") a caller-bug can pass. This pins that, and it is a
+// regression guard: the Forgejo driver first reused the list-filter
+// forgejoIssueStateParam here, whose default returns gitea.StateAll ("all") — an
+// invalid mutate state — so the StateAll and "garbage" rows below FAIL against
+// that old wiring and pass only with the dedicated forgejoIssueStateMutation.
+// All three drivers must agree on the shape: StateClosed closes, else reopens.
+func TestIssueStateMutationMappers(t *testing.T) {
+	for _, tc := range []struct {
+		in           IssueState
+		gitlab       string
+		forgejo      gitea.StateType
+		githubState  string
+		githubReason string
+	}{
+		{StateClosed, "close", gitea.StateClosed, "closed", "completed"},
+		{StateOpened, "reopen", gitea.StateOpen, "open", "reopened"},
+		// The zero value and any bogus value are out of contract, but a mutate must
+		// still resolve to a valid state — reopen is the safe direction.
+		{StateAll, "reopen", gitea.StateOpen, "open", "reopened"},
+		{IssueState("garbage"), "reopen", gitea.StateOpen, "open", "reopened"},
+	} {
+		if got := gitlabIssueStateEvent(tc.in); got != tc.gitlab {
+			t.Errorf("gitlabIssueStateEvent(%q) = %q, want %q", tc.in, got, tc.gitlab)
+		}
+		if got := forgejoIssueStateMutation(tc.in); got != tc.forgejo {
+			t.Errorf("forgejoIssueStateMutation(%q) = %q, want %q", tc.in, got, tc.forgejo)
+		}
+		if gotState, gotReason := githubIssueStateMutation(tc.in); gotState != tc.githubState || gotReason != tc.githubReason {
+			t.Errorf("githubIssueStateMutation(%q) = (%q, %q), want (%q, %q)",
+				tc.in, gotState, gotReason, tc.githubState, tc.githubReason)
+		}
+	}
+}
+
 // StateAll must be the ZERO VALUE, so every pre-M6 caller that never sets State keeps
 // getting "all". Decision 10 turns on this: the Closed column and de-label/close
 // eviction both need closed issues, and there are callers in forgesvc, selfimprove and

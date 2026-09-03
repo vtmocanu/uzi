@@ -368,6 +368,46 @@ func TestClaimReviewCommentsOmitemptyContract(t *testing.T) {
 	}
 }
 
+// TestClaimCheckpointTipOmitemptyContract pins issue #1042 M4's claim addition:
+// checkpoint_tip rides a resume claim (the tip THIS run last published to its own
+// checkpoint ref — the owner-anchor the worker's adopt guard compares against) and
+// carries `omitempty`, so the wire key is PRESENT when the run has a persisted tip and
+// ABSENT when it is nil (a run that never published a checkpoint). Non-vacuous: it
+// marshals real JSON and checks the KEY, not a `== nil` on the Go struct.
+func TestClaimCheckpointTipOmitemptyContract(t *testing.T) {
+	// Set: a resume whose run persisted its own checkpoint tip carries the key verbatim.
+	const tip = "0123456789abcdef0123456789abcdef01234567"
+	p := sampleClaimPayloadWithSkills()
+	p.CheckpointTip = strPtr(tip)
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
+	if got, ok := m["checkpoint_tip"]; !ok {
+		t.Error("claim must carry checkpoint_tip when the run has a persisted tip (issue #1042 M4); key absent")
+	} else if got != tip {
+		t.Errorf("checkpoint_tip = %v, want %s", got, tip)
+	}
+
+	// Nil: a run that never published a checkpoint has NULL checkpoint_tip; omitempty must
+	// DROP the key entirely (the sample already leaves it nil).
+	bn, err := json.Marshal(sampleClaimPayloadWithSkills())
+	if err != nil {
+		t.Fatalf("marshal nil-checkpoint-tip claim: %v", err)
+	}
+	var mn map[string]any
+	if err := json.Unmarshal(bn, &mn); err != nil {
+		t.Fatalf("unmarshal nil-checkpoint-tip claim: %v", err)
+	}
+	if _, present := mn["checkpoint_tip"]; present {
+		t.Error("checkpoint_tip key must be ABSENT when the field is nil (omitempty contract); key present")
+	}
+}
+
 // TestClaimCarriesReviewTargetRunID pins PRD #400 M4a's claim addition: review_target_run_id
 // rides every claim (a *string, no omitempty) — null for a non-review run, and the reviewed
 // task's id for a review run, which is how the worker (M4b) routes a claim to its diff-review

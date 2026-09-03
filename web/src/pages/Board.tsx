@@ -2,8 +2,9 @@
 // forge-first (the server writes the label, then returns the authoritative
 // card — a failed move snaps back because nothing moved optimistically).
 // Column identity follows a status-color language:
-// every column gets a stable accent dot, Backlog is neutral, Closed is muted and
-// not a drop target. Cards are content-first: title,
+// every column gets a stable accent dot, Backlog is neutral, Closed is muted. Closed
+// is now a real drop target (PRD #1034 M4): dragging an open card into it closes the
+// issue, and dragging a closed card onto any open lane reopens it. Cards are content-first: title,
 // meta, badges. Live behavior (latest_run badges, 10s visibility-gated polling,
 // auto-move toasts, the attention strip, in-app issue links) is PRD #12 M2/M3.
 
@@ -660,7 +661,6 @@ export function Board() {
   // move returns whether the forge write succeeded, so a cross-column drop can stop
   // before it freezes the order (PRD #102 M5). Nothing else about it changed.
   const move = async (toKey: string, iid: number): Promise<boolean> => {
-    if (toKey === CLOSED_KEY) return false; // Closed is not a drop target in the MVP.
     setError("");
     // Suppress the auto-move toast for this card: a poll landing between the
     // server commit below and the local setBoard would otherwise diff the new
@@ -669,8 +669,10 @@ export function Board() {
     try {
       // "open" is the WIRE name of the implicit column, matched server-side with
       // EqualFold (handler/board.go). The M1 Open→Backlog rename is display-only:
-      // renaming this literal (or OPEN_KEY) breaks drag-to-Backlog.
-      const to = toKey === OPEN_KEY ? "open" : toKey;
+      // renaming this literal (or OPEN_KEY) breaks drag-to-Backlog. "closed" is the
+      // wire signal the server reads as a close (PRD #1034 M4); dropping a closed card
+      // onto an open lane sends that lane's key, which the server reads as a reopen.
+      const to = toKey === OPEN_KEY ? "open" : toKey === CLOSED_KEY ? "closed" : toKey;
       const { card } = await api.moveIssue(repoId, iid, to);
       // Forge-first: the server applied the label change and returned the
       // authoritative card. Replace it in place (no optimistic move, so a
@@ -718,7 +720,10 @@ export function Board() {
         accent: COLUMN_ACCENTS[i % COLUMN_ACCENTS.length],
       });
     });
-    cols.push({ key: CLOSED_KEY, label: "Closed", droppable: false, accent: "bg-edge-strong" });
+    // PRD #1034 M4: Closed is a whole-lane drop target (close on drop) — droppable:true —
+    // but it has NO per-card insertion/reorder semantics; the render gates those on
+    // `!closedCol` so a drop anywhere in the lane bubbles to the lane onDrop as a close.
+    cols.push({ key: CLOSED_KEY, label: "Closed", droppable: true, accent: "bg-edge-strong" });
     return cols;
   }, [board]);
 
@@ -903,14 +908,48 @@ export function Board() {
   // refetch, not two drags in one tab in one second.
   const applyDrop = useCallback(
     async (dragIid: number, destKey: string, anchor: DropAnchor | null): Promise<boolean> => {
-      if (destKey === CLOSED_KEY) return false; // Closed is not a drop target.
+      // PRD #1034 M4: close/reopen are STATE changes, not reorders, so they route through
+      // move() alone and never touch the lane freeze. This branch sits at the very TOP of
+      // applyDrop, before the reorderRef guard, because there is no position to compute: a
+      // close leaves the card in place, and a reopen lands at the bottom of its new lane
+      // because the server nulls board_position (ORDER BY board_position ASC NULLS LAST).
+      // dropIntent's own `dragged.closed` bail therefore stays as a safety net — a closed
+      // card is short-circuited to move() here and never reaches dropIntent through this
+      // path, but the bail guarantees it could never be ranked even if it did.
+      const draggedCard = payloadCards.find((c) => c.iid === dragIid);
+      if (!draggedCard) return false;
+      const toClosed = destKey === CLOSED_KEY;
+      if (toClosed && draggedCard.closed) return false; // Closed → Closed: no-op, no mutation
+
+      // ONE synchronous lock across ALL board mutations — state moves (close/reopen) AND
+      // reorders. reorderRef must be checked BEFORE the state-move branches below: a
+      // close/reopen that ran while a reorder's reorderBoard() was still in flight could
+      // have the older reorder response resolve last and setBoard(fresh) overwrite the
+      // newer state-transition card with stale board data (and, symmetrically, a reorder
+      // starting under a pending close/reopen). Refusing a re-entrant mutation beats
+      // losing one, and silence is not the trade-off — every other rejection here speaks
+      // (move() surfaces a forge error, a failed reorder sets "Could not save the new
+      // order"), so on a slow link a user who drags twice is told, not left guessing.
       if (reorderRef.current) {
-        // S8. Refusing beats losing the move, but silence is not the trade-off — every
-        // other rejection here speaks (move() surfaces a forge error, a failed reorder
-        // sets "Could not save the new order"). On a slow link a user who drags twice
-        // would otherwise conclude the drag is broken.
         setError("Still saving the previous move — try again in a moment.");
         return false;
+      }
+
+      // State changes (close/reopen) route through move() alone — there is no position to
+      // compute (a close leaves the card in place; a reopen lands at the bottom of its new
+      // lane because the server nulls board_position, ORDER BY board_position ASC NULLS
+      // LAST) — but they still hold the SAME lock so a reorder cannot interleave with the
+      // pending forge write. dropIntent's own `dragged.closed` bail stays a safety net.
+      if (toClosed || draggedCard.closed) {
+        reorderRef.current = true;
+        setReordering(true);
+        try {
+          // open → Closed = close (state only); closed → open lane = reopen + move (bottom).
+          return await move(toClosed ? CLOSED_KEY : destKey, dragIid);
+        } finally {
+          reorderRef.current = false;
+          setReordering(false);
+        }
       }
       const intent = dropIntent({
         payloadCards, // UNFILTERED — the payload-set rule (Decision 7b)
@@ -1380,14 +1419,14 @@ export function Board() {
                     onMoveDown={() => moveCard(card, "down")}
                     // Never an edge on the dragged card itself.
                     insertionEdge={
-                      col.droppable && insertAt?.iid === card.iid && dragIid !== card.iid
+                      col.droppable && !closedCol && insertAt?.iid === card.iid && dragIid !== card.iid
                         ? insertAt.before
                           ? "top"
                           : "bottom"
                         : null
                     }
                     onCardDragOver={
-                      col.droppable
+                      col.droppable && !closedCol
                         ? (e) => {
                             // preventDefault or the drop is refused. Deliberately NOT
                             // stopPropagation: the lane's own onDragOver still has to
@@ -1405,12 +1444,12 @@ export function Board() {
                         : undefined
                     }
                     onCardDragLeave={
-                      col.droppable
+                      col.droppable && !closedCol
                         ? () => setInsertAt((prev) => (prev?.iid === card.iid ? null : prev))
                         : undefined
                     }
                     onCardDrop={
-                      col.droppable
+                      col.droppable && !closedCol
                         ? (e) => {
                             // stopPropagation is REQUIRED: without it the lane's onDrop
                             // runs afterwards and issues a second, anchor-less drop.
@@ -1471,7 +1510,9 @@ export function Board() {
 
                     Not rendered for an empty lane — the "Drop a card here" placeholder
                     below already says it, and two indicators would contradict. */}
-                {dragIid != null && isTarget && insertAt == null && cards.length > 0 && (
+                {/* Not in the Closed lane (PRD #1034 M4): a drop there is a CLOSE, not an
+                    append-at-rank, so the "drop at the end" cue would misdescribe it. */}
+                {dragIid != null && isTarget && insertAt == null && cards.length > 0 && !closedCol && (
                   <div
                     aria-hidden="true"
                     className="rounded-lg border-2 border-dashed border-brand/70 py-3 text-center text-[11px] text-brand"
@@ -1481,7 +1522,7 @@ export function Board() {
                 )}
                 {cards.length === 0 && (
                   <p className="rounded-lg border border-dashed border-edge py-6 text-center text-xs text-faint">
-                    {col.droppable ? "Drop a card here" : "Nothing closed yet"}
+                    {closedCol ? "Nothing closed yet" : "Drop a card here"}
                   </p>
                 )}
               </div>
