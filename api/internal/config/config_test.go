@@ -595,6 +595,76 @@ func TestLoadVaultLockNotice(t *testing.T) {
 	})
 }
 
+// TestLoadUsageRefold exercises the history-refold knobs through Load() (PRD #1079
+// M3): the defaults (enabled, batch 50), the explicit disable/override, and both a
+// malformed kill-switch and a malformed/non-positive batch aborting boot the same way
+// the registration switch does.
+func TestLoadUsageRefold(t *testing.T) {
+	setBase := func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+		t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+		varied := make([]byte, secretbox.KeySize)
+		for i := range varied {
+			varied[i] = byte(i + 1)
+		}
+		t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+	}
+
+	t.Run("defaults: enabled, batch 50", func(t *testing.T) {
+		setBase(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.UsageRefoldEnabled {
+			t.Error("UsageRefoldEnabled should default to true")
+		}
+		if cfg.UsageRefoldBatch != 50 {
+			t.Errorf("UsageRefoldBatch = %d, want 50", cfg.UsageRefoldBatch)
+		}
+	})
+
+	t.Run("explicit disable and batch override", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_USAGE_REFOLD_ENABLED", "false")
+		t.Setenv("UZI_USAGE_REFOLD_BATCH", "10")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.UsageRefoldEnabled {
+			t.Error("UsageRefoldEnabled should be false")
+		}
+		if cfg.UsageRefoldBatch != 10 {
+			t.Errorf("UsageRefoldBatch = %d, want 10", cfg.UsageRefoldBatch)
+		}
+	})
+
+	t.Run("malformed kill-switch aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_USAGE_REFOLD_ENABLED", "notabool")
+		if _, err := Load(); err == nil {
+			t.Fatal("a malformed UZI_USAGE_REFOLD_ENABLED must abort boot")
+		}
+	})
+
+	t.Run("malformed batch aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_USAGE_REFOLD_BATCH", "notanint")
+		if _, err := Load(); err == nil {
+			t.Fatal("a malformed UZI_USAGE_REFOLD_BATCH must abort boot")
+		}
+	})
+
+	t.Run("non-positive batch aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_USAGE_REFOLD_BATCH", "0")
+		if _, err := Load(); err == nil {
+			t.Fatal("a non-positive UZI_USAGE_REFOLD_BATCH must abort boot")
+		}
+	})
+}
+
 // TestLoadReleaseCheck exercises the upstream-release-check seed knobs through Load()
 // (PRD #836 M2): the defaults (enabled + banner on, 6h interval, no token), explicit
 // overrides, and a malformed bool aborting boot the same way the registration

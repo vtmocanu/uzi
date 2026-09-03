@@ -891,6 +891,21 @@ func (q *Queries) CountRunReviseInputs(ctx context.Context, runID uuid.UUID) (in
 	return count, err
 }
 
+const countRunsAwaitingUsageRefold = `-- name: CountRunsAwaitingUsageRefold :one
+SELECT COUNT(*) FROM runs WHERE NOT usage_refolded
+`
+
+// Every run still marked un-refolded, TERMINAL OR NOT. This is the boot one-shot's
+// STOP condition: a pre-migration run still running at boot is usage_refolded=false
+// but not yet terminal, so the ticker must outlive it (re-checking until this reaches
+// zero) rather than stop when the terminal-only pending batch empties.
+func (q *Queries) CountRunsAwaitingUsageRefold(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countRunsAwaitingUsageRefold)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countWorkerNonTerminalRuns = `-- name: CountWorkerNonTerminalRuns :one
 SELECT count(*) FROM runs
 WHERE worker_id = $1
@@ -1591,6 +1606,18 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.EphemeralRunID,
 	)
 	return i, err
+}
+
+const deleteRunUsage = `-- name: DeleteRunUsage :exec
+DELETE FROM run_usage WHERE run_id = $1
+`
+
+// Clears a run's run_usage rows so RefoldRunUsage can re-fold from the frame history
+// without the old collapsed rows lingering. Runs in the same transaction as the fold;
+// a refold of a run with no result frames simply leaves zero rows behind.
+func (q *Queries) DeleteRunUsage(ctx context.Context, runID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteRunUsage, runID)
+	return err
 }
 
 const deleteWorkerForUser = `-- name: DeleteWorkerForUser :execrows
@@ -3765,6 +3792,56 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 	return items, nil
 }
 
+const listRunUsageFrames = `-- name: ListRunUsageFrames :many
+
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+FROM run_messages
+WHERE run_id = $1 AND kind IN ('status', 'error')
+ORDER BY seq ASC
+`
+
+// History usage refold (PRD #1079 M3) ---------------------------------------
+// A boot one-shot re-folds every PRE-MIGRATION terminal non-chat run through the
+// SAME foldUsageFrames the incremental path uses, replacing the collapsed
+// (run, session, model) rows the old MAX-per-model key produced with correct
+// per-leg rows. 00187 added runs.usage_refolded (DEFAULT true, set false for every
+// non-chat row that existed at migration time), which scopes the job to history and
+// makes it converge: a post-migration run is born refolded and never selected here.
+// A run's full status/error frame history in seq order — the exact frame shape
+// foldUsageFrames folds (never tool/text traffic). Column order matches
+// ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
+// the `init` markers CountRunInitFramesBefore counts and the success result frames;
+// error carries a failed turn's result frame. This is a few dozen rows per run.
+func (q *Queries) ListRunUsageFrames(ctx context.Context, runID uuid.UUID) ([]RunMessage, error) {
+	rows, err := q.db.Query(ctx, listRunUsageFrames, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunMessage{}
+	for rows.Next() {
+		var i RunMessage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Seq,
+			&i.Kind,
+			&i.Agent,
+			&i.Payload,
+			&i.CreatedAt,
+			&i.AgentInstance,
+			&i.AgentLabel,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForUser = `-- name: ListRunsForUser :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
@@ -4064,6 +4141,144 @@ func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWork
 			&i.UpdatedAt,
 			&i.RepoPath,
 			&i.RepoWebUrl,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunsPendingUsageRefold = `-- name: ListRunsPendingUsageRefold :many
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded FROM runs
+WHERE NOT usage_refolded AND status IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at
+LIMIT $1
+`
+
+// One batch of TERMINAL pre-migration runs still awaiting refold, oldest first. Chat
+// rows were never set usage_refolded=false (00187), so no kind filter is needed here;
+// restricting to terminal statuses keeps the refold from racing an in-flight fold (a
+// straggler re-delivery after a refold is a GREATEST no-op at the position-absolute
+// epoch, but only terminal runs are ever folded here). A run that is pre-migration and
+// still RUNNING at boot is deliberately NOT selected until it finishes — the awaiting
+// count below is what keeps the one-shot alive to catch it in-process.
+func (q *Queries) ListRunsPendingUsageRefold(ctx context.Context, lim int32) ([]Run, error) {
+	rows, err := q.db.Query(ctx, listRunsPendingUsageRefold, lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Run{}
+	for rows.Next() {
+		var i Run
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RepoID,
+			&i.IssueIid,
+			&i.IssueTitle,
+			&i.IssueDescription,
+			&i.Status,
+			&i.RequeueCount,
+			&i.WorkerID,
+			&i.SessionID,
+			&i.LastSeq,
+			&i.Branch,
+			&i.MrIid,
+			&i.FailureReason,
+			&i.PlanMd,
+			&i.IterationCount,
+			&i.ClaimedAt,
+			&i.StartedAt,
+			&i.FinishedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.OriginColumn,
+			&i.BoardColumn,
+			&i.MovePendingSince,
+			&i.MrState,
+			&i.AutoApprove,
+			&i.AutopilotCommentedAt,
+			&i.Kind,
+			&i.PipelineID,
+			&i.PipelineRef,
+			&i.FailureSnapshot,
+			&i.FixVerdict,
+			&i.StopKind,
+			&i.AgentSource,
+			&i.AgentExclusions,
+			&i.RepoAgents,
+			&i.Title,
+			&i.ResumeOfRunID,
+			&i.LastActivityAt,
+			&i.Health,
+			&i.HealthReason,
+			&i.HealthSince,
+			&i.HealthNotifiedAt,
+			&i.TargetRunID,
+			&i.MrWebUrl,
+			&i.PrdDonePath,
+			&i.PrdPatchSettledAt,
+			&i.AnthropicSecretID,
+			&i.AnthropicSecretLabel,
+			&i.AnthropicSelectReason,
+			&i.AnthropicHeadroomPct,
+			&i.WaitOnLimit,
+			&i.LimitResetsAt,
+			&i.RetryNotBefore,
+			&i.LimitWaitCount,
+			&i.RateLimitType,
+			&i.OpenQuestionID,
+			&i.ReviseCount,
+			&i.PlanSource,
+			&i.PlannedBaseCommit,
+			&i.RequireBaseMatch,
+			&i.MilestonesCandidate,
+			&i.MilestonesFrozen,
+			&i.MilestonesCompleted,
+			&i.MilestonesInProgress,
+			&i.BudgetMaxIterations,
+			&i.BudgetWallSeconds,
+			&i.ScheduleID,
+			&i.LimitDeadSecretID,
+			&i.ReportOnly,
+			&i.ReportMd,
+			&i.CiConfigPaths,
+			&i.Model,
+			&i.OverrideSubagentModel,
+			&i.FailOrigin,
+			&i.Priority,
+			&i.SummaryIntent,
+			&i.SummaryPlan,
+			&i.SummaryDeltas,
+			&i.IssueComments,
+			&i.BaseBranch,
+			&i.OpenMr,
+			&i.DispatchedAt,
+			&i.ReviewTargetRunID,
+			&i.ReviewRequested,
+			&i.ThenFixRequested,
+			&i.ThenFixOfRunID,
+			&i.PreservedPatch,
+			&i.RequiredCapabilities,
+			&i.StopReason,
+			&i.RequiredTools,
+			&i.SizeClass,
+			&i.Interactive,
+			&i.OpenFollowupID,
+			&i.PlanChangedFiles,
+			&i.ScopeCeiling,
+			&i.StatusSince,
+			&i.ReviewComments,
+			&i.BudgetPausedSeconds,
+			&i.MrReworkEnabled,
+			&i.TriggerSource,
+			&i.CheckpointTip,
+			&i.UsageRefolded,
 		); err != nil {
 			return nil, err
 		}
@@ -4516,6 +4731,18 @@ func (q *Queries) MarkRunFailedByID(ctx context.Context, arg MarkRunFailedByIDPa
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const markRunUsageRefolded = `-- name: MarkRunUsageRefolded :exec
+UPDATE runs SET usage_refolded = true, updated_at = now() WHERE id = $1
+`
+
+// Marks a run's usage as refolded per leg (PRD #1079 M3), inside RefoldRunUsage's
+// transaction so the delete+fold+mark commit atomically. Once true the ticker never
+// selects the run again and the incremental fold stays its only usage writer.
+func (q *Queries) MarkRunUsageRefolded(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markRunUsageRefolded, id)
+	return err
 }
 
 const markStaleWorkersOffline = `-- name: MarkStaleWorkersOffline :execrows

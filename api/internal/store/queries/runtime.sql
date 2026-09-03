@@ -2342,6 +2342,57 @@ WHERE r.kind <> 'chat'
 GROUP BY u.id, u.email
 ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 
+-- History usage refold (PRD #1079 M3) ---------------------------------------
+-- A boot one-shot re-folds every PRE-MIGRATION terminal non-chat run through the
+-- SAME foldUsageFrames the incremental path uses, replacing the collapsed
+-- (run, session, model) rows the old MAX-per-model key produced with correct
+-- per-leg rows. 00187 added runs.usage_refolded (DEFAULT true, set false for every
+-- non-chat row that existed at migration time), which scopes the job to history and
+-- makes it converge: a post-migration run is born refolded and never selected here.
+
+-- name: ListRunUsageFrames :many
+-- A run's full status/error frame history in seq order — the exact frame shape
+-- foldUsageFrames folds (never tool/text traffic). Column order matches
+-- ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
+-- the `init` markers CountRunInitFramesBefore counts and the success result frames;
+-- error carries a failed turn's result frame. This is a few dozen rows per run.
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+FROM run_messages
+WHERE run_id = @run_id AND kind IN ('status', 'error')
+ORDER BY seq ASC;
+
+-- name: ListRunsPendingUsageRefold :many
+-- One batch of TERMINAL pre-migration runs still awaiting refold, oldest first. Chat
+-- rows were never set usage_refolded=false (00187), so no kind filter is needed here;
+-- restricting to terminal statuses keeps the refold from racing an in-flight fold (a
+-- straggler re-delivery after a refold is a GREATEST no-op at the position-absolute
+-- epoch, but only terminal runs are ever folded here). A run that is pre-migration and
+-- still RUNNING at boot is deliberately NOT selected until it finishes — the awaiting
+-- count below is what keeps the one-shot alive to catch it in-process.
+SELECT * FROM runs
+WHERE NOT usage_refolded AND status IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at
+LIMIT @lim;
+
+-- name: CountRunsAwaitingUsageRefold :one
+-- Every run still marked un-refolded, TERMINAL OR NOT. This is the boot one-shot's
+-- STOP condition: a pre-migration run still running at boot is usage_refolded=false
+-- but not yet terminal, so the ticker must outlive it (re-checking until this reaches
+-- zero) rather than stop when the terminal-only pending batch empties.
+SELECT COUNT(*) FROM runs WHERE NOT usage_refolded;
+
+-- name: MarkRunUsageRefolded :exec
+-- Marks a run's usage as refolded per leg (PRD #1079 M3), inside RefoldRunUsage's
+-- transaction so the delete+fold+mark commit atomically. Once true the ticker never
+-- selects the run again and the incremental fold stays its only usage writer.
+UPDATE runs SET usage_refolded = true, updated_at = now() WHERE id = @id;
+
+-- name: DeleteRunUsage :exec
+-- Clears a run's run_usage rows so RefoldRunUsage can re-fold from the frame history
+-- without the old collapsed rows lingering. Runs in the same transaction as the fold;
+-- a refold of a run with no result frames simply leaves zero rows behind.
+DELETE FROM run_usage WHERE run_id = @run_id;
+
 -- Worker chat read surface (PRD #39 M3, Decision 7) --------------------------
 -- The chat agent investigates its OWNER'S runs (both kinds) via the worker. These
 -- queries are USER_ID-scoped (from the authenticated worker), NEVER a bare run_id
