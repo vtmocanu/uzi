@@ -454,12 +454,11 @@ where the worker runs:
 - **Kubernetes**: closed. The `api` gains an **optional second listener in-process**
   (`API_TLS_CERT`/`API_TLS_KEY`, default `:8443`), and hosted workers plus the
   worker controller dial it over `https://`, verifying a cert-manager-issued CA
-  that they pin *exclusively*. Note the mechanism, because an earlier version of
-  this section named the wrong one: it is **not** a TLS-terminating ingress in front
-  of `api`. Workers dial the `api` **directly**, so an ingress was never in their
-  path and would not have encrypted this hop at all. The plain listener stays for
-  `web`'s nginx and the kubelet probes, and the two are separate ports on purpose —
-  a NetworkPolicy admits the worker namespace to the TLS one and nothing else.
+  that they pin *exclusively*. It is a direct-dial listener, **not** a
+  TLS-terminating ingress in front of `api`: workers dial `api` directly, so an
+  ingress was never in their path. The plain listener stays for `web`'s nginx and
+  the kubelet probes, on a separate port on purpose: a NetworkPolicy admits the
+  worker namespace to the TLS one and nothing else.
 
 Two properties of that listener that are easy to get backwards, both enforced in
 code rather than intended: it serves **only** `/api/worker/*` + `/api/controller/*`
@@ -527,89 +526,76 @@ One `runs` row is the unit of work; an issue can accumulate several over its
 life (a DB partial unique index enforces at most one non-terminal run per
 issue). A row enters `queued` from one of three origins: the manual **Start
 run** button (`IssueView.tsx` → `POST /api/repos/{id}/runs`); **autopilot**
-(PRD #19), event-driven off a forge label; and, since PRD #241, the
-**scheduler** — time-driven. `api/internal/schedsvc`'s engine is a
-single-instance background actor (a wake ticker over the durable
-`run_schedules.next_fire_at` due-gate, `FOR UPDATE SKIP LOCKED` claim, a
-`Boot()` immediate tick so a fire missed across a restart happens promptly
-on the next wake rather than waiting a full cadence — never a backfill of
-the cadences it missed). A due schedule fires
-through the exact `workersvc.CreateRun`/`CreateAutopilotRun` seam autopilot
-uses, so the eligibility gate (PRD #764 M1's `isEligibleIssue`, widened by PRD #767 M2 to also match `assignee_ids` against the connection's `bot_forge_user_id`), the fresh-label forge fetch, active-run dedup, and
-the usage-limit park all apply exactly as for a manual start; the exception
-is its **ad-hoc prompt** target, which — like `ci_fix` — has no issue to
-seam through, so it lands via a dedicated INSERT as a new `prompt` run kind
-(`runs.kind`, beside `chat`/`ci_fix`/`self_improve`/`judge`/`issue`):
-repo-ful, issue-less, `schedule_id`-keyed for dedup (no issue to key
-`HasActiveRunForIssue` on), and MR-opening on the `ci_fix` shape. A **sweep**
-target fans out over the oldest open issues matching its label; its
-`max_issues` cap counts runs *started*, not candidates matched — a candidate
-it can't start is flagged and the fire backfills from the next eligible issue
-within a bounded scan window (`fireSweep`, issue #416), so a stale ineligible
-issue at the head no longer under-fills every fire. See
+(PRD #19), event-driven off a forge label; and the **scheduler** (PRD #241),
+time-driven. `api/internal/schedsvc`'s engine is a single-instance background
+actor (a wake ticker over the durable `run_schedules.next_fire_at` due-gate,
+`FOR UPDATE SKIP LOCKED` claim, a `Boot()` immediate tick so a fire missed
+across a restart happens on the next wake rather than backfilling the missed
+cadences). A due schedule fires through the same `workersvc.CreateRun`/
+`CreateAutopilotRun` seam autopilot uses, so the eligibility gate
+(`isEligibleIssue`, PRD #764 M1, widened by PRD #767 M2 to also match
+`assignee_ids` against the connection's `bot_forge_user_id`), the fresh-label
+fetch, active-run dedup, and the usage-limit park all apply as for a manual
+start. Its **ad-hoc prompt** target has no issue to seam through, so it lands
+via a dedicated INSERT as a `prompt` run kind: repo-ful, issue-less,
+`schedule_id`-keyed for dedup, MR-opening on the `ci_fix` shape. A **sweep**
+target fans out over the oldest open issues matching its label; `max_issues`
+counts runs *started*, not candidates matched, and `fireSweep` backfills from
+the next eligible issue within a bounded scan window (issue #416) so a stale
+ineligible head no longer under-fills a fire. See
 [docs/scheduling.md](docs/scheduling.md) and
 `prds/done/241-schedule-runs.md`.
 
 **Assignment is not a weaker gate than the label (PRD #767 D6).** Assigning
 an issue requires the same forge permission tier as applying a label on all
-three drivers — GitHub Triage, GitLab Reporter (a Guest/author can set
-metadata only at creation, applying equally to labels and assignees),
-Forgejo/Gitea Write on the Issues unit — verified, not assumed; GitLab
-bundles assignee+label under one "edit issue metadata" permission, and that
-bundling is version-dependent, so re-check on a major GitLab upgrade.
+three drivers (GitHub Triage, GitLab Reporter, Forgejo/Gitea Write on the
+Issues unit). GitLab bundles assignee+label under one version-dependent "edit
+issue metadata" permission, so re-check on a major GitLab upgrade.
 
-Since PRD #589, a `run_schedules` row can also be `origin='default'`: a
-`go:embed`'d catalog (`api/internal/schedtmpl/`, nine entries, mirroring
-`agenttmpl/builtins`) that a user enables per repo. One of them, `assigned-sweep`
-(PRD #767 M4), sweeps issues assigned to the uzi-bot via a new non-label
-`SelectorAssigned` selector kind, distinct from the other sweeps' label selector. A default row stores no
-prompt of its own — it carries `catalog_slug` and the scheduler resolves the
-baked prompt/labels/guidance from the catalog at fire time, so a shipped
-catalog fix reaches every enabled default on the next release with no
-re-seeding. Cloning a default copies the catalog text into a fresh
-`origin='user'` row (`catalog_slug` cleared) and lifts the prompt lock; `Reset`
-restores an edited default's cadence/model/options from the catalog. See
-[docs/scheduling.md](docs/scheduling.md#default-jobs) and
+Since PRD #589 a `run_schedules` row can be `origin='default'`: a `go:embed`'d
+catalog (`api/internal/schedtmpl/`, nine entries, mirroring `agenttmpl/builtins`)
+a user enables per repo. One, `assigned-sweep` (PRD #767 M4), sweeps
+uzi-bot-assigned issues via a non-label `SelectorAssigned` selector. A default
+row carries `catalog_slug` and the scheduler resolves the baked
+prompt/labels/guidance from the catalog at fire time, so a shipped catalog fix
+reaches every enabled default on the next release with no re-seeding. Cloning a
+default copies the text into a fresh `origin='user'` row (`catalog_slug`
+cleared) and lifts the prompt lock; `Reset` restores an edited default from the
+catalog. See [docs/scheduling.md](docs/scheduling.md#default-jobs) and
 `prds/done/589-default-scheduled-jobs.md`.
 
-Self-improvement (PRD #46) is one of those catalog entries, `self_improve` —
-a fourth schedule target beside `issue`/`sweep`/`prompt` above, and the only
-promptless one: its directive is baked worker-side, so the catalog entry
-carries just a cadence and a model. PRD #590 retired the old bespoke
-`api/internal/selfimprove` engine (a standalone, admin-only, instance-wide
-`Boot`+ticker actor) in favor of this: any user can enable `self_improve` on
-a repo they own, and each fire folds that user's own open `improve_uzi`
+Self-improvement (PRD #46) is one catalog entry, `self_improve`, a fourth
+schedule target beside `issue`/`sweep`/`prompt` and the only promptless one
+(its directive is baked worker-side). PRD #590 retired the old bespoke
+`api/internal/selfimprove` engine for this: any user can enable `self_improve`
+on a repo they own, and each fire folds that user's open `improve_uzi`
 [judge](docs/judge.md) recommendations, reuses or files a
 `uzi-self-improve`-labelled tracking issue, and opens or extends one MR per
-cycle — same guardrails as any other run, `main` untouched. See
+cycle, `main` untouched. See
 [docs/scheduling.md](docs/scheduling.md#default-jobs) and PRD #590.
 
-Since PRD #636, a custom (`origin='user'`) `run_schedules` row can also carry
-a nullable `sibling_group_id`: a client-generated group id that a multi-repo
-create or a new `POST /api/schedules/{id}/add-repo` stamps onto every row it
-fans out, purely so the web can render N per-repo rows as one expandable
-group, the same way `catalog_slug` already groups a default enabled on
-several repos. It is display-only — `schedsvc` never reads it, and
-`UpdateRunSchedule`'s SET list omits it, so it is create-only and cannot be
-set or clobbered by a later PATCH — so each sibling stays a fully
-independent row; editing, pausing, or removing one never touches another.
-`add-repo` allocates the group id with a coalescing `UPDATE … RETURNING`
-under the source row's lock, so two racing calls settle on one id rather
-than splitting the group. See
+Since PRD #636 a custom (`origin='user'`) row can carry a nullable
+`sibling_group_id`, a client-generated id a multi-repo create or `POST
+/api/schedules/{id}/add-repo` stamps onto every fanned-out row so the web can
+render N per-repo rows as one expandable group. It is display-only: `schedsvc`
+never reads it and `UpdateRunSchedule` omits it from its SET list, so it is
+create-only and each sibling stays fully independent (editing, pausing, or
+removing one never touches another). `add-repo` allocates the group id with a
+coalescing `UPDATE … RETURNING` under the source row's lock so two racing
+calls settle on one id. See
 [docs/scheduling.md](docs/scheduling.md#running-a-schedule-on-several-repos)
 and `prds/done/636-multi-repo-custom-schedules.md`.
 
-`task` (PRD #400, `uzi handoff`/`uzi task`) is the **seventh** `runs.kind`,
-alongside `issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt` above. Like
-`prompt` it adds no new service — it rides the same worker/run machinery —
-but it is CLI-only and MR-less by default: the CLI (not the worker) pushes
-the user's own HEAD to a server-named `uzi/task/<run-id>` branch with the
-user's own git credentials, then dispatches the run so the worker can clone
-that branch, work the inline context, and push its commits back to it, with
-no forge issue and no merge request unless `--mr` is passed. See
-[prds/done/400-uzi-handoff.md](prds/done/400-uzi-handoff.md) for the full design and
-[docs/handoff.md](docs/handoff.md) / [docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs)
-for usage. Status is a linear state machine:
+`task` (PRD #400, `uzi handoff`/`uzi task`) is the **seventh** `runs.kind`. Like
+`prompt` it adds no new service, but it is CLI-only and MR-less by default: the
+CLI (not the worker) pushes the user's own HEAD to a server-named
+`uzi/task/<run-id>` branch with the user's own git credentials, then dispatches
+the run so the worker clones that branch, works the inline context, and pushes
+commits back, with no forge issue and no MR unless `--mr` is passed. See
+[prds/done/400-uzi-handoff.md](prds/done/400-uzi-handoff.md),
+[docs/handoff.md](docs/handoff.md), and
+[docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs). Status
+is a linear state machine:
 
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
@@ -642,403 +628,288 @@ chain in the diagram above, with no intervening `running`.
 
 - **running → limit_wait** (PRD #35, opt-in per run or per user) — a run that
   exhausts the owner's Anthropic usage limit **parks** instead of failing: the
-  worker's slot is released, but its runner clone, skills plugin dir and per-run
-  SDK home stay on disk, which is what lets the resume continue the same session
-  rather than starting fresh. A sweeper pass promotes it back to `queued` once
-  `retry_not_before` passes, and the resume skips the plan gate when the plan was
-  already approved. Two independent guards keep the on-disk state alive: the
-  runner's cleanup carve-out (teardown) and `home-reclaim`'s terminal-status check
-  (the background sweep, hours later) — losing either loses the transcript. The
-  park is server-timed and server-clamped, never worker-trusted; `retry_not_before`
-  means *the earliest moment this user could spend anything*, computed at park time
-  across the whole credential pool. See [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md)
-  for why that timing could not be deferred to the claim, and
-  `prds/done/35-run-limit-retry.md` for the fourteen decisions.
-  **Only committed history survives a park by itself** — the on-disk clone
-  above carries whatever the branch's tracking ref already has, but nothing
-  about parking commits anything, so uncommitted mid-milestone edits were
-  lost outright (incident #685). PRD #759 closes that gap: on park, the
-  runner auto-commits any uncommitted changes to a clearly-marked throwaway
-  `wip(park):` commit (as the runner uid, before the tree is wiped) so the
-  existing fetch-back and [PRD #628](prds/done/628-cross-worker-resume-durability.md)
-  checkpoint broker carry it off the worker the same as any real commit; on
-  adopt, the reseed recognizes a `wip(park):` tip and `git reset --soft`s it
-  back to *uncommitted*, so the marker never enters the history the agent
-  builds on and never reaches the merge request — deliberately not a
-  finalize-time rewrite, which would collide with
-  [ADR-456](adr/0456-rebase-before-finalize-push.md). Recovery is exact for a
-  **same-worker** resume (the tracking-ref leg carries no ancestry test); for
-  a **cross-worker** resume it is **best-effort** — a clean `cherry-pick
-  --no-commit` of the WIP tree onto the new floor recovers it, a diverged,
-  non-clean tree fails safely (the WIP is not restored — `wipRecovered` false —
-  and `seededFrom` stays the fallback floor: the run's own `origin` branch when
-  it still exists, else `default`) rather than forcing it. `WORKER_AFFINITY_CEILING`
-  (raised 30m→2h) is what makes same-worker the common case: it bounds how
-  long a *promoted, still-queued* run stays pinned to an alive-but-busy
-  original worker before a peer may steal it — a queue-dwell ceiling, not a
-  cover for the park duration itself ([ADR-628](adr/0628-cross-worker-resume-durability.md)
-  D3a rejected duration-awareness outright). A resumed run whose plan is **provably reviewed**
-  (`plan_source` provenance, not bare `plan_approved`) and whose work
-  recovered — committed progress OR a WIP snapshot — continues implementing
-  from the persisted plan without re-gating; a human-approved run re-gates
-  only on a TOTAL loss (neither recovered: `seededFrom` `default` and
-  `wipRecovered` false), preserving
-  [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection safety property. The run feed distinguishes recovering this uncommitted
-  snapshot from recovering a committed milestone. See
-  `adr/0759-protect-run-work-usage-limit-park.md` for the full Decision Log. <!-- check-docs:ignore-path -->
+  worker's slot is released while its runner clone, skills plugin dir and per-run
+  SDK home stay on disk so the resume continues the same session. A sweeper
+  promotes it back to `queued` once `retry_not_before` passes (server-timed and
+  server-clamped, never worker-trusted: the earliest moment this user could spend
+  anything across the whole credential pool), and the resume skips the plan gate
+  when the plan was already approved. Two independent guards keep the on-disk
+  state alive (the runner's teardown carve-out and `home-reclaim`'s
+  terminal-status check); losing either loses the transcript. See
+  [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md) and
+  `prds/done/35-run-limit-retry.md`.
+  **Only committed history survives a park by itself.** PRD #759 closes the gap
+  for uncommitted mid-milestone edits: on park the runner auto-commits them to a
+  throwaway `wip(park):` commit (runner uid, before the tree is wiped) so the
+  existing fetch-back and the [PRD #628](prds/done/628-cross-worker-resume-durability.md)
+  checkpoint broker carry it off the worker; on adopt the reseed peels a
+  `wip(park):` tip back to *uncommitted* so the marker never enters history or the
+  MR. Recovery is **exact** for a same-worker resume and **best-effort** for a
+  cross-worker one (a clean `cherry-pick --no-commit` of the WIP tree recovers it;
+  a diverged tree fails safely to the fallback floor rather than forcing it).
+  `WORKER_AFFINITY_CEILING` bounds how long a promoted, still-queued run stays
+  pinned to an alive-but-busy original worker before a peer may steal it, which is
+  what makes same-worker the common case. A resumed run whose plan is provably
+  reviewed (`plan_source` provenance) and whose work recovered continues
+  implementing without re-gating; a human-approved run re-gates only on a TOTAL
+  loss, preserving [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection
+  property. See [adr/0759-protect-run-work-usage-limit-park.md](adr/0759-protect-run-work-usage-limit-park.md)
+  for the full Decision Log.
 
-- **Affinity now holds through a worker roll, and the forge-checkpoint net behind
-  it is reliable and observable ([PRD #1030](prds/done/1030-worker-resume-durability.md)).**
-  Before this PRD, `ClaimRun`'s affinity leg fell open the instant a parked run's
-  owner started draining — including a routine image roll — so a park landing on a
-  worker mid-roll cold-restarted on a peer with no clone (`resume_lineage_break`,
-  incident run #1009), even though the owner's worker **row and PVC survive** a
-  roll. The fix distinguishes **roll** from **teardown** with no new column: a roll
-  sets `draining_since` but keeps the worker row (`RegisterWorker` clears
-  `draining_since` when the pod returns, per PRD #422 above); a teardown deletes
-  the row **API-side** (`DeleteWorkerForUser`/`ReapEphemeralWorkers`) *before* the
-  controller's kube teardown runs, so `teardown ⟺ row absent`. `ClaimRun` now holds
-  the pin while the owner's row exists and it is either draining or heartbeat-fresh,
-  and falls open immediately only when the row is gone (teardown) or the row is
-  heartbeat-stale with no drain in progress (death/hang) — bounded by the existing
-  `WORKER_AFFINITY_CEILING`. A companion `@claimant_draining` claim parameter keeps a
-  draining worker's own claim scoped to **its own** promoted run, so lifting the
-  "draining workers claim nothing" early return does not let it pick up a new or
-  fallen-open run (preserving PRD #422 D7). Independently, `pushbroker.Publish`
-  (`api/internal/pushbroker/pushbroker.go`) no longer fails `object not found` the
-  first time a checkpoint publishes after `main` has advanced past a worker's clone
-  base: it now forwards the worker's already-built pack through a manual
-  `git-receive-pack` session, with `Command.Old` bound to the fetched checkpoint
-  tip as a server-side, never-forced compare-and-swap, instead of asking go-git to
-  recompute a send-set from a depth-1 local snapshot that lacks the old default's
-  history. Publish failures and skips are now surfaced on the run feed (not just
-  logged silently), and the api's failure log carries `run_id`/`worker_id`/`reason`.
-  A graceful shutdown now publishes a final checkpoint within the k8s termination
-  grace, and every terminal transition best-effort deletes the run's
-  `refs/uzi-checkpoints/<branch>`, so a stale ref cannot block a later run on the
-  same issue. See [ADR-628](adr/0628-cross-worker-resume-durability.md)'s PRD #1030
-  amendment for the roll-vs-teardown discriminator and the pushbroker mechanism in
-  full.
+- **Affinity holds through a worker roll, and the forge-checkpoint net behind it
+  is reliable and observable ([PRD #1030](prds/done/1030-worker-resume-durability.md)).**
+  `ClaimRun` used to fall open the instant a parked run's owner started draining
+  (a routine image roll included), so a park landing mid-roll cold-restarted on a
+  peer with no clone even though the owner's worker row and PVC survive a roll. The
+  fix distinguishes **roll** from **teardown** with no new column: a roll sets
+  `draining_since` but keeps the worker row, while a teardown deletes the row
+  API-side before the controller's kube teardown, so `teardown ⟺ row absent`.
+  `ClaimRun` now holds the pin while the owner's row exists and is either draining
+  or heartbeat-fresh, and falls open only when the row is gone (teardown) or
+  heartbeat-stale with no drain (death/hang), bounded by `WORKER_AFFINITY_CEILING`.
+  A `@claimant_draining` claim parameter scopes a draining worker's claim to its
+  own promoted run (preserving PRD #422 D7). Independently, `pushbroker.Publish`
+  (`api/internal/pushbroker/pushbroker.go`) no longer fails `object not found` when
+  a checkpoint publishes after `main` advanced past the worker's clone base: it
+  forwards the worker's already-built pack through a manual `git-receive-pack`
+  session with `Command.Old` bound to the fetched checkpoint tip as a server-side,
+  never-forced compare-and-swap. Publish failures and skips now surface on the run
+  feed with `run_id`/`worker_id`/`reason` in the api log, a graceful shutdown
+  publishes a final checkpoint within the k8s termination grace, and every terminal
+  transition best-effort deletes the run's `refs/uzi-checkpoints/<branch>` so a
+  stale ref cannot block a later run on the same issue. See
+  [ADR-628](adr/0628-cross-worker-resume-durability.md)'s PRD #1030 amendment for
+  the discriminator and the pushbroker mechanism in full.
 
-- **The checkpoint net now survives a branch behind `main` on `.github/workflows`
-  ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), the completion of
-  #1030's residuals).** M1 (#1059) unified checkpoint adoption on the owner anchor and
-  M3 (#1037) extended checkpointing to `self_improve` runs; M2 (#1036) closes the case
-  where the broker PAT (which lacks `workflow` scope) had every checkpoint on a
-  behind-on-workflows GitHub branch rejected `skipped:"workflow_scope"`. The worker now
-  synthesizes a `ckpt(overlay):` wrapper commit — the real tip's tree with
-  `.github/workflows` swapped to the current default's, built in a throwaway index so no
-  working tree is populated and no `.gitattributes` filter driver fires — and declares it
-  as the checkpoint tip; the wrapper's workflow tree byte-matches the default so the
-  **byte-unchanged** [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as an
-  ordinary fast-forward, and adoption peels it back to the real tip so the branch never
-  carries the swapped tree. The wrapper's parents are **base-first, real-tip-last** so the
-  broker's parent[0]-first depth-1 ancestry walk accepts a sequential overlay, and the
-  PAT-bearing default fetch it needs is confined to already-reaped paths (park, shutdown,
-  `reap:true` milestone) to keep REAP-BEFORE-GIT. GitHub-only; the mid-run sibling of
-  ADR-456's #627 finalize `workflow-subtree` overlay. See
-  [ADR-1036](adr/1036-checkpoint-workflow-overlay.md) for the transport-wrapper contract.
+- **The checkpoint net survives a branch behind `main` on `.github/workflows`
+  ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), completing
+  #1030's residuals).** M1 (#1059) unified checkpoint adoption on the owner anchor
+  and M3 (#1037) extended checkpointing to `self_improve` runs; M2 (#1036) closes
+  the case where the broker PAT (lacking `workflow` scope) had every checkpoint on
+  a behind-on-workflows GitHub branch rejected `skipped:"workflow_scope"`. The
+  worker synthesizes a `ckpt(overlay):` wrapper commit (the real tip's tree with
+  `.github/workflows` swapped to the current default's, built in a throwaway index)
+  and declares it the checkpoint tip; its workflow tree byte-matches the default so
+  the [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as an ordinary
+  fast-forward, and adoption peels it back to the real tip so the branch never
+  carries the swapped tree. GitHub-only; the mid-run sibling of ADR-456's finalize
+  `workflow-subtree` overlay. See
+  [ADR-1036](adr/1036-checkpoint-workflow-overlay.md) for the transport-wrapper
+  contract, including the base-first parent ordering and the REAP-BEFORE-GIT
+  confinement.
 
 - **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
   oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),
-  or the caller's own re-queued run if it is still inside its **affinity
-  grace** (`WORKER_AFFINITY_GRACE`, default 2m) — giving a resume the best
-  chance of landing back on the worker whose disk still holds the session and
-  git worktree. After the grace window any of the user's workers may claim it —
-  and when one does, the SDK session is **not** portable: a session is a local
-  JSONL transcript at `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`
-  on the worker that wrote it, not server-side state. Being keyed by **both**
-  HOME and cwd, it is lost to a different worker, to a replaced volume, and to
-  a changed clone path on the very same machine. The worker therefore
-  preflights the transcript before resuming (`agent/src/sdk-session.ts`, issue
-  #105) and, when it is not resolvable here, drops the resume and says so on
-  the feed rather than passing an id the SDK can only fail on — it resolves a
-  resume locally, so an unresolvable id kills the run on its first turn instead
-  of starting fresh. The run continues without its earlier context; if the
-  branch already carries pushed work, the planning prompt says so, so an
-  amnesiac lead reads that work instead of redoing it.
-  Claim placement is also **fleet-aware** (PRD #216): affinity is checked
-  first, as above, but past that, a worker already holding an active run
-  defers a fresh queued run to a live, eligible peer that is strictly less
-  loaded and has a free slot, rather than taking a second run while that peer
-  sits idle. A queued run older than `WORKER_SPREAD_GRACE` (default 3× the
-  poll interval) is exempt from this deferral so it can never be stranded
-  waiting for a peer — see [adr/0216-fleet-aware-claim.md](adr/0216-fleet-aware-claim.md)
-  for the eligibility seam and the placement/enforcement boundary against
-  ADR-42.
-  The same `fn_worker_can_claim` predicate also gates a Docker-capable
-  worker against the `docker_repo_allowlist` admin setting ([PRD #361](prds/done/361-repo-setup-indicator.md)):
-  two read-only surfaces reuse it rather than re-deriving eligibility —
-  `RepoDTO.DockerAllowlisted`/`DockerBlocked` (`apitypes.RepoDTO`) are
-  computed, caller-scoped booleans about the caller's own repo, never the
-  list (the same shape as `GuardrailBlocked`), feeding the Repos page's
-  Setup chip; and the PRD #47 `queuedReason` resolver (`workersvc/health.go`)
-  adds `reasonRepoNotDockerAllowed`, mapped onto the existing
-  `waiting_worker` health enum, when every online worker is Docker-capable
-  and none is eligible for the run's repo. No migration — `runs.health_reason`
-  is free text.
-- **Capability-aware eligibility, claim through plan gate (PRD #84).** A
-  worker advertises a capability set (`workers.capabilities`, from the
-  closed `{docker, jvm}` vocabulary: `jvm` is template-derived from its
-  image, `docker` is worker-self-reported when a DinD sidecar answers, both
-  `capability.Filter`-ed at register so a worker can never spoof a
-  template-only name). A run carries `required_capabilities`, seeded from a
-  static per-repo hint (`repos.required_capabilities`, set in Repo settings)
-  and escalation-only unioned with what the lead's deterministic clone scan
-  (`agent/src/toolchain-detect.ts`) infers at plan time, plus a
-  display-only `required_tools` (provisionable toolchains) and
-  `size_class`. `fn_worker_can_claim` (migration `00142`) folds a worker's
-  `docker_enabled` flag into its capabilities and requires
-  `required ⊆ effective` before the claim query returns that run to it; the
-  same fold blocks plan-approval server-side (409, naming the unmet set) if
-  the run's assigned worker still can't satisfy it once a plan exists, with
-  an owner override that clears the run's requirement — correcting a
-  false-positive inference — rather than bypassing the runtime docker
-  guardrail. Both the claim clause and the approval block are gated by the
-  `capability_aware_scheduling` admin kill-switch (default on); off, the
-  pre-existing docker-worker→repo-allowlist enforcement (PRD #83/#89,
-  `docker_repo_allowlist`) is unaffected, but capability matching reverts to
-  best-effort claiming, so a mismatched run degrades to the pre-#84 mid-run
-  failure instead of being blocked up front. See
-  [docs/capability-scheduling.md](docs/capability-scheduling.md).
-- **Ephemeral, run-bound hosted workers on an unmet capability OR a
-  saturated fleet (PRD #529, Path 1 of #84's Decision-9 remediation
-  spectrum; second trigger PRD #747).** When the reason above fires with
-  zero online workers satisfying the run's capabilities, and the owner has
-  opted in (`users.ephemeral_workers_enabled`) with the admin instance
-  kill-switch also on, a background api pass
-  (`api/internal/hostedsvc/ephemeral.go`) auto-provisions ONE hosted worker
-  bound to that run: `kind='hosted'`, `ephemeral=true`,
-  `ephemeral_run_id=<run>` — two columns added to `workers` by migration
+  or the caller's own re-queued run still inside its **affinity grace**
+  (`WORKER_AFFINITY_GRACE`, default 2m), giving a resume the best chance of
+  landing back on the worker whose disk holds the session and worktree. Past the
+  grace any of the user's workers may claim it, and the SDK session is **not**
+  portable: it is a local JSONL transcript at
+  `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, keyed by both HOME
+  and cwd, so it is lost to a different worker, a replaced volume, or a changed
+  clone path on the same machine. The worker preflights the transcript before
+  resuming (`agent/src/sdk-session.ts`, issue #105) and, when it is not
+  resolvable, drops the resume and says so on the feed rather than passing an id
+  the SDK can only fail on. The run continues without its earlier context; if the
+  branch already carries pushed work, the planning prompt says so.
+  Claim placement is also **fleet-aware** (PRD #216): past affinity, a worker
+  already holding an active run defers a fresh queued run to a live, eligible peer
+  that is strictly less loaded with a free slot, rather than taking a second run
+  while that peer idles; a queued run older than `WORKER_SPREAD_GRACE` (default 3×
+  the poll interval) is exempt so it can never be stranded. See
+  [adr/0216-fleet-aware-claim.md](adr/0216-fleet-aware-claim.md) for the
+  eligibility seam and the boundary against ADR-42.
+  The same `fn_worker_can_claim` predicate gates a Docker-capable worker against
+  the `docker_repo_allowlist` admin setting ([PRD #361](prds/done/361-repo-setup-indicator.md)),
+  and two read-only surfaces reuse it: `RepoDTO.DockerAllowlisted`/`DockerBlocked`
+  (`apitypes.RepoDTO`) are computed caller-scoped booleans feeding the Repos page's
+  Setup chip, and the PRD #47 `queuedReason` resolver (`workersvc/health.go`) adds
+  `reasonRepoNotDockerAllowed` onto the `waiting_worker` health enum when every
+  online worker is Docker-capable and none is eligible for the run's repo.
+- **Capability-aware eligibility, claim through plan gate (PRD #84).** A worker
+  advertises a capability set (`workers.capabilities`, from the closed `{docker,
+  jvm}` vocabulary: `jvm` is template-derived, `docker` worker-self-reported when a
+  DinD sidecar answers, both `capability.Filter`-ed at register so a worker cannot
+  spoof a template-only name). A run carries `required_capabilities`, seeded from a
+  static per-repo hint (`repos.required_capabilities`) and escalation-only unioned
+  with the lead's deterministic clone scan (`agent/src/toolchain-detect.ts`) at
+  plan time, plus display-only `required_tools` and `size_class`.
+  `fn_worker_can_claim` (migration `00142`) folds `docker_enabled` into a worker's
+  capabilities and requires `required ⊆ effective` before the claim returns that
+  run; the same fold blocks plan-approval server-side (409, naming the unmet set)
+  if the assigned worker still can't satisfy it once a plan exists, with an owner
+  override that clears the requirement rather than bypassing the runtime docker
+  guardrail. Both are gated by the `capability_aware_scheduling` admin kill-switch
+  (default on); off, capability matching reverts to best-effort claiming (a
+  mismatched run degrades to the pre-#84 mid-run failure) while the pre-existing
+  docker-worker→repo-allowlist enforcement (PRD #83/#89, `docker_repo_allowlist`)
+  is unaffected. See [docs/capability-scheduling.md](docs/capability-scheduling.md).
+- **Ephemeral, run-bound hosted workers on an unmet capability OR a saturated
+  fleet (PRD #529, second trigger PRD #747).** When the reason above fires with
+  zero online workers satisfying the run's capabilities and the owner has opted in
+  (`users.ephemeral_workers_enabled`, with the admin instance kill-switch on), a
+  background api pass (`api/internal/hostedsvc/ephemeral.go`) auto-provisions ONE
+  hosted worker bound to that run: `kind='hosted'`, `ephemeral=true`,
+  `ephemeral_run_id=<run>` (two columns added to `workers` by migration
   `00155_ephemeral_workers.sql`, not a new table, so the controller's
-  poll/reconcile/teardown ([below](#worker-controller-k8s-only)) are
-  completely unchanged; dropping the row **is** the teardown primitive.
-  Provisioning is advisory-locked per user and made one-per-run by a partial
-  `UNIQUE (ephemeral_run_id) WHERE ephemeral` index
-  (`api/internal/store/queries/hosted_workers.sql`), under a concurrent cap
-  (`UZI_EPHEMERAL_MAX_PER_USER`) separate from the standing hosted quota.
-  `fn_worker_can_claim`/`ClaimRun` (`api/internal/store/queries/runtime.sql`)
-  restrict such a worker to claim **only** its bound run, on both the run and
-  chat claim lanes. On the run's terminal transition the api drops the row —
-  busy-guarded (`CountWorkerNonTerminalRuns = 0`, so a still-working pod is
-  never SIGTERMed) — and an unconditional GC reaper backstops teardown for a
-  terminal/absent owning run, a provision that never reached `online` within
-  a deadline, or a worker left idle because a genuinely-eligible sibling
-  claimed the run first during cold-start (the bound run is not hard-pinned).
-  See `prds/done/529-ephemeral-workers.md` for the full Decision Log and
-  [ADR-91](adr/0091-runner-cross-run-persistence-residual.md): each ephemeral
-  worker's fresh, per-worker `-nix`/`-data` PVCs structurally close the
-  cross-run executable-persistence residual that ADR records (finalized by
-  the PRD's M8). Size-aware provisioning and Path 2 (an approve-time
-  capability denial) remain deferred. PRD #649 surfaced both gates in the
-  SPA: an admin kill-switch card in Admin Settings
-  (`web/src/pages/adminSettings/EphemeralWorkersCard.tsx`), a per-user opt-in toggle in the
-  hosted-worker section of the Workers page
-  (`web/src/components/HostedWorkers.tsx`), gated on the hosted-config
-  `ephemeral_enabled` derived signal, and an `ephemeral` badge in the fleet
-  list marking a bound worker while it exists. A **second trigger** (issue
-  #747) reuses this same machinery for a run that is capability-*placeable*
-  but slot-*blocked* — some online worker could claim it, but every
-  capability-matching worker is pinned at `max_concurrent_runs` (fleet
-  saturated). Unlike the capability-gap path above, which provisions
-  immediately (a gap is permanent), this path is **debounced** on
-  `UZI_EPHEMERAL_SATURATION_DELAY` (default 90s ≈ worker cold-start),
-  measured against `runs.status_since` (the same queued-age clock the
-  health "fleet saturated" display reason uses), because saturation is
-  transient: a slot freeing before the debounce elapses may claim the run
-  first, avoiding a pod that turns out to be unneeded. A burst pod that
-  loses that race is idle and shares the same 10m reaper grace as the
-  cold-start-loss case above rather than a second knob (accepted cost, PRD
-  #747 M3). The debounce is deliberately independent of `health_enabled`
-  and the queued-health threshold that gates the "fleet saturated" *display*
-  reason — burst is a capacity action, not a UI state, though both clocks
-  read `status_since`. See
-  `prds/done/747-ephemeral-saturation-burst.md` for the full Decision Log.
-- **claimed → running, before the plan turn** — once `provisionRunTools` has set up
+  poll/reconcile/teardown [below](#worker-controller-k8s-only) are unchanged and
+  dropping the row **is** the teardown primitive). Provisioning is advisory-locked
+  per user, made one-per-run by a partial `UNIQUE (ephemeral_run_id) WHERE
+  ephemeral` index, and under a concurrent cap (`UZI_EPHEMERAL_MAX_PER_USER`)
+  separate from the standing hosted quota. `fn_worker_can_claim`/`ClaimRun`
+  restrict such a worker to claim **only** its bound run, on both the run and chat
+  lanes. On the run's terminal transition the api drops the row (busy-guarded so a
+  still-working pod is never SIGTERMed), and an unconditional GC reaper backstops
+  teardown for a terminal/absent owning run, a provision that never reached
+  `online`, or a worker left idle when a genuinely-eligible sibling claimed the run
+  first. Each ephemeral worker's fresh per-worker `-nix`/`-data` PVCs structurally
+  close the cross-run executable-persistence residual
+  [ADR-91](adr/0091-runner-cross-run-persistence-residual.md) records. The
+  **second trigger** (PRD #747) reuses this machinery for a run that is
+  capability-*placeable* but slot-*blocked* (every capability-matching worker
+  pinned at `max_concurrent_runs`); unlike the capability-gap path it is
+  **debounced** on `UZI_EPHEMERAL_SATURATION_DELAY` (default 90s, against
+  `runs.status_since`) because saturation is transient. PRD #649 surfaced both
+  gates in the SPA: an admin kill-switch card
+  (`web/src/pages/adminSettings/EphemeralWorkersCard.tsx`), a per-user opt-in
+  toggle (`web/src/components/HostedWorkers.tsx`), and an `ephemeral` badge in the
+  fleet list. Size-aware provisioning and #529's Path 2 (an approve-time capability
+  denial) remain deferred. See `prds/done/529-ephemeral-workers.md` and
+  `prds/done/747-ephemeral-saturation-burst.md` for the full Decision Logs.
+- **claimed → running, before the plan turn** — once `provisionRunTools` sets up
   the run's tool env, the executor kicks off a lockfile-driven JS dependency
-  install for the cloned repo, picked per discovered lockfile (monorepo
-  workspaces resolving to one root install): a frozen, `--ignore-scripts`
-  install per manager, **plus** per-manager hardening flags beyond that alone —
-  `--ignore-scripts` does not close every repo-controlled install-time vector
-  (see the PRD's Trust posture section). Exact commands live at
-  `INSTALL_COMMANDS` in `agent/src/js-deps.ts`, kept there rather than
-  duplicated here so this bullet can't drift from what ships. Runs under the
-  same runner-uid + scrubbed-env sandbox as the checks below, concurrently
-  with the plan turn — and, on human-gated runs, the `awaiting_approval` wait
-  — and is joined before the first implement turn, so the agent's own
-  dependency install never races it (PRD #121).
-- **A run can also be born already past the gate** (PRD #209, `plan_source='seeded'`):
-  `POST /api/repos/{id}/runs` accepts an externally-authored `plan_md` (+ an
-  optional agent selection and a planned-against base commit) at create time,
-  and such a run skips the planning turn and the `awaiting_approval` bullet
-  below entirely — the worker implements the supplied plan directly, and the
-  human checkpoint moves from the plan gate to the merge request. Reachable
-  from the CLI only (`uzi run create --plan-file`, [docs/cli.md](docs/cli.md),
-  [docs/seeded-plans.md](docs/seeded-plans.md)); the web board's start button
-  is unchanged. Everything else about the run — status machine, sweeper
-  coverage, guardrails below — is the same run this bullet describes.
-- **running → awaiting_approval → running** — the lead agent produces a plan;
-  the worker reports it (`POST /api/worker/runs/:id/state`) and the run parks
-  at the gate until the user approves or rejects it in the run view, or
-  `WORKER_PLAN_APPROVAL_TIMEOUT` (worker-side, default 24h) elapses. **The
-  gate is a round-aware loop, not a single step (PRD #41).** Alongside
-  approve/reject the user can **request changes**: the worker resumes the
-  *same* SDK session with the feedback, the lead revises the plan, and the
-  run re-parks at `awaiting_approval` with plan v2 — no new status, since the
-  loop is entirely worker-internal (`plan → gate → (revise → resume → new
-  plan → re-gate)* → approve/reject/cancel`, fail-closed on any other exit).
-  Rounds are bounded by `PLAN_MAX_REVISIONS` (default 3, enforced both
-  server- and worker-side; the server half is a counter on the run row, for
-  the concurrency reason in [ADR-106](adr/0106-revise-cap-atomicity.md)), and
-  the whole loop shares **one absolute `WORKER_PLAN_APPROVAL_TIMEOUT`
-  deadline** computed at first gate entry, not
-  a fresh one per round. A monotonic **gate epoch**, bumped at each
-  `awaiting_approval` re-report, ties every verdict to the plan version the
-  user actually saw — an approve or reject arriving mid-revision is
-  discarded rather than silently applied to a plan no human reviewed. Once
-  approved, the run resumes the same SDK session into the implement ⇄ review
-  loop (`RUN_MAX_ITERATIONS`, default 5). See [PRD #41](prds/done/41-plan-revision-gate.md)
-  for the epoch mechanism (Decisions 2/3) and
-  [docs/run-activity.md](docs/run-activity.md#plan-approval-gate) for the
-  user-facing actions. The worker also generates a short plain-English intent
-  summary before planning and a plan summary + deltas at this gate, both
-  advisory (skipped on any failure, never blocking the run) and spent on the
-  run owner's own token — see [PRD #362](prds/done/362-run-summaries.md) and
+  install for the cloned repo (per discovered lockfile, monorepo workspaces
+  resolving to one root install): a frozen, `--ignore-scripts` install per manager
+  plus per-manager hardening flags, since `--ignore-scripts` alone does not close
+  every repo-controlled install-time vector. Exact commands live at
+  `INSTALL_COMMANDS` in `agent/src/js-deps.ts` so this bullet can't drift from what
+  ships. It runs under the same runner-uid + scrubbed-env sandbox as the checks
+  below, concurrently with the plan turn (and the `awaiting_approval` wait), and is
+  joined before the first implement turn so the agent's own install never races it
+  (PRD #121).
+- **A run can be born already past the gate** (PRD #209, `plan_source='seeded'`):
+  `POST /api/repos/{id}/runs` accepts an externally-authored `plan_md` (plus an
+  optional agent selection and a planned-against base commit) at create time, and
+  such a run skips the planning turn and the `awaiting_approval` bullet below
+  entirely, so the human checkpoint moves from the plan gate to the merge request.
+  CLI-only (`uzi run create --plan-file`, [docs/cli.md](docs/cli.md),
+  [docs/seeded-plans.md](docs/seeded-plans.md)); the web start button is unchanged.
+  Everything else (status machine, sweeper coverage, guardrails) is the same run.
+- **running → awaiting_approval → running** — the lead produces a plan; the
+  worker reports it (`POST /api/worker/runs/:id/state`) and the run parks at the
+  gate until the user approves or rejects it, or `WORKER_PLAN_APPROVAL_TIMEOUT`
+  (worker-side, default 24h) elapses. **The gate is a round-aware loop, not a
+  single step (PRD #41).** The user can also **request changes**: the worker
+  resumes the *same* SDK session with the feedback, the lead revises, and the run
+  re-parks with plan v2, no new status (the loop is entirely worker-internal,
+  fail-closed on any exit but approve/reject/cancel). Rounds are bounded by
+  `PLAN_MAX_REVISIONS` (default 3, enforced server- and worker-side; the server
+  half is a run-row counter, for the concurrency reason in
+  [ADR-106](adr/0106-revise-cap-atomicity.md)), the whole loop shares **one
+  absolute `WORKER_PLAN_APPROVAL_TIMEOUT` deadline** from first gate entry, and a
+  monotonic **gate epoch** bumped at each re-report ties every verdict to the plan
+  version the user saw so an approve/reject arriving mid-revision is discarded.
+  Once approved the run resumes the same session into the implement ⇄ review loop
+  (`RUN_MAX_ITERATIONS`, default 5). See
+  [PRD #41](prds/done/41-plan-revision-gate.md) and
+  [docs/run-activity.md](docs/run-activity.md#plan-approval-gate). The worker also
+  generates a plain-English intent summary before planning and a plan summary +
+  deltas at this gate, both advisory (skipped on failure, never blocking) and spent
+  on the owner's own token, see [PRD #362](prds/done/362-run-summaries.md) and
   [docs/run-summaries.md](docs/run-summaries.md).
-- **running ⇄ awaiting_input — the run's third human-in-the-loop channel**
-  ([PRD #88](prds/done/88-ask-user-clarification.md)), beside the plan gate above
-  and user-initiated steering below. The lead calls an in-process `ask_user`
-  signal when it hits a fork it shouldn't resolve alone; the worker parks the
-  run, posts a `question` run-message, and awaits an `answer` steering input
-  the way `gatePlan` awaits a plan verdict. On answer it resumes the *same*
-  SDK session (no transcript replay) and continues — a **pre-run** question
-  (asked before `submit_plan`) resumes into a fresh planning turn that
-  eventually reaches the plan gate; a **mid-run** question resumes the
-  implement ⇄ review loop it interrupted. It is a distinct status rather than
-  a sub-state of `awaiting_approval`, because `SetRunRunning`'s resume
-  transition requires a *consumed* `approve_plan`, which an `answer` can
-  never satisfy — the plan gate's status could not be reused for a question.
-  It otherwise inherits `awaiting_approval`'s treatment everywhere that
-  matters: every worker-death sweep, the `busy`/`active_runs` and
-  rate-limit-window concurrency counts, and the board's move-pending
-  bookkeeping all list `awaiting_input` alongside `awaiting_approval`, so a
-  parked question is recoverable across a worker death, holds its worker
-  slot, and never wedges a board card. The resume guard is keyed on the open
-  **question's identity**, not on a timestamp or an arrival order: a
-  worker-death requeue re-parks on the *same* question id (re-stamped from
-  the claim), so an answer submitted just before the crash still resumes the
-  run afterwards, while an answer to an already-superseded question is
-  rejected. Bounded by an absolute answer deadline
-  (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a per-run question cap
-  (`QUESTION_MAX`, default 5), both enforced worker-side and both
-  **worker-in-memory** — a requeue resets both counters, so the honest
-  worst case over a run's life is each value **× (RUN_MAX_REQUEUES + 1)**,
-  not the configured value flat. **Only the deadline fails the run closed**
-  ("clarification timed out"); there is no configurable default action.
-  Exhausting the question cap does **not** fail the run — it emits a feed
-  notice and the lead proceeds on its own best judgment instead. (The one
-  cap-adjacent failure, a distinct message, is pre-run-only: looping on
-  questions without ever reaching a plan.)
-  **Autopilot never parks**: the same `claim.auto_approve` that
-  short-circuits `gatePlan` short-circuits `ask_user`, auto-resolving with a
-  frozen `"no human available — proceed on your best judgment, and note the
-  assumption you made"` answer instead. The wording is quoted exactly because
-  it is a frozen constant (`AUTOPILOT_SENTINEL_ANSWER`) that a test asserts
-  byte-for-byte: an approximate quote here would read as the spec and send
-  someone "fixing" the constant to match the doc. The question surfaces on every surface a
-  user might be watching — the run view (an "Answer required" composer), the
-  owner's opt-in Slack DM thread (free-text reply), and `uzi run answer` —
-  and all three derive the open question from the run feed rather than a
-  dedicated field, so no surface invents a question the others don't have. See
-  the PRD's Decision Log for the full mechanism (including the accepted
-  mixed-fleet-rollout residual: a run resumed onto a pre-#88 worker degrades
-  to guessing rather than asking, mid-run, and a pending answer in transit is
-  lost) and [docs/run-activity.md](docs/run-activity.md#answering-a-question),
-  [docs/slack.md](docs/slack.md#using-it) and [docs/cli.md](docs/cli.md#commands)
-  for the user-facing surfaces.
+- **running ⇄ awaiting_input — the third human-in-the-loop channel**
+  ([PRD #88](prds/done/88-ask-user-clarification.md)), beside the plan gate and
+  steering. The lead calls an in-process `ask_user` signal at a fork it shouldn't
+  resolve alone; the worker parks the run, posts a `question` run-message, and
+  awaits an `answer` the way `gatePlan` awaits a plan verdict. On answer it resumes
+  the *same* SDK session: a **pre-run** question (before `submit_plan`) resumes
+  into a fresh planning turn that reaches the plan gate, a **mid-run** one resumes
+  the implement ⇄ review loop it interrupted. It is a distinct status, not a
+  sub-state of `awaiting_approval` (whose resume requires a consumed `approve_plan`
+  an `answer` can never satisfy), but inherits `awaiting_approval`'s treatment
+  everywhere that matters (worker-death sweeps, the `busy`/`active_runs` and
+  rate-limit concurrency counts, board move-pending), so a parked question is
+  recoverable across a worker death, holds its slot, and never wedges a card. The
+  resume guard is keyed on the open **question's identity**, not a timestamp: a
+  requeue re-parks on the same question id, so an answer submitted just before a
+  crash still resumes and an answer to a superseded question is rejected. Bounds
+  are an absolute answer deadline (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a
+  per-run cap (`QUESTION_MAX`, default 5), both worker-in-memory (a requeue resets
+  both, so the honest worst case is each **× (RUN_MAX_REQUEUES + 1)**). **Only the
+  deadline fails the run closed**; exhausting the cap emits a feed notice and the
+  lead proceeds on its own judgment (the one cap-adjacent failure is pre-run-only:
+  looping on questions without ever reaching a plan). **Autopilot never parks**:
+  the same `claim.auto_approve` that short-circuits `gatePlan` short-circuits
+  `ask_user`, auto-resolving with the frozen `AUTOPILOT_SENTINEL_ANSWER` constant
+  (asserted byte-for-byte by a test, so do not paraphrase it here). The question
+  surfaces on the run view, the owner's opt-in Slack DM, and `uzi run answer`, all
+  three deriving it from the run feed rather than a dedicated field. See the PRD's
+  Decision Log (including the accepted mixed-fleet residual) and
+  [docs/run-activity.md](docs/run-activity.md#answering-a-question),
+  [docs/slack.md](docs/slack.md#using-it), and
+  [docs/cli.md](docs/cli.md#commands).
 - **→ completed / failed** — the **worker**, not the agent, pushes the branch
   (`agent/issue-{iid}`) and opens the MR on completion (see Secrets, below);
-  failure carries a `failure_reason`. The push and the whole MR-create call are
-  wrapped in a bounded, fast transient-retry (`[1s,2s,4s,8s,16s]`,
-  `agent/src/forge-retry.ts`): a dropped HTTP/2 stream, a 5xx, or a connection
-  reset retries so a run whose work is already committed is not discarded, while
-  a **permanent** rejection — auth failure, a protected-branch guardrail,
-  non-fast-forward — fails fast and is never retried, per
-  [ADR-284](adr/0284-forge-push-retry-classifier.md). A `failed` transition also
-  lands an in-app inbox notification (`notifysvc.Notify`, inbox-only —
-  Slack is not attempted, since the existing Slack ❌ DM already covers opted-in
-  users) for the run's owner, gated on `stop_kind` so a deliberate cancel or
+  failure carries a `failure_reason`. The push and MR-create are wrapped in a
+  bounded transient-retry (`[1s,2s,4s,8s,16s]`, `agent/src/forge-retry.ts`): a
+  dropped HTTP/2 stream, 5xx, or connection reset retries so already-committed work
+  is not discarded, while a permanent rejection (auth, protected-branch guardrail,
+  non-fast-forward) fails fast, per
+  [ADR-284](adr/0284-forge-push-retry-classifier.md). A `failed` transition lands
+  an in-app inbox notification (`notifysvc.Notify`, inbox-only since the Slack ❌ DM
+  already covers opted-in users), gated on `stop_kind` so a deliberate cancel or
   plan-rejection stays silent and only genuine breakage notifies.
 - **Finalize, GitHub only: align a behind-on-workflows branch before that push**
   (PRD #456). GitHub rejects the bot's `repo`-only PAT push whenever the pushed
-  tip's `.github/workflows/**` tree differs from the *current* default branch —
-  even when the run's own branch never touched a workflow file, only fell
-  behind on one because main advanced it mid-run. Immediately before the push
-  above, uzi fetches the default branch's fresh tip and, only when the
-  workflow trees actually differ, aligns the branch to it: a SHA-preserving
-  merge first, falling back to a rebase (the mechanism proven to clear the
-  rejection) if the merged push is still refused. An unresolvable conflict
-  fails the run typed (`fail_origin = finalize_base_align_conflict`) with the
-  pre-align diff preserved on the failed-run card, via the same
-  `preserved_patch` mechanism PRD #377 built for a branch that *modifies* a
-  workflow file (a distinct, earlier-firing guard on the same finalize path).
-  See [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism and
-  why merge is tried before rebase.
+  tip's `.github/workflows/**` tree differs from the current default branch, even
+  when the run's branch never touched a workflow file but only fell behind as main
+  advanced mid-run. Just before the push, uzi fetches the default tip and, only
+  when the workflow trees differ, aligns the branch: a SHA-preserving merge first,
+  falling back to a rebase if still refused. An unresolvable conflict fails the run
+  typed (`fail_origin = finalize_base_align_conflict`) with the pre-align diff
+  preserved on the failed-run card via the same `preserved_patch` mechanism PRD
+  #377 built for a branch that *modifies* a workflow file. See
+  [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism and why
+  merge precedes rebase.
 - **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265 + PRD #390) — on a
-  milestone-structured `issue` run the run view shows a *reported-complete*
-  tracker (`runs.milestones_completed`, a monotone server-side union; never
-  "verified"). Two sources feed it, both subset-validated against the frozen
-  list server-side: mid-run `report_progress` calls (visible immediately,
-  turn-non-ending), and — since PRD #265 — the lead's declaration on
-  `signal_done` of the milestones it actually finished, unioned into the tracker
-  on the `completed` transition. The declaration is what keeps a **single-turn
-  run** honest: one that goes straight to `signal_done` never emits a mid-run
-  report, so without it the tracker would freeze at "nothing reported" on a run
-  that shipped its work. Completion is **declared, not inferred** — a milestone
-  the lead leaves undeclared stays not-complete, so a deliberately-skipped
-  milestone is not back-filled. `milestones_in_progress` (a snapshot, not a
-  union) is cleared on every terminal transition a milestone-bearing run can
-  reach, since "in progress" is meaningless on a done/failed/cancelled run. The web renders a **null** tracker
-  as "not reported" (`M–/N`), distinct from a genuine `0/N`, so a completed run
-  that simply never reported does not read as a failure. PRD #390 is the
-  "make mid-run reporting truthful and enforced" step in that #122 → #265 → #390
-  progression: mid-run reporting is now **enforced**, not merely offered — the
-  per-turn prompt requires a `report_progress` declaration (`agent/src/prompt.ts`),
-  and the implement/review loop (`agent/src/sdk-executor.ts`) escalates the next
-  turn's prompt when a work turn leaves a milestone-bearing run with no milestone
-  marked in progress, then surfaces a feed-only `status` signal after K=2
-  consecutive misses so a silently-non-reporting lead is observable — while still
-  never failing the run (D4) and keeping `checkpoint` a durability boundary, not a
-  gate (D2): a cooperative checkpoint re-arms enforcement and clears the
-  in-progress latch instead of nagging past a milestone boundary. Complementing
-  that, an all-empty `report_progress` call (both sides empty after parsing) is
-  now a **no-op, not a signal** (D3, `agent/src/signals.ts`) — it never persists a
-  misleading `[]`, so the `milestones_completed` column stays `null` on a run that
-  truly never reported and the neutral `M–/N` render is what that run actually
-  shows. The CLI's `uzi run get` now renders that same neutral `–/N` numerator for
-  a never-reported run (PRD #390 D5/M4, `api/cmd/uzi/run_render.go`), bringing it to
-  display parity with the web badge and the TUI rail.
+  milestone-structured `issue` run the run view shows a *reported-complete* tracker
+  (`runs.milestones_completed`, a monotone server-side union, never "verified").
+  Two subset-validated sources feed it: mid-run `report_progress` calls (visible
+  immediately, turn-non-ending) and, since PRD #265, the lead's `signal_done`
+  declaration of the milestones it finished, unioned on the `completed` transition.
+  The declaration keeps a **single-turn run** honest (one going straight to
+  `signal_done` emits no mid-run report). Completion is **declared, not inferred**,
+  so a milestone left undeclared stays not-complete and a skipped one is not
+  back-filled. `milestones_in_progress` (a snapshot, not a union) is cleared on
+  every terminal transition, and the web renders a **null** tracker as "not
+  reported" (`M–/N`), distinct from a genuine `0/N`. PRD #390 makes mid-run
+  reporting **enforced**, not merely offered: the per-turn prompt requires a
+  `report_progress` declaration (`agent/src/prompt.ts`), the implement/review loop
+  (`agent/src/sdk-executor.ts`) escalates the next turn's prompt when a work turn
+  leaves a milestone-bearing run with none marked in progress and surfaces a
+  feed-only `status` signal after K=2 consecutive misses, while never failing the
+  run (D4) and keeping `checkpoint` a durability boundary, not a gate (D2). An
+  all-empty `report_progress` call is a **no-op, not a signal** (D3,
+  `agent/src/signals.ts`), so `milestones_completed` stays `null` on a run that
+  never truly reported. The CLI's `uzi run get` renders the same neutral `–/N`
+  numerator (`api/cmd/uzi/run_render.go`), at parity with the web badge and the TUI
+  rail.
 - **Operator scope steering** (PRD #634, [ADR-634](adr/0634-run-scope-steering.md)) —
-  a mid-run `uzi run stop` or `uzi run scope --through N` on a
-  milestone-structured `issue` run writes **one** nullable column,
-  `runs.scope_ceiling` (the count of milestones the run may complete, over
-  the `milestones_frozen` list above). `stop` resolves server-side to
-  `scope_ceiling = completed_count`; a forward ceiling clamps to
-  `[completed_count, len(frozen)]`. Both actions share the same field, so a
-  later write is genuinely **last-writer-wins** (supersede) with no
-  cross-channel ordering to reason about. Delivery rides the existing
-  per-iteration `reportIteration` ACK (re-read every loop, self-healing) and
-  the claim payload (durability across a requeue), and is **honored at the
-  top of the implement loop** — not at the cooperative `checkpoint` — so it
-  fires every iteration regardless of whether the lead checkpointed. Once
-  `completed_count >= scope_ceiling` the worker starts no further milestone
-  and takes the same graceful-finalize path as any other completion (push +
-  MR iff requested), reporting `completed` with `stop_kind='scope_capped'`.
-  `milestones_frozen` itself is never rewritten — the ceiling is a
-  truncation layered over the immutable approved list, not an edit to it.
-  The `kind='scope'` `run_user_inputs` row this also writes is **audit-only**
-  (surfaced via `uzi run inputs`, the web steer queue, and — surface-only —
-  Slack); the worker never routes it, only the column controls behavior.
+  a mid-run `uzi run stop` or `uzi run scope --through N` on a milestone-structured
+  `issue` run writes **one** nullable column, `runs.scope_ceiling` (milestones the
+  run may complete over the `milestones_frozen` list). `stop` resolves server-side
+  to `scope_ceiling = completed_count`; a forward ceiling clamps to
+  `[completed_count, len(frozen)]`. Sharing one field makes a later write
+  **last-writer-wins** with no cross-channel ordering. Delivery rides the
+  per-iteration `reportIteration` ACK (re-read every loop) and the claim payload
+  (durability across a requeue), honored at the **top of the implement loop**, not
+  the cooperative `checkpoint`, so it fires every iteration. Once `completed_count
+  >= scope_ceiling` the worker starts no further milestone and takes the graceful
+  finalize path (push + MR iff requested), reporting `completed` with
+  `stop_kind='scope_capped'`. `milestones_frozen` is never rewritten (the ceiling
+  is a truncation over the immutable approved list). The `kind='scope'`
+  `run_user_inputs` row is **audit-only** (surfaced via `uzi run inputs`, the web
+  steer queue, and Slack); only the column controls behavior.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers
   can't be trusted to self-report: a claimed-but-never-started run older than
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
@@ -1058,19 +929,16 @@ chain in the diagram above, with no intervening `running`.
   captured plan/session id survive every transition above, so a resumed run
   continues exactly where it left off — see Live message stream, below.
 - **Bounded worker concurrency** (PRD #42, `adr/0042-worker-run-concurrency.md`): a
-  worker may drive more than one of these state machines at once, capped by a
-  worker-side slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1 — the serial
-  behavior above, unchanged) that the worker advertises at registration but the
-  server never enforces. A run parked at `awaiting_approval` holds its slot the
-  whole time, same as any other non-terminal run. Cap>1 is an informed opt-in with
-  one accepted intra-user residual (Bash writes reaching outside a run's own
-  worktree) — the sibling push-credential read is now closed by the PRD #51 uid
-  split on the root-started compose path (a sibling run's agent is the `runner` uid;
-  the push git child is the `worker` uid; a #58 single-uid start does not split) —
-  documented at the knob in
+  worker may drive several of these state machines at once, capped by a worker-side
+  slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1, the serial behavior
+  above) that the worker advertises at registration but the server never enforces.
+  A run parked at `awaiting_approval` holds its slot. Cap>1 is an informed opt-in
+  with one accepted intra-user residual (Bash writes reaching outside a run's own
+  worktree); the sibling push-credential read is closed by the PRD #51 uid split on
+  the root-started compose path. See
   [docs/worker-setup.md](docs/worker-setup.md#concurrent-runs); the real fix for
-  the remaining one — container-per-run — belongs to the future k8s-operator
-  deployment (see Not yet in scope, below).
+  the remaining residual, container-per-run, belongs to the k8s-operator path (see
+  Not yet in scope, below).
 
 ### Secrets: who holds what
 
@@ -1213,30 +1081,37 @@ re-read-on-signal shape — no new server-pushed state. See
 
 ### Worker message-path contract (PRD #108)
 
-A worker is untrusted input on `/api/worker/runs/:id/messages` and `/state`, exactly as `sanitizeSelfReported` already assumes for the self-reported register fields above. Before this PRD, three byte patterns a worker can legitimately emit were ones Postgres refuses to store, and a rejection wedged the run: the store error fell through to a generic 500, and the worker's batcher treated any throw as retryable, re-posting the identical (and growing) batch forever — 27 minutes and 239 lost messages in the incident that motivated the fix. Full rationale and Decision Log: [prds/done/108-worker-retry-loop-autostop.md](prds/done/108-worker-retry-loop-autostop.md). This section is the contract, not a changelog.
+A worker is untrusted input on `/api/worker/runs/:id/messages` and `/state`, exactly as `sanitizeSelfReported` already assumes for the self-reported register fields above. The problem this closes: three byte patterns a worker can legitimately emit are ones Postgres refuses to store, and a rejection used to wedge the run (the store error fell through to a generic 500 and the batcher retried the identical, growing batch forever). Full rationale and Decision Log: [prds/done/108-worker-retry-loop-autostop.md](prds/done/108-worker-retry-loop-autostop.md). This section is the contract, not a changelog.
 
-**What is sanitized, and where.** `workersvc.AppendMessages` (`api/internal/workersvc/service.go`) is the authoritative choke point. It strips `\u0000`, unpaired UTF-16 surrogates (U+D800–U+DFFF), and raw invalid UTF-8 from the message `payload` with a JSON-aware, in-string-state scanner (`sanitizePayloadJSON`, `workersvc/sanitize.go`) — deliberately not a decode/walk/re-encode, which would silently corrupt large integers (`jsonb` stores numbers exactly; a Go float64 round-trip does not). It NUL-strips (only) the four sibling worker-controlled TEXT columns — `kind`, `agent`, `agent_instance`, `agent_label` — since `encoding/json` has already folded surrogates and bad UTF-8 to U+FFFD by the time those exist as Go strings. Each is also rune-capped (`kind` 64, `agent` = `agenttmpl.MaxNameLen`, `agent_instance` 128, `agent_label` 80 — hardcoded constants, not env, since they bound a per-frame-repeated attribution field rather than tune an operator knob) so an unbounded value cannot become an unbounded column or an unbounded log line. Every strip is counted and logged, never silent, so a NUL-emitting tool stays visible rather than laundered. Deliberately **not** stripped: `\n`, `\t`, ANSI escapes — legal in `jsonb`, load-bearing in tool output, and rendered by a React component that escapes them (a different rule than PRD #90's `sanitizeMemoryField`, whose sink is a terminal table printer). The worker (`agent/src/sanitize.ts`, wired into `batcher.ts`'s `emit()`) applies the identical treatment before anything leaves the box — defense in depth, explicitly not the mechanism, since only a worker already running the patched image benefits from it.
+**What is sanitized, and where.** `workersvc.AppendMessages` (`api/internal/workersvc/service.go`) is the authoritative choke point. It strips `\u0000`, unpaired UTF-16 surrogates (U+D800–U+DFFF), and raw invalid UTF-8 from the message `payload` with a JSON-aware, in-string-state scanner (`sanitizePayloadJSON`, `workersvc/sanitize.go`), deliberately not a decode/walk/re-encode (which would corrupt large integers, since `jsonb` stores numbers exactly and a Go float64 round-trip does not). It NUL-strips the four sibling worker-controlled TEXT columns (`kind`, `agent`, `agent_instance`, `agent_label`), which `encoding/json` has already folded to U+FFFD, and rune-caps each (`kind` 64, `agent` = `agenttmpl.MaxNameLen`, `agent_instance` 128, `agent_label` 80) so an unbounded value cannot become an unbounded column or log line. Every strip is counted and logged, never silent. Deliberately **not** stripped: `\n`, `\t`, ANSI escapes, which are legal in `jsonb`, load-bearing in tool output, and escaped by the React renderer (unlike PRD #90's `sanitizeMemoryField`, whose sink is a terminal table printer). The worker (`agent/src/sanitize.ts`, wired into `batcher.ts`'s `emit()`) applies the identical treatment before anything leaves the box, as defense in depth, not the mechanism.
 
-`/state`'s worker-reported text (`failure_reason`, plus `session_id`/`plan_md`/`branch`/`mr_web_url`) gets the same NUL-strip on the same authoritative choke point (`sanitizeFailureReason`/`stripNULParam`, `workersvc/service.go`) — but **silently**, unlike `/messages`' count-and-log: these fields are worker/forge/git-minted rather than free tool output, so a NUL there is already anomalous rather than expected untrusted content, and `failure_reason` additionally carries the breaker's own trip report (below), so a poisoned run must still be able to record that it failed.
+`/state`'s worker-reported text (`failure_reason`, plus `session_id`/`plan_md`/`branch`/`mr_web_url`) gets the same NUL-strip at the same choke point (`sanitizeFailureReason`/`stripNULParam`, `workersvc/service.go`) but **silently**, since these fields are worker/forge/git-minted rather than free tool output and `failure_reason` must still be able to record the breaker's own trip report.
 
-**What returns 400 vs 413 vs 500 — the retry contract.** The status code is what the client is obliged to believe, not a detail. `workersvc.ErrUnstorableMessage` maps to **400** for an enumerated, measured set of permanent Postgres SQLSTATEs — `22P05` (unsupported Unicode escape), `22P02` (invalid JSON text representation), `22021` (invalid byte sequence), and `22003` (numeric overflow: `{"n":1e1000000}` is legal JSON that sanitation cannot touch and `jsonb` cannot store). Classification is deliberately statement-level — only `InsertRunMessage`'s own error is eligible — so a `22P02` raised by the unrelated `foldRunUsage` fold is never misreported as "your batch is poisoned," which would drop messages that were never the problem. Everything else — connection loss, pool exhaustion, serialization failures, lock timeouts, statement cancellation, any non-`PgError` (notably a disconnecting client's `context.Canceled`), and `23503` (the run was deleted mid-batch: permanent, but not a payload fault) — stays on **500**, because a 500 must mean "try again"; misclassifying a transient failure as permanent is the mirror-image bug. **413** is separate and route-specific: `DecodeJSONLimited` (`api/internal/httpx/respond.go`) swaps the silently-truncating `io.LimitReader` for `http.MaxBytesReader` on this one route, so an oversize body is reported as oversize instead of folding into the same generic 400 a malformed batch gets — otherwise the worker has no way to learn "too large" from the server at all. 413 is a **split-and-retry** signal, never a poison verdict; the worker's own conservative byte cap keeps this a backstop it should rarely reach, and "no 413" is never proof of being under the cap (`MaxBytesReader` fires on the read, not the decoded value).
+**What returns 400 vs 413 vs 500 — the retry contract.** The status code is what the client is obliged to believe. Classification is statement-level (only `InsertRunMessage`'s own error is eligible), so a matching SQLSTATE raised by the unrelated `foldRunUsage` fold is never misreported as poison.
 
-**A second poison-pill class, closed the same way.** `run_usage`'s primary key `(run_id, session_id, model)` (`00062_run_usage.sql`) has both `session_id` and `model` worker-controlled and untouched by the payload sanitizer above (no escapes, no invalid bytes — just length). `foldRunUsage` caps both at 200 runes before the upsert, because an over-long value overflows a btree index entry (2704 bytes) and raises `54000`, which is outside the enumerated permanent set and would otherwise 500 into the same forever-retry wedge one sink over. Truncating (never rejecting) is safe because both are a grouping key, not content, and a collision between two over-long values is absorbed by the same idempotent `GREATEST` merge that makes at-least-once delivery converge.
+| response | meaning | trigger |
+|---|---|---|
+| **400** (`ErrUnstorableMessage`) | permanent poison: drop, do not retry | `22P05` unsupported Unicode escape, `22P02` invalid JSON text, `22021` invalid byte sequence, `22003` numeric overflow (`{"n":1e1000000}`, legal JSON `jsonb` cannot store) |
+| **500** | transient: try again | connection loss, pool exhaustion, serialization failure, lock timeout, statement cancellation, any non-`PgError` (a client's `context.Canceled`), `23503` (run deleted mid-batch: permanent but not a payload fault) |
+| **413** (route-specific) | oversize: split and retry | body past `http.MaxBytesReader`'s cap on this route (`DecodeJSONLimited`, `api/internal/httpx/respond.go`) |
 
-**How a batch is bounded, split, and bisected.** `agent/src/batcher.ts` caps a flush at `MAX_BATCH_BYTES` (512 KiB — a soft grouping target: the longest head prefix that fits) and tombstones any single message over `MAX_MESSAGE_BYTES` (900 KiB) at `emit()` time, before it ever reaches the flush state machine. A 413 splits the batch in half and **resets** the failure streak — a legitimate split is progress, not a repeat failure. A 400 with more than one message left triggers **bisection**: a one-sided search — post the left half; a failure narrows the search to it, a 2xx confirms the right half clean — isolates the single poisoned message in `ceil(log2 n)` posts (8 for the incident's n=239), backstopped at `MAX_BISECT_POSTS` (24). The isolated message is **tombstoned, not dropped**: it is re-posted under its original `seq` as a worker-minted `status` marker (`{"event":"message_dropped",...}`), because `web/src/lib/runStream.ts` requires seq contiguity and a genuine drop would freeze the live run view at the gap permanently — trading a client-side wedge for the server-side one this PRD removes. Only a *rejected* tombstone is a true, unrecoverable drop; it is idempotent (re-tombstoning a marker is a no-op) and carries the full attribution triple (`agent`/`agent_instance`/`agent_label`) so the loss renders in the subagent lane it happened in, not the top-level stream.
+413 is never a poison verdict, and "no 413" is not proof of being under the cap (`MaxBytesReader` fires on the read, not the decoded value).
 
-The breaker trips immediately on a fatal verdict (401/403/404 — every message would fail, so bisecting only burns budget proving it), on a rejected tombstone, or on an exhausted bisect budget. On an ordinary **transient** run it trips only after `TRANSIENT_TRIP_MS` (~10 minutes) of unbroken failure — a duration, deliberately not "N consecutive same-batch failures": once the 400/413 reclassification above is in place, a 5xx on this route means a genuine transient, so a tight count-based trip would fail healthy runs through an ordinary API restart. A trip's explanation is never emitted through the batcher itself — `concat` is order-preserving, so it would queue behind the very poison it's explaining, and a tripped batcher never flushes again — it is routed through each runner's `reportState` call instead, which carries its own bounded retries and 4xx-fatal semantics.
+**A second poison-pill class, closed the same way.** `run_usage`'s primary key `(run_id, session_id, model)` (`00062_run_usage.sql`) has both `session_id` and `model` worker-controlled. `foldRunUsage` caps both at 200 runes before the upsert, because an over-long value overflows a btree index entry (2704 bytes) and raises `54000`, outside the enumerated permanent set. Truncating (never rejecting) is safe because both are a grouping key, and a collision is absorbed by the idempotent `GREATEST` merge that makes at-least-once delivery converge.
 
-**The server-side half: detect the loop, then stop it (PRD #108 Phase 2).** Everything above protects a worker running the patched image. A fleet on an older image has none of it, so the authoritative detection and stop are server-side. **A detector that infers health from the message stream cannot detect a broken message stream** — PRD #47's `looping` reads its evidence from persisted `run_messages` (`toolWindow` → `ListRunToolWindow`), and this wedge *is* a failure to persist them, so that arm is blind by construction rather than by threshold. The signal that can see it is the API's own count of `AppendMessages` failures per run, produced on the failing path itself and needing no cooperation from the worker: `AppendMessages` and `detectRunHealth` are methods on the same `*Service` in the same process, so the failing writer writes `workersvc/persistfail.go`'s tracker directly and the sweeper reads it directly. The wedge cannot suppress it, because the wedge *is* the event being counted.
+**How a batch is bounded, split, and bisected.** `agent/src/batcher.ts` caps a flush at `MAX_BATCH_BYTES` (512 KiB, a soft grouping target) and tombstones any single message over `MAX_MESSAGE_BYTES` (900 KiB) at `emit()` time. A 413 splits the batch in half and **resets** the failure streak (a legitimate split is progress). A 400 with more than one message left triggers **bisection**, isolating the single poisoned message in `ceil(log2 n)` posts, backstopped at `MAX_BISECT_POSTS` (24). The isolated message is **tombstoned, not dropped**: it is re-posted under its original `seq` as a worker-minted `status` marker (`{"event":"message_dropped",...}`), because `web/src/lib/runStream.ts` requires seq contiguity and a real gap would freeze the live view. Only a *rejected* tombstone is a true drop; it is idempotent and carries the full attribution triple (`agent`/`agent_instance`/`agent_label`) so the loss renders in the subagent lane it happened in.
 
-- **The counter's boundary is the ownership gate, and that is the whole of its safety.** Every recorded failure is reached only after `runOwnedByWorker` has succeeded, at exactly three non-test sites: `AppendMessages`' recorder (which requires a resolved run), `NoteOversizeBatch` (which re-checks ownership itself, because the 413 is answered *before* any ownership check runs), and nothing else. That gate — not the entry cap, which is defense in depth — is what bounds the map's key space to runs really claimed by the caller's own workers, and what stops a worker driving a streak against somebody else's run. A fourth recording hook added without it would be a cross-tenant kill primitive.
-- **The flag is early warning and rides the health toggle; the stop does not.** At a low threshold (5 failures over 10s) the run reads `looping` with a reason naming the mechanism — *"the agent's updates can't be saved, so it keeps resending them"* — instead of falling through to `slow` at 45 minutes, which is what the incident actually reported. That arm is checked **first, above all three existing ones** — the resulting priority is persist-looping > tool-looping > stalled > slow. Above the tool-window arm because both map to the same enum and the persistence cause is the more specific truth on a run doing both; above `stalled` as a consequence, and that consequence is **user-visible**: a wedged run whose last persisted message is a *completed* `tool_result` used to read `stalled` and now reads `looping`, with a different Slack head and a different reason. It is not a purely additive arm, and describing it as one was wrong — an arm that returns first necessarily pre-empts the ones below it. The **stop** is a separate sweep step with its own operator switch (`UZI_AUTOSTOP_ENABLED`, env, default on), deliberately not `health_enabled` — an admin disabling health must not silently disable loop protection — and deliberately not a settings key, since an automatic destructive behaviour should not depend for its off switch on the database it might be misbehaving against.
-- **The conjunction is the design, and it is deliberately not summarised as a count** (a tally cannot detect its own referent disappearing — see `00082`). Every member lives in `autoStopWedgedRuns`/`evaluateAutoStop`: the operator kill switch, ≥20 consecutive failures, sustained ≥60s, the run's `runs.last_seq` not advancing, the same failure class throughout, that class being one **a correct pre-0.10.1 worker could have hit through no fault of its own**, and **other runs succeeding on this same instance** inside the window. The last is the outage-vs-poison discriminator and the entire safety argument: if the API is broken, *every* run's writes fail and killing them turns an outage into data loss. When the comparison set is empty the rule is **flag and do not kill, permanently** — no fallback, no timeout into killing. The class guard is the one that is easy to get wrong: `unstorable` and `oversize` may kill (a browser's NUL bytes and a batch grown past 1 MiB are both things the world does to a correct old worker), while `invalid` and `store` may not — a malformed batch means the worker *build* is broken, and a 500 means retry, which is the contract the 400/413 split above exists to make honest. The no-progress and same-class guards are implemented as streak *resets* rather than as predicates at decision time, so reaching the threshold **is** the proof that neither changed.
-- **A streak is evidence about one running attempt.** It is evicted when the run is observed terminal, when the run leaves `running`, and — load-bearing — whenever the sweeper hands the run back to the queue. Without that last one a requeued run returns under a fresh worker still carrying the dead attempt's streak and is stopped before the new worker persists a byte, which is likely rather than exotic for this population: a pre-0.10.1 worker wedged at 2 Hz with a growing batch is a prime OOM candidate, and OOM is what puts it there. The sweeper gives that window 15 seconds against the 5 minutes `defaultClaimGrace` budgets for claimed→started, and a fresh container from a *new image* takes `ensureClone`'s cold `cloneBare` path, so the gap spans an entire clone.
-- **Two stop halves, one wire format.** With a live poller the server enqueues a synthetic verdict through `CreateStopVerdictInput` — and it rides `kind='cancel'`, not a new kind, because `SteeringChannel.route`'s `default:` arm **logs and drops** an unrecognised kind while `/inputs` is consume-on-read, making the drop permanent and unacknowledgeable. A new kind would therefore be a silent no-op on exactly the older fleet this exists to protect. Version skew is impossible by construction: the only thing on the wire is a cancel every worker version has always understood. With no live poller (or if a live worker ignores the cancel for 60s) the server takes the terminal transition itself via `FailRunAutoStop`, status-scoped so a run that finished in between is a no-op, and firing the same `publishSwept` + judge-enqueue side effects every other server-side `failed` path fires.
-- **`stop_kind = 'auto_stopped'` is the contract; `failure_reason` is decoration and must never be parsed.** On the live half the worker reports its own terminal state, and `SetRunFailed` overwrites `failure_reason` unconditionally with `"run cancelled"` — so the two halves genuinely carry different strings and only `stop_kind` survives both. Migration `00082` widens the `runs_stop_kind_check` domain (constraint name measured, not assumed). Consumers must not fold the third value in with the two human ones: `web/src/lib/runBadge.ts`'s `isStoppedRun` enumerates the human kinds rather than null-testing, because a deliberate stop is not breakage and an auto-stop is, and `uzi run get` prints a `STOP_KIND` row for the same reason.
-- **This is the fourth reason `api` is a hard singleton, and the one that fails silently.** The streak counters and the "other runs are succeeding" comparison set are in-process. Split across replicas, neither pod's streak reaches the threshold and each pod's comparison set is a fraction of reality, so auto-stop simply stops firing rather than misfiring — a guard that quietly disarms looks exactly like a healthy fleet. `deploy/chart/values.yaml`'s `api.replicaCount` comment says so at the place someone would change it.
-- **Honest scope, which review must not oversell: this would not have fired on the incident that motivated it.** There was one active run, so there was no comparison set, so the rule degrades to flag-and-notify permanently — the correct behaviour on insufficient evidence, and tested as such rather than as a limitation. On a single-active-run deployment the *flag* is the value and the kill is insurance for multi-run instances and for pre-0.10.1 workers. There is also no metrics surface in `api` (no `promhttp`, no `/metrics`, no dependency), so the structured log lines named in [docs/run-auto-stopped.md](docs/run-auto-stopped.md) are the operator's interface, not a dashboard — and because every terminal path clears run health per PRD #47's exit contract, an auto-stopped run carries no flag afterwards, making those lines and that page the only durable record of why.
+The breaker trips immediately on a fatal verdict (401/403/404), a rejected tombstone, or an exhausted bisect budget, and on a transient run only after `TRANSIENT_TRIP_MS` (~10 minutes) of unbroken failure (a duration, not a count, so an ordinary API restart does not fail a healthy run). A trip's explanation routes through each runner's `reportState` call, not the batcher itself (a tripped batcher never flushes again).
+
+**The server-side half: detect the loop, then stop it (PRD #108 Phase 2).** A fleet on an older image has none of the above, so the authoritative detection and stop are server-side. A detector that infers health from the message stream cannot detect a broken message stream (PRD #47's `looping` reads persisted `run_messages`, and this wedge *is* a failure to persist them). The signal that can see it is the API's own count of `AppendMessages` failures per run: `AppendMessages` and `detectRunHealth` are methods on the same `*Service`, so the failing writer writes `workersvc/persistfail.go`'s tracker and the sweeper reads it, and the wedge cannot suppress the event it is counting.
+
+- **The counter's boundary is the ownership gate.** Every recorded failure is reached only after `runOwnedByWorker` succeeds, at three non-test sites (`AppendMessages`' recorder, `NoteOversizeBatch` which re-checks ownership itself because the 413 is answered before any ownership check, and nothing else), so the map's key space is bounded to runs the caller's own workers really claimed and a worker cannot drive a streak against another user's run.
+- **The flag rides the health toggle; the stop does not.** At a low threshold (5 failures over 10s) the run reads `looping` with a reason naming the mechanism, checked **first** so the priority is persist-looping > tool-looping > stalled > slow. The **stop** is a separate sweep step with its own switch (`UZI_AUTOSTOP_ENABLED`, env, default on), deliberately not `health_enabled` (an admin disabling health must not disable loop protection) and deliberately not a settings key (the off switch must not depend on the database it might be misbehaving against).
+- **The kill is a conjunction, never a count** (a tally cannot detect its own referent disappearing; see `00082`). `autoStopWedgedRuns`/`evaluateAutoStop` requires all of: the operator switch, ≥20 consecutive failures, sustained ≥60s, `runs.last_seq` not advancing, one failure class throughout, that class being one a correct pre-0.10.1 worker could have hit (`unstorable`/`oversize` may kill; `invalid`/`store` may not, since those mean a broken worker build or a retryable 500), and **other runs succeeding on this instance** in the window. That last is the outage-vs-poison discriminator: an empty comparison set is **flag and do not kill, permanently**. The no-progress and same-class guards are streak *resets*, so reaching the threshold is itself the proof neither changed.
+- **A streak is evidence about one running attempt.** It is evicted when the run is observed terminal, leaves `running`, or is handed back to the queue (the last is load-bearing: without it a requeued run inherits the dead attempt's streak and is stopped before the new worker persists a byte).
+- **Two stop halves, one wire format.** With a live poller the server enqueues a synthetic verdict through `CreateStopVerdictInput` riding `kind='cancel'` (not a new kind, which `SteeringChannel.route`'s `default:` arm would silently drop on the older fleet this protects). With no live poller (or a worker ignoring the cancel for 60s) the server takes the terminal transition itself via `FailRunAutoStop`, status-scoped, firing the same `publishSwept` + judge-enqueue side effects as any server-side `failed`.
+- **`stop_kind = 'auto_stopped'` is the contract; `failure_reason` is decoration and must never be parsed** (the live half's `SetRunFailed` overwrites it with `"run cancelled"`, so only `stop_kind` survives both halves). Migration `00082` widens `runs_stop_kind_check`. Consumers must not fold the third value in with the two human ones: `web/src/lib/runBadge.ts`'s `isStoppedRun` enumerates the human kinds rather than null-testing, and `uzi run get` prints a `STOP_KIND` row.
+- **This is the fourth reason `api` is a hard singleton, and the one that fails silently.** The streak counters and the comparison set are in-process; split across replicas, auto-stop simply stops firing rather than misfiring, and a guard that quietly disarms looks like a healthy fleet. `deploy/chart/values.yaml`'s `api.replicaCount` comment says so. On a single-active-run deployment the *flag* is the value and the kill is insurance for multi-run instances and pre-0.10.1 workers; the operator interface is the structured log lines in [docs/run-auto-stopped.md](docs/run-auto-stopped.md) (there is no `/metrics` in `api`, and every terminal path clears run health, so those lines are the only durable record of why).
 
 ### Incidental findings (PRD #333)
 
