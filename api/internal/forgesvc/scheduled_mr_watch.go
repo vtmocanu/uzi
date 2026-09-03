@@ -19,6 +19,14 @@ import (
 // cancelReworkOnClosedMR (issue #853 contract, reused verbatim). Reads the run set from
 // ListScheduledMRStateWatchCandidates, which self-evicts a run once its mr_state is terminal.
 //
+// SCOPE BOUNDARY (PRD #908 design, "self-bounding like Lane B"): closed AND merged are
+// terminal for this lane — the candidate query drops a run at mr_state='closed', so a
+// scheduled MR that a reviewer closes then REOPENS is not re-watched and does not regain
+// mr_rework eligibility. That is deliberate: unlike the issue lane's board-coupled Lane A
+// (which keeps watching a closed-issue run for the reopen edge), a board-free recorder that
+// kept polling closed MRs forever would reintroduce the unbounded-growth cost the design
+// rejected. There is therefore no closed->opened arm below (unlike syncOneMRState).
+//
 // Like SyncMRStates it never returns a per-candidate error (log-and-skip); only a failure
 // to enumerate candidates surfaces to the poller.
 func (s *Service) SyncScheduledMRStates(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) error {
@@ -72,9 +80,6 @@ func (s *Service) recordScheduledMRState(ctx context.Context, repoID uuid.UUID, 
 			slog.Warn("forgesvc: cancel scheduled rework on MR close failed, will retry", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "error", err)
 			return
 		}
-		s.recordMRState(ctx, c.ID, observed)
-	case stored == forge.MRStateClosed && observed == forge.MRStateOpened:
-		// reopen-edge: no card to restore; just record so the rework gate reopens.
 		s.recordMRState(ctx, c.ID, observed)
 	default:
 		// KNOWN non-edge transition (merged / locked). A merge means the branch is gone ->

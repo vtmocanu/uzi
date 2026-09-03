@@ -306,8 +306,10 @@ type ListMRReworkCandidatesRow struct {
 //     ('issue','prompt','self_improve') (PRD #908 widened this from issue-only —
 //     chat/judge still out of scope). For the scheduled lanes runs.mr_state is made
 //     reliable by forgesvc.SyncScheduledMRStates (PRD #908 M3); prompt runs are
-//     issue-less and self_improve shares one tracking issue, so the board-coupled
-//     ListMRWatchCandidates never watched them. DISTINCT ON (r.branch) picks the
+//     issue-less (so the board-coupled ListMRWatchCandidates, which JOINs issues,
+//     never watched them) and self_improve shares one tracking issue (so that watcher
+//     recorded mr_state only for the newest cycle via DISTINCT ON (issue_iid) — and
+//     only when the tracking issue is cached). DISTINCT ON (r.branch) picks the
 //     NEWEST such run per branch (mirroring ListCIAutofixCandidateRefs).
 //  2. The run is completed and carries an mr_iid, and the WATCHER-OWNED mr_state is
 //     'opened' (Decision 10 — gate on runs.mr_state, which SyncMRStates set FIRST
