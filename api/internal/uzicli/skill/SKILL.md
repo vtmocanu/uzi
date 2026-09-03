@@ -166,6 +166,9 @@ uzi schedule get <schedule-id>
 uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
+uzi schedule pause-all --until <when>
+uzi schedule resume-all
+uzi schedule pause-status
 uzi schedule run-now <schedule-id>
 uzi schedule delete <schedule-id>
 uzi schedule catalog list
@@ -600,6 +603,23 @@ nothing a manual start cannot.
   for that).
 - `uzi schedule pause <schedule-id>` / `uzi schedule resume <schedule-id>` — stop or
   restart firing without deleting (a `PATCH` of just `enabled`).
+- `uzi schedule pause-all --until <when>` — the user-level **kill switch**: pause EVERY
+  schedule you own, on every repo (default jobs and your own alike), until `<when>`.
+  Per-schedule on/off switches are left untouched, so `resume-all` restores the prior set;
+  `run-now` still fires while paused and runs already in flight are not stopped. `--until`
+  is **required** (a bare `pause-all` never silently means forever) and accepts an RFC3339
+  time, a Go duration (`24h`, `12h30m`), `tomorrow[ HH:MM]`, a weekday name `[ HH:MM]`
+  (default `09:00`, the next occurrence strictly after now), or `never` (pause until you
+  resume). Relative forms are resolved in your **local timezone** and sent as an absolute
+  time. `--json` emits the pause state (`paused`, `until`).
+- `uzi schedule resume-all` — lift a `pause-all`, restoring every schedule to its own prior
+  on/off state. Idempotent (resuming when not paused is a clean no-op). `--json` emits the
+  state.
+- `uzi schedule pause-status` — show whether all your schedules are paused, and until when
+  (`paused until <stamp>`, `paused indefinitely`, or `not paused`). An expired `until` reads
+  as `not paused` (auto-resumed, no background job). `--json` emits the state. While a
+  pause-all is active, `uzi schedule list`'s `NEXT` column reads `paused (all) until <stamp>`
+  (or `paused (all)`) for every row.
 - `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence.
   Prints a per-candidate breakdown: a `Started N run(s)` header with the created run
   id(s), one line per started run, then — when candidates were skipped — a

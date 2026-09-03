@@ -1,6 +1,8 @@
 package uzicli
 
 import (
+	"time"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
@@ -290,6 +292,19 @@ type FakeClient struct {
 	LastAddRepoSchedID string
 	LastAddRepoRepoID  string
 	AddRepoErr         error
+
+	// User-level pause-all (PRD #1093 M3). PauseState is the canned SchedulePauseDTO the
+	// getters (GetSchedulePause) and the writers (SetSchedulePause/ClearSchedulePause)
+	// return, mirroring the server-normalized state. The captures record what each write
+	// sent: LastPauseUntil keeps the POINTER SetSchedulePause forwarded so a test can tell
+	// nil (indefinite "until I resume") from a non-nil absolute instant — the exact
+	// distinction `pause-all --until never` vs `--until 24h` carries; LastPauseSet records
+	// that a pause write happened at all (so a nil LastPauseUntil is unambiguous), and
+	// PauseCleared records that resume-all reached ClearSchedulePause.
+	PauseState     apitypes.SchedulePauseDTO
+	LastPauseUntil *time.Time
+	LastPauseSet   bool
+	PauseCleared   bool
 
 	// Sweep-label guardrail (PRD #589 M4). MissingLabels is the canned CheckRepoLabels
 	// reply (the labels reported absent). CheckLabelsCalls / EnsureLabelsCalls record EACH

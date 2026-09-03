@@ -46,6 +46,9 @@ func newScheduleCmd(env Env, gf *globalFlags) *cobra.Command {
 		newScheduleEditCmd(env, gf),
 		newSchedulePauseCmd(env, gf),
 		newScheduleResumeCmd(env, gf),
+		newSchedulePauseAllCmd(env, gf),
+		newScheduleResumeAllCmd(env, gf),
+		newSchedulePauseStatusCmd(env, gf),
 		newScheduleRunNowCmd(env, gf),
 		newScheduleDeleteCmd(env, gf),
 		newScheduleCatalogCmd(env, gf),
@@ -289,8 +292,20 @@ func newScheduleListCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
+				// list --json stays a BARE array of ScheduleDTO (unchanged): only the
+				// human table reflects the user-wide pause, so the pause state is fetched
+				// only below, in the table branch.
 				return p.JSON(scheds)
 			}
+			// Fetch the user-level pause-all state once (PRD #1093 Solution 5). While it
+			// is active, every row's NEXT reads "paused (all) …" regardless of the row's
+			// own next fire; an expired until is server-normalized to not-paused, so the
+			// normal next fire renders with no client-side special-casing.
+			pause, err := c.GetSchedulePause(cmd.Context())
+			if err != nil {
+				return err
+			}
+			now := time.Now()
 			rows := make([][]string, 0, len(scheds))
 			for _, s := range scheds {
 				rows = append(rows, []string{
@@ -298,7 +313,7 @@ func newScheduleListCmd(env Env, gf *globalFlags) *cobra.Command {
 					scheduleTarget(s),
 					strOr(&s.RepoPath, "-"),
 					scheduleWhen(s),
-					scheduleNext(s, time.Now()),
+					scheduleNextCell(s, now, pause),
 					scheduleOn(s),
 				})
 			}
@@ -429,6 +444,157 @@ func newScheduleResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			return setScheduleEnabled(env, gf, cmd, args[0], true)
 		},
 	}
+}
+
+// newSchedulePauseAllCmd — `uzi schedule pause-all --until <when>` (PRD #1093 M3): the
+// user-level kill switch that pauses EVERY schedule the caller owns, on every repo,
+// with an auto-resume instant. Named pause-all (not pause) to avoid clashing with the
+// per-row `pause <id>` verb. --until is REQUIRED so a bare pause-all can never silently
+// mean forever; its relative forms are resolved client-side in the local timezone (D8)
+// and sent as an absolute instant, while `never` sends until=null (indefinite).
+func newSchedulePauseAllCmd(env Env, gf *globalFlags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "pause-all --until <when>",
+		Short: "Pause every schedule you own until a time (or until you resume)",
+		Long: "Pause every schedule you own, on every repo — default jobs and your own alike —\n" +
+			"until --until. Per-schedule on/off switches are left exactly as they are, so resuming\n" +
+			"restores the prior set. Run-now still fires while paused; runs already in flight are\n" +
+			"not stopped. --until accepts an RFC3339 time, a Go duration (24h, 12h30m), " +
+			"`tomorrow[ HH:MM]`,\na weekday name `[ HH:MM]` (default 09:00, next occurrence), or `never` " +
+			"(pause until you\nresume). Relative forms are resolved in your local timezone.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			when, _ := cmd.Flags().GetString("until")
+			at, indefinite, err := resolveUntil(when, time.Now(), time.Local)
+			if err != nil {
+				return uzicli.Exitf(uzicli.ExitUsage, "invalid --until: %v", err)
+			}
+			var untilPtr *time.Time
+			if !indefinite {
+				untilPtr = &at
+			}
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			state, err := c.SetSchedulePause(cmd.Context(), untilPtr)
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(state)
+			}
+			if !gf.quiet {
+				p.Printf("%s Run-now still works; resume early with `uzi schedule resume-all`.\n",
+					pausedSentence(state, time.Now()))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().String("until", "", "when to auto-resume: an RFC3339 time, a duration (24h), tomorrow[ HH:MM], a weekday[ HH:MM] (default 09:00), or never (required)")
+	_ = cmd.MarkFlagRequired("until")
+	return cmd
+}
+
+// newScheduleResumeAllCmd — `uzi schedule resume-all` (PRD #1093 M3): lift the
+// user-level pause, restoring every schedule to its own prior on/off state. Idempotent
+// (resuming when not paused is a clean no-op).
+func newScheduleResumeAllCmd(env Env, gf *globalFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "resume-all",
+		Short: "Resume all your schedules (lift a pause-all)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			state, err := c.ClearSchedulePause(cmd.Context())
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(state)
+			}
+			if !gf.quiet {
+				p.Printf("All schedules resumed.\n")
+			}
+			return nil
+		},
+	}
+}
+
+// newSchedulePauseStatusCmd — `uzi schedule pause-status` (PRD #1093 M3): read the
+// user-level pause state. The server normalizes an expired until to not-paused, so this
+// renders "not paused" for it with no client-side expiry check.
+func newSchedulePauseStatusCmd(env Env, gf *globalFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "pause-status",
+		Short: "Show whether all your schedules are paused, and until when",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			state, err := c.GetSchedulePause(cmd.Context())
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(state)
+			}
+			if !gf.quiet {
+				p.Printf("%s\n", pauseStatusLine(state, time.Now()))
+			}
+			return nil
+		},
+	}
+}
+
+// pausedSentence is the leading clause of `pause-all`'s confirmation: "All schedules
+// paused until <stamp> (in Xh)." or "All schedules paused indefinitely." It reads the
+// SERVER-returned (normalized) state so the confirmed instant matches what was stored.
+func pausedSentence(state apitypes.SchedulePauseDTO, now time.Time) string {
+	if state.Until == nil {
+		return "All schedules paused indefinitely."
+	}
+	return fmt.Sprintf("All schedules paused until %s (in %s).", fmtStamp(*state.Until), fmtUntil(state.Until.Sub(now)))
+}
+
+// pauseStatusLine renders `pause-status`: "paused until <stamp> (in Xh)", "paused
+// indefinitely", or "not paused", off the normalized state.
+func pauseStatusLine(state apitypes.SchedulePauseDTO, now time.Time) string {
+	if !state.Paused {
+		return "not paused"
+	}
+	if state.Until == nil {
+		return "paused indefinitely"
+	}
+	return fmt.Sprintf("paused until %s (in %s)", fmtStamp(*state.Until), fmtUntil(state.Until.Sub(now)))
+}
+
+// scheduleNextCell renders a list row's NEXT while honoring the user-wide pause: when
+// pause-all is active every row reads "paused (all) until <stamp>" (or "paused (all)"
+// for an indefinite pause), regardless of the row's own next fire. Not paused (incl. an
+// expired, server-normalized until) falls back to the ordinary next-fire cell.
+func scheduleNextCell(s apitypes.ScheduleDTO, now time.Time, pause apitypes.SchedulePauseDTO) string {
+	if pause.Paused {
+		if pause.Until != nil {
+			return "paused (all) until " + fmtStamp(*pause.Until)
+		}
+		return "paused (all)"
+	}
+	return scheduleNext(s, now)
+}
+
+// fmtStamp renders an absolute pause instant in the caller's local zone, minute
+// precision with the zone abbreviation, e.g. "2026-09-04 09:00 EDT".
+func fmtStamp(t time.Time) string {
+	return t.Local().Format("2006-01-02 15:04 MST")
 }
 
 // setScheduleEnabled backs pause/resume: a PATCH carrying only {enabled}. --json dumps
