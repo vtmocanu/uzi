@@ -688,7 +688,7 @@ chain in the diagram above, with no intervening `running`.
   is unaffected. See [docs/capability-scheduling.md](docs/capability-scheduling.md).
 - **Ephemeral, run-bound hosted workers** (PRD #529, second trigger PRD #747): on
   an unmet capability with zero eligible workers, or (debounced) a saturated fleet,
-  an opted-in owner gets ONE auto-provisioned hosted worker
+  an opted-in owner gets ONE auto-provisioned hosted worker, and only while the admin instance kill-switch (`EphemeralWorkersEnabled`) is on
   (`api/internal/hostedsvc/ephemeral.go`) bound to that run via two `workers`
   columns (`ephemeral`, `ephemeral_run_id`, migration `00155`), restricted to claim
   only its bound run and torn down by dropping the row (busy-guarded,
