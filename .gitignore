@@ -38,6 +38,9 @@ api/uzi
 # tracked (4757 blobs) until the public-migration hygiene pass removed it.
 .golangci-cache/
 
+# Local gate-run logs (the "run a gate once, to a log" convention: mktemp ./gate-log.XXXXXX)
+gate-log.*
+
 # Editor / OS
 .DS_Store
 *.swp
