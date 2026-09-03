@@ -39,7 +39,7 @@ go install github.com/go-task/task/v3/cmd/task@v3.51.1   # pinned, sumdb-verifie
 
 - Version-matched to CI. `brew install go-task` works but is unpinned and drifts from CI.
 - `task` does **not** go in `devbox.json`: that is tier-2 *worker* config whose `packages` array is provisioned into opted-in runs (`agent/src/repo-tools.ts`), not a contributor environment.
-- `go install` builds from source, so the binary is not byte-identical to the release tarball CI's `.task_setup` sha256-verifies. Matching `task --version` is the equivalence check, as for `sqlc@v1.30.0`.
+- `go install` builds from source, so the binary is not byte-identical to the release tarball CI's `.task_setup` sha256-verifies. Matching `task --version` is the equivalence check, as for `sqlc@v1.31.1`.
 
 ### Gate targets
 
@@ -158,7 +158,7 @@ The map stops at the run lane. The rest, one line each, with `ARCHITECTURE.md`'s
 - **Judge** (`agent/src/judge-runner.ts`, `api/internal/handler/judge*.go`, `docs/judge.md`): a retrospective LLM pass over each finished run's trace, on its own claim lane and the user's own Anthropic token, producing a verdict plus structured recommendations. Advice only: it never writes code. Off by default, gated twice (admin globally, then per user).
 - **Self-improvement** (`self_improve` [default scheduled job](docs/scheduling.md#default-jobs), built on the schedule catalog `api/internal/schedsvc` + `api/internal/schedtmpl`): any user can enable it on a repo they own, off by default, no admin gate. Each cycle opens or extends one MR on the target repo. `main` untouched, human merges.
 - **Per-user vault** (`api/internal/vault`): a Bitwarden-style key hierarchy over `secretbox` for personal secrets. Read `docs/vault-threat-model.md` before touching anything in there.
-- **OIDC** (`api/internal/oidc`, `docs/oidc.md`): optional SSO alongside password auth. The `oidc` / `oidc-degraded` / `sso-only` mock scenarios in `.claude/rules/web.md` are the only way to see its UX without an IdP.
+- **OIDC** (`api/internal/oidc`, `docs/oidc.md`): optional SSO alongside password auth. The `oidc` / `oidc-degraded` / `sso-only` mock scenarios (named in `docs/dev-conventions.md#the-mockdemo-build`; mock mode itself is in `.claude/rules/web.md`) are the only way to see its UX without an IdP.
 
 ## Conventions
 
