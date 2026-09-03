@@ -610,65 +610,35 @@ chain in the diagram above, with no intervening `running`.
   terminal-status check); losing either loses the transcript. See
   [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md) and
   `prds/done/35-run-limit-retry.md`.
-  **Only committed history survives a park by itself.** PRD #759 closes the gap
-  for uncommitted mid-milestone edits: on park the runner auto-commits them to a
-  throwaway `wip(park):` commit (runner uid, before the tree is wiped) so the
-  existing fetch-back and the [PRD #628](prds/done/628-cross-worker-resume-durability.md)
-  checkpoint broker carry it off the worker; on adopt the reseed peels a
-  `wip(park):` tip back to *uncommitted* so the marker never enters history or the
-  MR. Recovery is **exact** for a same-worker resume and **best-effort** for a
-  cross-worker one (a clean `cherry-pick --no-commit` of the WIP tree recovers it;
-  a diverged tree fails safely to the fallback floor rather than forcing it).
-  `WORKER_AFFINITY_CEILING` bounds how long a promoted, still-queued run stays
-  pinned to an alive-but-busy original worker before a peer may steal it, which is
-  what makes same-worker the common case. A resumed run whose plan is provably
-  reviewed (`plan_source` provenance) and whose work recovered continues
-  implementing without re-gating; a human-approved run re-gates only on a TOTAL
-  loss, preserving [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection
-  property. See [adr/0759-protect-run-work-usage-limit-park.md](adr/0759-protect-run-work-usage-limit-park.md)
-  for the full Decision Log.
+  **Only committed history survives a park by itself**; PRD #759 additionally
+  captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
+  the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
+  carries off the worker and adoption peels back to uncommitted (exact recovery
+  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`). A
+  resumed run whose plan is provably reviewed and whose work recovered continues
+  without re-gating; a total loss re-gates a human-approved run, preserving
+  [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection property. See
+  [adr/0759-protect-run-work-usage-limit-park.md](adr/0759-protect-run-work-usage-limit-park.md).
 
-- **Affinity holds through a worker roll, and the forge-checkpoint net behind it
-  is reliable and observable ([PRD #1030](prds/done/1030-worker-resume-durability.md)).**
-  `ClaimRun` used to fall open the instant a parked run's owner started draining
-  (a routine image roll included), so a park landing mid-roll cold-restarted on a
-  peer with no clone even though the owner's worker row and PVC survive a roll. The
-  fix distinguishes **roll** from **teardown** with no new column: a roll sets
-  `draining_since` but keeps the worker row, while a teardown deletes the row
-  API-side before the controller's kube teardown, so `teardown ⟺ row absent`.
-  `ClaimRun` now holds the pin while the owner's row exists and is either draining
-  or heartbeat-fresh, and falls open only when the row is gone (teardown) or
-  heartbeat-stale with no drain (death/hang), bounded by `WORKER_AFFINITY_CEILING`.
-  A `@claimant_draining` claim parameter scopes a draining worker's claim to its
-  own promoted run (preserving PRD #422 D7). Independently, `pushbroker.Publish`
-  (`api/internal/pushbroker/pushbroker.go`) no longer fails `object not found` when
-  a checkpoint publishes after `main` advanced past the worker's clone base: it
-  forwards the worker's already-built pack through a manual `git-receive-pack`
-  session with `Command.Old` bound to the fetched checkpoint tip as a server-side,
-  never-forced compare-and-swap. Publish failures and skips now surface on the run
-  feed with `run_id`/`worker_id`/`reason` in the api log, a graceful shutdown
-  publishes a final checkpoint within the k8s termination grace, and every terminal
-  transition best-effort deletes the run's `refs/uzi-checkpoints/<branch>` so a
-  stale ref cannot block a later run on the same issue. See
-  [ADR-628](adr/0628-cross-worker-resume-durability.md)'s PRD #1030 amendment for
-  the discriminator and the pushbroker mechanism in full.
+- **Affinity holds through a worker roll** ([PRD #1030](prds/done/1030-worker-resume-durability.md)).
+  The fix distinguishes a **roll** (sets `draining_since`, keeps the worker row)
+  from a **teardown** (deletes the row API-side), so `teardown ⟺ row absent` and
+  `ClaimRun` holds the affinity pin through a roll, falling open only on teardown or
+  heartbeat-staleness (bounded by `WORKER_AFFINITY_CEILING`). Independently, the
+  forge-checkpoint `pushbroker.Publish` no longer fails when `main` advanced past
+  the clone base (a server-side compare-and-swap on the fetched checkpoint tip),
+  publish outcomes now surface on the run feed, and every terminal transition
+  deletes the run's `refs/uzi-checkpoints/<branch>`. See
+  [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
 
-- **The checkpoint net survives a branch behind `main` on `.github/workflows`
+- **The checkpoint net survives a branch behind `main` on `.github/workflows`**
   ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), completing
-  #1030's residuals).** M1 (#1059) unified checkpoint adoption on the owner anchor
-  and M3 (#1037) extended checkpointing to `self_improve` runs; M2 (#1036) closes
-  the case where the broker PAT (lacking `workflow` scope) had every checkpoint on
-  a behind-on-workflows GitHub branch rejected `skipped:"workflow_scope"`. The
-  worker synthesizes a `ckpt(overlay):` wrapper commit (the real tip's tree with
-  `.github/workflows` swapped to the current default's, built in a throwaway index)
-  and declares it the checkpoint tip; its workflow tree byte-matches the default so
-  the [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as an ordinary
-  fast-forward, and adoption peels it back to the real tip so the branch never
-  carries the swapped tree. GitHub-only; the mid-run sibling of ADR-456's finalize
-  `workflow-subtree` overlay. See
-  [ADR-1036](adr/1036-checkpoint-workflow-overlay.md) for the transport-wrapper
-  contract, including the base-first parent ordering and the REAP-BEFORE-GIT
-  confinement.
+  #1030's residuals; M1 #1059 unified adoption, M3 #1037 covered `self_improve`).
+  Because the broker PAT lacks `workflow` scope, the worker checkpoints a
+  `ckpt(overlay):` wrapper whose `.github/workflows` tree byte-matches the current
+  default, so the [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as a
+  fast-forward and adoption peels it back to the real tip. GitHub-only. See
+  [ADR-1036](adr/1036-checkpoint-workflow-overlay.md).
 
 - **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
   oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),
@@ -716,38 +686,17 @@ chain in the diagram above, with no intervening `running`.
   mismatched run degrades to the pre-#84 mid-run failure) while the pre-existing
   docker-worker→repo-allowlist enforcement (PRD #83/#89, `docker_repo_allowlist`)
   is unaffected. See [docs/capability-scheduling.md](docs/capability-scheduling.md).
-- **Ephemeral, run-bound hosted workers on an unmet capability OR a saturated
-  fleet (PRD #529, second trigger PRD #747).** When the reason above fires with
-  zero online workers satisfying the run's capabilities and the owner has opted in
-  (`users.ephemeral_workers_enabled`, with the admin instance kill-switch on), a
-  background api pass (`api/internal/hostedsvc/ephemeral.go`) auto-provisions ONE
-  hosted worker bound to that run: `kind='hosted'`, `ephemeral=true`,
-  `ephemeral_run_id=<run>` (two columns added to `workers` by migration
-  `00155_ephemeral_workers.sql`, not a new table, so the controller's
-  poll/reconcile/teardown [below](#worker-controller-k8s-only) are unchanged and
-  dropping the row **is** the teardown primitive). Provisioning is advisory-locked
-  per user, made one-per-run by a partial `UNIQUE (ephemeral_run_id) WHERE
-  ephemeral` index, and under a concurrent cap (`UZI_EPHEMERAL_MAX_PER_USER`)
-  separate from the standing hosted quota. `fn_worker_can_claim`/`ClaimRun`
-  restrict such a worker to claim **only** its bound run, on both the run and chat
-  lanes. On the run's terminal transition the api drops the row (busy-guarded so a
-  still-working pod is never SIGTERMed), and an unconditional GC reaper backstops
-  teardown for a terminal/absent owning run, a provision that never reached
-  `online`, or a worker left idle when a genuinely-eligible sibling claimed the run
-  first. Each ephemeral worker's fresh per-worker `-nix`/`-data` PVCs structurally
-  close the cross-run executable-persistence residual
-  [ADR-91](adr/0091-runner-cross-run-persistence-residual.md) records. The
-  **second trigger** (PRD #747) reuses this machinery for a run that is
-  capability-*placeable* but slot-*blocked* (every capability-matching worker
-  pinned at `max_concurrent_runs`); unlike the capability-gap path it is
-  **debounced** on `UZI_EPHEMERAL_SATURATION_DELAY` (default 90s, against
-  `runs.status_since`) because saturation is transient. PRD #649 surfaced both
-  gates in the SPA: an admin kill-switch card
-  (`web/src/pages/adminSettings/EphemeralWorkersCard.tsx`), a per-user opt-in
-  toggle (`web/src/components/HostedWorkers.tsx`), and an `ephemeral` badge in the
-  fleet list. Size-aware provisioning and #529's Path 2 (an approve-time capability
-  denial) remain deferred. See `prds/done/529-ephemeral-workers.md` and
-  `prds/done/747-ephemeral-saturation-burst.md` for the full Decision Logs.
+- **Ephemeral, run-bound hosted workers** (PRD #529, second trigger PRD #747): on
+  an unmet capability with zero eligible workers, or (debounced) a saturated fleet,
+  an opted-in owner gets ONE auto-provisioned hosted worker
+  (`api/internal/hostedsvc/ephemeral.go`) bound to that run via two `workers`
+  columns (`ephemeral`, `ephemeral_run_id`, migration `00155`), restricted to claim
+  only its bound run and torn down by dropping the row (busy-guarded,
+  GC-backstopped) on the run's terminal transition. Its fresh per-worker PVCs close
+  the cross-run persistence residual [ADR-91](adr/0091-runner-cross-run-persistence-residual.md)
+  records. Size-aware provisioning and #529's Path 2 remain deferred. See
+  `prds/done/529-ephemeral-workers.md` and
+  `prds/done/747-ephemeral-saturation-burst.md`.
 - **claimed → running, before the plan turn** — once `provisionRunTools` sets up
   the run's tool env, the executor kicks off a lockfile-driven JS dependency
   install for the cloned repo (per discovered lockfile, monorepo workspaces
@@ -843,45 +792,23 @@ chain in the diagram above, with no intervening `running`.
   #377 built for a branch that *modifies* a workflow file. See
   [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism and why
   merge precedes rebase.
-- **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265 + PRD #390) — on a
-  milestone-structured `issue` run the run view shows a *reported-complete* tracker
-  (`runs.milestones_completed`, a monotone server-side union, never "verified").
-  Two subset-validated sources feed it: mid-run `report_progress` calls (visible
-  immediately, turn-non-ending) and, since PRD #265, the lead's `signal_done`
-  declaration of the milestones it finished, unioned on the `completed` transition.
-  The declaration keeps a **single-turn run** honest (one going straight to
-  `signal_done` emits no mid-run report). Completion is **declared, not inferred**,
-  so a milestone left undeclared stays not-complete and a skipped one is not
-  back-filled. `milestones_in_progress` (a snapshot, not a union) is cleared on
-  every terminal transition, and the web renders a **null** tracker as "not
-  reported" (`M–/N`), distinct from a genuine `0/N`. PRD #390 makes mid-run
-  reporting **enforced**, not merely offered: the per-turn prompt requires a
-  `report_progress` declaration (`agent/src/prompt.ts`), the implement/review loop
-  (`agent/src/sdk-executor.ts`) escalates the next turn's prompt when a work turn
-  leaves a milestone-bearing run with none marked in progress and surfaces a
-  feed-only `status` signal after K=2 consecutive misses, while never failing the
-  run (D4) and keeping `checkpoint` a durability boundary, not a gate (D2). An
-  all-empty `report_progress` call is a **no-op, not a signal** (D3,
-  `agent/src/signals.ts`), so `milestones_completed` stays `null` on a run that
-  never truly reported. The CLI's `uzi run get` renders the same neutral `–/N`
-  numerator (`api/cmd/uzi/run_render.go`), at parity with the web badge and the TUI
+- **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
+  `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
+  monotone union, never "verified"), fed by mid-run `report_progress` and the lead's
+  `signal_done` declaration. Completion is **declared, not inferred**; a null
+  tracker renders "not reported" (`M–/N`), distinct from `0/N`, and
+  `milestones_in_progress` clears on every terminal transition. PRD #390 makes
+  per-turn reporting enforced (an escalating prompt plus a feed-only `status` after
+  K=2 misses) while never failing the run, and an all-empty `report_progress` is a
+  no-op. `uzi run get` renders the same `–/N`, at parity with the web badge and TUI
   rail.
 - **Operator scope steering** (PRD #634, [ADR-634](adr/0634-run-scope-steering.md)) —
-  a mid-run `uzi run stop` or `uzi run scope --through N` on a milestone-structured
-  `issue` run writes **one** nullable column, `runs.scope_ceiling` (milestones the
-  run may complete over the `milestones_frozen` list). `stop` resolves server-side
-  to `scope_ceiling = completed_count`; a forward ceiling clamps to
-  `[completed_count, len(frozen)]`. Sharing one field makes a later write
-  **last-writer-wins** with no cross-channel ordering. Delivery rides the
-  per-iteration `reportIteration` ACK (re-read every loop) and the claim payload
-  (durability across a requeue), honored at the **top of the implement loop**, not
-  the cooperative `checkpoint`, so it fires every iteration. Once `completed_count
-  >= scope_ceiling` the worker starts no further milestone and takes the graceful
-  finalize path (push + MR iff requested), reporting `completed` with
-  `stop_kind='scope_capped'`. `milestones_frozen` is never rewritten (the ceiling
-  is a truncation over the immutable approved list). The `kind='scope'`
-  `run_user_inputs` row is **audit-only** (surfaced via `uzi run inputs`, the web
-  steer queue, and Slack); only the column controls behavior.
+  a mid-run `uzi run stop`/`uzi run scope --through N` on a milestone run writes one
+  nullable `runs.scope_ceiling` (last-writer-wins, clamped to `[completed_count,
+  len(frozen)]`), delivered via the per-iteration ACK and claim payload and honored
+  at the top of the implement loop. Once `completed_count >= scope_ceiling` the
+  worker finalizes gracefully (`stop_kind='scope_capped'`); `milestones_frozen` is
+  never rewritten, and the paired `run_user_inputs` row is audit-only.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers
   can't be trusted to self-report: a claimed-but-never-started run older than
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
