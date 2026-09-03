@@ -186,7 +186,7 @@ The map stops at the run lane. The rest, one line each, with `ARCHITECTURE.md`'s
 ## Run economy (agents)
 
 - **Run a gate once, to a log, then read the log.** `log=$(mktemp ./gate-log.XXXXXX); rc=0; task gate:<component> > "$log" 2>&1 || rc=$?; echo "EXIT=$rc" >> "$log"; test "$rc" -eq 0` inside the worktree, then `tail`/`grep` the file. Never rerun the same gate on the same tree to read its output differently.
-- **Non-blocking review notes are not reworked in-run.** A finding a validator labels non-blocking is filed as an incidental finding (`report_incidental_issue`) or left for MR review; only a correctness or trust-boundary finding earns a rework commit and its re-validation round.
+- **Non-blocking review notes are not reworked in-run.** A finding a validator labels non-blocking is filed as an incidental finding (`report_incidental_issue`) or left for MR review; only a correctness finding, or one in a trust-boundary, data-integrity, auth or untrusted-input class, earns a rework commit and its re-validation round.
 - **Scale the validator wave to the diff's risk class.** Presentation, copy, docs and refactor diffs get one reviewer for one round; trust-boundary, data-integrity, auth and untrusted-input diffs get reviewer + tester (+ auditor). Mechanical work (anchor verification, gate running, docs) runs on the sonnet-tier roles (`researcher`, `tester`, `documenter`); judgment work stays on opus.
 
 ## Agent-team workflow
