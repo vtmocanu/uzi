@@ -459,10 +459,10 @@ type Run struct {
 	StatusSince           pgtype.Timestamptz `json:"status_since"`
 	ReviewComments        []byte             `json:"review_comments"`
 	BudgetPausedSeconds   int32              `json:"budget_paused_seconds"`
-	LineageEpoch          int32              `json:"lineage_epoch"`
 	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
 	TriggerSource         string             `json:"trigger_source"`
 	CheckpointTip         pgtype.Text        `json:"checkpoint_tip"`
+	UsageRefolded         bool               `json:"usage_refolded"`
 }
 
 type RunMessage struct {

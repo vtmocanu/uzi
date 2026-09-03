@@ -2215,18 +2215,20 @@ LIMIT @lim;
 
 -- name: UpsertRunUsage :exec
 -- Fold one model's usage from a delivered result frame into the run's accounting
--- (Decision 2). The result frame's totals are CUMULATIVE-across-resume (M1's
--- Decision 3 verdict b), so the token/cost columns are monotonic per (run_id,
--- session_id, model) and the merge is GREATEST — never a plain overwrite: a
--- crash-retry that re-delivers an EARLIER frame after a LATER one must not regress
--- the row (that is exactly what makes "re-delivering the whole batch changes
--- nothing" true under verdict b, where a stable session_id can otherwise see two
--- different cumulative snapshots hit the same key). The API calls this for every
--- delivered result frame incl. seq-deduped replays, so at-least-once delivery +
--- this idempotent monotonic merge = correct totals with no crash window.
--- lineage_epoch (PRD #632) is a stamped attribute pinned to first insert (omitted
--- from DO UPDATE SET) — the fresh dropped-resume leg's distinct session_id is the
--- row-splitter, and pinning prevents a late re-fold from re-collapsing legs.
+-- (Decision 2). Each result frame is ONE SDK query() LEG and reports only that leg
+-- (PRD #1079: the Agent SDK cost-tracking docs — "the cost reported is limited to
+-- the individual query call rather than the entire session"), so lineage_epoch is
+-- part of the key and each leg lands in its own row. GREATEST here is for RE-DELIVERY
+-- idempotency — a crash-retry that re-delivers the SAME leg (same run_id/session_id/
+-- model/lineage_epoch) must not regress the row — and for the case of MULTIPLE
+-- cumulative result frames inside ONE process (a multi-turn query() reporting running
+-- totals under one epoch); it is NEVER a cross-leg collapse. That collapse was the
+-- pre-#1079 under-count: distinct legs sharing runs.session_id merged at the old
+-- three-column key and GREATEST kept only the largest. The API calls this for every
+-- delivered result frame incl. seq-deduped replays, so at-least-once delivery + this
+-- idempotent monotonic merge = correct totals with no crash window. The run_usage_totals
+-- view (00177) MAXes within (run_id, model, lineage_epoch) then SUMs across, which is
+-- exactly the per-leg rule once every leg has its own epoch.
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
     input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, updated_at
@@ -2234,7 +2236,7 @@ INSERT INTO run_usage (
     @run_id, @session_id, @model, @lineage_epoch,
     @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, now()
 )
-ON CONFLICT (run_id, session_id, model) DO UPDATE SET
+ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
     cache_read_tokens     = GREATEST(run_usage.cache_read_tokens,     EXCLUDED.cache_read_tokens),
     cache_creation_tokens = GREATEST(run_usage.cache_creation_tokens, EXCLUDED.cache_creation_tokens),
@@ -2242,14 +2244,17 @@ ON CONFLICT (run_id, session_id, model) DO UPDATE SET
     cost_usd              = GREATEST(run_usage.cost_usd,              EXCLUDED.cost_usd),
     updated_at            = now();
 
--- name: BumpRunLineageEpoch :exec
--- PRD #632: increment a run's lineage-epoch counter by one. The API calls this once
--- per NEWLY-INSERTED resume_lineage_break status event (dropped-resume signal, #334)
--- so a fresh SDK leg's run_usage rows are stamped with a higher epoch than the prior
--- leg's; the run_usage_totals view then SUMs across epochs instead of MAX-masking the
--- smaller leg. Bumping only for events in `inserted` (never re-deliveries) keeps it
--- idempotent under at-least-once delivery.
-UPDATE runs SET lineage_epoch = lineage_epoch + 1, updated_at = now() WHERE id = @id;
+-- name: CountRunInitFramesBefore :one
+-- The leg index of a result frame (PRD #1079): the position-absolute count of persisted
+-- `init` status frames of this run with a lower seq. mapResult persists the SDK's
+-- system/init message as a status frame with payload.event='init' at the start of EVERY
+-- query() call, so this counts the legs that preceded the frame. It is a pure function of
+-- (run_id, seq): a re-delivered frame recomputes the same value and lands in the same
+-- run_usage row whatever else has landed since. Backed by idx_run_messages_init (00187),
+-- so it is O(legs), not O(messages).
+SELECT COUNT(*) FROM run_messages
+WHERE run_id = @run_id AND kind = 'status'
+  AND payload->>'event' = 'init' AND seq < @seq;
 
 -- name: GetRunUsageTotal :one
 -- One run's rollup totals (PRD #40 M3), for the run-detail usage strip. Reads the
