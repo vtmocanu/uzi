@@ -34,9 +34,9 @@ func (q *Queries) CountActiveSelfImproveRunsForRepo(ctx context.Context, repoID 
 const createSelfImproveRun = `-- name: CreateSelfImproveRun :one
 
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, override_subagent_model, required_capabilities, trigger_source
+    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, override_subagent_model, mr_rework_enabled, required_capabilities, trigger_source
 ) VALUES (
-    $1, $2::uuid, 'self_improve', $3, $4, $5, true, $6, $7, $8,
+    $1, $2::uuid, 'self_improve', $3, $4, $5, true, $6, $7, $8, $9,
     -- required_capabilities (PRD #84 M2, issue #512 M1): a self_improve run is REPO-BEARING
     -- (it targets uzi's own repo, the likeliest to require docker to build/test), so it must
     -- inherit the repo's capability hint like every other repo-bearing path — else with
@@ -56,6 +56,7 @@ type CreateSelfImproveRunParams struct {
 	WaitOnLimit           bool        `json:"wait_on_limit"`
 	Model                 pgtype.Text `json:"model"`
 	OverrideSubagentModel bool        `json:"override_subagent_model"`
+	MrReworkEnabled       pgtype.Bool `json:"mr_rework_enabled"`
 }
 
 // Self-improvement engine (PRD #46 Decisions 9-11, M5) ------------------------
@@ -93,6 +94,9 @@ type CreateSelfImproveRunParams struct {
 // default at claim assembly) and the "apply model also to agents" opt-in
 // (@override_subagent_model, a plain bool). The bespoke engine passes nil/false, freezing
 // NULL/false onto its run exactly as before this column pair was threaded through.
+// mr_rework_enabled (PRD #908 M1): the schedule-driven fire path threads the schedule's
+// per-schedule mr_rework override the same way (sqlc.narg('mr_rework_enabled'), nil =>
+// inherit the owner default live at read time). The bespoke engine passes nil, freezing NULL.
 func (q *Queries) CreateSelfImproveRun(ctx context.Context, arg CreateSelfImproveRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createSelfImproveRun,
 		arg.UserID,
@@ -103,6 +107,7 @@ func (q *Queries) CreateSelfImproveRun(ctx context.Context, arg CreateSelfImprov
 		arg.WaitOnLimit,
 		arg.Model,
 		arg.OverrideSubagentModel,
+		arg.MrReworkEnabled,
 	)
 	var i Run
 	err := row.Scan(

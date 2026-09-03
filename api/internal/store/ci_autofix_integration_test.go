@@ -79,6 +79,18 @@ func TestCIAutofixLiveDB(t *testing.T) {
 			 VALUES ($1, $2, $3, $4, 't', 'd', 'completed', $5, $6, now() - $7::interval)`,
 			owner, repoID, kind, issueIID, branch, mr, createdOffset)
 	}
+	// insertPromptRun inserts a prompt-shaped run (issue_iid = NULL, per the
+	// runs_kind_shape CHECK for kind='prompt') on a scheduled-lane branch.
+	insertPromptRun := func(owner uuid.UUID, branch string, mrIID *int64, createdOffset string) {
+		var mr any
+		if mrIID != nil {
+			mr = *mrIID
+		}
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, branch, mr_iid, created_at)
+			 VALUES ($1, $2, 'prompt', NULL, 't', 'd', 'completed', $3, $4, now() - $5::interval)`,
+			owner, repoID, branch, mr, createdOffset)
+	}
 	// insertPipeline caches a pipeline_status row for a ref.
 	insertPipeline := func(ref string, pipelineID int64, status string) {
 		mustExec(ctx, t, pool,
@@ -108,30 +120,69 @@ func TestCIAutofixLiveDB(t *testing.T) {
 	insertRun(u1, "issue", "agent/issue-4", 4, iid(104), "1 hour")
 	insertPipeline("agent/issue-4", 9004, "success")
 
-	// u1: kind self_improve — excluded by kind-awareness (only issue/ci_fix own agent
-	// MR branches), despite being issue-shaped with a failed pipeline + mr_iid.
-	insertRun(u1, "self_improve", "agent/issue-5", 5, iid(105), "1 hour")
-	insertPipeline("agent/issue-5", 9005, "failed")
+	// PRD #908 M4: ListCIAutofixCandidateRefs's kind filter widened to
+	// kind IN ('issue','ci_fix','prompt','self_improve'), so the scheduled lanes are now
+	// INCLUDED. Two runs owned by the eligible owner u1, each on a scheduled-lane branch
+	// with a FAILED pipeline + mr_iid, must BOTH surface as candidates.
+	//
+	// u1: a self_improve run (issue_iid set, per the runs_kind_shape CHECK for the kind) on
+	// a uzi/self-improve/<uuid> branch — previously EXCLUDED by kind-awareness, now included.
+	selfImproveBranch := "uzi/self-improve/" + uuid.New().String()
+	insertRun(u1, "self_improve", selfImproveBranch, 5, iid(105), "1 hour")
+	insertPipeline(selfImproveBranch, 9005, "failed")
 
-	// u2: opted OUT — excluded by the owner opt-in gate.
-	insertRun(u2, "issue", "agent/issue-6", 6, iid(106), "1 hour")
-	insertPipeline("agent/issue-6", 9006, "failed")
+	// u1: a prompt run (issue_iid NULL, per the shape CHECK) on a uzi/prompt-<uuid> branch.
+	promptBranch := "uzi/prompt-" + uuid.New().String()
+	insertPromptRun(u1, promptBranch, iid(108), "1 hour")
+	insertPipeline(promptBranch, 9008, "failed")
 
-	// u3: opted in but NO token — excluded by the token gate.
-	insertRun(u3, "issue", "agent/issue-7", 7, iid(107), "1 hour")
-	insertPipeline("agent/issue-7", 9007, "failed")
+	// u2: a prompt run whose owner opted OUT — still excluded by the owner opt-in gate,
+	// proving that gate is kind-INDEPENDENT (it drops a scheduled-lane run the same as an
+	// issue run).
+	u2PromptBranch := "uzi/prompt-" + uuid.New().String()
+	insertPromptRun(u2, u2PromptBranch, iid(106), "1 hour")
+	insertPipeline(u2PromptBranch, 9006, "failed")
 
-	// ── ListCIAutofixCandidateRefs: exactly the one eligible ref ──
+	// u3: a self_improve run whose owner has NO token — still excluded by the token gate,
+	// again kind-independent.
+	u3SelfImproveBranch := "uzi/self-improve/" + uuid.New().String()
+	insertRun(u3, "self_improve", u3SelfImproveBranch, 7, iid(107), "1 hour")
+	insertPipeline(u3SelfImproveBranch, 9007, "failed")
+
+	// ── ListCIAutofixCandidateRefs: the exact eligible SET ──
+	// Eligible now = agent/issue-1 (issue lane) + u1's two scheduled-lane branches. Every
+	// other seed is excluded by a specific gate (default-branch, mr_iid, green pipeline,
+	// owner opt-out, missing token). Assert the exact set by branch name — precise, not a
+	// bare count — so a stray candidate or a missing one both fail.
 	cands, err := q.ListCIAutofixCandidateRefs(ctx, repoID)
 	if err != nil {
 		t.Fatalf("ListCIAutofixCandidateRefs: %v", err)
 	}
-	if len(cands) != 1 {
-		t.Fatalf("want exactly one candidate (agent/issue-1), got %d: %+v", len(cands), cands)
+	gotRefs := make(map[string]bool, len(cands))
+	for _, cand := range cands {
+		gotRefs[cand.Ref.String] = true
 	}
-	c := cands[0]
-	if c.Ref.String != "agent/issue-1" {
-		t.Errorf("candidate ref = %q, want agent/issue-1", c.Ref.String)
+	wantRefs := []string{"agent/issue-1", selfImproveBranch, promptBranch}
+	if len(cands) != len(wantRefs) {
+		t.Fatalf("want exactly %d candidates %v, got %d: %+v", len(wantRefs), wantRefs, len(cands), cands)
+	}
+	for _, ref := range wantRefs {
+		if !gotRefs[ref] {
+			t.Errorf("expected %q to be an eligible ci-autofix candidate, got set %v", ref, gotRefs)
+		}
+	}
+
+	// The issue-lane candidate still carries the NEWEST run's mr_iid (DISTINCT-ON pick), its
+	// owner, and its failed pipeline — unchanged by the scheduled-lane widening.
+	var c store.ListCIAutofixCandidateRefsRow
+	foundIssue := false
+	for _, cand := range cands {
+		if cand.Ref.String == "agent/issue-1" {
+			c, foundIssue = cand, true
+		}
+	}
+	if !foundIssue {
+		t.Fatalf("agent/issue-1 must remain a candidate")
 	}
 	if !c.MrIid.Valid || c.MrIid.Int64 != 101 {
 		t.Errorf("candidate must carry the NEWEST run's mr_iid=101, got %+v", c.MrIid)

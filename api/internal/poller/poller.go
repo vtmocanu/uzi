@@ -368,6 +368,16 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		slog.Error("poller: sync MR states", "repo", r.PathWithNamespace, "error", err)
 	}
 
+	// Scheduled-lane MR-state recorder (PRD #908): board-free sibling of SyncMRStates for
+	// prompt/self_improve runs, so their runs.mr_state is fresh for the mr_rework detector
+	// reading candidates later this same tick. Reads live forge state (needs the forge
+	// reachable, guaranteed by the early returns above); records mr_state and cancels an
+	// in-flight rework on close/merge, but moves NO board card. Per-candidate errors are
+	// log-and-skipped inside; only a candidate-enumeration failure surfaces here.
+	if err := e.svc.SyncScheduledMRStates(ctx, r.ID, r.ForgeProjectID, f); err != nil {
+		slog.Error("poller: sync scheduled MR states", "repo", r.PathWithNamespace, "error", err)
+	}
+
 	// PRD-link patch (PRD #72 M5): once a run's MR has merged, rewrite the issue's
 	// own `prds/*.md` link to the path the run moved the file to. Placed HERE — after
 	// SyncMRStates, before the filed→close sync — because it needs a live forge

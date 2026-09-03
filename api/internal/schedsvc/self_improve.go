@@ -186,7 +186,7 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	// A lost unique-index race (ErrActiveSelfImproveExists) is benign — the index did its job,
 	// a cycle is already in flight — so advance. Any other error (incl. ErrRepoNotFound /
 	// ErrGuardrailBlocked from the seam) rides up unchanged so advance() classifies it.
-	run, err := e.runs.CreateSelfImproveRun(ctx, sched.UserID, sched.RepoID, issueIID, selfImproveTrackingTitle, description, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
+	run, err := e.runs.CreateSelfImproveRun(ctx, sched.UserID, sched.RepoID, issueIID, selfImproveTrackingTitle, description, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	if err != nil {
 		if errors.Is(err, workersvc.ErrActiveSelfImproveExists) {
 			e.logger.Info("scheduler: self_improve run already active (race)", "schedule", sched.ID.String())

@@ -3,9 +3,11 @@
 > Anchors re-verified against main at fcfd8aa on 2026-09-03, after the epic #915 file splits and the pgconv consolidation.
 
 **Issue**: #908
-**Status**: Draft — ready for implementation
+**Status**: Implemented (api/ + docs/ landed; offline + `*LiveDB` validation green). The
+one-per-lane **live-forge** end-to-end is the post-merge acceptance step, outside the branch
+diff by design (see the workflow-scope note) — not run in-branch.
 **Priority**: Medium
-**Design companion**: `prds/908-mr-rework-scheduled-runs-design.md` (the board-free recorder decision, mechanism, contracts, and risks — read it for the MR-rework half's deep design).
+**Design companion**: `prds/done/908-mr-rework-scheduled-runs-design.md` (the board-free recorder decision, mechanism, contracts, and risks — read it for the MR-rework half's deep design).
 **Related**: #914 — CI autofix on by default (split out from this PRD's former Part B). The two share edits to `ci_autofix.sql` (this PRD's M4 widens its kind filter; #914 changes its user gate), so land #914 **after** this one to avoid a conflict.
 **Scope**: `api/` + `docs/` only. No `agent/` change, no `web/` code change, **no new migration**.
 
@@ -114,21 +116,21 @@ invariant reasoning are in the companion §1.
 Dependency-ordered. **Offline** = unit-testable with in-memory fakes. **LiveDB** = needs
 `./e2e/run-store-it.sh`. **Live forge** = end-to-end against a real MR (post-merge validation).
 
-- [ ] **M1 — Thread the per-schedule mr-rework toggle through self_improve.** *(Offline; mr_rework)*
+- [x] **M1 — Thread the per-schedule mr-rework toggle through self_improve.** *(Offline; mr_rework)*
   Add an `mrReworkEnabled *bool` param to `CreateSelfImproveRun` (`workersvc/self_improve.go`),
   add `mr_rework_enabled = sqlc.narg('mr_rework_enabled')` to the `selfimprove.sql` INSERT, extend
   the `schedsvc` interface signature (`scheduler.go:127`) and its test fake
   (`scheduler_test.go:343`), and pass `scheduleMrRework(sched)` at the fire site
   (`schedsvc/self_improve.go:189`) — mirroring the prompt path. Regenerate sqlc.
 
-- [ ] **M2 — Decouple both detectors from `agent/issue-N`.** *(Offline; both lanes)*
+- [x] **M2 — Decouple both detectors from `agent/issue-N`.** *(Offline; both lanes)*
   In `poller/mr_review_watch.go` and `poller/ci_autofix.go`, stop returning early when
   `issueIIDFromBranch(ref)` fails. Make every issue-comment post conditional on the branch
   parsing to an issue IID (mr_rework cap-halt `:250`; ci_autofix start `:268` + halt `:224`);
   otherwise skip the comment and keep the inbox notification (`notifyHalt` tolerating a zero IID).
   Issue-run behavior is unchanged (the `agent/issue-N` parse still succeeds and still comments).
 
-- [ ] **M3 — Board-free scheduled MR-state recorder.** *(Offline + LiveDB; mr_rework)*
+- [x] **M3 — Board-free scheduled MR-state recorder.** *(Offline + LiveDB; mr_rework)*
   Add `ListScheduledMRStateWatchCandidates` (runs-only, `kind IN ('prompt','self_improve')`,
   `status='completed'`, `mr_iid` set, `mr_state` non-terminal, no issues JOIN, no `DISTINCT ON`,
   `LIMIT 100`) to `forge.sql`. Add `forgesvc.SyncScheduledMRStates(ctx, repoID, forgeProjectID,
@@ -139,7 +141,7 @@ Dependency-ordered. **Offline** = unit-testable with in-memory fakes. **LiveDB**
   disjoint run sets" (wording only — `TestMRStateIsWatcherOwned` still passes). See companion §3–§4
   for the exact contract and the differential-test requirement.
 
-- [ ] **M4 — Widen both candidate-query kind filters.** *(Offline build; LiveDB to validate)*
+- [x] **M4 — Widen both candidate-query kind filters.** *(Offline build; LiveDB to validate)*
   `ListMRReworkCandidates` (`mr_rework.sql`): `r.kind = 'issue'` → `r.kind IN
   ('issue','prompt','self_improve')`, keeping `mr_state='opened'` and `DISTINCT ON (r.branch)`.
   `ListCIAutofixCandidateRefs` (`ci_autofix.sql`): `r.kind IN ('issue','ci_fix')` → add
@@ -148,7 +150,7 @@ Dependency-ordered. **Offline** = unit-testable with in-memory fakes. **LiveDB**
   the `CreateAutoMRReworkRun` "pipeline_ref = agent/issue-N" comment (now any agent branch).
   Regenerate sqlc and confirm the generated consts moved.
 
-- [ ] **M5 — Tests.** *(LiveDB + live forge)*
+- [x] **M5 — Tests.** *(LiveDB done in-branch; live forge is the post-merge step)*
   Recorder differential/mirror contract vs `syncOneMRState` (companion §4: seven fixture cases,
   each proven exercised), incl. the R1 no-board-move guard (a self_improve run the recorder marks
   `closed`, with a cached tracking issue, produces zero `AutoMove`). Detector decoupling for both
@@ -159,7 +161,7 @@ Dependency-ordered. **Offline** = unit-testable with in-memory fakes. **LiveDB**
   per-MR uniqueness hold for the new branches. One live-forge end-to-end per lane (a landed review
   comment → rework; a red pipeline → ci_fix), and the mr_rework schedule toggle Off suppressing it.
 
-- [ ] **M6 — Docs.** *(Offline)*
+- [x] **M6 — Docs.** *(Offline)*
   Update `docs/scheduling.md`: prompt and self_improve MRs now participate in both autofix lanes;
   mr_rework default-on with the four-layer opt-out (per-schedule toggle in the web ScheduleModal +
   CLI `--mr-rework`), ci_autofix user opt-in default-off. `npm run build`'s `check-docs.mjs` passes.

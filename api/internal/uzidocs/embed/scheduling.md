@@ -366,6 +366,35 @@ never blocks it, including when the check itself can't reach the forge (an
 expired token, a rate limit, an outage) — it just means the sweep won't match
 anything until the label exists.
 
+## Automatic fixes on scheduled-run MRs
+
+The merge requests a schedule opens — both the **ad-hoc prompt** jobs (docs
+hygiene, test improvement, bug hunt, feature bingo, refactor scout, and any
+custom prompt schedule) and the [self-improvement](#self-improvement) job —
+participate in uzi's two unattended autofix lanes, exactly like the MRs your
+issue runs open:
+
+- **[MR review rework](./mr-review-watcher.md)** folds new review comments on a
+  green, still-open MR back onto the branch. It is **on by default** with a
+  four-layer opt-out; the per-schedule **"Auto-rework MR review comments"**
+  control (a three-way Inherit/On/Off choice in the schedule modal, or
+  `--mr-rework` / `--mr-rework=false` on `uzi schedule create`/`edit` and
+  `--clear-mr-rework` to return to Inherit) is where you turn it off for a given
+  schedule's runs. See [that page's Enablement
+  section](./mr-review-watcher.md#enablement) for the full resolution order.
+- **[Automatic CI fixes](./ci-autofix.md)** react to a failed head pipeline on a
+  scheduled-run MR branch. This lane stays **opt-in, off by default**, on the
+  same account-wide **Settings → Automatic CI fixes** toggle your issue runs use
+  — a scheduled run inherits the owner's opt-in; there is no separate
+  per-schedule switch for it.
+
+Both lanes act only on a **still-open** MR and spend the schedule owner's own
+Anthropic token, the same as any other run. A prompt schedule's MR has no
+backing issue, so the notices these lanes post as an issue comment on an
+issue-run MR (ci_autofix's start and halt; mr_rework's per-MR cap halt) arrive
+as an **in-app notification only** for a prompt MR; a self-improvement MR's
+shared tracking issue is likewise left untouched.
+
 ## Restarts and missed fires
 
 A recurring schedule survives an api restart: its next fire time is stored,

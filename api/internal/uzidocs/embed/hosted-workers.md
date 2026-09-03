@@ -14,13 +14,14 @@ available if your admin has turned hosting on for this instance.
 
 ## Provision one
 
-1. Open **Settings → Workers**. If hosting is available, a **Provision a
-   hosted worker** card appears above your worker list.
+1. Open **Settings → Workers**, then the **Add a worker** tab. If hosting is
+   available, the **Hosted workers** card is the first card there, above
+   **Register your own worker**.
 2. Pick a **type** and a **size** (below), optionally tick **Docker-capable**
    (see [Docker inside a worker](./worker-docker.md) — needs an instance
    whose admin has turned the docker tier on), then **Provision**.
-3. The new worker appears in your list right away and comes online on its
-   own, usually within a few seconds — nothing to run, nothing to copy.
+3. The new worker appears under **Your workers** right away and comes online
+   on its own, usually within a few seconds — nothing to run, nothing to copy.
 
 ## Type and size
 
@@ -48,7 +49,9 @@ is capacity someone else's worker doesn't get.
 
 You may hold a limited number of hosted workers at once (an admin-set quota,
 shown on the provision card as "N of M used"); provisioning past it is
-refused until you delete one. See [Admin settings](./admin-settings.md#hosted-worker-quota)
+refused until you delete one. At quota, the card's "delete one to provision
+another" text is a link back to **Your workers**, so you don't have to hunt
+for the tab yourself. See [Admin settings](./admin-settings.md#hosted-worker-quota)
 for how an admin sets it — including turning self-service off entirely.
 
 ## Deleting one

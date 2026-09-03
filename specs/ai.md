@@ -19087,6 +19087,19 @@ session_id gate**: a design-wave counterexample showed a session-keyed gate let 
 *different* dead run's orphan ref (same session lineage, different run), i.e. false provenance.
 Anchoring to the run id closes that.
 
+*issue #887/#909 — stamp encoding and the read-fallback.* The stamp is authoritatively written and
+cleared under the #887 **subsection** form `uzi-trackowner.<branch>.owner` (branch verbatim in the
+subsection, so distinct branches never collide). During the rollout window a persistent bare may
+still carry a stamp under the **pre-#887 flattened** form `uzi-trackowner.<flattened>`
+(`/`,`.`->`-`, 2-part, no `.owner`); a reader that consulted only the new key would read empty and
+redo a stable branch's unpushed work. So the reader (#909) ALSO falls back to the flattened form,
+**read-only** and **collision-guarded** — the flat key is not branch-injective, so it is consulted
+only when no other live `refs/uzi-runner/<branch>` flattens to the same key — and still gated by the
+run-id-equality check above. The clear path likewise unsets the flattened key, skipping it when a
+distinct live sibling shares it. Nothing ever WRITES the flat form, so once any run re-stamps under
+the subsection key the READ heals (the subsection key now takes precedence); the stale flat entry
+itself persists as dead config the reader ignores, cleared only if it later D/F-blocks a fetch.
+
 **Decision 4: shutdown durability (shape B), abort in-flight runs on SIGTERM, then fetch back.**
 `Runner.shutdown()` plus a per-run registry aborts each in-flight run's controller on SIGTERM
 (`agent/src/runner.ts`; the worker's existing SIGTERM/SIGINT handler in `agent/src/main.ts` drives
@@ -23806,3 +23819,21 @@ Serves human Feature #218 (park-resume durability). #1042 M4 (§604 D7(c)) owner
 - **Consequence: the #759 leg-#4 cherry-pick is now production-reachable only via `ownerMatch && originExists && diverged`.** The classic UNPUSHED #759 incident is served by Path A plus the adopt-time wip(park) `reset --soft`, not by leg #4. This narrows leg #4's reachability but is not a regression versus pre-#1059 — the paths that legitimately recovered this run's own work still do.
 
 Cross-refs: §604 (PRD #1030→#1042, the owner-anchor column `runs.checkpoint_tip` and its compare-and-delete this leg reuses); §582 (PRD #759, the wip(park) marker and the leg-#4 cherry-pick this guard keeps foreign work out of).
+
+## 610. PRD #1063 — Workers page split into "Your workers" and "Add a worker" tabs, hosted-first
+
+Serves human: "the fleet a user opens the page to check sat under two one-time forms, and the wrong form (self-hosted registration) led on a k8s deployment where hosted is the primary path." `web/src/pages/WorkersSettings.tsx` gains a two-tab `role="tablist"` (the `web/src/pages/Schedules.tsx` recipe, copied not extracted) — **Your workers · N** and **Add a worker** — with the hosted (`web/src/components/HostedWorkers.tsx`) card moved ahead of the register card on the add tab. Web-only composition and copy: same components, same API calls, same DTOs, no route/handler/CLI change (`api/cmd/uzi/` untouched).
+
+- **D1 — tabs, not a modal/drawer**, because `web/` has no modal primitive (specs/ai.md:7457, PRD #58) and a drawer risks losing the one-time join token on outside-click.
+- **D2 — names `Your workers · N` / `Add a worker`**, the Schedules `· count` convention.
+- **D3 — hosted card first on the add tab**, register card retitled **Register your own worker**, matching hosted's status as the primary path on k8s.
+- **D4 — both panels stay mounted, the inactive one `hidden`** (not unmounted like Schedules): keeps the join-token card alive across a switch, keeps `HostedWorkers`' one-shot config fetch running so `onAvailability` can reach the page from a hidden panel.
+- **D5 — Auto-provision on demand stays inside the hosted card**, not promoted to a fleet-level control.
+- **D6 — the Schedules tab markup is copied, not extracted into a shared `Tabs` primitive** (a three-page migration deferred to a follow-up issue).
+- **D7 — deep link `?tab=add` / `?tab=workers`** via `useSearchParams` (the `Findings` precedent), written with `{ replace: true }`.
+- **D8 — hosting availability reaches the page via an `onAvailability` callback**, not by lifting `HostedWorkers`' config fetch into the page (would move 24 pinned tests).
+- **D9 — the header's Add worker button stays visible on both tabs** rather than hiding on the add tab.
+- **D10 — explicit focus targets** for the header button, empty-state CTAs, and the at-quota "delete one" link — never a Delete button.
+- **D11 — the landing tab is decided once, after the first fleet load**: empty fleet → Add a worker, non-empty (any state, including all-unhealthy) → Your workers; a URL param overrides; the count never re-steers the tab after that.
+
+Cross-refs: `web/src/pages/Schedules.tsx` (tab recipe source); `web/src/pages/Findings.tsx` (`useSearchParams` precedent); PRD #58 (the no-modal precedent, unaffected — tabs are not a modal).

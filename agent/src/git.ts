@@ -171,6 +171,14 @@ function runnerTrackingOwnerKey(branch: string): string {
   return `uzi-trackowner.${branch}.owner`;
 }
 
+// issue #909 — the PRE-#887 flattened owner-key form. Kept ONLY so a resume can still READ a
+// stamp a persistent bare wrote under old code during the rollout window. flatten() is lossy
+// (`/`, `.` -> `-`), so this key is NOT branch-injective: never WRITE under it, and read it only
+// through readTrackingOwner()'s collision guard plus the caller's runId-equality gate.
+function legacyFlatTrackingOwnerKey(branch: string): string {
+  return `uzi-trackowner.${branch.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
+
 export interface RunnerClone {
   /** Absolute path to the runner clone's working tree (the ONLY working tree under
    *  (b) — the worker is bare-only). The agent checks out + commits here. */
@@ -548,7 +556,7 @@ export class GitCache {
       }
       const trackingExists = trackingExistsRaw && !trackingDisjoint;
       const owner = trackingExists
-        ? await this.tryGitStdout(barePath, ["config", "--get", runnerTrackingOwnerKey(branch)])
+        ? await this.readTrackingOwner(barePath, branch)
         : "";
       const ownedHere = trackingExists && runId !== undefined && owner === runId;
       // PRD #122 M8 cross-worker candidate: origin's checkpoint ref, mirrored into the bare
@@ -1090,9 +1098,10 @@ export class GitCache {
    * live subtree on a guess.
    *
    * Any conflicting ancestor found is ARCHIVED (its tip may carry unmerged commits) under
-   * refs/uzi-archive/<sanitized>/<sha> before it is deleted, and its dangling PRD #218
-   * owner-config key is cleared. Deepest-first so a partially-migrated bare with several
-   * stacked ancestors is cleaned bottom-up.
+   * refs/uzi-archive/<sanitized>/<sha> before it is deleted. Its dangling PRD #218 owner stamp
+   * is cleared under the #887 subsection key, and — when no colliding live sibling shares it —
+   * under the pre-#887 flattened key too (issue #909). Deepest-first so a partially-migrated
+   * bare with several stacked ancestors is cleaned bottom-up.
    */
   private async clearConflictingAncestorTrackingRefs(barePath: string, dst: string): Promise<void> {
     // Only refs inside the tracking namespace can D/F-conflict with a tracking-ref dst.
@@ -1124,6 +1133,14 @@ export class GitCache {
       // Clear the now-dangling PRD #218 owner stamp for the deleted ref. tryGit swallows
       // exit 5 (key absent), which runGit would instead throw on — see the helper notes.
       await this.tryGit(barePath, ["config", "--local", "--unset", runnerTrackingOwnerKey(ancestorBranch)]);
+      // issue #909 — a pre-#887 bare may hold the stamp under the FLATTENED key instead. Clear it
+      // too, but only when unattributable-to-a-sibling: the flat key is lossy, so unsetting it
+      // while a DISTINCT live tracking ref flattens to the same token would wipe THAT branch's
+      // stamp (the #887 collision). The ancestor ref was deleted just above, so it is already out
+      // of the live set and cannot flag itself; a colliding live sibling still would.
+      if (!(await this.flatOwnerKeyAmbiguous(barePath, ancestorBranch))) {
+        await this.tryGit(barePath, ["config", "--local", "--unset", legacyFlatTrackingOwnerKey(ancestorBranch)]);
+      }
     }
   }
 
@@ -2084,6 +2101,37 @@ export class GitCache {
       const code = (err as { code?: unknown }).code;
       return typeof code === "number" ? code : 1;
     }
+  }
+
+  /** issue #909 — read the tracking-ref owner stamp. Prefer the #887 subsection form; fall back
+   *  to the pre-#887 flattened form for a bare stamped under old code during the rollout window.
+   *  The fallback is COLLISION-AWARE: the flat key is not branch-injective, so it is consulted
+   *  only when no OTHER live tracking ref flattens to the same key. The decisive second guard is
+   *  the caller's runId-equality test (a foreign branch's stamp carries a different, globally
+   *  unique runId). Returns "" when neither form is present. Best-effort throughout. */
+  private async readTrackingOwner(barePath: string, branch: string): Promise<string> {
+    const current = await this.tryGitStdout(barePath, ["config", "--get", runnerTrackingOwnerKey(branch)]);
+    if (current) return current;
+    const legacy = await this.tryGitStdout(barePath, ["config", "--get", legacyFlatTrackingOwnerKey(branch)]);
+    if (!legacy) return "";
+    if (await this.flatOwnerKeyAmbiguous(barePath, branch)) return "";
+    return legacy;
+  }
+
+  /** issue #909 — true when a DISTINCT live tracking ref (refs/uzi-runner/<branch>) flattens to
+   *  the same pre-#887 flat owner key as `branch`, making a legacy flat stamp unattributable.
+   *  Enumerates the tracking namespace; the ref suffix is the branch. Best-effort. */
+  private async flatOwnerKeyAmbiguous(barePath: string, branch: string): Promise<boolean> {
+    const token = branch.replace(/[^A-Za-z0-9_-]/g, "-");
+    const out = await this.tryGitStdout(barePath, ["for-each-ref", "--format=%(refname)", RUNNER_TRACKING_PREFIX]);
+    if (!out) return false;
+    for (const ref of out.split("\n")) {
+      if (!ref.startsWith(RUNNER_TRACKING_PREFIX)) continue;
+      const other = ref.slice(RUNNER_TRACKING_PREFIX.length);
+      if (other === branch) continue;
+      if (other.replace(/[^A-Za-z0-9_-]/g, "-") === token) return true;
+    }
+    return false;
   }
 
   private async tryGitStdout(cwd: string | undefined, args: string[]): Promise<string> {

@@ -1459,3 +1459,134 @@ describe("issue #887 — fetchAgentBranch clears a D/F-conflicting legacy ancest
     );
   });
 });
+
+describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flattened key, collision-guarded", () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+  function refInBare(bare: string, ref: string): boolean {
+    try {
+      gitIn(bare, ["rev-parse", "--verify", "--quiet", ref]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("(a) reader fallback: a stable branch owned ONLY under the legacy flat key resumes off its unpushed tracking ref", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const runId = "run-500";
+    const branch = "agent/issue-500";
+
+    // Build a genuine UNPUSHED commit that descends origin/main and land it in the worker
+    // bare as a fetch-back would, creating refs/uzi-runner/agent/issue-500 at that tip.
+    const first = await git.runnerCloneForBranch(bare, branch, "issue-500", runId);
+    fs.writeFileSync(path.join(first.path, "W.txt"), "unpushed work\n");
+    gitIn(first.path, ["add", "W.txt"]);
+    gitIn(first.path, [...IDENT, "commit", "-m", "unpushed work"]);
+    const workSha = gitIn(first.path, ["rev-parse", "HEAD"]);
+    await git.fetchAgentBranch(bare, first.path, branch, runId);
+    await git.removeRunnerClone(first.path);
+
+    // Simulate a PRE-#887 persistent bare: no #887 subsection stamp, only the old FLATTENED
+    // 2-part key (no `.owner`). Drop the new-key stamp fetchAgentBranch just wrote and plant
+    // the legacy flat one in its place.
+    gitIn(bare, ["config", "--local", "--unset", "uzi-trackowner.agent/issue-500.owner"]);
+    gitIn(bare, ["config", "--local", "uzi-trackowner.agent-issue-500", runId]);
+
+    // No origin/agent/issue-500 (never pushed), so ownedHere alone decides. On unfixed code
+    // the reader sees only the (absent) subsection key ⇒ ownedHere=false ⇒ seededFrom other
+    // than "tracking" and the unpushed commit is silently redone.
+    const rc = await git.runnerCloneForBranch(bare, branch, "issue-500", runId);
+    assert.strictEqual(rc.seededFrom, "tracking", "the legacy-flat-owned tracking ref must be adopted via the fallback");
+    assert.strictEqual(rc.baseCommit, workSha, "…seeded off the unpushed tracking tip, not the default floor");
+  });
+
+  it("(b) collision-aware negative: a legacy flat stamp two live refs flatten to is NOT adopted", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const runId = "run-500";
+    const mainSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+
+    // Two DISTINCT live tracking refs whose branches both flatten to "agent-issue-500":
+    // the slash form (current) and the literal hyphen form (sibling).
+    gitIn(bare, ["update-ref", "refs/uzi-runner/agent/issue-500", mainSha]);
+    gitIn(bare, ["update-ref", "refs/uzi-runner/agent-issue-500", mainSha]);
+    // The shared, ambiguous legacy flat stamp. Its value is set to THIS run's id, so only the
+    // collision guard — not a value mismatch — can keep the fallback from adopting it.
+    gitIn(bare, ["config", "--local", "uzi-trackowner.agent-issue-500", runId]);
+
+    const rc = await git.runnerCloneForBranch(bare, "agent/issue-500", "issue-500", runId);
+    assert.notStrictEqual(rc.seededFrom, "tracking", "an ambiguous flat stamp must not be attributed to either branch");
+  });
+
+  it("(c) new-key precedence: the #887 subsection value wins and the flat value is never consulted", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const mainSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+    gitIn(bare, ["update-ref", "refs/uzi-runner/agent/issue-500", mainSha]);
+
+    // BOTH forms present with DIFFERENT values.
+    gitIn(bare, ["config", "--local", "uzi-trackowner.agent/issue-500.owner", "new-run"]);
+    gitIn(bare, ["config", "--local", "uzi-trackowner.agent-issue-500", "flat-run"]);
+
+    // The run whose id matches the NEW subsection value is ownedHere.
+    const owned = await git.runnerCloneForBranch(bare, "agent/issue-500", "issue-500", "new-run");
+    assert.strictEqual(owned.seededFrom, "tracking", "the new subsection stamp must decide ownership");
+    // The run whose id matches only the FLAT value is NOT ownedHere — the flat value is never
+    // consulted once the subsection key is present.
+    const notOwned = await git.runnerCloneForBranch(bare, "agent/issue-500", "issue-500", "flat-run");
+    assert.notStrictEqual(notOwned.seededFrom, "tracking", "the flat value must never be consulted when the subsection key exists");
+  });
+
+  it("(d1) clear path: a cleared ancestor's legacy flat stamp is UNSET when unambiguous", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const mainSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+
+    // The pre-#774 FLAT leaf ancestor that path-blocks the per-run dst (mirrors the #887 test).
+    gitIn(bare, ["update-ref", "refs/uzi-runner/uzi/self-improve", mainSha]);
+    // Its dangling stamp under the PRE-#887 FLAT key (2-part, no `.owner`). Nothing else in the
+    // live set flattens to "uzi-self-improve", so it is unambiguous.
+    gitIn(bare, ["config", "--local", "uzi-trackowner.uzi-self-improve", "old-flat-run"]);
+
+    const runId = "37702d9d-909d-49c9-b3cd-7974a3b2ecde";
+    const branch = `uzi/self-improve/${runId}`;
+    const rc = await git.runnerCloneForBranch(bare, branch, `self-improve-${runId}`, runId);
+    fs.writeFileSync(path.join(rc.path, "SI.txt"), "self-improve\n");
+    gitIn(rc.path, ["add", "SI.txt"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "self-improve work"]);
+    await git.fetchAgentBranch(bare, rc.path, branch, runId);
+
+    assert.throws(
+      () => gitIn(bare, ["config", "--local", "--get", "uzi-trackowner.uzi-self-improve"]),
+      "the cleared ancestor's legacy flat owner stamp must be unset when no live sibling collides",
+    );
+  });
+
+  it("(d2) clear path: the legacy flat stamp SURVIVES when a distinct colliding sibling ref is live", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const mainSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+
+    // The FLAT leaf ancestor being cleared (branch "uzi/self-improve", flat token
+    // "uzi-self-improve"), plus a DISTINCT live sibling "uzi-self-improve" (hyphen) whose
+    // branch flattens to the SAME token — the exact #887 collision.
+    gitIn(bare, ["update-ref", "refs/uzi-runner/uzi/self-improve", mainSha]);
+    gitIn(bare, ["update-ref", "refs/uzi-runner/uzi-self-improve", mainSha]);
+    // The shared flat stamp (attributable to the live hyphen sibling, not the cleared ancestor).
+    gitIn(bare, ["config", "--local", "uzi-trackowner.uzi-self-improve", "sibling-flat-run"]);
+
+    const runId = "37702d9d-909e-49c9-b3cd-7974a3b2ecde";
+    const branch = `uzi/self-improve/${runId}`;
+    const rc = await git.runnerCloneForBranch(bare, branch, `self-improve-${runId}`, runId);
+    fs.writeFileSync(path.join(rc.path, "SI.txt"), "self-improve\n");
+    gitIn(rc.path, ["add", "SI.txt"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "self-improve work"]);
+    await git.fetchAgentBranch(bare, rc.path, branch, runId);
+
+    // The ancestor "uzi/self-improve" was cleared, but the flat key is ambiguous (the live
+    // hyphen sibling flattens to it), so the new unset must NOT fire and the stamp survives.
+    assert.strictEqual(
+      gitIn(bare, ["config", "--local", "--get", "uzi-trackowner.uzi-self-improve"]),
+      "sibling-flat-run",
+      "a flat stamp a distinct live sibling shares must not be collaterally unset",
+    );
+    // The live hyphen sibling's own tracking ref is untouched.
+    assert.strictEqual(refInBare(bare, "refs/uzi-runner/uzi-self-improve"), true);
+  });
+});

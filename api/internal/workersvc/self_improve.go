@@ -28,7 +28,12 @@ var ErrActiveSelfImproveExists = errors.New("a self-improvement run is already a
 // title/description directly (issue_description carries the accumulated improve_uzi
 // backlog, which the worker frames as untrusted data). A second active run is
 // rejected by the partial unique index → ErrActiveSelfImproveExists.
-func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, model *string, overrideSubagentModel bool) (store.Run, error) {
+//
+// mrReworkEnabled threads the schedule's per-schedule mr_rework override (PRD #908),
+// same shape as the model override: nil ⇒ NULL ⇒ the run inherits the owner default
+// live at read time; true/false stamp an explicit per-run override. The bespoke engine
+// passes nil.
+func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -55,6 +60,9 @@ func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.
 		// nil/false, freezing NULL/false onto its run exactly as before.
 		Model:                 pgconv.TextPtr(model),
 		OverrideSubagentModel: overrideSubagentModel,
+		// PRD #908 M1: the schedule's mr_rework override, stamped THROUGH live-inherit —
+		// nil ⇒ NULL ⇒ the run follows the owner default at read time.
+		MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
