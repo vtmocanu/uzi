@@ -362,7 +362,8 @@ A few worth knowing:
   exact set of schedules that were on before. `pause-status` prints the
   current state (paused, and until when, or not paused); `schedule list`'s
   `NEXT` column reads `paused (all)` (with the resume stamp, if any) for
-  every row while a pause-all is active. `--json` works on all three,
+  every row that would otherwise fire while a pause-all is active; a row
+  whose own switch is off keeps `—`. `--json` works on all three,
   returning the same `{paused, until}` shape. See [Pausing everything at
   once](./scheduling.md#pausing-everything-at-once) for the full behaviour.
 - **Default scheduled jobs (`schedule catalog`).** uzi ships a small catalog of

@@ -301,7 +301,10 @@ type FakeClient struct {
 	// distinction `pause-all --until never` vs `--until 24h` carries; LastPauseSet records
 	// that a pause write happened at all (so a nil LastPauseUntil is unambiguous), and
 	// PauseCleared records that resume-all reached ClearSchedulePause.
-	PauseState     apitypes.SchedulePauseDTO
+	PauseState apitypes.SchedulePauseDTO
+	// PauseErr fails ONLY GetSchedulePause (the other verbs keep working), so a test can
+	// prove `schedule list` degrades to the ordinary NEXT cell instead of failing outright.
+	PauseErr       error
 	LastPauseUntil *time.Time
 	LastPauseSet   bool
 	PauseCleared   bool

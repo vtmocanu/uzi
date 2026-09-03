@@ -12,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -21,13 +22,14 @@ import (
 // the row is always the caller's own user, so there is no id to check.
 // -------------------------------------------------------------------------
 
-// normalizeSchedulePause turns the RAW pause columns into the NORMALIZED wire DTO,
-// applying the same expiry rule as M1's scheduler pauseCache: paused AND (until NULL
-// OR until > now). An expired `until` reads as not paused (until:null). The read-time
-// normalization uses time.Now() at the call site rather than an injected clock, unlike
-// the scheduler which fires against its own e.now().
+// normalizeSchedulePause turns the RAW pause columns into the NORMALIZED wire DTO through
+// schedsvc.PauseActive, the ONE definition of "paused right now" the scheduler also
+// enforces at fire time, so the API can never report a state the scheduler disagrees
+// with. An expired `until` reads as not paused (until:null). The read-time normalization
+// uses time.Now() at the call site rather than an injected clock, unlike the scheduler
+// which fires against its own e.now().
 func normalizeSchedulePause(paused bool, until pgtype.Timestamptz, now time.Time) apitypes.SchedulePauseDTO {
-	if !paused || (until.Valid && !until.Time.After(now)) {
+	if !schedsvc.PauseActive(paused, until, now) {
 		return apitypes.SchedulePauseDTO{Paused: false, Until: nil}
 	}
 	if until.Valid {

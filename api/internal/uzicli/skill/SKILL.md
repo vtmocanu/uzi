@@ -619,7 +619,10 @@ nothing a manual start cannot.
   (`paused until <stamp>`, `paused indefinitely`, or `not paused`). An expired `until` reads
   as `not paused` (auto-resumed, no background job). `--json` emits the state. While a
   pause-all is active, `uzi schedule list`'s `NEXT` column reads `paused (all) until <stamp>`
-  (or `paused (all)`) for every row.
+  (or `paused (all)`) for every row that would otherwise fire; a row whose own switch is
+  off, or with no next fire, keeps `—` (resuming would not fire it). If the pause-all state
+  cannot be read (an older server without the route, a transient error) the list still
+  renders with the ordinary `NEXT` and a `WARNING` on stderr; it never fails on that read.
 - `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence.
   Prints a per-candidate breakdown: a `Started N run(s)` header with the created run
   id(s), one line per started run, then — when candidates were skipped — a

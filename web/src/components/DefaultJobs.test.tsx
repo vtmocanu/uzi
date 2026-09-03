@@ -417,10 +417,16 @@ describe("DefaultJobs — pause-all Next-run note (PRD #1093)", () => {
     expect(screen.getByText("paused until Wed 09:00")).toBeTruthy();
   });
 
-  it("shows the paused line even when the job is enabled on no repo (not-enabled cell)", () => {
+  it("shows no paused line when the job is enabled on no repo (nothing would fire)", () => {
     renderTab({ pauseNote: "paused until Wed 09:00" });
     expect(screen.getByText("not enabled")).toBeTruthy();
-    expect(screen.getByText("paused until Wed 09:00")).toBeTruthy();
+    expect(screen.queryByText("paused until Wed 09:00")).toBeNull();
+  });
+
+  it("shows no paused line when every enabled row is itself paused (nothing would fire)", () => {
+    renderTab({ schedules: [defRow({ enabled: false })], pauseNote: "paused until Wed 09:00" });
+    expect(screen.getByText("1 repo")).toBeTruthy();
+    expect(screen.queryByText("paused until Wed 09:00")).toBeNull();
   });
 
   it("shows no paused line when not paused (control)", () => {

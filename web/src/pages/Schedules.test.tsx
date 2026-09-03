@@ -877,6 +877,22 @@ describe("Schedules — pause all (PRD #1093)", () => {
     expect(screen.queryByText(/All schedules paused/)).toBeNull();
   });
 
+  it("re-reads the pause state when `until` passes on an open page, clearing the banner (auto-resume transition)", async () => {
+    // Real timers on purpose: the page arms one setTimeout for the auto-resume instant and
+    // re-fetches then. A short until makes that fire within the test; the second read is
+    // the server's normalized "not paused" answer, so the banner must give way to the button.
+    const soon = new Date(Date.now() + 60).toISOString();
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockResolvedValue({ paused: false, until: null });
+    renderRoot();
+    await waitFor(() => expect(screen.getByText(/All schedules paused until/)).toBeTruthy());
+    await waitFor(() => expect(screen.queryByText(/All schedules paused/)).toBeNull());
+    expect(screen.getByRole("button", { name: /Pause all/ })).toBeTruthy();
+    // The re-read happened (initial load + the timer's refresh), not a local guess.
+    expect(mockApi.getSchedulePause.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
   it("the picker opens with 'Until tomorrow 09:00' as the default preset and correct resolved stamps (fixed clock)", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     // A fixed instant so the resolved preset stamps are deterministic.

@@ -90,8 +90,11 @@ type fakeStore struct {
 	// pgx.ErrNoRows so the scheduler's fail-open branch is exercised. getSchedulePauseCalls
 	// counts every call and getSchedulePauseUsers records the user ids, so a test can prove
 	// the per-tick memoization (N due rows of one owner ⇒ exactly one call).
-	schedulePause         map[uuid.UUID]store.GetUserSchedulePauseRow
-	schedulePauseNoRows   bool
+	schedulePause       map[uuid.UUID]store.GetUserSchedulePauseRow
+	schedulePauseNoRows bool
+	// schedulePauseErr, when set, is returned from GetUserSchedulePause for every user
+	// (a transient DB error), exercising the hold-this-tick branch.
+	schedulePauseErr      error
 	getSchedulePauseCalls int
 	getSchedulePauseUsers []uuid.UUID
 }
@@ -139,6 +142,9 @@ func (f *fakeStore) ClearVaultLockNotice(_ context.Context, userID uuid.UUID) er
 func (f *fakeStore) GetUserSchedulePause(_ context.Context, userID uuid.UUID) (store.GetUserSchedulePauseRow, error) {
 	f.getSchedulePauseCalls++
 	f.getSchedulePauseUsers = append(f.getSchedulePauseUsers, userID)
+	if f.schedulePauseErr != nil {
+		return store.GetUserSchedulePauseRow{}, f.schedulePauseErr
+	}
 	if row, ok := f.schedulePause[userID]; ok {
 		return row, nil
 	}
@@ -1898,6 +1904,37 @@ func TestTickFailOpenWhenPauseLookupErrors(t *testing.T) {
 
 	if len(h.runs.autopilot) != 1 {
 		t.Fatalf("ErrNoRows must fail open (fire): autopilot calls = %d, want 1", len(h.runs.autopilot))
+	}
+}
+
+// TestTickPauseLookupErrorHoldsRowThisTick pins the fail-CLOSED contract for a transient
+// lookup error (PR #1096 review): a kill switch must not fire the very runs it exists to
+// stop because the DB blipped. The due row is neither fired, advanced nor parked this
+// tick; it stays due and fires on the next tick once the lookup works again. Mutation:
+// map the default error branch back to "not paused" → the row fires on the first Boot.
+func TestTickPauseLookupErrorHoldsRowThisTick(t *testing.T) {
+	h := newHarness()
+	h.st.schedulePauseErr = errors.New("db: connection reset")
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if h.runsCreated() != 0 {
+		t.Fatalf("lookup error must hold the row (no fire), got %d runs", h.runsCreated())
+	}
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("lookup error must NOT advance the row, got %d advances", len(h.st.advanceCalls))
+	}
+	if len(h.st.statusCalls) != 0 {
+		t.Fatalf("lookup error must NOT park the row, got %d status writes", len(h.st.statusCalls))
+	}
+
+	// The blip clears: the still-due row fires on the next tick.
+	h.st.schedulePauseErr = nil
+	h.sched.Boot(context.Background())
+
+	if h.runsCreated() != 1 {
+		t.Fatalf("after the lookup recovers the held row must fire exactly once, got %d", h.runsCreated())
 	}
 }
 

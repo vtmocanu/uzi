@@ -199,11 +199,16 @@ export function ScheduleSubRow({
           </div>
           <div className="mt-0.5 font-mono text-[11.5px] text-faint">
             {cronExpr} · {humanizeCron(cronExpr)}
-            {pausedNote ? (
-              <span className="text-warn"> · {pausedNote}</span>
-            ) : (
-              enabled && nextFire && <span> · next {relativeFromNow(nextFire)}</span>
-            )}
+            {/* The pause-all note replaces "next …" only where a next fire would have
+                shown: a row whose own switch is off, or with no next fire, never
+                promises that resuming will fire it. */}
+            {enabled &&
+              nextFire &&
+              (pausedNote ? (
+                <span className="text-warn"> · {pausedNote}</span>
+              ) : (
+                <span> · next {relativeFromNow(nextFire)}</span>
+              ))}
           </div>
         </div>
 

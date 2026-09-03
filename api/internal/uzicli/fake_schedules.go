@@ -127,6 +127,9 @@ func (f *FakeClient) AddScheduleRepo(_ context.Context, id, repoID string) (apit
 // GetSchedulePause returns the canned PauseState (the server-normalized pause-all
 // state). Returns f.Err when set, like the other read verbs.
 func (f *FakeClient) GetSchedulePause(context.Context) (apitypes.SchedulePauseDTO, error) {
+	if f.PauseErr != nil {
+		return apitypes.SchedulePauseDTO{}, f.PauseErr
+	}
 	if f.Err != nil {
 		return apitypes.SchedulePauseDTO{}, f.Err
 	}

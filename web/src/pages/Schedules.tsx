@@ -5,7 +5,7 @@
 // a fired `once` row shows as terminal; a status='error' (parked) row is called out
 // distinctly. The "New schedule" button and the per-row ✎ open the shared modal.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -349,6 +349,22 @@ export function Schedules() {
   // switch is on (warn-coloured at the render site); null when not paused. Computed once
   // here so the row components stay dump — they only render the string when present.
   const pauseActive = pause?.paused ?? false;
+  // The server normalizes an expired `until` on every read, but an open page does not
+  // re-read on its own: arm one timer for the auto-resume instant and re-fetch then, so
+  // the banner and the row notes clear at the moment the scheduler stops honouring the
+  // pause. Re-armed whenever the state changes; cleared on unmount. setTimeout's delay
+  // is a 32-bit signed int, so a far-off until is clamped and re-armed on fire.
+  useEffect(() => {
+    if (!pause?.paused || !pause.until) return;
+    const delay = Math.min(Math.max(new Date(pause.until).getTime() - Date.now(), 0), 2_147_483_647);
+    const id = setTimeout(() => {
+      api
+        .getSchedulePause()
+        .then(setPause)
+        .catch(() => setPause({ paused: false, until: null }));
+    }, delay);
+    return () => clearTimeout(id);
+  }, [pause]);
   const pauseNote = pauseActive
     ? pause?.until
       ? `paused until ${formatStamp(pause.until)}`
@@ -418,8 +434,11 @@ export function Schedules() {
         </button>
         {/* Running state only: the button sits at the right end of the tab row (ml-auto),
             directly under "New schedule", so no header height is added. It disappears
-            while paused (the banner above carries Resume) or while the picker is open. */}
-        {!pauseActive && !pickerOpen && (
+            while paused (the banner above carries Resume) or while the picker is open,
+            and it does not render until the pause state has LOADED (pause !== null):
+            an unresolved read must not offer a control that could overwrite a pause the
+            server already holds. */}
+        {pause !== null && !pauseActive && !pickerOpen && (
           <PauseAllButton onClick={() => setPickerOpen(true)} disabled={pauseBusy} />
         )}
       </div>

@@ -24,7 +24,7 @@ import {
 
 // The one scope sentence shown in both the picker and the paused banner, so the two
 // never drift. Kept as a single string constant to make the copy greppable.
-export const PAUSE_SCOPE_SENTENCE =
+const PAUSE_SCOPE_SENTENCE =
   "Every schedule you own, on every repo, default jobs and your own. Per-schedule switches are left as they are. Run now still works; runs already in flight are not stopped.";
 
 // PauseAllButton — the tab-row control shown only in the running state (D9: right end of
@@ -94,7 +94,10 @@ export function PausePanel({
   const presets = resolvePausePresets(now);
 
   const resolved = resolvePreset(preset, now, customLocal);
-  const customUnset = preset === "custom" && !customLocal;
+  // Gate on the RESOLVED instant, not on the raw field: a non-empty but unparseable
+  // datetime-local value resolves to null, and null on submit means "indefinitely",
+  // which is not what a custom pick intends.
+  const customUnset = preset === "custom" && resolved === null;
   const submitLabel =
     preset === "indefinite"
       ? "Pause all indefinitely"

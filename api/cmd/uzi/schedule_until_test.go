@@ -170,3 +170,17 @@ func TestResolveUntilErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveUntilRejectsNonPositiveDuration: a zero or negative duration is a usage
+// error the CLI names itself, never a past instant round-tripped to the server's 422.
+func TestResolveUntilRejectsNonPositiveDuration(t *testing.T) {
+	now := time.Date(2026, 9, 2, 14, 0, 0, 0, time.UTC)
+	for _, in := range []string{"-1h", "0s", "-30m"} {
+		if _, _, err := resolveUntil(in, now, time.UTC); err == nil {
+			t.Errorf("resolveUntil(%q) = nil error, want a positive-duration usage error", in)
+		}
+	}
+	if _, _, err := resolveUntil("1h", now, time.UTC); err != nil {
+		t.Errorf("resolveUntil(1h) control errored: %v", err)
+	}
+}

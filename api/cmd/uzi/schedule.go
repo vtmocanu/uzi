@@ -301,9 +301,13 @@ func newScheduleListCmd(env Env, gf *globalFlags) *cobra.Command {
 			// is active, every row's NEXT reads "paused (all) …" regardless of the row's
 			// own next fire; an expired until is server-normalized to not-paused, so the
 			// normal next fire renders with no client-side special-casing.
+			// The pause read is decoration on the list, not a precondition: a server
+			// that predates the route (404), or a transient failure, degrades to the
+			// ordinary NEXT column with a WARNING on stderr instead of blanking the list.
 			pause, err := c.GetSchedulePause(cmd.Context())
 			if err != nil {
-				return err
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: could not read the pause-all state, NEXT ignores it: %v\n", err)
+				pause = apitypes.SchedulePauseDTO{}
 			}
 			now := time.Now()
 			rows := make([][]string, 0, len(scheds))
@@ -577,18 +581,21 @@ func pauseStatusLine(state apitypes.SchedulePauseDTO, now time.Time) string {
 	return fmt.Sprintf("paused until %s (in %s)", fmtStamp(*state.Until), fmtUntil(state.Until.Sub(now)))
 }
 
-// scheduleNextCell renders a list row's NEXT while honoring the user-wide pause: when
-// pause-all is active every row reads "paused (all) until <stamp>" (or "paused (all)"
-// for an indefinite pause), regardless of the row's own next fire. Not paused (incl. an
-// expired, server-normalized until) falls back to the ordinary next-fire cell.
+// scheduleNextCell renders a list row's NEXT while honoring the user-wide pause: a row
+// that would otherwise fire reads "paused (all) until <stamp>" (or "paused (all)" for an
+// indefinite pause). A row that would not fire anyway (its own switch off, or no next
+// fire: parked, or a fired once) keeps scheduleNext's "—", so the column never promises
+// that resuming will fire it. Not paused (incl. an expired, server-normalized until)
+// falls back to the ordinary next-fire cell.
 func scheduleNextCell(s apitypes.ScheduleDTO, now time.Time, pause apitypes.SchedulePauseDTO) string {
-	if pause.Paused {
+	base := scheduleNext(s, now)
+	if pause.Paused && base != "—" {
 		if pause.Until != nil {
 			return "paused (all) until " + fmtStamp(*pause.Until)
 		}
 		return "paused (all)"
 	}
-	return scheduleNext(s, now)
+	return base
 }
 
 // fmtStamp renders an absolute pause instant in the caller's local zone, minute

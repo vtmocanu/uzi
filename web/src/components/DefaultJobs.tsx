@@ -301,17 +301,18 @@ function CatalogRow({
       }
       nextCell={
         enabledCount === 0 ? (
-          <div className="flex flex-col gap-1">
-            <span className="text-[12.5px] text-faint">not enabled</span>
-            {pauseNote && <span className="text-[11px] text-warn">{pauseNote}</span>}
-          </div>
+          <span className="text-[12.5px] text-faint">not enabled</span>
         ) : (
           <div className="flex flex-col gap-1">
             <Badge tone="ok">{enabledCount} repo{enabledCount === 1 ? "" : "s"}</Badge>
             {activeCount < enabledCount && (
               <span className="text-[11px] text-faint">{enabledCount - activeCount} paused</span>
             )}
-            {pauseNote && <span className="text-[11px] text-warn">{pauseNote}</span>}
+            {/* Only a job with at least one active row would fire, so only then does
+                the pause-all note apply; "not enabled" + "paused until" contradict. */}
+            {pauseNote && activeCount > 0 && (
+              <span className="text-[11px] text-warn">{pauseNote}</span>
+            )}
           </div>
         )
       }

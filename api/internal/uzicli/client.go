@@ -738,6 +738,14 @@ func statusError(status int, body []byte) *ExitError {
 			msg = "bad request"
 		}
 		return Exitf(ExitUsage, "%s", msg)
+	case status == http.StatusUnprocessableEntity:
+		// A 422 is the server rejecting the request's CONTENT (a past `until`, an
+		// issue-target schedule repointed to another repo): a usage error like a 400,
+		// so it exits 2 and the message names the offending value.
+		if msg == "" {
+			msg = "unprocessable request"
+		}
+		return Exitf(ExitUsage, "%s", msg)
 	case status == http.StatusUnauthorized:
 		if msg == "" {
 			msg = "authentication required or token invalid — run `uzi auth token` or set $UZI_TOKEN"

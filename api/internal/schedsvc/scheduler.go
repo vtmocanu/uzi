@@ -233,37 +233,63 @@ func (e *Scheduler) tick(ctx context.Context) {
 		e.logger.Error("scheduler: claim due schedules", "error", err)
 		return
 	}
-	pc := &pauseCache{e: e, seen: make(map[uuid.UUID]bool)}
+	if len(scheds) == 0 {
+		return
+	}
+	pc := &pauseCache{e: e, seen: make(map[uuid.UUID]pauseState)}
 	for _, sched := range scheds {
 		e.process(ctx, sched, pc)
 	}
 }
 
-// pauseCache resolves an owner's user-level "pause all schedules" state (PRD #1093)
-// once per distinct UserID per tick. Expiry is computed in Go against e.now() (never SQL
-// now()), so the test's fake clock drives auto-resume. A missing owner row (ErrNoRows) or
-// any lookup error resolves fail-open to "not paused": a pause must never wedge the tick.
-type pauseCache struct {
-	e    *Scheduler
-	seen map[uuid.UUID]bool
+// PauseActive is THE definition of "this owner's pause-all switch is active right now"
+// (PRD #1093 D2): paused AND (until NULL OR until > now). The scheduler's fire-time check
+// and the handler's read-time normalization both call it, so the API can never report a
+// state the scheduler does not enforce. Strict After: an until equal to now has expired.
+func PauseActive(paused bool, until pgtype.Timestamptz, now time.Time) bool {
+	return paused && (!until.Valid || until.Time.After(now))
 }
 
-// paused reports whether the owner has paused all their schedules right now, memoizing
-// the per-user answer for the lifetime of this tick's cache.
-func (c *pauseCache) paused(ctx context.Context, userID uuid.UUID) bool {
+// pauseState is the per-owner answer a tick caches: off, on, or unknown (the lookup
+// failed with something other than ErrNoRows).
+type pauseState uint8
+
+const (
+	pauseOff pauseState = iota
+	pauseOn
+	pauseUnknown
+)
+
+// pauseCache resolves an owner's user-level "pause all schedules" state (PRD #1093)
+// once per distinct UserID per tick. Expiry is computed in Go against e.now() (never SQL
+// now()), so the test's fake clock drives auto-resume. A missing owner row (ErrNoRows)
+// resolves to "not paused" (fail-open: the FK makes it unreachable for a live owner). A
+// transient lookup error resolves to UNKNOWN, and process holds the row for this tick:
+// a kill switch must not fail open on a DB blip and fire the very runs it exists to
+// stop, and holding one owner's rows for one tick wedges nobody else.
+type pauseCache struct {
+	e    *Scheduler
+	seen map[uuid.UUID]pauseState
+}
+
+// paused reports the owner's pause state right now, memoizing the per-user answer for
+// the lifetime of this tick's cache.
+func (c *pauseCache) paused(ctx context.Context, userID uuid.UUID) pauseState {
 	if v, ok := c.seen[userID]; ok {
 		return v
 	}
 	row, err := c.e.store.GetUserSchedulePause(ctx, userID)
-	v := false
+	v := pauseOff
 	switch {
 	case err == nil:
-		v = row.SchedulesPaused && (!row.SchedulesPausedUntil.Valid || row.SchedulesPausedUntil.Time.After(c.e.now()))
+		if PauseActive(row.SchedulesPaused, row.SchedulesPausedUntil, c.e.now()) {
+			v = pauseOn
+		}
 	case isNoRows(err):
-		v = false // fail-open: no owner row ⇒ not paused
+		v = pauseOff // fail-open: no owner row ⇒ not paused
 	default:
-		c.e.logger.Warn("scheduler: resolve pause state", "user", userID.String(), "error", err)
-		v = false // fail-open: never wedge the tick
+		c.e.logger.Warn("scheduler: resolve pause state, holding this owner's due schedules for one tick", "user", userID.String(), "error", err)
+		v = pauseUnknown
 	}
 	c.seen[userID] = v
 	return v
@@ -283,7 +309,13 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 	// replays on resume. A paused once row is left un-advanced and unwritten so it stays
 	// overdue and fires on the first tick after the pause ends — NOT routed through
 	// advance's transient branch, which would Warn every tick for the length of the pause.
-	if pc.paused(ctx, sched.UserID) {
+	switch pc.paused(ctx, sched.UserID) {
+	case pauseUnknown:
+		// The lookup failed: neither fire nor advance. The row stays due and is
+		// re-claimed next tick, when the lookup is retried (the Warn is in pauseCache).
+		e.logger.Debug("scheduler: pause state unknown, holding schedule this tick", "schedule", sched.ID.String())
+		return
+	case pauseOn:
 		if sched.Timing == "once" {
 			e.logger.Debug("scheduler: owner paused, holding once schedule", "schedule", sched.ID.String())
 			return

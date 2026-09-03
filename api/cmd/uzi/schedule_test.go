@@ -1781,3 +1781,51 @@ func TestScheduleRunNowNoneStarted(t *testing.T) {
 }
 
 func ptrInt64(n int64) *int64 { return &n }
+
+// TestScheduleListPausedAllKeepsDashForRowsThatWouldNotFire: while pause-all is active,
+// a row whose own switch is off (or with no next fire) keeps scheduleNext's "—" instead
+// of "paused (all) …", so the column never claims that resuming would fire it.
+func TestScheduleListPausedAllKeepsDashForRowsThatWouldNotFire(t *testing.T) {
+	next := time.Now().Add(6 * time.Hour)
+	until := time.Now().Add(20 * time.Hour)
+	fc := &uzicli.FakeClient{
+		Schedules: []apitypes.ScheduleDTO{
+			{ID: "sch_off", Target: "sweep", Labels: []string{"bug"}, RepoPath: "vtmocanu/uzi", Timing: "recurring", CronExpr: "0 9 * * 1", NextFireAt: &next, Enabled: false},
+		},
+		PauseState: apitypes.SchedulePauseDTO{Paused: true, Until: &until},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out, "paused (all)") {
+		t.Errorf("a disabled row must keep '—', not 'paused (all)'\n%s", out)
+	}
+	if !strings.Contains(out, "—") {
+		t.Errorf("disabled row NEXT missing '—'\n%s", out)
+	}
+}
+
+// TestScheduleListDegradesWhenPauseReadFails: the pause-all read decorates the list, it
+// does not gate it. When only that read fails (an older server without the route, a
+// transient error), the table still renders from the schedules alone, exit 0, with a
+// WARNING on stderr and the ordinary NEXT cell.
+func TestScheduleListDegradesWhenPauseReadFails(t *testing.T) {
+	next := time.Now().Add(6 * time.Hour)
+	fc := &uzicli.FakeClient{
+		Schedules: []apitypes.ScheduleDTO{
+			{ID: "sch_a", Target: "sweep", Labels: []string{"bug"}, RepoPath: "vtmocanu/uzi", Timing: "recurring", CronExpr: "0 9 * * 1", NextFireAt: &next, Enabled: true},
+		},
+		PauseErr: uzicli.Exitf(uzicli.ExitNotFound, "not found"),
+	}
+	out, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (the list must render without the pause state)", code)
+	}
+	if !strings.Contains(out, "sch_a") || !strings.Contains(out, "in ") {
+		t.Errorf("list must still render the row and its normal NEXT\n%s", out)
+	}
+	if !strings.Contains(errOut, "WARNING") {
+		t.Errorf("stderr = %q, want a WARNING about the pause-all read", errOut)
+	}
+}

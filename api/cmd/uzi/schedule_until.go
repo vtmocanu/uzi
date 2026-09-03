@@ -45,6 +45,11 @@ func resolveUntil(input string, now time.Time, loc *time.Location) (time.Time, b
 	// A Go duration added to now. Tried before the word forms because a duration never
 	// collides with "tomorrow"/a weekday name (time.ParseDuration rejects those).
 	if d, err := time.ParseDuration(s); err == nil {
+		if d <= 0 {
+			// Rejected here, not by the server's 422: "-1h" or "0s" is a usage error the
+			// CLI can name precisely, and a past instant would only round-trip to fail.
+			return time.Time{}, false, fmt.Errorf("--until duration must be positive, got %q", s)
+		}
 		return now.Add(d), false, nil
 	}
 
