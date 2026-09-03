@@ -1,6 +1,6 @@
 // Package forgetest provides shared test-support scaffolding for the
 // forge.Forge driver contract. Its centrepiece is BaseFake: an embeddable
-// implementation of all 25 Forge methods with safe defaults, so a hand-written
+// implementation of all 26 Forge methods with safe defaults, so a hand-written
 // test fake can embed it and override only the methods it actually exercises.
 //
 // The point is the interface-change tax. Adding a method to forge.Forge used to
@@ -37,7 +37,7 @@ func notStubbed(method string) error {
 }
 
 // BaseFake is an empty struct that implements the entire forge.Forge interface
-// (all 25 methods) with safe defaults, designed to be embedded by value in a
+// (all 26 methods) with safe defaults, designed to be embedded by value in a
 // hand-written test fake used through a pointer. Every method has a pointer
 // receiver so method promotion works when the embedder is used as *fakeForge.
 //
@@ -94,6 +94,11 @@ func (*BaseFake) UpdateIssueLabels(context.Context, int64, int64, []string, []st
 // UpdateIssueDescription implements forge.Forge.
 func (*BaseFake) UpdateIssueDescription(context.Context, int64, int64, string) error {
 	return notStubbed("UpdateIssueDescription")
+}
+
+// SetIssueState implements forge.Forge.
+func (*BaseFake) SetIssueState(context.Context, int64, int64, forge.IssueState) error {
+	return notStubbed("SetIssueState")
 }
 
 // UserExists implements forge.Forge.

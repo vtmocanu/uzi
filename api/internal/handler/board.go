@@ -636,6 +636,18 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		if name == "" {
 			continue
 		}
+		// Two reserved close sentinels: "closed" (MoveIssue canonicalizes a
+		// case-insensitive "closed" target to the literal and routes it to CloseIssue)
+		// and "__closed__" (the web's CLOSED_KEY for the synthetic Closed lane, which
+		// Board.tsx maps to the wire value "closed" — web/src/pages/Board.tsx). A user
+		// column named either could never receive a card (a drop onto it closes the
+		// issue), and "__closed__" additionally collides with the synthetic lane's key
+		// in the board's column map. Reject both at configuration time rather than
+		// create a silently unreachable, issue-closing column.
+		if strings.EqualFold(name, "closed") || strings.EqualFold(name, "__closed__") {
+			httpx.Error(w, http.StatusBadRequest, `"closed" and "__closed__" are reserved column names (the close action and the board's internal Closed lane); choose another name`)
+			return
+		}
 		if _, dup := seen[name]; dup {
 			continue
 		}
@@ -824,11 +836,27 @@ type moveIssueRequest struct {
 	ToColumn string `json:"to_column"`
 }
 
-// MoveIssue moves a card to a column by writing the label change to the forge
-// FIRST, then updating the cache. Single-column enforcement: the target column
-// label is added and every other column label removed in one atomic call.
-// Moving to Open ("" / "open") removes all column labels; moving to Closed is
-// not supported in the MVP (close/reopen stays on the forge).
+// MoveIssue moves a card by writing to the forge FIRST, then updating the cache.
+// The target column disambiguates three actions (PRD #1034 M3):
+//
+//   - a configured column (or Open, "" / "open") — an ordinary single-column move:
+//     the target column label is added and every other column label removed in one
+//     atomic call; Open removes all column labels.
+//   - "closed" (drag a card into the Closed lane) — CLOSE the issue on the forge.
+//     Close is state-only: labels are left untouched (CloseIssue never moves them),
+//     and issueToCard→board.ResolveColumn renders closed=true from the issue's state
+//     regardless of any column labels, so the returned card lands in the Closed lane.
+//   - any open target when the SOURCE card is already closed (drag a closed card out) —
+//     REOPEN the issue and move it to the drop target (Backlog "" clears column labels).
+//     Reopen composes a state-flip then a label move; if only the move half fails the
+//     handler still 502s (the card snaps back optimistically and the next poll
+//     reconciles to the reopened state), preserving the 502-on-forge-error contract.
+//
+// Two intended (not-bug) behaviours from the PRD: closing a card whose run is still in
+// flight does NOT stop the run or its MR — ResolveColumn forces closed=true regardless
+// of lifecycle labels, so the card just moves to Closed while the run keeps going. And a
+// stale poll fetched before a manual close lands can briefly re-render a just-closed card
+// as open (a pre-existing race class shared with label moves); no fix here.
 func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {
@@ -848,9 +876,12 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	if strings.EqualFold(target, "open") {
 		target = ""
 	}
-	if strings.EqualFold(target, "closed") {
-		httpx.Error(w, http.StatusBadRequest, "moving to the Closed column is not supported; close the issue on the forge")
-		return
+	// Canonicalize a case-insensitive "closed" to the literal so it flows unchanged to
+	// the close branch below and to ForwardMove (which maps "closed"→the board's Done
+	// option). The source card's state disambiguates reopen from a plain move.
+	isClose := strings.EqualFold(target, "closed")
+	if isClose {
+		target = "closed"
 	}
 
 	cols, err := h.q.ListBoardColumns(r.Context(), repo.ID)
@@ -863,7 +894,9 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		columnSet[c.LabelName] = struct{}{}
 	}
-	if target != "" {
+	// A close carries the "closed" sentinel, not a board column, so it skips column
+	// validation; a reopen/move target still has to be a configured column (or Open "").
+	if !isClose && target != "" {
 		if _, ok := columnSet[target]; !ok {
 			httpx.Error(w, http.StatusBadRequest, "target column is not configured for this repo")
 			return
@@ -887,10 +920,24 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// Forge-first single-column move + cache snapshot, shared with the run
-	// automation (forgesvc.AutoMove). On failure the cache is untouched and the
-	// client snaps the card back.
-	updated, err := h.svc.AutoMove(r.Context(), f, repo.ForgeProjectID, issue, cols, target)
+	// Forge-first mutation + cache snapshot, shared with the run automation. Which one
+	// fires depends on the target and the source card's state (PRD #1034 M3):
+	//   - isClose            → CloseIssue (state-only flip; labels untouched).
+	//   - source is closed   → ReopenIssue (state flip then move to the drop target).
+	//   - otherwise          → AutoMove (ordinary single-column label move).
+	// All three keep the snap-back contract: on failure the cache is untouched (or, for
+	// a reopen whose move-half fails, left reopened-but-unmoved) and the client snaps
+	// the card back while a 502 surfaces.
+	sourceClosed := issue.State == string(forge.StateClosed)
+	var updated store.Issue
+	switch {
+	case isClose:
+		updated, err = h.svc.CloseIssue(r.Context(), f, repo.ForgeProjectID, issue)
+	case sourceClosed:
+		updated, err = h.svc.ReopenIssue(r.Context(), f, repo.ForgeProjectID, issue, cols, target)
+	default:
+		updated, err = h.svc.AutoMove(r.Context(), f, repo.ForgeProjectID, issue, cols, target)
+	}
 	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue on the forge: "+err.Error())
 		return

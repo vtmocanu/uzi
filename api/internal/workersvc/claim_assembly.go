@@ -307,6 +307,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Pipeline:       pipeline,
 		Branch:         textPtr(branch),
 		SessionID:      textPtr(run.SessionID),
+		CheckpointTip:  textPtr(run.CheckpointTip),
 		LastSeq:        run.LastSeq,
 		IterationCount: run.IterationCount,
 		RequeueCount:   run.RequeueCount,

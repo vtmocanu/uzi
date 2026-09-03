@@ -34,6 +34,14 @@ import (
 //
 // targetColumn "" is uzi's implicit Open, which maps to GitHub's native "No
 // Status" (D2): the option id is "" and the Status is CLEARED.
+//
+// targetColumn "closed" is the issue-state sentinel the board handler sends on a
+// drag-to-Closed (PRD #1034 M3): it is NOT a board column, and it drives the board's
+// reserved Done option (link.DoneOptionID) so a closed card lands in Done on the
+// linked Projects v2 board. A board with no Done option logs and no-ops (Status left
+// untouched), mirroring the unmapped-column no-op. Reopen rides the ordinary
+// column/"" paths — the handler passes the drop-target column (or "" for Backlog),
+// never "closed".
 func (s *ProjectSyncService) ForwardMove(ctx context.Context, repoID uuid.UUID, issueIID int64, targetColumn string) error {
 	// Instance kill-switch: sync off instance-wide → no-op.
 	enabled, err := s.settings.GithubProjectSyncEnabled(ctx)
@@ -77,9 +85,21 @@ func (s *ProjectSyncService) ForwardMove(ctx context.Context, repoID uuid.UUID, 
 	// Resolve the target Status option. Open ("" column) → "" (clear). A mapped
 	// column → its option id. An UNMAPPED column (e.g. a "Later" with no matching
 	// Status option) cannot be projected: log and no-op, leaving the card's current
-	// Status untouched.
+	// Status untouched. The "closed" sentinel → the board's reserved Done option.
 	var targetOption string
-	if targetColumn != "" {
+	switch {
+	case targetColumn == "closed":
+		// Drag-to-Closed (PRD #1034 M3): drive the board's reserved Done option. No
+		// board column is literally "closed" (it is the issue-state sentinel the board
+		// handler sends), so this never shadows a real column mapping. A board with no
+		// Done option has nowhere to project: log and no-op like an unmapped column.
+		if link.DoneOptionID == "" {
+			s.log.Info("project sync: forward move to closed skipped, board has no Done option",
+				"repo", repoID, "issue", issueIID)
+			return nil
+		}
+		targetOption = link.DoneOptionID
+	case targetColumn != "":
 		var columnOption map[string]string
 		if err := json.Unmarshal(link.StatusOptions, &columnOption); err != nil {
 			s.log.Warn("project sync: forward move parse status options", "repo", repoID, "issue", issueIID, "error", err)
@@ -92,6 +112,8 @@ func (s *ProjectSyncService) ForwardMove(ctx context.Context, repoID uuid.UUID, 
 			return nil
 		}
 		targetOption = optID
+	default:
+		// targetColumn "" → clear (No Status); targetOption stays "".
 	}
 
 	// Ensure the item exists on the board. A tracked item carries its node id and

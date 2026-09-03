@@ -39,6 +39,13 @@ func (p *publishStore) GetRunClaimContext(context.Context, uuid.UUID) (store.Get
 	return p.claim, p.claimErr
 }
 
+// SetRunCheckpointTip is the best-effort tip persist a successful publish makes
+// (PRD #1042 M2). The handler tests only need it to not fault, so it reports one
+// row moved and never errors.
+func (p *publishStore) SetRunCheckpointTip(context.Context, store.SetRunCheckpointTipParams) (int64, error) {
+	return 1, nil
+}
+
 // newPublishHandler builds a handler whose workersvc uses box (so a token sealed
 // with the same box decrypts), with the SSRF gate and the go-git publisher wired to
 // injectable stubs.

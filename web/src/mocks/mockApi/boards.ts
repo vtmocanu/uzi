@@ -80,16 +80,35 @@ export const boardsApi = {
     }
     return delay(boardResponse(b));
   },
+  // moveIssue writes the forge label and returns the authoritative card. PRD #1034 M4:
+  // "closed" is not a column — it CLOSES the issue (state/labels/column left otherwise
+  // untouched). Dropping a closed card onto an open column REOPENS it: the card reopens,
+  // moves to that column, and is spliced to the END of b.cards so it sorts to the bottom,
+  // mirroring the server nulling board_position (ORDER BY board_position ASC NULLS LAST).
   moveIssue: async (repoId: string, iid: number, toColumn: string) => {
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === iid);
     if (!b || !card) throw new ApiError(404, "issue not found");
-    const to = toColumn === "open" ? "" : toColumn;
     const columnNames = b.columns.map((c) => c.label_name);
+    if (toColumn === "closed") {
+      // Close leaves the card's labels and column as they are; only the state flips.
+      card.state = "closed";
+      card.closed = true;
+      card.conflict = false;
+      return delay({ card: { ...card } }, 320);
+    }
+    const to = toColumn === "open" ? "" : toColumn;
+    const wasClosed = card.closed;
     // Preserve every non-column label (incl. `uzi`) and set the new column label.
     card.labels = [...card.labels.filter((l) => !columnNames.includes(l)), ...(to ? [to] : [])];
     card.column = to;
     card.conflict = false;
+    if (wasClosed) {
+      card.state = "opened";
+      card.closed = false;
+      // Reopened: the card lands at the bottom of its new lane (server nulls its position).
+      b.cards = [...b.cards.filter((c) => c.iid !== iid), card];
+    }
     return delay({ card: { ...card } }, 320);
   },
   // Promote (PRD #102 M6, Decision 15; PRD #764): add the configured `uzi` label,

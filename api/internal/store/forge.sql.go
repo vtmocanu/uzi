@@ -1235,6 +1235,47 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 	return items, nil
 }
 
+const reopenIssueState = `-- name: ReopenIssueState :one
+UPDATE issues
+SET state = 'opened', board_position = NULL, synced_at = now()
+WHERE repo_id = $1 AND forge_issue_iid = $2
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
+`
+
+type ReopenIssueStateParams struct {
+	RepoID        uuid.UUID `json:"repo_id"`
+	ForgeIssueIid int64     `json:"forge_issue_iid"`
+}
+
+// Reopen's cache flip (PRD #1034 M2): set state back to 'opened' AND NULL board_position
+// in one statement, so a reopened card lands at the BOTTOM of its destination lane
+// (ListIssuesByRepo sorts board_position ASC NULLS LAST) rather than silently inheriting
+// its stale pre-close slot. Neither UpsertIssue nor UpsertIssueLabels can null
+// board_position (both omit it by design to protect manual order), so this is the only
+// path that resets it. Labels are left untouched here; the subsequent AutoMove applies the
+// drop-target column's labels (with State already flipped to opened, or its EXCLUDED.state
+// write would clobber this flip back to closed — see forgesvc.ReopenIssue).
+func (q *Queries) ReopenIssueState(ctx context.Context, arg ReopenIssueStateParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, reopenIssueState, arg.RepoID, arg.ForgeIssueIid)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.RepoID,
+		&i.ForgeIssueIid,
+		&i.Title,
+		&i.State,
+		&i.Labels,
+		&i.WebUrl,
+		&i.Author,
+		&i.HasPrdLink,
+		&i.ForgeUpdatedAt,
+		&i.SyncedAt,
+		&i.BoardPosition,
+		&i.AssigneeIds,
+	)
+	return i, err
+}
+
 const setBoardOrderPositions = `-- name: SetBoardOrderPositions :exec
 UPDATE issues i
 SET board_position = v.pos
@@ -1776,6 +1817,49 @@ func (q *Queries) TouchForgeConnectionVerified(ctx context.Context, arg TouchFor
 		&i.PrivilegeCheckedAt,
 		&i.PrivilegeStatus,
 		&i.HumanUsername,
+	)
+	return i, err
+}
+
+const updateIssueState = `-- name: UpdateIssueState :one
+UPDATE issues
+SET state = $3, synced_at = now()
+WHERE repo_id = $1 AND forge_issue_iid = $2
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
+`
+
+type UpdateIssueStateParams struct {
+	RepoID        uuid.UUID `json:"repo_id"`
+	ForgeIssueIid int64     `json:"forge_issue_iid"`
+	State         string    `json:"state"`
+}
+
+// Flip an issue's cached open/closed state ONLY (the bare-close path, PRD #1034 M2).
+// Deliberately touches nothing else: labels, assignee_ids and board_position are all
+// left exactly as the last sync/move stored them — a close leaves the card's column
+// membership intact (a closed card renders in the Closed lane regardless via
+// board.ResolveColumn) and its slot is meaningless while closed. Forge-first: the
+// caller has already written the forge, this only mirrors the result into the cache.
+// Keyed on (repo_id, forge_issue_iid) like every other issues write here, never on
+// forge_issue_iid alone (that iid is per-project, not global). RETURNING * so the
+// service returns the re-cached row for the single-card re-render.
+func (q *Queries) UpdateIssueState(ctx context.Context, arg UpdateIssueStateParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, updateIssueState, arg.RepoID, arg.ForgeIssueIid, arg.State)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.RepoID,
+		&i.ForgeIssueIid,
+		&i.Title,
+		&i.State,
+		&i.Labels,
+		&i.WebUrl,
+		&i.Author,
+		&i.HasPrdLink,
+		&i.ForgeUpdatedAt,
+		&i.SyncedAt,
+		&i.BoardPosition,
+		&i.AssigneeIds,
 	)
 	return i, err
 }

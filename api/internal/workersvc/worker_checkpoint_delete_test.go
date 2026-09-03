@@ -13,11 +13,21 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// testCheckpointTip is a plausible checkpoint tip SHA the delete helper seeds by
+// default, so a run under test is treated as one that DID publish a checkpoint
+// (checkpoint_tip non-NULL) and therefore exercises the CAS delete (PRD #1042 M3). A
+// test covering the never-published case clears fs.claimCtx.CheckpointTip to NULL.
+const testCheckpointTip = "1111111111111111111111111111111111111111"
+
 // checkpointDeleteSvc builds a Service wired for the terminal-transition checkpoint
 // cleanup (PRD #1030 M4): the SSRF gate open, a sealed bot PAT in the claim context,
 // the background dispatcher forced SYNCHRONOUS so the async delete is observed
 // deterministically, and the delete seam stubbed to record every DeleteOptions it is
 // called with (and optionally fail, to prove the terminal state is set regardless).
+//
+// The seeded claim context carries a non-NULL checkpoint_tip (testCheckpointTip): the
+// runs these tests exercise DID publish a checkpoint, so the delete must fire. The
+// PRD #1042 M3 NULL-skip case clears it explicitly.
 func checkpointDeleteSvc(t *testing.T, fs *fakeStore, deleteErr error) (*Service, *[]pushbroker.DeleteOptions) {
 	t.Helper()
 	box := newBox(t)
@@ -31,6 +41,7 @@ func checkpointDeleteSvc(t *testing.T, fs *fakeStore, deleteErr error) (*Service
 		BaseUrl:         "https://gitlab.example.com",
 		BotUsername:     "uzi-bot",
 		TokenCiphertext: sealed,
+		CheckpointTip:   pgtype.Text{String: testCheckpointTip, Valid: true},
 	}
 	svc := New(fs, box, testParams())
 	svc.SetForgeBaseURLAllowed(func(u string) bool { return u == "https://gitlab.example.com" })
@@ -81,6 +92,69 @@ func TestSetStateCompletedDeletesCheckpoint(t *testing.T) {
 	}
 	if string((*calls)[0].PAT) != "bot-pat-CHECKPOINTDELETE-abcdef1234567890" {
 		t.Errorf("delete PAT was not the decrypted bot PAT")
+	}
+}
+
+// TestSetStateCompletedNullCheckpointTipNoDelete is the PRD #1042 M3 skip-on-NULL
+// guard: a checkpoint-eligible issue run whose runs.checkpoint_tip is NULL NEVER
+// published a checkpoint ref, so it owns nothing — deleteCheckpointBestEffort must NOT
+// invoke the delete seam (an unconditional delete could clobber a SIBLING run's fresh
+// checkpoint on the same branch). The terminal completion is still recorded.
+func TestSetStateCompletedNullCheckpointTipNoDelete(t *testing.T) {
+	fs := &fakeStore{
+		runOwned: store.Run{
+			Kind:     runkind.Issue,
+			IssueIid: pgtype.Int8{Int64: 123, Valid: true},
+			Status:   "completed",
+		},
+		setCompletedRows: 1,
+	}
+	svc, calls := checkpointDeleteSvc(t, fs, nil)
+	// This run NEVER published a checkpoint: checkpoint_tip is NULL.
+	fs.claimCtx.CheckpointTip = pgtype.Text{} // Valid == false
+
+	_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("SetState(completed): %v", err)
+	}
+	if !applied {
+		t.Fatalf("applied = false, want true")
+	}
+	if fs.setCompleted == nil {
+		t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded")
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("delete calls = %d, want 0 (a never-published run owns no ref and must not attempt a delete)", len(*calls))
+	}
+}
+
+// TestSetStateCompletedPassesExpectedOldTip proves the non-NULL path: a run that DID
+// publish a checkpoint deletes it, passing its persisted tip as the CAS Old
+// (DeleteOptions.ExpectedOldTip), so the ref is removed only while origin still points
+// at exactly the tip THIS run published.
+func TestSetStateCompletedPassesExpectedOldTip(t *testing.T) {
+	fs := &fakeStore{
+		runOwned: store.Run{
+			Kind:     runkind.Issue,
+			IssueIid: pgtype.Int8{Int64: 55, Valid: true},
+			Status:   "completed",
+		},
+		setCompletedRows: 1,
+	}
+	svc, calls := checkpointDeleteSvc(t, fs, nil) // seeds CheckpointTip = testCheckpointTip
+
+	_, applied, err := svc.SetState(context.Background(), worker(), fs.runOwned.ID, StateRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("SetState(completed): %v", err)
+	}
+	if !applied {
+		t.Fatalf("applied = false, want true")
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("delete calls = %d, want 1 (a published run must clean up its ref)", len(*calls))
+	}
+	if got := (*calls)[0].ExpectedOldTip; got != testCheckpointTip {
+		t.Errorf("delete ExpectedOldTip = %q, want the persisted tip %q", got, testCheckpointTip)
 	}
 }
 
