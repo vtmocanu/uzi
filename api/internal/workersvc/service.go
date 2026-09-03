@@ -423,6 +423,9 @@ type Store interface {
 	// /runs + board plan-revise flag (issue #750): the plan-ish message rows for a page of
 	// runs, folded into the is_revising set in Go by planRevisingSet — never in SQL.
 	ListPlanRevisionStateForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.ListPlanRevisionStateForRunsRow, error)
+	// /runs + board + run-view current_activity (PRD #1064 M2): the newest tool_use frame
+	// per run for a page, folded into the "now" line in Go by runactivity.FromFrame.
+	LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error)
 	ListOwnedRecommendationsForCoords(ctx context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error)
 	// The fan-out write itself: ONE multi-row upsert over the RESOLVED coordinates, so a
 	// bulk call is a single round-trip that cannot half-apply (PRD #98 M2, audit NB-A).

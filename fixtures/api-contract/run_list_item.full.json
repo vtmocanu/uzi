@@ -124,6 +124,14 @@
   "plan_changed_files": [
     "x"
   ],
+  "current_activity": {
+    "agent": "x",
+    "agent_label": "x",
+    "tool": "x",
+    "detail": "x",
+    "at": "2020-01-02T03:04:05Z",
+    "seq": 1
+  },
   "repo_path": "x",
   "worker_name": "x",
   "owner_email": "x",

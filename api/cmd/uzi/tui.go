@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -69,6 +70,13 @@ type stripTickMsg struct{}
 // footer skew banner lights within one interval of a server rolling forward, independently
 // of the 2s boardTickMsg runs cadence.
 type skewTickMsg struct{}
+
+// blinkTickMsg fires on the 500ms blinkInterval to toggle the in-progress milestone cell
+// (PRD #1064 D4). Unlike the board/strip/skew tickers it is NOT armed at Init: it is started
+// only when the board (or the drilled-in run) first holds a visible, non-terminal run with a
+// non-empty MilestonesInProgress (maybeArmBlink), and re-arms itself from this message only
+// while such a run remains — so an idle board wakes on nothing.
+type blinkTickMsg struct{}
 
 // secretsMsg carries the viewer's Anthropic token count (from ListSecrets), fetched once
 // at Init to gate the board credential column on PRD #295's more-than-one-token rule.
@@ -206,6 +214,21 @@ type tuiModel struct {
 	// though it never auto-probes. The auto-probe stays gated by skewCheck (= showVersion &&
 	// stamped build). --demo and direct newTUIModel test construction leave this false.
 	showVersion bool
+
+	// blinkOn is the current phase of the 500ms in-progress-cell blink (PRD #1064 D4): the
+	// board micro-bar's and the crew rail's in-progress cell render ▰ when true, ▱ when false.
+	// It starts false so a single non-tty/offline render (the tui-ux renderer, the #1061 sketch
+	// harness) shows the STATIC frame, and it only ever toggles while a blink tick is armed.
+	blinkOn bool
+	// blinkArmed is whether a 500ms blinkTickMsg is currently scheduled. It guards against a 2s
+	// board refresh that reveals an in-progress run stacking a second tick on top of the one
+	// already running (double renders): the tick re-arms itself only from its own message, and
+	// maybeArmBlink starts one only when none is armed.
+	blinkArmed bool
+	// noBlink pins the static frame (UZI_TUI_NO_BLINK=1, the reduced-motion opt-out), read
+	// ONCE at model init with the CLI's os.Getenv idiom — never per render. When set the blink
+	// tick is never armed and blinkOn stays false.
+	noBlink bool
 }
 
 func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel {
@@ -256,6 +279,45 @@ func stripTickCmd() tea.Cmd {
 
 func skewTickCmd() tea.Cmd {
 	return tea.Tick(skewPollInterval, func(time.Time) tea.Msg { return skewTickMsg{} })
+}
+
+// blinkInterval is the in-progress-cell blink cadence (PRD #1064 D4). A var (not const) so a
+// test can shrink it.
+var blinkInterval = 500 * time.Millisecond
+
+func blinkCmd() tea.Cmd {
+	return tea.Tick(blinkInterval, func(time.Time) tea.Msg { return blinkTickMsg{} })
+}
+
+// blinkWanted reports whether the in-progress cell should be animating: at least one VISIBLE,
+// non-terminal run — on the board, or the drilled-in run — carries a non-empty
+// MilestonesInProgress. Always false under UZI_TUI_NO_BLINK, which pins the static frame.
+func (m tuiModel) blinkWanted() bool {
+	if m.noBlink {
+		return false
+	}
+	for _, r := range m.board.visible() {
+		if !terminalRunStatuses[r.Status] && len(r.MilestonesInProgress) > 0 {
+			return true
+		}
+	}
+	if m.view == viewDetail && !terminalRunStatuses[m.detail.run.Status] &&
+		len(m.detail.run.MilestonesInProgress) > 0 {
+		return true
+	}
+	return false
+}
+
+// maybeArmBlink starts the 500ms blink tick when the model now holds an in-progress run and no
+// tick is already scheduled, marking the model armed. It is the ONLY place a tick is started
+// from outside the tick's own message; blinkArmed is what stops a 2s board refresh from
+// stacking a second tick.
+func (m *tuiModel) maybeArmBlink() tea.Cmd {
+	if m.blinkArmed || !m.blinkWanted() {
+		return nil
+	}
+	m.blinkArmed = true
+	return blinkCmd()
 }
 
 func (m tuiModel) fetchRunsCmd(admin bool) tea.Cmd {
@@ -426,7 +488,20 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case boardRunsMsg:
 		m.board.apply(msg)
-		return m, nil
+		// A refresh that first reveals a visible in-progress run arms the blink; blinkArmed
+		// keeps a later refresh from stacking a second tick.
+		return m, m.maybeArmBlink()
+
+	case blinkTickMsg:
+		if !m.blinkWanted() {
+			// Nothing in progress any more (or the blink is disabled): drop to the static
+			// frame and let the tick lapse — it re-arms only when an in-progress run reappears.
+			m.blinkArmed = false
+			m.blinkOn = false
+			return m, nil
+		}
+		m.blinkOn = !m.blinkOn
+		return m, blinkCmd()
 
 	case secretsMsg:
 		if msg.err == nil {
@@ -471,15 +546,17 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.detail.applyLoaded(msg)
-		// The ownership probe rides the same call the queue indicator needs.
-		return m, m.fetchInputsCmd(m.detail.runID)
+		// The ownership probe rides the same call the queue indicator needs; a milestone run
+		// that opens with work in progress arms the blink too.
+		return m, tea.Batch(m.fetchInputsCmd(m.detail.runID), m.maybeArmBlink())
 
 	case detailMetaMsg:
 		if msg.runID != m.detail.runID || msg.err != nil {
 			return m, nil
 		}
 		m.detail.applyMeta(msg.run)
-		return m, nil
+		// A poll that first reveals the drilled-in run's in-progress milestone arms the blink.
+		return m, m.maybeArmBlink()
 
 	case runInputsMsg:
 		if msg.runID != m.detail.runID {
@@ -704,6 +781,9 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			enabled := versionCheckEnabled(env, gf)
 			m.showVersion = enabled
 			m.skewCheck = enabled && uzicli.IsStampedVersion(version)
+			// The reduced-motion opt-out is read ONCE here, with the CLI's os.Getenv idiom
+			// (root.go), never per render (PRD #1064 D4).
+			m.noBlink = os.Getenv("UZI_TUI_NO_BLINK") == "1"
 			p := tea.NewProgram(m, tea.WithContext(cmd.Context()),
 				tea.WithInput(env.Stdin), tea.WithOutput(env.Stdout))
 			if _, err := p.Run(); err != nil {

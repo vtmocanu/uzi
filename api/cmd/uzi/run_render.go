@@ -146,6 +146,12 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
 	// same back-compat contract the DTO's nil slices and null budgets carry.
 	rows = append(rows, milestoneRows(r)...)
+	// The NOW row (PRD #1064 M5, D7): the run's server-derived current_activity, placed
+	// right after the MILESTONES block. nowRow returns nil for a terminal run or one with
+	// no activity, so a finished run and any pre-#1064 run are byte-for-byte unchanged.
+	if row := nowRow(r); row != nil {
+		rows = append(rows, row)
+	}
 	if r.BudgetMaxIterations != nil {
 		rows = append(rows, []string{"BUDGET_ITERATIONS", itoa(*r.BudgetMaxIterations)})
 	}
@@ -328,6 +334,62 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 	rows = append(rows, []string{"MILESTONES", summary})
 	rows = append(rows, perMilestone...)
 	return rows
+}
+
+// nowRow renders the NOW line of `uzi run get` (PRD #1064 M5, D7): the run's
+// server-derived current_activity folded into one row,
+// `<agent> · <agent_label> · <tool> <detail> · <age> ago`. It is the CLI twin of the
+// web run view's now line, the TUI board's second line (boardSecondLine) and the crew
+// rail's `↳` line, and reads RunDTO.CurrentActivity directly — no milestone
+// precondition (D5): any non-terminal run that has an activity gets the row.
+//
+// Rendered ONLY when current_activity is present AND the run is non-terminal. The
+// server already returns null for a terminal run and for a run with no tool_use frame,
+// so the nil guard alone matches the wire; the terminal-status guard is the same
+// belt-and-braces the board's boardShowSecondLine carries — a finished run has no
+// "now" — so a hostile/buggy server that leaves an activity on a terminal run still
+// prints nothing. A pre-#1064 run, a chat/self-improve run with no activity, and every
+// terminal run therefore render byte-for-byte as before.
+//
+// Each display part is joined with " · " and EMPTY parts are dropped, so a lead frame
+// with no dispatch label (AgentLabel "") or a tool with no detail never leaves a
+// dangling separator. Age is rendered by relAge — the CLI's existing relative-age
+// helper (the steer-queue AGE column) — with the " ago" suffix the PRD mock carries.
+//
+// Agent, AgentLabel, Tool and Detail are UNTRUSTED, model-authored text. The server
+// caps only Detail/AgentLabel, leaving Agent/Tool unsanitized on the wire (D7), so
+// every part goes through cellText — the render-time backstop that strips
+// terminal-unsafe runes, folds newlines/tabs and caps width, the same wrapper the
+// milestone-title and ANTHROPIC_TOKEN rows rely on to keep a hostile value from
+// breaking the table rail. The runactivity rule that builds current_activity NEVER
+// puts a Bash command in Detail (it uses the Bash tool's description), so the NOW row
+// inherits that exclusion and can never surface a raw command.
+func nowRow(r apitypes.RunDTO) []string {
+	act := r.CurrentActivity
+	if act == nil || terminalRunStatuses[r.Status] {
+		return nil
+	}
+	parts := make([]string, 0, 4)
+	if agent := cellText(act.Agent); agent != "" {
+		parts = append(parts, agent)
+	}
+	if label := cellText(act.AgentLabel); label != "" {
+		parts = append(parts, label)
+	}
+	// Tool + its most identifying argument as ONE segment: "Edit <path>",
+	// "Agent <description>", or a bare tool name when the rule left no detail.
+	tool := cellText(act.Tool)
+	detail := cellText(act.Detail)
+	switch {
+	case tool != "" && detail != "":
+		parts = append(parts, tool+" "+detail)
+	case tool != "":
+		parts = append(parts, tool)
+	case detail != "":
+		parts = append(parts, detail)
+	}
+	parts = append(parts, relAge(act.At)+" ago")
+	return []string{"NOW", strings.Join(parts, " · ")}
 }
 
 // summaryRows is the CLI surface of the plain-English run summaries (PRD #362 M5): the

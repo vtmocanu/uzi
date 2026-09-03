@@ -7,7 +7,7 @@ import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai
 import { SdkExecutor, resolveLeadModel, embedSeededPlan, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
-import type { AgentTemplate, ClaimSkill, MilestoneProgress } from "../src/protocol.js";
+import type { AgentTemplate, ClaimSkill, Milestone, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -1010,6 +1010,175 @@ describe("SdkExecutor milestone checkpoint (PRD #122 M6)", () => {
     // `break` exits before the iteration-boundary fallback is reached.
     assert.deepStrictEqual(calls, []);
     assert.strictEqual(turns.length, 2, "one planning turn + one loop turn, then done");
+  });
+});
+
+// PRD #1064 M1: push progress the MOMENT it is observed (Decision 1) and emit a worker
+// `status` transition frame per NEW transition (Decision 2). Today the observed snapshot
+// only reaches the api at the NEXT turn-boundary reportIteration, so a milestone that
+// completes inside a single turn is never seen in progress at all.
+const MILESTONES: Milestone[] = [
+  { id: "m1", title: "Thread the toggle" },
+  { id: "m2", title: "Decouple both detectors" },
+];
+/** A submit_plan tool_use carrying a milestone breakdown (issue runs freeze it at the gate). */
+function submitPlanWithMilestones(
+  milestones: Milestone[] = MILESTONES,
+  plan = "plan",
+  sessionId = "sess-1",
+): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: {
+      content: [
+        { type: "tool_use", id: "t1", name: "mcp__uzi__submit_plan", input: { plan_md: plan, milestones } },
+      ],
+    },
+  } as unknown as SDKMessage;
+}
+/** The transition `status` frames the executor emitted, in emit order. */
+function transitionFrames(emits: EmittedMessage[]): string[] {
+  return emits
+    .filter((m) => m.kind === "status" && String(m.payload["text"]).startsWith("milestone "))
+    .map((m) => String(m.payload["text"]));
+}
+
+describe("SdkExecutor immediate progress push + transition frames (PRD #1064 M1)", () => {
+  it("(a) pushes the in-progress snapshot the moment report_progress is observed, before the next reportIteration", async () => {
+    // iter 1 reports in_progress:[m2] and does NOT finish, so today the snapshot reaches the
+    // api only at iter 2's reportIteration. With the fix it is pushed DURING iter 1.
+    const events: Array<{ kind: "progress" | "iteration"; value: string }> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones(), resultSuccess()], // plan
+      [reportProgress([], ["m2"]), resultSuccess()], // iter 1: in-progress, no done
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 2: done
+    ]);
+    const probe = makeCtx({
+      reportIteration: (n) => {
+        events.push({ kind: "iteration", value: String(n) });
+      },
+      reportProgress: async (p) => {
+        events.push({ kind: "progress", value: p.in_progress.join(",") });
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const progIdx = events.findIndex((e) => e.kind === "progress" && e.value === "m2");
+    assert.ok(
+      progIdx >= 0,
+      "reportProgress fired with in_progress [m2] during the turn (today it never fires mid-turn)",
+    );
+    const iter2Idx = events.findIndex((e) => e.kind === "iteration" && e.value === "2");
+    assert.ok(iter2Idx >= 0, "iteration 2's turn-boundary report was made");
+    assert.ok(progIdx < iter2Idx, "the immediate push precedes iteration 2's boundary report");
+  });
+
+  it("(b) a milestone that goes in-progress then completed within ONE turn still leaves the fake having seen the in-progress snapshot", async () => {
+    // The two report_progress calls MUST be two SEPARATE assistant messages: scanSignals is
+    // last-wins PER MESSAGE, so a pair inside one message would collapse to `completed` on
+    // fixed and unfixed code alike and this test would be vacuous.
+    const seen: MilestoneProgress[] = [];
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones(), resultSuccess()], // plan
+      [
+        reportProgress([], ["m2"]), // message 1: m2 in progress
+        reportProgress(["m2"], []), // message 2: m2 completed (same turn)
+        signalDone(),
+        resultSuccess(),
+      ],
+    ]);
+    const probe = makeCtx({
+      reportProgress: async (p) => {
+        seen.push(p);
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(
+      seen.some((p) => p.in_progress.includes("m2")),
+      "the fake saw m2 in-progress (today the collapsed completed snapshot is all that reaches the next boundary report)",
+    );
+    assert.ok(
+      seen.some((p) => p.completed.includes("m2")),
+      "and the completed snapshot too",
+    );
+  });
+
+  it("(c) emits one transition frame per NEW transition and nothing on repeats", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones(), resultSuccess()], // plan
+      [reportProgress([], ["m2"]), resultSuccess()], // iter 1: m2 started
+      [reportProgress([], ["m2"]), resultSuccess()], // iter 2: repeat → nothing
+      [reportProgress(["m2"], []), signalDone(), resultSuccess()], // iter 3: m2 reported complete
+    ]);
+    const probe = makeCtx({ reportProgress: async () => {} });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(transitionFrames(probe.emits), [
+      `milestone m2 started — Decouple both detectors`,
+      `milestone m2 reported complete — Decouple both detectors`,
+    ]);
+  });
+
+  it("(c2) resumed run: a milestone absent from the loop-scope frozen list falls back to the claim's frozen list, then degrades to a titleless frame", async () => {
+    // frozenMilestones (loop-scope) stays undefined here because the plan turn declares no
+    // milestones; the claim's frozen list (ctx.frozenMilestones) supplies m1's title, and m3
+    // (in neither list) degrades to a titleless frame rather than being skipped.
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones([]), resultSuccess()], // plan with no milestones → loop-scope frozen list undefined
+      [reportProgress([], ["m1"]), resultSuccess()], // titled from the claim's frozen list
+      [reportProgress(["m1"], ["m3"]), signalDone(), resultSuccess()], // m1 complete (titled), m3 started (titleless)
+    ]);
+    const probe = makeCtx({
+      frozenMilestones: [{ id: "m1", title: "Thread the toggle" }],
+      reportProgress: async () => {},
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(transitionFrames(probe.emits), [
+      `milestone m1 started — Thread the toggle`,
+      `milestone m1 reported complete — Thread the toggle`,
+      `milestone m3 started`,
+    ]);
+  });
+
+  it("(d) an all-empty report_progress call pushes nothing and emits no frame (#390 D3 preserved)", async () => {
+    let pushes = 0;
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones(), resultSuccess()], // plan
+      [reportProgress([], []), signalDone(), resultSuccess()], // iter 1: all-empty call → no signal
+    ]);
+    const probe = makeCtx({
+      reportProgress: async () => {
+        pushes++;
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(pushes, 0, "an all-empty report_progress is no signal, so nothing is pushed");
+    assert.deepStrictEqual(transitionFrames(probe.emits), [], "and no transition frame is emitted");
+  });
+
+  it("(e) a reportProgress rejection does not fail the run", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones(), resultSuccess()], // plan
+      [reportProgress([], ["m2"]), assistantText("done"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      reportProgress: () => Promise.reject(new Error("boom")),
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the run completed despite the rejected push");
+  });
+
+  it("(e2) a reportProgress that throws synchronously does not fail the run", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones(), resultSuccess()], // plan
+      [reportProgress([], ["m2"]), assistantText("done"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      reportProgress: () => {
+        throw new Error("sync boom");
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the run completed despite the throwing push");
   });
 });
 

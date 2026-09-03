@@ -46,6 +46,12 @@ type runsStore struct {
 	planRevisionRunArg  []uuid.UUID
 	planRevisionRunErr  error
 
+	// PRD #1064 M2 current_activity: scripted newest-tool_use rows for the page's runs,
+	// and the (non-terminal) run ids the handler passed.
+	latestToolUseRows []store.LatestToolUseForRunsRow
+	latestToolUseArg  []uuid.UUID
+	latestToolUseErr  error
+
 	workersvc.Store
 	ownerID uuid.UUID
 	run     store.Run
@@ -1083,4 +1089,31 @@ func (s *runsStore) ListJudgeTriageRowsForRuns(_ context.Context, arg store.List
 func (s *runsStore) ListPlanRevisionStateForRuns(_ context.Context, runIds []uuid.UUID) ([]store.ListPlanRevisionStateForRunsRow, error) {
 	s.planRevisionRunArg = runIds
 	return s.planRevisionRunRows, s.planRevisionRunErr
+}
+
+// LatestToolUseForRuns backs the current_activity "now" line (PRD #1064 M2). The default
+// is no rows — no tool_use frame, so every run reads a null current_activity and every
+// pre-existing run-list/get test keeps its meaning; latestToolUseRows lets a test script
+// the newest tool_use per run, latestToolUseArg captures the (non-terminal) ids passed.
+//
+// It mirrors the real query's `WHERE run_id = ANY($1)` predicate: only rows whose RunID
+// is in the requested set are returned. That faithfulness is load-bearing for the
+// terminal-filter assertion — a terminal run's id is never passed (the handler excludes
+// it), so its scripted row must not leak back into the activity map.
+func (s *runsStore) LatestToolUseForRuns(_ context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error) {
+	s.latestToolUseArg = runIds
+	if s.latestToolUseErr != nil {
+		return nil, s.latestToolUseErr
+	}
+	want := make(map[uuid.UUID]bool, len(runIds))
+	for _, id := range runIds {
+		want[id] = true
+	}
+	out := make([]store.LatestToolUseForRunsRow, 0, len(s.latestToolUseRows))
+	for _, row := range s.latestToolUseRows {
+		if want[row.RunID] {
+			out = append(out, row)
+		}
+	}
+	return out, nil
 }

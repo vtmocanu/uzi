@@ -18,6 +18,15 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **The board, run view and crew rail now show what your crew is doing right now, not just which milestone is "done" ([#1064](https://github.com/vtmocanu/uzi/issues/1064)).**
+  A milestone reported in progress gets a live "now" line naming the active lane's role, its task label, its last tool and an age, sourced from the run's newest tool-use frame (never a raw `Bash` command). The web run view, dashboard/runs-list cards, the TUI's crew rail and board second line, and `uzi run get`'s new `NOW` row all read the same server-derived `current_activity` field on the run, so the four surfaces cannot disagree; the web milestone badge also gains a `◐` suffix when a milestone is in progress.
+- **The TUI's in-progress milestone cell blinks instead of sitting static ([#1064](https://github.com/vtmocanu/uzi/issues/1064)).**
+  The board's micro-bar and the crew rail's milestone row alternate `▰`/`▱` in the wait colour on a half-second tick. A piped or offline render, or `UZI_TUI_NO_BLINK=1` (a reduced-motion opt-out), pins the static `▱` frame instead of blinking.
+- **A milestone shows as in progress the moment the worker reports it, instead of only at the next turn boundary ([#1064](https://github.com/vtmocanu/uzi/issues/1064)).**
+  The worker now pushes a `running` state report the instant it observes a `report_progress` signal, rather than waiting for the next iteration or checkpoint report to carry it, and emits a feed line per transition ("milestone m2 started — <title>" / "milestone m1 reported complete — <title>"). Wording always says "reported complete", never "done" or "verified" — uzi shows what the worker reported and has not itself checked the work.
+
 ## [0.76.0] - 2026-09-03
 
 ### Added
