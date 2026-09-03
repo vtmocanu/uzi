@@ -393,8 +393,7 @@ jobs:
 
   # ------------------------------------------------------------- repo-wide ----
   # shellcheck (pinned, Renovate-tracked) + yamllint + ruby formula syntax +
-  # actionlint/zizmor (pinned) + composite-action embedded shellcheck (issue #948,
-  # yq from the runner image) + gitleaks. Invokes the composed `task gate:repo`;
+  # actionlint/zizmor (pinned) + gitleaks. Invokes the composed `task gate:repo`;
   # the *_REQUIRED flags
   # turn each check's fail-open SKIP into exit 2 so a missing tool in CI cannot pass
   # silently.
@@ -503,20 +502,7 @@ jobs:
         # same drift the pinned zizmor/shellcheck above guard against.
         # renovate: datasource=pypi depName=semgrep versioning=pep440
         run: pipx install semgrep==1.175.0
-      - name: Verify yq (mikefarah v4; provided by the runner image)
-        # lint:actions:embedded (issue #948) reads composite action.yml via yq. It is
-        # preinstalled on ubuntu-latest, so no pin/install is needed -- it only READS
-        # YAML, whose output is stable across versions, the same reasoning lint-yaml.sh
-        # applies to yamllint. This step asserts it is present and is v4 (the syntax the
-        # script uses): if a future runner image drops it, this fails LOUDLY here rather
-        # than the script's REQUIRED path exiting 2 mid-gate with a less obvious cause.
-        run: |
-          set -euo pipefail
-          command -v yq
-          yq --version
-          yq --version | grep -qE 'version v?4\.' \
-            || { echo "::error::expected mikefarah yq v4; got: $(yq --version)"; exit 1; }
-      - name: gate:repo (shell + yaml + formula + actions + embedded-actions + secrets + sast)
+      - name: gate:repo (shell + yaml + formula + actions + secrets + sast)
         env:
           UZI_LINT_SHELL_REQUIRED: "1"
           UZI_LINT_YAML_REQUIRED: "1"

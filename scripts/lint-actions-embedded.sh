@@ -119,6 +119,30 @@ missing() {
 command -v shellcheck >/dev/null 2>&1 || missing shellcheck "install the pinned shellcheck (see lint:shell / the lint-repo job)."
 command -v yq         >/dev/null 2>&1 || missing yq         "install mikefarah yq v4 ('brew install yq')."
 
+# 🔴 yq MUST BE MIKEFARAH v4, AND A WRONG FLAVOUR IS exit 2 (NOT a skip). Two YAML
+# tools answer to `yq`: mikefarah (Go, whose expression syntax this script uses) and
+# python-yq (a jq wrapper with a different CLI). A present-but-wrong `yq` would run and
+# misread the manifests silently, so this asserts the flavour rather than trusting the
+# name -- the same "present at the wrong build is a hard fail" split lint-shell.sh draws
+# for shellcheck's version. It is NOT an exact pin: yq only READS YAML, whose output is
+# stable across v4 patches (lint-yaml.sh's reasoning for leaving yamllint unpinned), so
+# the assertion is the major line (mikefarah, v4), not a literal version. This guard
+# runs both locally and in CI, so it stays in lockstep with no workflow edit -- the CI
+# job needs no yq step; gate:repo already carries UZI_LINT_ACTIONS_REQUIRED.
+YQ_VERSION_RAW="$(yq --version 2>/dev/null)" || {
+  echo "lint-actions-embedded: 'yq --version' failed." >&2
+  exit 2
+}
+case "$YQ_VERSION_RAW" in
+  *mikefarah*version\ v4.*|*mikefarah*version\ 4.*) ;;
+  *)
+    echo "lint-actions-embedded: need mikefarah yq v4; got: $YQ_VERSION_RAW" >&2
+    echo "  (python-yq or an older mikefarah use a different CLI and would misread the" >&2
+    echo "  composite manifests. Install mikefarah yq v4: https://github.com/mikefarah/yq) (exit 2)" >&2
+    exit 2
+    ;;
+esac
+
 # 🔴 VERSION ASSERT (lint-shell.sh's argument: an exact pin, not a floor -- 0.10.0
 # does not emit SC3067 at all, so a different build is a different gate). Assignment,
 # not a pipe: `$?` after a pipe reads the LAST command, never shellcheck's.
@@ -140,8 +164,24 @@ fi
 
 # Map a composite step's `shell:` onto a shellcheck dialect. Returns non-zero for a
 # non-shell (or unrecognised) shell, which the caller reads as "skip this step".
+#
+# 🔴 `shell:` MAY BE A CUSTOM TEMPLATE, NOT A BARE NAME. GitHub Actions lets a step
+# set `shell: bash {0}` (or `/usr/bin/perl {0}`, etc.): the FIRST whitespace-delimited
+# token is the command and `{0}` is the script path. So the command is parsed off the
+# front and basename'd before matching -- otherwise a legitimate `bash {0}` step would
+# fall through to `*)` and be SILENTLY SKIPPED, unlinted, which is the gap this whole
+# gate exists to close (CodeRabbit, PR #1070).
 sc_dialect() {
-  case "${1:-bash}" in
+  # Take the command token off a possible "cmd [args] {0}" template via PARAMETER
+  # EXPANSION, deliberately NOT `set -- $1` word splitting: the caller runs this inside
+  # a loop with IFS set to newline, under which a word split would NOT break on the
+  # space and "bash {0}" would stay one token and be skipped (measured on PR #1070 --
+  # the isolated unit test passed under the default IFS and hid it). `%% *` strips from
+  # the first space (GitHub templates use a single space before {0}); `##*/` a path.
+  _shcmd="${1:-bash}"
+  _shcmd="${_shcmd%% *}"  # "bash {0}" -> "bash"; "bash" -> "bash"
+  _shcmd="${_shcmd##*/}"  # "/usr/bin/bash" -> "bash"
+  case "$_shcmd" in
     bash)            printf 'bash' ;;
     sh|dash)         printf 'sh'   ;;  # no `dash` dialect exists; sh is the POSIX one
     ksh)             printf 'ksh'  ;;
@@ -169,6 +209,10 @@ trap "rm -f '$tmp'" EXIT INT TERM
 oldIFS="${IFS-}"
 IFS='
 '
+# `set -f` (noglob) so a tracked path containing a `*`/`?` is not re-expanded
+# against the working tree when the unquoted `$FILES` is split -- lint-shell.sh's
+# idiom, kept here for parity even though composite-action paths rarely hit it.
+set -f
 for action in $FILES; do
   [ -n "$action" ] || continue
 
@@ -218,6 +262,7 @@ for action in $FILES; do
     i=$((i + 1))
   done
 done
+set +f
 IFS="$oldIFS"
 
 if [ "$fail" = "2" ]; then
