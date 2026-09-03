@@ -31,6 +31,11 @@ const deleteButtonId = (workerId: string) => `worker-delete-${workerId}`;
 // tabIndex={-1} so the at-quota "delete one to provision another" jump can focus the
 // first hosted row's CONTAINER after crossing tabs (D10) — never a Delete button.
 const rowId = (workerId: string) => `worker-row-${workerId}`;
+// Stable id for the row's worker-name <span>, mirroring rowId/deleteButtonId. The row
+// <li> points aria-labelledby here so a screen reader announces the worker's name when
+// the at-quota jump programmatically focuses the row — an aria-label would suppress the
+// badges, so the name span is labelled instead.
+const rowNameId = (workerId: string) => `worker-name-${workerId}`;
 // The picker's <option> values encode the MODE, not just a label, because since
 // PRD #111 M3 there are three kinds of choice and only one of them names a token.
 // AUTO_OPTION is a sentinel rather than a label, and deliberately a string no label
@@ -575,7 +580,15 @@ export function WorkersSettings() {
                 // hosted row's container here (D10). Harmless on every row.
                 id={rowId(w.id)}
                 tabIndex={-1}
-                className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm outline-hidden"
+                // Named by its worker-name <span> (below) so a screen reader announces the
+                // worker when the at-quota jump focuses this row. aria-label would suppress
+                // the badges; aria-labelledby names the row without hiding them.
+                aria-labelledby={rowNameId(w.id)}
+                // A visible focus ring for the programmatic at-quota jump. The global
+                // focus-ring rule (index.css) excludes [tabindex="-1"], and this row is ONLY
+                // ever focused programmatically (never a tab stop), so a plain :focus ring —
+                // the app's ring convention — is safe: it can only appear right after the jump.
+                className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-ink"
               >
                 <div>
                   {/* Row 1 — identity | badges. min-w-0 + break-words lets a long name
@@ -606,7 +619,7 @@ export function WorkersSettings() {
                           unchanged, and the reason is now the stronger one: rows stored
                           before that validator landed cannot be cleaned retroactively, so
                           this strip still has real work to do. */}
-                      <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
+                      <span id={rowNameId(w.id)} className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                       <span className="ml-2 align-middle">
                         <WorkerUpgradeBadge worker={w} />
                       </span>

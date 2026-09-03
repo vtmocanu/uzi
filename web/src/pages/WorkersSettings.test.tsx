@@ -573,6 +573,25 @@ describe("WorkersSettings hosted quota is escapable (the primary journey)", () =
     }
   });
 
+  it("names each worker row via aria-labelledby pointing at the worker-name span (M4, a11y)", async () => {
+    const h1 = aWorker({ id: "w-h1", name: "base (S)", kind: "hosted", hosted_size: "s" });
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [h1] });
+    renderPage();
+
+    await screen.findByText("base (S)");
+    // The row <li> is focused programmatically by the at-quota jump; without an accessible
+    // name a screen reader announces something AT-dependent on landing. aria-labelledby
+    // resolves to the worker-name span (not a blanket aria-label, which would suppress the
+    // badges), so the row is announced as the worker it holds.
+    const row = document.getElementById("worker-row-w-h1")!;
+    const labelledby = row.getAttribute("aria-labelledby");
+    expect(labelledby).toBeTruthy();
+    const nameEl = document.getElementById(labelledby!);
+    expect(nameEl).not.toBeNull();
+    expect(nameEl!.textContent).toBe("base (S)");
+  });
+
   it("keeps the at-quota focus parked on the row across a 10s poll tick with an unchanged fleet (M3, Risks)", async () => {
     // Fake timers so the 10s liveness poll can be driven deterministically; the afterEach
     // restores real timers. Loads/config are flushed with advanceTimersByTimeAsync(0), so
