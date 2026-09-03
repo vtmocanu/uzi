@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { WorkersSettings } from "./WorkersSettings";
 import { api, type SecretMeta, type Worker } from "../lib/api";
 
@@ -113,12 +113,34 @@ const fleet: Worker[] = [
   aWorker({ id: "w-nas", name: "nas", stats_cpu_pct: 8, stats_mem_bytes: 503316480, stats_mem_limit_bytes: null, stats_source: "process" }),
 ];
 
-function renderPage() {
+// A probe that mirrors the router's current search string into the DOM, so a test can
+// assert the URL after a tab switch (the tab param is written with { replace: true }).
+function LocationProbe() {
+  const { search } = useLocation();
+  return <div data-testid="location-search">{search}</div>;
+}
+
+function renderPage(initialEntries?: string[]) {
   return render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={initialEntries}>
       <WorkersSettings />
+      <LocationProbe />
     </MemoryRouter>,
   );
+}
+
+// The add-panel content (join-token card, HostedWorkers, register form) lives behind a
+// tab. When the fleet is non-empty the page lands on Your workers (D11), so reaching an
+// add-panel control BY ROLE means clicking the "Add a worker" tab first — the inactive
+// panel carries the real `hidden` attribute, which removes it from getByRole. Text
+// queries still see hidden content, so those tests need no switch.
+function openAddTab() {
+  fireEvent.click(screen.getByRole("tab", { name: /^Add a worker$/ }));
+}
+// The inverse: Delete lives in the Your workers panel, so a test that provisioned or
+// checked add-panel state and now needs a worker row switches back.
+function openWorkersTab() {
+  fireEvent.click(screen.getByRole("tab", { name: /^Your workers/ }));
 }
 
 describe("WorkersSettings — always-visible worker-setup guide link (PRD #57 M2)", () => {
@@ -479,17 +501,24 @@ describe("WorkersSettings hosted quota is escapable (the primary journey)", () =
     mockApi.deleteWorker.mockResolvedValue(null);
     renderPage();
 
+    // A non-empty fleet lands on Your workers (D11); the Provision button is on the add
+    // tab, so open it to reach the control by role.
+    await screen.findByText("base (M)");
+    openAddTab();
     const provision = () => screen.getByRole("button", { name: /^Provision$/ });
     expect(await screen.findByText(/2 of 2 used/)).toBeTruthy();
     expect(provision().hasAttribute("disabled")).toBe(true);
 
     // Delete one → the page reloads the fleet → the count drops → the gate lifts.
     // Hosted deletes confirm first, so the journey out of the quota is now two clicks.
+    // Delete happens on Your workers; the Provision gate is re-checked back on the add tab.
+    openWorkersTab();
     mockApi.listWorkers.mockResolvedValue({ workers: [h1] });
     fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[1]);
     fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
 
     await waitFor(() => expect(mockApi.deleteWorker).toHaveBeenCalledWith("w-h2"));
+    openAddTab();
     expect(await screen.findByText(/1 of 2 used/)).toBeTruthy();
     await waitFor(() => expect(provision().hasAttribute("disabled")).toBe(false));
   });
@@ -681,9 +710,11 @@ describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11
     mockApi.deleteWorker.mockResolvedValue(null);
     renderPage();
 
+    // Empty fleet lands on the add tab (D11), where the Provision button lives.
     fireEvent.click(await screen.findByRole("button", { name: "Provision" }));
     expect(await screen.findByText(/Provisioned base \(S\)/)).toBeTruthy();
-    // The row it describes is now listed.
+    // The row it describes is now listed — on the Your workers tab, where Delete lives.
+    openWorkersTab();
     const del = await screen.findByRole("button", { name: "Delete" });
 
     mockApi.listWorkers.mockResolvedValue({ workers: [] }); // gone after the delete
@@ -1150,5 +1181,185 @@ describe("WorkersSettings sanitizes worker names (PRD #111 pre-PR)", () => {
     await screen.findByText(/safe/);
     expect(container.textContent).not.toContain("\u202E");
     expect(container.textContent).toContain("safe");
+  });
+});
+
+// \u2500\u2500 Two-tab page: tablist, landing tab, deep link, panels (PRD #1063 M1) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+describe("WorkersSettings \u2014 two tabs (PRD #1063 M1)", () => {
+  const selected = (name: RegExp) =>
+    screen.getByRole("tab", { name }).getAttribute("aria-selected");
+
+  it("renders a two-tab tablist labelled Workers, with the live count on Your workers", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker(), aWorker({ id: "w2", name: "ci" })],
+    });
+    renderPage();
+    await screen.findByText("laptop");
+
+    expect(screen.getByRole("tablist", { name: "Workers" })).toBeTruthy();
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs).toHaveLength(2);
+    // `Your workers \u00B7 N` (Schedules `\u00B7 count` convention), Add a worker exact.
+    expect(tabs[0].textContent).toBe("Your workers \u00B7 2");
+    expect(tabs[1].textContent).toBe("Add a worker");
+  });
+
+  it("lands on Your workers with a non-empty fleet; the add panel is hidden and one tabpanel shows", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    renderPage();
+    await screen.findByText("laptop");
+
+    expect(selected(/^Your workers/)).toBe("true");
+    expect(selected(/^Add a worker$/)).toBe("false");
+    // `hidden` removes the inactive panel from getByRole and the a11y tree (D4), so
+    // exactly one tabpanel is queryable, and it is the Your workers one.
+    const panels = screen.getAllByRole("tabpanel");
+    expect(panels).toHaveLength(1);
+    expect(panels[0].getAttribute("aria-labelledby")).toBe("workers-tab-workers");
+    // The add panel is present in the DOM but carries the real `hidden` attribute (not a
+    // CSS class), which is what keeps it out of the a11y tree.
+    expect(document.getElementById("workers-panel-add")?.hasAttribute("hidden")).toBe(true);
+  });
+
+  it("lands on Add a worker with an empty fleet (D11) and omits the count suffix", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    renderPage();
+    await screen.findByText("Register your own worker");
+
+    expect(selected(/^Add a worker$/)).toBe("true");
+    const yourTab = screen.getByRole("tab", { name: /^Your workers$/ });
+    expect(yourTab.getAttribute("aria-selected")).toBe("false");
+    expect(yourTab.textContent).toBe("Your workers"); // suffix omitted at 0
+  });
+
+  it("selects no tab and shows no panel before the first load resolves", async () => {
+    let resolveWorkers: (v: { workers: Worker[] }) => void = () => {};
+    mockApi.listWorkers.mockReturnValue(
+      new Promise<{ workers: Worker[] }>((r) => {
+        resolveWorkers = r;
+      }),
+    );
+    renderPage();
+
+    const tabs = await screen.findAllByRole("tab");
+    expect(tabs).toHaveLength(2);
+    tabs.forEach((t) => expect(t.getAttribute("aria-selected")).toBe("false"));
+    // Both panels hidden behind the skeleton until the landing tab is latched.
+    expect(screen.queryByRole("tabpanel")).toBeNull();
+
+    // Resolve so the pending load settles inside act (empty \u2192 add tab latches).
+    resolveWorkers({ workers: [] });
+    await screen.findByText("Register your own worker");
+  });
+
+  it("keeps Your workers selected when the last worker is deleted (1 \u2192 0)", async () => {
+    const w = aWorker({ id: "w-x", name: "laptop" }); // external \u2192 one-click delete
+    mockApi.listWorkers
+      .mockResolvedValueOnce({ workers: [w] })
+      .mockResolvedValue({ workers: [] });
+    mockApi.deleteWorker.mockResolvedValue(null);
+    renderPage();
+    await screen.findByText("laptop");
+    expect(selected(/^Your workers/)).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(mockApi.deleteWorker).toHaveBeenCalledWith("w-x"));
+    await screen.findByText(/No workers yet/);
+
+    // The empty state shows on Your workers; the selection did not move on its own.
+    expect(screen.getByRole("tab", { name: /^Your workers$/ }).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("keeps Add a worker selected when a first worker arrives via the poll (0 \u2192 1)", async () => {
+    vi.useFakeTimers();
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    renderPage();
+    // Flush the initial load's promise chain AND the landing-tab latch effect (several
+    // microtask/render rounds resolve the fetch, commit loading:false, then run the latch).
+    for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+    expect(selected(/^Add a worker$/)).toBe("true");
+
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    await vi.advanceTimersByTimeAsync(10000); // one poll interval
+
+    // A worker arriving mid-session must not yank the user off the add tab.
+    expect(selected(/^Add a worker$/)).toBe("true");
+    expect(selected(/^Your workers/)).toBe("false");
+  });
+
+  it("moves selection and focus by click and by ArrowRight/ArrowLeft (wrap), Home and End", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    renderPage();
+    await screen.findByText("laptop");
+    const workersTab = screen.getByRole("tab", { name: /^Your workers/ });
+    const addTab = screen.getByRole("tab", { name: /^Add a worker$/ });
+
+    // Click selects (order is [workers, add]).
+    fireEvent.click(addTab);
+    expect(addTab.getAttribute("aria-selected")).toBe("true");
+
+    // ArrowRight from add(1) wraps to workers(0); focus follows (automatic activation).
+    fireEvent.keyDown(addTab, { key: "ArrowRight" });
+    expect(workersTab.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(workersTab);
+
+    // ArrowLeft from workers(0) wraps to add(1).
+    fireEvent.keyDown(workersTab, { key: "ArrowLeft" });
+    expect(addTab.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(addTab);
+
+    // Home jumps to the first tab, End to the last.
+    fireEvent.keyDown(addTab, { key: "Home" });
+    expect(workersTab.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(workersTab);
+
+    fireEvent.keyDown(workersTab, { key: "End" });
+    expect(addTab.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(addTab);
+  });
+
+  it("?tab=add selects the add tab on load even with a non-empty fleet", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    renderPage(["/workers?tab=add"]);
+    await screen.findByText("Register your own worker");
+
+    expect(selected(/^Add a worker$/)).toBe("true");
+    expect(selected(/^Your workers/)).toBe("false");
+  });
+
+  it("?tab=workers selects Your workers even with an empty fleet", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    renderPage(["/workers?tab=workers"]);
+    await screen.findByText(/No workers yet/);
+
+    expect(selected(/^Your workers$/)).toBe("true");
+    expect(selected(/^Add a worker$/)).toBe("false");
+  });
+
+  it("writes the selected tab to the URL param (replace: true keeps it shareable)", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    renderPage();
+    await screen.findByText("laptop");
+    // Landing does not write the param; only an explicit switch does.
+    expect(screen.getByTestId("location-search").textContent).toBe("");
+
+    fireEvent.click(screen.getByRole("tab", { name: /^Add a worker$/ }));
+    expect(screen.getByTestId("location-search").textContent).toBe("?tab=add");
+
+    fireEvent.click(screen.getByRole("tab", { name: /^Your workers/ }));
+    expect(screen.getByTestId("location-search").textContent).toBe("?tab=workers");
+  });
+
+  it("orders the Hosted workers card before the register card in the add panel", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 5, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [] }); // empty \u2192 add tab
+    renderPage();
+
+    const hosted = await screen.findByText("Hosted workers");
+    const register = await screen.findByText("Register your own worker");
+    // Hosted first (D3): the primary worker path leads.
+    expect(
+      hosted.compareDocumentPosition(register) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 });

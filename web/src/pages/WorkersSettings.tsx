@@ -4,11 +4,11 @@
 // (fleet status, upgrade rolls, the sidebar attention badge), not a preference.
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { api, type BindMode, type Worker } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton, cx } from "../components/ui";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
 import { useAppVersion } from "../components/AppShell";
 import { ServerIcon } from "../components/icons";
@@ -39,6 +39,21 @@ const deleteButtonId = (workerId: string) => `worker-delete-${workerId}`;
 const AUTO_OPTION = "\u0000auto";
 
 const deleteWarningId = (workerId: string) => `worker-delete-warning-${workerId}`;
+
+// Two-tab page (PRD #1063): "Your workers" (the fleet) and "Add a worker" (the forms).
+// The tab recipe is COPIED from Schedules.tsx, not extracted into a shared primitive
+// (D6): Schedules is in another PRD's diff and the other tabbed pages carry their own
+// inline classes, so a shared Tabs component is a multi-page migration filed as a
+// follow-up. TAB_ORDER drives the APG roving-tabindex arrow-key handler; the TAB_*
+// class constants are copied verbatim from Schedules.tsx:65-68.
+type Tab = "workers" | "add";
+const TAB_ORDER: Tab[] = ["workers", "add"];
+const tabId = (t: Tab) => `workers-tab-${t}`;
+const panelId = (t: Tab) => `workers-panel-${t}`;
+const TAB_BASE =
+  "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors";
+const TAB_ACTIVE = "border-brand text-fg";
+const TAB_INACTIVE = "border-transparent text-muted hover:border-edge-strong hover:text-fg";
 
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -110,6 +125,47 @@ export function WorkersSettings() {
   const announce = useCallback((text: string, tone: "success" | "warning" = "success") => {
     setNotice({ text, tone });
   }, []);
+
+  // Two-tab state (PRD #1063). `tab` is null until the landing tab is decided ONCE,
+  // after the first workers load resolves (D11) — so the page renders the tablist with
+  // no tab selected and a skeleton in place of both panels, and never flashes the wrong
+  // tab. A valid `?tab=` deep link (D7) beats the count default and selects immediately,
+  // even before load, since it is explicit.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [tab, setTab] = useState<Tab | null>(null);
+  // Refs to the tab buttons so the arrow-key handler moves focus with selection (APG
+  // tabs, automatic activation): Left/Right wrap, Home/End jump to the ends.
+  const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
+  // Latch: the landing tab is applied exactly once. Deleting the last worker must not
+  // move the selection off Your workers, and a first worker arriving via the 10s poll
+  // must not yank the user off Add a worker mid-copy of a join token — so this is a
+  // one-shot flag, not a value derived on every render.
+  const initialTabApplied = useRef(false);
+  // Selecting a tab also writes the URL param (replace: true), so the tab is shareable
+  // without polluting history (D7, the Findings precedent). No other state goes in the URL.
+  const selectTab = useCallback(
+    (t: Tab) => {
+      setTab(t);
+      const next = new URLSearchParams(searchParams);
+      next.set("tab", t);
+      setSearchParams(next, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
+  const onTabKeyDown = (e: React.KeyboardEvent) => {
+    if (tab === null) return;
+    const idx = TAB_ORDER.indexOf(tab);
+    let next = idx;
+    if (e.key === "ArrowRight") next = (idx + 1) % TAB_ORDER.length;
+    else if (e.key === "ArrowLeft") next = (idx - 1 + TAB_ORDER.length) % TAB_ORDER.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = TAB_ORDER.length - 1;
+    else return;
+    e.preventDefault();
+    const target = TAB_ORDER[next];
+    selectTab(target);
+    tabRefs.current[target]?.focus();
+  };
 
   // rebind points one worker at a named token, or clears the binding when the
   // picker returns to "default token". The change lands on the worker's NEXT
@@ -228,6 +284,27 @@ export function WorkersSettings() {
     }
   };
 
+  // Decide the landing tab once (D11): a valid `?tab=` deep link wins and applies
+  // immediately (even before the load resolves), otherwise the count default is applied
+  // exactly once, at the first load-resolved render — `workers.length === 0` → Add a
+  // worker, otherwise Your workers. Count EVERY worker the list returns, whatever its
+  // state (offline/upgrading/cordoned/draining/…): those are exactly the ones the owner
+  // opened the page to look at, so raw `workers.length`, never a health/online filter.
+  // The latch guarantees the selection never moves on its own afterwards.
+  useEffect(() => {
+    if (initialTabApplied.current) return;
+    const param = searchParams.get("tab");
+    if (param === "add" || param === "workers") {
+      initialTabApplied.current = true;
+      setTab(param);
+      return;
+    }
+    if (!loading) {
+      initialTabApplied.current = true;
+      setTab(workers.length === 0 ? "add" : "workers");
+    }
+  }, [loading, workers.length, searchParams]);
+
   // Move focus to whatever we just announced. Deleting destroys the control the user
   // acted through — the row and its button both go — so focus would otherwise land on
   // <body>, and delete→provision is a LOOP: the user deletes in order to provision, so
@@ -299,113 +376,86 @@ export function WorkersSettings() {
           </>
         }
       />
+      {/* The page-level error alert stays ABOVE the tabs (D-unchanged). */}
       {(error || loadError) && <Alert message={error || loadError} />}
 
-      {newToken && (
-        <Card className="space-y-3 border-ok/40">
-          {/* stripUnsafeChars here too, converged with the other three worker.name
-              sites in this file; the reason it is LOW rather than the same severity as
-              the list: this name is the one the user typed into the create form seconds
-              ago, in the same session — a user can only spoof their own immediate echo,
-              with no cross-tenant path and nothing stored-then-surprising. The worker
-              LIST renders names created at any time, and the admin view renders other
-              people's. Fixed anyway because it is the same class and the same one-word
-              fix.
+      {/* Tab bar (PRD #1063), the Schedules recipe copied verbatim (D6): a role=tablist
+          with two role=tab buttons carrying ids, aria-selected, aria-controls, a roving
+          tabIndex and the arrow/Home/End handler. Both tabs are always rendered (a
+          one-tab tablist is an a11y smell). `Your workers · N` carries the live count. */}
+      <div className="flex gap-1 overflow-x-auto border-b border-edge" role="tablist" aria-label="Workers">
+        <button
+          type="button"
+          role="tab"
+          id={tabId("workers")}
+          aria-selected={tab === "workers"}
+          aria-controls={panelId("workers")}
+          tabIndex={tab === "workers" ? 0 : -1}
+          ref={(el) => {
+            tabRefs.current.workers = el;
+          }}
+          onKeyDown={onTabKeyDown}
+          onClick={() => selectTab("workers")}
+          className={cx(TAB_BASE, tab === "workers" ? TAB_ACTIVE : TAB_INACTIVE)}
+        >
+          Your workers{workers.length > 0 ? ` · ${workers.length}` : ""}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id={tabId("add")}
+          aria-selected={tab === "add"}
+          aria-controls={panelId("add")}
+          tabIndex={tab === "add" ? 0 : -1}
+          ref={(el) => {
+            tabRefs.current.add = el;
+          }}
+          onKeyDown={onTabKeyDown}
+          onClick={() => selectTab("add")}
+          className={cx(TAB_BASE, tab === "add" ? TAB_ACTIVE : TAB_INACTIVE)}
+        >
+          Add a worker
+        </button>
+      </div>
 
-              The announce() strings are escaped and injection-free; the
-              rebind/provisioning ones lean on their visible list counterpart being
-              sanitized. The delete-success announcement (#173) was the ONE where that
-              lean did not hold — by construction, the row it names is already deleted, so
-              no visible counterpart survives — so it is now itself passed through
-              stripUnsafeChars (remove(), above). Recorded so nobody re-derives it. */}
-          <SectionTitle className="text-ok">Join token for “{stripUnsafeChars(newToken.worker)}”</SectionTitle>
-          <p className="text-sm text-muted">
-            Copy it now — it is shown once and never again (only its hash is stored). Set it as{" "}
-            <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_WORKER_TOKEN</code> on the
-            worker container.
-          </p>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 overflow-x-auto rounded-lg border border-edge bg-ink px-3 py-2 font-mono text-sm text-ok">
-              {newToken.token}
-            </code>
-            <Button variant="secondary" onClick={copy}>
-              {copied ? "Copied" : "Copy"}
-            </Button>
-          </div>
-          <div>
-            <Button variant="ghost" onClick={() => setNewToken(null)}>
-              Done
-            </Button>
+      {tab === null ? (
+        /* Before the first load resolves: no tab is selected and neither panel is shown,
+           so the page never flashes the wrong tab (D11). The Your workers skeleton stands
+           in until the landing tab is latched. */
+        <Card className="space-y-3">
+          <SectionTitle>Your workers</SectionTitle>
+          <div className="space-y-2">
+            <Skeleton className="h-12" />
+            <Skeleton className="h-12" />
           </div>
         </Card>
-      )}
+      ) : (
+        <>
+          {/* Your workers panel — both panels are always mounted; the inactive one carries
+              the real `hidden` attribute (D4), which removes it from getByRole and the a11y
+              tree (NOT a CSS class). */}
+          <div
+            role="tabpanel"
+            id={panelId("workers")}
+            aria-labelledby={tabId("workers")}
+            hidden={tab !== "workers"}
+            className="space-y-6"
+          >
+            {/* The announcement slot lives at the TOP of this panel: every announcement
+                describes the list, and its focus behaviour is unchanged (the effect keys on
+                `notice`). Each announcement replaces the last, so nothing here can outlive
+                its truth — which is why there is no dismiss. (The token card in the add
+                panel has a Done button for a different reason: it holds a SECRET that should
+                not linger on screen.) */}
+            {notice && (
+              // tabIndex -1: focusable programmatically, never a tab stop of its own.
+              <div ref={noticeRef} tabIndex={-1} className="outline-hidden">
+                <Alert tone={notice.tone} message={notice.text} />
+              </div>
+            )}
 
-      <Card className="space-y-4">
-        <SectionTitle>Register a worker</SectionTitle>
-        <form onSubmit={create} className="flex flex-wrap items-end gap-3">
-          <div className="min-w-[16rem] flex-1">
-            <Field label="Name">
-              <Input
-                placeholder="e.g. laptop, ci-runner-1"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-              />
-            </Field>
-          </div>
-          <div className="min-w-[10rem]">
-            <Field label="Template">
-              <Select
-                aria-label="Worker template"
-                value={template}
-                onChange={(e) => setTemplate(e.target.value)}
-              >
-                {WORKER_TEMPLATES.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
-                ))}
-              </Select>
-            </Field>
-          </div>
-          <Button type="submit" disabled={busy || name.trim() === ""}>
-            {busy ? "Creating…" : "Generate join token"}
-          </Button>
-        </form>
-        <p className="text-xs text-muted">
-          The template is the worker image to build (<code className="rounded bg-raised px-1 py-0.5 text-fg">base</code> plus
-          heavy-dependency variants like <code className="rounded bg-raised px-1 py-0.5 text-fg">jvm</code>). Build the
-          worker with a matching{" "}
-          <code className="rounded bg-raised px-1 py-0.5 text-fg">WORKER_TEMPLATE</code>; if the worker reports a different
-          one it is flagged below, never rejected.
-        </p>
-      </Card>
-
-      {/* Hosted workers (PRD #58): renders itself only when the instance has hosting
-          on and self-service quota left. One list below, not two — a hosted worker is
-          an ordinary worker whose container the controller runs, so it keeps the same
-          status, gauges, run badge and delete rule, and only its origin differs. */}
-      <HostedWorkers
-        hostedCount={workers.filter((w) => w.kind === "hosted").length}
-        onProvisioned={async (worker) => {
-          announce(`Provisioned ${worker.name} — it appears in your workers below.`);
-          await reload();
-        }}
-      />
-
-      {/* Between the forms and the list: it is what the forms just did and where the
-          list just changed, and the delete→provision loop wants the user near both.
-          Each announcement replaces the last, so nothing here can outlive its truth —
-          which is why there is no dismiss. (The token card above has a Done button for
-          a different reason: it holds a SECRET that should not linger on screen.) */}
-      {notice && (
-        // tabIndex -1: focusable programmatically, never a tab stop of its own.
-        <div ref={noticeRef} tabIndex={-1} className="outline-hidden">
-          <Alert tone={notice.tone} message={notice.text} />
-        </div>
-      )}
-
-      <Card className="space-y-3">
-        <SectionTitle>Your workers</SectionTitle>
+            <Card className="space-y-3">
+              <SectionTitle>Your workers</SectionTitle>
         {loading ? (
           <div className="space-y-2">
             <Skeleton className="h-12" />
@@ -753,7 +803,114 @@ export function WorkersSettings() {
             </ul>
           </>
         )}
-      </Card>
+            </Card>
+          </div>
+
+          {/* Add a worker panel — always mounted while hidden (D4): the one-time
+              join-token card must not vanish on a tab switch, and HostedWorkers keeps its
+              one-shot config fetch on mount. Hosted first (D3): it is the primary,
+              zero-effort worker path on k8s deployments, so it leads; the register card
+              follows, retitled to make the contrast read. */}
+          <div
+            role="tabpanel"
+            id={panelId("add")}
+            aria-labelledby={tabId("add")}
+            hidden={tab !== "add"}
+            className="space-y-6"
+          >
+            {newToken && (
+              <Card className="space-y-3 border-ok/40">
+                {/* stripUnsafeChars here too, converged with the other three worker.name
+                    sites in this file; the reason it is LOW rather than the same severity as
+                    the list: this name is the one the user typed into the create form seconds
+                    ago, in the same session — a user can only spoof their own immediate echo,
+                    with no cross-tenant path and nothing stored-then-surprising. The worker
+                    LIST renders names created at any time, and the admin view renders other
+                    people's. Fixed anyway because it is the same class and the same one-word
+                    fix.
+
+                    The announce() strings are escaped and injection-free; the
+                    rebind/provisioning ones lean on their visible list counterpart being
+                    sanitized. The delete-success announcement (#173) was the ONE where that
+                    lean did not hold — by construction, the row it names is already deleted, so
+                    no visible counterpart survives — so it is now itself passed through
+                    stripUnsafeChars (remove(), above). Recorded so nobody re-derives it. */}
+                <SectionTitle className="text-ok">Join token for “{stripUnsafeChars(newToken.worker)}”</SectionTitle>
+                <p className="text-sm text-muted">
+                  Copy it now — it is shown once and never again (only its hash is stored). Set it as{" "}
+                  <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_WORKER_TOKEN</code> on the
+                  worker container.
+                </p>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 overflow-x-auto rounded-lg border border-edge bg-ink px-3 py-2 font-mono text-sm text-ok">
+                    {newToken.token}
+                  </code>
+                  <Button variant="secondary" onClick={copy}>
+                    {copied ? "Copied" : "Copy"}
+                  </Button>
+                </div>
+                <div>
+                  <Button variant="ghost" onClick={() => setNewToken(null)}>
+                    Done
+                  </Button>
+                </div>
+              </Card>
+            )}
+
+            {/* Hosted workers (PRD #58): renders itself only when the instance has hosting
+                on and self-service quota left. One list below, not two — a hosted worker is
+                an ordinary worker whose container the controller runs, so it keeps the same
+                status, gauges, run badge and delete rule, and only its origin differs. */}
+            <HostedWorkers
+              hostedCount={workers.filter((w) => w.kind === "hosted").length}
+              onProvisioned={async (worker) => {
+                announce(`Provisioned ${worker.name} — it appears in your workers below.`);
+                await reload();
+              }}
+            />
+
+            <Card className="space-y-4">
+              <SectionTitle>Register your own worker</SectionTitle>
+              <form onSubmit={create} className="flex flex-wrap items-end gap-3">
+                <div className="min-w-[16rem] flex-1">
+                  <Field label="Name">
+                    <Input
+                      placeholder="e.g. laptop, ci-runner-1"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                    />
+                  </Field>
+                </div>
+                <div className="min-w-[10rem]">
+                  <Field label="Template">
+                    <Select
+                      aria-label="Worker template"
+                      value={template}
+                      onChange={(e) => setTemplate(e.target.value)}
+                    >
+                      {WORKER_TEMPLATES.map((t) => (
+                        <option key={t} value={t}>
+                          {t}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                </div>
+                <Button type="submit" disabled={busy || name.trim() === ""}>
+                  {busy ? "Creating…" : "Generate join token"}
+                </Button>
+              </form>
+              <p className="text-xs text-muted">
+                The template is the worker image to build (<code className="rounded bg-raised px-1 py-0.5 text-fg">base</code> plus
+                heavy-dependency variants like <code className="rounded bg-raised px-1 py-0.5 text-fg">jvm</code>). Build the
+                worker with a matching{" "}
+                <code className="rounded bg-raised px-1 py-0.5 text-fg">WORKER_TEMPLATE</code>; if the worker reports a different
+                one it is flagged under Your workers, never rejected.
+              </p>
+            </Card>
+          </div>
+        </>
+      )}
     </div>
   );
 }
