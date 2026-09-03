@@ -19096,8 +19096,9 @@ redo a stable branch's unpushed work. So the reader (#909) ALSO falls back to th
 **read-only** and **collision-guarded** — the flat key is not branch-injective, so it is consulted
 only when no other live `refs/uzi-runner/<branch>` flattens to the same key — and still gated by the
 run-id-equality check above. The clear path likewise unsets the flattened key, skipping it when a
-distinct live sibling shares it. Nothing ever WRITES the flat form, so the stamp self-heals to the
-subsection key the first time any run re-stamps.
+distinct live sibling shares it. Nothing ever WRITES the flat form, so once any run re-stamps under
+the subsection key the READ heals (the subsection key now takes precedence); the stale flat entry
+itself persists as dead config the reader ignores, cleared only if it later D/F-blocks a fetch.
 
 **Decision 4: shutdown durability (shape B), abort in-flight runs on SIGTERM, then fetch back.**
 `Runner.shutdown()` plus a per-run registry aborts each in-flight run's controller on SIGTERM
