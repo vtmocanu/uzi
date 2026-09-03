@@ -26,7 +26,15 @@ import { MrChip } from "../components/MrChip";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
-import { effectiveRunStatus, isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
+import {
+  effectiveRunStatus,
+  firstInProgressMilestoneId,
+  isStoppedRun,
+  milestoneBadge,
+  milestoneBadgeText,
+  mrChipState,
+} from "../lib/runBadge";
+import { activityAge } from "../lib/runActivity";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { runDurationLabel } from "../lib/runDuration";
@@ -200,7 +208,9 @@ export function RunsLayout() {
   );
 }
 
-function RunRow({
+// Exported for a focused row-level test (PRD #1064 M3: the "now" line, terminal-hiding
+// and the ◐ badge suffix), rendered inside a Router without the full layout fetch.
+export function RunRow({
   run,
   now,
   showOwner,
@@ -256,8 +266,15 @@ function RunRow({
   );
   // PRD #122: compact milestone progress for the row; null on a non-milestone run,
   // which then renders no new badge (the row had none before this feature).
+  // PRD #1064 M3: the badge gains a ◐ suffix while a milestone is in progress.
   const ms = milestoneBadge(run);
-  const msBadge = ms ? milestoneBadgeText(ms) : null;
+  const msBadge = ms ? milestoneBadgeText(ms, (run.milestones_in_progress?.length ?? 0) > 0) : null;
+  // PRD #1064 M3: the "now" line under the title for ANY non-terminal run carrying a
+  // current_activity DTO field; hidden when null or terminal, so a pre-feature run and a
+  // finished run read exactly as before (D5). Untrusted fields render escaped.
+  const activity = run.current_activity;
+  const showNow = activity != null && !isTerminalRun(run.status);
+  const nowMilestone = firstInProgressMilestoneId(run);
   // Issue #256 M3: a live, per-state duration token ("running 1h 30m", "ran 42m", …);
   // "" for a pre-feature/no-anchor run, which then adds nothing to the meta line.
   const duration = runDurationLabel(run, now);
@@ -320,6 +337,19 @@ function RunRow({
               worker posts the intent summary, so a pre-feature/early run shows only the title. */}
           {run.summary_intent && run.summary_intent.trim() !== "" && (
             <p className="mt-0.5 truncate text-xs text-muted">{stripUnsafeChars(run.summary_intent)}</p>
+          )}
+          {showNow && activity && (
+            <p className="mt-0.5 flex items-center gap-1.5 text-xs text-faint">
+              <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok animate-pulse" />
+              <span className="shrink-0 font-medium text-ok">{stripUnsafeChars(activity.agent)}</span>
+              {nowMilestone && <span className="shrink-0 font-mono text-faint">{nowMilestone}</span>}
+              <span className="min-w-0 truncate italic text-muted">
+                {stripUnsafeChars(activity.agent_label || activity.detail || activity.tool)}
+              </span>
+              <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
+                {activityAge(activity.at, now)}
+              </span>
+            </p>
           )}
           <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
             <span className="inline-flex items-center gap-1">

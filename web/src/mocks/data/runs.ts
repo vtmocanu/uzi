@@ -2,7 +2,7 @@ import type {
   Milestone,
   Run,
 } from "../../lib/api";
-import { daysAgo, minsAgo, minsAhead } from "./time";
+import { daysAgo, minsAgo, minsAhead, secsAgo } from "./time";
 import { LIVE_RUN_ID } from "./boards";
 import { SAMPLE_PLAN, SEEDED_PLAN } from "./plans";
 
@@ -418,6 +418,18 @@ export const mockRuns: Run[] = [
     milestones_completed: ["hb-1"],
     milestones_in_progress: ["hb-2"],
     milestones_candidate: null,
+    // PRD #1064 M3: the server-derived "now" line the board card and runs-list row read
+    // directly (the run view instead derives its own from the live frames). engine.ts
+    // advances this alongside the milestone transitions and nulls it on completion, so
+    // the line is demonstrable in mock mode without a stack.
+    current_activity: {
+      agent: "coder",
+      agent_label: "Expose heartbeat freshness gauge",
+      tool: "Edit",
+      detail: "api/internal/handler/metrics.go",
+      at: secsAgo(40),
+      seq: 12,
+    },
     budget_max_iterations: 12,
     budget_wall_seconds: 7200,
     anthropic_secret_id: "sec-console",

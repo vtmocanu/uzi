@@ -100,6 +100,11 @@ var d7UntrustedFields = []string{
 	"AgentLabel",
 	"HealthReason",
 	"FailureReason",
+	// Detail is the model-authored tool detail on apitypes.RunActivity (a file path, an
+	// Agent/Bash description) surfaced on the crew rail's now line (railNowLines, via
+	// activityLabel's fallback) and the board's selected-row second line (boardSecondLine),
+	// both through renderer.Plain. Agent/AgentLabel (already listed) are the other two
+	// RunActivity display fields these draw; Tool is not surfaced in the TUI.
 	// Milestone titles are repo/agent-authored free text drawn in the crew rail's
 	// milestone block (renderMilestones). apitypes.Milestone.Title is the wire field;
 	// the rail draws it through renderer.Plain.

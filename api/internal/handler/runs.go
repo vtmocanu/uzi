@@ -69,6 +69,21 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		slog.Error("plan revising states", "error", err)
 		revising = nil
 	}
+	// PRD #1064 M2: the server-derived "now" line for the NON-TERMINAL runs on this
+	// page (a finished run has no "now"). Same best-effort contract as the
+	// judge/revising decoration above — a failure logs and leaves every current_activity
+	// null rather than failing the run list.
+	activeIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		if !apitypes.IsTerminalRunStatus(row.Run.Status) {
+			activeIDs = append(activeIDs, row.Run.ID)
+		}
+	}
+	activity, err := h.wsvc.CurrentActivityForRuns(r.Context(), activeIDs)
+	if err != nil {
+		slog.Error("current activity", "error", err)
+		activity = nil
+	}
 
 	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
@@ -84,7 +99,8 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		// nil stays nil for an unjudged run — absent, not a neutral verdict.
 		item.JudgeVerdict = textPtrValue(row.JudgeVerdict.Valid, row.JudgeVerdict.String)
 		item.JudgeTodoCount = todo[row.Run.ID]
-		item.IsRevising = revising[row.Run.ID] // nil map ⇒ false (issue #750)
+		item.IsRevising = revising[row.Run.ID]      // nil map ⇒ false (issue #750)
+		item.CurrentActivity = activity[row.Run.ID] // nil map ⇒ null (PRD #1064)
 		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})
@@ -112,6 +128,21 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		slog.Error("plan revising states", "error", err)
 		revising = nil
 	}
+	// PRD #1064 M2: the "now" line for the non-terminal runs on this page. AdminListRuns
+	// (ListActiveRunsAll) already excludes terminal runs, so every id here is active; the
+	// IsTerminalRunStatus guard is kept for parity with ListRuns and to stay correct if
+	// that query ever widens. Best-effort like the revising decoration above.
+	activeIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		if !apitypes.IsTerminalRunStatus(row.Run.Status) {
+			activeIDs = append(activeIDs, row.Run.ID)
+		}
+	}
+	activity, err := h.wsvc.CurrentActivityForRuns(r.Context(), activeIDs)
+	if err != nil {
+		slog.Error("current activity", "error", err)
+		activity = nil
+	}
 
 	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
@@ -125,7 +156,8 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
-		item.IsRevising = revising[row.Run.ID] // nil map ⇒ false (issue #750)
+		item.IsRevising = revising[row.Run.ID]      // nil map ⇒ false (issue #750)
+		item.CurrentActivity = activity[row.Run.ID] // nil map ⇒ null (PRD #1064)
 		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})

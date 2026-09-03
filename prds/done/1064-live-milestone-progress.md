@@ -2,7 +2,7 @@
 
 **Issue**: #1064
 **Priority**: Medium
-**Status**: draft
+**Status**: complete (all milestones shipped on `agent/issue-1064`)
 **Base**: `main` @ `7435327` (every `file:line` below was read at that commit; re-derive before citing)
 
 ## Status
@@ -352,14 +352,14 @@ Phase table (which milestones can run as parallel agents; files are disjoint per
 
 ### M1 — Worker: push progress on observation, emit transition frames
 
-- [ ] `ExecutorContext.reportProgress?(progress: MilestoneProgress): Promise<void>` in
+- [x] `ExecutorContext.reportProgress?(progress: MilestoneProgress): Promise<void>` in
       `agent/src/executor.ts`; called from the scan loop right where `sig.progress` is
       folded (`sdk-executor.ts:2576-2579`), awaited off the loop via a per-run promise chain.
-- [ ] Runner wiring next to `reportIteration` (`runner.ts:2507`): a `running` report with
+- [x] Runner wiring next to `reportIteration` (`runner.ts:2507`): a `running` report with
       the milestone fields and no `iteration_count`; log-and-continue on failure.
-- [ ] Transition frames per D2, emitted from the executor with `agent: "worker"`,
+- [x] Transition frames per D2, emitted from the executor with `agent: "worker"`,
       `kind: "status"`, diffed against the previous observed progress.
-- [ ] **Regression tests that go red on the unfixed code**: (a) a fake `reportState`
+- [x] **Regression tests that go red on the unfixed code**: (a) a fake `reportState`
       receives `milestones_in_progress: ["m2"]` BEFORE the turn's result frame is processed
       (today: only at the next `reportIteration`); (b) a turn whose lead reports
       `in_progress: [m2]` and later `completed: [m2]` leaves the fake having SEEN the
@@ -371,22 +371,22 @@ Phase table (which milestones can run as parallel agents; files are disjoint per
       and not on repeats; (d) an all-empty call still emits nothing (#390 D3 preserved);
       (e) `reportProgress` rejection does not fail the run. Verify each fails on a
       mutated/unfixed tree (mutation discipline, `.claude/rules/go.md` / `agent-team.md`).
-- [ ] `task gate:agent` green.
+- [x] `task gate:agent` green.
 
 ### M2 — API: `current_activity` on the run DTO
 
-- [ ] `api/internal/runactivity` (stdlib-only) with `FromFrame` per D3 and unit tests
+- [x] `api/internal/runactivity` (stdlib-only) with `FromFrame` per D3 and unit tests
       covering each tool family, the cap, the strip, and `Bash` command exclusion.
-- [ ] sqlc query `LatestToolUseForRuns(run_ids uuid[])` (`DISTINCT ON (run_id)`, `kind =
+- [x] sqlc query `LatestToolUseForRuns(run_ids uuid[])` (`DISTINCT ON (run_id)`, `kind =
       'tool_use'`, `ORDER BY run_id, seq DESC`) + `sqlc generate`; a live-DB test asserting
       the newest frame wins, that a newer `tool_result` is skipped, and that a run with no
       tool_use returns no row.
-- [ ] Migration adding the partial index `run_messages (run_id, seq DESC) WHERE kind =
+- [x] Migration adding the partial index `run_messages (run_id, seq DESC) WHERE kind =
       'tool_use'` (goose number assigned at merge, above the live head) — the existing
       `UNIQUE (run_id, seq)` makes the `DISTINCT ON` walk back over every trailing non-tool
       frame, and the board polls every 2 s; land the index with the query rather than
       after a measurement, and record the `EXPLAIN` from the live-DB test in the MR.
-- [ ] `RunDTO.CurrentActivity *apitypes.RunActivity` (`json:"current_activity"`, null when
+- [x] `RunDTO.CurrentActivity *apitypes.RunActivity` (`json:"current_activity"`, null when
       absent or terminal), populated in `runToDTO`'s callers: the get path and both list
       builders (`handler/runs.go:73`, `:116`) via the batched query — `runToDTO` itself
       stays pure (`runs_dto.go:59-63`), so the GET handler sets the field too, not only
@@ -398,73 +398,73 @@ Phase table (which milestones can run as parallel agents; files are disjoint per
       `run_list_item.{zero,full}.json` from the failing contract test's output, and add the
       field to `web/src/lib/apiTypes.ts` (its `apiContract.test.ts` half reddens otherwise;
       the TS type lands here so `gate:web` is green before M3 starts).
-- [ ] `Latest(frames)` in `runactivity` plus the golden fixture
+- [x] `Latest(frames)` in `runactivity` plus the golden fixture
       `fixtures/run-activity/cases.json` (frame LIST → expected activity, the D3 case list)
       asserted by the Go unit test with an every-case-exercised check; M3 asserts the same
       file from vitest.
-- [ ] `task gate:api` green; the lint ratchet in `.golangci.yml` applies (read the file, not
+- [x] `task gate:api` green; the lint ratchet in `.golangci.yml` applies (read the file, not
       the gate's capped output; `--max-same-issues=0` before counting).
 
 ### M3 — Web: the now line on run view, board and list
 
-- [ ] `web/src/lib/runActivity.ts`: `latestActivity(messages)` mirroring `Latest` (D3:
+- [x] `web/src/lib/runActivity.ts`: `latestActivity(messages)` mirroring `Latest` (D3:
       selection AND fold), tested against `fixtures/run-activity/cases.json` with the same
       every-case-exercised check.
-- [ ] `MilestoneChecklist` signature grows from `{ run }` to `{ run, activity }`, where
+- [x] `MilestoneChecklist` signature grows from `{ run }` to `{ run, activity }`, where
       `activity = latestActivity(messages)` is computed in `RunView` from the frames
       `useRunStream` holds (`RunView.tsx:759`) and passed down (memoised on the newest
       seq); now-line strip under the `◐` row (or unattached under the header), header
       count `1/6 ◐ m2` — the attach point and the header id follow the D4 selection rule
       (first in-progress id by frozen order) — three variants (lead alone, waiting, nothing
       declared), `prefers-reduced-motion` respected, all text via `stripUnsafeChars`.
-- [ ] `milestoneBadgeText` gains the `◐` suffix when `milestones_in_progress` is non-empty;
+- [x] `milestoneBadgeText` gains the `◐` suffix when `milestones_in_progress` is non-empty;
       board card (`Dashboard.tsx`) and runs-list row (`RunsList.tsx`) render one now line
       from `run.current_activity`.
-- [ ] Mock mode: `run-live` fixture and the `engine.ts` sim carry `current_activity` so the
+- [x] Mock mode: `run-live` fixture and the `engine.ts` sim carry `current_activity` so the
       line is demonstrable without a stack; the null-milestone fixtures prove D5.
-- [ ] vitest tests: render with/without activity, with/without declared milestone, terminal
+- [x] vitest tests: render with/without activity, with/without declared milestone, terminal
       run hides the line, badge suffix, byte-identical output for null-milestone runs.
-- [ ] `task gate:web` green (knip zero-tolerance on unused exports — export only what is
+- [x] `task gate:web` green (knip zero-tolerance on unused exports — export only what is
       consumed); `web-ux` pass in mock mode.
 
 ### M4 — TUI: blinking cell, rail rows, board second line
 
-- [ ] `blinkTickMsg` + `blinkCmd` (500 ms) armed/disarmed per D4; `m.blinkOn` initial
+- [x] `blinkTickMsg` + `blinkCmd` (500 ms) armed/disarmed per D4; `m.blinkOn` initial
       `false`; `UZI_TUI_NO_BLINK=1` honoured.
-- [ ] `milestoneMarker`: the in-progress cell (first frozen id in `MilestonesInProgress`,
+- [x] `milestoneMarker`: the in-progress cell (first frozen id in `MilestonesInProgress`,
       by frozen order) renders `▰`/`▱` in `pal.wait`; bar otherwise unchanged; width rules
       (`boardMileWidth`, `boardMileCap`, `boardShowMile`) unchanged.
-- [ ] `renderMilestones`: eyebrow `· <id>` suffix, in-progress row mark = the same cell,
+- [x] `renderMilestones`: eyebrow `· <id>` suffix, in-progress row mark = the same cell,
       `↳ <role> · <age>` + italic label line beneath it (or unattached under the eyebrow),
       all through `renderer.Plain` (D7 untrusted fields, add `AgentLabel`/`Detail` to
       `d7UntrustedFields`); rail derives the activity from its own frames via
       `runactivity`.
-- [ ] Board: selected-row second line per D4 from `RunDTO.CurrentActivity`, width-clamped,
+- [x] Board: selected-row second line per D4 from `RunDTO.CurrentActivity`, width-clamped,
       riding the selection bg like the lane label line. The lane-label line is a DETAIL-rail
       precedent, not a board one: the board's selection/scroll math must tolerate one
       variable-height row — test with the top and the bottom row selected, and with the
       selection moving across a run that gains/loses activity between polls.
-- [ ] Tests: static frame equals today's frame plus `▱`+`· m2` (golden), tick armed only
+- [x] Tests: static frame equals today's frame plus `▱`+`· m2` (golden), tick armed only
       with in-progress runs and never double-armed across board refreshes (`blinkArmed`),
       `UZI_TUI_NO_BLINK=1` pins the static frame, Ascii-profile output alternates by
       shape, null-milestone run byte-identical (D5). `tui-ux` offline render light/dark/NO_COLOR.
-- [ ] `task gate:api` green (the TUI lives in the api module).
+- [x] `task gate:api` green (the TUI lives in the api module).
 
 ### M5 — CLI: `uzi run get` NOW row
 
-- [ ] `NOW` row after the `MILESTONES` block in `milestoneRows`'s caller, `cellText`-safe,
+- [x] `NOW` row after the `MILESTONES` block in `milestoneRows`'s caller, `cellText`-safe,
       hidden when `current_activity` is null; `--json` carries the object; `--field` on it
       is the documented exit 2.
-- [ ] Table test for present/absent/terminal; `task gate:api` green.
+- [x] Table test for present/absent/terminal; `task gate:api` green.
 
 ### M6 — Docs, specs, changelog
 
-- [ ] `docs/run-activity.md`: a "Milestones and the now line" section (what ◐/the blinking
+- [x] `docs/run-activity.md`: a "Milestones and the now line" section (what ◐/the blinking
       cell mean, where the line's words come from, "reported complete" wording).
-- [ ] `docs/cli.md`: the TUI section (`:688`, `:723-725`) and `uzi run get` gain the new
+- [x] `docs/cli.md`: the TUI section (`:688`, `:723-725`) and `uzi run get` gain the new
       rows/cell; `UZI_TUI_NO_BLINK` documented.
-- [ ] `specs/ai.md`: one decision entry (D1-D4); `specs/human.md` hygiene only.
-- [ ] `CHANGELOG.md` `[Unreleased]` entries per component. `web/scripts/check-docs.mjs`
+- [x] `specs/ai.md`: one decision entry (D1-D4); `specs/human.md` hygiene only.
+- [x] `CHANGELOG.md` `[Unreleased]` entries per component. `web/scripts/check-docs.mjs`
       passes (frontmatter, links).
 
 ## Success criteria

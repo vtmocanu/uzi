@@ -762,8 +762,15 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// oscLink used sanitizeTTY (which spares \n/\t) instead of its OSC-8-strict strip.
 	hostileURL := nasty + "\n  FORGED-ROW\t"
 	hostileIID := int64(519)
+	// A hostile current_activity on the SELECTED row exercises the board's second "now" line
+	// (boardSecondLine, PRD #1064 D4): its Agent (role) and AgentLabel/Detail (task label) are
+	// model-authored, unsanitized on the wire, and drawn through renderer.Plain. Its milestone
+	// (hostile title) drives the `▸ <id> <title>` prefix too.
+	hostileActivity := apitypes.RunActivity{Agent: nasty, AgentLabel: nasty, Tool: "Edit", Detail: nasty}
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty, AnthropicSecretLabel: &hostileLabel}},
+		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty, AnthropicSecretLabel: &hostileLabel,
+			Milestones: []apitypes.Milestone{{ID: "m1", Title: nasty}}, MilestonesInProgress: []string{"m1"},
+			CurrentActivity: &hostileActivity}},
 		{RunDTO: apitypes.RunDTO{ID: "77777777-2222", Kind: "issue", Status: "running", IssueTitle: nasty,
 			IssueIID: &hostileIID, IssueWebURL: &hostileURL}},
 	}}
@@ -824,6 +831,12 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 			MilestonesInProgress: []string{"m1"}},
 		msgs: []apitypes.MessageDTO{
 			msgDTO(1, "text", nasty, "toolu_"+nasty, nasty, nasty, now),
+			// A hostile tool_use frame drives the crew rail's now line (renderMilestones →
+			// railNowLines, PRD #1064 D4): the role (Agent) and the italic task label
+			// (AgentLabel / the Bash description Detail) are model-authored, unsanitized on the
+			// wire, and must be drawn through renderer.Plain.
+			{Seq: 2, Kind: "tool_use", Agent: ptr(nasty), AgentLabel: ptr(nasty), CreatedAt: now,
+				Payload: json.RawMessage(`{"name":"Bash","input":{"description":` + quoteJSON(nasty) + `}}`)},
 		},
 	})
 	detail = next.(tuiModel)
@@ -1110,10 +1123,21 @@ func TestTUIDetailMilestoneBlock(t *testing.T) {
 	}
 
 	out := load(milestoneRun)
-	for _, want := range []string{"MILESTONES", "2/4", "✓", "◐", "○", "Alpha", "Gamma"} {
+	// PRD #1064 D4: the in-progress row's mark is the blinking cell (▰/▱ in the wait colour),
+	// NOT the old ◐, and the eyebrow gains a `· <id>` suffix naming the in-progress milestone.
+	for _, want := range []string{"MILESTONES", "2/4", "✓", "○", "Alpha", "Gamma", "· m3"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("milestone block missing %q\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "◐") {
+		t.Errorf("the in-progress row must use the blinking cell, not the retired ◐ glyph\n%s", out)
+	}
+	// blinkOn defaults false, so the static frame shows the in-progress cell as ▱ in the wait
+	// colour — the same span the eyebrow micro-bar's in-progress cell uses.
+	waitCell := paintSeg(newPalette(true).wait, nil, false, "▱")
+	if !strings.Contains(out, waitCell) {
+		t.Errorf("the in-progress cell (▱ in the wait colour) is not rendered in the static frame\n%s", out)
 	}
 
 	// A run with no frozen list draws no block at all (back-compat: pre-#122 runs unchanged).

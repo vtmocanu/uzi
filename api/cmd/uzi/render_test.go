@@ -541,6 +541,163 @@ func TestRenderRunDetailMilestoneTitleSanitized(t *testing.T) {
 	}
 }
 
+// ---- PRD #1064 M5: the NOW row ----------------------------------------------
+
+// TestRenderRunDetailNowRow pins `uzi run get`'s NOW row (PRD #1064 M5, D7): the
+// server-derived current_activity rendered after the MILESTONES block as
+// `<agent> · <agent_label> · <tool> <detail> · <age> ago`. It covers the three D7
+// display cases the mock names — a full subagent activity, a lead-alone frame with no
+// dispatch label — and the empty-part handling that must never leave a dangling
+// separator.
+func TestRenderRunDetailNowRow(t *testing.T) {
+	// (a) A non-terminal run WITH a full current_activity renders the NOW row with the
+	// role · label · tool detail · age text, in that order. A minutes-scale age keeps the
+	// rendered string stable across the test's own runtime (relAge floors to whole
+	// minutes, so 1m30s reads "1m" for the whole sub-second window this test runs in).
+	r := milestoneRun()
+	r.CurrentActivity = &apitypes.RunActivity{
+		Agent:      "coder",
+		AgentLabel: "Decouple ci_fix detector from branch naming",
+		Tool:       "Edit",
+		Detail:     "api/internal/poller/ci_autofix.go",
+		At:         time.Now().Add(-90 * time.Second),
+	}
+	out := renderDetail(t, r)
+	if !strings.Contains(out, "NOW") {
+		t.Errorf("a non-terminal run with an activity must render a NOW row, got:\n%s", out)
+	}
+	want := "coder · Decouple ci_fix detector from branch naming · Edit api/internal/poller/ci_autofix.go · 1m ago"
+	if !strings.Contains(out, want) {
+		t.Errorf("the NOW row must read %q, got:\n%s", want, out)
+	}
+	// The NOW row sits AFTER the MILESTONES block (PRD target rendering).
+	if mi, ni := strings.Index(out, "MILESTONES"), strings.Index(out, "NOW"); mi < 0 || ni < 0 || ni < mi {
+		t.Errorf("the NOW row must come after the MILESTONES block, got:\n%s", out)
+	}
+
+	// (b) A lead-alone frame (no dispatch label, a tool with no detail) drops the empty
+	// parts rather than rendering a dangling " · ": the row is `lead · Read · <age> ago`.
+	lead := apitypes.RunDTO{ID: "run-lead", Kind: "issue", Status: "running", Health: "ok"}
+	lead.CurrentActivity = &apitypes.RunActivity{
+		Agent: "lead",
+		Tool:  "Read",
+		At:    time.Now().Add(-30 * time.Second),
+	}
+	lout := renderDetail(t, lead)
+	if !strings.Contains(lout, "lead · Read · ") || !strings.Contains(lout, "ago") {
+		t.Errorf("a lead-alone activity must render `lead · Read · <age> ago`, got:\n%s", lout)
+	}
+	if strings.Contains(lout, "· ·") || strings.Contains(lout, " ·  · ") {
+		t.Errorf("an empty part left a dangling separator, got:\n%s", lout)
+	}
+}
+
+// TestRenderRunDetailNowRowAbsent pins the two states that show NO NOW row: a run with
+// a nil current_activity (the server nulls it for a run with no tool_use frame), and a
+// terminal run (completed/failed/cancelled — where the server would null it, and the
+// belt-and-braces terminal guard drops it even if a buggy server did not). These make
+// the row's guard non-vacuous: the test goes red if the row were rendered on a null
+// activity or on a finished run.
+func TestRenderRunDetailNowRowAbsent(t *testing.T) {
+	// Nil activity: no NOW row (byte-for-byte the pre-#1064 output for the milestone run).
+	nilAct := milestoneRun()
+	nilAct.CurrentActivity = nil
+	if out := renderDetail(t, nilAct); strings.Contains(out, "NOW") {
+		t.Errorf("a run with a nil current_activity must render no NOW row, got:\n%s", out)
+	}
+
+	// Terminal runs: even WITH an activity populated, a finished run has no "now".
+	for _, status := range []string{"completed", "failed", "cancelled"} {
+		term := milestoneRun()
+		term.Status = status
+		term.CurrentActivity = &apitypes.RunActivity{
+			Agent: "coder", AgentLabel: "still here", Tool: "Edit", Detail: "x.go",
+			At: time.Now().Add(-10 * time.Second),
+		}
+		if out := renderDetail(t, term); strings.Contains(out, "NOW") {
+			t.Errorf("a %s run must render no NOW row even with an activity, got:\n%s", status, out)
+		}
+	}
+}
+
+// TestRenderRunDetailNowRowSanitized is the NOW-row twin of
+// TestRenderRunDetailMilestoneTitleSanitized: Agent/AgentLabel/Tool/Detail are
+// UNTRUSTED, model-authored text (the server leaves Agent/Tool unsanitized on the wire,
+// D7), so every part must go through cellText — bidi override and CSI escape stripped,
+// newline folded so the table rail holds, tab folded, and an oversized part capped.
+func TestRenderRunDetailNowRowSanitized(t *testing.T) {
+	// bidi is a right-to-left override (U+202E), constructed from its code point rather
+	// than pasted as a raw control rune into source. It is a unicode.Cf format rune that
+	// cellText must strip; \x1b is the CSI escape introducer.
+	bidi := string(rune(0x202e))
+	r := milestoneRun()
+	r.CurrentActivity = &apitypes.RunActivity{
+		Agent:      "cod" + bidi + "er\x1b[31m",
+		AgentLabel: "hostile\nlabel\tcol",
+		Tool:       "Edit",
+		Detail:     "api/" + bidi + "file.go" + strings.Repeat("x", 250),
+		At:         time.Now().Add(-45 * time.Second),
+	}
+	out := renderDetail(t, r)
+	for _, bad := range []string{bidi, "\x1b", "hostile\nlabel", "\t"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("a hostile activity reached the terminal carrying %q, got:\n%q", bad, out)
+		}
+	}
+	if !strings.Contains(out, "coder") || !strings.Contains(out, "hostile") {
+		t.Errorf("sanitizing dropped the printable activity text too, got:\n%q", out)
+	}
+	// The cap: a 250-char detail must be truncated, not passed through whole.
+	if strings.Contains(out, strings.Repeat("x", 250)) {
+		t.Errorf("an oversized activity detail reached the terminal uncapped, got:\n%q", out)
+	}
+}
+
+// TestRenderRunDetailNowRowAgentToolWidthCapped pins the ONE guarantee the sibling
+// TestRenderRunDetailNowRowSanitized cannot: that nowRow's own cellText — not the
+// defense-in-depth CellText that Printer.Table runs over every cell — width-caps the
+// Agent and Tool parts.
+//
+// Two facts make this its own case rather than another line in the Sanitized test:
+//   - The width cap (200 runes) lives ONLY in nowRow's cellText. uzicli.Printer.Table →
+//     termsafe.CellText independently strips bidi/CSI/newline/tab (so the Sanitized
+//     test's other assertions survive cellText being dropped) but deliberately does NOT
+//     truncate. So the cap is the sole property that reddens if cellText leaves the
+//     agent/tool render lines.
+//   - The Sanitized test puts its oversized payload in Detail, which the SERVER already
+//     caps to 200 — so it is NOT a load-bearing width guard for the fields nowRow's
+//     cellText is genuinely the sole cap for. Agent and Tool ship UNSANITIZED on the
+//     wire (D7, and the run_render.go comment says so), so an over-long Agent/Tool value
+//     reaches the terminal uncapped the instant cellText is dropped from those lines.
+//
+// Distinct sentinels ('A' for Agent, 'T' for Tool) so a regression on either line is
+// named unambiguously; both are 250 runes, past cellText's 200-rune cap.
+func TestRenderRunDetailNowRowAgentToolWidthCapped(t *testing.T) {
+	longAgent := strings.Repeat("A", 250)
+	longTool := strings.Repeat("T", 250)
+	r := milestoneRun()
+	r.CurrentActivity = &apitypes.RunActivity{
+		Agent:      longAgent,
+		AgentLabel: "dispatch",
+		Tool:       longTool,
+		Detail:     "x.go",
+		At:         time.Now().Add(-45 * time.Second),
+	}
+	out := renderDetail(t, r)
+	if !strings.Contains(out, "NOW") {
+		t.Fatalf("a non-terminal run with an activity must render a NOW row, got:\n%s", out)
+	}
+	// The load-bearing assertions: neither the 250-rune Agent nor the 250-rune Tool may
+	// reach the terminal whole. Each reddens iff cellText is dropped from its render line
+	// (Printer.Table's CellText does not truncate, so it cannot mask a missing cap).
+	if strings.Contains(out, longAgent) {
+		t.Errorf("an oversized activity AGENT reached the terminal uncapped, got:\n%q", out)
+	}
+	if strings.Contains(out, longTool) {
+		t.Errorf("an oversized activity TOOL reached the terminal uncapped, got:\n%q", out)
+	}
+}
+
 // ---- PRD #362 M5: plain-English run summaries -------------------------------
 
 // TestRenderRunDetailSummaries pins `uzi run get`'s intent/plan/deltas block (PRD #362
