@@ -19087,6 +19087,18 @@ session_id gate**: a design-wave counterexample showed a session-keyed gate let 
 *different* dead run's orphan ref (same session lineage, different run), i.e. false provenance.
 Anchoring to the run id closes that.
 
+*issue #887/#909 — stamp encoding and the read-fallback.* The stamp is authoritatively written and
+cleared under the #887 **subsection** form `uzi-trackowner.<branch>.owner` (branch verbatim in the
+subsection, so distinct branches never collide). During the rollout window a persistent bare may
+still carry a stamp under the **pre-#887 flattened** form `uzi-trackowner.<flattened>`
+(`/`,`.`->`-`, 2-part, no `.owner`); a reader that consulted only the new key would read empty and
+redo a stable branch's unpushed work. So the reader (#909) ALSO falls back to the flattened form,
+**read-only** and **collision-guarded** — the flat key is not branch-injective, so it is consulted
+only when no other live `refs/uzi-runner/<branch>` flattens to the same key — and still gated by the
+run-id-equality check above. The clear path likewise unsets the flattened key, skipping it when a
+distinct live sibling shares it. Nothing ever WRITES the flat form, so the stamp self-heals to the
+subsection key the first time any run re-stamps.
+
 **Decision 4: shutdown durability (shape B), abort in-flight runs on SIGTERM, then fetch back.**
 `Runner.shutdown()` plus a per-run registry aborts each in-flight run's controller on SIGTERM
 (`agent/src/runner.ts`; the worker's existing SIGTERM/SIGINT handler in `agent/src/main.ts` drives
