@@ -71,23 +71,27 @@ const provisioned: Worker = {
 };
 
 function renderCard(hostedCount = 0, onProvisioned = vi.fn()) {
-  render(<HostedWorkers hostedCount={hostedCount} onProvisioned={onProvisioned} />);
+  // onShowWorkers is REQUIRED (M3); a stub keeps every existing test type-clean.
+  render(<HostedWorkers hostedCount={hostedCount} onProvisioned={onProvisioned} onShowWorkers={() => {}} />);
   return onProvisioned;
 }
 
-const provisionButton = () => screen.findByRole("button", { name: /provision/i });
+// Anchored at the start so it matches the submit button ("Provision" / "Provisioning…")
+// but NOT the at-quota "delete one to provision another" link, which also contains
+// "provision" (M3).
+const provisionButton = () => screen.findByRole("button", { name: /^Provision/ });
 
 describe("HostedWorkers visibility (the card is hidden, never disabled-with-excuse)", () => {
   it("renders nothing while the config is still in flight", () => {
     mockApi.hostedConfig.mockReturnValue(new Promise(() => {})); // never settles
-    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} />);
+    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} />);
     // No skeleton either: a placeholder would promise a card that may never come.
     expect(container.firstChild).toBeNull();
   });
 
   it("renders nothing when hosting is disabled on the instance", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: false, quota: 2, ephemeral_enabled: false });
-    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} />);
+    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} />);
     await waitFor(() => expect(mockApi.hostedConfig).toHaveBeenCalled());
     // Disabled beats a non-zero quota: a client reading enabled:false renders nothing
     // hosted regardless of the number beside it.
@@ -96,7 +100,7 @@ describe("HostedWorkers visibility (the card is hidden, never disabled-with-excu
 
   it("fails closed when the config read rejects — no card, no error banner", async () => {
     mockApi.hostedConfig.mockRejectedValue(new ApiError(500, "internal error"));
-    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} />);
+    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} />);
     await waitFor(() => expect(mockApi.hostedConfig).toHaveBeenCalled());
     expect(container.firstChild).toBeNull();
     // A capability probe that blipped must not shout at a user who may not even have
@@ -106,7 +110,7 @@ describe("HostedWorkers visibility (the card is hidden, never disabled-with-excu
 
   it("hides the form when the quota is 0 — that is policy, not a full quota", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 0, ephemeral_enabled: false });
-    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} />);
+    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} />);
     await waitFor(() => expect(mockApi.hostedConfig).toHaveBeenCalled());
     // No "0 of 0 used" and no disabled button: deleting a worker would not help, so
     // offering the affordance would be a lie. The user's existing hosted rows are the
@@ -126,7 +130,7 @@ describe("HostedWorkers onAvailability (D8 — tells the page whether the hosted
   it("fires once with { manual: true } when hosting is enabled and quota > 0", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     const onAvailability = vi.fn();
-    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} onAvailability={onAvailability} />);
     await waitFor(() => expect(onAvailability).toHaveBeenCalledWith({ manual: true }));
     expect(onAvailability).toHaveBeenCalledTimes(1);
   });
@@ -134,7 +138,7 @@ describe("HostedWorkers onAvailability (D8 — tells the page whether the hosted
   it("fires with { manual: false } when enabled but the quota is 0", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 0, ephemeral_enabled: true });
     const onAvailability = vi.fn();
-    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} onAvailability={onAvailability} />);
     await waitFor(() => expect(onAvailability).toHaveBeenCalledWith({ manual: false }));
     expect(onAvailability).toHaveBeenCalledTimes(1);
   });
@@ -142,7 +146,7 @@ describe("HostedWorkers onAvailability (D8 — tells the page whether the hosted
   it("fires with { manual: false } when hosting is disabled", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: false, quota: 5, ephemeral_enabled: false });
     const onAvailability = vi.fn();
-    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} onAvailability={onAvailability} />);
     await waitFor(() => expect(onAvailability).toHaveBeenCalledWith({ manual: false }));
     expect(onAvailability).toHaveBeenCalledTimes(1);
   });
@@ -150,7 +154,7 @@ describe("HostedWorkers onAvailability (D8 — tells the page whether the hosted
   it("fires with { manual: false } when the config read rejects (fail closed)", async () => {
     mockApi.hostedConfig.mockRejectedValue(new ApiError(500, "internal error"));
     const onAvailability = vi.fn();
-    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} onAvailability={onAvailability} />);
     await waitFor(() => expect(onAvailability).toHaveBeenCalledWith({ manual: false }));
     expect(onAvailability).toHaveBeenCalledTimes(1);
   });
@@ -159,12 +163,12 @@ describe("HostedWorkers onAvailability (D8 — tells the page whether the hosted
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     const onAvailability = vi.fn();
     const { rerender } = render(
-      <HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onAvailability={onAvailability} />,
+      <HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} onAvailability={onAvailability} />,
     );
     await waitFor(() => expect(onAvailability).toHaveBeenCalledTimes(1));
     // Force a rerender (a new prop identity) — the one-shot fetch effect must not re-run and
     // the latch must hold, so the count stays 1.
-    rerender(<HostedWorkers hostedCount={1} onProvisioned={vi.fn()} onAvailability={onAvailability} />);
+    rerender(<HostedWorkers hostedCount={1} onProvisioned={vi.fn()} onShowWorkers={() => {}} onAvailability={onAvailability} />);
     await Promise.resolve();
     expect(onAvailability).toHaveBeenCalledTimes(1);
   });
@@ -178,12 +182,30 @@ describe("HostedWorkers quota states", () => {
     expect((await provisionButton()).hasAttribute("disabled")).toBe(false);
   });
 
-  it("disables the submit at quota and says how to get out of it", async () => {
+  it("disables the submit at quota and offers a link back to Your workers (M3)", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     renderCard(2);
     expect(await screen.findByText(/2 of 2 used/)).toBeTruthy();
-    expect(await screen.findByText(/delete one to provision another/)).toBeTruthy();
+    // The escape hatch is now a link-styled BUTTON, not plain text (M3).
+    expect(await screen.findByRole("button", { name: "delete one to provision another" })).toBeTruthy();
     expect((await provisionButton()).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("does not render the delete-one link below quota", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    renderCard(1);
+    expect(await screen.findByText(/1 of 2 used/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "delete one to provision another" })).toBeNull();
+  });
+
+  it("calls onShowWorkers when the at-quota delete-one link is clicked (M3)", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    const onShowWorkers = vi.fn();
+    render(
+      <HostedWorkers hostedCount={2} onProvisioned={vi.fn()} onShowWorkers={onShowWorkers} />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "delete one to provision another" }));
+    expect(onShowWorkers).toHaveBeenCalledTimes(1);
   });
 
   it("never calls the endpoint while at quota", async () => {
@@ -231,7 +253,7 @@ describe("HostedWorkers provisioning", () => {
     // token-shaped in this DOM means someone copied the wrong flow.
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
-    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} />);
+    const { container } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} />);
 
     fireEvent.click(await provisionButton());
     await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalled());

@@ -412,6 +412,32 @@ describe("WorkersSettings hosted workers (PRD #58 M5)", () => {
     expect(await screen.findByText("uzi_wk_deadbeef")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Copy" })).toBeTruthy();
   });
+
+  it("keeps the join-token card across a tab round-trip and clears it on Done (M3)", async () => {
+    // The token card must survive a tab switch (both panels stay mounted, D4) and clear only
+    // on Done — it holds a secret shown exactly once.
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.createWorker.mockResolvedValue({
+      worker: aWorker({ id: "w-new", name: "nas" }),
+      token: "uzi_wk_deadbeef",
+    });
+    renderPage();
+
+    // Empty fleet lands on the add tab, where the register form and token card live.
+    fireEvent.change(await screen.findByPlaceholderText(/laptop, ci-runner-1/), { target: { value: "nas" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate join token" }));
+    expect(await screen.findByText("uzi_wk_deadbeef")).toBeTruthy();
+
+    // Round-trip: add → workers → add. The card is still there (query by role excludes the
+    // hidden panel, so this also proves the card is on the currently-shown add panel).
+    openWorkersTab();
+    openAddTab();
+    expect(screen.getByText("uzi_wk_deadbeef")).toBeTruthy();
+
+    // Done clears it.
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(screen.queryByText("uzi_wk_deadbeef")).toBeNull();
+  });
 });
 
 describe("WorkersSettings — Option B header grouping (PRD #560)", () => {
@@ -521,6 +547,30 @@ describe("WorkersSettings hosted quota is escapable (the primary journey)", () =
     openAddTab();
     expect(await screen.findByText(/1 of 2 used/)).toBeTruthy();
     await waitFor(() => expect(provision().hasAttribute("disabled")).toBe(false));
+  });
+
+  it("the at-quota 'delete one to provision another' link crosses to Your workers and focuses the first hosted row, not a Delete button (M3, D10)", async () => {
+    const h1 = aWorker({ id: "w-h1", name: "base (S)", kind: "hosted", hosted_size: "s" });
+    const h2 = aWorker({ id: "w-h2", name: "base (M)", kind: "hosted", hosted_size: "m" });
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [h1, h2] });
+    renderPage();
+
+    // A full fleet lands on Your workers; the at-quota link lives on the add tab.
+    await screen.findByText("base (M)");
+    openAddTab();
+    const link = await screen.findByRole("button", { name: "delete one to provision another" });
+    fireEvent.click(link);
+
+    // It selects Your workers and parks focus on the FIRST hosted row's <li> container.
+    expect(screen.getByRole("tab", { name: /^Your workers/ }).getAttribute("aria-selected")).toBe("true");
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("worker-row-w-h1")));
+    // The focused element is the row container (an <li>), never a Delete button — the
+    // never-park-on-a-destructor rule stands (D10).
+    expect((document.activeElement as HTMLElement).tagName).toBe("LI");
+    for (const b of screen.getAllByRole("button", { name: "Delete" })) {
+      expect(document.activeElement).not.toBe(b);
+    }
   });
 });
 
@@ -687,14 +737,21 @@ describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11
   const externalW = aWorker({ id: "w-x", name: "laptop" });
   const provisioned = aWorker({ id: "w-new", name: "base (S)", kind: "hosted", hosted_size: "s" });
 
-  it("announces a provision, names the server's worker, and takes focus", async () => {
+  it("announces a provision, lands on Your workers, and takes focus (M3 batches tab+announce)", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     mockApi.listWorkers.mockResolvedValue({ workers: [] });
     mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: "Provision" }));
 
-    const msg = await screen.findByText("Provisioned base (S) — it appears in your workers below.");
+    // New copy (M3), and the notice now lives on the Your workers panel, which the handler
+    // un-hides in the SAME batch as the announce — so the focus lands. If the tab switch and
+    // the announce were not batched the notice would render inside a still-hidden panel and
+    // .focus() would silently no-op: this focus assertion is the regression guard for that.
+    const msg = await screen.findByText("Provisioned base (S) — it is listed below and comes online on its own.");
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: /^Your workers/ }).getAttribute("aria-selected")).toBe("true"),
+    );
     // toBe the wrapper, not a textContent match: focus on <body> would match anything,
     // since body.textContent is the entire page.
     await waitFor(() => expect(document.activeElement).toBe(msg.parentElement));
@@ -710,11 +767,11 @@ describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11
     mockApi.deleteWorker.mockResolvedValue(null);
     renderPage();
 
-    // Empty fleet lands on the add tab (D11), where the Provision button lives.
+    // Empty fleet lands on the add tab (D11), where the Provision button lives. The M3
+    // handler switches to Your workers as it announces, so the row it describes is already
+    // visible where Delete lives.
     fireEvent.click(await screen.findByRole("button", { name: "Provision" }));
     expect(await screen.findByText(/Provisioned base \(S\)/)).toBeTruthy();
-    // The row it describes is now listed — on the Your workers tab, where Delete lives.
-    openWorkersTab();
     const del = await screen.findByRole("button", { name: "Delete" });
 
     mockApi.listWorkers.mockResolvedValue({ workers: [] }); // gone after the delete
@@ -722,7 +779,8 @@ describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11
     fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
 
     expect(await screen.findByText("Deleted base (S).")).toBeTruthy();
-    expect(screen.queryByText(/it appears in your workers below/)).toBeNull();
+    // The provision notice must not outlive the row it named (new M3 copy).
+    expect(screen.queryByText(/it is listed below/)).toBeNull();
   });
 
   it("announces a hosted delete and takes focus — not the next row's Delete button", async () => {

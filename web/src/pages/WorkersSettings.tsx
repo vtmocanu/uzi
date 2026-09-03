@@ -27,6 +27,10 @@ import { DOC_WORKER_SETUP } from "../lib/doclinks";
 // Stable per-row ids: the delete button is a focus target after a dismissed confirm,
 // and the warning is the confirm group's aria-description (PRD #58).
 const deleteButtonId = (workerId: string) => `worker-delete-${workerId}`;
+// Stable per-row id, mirroring deleteButtonId. The row <li> carries this plus
+// tabIndex={-1} so the at-quota "delete one to provision another" jump can focus the
+// first hosted row's CONTAINER after crossing tabs (D10) — never a Delete button.
+const rowId = (workerId: string) => `worker-row-${workerId}`;
 // The picker's <option> values encode the MODE, not just a label, because since
 // PRD #111 M3 there are three kinds of choice and only one of them names a token.
 // AUTO_OPTION is a sentinel rather than a label, and deliberately a string no label
@@ -189,6 +193,27 @@ export function WorkersSettings() {
     target?.focus();
     setPendingFocus(null);
   }, [pendingFocus]);
+  // A pending focus onto a worker ROW's <li> (D10), the parallel of pendingFocus for the
+  // at-quota jump: the HostedWorkers "delete one to provision another" link crosses to the
+  // Your workers tab, and focus must land on the first hosted row AFTER that panel un-hides.
+  // Same effect-after-commit reason as pendingFocus — a synchronous .focus() would fire
+  // while the workers panel is still hidden and silently no-op. If the row is gone (the poll
+  // dropped it), <body> is the honest answer, so no crash.
+  const [pendingRowFocus, setPendingRowFocus] = useState<string | null>(null);
+  useEffect(() => {
+    if (!pendingRowFocus) return;
+    document.getElementById(rowId(pendingRowFocus))?.focus();
+    setPendingRowFocus(null);
+  }, [pendingRowFocus]);
+  // Cross the tabs back to Your workers and focus the first HOSTED row's container so the
+  // user can delete one and free quota (D10). Never a Delete button — the focus rule below
+  // stands. If there is no hosted worker (shouldn't happen at quota), just switch tabs and
+  // let focus fall to <body>.
+  const onShowWorkers = useCallback(() => {
+    selectTab("workers");
+    const firstHosted = workers.find((w) => w.kind === "hosted");
+    if (firstHosted) setPendingRowFocus(firstHosted.id);
+  }, [selectTab, workers]);
   const onTabKeyDown = (e: React.KeyboardEvent) => {
     if (tab === null) return;
     const idx = TAB_ORDER.indexOf(tab);
@@ -545,7 +570,12 @@ export function WorkersSettings() {
             {workers.map((w) => (
               <li
                 key={w.id}
-                className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm"
+                // Stable id + programmatically-focusable (tabIndex -1, never a tab stop):
+                // the at-quota "delete one to provision another" jump focuses the first
+                // hosted row's container here (D10). Harmless on every row.
+                id={rowId(w.id)}
+                tabIndex={-1}
+                className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm outline-hidden"
               >
                 <div>
                   {/* Row 1 — identity | badges. min-w-0 + break-words lets a long name
@@ -935,9 +965,16 @@ export function WorkersSettings() {
             <HostedWorkers
               hostedCount={workers.filter((w) => w.kind === "hosted").length}
               onProvisioned={async (worker) => {
-                announce(`Provisioned ${worker.name} — it appears in your workers below.`);
+                // Switch to Your workers AND announce in the SAME synchronous batch, both
+                // before any await (D "After a provision"): the panel un-hides in the same
+                // render the [notice] focus effect runs in, so .focus() lands — a focus on an
+                // element inside a `hidden` panel silently no-ops. The notice sits at the top
+                // of that panel, so it is visible and takes focus.
+                selectTab("workers");
+                announce(`Provisioned ${worker.name} — it is listed below and comes online on its own.`);
                 await reload();
               }}
+              onShowWorkers={onShowWorkers}
               onAvailability={onHostedAvailability}
             />
 

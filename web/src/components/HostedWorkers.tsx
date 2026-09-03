@@ -21,6 +21,7 @@ import { DEFAULT_WORKER_SIZE, WORKER_SIZES, sizeOptionLabel } from "../lib/worke
 export function HostedWorkers({
   hostedCount,
   onProvisioned,
+  onShowWorkers,
   onAvailability,
 }: {
   /** How many hosted workers the user already holds, counted from the fleet list the
@@ -30,6 +31,10 @@ export function HostedWorkers({
    *  be able to replace a provision's message, and deletes are the page's) and the
    *  fleet refresh. */
   onProvisioned: (worker: Worker) => void | Promise<void>;
+  /** Cross the tabs back to Your workers so the user can delete a hosted worker; the
+   *  page selects that tab and focuses the first hosted row. Fired by the at-quota
+   *  "delete one to provision another" link (D10). */
+  onShowWorkers: () => void;
   /** Tell the page whether MANUAL hosted provisioning is available, so its empty state
    *  can lead with a hosted CTA (D8). It is fired FROM the config-fetch effect below,
    *  exactly once per mount, and BEFORE the render-time early `return null` gates: the
@@ -237,13 +242,30 @@ export function HostedWorkers({
             </Button>
             <span className="pb-2 text-xs text-muted">
               {hostedCount} of {config.quota} used
-              {atQuota && " — delete one to provision another"}
+              {atQuota && (
+                <>
+                  {" — "}
+                  {/* A link-styled button, not plain text (D "At quota"): it crosses the
+                      tabs back to Your workers so the user can delete a hosted worker. The
+                      styling mirrors the inline link-buttons elsewhere (e.g. JudgePanel's
+                      Undo): the surrounding muted colour, underlined, brightening to text-fg
+                      on hover — no new palette class. */}
+                  <button
+                    type="button"
+                    onClick={onShowWorkers}
+                    className="text-muted underline underline-offset-2 transition-colors hover:text-fg"
+                  >
+                    delete one to provision another
+                  </button>
+                </>
+              )}
             </span>
           </form>
           <p className="text-xs text-muted">
             A hosted worker runs in the cluster, not on your machine: there is no join token to
-            copy and no container to start. It appears below and comes online on its own, and you
-            delete it there like any other worker. Tick <em>Docker-capable</em> to give its agent
+            copy and no container to start. It shows up under <strong>Your workers</strong> and
+            comes online on its own, and you delete it there like any other worker. Tick{" "}
+            <em>Docker-capable</em> to give its agent
             a rootless, isolated Docker daemon (for docker and docker&nbsp;compose); it costs extra
             CPU and storage and needs an instance that offers the docker tier.
           </p>
