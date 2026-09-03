@@ -1,6 +1,6 @@
 # Architecture
 
-uzi's current MVP is a docker-compose stack of three always-on services (`web`, `api`, `db`) plus one opt-in, profile-gated service (`agent`, a per-user worker — PRD #4), with three trust boundaries: the inbound edge at nginx, the API's outbound calls to the forge (GitLab), and the API's connection to each user's worker. This document describes that shape; see [docs/auth-design.md](docs/auth-design.md) for the auth surface, and [docs/proc-hardening.md](docs/proc-hardening.md) for the worker/agent process-isolation detail the Secrets and Guardrails sections below summarize.
+uzi's current MVP is a docker-compose stack of three always-on services (`web`, `api`, `db`) plus one opt-in, profile-gated service (`agent`, a per-user worker — PRD #4), with three trust boundaries: the inbound edge at nginx, the API's outbound calls to the forge (GitLab, Forgejo or GitHub), and the API's connection to each user's worker. This document describes that shape; see [docs/auth-design.md](docs/auth-design.md) for the auth surface, and [docs/proc-hardening.md](docs/proc-hardening.md) for the worker/agent process-isolation detail the Secrets and Guardrails sections below summarize.
 
 ## Services
 
@@ -72,7 +72,7 @@ State-changing requests (POST/PATCH) additionally run CSRF validation inside `Re
 
 ## Forge integration
 
-uzi's second surface connects each user to a git forge (**GitLab, Forgejo, and GitHub**, behind a forge-generic interface) so the board has real work to show. The Forgejo driver (PRD #65) was the second driver; the GitHub driver (PRD #238) is the third, and — unlike Forgejo — landed with **no interface method-set change at all**, evidence the abstraction ADR-0065 built now genuinely scales to a new forge as "a driver file plus its per-forge seam arms." Every milestone but the last landed dark; the go-live flip (PRD #238's last milestone) now has `handler/forge.go` **advertise and accept `github`**, so a GitHub classic-PAT connection is connectable through the product. Neither driver adds a new service — everything below lives inside `api` — but each does confirm the same second trust boundary: `api` makes authenticated *outbound* calls to a third party (the forge) on top of the inbound boundary at the nginx edge described above. See [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md), [docs/forgejo-bot-setup.md](docs/forgejo-bot-setup.md), and [docs/github-bot-setup.md](docs/github-bot-setup.md) for the per-forge operator/user procedure, [adr/0065-forgejo-driver.md](adr/0065-forgejo-driver.md) and [adr/0238-github-driver.md](adr/0238-github-driver.md) for the second- and third-driver design records, and the PRDs (`prds/done/2-forge-integration-kanban.md`, `prds/done/65-forgejo-support.md`, `prds/done/238-github-forge-support.md`) for the full rationale. A GitHub-only, label-canonical extension (PRD #364) projects the label board's columns onto a linked GitHub Projects v2 board's Status field, forward on every uzi-side move and reverse on the poll cadence — see [docs/github-project-sync.md](docs/github-project-sync.md).
+uzi's second surface connects each user to a git forge (**GitLab, Forgejo, and GitHub**, behind a forge-generic interface) so the board has real work to show. Three drivers sit behind one interface: GitLab, then Forgejo (the second driver, PRD #65), then GitHub (the third, PRD #238, which added no interface method-set change at all). `handler/forge.go` advertises and accepts all three, so a GitHub classic-PAT connection is connectable through the product. Neither added driver adds a new service (everything below lives inside `api`), but each confirms the same second trust boundary: `api` makes authenticated *outbound* calls to a third party (the forge) on top of the inbound boundary at the nginx edge above. See [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md), [docs/forgejo-bot-setup.md](docs/forgejo-bot-setup.md), and [docs/github-bot-setup.md](docs/github-bot-setup.md) for the per-forge procedure, [adr/0065-forgejo-driver.md](adr/0065-forgejo-driver.md) and [adr/0238-github-driver.md](adr/0238-github-driver.md) for the driver design records, and the PRDs (`prds/done/2-forge-integration-kanban.md`, `prds/done/65-forgejo-support.md`, `prds/done/238-github-forge-support.md`) for the full rationale. A GitHub-only, label-canonical extension (PRD #364) projects the board's columns onto a linked GitHub Projects v2 board's Status field, forward on every uzi-side move and reverse on the poll cadence — see [docs/github-project-sync.md](docs/github-project-sync.md).
 
 ### Forge abstraction
 
@@ -86,7 +86,7 @@ The GitHub driver (`github.com/google/go-github/v90`, github.com only, classic P
 
 A worker's context is no longer just an issue's title + description: `api/internal/forge`'s `Forge` interface gained a fourth read, `ListIssueComments`, implemented across all three drivers — the GitLab driver drops forge **system** notes (`Note.System`), Forgejo and GitHub have no such notes to drop — and every driver normalizes to **oldest-first** regardless of the forge's native sort. At run creation, `workersvc.createRun` snapshots the issue's comments into a new nullable `runs.issue_comments` JSONB column via `buildIssueCommentsSnapshot` (`api/internal/workersvc/issue_comments.go`), carried structured on the worker claim next to the description. The snapshot excludes **uzi's own bot-authored comments**, matched against the connection's stored `bot_forge_user_id` — an unknown/zero bot id omits comments entirely rather than risk leaking uzi's own status chatter back into the prompt (see the security note below) — and is bounded to 200 newest comments and 32 KiB of body bytes, with a `truncated` flag when the cap clips the thread. The LEAD's plan prompt renders the snapshot in `agent/src/prompt.ts` (`buildIssueCommentsContext`) immediately after `<issue_description>`, under a per-prompt CSPRNG nonce fence — the same discipline the file already applies to cross-run memory and job logs — with uzi-owned `author`/`timestamp` headers and comment bodies as untrusted data; a comment-less run's prompt is byte-for-byte unchanged from before this landed. The live `get_issue` forge tool (`handler/worker_forge.go`, `assembleForgeIssueComments`) applies the same bot/system filtering and oldest-first ordering with its own 200-item/32 KiB cap, so a mid-run agent pull sees the same shape as the initial snapshot. See [prds/done/381-worker-reads-issue-comments.md](prds/done/381-worker-reads-issue-comments.md) for the full design and decision log.
 
-**Security note.** This widens the injection surface without opening a new trust boundary: a comment body is attacker-influenceable free text exactly like the issue description already was (see [adr/0246-trusted-repo-instructions.md](adr/0246-trusted-repo-instructions.md)) — the multi-author worst case of the same untrusted class, since each comment is independently attacker-authored and a body could otherwise embed a forged closing tag or a spoofed `author: admin (approved)` line. The per-prompt CSPRNG nonce fence defeats that breakout class the same way it already does for every other attacker-authored block: no comment body can predict the nonce, so none can forge the block's close delimiter or spoof the uzi-owned author/timestamp header around it. The numeric forge user id used for the bot filter is read server-side only and is never surfaced to the agent. The bot-exclusion filter and its zero/unknown-id fail-safe (skip the feature rather than risk exposing uzi's own comments) are what keep this from becoming a feedback loop where the agent reacts to uzi's own status notes.
+**Security note.** This widens the injection surface without opening a new trust boundary: a comment body is attacker-influenceable free text exactly like the issue description already was, the multi-author worst case of the same untrusted class. The per-prompt CSPRNG nonce fence defeats the breakout class (no comment body can predict the nonce, so none can forge the block's close delimiter or spoof the uzi-owned author/timestamp header). The numeric forge user id used for the bot filter is read server-side only, never surfaced to the agent, and the bot-exclusion filter with its zero/unknown-id fail-safe is what keeps this from becoming a feedback loop on uzi's own status notes. See [adr/0246-trusted-repo-instructions.md](adr/0246-trusted-repo-instructions.md) for the trust model.
 
 ### Bot PATs, encrypted at rest
 
@@ -127,7 +127,7 @@ A `ci_fix` run rides PRD #4's run machinery as a second run **kind** (`runs.kind
 
 **Verification** ("uzi verifies its work"): the pipeline sync stamps a `ci_fix` run's `fix_verdict` — `verified` when its post-fix pipeline passes, `fix_failed` when it fails — keyed on `runs.branch` (the fix branch, not the failed ref, which differ for a default-branch fix) with an `observed pipeline id > snapshot pipeline id` guard so the original failing pipeline never false-stamps. See [docs/configuration.md](docs/configuration.md#ci-status-integration-prd-6) for the env knobs and the documented residual risks (poll-based staleness, third-party secrets in logs, merge-result false-positives).
 
-**Automatic fixes (PRD #71)** extend this with an opt-in per-user trigger (`users.ci_autofix_enabled`, default off): the same poller tick, via a `CIAutoFix` detector that runs after the pipeline sync, auto-queues the identical `ci_fix` run — auto-approved, skipping the plan gate — when a watched **agent-owned MR branch**'s pipeline fails and its owner opted in. `main`, the repo's default branch, and any non-MR ref are never eligible; only a branch an agent run itself produced is. A loop guard bounds it so a persistently red pipeline can't retry forever: a cap on automatic attempts per branch (`CI_AUTOFIX_MAX_ATTEMPTS`), plus an early halt when a fix attempt's pipeline fails again with the same failure signature as the one before it — either way it stops and notifies rather than retrying on its own, and the manual **Fix CI** button remains the escape hatch. A code-only fix pushes automatically like any auto-approved run; a fix whose diff touches the CI config (`.gitlab-ci.yml`, `.gitlab/`, the project's configured CI config path) is instead parked for human approval, with a fail-closed worker push guard as backstop for an auto-approved plan that turns out to touch those paths anyway. See [docs/ci-autofix.md](docs/ci-autofix.md) for the user-facing behavior and knobs.
+**Automatic fixes (PRD #71)** extend this with an opt-in per-user trigger (`users.ci_autofix_enabled`, default off): a `CIAutoFix` detector on the same poller tick (after the pipeline sync) auto-queues the identical `ci_fix` run, auto-approved and skipping the plan gate, when a watched **agent-owned MR branch**'s pipeline fails and its owner opted in. `main`, the repo's default branch, and any non-MR ref are never eligible; only a branch an agent run itself produced is. A loop guard bounds retries (a per-branch attempt cap `CI_AUTOFIX_MAX_ATTEMPTS`, plus an early halt on a repeated failure signature), and a fix whose diff touches the CI config (`.gitlab-ci.yml`, `.gitlab/`, the project's configured CI config path) is parked for human approval with a fail-closed worker push guard as backstop. The manual **Fix CI** button remains the escape hatch. See [docs/ci-autofix.md](docs/ci-autofix.md) for the loop-guard rationale, the user-facing behavior, and the knobs.
 
 ### MR review watcher: auto-rework review comments (PRD #700)
 
@@ -135,7 +135,7 @@ CI red is `ci_fix`'s job (above); a **green** pipeline with new review feedback 
 
 **PRD #841** layers two more nullable overrides underneath the per-user default above: per-run (`runs.mr_rework_enabled`) and per-schedule (`run_schedules.mr_rework_enabled`, stamped onto the run at creation time unless the run's own create request overrides it). Both resolve live, not as a snapshot — `ListMRReworkCandidates`'s `COALESCE(run, owner) IS NOT FALSE` reads the run's own override first and only falls through to the owner default when it is NULL — and both bind to the newest issue run per branch, since the query's `per_branch` CTE is a `DISTINCT ON (r.branch)` keyed on `created_at DESC`, so a branch reused by a re-run is governed by that newest run's setting.
 
-The forge interface widened to make this possible: `MRComment` (with **two** thread anchors, since on GitHub the REST reply id and the GraphQL resolve-thread node id differ, while GitLab and Forgejo use one) plus `ListMergeRequestComments`/`ReplyMergeRequestComment`/`ResolveMergeRequestThread` across all three drivers. GitHub's read stitches REST comments to a GraphQL `reviewThreads` query for the resolve anchor (go-github ships no GraphQL client, so this is a raw authenticated POST); its `reviewThreads(first: 100)` has no pagination, so a PR past roughly 100 review threads can leave some resolve anchors unmatched — reply still works per comment regardless. Forgejo/Gitea has no resolvable-thread concept on any released version (only Gitea's unreleased main/nightly carries the primitive), so its driver returns the sentinel `forge.ErrResolveUnsupported` and every caller — the poller's snapshot builder, the worker endpoint, the prompt — treats it as a tolerated no-op rather than a failure: reply-only is the documented Forgejo contract, not a bug.
+The forge interface widened for this: `MRComment` (with **two** thread anchors, since GitHub's REST reply id and GraphQL resolve-thread node id differ, while GitLab and Forgejo use one) plus `ListMergeRequestComments`/`ReplyMergeRequestComment`/`ResolveMergeRequestThread` across all three drivers. GitHub stitches REST comments to a GraphQL `reviewThreads` query for the resolve anchor (a raw authenticated POST, since go-github ships no GraphQL client), with an unpaginated `reviewThreads(first: 100)` limit past which some resolve anchors go unmatched though reply still works. Forgejo/Gitea has no resolvable-thread primitive on any released version, so its driver returns the sentinel `forge.ErrResolveUnsupported` and every caller treats it as a tolerated no-op: reply-only is the documented Forgejo contract.
 
 A firing detector calls `workersvc.CreateAutoMRReworkRun`, which lands a new **`mr_rework`** run kind (`runs.kind`, an eighth beside `issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt`/`task`) shaped by `runs_kind_shape` as `repo_id` + `pipeline_ref` + `mr_iid` + `target_run_id` all required (`target_run_id` points at the completed run whose MR is watched, mirroring `judge`'s use of the same column; `pipeline_ref` is the `agent/issue-N` branch it folds fixes onto). Two guards run at INSERT, both create-time rather than reactive: a same-kind partial unique index (`uq_runs_one_active_mr_rework` on `(repo_id, mr_iid)`) rejects a second concurrent rework on one MR, and a **cross-kind** partial unique index (`uq_runs_one_active_branch_ref` on `(repo_id, pipeline_ref)`, spanning both `ci_fix` and `mr_rework`) keeps the two features off the same branch worktree at once. The cross-kind guard is the one place this diverges from a naive reuse of `ci_fix`'s existing branch check: `runs.branch` is NULL for a run's entire active life (only a *completed* run's `SetRunCompleted`/`ReconcileRunMR` ever populate it), so two freshly-created runs of either kind would both read NULL and never see each other — `pipeline_ref` is written at INSERT specifically so the guard has something to count against immediately. The MR's review-comment snapshot rides this create path explicitly (`fetchReviewCommentsSnapshot`, a sibling of PRD #381's issue-comment snapshot, reusing its 32 KiB cap and bot self-filter) rather than through the generic `CreateRun` issue-comment fetch, which would have fetched nothing (an `mr_rework` run has no `issue_iid`). The run is therefore also **issue-less on the board**: queuing it fires no board-column move and it never appears in the runs list's issue-scoped lanes, only via its own `kind`.
 
@@ -152,84 +152,69 @@ agent can play: name, description, an optional model override, an optional
 tools allowlist, and a prompt body. It is not itself an agent; it is the
 recipe a later release renders into a running one.
 
-- **`builtins/` is the single source of truth.** Twelve builtin roles — the
-  `lead` orchestrator (`model: opus`) plus eleven subagents (`coder`,
-  `reviewer`, `auditor`, `tester`, `architect`, `documenter`, `fact-checker`,
-  `spec-keeper`, `researcher`, `ux-designer`, `web-ux`) — are Go-embedded from `api/internal/agenttmpl/builtins/*.md`,
-  parsed at package `init()`. This directory is independent of this repo's own
-  `.claude/agents/*.md` dev-team roster (PRD #17): that roster is free to
-  drift and product changes never touch it. At every boot,
-  `store.ReconcileBuiltinTemplates` inserts any builtin row missing from the
-  DB and never touches one that already exists, so an admin's edits to a
-  builtin survive restarts, and future releases can add or upgrade builtins
-  without a SQL seed that can't be re-run; a boot-time warning is logged if a
-  non-builtin row already occupies a builtin's name (e.g. a custom `lead`
-  template blocks the seed).
+- **`builtins/` is the single source of truth.** Twelve builtin roles, the
+  `lead` orchestrator (`model: opus`) plus eleven subagents (`coder`, `reviewer`,
+  `auditor`, `tester`, `architect`, `documenter`, `fact-checker`, `spec-keeper`,
+  `researcher`, `ux-designer`, `web-ux`), are Go-embedded from
+  `api/internal/agenttmpl/builtins/*.md`, parsed at package `init()`. This is
+  independent of the repo's own `.claude/agents/*.md` dev-team roster (PRD #17),
+  which is free to drift and never touched by product changes. At every boot
+  `store.ReconcileBuiltinTemplates` inserts any missing builtin and never touches
+  an existing one, so admin edits survive restarts and future releases add or
+  upgrade builtins without a non-re-runnable SQL seed; a boot warning is logged if
+  a non-builtin row already occupies a builtin's name.
 - **The `lead` is the main thread, not a subagent.** The worker
-  (`agent/src/agents.ts`) partitions templates by name (`LEAD_NAME_RE`,
-  matching `lead`/`orchestrator`) and routes the matched template's
-  `prompt_body`/`model` into the run's main SDK thread instead of registering
-  it as an invokable subagent. Model precedence for that main thread: the run
-  owner's per-user default model (`users.default_model`, set from Settings,
-  carried through the claim payload) → the `lead` template's `model` → the
-  SDK/Anthropic-account default. A subagent's own template `model`, when set,
-  always wins for that subagent; unset, it inherits the resolved main-thread
-  model. See [docs/worker-model.md](docs/worker-model.md). The same claim
-  also carries the owner's per-user **reasoning effort**
-  (`users.default_effort`, PRD #617): when set it is applied to the SDK's
-  top-level effort for the main thread and inherited by its subagents;
-  unset omits the key so the SDK default (`high`) applies. See
-  [docs/worker-effort.md](docs/worker-effort.md).
+  (`agent/src/agents.ts`) partitions templates by name (`LEAD_NAME_RE`, matching
+  `lead`/`orchestrator`) and routes the matched template's `prompt_body`/`model`
+  into the run's main SDK thread rather than an invokable subagent. Main-thread
+  model precedence: the owner's per-user default (`users.default_model`) → the
+  `lead` template's `model` → the SDK/account default. A subagent's own `model`
+  wins for it when set, else inherits the resolved main-thread model. See
+  [docs/worker-model.md](docs/worker-model.md). The same claim carries the owner's
+  per-user **reasoning effort** (`users.default_effort`, PRD #617): set, it applies
+  to the SDK top-level effort for the main thread and its subagents; unset, the SDK
+  default (`high`) applies. See [docs/worker-effort.md](docs/worker-effort.md).
 - **Scopes + per-user ownership (PRD #18).** Each template has a `scope`
-  (`builtin`/`global`/`user`) and, for user scope, a `user_id`, mirroring the
-  skills model. Builtin and global are visible to everyone and admin-managed; a
-  `user` template is visible to and editable by only its owner. Reads and
-  writes are scope-authorized per row (not a blanket `RequireAdmin`): any user
-  creates/edits/deletes their own templates, builtin/global management stays
-  admin-only, and a non-owner never learns a private template exists (404, not
-  403). `is_builtin` is retained as a compat column a CHECK ties to
-  `scope='builtin'`. Two partial-unique name indexes (shared names unique
-  across builtin+global; per-user names unique) let a user own a name that
-  collides with a shared one; `lead`/`orchestrator` are reserved so no
-  API-created template (global or user) can take a lead name — the invariant
-  behind the worker's "a claim never carries two lead-matching templates" pin.
-  This still closes the hole where any user could rewrite the shared prompts.
-- **Allocation + claim filtering (PRD #18).** `agent_template_allocations`
-  decides which templates ride each run: a global-default layer (admin,
-  `user_id NULL`, always enabled) plus a per-user `enabled` overlay. Seeded
-  with no empty-means-all cliff — every builtin/global gets an explicit default
-  row (at migration, on the reconciler's first insert of a builtin, and on a
-  global's creation), so absence of a row is always a deliberate removal. A
-  claim delivers only the run owner's **resolved** set (`ListClaimAgentTemplates`:
-  the overlay wins, else the global default, else dropped) — builtin∪global
-  defaults ± the owner's overlay + the owner's own allocated user templates,
-  never another user's rows. A user template whose name collides with a
-  builtin/global is dropped from the claim (**shared precedence**), so the
-  worker's name-keyed subagent map never has the curated builtin displaced (a
-  deliberate divergence from skills' body-precedence; surfaced in the UI as a
-  `shadowed` badge). The lead is a normal template in the set — a user may
-  disable it, and the worker degrades to its hardcoded guardrail lead prompt.
-- **Renderer.** `api/internal/agenttmpl/render.go` turns a template into
-  Claude Code's subagent Markdown (fixed-order YAML frontmatter, `tools` as an
-  inline comma-separated string, `tools`/`model` omitted when they inherit).
-  It is a pure function with no DB dependency; parse/validity tests (not a
-  byte-match against `.claude/agents/`, dropped with the source-of-truth
-  split above) guard the embedded builtins directly. `GET
-  /api/agent-templates/:id/rendered` serves this Markdown directly; nothing
-  in this release writes it to a filesystem or spawns anything from it (that
-  is a later release's job). See
+  (`builtin`/`global`/`user`) and, for user scope, a `user_id`, mirroring skills.
+  Builtin and global are visible to everyone and admin-managed; a `user` template
+  is visible to and editable by only its owner. Reads and writes are
+  scope-authorized per row (not blanket `RequireAdmin`): any user manages their own
+  templates, builtin/global stays admin-only, and a non-owner never learns a
+  private template exists (404, not 403). `is_builtin` is a compat column a CHECK
+  ties to `scope='builtin'`. Two partial-unique name indexes (shared names unique
+  across builtin+global; per-user names unique) let a user own a name colliding
+  with a shared one; `lead`/`orchestrator` are reserved so no API-created template
+  can take a lead name, the invariant behind the worker's "a claim never carries
+  two lead-matching templates" pin.
+- **Allocation + claim filtering (PRD #18).** `agent_template_allocations` decides
+  which templates ride each run: a global-default layer (admin, `user_id NULL`,
+  always enabled) plus a per-user `enabled` overlay. Every builtin/global gets an
+  explicit default row (at migration, at first insert, at global creation), so
+  there is no empty-means-all cliff and absence of a row is a deliberate removal. A
+  claim delivers only the owner's **resolved** set (`ListClaimAgentTemplates`:
+  overlay wins, else global default, else dropped), never another user's rows. A
+  user template whose name collides with a builtin/global is dropped (**shared
+  precedence**, a deliberate divergence from skills' body-precedence, surfaced as a
+  `shadowed` badge) so the worker's name-keyed subagent map never displaces the
+  curated builtin. The lead is a normal template: a user may disable it, and the
+  worker degrades to its hardcoded guardrail lead prompt.
+- **Renderer.** `api/internal/agenttmpl/render.go` turns a template into Claude
+  Code's subagent Markdown (fixed-order YAML frontmatter, `tools` as an inline
+  comma-separated string, `tools`/`model` omitted when they inherit). It is a pure
+  function with no DB dependency; parse/validity tests guard the embedded builtins
+  directly. `GET /api/agent-templates/:id/rendered` serves this Markdown; nothing
+  in this release writes it to a filesystem or spawns from it. See
   [docs/agent-templates.md](docs/agent-templates.md).
-- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique
-  within its scope namespace (the two partial-unique indexes above), not a
-  reserved lead name for an API create, and immutable after creation (it is the
-  subagent's filename and identity; renaming means creating a new template and
-  deleting the old one; builtins are never renamed). `description` and `prompt_body` are required and
-  non-empty; `description`, `model`, and each tool name must not contain a
-  newline, carriage return, or other control character (they each render on
-  a single frontmatter line). A template is rejected if its description or
-  prompt body contains what looks like a complete Anthropic token (a
-  high-confidence `sk-ant-...` match); the UI separately warns, without
-  blocking, on looser patterns so legitimate text stays savable.
+- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique within
+  its scope namespace, not a reserved lead name for an API create, and immutable
+  after creation (it is the subagent's filename; renaming means create-new +
+  delete-old; builtins are never renamed). `description` and `prompt_body` are
+  required and non-empty; `description`, `model`, and each tool name must contain
+  no newline, carriage return, or control character (each renders on one
+  frontmatter line). A template is rejected if its description or prompt body
+  contains a high-confidence complete Anthropic token (`sk-ant-...`); the UI
+  separately warns without blocking on looser patterns so legitimate text stays
+  savable.
 - **API surface.** All endpoints require authentication (session + CSRF);
   writes are scope-authorized per row (PRD #18), not blanket-admin: `GET
   /api/agent-templates` (list, viewer-scoped), `GET /api/agent-templates/:id`
@@ -239,21 +224,21 @@ recipe a later release renders into a running one.
   /api/agent-templates` (create; `scope` global⇒admin or user⇒owner, blank⇒global
   for back-compat; a reserved lead name is rejected), `PUT .../:id` (update; name
   and scope are ignored, immutable), `DELETE .../:id` (409 on a builtin), `POST
-  .../:id/reset` (400 on a non-builtin). Edits are last-write-wins — no
-  optimistic-concurrency check in this release — but every row records
-  `updated_by` and `updated_at` so concurrent edits are at least attributable.
+  .../:id/reset` (400 on a non-builtin). Edits are last-write-wins (no
+  optimistic-concurrency check), but every row records `updated_by`/`updated_at`
+  for attribution.
 - **Agent source (PRD #602).** `api/internal/agentsource` layers an
-  admin-configurable, opt-in runtime sync additively over the builtins
-  above: a new clone-and-read `go-git` path fetches a pinned ref, a
-  new parser reproducing `agent/src/repoagents.ts`'s tolerant contract
-  parses each `.md` role file, and the result only ever **stages** a diff —
-  writing `agent_templates` happens exclusively through an admin's
-  approve-and-apply, never at reconcile. Provenance rides a new
-  `agent_templates.origin` column (added by this PRD's M1), which M1 also
-  widened PRD #275's boot-reconcile to read — a third state (`synced`,
-  alongside `embedded`/`admin`) so the sync and boot-reconcile never fight. See [adr/0602-agent-source-repo-sync.md](adr/0602-agent-source-repo-sync.md)
+  admin-configurable, opt-in runtime sync additively over the builtins: a
+  `go-git` clone-and-read of a pinned ref parses each `.md` role file (a
+  parser reproducing `agent/src/repoagents.ts`'s tolerant contract) and only
+  ever **stages** a diff, with writes to `agent_templates` happening
+  exclusively through an admin's approve-and-apply, never at reconcile.
+  Provenance rides an `agent_templates.origin` column with a third state
+  (`synced`, beside `embedded`/`admin`) so the sync and PRD #275's
+  boot-reconcile never fight. See
+  [adr/0602-agent-source-repo-sync.md](adr/0602-agent-source-repo-sync.md)
   for the trust seam and [docs/agent-source.md](docs/agent-source.md) for
-  the operator-facing surface.
+  the operator surface.
 
 ## Agent skills
 
@@ -264,92 +249,79 @@ in `prds/done/16-agent-skills.md` (Solution Overview, Technical Design, Trust
 model); this section is the map. User-facing usage is
 [docs/skills.md](docs/skills.md).
 
-- **Storage.** `skills` (`scope` ∈ `builtin`/`global`/`user`; `name` is
-  kebab-case and immutable; `body` is the raw SKILL.md content below the
-  frontmatter, which is synthesized at delivery, never stored) and
-  `agent_skill_allocations` (`user_id NULL` for a shared/admin-managed
-  allocation, non-`NULL` for a specific user's private overlay; unique on
-  `(template_id, skill_id, COALESCE(user_id, sentinel))`, so a shared
-  allocation and a user's overlay allocation of the same skill to the same
-  template coexist as two distinct rows, no surrogate PK needed).
-  `repos.repo_skills_enabled` is the opt-in flag for repo-borne skills,
-  below. Builtins are seeded/repaired by the same reconciler pattern as agent
-  templates (editable, resettable, never deletable), Go-embedded from
-  `api/internal/skilltmpl/builtins/` (no `.claude/skills/` mirror, per the
-  builtins convention above) — `prd-lifecycle`.
-- **Default allocations** (PRD #72 M2). A builtin with no allocation row
-  reaches *nobody* — not its scoped subagents and not the lead either, since
-  the union `ListRunSkillAllocations` builds is what the lead receives. So
-  each builtin carries a default target list (a Go-side map in `skilltmpl`
-  keyed by skill name, deliberately not frontmatter: `skilltmpl.Parse`
-  rejects every unknown key and that strictness is worth keeping), seeded in
-  the **same transaction** as the insert and **only** on the boot that
-  inserts the skill — `ReconcileBuiltinTemplates`' `n > 0` rule, for its
-  reason: a default an admin later removes stays removed. The targets are
-  agent-template *names*, so the template reconciler must run first (see
-  [Startup](#startup-and-migrations)), and a zero-row seed warns rather than
-  failing silently.
+- **Storage.** `skills` (`scope` ∈ `builtin`/`global`/`user`; `name` kebab-case and
+  immutable; `body` is the raw SKILL.md content below the frontmatter, which is
+  synthesized at delivery, never stored) and `agent_skill_allocations` (`user_id
+  NULL` for a shared/admin allocation, non-`NULL` for a user's private overlay;
+  unique on `(template_id, skill_id, COALESCE(user_id, sentinel))`, so a shared
+  allocation and a user's overlay of the same skill to the same template coexist as
+  two rows, no surrogate PK). `repos.repo_skills_enabled` is the opt-in flag for
+  repo skills, below. Builtins are seeded/repaired by the same reconciler pattern as
+  agent templates (editable, resettable, never deletable), Go-embedded from
+  `api/internal/skilltmpl/builtins/` (no `.claude/skills/` mirror), currently
+  `prd-lifecycle`.
+- **Default allocations** (PRD #72 M2). A builtin with no allocation row reaches
+  *nobody*, not its scoped subagents and not the lead (the union
+  `ListRunSkillAllocations` builds is what the lead receives). So each builtin
+  carries a default target list (a Go-side map in `skilltmpl` keyed by skill name,
+  deliberately not frontmatter, since `skilltmpl.Parse` rejects every unknown key),
+  seeded in the **same transaction** as the insert and **only** on the boot that
+  inserts the skill (`ReconcileBuiltinTemplates`' `n > 0` rule: a default an admin
+  later removes stays removed). The targets are agent-template *names*, so the
+  template reconciler must run first (see [Startup](#startup-and-migrations)), and a
+  zero-row seed warns rather than failing silently.
 - **Read authz is deliberately not the agent-templates pattern.** Templates
   are all-shared; skills are not. Every read (`GET /api/skills*`) returns
   builtin ∪ global ∪ the caller's own user skills; admins additionally see
   other users' private skills (they can read the DB anyway). Allocation reads
   follow the same rule: a template's shared allocations plus only the
   caller's own overlay, never another user's.
-- **Claim payload delta** (`api/internal/workersvc/claim.go`): `ClaimPayload.skills` is
-  the run's deduplicated skill union (`{name, description, body}`), assembled
-  server-side per the claiming user (shared allocations ∪ that user's
-  overlay, across every template, since every template ships in every
-  claim); `ClaimPayload.skills_dropped` carries assembly-time drops
-  (`{name, reason}` — `shadowed` or `over_limit`). Each `ClaimAgent.skills`
-  is that template's allocated skill names. `ClaimRepo.skills_enabled` mirrors
-  `repos.repo_skills_enabled`. `ClaimConfig.skill_max_bytes` /
-  `skills_max_per_run` carry the server's configured caps
-  (`SKILL_MAX_BYTES`/`SKILLS_MAX_PER_RUN`) so the worker enforces the same
-  limits the server assembled against, with no hardcoded drift. Name-collision
-  precedence at assembly is user > global > builtin; the loser is dropped as
-  `shadowed`. The server never writes `run_messages` for these drops — it
-  hands the worker the list, and the worker (which owns the gapless per-run
-  `seq`) logs each one as a run message.
-- **Worker delivery** (`agent/src/skills-plugin.ts`,
-  `agent/src/sdk-executor.ts`). Every claim (including a resume) rebuilds a
-  local SDK plugin directory **outside the clone**, a sibling of the
-  worktree: `.claude-plugin/plugin.json` plus `skills/<name>/SKILL.md` per
-  surviving skill, with `name`/`description` frontmatter synthesized as
-  quoted, fully-escaped YAML scalars (a frontmatter-injection guard covering
-  every YAML metacharacter class, not just newlines). The SDK's top-level
-  `skills` option is always sent as an explicit list — omitting it is not
-  "skills off" — set to the run's full plugin-qualified union; the `lead`
-  template runs on the main thread (not a subagent), so this union is also
-  its only allocation surface. On an **own-template** run each subagent's
-  `AgentDefinition.skills` scopes it to its own allocated skills, re-filtered
-  to what actually survived materialization. On a **repo-source** run
-  (`agent/src/agents.ts` `subagentsFromTemplates`, PRD #72) there are no
-  template rows to allocate against, so every repo subagent receives the run's
-  whole surviving set instead — the same all-templates rule repo skills follow.
-- **Repo skills** (`agent/src/repo-skills.ts`), opt-in and default off. Only
-  when `ClaimRepo.skills_enabled`, the worker enumerates
-  `<clone>/.claude/skills/*/SKILL.md` after checkout, keeping only the `name`
-  and `description` frontmatter keys (every other key, e.g. `allowed-tools`,
-  is stripped — that is the security point) and re-synthesizing them through
-  the same escaped-YAML materializer as delivered skills. Repo skills carry
-  no allocation, so a surviving one attaches to **every** template in the
-  run; they rank at the lowest precedence (a name collision with any
-  delivered skill drops the repo skill) and are the first evicted if the
-  combined set exceeds `skills_max_per_run`. This is the **only** clone-borne
-  configuration the worker ever reads — no hooks, no settings, no commands,
-  no `CLAUDE.md` — and it is why the toggle exists per repo: a repo's
-  `.claude/` is exactly the config class `settingSources: []` (see Guardrail
-  layers, below) is built to keep closed, so loading even this much requires
-  the repo owner (or an admin) to vouch for that repo's review discipline.
-- **Trust boundary.** `settingSources: []` stays `[]` in every configuration,
-  with or without repo skills enabled — the plugin channel
-  (`plugins: [{type: 'local', ...}]`) is a separate SDK option, independent
-  of `settingSources`, so this delivery mechanism never has to loosen that
-  isolation. A hostile repo skill still cannot push code (the worker alone
-  holds the PAT), still hits the `PreToolUse` deny-hook, and still cannot
-  load hooks, settings, or commands from the repo — only its own SKILL.md
-  bodies, stripped to name + description, at the bottom of the precedence
-  order.
+- **Claim payload delta** (`api/internal/workersvc/claim.go`): `ClaimPayload.skills`
+  is the run's deduplicated skill union (`{name, description, body}`), assembled
+  server-side per claiming user (shared allocations ∪ that user's overlay, across
+  every template since every template ships in every claim); `ClaimPayload.skills_dropped`
+  carries assembly-time drops (`{name, reason}`, `shadowed` or `over_limit`). Each
+  `ClaimAgent.skills` is that template's allocated names, `ClaimRepo.skills_enabled`
+  mirrors `repos.repo_skills_enabled`, and `ClaimConfig.skill_max_bytes`/`skills_max_per_run`
+  carry the server caps (`SKILL_MAX_BYTES`/`SKILLS_MAX_PER_RUN`) so the worker
+  enforces the same limits with no hardcoded drift. Name-collision precedence at
+  assembly is user > global > builtin; the loser is dropped as `shadowed`. The
+  server never writes `run_messages` for these drops; it hands the worker the list
+  and the worker (owning the gapless `seq`) logs each.
+- **Worker delivery** (`agent/src/skills-plugin.ts`, `agent/src/sdk-executor.ts`).
+  Every claim (including a resume) rebuilds a local SDK plugin directory **outside
+  the clone**, a sibling of the worktree: `.claude-plugin/plugin.json` plus
+  `skills/<name>/SKILL.md` per surviving skill, with `name`/`description`
+  frontmatter synthesized as quoted, fully-escaped YAML scalars (a
+  frontmatter-injection guard covering every YAML metacharacter class). The SDK's
+  top-level `skills` option is always sent as an explicit list (omitting it is not
+  "skills off") set to the run's full plugin-qualified union; the `lead` runs on
+  the main thread, so this union is also its only allocation surface. On an
+  **own-template** run each subagent's `AgentDefinition.skills` scopes it to its own
+  allocated skills, re-filtered to what survived materialization. On a
+  **repo-source** run (`agent/src/agents.ts` `subagentsFromTemplates`, PRD #72)
+  there are no template rows, so every repo subagent receives the whole surviving
+  set.
+- **Repo skills** (`agent/src/repo-skills.ts`), opt-in and default off. Only when
+  `ClaimRepo.skills_enabled`, the worker enumerates
+  `<clone>/.claude/skills/*/SKILL.md` after checkout, keeping only the `name` and
+  `description` frontmatter keys (every other key, e.g. `allowed-tools`, is
+  stripped, the security point) and re-synthesizing through the same escaped-YAML
+  materializer. Repo skills carry no allocation, so a surviving one attaches to
+  **every** template; they rank lowest (a name collision with any delivered skill
+  drops the repo skill) and are first evicted if the set exceeds
+  `skills_max_per_run`. This is the **only** clone-borne configuration the worker
+  reads (no hooks, settings, commands, or `CLAUDE.md`), which is why the toggle is
+  per repo: a repo's `.claude/` is exactly the config class `settingSources: []`
+  keeps closed, so loading even this much requires the repo owner or an admin to
+  vouch for that repo's review discipline.
+- **Trust boundary.** `settingSources: []` stays `[]` with or without repo skills
+  enabled; the plugin channel (`plugins: [{type: 'local', ...}]`) is a separate SDK
+  option, so this delivery never loosens that isolation. A hostile repo skill still
+  cannot push code (the worker alone holds the PAT), still hits the `PreToolUse`
+  deny-hook, and still cannot load hooks, settings, or commands from the repo, only
+  its own SKILL.md bodies stripped to name + description at the bottom of the
+  precedence order.
 
 ## Secrets: per-user credentials at rest
 
@@ -358,8 +330,7 @@ model); this section is the map. User-facing usage is
 new table) holding AES-256-GCM-sealed per-user secrets. A user may hold
 **several** secrets of one kind, each under a label they chose, exactly one of
 which is flagged `is_default` — the one every unbound consumer resolves
-(PRD #104). It held exactly one per `(user, kind)` until migration `00077`
-dropped the unique constraint that said so. The
+(PRD #104). The
 `secretbox` package (`api/internal/secretbox/`) wraps `Seal`/`Open` around a
 single 32-byte key that `config.Load` validates from `UZI_SECRET_KEY` at boot
 (refusing to start if it is missing, malformed, or a low-entropy placeholder)
@@ -432,7 +403,7 @@ whether the cheaper run is as good.
 browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (compose) / HTTPS (k8s), poll/claim/report── agent (worker, per user)
                                        │  ▲                                        │
                                        ▼  │ decrypted per-run secrets              ▼
-                                      db  └── forge (GitLab): issues, MRs     repo clone + worktrees
+                                      db  └── forge: issues, MRs             repo clone + worktrees
 ```
 
 ### Server/worker trust boundary
@@ -455,12 +426,11 @@ where the worker runs:
 - **Kubernetes**: closed. The `api` gains an **optional second listener in-process**
   (`API_TLS_CERT`/`API_TLS_KEY`, default `:8443`), and hosted workers plus the
   worker controller dial it over `https://`, verifying a cert-manager-issued CA
-  that they pin *exclusively*. Note the mechanism, because an earlier version of
-  this section named the wrong one: it is **not** a TLS-terminating ingress in front
-  of `api`. Workers dial the `api` **directly**, so an ingress was never in their
-  path and would not have encrypted this hop at all. The plain listener stays for
-  `web`'s nginx and the kubelet probes, and the two are separate ports on purpose —
-  a NetworkPolicy admits the worker namespace to the TLS one and nothing else.
+  that they pin *exclusively*. It is a direct-dial listener, **not** a
+  TLS-terminating ingress in front of `api`: workers dial `api` directly, so an
+  ingress was never in their path. The plain listener stays for `web`'s nginx and
+  the kubelet probes, on a separate port on purpose: a NetworkPolicy admits the
+  worker namespace to the TLS one and nothing else.
 
 Two properties of that listener that are easy to get backwards, both enforced in
 code rather than intended: it serves **only** `/api/worker/*` + `/api/controller/*`
@@ -528,89 +498,76 @@ One `runs` row is the unit of work; an issue can accumulate several over its
 life (a DB partial unique index enforces at most one non-terminal run per
 issue). A row enters `queued` from one of three origins: the manual **Start
 run** button (`IssueView.tsx` → `POST /api/repos/{id}/runs`); **autopilot**
-(PRD #19), event-driven off a forge label; and, since PRD #241, the
-**scheduler** — time-driven. `api/internal/schedsvc`'s engine is a
-single-instance background actor (a wake ticker over the durable
-`run_schedules.next_fire_at` due-gate, `FOR UPDATE SKIP LOCKED` claim, a
-`Boot()` immediate tick so a fire missed across a restart happens promptly
-on the next wake rather than waiting a full cadence — never a backfill of
-the cadences it missed). A due schedule fires
-through the exact `workersvc.CreateRun`/`CreateAutopilotRun` seam autopilot
-uses, so the eligibility gate (PRD #764 M1's `isEligibleIssue`, widened by PRD #767 M2 to also match `assignee_ids` against the connection's `bot_forge_user_id`), the fresh-label forge fetch, active-run dedup, and
-the usage-limit park all apply exactly as for a manual start; the exception
-is its **ad-hoc prompt** target, which — like `ci_fix` — has no issue to
-seam through, so it lands via a dedicated INSERT as a new `prompt` run kind
-(`runs.kind`, beside `chat`/`ci_fix`/`self_improve`/`judge`/`issue`):
-repo-ful, issue-less, `schedule_id`-keyed for dedup (no issue to key
-`HasActiveRunForIssue` on), and MR-opening on the `ci_fix` shape. A **sweep**
-target fans out over the oldest open issues matching its label; its
-`max_issues` cap counts runs *started*, not candidates matched — a candidate
-it can't start is flagged and the fire backfills from the next eligible issue
-within a bounded scan window (`fireSweep`, issue #416), so a stale ineligible
-issue at the head no longer under-fills every fire. See
+(PRD #19), event-driven off a forge label; and the **scheduler** (PRD #241),
+time-driven. `api/internal/schedsvc`'s engine is a single-instance background
+actor (a wake ticker over the durable `run_schedules.next_fire_at` due-gate,
+`FOR UPDATE SKIP LOCKED` claim, a `Boot()` immediate tick so a fire missed
+across a restart happens on the next wake rather than backfilling the missed
+cadences). A due schedule fires through the same `workersvc.CreateRun`/
+`CreateAutopilotRun` seam autopilot uses, so the eligibility gate
+(`isEligibleIssue`, PRD #764 M1, widened by PRD #767 M2 to also match
+`assignee_ids` against the connection's `bot_forge_user_id`), the fresh-label
+fetch, active-run dedup, and the usage-limit park all apply as for a manual
+start. Its **ad-hoc prompt** target has no issue to seam through, so it lands
+via a dedicated INSERT as a `prompt` run kind: repo-ful, issue-less,
+`schedule_id`-keyed for dedup, MR-opening on the `ci_fix` shape. A **sweep**
+target fans out over the oldest open issues matching its label; `max_issues`
+counts runs *started*, not candidates matched, and `fireSweep` backfills from
+the next eligible issue within a bounded scan window (issue #416) so a stale
+ineligible head no longer under-fills a fire. See
 [docs/scheduling.md](docs/scheduling.md) and
 `prds/done/241-schedule-runs.md`.
 
 **Assignment is not a weaker gate than the label (PRD #767 D6).** Assigning
 an issue requires the same forge permission tier as applying a label on all
-three drivers — GitHub Triage, GitLab Reporter (a Guest/author can set
-metadata only at creation, applying equally to labels and assignees),
-Forgejo/Gitea Write on the Issues unit — verified, not assumed; GitLab
-bundles assignee+label under one "edit issue metadata" permission, and that
-bundling is version-dependent, so re-check on a major GitLab upgrade.
+three drivers (GitHub Triage, GitLab Reporter, Forgejo/Gitea Write on the
+Issues unit). GitLab bundles assignee+label under one version-dependent "edit
+issue metadata" permission, so re-check on a major GitLab upgrade.
 
-Since PRD #589, a `run_schedules` row can also be `origin='default'`: a
-`go:embed`'d catalog (`api/internal/schedtmpl/`, nine entries, mirroring
-`agenttmpl/builtins`) that a user enables per repo. One of them, `assigned-sweep`
-(PRD #767 M4), sweeps issues assigned to the uzi-bot via a new non-label
-`SelectorAssigned` selector kind, distinct from the other sweeps' label selector. A default row stores no
-prompt of its own — it carries `catalog_slug` and the scheduler resolves the
-baked prompt/labels/guidance from the catalog at fire time, so a shipped
-catalog fix reaches every enabled default on the next release with no
-re-seeding. Cloning a default copies the catalog text into a fresh
-`origin='user'` row (`catalog_slug` cleared) and lifts the prompt lock; `Reset`
-restores an edited default's cadence/model/options from the catalog. See
-[docs/scheduling.md](docs/scheduling.md#default-jobs) and
+Since PRD #589 a `run_schedules` row can be `origin='default'`: a `go:embed`'d
+catalog (`api/internal/schedtmpl/`, nine entries, mirroring `agenttmpl/builtins`)
+a user enables per repo. One, `assigned-sweep` (PRD #767 M4), sweeps
+uzi-bot-assigned issues via a non-label `SelectorAssigned` selector. A default
+row carries `catalog_slug` and the scheduler resolves the baked
+prompt/labels/guidance from the catalog at fire time, so a shipped catalog fix
+reaches every enabled default on the next release with no re-seeding. Cloning a
+default copies the text into a fresh `origin='user'` row (`catalog_slug`
+cleared) and lifts the prompt lock; `Reset` restores an edited default from the
+catalog. See [docs/scheduling.md](docs/scheduling.md#default-jobs) and
 `prds/done/589-default-scheduled-jobs.md`.
 
-Self-improvement (PRD #46) is one of those catalog entries, `self_improve` —
-a fourth schedule target beside `issue`/`sweep`/`prompt` above, and the only
-promptless one: its directive is baked worker-side, so the catalog entry
-carries just a cadence and a model. PRD #590 retired the old bespoke
-`api/internal/selfimprove` engine (a standalone, admin-only, instance-wide
-`Boot`+ticker actor) in favor of this: any user can enable `self_improve` on
-a repo they own, and each fire folds that user's own open `improve_uzi`
+Self-improvement (PRD #46) is one catalog entry, `self_improve`, a fourth
+schedule target beside `issue`/`sweep`/`prompt` and the only promptless one
+(its directive is baked worker-side). PRD #590 retired the old bespoke
+`api/internal/selfimprove` engine for this: any user can enable `self_improve`
+on a repo they own, and each fire folds that user's open `improve_uzi`
 [judge](docs/judge.md) recommendations, reuses or files a
 `uzi-self-improve`-labelled tracking issue, and opens or extends one MR per
-cycle — same guardrails as any other run, `main` untouched. See
+cycle, `main` untouched. See
 [docs/scheduling.md](docs/scheduling.md#default-jobs) and PRD #590.
 
-Since PRD #636, a custom (`origin='user'`) `run_schedules` row can also carry
-a nullable `sibling_group_id`: a client-generated group id that a multi-repo
-create or a new `POST /api/schedules/{id}/add-repo` stamps onto every row it
-fans out, purely so the web can render N per-repo rows as one expandable
-group, the same way `catalog_slug` already groups a default enabled on
-several repos. It is display-only — `schedsvc` never reads it, and
-`UpdateRunSchedule`'s SET list omits it, so it is create-only and cannot be
-set or clobbered by a later PATCH — so each sibling stays a fully
-independent row; editing, pausing, or removing one never touches another.
-`add-repo` allocates the group id with a coalescing `UPDATE … RETURNING`
-under the source row's lock, so two racing calls settle on one id rather
-than splitting the group. See
+Since PRD #636 a custom (`origin='user'`) row can carry a nullable
+`sibling_group_id`, a client-generated id a multi-repo create or `POST
+/api/schedules/{id}/add-repo` stamps onto every fanned-out row so the web can
+render N per-repo rows as one expandable group. It is display-only: `schedsvc`
+never reads it and `UpdateRunSchedule` omits it from its SET list, so it is
+create-only and each sibling stays fully independent (editing, pausing, or
+removing one never touches another). `add-repo` allocates the group id with a
+coalescing `UPDATE … RETURNING` under the source row's lock so two racing
+calls settle on one id. See
 [docs/scheduling.md](docs/scheduling.md#running-a-schedule-on-several-repos)
 and `prds/done/636-multi-repo-custom-schedules.md`.
 
-`task` (PRD #400, `uzi handoff`/`uzi task`) is the **seventh** `runs.kind`,
-alongside `issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt` above. Like
-`prompt` it adds no new service — it rides the same worker/run machinery —
-but it is CLI-only and MR-less by default: the CLI (not the worker) pushes
-the user's own HEAD to a server-named `uzi/task/<run-id>` branch with the
-user's own git credentials, then dispatches the run so the worker can clone
-that branch, work the inline context, and push its commits back to it, with
-no forge issue and no merge request unless `--mr` is passed. See
-[prds/done/400-uzi-handoff.md](prds/done/400-uzi-handoff.md) for the full design and
-[docs/handoff.md](docs/handoff.md) / [docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs)
-for usage. Status is a linear state machine:
+`task` (PRD #400, `uzi handoff`/`uzi task`) is the **seventh** `runs.kind`. Like
+`prompt` it adds no new service, but it is CLI-only and MR-less by default: the
+CLI (not the worker) pushes the user's own HEAD to a server-named
+`uzi/task/<run-id>` branch with the user's own git credentials, then dispatches
+the run so the worker clones that branch, works the inline context, and pushes
+commits back, with no forge issue and no MR unless `--mr` is passed. See
+[prds/done/400-uzi-handoff.md](prds/done/400-uzi-handoff.md),
+[docs/handoff.md](docs/handoff.md), and
+[docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs). Status
+is a linear state machine:
 
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
@@ -643,403 +600,215 @@ chain in the diagram above, with no intervening `running`.
 
 - **running → limit_wait** (PRD #35, opt-in per run or per user) — a run that
   exhausts the owner's Anthropic usage limit **parks** instead of failing: the
-  worker's slot is released, but its runner clone, skills plugin dir and per-run
-  SDK home stay on disk, which is what lets the resume continue the same session
-  rather than starting fresh. A sweeper pass promotes it back to `queued` once
-  `retry_not_before` passes, and the resume skips the plan gate when the plan was
-  already approved. Two independent guards keep the on-disk state alive: the
-  runner's cleanup carve-out (teardown) and `home-reclaim`'s terminal-status check
-  (the background sweep, hours later) — losing either loses the transcript. The
-  park is server-timed and server-clamped, never worker-trusted; `retry_not_before`
-  means *the earliest moment this user could spend anything*, computed at park time
-  across the whole credential pool. See [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md)
-  for why that timing could not be deferred to the claim, and
-  `prds/done/35-run-limit-retry.md` for the fourteen decisions.
-  **Only committed history survives a park by itself** — the on-disk clone
-  above carries whatever the branch's tracking ref already has, but nothing
-  about parking commits anything, so uncommitted mid-milestone edits were
-  lost outright (incident #685). PRD #759 closes that gap: on park, the
-  runner auto-commits any uncommitted changes to a clearly-marked throwaway
-  `wip(park):` commit (as the runner uid, before the tree is wiped) so the
-  existing fetch-back and [PRD #628](prds/done/628-cross-worker-resume-durability.md)
-  checkpoint broker carry it off the worker the same as any real commit; on
-  adopt, the reseed recognizes a `wip(park):` tip and `git reset --soft`s it
-  back to *uncommitted*, so the marker never enters the history the agent
-  builds on and never reaches the merge request — deliberately not a
-  finalize-time rewrite, which would collide with
-  [ADR-456](adr/0456-rebase-before-finalize-push.md). Recovery is exact for a
-  **same-worker** resume (the tracking-ref leg carries no ancestry test); for
-  a **cross-worker** resume it is **best-effort** — a clean `cherry-pick
-  --no-commit` of the WIP tree onto the new floor recovers it, a diverged,
-  non-clean tree fails safely (the WIP is not restored — `wipRecovered` false —
-  and `seededFrom` stays the fallback floor: the run's own `origin` branch when
-  it still exists, else `default`) rather than forcing it. `WORKER_AFFINITY_CEILING`
-  (raised 30m→2h) is what makes same-worker the common case: it bounds how
-  long a *promoted, still-queued* run stays pinned to an alive-but-busy
-  original worker before a peer may steal it — a queue-dwell ceiling, not a
-  cover for the park duration itself ([ADR-628](adr/0628-cross-worker-resume-durability.md)
-  D3a rejected duration-awareness outright). A resumed run whose plan is **provably reviewed**
-  (`plan_source` provenance, not bare `plan_approved`) and whose work
-  recovered — committed progress OR a WIP snapshot — continues implementing
-  from the persisted plan without re-gating; a human-approved run re-gates
-  only on a TOTAL loss (neither recovered: `seededFrom` `default` and
-  `wipRecovered` false), preserving
-  [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection safety property. The run feed distinguishes recovering this uncommitted
-  snapshot from recovering a committed milestone. See
-  `adr/0759-protect-run-work-usage-limit-park.md` for the full Decision Log. <!-- check-docs:ignore-path -->
+  worker's slot is released while its runner clone, skills plugin dir and per-run
+  SDK home stay on disk so the resume continues the same session. A sweeper
+  promotes it back to `queued` once `retry_not_before` passes (server-timed and
+  server-clamped, never worker-trusted: the earliest moment this user could spend
+  anything across the whole credential pool), and the resume skips the plan gate
+  when the plan was already approved. Two independent guards keep the on-disk
+  state alive (the runner's teardown carve-out and `home-reclaim`'s
+  terminal-status check); losing either loses the transcript. See
+  [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md) and
+  `prds/done/35-run-limit-retry.md`.
+  **Only committed history survives a park by itself**; PRD #759 additionally
+  captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
+  the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
+  carries off the worker and adoption peels back to uncommitted (exact recovery
+  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`). A
+  resumed run whose plan is provably reviewed and whose work recovered continues
+  without re-gating; a total loss re-gates a human-approved run, preserving
+  [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection property. See
+  [adr/0759-protect-run-work-usage-limit-park.md](adr/0759-protect-run-work-usage-limit-park.md).
 
-- **Affinity now holds through a worker roll, and the forge-checkpoint net behind
-  it is reliable and observable ([PRD #1030](prds/done/1030-worker-resume-durability.md)).**
-  Before this PRD, `ClaimRun`'s affinity leg fell open the instant a parked run's
-  owner started draining — including a routine image roll — so a park landing on a
-  worker mid-roll cold-restarted on a peer with no clone (`resume_lineage_break`,
-  incident run #1009), even though the owner's worker **row and PVC survive** a
-  roll. The fix distinguishes **roll** from **teardown** with no new column: a roll
-  sets `draining_since` but keeps the worker row (`RegisterWorker` clears
-  `draining_since` when the pod returns, per PRD #422 above); a teardown deletes
-  the row **API-side** (`DeleteWorkerForUser`/`ReapEphemeralWorkers`) *before* the
-  controller's kube teardown runs, so `teardown ⟺ row absent`. `ClaimRun` now holds
-  the pin while the owner's row exists and it is either draining or heartbeat-fresh,
-  and falls open immediately only when the row is gone (teardown) or the row is
-  heartbeat-stale with no drain in progress (death/hang) — bounded by the existing
-  `WORKER_AFFINITY_CEILING`. A companion `@claimant_draining` claim parameter keeps a
-  draining worker's own claim scoped to **its own** promoted run, so lifting the
-  "draining workers claim nothing" early return does not let it pick up a new or
-  fallen-open run (preserving PRD #422 D7). Independently, `pushbroker.Publish`
-  (`api/internal/pushbroker/pushbroker.go`) no longer fails `object not found` the
-  first time a checkpoint publishes after `main` has advanced past a worker's clone
-  base: it now forwards the worker's already-built pack through a manual
-  `git-receive-pack` session, with `Command.Old` bound to the fetched checkpoint
-  tip as a server-side, never-forced compare-and-swap, instead of asking go-git to
-  recompute a send-set from a depth-1 local snapshot that lacks the old default's
-  history. Publish failures and skips are now surfaced on the run feed (not just
-  logged silently), and the api's failure log carries `run_id`/`worker_id`/`reason`.
-  A graceful shutdown now publishes a final checkpoint within the k8s termination
-  grace, and every terminal transition best-effort deletes the run's
-  `refs/uzi-checkpoints/<branch>`, so a stale ref cannot block a later run on the
-  same issue. See [ADR-628](adr/0628-cross-worker-resume-durability.md)'s PRD #1030
-  amendment for the roll-vs-teardown discriminator and the pushbroker mechanism in
-  full.
+- **Affinity holds through a worker roll** ([PRD #1030](prds/done/1030-worker-resume-durability.md)).
+  The fix distinguishes a **roll** (sets `draining_since`, keeps the worker row)
+  from a **teardown** (deletes the row API-side), so `teardown ⟺ row absent` and
+  `ClaimRun` holds the affinity pin through a roll, falling open only on teardown or
+  heartbeat-staleness (bounded by `WORKER_AFFINITY_CEILING`). Independently, the
+  forge-checkpoint `pushbroker.Publish` no longer fails when `main` advanced past
+  the clone base (a server-side compare-and-swap on the fetched checkpoint tip),
+  publish outcomes now surface on the run feed, and every terminal transition
+  deletes the run's `refs/uzi-checkpoints/<branch>`. See
+  [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
 
-- **The checkpoint net now survives a branch behind `main` on `.github/workflows`
-  ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), the completion of
-  #1030's residuals).** M1 (#1059) unified checkpoint adoption on the owner anchor and
-  M3 (#1037) extended checkpointing to `self_improve` runs; M2 (#1036) closes the case
-  where the broker PAT (which lacks `workflow` scope) had every checkpoint on a
-  behind-on-workflows GitHub branch rejected `skipped:"workflow_scope"`. The worker now
-  synthesizes a `ckpt(overlay):` wrapper commit — the real tip's tree with
-  `.github/workflows` swapped to the current default's, built in a throwaway index so no
-  working tree is populated and no `.gitattributes` filter driver fires — and declares it
-  as the checkpoint tip; the wrapper's workflow tree byte-matches the default so the
-  **byte-unchanged** [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as an
-  ordinary fast-forward, and adoption peels it back to the real tip so the branch never
-  carries the swapped tree. The wrapper's parents are **base-first, real-tip-last** so the
-  broker's parent[0]-first depth-1 ancestry walk accepts a sequential overlay, and the
-  PAT-bearing default fetch it needs is confined to already-reaped paths (park, shutdown,
-  `reap:true` milestone) to keep REAP-BEFORE-GIT. GitHub-only; the mid-run sibling of
-  ADR-456's #627 finalize `workflow-subtree` overlay. See
-  [ADR-1036](adr/1036-checkpoint-workflow-overlay.md) for the transport-wrapper contract.
+- **The checkpoint net survives a branch behind `main` on `.github/workflows`**
+  ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), completing
+  #1030's residuals; M1 #1059 unified adoption, M3 #1037 covered `self_improve`).
+  Because the broker PAT lacks `workflow` scope, the worker checkpoints a
+  `ckpt(overlay):` wrapper whose `.github/workflows` tree byte-matches the current
+  default, so the [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as a
+  fast-forward and adoption peels it back to the real tip. GitHub-only. See
+  [ADR-1036](adr/1036-checkpoint-workflow-overlay.md).
 
 - **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
   oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),
-  or the caller's own re-queued run if it is still inside its **affinity
-  grace** (`WORKER_AFFINITY_GRACE`, default 2m) — giving a resume the best
-  chance of landing back on the worker whose disk still holds the session and
-  git worktree. After the grace window any of the user's workers may claim it —
-  and when one does, the SDK session is **not** portable: a session is a local
-  JSONL transcript at `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`
-  on the worker that wrote it, not server-side state. Being keyed by **both**
-  HOME and cwd, it is lost to a different worker, to a replaced volume, and to
-  a changed clone path on the very same machine. The worker therefore
-  preflights the transcript before resuming (`agent/src/sdk-session.ts`, issue
-  #105) and, when it is not resolvable here, drops the resume and says so on
-  the feed rather than passing an id the SDK can only fail on — it resolves a
-  resume locally, so an unresolvable id kills the run on its first turn instead
-  of starting fresh. The run continues without its earlier context; if the
-  branch already carries pushed work, the planning prompt says so, so an
-  amnesiac lead reads that work instead of redoing it.
-  Claim placement is also **fleet-aware** (PRD #216): affinity is checked
-  first, as above, but past that, a worker already holding an active run
-  defers a fresh queued run to a live, eligible peer that is strictly less
-  loaded and has a free slot, rather than taking a second run while that peer
-  sits idle. A queued run older than `WORKER_SPREAD_GRACE` (default 3× the
-  poll interval) is exempt from this deferral so it can never be stranded
-  waiting for a peer — see [adr/0216-fleet-aware-claim.md](adr/0216-fleet-aware-claim.md)
-  for the eligibility seam and the placement/enforcement boundary against
-  ADR-42.
-  The same `fn_worker_can_claim` predicate also gates a Docker-capable
-  worker against the `docker_repo_allowlist` admin setting ([PRD #361](prds/done/361-repo-setup-indicator.md)):
-  two read-only surfaces reuse it rather than re-deriving eligibility —
-  `RepoDTO.DockerAllowlisted`/`DockerBlocked` (`apitypes.RepoDTO`) are
-  computed, caller-scoped booleans about the caller's own repo, never the
-  list (the same shape as `GuardrailBlocked`), feeding the Repos page's
-  Setup chip; and the PRD #47 `queuedReason` resolver (`workersvc/health.go`)
-  adds `reasonRepoNotDockerAllowed`, mapped onto the existing
-  `waiting_worker` health enum, when every online worker is Docker-capable
-  and none is eligible for the run's repo. No migration — `runs.health_reason`
-  is free text.
-- **Capability-aware eligibility, claim through plan gate (PRD #84).** A
-  worker advertises a capability set (`workers.capabilities`, from the
-  closed `{docker, jvm}` vocabulary: `jvm` is template-derived from its
-  image, `docker` is worker-self-reported when a DinD sidecar answers, both
-  `capability.Filter`-ed at register so a worker can never spoof a
-  template-only name). A run carries `required_capabilities`, seeded from a
-  static per-repo hint (`repos.required_capabilities`, set in Repo settings)
-  and escalation-only unioned with what the lead's deterministic clone scan
-  (`agent/src/toolchain-detect.ts`) infers at plan time, plus a
-  display-only `required_tools` (provisionable toolchains) and
-  `size_class`. `fn_worker_can_claim` (migration `00142`) folds a worker's
-  `docker_enabled` flag into its capabilities and requires
-  `required ⊆ effective` before the claim query returns that run to it; the
-  same fold blocks plan-approval server-side (409, naming the unmet set) if
-  the run's assigned worker still can't satisfy it once a plan exists, with
-  an owner override that clears the run's requirement — correcting a
-  false-positive inference — rather than bypassing the runtime docker
-  guardrail. Both the claim clause and the approval block are gated by the
-  `capability_aware_scheduling` admin kill-switch (default on); off, the
-  pre-existing docker-worker→repo-allowlist enforcement (PRD #83/#89,
-  `docker_repo_allowlist`) is unaffected, but capability matching reverts to
-  best-effort claiming, so a mismatched run degrades to the pre-#84 mid-run
-  failure instead of being blocked up front. See
-  [docs/capability-scheduling.md](docs/capability-scheduling.md).
-- **Ephemeral, run-bound hosted workers on an unmet capability OR a
-  saturated fleet (PRD #529, Path 1 of #84's Decision-9 remediation
-  spectrum; second trigger PRD #747).** When the reason above fires with
-  zero online workers satisfying the run's capabilities, and the owner has
-  opted in (`users.ephemeral_workers_enabled`) with the admin instance
-  kill-switch also on, a background api pass
-  (`api/internal/hostedsvc/ephemeral.go`) auto-provisions ONE hosted worker
-  bound to that run: `kind='hosted'`, `ephemeral=true`,
-  `ephemeral_run_id=<run>` — two columns added to `workers` by migration
-  `00155_ephemeral_workers.sql`, not a new table, so the controller's
-  poll/reconcile/teardown ([below](#worker-controller-k8s-only)) are
-  completely unchanged; dropping the row **is** the teardown primitive.
-  Provisioning is advisory-locked per user and made one-per-run by a partial
-  `UNIQUE (ephemeral_run_id) WHERE ephemeral` index
-  (`api/internal/store/queries/hosted_workers.sql`), under a concurrent cap
-  (`UZI_EPHEMERAL_MAX_PER_USER`) separate from the standing hosted quota.
-  `fn_worker_can_claim`/`ClaimRun` (`api/internal/store/queries/runtime.sql`)
-  restrict such a worker to claim **only** its bound run, on both the run and
-  chat claim lanes. On the run's terminal transition the api drops the row —
-  busy-guarded (`CountWorkerNonTerminalRuns = 0`, so a still-working pod is
-  never SIGTERMed) — and an unconditional GC reaper backstops teardown for a
-  terminal/absent owning run, a provision that never reached `online` within
-  a deadline, or a worker left idle because a genuinely-eligible sibling
-  claimed the run first during cold-start (the bound run is not hard-pinned).
-  See `prds/done/529-ephemeral-workers.md` for the full Decision Log and
-  [ADR-91](adr/0091-runner-cross-run-persistence-residual.md): each ephemeral
-  worker's fresh, per-worker `-nix`/`-data` PVCs structurally close the
-  cross-run executable-persistence residual that ADR records (finalized by
-  the PRD's M8). Size-aware provisioning and Path 2 (an approve-time
-  capability denial) remain deferred. PRD #649 surfaced both gates in the
-  SPA: an admin kill-switch card in Admin Settings
-  (`web/src/pages/adminSettings/EphemeralWorkersCard.tsx`), a per-user opt-in toggle in the
-  hosted-worker section of the Workers page
-  (`web/src/components/HostedWorkers.tsx`), gated on the hosted-config
-  `ephemeral_enabled` derived signal, and an `ephemeral` badge in the fleet
-  list marking a bound worker while it exists. A **second trigger** (issue
-  #747) reuses this same machinery for a run that is capability-*placeable*
-  but slot-*blocked* — some online worker could claim it, but every
-  capability-matching worker is pinned at `max_concurrent_runs` (fleet
-  saturated). Unlike the capability-gap path above, which provisions
-  immediately (a gap is permanent), this path is **debounced** on
-  `UZI_EPHEMERAL_SATURATION_DELAY` (default 90s ≈ worker cold-start),
-  measured against `runs.status_since` (the same queued-age clock the
-  health "fleet saturated" display reason uses), because saturation is
-  transient: a slot freeing before the debounce elapses may claim the run
-  first, avoiding a pod that turns out to be unneeded. A burst pod that
-  loses that race is idle and shares the same 10m reaper grace as the
-  cold-start-loss case above rather than a second knob (accepted cost, PRD
-  #747 M3). The debounce is deliberately independent of `health_enabled`
-  and the queued-health threshold that gates the "fleet saturated" *display*
-  reason — burst is a capacity action, not a UI state, though both clocks
-  read `status_since`. See
-  `prds/done/747-ephemeral-saturation-burst.md` for the full Decision Log.
-- **claimed → running, before the plan turn** — once `provisionRunTools` has set up
+  or the caller's own re-queued run still inside its **affinity grace**
+  (`WORKER_AFFINITY_GRACE`, default 2m), giving a resume the best chance of
+  landing back on the worker whose disk holds the session and worktree. Past the
+  grace any of the user's workers may claim it, and the SDK session is **not**
+  portable: it is a local JSONL transcript at
+  `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, keyed by both HOME
+  and cwd, so it is lost to a different worker, a replaced volume, or a changed
+  clone path on the same machine. The worker preflights the transcript before
+  resuming (`agent/src/sdk-session.ts`, issue #105) and, when it is not
+  resolvable, drops the resume and says so on the feed rather than passing an id
+  the SDK can only fail on. The run continues without its earlier context; if the
+  branch already carries pushed work, the planning prompt says so.
+  Claim placement is also **fleet-aware** (PRD #216): past affinity, a worker
+  already holding an active run defers a fresh queued run to a live, eligible peer
+  that is strictly less loaded with a free slot, rather than taking a second run
+  while that peer idles; a queued run older than `WORKER_SPREAD_GRACE` (default 3×
+  the poll interval) is exempt so it can never be stranded. See
+  [adr/0216-fleet-aware-claim.md](adr/0216-fleet-aware-claim.md) for the
+  eligibility seam and the boundary against ADR-42.
+  The same `fn_worker_can_claim` predicate gates a Docker-capable worker against
+  the `docker_repo_allowlist` admin setting ([PRD #361](prds/done/361-repo-setup-indicator.md)),
+  and two read-only surfaces reuse it: `RepoDTO.DockerAllowlisted`/`DockerBlocked`
+  (`apitypes.RepoDTO`) are computed caller-scoped booleans feeding the Repos page's
+  Setup chip, and the PRD #47 `queuedReason` resolver (`workersvc/health.go`) adds
+  `reasonRepoNotDockerAllowed` onto the `waiting_worker` health enum when every
+  online worker is Docker-capable and none is eligible for the run's repo.
+- **Capability-aware eligibility, claim through plan gate (PRD #84).** A worker
+  advertises a capability set (`workers.capabilities`, from the closed `{docker,
+  jvm}` vocabulary: `jvm` is template-derived, `docker` worker-self-reported when a
+  DinD sidecar answers, both `capability.Filter`-ed at register so a worker cannot
+  spoof a template-only name). A run carries `required_capabilities`, seeded from a
+  static per-repo hint (`repos.required_capabilities`) and escalation-only unioned
+  with the lead's deterministic clone scan (`agent/src/toolchain-detect.ts`) at
+  plan time, plus display-only `required_tools` and `size_class`.
+  `fn_worker_can_claim` (migration `00142`) folds `docker_enabled` into a worker's
+  capabilities and requires `required ⊆ effective` before the claim returns that
+  run; the same fold blocks plan-approval server-side (409, naming the unmet set)
+  if the assigned worker still can't satisfy it once a plan exists, with an owner
+  override that clears the requirement rather than bypassing the runtime docker
+  guardrail. Both are gated by the `capability_aware_scheduling` admin kill-switch
+  (default on); off, capability matching reverts to best-effort claiming (a
+  mismatched run degrades to the pre-#84 mid-run failure) while the pre-existing
+  docker-worker→repo-allowlist enforcement (PRD #83/#89, `docker_repo_allowlist`)
+  is unaffected. See [docs/capability-scheduling.md](docs/capability-scheduling.md).
+- **Ephemeral, run-bound hosted workers** (PRD #529, second trigger PRD #747): on
+  an unmet capability with zero eligible workers, or (debounced) a saturated fleet,
+  an opted-in owner gets ONE auto-provisioned hosted worker, and only while the admin instance kill-switch (`EphemeralWorkersEnabled`) is on
+  (`api/internal/hostedsvc/ephemeral.go`) bound to that run via two `workers`
+  columns (`ephemeral`, `ephemeral_run_id`, migration `00155`), restricted to claim
+  only its bound run and torn down by dropping the row (busy-guarded,
+  GC-backstopped) on the run's terminal transition. Its fresh per-worker PVCs close
+  the cross-run persistence residual [ADR-91](adr/0091-runner-cross-run-persistence-residual.md)
+  records. Size-aware provisioning and #529's Path 2 remain deferred. See
+  `prds/done/529-ephemeral-workers.md` and
+  `prds/done/747-ephemeral-saturation-burst.md`.
+- **claimed → running, before the plan turn** — once `provisionRunTools` sets up
   the run's tool env, the executor kicks off a lockfile-driven JS dependency
-  install for the cloned repo, picked per discovered lockfile (monorepo
-  workspaces resolving to one root install): a frozen, `--ignore-scripts`
-  install per manager, **plus** per-manager hardening flags beyond that alone —
-  `--ignore-scripts` does not close every repo-controlled install-time vector
-  (see the PRD's Trust posture section). Exact commands live at
-  `INSTALL_COMMANDS` in `agent/src/js-deps.ts`, kept there rather than
-  duplicated here so this bullet can't drift from what ships. Runs under the
-  same runner-uid + scrubbed-env sandbox as the checks below, concurrently
-  with the plan turn — and, on human-gated runs, the `awaiting_approval` wait
-  — and is joined before the first implement turn, so the agent's own
-  dependency install never races it (PRD #121).
-- **A run can also be born already past the gate** (PRD #209, `plan_source='seeded'`):
-  `POST /api/repos/{id}/runs` accepts an externally-authored `plan_md` (+ an
-  optional agent selection and a planned-against base commit) at create time,
-  and such a run skips the planning turn and the `awaiting_approval` bullet
-  below entirely — the worker implements the supplied plan directly, and the
-  human checkpoint moves from the plan gate to the merge request. Reachable
-  from the CLI only (`uzi run create --plan-file`, [docs/cli.md](docs/cli.md),
-  [docs/seeded-plans.md](docs/seeded-plans.md)); the web board's start button
-  is unchanged. Everything else about the run — status machine, sweeper
-  coverage, guardrails below — is the same run this bullet describes.
-- **running → awaiting_approval → running** — the lead agent produces a plan;
-  the worker reports it (`POST /api/worker/runs/:id/state`) and the run parks
-  at the gate until the user approves or rejects it in the run view, or
-  `WORKER_PLAN_APPROVAL_TIMEOUT` (worker-side, default 24h) elapses. **The
-  gate is a round-aware loop, not a single step (PRD #41).** Alongside
-  approve/reject the user can **request changes**: the worker resumes the
-  *same* SDK session with the feedback, the lead revises the plan, and the
-  run re-parks at `awaiting_approval` with plan v2 — no new status, since the
-  loop is entirely worker-internal (`plan → gate → (revise → resume → new
-  plan → re-gate)* → approve/reject/cancel`, fail-closed on any other exit).
-  Rounds are bounded by `PLAN_MAX_REVISIONS` (default 3, enforced both
-  server- and worker-side; the server half is a counter on the run row, for
-  the concurrency reason in [ADR-106](adr/0106-revise-cap-atomicity.md)), and
-  the whole loop shares **one absolute `WORKER_PLAN_APPROVAL_TIMEOUT`
-  deadline** computed at first gate entry, not
-  a fresh one per round. A monotonic **gate epoch**, bumped at each
-  `awaiting_approval` re-report, ties every verdict to the plan version the
-  user actually saw — an approve or reject arriving mid-revision is
-  discarded rather than silently applied to a plan no human reviewed. Once
-  approved, the run resumes the same SDK session into the implement ⇄ review
-  loop (`RUN_MAX_ITERATIONS`, default 5). See [PRD #41](prds/done/41-plan-revision-gate.md)
-  for the epoch mechanism (Decisions 2/3) and
-  [docs/run-activity.md](docs/run-activity.md#plan-approval-gate) for the
-  user-facing actions. The worker also generates a short plain-English intent
-  summary before planning and a plan summary + deltas at this gate, both
-  advisory (skipped on any failure, never blocking the run) and spent on the
-  run owner's own token — see [PRD #362](prds/done/362-run-summaries.md) and
+  install for the cloned repo (per discovered lockfile, monorepo workspaces
+  resolving to one root install): a frozen, `--ignore-scripts` install per manager
+  plus per-manager hardening flags, since `--ignore-scripts` alone does not close
+  every repo-controlled install-time vector. Exact commands live at
+  `INSTALL_COMMANDS` in `agent/src/js-deps.ts` so this bullet can't drift from what
+  ships. It runs under the same runner-uid + scrubbed-env sandbox as the checks
+  below, concurrently with the plan turn (and the `awaiting_approval` wait), and is
+  joined before the first implement turn so the agent's own install never races it
+  (PRD #121).
+- **A run can be born already past the gate** (PRD #209, `plan_source='seeded'`):
+  `POST /api/repos/{id}/runs` accepts an externally-authored `plan_md` (plus an
+  optional agent selection and a planned-against base commit) at create time, and
+  such a run skips the planning turn and the `awaiting_approval` bullet below
+  entirely, so the human checkpoint moves from the plan gate to the merge request.
+  CLI-only (`uzi run create --plan-file`, [docs/cli.md](docs/cli.md),
+  [docs/seeded-plans.md](docs/seeded-plans.md)); the web start button is unchanged.
+  Everything else (status machine, sweeper coverage, guardrails) is the same run.
+- **running → awaiting_approval → running** — the lead produces a plan; the
+  worker reports it (`POST /api/worker/runs/:id/state`) and the run parks at the
+  gate until the user approves or rejects it, or `WORKER_PLAN_APPROVAL_TIMEOUT`
+  (worker-side, default 24h) elapses. **The gate is a round-aware loop, not a
+  single step (PRD #41).** The user can also **request changes**: the worker
+  resumes the *same* SDK session with the feedback, the lead revises, and the run
+  re-parks with plan v2, no new status (the loop is entirely worker-internal,
+  fail-closed on any exit but approve/reject/cancel). Rounds are bounded by
+  `PLAN_MAX_REVISIONS` (default 3, enforced server- and worker-side; the server
+  half is a run-row counter, for the concurrency reason in
+  [ADR-106](adr/0106-revise-cap-atomicity.md)), the whole loop shares **one
+  absolute `WORKER_PLAN_APPROVAL_TIMEOUT` deadline** from first gate entry, and a
+  monotonic **gate epoch** bumped at each re-report ties every verdict to the plan
+  version the user saw so an approve/reject arriving mid-revision is discarded.
+  Once approved the run resumes the same session into the implement ⇄ review loop
+  (`RUN_MAX_ITERATIONS`, default 5). See
+  [PRD #41](prds/done/41-plan-revision-gate.md) and
+  [docs/run-activity.md](docs/run-activity.md#plan-approval-gate). The worker also
+  generates a plain-English intent summary before planning and a plan summary +
+  deltas at this gate, both advisory (skipped on failure, never blocking) and spent
+  on the owner's own token, see [PRD #362](prds/done/362-run-summaries.md) and
   [docs/run-summaries.md](docs/run-summaries.md).
-- **running ⇄ awaiting_input — the run's third human-in-the-loop channel**
-  ([PRD #88](prds/done/88-ask-user-clarification.md)), beside the plan gate above
-  and user-initiated steering below. The lead calls an in-process `ask_user`
-  signal when it hits a fork it shouldn't resolve alone; the worker parks the
-  run, posts a `question` run-message, and awaits an `answer` steering input
-  the way `gatePlan` awaits a plan verdict. On answer it resumes the *same*
-  SDK session (no transcript replay) and continues — a **pre-run** question
-  (asked before `submit_plan`) resumes into a fresh planning turn that
-  eventually reaches the plan gate; a **mid-run** question resumes the
-  implement ⇄ review loop it interrupted. It is a distinct status rather than
-  a sub-state of `awaiting_approval`, because `SetRunRunning`'s resume
-  transition requires a *consumed* `approve_plan`, which an `answer` can
-  never satisfy — the plan gate's status could not be reused for a question.
-  It otherwise inherits `awaiting_approval`'s treatment everywhere that
-  matters: every worker-death sweep, the `busy`/`active_runs` and
-  rate-limit-window concurrency counts, and the board's move-pending
-  bookkeeping all list `awaiting_input` alongside `awaiting_approval`, so a
-  parked question is recoverable across a worker death, holds its worker
-  slot, and never wedges a board card. The resume guard is keyed on the open
-  **question's identity**, not on a timestamp or an arrival order: a
-  worker-death requeue re-parks on the *same* question id (re-stamped from
-  the claim), so an answer submitted just before the crash still resumes the
-  run afterwards, while an answer to an already-superseded question is
-  rejected. Bounded by an absolute answer deadline
-  (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a per-run question cap
-  (`QUESTION_MAX`, default 5), both enforced worker-side and both
-  **worker-in-memory** — a requeue resets both counters, so the honest
-  worst case over a run's life is each value **× (RUN_MAX_REQUEUES + 1)**,
-  not the configured value flat. **Only the deadline fails the run closed**
-  ("clarification timed out"); there is no configurable default action.
-  Exhausting the question cap does **not** fail the run — it emits a feed
-  notice and the lead proceeds on its own best judgment instead. (The one
-  cap-adjacent failure, a distinct message, is pre-run-only: looping on
-  questions without ever reaching a plan.)
-  **Autopilot never parks**: the same `claim.auto_approve` that
-  short-circuits `gatePlan` short-circuits `ask_user`, auto-resolving with a
-  frozen `"no human available — proceed on your best judgment, and note the
-  assumption you made"` answer instead. The wording is quoted exactly because
-  it is a frozen constant (`AUTOPILOT_SENTINEL_ANSWER`) that a test asserts
-  byte-for-byte: an approximate quote here would read as the spec and send
-  someone "fixing" the constant to match the doc. The question surfaces on every surface a
-  user might be watching — the run view (an "Answer required" composer), the
-  owner's opt-in Slack DM thread (free-text reply), and `uzi run answer` —
-  and all three derive the open question from the run feed rather than a
-  dedicated field, so no surface invents a question the others don't have. See
-  the PRD's Decision Log for the full mechanism (including the accepted
-  mixed-fleet-rollout residual: a run resumed onto a pre-#88 worker degrades
-  to guessing rather than asking, mid-run, and a pending answer in transit is
-  lost) and [docs/run-activity.md](docs/run-activity.md#answering-a-question),
-  [docs/slack.md](docs/slack.md#using-it) and [docs/cli.md](docs/cli.md#commands)
-  for the user-facing surfaces.
+- **running ⇄ awaiting_input — the third human-in-the-loop channel**
+  ([PRD #88](prds/done/88-ask-user-clarification.md)), beside the plan gate and
+  steering. The lead calls an in-process `ask_user` signal at a fork it shouldn't
+  resolve alone; the worker parks the run, posts a `question` run-message, and
+  awaits an `answer` the way `gatePlan` awaits a plan verdict. On answer it resumes
+  the *same* SDK session: a **pre-run** question (before `submit_plan`) resumes
+  into a fresh planning turn that reaches the plan gate, a **mid-run** one resumes
+  the implement ⇄ review loop it interrupted. It is a distinct status, not a
+  sub-state of `awaiting_approval` (whose resume requires a consumed `approve_plan`
+  an `answer` can never satisfy), but inherits `awaiting_approval`'s treatment
+  everywhere that matters (worker-death sweeps, the `busy`/`active_runs` and
+  rate-limit concurrency counts, board move-pending), so a parked question is
+  recoverable across a worker death, holds its slot, and never wedges a card. The
+  resume guard is keyed on the open **question's identity**, not a timestamp: a
+  requeue re-parks on the same question id, so an answer submitted just before a
+  crash still resumes and an answer to a superseded question is rejected. Bounds
+  are an absolute answer deadline (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a
+  per-run cap (`QUESTION_MAX`, default 5), both worker-in-memory (a requeue resets
+  both, so the honest worst case is each **× (RUN_MAX_REQUEUES + 1)**). **Only the
+  deadline fails the run closed**; exhausting the cap emits a feed notice and the
+  lead proceeds on its own judgment (the one cap-adjacent failure is pre-run-only:
+  looping on questions without ever reaching a plan). **Autopilot never parks**:
+  the same `claim.auto_approve` that short-circuits `gatePlan` short-circuits
+  `ask_user`, auto-resolving with the frozen `AUTOPILOT_SENTINEL_ANSWER` constant
+  (asserted byte-for-byte by a test, so do not paraphrase it here). The question
+  surfaces on the run view, the owner's opt-in Slack DM, and `uzi run answer`, all
+  three deriving it from the run feed rather than a dedicated field. See the PRD's
+  Decision Log (including the accepted mixed-fleet residual) and
+  [docs/run-activity.md](docs/run-activity.md#answering-a-question),
+  [docs/slack.md](docs/slack.md#using-it), and
+  [docs/cli.md](docs/cli.md#commands).
 - **→ completed / failed** — the **worker**, not the agent, pushes the branch
   (`agent/issue-{iid}`) and opens the MR on completion (see Secrets, below);
-  failure carries a `failure_reason`. The push and the whole MR-create call are
-  wrapped in a bounded, fast transient-retry (`[1s,2s,4s,8s,16s]`,
-  `agent/src/forge-retry.ts`): a dropped HTTP/2 stream, a 5xx, or a connection
-  reset retries so a run whose work is already committed is not discarded, while
-  a **permanent** rejection — auth failure, a protected-branch guardrail,
-  non-fast-forward — fails fast and is never retried, per
-  [ADR-284](adr/0284-forge-push-retry-classifier.md). A `failed` transition also
-  lands an in-app inbox notification (`notifysvc.Notify`, inbox-only —
-  Slack is not attempted, since the existing Slack ❌ DM already covers opted-in
-  users) for the run's owner, gated on `stop_kind` so a deliberate cancel or
+  failure carries a `failure_reason`. The push and MR-create are wrapped in a
+  bounded transient-retry (`[1s,2s,4s,8s,16s]`, `agent/src/forge-retry.ts`): a
+  dropped HTTP/2 stream, 5xx, or connection reset retries so already-committed work
+  is not discarded, while a permanent rejection (auth, protected-branch guardrail,
+  non-fast-forward) fails fast, per
+  [ADR-284](adr/0284-forge-push-retry-classifier.md). A `failed` transition lands
+  an in-app inbox notification (`notifysvc.Notify`, inbox-only since the Slack ❌ DM
+  already covers opted-in users), gated on `stop_kind` so a deliberate cancel or
   plan-rejection stays silent and only genuine breakage notifies.
 - **Finalize, GitHub only: align a behind-on-workflows branch before that push**
   (PRD #456). GitHub rejects the bot's `repo`-only PAT push whenever the pushed
-  tip's `.github/workflows/**` tree differs from the *current* default branch —
-  even when the run's own branch never touched a workflow file, only fell
-  behind on one because main advanced it mid-run. Immediately before the push
-  above, uzi fetches the default branch's fresh tip and, only when the
-  workflow trees actually differ, aligns the branch to it: a SHA-preserving
-  merge first, falling back to a rebase (the mechanism proven to clear the
-  rejection) if the merged push is still refused. An unresolvable conflict
-  fails the run typed (`fail_origin = finalize_base_align_conflict`) with the
-  pre-align diff preserved on the failed-run card, via the same
-  `preserved_patch` mechanism PRD #377 built for a branch that *modifies* a
-  workflow file (a distinct, earlier-firing guard on the same finalize path).
-  See [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism and
-  why merge is tried before rebase.
-- **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265 + PRD #390) — on a
-  milestone-structured `issue` run the run view shows a *reported-complete*
-  tracker (`runs.milestones_completed`, a monotone server-side union; never
-  "verified"). Two sources feed it, both subset-validated against the frozen
-  list server-side: mid-run `report_progress` calls (visible immediately,
-  turn-non-ending), and — since PRD #265 — the lead's declaration on
-  `signal_done` of the milestones it actually finished, unioned into the tracker
-  on the `completed` transition. The declaration is what keeps a **single-turn
-  run** honest: one that goes straight to `signal_done` never emits a mid-run
-  report, so without it the tracker would freeze at "nothing reported" on a run
-  that shipped its work. Completion is **declared, not inferred** — a milestone
-  the lead leaves undeclared stays not-complete, so a deliberately-skipped
-  milestone is not back-filled. `milestones_in_progress` (a snapshot, not a
-  union) is cleared on every terminal transition a milestone-bearing run can
-  reach, since "in progress" is meaningless on a done/failed/cancelled run. The web renders a **null** tracker
-  as "not reported" (`M–/N`), distinct from a genuine `0/N`, so a completed run
-  that simply never reported does not read as a failure. PRD #390 is the
-  "make mid-run reporting truthful and enforced" step in that #122 → #265 → #390
-  progression: mid-run reporting is now **enforced**, not merely offered — the
-  per-turn prompt requires a `report_progress` declaration (`agent/src/prompt.ts`),
-  and the implement/review loop (`agent/src/sdk-executor.ts`) escalates the next
-  turn's prompt when a work turn leaves a milestone-bearing run with no milestone
-  marked in progress, then surfaces a feed-only `status` signal after K=2
-  consecutive misses so a silently-non-reporting lead is observable — while still
-  never failing the run (D4) and keeping `checkpoint` a durability boundary, not a
-  gate (D2): a cooperative checkpoint re-arms enforcement and clears the
-  in-progress latch instead of nagging past a milestone boundary. Complementing
-  that, an all-empty `report_progress` call (both sides empty after parsing) is
-  now a **no-op, not a signal** (D3, `agent/src/signals.ts`) — it never persists a
-  misleading `[]`, so the `milestones_completed` column stays `null` on a run that
-  truly never reported and the neutral `M–/N` render is what that run actually
-  shows. The CLI's `uzi run get` now renders that same neutral `–/N` numerator for
-  a never-reported run (PRD #390 D5/M4, `api/cmd/uzi/run_render.go`), bringing it to
-  display parity with the web badge and the TUI rail.
+  tip's `.github/workflows/**` tree differs from the current default branch, even
+  when the run's branch never touched a workflow file but only fell behind as main
+  advanced mid-run. Just before the push, uzi fetches the default tip and, only
+  when the workflow trees differ, aligns the branch: a SHA-preserving merge first,
+  falling back to a rebase if still refused. An unresolvable conflict fails the run
+  typed (`fail_origin = finalize_base_align_conflict`) with the pre-align diff
+  preserved on the failed-run card via the same `preserved_patch` mechanism PRD
+  #377 built for a branch that *modifies* a workflow file. See
+  [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism and why
+  merge precedes rebase.
+- **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
+  `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
+  monotone union, never "verified"), fed by mid-run `report_progress` and the lead's
+  `signal_done` declaration. Completion is **declared, not inferred**; a null
+  tracker renders "not reported" (`M–/N`), distinct from `0/N`, and
+  `milestones_in_progress` clears on every terminal transition. PRD #390 makes
+  per-turn reporting enforced (an escalating prompt plus a feed-only `status` after
+  K=2 misses) while never failing the run, and an all-empty `report_progress` is a
+  no-op. `uzi run get` renders the same `–/N`, at parity with the web badge and TUI
+  rail.
 - **Operator scope steering** (PRD #634, [ADR-634](adr/0634-run-scope-steering.md)) —
-  a mid-run `uzi run stop` or `uzi run scope --through N` on a
-  milestone-structured `issue` run writes **one** nullable column,
-  `runs.scope_ceiling` (the count of milestones the run may complete, over
-  the `milestones_frozen` list above). `stop` resolves server-side to
-  `scope_ceiling = completed_count`; a forward ceiling clamps to
-  `[completed_count, len(frozen)]`. Both actions share the same field, so a
-  later write is genuinely **last-writer-wins** (supersede) with no
-  cross-channel ordering to reason about. Delivery rides the existing
-  per-iteration `reportIteration` ACK (re-read every loop, self-healing) and
-  the claim payload (durability across a requeue), and is **honored at the
-  top of the implement loop** — not at the cooperative `checkpoint` — so it
-  fires every iteration regardless of whether the lead checkpointed. Once
-  `completed_count >= scope_ceiling` the worker starts no further milestone
-  and takes the same graceful-finalize path as any other completion (push +
-  MR iff requested), reporting `completed` with `stop_kind='scope_capped'`.
-  `milestones_frozen` itself is never rewritten — the ceiling is a
-  truncation layered over the immutable approved list, not an edit to it.
-  The `kind='scope'` `run_user_inputs` row this also writes is **audit-only**
-  (surfaced via `uzi run inputs`, the web steer queue, and — surface-only —
-  Slack); the worker never routes it, only the column controls behavior.
+  a mid-run `uzi run stop`/`uzi run scope --through N` on a milestone run writes one
+  nullable `runs.scope_ceiling` (last-writer-wins, clamped to `[completed_count,
+  len(frozen)]`), delivered via the per-iteration ACK and claim payload and honored
+  at the top of the implement loop. Once `completed_count >= scope_ceiling` the
+  worker finalizes gracefully (`stop_kind='scope_capped'`); `milestones_frozen` is
+  never rewritten, and the paired `run_user_inputs` row is audit-only.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers
   can't be trusted to self-report: a claimed-but-never-started run older than
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
@@ -1059,19 +828,16 @@ chain in the diagram above, with no intervening `running`.
   captured plan/session id survive every transition above, so a resumed run
   continues exactly where it left off — see Live message stream, below.
 - **Bounded worker concurrency** (PRD #42, `adr/0042-worker-run-concurrency.md`): a
-  worker may drive more than one of these state machines at once, capped by a
-  worker-side slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1 — the serial
-  behavior above, unchanged) that the worker advertises at registration but the
-  server never enforces. A run parked at `awaiting_approval` holds its slot the
-  whole time, same as any other non-terminal run. Cap>1 is an informed opt-in with
-  one accepted intra-user residual (Bash writes reaching outside a run's own
-  worktree) — the sibling push-credential read is now closed by the PRD #51 uid
-  split on the root-started compose path (a sibling run's agent is the `runner` uid;
-  the push git child is the `worker` uid; a #58 single-uid start does not split) —
-  documented at the knob in
+  worker may drive several of these state machines at once, capped by a worker-side
+  slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1, the serial behavior
+  above) that the worker advertises at registration but the server never enforces.
+  A run parked at `awaiting_approval` holds its slot. Cap>1 is an informed opt-in
+  with one accepted intra-user residual (Bash writes reaching outside a run's own
+  worktree); the sibling push-credential read is closed by the PRD #51 uid split on
+  the root-started compose path. See
   [docs/worker-setup.md](docs/worker-setup.md#concurrent-runs); the real fix for
-  the remaining one — container-per-run — belongs to the future k8s-operator
-  deployment (see Not yet in scope, below).
+  the remaining residual, container-per-run, belongs to the k8s-operator path (see
+  Not yet in scope, below).
 
 ### Secrets: who holds what
 
@@ -1214,30 +980,37 @@ re-read-on-signal shape — no new server-pushed state. See
 
 ### Worker message-path contract (PRD #108)
 
-A worker is untrusted input on `/api/worker/runs/:id/messages` and `/state`, exactly as `sanitizeSelfReported` already assumes for the self-reported register fields above. Before this PRD, three byte patterns a worker can legitimately emit were ones Postgres refuses to store, and a rejection wedged the run: the store error fell through to a generic 500, and the worker's batcher treated any throw as retryable, re-posting the identical (and growing) batch forever — 27 minutes and 239 lost messages in the incident that motivated the fix. Full rationale and Decision Log: [prds/done/108-worker-retry-loop-autostop.md](prds/done/108-worker-retry-loop-autostop.md). This section is the contract, not a changelog.
+A worker is untrusted input on `/api/worker/runs/:id/messages` and `/state`, exactly as `sanitizeSelfReported` already assumes for the self-reported register fields above. The problem this closes: three byte patterns a worker can legitimately emit are ones Postgres refuses to store, and a rejection used to wedge the run (the store error fell through to a generic 500 and the batcher retried the identical, growing batch forever). Full rationale and Decision Log: [prds/done/108-worker-retry-loop-autostop.md](prds/done/108-worker-retry-loop-autostop.md). This section is the contract, not a changelog.
 
-**What is sanitized, and where.** `workersvc.AppendMessages` (`api/internal/workersvc/service.go`) is the authoritative choke point. It strips `\u0000`, unpaired UTF-16 surrogates (U+D800–U+DFFF), and raw invalid UTF-8 from the message `payload` with a JSON-aware, in-string-state scanner (`sanitizePayloadJSON`, `workersvc/sanitize.go`) — deliberately not a decode/walk/re-encode, which would silently corrupt large integers (`jsonb` stores numbers exactly; a Go float64 round-trip does not). It NUL-strips (only) the four sibling worker-controlled TEXT columns — `kind`, `agent`, `agent_instance`, `agent_label` — since `encoding/json` has already folded surrogates and bad UTF-8 to U+FFFD by the time those exist as Go strings. Each is also rune-capped (`kind` 64, `agent` = `agenttmpl.MaxNameLen`, `agent_instance` 128, `agent_label` 80 — hardcoded constants, not env, since they bound a per-frame-repeated attribution field rather than tune an operator knob) so an unbounded value cannot become an unbounded column or an unbounded log line. Every strip is counted and logged, never silent, so a NUL-emitting tool stays visible rather than laundered. Deliberately **not** stripped: `\n`, `\t`, ANSI escapes — legal in `jsonb`, load-bearing in tool output, and rendered by a React component that escapes them (a different rule than PRD #90's `sanitizeMemoryField`, whose sink is a terminal table printer). The worker (`agent/src/sanitize.ts`, wired into `batcher.ts`'s `emit()`) applies the identical treatment before anything leaves the box — defense in depth, explicitly not the mechanism, since only a worker already running the patched image benefits from it.
+**What is sanitized, and where.** `workersvc.AppendMessages` (`api/internal/workersvc/service.go`) is the authoritative choke point. It strips `\u0000`, unpaired UTF-16 surrogates (U+D800–U+DFFF), and raw invalid UTF-8 from the message `payload` with a JSON-aware, in-string-state scanner (`sanitizePayloadJSON`, `workersvc/sanitize.go`), deliberately not a decode/walk/re-encode (which would corrupt large integers, since `jsonb` stores numbers exactly and a Go float64 round-trip does not). It NUL-strips the four sibling worker-controlled TEXT columns (`kind`, `agent`, `agent_instance`, `agent_label`), which `encoding/json` has already folded to U+FFFD, and rune-caps each (`kind` 64, `agent` = `agenttmpl.MaxNameLen`, `agent_instance` 128, `agent_label` 80) so an unbounded value cannot become an unbounded column or log line. Every strip is counted and logged, never silent. Deliberately **not** stripped: `\n`, `\t`, ANSI escapes, which are legal in `jsonb`, load-bearing in tool output, and escaped by the React renderer (unlike PRD #90's `sanitizeMemoryField`, whose sink is a terminal table printer). The worker (`agent/src/sanitize.ts`, wired into `batcher.ts`'s `emit()`) applies the identical treatment before anything leaves the box, as defense in depth, not the mechanism.
 
-`/state`'s worker-reported text (`failure_reason`, plus `session_id`/`plan_md`/`branch`/`mr_web_url`) gets the same NUL-strip on the same authoritative choke point (`sanitizeFailureReason`/`stripNULParam`, `workersvc/service.go`) — but **silently**, unlike `/messages`' count-and-log: these fields are worker/forge/git-minted rather than free tool output, so a NUL there is already anomalous rather than expected untrusted content, and `failure_reason` additionally carries the breaker's own trip report (below), so a poisoned run must still be able to record that it failed.
+`/state`'s worker-reported text (`failure_reason`, plus `session_id`/`plan_md`/`branch`/`mr_web_url`) gets the same NUL-strip at the same choke point (`sanitizeFailureReason`/`stripNULParam`, `workersvc/service.go`) but **silently**, since these fields are worker/forge/git-minted rather than free tool output and `failure_reason` must still be able to record the breaker's own trip report.
 
-**What returns 400 vs 413 vs 500 — the retry contract.** The status code is what the client is obliged to believe, not a detail. `workersvc.ErrUnstorableMessage` maps to **400** for an enumerated, measured set of permanent Postgres SQLSTATEs — `22P05` (unsupported Unicode escape), `22P02` (invalid JSON text representation), `22021` (invalid byte sequence), and `22003` (numeric overflow: `{"n":1e1000000}` is legal JSON that sanitation cannot touch and `jsonb` cannot store). Classification is deliberately statement-level — only `InsertRunMessage`'s own error is eligible — so a `22P02` raised by the unrelated `foldRunUsage` fold is never misreported as "your batch is poisoned," which would drop messages that were never the problem. Everything else — connection loss, pool exhaustion, serialization failures, lock timeouts, statement cancellation, any non-`PgError` (notably a disconnecting client's `context.Canceled`), and `23503` (the run was deleted mid-batch: permanent, but not a payload fault) — stays on **500**, because a 500 must mean "try again"; misclassifying a transient failure as permanent is the mirror-image bug. **413** is separate and route-specific: `DecodeJSONLimited` (`api/internal/httpx/respond.go`) swaps the silently-truncating `io.LimitReader` for `http.MaxBytesReader` on this one route, so an oversize body is reported as oversize instead of folding into the same generic 400 a malformed batch gets — otherwise the worker has no way to learn "too large" from the server at all. 413 is a **split-and-retry** signal, never a poison verdict; the worker's own conservative byte cap keeps this a backstop it should rarely reach, and "no 413" is never proof of being under the cap (`MaxBytesReader` fires on the read, not the decoded value).
+**What returns 400 vs 413 vs 500 — the retry contract.** The status code is what the client is obliged to believe. Classification is statement-level (only `InsertRunMessage`'s own error is eligible), so a matching SQLSTATE raised by the unrelated `foldRunUsage` fold is never misreported as poison.
 
-**A second poison-pill class, closed the same way.** `run_usage`'s primary key `(run_id, session_id, model)` (`00062_run_usage.sql`) has both `session_id` and `model` worker-controlled and untouched by the payload sanitizer above (no escapes, no invalid bytes — just length). `foldRunUsage` caps both at 200 runes before the upsert, because an over-long value overflows a btree index entry (2704 bytes) and raises `54000`, which is outside the enumerated permanent set and would otherwise 500 into the same forever-retry wedge one sink over. Truncating (never rejecting) is safe because both are a grouping key, not content, and a collision between two over-long values is absorbed by the same idempotent `GREATEST` merge that makes at-least-once delivery converge.
+| response | meaning | trigger |
+|---|---|---|
+| **400** (`ErrUnstorableMessage`) | permanent poison: drop, do not retry | `22P05` unsupported Unicode escape, `22P02` invalid JSON text, `22021` invalid byte sequence, `22003` numeric overflow (`{"n":1e1000000}`, legal JSON `jsonb` cannot store) |
+| **500** | transient: try again | connection loss, pool exhaustion, serialization failure, lock timeout, statement cancellation, any non-`PgError` (a client's `context.Canceled`), `23503` (run deleted mid-batch: permanent but not a payload fault) |
+| **413** (route-specific) | oversize: split and retry | body past `http.MaxBytesReader`'s cap on this route (`DecodeJSONLimited`, `api/internal/httpx/respond.go`) |
 
-**How a batch is bounded, split, and bisected.** `agent/src/batcher.ts` caps a flush at `MAX_BATCH_BYTES` (512 KiB — a soft grouping target: the longest head prefix that fits) and tombstones any single message over `MAX_MESSAGE_BYTES` (900 KiB) at `emit()` time, before it ever reaches the flush state machine. A 413 splits the batch in half and **resets** the failure streak — a legitimate split is progress, not a repeat failure. A 400 with more than one message left triggers **bisection**: a one-sided search — post the left half; a failure narrows the search to it, a 2xx confirms the right half clean — isolates the single poisoned message in `ceil(log2 n)` posts (8 for the incident's n=239), backstopped at `MAX_BISECT_POSTS` (24). The isolated message is **tombstoned, not dropped**: it is re-posted under its original `seq` as a worker-minted `status` marker (`{"event":"message_dropped",...}`), because `web/src/lib/runStream.ts` requires seq contiguity and a genuine drop would freeze the live run view at the gap permanently — trading a client-side wedge for the server-side one this PRD removes. Only a *rejected* tombstone is a true, unrecoverable drop; it is idempotent (re-tombstoning a marker is a no-op) and carries the full attribution triple (`agent`/`agent_instance`/`agent_label`) so the loss renders in the subagent lane it happened in, not the top-level stream.
+413 is never a poison verdict, and "no 413" is not proof of being under the cap (`MaxBytesReader` fires on the read, not the decoded value).
 
-The breaker trips immediately on a fatal verdict (401/403/404 — every message would fail, so bisecting only burns budget proving it), on a rejected tombstone, or on an exhausted bisect budget. On an ordinary **transient** run it trips only after `TRANSIENT_TRIP_MS` (~10 minutes) of unbroken failure — a duration, deliberately not "N consecutive same-batch failures": once the 400/413 reclassification above is in place, a 5xx on this route means a genuine transient, so a tight count-based trip would fail healthy runs through an ordinary API restart. A trip's explanation is never emitted through the batcher itself — `concat` is order-preserving, so it would queue behind the very poison it's explaining, and a tripped batcher never flushes again — it is routed through each runner's `reportState` call instead, which carries its own bounded retries and 4xx-fatal semantics.
+**A second poison-pill class, closed the same way.** `run_usage`'s primary key `(run_id, session_id, model)` (`00062_run_usage.sql`) has both `session_id` and `model` worker-controlled. `foldRunUsage` caps both at 200 runes before the upsert, because an over-long value overflows a btree index entry (2704 bytes) and raises `54000`, outside the enumerated permanent set. Truncating (never rejecting) is safe because both are a grouping key, and a collision is absorbed by the idempotent `GREATEST` merge that makes at-least-once delivery converge.
 
-**The server-side half: detect the loop, then stop it (PRD #108 Phase 2).** Everything above protects a worker running the patched image. A fleet on an older image has none of it, so the authoritative detection and stop are server-side. **A detector that infers health from the message stream cannot detect a broken message stream** — PRD #47's `looping` reads its evidence from persisted `run_messages` (`toolWindow` → `ListRunToolWindow`), and this wedge *is* a failure to persist them, so that arm is blind by construction rather than by threshold. The signal that can see it is the API's own count of `AppendMessages` failures per run, produced on the failing path itself and needing no cooperation from the worker: `AppendMessages` and `detectRunHealth` are methods on the same `*Service` in the same process, so the failing writer writes `workersvc/persistfail.go`'s tracker directly and the sweeper reads it directly. The wedge cannot suppress it, because the wedge *is* the event being counted.
+**How a batch is bounded, split, and bisected.** `agent/src/batcher.ts` caps a flush at `MAX_BATCH_BYTES` (512 KiB, a soft grouping target) and tombstones any single message over `MAX_MESSAGE_BYTES` (900 KiB) at `emit()` time. A 413 splits the batch in half and **resets** the failure streak (a legitimate split is progress). A 400 with more than one message left triggers **bisection**, isolating the single poisoned message in `ceil(log2 n)` posts, backstopped at `MAX_BISECT_POSTS` (24). The isolated message is **tombstoned, not dropped**: it is re-posted under its original `seq` as a worker-minted `status` marker (`{"event":"message_dropped",...}`), because `web/src/lib/runStream.ts` requires seq contiguity and a real gap would freeze the live view. Only a *rejected* tombstone is a true drop; it is idempotent and carries the full attribution triple (`agent`/`agent_instance`/`agent_label`) so the loss renders in the subagent lane it happened in.
 
-- **The counter's boundary is the ownership gate, and that is the whole of its safety.** Every recorded failure is reached only after `runOwnedByWorker` has succeeded, at exactly three non-test sites: `AppendMessages`' recorder (which requires a resolved run), `NoteOversizeBatch` (which re-checks ownership itself, because the 413 is answered *before* any ownership check runs), and nothing else. That gate — not the entry cap, which is defense in depth — is what bounds the map's key space to runs really claimed by the caller's own workers, and what stops a worker driving a streak against somebody else's run. A fourth recording hook added without it would be a cross-tenant kill primitive.
-- **The flag is early warning and rides the health toggle; the stop does not.** At a low threshold (5 failures over 10s) the run reads `looping` with a reason naming the mechanism — *"the agent's updates can't be saved, so it keeps resending them"* — instead of falling through to `slow` at 45 minutes, which is what the incident actually reported. That arm is checked **first, above all three existing ones** — the resulting priority is persist-looping > tool-looping > stalled > slow. Above the tool-window arm because both map to the same enum and the persistence cause is the more specific truth on a run doing both; above `stalled` as a consequence, and that consequence is **user-visible**: a wedged run whose last persisted message is a *completed* `tool_result` used to read `stalled` and now reads `looping`, with a different Slack head and a different reason. It is not a purely additive arm, and describing it as one was wrong — an arm that returns first necessarily pre-empts the ones below it. The **stop** is a separate sweep step with its own operator switch (`UZI_AUTOSTOP_ENABLED`, env, default on), deliberately not `health_enabled` — an admin disabling health must not silently disable loop protection — and deliberately not a settings key, since an automatic destructive behaviour should not depend for its off switch on the database it might be misbehaving against.
-- **The conjunction is the design, and it is deliberately not summarised as a count** (a tally cannot detect its own referent disappearing — see `00082`). Every member lives in `autoStopWedgedRuns`/`evaluateAutoStop`: the operator kill switch, ≥20 consecutive failures, sustained ≥60s, the run's `runs.last_seq` not advancing, the same failure class throughout, that class being one **a correct pre-0.10.1 worker could have hit through no fault of its own**, and **other runs succeeding on this same instance** inside the window. The last is the outage-vs-poison discriminator and the entire safety argument: if the API is broken, *every* run's writes fail and killing them turns an outage into data loss. When the comparison set is empty the rule is **flag and do not kill, permanently** — no fallback, no timeout into killing. The class guard is the one that is easy to get wrong: `unstorable` and `oversize` may kill (a browser's NUL bytes and a batch grown past 1 MiB are both things the world does to a correct old worker), while `invalid` and `store` may not — a malformed batch means the worker *build* is broken, and a 500 means retry, which is the contract the 400/413 split above exists to make honest. The no-progress and same-class guards are implemented as streak *resets* rather than as predicates at decision time, so reaching the threshold **is** the proof that neither changed.
-- **A streak is evidence about one running attempt.** It is evicted when the run is observed terminal, when the run leaves `running`, and — load-bearing — whenever the sweeper hands the run back to the queue. Without that last one a requeued run returns under a fresh worker still carrying the dead attempt's streak and is stopped before the new worker persists a byte, which is likely rather than exotic for this population: a pre-0.10.1 worker wedged at 2 Hz with a growing batch is a prime OOM candidate, and OOM is what puts it there. The sweeper gives that window 15 seconds against the 5 minutes `defaultClaimGrace` budgets for claimed→started, and a fresh container from a *new image* takes `ensureClone`'s cold `cloneBare` path, so the gap spans an entire clone.
-- **Two stop halves, one wire format.** With a live poller the server enqueues a synthetic verdict through `CreateStopVerdictInput` — and it rides `kind='cancel'`, not a new kind, because `SteeringChannel.route`'s `default:` arm **logs and drops** an unrecognised kind while `/inputs` is consume-on-read, making the drop permanent and unacknowledgeable. A new kind would therefore be a silent no-op on exactly the older fleet this exists to protect. Version skew is impossible by construction: the only thing on the wire is a cancel every worker version has always understood. With no live poller (or if a live worker ignores the cancel for 60s) the server takes the terminal transition itself via `FailRunAutoStop`, status-scoped so a run that finished in between is a no-op, and firing the same `publishSwept` + judge-enqueue side effects every other server-side `failed` path fires.
-- **`stop_kind = 'auto_stopped'` is the contract; `failure_reason` is decoration and must never be parsed.** On the live half the worker reports its own terminal state, and `SetRunFailed` overwrites `failure_reason` unconditionally with `"run cancelled"` — so the two halves genuinely carry different strings and only `stop_kind` survives both. Migration `00082` widens the `runs_stop_kind_check` domain (constraint name measured, not assumed). Consumers must not fold the third value in with the two human ones: `web/src/lib/runBadge.ts`'s `isStoppedRun` enumerates the human kinds rather than null-testing, because a deliberate stop is not breakage and an auto-stop is, and `uzi run get` prints a `STOP_KIND` row for the same reason.
-- **This is the fourth reason `api` is a hard singleton, and the one that fails silently.** The streak counters and the "other runs are succeeding" comparison set are in-process. Split across replicas, neither pod's streak reaches the threshold and each pod's comparison set is a fraction of reality, so auto-stop simply stops firing rather than misfiring — a guard that quietly disarms looks exactly like a healthy fleet. `deploy/chart/values.yaml`'s `api.replicaCount` comment says so at the place someone would change it.
-- **Honest scope, which review must not oversell: this would not have fired on the incident that motivated it.** There was one active run, so there was no comparison set, so the rule degrades to flag-and-notify permanently — the correct behaviour on insufficient evidence, and tested as such rather than as a limitation. On a single-active-run deployment the *flag* is the value and the kill is insurance for multi-run instances and for pre-0.10.1 workers. There is also no metrics surface in `api` (no `promhttp`, no `/metrics`, no dependency), so the structured log lines named in [docs/run-auto-stopped.md](docs/run-auto-stopped.md) are the operator's interface, not a dashboard — and because every terminal path clears run health per PRD #47's exit contract, an auto-stopped run carries no flag afterwards, making those lines and that page the only durable record of why.
+The breaker trips immediately on a fatal verdict (401/403/404), a rejected tombstone, or an exhausted bisect budget, and on a transient run only after `TRANSIENT_TRIP_MS` (~10 minutes) of unbroken failure (a duration, not a count, so an ordinary API restart does not fail a healthy run). A trip's explanation routes through each runner's `reportState` call, not the batcher itself (a tripped batcher never flushes again).
+
+**The server-side half: detect the loop, then stop it (PRD #108 Phase 2).** A fleet on an older image has none of the above, so the authoritative detection and stop are server-side. A detector that infers health from the message stream cannot detect a broken message stream (PRD #47's `looping` reads persisted `run_messages`, and this wedge *is* a failure to persist them). The signal that can see it is the API's own count of `AppendMessages` failures per run: `AppendMessages` and `detectRunHealth` are methods on the same `*Service`, so the failing writer writes `workersvc/persistfail.go`'s tracker and the sweeper reads it, and the wedge cannot suppress the event it is counting.
+
+- **The counter's boundary is the ownership gate.** Every recorded failure is reached only after `runOwnedByWorker` succeeds, at three non-test sites (`AppendMessages`' recorder, `NoteOversizeBatch` which re-checks ownership itself because the 413 is answered before any ownership check, and nothing else), so the map's key space is bounded to runs the caller's own workers really claimed and a worker cannot drive a streak against another user's run.
+- **The flag rides the health toggle; the stop does not.** At a low threshold (5 failures over 10s) the run reads `looping` with a reason naming the mechanism, checked **first** so the priority is persist-looping > tool-looping > stalled > slow. The **stop** is a separate sweep step with its own switch (`UZI_AUTOSTOP_ENABLED`, env, default on), deliberately not `health_enabled` (an admin disabling health must not disable loop protection) and deliberately not a settings key (the off switch must not depend on the database it might be misbehaving against).
+- **The kill is a conjunction, never a count** (a tally cannot detect its own referent disappearing; see `00082`). `autoStopWedgedRuns`/`evaluateAutoStop` requires all of: the operator switch, ≥20 consecutive failures, sustained ≥60s, `runs.last_seq` not advancing, one failure class throughout, that class being one a correct pre-0.10.1 worker could have hit (`unstorable`/`oversize` may kill; `invalid`/`store` may not, since those mean a broken worker build or a retryable 500), and **other runs succeeding on this instance** in the window. That last is the outage-vs-poison discriminator: an empty comparison set is **flag and do not kill, permanently**. The no-progress and same-class guards are streak *resets*, so reaching the threshold is itself the proof neither changed.
+- **A streak is evidence about one running attempt.** It is evicted when the run is observed terminal, leaves `running`, or is handed back to the queue (the last is load-bearing: without it a requeued run inherits the dead attempt's streak and is stopped before the new worker persists a byte).
+- **Two stop halves, one wire format.** With a live poller the server enqueues a synthetic verdict through `CreateStopVerdictInput` riding `kind='cancel'` (not a new kind, which `SteeringChannel.route`'s `default:` arm would silently drop on the older fleet this protects). With no live poller (or a worker ignoring the cancel for 60s) the server takes the terminal transition itself via `FailRunAutoStop`, status-scoped, firing the same `publishSwept` + judge-enqueue side effects as any server-side `failed`.
+- **`stop_kind = 'auto_stopped'` is the contract; `failure_reason` is decoration and must never be parsed** (the live half's `SetRunFailed` overwrites it with `"run cancelled"`, so only `stop_kind` survives both halves). Migration `00082` widens `runs_stop_kind_check`. Consumers must not fold the third value in with the two human ones: `web/src/lib/runBadge.ts`'s `isStoppedRun` enumerates the human kinds rather than null-testing, and `uzi run get` prints a `STOP_KIND` row.
+- **This is the fourth reason `api` is a hard singleton, and the one that fails silently.** The streak counters and the comparison set are in-process; split across replicas, auto-stop simply stops firing rather than misfiring, and a guard that quietly disarms looks like a healthy fleet. `deploy/chart/values.yaml`'s `api.replicaCount` comment says so. On a single-active-run deployment the *flag* is the value and the kill is insurance for multi-run instances and pre-0.10.1 workers; the operator interface is the structured log lines in [docs/run-auto-stopped.md](docs/run-auto-stopped.md) (there is no `/metrics` in `api`, and every terminal path clears run health, so those lines are the only durable record of why).
 
 ### Incidental findings (PRD #333)
 
@@ -1277,114 +1050,102 @@ usage is [docs/findings.md](docs/findings.md).
 uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slacksvc`, PRD #25): per-user run DMs, plan-approval buttons, reply-from-Slack steering, and — since PRD #191 — a conversational chat surface (a top-level DM to the bot opens a `kind='chat'` run streamed back into a thread, with `start_run`/`cancel_run`/`steer_run` tools and issue-proposal cards, the run-control trio added by PRD #322). It adds no new service and no new inbound port — the trust posture below is why. Full design rationale lives in the PRD (`prds/done/25-slack-integration.md`, especially its Security posture and Decision Log; the conversational surface in `prds/done/191-slack-chat-surface.md`); user-facing setup is [docs/slack.md](docs/slack.md).
 
 - **Outbound-only, no inbound surface.** The manager (`slacksvc.Manager`) opens a Socket Mode WebSocket *out* to Slack and polls it live; there is no public URL, no signing-secret HTTP endpoint, and no new port on `api`. This holds the same "only `web` publishes a port" boundary above unchanged — Slack is a second *outbound* relationship, the same shape as the forge integration, not a new inbound one. The honest caveat: enabling Slack does export run *status metadata* off-box to Slack's cloud — and, since PRD #41, gated plan bodies too, and since PRD #191 chat message content for `kind='chat'` runs (see Content minimization, below).
-- **`api` is the sole custodian of both Slack tokens.** The bot (`xoxb-`) and app-level (`xapp-`) tokens are settings values, sealed with the same `secretbox` key as every other secret at rest, and structurally excluded from every value-producing settings read (`settings.SecretKeys`, kept out of `Defaults` so `All()`/`Effective()` cannot emit them by construction — the same "cannot forget to redact" pattern used for the Anthropic token above). They are readable only through slacksvc's own decrypt accessors. A dedicated `slacksvc.Redact` additionally scrubs `xoxb-`/`xapp-` patterns *and* the Socket Mode connection URL's `?ticket=` query — a live-session credential the token-shape redaction alone would miss — from every log line. Neither token, nor the ticket URL, is ever sent to a worker or agent.
-- **Identity mapping is the authz primitive for every inbound action.** `users.slack_resolved_id` (the manual override, or a cached `users.lookupByEmail` match) has a partial unique index (`users_slack_resolved_id_key`, `WHERE slack_resolved_id IS NOT NULL`), so at most one uzi user can ever resolve from a given Slack id. Every inbound handler (the Gatekeeper's Approve/Reject, the Replier's thread replies) re-resolves the Slack-authenticated envelope actor through `GetConfirmedUserBySlackID`, which additionally requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true` — an unconfirmed link or a deactivated account resolves to no row and the action is refused with an ephemeral notice, never guessed at. Content flows only after the user completes a link-confirmation DM round-trip; since uzi emails are unverified at registration, that confirmation click — not the email match itself — is what makes the mapping trustworthy against account-squatting. Approve/Reject, follow-up and clarification-answer submissions then ride `workersvc.SubmitInput`'s own ownership check (`GetRunByIDForUser`) as a second, independent gate. A Slack answer additionally carries no id of its own, which makes *which question it answers* a derivation rather than a fact (PRD #88 M3). Web and CLI echo back the id they were shown; a free-text reply cannot, and the tempting derivation — "whichever question is open when it arrives" — is an **arrival-time key wearing identity's clothes**: a reply written against Q1 that lands after Q2 opened would be stamped with Q2's id *by the server*, and would then satisfy every downstream equality check precisely because the server supplied it, re-opening the race identity keying exists to close. So the reply is instead bound to the question it **follows**, by ordering its `ts` against the `ts` of the question message the notifier posted (`slack_run_messages.question_id` + `question_ts`); a reply predating the current card is refused as answering a superseded question, and an unorderable pair fails closed. That survives a requeue for free, because a re-park re-uses the question id, the notifier's identity dedupe therefore does not re-post, and the recorded `ts` still points at the original card. The body produced is the same `{question_id, answers}` shape (`workersvc.AnswerBody`, marshalled by the `gateSubmitter` adapter in `cmd/server`, so the wire shape is declared exactly once), and the server re-checks the id against `runs.open_question_id` — keeping the two facts independent: Slack says what the user answered, `workersvc` says whether that is still open.
-- **Content minimization — with four deliberate exceptions: the plan gate, the clarification question, milestone titles, and (PRD #191) chat message content.** Slack messages otherwise carry status, repository path, issue number and title, MR link, and failure reason only — diff content never leaves `api`. Every dynamic field that could carry forge- or worker-controlled text (issue title, repo path, failure reason, a linked account's label) is mrkdwn-escaped (`EscapeMrkdwn`) before interpolation, so it can't smuggle a clickable link or an `@mention` into a message that also carries trusted deep-link markup, and a separate outbound scrub (`ScrubSecrets`) strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string as defense in depth. **The plan body is the one exception** (user-approved 2026-07-10, reversing this minimization for `plan_md` only — [PRD #41](prds/done/41-plan-revision-gate.md) Decision 10): every gated plan, and each revision a Request-changes round produces, is posted into the run's Slack thread — `ScrubSecrets`, then whole-blob CommonMark→mrkdwn rendering (`SlackMrkdwn`, not the per-field `EscapeMrkdwn` rule above, since the blob carries no trusted markup of its own to preserve — PRD #292, see below), then a rune-safe truncate to Slack's 3000-char block limit, with the deep link appended as trusted markup outside the truncated region. This genuinely widens what leaves the box: plan bodies quote source/issue content, and no layer here catches a secret a model happens to quote verbatim into a plan — only the four known token *patterns* above are stripped. Gate posts still land only in the owner's own 1:1 DM, so the added exposure is Slack's cloud (retention, admin export, e-discovery) plus that workspace's own admin boundary, not other members; the deep link (`UZI_PUBLIC_BASE_URL`/`public_base_url`) stays the canonical, untruncated rendering. **The clarification question is the second exception, on the same terms** ([PRD #88](prds/done/88-ask-user-clarification.md) Decision 9): when a run parks at `awaiting_input`, the question body — headers, question text, and any suggested option labels and descriptions — is posted into the same 1:1 DM thread through the *same* pipeline (`ScrubSecrets` → whole-blob `SlackMrkdwn` rendering (PRD #292) → rune-safe truncate → deep link as a separate block, `slacksvc.questionThreadBlocks`). It widens exposure the same way and for the same reason, and the same limit applies: question text is model-authored from repo and issue content, and only the four known token *patterns* are stripped, so a secret quoted verbatim into a question is not caught by any layer. Two things are specific to it. First, the text is **attacker-influenceable in a directed way** — an injected repo file can steer what the lead asks — so the question is treated as untrusted at every sink, and the lead's prompt forbids asking for a credential, token or password (D-G). Second, the widening runs in **both directions**: a question invites a human to type an answer back, and that answer is `ScrubSecrets`-ed and length-bounded in `workersvc.SubmitInput` so every surface inherits the scrub, not just the Slack one that always had it. **Milestone titles are the third**, a narrower one ([PRD #122](prds/done/122-milestone-structured-runs.md) M4): a `✓ N/M · working <title>` progress line carries a plan-authored milestone title, `EscapeMrkdwn`-escaped like the status fields but genuinely model-authored, so it shades from status metadata into content — which is part of why the count is four, not two. **Chat message content is the fourth, default-on wherever Slack is on** ([PRD #191](prds/done/191-slack-chat-surface.md) Decision 10): a `kind='chat'` run opened from a Slack DM streams its turns back into that DM's thread, each turn's `text` frames coalesced into one edited message through the *same* pipeline (`ScrubSecrets` → whole-blob `SlackMrkdwn` rendering (PRD #292) → rune-safe truncate → deep link outside the truncated region, `slacksvc/chatpost.go`); it widens exposure the same way and for the same reason, with the same limit (only the four known token *patterns* are stripped, so a secret the model quotes verbatim into an answer is not caught). Two things are specific to it. First — the **second-order exposure** — the exposure is broader than the run-state DM lanes it rides beside: the chat agent's read tools (`list_runs`/`get_run`/`get_run_messages`) are user-scoped but **not** kind-scoped, so a Slack chat can be asked to quote an **`issue` run's** message content — plan bodies, diffs, tool output — into Slack. The run-state notification lanes for the five non-chat kinds (`issue`, `ci_fix`, `judge`, `self_improve`, `prompt`) stay byte-identical to before; what changed is that run *content* now has a route to Slack, through chat, that it did not have. Second, the write direction is human-gated the same way the web Chat page is: the `start_run` tool and `propose_issue` emit **cards** whose Create/Start button — not the tool call — performs the forge write / run start, through the presser's own connection, so a repo that says "start a run on #42" produces at most a card. The same gate covers run control (PRD #322): `cancel_run` and `steer_run` likewise only emit cards — a danger Cancel button (confirm-gated) and a Steer button that, on press, arms a one-shot pending steer and asks the presser to reply in the thread with their instruction — and it is that button press (cancel) or in-thread reply (steer), not the tool call, that reaches `SubmitInput`.
-- **Untrusted bodies render, they no longer just escape** ([PRD #292](prds/done/292-slack-mrkdwn-rendering.md)). The four sites above that post whole-blob model-authored text — the chat answer, the plan/gate body, the clarification question, and (new here) the judge review / self-improvement / schedule-paused notification body — now run that text through `SlackMrkdwn` (`api/internal/slacksvc/mrkdwn.go`), a goldmark-AST CommonMark→Slack-mrkdwn renderer, in place of the old whole-blob `EscapeMrkdwn`. It is at least as safe as the escape it replaces: every text/code/raw-HTML node's content still goes through the same `slackutilsx.EscapeMessage` `EscapeMrkdwn` wraps, so an injected `<@U123>` mention or a `<https://evil|Open>` payload still parses as inert text, not live markup; a clickable `<url|label>` is only ever emitted from an `https://` link node, with both the URL and label sanitized so neither can re-open Slack's link grammar; and anything the renderer doesn't understand (tables, images, raw HTML) degrades to escaped plain text rather than a parse error. The trusted per-field chrome around these bodies — repo path, titles, agent names, verdict/category chips, deep links — is untouched by this change and stays on the per-field `EscapeMrkdwn` used everywhere else in this section, since that text carries intentional uzi-authored markup rather than being an untrusted blob.
-- **Inbound rate limits, at two layers.** The Socket Mode receive loop ACKs every envelope before processing (Slack retries an un-ACKed one in ~3s), and a per-Slack-user flood window bounds thread-reply volume. Separately, the two `/me/slack` endpoints that trigger an outbound DM to a caller-supplied Slack id (`PUT .../override`, `POST .../test-dm`) sit behind a dedicated, tighter per-user `mw.Limiter` (`SLACK_DM_RATE_LIMIT_MAX`/`_WINDOW`, distinct from the forge limiter above) plus a 30-second per-target DM cooldown in `slacksvc.Linker` — together bounding both an arbitrary-member DM-spam primitive and a member-id enumeration oracle.
+- **`api` is the sole custodian of both Slack tokens.** The bot (`xoxb-`) and app-level (`xapp-`) tokens are settings values sealed with the same `secretbox` key as every secret at rest, and structurally excluded from every value-producing settings read (`settings.SecretKeys`, kept out of `Defaults` so `All()`/`Effective()` cannot emit them). They are readable only through slacksvc's decrypt accessors. A dedicated `slacksvc.Redact` also scrubs `xoxb-`/`xapp-` patterns and the Socket Mode URL's `?ticket=` query (a live-session credential the token-shape redaction would miss) from every log line. Neither token nor the ticket URL is ever sent to a worker or agent.
+- **Identity mapping is the authz primitive for every inbound action.** `users.slack_resolved_id` (manual override or a cached `users.lookupByEmail` match) has a partial unique index (`users_slack_resolved_id_key WHERE slack_resolved_id IS NOT NULL`), so at most one uzi user resolves from a given Slack id. Every inbound handler re-resolves the Slack-authenticated actor through `GetConfirmedUserBySlackID`, which also requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true`, so an unconfirmed link or deactivated account resolves to no row and the action is refused. Since uzi emails are unverified at registration, the link-confirmation DM click, not the email match, is what makes the mapping trustworthy against account-squatting. Approve/reject and answer submissions then ride `workersvc.SubmitInput`'s own ownership check (`GetRunByIDForUser`) as a second gate. A Slack answer carries no id of its own (PRD #88 M3), so *which question it answers* is a derivation, not a fact: binding it to "whichever question is open on arrival" would be an **arrival-time key wearing identity's clothes** (a reply written against Q1 that lands after Q2 opened would be mis-stamped Q2 by the server, re-opening the race). It is instead bound to the question it **follows**, ordering its `ts` against the question message's `ts` (`slack_run_messages.question_id` + `question_ts`); a reply predating the current card is refused, an unorderable pair fails closed, and a requeue re-uses the question id so the recorded `ts` still points at the original card. The body is the `{question_id, answers}` shape (`workersvc.AnswerBody`, marshalled by the `gateSubmitter` adapter in `cmd/server`), and the server re-checks the id against `runs.open_question_id`.
+- **Content minimization, with four deliberate exceptions: the plan gate, the clarification question, milestone titles, and (PRD #191) chat message content.** Slack messages otherwise carry status, repo path, issue number and title, MR link, and failure reason only; diff content never leaves `api`. Every dynamic forge- or worker-controlled field (issue title, repo path, failure reason, a linked account's label) is `EscapeMrkdwn`-escaped before interpolation so it cannot smuggle a link or `@mention` into trusted deep-link markup, and a separate `ScrubSecrets` strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string. The four exceptions all post whole-blob model-authored text into the owner's own 1:1 DM through the **same pipeline** (`ScrubSecrets` → whole-blob `SlackMrkdwn` render (PRD #292) → rune-safe truncate to Slack's 3000-char block limit → deep link, `UZI_PUBLIC_BASE_URL`/`public_base_url`, appended as trusted markup outside the truncated region) and carry the **same limit**: only the four token *patterns* are stripped, so a secret a model quotes verbatim is not caught. The added exposure is Slack's cloud (retention, admin export, e-discovery) and that workspace's admin boundary, not other members.
+  - **The plan body** (user-approved 2026-07-10, [PRD #41](prds/done/41-plan-revision-gate.md) Decision 10): every gated plan and each Request-changes revision, posted into the run's thread.
+  - **The clarification question** ([PRD #88](prds/done/88-ask-user-clarification.md) Decision 9, `slacksvc.questionThreadBlocks`): headers, question text, and any suggested option labels/descriptions. Two specifics: the text is **attacker-influenceable in a directed way** (an injected repo file can steer what the lead asks), so the lead's prompt forbids asking for a credential (D-G); and the widening runs **both directions**, so the typed answer is `ScrubSecrets`-ed and length-bounded in `workersvc.SubmitInput` for every surface.
+  - **Milestone titles** ([PRD #122](prds/done/122-milestone-structured-runs.md) M4): a `✓ N/M · working <title>` line carries a plan-authored, model-authored title, `EscapeMrkdwn`-escaped like the status fields, so it shades from metadata into content (part of why the count is four, not two).
+  - **Chat message content**, default-on wherever Slack is on ([PRD #191](prds/done/191-slack-chat-surface.md) Decision 10, `slacksvc/chatpost.go`): a `kind='chat'` run's turns stream back into the DM thread. Two specifics: the **second-order exposure** is broader than the run-state lanes, since the chat agent's read tools (`list_runs`/`get_run`/`get_run_messages`) are user-scoped but **not** kind-scoped, so a chat can be asked to quote an **`issue` run's** content (plans, diffs, tool output) into Slack (the run-state lanes for the five non-chat kinds stay byte-identical); and the write direction is human-gated like the web Chat page, `start_run`/`propose_issue`/`cancel_run`/`steer_run` emitting **cards** whose button press (or Steer thread-reply), not the tool call, reaches `SubmitInput` through the presser's own connection (PRD #322).
+- **Untrusted bodies render, not just escape** ([PRD #292](prds/done/292-slack-mrkdwn-rendering.md)). The whole-blob sites above (plus the judge/self-improve/schedule-paused notification body) run through `SlackMrkdwn` (`api/internal/slacksvc/mrkdwn.go`), a goldmark-AST CommonMark→mrkdwn renderer, in place of whole-blob `EscapeMrkdwn`. It is at least as safe: every text/code/raw-HTML node still passes through the same `slackutilsx.EscapeMessage` (so an injected `<@U123>` or `<https://evil|Open>` stays inert), a clickable `<url|label>` is emitted only from an `https://` link node with URL and label sanitized, and anything unrecognized (tables, images, raw HTML) degrades to escaped plain text. The trusted per-field chrome (repo path, titles, agent names, chips, deep links) stays on per-field `EscapeMrkdwn`.
+- **Inbound rate limits, at two layers.** The Socket Mode receive loop ACKs every envelope before processing (Slack retries an un-ACKed one in ~3s), and a per-Slack-user flood window bounds thread-reply volume. Separately, the two `/me/slack` endpoints that trigger an outbound DM to a caller-supplied Slack id (`PUT .../override`, `POST .../test-dm`) sit behind a dedicated per-user `mw.Limiter` (`SLACK_DM_RATE_LIMIT_MAX`/`_WINDOW`) plus a 30-second per-target DM cooldown in `slacksvc.Linker`, bounding both a DM-spam primitive and a member-id enumeration oracle.
 - **The primary directive is unaffected.** Slack can only approve, reject, request changes to (feeding text back into the same planning session), or otherwise thread-steer a plan gate — a latency/authorization control, not a `main`-write capability. A wrongful approval can at worst produce a branch + MR, same as an approval from the web UI, and every one of the [four guardrail layers](#guardrail-layers-the-primary-directive) is untouched by this integration: Slack never holds a forge credential, never talks to a worker, and never reaches the agent's own context.
 - **Fails safe when unconfigured.** With Slack disabled (the default) or either token absent, the manager idles and every other surface behaves exactly as before — nothing here is a hard dependency of the run lifecycle.
 
 ## Chat with uzi (the fifth surface)
 
-uzi's fifth surface is a conversational one: a **Chat** page — and, since PRD #191, a **Slack DM** to the bot (see the Slack section above) — where a user talks to an agent that knows uzi's own source, can investigate the user's runs, and can draft GitLab issues or start runs the user confirms. It adds **no new service and no new trust boundary** — chat rides the existing worker/run machinery as a third run **kind** (`runs.kind = 'chat'`), the same way `ci_fix` did as a second kind. Full design rationale is in the PRD (`prds/done/39-chat-agent.md`, especially its Decision Log and the review-corrected decisions); user-facing usage is [docs/chat.md](docs/chat.md). The short map:
+uzi's fifth surface is a conversational one: a **Chat** page, and since PRD #191 a **Slack DM** to the bot (see the Slack section above), where a user talks to an agent that knows uzi's own source, can investigate the user's runs, and can draft forge issues or start runs the user confirms. It adds **no new service and no new trust boundary**: chat rides the existing worker/run machinery as a third run **kind** (`runs.kind = 'chat'`), the same way `ci_fix` did as a second kind. Full design rationale is in the PRD (`prds/done/39-chat-agent.md`); user-facing usage is [docs/chat.md](docs/chat.md). The short map:
 
 - **Chat is a run kind, not a new service.** A conversation is one `chat` run: `repo_id`/`issue_iid`/`branch` all NULL (`runs.repo_id` was made nullable, with `runs_kind_shape` enforcing the all-NULL shape for chat and the existing NOT-NULL shape for every other kind). The first user message and every follow-up are ordinary `run_user_inputs` (`kind='follow_up'`) rows — the initial message is atomically seeded into `run_user_inputs` by `CreateChatRun` so a chat can never exist without its first message — and the whole conversation streams through the same persisted-first `run_messages` → `/api/ws` pipeline (with REST replay) as any run. Chat runs are excluded from the board, the runs list, and the admin runs list (they have no repo/issue), but an individual chat is still openable owner-or-admin via the run view (`GET /api/runs/:id`).
-- **A dedicated claim lane, narrower credentials.** The worker polls a second, independent claim lane (`POST /api/worker/runs/claim?lane=chat`) alongside its run slot, so a chat is served concurrently with an executing run (up to `WORKER_CHAT_SESSIONS`, default 1) without queueing behind a long run. Chat is cheap to hold — no clone, no worktree, no provisioning. The chat claim payload is a **separate `ChatClaimPayload` that structurally cannot carry a forge PAT** — the `ForgePAT` field does not exist on it, one tier narrower than a run claim (which carries the PAT for the worker's git operations). A chat needs no repo and no forge connection at all: a user with only an Anthropic token can still chat.
-- **`ChatRunner`, not `RunRunner`.** Chat has its own slim runner (claim → session loop → complete) with no git/clone/push/MR spine. The `ChatExecutor` runs the SDK session with `cwd` at the baked source and a **deny-by-default tool surface**: the SDK `tools` option is restricted to `Read`/`Grep`/`Glob` plus the uzi MCP tools (not `allowedTools`, which does not confine under `bypassPermissions`), with `disallowedTools`, `settingSources: []`, the Bash deny-hook, and the **path-guard hook rooted at `/opt/uzi-src`** (with the worker join-token path in `extraSecretPaths` as defense-in-depth; the load-bearing protection is the outside-root deny, since the token file lives outside the baked root, plus the `/proc` deny that closes the one non-Bash egress for `CLAUDE_CODE_OAUTH_TOKEN`). No Bash, no Write/Edit, no WebFetch/WebSearch, no subagents. Lifecycle is idle-bounded + per-turn wall-clocked + turn-capped (server-enforced from persisted inputs, not worker-trusted); an idle sweep replaces the 2h `RUN_TIMEOUT` for chat. An idle-ended conversation is resumable via **Continue** (a new chat run carrying `resume_of_run_id`, resuming the persisted SDK session when the worker's disk still holds it).
-- **Baked source, never a clone.** uzi's own source is copied into the worker image at build time to `/opt/uzi-src` (read-only, root-owned) with a `BUILD_INFO` stamp, so the agent's answers match the *deployed* version exactly and need no PAT and no network — the same bundle-at-build discipline the docs section uses. This required moving the agent image's build context to the repo root with a per-Dockerfile ignore that hard-excludes `.env*`, `.git`, `inspiration/`, and `node_modules` (committed history is never baked).
-- **uzi tools are an in-worker MCP server** (`agent/src/uzi-tools.ts`, the `signals.ts` precedent): `list_runs` / `get_run` / `get_run_messages` read the worker's **own user's** runs (new user-scoped worker endpoints, `GET /api/worker/chat/runs*`, that filter by the authenticated worker's `user_id` — never a bare run id, so a foreign id is a 404), and `propose_issue` drafts an issue on the **current** chat run only (closure-scoped, no injectable run id) and **never writes the forge**. All forge- and model-derived text returned by the read tools (titles, failure reasons, messages, plans) is wrapped in an **untrusted-evidence fence** with a per-call CSPRNG nonce in the closing sentinel, so attacker-authored evidence cannot forge a close tag and break out to become an instruction — the same posture `ci_fix` uses for job logs. `start_run`, and — since PRD #322 — `cancel_run` and `steer_run`, are the run-control analogue of the next point: each emits a card only (`run_request` / `cancel_request` / `steer_request`) and makes **no mutating call** from the tool handler, so the run write happens on the human's Create/Start/Cancel click or Steer thread-reply, through the presser's own connection, resolved against the existing owner-scoped `SubmitInput` (`cancel`/`follow_up`) — no new endpoint, no new run kind, no migration.
-- **Issue creation is structurally human-gated.** `propose_issue` persists a `pending` `issue_proposals` row and emits a `proposal`-kind run_message rendered as a card by the browser (and, PRD #191, as a Block Kit card in Slack); only a human Create click — the browser's session+CSRF `POST /api/chats/:id/proposals/:pid/confirm`, or the Slack card's button routed through the same lifted `ConfirmProposalForUser` — executes `Forge.CreateIssue` via the user's own connection (forge-first, PAT-redacted, per-user forge-rate-limited). Confirm is **claim-first** (atomic `pending → confirming` before the forge call, revert on failure) so a double-confirm creates exactly one issue; a stuck-`confirming` row is swept back to `pending`, and a boot-time clamp keeps the sweep timeout safely above the forge HTTP timeout so a slow-but-alive confirm is never reaped into a duplicate. The proposal write path simply does not exist without the human click.
+- **A dedicated claim lane, narrower credentials.** The worker polls a second, independent claim lane (`POST /api/worker/runs/claim?lane=chat`) alongside its run slot, so a chat is served concurrently with an executing run (up to `WORKER_CHAT_SESSIONS`, default 1) without queueing behind a long run. Chat is cheap to hold (no clone, worktree, or provisioning). The chat claim payload is a **separate `ChatClaimPayload` that structurally cannot carry a forge PAT** (the `ForgePAT` field does not exist on it), one tier narrower than a run claim. A chat needs no repo and no forge connection: a user with only an Anthropic token can still chat.
+- **`ChatRunner`, not `RunRunner`.** Chat has its own slim runner (claim → session loop → complete) with no git/clone/push/MR spine. The `ChatExecutor` runs the SDK session at the baked source under a **deny-by-default tool surface**: `tools` restricted to `Read`/`Grep`/`Glob` plus the uzi MCP tools (not `allowedTools`, which does not confine under `bypassPermissions`), with `disallowedTools`, `settingSources: []`, the Bash deny-hook, and the **path-guard hook rooted at `/opt/uzi-src`** (the load-bearing protection is the outside-root deny, since the token file lives outside the baked root, plus the `/proc` deny closing the one non-Bash egress for `CLAUDE_CODE_OAUTH_TOKEN`). No Bash, Write/Edit, WebFetch/WebSearch, or subagents. Lifecycle is idle-bounded + per-turn wall-clocked + turn-capped (server-enforced from persisted inputs); an idle sweep replaces the 2h `RUN_TIMEOUT`. An idle-ended conversation is resumable via **Continue** (a new chat run carrying `resume_of_run_id`).
+- **Baked source, never a clone.** uzi's own source is copied into the worker image at build time to `/opt/uzi-src` (read-only, root-owned) with a `BUILD_INFO` stamp, so the agent's answers match the *deployed* version exactly and need no PAT and no network, the same bundle-at-build discipline the docs section uses. This moved the agent image's build context to the repo root with a per-Dockerfile ignore that hard-excludes `.env*`, `.git`, `inspiration/`, and `node_modules` (committed history is never baked).
+- **uzi tools are an in-worker MCP server** (`agent/src/uzi-tools.ts`, the `signals.ts` precedent): `list_runs`/`get_run`/`get_run_messages` read the worker's **own user's** runs (user-scoped worker endpoints `GET /api/worker/chat/runs*` filtering by the authenticated worker's `user_id`, never a bare run id, so a foreign id is a 404), and `propose_issue` drafts on the **current** chat run only (closure-scoped) and **never writes the forge**. All forge- and model-derived text the read tools return is wrapped in an **untrusted-evidence fence** with a per-call CSPRNG nonce in the closing sentinel, the same posture `ci_fix` uses for job logs. `start_run` and, since PRD #322, `cancel_run`/`steer_run` each emit a **card only** (`run_request`/`cancel_request`/`steer_request`) and make no mutating call, so the run write happens on the human's click or Steer thread-reply through the presser's own connection, resolved against the owner-scoped `SubmitInput` (no new endpoint, run kind, or migration).
+- **Issue creation is structurally human-gated.** `propose_issue` persists a `pending` `issue_proposals` row and emits a `proposal` run_message rendered as a card (browser, and PRD #191 a Block Kit card in Slack); only a human Create click (`POST /api/chats/:id/proposals/:pid/confirm`, or the Slack button through the lifted `ConfirmProposalForUser`) executes `Forge.CreateIssue` via the user's own connection (forge-first, PAT-redacted, forge-rate-limited). Confirm is **claim-first** (atomic `pending → confirming`, revert on failure) so a double-confirm creates one issue; a stuck-`confirming` row is swept back to `pending`, with a boot-time clamp keeping the sweep timeout above the forge HTTP timeout so a slow confirm is never reaped into a duplicate.
 - **The primary directive is unaffected.** Chat holds no forge credential and has no git access; the worst it can do is draft an issue the user must click to file. Every guardrail layer is intact — `settingSources` stays `[]`, the deny-hooks still fire, and no PAT is ever in reach of the chat agent. Named residual (unchanged from the run surface): `CLAUDE_CODE_OAUTH_TOKEN` is in the agent's env, but chat's no-Bash/no-network/no-`/proc` surface is strictly stronger than a run's, so a prompt-injected chat has no egress channel for it.
-- **Slack is a second entry point to the same chat** (PRD #191). A top-level DM to the bot opens a `kind='chat'` run through the identical service verbs the web uses; nothing kind-scoped forks (no new run kind, no new claim lane, no new credential — the chat claim still carries no forge PAT). The composite operations the web did in its *handlers* — proposal confirm and run start — were lifted into `workersvc` (`ConfirmProposalForUser`, `StartRunForUser`) so both surfaces share one claim-first, ownership-scoped, PRD-gated path; the `start_run` tool lands in web chat in the same change. Turns stream back into the DM thread (content-widened per Decision 10, above); issue proposals and start-run requests render as Block Kit cards in a third `slack_chat_*` action namespace (not the plan gatekeeper's), whose Create/Start click performs the write through the presser's own connection. The per-user chat spend limiter is shared across web and Slack (one budget bounds the person, not the surface), and the run-affecting verbs keep riding `workersvc`'s ownership checks, so a forged card value can only ever act on the confirmed presser's own runs.
+- **Slack is a second entry point to the same chat** (PRD #191). A top-level DM opens a `kind='chat'` run through the identical service verbs the web uses; nothing kind-scoped forks (no new run kind, claim lane, or credential). The composite web-handler operations (proposal confirm, run start) were lifted into `workersvc` (`ConfirmProposalForUser`, `StartRunForUser`) so both surfaces share one claim-first, ownership-scoped, PRD-gated path; the `start_run` tool lands in web chat in the same change. Turns stream back into the DM thread (content-widened per the Slack section); proposals and start-run requests render as Block Kit cards in a `slack_chat_*` action namespace whose Create/Start click performs the write through the presser's own connection. The per-user chat spend limiter is shared across web and Slack, and the run-affecting verbs keep riding `workersvc`'s ownership checks, so a forged card value can only act on the presser's own runs.
 
 ## The uzi CLI: a second API consumer
 
 Until PRD #64, `web` (browser + session cookie) was the API's only caller.
 The `uzi` CLI (`api/cmd/uzi/`, same module as `api`) is a second one, driven
-identically by humans and agents — it talks to the same JSON API `web` does,
-over a different credential. It adds **no new service and no new inbound
-port**: the CLI is an outbound-only client of the existing `api`, the same
-way a browser is. User-facing usage is [docs/cli.md](docs/cli.md); full
-design rationale — including the security audit that found and closed the
-scope-ceiling gap below — is in the PRD (`prds/done/64-uzi-cli.md`, especially its
-Decision Log).
+identically by humans and agents over a different credential against the same
+JSON API. It adds **no new service and no new inbound port**: it is an
+outbound-only client of `api`, like a browser. Usage is
+[docs/cli.md](docs/cli.md); full rationale, including the security audit that
+closed the scope-ceiling gap below, is in the PRD (`prds/done/64-uzi-cli.md`).
 
 `uzi tui` (PRD #112, `api/cmd/uzi/tui_*.go`) is a full-screen view over that same
-client — a live runs board, a run-detail split with a per-agent lane rail and
-transcript, and run-level steering. It adds **no endpoint and no service**: every
+client (live runs board, run-detail split with a per-agent lane rail and
+transcript, run-level steering). It adds **no endpoint and no service**: every
 read and write is a call the plain CLI already makes. Its one new capability is a
-Bearer-authenticated subscription to the existing `/api/ws` hub, which required
-moving that route from the cookie-only group into `RequireUser` — a route move with
-`websocket.Accept`'s options untouched (see the ws section above for why the
-same-origin rule still covers both credential paths). It lives in `package main`
-rather than a `tui/` subpackage because Go forbids importing a main package, and the
-sanitize and render helpers it must reuse live there; that trade is recorded in
-[prds/done/112-uzi-tui.md](prds/done/112-uzi-tui.md). User-facing usage is
-[docs/cli.md](docs/cli.md); the plain `--json` verbs remain the agent-facing surface
-and are unchanged.
+Bearer-authenticated subscription to `/api/ws`, which required moving that route
+from the cookie-only group into `RequireUser` with `websocket.Accept`'s options
+untouched (see the ws section for why the same-origin rule still covers both
+credential paths). It lives in `package main` because Go forbids importing a main
+package and the sanitize/render helpers it reuses live there
+([prds/done/112-uzi-tui.md](prds/done/112-uzi-tui.md)). The plain `--json` verbs
+remain the agent-facing surface, unchanged.
 
-The CLI can also hold several credentials at once as **named contexts**
-(`uzi context …`, PRD #427) and switch which one a command uses via a flag, an
-env var, or a sticky default. This is purely client-side credential selection —
-which already-stored `{URL, token}` pair a command sends — with no server, API,
-or scope change; authority is still the token's server-enforced scope. See
-[Config and credentials](docs/cli.md#config-and-credentials) for the mechanics.
+The CLI can hold several credentials as **named contexts** (`uzi context …`,
+PRD #427), switching which one a command uses via a flag, env var, or sticky
+default. This is purely client-side selection of which stored `{URL, token}` pair
+a command sends, with no server, API, or scope change; authority is still the
+token's server-enforced scope. See
+[Config and credentials](docs/cli.md#config-and-credentials).
 
 - **One new credential, one new middleware.** A `cli_tokens` row (`uzc_`
   user-scoped / `uza_` admin-scoped, sha256 at rest, mirroring the worker
   join-token posture) is presented as `Authorization: Bearer …`.
   `mw.RequireUser` dispatches on whether that header **parses** as
-  `Bearer <non-empty>` — never on bare presence, and never "try cookie, fall
-  back to Bearer" — so a request takes exactly one path: a parsing Bearer
-  header goes CLI-token-only (no CSRF), anything else goes through the
-  existing `RequireAuth` cookie path, CSRF-enforced, byte-identical to
-  before. Both populate the same `userKey` every handler already reads, so
-  no handler needed to change to gain a CLI-reachable route.
-- **The route swap is enumerated per route, not per group.** Only the routes
-  a v1 CLI verb needs were moved onto `RequireUser` (`GET /api/auth/me`,
-  the `/api/runs` read+input routes including `/review`, `GET /api/repos` +
-  `POST /api/repos/{id}/runs`, `GET/DELETE /api/workers`, the 9 admin GETs).
-  Everything else — `POST /api/workers` (mints a plaintext join token that
-  can read decrypted secrets), `/api/me/cli-tokens` itself, `/api/vault/*`,
-  `/api/forge/*`, `/api/me/secrets/*`, and every admin write — stayed
-  cookie-only. Swapping whole route groups would have hit endpoints no v1
-  command needs and materially widened what a stolen CLI token could do; see
-  the PRD's route-disposition table for the full per-route reasoning.
-- **`scope` is a ceiling, enforced in the middleware, not just at
-  `/api/admin/*`.** `RequireAdminRO` is a plain `user.IsAdmin` check — the
-  real control is upstream, in `RequireUser`: a CLI token whose `scope !=
-  'admin_ro'` gets a **copy** of the user row with `IsAdmin=false` installed
-  in the request context. Every owner-or-admin handler outside
+  `Bearer <non-empty>`, never on bare presence and never "try cookie, fall back
+  to Bearer", so a request takes exactly one path: a parsing Bearer header goes
+  CLI-token-only (no CSRF), anything else goes through `RequireAuth` cookie+CSRF,
+  byte-identical to before. Both populate the same `userKey`, so no handler
+  changed to gain a CLI-reachable route.
+- **The route swap is enumerated per route, not per group.** Only the routes a v1
+  CLI verb needs were moved onto `RequireUser` (`GET /api/auth/me`, the
+  `/api/runs` read+input routes including `/review`, `GET /api/repos` + `POST
+  /api/repos/{id}/runs`, `GET/DELETE /api/workers`, the 9 admin GETs). Everything
+  else (`POST /api/workers`, `/api/me/cli-tokens`, `/api/vault/*`, `/api/forge/*`,
+  `/api/me/secrets/*`, every admin write) stayed cookie-only, since swapping whole
+  groups would have widened what a stolen CLI token could do. See the PRD's
+  route-disposition table.
+- **`scope` is a ceiling, enforced in the middleware, not just at `/api/admin/*`.**
+  `RequireAdminRO` is a plain `user.IsAdmin` check; the real control is upstream in
+  `RequireUser`, which gives a CLI token whose `scope != 'admin_ro'` a **copy** of
+  the user row with `IsAdmin=false`. Every owner-or-admin handler outside
   `/api/admin/*` that reads admin-ness live (`GetRunForViewer`,
-  `ListRunMessagesForViewer`, `GetReviewForTarget` — three run-visibility
-  checks an admin's default `uzc_` would otherwise widen to "any user's
-  run") degrades to owner-only **for free**, with no handler change. This is
-  the fix a security audit added mid-design: an earlier draft checked scope
-  only under `/api/admin/*` and would have shipped an admin's everyday
-  token able to read every user's run transcripts.
-- **`apitypes` (`api/internal/apitypes/`) is a stdlib-only leaf.** The CLI
-  imports handler DTOs through it rather than `internal/handler` directly,
-  so the binary never drags in `chi`/`pgx`. Enforced mechanically, not by
-  convention: a test runs `go list -deps ./cmd/uzi` and fails if `pgx` or
-  `chi` appears in the dependency graph. The api↔web JSON wire contract for
-  the hot DTOs is pinned the same mechanical way: `fixtures/api-contract/`
-  holds a Go-recorded `zero.json`/`full.json` per DTO, checked by a Go half
-  (byte-equal marshal + `DisallowUnknownFields` round-trip) and a TS half
-  (`web/src/lib/apiContract.test.ts`, keyof set-equality + literal-widened
-  nullability via `resolveJsonModule`), so a Go-side or TS-side drift
-  reddens exactly that side's gate.
-- **Browser login is poll-based, not a loopback listener.** `uzi login`
-  generates a PKCE verifier locally, sends only its challenge to
-  `POST /api/auth/cli/start`, prints a `user_code` plus a `/cli-auth?request=`
-  URL, and polls `POST /api/auth/cli/poll` until a human — in an
-  already-authenticated browser tab, via whatever this instance's login
-  method is (password or OIDC) — types the code and approves. No token is
+  `ListRunMessagesForViewer`, `GetReviewForTarget`) degrades to owner-only for
+  free. This is the fix a security audit added mid-design: an earlier draft checked
+  scope only under `/api/admin/*` and would have shipped an admin's everyday token
+  able to read every user's run transcripts.
+- **`apitypes` (`api/internal/apitypes/`) is a stdlib-only leaf.** The CLI imports
+  handler DTOs through it rather than `internal/handler`, so the binary never drags
+  in `chi`/`pgx`; a test runs `go list -deps ./cmd/uzi` and fails if either
+  appears. The api↔web JSON wire contract for the hot DTOs is pinned the same way:
+  `fixtures/api-contract/` holds a Go-recorded `zero.json`/`full.json` per DTO,
+  checked by a Go half (byte-equal marshal + `DisallowUnknownFields`) and a TS half
+  (`web/src/lib/apiContract.test.ts`), so a drift reddens exactly that side's gate.
+- **Browser login is poll-based, not a loopback listener.** `uzi login` generates
+  a PKCE verifier locally, sends only its challenge to `POST /api/auth/cli/start`,
+  prints a `user_code` plus a `/cli-auth?request=` URL, and polls
+  `POST /api/auth/cli/poll` until a human approves in an already-authenticated
+  browser tab (via this instance's login method, password or OIDC). No token is
   minted at approve; the poll mints it, claim-first (`UPDATE … WHERE
-  status='approved' … RETURNING`) so two racing polls can't both mint from
-  one approval. This deliberately avoids a loopback-listener design (a
-  session JWT in a URL, SSH-hostile, LAN-exposed binding heuristics) — see
-  the PRD's inspiration-check table.
+  status='approved' … RETURNING`) so two racing polls can't both mint from one
+  approval. This avoids a loopback-listener design (a session JWT in a URL,
+  SSH-hostile, LAN-exposed binding heuristics).
 
 ## Docs
 
@@ -1415,8 +1176,9 @@ rationale.
 - **Link rewriting.** A relative link to another in-app-routable page becomes an
   in-app route (`/docs/:slug`) — `user` pages for everyone, `operator` pages for
   admins (`rewriteHref(href, isAdmin)`); a link to a repo-only file (`../plan.md`,
-  a `design`/`contributor` doc) rewrites to the pinned GitLab blob URL instead.
-  `#anchor` fragments are preserved either way.
+  a `design`/`contributor` doc) rewrites to the pinned GitHub blob URL instead
+  (`REPO_BLOB_BASE`, `web/src/lib/docs.ts`). `#anchor` fragments are preserved
+  either way.
 - **Build-time validation gate.** `web/scripts/check-docs.mjs` runs ahead of
   `npm run build` and fails on missing/invalid frontmatter, a missing or
   duplicate `order` among `user` or `operator` pages (each its own namespace), a
@@ -1521,61 +1283,43 @@ Shipped in the chart but **off by default** (`workers.enabled: false`); see
 and [deploy/README.md](deploy/README.md#hosted-workers-prd-58) for turning it
 on.
 
-- **Scoped to two empty namespaces, one of them privileged.** Its
-  ServiceAccount carries a `Role` bound to the dedicated `uzi-workers`
-  (**restricted**-tier) namespace containing nothing but hosted worker
-  objects — no CNPG, no other app's Secrets, no privileged ServiceAccounts —
-  plus, when the docker tier is enabled, a second `Role`+`RoleBinding` into a
-  dedicated `uzi-workers-docker` namespace running
-  `pod-security.kubernetes.io/enforce: privileged` (PRD #83 M3). The
-  privileged tier is a recorded deviation from the PRD's original
-  `baseline`-namespace intent: the cluster's k8s and containerd versions
-  are below what pod user namespaces need, so a flagless-rootless DinD
-  sidecar is infeasible there, and the userns remap inside the
-  `docker:dind-rootless` image is the security property instead. Isolating
-  that privileged tier in its own namespace is what still bounds a
-  compromised controller — a `Role` that can create pods in a namespace can
-  mount any Secret and impersonate any ServiceAccount already there, so the
-  emptiness (not the RBAC verbs alone) is the real fence, exactly as the
-  restricted namespace already relied on — plus its own default-deny
-  `NetworkPolicy` (in-cluster lateral egress denied; external egress is the
-  named [PRD #50](prds/50-llm-egress-proxy.md) residual, not closed here).
-  **The two tiers' external egress is OPPOSITE, and a probe that does not name
-  the tier is uninterpretable:** the **restricted** tier enforces the FQDN
-  allowlist (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml`
-  default-deny floor — only `cache.nixos.org`, the forge (as of
-  [PRD #808](prds/done/808-worker-egress-single-source.md), derived from
-  `FORGE_ALLOWED_BASE_URLS` — one chart value, `forge.allowedBaseURLs`, feeds
-  both the api's SSRF allowlist and the restricted-tier FQDN list, so the two
-  can no longer drift apart), `*.anthropic.com`, `search.devbox.sh` (also
-  added by PRD #808 — a deliberate egress **widening** so the devbox package
-  resolver is reachable on this tier, backstopped by the server-side tier-1
-  admin allowlist rather than by egress being locked), `api.github.com`
-  (re-added by #818 as a devbox/nixpkgs host — `devbox install` resolves the
-  floating `nixpkgs-unstable` ref through it, forge-independent — distinct from
-  the CNPG use #285 removed), and, as of #285, the CNPG chart's OCI pair
-  (`ghcr.io` + `pkg-containers.githubusercontent.com`, replacing four
-  GitHub-ish hosts as the CNPG-fetch route). A host that stays **off**-allowlist
-  on this tier is `codeload.github.com` (the nixpkgs source tarball —
-  **TIMEOUT**, measured #818), while the **docker** tier reaches arbitrary
-  internet hosts by design (`0.0.0.0/0`-except-in-cluster by CIDR,
-  `worker-docker-networkpolicy.yaml`: `codeload.github.com` **301** completes
-  there) — [PRD #50](prds/50-llm-egress-proxy.md)'s
-  residual, not a broken control. A docker-tier reading looks exactly like a
-  broken standard-tier allowlist; two false alarms have resulted (an operator
-  during #123, and a closed #283 on 2026-08-09), so **check `uzi admin workers`
-  → `docker:` (true = docker tier = broad egress) before concluding anything
-  about egress enforcement, and re-measure on the restricted tier.** A
-  build-time completeness guard (`scripts/assert-chart-render.sh`, run inside
-  the `helm-chart` CI job) fails the render, naming the missing host, if any
+- **Scoped to two empty namespaces, one of them privileged.** Its ServiceAccount
+  carries a `Role` bound to the dedicated `uzi-workers` (**restricted**-tier)
+  namespace holding nothing but hosted worker objects, plus, when the docker tier
+  is enabled, a second `Role`+`RoleBinding` into a dedicated `uzi-workers-docker`
+  namespace running `pod-security.kubernetes.io/enforce: privileged` (PRD #83 M3).
+  The privileged tier is a recorded deviation from the PRD's `baseline`-namespace
+  intent: the cluster's k8s/containerd versions are below what pod user namespaces
+  need, so the userns remap inside the `docker:dind-rootless` image is the security
+  property instead. Isolating that tier in its own empty namespace is what bounds a
+  compromised controller (a `Role` that can create pods can mount any Secret and
+  impersonate any ServiceAccount already there, so the emptiness, not the RBAC
+  verbs alone, is the fence), plus its own default-deny `NetworkPolicy` (external
+  egress is the named [PRD #50](prds/50-llm-egress-proxy.md) residual).
+  **The two tiers' external egress is OPPOSITE, and a probe that does not name the
+  tier is uninterpretable:** the **restricted** tier enforces an FQDN allowlist
+  (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml` default-deny
+  floor) reaching only `cache.nixos.org`, the forge (derived from
+  `FORGE_ALLOWED_BASE_URLS` through one chart value `forge.allowedBaseURLs`, since
+  [PRD #808](prds/done/808-worker-egress-single-source.md), so the SSRF allowlist
+  and the FQDN list cannot drift), `*.anthropic.com`, `search.devbox.sh`,
+  `api.github.com` (the devbox/nixpkgs resolver host), and the CNPG chart's OCI pair
+  (`ghcr.io` + `pkg-containers.githubusercontent.com`); `codeload.github.com` stays
+  **off**-allowlist there (**TIMEOUT**). The **docker** tier reaches arbitrary
+  internet hosts by design (`0.0.0.0/0`-except-in-cluster, `worker-docker-networkpolicy.yaml`),
+  [PRD #50](prds/50-llm-egress-proxy.md)'s residual, not a broken control. A
+  docker-tier reading looks exactly like a broken restricted-tier allowlist, so
+  **check `uzi admin workers` → `docker:` (true = docker tier = broad egress)
+  before concluding anything about egress enforcement, and re-measure on the
+  restricted tier.** A build-time completeness guard (`scripts/assert-chart-render.sh`,
+  in the `helm-chart` CI job) fails the render, naming the missing host, if any
   canonical worker destination is absent from the rendered restricted-tier
-  allow-list — turning "the tight tier silently can't reach X" into a red gate
-  instead of a hung run.
-  Both namespaces' Roles carry the same pinned-minimal verbs: Deployments/PVCs
-  create/list/patch(Deployments only)/delete; Secrets **create/delete
-  only** — no `get`/`list`, so the controller writes each worker's join
-  token once and can never read any token back, including one it didn't
-  create. No pod access at all, in either namespace.
+  allow-list. Both namespaces' Roles carry the same pinned-minimal verbs:
+  Deployments/PVCs create/list/patch(Deployments only)/delete; Secrets
+  **create/delete only** (no `get`/`list`, so the controller writes each join token
+  once and can never read one back). No pod access, in either namespace. See
+  [ADR-285](adr/0285-worker-egress-tier-trust-model.md) for the two-tier egress
+  trust model.
 - **Outbound-only, like a worker.** The controller authenticates to `api`
   with its own bearer credential and polls a controller-facing endpoint for
   desired state; there is no inbound port on the controller and `api` never
@@ -1687,7 +1431,6 @@ open (a CLI drain verb, live-cluster validation) are in
 
 ## Not yet in scope
 
-Auto-starting a run from a GitLab label, a CI-status watching/fixing agent,
 WS wakeup for idle workers (a 3s poll is the MVP), **wiring PRD #84's
 capability-aware readiness pass into PRD #88's `ask_user` path** (#84's own
 infra-readiness scope — declare, match, gate — has shipped; see
