@@ -4756,12 +4756,15 @@ func (q *Queries) MarkRunFailedByID(ctx context.Context, arg MarkRunFailedByIDPa
 }
 
 const markRunUsageRefolded = `-- name: MarkRunUsageRefolded :exec
-UPDATE runs SET usage_refolded = true, updated_at = now() WHERE id = $1
+UPDATE runs SET usage_refolded = true WHERE id = $1
 `
 
 // Marks a run's usage as refolded per leg (PRD #1079 M3), inside RefoldRunUsage's
 // transaction so the delete+fold+mark commit atomically. Once true the ticker never
 // selects the run again and the incremental fold stays its only usage writer.
+// Deliberately does NOT touch updated_at: this is a one-off backfill over historical
+// terminal runs, and RunDTO exposes runs.updated_at, so bumping it would make every
+// pre-migration run appear recently updated in the API/UI. Refold is invisible to recency.
 func (q *Queries) MarkRunUsageRefolded(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, markRunUsageRefolded, id)
 	return err
