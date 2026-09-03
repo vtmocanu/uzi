@@ -27,11 +27,16 @@ ALTER TABLE run_usage DROP CONSTRAINT run_usage_pkey,
     ADD PRIMARY KEY (run_id, session_id, model, lineage_epoch);
 
 -- Retire the mutable per-run counter (PRD D4). With the position-absolute epoch there
--- is nothing to bump: runs.lineage_epoch, BumpRunLineageEpoch and the
--- resume_lineage_break bump loop all go away. This DROP regenerates every
--- `SELECT *` / `RETURNING *` on runs (a broad but mechanical sqlc diff removing
--- LineageEpoch from the Run struct and its scans).
-ALTER TABLE runs DROP COLUMN lineage_epoch;
+-- is nothing to bump: BumpRunLineageEpoch and the resume_lineage_break bump loop are
+-- deleted in code, and nothing reads or writes runs.lineage_epoch any more.
+--
+-- The COLUMN itself is intentionally KEPT this release, NOT dropped. check:migration-additive
+-- (PRD #422 Decision 2 / M6, gate:repo) forbids dropping an api-facing column in a forward
+-- migration: sqlc emits explicit column lists, so an N-1 api replica still SELECTs
+-- runs.lineage_epoch by name during a rolling release and would error "column does not
+-- exist" the instant it is dropped. The column becomes dead (sqlc still generates an
+-- unread LineageEpoch field on the Run struct); a follow-up migration drops it a release
+-- later, once no N-1 replica remains (issue #1087).
 
 -- M3's one-off history-refold marker (PRD D5). A row is "refolded" once its run_usage
 -- rows are keyed per leg. New rows are born refolded (DEFAULT true), so the incremental
@@ -57,8 +62,8 @@ DROP INDEX idx_run_messages_init;
 
 ALTER TABLE runs DROP COLUMN usage_refolded;
 
--- Restore the mutable counter default 0 (every row single-lineage, as before 00176 use).
-ALTER TABLE runs ADD COLUMN lineage_epoch integer NOT NULL DEFAULT 0;
+-- runs.lineage_epoch is untouched by the Up (the counter was retired in code but the
+-- column kept for rolling-upgrade safety), so the Down does not re-add it.
 
 -- Collapse run_usage to the old key BEFORE restoring the old PK: the four-column key
 -- can hold several epochs per (run_id, session_id, model), which the three-column PK
