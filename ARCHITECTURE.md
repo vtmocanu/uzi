@@ -1,6 +1,6 @@
 # Architecture
 
-uzi's current MVP is a docker-compose stack of three always-on services (`web`, `api`, `db`) plus one opt-in, profile-gated service (`agent`, a per-user worker — PRD #4), with three trust boundaries: the inbound edge at nginx, the API's outbound calls to the forge (GitLab), and the API's connection to each user's worker. This document describes that shape; see [docs/auth-design.md](docs/auth-design.md) for the auth surface, and [docs/proc-hardening.md](docs/proc-hardening.md) for the worker/agent process-isolation detail the Secrets and Guardrails sections below summarize.
+uzi's current MVP is a docker-compose stack of three always-on services (`web`, `api`, `db`) plus one opt-in, profile-gated service (`agent`, a per-user worker — PRD #4), with three trust boundaries: the inbound edge at nginx, the API's outbound calls to the forge (GitLab, Forgejo or GitHub), and the API's connection to each user's worker. This document describes that shape; see [docs/auth-design.md](docs/auth-design.md) for the auth surface, and [docs/proc-hardening.md](docs/proc-hardening.md) for the worker/agent process-isolation detail the Secrets and Guardrails sections below summarize.
 
 ## Services
 
@@ -403,7 +403,7 @@ whether the cheaper run is as good.
 browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (compose) / HTTPS (k8s), poll/claim/report── agent (worker, per user)
                                        │  ▲                                        │
                                        ▼  │ decrypted per-run secrets              ▼
-                                      db  └── forge (GitLab): issues, MRs     repo clone + worktrees
+                                      db  └── forge: issues, MRs             repo clone + worktrees
 ```
 
 ### Server/worker trust boundary
