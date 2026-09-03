@@ -22,9 +22,15 @@ open-web lookup.
 - **M2 (#1036)** — design FINALIZED (D7 resolved: Option B, worker-side temp-index
   `.github/workflows` overlay; `agent/src/git.ts`-only, broker untouched). Ready to
   implement now that M1 merged. Rebases on M1's adopt block.
-- **M3 (#1037)** — designed, server-only (`service.go`; worker adoption plumbing already
-  threads `checkpoint_tip`+`resume` for all kinds — see M3). File-disjoint from M2 under
-  Option B, so **M2 ‖ M3 can run in parallel** after M1.
+- **M3 (#1037)** — **IMPLEMENTED** (this MR), server-only. `Publish` and
+  `deleteCheckpointBestEffort` in `api/internal/workersvc/service.go` now gate on a
+  checkpoint-eligible SET (issue + self_improve) via a new kind-first
+  `checkpoint_branch.go` helper; the worker adoption plumbing already threaded
+  `checkpoint_tip`+`resume` for all kinds. Contract A pinned by
+  `fixtures/checkpoint-branch/cases.json` + a Go and a TS half. No schema/migration,
+  no `git.ts`/`sdk-executor.ts` change. File-disjoint from M2 under Option B, so
+  **M2 ‖ M3 ran in parallel** after M1. Covers graceful interrupts only; the
+  hard-kill mid-run cadence stays a documented residual (see *Deferred*).
 
 ## Problem
 

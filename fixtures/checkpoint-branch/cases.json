@@ -1,0 +1,7 @@
+{
+  "eligible": [
+    { "kind": "issue", "run_id": "11111111-1111-4111-8111-111111111111", "issue_iid": 42, "branch": "agent/issue-42" },
+    { "kind": "self_improve", "run_id": "22222222-2222-4222-8222-222222222222", "issue_iid": 7, "branch": "uzi/self-improve/22222222-2222-4222-8222-222222222222" }
+  ],
+  "ineligible": ["chat", "judge", "prompt", "task", "ci_fix", "mr_rework"]
+}

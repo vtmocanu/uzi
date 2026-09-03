@@ -95,6 +95,46 @@ func TestSetStateCompletedDeletesCheckpoint(t *testing.T) {
 	}
 }
 
+// TestSetStateCompletedSelfImproveDeletesCheckpoint pins PRD #1062 M3: a terminal
+// self_improve run whose checkpoint_tip is non-NULL deletes its checkpoint ref, targeting
+// the run-uuid-keyed branch uzi/self-improve/<runID> — NOT the issue branch, even though
+// the run carries a valid issue_iid. It would FAIL against the old issue-only gate (which
+// no-op'd every non-issue kind, so this delete never fired).
+func TestSetStateCompletedSelfImproveDeletesCheckpoint(t *testing.T) {
+	runID := uuid.New()
+	fs := &fakeStore{
+		runOwned: store.Run{
+			ID:       runID,
+			Kind:     runkind.SelfImprove,
+			IssueIid: pgtype.Int8{Int64: 7, Valid: true}, // stable tracking issue, must be ignored
+			Status:   "completed",
+		},
+		setCompletedRows: 1,
+	}
+	svc, calls := checkpointDeleteSvc(t, fs, nil)
+
+	_, applied, err := svc.SetState(context.Background(), worker(), runID, StateRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("SetState(completed): %v", err)
+	}
+	if !applied {
+		t.Fatalf("applied = false, want true")
+	}
+	if fs.setCompleted == nil {
+		t.Fatalf("SetRunCompleted was not called; the terminal state must be recorded")
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("delete calls = %d, want 1 (a self_improve run's checkpoint must be cleaned up)", len(*calls))
+	}
+	wantBranch := "uzi/self-improve/" + runID.String()
+	if got := (*calls)[0].Branch; got != wantBranch {
+		t.Errorf("delete branch = %q, want %q (run-uuid-keyed, NOT the issue branch)", got, wantBranch)
+	}
+	if got := (*calls)[0].ExpectedOldTip; got != testCheckpointTip {
+		t.Errorf("delete ExpectedOldTip = %q, want the persisted tip %q", got, testCheckpointTip)
+	}
+}
+
 // TestSetStateCompletedNullCheckpointTipNoDelete is the PRD #1042 M3 skip-on-NULL
 // guard: a checkpoint-eligible issue run whose runs.checkpoint_tip is NULL NEVER
 // published a checkpoint ref, so it owns nothing — deleteCheckpointBestEffort must NOT
