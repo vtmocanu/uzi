@@ -893,6 +893,22 @@ describe("Schedules — pause all (PRD #1093)", () => {
     expect(mockApi.getSchedulePause.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("keeps the last known paused state when the expiry re-read fails (never guesses 'not paused')", async () => {
+    const soon = new Date(Date.now() + 60).toISOString();
+    mockApi.getSchedulePause
+      .mockResolvedValueOnce({ paused: true, until: soon })
+      .mockRejectedValue(new Error("network down"));
+    renderRoot();
+    await waitFor(() => expect(screen.getByText(/All schedules paused until/)).toBeTruthy());
+    // The timer fired and the re-read was attempted (and rejected).
+    await waitFor(() => expect(mockApi.getSchedulePause.mock.calls.length).toBeGreaterThanOrEqual(2));
+    // Positive control for the negative below: the page is still rendered.
+    expect(screen.getByRole("tab", { name: /Default jobs/ })).toBeTruthy();
+    // The banner stays and the running control does not appear on an unknown state.
+    expect(screen.getByText(/All schedules paused until/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Pause all$/ })).toBeNull();
+  });
+
   it("the picker opens with 'Until tomorrow 09:00' as the default preset and correct resolved stamps (fixed clock)", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     // A fixed instant so the resolved preset stamps are deterministic.

@@ -353,18 +353,22 @@ export function Schedules() {
   // re-read on its own: arm one timer for the auto-resume instant and re-fetch then, so
   // the banner and the row notes clear at the moment the scheduler stops honouring the
   // pause. Re-armed whenever the state changes; cleared on unmount. setTimeout's delay
-  // is a 32-bit signed int, so a far-off until is clamped and re-armed on fire.
+  // is a 32-bit signed int, so a far-off until is clamped and re-armed on fire. A failed
+  // re-read keeps the LAST KNOWN state (the server may still be honouring the pause) and
+  // retries a minute later via pauseRefreshAttempt; it never guesses "not paused".
+  const [pauseRefreshAttempt, setPauseRefreshAttempt] = useState(0);
   useEffect(() => {
     if (!pause?.paused || !pause.until) return;
-    const delay = Math.min(Math.max(new Date(pause.until).getTime() - Date.now(), 0), 2_147_483_647);
+    const remaining = new Date(pause.until).getTime() - Date.now();
+    const delay = remaining > 0 ? Math.min(remaining, 2_147_483_647) : pauseRefreshAttempt > 0 ? 60_000 : 0;
     const id = setTimeout(() => {
       api
         .getSchedulePause()
         .then(setPause)
-        .catch(() => setPause({ paused: false, until: null }));
+        .catch(() => setPauseRefreshAttempt((n) => n + 1));
     }, delay);
     return () => clearTimeout(id);
-  }, [pause]);
+  }, [pause, pauseRefreshAttempt]);
   const pauseNote = pauseActive
     ? pause?.until
       ? `paused until ${formatStamp(pause.until)}`
