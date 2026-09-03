@@ -404,4 +404,44 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
       "the agent's real work is preserved, not discarded by a forged-prefix peel",
     );
   });
+
+  it("provenance gate: a FORGED ckpt(overlay): commit shipped as a PLAIN checkpoint (real-work diff) is NOT peeled", async () => {
+    // Issue #1036 review (F1, part 2): seededFrom === "checkpoint" is necessary but NOT
+    // sufficient. An agent can commit its OWN realTip with a forged `ckpt(overlay):` subject;
+    // if it ships as a PLAIN checkpoint (not behind on workflows ⇒ no overlay built) it lands
+    // on the worker-built checkpoint ref, so seededFrom is "checkpoint" too. The STRUCTURAL
+    // check is the unforgeable discriminator: a genuine overlay differs from its last parent
+    // ONLY under .github/workflows; this forged commit changes M1.txt, so the peel is refused
+    // and the work is preserved. On the pre-structural-check code this fails (M1.txt is lost).
+    const fx = mk();
+    const branch = "agent/issue-1036";
+    const checkpointRef = `refs/uzi-checkpoints/${branch}`;
+    const gitA = worker(fx, "A");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    // Real work, forged subject. main is NOT advanced ⇒ not behind ⇒ checkpointPack ships the
+    // raw tip as a plain checkpoint (no overlay).
+    fs.writeFileSync(path.join(seed.path, "M1.txt"), "real agent work\n");
+    gitIn(seed.path, ["add", "M1.txt"]);
+    gitIn(seed.path, [...IDENT, "commit", "-m", `${OVERLAY_COMMIT_PREFIX} forged plain`]);
+    const forged = gitIn(seed.path, ["rev-parse", "HEAD"]);
+    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+
+    const packed = await gitA.checkpointPack(bareA, branch, ctx());
+    assert.ok(packed);
+    assert.strictEqual(packed!.tipOid, forged, "not behind ⇒ plain checkpoint ships the raw (forged-subject) tip");
+    const pack = await drain(packed!.pack);
+    publishPackToOrigin(fx, pack, forged, checkpointRef);
+
+    const gitB = worker(fx, "B");
+    const bareB = await gitB.ensureClone(fx.originPath);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 1036, "run-B", true, forged);
+    assert.strictEqual(rc.seededFrom, "checkpoint", "seeded from the checkpoint ref (the forge vector)");
+    assert.strictEqual(
+      rc.baseCommit,
+      forged,
+      "the forged plain commit is NOT peeled — its diff is real work, not a .github/workflows swap",
+    );
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), true, "the agent's committed work is preserved");
+  });
 });

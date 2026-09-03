@@ -733,7 +733,24 @@ export class GitCache {
                 await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${overlaySha}^${nParents}`])
               ).trim()
             : "";
-        if (/^[0-9a-f]{40}$/.test(realTip)) {
+        // PROVENANCE, part 2 (issue #1036 review F1): the subject prefix + the seededFrom gate
+        // are necessary but NOT sufficient. An agent can commit its OWN realTip with a forged
+        // `ckpt(overlay):` subject; if that tip ships as a PLAIN checkpoint (not behind on
+        // workflows, so checkpointPack builds no overlay) it lands on the worker-built checkpoint
+        // ref, so seededFrom is "checkpoint" too — and peeling it would DISCARD the agent's commit.
+        // Structural distinction: a genuine overlay differs from its realTip parent ONLY under
+        // `.github/workflows/` (all checkpointPack swaps), and non-trivially; a forged work commit
+        // differs in real files. Peel ONLY when the diff realTip..overlay is NON-EMPTY and wholly
+        // under `.github/workflows/`. This is the unforgeable check: an agent cannot make a commit
+        // carrying real work look like a workflow-only swap of its own parent.
+        const changed =
+          /^[0-9a-f]{40}$/.test(realTip)
+            ? (await this.tryGitStdout(barePath, ["diff", "--name-only", realTip, overlaySha])).trim()
+            : "";
+        const changedPaths = changed === "" ? [] : changed.split("\n");
+        const isOverlayStructure =
+          changedPaths.length > 0 && changedPaths.every((p) => p.startsWith(".github/workflows/"));
+        if (/^[0-9a-f]{40}$/.test(realTip) && isOverlayStructure) {
           baseSha = realTip;
           this.log.info("runner clone: peeled .github/workflows overlay wrapper to its realTip", {
             branch,
@@ -741,6 +758,17 @@ export class GitCache {
             real_tip: realTip,
             seeded_from: seededFrom,
           });
+        } else if (/^[0-9a-f]{40}$/.test(realTip)) {
+          this.log.warn(
+            "runner clone: `ckpt(overlay):` subject but the diff to its last parent is NOT confined to .github/workflows — NOT peeling (forged or non-overlay tip), preserving the checkpoint tip as branch content",
+            {
+              branch,
+              overlay_sha: overlaySha,
+              real_tip: realTip,
+              changed_paths: changedPaths.length,
+              seeded_from: seededFrom,
+            },
+          );
         } else {
           this.log.warn("runner clone: overlay marker present but its realTip parent did not resolve — not peeling", {
             branch,
