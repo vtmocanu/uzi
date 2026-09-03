@@ -54,109 +54,18 @@ Implement the requested change; read any referenced spec or task files first.
 
 ## For this repo (uzi)
 
-Gate slots here are: **format `task fmt-check`, lint `task lint`, dead code
-`task deadcode`, coverage `none (gap)`** — so "run every slot" means fmt-check +
-vet + build + lint + deadcode + typecheck + test, plus `gate:repo`'s three
-repo-wide checks (shellcheck, yamllint, the Homebrew formula) with no component
-of their own — all of which is what `task gate` runs. *(PRD #103 M4, 2026-08-02:
-the dead-code slot read `none (gap)` here until M4 closed it. Note this file
-phrases the claim differently from every other copy, which is how a literal grep
-for the wording used elsewhere missed it during M3. PRD #103 M5, 2026-08-03: this
-undercounted `task gate` again, having stopped naming `gate:repo`, added the same
-milestone.)*
+**Gate slots:** format `task fmt-check`, lint `task lint`, dead code `task deadcode`; coverage has no slot. Recipes live only in root `Taskfile.yml` (`task --list`). Gate the components you touched: `task gate:api`, `task gate:web`, `task gate:agent`, `task gate:controller`. `task gate` runs `gate:repo` (shell/YAML/formula) first, then the four components serially. **`task` exits 201 on any failure, not the command's code, test for non-zero, never a number.** After editing `internal/store/migrations/` or `queries/`, regenerate with the pinned `sqlc generate` and confirm `git diff -- internal/store` is empty (CI asserts it).
 
-**Two things about the dead-code slot that decide how you read a green.** The Go
-half (`deadcode -test ./...` per module) gates at ZERO against a committed,
-EMPTY baseline — if it reddens, DELETE the function; adding a line to
-`api/.deadcode-baseline` is a deliberate suppression that owes a reason in a
-comment, and the gate treats an entry that has stopped being reported as a
-failure so a suppression cannot outlive its finding. The npm half (knip) now
-GATES the **exports/types family at `error`** — promoted from `warn` and burned
-to zero (issue #596/#597, 2026-08-29) — alongside unused files and dependencies,
-which already gated at zero. So a green `task deadcode:web` DOES mean "no new
-unused export" (DTO and contract types kept exported are covered by
-`ignoreExportsUsedInFile`, not a blanket suppression). Neither
-tool sees a dead **branch** (a `case` arm nothing reaches inside a live
-function); that stays the reviewer's job.
+**Dead code, two halves.** Go (`deadcode -test ./...` per module) gates at zero against a committed, empty `api/.deadcode-baseline`: if it reddens, DELETE the function; a baseline line is a deliberate suppression owing a comment, and an entry that stops being reported also fails. npm (knip) gates the exports/types family at `error` plus unused files/deps at zero, so a green `deadcode:web` means "no new unused export" (DTO/contract types stay exported via `ignoreExportsUsedInFile`). Neither sees a dead branch inside a live function; that's the reviewer's job.
 
-**The lint slot is ratcheted on the Go side and `task`'s echo cannot show it.**
-`.golangci.yml` carries `issues: {new-from-merge-base: origin/main,
-whole-files: true}`, so only findings your branch introduces block — and
-`whole-files` means **pre-existing findings in a file you merely touched block
-too**. That is the flag working, not a bug, and it is the adoption cost you will
-meet first. `task lint:api:all` / `lint:controller:all` print the unfiltered
-backlog; they are reported, never gating, and are not in `task gate` — though
-they still **exit nonzero** whenever they report anything. **Run one rather than
-quoting a number from here**: this block sits two slots below a `format` slot
-whose whole comment is about a tally that read 26, then 25, then 19, then 16. If a lint target dies with `origin/main is unresolvable`,
-run `git fetch origin main` — **do not read the backlog it would otherwise
-print as your branch's findings.** And if a Go lint target prints
-`Error: parallel golangci-lint is running`, a sibling worktree holds the
-host-global lock: **re-run, do not report a red gate.** That one is invisible
-through `task` — golangci-lint exits 3, and since PRD #230 M5 the
-`scripts/golangci-lint.sh` wrapper execs the binary so that 3 now reaches the
-SCRIPT's exit (the old `go run` flattened it to 1); but `task` flattens every
-nonzero to its usual 201, so `task lint:api` reports 201 for a lock exactly as for
-a finding — the message text is the only discriminator. *(PRD #103 M3, 2026-08-02: this paragraph
-said "this repo has no linter yet (PRD #103 M3 builds one)" and "Do not go
-hunting for a lint command; there isn't one". M3 landed golangci-lint for both
-Go modules and oxlint for both npm packages.)* `fmt-check:api` /
-`fmt-check:controller` run FIRST inside
-`gate:api` / `gate:controller`, so a component gate already covers the format
-slot; `task fmt-check` runs just that slot over both Go modules. It fails on any
-`gofmt` drift and names the files, module-relative (`internal/…`). *(PRD #103 M2,
-2026-08-02: this paragraph read "no linter or format check yet" and put `format`
-at `none (gap)`. M2 cleared the drift under `api/` and added the gate.)*
+**Lint is ratcheted (Go side)** in `.golangci.yml` (`issues: {new-from-merge-base: origin/main, whole-files: true}`): only your branch's new findings block, and `whole-files` also blocks pre-existing findings in a file you touch. `lint:api:all` / `lint:controller:all` print the unfiltered backlog (not gating, not in `task gate`, exit nonzero on any finding), run one, don't quote a count. On `origin/main is unresolvable`, `git fetch origin main` (don't read the backlog as your findings). On `Error: parallel golangci-lint is running` a sibling worktree holds the host-global lock: re-run, don't report red, golangci-lint exits 3 but `task` flattens it to 201 like a finding, so the message text is the only tell. `fmt-check:*` runs first in each component gate; `task fmt-check` runs just that slot over both Go modules, failing on `gofmt` drift and naming files module-relative.
 
-**Every gate recipe lives in root `Taskfile.yml` and nowhere else** (PRD #103 M1);
-`task --list` enumerates it. Gates before reporting done: `task gate:api`
-(after editing `internal/store/migrations/` or `queries/`, also regenerate with the
-pinned `sqlc generate` and confirm `git diff -- internal/store` is empty — CI asserts
-it); `task gate:web`; `task gate:agent`; `task gate:controller` if you touched that
-module. `task gate` runs `gate:repo` (shell/YAML/formula) first, then all four
-components, serially. **`task` exits 201 on any failure, not
-the underlying command's code** — test for non-zero, never a number.
+**`task gate:web` does NOT bundle** (`vite build` runs only in the web image build): run `cd web && npm run build` by hand after touching anything the bundler resolves.
 
-`task gate:web` is check-docs + typecheck + test and does NOT bundle: `cd web && npm
-run build` additionally runs `vite build`, which no gate job runs (only the web image
-build does). Run it by hand after touching anything the bundler resolves.
+**Full-stack proof** is `./e2e/run-e2e.sh` + `./scripts/smoke.sh`, never a bare `docker compose up`: your shell's real secrets outrank `--env-file`, so use `env -i HOME=$HOME PATH=$PATH docker compose --env-file <dummy.env> -p <unique> …` and verify with `compose config`.
 
-Full-stack proof is `./e2e/run-e2e.sh` (isolated, dummy creds, stub executor) +
-`./scripts/smoke.sh` — never a bare `docker compose up`. **The reason is your SHELL,
-not a dotfile**: the developer's profile exports the real `UZI_SEED_*`, `JWT_SECRET`,
-`UZI_SECRET_KEY` and `POSTGRES_PASSWORD`, and Compose ranks shell environment ABOVE
-`--env-file`, so dummy secrets alone are NOT sufficient — use `env -i HOME=$HOME
-PATH=$PATH docker compose --env-file <dummy.env> -p <unique> …` and verify with
-`compose config`. (Corrected 2026-08-02: this line said a bare `up` "autoloads the
-real `./.env`", which `.claude/rules/stack.md` records as measured-false on this host — there
-is no `.env` in any worktree or at the bare-clone root. The precaution was right and
-its stated mechanism was wrong.)
+**Remote is GitHub** (`github.com/vtmocanu/uzi`): derive the CLI from `git remote get-url origin` → `gh`, never `glab`/`tea`.
 
-Authoring rules live in root `CLAUDE.md` + `ARCHITECTURE.md` (read it
-for cross-service work). We test in k8s first now (dev-cluster, ArgoCD) — a
-worker/runtime feature is not done just because compose works. Remote is GitLab
-`gitlab.example.com:vtmocanu/uzi` (`env -u GITLAB_TOKEN glab`, never `gh`/`tea`).
-Goose migration numbers are draft until merge — renumber above the live head on landing.
-In linked worktrees a bare `go build` can fail on VCS stamping. You cannot append a flag
-to a task target, so export `GOFLAGS=-buildvcs=false` in your shell instead; never commit
-either form. In parallel mode, the shared files to stop-and-report on here
-(rather than edit) are `api/go.mod`/`go.sum`, sqlc-generated code, `docker-compose.yml`,
-`.env.example`, `Taskfile.yml` and `.github/workflows/ci.yml` (PRD #103's milestones each appended to
-both), and **`web/package.json` / `agent/package.json`** — the lead does one consolidated
-edit after the parallel units land. The two `package.json` files are a three-way and a
-two-way contention in PRD #103 alone (M3 oxlint devDeps, M4 knip, M6 `@vitest/coverage-v8`),
-npm's `devDependencies` ordering makes a conflict likely rather than possible, and a
-teammate may have symlinked `node_modules` from a sibling worktree on the strength of the
-lockfiles being identical, which your edit breaks. Report before touching either.
+Root `CLAUDE.md` + `ARCHITECTURE.md` hold authoring rules (read the latter for cross-service work). Test in k8s first (dev-cluster, ArgoCD): a worker/runtime feature isn't done just because compose works. Goose migration numbers are draft until merge, renumber above the live head on landing. In a linked worktree a bare `go build` can fail on VCS stamping; export `GOFLAGS=-buildvcs=false` in your shell (never commit either form). A uzi worker installs the JS deps in the background at run start, so don't run your own `npm ci` / `npm install`; report a missing-module test failure rather than installing.
 
-**Reporting + dependencies.** Your report reaches the parent as your RETURN VALUE: a
-subagent's final message text is delivered to the orchestrator automatically as its
-result, so it arrives whether or not you also SendMessage. The orchestrator is the main
-thread, not a registered subagent — its SendMessage name is `main`; there is no agent named
-`lead` or `orchestrator`, and messaging those fails with "No agent named ... is reachable".
-When a uzi worker runs this repo it installs the JS deps (`web/`, `agent/`) in the
-background as the run starts, so do not run your own `npm ci` / `npm install` (`npm ci`
-deletes `node_modules` before reinstalling, and either races that install); if a targeted
-test fails on a missing module, report it rather than installing.
-
-**Run a gate ONCE, to a log, then read the log.** `task gate:<component> > gate.log 2>&1; rc=$?; echo "EXIT=$rc" >> gate.log; test "$rc" -eq 0` (gitignored path inside the worktree), then `tail`/`grep` the file. Never run the same gate a second time just to read its output differently: on run `02854d5e` coders ran `gate:api` back-to-back four times (`| tail -40`, then `> log` to grep), ~2 min and a full context re-read each. One run, one file, every read from it.
+**Parallel mode:** stop and report rather than edit these shared files, `api/go.mod`/`go.sum`, sqlc-generated code, `docker-compose.yml`, `.env.example`, `Taskfile.yml`, `.github/workflows/ci.yml`, `web/package.json` / `agent/package.json`; the lead does one consolidated edit after the units land. Report before touching either `package.json`: a teammate may have symlinked `node_modules` from a sibling worktree on matching lockfiles, which your edit breaks.
