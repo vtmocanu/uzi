@@ -70,7 +70,11 @@ func (g *github) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue
 	if err != nil {
 		return Issue{}, err
 	}
-	i, _, err := g.client.Issues.Get(ctx, slug.owner, slug.repo, int(issueIID))
+	num, err := ghNum(issueIID)
+	if err != nil {
+		return Issue{}, g.wrapErr("get issue", err)
+	}
+	i, _, err := g.client.Issues.Get(ctx, slug.owner, slug.repo, num)
 	if err != nil {
 		return Issue{}, g.wrapErr("get issue", err)
 	}
@@ -107,8 +111,12 @@ func (g *github) UpdateIssueDescription(ctx context.Context, projectID, issueIID
 	if err != nil {
 		return err
 	}
+	num, err := ghNum(issueIID)
+	if err != nil {
+		return g.wrapErr("update issue description", err)
+	}
 	req := gh.UpdateIssueRequest{Body: &description}
-	if _, _, err := g.client.Issues.Update(ctx, slug.owner, slug.repo, int(issueIID), req); err != nil {
+	if _, _, err := g.client.Issues.Update(ctx, slug.owner, slug.repo, num, req); err != nil {
 		return g.wrapErr("update issue description", err)
 	}
 	return nil
@@ -159,11 +167,15 @@ func (g *github) ListIssueComments(ctx context.Context, projectID, issueIID int6
 	if err != nil {
 		return nil, err
 	}
+	num, err := ghNum(issueIID)
+	if err != nil {
+		return nil, g.wrapErr("list issue comments", err)
+	}
 	opt := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
 	wrap := func(e error) error { return g.wrapErr("list issue comments", e) }
 	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
 		opt.Page = page
-		comments, resp, err := g.client.Issues.ListComments(ctx, slug.owner, slug.repo, int(issueIID), opt)
+		comments, resp, err := g.client.Issues.ListComments(ctx, slug.owner, slug.repo, num, opt)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -191,7 +203,11 @@ func (g *github) CreateIssueNote(ctx context.Context, projectID, issueIID int64,
 	if err != nil {
 		return IssueNote{}, err
 	}
-	c, _, err := g.client.Issues.CreateComment(ctx, slug.owner, slug.repo, int(issueIID), &gh.IssueComment{Body: &body})
+	num, err := ghNum(issueIID)
+	if err != nil {
+		return IssueNote{}, g.wrapErr("create issue note", err)
+	}
+	c, _, err := g.client.Issues.CreateComment(ctx, slug.owner, slug.repo, num, &gh.IssueComment{Body: &body})
 	if err != nil {
 		return IssueNote{}, g.wrapErr("create issue note", err)
 	}

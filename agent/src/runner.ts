@@ -3061,6 +3061,14 @@ export class RunRunner {
     // during the park, a valid mirrored checkpoint diverges from the moved default and the
     // strict-descendant test would discard the committed milestones and cold-start.
     const resume = claim.session_id != null;
+    // issue #1042 M4: the OWNER ANCHOR for the cross-worker checkpoint adopt guard — the tip
+    // THIS run last published to its own refs/uzi-checkpoints/<branch> ref, persisted
+    // server-side on every publish (M2) and delivered on the claim. runnerCloneForBranch
+    // adopts a mirrored checkpoint on the resume/unpushed leg ONLY when this equals the
+    // checkpoint's current SHA, so a resumed run that never published its own checkpoint
+    // cannot seed off a PRIOR (possibly plan-rejected) run's work. `?? undefined` maps the
+    // wire's null (a never-published run) to the "do not adopt" sentinel the git layer reads.
+    const expectedCheckpointTip = claim.checkpoint_tip ?? undefined;
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
@@ -3077,10 +3085,11 @@ export class RunRunner {
         cloneBranch.slug,
         runId,
         resume,
+        expectedCheckpointTip,
       );
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip);
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.

@@ -87,12 +87,16 @@ func (g *github) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 	if err != nil {
 		return err
 	}
+	num, err := ghNum(issueIID)
+	if err != nil {
+		return g.wrapErr("update issue labels", err)
+	}
 	// GitHub's set-replace is PUT /issues/{n}/labels (ReplaceLabelsForIssue). Read
 	// the current set, compute the target client-side (current − remove + add), and
 	// PUT once. An unrelated label the caller neither adds nor removes SURVIVES
 	// because it stays in target. The read/write is not transactional, so the same
 	// lost-update window the Forgejo/GitLab drivers accept (D3) applies.
-	cur, _, err := g.client.Issues.Get(ctx, slug.owner, slug.repo, int(issueIID))
+	cur, _, err := g.client.Issues.Get(ctx, slug.owner, slug.repo, num)
 	if err != nil {
 		return g.wrapErr("update issue labels: read current issue", err)
 	}
@@ -123,7 +127,7 @@ func (g *github) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 	for name := range target {
 		names = append(names, name)
 	}
-	if _, _, err := g.client.Issues.ReplaceLabelsForIssue(ctx, slug.owner, slug.repo, int(issueIID), names); err != nil {
+	if _, _, err := g.client.Issues.ReplaceLabelsForIssue(ctx, slug.owner, slug.repo, num, names); err != nil {
 		return g.wrapErr("update issue labels", err)
 	}
 	return nil
@@ -138,11 +142,15 @@ func (g *github) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 	// which needed a hand-parse): each IssueEvent carries event, actor, created_at,
 	// and a single label object. "labeled"→add, "unlabeled"→remove; other events are
 	// skipped. Chronological (oldest first), matching the GitLab driver. Paginated.
+	num, err := ghNum(issueIID)
+	if err != nil {
+		return nil, g.wrapErr("list issue label events", err)
+	}
 	opt := &gh.ListOptions{PerPage: githubPerPage}
 	wrap := func(e error) error { return g.wrapErr("list issue label events", e) }
 	return paginate(wrap, func(page int) ([]LabelEvent, int, error) {
 		opt.Page = page
-		events, resp, err := g.client.Issues.ListIssueEvents(ctx, slug.owner, slug.repo, int(issueIID), opt)
+		events, resp, err := g.client.Issues.ListIssueEvents(ctx, slug.owner, slug.repo, num, opt)
 		if err != nil {
 			return nil, 0, err
 		}
