@@ -23,10 +23,13 @@ var embeddedSkill string
 // test and `uzi skill status` read it from here so both see the shipped bytes.
 func EmbeddedSkill() string { return embeddedSkill }
 
-// skillDirParts is the FIXED install location under $HOME, as a compile-time
-// constant with NO user-supplied component. Because nothing here is derived from
-// a flag/env/config, no path traversal is expressible and the writer can never
-// reach ~/.claude/commands/ (a disjoint tree). Do not thread user input into it.
+// skillDirParts is the FIXED Claude install tail under $HOME (the Claude
+// constructors join it onto the home dir), a compile-time constant with NO
+// user-supplied component. The Codex skill tail is likewise fixed
+// (codexSkillDirParts in skilltarget.go); only the Codex hook/config home follows
+// $CODEX_HOME, validated absolute and cleaned. Because no path component here is
+// derived from a flag/env/config, no path traversal is expressible and a writer can
+// never reach ~/.claude/commands/ (a disjoint tree). Do not thread user input into it.
 var skillDirParts = []string{".claude", "skills", "uzi-cli"}
 
 const (
@@ -35,35 +38,47 @@ const (
 	skillStateName  = ".uzi-cli-state.json"
 )
 
-// SkillInstaller writes the bundled skill under a home directory and tracks
-// staleness by content hash. The home is resolved ONCE (os.UserHomeDir for the
-// real CLI; an explicit dir for tests) and never from user input.
+// SkillInstaller writes the bundled skill into one target directory and tracks
+// staleness by content hash. The directory is an absolute path resolved ONCE (from
+// os.UserHomeDir + the fixed tail for the real CLI, an explicit dir for tests, or a
+// resolved SkillTarget for a specific harness) and never from user input.
 type SkillInstaller struct {
-	home    string // base dir; the skill lives at home/.claude/skills/uzi-cli/
-	version string // CLI version, recorded in the sidecar (informational only)
+	skillDir string // absolute dir the skill lives in (e.g. home/.claude/skills/uzi-cli)
+	name     string // target name for reporting ("claude" | "codex")
+	version  string // CLI version, recorded in the sidecar (informational only)
 }
 
-// NewSkillInstaller builds an installer rooted at the user's home directory.
+// NewSkillInstaller builds a Claude installer rooted at the user's home directory.
 // A missing home dir is an error the caller treats as "nothing to install".
 func NewSkillInstaller(version string) (*SkillInstaller, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
-	return &SkillInstaller{home: home, version: version}, nil
+	return NewSkillInstallerAt(home, version), nil
 }
 
-// NewSkillInstallerAt builds an installer rooted at an explicit home directory.
+// NewSkillInstallerAt builds a Claude installer rooted at an explicit home directory
+// (dir = home/.claude/skills/uzi-cli, name "claude").
 // TEST/INJECTION SEAM ONLY: the real CLI always goes through NewSkillInstaller
 // (os.UserHomeDir); this exists so tests can point the install at a temp dir and
 // never touch the developer's real ~/.claude. It is not wired to any flag/env.
 func NewSkillInstallerAt(home, version string) *SkillInstaller {
-	return &SkillInstaller{home: home, version: version}
+	return &SkillInstaller{
+		skillDir: filepath.Join(append([]string{home}, skillDirParts...)...),
+		name:     "claude",
+		version:  version,
+	}
 }
 
-func (si *SkillInstaller) dir() string {
-	return filepath.Join(append([]string{si.home}, skillDirParts...)...)
+// NewSkillInstallerForTarget builds an installer for a resolved SkillTarget, writing
+// under the target's own SkillDir with its own sidecar/backup. This is the
+// multi-target constructor the CLI uses once targets are resolved.
+func NewSkillInstallerForTarget(t SkillTarget, version string) *SkillInstaller {
+	return &SkillInstaller{skillDir: t.SkillDir, name: t.Name, version: version}
 }
+
+func (si *SkillInstaller) dir() string        { return si.skillDir }
 func (si *SkillInstaller) skillPath() string  { return filepath.Join(si.dir(), skillFileName) }
 func (si *SkillInstaller) backupPath() string { return filepath.Join(si.dir(), skillBackupName) }
 func (si *SkillInstaller) statePath() string  { return filepath.Join(si.dir(), skillStateName) }

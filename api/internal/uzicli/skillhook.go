@@ -25,9 +25,11 @@ type HookManager struct {
 	home string // base dir; settings.json lives at home/.claude/settings.json
 }
 
-// settingsDirParts is the FIXED location under $HOME, a compile-time constant
-// with NO user-supplied component (mirrors skill.go's skillDirParts). Nothing
-// here is derived from a flag/env/config, so no path traversal is expressible.
+// settingsDirParts is the FIXED Claude location under $HOME, a compile-time
+// constant with NO user-supplied component (mirrors skill.go's skillDirParts).
+// Nothing here is derived from a flag/env/config, so no path traversal is
+// expressible. (The Codex hook path is resolved separately in skilltarget.go from
+// $CODEX_HOME — validated absolute and cleaned; M2 wires its manager.)
 var settingsDirParts = []string{".claude"}
 
 const (
@@ -284,7 +286,7 @@ func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 		return res, err
 	}
 
-	if err := os.MkdirAll(hm.dir(), 0o755); err != nil {
+	if err := os.MkdirAll(hm.dir(), 0o750); err != nil {
 		return res, err
 	}
 	// Back up the prior file before the first mutating write. settings.json can
@@ -380,7 +382,7 @@ func (hm *HookManager) UninstallHook() (HookUninstallResult, error) {
 	if err != nil {
 		return res, err
 	}
-	if err := os.MkdirAll(hm.dir(), 0o755); err != nil {
+	if err := os.MkdirAll(hm.dir(), 0o750); err != nil {
 		return res, err
 	}
 	if err := writeFileAtomic(hm.backupPath(), raw, 0o600); err != nil {
