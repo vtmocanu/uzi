@@ -1,17 +1,19 @@
 # ADR-1106: Codex harness boundary and SDK feasibility evidence
 
-**Status**: Accepted
+**Status**: Proposed (M0 reopened by whole-PRD review)
 **Date**: 2026-09-05
 **PRD**: [PRD #1106](../prds/1106-codex-harness-phase1.md)
 
 ## Context
 
 PRD #1106 adds a whole-run Codex choice without changing the existing Claude
-path. Its first milestone was a maintainer-local spike against pinned
-`@openai/codex@0.153.2` and `@openai/codex-sdk@0.153.2`. The spike settled
-process control, resume behaviour, subagent visibility, hook names and
-enforcement, credential refresh handling, the initial model vocabulary, and the
-provider-neutral executor boundary before the production adapter is written.
+path. Its first milestone is a maintainer-local spike against pinned
+`@openai/codex@0.153.2` and `@openai/codex-sdk@0.153.2`. The spike measured
+process control, resume behaviour, subagent visibility, hook names, credential
+refresh handling, and the initial model vocabulary. A subsequent whole-PRD
+review found that those measurements do not yet establish a fail-closed
+execution design or a complete provider-neutral boundary. The evidence below
+stands; the boundary is not accepted and M0 is reopened.
 
 The probe harness and packages lived only in private temporary storage. No pod,
 worker image, deployment, or uzi worker was used, and no repository package or
@@ -101,12 +103,13 @@ Consequences for the lifecycle are explicit:
 
 - delegation lifecycle status may use only identifiers actually present in the
   runtime frame or hook event;
-- a turn boundary reaps delegated work because a child may still be running when
-  the parent completes; and
-- subagent signal tools are denied by the attributed hook before invocation.
+- a child may still be running when the parent completes, but no public child
+  drain or close operation has been measured; and
+- subagent signal tools must be denied before invocation, but the attributed
+  happy-path hook observation does not prove that guarantee on hook failure.
   The parent stream observes only root MCP frames, so it cannot serve as a second
   classifier for hidden child frames. Any future frame whose origin cannot be
-  proven is `unknown` and fails closed for signal latching.
+  proven is `unknown` and must fail closed for signal latching.
 
 ## Credential refresh evidence and limit
 
@@ -149,13 +152,39 @@ sanitized error could not distinguish unsupported effort from a narrower server
 or entitlement failure. The SDK's open model string and wider effort union are
 therefore transport types, not picker authority.
 
-## Accepted harness boundary
+## Review disposition / blockers
 
-The boundary is one per-run object. Construction owns immutable provider and
+The whole-PRD review found six blockers that the successful probes did not
+exercise:
+
+- upstream 0.153.2 `PreToolUse` handling fails open when input serialization,
+  hook spawn, timeout, or output parsing fails;
+- `write_stdin` emits no hook, so an initially allowed reusable interpreter can
+  receive a command later that the initial spawn hook never screened;
+- role-file loading admits only bounded overrides and filters sandbox, web and
+  MCP changes, preserving the parent sandbox, approval and MCP configuration;
+- the current Claude `buildPathGuardHook` and `buildAgentGuardHook` neither
+  accept Codex's canonical names nor parse its payloads, including
+  `apply_patch` paths;
+- a child was measured outliving `turn.completed`, but no public child
+  close/drain control was found or exercised; and
+- the per-run MCP transport still needs a defined disposal lifecycle and proven
+  bearer-token and shell/process isolation.
+
+Therefore hook success on the measured happy path is not a fail-closed guardrail
+design. M0 cannot close until the failure modes above have a fail-closed execution
+design and Codex child draining is measured. No alias-only reuse of the Claude
+hooks, inferred role-file restriction, or process-group kill is accepted as a
+substitute for those proofs.
+
+## Provisional harness boundary
+
+The useful shape remains one per-run object. Construction owns immutable provider and
 isolation inputs: the credential, home, workspace and secret paths, available
 skills, MCP handlers, guardrails, and process launcher. Mutable uzi policy stays
 outside it: planning and approval, checkpoints and git operations, run-state
-transitions, and signal latches.
+transitions, and signal latches. This shape is incomplete and not an
+implementation decision.
 
 ```ts
 type SessionPresence = "present" | "absent" | "unknown";
@@ -259,7 +288,7 @@ interface HarnessError {
 interface RunHarness {
   inspectSession(id: string): Promise<SessionPresence>;
   runTurn(request: RunTurnRequest): AsyncIterable<HarnessEvent>;
-  reap(): void;
+  // OPEN PLACEHOLDER: an async provider-child drain/close surface belongs here.
 }
 
 interface AdviceRequest {
@@ -275,14 +304,34 @@ interface AdviceHarness {
 }
 ```
 
-Usage, context, metrics and rate-limit shapes are provider-neutral uzi contracts.
+The interface sketch intentionally leaves contract work visible rather than
+guessing at it:
+
+- `HarnessUsage`, `HarnessContext`, `HarnessMetrics` and `HarnessRateLimit` are
+  not yet defined;
+- D0 requires exact preservation of Claude init/result/error mapping, and the
+  authority between a thrown adapter error and a terminal error event is open;
+- per-agent skill allocation is absent from `HarnessAgent`;
+- `AdviceHarness` does not yet preserve the advice lane's typed rate-limit
+  behaviour;
+- per-run MCP disposal is not represented; and
+- no signature is accepted yet for the distinct operations of reaping the CLI
+  process tree and draining/closing Codex child threads.
+
+The current runner deliberately uses `reap: false` at ordinary iteration
+boundaries. Full process-tree reap occurs only at safe checkpoint, terminal, or
+pre-credentialed-git boundaries; that process operation has not been shown to
+drain a Codex child thread. The placeholder above must become an asynchronous,
+measured lifecycle contract before this boundary can be accepted.
+
+The eventual usage, context, metrics and rate-limit shapes must be
+provider-neutral uzi contracts.
 `HarnessOrigin` carries the current message-mapping concepts: optional role/name,
 invocation instance and label. Hook `agent_id`/`agent_type` remain delegation or
 hook-lifecycle identifiers; they are not silently translated into message
 attribution. `inspectSession` is tri-state so a dropped resume id is cleared only
 on proven absence; an I/O or protocol failure returns `unknown`. `session_id` is
-lazy because Codex does not make it available at construction. `reap()` is
-mandatory at every turn boundary and before credentialed git.
+lazy because Codex does not make it available at construction.
 
 Provider `item.updated` events reset liveness only; they do not become persisted
 frames. A frame keeps its mapped items grouped because the current Claude mapper
@@ -293,17 +342,17 @@ producer of `EmittedMessage[]`, signal latches, the current session id, and the
 terminal turn result. Raw Claude or Codex events never reach lifecycle code.
 Origin `unknown` is preserved and fails closed for signals.
 
-The advice boundary matches the current judge/review/summary call sites: it owns
-one isolated tool-less pass and returns accumulated text plus optional usage.
-Structured-output validation and tolerant parsing remain with the caller, because
-those policies differ by advice consumer.
+The advice sketch follows the current judge/review/summary call shape: one
+isolated tool-less pass returning accumulated text plus optional usage.
+Structured-output validation and tolerant parsing remain with the caller, while
+typed rate-limit and terminal-error behaviour still require a contract.
 
 ## Consequences
 
-- M2 extracts the Claude path behind these interfaces without changing its
-  behaviour; M3 adds the Codex adapter and the runtime `collab_tool_call` decoder.
-- Production hook matchers cover every observed normal/v1 and code-mode name and
-  are tested by side effect, not hook input alone.
+- M2 cannot treat this sketch as accepted until M0 closes the lifecycle, error,
+  usage and advice gaps without changing Claude behaviour.
+- Covering every observed normal/v1 and code-mode hook name is necessary but not
+  sufficient; the failure and `write_stdin` paths need a fail-closed design.
 - Codex feeds show root frames plus honest delegation lifecycle status. They do
   not fabricate child content that 0.153.2 does not expose.
 - The seat lock and checkpoint/write-back design remain conservative despite
