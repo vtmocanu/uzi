@@ -7651,7 +7651,7 @@ worker-execution protocol, which stays `/api/worker/*`).
   uzi worker list|rm            # NO create — minting a join token is a webui action (§279)
   uzi repo list
   uzi admin users|runs|workers|usage|rate-limits   # READ-ONLY; needs a uza_ token
-  uzi skill status|install [--force]
+  uzi skill status|install [--force]|install-hook|uninstall-hook  [--target claude|codex|all]
   uzi version
   ```
   Global flags: `--json --url --quiet --no-color`. `admin` has **no write verbs by construction** — the
@@ -7950,18 +7950,65 @@ line, recorded per the phase-2 follow-ups.
     this (PRD #64 Risk 13 — a risk the `--json` swap *creates* by turning an escaped-text-for-a-human
     payload into an agent-read channel).
 
-## 284. Bundled skill — `go:embed`, content-hash self-upgrade, `.bak` rescue, never-fatal, drift-tested
+## 284. Bundled skill — `go:embed`, content-hash self-upgrade, `.bak` rescue, never-fatal, drift-tested; dual-target (Claude + Codex) install and session-start hooks
 
 Serves human: Feature #64 (agents always know how to drive the *installed* CLI); Success Criterion 5.
-PRD #64 skill section + Decision 14. Realized in `api/internal/uzicli/skill/` (`SKILL.md` embedded) +
-`api/internal/uzicli/skill.go`.
+PRD #64 skill section + Decision 14; **dual-target install + auto-refresh hook is PRD #1143 (M1-M3)**.
+Realized in `api/internal/uzicli/skill/` (`SKILL.md` embedded) + `api/internal/uzicli/skill.go`
+(`SkillInstaller`), `api/internal/uzicli/skilltarget.go` (`SkillTarget`, `ResolveSkillTargets`),
+`api/internal/uzicli/skillhook.go` (`HookManager`, `NewCodexHookManager`), and the cobra verbs in
+`api/cmd/uzi/skill.go` (`status|install|install-hook|uninstall-hook`, shared `--target` flag).
 
-- **Decision — the skill is `go:embed`ed into the binary and written to
-  `~/.claude/skills/uzi-cli/SKILL.md`**, in the measured plugin format
-  (`---\nname:…\ndescription:…\n---\n\n<body>`, plus `allowed-tools: Bash(uzi *)` and
-  `user-invocable: false`). Beats a fetch-from-GitHub-`main` approach: an embedded skill cannot
-  describe a version other than the one running, works offline, and works for a **private** repo
-  (a fetched-from-GitHub skill is unusable for us).
+- **Decision — the skill is `go:embed`ed into the binary and written per target** in the measured
+  plugin format (`---\nname:…\ndescription:…\n---\n\n<body>`, plus `allowed-tools: Bash(uzi *)` and
+  `user-invocable: false`). The same embedded `SKILL.md` serves every harness. Beats a
+  fetch-from-GitHub-`main` approach: an embedded skill cannot describe a version other than the one
+  running, works offline, and works for a **private** repo (a fetched-from-GitHub skill is unusable
+  for us).
+
+### Dual-target model (`--target claude|codex|all`, PRD #1143 M1)
+- **Two install targets, resolved by `ResolveSkillTargets(home, getenv)` into `[]ResolvedTarget`:**
+  - **Claude** — skill `~/.claude/skills/uzi-cli/SKILL.md`; hook file `~/.claude/settings.json`. Path
+    tail is a compile-time constant under `$HOME` with no user-supplied component.
+  - **Codex CLI** — skill `$HOME/.agents/skills/uzi-cli/SKILL.md` (the documented Codex user-skill
+    root, deliberately **independent of `$CODEX_HOME`** — no env-derived string reaches the skill path);
+    hook file `$CODEX_HOME/hooks.json`, defaulting to `~/.codex/hooks.json` when `$CODEX_HOME` is unset.
+- **Env access via an injected `getenv` seam, never package-global `os.Getenv`** — keeps a test's temp
+  home from being polluted by a developer's exported `$CODEX_HOME`.
+- **`--target` (persistent flag on the `skill` subtree; applies to every verb), default auto-detect:**
+  - omitted → **auto-detect**: Claude is **always** a target; Codex is added only when its config home
+    exists as a directory (`isDir`). A machine without Codex silently gets Claude-only.
+  - `claude` / `codex` / `all` → the explicit selection.
+- **A relative, non-empty `$CODEX_HOME` is a usage error only when Codex is selected explicitly**
+  (`ExitUsage`); on the automatic path it is skipped (Codex just stays undetected). Only the Codex
+  hook/config home is derived from `$CODEX_HOME`, and it is validated absolute and `filepath.Clean`ed
+  before becoming a path component (PRD #1143 D8).
+
+### Session-start hooks — target-specific `HookManager` (PRD #1143 M2)
+- **`install-hook` / `uninstall-hook` manage an opt-in SessionStart hook that re-runs `uzi skill
+  install` at every harness session start**, so the installed skill self-refreshes without the user
+  re-invoking anything. One `HookManager` type, two constructors carrying the per-harness differences:
+  - **Claude** (`NewHookManagerAt`): `settings.json`, matcher `startup`, canonical command
+    `uzi skill install --target claude`, file perm `0o600` (settings.json may hold secrets).
+  - **Codex** (`NewCodexHookManager`): `hooks.json`, matcher `startup|resume`, canonical command
+    `uzi skill install --target codex`, file perm `0o644`.
+- **Foreign entries and array order are preserved**; a legacy/differently-spelled uzi command is
+  migrated in place to the canonical one rather than duplicated (`migrateLegacyCommand`); install is
+  idempotent (exactly one entry).
+- **A byte-identical `.bak` of the prior hook file is written before the first mutation.** Malformed
+  JSON aborts rather than clobbering the file.
+- **Codex trust is the user's, never uzi's.** uzi writes only `hooks.json`; the user reviews and trusts
+  the hook once via Codex's `/hooks` flow. uzi **NEVER** writes Codex trust state or `config.toml`, and
+  **refuses (read-only) to create a `hooks.json` when an inline `[hooks]` table already exists in
+  `config.toml`** — that mixed representation is Codex-warned, so we surface it (`HookConfigConflict`)
+  and abort instead of producing it.
+
+### JSON envelope — backward-compatible `targets[]` (PRD #1143 M3)
+- **`--target` omitted → the response keeps today's Claude single-target top-level fields
+  (`skill`/`hook`, or the install/hook result) AND adds a `targets` array**, so existing `--json`
+  consumers/tests keyed on the top-level shape keep working while new consumers read every selected
+  target from `targets[]`.
+- **`--target` given → the response emits `{targets}` only** (no legacy top-level duplication).
 - **Staleness = content hash, not CLI version.** A sidecar `.uzi-cli-state.json` records
   `{cli_version, skill_sha256}`; rewrite iff `embedded_sha != recorded_sha`. Keying on the CLI version
   would rewrite on every unrelated release.
@@ -7973,8 +8020,10 @@ PRD #64 skill section + Decision 14. Realized in `api/internal/uzicli/skill/` (`
   `UZI_SKILL_AUTO_UPGRADE=0`, `uzi skill status`, `uzi skill install --force`.
 - **Atomic**: temp file in the same dir + `os.Rename`; handles racing `uzi` processes without a
   lockfile.
-- **Cannot clobber `~/.claude/commands/`**: the write path is a compile-time constant joined to
-  `os.UserHomeDir()` with no user-supplied component, so no traversal is expressible.
+- **Cannot clobber an adjacent dir (e.g. `~/.claude/commands/`)**: every skill write path is a
+  compile-time constant tail joined to the home dir with no user-supplied component (Claude and Codex
+  alike; the Codex skill tail is likewise `$HOME`-fixed, independent of `$CODEX_HOME`), so no traversal
+  is expressible.
 - **Drift control — a test asserts every command/flag the SKILL.md documents exists in the cobra
   tree** (`skill_drift_test.go`). This is the same discipline a manual source-map doc would enforce by
   hand, done **mechanically**, possible because our skill documents our own CLI. Its limit (recorded): it
@@ -18017,8 +18066,9 @@ about, so a stale binary answers confidently and wrongly, and nothing anywhere s
   precisely when they suspect something is wrong, so a failed live probe falls back to the last
   known-good reading instead of to nothing.
 - Also exempt: the `skill` subtree (already exempt for the auto-upgrade hook, and
-  `uzi skill install` is machine-invoked at every Claude Code session start, where an extra
-  stderr line is pure noise in an agent context); `completion`, whose script is `eval`'d from a
+  `uzi skill install` is machine-invoked at every Claude Code or Codex CLI session start — both
+  harnesses now install the refresh hook — where an extra stderr line is pure noise in an agent
+  context); `completion`, whose script is `eval`'d from a
   shell rc file, so the warning would print at every shell start; and cobra's
   `__complete`/`__completeNoDesc` RPC, invoked on every TAB, where a 2s stall is unacceptable
   and stderr corrupts the display in some shells. `--help`, `--version` and a bare non-runnable

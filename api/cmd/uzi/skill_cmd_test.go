@@ -27,7 +27,7 @@ func settingsFilePath(home string) string {
 }
 
 // hookCommandCount reads settings.json and counts SessionStart hook commands
-// equal to the canonical `uzi skill install`.
+// equal to the canonical `uzi skill install --target claude`.
 func hookCommandCount(t *testing.T, home string) int {
 	t.Helper()
 	b, err := os.ReadFile(settingsFilePath(home))
@@ -52,7 +52,7 @@ func hookCommandCount(t *testing.T, home string) int {
 			if !ok {
 				continue
 			}
-			if cmd, _ := hm["command"].(string); cmd == "uzi skill install" {
+			if cmd, _ := hm["command"].(string); cmd == "uzi skill install --target claude" {
 				n++
 			}
 		}
@@ -169,11 +169,11 @@ func TestSkillUninstallHookCommand(t *testing.T) {
 func TestSkillInstallHookMalformedFails(t *testing.T) {
 	home := t.TempDir()
 	dir := filepath.Join(home, ".claude")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	const bad = "{not json"
-	if err := os.WriteFile(settingsFilePath(home), []byte(bad), 0o644); err != nil {
+	if err := os.WriteFile(settingsFilePath(home), []byte(bad), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	env := fakeEnv(&uzicli.FakeClient{})
@@ -249,7 +249,7 @@ func TestAutoUpgradePreservesEditExit0(t *testing.T) {
 	}
 	// User edits the installed skill.
 	const edit = "# hand edits I want to keep\n"
-	if err := os.WriteFile(installedSkillPath(home), []byte(edit), 0o644); err != nil {
+	if err := os.WriteFile(installedSkillPath(home), []byte(edit), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// Any subsequent command triggers the rescue; it must still exit 0.
@@ -261,7 +261,7 @@ func TestAutoUpgradePreservesEditExit0(t *testing.T) {
 		t.Errorf("the real command did not run:\n%s", out)
 	}
 	bak := installedSkillPath(home) + ".bak"
-	if got, err := os.ReadFile(bak); err != nil || string(got) != edit {
+	if got, err := os.ReadFile(bak); err != nil || string(got) != edit { //nolint:gosec // G304: test reads a test-controlled temp path
 		t.Fatalf("edit not preserved at %s: got %q err %v", bak, got, err)
 	}
 	if got, _ := os.ReadFile(installedSkillPath(home)); string(got) != uzicli.EmbeddedSkill() {
@@ -291,7 +291,7 @@ func TestAutoUpgradeDisabledByEnv(t *testing.T) {
 func TestAutoUpgradeNeverFatalOnError(t *testing.T) {
 	t.Setenv("UZI_SKILL_AUTO_UPGRADE", "")
 	notADir := filepath.Join(t.TempDir(), "home-is-a-file")
-	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	fc := &uzicli.FakeClient{User: apitypes.UserDTO{ID: "u1", Email: "a@b.c"}}

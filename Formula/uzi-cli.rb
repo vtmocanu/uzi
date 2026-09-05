@@ -58,15 +58,19 @@ class UziCli < Formula
   # real `~/.claude` (disproven in PRD #86 review), so we only nudge the user.
   def caveats
     <<~EOS
-      uzi ships a self-updating Claude Code skill at
-      ~/.claude/skills/uzi-cli/SKILL.md.
+      uzi ships a self-updating skill for both Claude Code
+      (~/.claude/skills/uzi-cli/SKILL.md) and Codex CLI
+      (~/.agents/skills/uzi-cli/SKILL.md).
 
-      If you use Claude Code, run `uzi skill install-hook` once to wire a
+      Run `uzi skill install-hook [--target claude|codex|all]` once to wire a
       SessionStart hook so the skill refreshes at session start (otherwise it
-      only refreshes on your next `uzi` command).
+      only refreshes on your next `uzi` command). Omit --target to wire every
+      harness you have detected; Claude wires ~/.claude/settings.json, Codex
+      wires $CODEX_HOME/hooks.json and needs a one-time `/hooks` review in
+      Codex to trust it.
 
-      `uzi skill uninstall-hook` removes the hook; `uzi skill status` shows
-      whether it is wired.
+      `uzi skill uninstall-hook [--target ...]` removes the hook; `uzi skill
+      status [--target ...]` shows whether it is wired, per harness.
 
       uzi's product docs are embedded in the binary and readable offline:
       `uzi docs list`, `uzi docs search <query>`, `uzi docs show <slug>`.
