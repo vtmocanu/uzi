@@ -47,6 +47,12 @@ import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
 import type { WorkerClient } from "./client.js"; // type-only — erased at runtime; client.ts imports no runner/model-pass, so no cycle
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
+import type {
+  AdviceHarness,
+  AdviceRequest,
+  AdviceResult,
+  AdviceResultPolicy,
+} from "./harness.js"; // type-only — erased at runtime; harness.ts has no SDK import, so no cycle
 
 /** A PreToolUse deny for EVERY tool: the advice runners (judge/review/summary) are
  *  read-only. A deny is authoritative even under bypassPermissions (the same property
@@ -152,9 +158,39 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
       reject(new Error(`${opts.label} model call exceeded ${opts.timeoutMs}ms`));
     }, opts.timeoutMs);
   });
-  const consumePromise = consume(opts, homeDir, abort);
+  // The default neutral policy: throw the generic labeled error on a failed terminal,
+  // do nothing on success. This is byte-identical to today's `else if (isError) throw`
+  // branch. The judge's raw-msg shim REPLACES it (never called alongside), mirroring the
+  // old if/else. Either callback fires synchronously inside the terminal iteration body,
+  // before `break`, so a throw propagates out of run().
+  const policy: AdviceResultPolicy = {
+    onTerminal: (_t, { isError }) => {
+      if (isError) throw new Error(`${opts.label} model call returned an error result`);
+    },
+  };
+  const request: AdviceRequest = {
+    label: opts.label as AdviceRequest["label"],
+    systemPrompt: opts.systemPrompt,
+    prompt: opts.prompt,
+    model: opts.model,
+    output: { kind: "text" },
+    signal: abort.signal,
+    timeoutMs: opts.timeoutMs,
+    graceMs: opts.graceMs,
+  };
+  const runPromise = new ClaudeAdviceHarness({
+    token: opts.token,
+    homeDir,
+    abort,
+    queryFn: opts.queryFn,
+    denyReason: opts.denyReason,
+    log: opts.log,
+    rawResultShim: opts.onResult,
+  })
+    .run(request, policy)
+    .then((r) => r.text);
   try {
-    return await Promise.race([consumePromise, timeout]);
+    return await Promise.race([runPromise, timeout]);
   } finally {
     if (timer) clearTimeout(timer);
     // Defer HOME cleanup until the query settles (bounded by a grace after abort): on the
@@ -162,7 +198,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     // terminates the CLI asynchronously, so removing HOME here immediately could race the
     // aborted CLI while it is still exiting and may still touch $HOME. On the success path
     // the query has already settled, so this returns without waiting.
-    await awaitQuerySettled(consumePromise, opts.graceMs ?? DEFAULT_ABORT_GRACE_MS);
+    await awaitQuerySettled(runPromise, opts.graceMs ?? DEFAULT_ABORT_GRACE_MS);
     // Best-effort HOME cleanup. The M6 reclaim sweep will NEVER collect this directory:
     // it is named `uzi-<label>-*`, not a run UUID, so the sweep's RUN_ID_RE filter skips
     // it BY DESIGN — this warn is the only thing anywhere that will say a dir stranded.
@@ -173,52 +209,100 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
   }
 }
 
-/** Build the isolation-shaped options and stream one tool-less turn. */
-async function consume(opts: ReadOnlyModelPassOpts, homeDir: string, abort: AbortController): Promise<string> {
-  const env = buildSdkEnv(opts.token, homeDir);
-  const options: SdkOptions = {
-    env: env as unknown as Record<string, string | undefined>,
-    abortController: abort,
-    // 🔴 ISOLATION SINGLE POINT OF TRUTH. `settingSources: []` MUST stay a LITERAL at
-    // this one query site. The semgrep rule semgrep/settings-sources-isolation.yml
-    // fires on a WIDENED value only and is BLIND to an OMITTED key — so this is now the
-    // ONLY place the advice-lane literal lives, and a future edit that dropped this key
-    // would pass semgrep silently and re-open the repo-borne prompt-injection vector.
-    // Do NOT extract it to a variable, do NOT spread it in, do NOT delete it.
-    settingSources: [],
-    systemPrompt: opts.systemPrompt,
-    permissionMode: "bypassPermissions",
-    allowDangerouslySkipPermissions: true,
-    includePartialMessages: false,
-    hooks: { PreToolUse: [{ hooks: [buildDenyAllHook(opts.denyReason)] }] },
-    // Route the model-reasoning SDK CLI through the runner-uid detached spawn like every
-    // other SDK spawn (uniform boundary); the deny-all hook already blocks code-exec, so
-    // this is defense-in-depth. (PRD #51 M4 — keep this rationale.)
-    spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
-  };
-  if (opts.model) options.model = opts.model;
+/** Construction inputs for ClaudeAdviceHarness — the Claude-specific isolation and
+ *  compatibility surface the advice adapter absorbs from the old `consume` body. Module-
+ *  local (not in harness.ts, which stays SDK-free): only runReadOnlyModelPass builds one. */
+interface ClaudeAdviceInputs {
+  token: string;
+  homeDir: string;
+  abort: AbortController;
+  queryFn: SdkQueryFn;
+  denyReason: string;
+  log: Logger;
+  /** Claude-only raw-msg compat shim (the judge's onResult). When present it REPLACES the
+   *  policy's default onTerminal, mirroring today's `if (opts.onResult) … else …`. */
+  rawResultShim?: ReadOnlyModelPassOpts["onResult"];
+}
 
-  let text = "";
-  const rateLimits = new RateLimitObserver();
-  for await (const msg of opts.queryFn({ prompt: promptStream(opts.prompt), options })) {
-    rateLimits.observe(msg);
-    for (const em of mapSdkMessage(msg)) {
-      if (em.kind === "text") {
-        const t = (em.payload as { text?: string }).text;
-        if (t) text += t;
+/** The neutral advice seam's Claude adapter: builds the isolation-shaped SdkOptions and
+ *  streams one tool-less turn, absorbing the old `consume` body verbatim. Module-local and
+ *  UN-EXPORTED — its only caller is runReadOnlyModelPass in this file, so knip stays clean
+ *  without an export. */
+class ClaudeAdviceHarness implements AdviceHarness {
+  readonly kind = "claude";
+
+  constructor(private readonly inputs: ClaudeAdviceInputs) {}
+
+  async run(request: AdviceRequest, policy: AdviceResultPolicy): Promise<AdviceResult> {
+    const env = buildSdkEnv(this.inputs.token, this.inputs.homeDir);
+    const options: SdkOptions = {
+      env: env as unknown as Record<string, string | undefined>,
+      abortController: this.inputs.abort,
+      // 🔴 ISOLATION SINGLE POINT OF TRUTH. `settingSources: []` MUST stay a LITERAL at
+      // this one query site. The semgrep rule semgrep/settings-sources-isolation.yml
+      // fires on a WIDENED value only and is BLIND to an OMITTED key — so this is now the
+      // ONLY place the advice-lane literal lives, and a future edit that dropped this key
+      // would pass semgrep silently and re-open the repo-borne prompt-injection vector.
+      // Do NOT extract it to a variable, do NOT spread it in, do NOT delete it.
+      settingSources: [],
+      systemPrompt: request.systemPrompt,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      includePartialMessages: false,
+      hooks: { PreToolUse: [{ hooks: [buildDenyAllHook(this.inputs.denyReason)] }] },
+      // Route the model-reasoning SDK CLI through the runner-uid detached spawn like every
+      // other SDK spawn (uniform boundary); the deny-all hook already blocks code-exec, so
+      // this is defense-in-depth. (PRD #51 M4 — keep this rationale.)
+      spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
+    };
+    if (request.model) options.model = request.model;
+
+    let text = "";
+    let terminalMsg: unknown;
+    let terminalIsError = false;
+    const rateLimits = new RateLimitObserver();
+    for await (const msg of this.inputs.queryFn({ prompt: promptStream(request.prompt), options })) {
+      rateLimits.observe(msg);
+      for (const em of mapSdkMessage(msg)) {
+        if (em.kind === "text") {
+          const t = (em.payload as { text?: string }).text;
+          if (t) text += t;
+        }
+      }
+      if (isResult(msg)) {
+        const isError = isErrorResult(msg);
+        terminalMsg = msg;
+        terminalIsError = isError;
+        if (this.inputs.rawResultShim) {
+          // Judge: hand it the RAW SDK msg, unchanged from today's onResult path.
+          this.inputs.rawResultShim(msg, { isError, latest: rateLimits.latest });
+        } else {
+          // review/summary default: the neutral policy. Byte-identical throw/success to
+          // today's `else if (isError) throw …`.
+          policy.onTerminal(this.neutralTerminal(msg, isError), { isError, latest: undefined });
+        }
+        break;
       }
     }
-    if (isResult(msg)) {
-      const isError = isErrorResult(msg);
-      if (opts.onResult) {
-        opts.onResult(msg, { isError, latest: rateLimits.latest });
-      } else if (isError) {
-        throw new Error(`${opts.label} model call returned an error result`);
-      }
-      break;
-    }
+    return {
+      text,
+      end: { kind: "terminal", terminal: this.neutralTerminal(terminalMsg, terminalIsError) },
+      usage: undefined,
+    };
   }
-  return text;
+
+  /** A private MINIMAL neutral terminal builder that reads ONLY the raw `subtype` field.
+   *  It is unread by every M2 caller (the run-lane decoder lives elsewhere) and MUST NOT
+   *  be able to throw — no failure closure, no usage, no limit evidence. Do not grow a
+   *  real terminal decoder here. */
+  private neutralTerminal(msg: unknown, isError: boolean) {
+    return {
+      outcome: isError ? ("failed" as const) : ("success" as const),
+      subtype: String((msg as Record<string, unknown> | undefined)?.["subtype"] ?? "unknown"),
+      errors: [] as readonly string[],
+      metrics: { cost: { kind: "unreported" as const } },
+    };
+  }
 }
 
 /** The advice lane's failure_reason byte cap. Deliberately 500 — NOT runner.ts's

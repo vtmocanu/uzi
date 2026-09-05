@@ -21,6 +21,7 @@ import type {
 export type HarnessKind = "claude" | "codex";
 export type HarnessEffort = "low" | "medium" | "high" | "xhigh" | "max";
 export type SessionPresence = "present" | "absent" | "unknown";
+export type JsonObject = Readonly<Record<string, unknown>>;
 
 // Missing measurements mean unavailable, never zero. These are independent,
 // non-overlapping input buckets; output includes reasoning when reported.
@@ -312,9 +313,35 @@ export interface RunTurnReducer {
   finish(end: TurnStreamEnd): ReducedTurnCompletion;
 }
 
-// NOTE (PRD #1146 M2, milestone m1): the advice-lane surface
-// (AdviceRequest/AdviceResult/AdviceResultPolicy/AdviceHarness and the JsonObject
-// it used) is intentionally NOT authored here yet. This milestone extracts the RUN
-// lane only; no advice adapter exists, so exporting those types would leave
-// AdviceHarness with no M2 referent and redden the zero-unused-export gate
-// (deadcode:agent). They land with the advice extraction that wires model-pass.ts.
+export interface AdviceRequest {
+  label: "judge" | "review" | "summary";
+  systemPrompt: string;
+  prompt: string;
+  model?: string;
+  output: { kind: "text" } | { kind: "json"; schema: JsonObject };
+  signal: AbortSignal;
+  timeoutMs: number;
+  graceMs?: number;
+}
+
+export interface AdviceResult {
+  text: string;
+  end: TurnStreamEnd;
+  usage?: HarnessUsage;
+}
+
+export interface AdviceResultPolicy {
+  onTerminal(
+    terminal: HarnessTerminal,
+    context: { isError: boolean; latest: HarnessRateLimit | undefined },
+  ): void;
+}
+
+export interface AdviceHarness {
+  readonly kind: HarnessKind;
+  // One isolated pass, with its own disposable HOME and no run-tool authority.
+  // Both permit isolated pure calculation; current Claude stays tool-less.
+  // This interface requires no new Claude calculator. Terminal
+  // provider failures are data; setup/transport/timeout failures are thrown.
+  run(request: AdviceRequest, policy: AdviceResultPolicy): Promise<AdviceResult>;
+}
