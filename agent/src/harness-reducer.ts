@@ -34,7 +34,11 @@ export class RunTurnReducerImpl implements RunTurnReducer {
   /** First-truthy-once-per-run latch (run-level; persists across turns). */
   private reportedSessionId = false;
 
-  // --- Per-turn state, reset at each turn boundary (finish). ---
+  /** True once a turn's first event has been accepted, until `finish`; gates the
+   *  turn-start reset below. Run-level, NOT reset per turn. */
+  private turnActive = false;
+
+  // --- Per-turn state, reset at each turn boundary (turn start / finish). ---
   private result: ReducedTurnResult = { done: false };
   /** The lead's own text this turn, in emit order (no-progress detector input). */
   private leadText: string[] = [];
@@ -47,6 +51,15 @@ export class RunTurnReducerImpl implements RunTurnReducer {
   constructor(private readonly context: HarnessContextHook) {}
 
   async accept(event: HarnessEvent): Promise<TurnReduction> {
+    // Reset per-turn state at TURN START (first event of a new turn), making "each
+    // turn begins clean" structural again — robust to a future throw path that skips
+    // `finish` and then reuses this reducer for the next turn. The run-level
+    // `reportedSessionId` latch is deliberately NOT reset here.
+    if (!this.turnActive) {
+      this.turnActive = true;
+      this.resetPerTurn();
+    }
+
     const reduction: TurnReduction = { messages: [], diagnostics: [] };
 
     // Session id is accepted lazily off ANY event (including ignored/partial
@@ -192,12 +205,21 @@ export class RunTurnReducerImpl implements RunTurnReducer {
     if (this.leadText.length > 0) this.result.finalText = this.leadText.join("\n");
     const result = this.result;
 
-    // Reset per-turn state; keep the run-level session latch.
+    // End the turn; keep the run-level session latch. The reset is redundant with the
+    // turn-start reset in `accept` on the clean path, but harmless, and closes the
+    // turn so the next `accept` re-arms the turn-start reset.
+    this.turnActive = false;
+    this.resetPerTurn();
+
+    return { result, end };
+  }
+
+  /** Reset the per-turn accumulators; leaves the run-level latches (`reportedSessionId`,
+   *  `turnActive`) untouched. */
+  private resetPerTurn(): void {
     this.result = { done: false };
     this.leadText = [];
     this.turnSessionId = undefined;
     this.contextRequested = false;
-
-    return { result, end };
   }
 }
