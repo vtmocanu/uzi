@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
@@ -74,6 +76,11 @@ type ObservedWorker struct {
 	HasDataPVC     bool
 	HasNixPVC      bool
 	HasDinDDataPVC bool
+	// NixPVCSize is the observed /nix PVC's requested storage (spec.resources.requests[storage]),
+	// recorded ONLY from a LIVE (deletionTimestamp == nil) nix PVC. nil means "no live nix PVC
+	// observed" — the PVC is absent OR Terminating. M3's size-drift arm compares it against the
+	// resolved Spec.NixSize; a nil here never triggers a recycle.
+	NixPVCSize *resource.Quantity
 	// Namespace is the namespace the object(s) for this worker were OBSERVED in
 	// (PRD #83 M3). With two worker namespaces — the restricted default and the
 	// privileged docker tier — teardown of a worker the api no longer wants must
