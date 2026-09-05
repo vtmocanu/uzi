@@ -340,7 +340,7 @@ can expand one provider assistant frame into several items, after which
 first surviving item. One reducer consumes the normalized stream and is the sole
 producer of `EmittedMessage[]`, signal latches, the current session id, and the
 terminal turn result. Raw Claude or Codex events never reach lifecycle code.
-Origin `unknown` is preserved and fails closed for signals.
+Origin `unknown` must be preserved and must fail closed for signals.
 
 The advice sketch follows the current judge/review/summary call shape: one
 isolated tool-less pass returning accumulated text plus optional usage.
