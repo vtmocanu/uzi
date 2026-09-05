@@ -1,147 +1,310 @@
 # ADR-1106: Codex harness boundary and SDK feasibility evidence
 
-**Status**: Proposed (M0 partially measured; live credential-backed probes remain)
+**Status**: Accepted
 **Date**: 2026-09-05
 **PRD**: [PRD #1106](../prds/1106-codex-harness-phase1.md)
 
 ## Context
 
 PRD #1106 adds a whole-run Codex choice without changing the existing Claude
-path. Its first milestone is a maintainer-local spike against the pinned Codex
-packages. The spike must settle process control, resume behaviour, subagent
-visibility, hook names and enforcement, credential refresh semantics, the
-initial model vocabulary, and the provider-neutral executor boundary before
-the production adapter is written.
+path. Its first milestone was a maintainer-local spike against pinned
+`@openai/codex@0.153.2` and `@openai/codex-sdk@0.153.2`. The spike settled
+process control, resume behaviour, subagent visibility, hook names and
+enforcement, credential refresh handling, the initial model vocabulary, and the
+provider-neutral executor boundary before the production adapter is written.
 
-This record is deliberately partial. No pod, worker image, deployment, uzi
-worker, or live Codex request was used for the evidence below. The sanitized
-live harness exists only under a private temporary directory and is not a
-repository artifact.
+The probe harness and packages lived only in private temporary storage. No pod,
+worker image, deployment, or uzi worker was used, and no repository package or
+lockfile changed. No credential value, hash, account identifier, or server-backed
+thread identifier is recorded here.
 
-## Environment and package surface
+## Process and session evidence
 
-The spike installed `@openai/codex@0.153.2` and
-`@openai/codex-sdk@0.153.2` only under a private temporary directory. npm
-reported integrity metadata for both pinned packages during installation. No
-package or lockfile in this repository changed.
-
-The pinned SDK declarations expose:
-
-- `TurnOptions.signal` and `resumeThread`;
-- `CodexOptions.env`, documented as a full replacement for the inherited
-  process environment;
-- `modelReasoningEffort` values `minimal`, `low`, `medium`, `high`, `xhigh`,
-  `max`, `ultra`, and `persistent`;
-- `model` as an arbitrary string rather than a closed model union; and
-- public `ThreadEvent` values with no parent/child attribution field.
-
-These declarations describe the public type surface. They do not prove that a
-server accepts a model or effort, that a server-backed thread resumes after an
-interrupted turn, or that child events are absent from some other observable
-channel.
-
-## Evidence recorded so far
-
-A credential-free fake-executable harness has three passing tests:
+The credential-free fake-executable harness passed three discriminating tests:
 
 | Probe | Positive control | Observation | Bound on the conclusion |
 |---|---|---|---|
-| Environment | the fake executable observed the explicitly supplied canary | `CodexOptions.env` replaced, rather than merged with, the parent environment | proves SDK subprocess construction only |
-| Resume | the fake executable observed the thread identifier returned by the first invocation | `resumeThread` supplied the same identifier on the resume invocation | proves argv/protocol plumbing only, not server-backed session recovery |
-| Abort | the fake executable was running before the signal fired | aborting `TurnOptions.signal` interrupted the CLI child promptly | proves local child-process interruption only, not the state a remote turn leaves resumable |
+| Environment | the fake executable observed the explicitly supplied canary | `CodexOptions.env` replaced, rather than merged with, the parent environment | SDK subprocess construction only |
+| Resume | the fake executable observed the thread identifier returned by the first invocation | `resumeThread` supplied the same identifier on the resume invocation | argv/protocol plumbing only |
+| Abort | the fake executable was running before the signal fired | aborting `TurnOptions.signal` interrupted the local CLI child promptly | local child-process interruption only |
 
-The tests were designed so a fake executable that never started, or a resume
-that invented a new identifier, could not satisfy them. Even so, a fake CLI is
-not an oracle for server state. The server half of M0(a) therefore remains
-open.
+The live server-backed abort/resume probe used `gpt-5.6-sol` at `low` effort.
+The stream reported a `command_execution` starting exactly `sleep 30`; aborting
+the turn's signal produced `AbortError`. `resumeThread` on that same thread then
+succeeded and returned terminal usage. This establishes that uzi can cancel at
+its existing turn boundary and resume the server-backed thread afterwards. It
+does not establish that arbitrary external side effects have been rolled back,
+so the existing checkpoint and process-reap boundaries remain necessary.
 
-## Credential-backed safety gate
+## Hooks and enforcement
 
-The live tool probe has not run. A copied `CODEX_HOME` isolates files but does
-not isolate the account or make its refresh token harmless. More importantly,
-the probe is intended to establish that `PreToolUse` hooks enforce the deny;
-using that same unproven hook as the protection for a model that can read the
-copied `auth.json` would be circular. If the hook did not fire, the model could
-exfiltrate a real credential.
+A credential-free real CLI+SDK probe used a dummy API key, a local fake Responses
+server, and a `codexPathOverride` wrapper that injected
+`--dangerously-bypass-hook-trust`. The SDK has no option for that flag, so the
+production wrapper must inject it. Under the normal/v1 tool path the exact
+`PreToolUse` stdin names were:
 
-Live probing is therefore paused for explicit informed approval and a design
-that does not expose a readable credential to the tool process before hook
-efficacy is independently established. No credential value, hash, account or
-thread identifier is recorded here. M0(e) must additionally treat refresh as
-server-side shared state: a temporary home cannot prevent a refresh from
-invalidating another login, and the newest successfully issued state must not
-be lost.
+| Operation | Exact `tool_name` | Matcher aliases in Codex source |
+|---|---|---|
+| shell command | `Bash` | none |
+| patch | `apply_patch` | `Write`, `Edit` |
+| ordinary file read through `exec_command` | `Bash` | none |
+| delegation | `spawn_agent` | `Agent` |
+| MCP server `m0`, tool `mark` | `mcp__m0__mark` | none |
 
-## Provisional harness boundary
+`Write`/`Edit` and `Agent` are matcher aliases, not the exact stdin names observed
+for `apply_patch` and `spawn_agent`. The observed sequence was `Bash`,
+`apply_patch`, `Bash`, `spawn_agent`, `mcp__m0__mark`; the measured Codex path
+had no separate `Read` hook. The deny decision reached the model's follow-up
+request, while the harmless shell and patch canaries remained absent; the probe
+therefore established enforcement rather than hook observation alone.
 
-The production boundary should keep uzi lifecycle policy outside provider
-adapters. The following shape is provisional until the live abort, resume and
-event probes finish:
+The approved credential-backed probe exercised the actual code-mode path. Its
+exact delegation hook names were `collaborationspawn_agent` and
+`collaborationwait_agent`, even with `multi_agent_v2 = false`. `SubagentStart`
+and `SubagentStop` carried `agent_id` and `agent_type = "m0_child"`. Production
+matchers must cover the normal/v1 names, their source aliases, and these code-mode
+names; none is safely inferred from another. Earlier denied attempts started no
+child, and neither those attempts nor the successful probe exposed a secret.
+
+Before the credential-backed probe, an independent macOS permissions profile
+served as a positive control: a workspace read succeeded, while a canary in the
+future credential-path class was denied and could not be copied into the
+workspace. Hook efficacy was therefore not used as the protection for the
+credential whose hook behaviour was being tested.
+
+The live root MCP probe produced `mcp_tool_call` started/completed frames for
+server `m0`, tool `mark`; its hook name was `mcp__m0__mark`, and the server's
+independent invocation counter was exactly one. With `approvalPolicy: "never"`,
+the MCP configuration also required `default_tools_approval_mode = "approve"`;
+otherwise the tool is unavailable before the hook question is exercised.
+
+## Delegation visibility
+
+The credential-free real CLI subagent probe gave the local server an independent
+view of two child requests and completions. The parent SDK stream exposed a
+runtime-only `collab_tool_call` and the parent's `agent_message`, but no child
+message or child tool frame. A delayed child response arrived after the parent's
+`turn.completed`, proving that a child can outlive its parent turn.
+
+The live code-mode probe agreed on the visibility boundary. The parent stream
+reported `collab_tool_call` started/completed with a sender id and an empty
+`receiver_thread_ids` list, but no child content. The hook lifecycle, not the
+parent stream, carried the child's `agent_id` and `agent_type`.
+`collab_tool_call` is absent from the 0.153.2 SDK declarations; the exact 0.153.2
+exec source filters notifications to the primary thread and turn. The adapter
+therefore needs a defensive runtime decoder for `collab_tool_call`, and it must
+not manufacture child messages, tools, or lead attribution from a root-only
+stream.
+
+Consequences for the lifecycle are explicit:
+
+- delegation lifecycle status may use only identifiers actually present in the
+  runtime frame or hook event;
+- a turn boundary reaps delegated work because a child may still be running when
+  the parent completes; and
+- subagent signal tools are denied by the attributed hook before invocation.
+  The parent stream observes only root MCP frames, so it cannot serve as a second
+  classifier for hidden child frames. Any future frame whose origin cannot be
+  proven is `unknown` and fails closed for signal latching.
+
+## Credential refresh evidence and limit
+
+A synthetic expired access-token JWT in one isolated seat copy forced
+`codex debug models` to refresh without invoking a model or tool. The persisted
+auth state changed, including rotation of the refresh token. A fresh
+`models_cache.json` recorded client version `0.153.2`, a fetch time after probe
+start, and a non-empty server catalog. The normal Codex home was then restored
+from the newer valid copy, and `codex login status` reported a ChatGPT login.
+
+The prior refresh token was deliberately not replayed. Exact source classifies
+`refresh_token_reused`, expired, and revoked refresh tokens as permanent
+re-login failures, so a replay experiment could revoke the token family and was
+not safe under the user's conditional approval. M0 therefore proves refresh and
+rotation, but does not claim the previous refresh token remains usable. Phase 1
+does not rely on prior-token usability: D5's one-in-flight-run-per-seat database
+invariant remains required, and the latest successfully issued auth state must be
+written back before another pod can use the seat.
+
+## Model and effort decision
+
+The refreshed server catalog visible to 0.153.2 contained:
+
+| Model | Default effort | Listed efforts |
+|---|---|---|
+| `gpt-6-astra` | `medium` | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+| `gpt-5.6-sol` | `low` | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+| `gpt-5.6-terra` | `medium` | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+| `gpt-5.6-luna` | `medium` | `low`, `medium`, `high`, `xhigh`, `max` |
+| `gpt-5.5` | `medium` | `low`, `medium`, `high`, `xhigh` |
+| `gpt-5.4-mini` | `medium` | `low`, `medium`, `high`, `xhigh` |
+| `gpt-5.3-codex-spark` | `high` | `low`, `medium`, `high`, `xhigh` |
+
+The initial product picker is deliberately narrower: `gpt-6-astra` and
+`gpt-5.6-sol`. Uzi's existing `low | medium | high | xhigh | max` contract maps
+one-to-one to Codex `modelReasoningEffort`; provider-only values are not added to
+the uzi contract in phase 1. Real no-tool turns at `max` succeeded on both initial
+models and returned the exact requested response. `persistent` failed, but the
+sanitized error could not distinguish unsupported effort from a narrower server
+or entitlement failure. The SDK's open model string and wider effort union are
+therefore transport types, not picker authority.
+
+## Accepted harness boundary
+
+The boundary is one per-run object. Construction owns immutable provider and
+isolation inputs: the credential, home, workspace and secret paths, available
+skills, MCP handlers, guardrails, and process launcher. Mutable uzi policy stays
+outside it: planning and approval, checkpoints and git operations, run-state
+transitions, and signal latches.
 
 ```ts
+type SessionPresence = "present" | "absent" | "unknown";
+
 type HarnessOrigin =
-  | { attribution: "main" }
-  | { attribution: "agent"; agentId: string; agentType?: string }
-  | { attribution: "ambiguous" };
+  | { kind: "main" }
+  | {
+      kind: "subagent";
+      role?: string;
+      name?: string;
+      instanceId?: string;
+      label?: string;
+    }
+  | { kind: "unknown" };
 
-type HarnessEvent =
-  | { kind: "session_started"; sessionId: string }
-  | { kind: "message"; origin: HarnessOrigin; text: string }
-  | { kind: "tool"; origin: HarnessOrigin; phase: "started" | "updated" | "completed"; tool: string; payload: unknown }
-  | { kind: "usage"; usage: HarnessUsage }
-  | { kind: "completed" }
-  | { kind: "error"; message: string };
-
-interface RunHarness {
-  start(options: RunHarnessOptions): Promise<HarnessSession>;
-  resume(sessionId: string, options: RunHarnessOptions): Promise<HarnessSession>;
+interface HarnessAgent {
+  description: string;
+  prompt: string;
+  tools?: readonly string[];
+  model?: string;
 }
 
-interface HarnessSession {
-  runTurn(prompt: string, options: { signal: AbortSignal }): AsyncIterable<HarnessEvent>;
+interface RunTurnRequest {
+  prompt: string;
+  resumeSessionId?: string;
+  signal: AbortSignal;
+  systemPrompt: string;
+  model?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  agents: Readonly<Record<string, HarnessAgent>>;
+}
+
+type HarnessItem =
+  | { kind: "text"; text: string }
+  | { kind: "thinking"; text: string }
+  | {
+      kind: "tool";
+      phase: "started";
+      id?: string;
+      name?: string;
+      input?: unknown;
+    }
+  | {
+      kind: "tool";
+      phase: "finished";
+      id?: string;
+      name?: string;
+      output?: unknown;
+      isError?: boolean;
+    };
+
+type HarnessErrorCategory =
+  | "aborted"
+  | "authentication"
+  | "authorization"
+  | "rate_limit"
+  | "model"
+  | "effort"
+  | "transport"
+  | "tool"
+  | "protocol"
+  | "session_missing"
+  | "unknown";
+
+type HarnessEvent =
+  | { kind: "turn_started" }
+  | { kind: "session_id"; sessionId: string }
+  | {
+      kind: "frame";
+      origin: HarnessOrigin;
+      items: readonly HarnessItem[];
+      usage?: HarnessUsage;
+      model?: string;
+    }
+  | {
+      kind: "delegation";
+      phase: "started" | "completed" | "failed";
+      identifiers: {
+        agentId?: string;
+        agentType?: string;
+        senderId?: string;
+        receiverThreadIds?: readonly string[];
+      };
+      error?: HarnessError;
+    }
+  | {
+      kind: "turn_finished";
+      outcome: "success" | "failed";
+      usage?: { basis: "turn" | "session"; value: HarnessUsage };
+      context?: HarnessContext;
+      metrics?: HarnessMetrics;
+      error?: HarnessError;
+      rateLimit?: HarnessRateLimit;
+    };
+
+interface HarnessError {
+  category: HarnessErrorCategory;
+  message: string;
+}
+
+interface RunHarness {
+  inspectSession(id: string): Promise<SessionPresence>;
+  runTurn(request: RunTurnRequest): AsyncIterable<HarnessEvent>;
+  reap(): void;
+}
+
+interface AdviceRequest {
+  systemPrompt: string;
+  prompt: string;
+  model?: string;
+  output: { kind: "text" } | { kind: "json"; schema: unknown };
+  signal: AbortSignal;
 }
 
 interface AdviceHarness {
-  run(request: AdviceRequest, options: { signal: AbortSignal }): Promise<{
-    output: string;
-    structuredOutput?: unknown;
-    usage: HarnessUsage;
-  }>;
+  run(request: AdviceRequest): Promise<{ text: string; usage?: HarnessUsage }>;
 }
 ```
 
-`HarnessUsage`, `RunHarnessOptions`, and `AdviceRequest` are provider-neutral
-uzi contracts; raw Claude and Codex event types stay inside their adapters.
-Credential persistence, checkpoints, git operations, run-state transitions,
-and signal latching do not belong on either interface. In particular,
-ambiguous Codex event origin must remain explicit and fail closed; it must not
-be silently promoted to the main thread. One shared event-mapping contract is
-the input to persistence and live-view rendering for both harnesses.
+Usage, context, metrics and rate-limit shapes are provider-neutral uzi contracts.
+`HarnessOrigin` carries the current message-mapping concepts: optional role/name,
+invocation instance and label. Hook `agent_id`/`agent_type` remain delegation or
+hook-lifecycle identifiers; they are not silently translated into message
+attribution. `inspectSession` is tri-state so a dropped resume id is cleared only
+on proven absence; an I/O or protocol failure returns `unknown`. `session_id` is
+lazy because Codex does not make it available at construction. `reap()` is
+mandatory at every turn boundary and before credentialed git.
 
-The final M0(g) decision must re-read the live run, advice, and message-mapping
-call sites and adjust these signatures to their actual needs after M0(a) and
-M0(b) establish what Codex can report.
+Provider `item.updated` events reset liveness only; they do not become persisted
+frames. A frame keeps its mapped items grouped because the current Claude mapper
+can expand one provider assistant frame into several items, after which
+`driveTurn` filters signal tools and attaches that frame's usage/model to the
+first surviving item. One reducer consumes the normalized stream and is the sole
+producer of `EmittedMessage[]`, signal latches, the current session id, and the
+terminal turn result. Raw Claude or Codex events never reach lifecycle code.
+Origin `unknown` is preserved and fails closed for signals.
 
-## Remaining evidence before acceptance
+The advice boundary matches the current judge/review/summary call sites: it owns
+one isolated tool-less pass and returns accumulated text plus optional usage.
+Structured-output validation and tolerant parsing remain with the caller, because
+those policies differ by advice consumer.
 
-- **M0(a), server half**: abort a real streamed turn and resume that exact
-  server-backed thread, recording what context and terminal events survive.
-- **M0(b)**: prove independently that a child ran, then determine which child
-  items reach the parent stream, how origin is attributed, and whether a child
-  can outlive the parent turn. Absence in the parent stream alone is not
-  evidence.
-- **M0(c), live half**: record exact hook `tool_name` values for shell,
-  `apply_patch`, file reads, `spawn_agent`, and MCP, then deny one harmless
-  action and prove its side effect did not occur. Seeing hook input without a
-  blocked side effect proves observation, not enforcement.
-- **M0(e)**: establish a reproducible forced-refresh lever and whether the old
-  refresh token remains usable after rotation, without losing the newest valid
-  auth state.
-- **M0(f), live half**: distinguish accepted model/effort combinations from
-  entitlement, authentication, rate-limit, and transient failures. The open
-  `model: string` type cannot answer this.
-- **M0(g), final**: reconcile the provisional interfaces above with the live
-  event and resume results and the current uzi call sites.
+## Consequences
 
-Until these are complete, M0 remains open and the provisional boundary is not
-an implementation decision.
+- M2 extracts the Claude path behind these interfaces without changing its
+  behaviour; M3 adds the Codex adapter and the runtime `collab_tool_call` decoder.
+- Production hook matchers cover every observed normal/v1 and code-mode name and
+  are tested by side effect, not hook input alone.
+- Codex feeds show root frames plus honest delegation lifecycle status. They do
+  not fabricate child content that 0.153.2 does not expose.
+- The seat lock and checkpoint/write-back design remain conservative despite
+  proven rotation, because previous-token usability was intentionally not tested.
