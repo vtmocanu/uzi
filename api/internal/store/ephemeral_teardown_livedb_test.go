@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -78,7 +79,12 @@ func tokenRowCount(fx *fleetFixture, workerID uuid.UUID) int {
 // poll (a hosted row's presence == the pod should exist; its absence == teardown).
 func inControllerList(fx *fleetFixture, workerID uuid.UUID) bool {
 	fx.t.Helper()
-	rows, err := fx.q.ListHostedWorkersForController(fx.ctx)
+	// disk_pressure derivation is irrelevant to a presence/absence check; pass any valid
+	// params (PRD #837 M4 parameterized this query).
+	rows, err := fx.q.ListHostedWorkersForController(fx.ctx, store.ListHostedWorkersForControllerParams{
+		DiskPressureMinStreak: 2,
+		HeartbeatCutoff:       pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true},
+	})
 	if err != nil {
 		fx.t.Fatalf("ListHostedWorkersForController: %v", err)
 	}

@@ -671,6 +671,13 @@ func TestNoStatsColumnsInSchedulingQueries(t *testing.T) {
 		"HeartbeatWorker":   true, // the sole writer of the stats_ columns
 		"ListWorkersByUser": true, // DTO read; today via w.*, allowlisted for a future explicit select
 		"ListAllWorkers":    true, // DTO read (admin); same rationale
+		// PRD #837 M4 — stats_disk_pressure_streak shares the stats_ prefix, so its two extra
+		// touchers land here too: RegisterWorker RESETS it on a fresh incarnation, and
+		// ListHostedWorkersForController is the ONE lifecycle reader (its debounced,
+		// freshness-gated disk_pressure derivation), allow-listed exactly like
+		// ReapEphemeralWorkers is for online_since. Neither feeds claim/scheduling.
+		"RegisterWorker":                 true,
+		"ListHostedWorkersForController": true,
 	}
 	files, err := filepath.Glob("../store/queries/*.sql")
 	if err != nil || len(files) == 0 {
@@ -703,12 +710,18 @@ func TestNoDiskStatsColumnsInSchedulingQueries(t *testing.T) {
 	// and so a future reader (e.g. M4's ListHostedWorkersForController poll derivation) is
 	// added deliberately, with a note, rather than slipping in under the generic guard.
 	allowed := map[string]bool{
-		"HeartbeatWorker":   true, // the sole writer of the stats_disk_ columns
+		"HeartbeatWorker":   true, // writes stats_disk_* AND increments/resets stats_disk_pressure_streak
 		"ListWorkersByUser": true, // DTO read; today via w.*, allowlisted for a future explicit select
 		"ListAllWorkers":    true, // DTO read (admin); same rationale
-		// NOTE: M4 will add "ListHostedWorkersForController" here (the poll's disk_pressure
-		// derivation is the one allowed lifecycle reader, like ReapEphemeralWorkers is for
-		// online_since) — until then, no query but HeartbeatWorker even names stats_disk_.
+		// PRD #837 M4 landed the streak column + its lifecycle reader:
+		//   * RegisterWorker RESETS stats_disk_pressure_streak on a fresh pod incarnation (a
+		//     WRITE, so a prior incarnation's streak never carries forward).
+		//   * ListHostedWorkersForController is the ONE allowed lifecycle READER — its poll
+		//     derives disk_pressure from the debounced, freshness-gated streak, allow-listed
+		//     exactly like ReapEphemeralWorkers is for online_since. It never orders/prefers a
+		//     worker for claiming, so the display-only invariant holds.
+		"RegisterWorker":                 true,
+		"ListHostedWorkersForController": true,
 	}
 	files, err := filepath.Glob("../store/queries/*.sql")
 	if err != nil || len(files) == 0 {

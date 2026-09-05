@@ -44,7 +44,7 @@ func newControllerHandler(t *testing.T, st hostedsvc.Store, enabled bool) *Handl
 		ControllerTokenSHA256: jointoken.Hash(testControllerToken),
 	}}
 	if st != nil {
-		h.SetHostedSvc(hostedsvc.New(st, box))
+		h.SetHostedSvc(hostedsvc.New(st, box, time.Now, time.Hour))
 	}
 	return h
 }
@@ -67,7 +67,7 @@ type pollStore struct {
 	uncordonErr  error
 }
 
-func (p *pollStore) ListHostedWorkersForController(context.Context) ([]store.ListHostedWorkersForControllerRow, error) {
+func (p *pollStore) ListHostedWorkersForController(context.Context, store.ListHostedWorkersForControllerParams) ([]store.ListHostedWorkersForControllerRow, error) {
 	return p.rows, nil
 }
 func (p *pollStore) UpsertHostedWorkerToken(context.Context, store.UpsertHostedWorkerTokenParams) error {

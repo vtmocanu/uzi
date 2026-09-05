@@ -81,6 +81,22 @@ type ObservedWorker struct {
 	// observed" — the PVC is absent OR Terminating. M3's size-drift arm compares it against the
 	// resolved Spec.NixSize; a nil here never triggers a recycle.
 	NixPVCSize *resource.Quantity
+	// DataPVCLive is true only when a LIVE (deletionTimestamp == nil) /data PVC was
+	// observed. It is the /data analogue of "NixPVCSize != nil": /data carries no size,
+	// so its liveness is the proxy the M4 disk-pressure recycle gates its delete on (a
+	// Terminating /data PVC is already being reaped, so it is not re-deleted) and the
+	// Deployment-recreate guard suppresses on (never place a Deployment over a doomed
+	// /data volume). HasDataPVC stays exists-in-ANY-state (it gates the create); this is
+	// the stricter live-only flag.
+	DataPVCLive bool
+	// NixPVCCreatedAt / DataPVCCreatedAt are the CreationTimestamps of the LIVE nix/data
+	// PVCs (nil when absent or Terminating), used by the M4 recycle cooldown: a worker
+	// back at disk pressure whose youngest volume was minted within the cooldown was
+	// just recycled, so it is surfaced as a capacity signal rather than recycled again
+	// into a thrash loop. The loop is stateless, so these apiserver-supplied timestamps
+	// are the only elapsed-time signal it has.
+	NixPVCCreatedAt  *time.Time
+	DataPVCCreatedAt *time.Time
 	// Namespace is the namespace the object(s) for this worker were OBSERVED in
 	// (PRD #83 M3). With two worker namespaces — the restricted default and the
 	// privileged docker tier — teardown of a worker the api no longer wants must

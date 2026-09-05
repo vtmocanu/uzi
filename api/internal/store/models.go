@@ -704,6 +704,7 @@ type Worker struct {
 	StatsDiskNixTotalBytes  pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
 	StatsDiskDataBytes      pgtype.Int8        `json:"stats_disk_data_bytes"`
 	StatsDiskDataTotalBytes pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak int32              `json:"stats_disk_pressure_streak"`
 }
 
 type WorkerUpgradeMute struct {

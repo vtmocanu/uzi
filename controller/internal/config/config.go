@@ -139,6 +139,23 @@ type Config struct {
 	// Default false.
 	ForceRoll bool
 
+	// --- disk-pressure self-heal (PRD #837 M4) --------------------------------
+	// WorkerDiskRecycleEnabled is the master toggle for the disk self-heal: when a
+	// worker reports disk pressure (or its /nix PVC is undersized vs the resolved spec),
+	// the controller recycles the affected volumes (teardown + reprovision). DEFAULT
+	// TRUE (UZI_WORKER_DISK_RECYCLE_ENABLED) — self-heal is on unless deliberately
+	// disabled. A set-but-unparseable value is a BOOT error rather than a silent default,
+	// mirroring UZI_WORKER_FORCE_ROLL: an operator disabling self-heal by typo must not
+	// silently leave it on.
+	WorkerDiskRecycleEnabled bool
+	// WorkerDiskRecycleCooldown bounds how soon after a recycle the same worker may be
+	// recycled again (UZI_WORKER_DISK_RECYCLE_COOLDOWN, default 1h). A worker back at disk
+	// pressure WITHIN the cooldown is a capacity signal (its volumes are genuinely too
+	// small for its workload), not a transient to reclaim, so it is surfaced rather than
+	// recycled into a teardown/reprovision thrash loop. The elapsed time is measured from
+	// the youngest recycled PVC's CreationTimestamp — the loop is stateless.
+	WorkerDiskRecycleCooldown time.Duration
+
 	// --- docker-capable workers (PRD #83 M3) ----------------------------------
 	// Both empty unless this instance offers docker workers. They travel TOGETHER:
 	// a docker worker is rendered into WorkerDockerNamespace with a DinD sidecar from
@@ -217,6 +234,23 @@ func Load() (Config, error) {
 		// Safe default: rootless. Overridden (and REQUIRED explicit) when the docker tier
 		// is configured — see validateDockerTier.
 		WorkerDinDRootless: true,
+		// The disk-pressure recycle cooldown (PRD #837 M4). Default 1h; parseDuration falls
+		// back on empty or a non-positive value, the same tuning-not-security split as the
+		// interval knobs above. WorkerDiskRecycleEnabled is set just below (default true).
+		WorkerDiskRecycleCooldown: parseDuration("UZI_WORKER_DISK_RECYCLE_COOLDOWN", time.Hour),
+	}
+
+	// The disk-pressure self-heal toggle (PRD #837 M4). DEFAULT TRUE: empty/unset leaves
+	// self-heal ON. A set but unparseable value is a BOOT error rather than a silent
+	// default — mirroring UZI_WORKER_FORCE_ROLL, an operator disabling self-heal by typo
+	// must not silently leave it on.
+	cfg.WorkerDiskRecycleEnabled = true
+	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_DISK_RECYCLE_ENABLED")); raw != "" {
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("UZI_WORKER_DISK_RECYCLE_ENABLED=%q is not a boolean (want true or false): %w", raw, err)
+		}
+		cfg.WorkerDiskRecycleEnabled = enabled
 	}
 
 	// The emergency force-roll override (PRD #422 M5). Empty defaults false; a set but
@@ -245,7 +279,7 @@ func Load() (Config, error) {
 	if path == "" {
 		return Config{}, fmt.Errorf("UZI_CONTROLLER_TOKEN_FILE is required (the path to the mounted controller bearer token; this credential is deliberately not accepted from an env var)")
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: the path is operator config (UZI_CONTROLLER_TOKEN_FILE), not user input; reading the mounted token file by its configured path is the whole point.
 	if err != nil {
 		// The path is operator config, not a secret; the contents never surface.
 		return Config{}, fmt.Errorf("UZI_CONTROLLER_TOKEN_FILE: read %s: %w", path, err)
@@ -455,7 +489,7 @@ func loadAPICA(cfg *Config) error {
 	if !strings.HasPrefix(cfg.APIBaseURL, "https://") {
 		return fmt.Errorf("UZI_API_CA_FILE is set but UZI_API_URL is not https; the CA would never be consulted and the join tokens this controller carries would cross the pod network in the clear")
 	}
-	pem, err := os.ReadFile(path)
+	pem, err := os.ReadFile(path) //nolint:gosec // G304: the path is operator config (UZI_API_CA_FILE), not user input; reading the mounted CA bundle by its configured path is intended.
 	if err != nil {
 		return fmt.Errorf("UZI_API_CA_FILE: read %s: %w", path, err)
 	}
