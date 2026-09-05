@@ -473,7 +473,7 @@ Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/done/64-uzi-cli.md`.
 
 Tracked as GitLab issue vtmocanu/uzi#71; PRD at `prds/done/71-ci-autofix.md`.
 
-- Automatic CI-fix is ON by default for every user (per-user tri-state opt-out, NULL=inherit=on), behind an admin instance-wide kill-switch (default on); admin can force-toggle any user. [user 2026-07-17] (AI-synced 2026-09-05, PRD #914)
+- Automatic CI-fix is ON by default for every user (per-user tri-state opt-out, NULL=inherit=on), behind an admin instance-wide kill-switch (default on); admin can force-toggle any user. [user, PRD #914 — supersedes the earlier default-off from #71]
 - Fires only on agent-owned MR-branch pipelines (`agent/issue-N`); `main`/protected branches are never auto-touched — a fix still lands on the MR branch and a human still merges (primary directive). [user 2026-07-17]
 - Loop-guarded: max 2 automatic attempts per branch + an early stop when the failure hasn't changed; on giving up, uzi comments + notifies and stops (the manual Fix CI button remains). [user 2026-07-17]
 - "Usually we fix the code, not CI itself, but if CI is really at fault we can add a CI fix in the MR" — code fixes push automatically; a fix that edits the CI config passes the approval gate (human-approved before it pushes). [user 2026-07-17]
