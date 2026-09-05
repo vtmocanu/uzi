@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
@@ -34,6 +35,28 @@ const (
 	proposalLabelBase = "proposal"
 	proposalLabelSep  = "::"
 )
+
+// ProposalLabel builds the scoped marker label for a proposal-shaped schedule (PRD #929
+// D2): the bare proposalLabelBase for a slugless (user) schedule, else
+// proposalLabelBase::<catalogSlug>. It is the SINGLE source of the label string so the fire
+// side (schedsvc, which lists issues carrying it to build the dedup digest) and this filing
+// side query and file the SAME label — they can never drift. The label is built purely from
+// the constants above plus the given slug; it never carries `uzi`, a sweep selector, or a
+// bot assignment (D3).
+func ProposalLabel(catalogSlug string) string {
+	if catalogSlug == "" {
+		return proposalLabelBase
+	}
+	return proposalLabelBase + proposalLabelSep + catalogSlug
+}
+
+// catalogSlugString reads a schedule's catalog slug as a plain string, "" when NULL/invalid.
+func catalogSlugString(sched store.RunSchedule) string {
+	if sched.CatalogSlug.Valid {
+		return sched.CatalogSlug.String
+	}
+	return ""
+}
 
 // clampWireProposal narrows the worker's proposal declaration to what may be filed.
 // It returns nil unless the run is a SCHEDULED PROMPT run (defense-in-depth kind gate;
@@ -98,13 +121,13 @@ func (s *Service) maybeFileProposal(ctx context.Context, run store.Run, proposal
 		return
 	}
 
-	// Resolve output mode; only issues-mode prompt schedules file a proposal. A
-	// payload on a non-issues run is defense-in-depth filed nothing (M4 only makes
-	// issues-mode agents emit one).
-	mode := "mr"
-	if sched.OutputMode.Valid {
-		mode = sched.OutputMode.String
-	}
+	// Resolve output mode via the shared resolver (PRD #929 M3) so this filing side and the
+	// fire side (schedsvc) interpret a NULL output_mode identically — a NULL row resolves to
+	// the CATALOG default, not a hardcoded "mr", so a catalog that ships `output: issues`
+	// files here too. Only issues-mode prompt schedules file a proposal; a payload on a
+	// non-issues run is defense-in-depth filed nothing (M4 only makes issues-mode agents
+	// emit one).
+	mode := schedtmpl.ResolveOutputMode(sched.OutputMode.String, sched.OutputMode.Valid, catalogSlugString(sched))
 	if mode != "issues" {
 		return
 	}
@@ -112,13 +135,10 @@ func (s *Service) maybeFileProposal(ctx context.Context, run store.Run, proposal
 		return
 	}
 
-	// The label set is EXACTLY one constant-built marker (D3, see proposalLabelBase).
-	// Never `uzi`, never a sweep selector, never a bot assignment, never anything from
-	// model output.
-	label := proposalLabelBase
-	if sched.CatalogSlug.Valid && sched.CatalogSlug.String != "" {
-		label = proposalLabelBase + proposalLabelSep + sched.CatalogSlug.String
-	}
+	// The label set is EXACTLY one constant-built marker (D3, via ProposalLabel — the SAME
+	// helper schedsvc queries with for the dedup digest). Never `uzi`, never a sweep
+	// selector, never a bot assignment, never anything from model output.
+	label := ProposalLabel(catalogSlugString(sched))
 	labels := []string{label}
 
 	repo, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: run.RepoID.Bytes, UserID: run.UserID})

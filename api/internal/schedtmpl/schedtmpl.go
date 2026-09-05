@@ -182,6 +182,29 @@ func (j DefaultJob) OutputMode() string {
 	return j.Output
 }
 
+// ResolveOutputMode resolves the effective output mode for a schedule from its stored
+// run_schedules.output_mode plus its catalog slug (PRD #929 M3). It is the SINGLE resolver
+// both the fire side (schedsvc) and the completion-filing side (workersvc) call, so the two
+// can never diverge on how a NULL mode is interpreted:
+//
+//   - a non-empty, valid stored mode wins (an explicit per-schedule choice);
+//   - otherwise, when catalogSlug names a known catalog job, that job's catalog default
+//     (DefaultJob.OutputMode) is used — so a catalog that ships `output: issues` as its
+//     default is honored identically on both sides;
+//   - otherwise (a user/slugless schedule, or an unknown slug) it falls back to
+//     DefaultOutputMode ("mr").
+func ResolveOutputMode(storedMode string, storedValid bool, catalogSlug string) string {
+	if storedValid && storedMode != "" {
+		return storedMode
+	}
+	if catalogSlug != "" {
+		if job, ok := BySlug(catalogSlug); ok {
+			return job.OutputMode()
+		}
+	}
+	return DefaultOutputMode
+}
+
 // cloneJob deep-copies the mutable Labels slice so a returned job shares nothing
 // with the package-level catalog.
 func cloneJob(j DefaultJob) DefaultJob {
