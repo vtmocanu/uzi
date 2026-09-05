@@ -2,7 +2,7 @@ import { useState } from "react";
 import { api, ApiError, isHttpsUrl, type IncidentalFindingFiledIssue } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { Badge, Button } from "./ui";
-import { AlertIcon, ExternalLinkIcon } from "./icons";
+import { BugIcon, ExternalLinkIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
 
 // FindingCard renders an incidental-finding card in the run stream (PRD #333 M7, D10).
@@ -123,7 +123,7 @@ export function FindingCard({
       <div className="flex items-center justify-between gap-2 border-b border-info/20 bg-info/10 px-3 py-2">
         <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-info">
           <span aria-hidden="true">
-            <AlertIcon />
+            <BugIcon />
           </span>
           Incidental finding
         </span>
