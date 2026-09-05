@@ -51,6 +51,77 @@ func ascending(seqs []int32) bool {
 	return true
 }
 
+// M5 regression: a FAILED initial tail page must NOT latch historyComplete. A tail error adds
+// no frames (lowSeq stays 0), and if the completion set were ungated the run would be marked
+// "complete" with zero history — and a later successful `r` retry would then never start the
+// backfill (the start guard requires !historyComplete). Here the tail errors, then a successful
+// tail lands (as `r` would deliver) and the backfill chain starts.
+func TestTUIDetailBackfillTailErrorDoesNotCompleteHistory(t *testing.T) {
+	shrinkPageSize(t, 2)
+	now := time.Now()
+	runID := "bf-tailerr"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailRunMsg{runID: runID, run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}})
+	m = next.(tuiModel)
+
+	// The initial tail page fails.
+	next, _ = m.Update(detailPageMsg{runID: runID, kind: pageTail, err: errFake("tail boom")})
+	m = next.(tuiModel)
+	if m.detail.historyComplete {
+		t.Fatal("a failed tail page must not latch historyComplete (zero history was loaded)")
+	}
+
+	// A successful tail retry lands the newest page (seqs 4,5) with older history below it; the
+	// backfill must now start rather than be blocked by a falsely-latched historyComplete.
+	nextM, cmd := m.Update(detailPageMsg{runID: runID, kind: pageTail, msgs: []apitypes.MessageDTO{
+		msgDTO(4, "text", "lead", "", "", "body-4", now),
+		msgDTO(5, "text", "lead", "", "", "body-5", now),
+	}})
+	m = nextM.(tuiModel)
+	if !m.detail.backfilling {
+		t.Fatal("after a successful tail retry with older history, the backfill must start")
+	}
+	if cmd == nil {
+		t.Fatal("the successful tail retry must return the first backfillCmd")
+	}
+	page, ok := cmd().(detailPageMsg)
+	if !ok || page.kind != pageBackfill {
+		t.Fatalf("the retry chained %T, want a pageBackfill", cmd())
+	}
+}
+
+// M5 regression: pressing `r` mid-walk re-issues loadTailCmd; its reply must NOT start a SECOND
+// backfill chain over the shared lowSeq cursor while one is already in flight (the !backfilling
+// start guard).
+func TestTUIDetailBackfillTailWhileBackfillingDoesNotDoubleStart(t *testing.T) {
+	shrinkPageSize(t, 2)
+	now := time.Now()
+	runID := "bf-double"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailRunMsg{runID: runID, run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}})
+	m = next.(tuiModel)
+
+	// First tail starts the walk (lowSeq 4 > 1).
+	next, _ = m.Update(detailPageMsg{runID: runID, kind: pageTail, msgs: []apitypes.MessageDTO{
+		msgDTO(4, "text", "lead", "", "", "body-4", now),
+		msgDTO(5, "text", "lead", "", "", "body-5", now),
+	}})
+	m = next.(tuiModel)
+	if !m.detail.backfilling {
+		t.Fatal("the first tail should have started the backfill")
+	}
+
+	// A second tail reply arrives (as a mid-walk `r` would) while backfilling is still true: it
+	// must NOT return a second backfillCmd.
+	_, cmd := m.Update(detailPageMsg{runID: runID, kind: pageTail, msgs: []apitypes.MessageDTO{
+		msgDTO(4, "text", "lead", "", "", "body-4", now),
+		msgDTO(5, "text", "lead", "", "", "body-5", now),
+	}})
+	if cmd != nil {
+		t.Fatalf("a tail reply while backfilling must not start a second chain, got %T", cmd())
+	}
+}
+
 // M5: the tail page starts the background backfill, which walks older history one page at a
 // time — Tail{2} → Before{4,2} → Before{2,2} — until it reaches the start, after which the badge
 // is gone and historyComplete is set. The exact RunLogsPage query sequence is asserted.

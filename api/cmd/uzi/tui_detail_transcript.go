@@ -432,7 +432,10 @@ func (m tuiModel) backfillBadge() string {
 		return lipgloss.NewStyle().Foreground(m.pal.amber).Render("⇡ earlier history unavailable · r")
 	}
 	if m.detail.backfilling {
-		held := len(m.detail.frames)
+		// held is derived from the seq bounds, not len(frames): seq is gapless from 1 (D5), so
+		// highSeq-lowSeq+1 is the count of message frames held and never exceeds the highSeq
+		// total, whereas len(frames) would also count any seq-less infra frame (N > M).
+		held := int(m.detail.highSeq - m.detail.lowSeq + 1)
 		return m.pal.faint.Render("⇡ loading earlier · " + itoa(held) + " of " + itoa(int(m.detail.highSeq)))
 	}
 	return ""

@@ -723,12 +723,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case pageTail:
 			m.detail.applyTailPage(msg.msgs, msg.err)
 			// Start the background backfill once the tail is in, if there is older history to
-			// walk (PRD #1137 D1). The reply chains the next page.
-			if msg.err == nil && !m.detail.historyComplete && m.detail.lowSeq > 1 {
+			// walk (PRD #1137 D1). The reply chains the next page. The !backfilling guard keeps
+			// a mid-walk `r` (which re-issues loadTailCmd) from starting a SECOND parallel chain
+			// over the shared lowSeq cursor.
+			if msg.err == nil && !m.detail.historyComplete && !m.detail.backfilling && m.detail.lowSeq > 1 {
 				m.detail.backfilling = true
 				return m, m.backfillCmd(m.detail.runID, m.detail.lowSeq)
 			}
-			if m.detail.lowSeq <= 1 { // 0 (empty run) or 1 (start already held): nothing older
+			// Only a SUCCESSFUL tail with nothing older is complete. A tail ERROR adds no frames
+			// (lowSeq stays 0), so it must NOT latch historyComplete — otherwise a later `r`
+			// retry that loads real history would never start the backfill (the start guard
+			// requires !historyComplete).
+			if msg.err == nil && m.detail.lowSeq <= 1 { // 0 (empty run) or 1 (start already held)
 				m.detail.historyComplete = true
 			}
 			return m, nil
