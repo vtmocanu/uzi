@@ -812,14 +812,18 @@ tasks:
       - ./scripts/check-spec-numbering.sh specs/ai.md scripts/spec-numbering-canary.md
 
   check:migration-additive:
-    desc: migration Up sections make no destructive change to a worker-facing table, with a canary proving the detector fired
+    desc: migration Up sections make no destructive change to a worker-facing table (except an exact allow-drop marker), with canaries proving the detector fired
     cmds:
       # Additive-only release-window discipline (PRD #422 M6): an N-1 worker reads a
       # HEAD schema during a rolling release, so a DROP/RENAME/RETYPE of a worker-facing
       # column/table in a forward migration breaks it. Scans Up sections ONLY (Down is a
-      # legitimate rollback). The canary carries a planted destructive statement the check
-      # must detect (Up) and one it must ignore (Down), or it exits 2 (instrument broken).
-      # Both args are explicit so this echo shows exactly what is scanned. See the script header.
+      # legitimate rollback). A contract-phase drop of a now-dead column may carry an exact
+      # `-- migration-additive:allow-drop <table>.<column>` marker to exempt just that column
+      # (issue #1087). The canary carries a planted destructive statement the check must
+      # detect (Up) and one it must ignore (Down); two sibling fixtures beside it prove the
+      # marker exemption is exact (a matching marker -> 0, a mismatched one -> 1). Any
+      # deviation exits 2 (instrument broken). The canary arg is explicit so this echo shows
+      # exactly what is scanned; the marker/mismatch fixtures are found beside it. See the script header.
       - ./scripts/check-migration-additive.sh scripts/migration-additive-canary.sql api/internal/store/migrations
 
   check:migration-numbering:
