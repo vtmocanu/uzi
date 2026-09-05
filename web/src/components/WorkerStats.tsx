@@ -49,6 +49,26 @@ function pctOf(used: number, limit: number | null): number | null {
   return (used / limit) * 100;
 }
 
+/** The two disk volumes a worker reports (PRD #837), each a used/total byte pair.
+ *  A volume is "present" only when BOTH its used and total are non-null — they arrive
+ *  as a pair — so a worker can report /nix, /data, both, or neither independently of
+ *  the mem sample. Returns each present volume with its used/total pct (total is always
+ *  positive when present, so pctOf never falls back to null here). */
+function diskVolumes(w: Worker): { label: string; used: number; total: number; pct: number }[] {
+  const out: { label: string; used: number; total: number; pct: number }[] = [];
+  const pairs: [string, number | null, number | null][] = [
+    ["Disk /nix", w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes],
+    ["Disk /data", w.stats_disk_data_bytes, w.stats_disk_data_total_bytes],
+  ];
+  for (const [label, used, total] of pairs) {
+    if (used == null || total == null) continue;
+    const pct = pctOf(used, total);
+    if (pct == null) continue;
+    out.push({ label, used, total, pct });
+  }
+  return out;
+}
+
 /** True once the worker has reported a usable sample. The single source of truth for
  *  "does this worker have stats to render" — the gauges, the compact line, and the
  *  Dashboard fleet card's filter all gate on this, so no surface can disagree about
@@ -119,6 +139,15 @@ export function WorkerStatGauges({ worker }: { worker: Worker }) {
           </span>
         </div>
       )}
+      {diskVolumes(worker).map((d) => (
+        <Bar
+          key={d.label}
+          label={d.label}
+          value={`${formatBytesPair(d.used, d.total)} · ${Math.round(d.pct)}%`}
+          valueText={`${formatBytesPair(d.used, d.total)}, ${Math.round(d.pct)}%`}
+          fillPct={d.pct}
+        />
+      ))}
       {isProcess && <p className="text-[0.7rem] text-faint">worker process only</p>}
     </div>
   );
@@ -136,12 +165,16 @@ export function WorkerStatLine({ worker }: { worker: Worker }) {
   const mem = worker.stats_mem_bytes!;
   const limit = worker.stats_mem_limit_bytes;
   const memText = limit != null && limit > 0 ? formatBytesPair(mem, limit) : formatBytes(mem);
+  // The fuller of the two reported volumes (highest used/total pct) stands in for disk
+  // on the one-liner; omitted entirely when no volume is reported (no dangling "· disk").
+  const fullestDisk = diskVolumes(worker).sort((a, b) => b.pct - a.pct)[0];
   return (
     <span
       className={cx("tabular-nums text-xs text-faint", offline && "opacity-50")}
       title={worker.stats_source === "process" ? "measures the worker process only" : undefined}
     >
       cpu {cpu == null ? "—" : `${Math.round(cpu)}%`} · mem {memText}
+      {fullestDisk && <> · disk {formatBytesPair(fullestDisk.used, fullestDisk.total)}</>}
     </span>
   );
 }

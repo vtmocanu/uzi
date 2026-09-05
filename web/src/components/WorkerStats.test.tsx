@@ -31,6 +31,10 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     stats_mem_bytes: null,
     stats_mem_limit_bytes: null,
     stats_source: null,
+    stats_disk_nix_bytes: null,
+    stats_disk_nix_total_bytes: null,
+    stats_disk_data_bytes: null,
+    stats_disk_data_total_bytes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -143,6 +147,59 @@ describe("WorkerStatGauges", () => {
     expect(cpuBar.className).toMatch(/bg-warn/);
     expect(cpuBar.className).not.toMatch(/bg-danger/);
   });
+
+  it("renders TWO disk bars at the right width/tone when both volumes are reported", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({
+          stats_mem_bytes: 1,
+          stats_source: "cgroup",
+          stats_disk_nix_bytes: 19327352832, // 18 GiB
+          stats_disk_nix_total_bytes: 21474836480, // 20 GiB → 90% (danger)
+          stats_disk_data_bytes: 4294967296, // 4 GiB
+          stats_disk_data_total_bytes: 10737418240, // 10 GiB → 40% (warn)
+        })}
+      />,
+    );
+    const nix = screen.getByRole("progressbar", { name: "Disk /nix" });
+    const data = screen.getByRole("progressbar", { name: "Disk /data" });
+    expect(nix.getAttribute("aria-valuenow")).toBe("90");
+    expect(data.getAttribute("aria-valuenow")).toBe("40");
+    expect((nix.firstChild as HTMLElement).className).toMatch(/bg-danger/);
+    expect((data.firstChild as HTMLElement).className).toMatch(/bg-warn/);
+    expect(screen.getByText(/18\/20 GiB · 90%/)).toBeTruthy();
+    expect(screen.getByText(/4\/10 GiB · 40%/)).toBeTruthy();
+    // aria-valuetext carries the byte figures + percent for a screen reader.
+    expect(nix.getAttribute("aria-valuetext")).toBe("18/20 GiB, 90%");
+  });
+
+  it("renders ONE disk bar when only a single volume is reported", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({
+          stats_mem_bytes: 1,
+          stats_source: "process",
+          stats_disk_data_bytes: 5368709120, // 5 GiB
+          stats_disk_data_total_bytes: 10737418240, // 10 GiB → 50%
+        })}
+      />,
+    );
+    expect(screen.getByRole("progressbar", { name: "Disk /data" }).getAttribute("aria-valuenow")).toBe("50");
+    // /nix was not reported → no bar for it.
+    expect(screen.queryByRole("progressbar", { name: "Disk /nix" })).toBeNull();
+  });
+
+  it("renders NO disk section when neither volume is reported (mem-only worker)", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({ stats_cpu_pct: 10, stats_mem_bytes: 1, stats_mem_limit_bytes: 2, stats_source: "cgroup" })}
+      />,
+    );
+    // Only CPU + Memory bars, no Disk bars.
+    expect(screen.getAllByRole("progressbar")).toHaveLength(2);
+    expect(screen.queryByRole("progressbar", { name: "Disk /nix" })).toBeNull();
+    expect(screen.queryByRole("progressbar", { name: "Disk /data" })).toBeNull();
+  });
 });
 
 describe("WorkerStatLine", () => {
@@ -158,5 +215,34 @@ describe("WorkerStatLine", () => {
   it("renders nothing without a sample", () => {
     const { container } = render(<WorkerStatLine worker={aWorker()} />);
     expect(container.firstChild).toBeNull();
+  });
+
+  it("appends '· disk used/total' for the fuller volume when disk is reported", () => {
+    const { container } = render(
+      <WorkerStatLine
+        worker={aWorker({
+          stats_cpu_pct: 34,
+          stats_mem_bytes: 2254857830,
+          stats_mem_limit_bytes: 4294967296,
+          stats_source: "cgroup",
+          stats_disk_nix_bytes: 19327352832, // 18 GiB → 90% (fuller)
+          stats_disk_nix_total_bytes: 21474836480, // 20 GiB
+          stats_disk_data_bytes: 4294967296, // 4 GiB → 40%
+          stats_disk_data_total_bytes: 10737418240, // 10 GiB
+        })}
+      />,
+    );
+    // The fuller volume (/nix at 90%) stands in for disk, not /data.
+    expect(container.textContent).toContain("cpu 34% · mem 2.1/4 GiB · disk 18/20 GiB");
+  });
+
+  it("omits the disk segment entirely when no volume is reported", () => {
+    const { container } = render(
+      <WorkerStatLine
+        worker={aWorker({ stats_cpu_pct: 34, stats_mem_bytes: 2254857830, stats_mem_limit_bytes: 4294967296, stats_source: "cgroup" })}
+      />,
+    );
+    expect(container.textContent).toContain("cpu 34% · mem 2.1/4 GiB");
+    expect(container.textContent).not.toContain("disk");
   });
 });
