@@ -1978,6 +1978,28 @@ tasks:
       # test file is a serialization point that no timeout value fixes.
       - npm test
 
+  test:codex-m0:
+    desc: Opt-in credential-free Codex 0.153.2 app-server characterization
+    cmds:
+      # External binary only; no installation or production dependency. Serial
+      # cases avoid child/process contention. The timeout catches harness hangs.
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/approvals.test.mjs
+      - node --check e2e/codex-m0/hook.mjs
+      - node --check e2e/codex-m0/hooks-stdin.test.mjs
+      - node --check e2e/codex-m0/children.test.mjs
+      - node --check e2e/codex-m0/dynamic-tools.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/approvals.test.mjs e2e/codex-m0/hooks-stdin.test.mjs e2e/codex-m0/children.test.mjs e2e/codex-m0/dynamic-tools.test.mjs
+
+  test:codex-m0:managed:
+    desc: Opt-in container-only Codex managed one-shot characterization
+    cmds:
+      # Requires the read-only /etc/codex/requirements.toml fixture inside the
+      # isolated test container. Never installs requirements on the host.
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/managed-one-shot.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/managed-one-shot.test.mjs
+
   # --------------------------------------------------------------------- docs --
   # docs:sync mirrors the root docs/*.md corpus into the api module tree so
   # api/internal/uzidocs can reach it with //go:embed (which cannot reference `..`,
