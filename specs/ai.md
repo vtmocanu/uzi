@@ -23931,7 +23931,7 @@ Serves human Feature #837: surface per-worker `/nix` and `/data` disk use in the
 
 Known v1 gaps (documented, not regressions): docker-tier `dind-data` (build/image cache) is unmetered and unrecyclable, so `disk_pressure` can never fire on it — a metering fast-follow. Agent-side `nix-collect-garbage` self-GC is out of scope (the controller cannot exec into a worker, and the incident volume was undersized where GC cannot help). A `nixSize` raise must move the `maxPVCStorage` LimitRange ceiling + quota together (currently at parity, 20Gi).
 
-## 617. PRD #1116 — Slack DM when a usage-limit-paused run resumes
+## 618. PRD #1116 — Slack DM when a usage-limit-paused run resumes
 
 Serves human Feature #35 (the resume-notification line: "when a run parked on a usage limit resumes, the owner gets a Slack message in the run's thread"); richer rationale is PRD #1116's Decision Log D1-D9. A run parking on `limit_wait` already posts `⏸️ Paused · usage limit` into its DM thread; this adds the matching `▶️ Resumed · usage limit cleared` reply.
 
