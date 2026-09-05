@@ -252,9 +252,14 @@ func (m tuiModel) milestoneCell(bg color.Color) string {
 // presence frame), which is therefore ALSO the static / non-tty / UZI_TUI_NO_BLINK frame, keeping
 // the in-progress state legible by SHAPE when the tint is stripped and never collapsing to a bare
 // not-started ○. Not milestoneCell (opposite mapping, different glyphs and colour).
-func (m tuiModel) milestoneRowCell() string {
+//
+// blink gates the animation to the SAME non-terminal condition the eyebrow micro-bar uses (D4):
+// blinkOn is a GLOBAL phase (any live board run drives the tick), so without this gate a terminal
+// run carrying a stale MilestonesInProgress would pulse its row to a bare ○ — the exact "never a
+// bare ○" case D4/SC3 exist to prevent. When !blink the row is the static ◐ presence frame.
+func (m tuiModel) milestoneRowCell(blink bool) string {
 	g := "◐"
-	if m.blinkOn {
+	if blink && m.blinkOn {
 		g = "○"
 	}
 	return paintSeg(m.pal.faintC, nil, false, g)
@@ -382,9 +387,10 @@ func (m tuiModel) renderMilestones() string {
 			style = m.pal.faint
 		case inProgress[mi.ID]:
 			// Every in-progress row is a ◐ ⇄ ○ half-circle blink in the faint/grey colour (PRD
-			// #1136 D4/D5), static ◐ under non-tty / NO_BLINK. The brighter (plain-fg) title, the
-			// ◐ shape, and the motion — never the glyph colour — separate it from a not-started ○.
-			glyph = m.milestoneRowCell()
+			// #1136 D4/D5), static ◐ under non-tty / NO_BLINK or on a terminal run (blink==false,
+			// same gate as the eyebrow micro-bar). The brighter (plain-fg) title, the ◐ shape, and
+			// the motion — never the glyph colour — separate it from a not-started ○.
+			glyph = m.milestoneRowCell(blink)
 			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
 		}
 		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")

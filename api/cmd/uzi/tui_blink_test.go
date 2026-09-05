@@ -202,6 +202,28 @@ func TestTUIDetailMilestoneRowAsciiShape(t *testing.T) {
 	}
 }
 
+// PRD #1136 D4/SC3: a TERMINAL run carrying a stale MilestonesInProgress must NOT pulse its
+// in-progress row — blinkOn is a GLOBAL phase driven by any live board run, so an ungated row
+// would flip to a bare ○ (indistinguishable from a not-started sibling) on half the frames on
+// finished/stale data. milestoneRowCell gates its animation on `blink` (the same !terminal
+// condition the eyebrow micro-bar uses), so a terminal run's row is the STATIC ◐ regardless of
+// blinkOn. Rendered at blinkOn==true — the frame that WOULD show ○ if the guard were missing.
+func TestTUIDetailMilestoneRowTerminalStaysStatic(t *testing.T) {
+	now := time.Now()
+	run := milestoneDetailRun("77777777-4444", 1, "m2")
+	run.Status = "completed" // terminal — the in-progress snapshot is stale (run.go terminalRunStatuses)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	next, _ := m.Update(detailLoadedMsg{run: run,
+		msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
+	m = next.(tuiModel)
+	m.blinkOn = true // the phase that would expose a bare ○ if the row weren't gated on !terminal
+	out := m.View().Content
+	pal := newPalette(true)
+	if !strings.Contains(out, paintSeg(pal.faintC, nil, false, "◐")) {
+		t.Errorf("terminal run: in-progress row must stay a static ◐ (not pulse to ○) at blinkOn=true\n%s", stripANSI(out))
+	}
+}
+
 // PRD #1064 D5: a run with NO frozen milestones AND no current_activity renders byte-for-byte
 // the same regardless of the blink phase or the noBlink pin — the blink machinery is inert on a
 // null-milestone run. Asserted on both the board and the run-detail rail.
