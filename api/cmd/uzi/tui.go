@@ -136,12 +136,14 @@ type detailRunMsg struct {
 }
 
 // detailPageKind tags a transcript page. pageTail is the newest page; pageBackfill is the
-// background walk toward older history (M5). pageCatchup is added by a later milestone.
+// background walk toward older history (M5); pageCatchup is the incremental socket-down /
+// manual-refresh recovery of frames after the highest seq held (M7).
 type detailPageKind int
 
 const (
 	pageTail detailPageKind = iota
 	pageBackfill
+	pageCatchup
 )
 
 // detailPageMsg carries one page of transcript messages for the drilled-in run.
@@ -150,6 +152,9 @@ type detailPageMsg struct {
 	kind  detailPageKind
 	msgs  []apitypes.MessageDTO
 	err   error
+	// reqID is the catch-up chain generation this page belongs to (M7), used only by pageCatchup
+	// so a superseded chain's reply is dropped; pageTail/pageBackfill leave it zero.
+	reqID uint64
 }
 
 type streamReadyMsg struct {
@@ -515,6 +520,26 @@ func (m tuiModel) backfillCmd(runID string, before int32) tea.Cmd {
 	}
 }
 
+// catchupCmd fetches the page of messages AFTER `after` (seq the view already holds), the socket-
+// down / manual-refresh path that recovers frames the dead stream would have carried. reqID tags
+// the reply so a superseded chain is dropped.
+func (m tuiModel) catchupCmd(runID string, after int32, reqID uint64) tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{After: after, Limit: detailPageSize, PayloadMax: detailPayloadMax})
+		return detailPageMsg{runID: runID, kind: pageCatchup, reqID: reqID, msgs: msgs, err: err}
+	}
+}
+
+// startDetailCatchupReq mints the next catch-up id and returns the first page from the highest seq
+// held. The caller must gate on catchupWaitID == 0 (no chain in flight) AND highSeq > 0 (never an
+// after=0 whole-transcript fetch — SC4).
+func (m *tuiModel) startDetailCatchupReq() tea.Cmd {
+	m.detail.catchupSeq++
+	m.detail.catchupWaitID = m.detail.catchupSeq
+	return m.catchupCmd(m.detail.runID, m.detail.highSeq, m.detail.catchupWaitID)
+}
+
 // refreshRunMetaCmd re-reads only the run DTO (no transcript replay), so the periodic
 // detail refresh is cheap: the socket already carries the frames, this just refreshes the
 // milestone / health / duration fields the stream does not send.
@@ -563,8 +588,12 @@ func readStreamCmd(runID string, s *uzicli.RunStream) tea.Cmd {
 	}
 }
 
+// pollFallbackInterval is the D8 REST-poll cadence (the same 2s `uzi run logs --follow` uses). A
+// var so a test can shrink it and drain the re-armed tick without blocking on the real 2s.
+var pollFallbackInterval = 2 * time.Second
+
 func pollFallbackCmd() tea.Cmd {
-	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return pollFallbackMsg{} })
+	return tea.Tick(pollFallbackInterval, func(time.Time) tea.Msg { return pollFallbackMsg{} })
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -722,6 +751,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.kind {
 		case pageTail:
 			m.detail.applyTailPage(msg.msgs, msg.err)
+			// Raise the stream's replay floor to the highest seq now held, so a reconnect replays
+			// only frames after the tail rather than the whole history (PRD #1137 M7).
+			if s := m.detail.stream; s != nil {
+				s.NoteSeen(m.detail.highSeq)
+			}
 			// Start the background backfill once the tail is in, if there is older history to
 			// walk (PRD #1137 D1). The reply chains the next page. The !backfilling guard keeps
 			// a mid-walk `r` (which re-issues loadTailCmd) from starting a SECOND parallel chain
@@ -740,6 +774,23 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case pageBackfill:
 			return m, (&m).applyBackfillPage(msg.msgs, msg.err)
+		case pageCatchup:
+			if msg.reqID != m.detail.catchupWaitID {
+				return m, nil // a superseded / stale catch-up reply
+			}
+			if msg.err != nil {
+				m.detail.catchupWaitID = 0 // chain ends; the next tick may retry
+				return m, nil
+			}
+			m.detail.applyCatchupPage(msg.msgs)
+			if s := m.detail.stream; s != nil {
+				s.NoteSeen(m.detail.highSeq)
+			}
+			if len(msg.msgs) == 0 {
+				m.detail.catchupWaitID = 0 // caught up: chain done
+				return m, nil
+			}
+			return m, m.catchupCmd(m.detail.runID, m.detail.highSeq, msg.reqID) // chain the next page (same id)
 		}
 		return m, nil
 
@@ -821,6 +872,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detail.stream = msg.stream
 		m.detail.streamErr = nil
 		m.detail.polling = false
+		// Seed the replay floor with the highest seq already held (from a tail/catch-up page that
+		// landed before the socket opened), so this stream's first reconnect replays only newer
+		// frames rather than the whole history (PRD #1137 M7).
+		m.detail.stream.NoteSeen(m.detail.highSeq)
 		return m, readStreamCmd(msg.runID, msg.stream)
 
 	case streamEventsMsg:
@@ -852,7 +907,14 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.view != viewDetail || !m.detail.polling {
 			return m, nil
 		}
-		return m, tea.Batch(m.loadRunCmd(m.detail.runID), m.loadTailCmd(m.detail.runID), pollFallbackCmd())
+		cmds := []tea.Cmd{pollFallbackCmd()} // always re-arm the 2s tick while polling
+		if m.detail.metaWaitID == 0 {
+			cmds = append(cmds, (&m).startDetailMetaReq()) // one meta refresh, guarded (#1135)
+		}
+		if m.detail.catchupWaitID == 0 && m.detail.highSeq > 0 {
+			cmds = append(cmds, (&m).startDetailCatchupReq()) // one catch-up chain, guarded
+		}
+		return m, tea.Batch(cmds...)
 	}
 	return m, nil
 }

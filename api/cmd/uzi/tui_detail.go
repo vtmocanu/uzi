@@ -100,6 +100,13 @@ type detailState struct {
 	metaSeq    uint64
 	metaWaitID uint64
 
+	// catchupSeq / catchupWaitID guard the incremental catch-up chain the poll fallback and `r`
+	// drive (PRD #1137 M7): catchupWaitID == 0 means no chain in flight, so a 2s tick never stacks a
+	// second chain on a slow link (the #1130 anti-stack property, applied to the catch-up). Each
+	// catch-up page carries the id; a reply is honoured only when it matches.
+	catchupSeq    uint64
+	catchupWaitID uint64
+
 	// M4 surfaces. steer is gated on OWNERSHIP, not visibility (see steerAccessFor);
 	// review is the [v] overlay.
 	steer  steerState2
@@ -242,21 +249,33 @@ func (m *tuiModel) applyBackfillPage(msgs []apitypes.MessageDTO, err error) tea.
 	return m.backfillCmd(m.detail.runID, m.detail.lowSeq)
 }
 
+// applyCatchupPage folds a catch-up page's frames in (append + dedup + rebuild). No tailLoaded /
+// pageErr — a catch-up is incremental recovery, not the initial pane load.
+func (d *detailState) applyCatchupPage(msgs []apitypes.MessageDTO) {
+	d.addFrames(framesFromMessages(msgs))
+	d.rebuild()
+}
+
 // applyMeta refreshes the run DTO from a periodic GetRun poll WITHOUT touching the frame
 // log — the transcript is fed by the stream/replay, this only refreshes the non-streamed
 // fields (milestones, health, kind, title, lifecycle stamps). Ignored until the initial
 // load has set the baseline, so a poll racing the first run load cannot flip `runLoaded`.
 //
-// Status is DELIBERATELY preserved rather than overwritten: the live stream owns it
-// (applyEvents sets it from authoritative `state` frames, including StreamRun's reconcile),
-// and applyMeta only runs while the stream is healthy (the dispatch guards on !polling).
+// While STREAMING, status is DELIBERATELY preserved rather than overwritten: the live stream owns
+// it (applyEvents sets it from authoritative `state` frames, including StreamRun's reconcile).
 // Overwriting it would let a GetRun response that was in flight across a status transition
 // revert the status for up to one 2s tick — e.g. dropping the plan-gate banner and its owner
 // keys the instant a run enters awaiting_approval, or flipping a just-finished run back to
-// running. When the stream is down the poll-fallback path (loadRunCmd/applyRun) owns
-// status instead, so nothing goes stale.
+// running. While POLLING (the D8 fallback, M7) the stream is gone and the DTO is the only status
+// source, so it is adopted wholesale instead.
 func (d *detailState) applyMeta(run apitypes.RunDTO) {
 	if !d.runLoaded {
+		return
+	}
+	if d.polling {
+		// The live stream that normally owns status is gone; while polling the DTO is the only
+		// status source, so adopt it wholesale (PRD #1137 M7). Streaming keeps preserving it below.
+		d.run = run
 		return
 	}
 	status := d.run.Status
@@ -434,11 +453,15 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	case keyEsc:
 		return m.exitToBoard()
 	case keyRefresh:
-		cmds := []tea.Cmd{m.loadRunCmd(m.detail.runID), m.loadTailCmd(m.detail.runID)}
-		// Resume a stalled or failed background backfill (M5): clear the failed flag and
-		// re-arm the walk from the current cursor. M7 reworks `r` to be fully incremental;
-		// this is the M5 resume. Skipped when the walk is already complete or in flight so a
-		// refresh never stacks a second backfill chain on the one already running.
+		var cmds []tea.Cmd
+		if m.detail.metaWaitID == 0 {
+			cmds = append(cmds, (&m).startDetailMetaReq())
+		}
+		if m.detail.catchupWaitID == 0 && m.detail.highSeq > 0 {
+			cmds = append(cmds, (&m).startDetailCatchupReq())
+		}
+		// Resume a stalled/failed background backfill from the current cursor (M5), guarded so a
+		// refresh never stacks a second chain on the one already running.
 		if !m.detail.historyComplete && !m.detail.backfilling && m.detail.lowSeq > 1 {
 			m.detail.backfillFailed = false
 			m.detail.backfilling = true

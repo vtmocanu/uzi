@@ -223,6 +223,10 @@ func (s *RunStream) raiseLastSeq(n int32) {
 // PRD #1137). Idempotent and monotonic; safe from any goroutine.
 func (s *RunStream) NoteSeen(seq int32) { s.raiseLastSeq(seq) }
 
+// LastSeen returns the stream's current replay floor — the highest seq it will NOT replay on the
+// next reconnect. Raised by live frames, replay, and NoteSeen. Safe from any goroutine.
+func (s *RunStream) LastSeen() int32 { return s.lastSeq.Load() }
+
 func (s *RunStream) setErr(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
