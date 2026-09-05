@@ -1756,3 +1756,144 @@ func quantityPtr(s string) *resource.Quantity {
 	q := resource.MustParse(s)
 	return &q
 }
+
+// --- stranded Pending PVC bind-timeout detection (#1115) --------------------
+
+// pvcNixPending builds a /nix claim (at the flat 20Gi so no M3 size-drift confuses the
+// test) whose observed .status.phase and CreationTimestamp are seeded, so a strand test
+// can drive the bind-timeout detector deterministically off the pinned m5Now clock.
+func pvcNixPending(id string, phase corev1.PersistentVolumeClaimPhase, created time.Time) *corev1.PersistentVolumeClaim {
+	p := pvcCreatedAt(pvcNix(id, "20Gi"), created)
+	p.Status.Phase = phase
+	return p
+}
+
+// A /nix PVC that has sat Pending past pvcBindTimeout is a STRANDED re-mint (#1115): the
+// detector must emit the greppable log token AND synthesize a `stuck` roll-health entry so
+// the display-only report path surfaces the worker. The two negative subtests prove the
+// detector is non-vacuous — a recent Pending (within the timeout) and a Bound PVC must NOT
+// flag, so it fires on the actual strand condition rather than on any /nix PVC at all.
+func TestObserveFlagsStrandedPendingPVC(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("stranded: Pending past the bind-timeout", func(t *testing.T) {
+		var logs strings.Builder
+		m, _ := newMatWithRecycle(t, nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, &logs,
+			pvcNixPending("w1", corev1.ClaimPending, m5Now.Add(-15*time.Minute)))
+
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		if len(observed) != 1 {
+			t.Fatalf("observed %d workers, want 1", len(observed))
+		}
+		o := observed[0]
+
+		wantToken := "pvc-bind-timeout worker=w1 pvc=" + nixPVCName("w1")
+		if !strings.Contains(logs.String(), wantToken) {
+			t.Errorf("missing stable strand token %q in logs:\n%s", wantToken, logs.String())
+		}
+		if o.Roll.Phase != protocol.PhaseStuck {
+			t.Errorf("Roll.Phase = %q, want %q — a strand must synthesize a stuck roll", o.Roll.Phase, protocol.PhaseStuck)
+		}
+		if o.Roll.BlockingContainer != nixPVCName("w1") {
+			t.Errorf("Roll.BlockingContainer = %q, want %q", o.Roll.BlockingContainer, nixPVCName("w1"))
+		}
+		if !strings.Contains(o.Roll.BlockingReason, "bind-timeout") {
+			t.Errorf("Roll.BlockingReason = %q, want it to mention the bind-timeout", o.Roll.BlockingReason)
+		}
+		if o.NixPVCPhase != "Pending" {
+			t.Errorf("NixPVCPhase = %q, want the raw observed Pending phase", o.NixPVCPhase)
+		}
+	})
+
+	t.Run("negative: Pending but within the bind-timeout", func(t *testing.T) {
+		var logs strings.Builder
+		m, _ := newMatWithRecycle(t, nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, &logs,
+			pvcNixPending("w1", corev1.ClaimPending, m5Now.Add(-1*time.Minute)))
+
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		if strings.Contains(logs.String(), "pvc-bind-timeout") {
+			t.Errorf("a Pending PVC within the bind-timeout must NOT emit the strand token; logs:\n%s", logs.String())
+		}
+		if observed[0].Roll.Phase == protocol.PhaseStuck {
+			t.Errorf("Roll.Phase = %q; a not-yet-timed-out Pending PVC must not synthesize a strand", observed[0].Roll.Phase)
+		}
+	})
+
+	t.Run("negative: Bound with an old CreationTimestamp", func(t *testing.T) {
+		var logs strings.Builder
+		m, _ := newMatWithRecycle(t, nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, &logs,
+			pvcNixPending("w1", corev1.ClaimBound, m5Now.Add(-15*time.Minute)))
+
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		if strings.Contains(logs.String(), "pvc-bind-timeout") {
+			t.Errorf("a Bound PVC must NOT emit the strand token; logs:\n%s", logs.String())
+		}
+		if observed[0].Roll.Phase == protocol.PhaseStuck {
+			t.Errorf("Roll.Phase = %q; a Bound PVC is not a strand", observed[0].Roll.Phase)
+		}
+		if observed[0].NixPVCPhase != "Bound" {
+			t.Errorf("NixPVCPhase = %q, want Bound", observed[0].NixPVCPhase)
+		}
+	})
+}
+
+// strandPoller / strandReporter are the minimal reconcile.Poller / reconcile.Reporter
+// fakes for the end-to-end strand→report test below (the reconcile package's own fakes
+// are unexported).
+type strandPoller struct{ resp protocol.PollResponse }
+
+func (p strandPoller) Poll(context.Context) (protocol.PollResponse, error) { return p.resp, nil }
+
+type strandReporter struct{ got []protocol.StatusReport }
+
+func (r *strandReporter) Report(_ context.Context, rep protocol.StatusReport) error {
+	r.got = append(r.got, rep)
+	return nil
+}
+
+// End-to-end: a stranded Pending /nix PVC observed by the REAL Materializer must reach the
+// actual WorkerStatus report through a real reconcile.Loop.Tick — proving the detection
+// (Observe synthesizes the stuck Roll) drives the existing display-only report path
+// (reconcile.report maps the Roll onto a WorkerStatus row) without any change to report().
+func TestStrandedPVCReachesTheStatusReport(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newMatWithRecycle(t, nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, io.Discard,
+		pvcNixPending("w1", corev1.ClaimPending, m5Now.Add(-15*time.Minute)))
+
+	poller := strandPoller{resp: protocol.PollResponse{Workers: []protocol.DesiredWorker{
+		{ID: "w1", Template: "base", Size: "m"},
+	}}}
+	reporter := &strandReporter{}
+	loop := reconcile.New(poller, m, reporter, 10*time.Second, "0.11.7", slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err := loop.Tick(ctx); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(reporter.got) != 1 {
+		t.Fatalf("Report called %d times, want 1", len(reporter.got))
+	}
+	var row *protocol.WorkerStatus
+	for i := range reporter.got[0].Workers {
+		if reporter.got[0].Workers[i].ID == "w1" {
+			row = &reporter.got[0].Workers[i]
+		}
+	}
+	if row == nil {
+		t.Fatalf("no w1 row in the report; workers = %+v", reporter.got[0].Workers)
+	}
+	if row.Phase != protocol.PhaseStuck {
+		t.Errorf("reported phase = %q, want %q", row.Phase, protocol.PhaseStuck)
+	}
+	if row.BlockingContainer == nil || *row.BlockingContainer != nixPVCName("w1") {
+		t.Errorf("reported blocking_container = %v, want %q", row.BlockingContainer, nixPVCName("w1"))
+	}
+}

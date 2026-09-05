@@ -97,6 +97,16 @@ type ObservedWorker struct {
 	// are the only elapsed-time signal it has.
 	NixPVCCreatedAt  *time.Time
 	DataPVCCreatedAt *time.Time
+	// NixPVCPhase / DataPVCPhase carry the RAW observed .status.phase of the LIVE nix/data
+	// PVC (e.g. "Pending", "Bound"), for the stranded-PVC bind-timeout detector (#1115).
+	// PRD #837's recycle deletes the old PVC before the create-gate re-mints it, so a
+	// re-mint that never binds (storageclass unavailable, quota exhausted, no schedulable
+	// node) sits Pending with the worker stranded and no signal; the detector reads this
+	// phase and, past a bound-timeout, surfaces the worker. "" when the PVC is absent OR
+	// Terminating — recorded only for a non-terminating PVC, the same liveness gate as
+	// NixPVCSize / DataPVCLive.
+	NixPVCPhase  string
+	DataPVCPhase string
 	// Namespace is the namespace the object(s) for this worker were OBSERVED in
 	// (PRD #83 M3). With two worker namespaces — the restricted default and the
 	// privileged docker tier — teardown of a worker the api no longer wants must
