@@ -9,7 +9,8 @@ import (
 // fake_runs.go holds the FakeClient run-lifecycle methods (uzi run / uzi handoff)
 // split out of fake.go (PRD #1017).
 
-func (f *FakeClient) ListRuns(context.Context) ([]apitypes.RunListItemDTO, error) {
+func (f *FakeClient) ListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error) {
+	f.LastListRunsCtx = ctx
 	f.ListRunsCalls++
 	if f.Err != nil {
 		return nil, f.Err
@@ -17,7 +18,8 @@ func (f *FakeClient) ListRuns(context.Context) ([]apitypes.RunListItemDTO, error
 	return f.Runs, nil
 }
 
-func (f *FakeClient) GetRun(_ context.Context, id string) (apitypes.RunDTO, error) {
+func (f *FakeClient) GetRun(ctx context.Context, id string) (apitypes.RunDTO, error) {
+	f.LastGetRunCtx = ctx
 	if f.Err != nil {
 		return apitypes.RunDTO{}, f.Err
 	}

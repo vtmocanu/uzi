@@ -32,6 +32,11 @@ import (
 // disproportionate.
 var boardPollInterval = 2 * time.Second
 
+// boardPollTimeout bounds a single periodic board / detail-meta poll independently of the
+// shared 30s http.Client.Timeout (client.go), which is right for one-shot CLI calls but far
+// too long for a 2s-cadence poll (PRD #1130 D3). A var (not const) so a test can shrink it.
+var boardPollTimeout = 10 * time.Second
+
 // rateLimitPollInterval is the strip's own cadence: re-fetch the per-token meters and
 // settings on ~60s, matching the web sidebar's useMyRateLimits(60_000). The server
 // recomputes meters only every ~5m (UZI_USAGE_POLL_INTERVAL), so polling faster
@@ -321,8 +326,13 @@ func (m *tuiModel) maybeArmBlink() tea.Cmd {
 }
 
 func (m tuiModel) fetchRunsCmd(admin bool) tea.Cmd {
-	c, ctx := m.client, m.ctx
+	c, parent := m.client, m.ctx
 	return func() tea.Msg {
+		// Per-poll deadline (PRD #1130 D3): a stalled poll fails within boardPollTimeout
+		// instead of the shared 30s http.Client.Timeout. WithTimeout + defer cancel() live
+		// INSIDE the closure so the cancel fires when the poll returns, not immediately.
+		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
+		defer cancel()
 		var runs []apitypes.RunListItemDTO
 		var err error
 		if admin {
@@ -393,8 +403,12 @@ func (m tuiModel) loadDetailCmd(runID string) tea.Cmd {
 // detail refresh is cheap: the socket already carries the frames, this just refreshes the
 // milestone / health / duration fields the stream does not send.
 func (m tuiModel) refreshRunMetaCmd(runID string) tea.Cmd {
-	c, ctx := m.client, m.ctx
+	c, parent := m.client, m.ctx
 	return func() tea.Msg {
+		// Per-poll deadline (PRD #1130 D3): same short bound as the board poll, derived
+		// inside the closure so defer cancel() fires on return rather than immediately.
+		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
+		defer cancel()
 		run, err := c.GetRun(ctx, runID)
 		return detailMetaMsg{runID: runID, run: run, err: err}
 	}

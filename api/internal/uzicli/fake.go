@@ -1,6 +1,7 @@
 package uzicli
 
 import (
+	"context"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -56,6 +57,15 @@ type FakeClient struct {
 	// two back-to-back periodic ticks) rather than a vacuous "not two".
 	ListRunsCalls      int
 	AdminListRunsCalls int
+
+	// LastListRunsCtx / LastGetRunCtx capture the context.Context the most recent
+	// ListRuns / GetRun call was handed (PRD #1130 M2). Purely additive — they let a
+	// test assert the per-poll deadline the board / detail-meta closures derive
+	// (context.WithTimeout(m.ctx, boardPollTimeout)) on CONTENT, without any blocking
+	// fake or timing, which on unfixed code (no deadline) fails deterministically with
+	// no goroutine hang.
+	LastListRunsCtx context.Context
+	LastGetRunCtx   context.Context
 
 	// Build is the canned GET /api/version reply; BuildErr fails that one call
 	// without failing the rest (see BuildInfo). BuildInfoCalls counts the calls —
