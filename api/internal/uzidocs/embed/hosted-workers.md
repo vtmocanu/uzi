@@ -102,7 +102,8 @@ sizing](./worker-setup.md#resource-stats-and-sizing).
 Two things now self-heal without you deleting and re-provisioning by hand:
 
 - **A tools cache smaller than the current size** (provisioned before a size
-  bump, like the one above) gets reconciled to the current size automatically.
+  bump, like the one above) gets reconciled to the current size automatically:
+  only the `/nix` cache is recycled, and the `/data` workspace is preserved.
 - **A volume that fills up** (at or above 90% used, sustained across a couple
   of heartbeats) gets recycled: the worker is drained first if it's busy —
   same cordon behavior as above — then **both** its volumes are deleted and
