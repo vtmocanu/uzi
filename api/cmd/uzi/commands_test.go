@@ -555,6 +555,21 @@ func TestRunLogsTailWithAfterIsUsageError(t *testing.T) {
 	}
 }
 
+// TestRunLogsNegativeTailIsUsageError: a non-positive --tail is rejected before any
+// request, not silently fallen through to the full history.
+func TestRunLogsNegativeTailIsUsageError(t *testing.T) {
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {{Seq: 1, Kind: "assistant", Payload: []byte(`{"text":"one"}`)}},
+	}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--tail", "-5")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want ExitUsage(%d)", code, uzicli.ExitUsage)
+	}
+	if len(fc.RunLogsPageCalls) != 0 {
+		t.Errorf("a usage error should make no page request, got %+v", fc.RunLogsPageCalls)
+	}
+}
+
 // TestRunLogsTailThenFollow: with --follow, --tail N renders the newest N and then the
 // drain loop continues polling from the HIGHEST tail seq (never re-fetching from 0).
 func TestRunLogsTailThenFollow(t *testing.T) {

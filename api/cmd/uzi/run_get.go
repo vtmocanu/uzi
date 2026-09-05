@@ -99,6 +99,12 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 			if tail != 0 && after != 0 {
 				return uzicli.Exitf(uzicli.ExitUsage, "--tail cannot be combined with --after")
 			}
+			// A non-positive --tail is a usage error, not a silent fall-through to the
+			// full history: the `tail > 0` guard below would otherwise skip the page
+			// path and print everything, the opposite of what the flag asks.
+			if tail < 0 {
+				return uzicli.Exitf(uzicli.ExitUsage, "--tail must be a positive integer")
+			}
 			p := env.printer(gf)
 			seq := after
 			// --tail N: fetch the newest N via one single-request page, render them,

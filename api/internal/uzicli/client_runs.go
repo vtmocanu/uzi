@@ -104,7 +104,7 @@ func (q LogsPageQuery) validate() error {
 	if hasLimit && q.Limit < 1 {
 		return Exitf(ExitUsage, "limit must be a positive integer")
 	}
-	if q.PayloadMax < 0 || (q.PayloadMax != 0 && q.PayloadMax < 1) {
+	if q.PayloadMax < 0 {
 		return Exitf(ExitUsage, "payload_max must be a positive integer")
 	}
 	if hasTail && (hasAfter || hasBefore || hasLimit) {
