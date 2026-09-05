@@ -182,16 +182,16 @@ changes.
 
 ## Milestones
 
-- [ ] **M1 — Micro-bar recolor.** `milestoneCell` renders `tungsten` (not `wait`),
+- [x] **M1 — Micro-bar recolor.** `milestoneCell` renders `tungsten` (not `wait`),
       recoloring both the crew-rail eyebrow micro-bar and the board per-run
       micro-bar; blink behavior unchanged. Comments referencing "wait colour"
       updated at the two call sites.
-- [ ] **M2 — Rail rows to blinking `◐ ⇄ ○`.** The crew-rail milestone checklist
+- [x] **M2 — Rail rows to blinking `◐ ⇄ ○`.** The crew-rail milestone checklist
       renders every in-progress row as a `◐`/`○` blink in the **`faint`/grey** color
       (same as the not-started `○`), static `◐` under non-tty / `UZI_TUI_NO_BLINK`,
       replacing the `▰`/`▱` cell. The in-progress title keeps its brighter (plain fg)
       style. `✓`/`○`/`—` states and the `· <id>` eyebrow unchanged.
-- [ ] **M3 — Tests flipped, ADDED, and pinned.** `tui_model_test.go` asserts the row
+- [x] **M3 — Tests flipped, ADDED, and pinned.** `tui_model_test.go` asserts the row
       `◐` (faint) by shape (distinct from the not-started `○`) and the tungsten (not
       wait) micro-bar static frame. **Add** the two new positive tests: a rail-row
       blink-alternation test (`blinkOn=true → ○`, `false → ◐`) and a rail-row
@@ -199,10 +199,10 @@ changes.
       SC1's alternation and SC4's row-Ascii unproven. `tui_blink_test.go` and
       `tui_detail_fixes_test.go` confirmed/updated. Each flipped or new assertion
       shown red on the old renderer, green on the new (mutation discipline).
-- [ ] **M4 — Docs + specs synced.** `docs/run-activity.md` and `docs/cli.md`
+- [x] **M4 — Docs + specs synced.** `docs/run-activity.md` and `docs/cli.md`
       updated to tungsten + the rail `◐`/`○`; `task docs:sync` run and the embed
       mirror committed; `specs/ai.md` decision entry added.
-- [ ] **M5 — Gate green, render verified.** `task gate:api` passes (fmt, vet,
+- [x] **M5 — Gate green, render verified.** `task gate:api` passes (fmt, vet,
       build, lint ratchet, deadcode, `-race` tests). The uxlab render harness
       (`api/cmd/uzi/uxlab`, per `.claude/rules/tui.md`) regenerated and confirmed in
       both light and dark PNGs: the rail in-progress row is a grey `◐`, the

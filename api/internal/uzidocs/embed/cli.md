@@ -720,10 +720,11 @@ also the TUI's own fallback when the live channel is unreachable (below).
   reported-complete milestone, `▱` for the rest, or `–/N` text when nothing
   has been reported complete yet); the micro-bar is hidden on a narrow
   terminal, and the full breakdown is on the run detail view. **The
-  in-progress milestone's cell blinks** `▰`/`▱` in the wait colour on a
-  half-second tick — a static `▱` frame renders instead when the terminal
-  isn't interactive (a piped or offline render) or with `UZI_TUI_NO_BLINK=1`
-  set (a reduced-motion opt-out, read once at startup). The **selected row**
+  in-progress milestone's cell blinks** `▰`/`▱` in the tungsten colour (the
+  same warm accent as the done fill) on a half-second tick — a static `▱`
+  frame renders instead when the terminal isn't interactive (a piped or
+  offline render) or with `UZI_TUI_NO_BLINK=1` set (a reduced-motion opt-out,
+  read once at startup). The **selected row**
   additionally gains a second line naming the active lane's role, task
   label and age — the run's current activity, the same information [the run
   activity docs](./run-activity.md#milestones-and-the-now-line) describe for
@@ -762,9 +763,12 @@ also the TUI's own fallback when the live channel is unreachable (below).
   For a milestone-structured run the rail also shows a
   `MILESTONES {done}/{total}` block below the lanes, one row per approved
   milestone in order, marked `✓` reported complete, `○` not started, or —
-  for the milestone in progress — the same blinking `▰`/`▱` cell the board's
-  micro-bar carries (static `▱` under `UZI_TUI_NO_BLINK=1` or a non-tty
-  render). The count reads "reported complete", not verified: uzi shows
+  for the milestone in progress — a `◐` that blinks `◐`/`○` in the faint grey
+  colour (the same colour as a not-started `○`; the row is told apart by the
+  `◐` shape, its motion and a brighter title, never by colour), a static `◐`
+  under `UZI_TUI_NO_BLINK=1` or a non-tty render. The rail's eyebrow also
+  carries a compact `▰`/`▱` micro-bar whose in-progress cell blinks in
+  tungsten, the twin of the board's. The count reads "reported complete", not verified: uzi shows
   what the run reported and does not itself check the work. The
   in-progress row also carries a **now line** beneath it — `↳ <role> ·
   <age>` plus its task label — the crew rail's own current-activity read;
