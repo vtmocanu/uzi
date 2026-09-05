@@ -272,6 +272,9 @@ func TestNotifyEarlyResetBuildsLoudSlackDM(t *testing.T) {
 	if r.Emoji != "🚨" {
 		t.Fatalf("slack emoji = %q, want the 🚨 alarm glyph", r.Emoji)
 	}
+	if r.Body != "Anthropic reopened your weekly window ahead of schedule." {
+		t.Fatalf("slack body = %q, want the neutral early-reopen body", r.Body)
+	}
 	if len(r.Facts) != 3 {
 		t.Fatalf("slack facts = %v, want three (hours-early, observed, expected)", r.Facts)
 	}

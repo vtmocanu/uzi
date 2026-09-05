@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { Board, IssueCard } from "./Board";
 import { api, ApiError, type Board as BoardData, type Card, type LatestRun } from "../lib/api";
@@ -23,6 +23,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       moveIssue: vi.fn(),
       reorderBoard: vi.fn(),
       promoteIssue: vi.fn(),
+      syncRepo: vi.fn(),
       configureColumns: vi.fn(),
     },
   };
@@ -1244,6 +1245,284 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
       // …and the Closed lane has reverted to iid-ascending [15,18] — Manual is identity over
       // the iid-ordered payload, so the desc order the toggle produced is gone. Accepted.
       expect(titlesIn(laneFor("Closed"))).toEqual(["issue fifteen", "issue eighteen"]);
+    });
+  });
+
+  // #1060 — a background poll's getBoard can be IN FLIGHT when a card mutation
+  // (reorder, column move, close/reopen) applies its authoritative card. Without a
+  // guard the older poll response resolves LATER and setBoard(fresh) clobbers the
+  // just-applied mutation with stale pre-mutation state (self-healing only ~10s later
+  // on the next poll). The fix is a mutation-generation counter bumped at the START
+  // AND the SETTLE of every real mutation; poll() captures it before its await and
+  // discards any response whose counter moved.
+  //
+  // These are deterministic — no fake or real timers, no sleeps, no wall-clock. The
+  // poll's getBoard is held on a captured resolver (the same deferred-promise idiom
+  // the reorder-lock tests use above); the mutation is applied while it hangs, then
+  // the poll is released with a STALE board and must be DROPPED. The trailing control
+  // test fires a poll that STARTS AFTER the mutation settled and proves that one DOES
+  // apply, so the guard is not vacuously passing.
+  describe("Board — a late poll does not clobber a just-applied mutation (#1060)", () => {
+    // Rendered-order readers (same shape as the outer suite's at :640 / the direction
+    // toggle's at :1115). Closed cards DO render an anchor matching /^issue /.
+    // queryAllByRole (not getAllByRole) so a lane that ends up EMPTY — e.g. Closed
+    // after the only closed card is reopened — reads as [] for a `.not.toContain`
+    // assertion instead of throwing on zero matches.
+    const titlesInLane = (label: string) =>
+      within(laneFor(label))
+        .queryAllByRole("link", { name: /^issue / })
+        .map((a) => a.textContent);
+
+    // The mount's load() getBoard has already resolved (the test awaits findByText
+    // "Backlog" first), so the NEXT getBoard is the poll's. Firing visibilitychange
+    // (jsdom's document.hidden is false) runs the poll synchronously up to its await,
+    // which is the moment poll() captures the mutation generation — its getBoard then
+    // hangs on the resolver we return.
+    async function firePollAndCapture(): Promise<(v: { board: BoardData }) => void> {
+      let release: (v: { board: BoardData }) => void = () => {};
+      mockApi.getBoard.mockImplementationOnce(
+        () => new Promise<{ board: BoardData }>((res) => { release = res; }),
+      );
+      fireEvent(document, new Event("visibilitychange"));
+      // getBoard #1 was the mount load(); #2 is this poll (now hung on `release`).
+      await waitFor(() => expect(mockApi.getBoard).toHaveBeenCalledTimes(2));
+      return release;
+    }
+
+    // Resolve the hung poll and let its continuation (the guard, then any setBoard)
+    // fully drain before the assertion — on the FIXED path there is no state change to
+    // waitFor, so the microtasks are flushed explicitly inside act().
+    async function releasePollWith(release: (v: { board: BoardData }) => void, board: BoardData) {
+      await act(async () => {
+        release({ board });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    }
+
+    it("keeps a within-lane reorder when a poll started before it resolves stale", async () => {
+      // Authoritative post-reorder Backlog order: card 1 moved one place down.
+      const reordered = aBoard({
+        cards: [
+          aCard({ iid: 2, title: "issue two", column: "", labels: ["uzi"] }),
+          aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"] }),
+          aCard({ iid: 3, title: "issue three", column: "", labels: ["uzi"] }),
+          aCard({ iid: 4, title: "issue four", column: "", labels: ["uzi"] }),
+          aCard({ iid: 9, title: "issue nine", column: "Planned", labels: ["uzi"] }),
+        ],
+      });
+      mockApi.reorderBoard.mockResolvedValue({ board: reordered });
+
+      renderBoard();
+      await screen.findByText("Backlog");
+
+      // A poll's getBoard is now in flight (its generation captured at 0).
+      const release = await firePollAndCapture();
+
+      // Apply the reorder — it bumps the generation twice (start + settle).
+      fireEvent.click(moveBtn(1, "down"));
+      await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+      await waitFor(() =>
+        expect(titlesInLane("Backlog")).toEqual(["issue two", "issue one", "issue three", "issue four"]),
+      );
+
+      // Release the poll with the STALE pre-reorder order — it must be DROPPED.
+      await releasePollWith(release, aBoard());
+
+      expect(titlesInLane("Backlog")).toEqual(["issue two", "issue one", "issue three", "issue four"]);
+    });
+
+    it("keeps a column move when a poll started before it resolves stale", async () => {
+      // Authoritative board: card 1 now lives in Planned.
+      const moved = aBoard({
+        cards: [
+          aCard({ iid: 1, title: "issue one", column: "Planned", labels: ["uzi"] }),
+          aCard({ iid: 2, title: "issue two", column: "", labels: ["uzi"] }),
+          aCard({ iid: 3, title: "issue three", column: "", labels: ["uzi"] }),
+          aCard({ iid: 4, title: "issue four", column: "", labels: ["uzi"] }),
+          aCard({ iid: 9, title: "issue nine", column: "Planned", labels: ["uzi"] }),
+        ],
+      });
+      mockApi.moveIssue.mockResolvedValue({ card: aCard({ iid: 1, title: "issue one", column: "Planned", labels: ["uzi"] }) });
+      mockApi.reorderBoard.mockResolvedValue({ board: moved });
+
+      renderBoard();
+      await screen.findByText("Backlog");
+
+      const release = await firePollAndCapture();
+
+      // Drag card 1 onto Planned — a cross-column drop (move() then reorderBoard),
+      // bumping the generation at start + settle.
+      dropOn(laneFor("Planned"), 1);
+      await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(titlesInLane("Planned")).toContain("issue one"));
+
+      // Release the poll with the STALE board (card 1 still in Backlog) — dropped.
+      await releasePollWith(release, aBoard());
+
+      expect(titlesInLane("Planned")).toContain("issue one");
+      expect(titlesInLane("Backlog")).not.toContain("issue one");
+    });
+
+    it("keeps a close when a poll started before it resolves stale", async () => {
+      mockApi.moveIssue.mockResolvedValue({
+        card: aCard({ iid: 1, title: "issue one", column: "", closed: true, labels: ["uzi"] }),
+      });
+
+      renderBoard();
+      await screen.findByText("Backlog");
+
+      const release = await firePollAndCapture();
+
+      // Drag open card 1 onto Closed — a close (move() alone), bumping the generation
+      // at start + settle.
+      dropOn(laneFor("Closed"), 1);
+      await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 1, "closed"));
+      await waitFor(() => expect(titlesInLane("Closed")).toContain("issue one"));
+
+      // Release the poll with the STALE board (card 1 still open in Backlog) — dropped.
+      await releasePollWith(release, aBoard());
+
+      expect(titlesInLane("Closed")).toContain("issue one");
+      expect(titlesInLane("Backlog")).not.toContain("issue one");
+    });
+
+    it("keeps a reopen when a poll started before it resolves stale", async () => {
+      // Card 99 (title "issue closed") is closed in the mount board; reopen it into Planned.
+      mockApi.moveIssue.mockResolvedValue({
+        card: aCard({ iid: 99, title: "issue closed", column: "Planned", closed: false, labels: ["uzi"] }),
+      });
+
+      renderBoard();
+      await screen.findByText("Backlog");
+
+      const release = await firePollAndCapture();
+
+      // Drag closed card 99 onto Planned — a reopen (move() alone via the closed
+      // branch), bumping the generation at start + settle.
+      dropOn(laneFor("Planned"), 99);
+      await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 99, "Planned"));
+      await waitFor(() => expect(titlesInLane("Planned")).toContain("issue closed"));
+
+      // Release the poll with the STALE board (card 99 still closed) — dropped.
+      await releasePollWith(release, aBoard());
+
+      expect(titlesInLane("Planned")).toContain("issue closed");
+      expect(titlesInLane("Closed")).not.toContain("issue closed");
+    });
+
+    // Control: a poll whose getBoard STARTS AFTER the mutation has settled captures the
+    // already-bumped generation, so its response is NOT discarded — proving the guard
+    // is not vacuously dropping every poll.
+    it("APPLIES a poll that starts after the mutation settled (control)", async () => {
+      const reordered = aBoard({
+        cards: [
+          aCard({ iid: 2, title: "issue two", column: "", labels: ["uzi"] }),
+          aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"] }),
+          aCard({ iid: 3, title: "issue three", column: "", labels: ["uzi"] }),
+          aCard({ iid: 4, title: "issue four", column: "", labels: ["uzi"] }),
+          aCard({ iid: 9, title: "issue nine", column: "Planned", labels: ["uzi"] }),
+        ],
+      });
+      mockApi.reorderBoard.mockResolvedValue({ board: reordered });
+
+      renderBoard();
+      await screen.findByText("Backlog");
+
+      // Settle the mutation FIRST.
+      fireEvent.click(moveBtn(1, "down"));
+      await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+      await waitFor(() =>
+        expect(titlesInLane("Backlog")).toEqual(["issue two", "issue one", "issue three", "issue four"]),
+      );
+
+      // NOW start the poll — it captures the already-bumped generation.
+      const release = await firePollAndCapture();
+
+      // A fresh server board (Backlog 3,4,1,2). No mutation ran while this poll was in
+      // flight, so its generation is unchanged and it MUST apply.
+      const serverFresh = aBoard({
+        cards: [
+          aCard({ iid: 3, title: "issue three", column: "", labels: ["uzi"] }),
+          aCard({ iid: 4, title: "issue four", column: "", labels: ["uzi"] }),
+          aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"] }),
+          aCard({ iid: 2, title: "issue two", column: "", labels: ["uzi"] }),
+          aCard({ iid: 9, title: "issue nine", column: "Planned", labels: ["uzi"] }),
+        ],
+      });
+      await releasePollWith(release, serverFresh);
+
+      expect(titlesInLane("Backlog")).toEqual(["issue three", "issue four", "issue one", "issue two"]);
+    });
+
+    // #1060 (rework, !1119 review): promote() and refresh() ALSO replace board state
+    // with an authoritative response but did NOT bump the generation, so an in-flight
+    // poll still clobbered them — the same defect the applyDrop guard closes. These
+    // two prove the bump now extends to those flows.
+    it("keeps a promote when a poll started before it resolves stale", async () => {
+      // A non-uzi card (5) renders a Promote button only when "show all" is on;
+      // promoting it adds the uzi label and swaps Promote → Start run.
+      const promotable = aBoard({
+        cards: [
+          aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"] }),
+          aCard({ iid: 5, title: "issue five", column: "", labels: [] }),
+        ],
+      });
+      mockApi.getBoard.mockResolvedValue({ board: promotable });
+      mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: true });
+      mockApi.promoteIssue.mockResolvedValue({
+        card: aCard({ iid: 5, title: "issue five", column: "", labels: ["uzi"] }),
+      });
+
+      renderBoard();
+      await screen.findByText("Backlog");
+      // Card 5 is promotable before we act — the control that the button is reachable.
+      expect(screen.getByRole("button", { name: /Promote to uzi/ })).toBeTruthy();
+
+      const release = await firePollAndCapture();
+
+      // Promote card 5 — bumps the generation at start + settle.
+      fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
+      await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 5));
+      await waitFor(() =>
+        expect(screen.queryByRole("button", { name: /Promote to uzi/ })).toBeNull(),
+      );
+
+      // Release the poll with the STALE board (card 5 still non-uzi) — must be DROPPED,
+      // so the promoted card does not revert to its promotable state.
+      await releasePollWith(release, promotable);
+
+      expect(screen.queryByRole("button", { name: /Promote to uzi/ })).toBeNull();
+    });
+
+    it("keeps a refresh when a poll started before it resolves stale", async () => {
+      // Refresh (syncRepo) returns an authoritative board with card 1 moved to Planned.
+      const synced = aBoard({
+        cards: [
+          aCard({ iid: 1, title: "issue one", column: "Planned", labels: ["uzi"] }),
+          aCard({ iid: 2, title: "issue two", column: "", labels: ["uzi"] }),
+          aCard({ iid: 3, title: "issue three", column: "", labels: ["uzi"] }),
+          aCard({ iid: 4, title: "issue four", column: "", labels: ["uzi"] }),
+          aCard({ iid: 9, title: "issue nine", column: "Planned", labels: ["uzi"] }),
+        ],
+      });
+      mockApi.syncRepo.mockResolvedValue({ board: synced });
+
+      renderBoard();
+      await screen.findByText("Backlog");
+
+      const release = await firePollAndCapture();
+
+      // Refresh — bumps the generation at start + settle.
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      await waitFor(() => expect(mockApi.syncRepo).toHaveBeenCalledWith("repo-1"));
+      await waitFor(() => expect(titlesInLane("Planned")).toContain("issue one"));
+
+      // Release the poll with the STALE pre-refresh board (card 1 still in Backlog) — dropped.
+      await releasePollWith(release, aBoard());
+
+      expect(titlesInLane("Planned")).toContain("issue one");
+      expect(titlesInLane("Backlog")).not.toContain("issue one");
     });
   });
 });

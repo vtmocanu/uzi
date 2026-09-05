@@ -429,6 +429,7 @@ Tracked as GitLab issue vtmocanu/uzi#53; PRD at `prds/done/53-rate-limits.md`.
 - Server polls with the user's own token; the token never leaves the api container — SPA sees only percentages.
 - The header-probe fallback spends ~1 token/interval of the user's own quota; operators can disable the probe (`UZI_USAGE_PROBE=false`) or the whole poller (`UZI_USAGE_POLL_INTERVAL=0`).
 - No Anthropic token ever appears in a log line, API response, or the SPA.
+- Alert the user (opt-in, default on; Slack DM + inbox) whenever their Anthropic 7-day window clears early — on ANY early clear, not only after their runs were blocked on that window. [user, #1114]
 
 ## Feature #55 — OIDC group → role/access mapping (Keycloak / Pocket ID)
 
@@ -604,6 +605,7 @@ ADR at `adr/0035-run-limit-retry.md`.
   runs, which have no start affordance at all]
 - `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
+- When a run parked on a usage limit resumes, the owner gets a Slack message in the run's thread. [user 2026-09-05, PRD #1116]
 
 ## Feature #218 — A park or shutdown must not lose the agent's committed work
 

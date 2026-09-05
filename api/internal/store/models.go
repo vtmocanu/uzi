@@ -581,6 +581,7 @@ type SlackRunMessage struct {
 	QuestionTs                  pgtype.Text        `json:"question_ts"`
 	MilestonesNotifiedCompleted pgtype.Int4        `json:"milestones_notified_completed"`
 	StatusTs                    pgtype.Text        `json:"status_ts"`
+	LimitPausedAt               pgtype.Timestamptz `json:"limit_paused_at"`
 }
 
 type TaskReview struct {

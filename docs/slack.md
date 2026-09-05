@@ -132,7 +132,7 @@ with the bot, so the sender is already `uzi`. Glyph legend:
 | | | |
 |---|---|---|
 | ⏳ Queued | ▶️ Running | ⏸️ Needs your approval |
-| ❓ Needs your answer | ⏸️ Paused · usage limit | ✅ Completed |
+| ❓ Needs your answer | ⏸️ Paused · usage limit → ▶️ Resumed · usage limit cleared | ✅ Completed |
 | ❌ Failed | 🚫 Cancelled | 🔀 View MR/PR |
 | 🧩 N/M milestones | 🔗 Open in uzi | 💬 Chat |
 | 🔎 Judge review (verdict ✅ ideal/ok · ⚠️ issues) | 🔧 Self-improvement | 📝 Issue proposal |
@@ -200,6 +200,18 @@ with the bot, so the sender is already `uzi`. Glyph legend:
     run you answered doesn't move, open it in uzi and answer there.
 - **Steering a live run**: reply in the thread outside a gate and it's
   submitted as a follow-up instruction, with a ✅ reaction as the ack.
+- **Usage-limit pause & resume**: when a run parks on an Anthropic usage
+  limit, its root status line edits to `⏸️ Paused · usage limit` and a
+  matching reply is threaded under it; the first time the run is working
+  again, a single `▶️ Resumed · usage limit cleared` reply is threaded under
+  the same message, carrying how long it waited and — from the second pause
+  on — the pause count. A Slack *edit* raises no notification, so the resume
+  is a new reply rather than just the root line flipping back to `▶️ Running`.
+  The separate resume reply is posted only when the run goes back to
+  `running`; if it comes back straight into the plan gate, a question, or a
+  finished state, that reply carries the news and no resume reply is added.
+  So one pause episode is at most one pause reply plus one resume reply
+  (bounded by the per-run retry cap).
 - **Scope-capped completions** (PRD #634): if you or a teammate stopped or
   narrowed a milestone-structured issue run's scope from the CLI or web (`uzi
   run stop` / `uzi run scope --through N` — see [Stopping or narrowing a
