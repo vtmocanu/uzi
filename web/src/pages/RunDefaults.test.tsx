@@ -483,6 +483,27 @@ describe("Run defaults judge token picker (PRD #104)", () => {
     expect(picker.value).toBe("\u0000auto");
   });
 
+  // GET /api/auth/me carries the pinned judge token's ID but never its LABEL (only the
+  // PUT /me/judge response fills it), so on a fresh page load the picker must resolve
+  // the label from the loaded secrets by id. Rendering "Use my default token" here is
+  // not cosmetic: the next picker change would replace the pin the user cannot see.
+  it("selects the pinned token by resolving its label from secrets when /me carries only the id", async () => {
+    mockAuth({
+      ...baseUser,
+      judge_anthropic_secret_id: "sec-cheap",
+      judge_anthropic_secret_label: null,
+      judge_anthropic_bind_mode: "pinned",
+    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Token the judge spends")) as HTMLSelectElement;
+    await waitFor(() => expect(picker.value).toBe("cheap-console"));
+  });
+
   // D4: an auto judge lane with an EMPTY pool spends the default token (unlike a
   // worker, which holds), so the warning names the default-token fallback.
   it("warns that an empty pool falls back to the default token in auto mode", async () => {

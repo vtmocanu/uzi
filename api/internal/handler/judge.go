@@ -64,22 +64,19 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	updated, err := h.q.SetUserJudgeEnabled(r.Context(), store.SetUserJudgeEnabledParams{
-		ID:           user.ID,
-		JudgeEnabled: req.Enabled,
-	})
-	if err != nil {
-		slog.Error("set judge enabled", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	// The token binding is a SEPARATE statement, and only runs when the field was
-	// present: an absent anthropic_token must leave an existing binding alone, or
-	// every existing client that PUTs {"enabled":true} would silently unbind the
-	// user's judge credential. The two writes are not transactional, and deliberately
-	// not: they are independent settings, and the worst a half-applied pair does is
-	// leave the opt-in flipped without the rebind, which the user can see and redo.
+	// The WHOLE binding request is parsed, validated and label-resolved BEFORE the
+	// first write. The opt-in flip and the binding are two separate statements,
+	// deliberately non-transactional (independent settings), and that is exactly why
+	// every 400 must be decided up front: a body like
+	// {"enabled":true,"judge_bind_mode":"pinned"} with no label must not durably
+	// enable judge runs (which spend the user's tokens) and THEN report a 400 for the
+	// half it could not apply. Validating first turns the only remaining
+	// half-applied pair into "the opt-in flipped, the rebind hit a 5xx", which the
+	// user can see and redo.
+	//
+	// An absent anthropic_token leaves an existing binding alone, or every existing
+	// client that PUTs {"enabled":true} would silently unbind the user's judge
+	// credential.
 	token, ok := parseTokenField(req.AnthropicToken)
 	if !ok {
 		httpx.Error(w, http.StatusBadRequest, "anthropic_token must be a token label, null, or omitted")
@@ -89,13 +86,15 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 	// omitted-both body (the common {"enabled":true}) leaves the binding untouched —
 	// this is the ONE divergence from PatchWorker, which 400s on neither present
 	// (workers.go:454). SetJudgeEnabled must not, because {"enabled":true} is legit.
-	if token.present || req.JudgeBindMode != nil {
-		// Default derivation from the token alone (mirrors PatchWorker): a label ⇒
-		// pinned, no label ⇒ default. An explicit judge_bind_mode overrides it below.
-		mode := workersvc.BindModePinned
-		if token.label == "" {
-			mode = workersvc.BindModeDefault
-		}
+	bindRequested := token.present || req.JudgeBindMode != nil
+	// Default derivation from the token alone (mirrors PatchWorker): a label ⇒
+	// pinned, no label ⇒ default. An explicit judge_bind_mode overrides it below.
+	mode := workersvc.BindModePinned
+	if token.label == "" {
+		mode = workersvc.BindModeDefault
+	}
+	var secretID *uuid.UUID
+	if bindRequested {
 		if req.JudgeBindMode != nil {
 			mode = *req.JudgeBindMode
 			if !workersvc.ValidBindMode(mode) {
@@ -111,7 +110,6 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		var secretID *uuid.UUID
 		if token.label != "" {
 			resolved, rerr := h.wsvc.ResolveTokenLabel(r.Context(), user.ID, token.label)
 			if rerr != nil {
@@ -125,6 +123,19 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 			}
 			secretID = &resolved
 		}
+	}
+
+	updated, err := h.q.SetUserJudgeEnabled(r.Context(), store.SetUserJudgeEnabledParams{
+		ID:           user.ID,
+		JudgeEnabled: req.Enabled,
+	})
+	if err != nil {
+		slog.Error("set judge enabled", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	if bindRequested {
 		bound, berr := h.wsvc.SetUserJudgeBinding(r.Context(), user.ID, mode, secretID)
 		if berr != nil {
 			if errors.Is(berr, workersvc.ErrSecretNotOwned) {

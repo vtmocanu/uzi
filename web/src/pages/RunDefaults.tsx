@@ -507,10 +507,23 @@ export function RunDefaults() {
             <Select
               aria-label="Token the judge spends"
               // Driven by the MODE first (mirroring the worker picker): an auto judge
-              // lane selects the sentinel, everything else falls back to the label, and
+              // lane selects the sentinel; a pinned one selects its token's label; and
               // a pinned binding whose token was deleted arrives here as effective mode
-              // "default" with a null label — so it shows the default-token option.
-              value={user?.judge_anthropic_bind_mode === "auto" ? AUTO_OPTION : (user?.judge_anthropic_secret_label ?? "")}
+              // "default" with a null pointer — so it shows the default-token option.
+              // The label is resolved from `secrets` by id BEFORE the DTO's own label:
+              // GET /api/auth/me never fills judge_anthropic_secret_label (only the
+              // PUT /me/judge response does, handler.go toDTO), so on a fresh page load a
+              // pinned lane would otherwise render as "Use my default token", and the
+              // next picker change would silently replace the pin.
+              value={
+                user?.judge_anthropic_bind_mode === "auto"
+                  ? AUTO_OPTION
+                  : user?.judge_anthropic_bind_mode === "pinned"
+                    ? (secrets.find((s) => s.id === user.judge_anthropic_secret_id)?.label ??
+                      user.judge_anthropic_secret_label ??
+                      "")
+                    : ""
+              }
               disabled={judgeBusy}
               onChange={(e) => setJudgeBinding(e.target.value)}
             >

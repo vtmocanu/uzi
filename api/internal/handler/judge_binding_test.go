@@ -389,6 +389,43 @@ func TestSetJudgePinnedModeNeedsLabel(t *testing.T) {
 	}
 }
 
+// TestSetJudgeInvalidBindingDoesNotFlipEnabled: a 400 on the binding half must be
+// decided BEFORE the opt-in write. The two statements are deliberately
+// non-transactional, so the only thing keeping {"enabled":true,"judge_bind_mode":
+// "pinned"} (no label) from durably enabling judge runs — token spend — and THEN
+// reporting a 400 is the ordering in the handler. Each body below is a distinct
+// 400 arm (mode/label contradiction, unknown label); each must leave BOTH writes
+// untouched, which is asserted on the fake's call flags, not on the status alone.
+func TestSetJudgeInvalidBindingDoesNotFlipEnabled(t *testing.T) {
+	owner := uuid.New()
+	for _, body := range []string{
+		`{"enabled":true,"judge_bind_mode":"pinned"}`,
+		`{"enabled":true,"judge_bind_mode":"pinned","anthropic_token":null}`,
+		`{"enabled":true,"judge_bind_mode":"auto","anthropic_token":"cheap-console"}`,
+		`{"enabled":true,"judge_bind_mode":"sometimes"}`,
+		`{"enabled":true,"anthropic_token":"nope"}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			db := &fakeUserDB{}
+			st := &judgeBindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+			h := newJudgeBindHandler(t, db, st)
+
+			rec := httptest.NewRecorder()
+			h.SetJudgeEnabled(rec, judgeReq(owner, body))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			if db.called {
+				t.Fatal("judge_enabled was written before the binding request was validated")
+			}
+			if st.setCalled {
+				t.Fatal("an invalid binding must not reach the binding UPDATE")
+			}
+		})
+	}
+}
+
 // TestSetJudgeAutoModeRejectsLabel: judge_bind_mode:"auto" (or default) WITH a token
 // label is a 400 — the two contradict.
 func TestSetJudgeAutoModeRejectsLabel(t *testing.T) {
