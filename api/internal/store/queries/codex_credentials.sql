@@ -75,3 +75,46 @@ SET material_revision = material_revision + 1,
     provider_account_id = NULL,
     updated_at = now()
 WHERE user_secret_id = @user_secret_id AND user_id = @user_id;
+
+-- name: CountCodexSecrets :one
+-- How many codex-kind credentials the user holds across BOTH kinds (PRD #1147 M1),
+-- read inside the mutation transaction so a create can decide whether this is the
+-- user's FIRST codex credential (and must therefore be forced default, mirroring the
+-- anthropic first-token rule but spanning openai_api_key + codex_auth together — the
+-- two share one default slot per user_secrets_codex_one_default_key). Under the
+-- advisory lock this count is stable against a concurrent create.
+SELECT count(*) FROM user_secrets
+WHERE user_id = @user_id AND kind IN ('openai_api_key', 'codex_auth');
+
+-- name: ClearCodexDefaults :execrows
+-- Clear the user's current codex default across BOTH codex kinds (PRD #1147 M1). The
+-- first half of the create-as-default and set-default swap: the codex kinds share ONE
+-- default slot (user_secrets_codex_one_default_key), so this must span openai_api_key
+-- AND codex_auth rather than one kind, unlike ClearDefaultUserSecret. Run under the
+-- advisory lock so it cannot race a concurrent promote into two defaults. Affects the
+-- single codex default row, or 0 when there is none. anthropic_token is untouched: it
+-- keeps its own separate default via 00077's per-kind index.
+UPDATE user_secrets SET is_default = false, updated_at = now()
+WHERE user_id = @user_id AND is_default AND kind IN ('openai_api_key', 'codex_auth');
+
+-- name: InsertCodexSecret :one
+-- Store a NEW codex-kind secret (PRD #1147 M1), setting is_default to @want_default
+-- EXACTLY as the caller asks — the caller decides. Deliberately NOT InsertUserSecret:
+-- that query force-defaults the FIRST secret OF A KIND, which here would mint a SECOND
+-- codex default the moment a user adds their first openai_api_key while already holding
+-- a codex_auth default (the two kinds share one default slot), violating
+-- user_secrets_codex_one_default_key. The caller (h.CreateCodexAuth/CreateOpenAIAPIKey)
+-- decides want_default from CountCodexSecrets across both kinds instead. auto_eligible
+-- takes its schema default (false) — neither codex kind opts into the anthropic pool,
+-- which 00087's kind CHECK requires. Returns metadata only, never the ciphertext.
+INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
+VALUES (@user_id, @kind, @label, @want_default, @ciphertext, @sealed_with)
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
+
+-- name: ListCodexCredentialStatesForUser :many
+-- Every codex_credential_state row this user owns (PRD #1147 M1): the (secret id,
+-- status) pairs the all-kinds list endpoint merges into each codex row's DTO so the UI
+-- can show staging/linked/failed/static. Owner-scoped; anthropic rows have no state
+-- row here and carry an empty status.
+SELECT user_secret_id, status FROM codex_credential_state
+WHERE user_id = @user_id;

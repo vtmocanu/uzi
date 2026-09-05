@@ -38,6 +38,44 @@ func (q *Queries) BumpCodexMaterialRevision(ctx context.Context, arg BumpCodexMa
 	return result.RowsAffected(), nil
 }
 
+const clearCodexDefaults = `-- name: ClearCodexDefaults :execrows
+UPDATE user_secrets SET is_default = false, updated_at = now()
+WHERE user_id = $1 AND is_default AND kind IN ('openai_api_key', 'codex_auth')
+`
+
+// Clear the user's current codex default across BOTH codex kinds (PRD #1147 M1). The
+// first half of the create-as-default and set-default swap: the codex kinds share ONE
+// default slot (user_secrets_codex_one_default_key), so this must span openai_api_key
+// AND codex_auth rather than one kind, unlike ClearDefaultUserSecret. Run under the
+// advisory lock so it cannot race a concurrent promote into two defaults. Affects the
+// single codex default row, or 0 when there is none. anthropic_token is untouched: it
+// keeps its own separate default via 00077's per-kind index.
+func (q *Queries) ClearCodexDefaults(ctx context.Context, userID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, clearCodexDefaults, userID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const countCodexSecrets = `-- name: CountCodexSecrets :one
+SELECT count(*) FROM user_secrets
+WHERE user_id = $1 AND kind IN ('openai_api_key', 'codex_auth')
+`
+
+// How many codex-kind credentials the user holds across BOTH kinds (PRD #1147 M1),
+// read inside the mutation transaction so a create can decide whether this is the
+// user's FIRST codex credential (and must therefore be forced default, mirroring the
+// anthropic first-token rule but spanning openai_api_key + codex_auth together — the
+// two share one default slot per user_secrets_codex_one_default_key). Under the
+// advisory lock this count is stable against a concurrent create.
+func (q *Queries) CountCodexSecrets(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countCodexSecrets, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const getCodexCredentialState = `-- name: GetCodexCredentialState :one
 SELECT user_secret_id, user_id, status, provider_account_id, material_revision, last_error, created_at, updated_at FROM codex_credential_state
 WHERE user_secret_id = $1 AND user_id = $2
@@ -222,6 +260,62 @@ func (q *Queries) InsertCodexProviderAccount(ctx context.Context, arg InsertCode
 	return i, err
 }
 
+const insertCodexSecret = `-- name: InsertCodexSecret :one
+INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at
+`
+
+type InsertCodexSecretParams struct {
+	UserID      uuid.UUID `json:"user_id"`
+	Kind        string    `json:"kind"`
+	Label       string    `json:"label"`
+	WantDefault bool      `json:"want_default"`
+	Ciphertext  []byte    `json:"ciphertext"`
+	SealedWith  string    `json:"sealed_with"`
+}
+
+type InsertCodexSecretRow struct {
+	ID           uuid.UUID          `json:"id"`
+	Kind         string             `json:"kind"`
+	Label        string             `json:"label"`
+	IsDefault    bool               `json:"is_default"`
+	AutoEligible bool               `json:"auto_eligible"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Store a NEW codex-kind secret (PRD #1147 M1), setting is_default to @want_default
+// EXACTLY as the caller asks — the caller decides. Deliberately NOT InsertUserSecret:
+// that query force-defaults the FIRST secret OF A KIND, which here would mint a SECOND
+// codex default the moment a user adds their first openai_api_key while already holding
+// a codex_auth default (the two kinds share one default slot), violating
+// user_secrets_codex_one_default_key. The caller (h.CreateCodexAuth/CreateOpenAIAPIKey)
+// decides want_default from CountCodexSecrets across both kinds instead. auto_eligible
+// takes its schema default (false) — neither codex kind opts into the anthropic pool,
+// which 00087's kind CHECK requires. Returns metadata only, never the ciphertext.
+func (q *Queries) InsertCodexSecret(ctx context.Context, arg InsertCodexSecretParams) (InsertCodexSecretRow, error) {
+	row := q.db.QueryRow(ctx, insertCodexSecret,
+		arg.UserID,
+		arg.Kind,
+		arg.Label,
+		arg.WantDefault,
+		arg.Ciphertext,
+		arg.SealedWith,
+	)
+	var i InsertCodexSecretRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Label,
+		&i.IsDefault,
+		&i.AutoEligible,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const linkCodexCredentialState = `-- name: LinkCodexCredentialState :execrows
 UPDATE codex_credential_state
 SET status = 'linked', provider_account_id = $1, updated_at = now()
@@ -243,6 +337,40 @@ func (q *Queries) LinkCodexCredentialState(ctx context.Context, arg LinkCodexCre
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const listCodexCredentialStatesForUser = `-- name: ListCodexCredentialStatesForUser :many
+SELECT user_secret_id, status FROM codex_credential_state
+WHERE user_id = $1
+`
+
+type ListCodexCredentialStatesForUserRow struct {
+	UserSecretID uuid.UUID `json:"user_secret_id"`
+	Status       string    `json:"status"`
+}
+
+// Every codex_credential_state row this user owns (PRD #1147 M1): the (secret id,
+// status) pairs the all-kinds list endpoint merges into each codex row's DTO so the UI
+// can show staging/linked/failed/static. Owner-scoped; anthropic rows have no state
+// row here and carry an empty status.
+func (q *Queries) ListCodexCredentialStatesForUser(ctx context.Context, userID uuid.UUID) ([]ListCodexCredentialStatesForUserRow, error) {
+	rows, err := q.db.Query(ctx, listCodexCredentialStatesForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCodexCredentialStatesForUserRow{}
+	for rows.Next() {
+		var i ListCodexCredentialStatesForUserRow
+		if err := rows.Scan(&i.UserSecretID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listUserSecretsAll = `-- name: ListUserSecretsAll :many
