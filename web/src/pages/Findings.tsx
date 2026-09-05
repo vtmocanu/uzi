@@ -29,7 +29,7 @@ import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { Alert, Badge, Button, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
-import { AlertIcon, XIcon } from "../components/icons";
+import { BugIcon, XIcon } from "../components/icons";
 
 // The three rungs the page's segmented control exposes (the `all` bucket the API also accepts is
 // deliberately not a tab — the backlog is a triage queue, not an archive browser). `to_file` is
@@ -208,7 +208,7 @@ export function Findings() {
         titleNode={
           <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
             <span className="text-info" aria-hidden="true">
-              <AlertIcon />
+              <BugIcon />
             </span>
             Findings
           </h1>
@@ -280,7 +280,7 @@ export function Findings() {
       {!loading && backlog && (
         backlog.findings.length === 0 ? (
           <EmptyState
-            icon={<AlertIcon />}
+            icon={<BugIcon />}
             title={runAnchor ? "No findings for this run" : `Nothing under ${TAB_LABEL[bucket]}`}
             description="Switch buckets or clear a filter to see findings in another state."
           />
