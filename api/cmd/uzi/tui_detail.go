@@ -60,9 +60,16 @@ type detailState struct {
 	railCollapsed bool
 	runLoaded     bool // the first GetRun has landed: header/milestones/accounts can render
 	tailLoaded    bool // the newest transcript page has landed
-	loadErr       error
-	stream        *uzicli.RunStream
-	streamErr     error
+	// loadErr is the RUN-load error only (GetRun) — fatal to the whole view, since the
+	// header/rail have no DTO to render from. pageErr is the transcript-page error,
+	// scoped to the pane so a failed tail leaves the header up (PRD #1137: the header is
+	// independent of the history). The two are separate fields precisely because the two
+	// commands are dispatched concurrently and share nothing else — folding both into one
+	// field let a tail success clear a run error (or a tail error erase a live header).
+	loadErr   error
+	pageErr   error
+	stream    *uzicli.RunStream
+	streamErr error
 	// polling is the D8 fallback: the socket is unusable, so the view re-reads over
 	// REST on the same 2s cadence `uzi run logs --follow` uses.
 	polling bool
@@ -103,14 +110,16 @@ func (d *detailState) applyRun(run apitypes.RunDTO, err error) {
 }
 
 // applyTailPage folds the newest transcript page in and marks the pane loaded. Frames are
-// deduped by seq (addFrame), so a live frame that beat the tail is not doubled.
+// deduped by seq (addFrame), so a live frame that beat the tail is not doubled. A page
+// error is recorded in pageErr — NOT loadErr — so it stays scoped to the transcript pane
+// and never swallows (or is swallowed by) the concurrent run-load result.
 func (d *detailState) applyTailPage(msgs []apitypes.MessageDTO, err error) {
 	if err != nil {
-		d.loadErr = err
+		d.pageErr = err
 		d.tailLoaded = true
 		return
 	}
-	d.loadErr = nil
+	d.pageErr = nil
 	for _, m := range msgs {
 		d.addFrame(laneFrameFromMessage(m))
 	}

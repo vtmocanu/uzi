@@ -362,12 +362,24 @@ func (m tuiModel) renderTranscript() string {
 		title += m.pal.faint.Render(" · " + m.renderer.Plain(lane.Role, 16))
 	}
 	// The transcript pane waits on its own tail page while the header/rail are already up
-	// (PRD #1137 M4): before the newest page lands and with no live frame yet, show the
-	// placeholder here alone. A live frame that beat the tail (len(frames) > 0) renders
-	// instead of hiding — the gate is tailLoaded || len(frames) > 0.
-	if !m.detail.tailLoaded && len(m.detail.frames) == 0 {
-		return m.padPaneTitle(title, "") + "\n" +
-			padLinesToViewport([]string{m.pal.faint.Render("loading…")}, m.transcriptViewport())
+	// (PRD #1137 M4). With no frame to show yet, the pane alone reports its state: a failed
+	// tail page shows the error HERE (the header stays up — a page error never collapses the
+	// whole view), otherwise the loading placeholder until the newest page lands. A live
+	// frame that beat the tail (len(frames) > 0) renders instead of hiding.
+	if len(m.detail.frames) == 0 {
+		var placeholder string
+		switch {
+		case m.detail.pageErr != nil:
+			placeholder = "could not load transcript: " + fmtErr(m.detail.pageErr) + " · r to retry"
+		case !m.detail.tailLoaded:
+			placeholder = "loading…"
+		}
+		if placeholder != "" {
+			return m.padPaneTitle(title, "") + "\n" +
+				padLinesToViewport([]string{m.pal.faint.Render(placeholder)}, m.transcriptViewport())
+		}
+		// tailLoaded with no frames and no error: a genuinely empty run — fall through to
+		// the normal (empty) transcript render below.
 	}
 	if !ok {
 		return m.padPaneTitle(title, "") + "\n" +

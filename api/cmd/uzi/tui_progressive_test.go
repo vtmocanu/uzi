@@ -109,6 +109,65 @@ func TestTUIDetailLoadTailUsesOneTailPage(t *testing.T) {
 	}
 }
 
+// M4: the run-load and tail-page commands are concurrent and share nothing but the run. A
+// GetRun error must NOT be swallowed by a tail-page success that lands last — the view shows the
+// load error, never a header painted from a zero RunDTO.
+func TestTUIDetailRunErrorSurvivesLateTailSuccess(t *testing.T) {
+	now := time.Now()
+	runID := "prog-err-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+
+	// GetRun fails.
+	next, _ := m.Update(detailRunMsg{runID: runID, err: errFake("boom")})
+	m = next.(tuiModel)
+	// The tail page succeeds and lands AFTER the run error.
+	next, _ = m.Update(detailPageMsg{runID: runID, kind: pageTail, msgs: []apitypes.MessageDTO{
+		msgDTO(1, "text", "lead", "", "", "some frame", now),
+	}})
+	m = next.(tuiModel)
+
+	if m.detail.loadErr == nil {
+		t.Fatal("the run-load error was swallowed by the tail-page success")
+	}
+	out := m.View().Content
+	if !strings.Contains(out, "could not load this run") {
+		t.Errorf("a run-load error must show the load-error message, not a header from a zero run\n%s", out)
+	}
+}
+
+// M4: conversely, a tail-page error must stay scoped to the transcript pane — the header that a
+// successful GetRun already painted stays up, and the pane reports the page failure locally.
+func TestTUIDetailTailErrorLeavesHeaderUp(t *testing.T) {
+	runID := "prog-err-2"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+
+	// GetRun succeeds: the header paints.
+	next, _ := m.Update(detailRunMsg{runID: runID, run: apitypes.RunDTO{
+		ID: runID, Kind: "issue", Status: "running", IssueTitle: "header stays",
+	}})
+	m = next.(tuiModel)
+	// The tail page fails.
+	next, _ = m.Update(detailPageMsg{runID: runID, kind: pageTail, err: errFake("tail boom")})
+	m = next.(tuiModel)
+
+	if m.detail.loadErr != nil {
+		t.Fatal("a tail-page error must not set loadErr (that would collapse the whole view)")
+	}
+	if m.detail.pageErr == nil {
+		t.Fatal("a tail-page error must be recorded in pageErr")
+	}
+	out := m.View().Content
+	if !strings.Contains(out, "header stays") {
+		t.Errorf("the header must stay up after a tail-page error\n%s", out)
+	}
+	if strings.Contains(out, "could not load this run") {
+		t.Errorf("a tail-page error must not show the full-view run-load error\n%s", out)
+	}
+	if !strings.Contains(out, "could not load transcript") {
+		t.Errorf("the transcript pane should report the page failure locally\n%s", out)
+	}
+}
+
 // M4 seam 4: a live frame that beats the tail page renders instead of hiding — the transcript
 // gate is tailLoaded || len(frames) > 0, so an early streamEventsMsg is shown, not held.
 func TestTUIDetailLiveFrameBeforeTailRenders(t *testing.T) {
