@@ -129,6 +129,36 @@ func TestInstallHookLegacyMigration(t *testing.T) {
 	}
 }
 
+// TestInstallHookLegacyMigrationPreservesFlags: a legacy entry carrying a user flag
+// (`uzi skill install --force`) is migrated to the canonical --target claude form with
+// the user's --force PRESERVED (not silently dropped).
+func TestInstallHookLegacyMigrationPreservesFlags(t *testing.T) {
+	home := t.TempDir()
+	const orig = `{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "startup", "hooks": [{"type": "command", "command": "uzi skill install --force", "timeout": 15}]}
+    ]
+  }
+}
+`
+	writeSettings(t, home, orig)
+	hm := NewHookManagerAt(home)
+
+	res, err := hm.InstallHook()
+	if err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	if !res.Changed || res.AlreadyPresent || !res.BackedUp {
+		t.Fatalf("migration: got %+v, want Changed+BackedUp, not AlreadyPresent", res)
+	}
+	cmds := commandsFrom(t, parseSettings(t, home))
+	const want = claudeCanonicalCommand + " --force"
+	if len(cmds) != 1 || cmds[0] != want {
+		t.Fatalf("after migration commands=%v, want exactly [%q] (--force preserved)", cmds, want)
+	}
+}
+
 // TestInstallHookPreservesTargetSpecificFlags: an existing Claude entry already in
 // canonical form but carrying a user's extra flag (`--target claude --force`) is
 // ALREADY PRESENT — InstallHook is a no-op (no rewrite, no .bak, Changed=false) and
@@ -348,6 +378,41 @@ func TestCodexInlineHooksConflict(t *testing.T) {
 	// Still never wrote config.toml or any trust state.
 	if got, _ := os.ReadFile(configPath); string(got) != configTOML { //nolint:gosec // G304: test reads a test-controlled temp path
 		t.Fatalf("config.toml was modified on the idempotent path: %q", got)
+	}
+}
+
+// TestCodexHookStateNotInlineConflict: a config.toml that declares NO inline hook event
+// but keeps Codex's trust-persistence subtable `[hooks.state."..."]` (the state of a
+// machine that keeps all its hooks in hooks.json and has trusted one) must NOT be
+// treated as a mixed-representation conflict. InstallHook succeeds and appends our
+// entry, and HookStatus reports no conflict. This fails on the pre-fix `len(hooks)>0`
+// guard and passes once only real hook-event keys count.
+func TestCodexHookStateNotInlineConflict(t *testing.T) {
+	codexHome := t.TempDir()
+	hookPath := codexHooksPathIn(codexHome)
+	configPath := filepath.Join(codexHome, "config.toml")
+	const configTOML = "[features]\nhooks = true\n\n[hooks.state]\n\n[hooks.state.\"/Users/x/.codex/hooks.json:session_start:0:0\"]\nenabled = true\ntrusted_hash = \"sha256:abc\"\n"
+	writeFileFixture(t, configPath, configTOML)
+	// An empty hooks.json (valid JSON object, no entry of ours).
+	writeFileFixture(t, hookPath, "{}\n")
+
+	hm := NewCodexHookManager(hookPath)
+	res, err := hm.InstallHook()
+	if err != nil {
+		t.Fatalf("InstallHook must succeed for a state-only config.toml: %v", err)
+	}
+	if !res.Changed || res.AlreadyPresent {
+		t.Fatalf("state-only install: got %+v, want Changed (entry appended)", res)
+	}
+	if cmds := commandsFrom(t, decodeFile(t, hookPath)); len(cmds) != 1 || cmds[0] != "uzi skill install --target codex" {
+		t.Fatalf("codex commands=%v, want our entry appended", cmds)
+	}
+	if st := hm.HookStatus(); st.HookConfigConflict {
+		t.Fatalf("HookStatus.HookConfigConflict=true for a state-only config.toml, want false")
+	}
+	// config.toml was never written.
+	if got, _ := os.ReadFile(configPath); string(got) != configTOML { //nolint:gosec // G304: test reads a test-controlled temp path
+		t.Fatalf("config.toml was modified: %q", got)
 	}
 }
 

@@ -295,14 +295,37 @@ func (hm *HookManager) hasOurHook(root map[string]any) bool {
 	return false
 }
 
-// configHasInlineHooks (Codex only) reports whether config.toml declares a
-// non-empty [hooks] table. TOML decodes both the standard-header form and the
-// inline form to the same map, so this matches ANY non-empty [hooks] table (a
-// superset that includes the inline form) — the intended, safe behavior. Read-only:
-// we NEVER write config.toml. A missing file mirrors LoadConfig's ErrNotExist
-// handling (no conflict). A parse error is treated as "cannot detect → proceed": we
-// do not block an install on someone else's malformed TOML, and since we never write
-// it a wrong guess only risks Codex's own dedup warning, never data loss.
+// codexHookEventKeys is the set of Codex hook EVENT names. A config.toml [hooks]
+// table declares an inline hook only via one of these keys, whether written inline
+// (`SessionStart = "..."`) or as a standard header (`[hooks.SessionStart]`) — both
+// decode to the same key under m["hooks"]. Codex's own trust-persistence subtable
+// `[hooks.state]` (and any other non-event metadata under [hooks]) is NOT a hook
+// event and must not count as an inline hook. Keys are PascalCase, matching Codex.
+var codexHookEventKeys = map[string]struct{}{
+	"PreToolUse":        {},
+	"PermissionRequest": {},
+	"PostToolUse":       {},
+	"PreCompact":        {},
+	"PostCompact":       {},
+	"SessionStart":      {},
+	"SessionEnd":        {},
+	"UserPromptSubmit":  {},
+	"SubagentStart":     {},
+	"SubagentStop":      {},
+	"Stop":              {},
+}
+
+// configHasInlineHooks (Codex only) reports whether config.toml declares at least one
+// inline hook EVENT under its [hooks] table. It tests each [hooks] child key against
+// codexHookEventKeys, which covers both the inline form (`SessionStart = "..."`) and
+// the standard-header form (`[hooks.SessionStart]`), while EXCLUDING Codex's
+// trust-persistence subtable `[hooks.state]` and any future non-event metadata under
+// [hooks] — otherwise a config that keeps all its hooks in hooks.json but has ever
+// trusted one would falsely conflict. Read-only: we NEVER write config.toml. A missing
+// file mirrors LoadConfig's ErrNotExist handling (no conflict). A parse error is
+// treated as "cannot detect → proceed": we do not block an install on someone else's
+// malformed TOML, and since we never write it a wrong guess only risks Codex's own
+// dedup warning, never data loss.
 func (hm *HookManager) configHasInlineHooks() bool {
 	b, err := os.ReadFile(hm.configTOMLPath)
 	if err != nil {
@@ -313,7 +336,15 @@ func (hm *HookManager) configHasInlineHooks() bool {
 		return false // malformed TOML ⇒ cannot detect ⇒ proceed
 	}
 	hooks, ok := m["hooks"].(map[string]any)
-	return ok && len(hooks) > 0
+	if !ok {
+		return false
+	}
+	for key := range hooks {
+		if _, isEvent := codexHookEventKeys[key]; isEvent {
+			return true // a real inline hook event ⇒ mixed representation
+		}
+	}
+	return false // only [hooks.state]/metadata ⇒ no inline hook event
 }
 
 // inlineHooksConflict reports the Codex mixed-representation conflict: a [hooks]
@@ -325,10 +356,11 @@ func (hm *HookManager) inlineHooksConflict(root map[string]any) bool {
 }
 
 // migrateLegacyCommand rewrites the FIRST legacy/non-canonical SessionStart command
-// we manage in place to the bare canonical command and reports whether it did. An
-// entry ALREADY in canonical form (exact or canonical+flags) is skipped so a user's
-// appended flags survive — those are handled by the caller's idempotent
-// short-circuit. Migrating only the first match avoids appending a duplicate.
+// we manage in place to the canonical command, PRESERVING any user suffix the legacy
+// entry carried (e.g. `--force`), and reports whether it did. An entry ALREADY in
+// canonical form (exact or canonical+flags) is skipped so a user's appended flags
+// survive — those are handled by the caller's idempotent short-circuit. Migrating only
+// the first match avoids appending a duplicate.
 func (hm *HookManager) migrateLegacyCommand(root map[string]any) bool {
 	for _, mo := range sessionStartArray(root) {
 		m, ok := mo.(map[string]any)
@@ -348,9 +380,17 @@ func (hm *HookManager) migrateLegacyCommand(root map[string]any) bool {
 			if !ok {
 				continue
 			}
-			if hm.isOurCommand(cmd) && !hm.isCanonicalCommand(cmd) {
-				hmap["command"] = hm.command
-				return true
+			if hm.isCanonicalCommand(cmd) {
+				continue // already canonical (exact or canonical+flags) — leave verbatim
+			}
+			for _, legacy := range hm.legacyCommands {
+				if commandMatches(cmd, legacy) {
+					// Rewrite to the canonical command, keeping any suffix the legacy
+					// entry carried (TrimPrefix yields "" for the bare legacy form) so a
+					// user's appended flags are never silently dropped.
+					hmap["command"] = hm.command + strings.TrimPrefix(cmd, legacy)
+					return true
+				}
 			}
 		}
 	}
