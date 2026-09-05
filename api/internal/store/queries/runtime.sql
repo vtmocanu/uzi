@@ -2234,6 +2234,21 @@ WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC
 LIMIT @lim;
 
+-- name: ListRunMessagesBeforePage :many
+-- Backward twin of ListRunMessagesAfterPage for the TUI's tail-first/backfill paging
+-- (PRD #1137): the newest @lim messages with seq < @before_seq, returned DESC. The
+-- service reverses to ascending in Go (D3) — NOT in a SQL subquery — so the row stays
+-- store.RunMessage. Authorization (owner-or-admin) is checked by the caller.
+-- Column order is IDENTICAL to ListRunMessagesAfter and ListRunMessagesAfterPage so
+-- the row stays store.RunMessage. New columns must be APPENDED to ALL THREE of these
+-- queries in the same order the ALTER TABLE adds them — see ListRunMessagesAfter's
+-- note. Diverge and sqlc mints a per-query Row type, breaking that []store.RunMessage.
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+FROM run_messages
+WHERE run_id = @run_id AND seq < @before_seq
+ORDER BY seq DESC
+LIMIT @lim;
+
 -- Usage accounting (PRD #40) ------------------------------------------------
 
 -- name: UpsertRunUsage :exec

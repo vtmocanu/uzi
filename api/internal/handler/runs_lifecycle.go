@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -414,11 +415,14 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 // down to this. Unset limit keeps the legacy unbounded path (non-breaking).
 const maxRunMessagesPage = 1000
 
-// ListRunMessages returns a run's persisted messages after ?after=<seq> (default
-// 0), the replay source a reconnecting browser reads before going live. Visible
-// to the run's owner or an admin. With ?limit=<n> (n >= 1) it returns a bounded
-// page of at most n (clamped to maxRunMessagesPage) for the CLI's paging; absent
-// limit is the unbounded legacy path the web SPA relies on.
+// ListRunMessages returns a run's persisted messages. The legacy forms are
+// ?after=<seq> (default 0; ascending, unbounded — the replay source a reconnecting
+// browser reads) and ?after + ?limit=<n> (a bounded page of at most n, clamped to
+// maxRunMessagesPage, for the CLI). PRD #1137 adds two tail-first paging forms:
+// ?tail=<n> (the newest n, ascending) and ?before=<seq> + ?limit=<n> (the newest
+// <= n with seq < before, ascending). The four params are mutually constrained
+// (validated below, before any store call); a violation is a 400. Visible to the
+// run's owner or an admin.
 func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -429,9 +433,22 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	q := r.URL.Query()
+	afterRaw := strings.TrimSpace(q.Get("after"))
+	limitRaw := strings.TrimSpace(q.Get("limit"))
+	tailRaw := strings.TrimSpace(q.Get("tail"))
+	beforeRaw := strings.TrimSpace(q.Get("before"))
+	hasAfter := afterRaw != ""
+	hasLimit := limitRaw != ""
+	hasTail := tailRaw != ""
+	hasBefore := beforeRaw != ""
+
+	// Parse each present value into a 400 on malformed input before enforcing the
+	// exclusivity matrix, so no store call happens on any bad request.
 	after := int32(0)
-	if raw := strings.TrimSpace(r.URL.Query().Get("after")); raw != "" {
-		n, err := strconv.ParseInt(raw, 10, 32)
+	if hasAfter {
+		n, err := strconv.ParseInt(afterRaw, 10, 32)
 		if err != nil || n < 0 {
 			httpx.Error(w, http.StatusBadRequest, "after must be a non-negative integer")
 			return
@@ -439,9 +456,8 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 		after = int32(n)
 	}
 	limit := int32(0)
-	bounded := false
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		n, err := strconv.ParseInt(raw, 10, 32)
+	if hasLimit {
+		n, err := strconv.ParseInt(limitRaw, 10, 32)
 		if err != nil || n < 1 {
 			httpx.Error(w, http.StatusBadRequest, "limit must be a positive integer")
 			return
@@ -450,13 +466,56 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 			n = maxRunMessagesPage
 		}
 		limit = int32(n)
-		bounded = true
 	}
+	tail := int32(0)
+	if hasTail {
+		n, err := strconv.ParseInt(tailRaw, 10, 32)
+		if err != nil || n < 1 {
+			httpx.Error(w, http.StatusBadRequest, "tail must be a positive integer")
+			return
+		}
+		if n > maxRunMessagesPage {
+			n = maxRunMessagesPage
+		}
+		tail = int32(n)
+	}
+	before := int32(0)
+	if hasBefore {
+		n, err := strconv.ParseInt(beforeRaw, 10, 32)
+		if err != nil || n < 1 {
+			httpx.Error(w, http.StatusBadRequest, "before must be a positive integer")
+			return
+		}
+		before = int32(n)
+	}
+
+	// Exclusivity matrix (all 400s, zero store calls on violation).
+	if hasTail && (hasAfter || hasBefore || hasLimit) {
+		httpx.Error(w, http.StatusBadRequest, "tail cannot be combined with after, before or limit")
+		return
+	}
+	if hasBefore {
+		if hasAfter || hasTail {
+			httpx.Error(w, http.StatusBadRequest, "before cannot be combined with after or tail")
+			return
+		}
+		if !hasLimit {
+			httpx.Error(w, http.StatusBadRequest, "before requires limit")
+			return
+		}
+	}
+
 	var msgs []store.RunMessage
 	var err error
-	if bounded {
+	switch {
+	case hasTail:
+		// tail is before_seq = MaxInt32 with limit = tail (seq is int32).
+		msgs, err = h.wsvc.ListRunMessagesForViewerBefore(r.Context(), user.ID, user.IsAdmin, id, math.MaxInt32, tail)
+	case hasBefore:
+		msgs, err = h.wsvc.ListRunMessagesForViewerBefore(r.Context(), user.ID, user.IsAdmin, id, before, limit)
+	case hasLimit:
 		msgs, err = h.wsvc.ListRunMessagesForViewerPage(r.Context(), user.ID, user.IsAdmin, id, after, limit)
-	} else {
+	default:
 		msgs, err = h.wsvc.ListRunMessagesForViewer(r.Context(), user.ID, user.IsAdmin, id, after)
 	}
 	if err != nil {

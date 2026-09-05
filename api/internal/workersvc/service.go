@@ -574,6 +574,7 @@ type Store interface {
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
 	ListRunMessagesAfterPage(ctx context.Context, arg store.ListRunMessagesAfterPageParams) ([]store.RunMessage, error)
+	ListRunMessagesBeforePage(ctx context.Context, arg store.ListRunMessagesBeforePageParams) ([]store.RunMessage, error)
 	// UpsertRunUsage folds a delivered result frame's per-model usage into
 	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
 	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
@@ -3752,6 +3753,25 @@ func (s *Service) ListRunMessagesForViewerPage(ctx context.Context, userID uuid.
 		return nil, err
 	}
 	return s.q.ListRunMessagesAfterPage(ctx, store.ListRunMessagesAfterPageParams{RunID: runID, AfterSeq: afterSeq, Lim: limit})
+}
+
+// ListRunMessagesForViewerBefore returns the newest <= limit messages with
+// seq < beforeSeq, in ASCENDING seq order (the store query returns DESC; the
+// reverse happens here, not in SQL — keeps the row store.RunMessage). Same
+// owner-or-admin gate as the sibling. Caller clamps limit.
+func (s *Service) ListRunMessagesForViewerBefore(ctx context.Context, userID uuid.UUID, isAdmin bool, runID uuid.UUID, beforeSeq int32, limit int32) ([]store.RunMessage, error) {
+	if _, err := s.GetRunForViewer(ctx, userID, isAdmin, runID); err != nil {
+		return nil, err
+	}
+	rows, err := s.q.ListRunMessagesBeforePage(ctx, store.ListRunMessagesBeforePageParams{RunID: runID, BeforeSeq: beforeSeq, Lim: limit})
+	if err != nil {
+		return nil, err
+	}
+	// reverse DESC -> ASC in place
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	return rows, nil
 }
 
 // ListRunsForUser returns the user's runs (newest first) with repo path and

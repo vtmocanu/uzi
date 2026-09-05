@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -61,10 +62,16 @@ type runsStore struct {
 	// can assert the handler clamped/forwarded the requested size BEFORE the store call —
 	// the fixture size alone can't distinguish a clamped page from an unclamped one.
 	lastPageLim int32
-	userRuns    []store.ListRunsForUserRow
-	lastRunsArg *store.ListRunsForUserParams
-	allWorkers  []store.ListAllWorkersRow
-	activeRuns  []store.ListActiveRunsAllRow
+	// lastBeforeSeq / lastBeforeLim record the BeforeSeq and Lim the handler forwarded
+	// to ListRunMessagesBeforePage on the ?tail= / ?before= paths (PRD #1137 M1), so the
+	// tests can assert the clamp-before-store-call and that a rejected combination made
+	// ZERO store calls (both stay at their sentinel).
+	lastBeforeSeq int32
+	lastBeforeLim int32
+	userRuns      []store.ListRunsForUserRow
+	lastRunsArg   *store.ListRunsForUserParams
+	allWorkers    []store.ListAllWorkersRow
+	activeRuns    []store.ListActiveRunsAllRow
 	// claimTemplates backs GetRun's own-roster resolution (PRD #37 M4-fix): the
 	// owner's allocation-resolved templates, lead included so the handler's strip is
 	// exercised.
@@ -115,6 +122,22 @@ func (s *runsStore) ListRunMessagesAfterPage(_ context.Context, arg store.ListRu
 		out = out[:arg.Lim]
 	}
 	return out, nil
+}
+func (s *runsStore) ListRunMessagesBeforePage(_ context.Context, arg store.ListRunMessagesBeforePageParams) ([]store.RunMessage, error) {
+	s.lastBeforeSeq = arg.BeforeSeq
+	s.lastBeforeLim = arg.Lim
+	// newest-first (DESC), seq < before, capped to Lim — mirrors the real query so the
+	// service's Go reverse (DESC -> ASC) is actually exercised under test.
+	var below []store.RunMessage
+	for i := len(s.msgs) - 1; i >= 0; i-- { // s.msgs is ascending by seq
+		if s.msgs[i].Seq < arg.BeforeSeq {
+			below = append(below, s.msgs[i])
+			if arg.Lim >= 0 && len(below) >= int(arg.Lim) {
+				break
+			}
+		}
+	}
+	return below, nil
 }
 func (s *runsStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return s.claimTemplates, nil
@@ -548,6 +571,203 @@ func TestListRunMessagesLimit(t *testing.T) {
 	}
 	if got := decodeSeqs(t, rec.Body.String()); len(got) > maxRunMessagesPage {
 		t.Fatalf("over-max limit returned %d messages, want <= %d", len(got), maxRunMessagesPage)
+	}
+}
+
+// decodeMessageSeqs pulls the seq of every message out of a ListRunMessages
+// response body, in order, for the PRD #1137 tail/before paging tests.
+func decodeMessageSeqs(t *testing.T, body string) []int32 {
+	t.Helper()
+	var env struct {
+		Messages []struct {
+			Seq int32 `json:"seq"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		t.Fatalf("decode messages: %v (body %q)", err, body)
+	}
+	seqs := make([]int32, 0, len(env.Messages))
+	for _, m := range env.Messages {
+		seqs = append(seqs, m.Seq)
+	}
+	return seqs
+}
+
+func newFiveMessageRun(owner store.User) (uuid.UUID, *runsStore) {
+	runID := uuid.New()
+	msgs := make([]store.RunMessage, 0, 5)
+	for i := 0; i < 5; i++ { // ascending by seq: 1..5
+		msgs = append(msgs, store.RunMessage{Seq: int32(i + 1), Kind: "text", Payload: []byte(`{}`)})
+	}
+	return runID, &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		msgs:    msgs,
+	}
+}
+
+// TestListRunMessagesTail covers the PRD #1137 ?tail= form: the newest n messages
+// returned in ASCENDING seq order. The fake returns DESC ([5,4] for tail=2), so an
+// ascending response is the proof the service's Go reverse ran — an untested reverse
+// would leak the DESC order here. Also asserts the pre-store clamp to maxRunMessagesPage.
+func TestListRunMessagesTail(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID, st := newFiveMessageRun(owner)
+	h := newRunsHandler(t, st)
+
+	// tail=2 on a 5-message run -> [4,5], ascending (the fake yields [5,4] DESC).
+	rec := httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "tail=2"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tail=2 status = %d, want 200", rec.Code)
+	}
+	if got := decodeMessageSeqs(t, rec.Body.String()); len(got) != 2 || got[0] != 4 || got[1] != 5 {
+		t.Fatalf("tail=2 seqs = %v, want [4 5] ascending", got)
+	}
+	// tail routes through the Before service method with before_seq = MaxInt32.
+	if st.lastBeforeSeq != math.MaxInt32 {
+		t.Fatalf("tail forwarded BeforeSeq = %d, want MaxInt32", st.lastBeforeSeq)
+	}
+	if st.lastBeforeLim != 2 {
+		t.Fatalf("tail=2 forwarded Lim = %d, want 2", st.lastBeforeLim)
+	}
+
+	// tail invalid values are 400.
+	for _, raw := range []string{"tail=0", "tail=-1", "tail=abc"} {
+		rec = httptest.NewRecorder()
+		h.ListRunMessages(rec, runReqQuery(owner, runID, raw))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400", raw, rec.Code)
+		}
+	}
+
+	// tail above maxRunMessagesPage is clamped to it BEFORE the store call — asserted on
+	// the forwarded Lim, mirroring TestListRunMessagesLimit's over-max subcase.
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "tail=5000"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tail=5000 status = %d, want 200", rec.Code)
+	}
+	if st.lastBeforeLim != maxRunMessagesPage {
+		t.Fatalf("tail=5000 forwarded Lim = %d, want it clamped to %d", st.lastBeforeLim, maxRunMessagesPage)
+	}
+}
+
+// TestListRunMessagesBefore covers the PRD #1137 ?before=<seq>&limit=<n> form: the
+// newest <= n messages with seq < before, ascending. limit is required.
+func TestListRunMessagesBefore(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID, st := newFiveMessageRun(owner)
+	h := newRunsHandler(t, st)
+
+	cases := []struct {
+		query string
+		want  []int32
+	}{
+		{"before=4&limit=2", []int32{2, 3}},
+		{"before=2&limit=2", []int32{1}},
+		{"before=1&limit=2", []int32{}},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		h.ListRunMessages(rec, runReqQuery(owner, runID, tc.query))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", tc.query, rec.Code)
+		}
+		got := decodeMessageSeqs(t, rec.Body.String())
+		if len(got) != len(tc.want) {
+			t.Fatalf("%s seqs = %v, want %v", tc.query, got, tc.want)
+		}
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Fatalf("%s seqs = %v, want %v", tc.query, got, tc.want)
+			}
+		}
+	}
+
+	// before without limit is a 400 (limit is required on this form).
+	rec := httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "before=4"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("before without limit status = %d, want 400", rec.Code)
+	}
+
+	// before invalid values are 400.
+	for _, raw := range []string{"before=0&limit=2", "before=-1&limit=2", "before=abc&limit=2"} {
+		rec = httptest.NewRecorder()
+		h.ListRunMessages(rec, runReqQuery(owner, runID, raw))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400", raw, rec.Code)
+		}
+	}
+}
+
+// TestListRunMessagesTailBeforeExclusive proves every forbidden param combination is
+// rejected with a 400 and makes ZERO store calls — asserted via the before-page capture
+// fields staying at a sentinel the fake never writes on a rejected request.
+func TestListRunMessagesTailBeforeExclusive(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID, _ := newFiveMessageRun(owner)
+
+	const sentinel = int32(-999)
+	forbidden := []string{
+		"tail=2&after=1",
+		"tail=2&before=3",
+		"tail=2&limit=2",
+		"before=3&after=1&limit=2",
+		"before=3&tail=2",
+		"before=3", // missing required limit
+	}
+	for _, raw := range forbidden {
+		_, st := newFiveMessageRun(owner)
+		st.lastBeforeSeq = sentinel
+		st.lastBeforeLim = sentinel
+		st.lastPageLim = sentinel
+		h := newRunsHandler(t, st)
+
+		rec := httptest.NewRecorder()
+		h.ListRunMessages(rec, runReqQuery(owner, runID, raw))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%q status = %d, want 400", raw, rec.Code)
+		}
+		if st.lastBeforeSeq != sentinel || st.lastBeforeLim != sentinel || st.lastPageLim != sentinel {
+			t.Fatalf("%q made a store call (captures moved off sentinel): beforeSeq=%d beforeLim=%d pageLim=%d",
+				raw, st.lastBeforeSeq, st.lastBeforeLim, st.lastPageLim)
+		}
+	}
+}
+
+// TestListRunMessagesTailViewerAuthz is the ?tail= twin of the paged authz test: the
+// owner-or-admin gate must hold on the tail path too.
+func TestListRunMessagesTailViewerAuthz(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID, st := newFiveMessageRun(owner)
+	h := newRunsHandler(t, st)
+
+	// Owner sees the tail page.
+	rec := httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "tail=2"))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"seq":5`) {
+		t.Fatalf("owner tail messages = %d %q, want 200 with seq 5", rec.Code, rec.Body.String())
+	}
+
+	// A non-owner is denied: 404, no messages.
+	other := store.User{ID: uuid.New()}
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(other, runID, "tail=2"))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("non-owner tail messages = %d, want 404", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), `"seq"`) {
+		t.Fatalf("non-owner tail messages must leak nothing, got %q", rec.Body.String())
+	}
+
+	// An admin sees any run through the tail path.
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(admin, runID, "tail=2"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin tail messages = %d, want 200", rec.Code)
 	}
 }
 

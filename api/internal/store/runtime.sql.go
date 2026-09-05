@@ -3754,6 +3754,58 @@ func (q *Queries) ListRunMessagesAfterPage(ctx context.Context, arg ListRunMessa
 	return items, nil
 }
 
+const listRunMessagesBeforePage = `-- name: ListRunMessagesBeforePage :many
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+FROM run_messages
+WHERE run_id = $1 AND seq < $2
+ORDER BY seq DESC
+LIMIT $3
+`
+
+type ListRunMessagesBeforePageParams struct {
+	RunID     uuid.UUID `json:"run_id"`
+	BeforeSeq int32     `json:"before_seq"`
+	Lim       int32     `json:"lim"`
+}
+
+// Backward twin of ListRunMessagesAfterPage for the TUI's tail-first/backfill paging
+// (PRD #1137): the newest @lim messages with seq < @before_seq, returned DESC. The
+// service reverses to ascending in Go (D3) — NOT in a SQL subquery — so the row stays
+// store.RunMessage. Authorization (owner-or-admin) is checked by the caller.
+// Column order is IDENTICAL to ListRunMessagesAfter and ListRunMessagesAfterPage so
+// the row stays store.RunMessage. New columns must be APPENDED to ALL THREE of these
+// queries in the same order the ALTER TABLE adds them — see ListRunMessagesAfter's
+// note. Diverge and sqlc mints a per-query Row type, breaking that []store.RunMessage.
+func (q *Queries) ListRunMessagesBeforePage(ctx context.Context, arg ListRunMessagesBeforePageParams) ([]RunMessage, error) {
+	rows, err := q.db.Query(ctx, listRunMessagesBeforePage, arg.RunID, arg.BeforeSeq, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunMessage{}
+	for rows.Next() {
+		var i RunMessage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Seq,
+			&i.Kind,
+			&i.Agent,
+			&i.Payload,
+			&i.CreatedAt,
+			&i.AgentInstance,
+			&i.AgentLabel,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunMessagesForWorkerPage = `-- name: ListRunMessagesForWorkerPage :many
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
 FROM run_messages
