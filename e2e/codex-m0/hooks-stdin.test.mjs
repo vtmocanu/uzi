@@ -7,6 +7,13 @@ import { Probe, callOutput, message, shellQuote, tool } from "./harness.mjs";
 
 const hookPath = fileURLToPath(new URL("./hook.mjs", import.meta.url));
 const stdinMarkerCommand = "printf 'M0 stdin marker\\n' > stdin-marker";
+const expectedHookResults = {
+  allow: { status: "completed", entries: [] },
+  deny: { status: "blocked", entries: [{ kind: "feedback", text: "M0 deterministic hook denial" }] },
+  missing: { status: "failed", entries: [{ kind: "error", text: "hook exited with code 127" }] },
+  malformed: { status: "failed", entries: [{ kind: "error", text: "hook returned invalid pre-tool-use JSON output" }] },
+  timeout: { status: "failed", entries: [{ kind: "error", text: "hook timed out after 1s" }] },
+};
 function hookConfig(mode) {
   return (p) => {
     const command = mode === "missing" ? shellQuote(path.join(p.root, "missing-hook-executable"))
@@ -44,11 +51,19 @@ for (const mode of ["allow", "deny", "missing", "malformed", "timeout"]) {
     assert.equal(p.requests.length, 2);
     assert.ok(callOutput(p.requests[1], "shell"));
     assert.equal(p.approvals.length, 0);
+    const completions = p.messages.filter((event) => event.method === "hook/completed"
+      && event.params.threadId === threadId && event.params.turnId === turnId);
+    assert.equal(completions.length, 1, "one hook completion is attributed to this exact thread and turn");
+    const hook = completions[0].params.run;
+    assert.equal(hook.eventName, "preToolUse");
+    assert.equal(hook.status, expectedHookResults[mode].status);
+    assert.deepEqual(hook.entries, expectedHookResults[mode].entries, "hook diagnostics identify the exercised failure or control path");
     const observed = await records(p);
     assert.deepEqual(observed.map((record) => record.tool), mode === "missing" ? [] : ["Bash"], p.stderr);
     assert.equal(await p.marker(), mode === "deny" ? null : "M0 marker\n");
     if (mode === "deny") assert.match(JSON.stringify(callOutput(p.requests[1], "shell")), /M0 deterministic hook denial/);
-    t.diagnostic(JSON.stringify({ mode, hookCalls: observed.length, marker: await p.marker(),
+    t.diagnostic(JSON.stringify({ mode, hookCalls: observed.length, hookStatus: hook.status,
+      hookEntries: hook.entries, marker: await p.marker(),
       interpretation: ["missing", "malformed", "timeout"].includes(mode) ? "stock hook failure is fail-open" : "positive control" }));
   });
 }

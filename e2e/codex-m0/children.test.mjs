@@ -124,7 +124,11 @@ for (const interrupt of [false, true]) {
       await p.rpc("turn/interrupt", { threadId: childId, turnId: childTurn });
       const terminal = await p.completed(childId, childTurn);
       assert.equal(terminal.params.turn.status, "interrupted");
+      const after = await p.rpc("thread/backgroundTerminals/list", { threadId: childId });
+      assert.deepEqual(after.data.map((item) => item.processId), [session[1]],
+        "the original child shell session survives turn interruption before explicit cleanup");
       terminalsAfterInterrupt = await p.terminateTerminals(childId);
+      assert.equal(terminalsAfterInterrupt, 1, "explicit cleanup terminates the surviving child shell");
       releaseChild();
       // The command itself waited three seconds; observe beyond that deadline.
       await new Promise((resolve) => setTimeout(resolve, 3500));
