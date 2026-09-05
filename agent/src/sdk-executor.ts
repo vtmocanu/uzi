@@ -446,8 +446,8 @@ export class SdkExecutor implements Executor {
   private readonly harness: ClaudeHarness;
   /** The per-run turn reducer, REUSED across every turn of the run (so its run-level
    *  session latch persists). Recreated per run in run() (the latch must not survive
-   *  into a second run() on the same instance). The concrete type is held so the owner
-   *  can call `beginTurn()` at each turn boundary. */
+   *  into a second run() on the same instance). Typed as the neutral RunTurnReducer
+   *  seam; `beginTurn()`/`accept()`/`finish()` are all on that interface. */
   private reducer: RunTurnReducer;
 
   /**
