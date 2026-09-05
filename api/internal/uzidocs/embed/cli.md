@@ -1330,45 +1330,82 @@ uzi run get <id> --field mr_web_url                   # the MR, raw
 
 ## Bundled skill and session-start hook
 
-**The skill itself.** The CLI installs (and self-upgrades)
-`~/.claude/skills/uzi-cli/SKILL.md` on first run, generated from the binary's
-own command tree — it never drifts from the CLI you actually have installed.
-Every `uzi` command refreshes it best-effort before it runs (set
-`UZI_SKILL_AUTO_UPGRADE=0` to disable that). `uzi skill install [--force]`
-refreshes it explicitly — `--force` overwrites even a file you edited (your
-edit is preserved to `SKILL.md.bak` first) — and `uzi skill status` reports
-its path and whether it's installed and current.
+**Two targets, one embedded body.** The CLI installs (and self-upgrades) the
+same bundled skill into **two** harnesses: Claude Code
+(`~/.claude/skills/uzi-cli/SKILL.md`) and Codex CLI
+(`~/.agents/skills/uzi-cli/SKILL.md`, independent of `$CODEX_HOME`). Both
+copies are generated from the binary's own command tree — neither ever drifts
+from the CLI you actually have installed. Every executing non-skill `uzi`
+command refreshes both, best-effort, before it runs (set
+`UZI_SKILL_AUTO_UPGRADE=0` to disable that); the automatic path only ever
+writes the Codex copy when a Codex config home already exists, so it never
+litters a machine that doesn't run Codex.
+
+All four `uzi skill` verbs (`status`, `install`, `install-hook`,
+`uninstall-hook`) take `--target claude|codex|all`:
+
+- **Omitted** (the default) — every auto-detected target: Claude always,
+  Codex only when its config home (`$CODEX_HOME`, or `~/.codex` when unset)
+  already exists as a directory.
+- **`claude`** / **`codex`** — that target only. An explicit `codex` (or
+  `all`) acts even when Codex was not auto-detected; `install`/`install-hook`
+  then create the directories Codex needs, while `status`/`uninstall-hook`
+  stay read-only/no-op over an absent directory.
+- **`all`** — both targets, unconditionally.
+
+`uzi skill install [--force] [--target ...]` refreshes the selected target(s)
+explicitly — `--force` overwrites even a file you edited (your edit is
+preserved to `SKILL.md.bak` first) — and `uzi skill status [--target ...]`
+reports every selected target's path and whether it's installed and current.
 
 **The session-start hook, opt-in.** The per-command refresh above only helps
-once a `uzi` command has run — right after `brew upgrade uzi-cli`, a fresh
-Claude Code session can still read the OLD skill before that happens. Run
-`uzi skill install-hook` to narrow that window: it wires a Claude Code
-`SessionStart` hook into `~/.claude/settings.json` whose command is
-`uzi skill install`, so the skill is refreshed at session start rather than
-waiting for your next `uzi` command.
+once a `uzi` command has run — right after an upgrade, a fresh session can
+still read the OLD skill before that happens. Run
+`uzi skill install-hook [--target ...]` to narrow that window, for the
+selected target(s):
 
-The write is surgical and non-destructive:
+- **Claude Code** — wires a `SessionStart` hook (matcher `startup`) into
+  `~/.claude/settings.json` whose command is `uzi skill install --target
+  claude`, so the skill is refreshed at session start rather than waiting for
+  your next `uzi` command.
+- **Codex CLI** — wires a `SessionStart` hook (matcher `startup|resume`) into
+  `$CODEX_HOME/hooks.json` whose command is `uzi skill install --target
+  codex`. Codex requires you to **review and trust the hook once via
+  `/hooks`** before it runs — uzi never writes Codex trust state or
+  `config.toml`, it only writes `hooks.json`.
 
-- **Opt-in.** Nothing installs this for you; you run it yourself, once.
-- **Merged, not clobbered.** It adds just our one hook entry to
-  `~/.claude/settings.json`, alongside any hooks other tools already put
-  there — those are left untouched.
-- **Backed up first.** The prior file is copied to `settings.json.bak` before
-  the first write.
-- **Abort on malformed JSON.** If `settings.json` exists but doesn't parse,
+The write is surgical and non-destructive, for either target:
+
+- **Opt-in.** Nothing installs this for you; you run it yourself, once, per
+  target.
+- **Merged, not clobbered.** It adds just our one hook entry to the target's
+  hook file, alongside any hooks other tools already put there — those are
+  left untouched.
+- **Backed up first.** The prior hook file is copied to a `.bak` sibling
+  before the first write.
+- **Abort on malformed JSON.** If the hook file exists but doesn't parse,
   `install-hook`/`uninstall-hook` refuse to touch it rather than risk
   clobbering a hand-maintained file.
-- **Idempotent.** Running `uzi skill install-hook` again is a no-op — it
-  detects the hook is already present.
-- **Visible in status.** `uzi skill status` (and `--json`) reports whether
-  the hook is installed and current, alongside the skill's own state.
-- **Reversible.** `uzi skill uninstall-hook` removes it, leaving every
-  sibling hook intact.
+- **Idempotent.** Running `uzi skill install-hook` again for the same
+  target is a no-op — it detects the hook is already present.
+- **Visible in status.** `uzi skill status` (and `--json`) reports every
+  selected target, and per target whether its hook is installed and current,
+  alongside the skill's own state.
+- **Reversible.** `uzi skill uninstall-hook [--target ...]` removes the
+  selected target's hook, leaving every sibling hook (and the other target's
+  hook) intact.
 
 The hook is best-effort and near-free to run: a failed refresh never blocks
 session start, and `uzi skill install` is a version-gated no-op once the
 skill is already current, so the hook costs almost nothing on a normal
 session start.
+
+**JSON output.** `uzi skill status|install|install-hook|uninstall-hook
+--json` without `--target` keeps today's Claude-only top-level fields (for
+compatibility with existing consumers) and adds a `targets` array covering
+every attempted target; with `--target` (any value), the output is
+`{targets}` only. `status` always reports every selected target, whichever
+form the output takes.
 
 ## Product docs, offline: `uzi docs`
 
