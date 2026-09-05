@@ -15,9 +15,11 @@ review found that those measurements do not yet establish a fail-closed
 execution design or a complete provider-neutral boundary. The evidence below
 stands; the boundary is not accepted and M0 is reopened.
 
-The probe harness and packages lived only in private temporary storage. No pod,
-worker image, deployment, or uzi worker was used, and no repository package or
-lockfile changed. No credential value, hash, account identifier, or server-backed
+The initial probe harness and packages lived only in private temporary storage.
+The credential-free app-server continuation is now committed in
+[`e2e/codex-m0/`](../e2e/codex-m0/README.md); its pinned binary remains external.
+No pod, worker image, deployment, or uzi worker was used, and no repository package
+or lockfile changed. No credential value, hash, account identifier, or server-backed
 thread identifier is recorded here.
 
 ## Process and session evidence
@@ -42,8 +44,9 @@ so the existing checkpoint and process-reap boundaries remain necessary.
 
 A credential-free real CLI+SDK probe used a dummy API key, a local fake Responses
 server, and a `codexPathOverride` wrapper that injected
-`--dangerously-bypass-hook-trust`. The SDK has no option for that flag, so the
-production wrapper must inject it. Under the normal/v1 tool path the exact
+`--dangerously-bypass-hook-trust`. The SDK has no option for that flag; this was
+the exec/SDK probe's wiring, not an accepted app-server trust design. Under the
+normal/v1 tool path the exact
 `PreToolUse` stdin names were:
 
 | Operation | Exact `tool_name` | Matcher aliases in Codex source |
@@ -83,11 +86,13 @@ otherwise the tool is unavailable before the hook question is exercised.
 
 ## Delegation visibility
 
-The credential-free real CLI subagent probe gave the local server an independent
-view of two child requests and completions. The parent SDK stream exposed a
-runtime-only `collab_tool_call` and the parent's `agent_message`, but no child
-message or child tool frame. A delayed child response arrived after the parent's
-`turn.completed`, proving that a child can outlive its parent turn.
+The initial credential-free CLI subagent probe timestamped the local server's
+child requests and responses. The parent SDK stream exposed a runtime-only
+`collab_tool_call` and the parent's `agent_message`, but no child message or child
+tool frame. A server response sent after parent `turn.completed` did not prove
+that the child consumed it or acted afterwards. The committed app-server probe
+below supplies that missing evidence through an actual post-parent marker and a
+subsequent child request carrying the tool result.
 
 The live code-mode probe agreed on the visibility boundary. The parent stream
 reported `collab_tool_call` started/completed with a sender id and an empty
@@ -103,13 +108,61 @@ Consequences for the lifecycle are explicit:
 
 - delegation lifecycle status may use only identifiers actually present in the
   runtime frame or hook event;
-- a child may still be running when the parent completes, but no public child
-  drain or close operation has been measured; and
+- the app-server continuation measures interruption and terminal cleanup for
+  known fixture children; complete child ownership and disposal remain open; and
 - subagent signal tools must be denied before invocation, but the attributed
   happy-path hook observation does not prove that guarantee on hook failure.
   The parent stream observes only root MCP frames, so it cannot serve as a second
   classifier for hidden child frames. Any future frame whose origin cannot be
   proven is `unknown` and must fail closed for signal latching.
+
+## App-server continuation evidence (2026-09-05)
+
+The committed [characterization harness](../e2e/codex-m0/README.md) drives real
+Codex 0.153.2 with fixed localhost Responses fixtures and the `gpt-5.5` native
+tool surface. No model decides which tools run. Recipes are the opt-in
+`task test:codex-m0` and container-only `task test:codex-m0:managed` in
+[`Taskfile.yml`](../Taskfile.yml); neither is part of `task gate`.
+At executable commit `d4e6301b5ee64ec19607c9d57f8cc76d8a74c6fa`, the lead recorded
+23/23 baseline and 6/6 managed cases passing on Linux with Node 24 Alpine; both
+runs exited 0 with no failures, skips or cancellations. The final assertions
+identify the failed hook events (exit 127, malformed output and one-second
+timeout), and the original child terminal surviving interruption as the sole
+listed session before termination. On macOS/Node 26, all 23 baseline cases passed
+at `20502ed135d3beadd733589a85b9f05014a37d32`; the 12 cases in the changed suites
+passed again at `d4e6301b5ee64ec19607c9d57f8cc76d8a74c6fa`. The Linux container used
+`--network none`, `--cap-drop ALL`, `no-new-privileges`, uid 10002, a read-only root
+filesystem and writable `/tmp` tmpfs, with fixtures and binary mounted read-only.
+A fresh subprocess environment does not suppress
+system configuration or macOS managed preferences; the isolated Linux container
+controls those inputs and external network access.
+
+| Probe | Discriminating observation and limit |
+|---|---|
+| Shell/patch approvals | `on-request` produced zero approvals for each measured action; `untrusted` produced one each. A shell prompt rule produced one approval: accept wrote its marker, decline and malformed decisions did not. This does not establish universal tool coverage. |
+| Pending approval and EOF | The marker stayed absent through observed app-server exit after stdin EOF. This is not immediate denial on every disconnect or transport. |
+| Hook trust and failure | These app-server hooks required `thread/start`'s `config: { bypass_hook_trust: true }`; the global CLI flag alone did not arm them. Healthy deny blocked the marker; missing executable, malformed output and timeout permitted it. Serialization failure remains source evidence, not a measured case. |
+| Retained terminal input | The identical marker command was denied through `exec_command`, but succeeded through PTY `write_stdin`. Only interpreter startup emitted a hook and approval, with `write_stdin_approval` both false and true. |
+| Child action after parent completion | Releasing the held child after parent completion created its marker and a second child request with actual tool output. Interrupting that waiting child produced its own `interrupted` terminal event, closed its HTTP request and prevented the action; the root remained usable. |
+| Running child terminal | A ready marker and returned session proved execution started. Turn interruption left one terminal; explicit `thread/backgroundTerminals/terminate`, an empty registry and observation beyond the command's three-second delay established no late marker. The uninterrupted control wrote it. |
+| Managed native one-shot | The read-only container [requirements fixture](../e2e/codex-m0/requirements.toml) pins `unified_exec = false` and `shell_tool = true` under `[features]`. It removed `write_stdin` from the schema and dispatcher. Forced `tty: true` still let `/bin/sh` exit 0 without a session; forced input returned exactly `unsupported call: write_stdin`. Accept wrote a marker; decline and malformed approval did not, each with one approval. |
+| One-shot timeout | The same ready-marker / sleep-two-seconds / late-marker command completed at `timeout_ms: 4000`; at 150 it returned exit 124 after writing ready, left an empty terminal registry and no late marker after another 2.5 seconds. |
+| Dynamic callback scope | `item/tool/call` supplied runtime `threadId`, `turnId` and `callId`. The handler wrote once for its known root and denied a second ordinary worker-created thread whose arguments spoofed that root. Malformed/error replies yielded failed tool results. Native-child inheritance and MCP replacement were not exercised. |
+
+App-server approval routing plus managed one-shot execution is a stock candidate
+for the native shell/patch and retained-stdin clauses. Dynamic callbacks are a
+candidate for worker-owned tool authorization. Neither candidate is an accepted
+production harness. The child observations cover known fixture children and
+registered terminals, not arbitrary detached descendants, discovery races or
+code-mode cells. M0 still needs the integrated policy on the intended models'
+code-mode surface, spawn and per-role tool authorization, MCP/dynamic routing,
+complete ownership/disposal, lane-specific isolation and the full neutral
+usage/event/error/skills contracts while preserving Claude D0.
+
+The earlier subscription login/refresh evidence remains separate from these dummy-key
+localhost tests. Both subscription and API-key support remain phase-1
+requirements; this continuation establishes no live API-key authentication,
+model access or entitlement.
 
 ## Credential refresh evidence and limit
 
@@ -166,16 +219,16 @@ exercise:
 - the current Claude `buildPathGuardHook` and `buildAgentGuardHook` neither
   accept Codex's canonical names nor parse its payloads, including
   `apply_patch` paths;
-- a child was measured outliving `turn.completed`, but no public child
-  close/drain control was found or exercised; and
+- the initial child timing evidence did not establish consumption after parent
+  completion, and no public child drain had been exercised at review time; and
 - the per-run MCP transport still needs a defined disposal lifecycle and proven
   bearer-token and shell/process isolation.
 
 Therefore hook success on the measured happy path is not a fail-closed guardrail
-design. M0 cannot close until the failure modes above have a fail-closed execution
-design and Codex child draining is measured. No alias-only reuse of the Claude
-hooks, inferred role-file restriction, or process-group kill is accepted as a
-substitute for those proofs.
+design. The continuation now measures bounded child/terminal cleanup and native
+one-shot enforcement, but M0 cannot close until those candidates form a complete
+fail-closed execution and ownership design. No alias-only reuse of Claude hooks,
+inferred role-file restriction, or process-group kill substitutes for those proofs.
 
 ## Provisional harness boundary
 
@@ -353,7 +406,8 @@ typed rate-limit and terminal-error behaviour still require a contract.
   usage and advice gaps without changing Claude behaviour.
 - Covering every observed normal/v1 and code-mode hook name is necessary but not
   sufficient; the failure and `write_stdin` paths need a fail-closed design.
-- Codex feeds show root frames plus honest delegation lifecycle status. They do
-  not fabricate child content that 0.153.2 does not expose.
+- The exec/SDK feed exposes root frames and delegation lifecycle; app-server
+  exposes attributed child events in the native fixtures. Final feed mapping
+  awaits the protocol decision and must never fabricate origin or content.
 - The seat lock and checkpoint/write-back design remain conservative despite
   proven rotation, because previous-token usability was intentionally not tested.
