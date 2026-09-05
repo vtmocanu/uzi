@@ -160,10 +160,10 @@ uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
 uzi run resume-now <run-id>
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
-uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]]
+uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues]
 uzi schedule list
 uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]]
+uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--output mr|issues|""] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule pause-all --until <when>
@@ -554,6 +554,13 @@ nothing a manual start cannot.
   - `--guidance <text>` (with `--issue`/`--sweep`) injects free owner steering into the
     run instruction ("keep the diff small", "add a failing test first") without editing
     each issue; capped at 8 KiB.
+  - `--output mr|issues` (with `--prompt` **only** — an `--issue`/`--sweep` target rejects
+    it, exit 2) picks a proposal run's output shape: `mr` (the default) writes an idea file
+    and opens an MR, `issues` files the proposal as a `proposal::<slug>`-labelled forge
+    issue server-side (that issue is never sweep-eligible until a human promotes it). It is
+    three-way like `--model`: omit to inherit the job/catalog default, set it explicitly to
+    override, and on `edit` pass `--output ""` to clear back to inherit. Shipped catalog
+    defaults stay `mr`.
   - `--model <alias|id>` (valid on every target) pins the model a fired run uses;
     `--apply-model-to-agents` (default off) additionally applies that model to every
     subagent, overriding each agent's own model pin. Both are restated on `edit`, so a

@@ -1,7 +1,7 @@
 ---
 slug: feature-bingo
 name: Feature bingo
-description: Weekly brainstorm that proposes one concrete new feature and opens an MR adding it as an idea file.
+description: Weekly brainstorm that proposes one concrete new feature or improvement.
 target: prompt
 cron: 0 3 * * 2
 timezone: UTC

@@ -884,7 +884,7 @@ export function ScheduleModal({
                       <option value="issues">Issues</option>
                     </Select>
                     <p className="mt-1 text-[11px] text-faint">
-                      How a prompt run delivers: open a merge request from an idea file, or file issues. Leave as job default to inherit.
+                      How a prompt run delivers: MR opens a merge request from an idea file; Issues files a labeled <code className="rounded bg-raised px-1">proposal::&lt;slug&gt;</code> issue (not sweep-eligible until promoted). Leave as job default to inherit.
                     </p>
                   </Field>
                 </>
