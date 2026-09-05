@@ -21,6 +21,57 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
 )
 
+// openWithAutoRetry opens choice's credential and returns the POST-retry choice, so
+// the caller records the final reason (open_failed on a fallback). It is the extracted
+// open-plus-retry both the run lane and the judge lane now share (PRD #1140 M2): before
+// this extraction assembleJudgeClaim opened directly with no retry, so an `auto` judge
+// pick that would not decrypt failed the judge run terminally while the identical pick
+// on the run lane floored onto another pooled token.
+//
+// 🔴 D14, reshaped by #754 M2. Without the retry arm, "auto never fails a run" is
+// simply untrue. recoverClaimAssembly maps errCredentialUnavailable to
+// MarkRunFailedByID — a TERMINAL failure — so a token that passes the gauge gate
+// and then will not decrypt (a rotated UZI_SECRET_KEY, a corrupt row, a token
+// deleted between the ranking query and the open) kills a run another POOLED
+// token could have completed.
+//
+// #754: the retry NEVER lands on workerSecretID(wkr)/nil/the non-pooled owner
+// default. autoFloorRetry re-floors onto ANOTHER pooled token (excluding the
+// pick that just failed, and still honouring the run's dead-secret exclude); when
+// no other pooled token remains it returns errCredentialUnavailable and the run
+// fails terminally rather than spending the default.
+//
+// Scoped as tightly as it can be, on three axes:
+//   - only a credential the AUTO lane resolved (choice.autoLaneRetryable) — a
+//     selector pick or a floor pick, never pinned/default/judge, which the user
+//     named and whose failure is how they learn the token is broken;
+//   - only errCredentialUnavailable. NOT errVaultLocked: that path already
+//     requeues the run, which is transient and correct, and retrying it would
+//     convert a wait into a spend on the wrong account;
+//   - exactly ONCE, by STRUCTURE. autoFloorRetry records reason=open_failed, which
+//     fails autoLaneRetryable on its REASON conjunct whatever the id turns out to
+//     be — so a second open failure is terminal with no counter and no dependency
+//     on an invariant enforced three files away.
+func (s *Service) openWithAutoRetry(ctx context.Context, run store.Run, choice secretChoice) (claimCred, secretChoice, error) {
+	cred, err := s.openAnthropic(ctx, run.UserID, choice.secretID)
+	if err != nil {
+		if !choice.autoLaneRetryable() || !errors.Is(err, errCredentialUnavailable) {
+			return claimCred{}, secretChoice{}, err
+		}
+		// autoLaneRetryable guarantees a non-nil secretID; read it BEFORE overwriting.
+		failedID := *choice.secretID
+		choice, err = s.autoFloorRetry(ctx, run, failedID)
+		if err != nil {
+			return claimCred{}, secretChoice{}, err
+		}
+		cred, err = s.openAnthropic(ctx, run.UserID, choice.secretID)
+		if err != nil {
+			return claimCred{}, secretChoice{}, err
+		}
+	}
+	return cred, choice, nil
+}
+
 // assembleClaim builds the claim payload for an already-claimed run. It takes the
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
@@ -88,45 +139,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if err != nil {
 		return nil, err
 	}
-	cred, err := s.openAnthropic(ctx, run.UserID, choice.secretID)
+	// Open with the shared auto-lane open-failed retry (D14), which returns the
+	// post-retry choice so the record below names the credential actually spent.
+	cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
 	if err != nil {
-		// 🔴 D14, reshaped by #754 M2. Without this arm, "auto never fails a run" is
-		// simply untrue. recoverClaimAssembly maps errCredentialUnavailable to
-		// MarkRunFailedByID — a TERMINAL failure — so a token that passes the gauge gate
-		// and then will not decrypt (a rotated UZI_SECRET_KEY, a corrupt row, a token
-		// deleted between the ranking query and the open) kills a run another POOLED
-		// token could have completed.
-		//
-		// #754: the retry NEVER lands on workerSecretID(wkr)/nil/the non-pooled owner
-		// default. autoFloorRetry re-floors onto ANOTHER pooled token (excluding the
-		// pick that just failed, and still honouring the run's dead-secret exclude); when
-		// no other pooled token remains it returns errCredentialUnavailable and the run
-		// fails terminally rather than spending the default.
-		//
-		// Scoped as tightly as it can be, on three axes:
-		//   - only a credential the AUTO lane resolved (choice.autoLaneRetryable) — a
-		//     selector pick or a floor pick, never pinned/default/judge, which the user
-		//     named and whose failure is how they learn the token is broken;
-		//   - only errCredentialUnavailable. NOT errVaultLocked: that path already
-		//     requeues the run, which is transient and correct, and retrying it would
-		//     convert a wait into a spend on the wrong account;
-		//   - exactly ONCE, by STRUCTURE. autoFloorRetry records reason=open_failed, which
-		//     fails autoLaneRetryable on its REASON conjunct whatever the id turns out to
-		//     be — so a second open failure is terminal with no counter and no dependency
-		//     on an invariant enforced three files away.
-		if !choice.autoLaneRetryable() || !errors.Is(err, errCredentialUnavailable) {
-			return nil, err
-		}
-		// autoLaneRetryable guarantees a non-nil secretID; read it BEFORE overwriting.
-		failedID := *choice.secretID
-		choice, err = s.autoFloorRetry(ctx, run, failedID)
-		if err != nil {
-			return nil, err
-		}
-		cred, err = s.openAnthropic(ctx, run.UserID, choice.secretID)
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 	// Record it before anything else can fail (PRD #111 M1): the credential HAS been
 	// opened at this point, so from the run's perspective it is already the account

@@ -198,9 +198,10 @@ func TestSetWorkerAnthropicTokenDropsTheIDOffPinned(t *testing.T) {
 // resolution the mint path performs first.
 type createStore struct {
 	Store
-	labels map[string]uuid.UUID
-	arg    store.CreateWorkerParams
-	called bool
+	labels  map[string]uuid.UUID
+	hasPool bool
+	arg     store.CreateWorkerParams
+	called  bool
 }
 
 func (c *createStore) GetUserSecretIDByLabel(_ context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error) {
@@ -209,6 +210,13 @@ func (c *createStore) GetUserSecretIDByLabel(_ context.Context, arg store.GetUse
 		return uuid.UUID{}, pgx.ErrNoRows
 	}
 	return id, nil
+}
+
+// UserHasAutoEligibleAnthropicToken is the pool read CreateWorker performs when no
+// label resolved (PRD #1140 M1): its answer is the second input to the bind-mode
+// derivation, so the tests set hasPool explicitly rather than leaving it implicit.
+func (c *createStore) UserHasAutoEligibleAnthropicToken(_ context.Context, _ uuid.UUID) (bool, error) {
+	return c.hasPool, nil
 }
 
 func (c *createStore) CreateWorker(_ context.Context, arg store.CreateWorkerParams) (store.Worker, error) {
@@ -239,7 +247,10 @@ func (c *createStore) CreateWorker(_ context.Context, arg store.CreateWorkerPara
 // credential it was minted with.
 func TestCreateWorkerWritesTheBindMode(t *testing.T) {
 	consoleID := uuid.New()
-	st := &createStore{labels: map[string]uuid.UUID{"console-key": consoleID}}
+	// hasPool: true stages the case a pin must WIN: a resolved label stays `pinned`
+	// even when the owner's auto-select pool is non-empty (PRD #1140 M1) — the pool is
+	// only consulted when no label resolved, so it must not override an explicit pin.
+	st := &createStore{labels: map[string]uuid.UUID{"console-key": consoleID}, hasPool: true}
 	svc := New(st, newBox(t), testParams())
 
 	wkr, _, err := svc.CreateWorker(context.Background(), uuid.New(), "alpha", "", "console-key")
@@ -264,10 +275,13 @@ func TestCreateWorkerWritesTheBindMode(t *testing.T) {
 	}
 }
 
-// The unbound mint is the overwhelming majority and must land 'default' with a NULL
-// id — the state every worker had before any of this existed.
-func TestCreateWorkerWithoutALabelIsDefault(t *testing.T) {
-	st := &createStore{labels: map[string]uuid.UUID{}}
+// TestCreateWorkerNoLabelEmptyPoolIsDefault is the renamed old "without a label is
+// default" case: since PRD #1140 M1 "no label" is no longer sufficient for `default`,
+// the pool answer is now an explicit input. With an EMPTY pool the unbound mint still
+// lands 'default' with a NULL id — the state every worker had before any of this
+// existed, and the only state a zero-token (or hand-emptied-pool) owner can reach.
+func TestCreateWorkerNoLabelEmptyPoolIsDefault(t *testing.T) {
+	st := &createStore{labels: map[string]uuid.UUID{}, hasPool: false}
 	svc := New(st, newBox(t), testParams())
 
 	wkr, _, err := svc.CreateWorker(context.Background(), uuid.New(), "alpha", "", "")
@@ -275,12 +289,35 @@ func TestCreateWorkerWithoutALabelIsDefault(t *testing.T) {
 		t.Fatalf("CreateWorker: %v", err)
 	}
 	if st.arg.AnthropicBindMode != BindModeDefault {
-		t.Fatalf("unbound mint wrote mode %q, want default", st.arg.AnthropicBindMode)
+		t.Fatalf("unbound mint on an empty pool wrote mode %q, want default", st.arg.AnthropicBindMode)
 	}
 	if st.arg.AnthropicSecretID.Valid {
 		t.Fatalf("unbound mint wrote a credential id: %+v", st.arg.AnthropicSecretID)
 	}
 	if got := workerSecretID(wkr); got != nil {
 		t.Fatalf("unbound worker resolved %v, want the owner's default", *got)
+	}
+}
+
+// TestCreateWorkerNoLabelPooledIsAuto is PRD #1140 M1's new default: with no label and
+// a NON-EMPTY auto-select pool the mint derives `auto`, the #804 rule now applied to
+// every worker create path. The id stays NULL — `auto` picks from the pool at claim
+// time, it never pins one credential at mint.
+func TestCreateWorkerNoLabelPooledIsAuto(t *testing.T) {
+	st := &createStore{labels: map[string]uuid.UUID{}, hasPool: true}
+	svc := New(st, newBox(t), testParams())
+
+	wkr, _, err := svc.CreateWorker(context.Background(), uuid.New(), "alpha", "", "")
+	if err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+	if st.arg.AnthropicBindMode != BindModeAuto {
+		t.Fatalf("unbound mint on a non-empty pool wrote mode %q, want auto", st.arg.AnthropicBindMode)
+	}
+	if st.arg.AnthropicSecretID.Valid {
+		t.Fatalf("auto mint wrote a credential id: %+v — auto picks from the pool at claim time, never at mint", st.arg.AnthropicSecretID)
+	}
+	if got := workerSecretID(wkr); got != nil {
+		t.Fatalf("auto worker resolved %v at mint, want the pool picked at claim time", *got)
 	}
 }

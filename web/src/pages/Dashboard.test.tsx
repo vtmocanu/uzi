@@ -44,6 +44,7 @@ const user = {
   notify_early_limit_reset: false,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,
+  judge_anthropic_bind_mode: "default" as const,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };

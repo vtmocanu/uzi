@@ -32,6 +32,12 @@ type setJudgeRequest struct {
 	// judge opt-in body. The instance-wide judge_model (settings.KeyJudgeModel) remains
 	// the admin fallback the per-user value overrides.
 	AnthropicToken json.RawMessage `json:"anthropic_token"`
+	// JudgeBindMode is the three-valued judge bind mode (PRD #1140 M2): "default",
+	// "pinned", or "auto". A *string so an omitted key (nil) leaves the mode alone,
+	// distinct from an explicit value — the same reason AnthropicToken is a RawMessage.
+	// When present its value rules mirror PatchWorker's: "pinned" requires a token
+	// label; "default"/"auto" forbid one. The admin route ignores it, like the token.
+	JudgeBindMode *string `json:"judge_bind_mode"`
 }
 
 // SetJudgeEnabled flips the CURRENT user's run-judge opt-in (PRD #46 Decision 7).
@@ -58,31 +64,54 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	updated, err := h.q.SetUserJudgeEnabled(r.Context(), store.SetUserJudgeEnabledParams{
-		ID:           user.ID,
-		JudgeEnabled: req.Enabled,
-	})
-	if err != nil {
-		slog.Error("set judge enabled", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	// The token binding is a SEPARATE statement, and only runs when the field was
-	// present: an absent anthropic_token must leave an existing binding alone, or
-	// every existing client that PUTs {"enabled":true} would silently unbind the
-	// user's judge credential. The two writes are not transactional, and deliberately
-	// not: they are independent settings, and the worst a half-applied pair does is
-	// leave the opt-in flipped without the rebind, which the user can see and redo.
+	// The WHOLE binding request is parsed, validated and label-resolved BEFORE the
+	// first write. The opt-in flip and the binding are two separate statements,
+	// deliberately non-transactional (independent settings), and that is exactly why
+	// every 400 must be decided up front: a body like
+	// {"enabled":true,"judge_bind_mode":"pinned"} with no label must not durably
+	// enable judge runs (which spend the user's tokens) and THEN report a 400 for the
+	// half it could not apply. Validating first turns the only remaining
+	// half-applied pair into "the opt-in flipped, the rebind hit a 5xx", which the
+	// user can see and redo.
+	//
+	// An absent anthropic_token leaves an existing binding alone, or every existing
+	// client that PUTs {"enabled":true} would silently unbind the user's judge
+	// credential.
 	token, ok := parseTokenField(req.AnthropicToken)
 	if !ok {
 		httpx.Error(w, http.StatusBadRequest, "anthropic_token must be a token label, null, or omitted")
 		return
 	}
-	if token.present {
-		var secretID *uuid.UUID
-		if l := token.label; l != "" {
-			resolved, rerr := h.wsvc.ResolveTokenLabel(r.Context(), user.ID, l)
+	// The binding is written only when the caller named a token OR a mode. An
+	// omitted-both body (the common {"enabled":true}) leaves the binding untouched —
+	// this is the ONE divergence from PatchWorker, which 400s on neither present
+	// (workers.go:454). SetJudgeEnabled must not, because {"enabled":true} is legit.
+	bindRequested := token.present || req.JudgeBindMode != nil
+	// Default derivation from the token alone (mirrors PatchWorker): a label ⇒
+	// pinned, no label ⇒ default. An explicit judge_bind_mode overrides it below.
+	mode := workersvc.BindModePinned
+	if token.label == "" {
+		mode = workersvc.BindModeDefault
+	}
+	var secretID *uuid.UUID
+	if bindRequested {
+		if req.JudgeBindMode != nil {
+			mode = *req.JudgeBindMode
+			if !workersvc.ValidBindMode(mode) {
+				httpx.Error(w, http.StatusBadRequest, "judge_bind_mode must be one of: default, pinned, auto")
+				return
+			}
+			switch {
+			case mode == workersvc.BindModePinned && token.label == "":
+				httpx.Error(w, http.StatusBadRequest, "judge_bind_mode=pinned requires a token label in anthropic_token")
+				return
+			case mode != workersvc.BindModePinned && token.label != "":
+				httpx.Error(w, http.StatusBadRequest, "anthropic_token must be null when judge_bind_mode is default or auto")
+				return
+			}
+		}
+		if token.label != "" {
+			resolved, rerr := h.wsvc.ResolveTokenLabel(r.Context(), user.ID, token.label)
 			if rerr != nil {
 				if errors.Is(rerr, workersvc.ErrUnknownSecretLabel) {
 					httpx.Error(w, http.StatusBadRequest, "no Anthropic token with that label")
@@ -94,7 +123,20 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 			}
 			secretID = &resolved
 		}
-		bound, berr := h.wsvc.SetUserJudgeToken(r.Context(), user.ID, secretID)
+	}
+
+	updated, err := h.q.SetUserJudgeEnabled(r.Context(), store.SetUserJudgeEnabledParams{
+		ID:           user.ID,
+		JudgeEnabled: req.Enabled,
+	})
+	if err != nil {
+		slog.Error("set judge enabled", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	if bindRequested {
+		bound, berr := h.wsvc.SetUserJudgeBinding(r.Context(), user.ID, mode, secretID)
 		if berr != nil {
 			if errors.Is(berr, workersvc.ErrSecretNotOwned) {
 				// 404, not 403: a 403 would confirm the id names a real credential
@@ -102,7 +144,7 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusNotFound, "anthropic token not found")
 				return
 			}
-			slog.Error("set judge anthropic token", "error", berr)
+			slog.Error("set judge binding", "error", berr)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
@@ -125,11 +167,13 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 // spends that user's tokens — an admin cannot redirect the spend elsewhere.
 //
 // It shares setJudgeRequest with the self-service route but deliberately IGNORES
-// anthropic_token (PRD #104 M4): "an admin cannot redirect the spend elsewhere" is
-// the property above, and honoring a binding here would let an admin choose WHICH of
-// a user's credentials burns — a narrower version of the same thing. An admin who
-// needs that asks the user. The field being silently ignored is safe precisely
-// because the only reachable effect would be the one we are refusing.
+// anthropic_token (PRD #104 M4) AND judge_bind_mode (PRD #1140 M2): "an admin cannot
+// redirect the spend elsewhere" is the property above, and honoring either the pointer
+// or the mode here would let an admin choose WHICH of a user's credentials burns — or
+// switch them onto the pool — a narrower version of the same thing. An admin who needs
+// that asks the user. Both fields being silently ignored is safe precisely because the
+// only reachable effect would be the one we are refusing: this handler reads only
+// req.Enabled.
 func (h *Handler) SetUserJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 	id, ok := httpx.PathUUID(w, r, "id", "user")
 	if !ok {
