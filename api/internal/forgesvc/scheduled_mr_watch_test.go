@@ -27,9 +27,9 @@ import (
 //   - opened->locked            → locked is transient: record, NO cancel.
 //   - locked->opened            → the transient state settles back to opened: record, NO cancel.
 //   - locked->merged            → merge from the transient state still cancels exactly once.
-//   - locked->closed            → records 'closed' but does NOT cancel — the close edge only
-//     cancels from 'opened' (default arm cancels only on merged), exact parity with the
-//     issue-lane syncOneMRState. Pinned so the parity gap is intentional, not an accident.
+//   - locked->closed            → a TERMINAL edge: cancels exactly once then records 'closed',
+//     matching the issue-lane syncOneMRState — both lanes cancel on any transition into
+//     closed/merged from a non-terminal stored state (issue #1072 closed the former parity gap).
 //   - unknown-state             → an unrecognized forge state writes nothing and cancels
 //     nothing (the baseline is preserved so a later real state still fires).
 //   - no-transition             → observed==stored: no write, no cancel.
@@ -102,8 +102,8 @@ func TestSyncScheduledMRStatesDifferential(t *testing.T) {
 			// the rework whenever the MR passed through 'locked' before closing — the run
 			// then self-evicted at mr_state='closed' with the rework still spending. Fixed by
 			// cancelling on any transition INTO closed/merged from a valid non-terminal state.
-			// (The issue-lane syncOneMRState still has the analogous latent leak; tracked
-			// separately as a follow-up.)
+			// (The issue-lane syncOneMRState carried the analogous latent leak; fixed in
+			// issue #1072 so both lanes now cancel on a locked->closed edge.)
 			name:       "locked->closed",
 			stored:     strptr(forge.MRStateLocked),
 			observed:   forge.MRStateClosed,
