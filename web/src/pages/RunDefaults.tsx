@@ -572,9 +572,11 @@ export function RunDefaults() {
         <div>
           <SectionTitle>Automatic CI fixes</SectionTitle>
           <p className="mt-2 text-sm text-muted">
-            With this on, when a pipeline fails on one of your agent merge-request branches, uzi spends
-            your <strong className="text-fg">own Anthropic tokens</strong> to attempt a fix automatically.
-            Off by default.
+            When a pipeline fails on one of your agent merge-request branches, uzi spends your{" "}
+            <strong className="text-fg">own Anthropic tokens</strong> to attempt a fix automatically.
+            On by default. Opting out stops autofix on{" "}
+            <strong className="text-fg">your</strong> MRs — the admin kill-switch that turns the
+            feature off for the whole instance is separate.
           </p>
         </div>
 
@@ -584,7 +586,7 @@ export function RunDefaults() {
           <input
             type="checkbox"
             className="h-4 w-4 accent-brand"
-            checked={user?.ci_autofix_enabled ?? false}
+            checked={user?.ci_autofix_enabled !== false}
             disabled={ciAutofixBusy}
             onChange={(e) => toggleCIAutofix(e.target.checked)}
           />

@@ -17,10 +17,11 @@ export interface User {
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
-  // ci_autofix_enabled is the per-user opt-in to automatic CI fixes (PRD #71).
-  // Default false; the user toggles their own from Settings, an admin can force any
-  // user's.
-  ci_autofix_enabled: boolean;
+  // ci_autofix_enabled is the per-user opt-in to automatic CI fixes (PRD #71, made
+  // a tri-state in #914 M3): true = explicit on, false = explicit off, null =
+  // inherit the admin global default (on). The user toggles their own from
+  // Settings, an admin can force any user's.
+  ci_autofix_enabled: boolean | null;
   // attribution_enabled is the per-user opt-out for AI attribution in worker commits
   // (issue #916). Default TRUE (today's behavior): when true the worker's commits keep
   // the Co-Authored-By: Claude trailer; when false it is suppressed on the user's next

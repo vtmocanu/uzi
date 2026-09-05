@@ -85,7 +85,11 @@ export function AdminUsers() {
     setError("");
     setCiAutofixBusyId(u.id);
     try {
-      const { user } = await api.setUserCIAutofixEnabled(u.id, !u.ci_autofix_enabled);
+      // NULL (inherit) and true both read as currently-on (PRD #914 M3); the admin
+      // control is an explicit force-toggle, so it always sends the opposite bool
+      // (never clears to inherit — that is a self-service capability only).
+      const currentlyOn = u.ci_autofix_enabled !== false;
+      const { user } = await api.setUserCIAutofixEnabled(u.id, !currentlyOn);
       setUsers((prev) => prev.map((x) => (x.id === user.id ? user : x)));
     } catch (err) {
       setError(errorMessage(err, "Update failed"));
@@ -156,8 +160,8 @@ export function AdminUsers() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
-                        <Badge tone={u.ci_autofix_enabled ? "ok" : "neutral"} dot>
-                          {u.ci_autofix_enabled ? "On" : "Off"}
+                        <Badge tone={u.ci_autofix_enabled !== false ? "ok" : "neutral"} dot>
+                          {u.ci_autofix_enabled !== false ? "On" : "Off"}
                         </Badge>
                         <Button
                           variant="ghost"
@@ -165,7 +169,7 @@ export function AdminUsers() {
                           disabled={ciAutofixBusyId === u.id}
                           onClick={() => toggleCIAutofix(u)}
                         >
-                          {u.ci_autofix_enabled ? "Disable" : "Enable"}
+                          {u.ci_autofix_enabled !== false ? "Disable" : "Enable"}
                         </Button>
                       </div>
                     </td>

@@ -676,13 +676,13 @@ export const settingsApi = {
 
   // ── CI-autofix opt-in (PRD #71) ──────────────────────────────────────────────
   // Own-user (session identity, never a body id, mirroring the server).
-  setCIAutofixEnabled: async (enabled: boolean) => {
+  setCIAutofixEnabled: async (enabled: boolean | null) => {
     const u = requireSession();
     u.ci_autofix_enabled = enabled;
     return delay({ user: { ...u } }, 200);
   },
   // Admin per-user toggle: target from the id argument (the path on the server).
-  setUserCIAutofixEnabled: async (id: string, enabled: boolean) => {
+  setUserCIAutofixEnabled: async (id: string, enabled: boolean | null) => {
     const u = users.find((x) => x.id === id);
     if (!u) throw new ApiError(404, "user not found");
     u.ci_autofix_enabled = enabled;
