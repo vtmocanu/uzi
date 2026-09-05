@@ -401,8 +401,9 @@ func (hm *HookManager) migrateLegacyCommand(root map[string]any) bool {
 // preserves every unrelated key and foreign hook and their order, refuses to touch
 // a malformed file, and classifies the existing entries three ways: an entry already
 // in canonical form (exact OR canonical+flags) is an idempotent no-op preserved
-// verbatim; a legacy/non-canonical form is MIGRATED in place to the bare canonical
-// command (no duplicate); otherwise the canonical matcher-object is appended. For
+// verbatim; a legacy/non-canonical form is MIGRATED in place to the canonical
+// command, preserving any user suffix it carried (no duplicate); otherwise the
+// canonical matcher-object is appended. For
 // Codex it first refuses (read-only) a mixed [hooks]-table/hooks.json representation.
 func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 	res := HookInstallResult{Path: hm.settingsPath(), BackupPath: hm.backupPath()}
