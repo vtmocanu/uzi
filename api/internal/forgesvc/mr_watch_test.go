@@ -315,6 +315,38 @@ func TestMRLockedIsRecordedNeverMoves(t *testing.T) {
 	assertRecorded(t, st, runID, "locked")
 }
 
+// TestMRLockedClosedCancelsRework pins the issue #1072 fix: a MR that passes
+// through the transient `locked` state before closing (opened->locked->closed)
+// reaches syncOneMRState on the `locked`->`closed` tick with stored=="locked", so
+// it falls to the `default` arm — not the `opened`->`closed` close arm. Before the
+// fix that arm cancelled only on `merged`, so the in-flight rework leaked; the run
+// then self-evicted at the terminal `closed` state with the rework still spending.
+// It must now cancel exactly once (keyed on the MR), while still making NO board
+// move (`locked` was mid-merge) and recording the terminal `closed`. The `run`
+// helper wires no canceller, so this builds the service directly.
+func TestMRLockedClosedCancelsRework(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrTxt("locked"))},
+		issue:      mrIssue(repoID, 9, "opened", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	f := &fakeForge{mr: forgeMR(13, "closed")}
+	canceller := &fakeReworkCanceller{}
+	svc := newTestService(st)
+	svc.SetReworkCanceller(canceller)
+
+	if err := svc.SyncMRStates(context.Background(), repoID, testProjectID, f); err != nil {
+		t.Fatalf("SyncMRStates: %v", err)
+	}
+
+	if len(canceller.calls) != 1 || canceller.calls[0] != 13 {
+		t.Fatalf("expected exactly one cancel of mr 13, got %v", canceller.calls)
+	}
+	assertNoMove(t, f) // locked is mid-merge → no board move, only the cancel was missing
+	assertRecorded(t, st, runID, "closed")
+}
+
 func TestMRUnknownStateInTransitionIsIgnored(t *testing.T) {
 	// Reviewer hardening (post-audit): an unrecognized state is ignored ENTIRELY —
 	// no move AND no write — so the prior baseline ("opened") is preserved and a
