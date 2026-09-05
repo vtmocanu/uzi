@@ -9,18 +9,18 @@ import (
 // documented `.agents/skills` root (Codex CLI 0.153.4). Like skillDirParts it is a
 // compile-time constant with NO user-supplied component, and it is deliberately
 // INDEPENDENT of $CODEX_HOME: only the Codex hook/config home follows that env var
-// (see resolveSkillTargets), so no environment-derived string ever reaches the
+// (see ResolveSkillTargets), so no environment-derived string ever reaches the
 // skill path component (PRD #1143 D1/D8).
 var codexSkillDirParts = []string{".agents", "skills", "uzi-cli"}
 
 // codexHookFileName is the documented Codex user-layer hook file, read/written
-// under the Codex config home ($CODEX_HOME, or ~/.codex when unset). M1 only
-// resolves the path; the Codex hook manager lands in M2.
+// under the Codex config home ($CODEX_HOME, or ~/.codex when unset) by
+// NewCodexHookManager (skillhook.go).
 const codexHookFileName = "hooks.json"
 
 // SkillTarget describes one harness the bundled skill can install into: the
 // absolute directory the SKILL.md copy lives in and the absolute path to that
-// harness's lifecycle-hook file. Both are fully resolved by resolveSkillTargets.
+// harness's lifecycle-hook file. Both are fully resolved by ResolveSkillTargets.
 type SkillTarget struct {
 	Name     string // "claude" | "codex"
 	SkillDir string // absolute dir where SKILL.md lives

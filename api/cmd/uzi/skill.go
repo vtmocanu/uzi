@@ -54,14 +54,13 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 					{"INSTALLED", boolStr(st.Installed)},
 					{"UP_TO_DATE", boolStr(st.UpToDate)},
 					{"USER_EDITED", boolStr(st.UserEdited)},
+					{"HOOK_INSTALLED", boolStr(hst.Installed)},
+					{"HOOK_CURRENT", boolStr(hst.Current)},
 				}
-				// The hook manager is Claude-only until M2, so only the Claude group
-				// carries hook rows.
-				if t.Name == "claude" {
-					rows = append(rows,
-						[]string{"HOOK_INSTALLED", boolStr(hst.Installed)},
-						[]string{"HOOK_CURRENT", boolStr(hst.Current)},
-					)
+				// Codex's mixed inline-[hooks]/hooks.json representation is surfaced only
+				// when detected (the row is absent for Claude and for a clean Codex tree).
+				if hst.HookConfigConflict {
+					rows = append(rows, []string{"HOOK_CONFIG_CONFLICT", boolStr(true)})
 				}
 				if err := p.Table(nil, rows); err != nil {
 					return err
@@ -123,40 +122,58 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	install.Flags().Bool("force", false, "overwrite an edited skill without prompting")
 
-	// install-hook / uninstall-hook manage the opt-in Claude Code SessionStart
-	// hook (PRD #86). They are VISIBLE and documented in SKILL.md — an
-	// unadvertised opt-in closes nothing, so discoverability is the point.
+	// install-hook / uninstall-hook manage the opt-in session-start hook (PRD #86,
+	// #1143) for every selected harness (Claude settings.json, Codex hooks.json).
+	// They are VISIBLE and documented in SKILL.md — an unadvertised opt-in closes
+	// nothing, so discoverability is the point.
 	installHook := &cobra.Command{
 		Use:   "install-hook",
-		Short: "Install the opt-in Claude Code SessionStart hook (runs `uzi skill install`)",
+		Short: "Install the opt-in session-start hook (runs `uzi skill install`) for the selected harness(es)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := guardHookTarget(targetFlag(cmd)); err != nil {
+			targets, err := selectSkillTargets(env, targetFlag(cmd))
+			if err != nil {
 				return err
 			}
-			hm, err := hookManager(env)
-			if err != nil {
-				return uzicli.Exitf(uzicli.ExitGeneric, "no home directory available: %v", err)
-			}
-			res, err := hm.InstallHook()
-			if err != nil {
-				return uzicli.Exitf(uzicli.ExitGeneric, "installing hook: %v", err)
+			// Attempt every selected target for its filesystem effect, then render.
+			results := make([]uzicli.HookInstallResult, 0, len(targets))
+			for _, t := range targets {
+				hm, err := hookManagerForTarget(env, t)
+				if err != nil {
+					return err
+				}
+				res, err := hm.InstallHook()
+				if err != nil {
+					return err
+				}
+				results = append(results, res)
 			}
 			p := env.printer(gf)
+			// M1/M2 keep the legacy single-object result for the first selected target;
+			// M3 replaces it with the full targets[] envelope.
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(res)
+				return p.JSON(results[0])
 			}
-			if res.BackedUp {
-				_, _ = fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
-			}
-			if !gf.quiet {
-				switch {
-				case res.AlreadyPresent:
-					p.Printf("SessionStart hook already present in %s\n", res.Path)
-				case res.Changed:
-					p.Printf("SessionStart hook installed in %s\n", res.Path)
-				default:
-					p.Printf("SessionStart hook unchanged in %s\n", res.Path)
+			for i, res := range results {
+				t := targets[i]
+				if res.BackedUp {
+					_, _ = fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
+				}
+				if !gf.quiet {
+					switch {
+					case res.AlreadyPresent:
+						p.Printf("%s session-start hook already present in %s\n", t.Name, res.Path)
+					case res.Changed:
+						p.Printf("%s session-start hook installed in %s\n", t.Name, res.Path)
+					default:
+						p.Printf("%s session-start hook unchanged in %s\n", t.Name, res.Path)
+					}
+				}
+				// Codex never writes trust: after a change, point the user at /hooks to
+				// review and trust the freshly written hook.
+				if t.Name == "codex" && res.Changed {
+					_, _ = fmt.Fprintf(env.Stderr,
+						"run /hooks in Codex to review and trust this hook (uzi never writes Codex trust state)\n")
 				}
 			}
 			return nil
@@ -165,32 +182,46 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	uninstallHook := &cobra.Command{
 		Use:   "uninstall-hook",
-		Short: "Remove the Claude Code SessionStart hook this CLI manages",
+		Short: "Remove the session-start hook this CLI manages from the selected harness(es)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := guardHookTarget(targetFlag(cmd)); err != nil {
+			targets, err := selectSkillTargets(env, targetFlag(cmd))
+			if err != nil {
 				return err
 			}
-			hm, err := hookManager(env)
-			if err != nil {
-				return uzicli.Exitf(uzicli.ExitGeneric, "no home directory available: %v", err)
-			}
-			res, err := hm.UninstallHook()
-			if err != nil {
-				return uzicli.Exitf(uzicli.ExitGeneric, "removing hook: %v", err)
+			results := make([]uzicli.HookUninstallResult, 0, len(targets))
+			for _, t := range targets {
+				hm, err := hookManagerForTarget(env, t)
+				if err != nil {
+					return err
+				}
+				res, err := hm.UninstallHook()
+				if err != nil {
+					return err
+				}
+				results = append(results, res)
 			}
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(res)
+				return p.JSON(results[0])
 			}
-			if res.BackedUp {
-				_, _ = fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
-			}
-			if !gf.quiet {
-				if res.Changed {
-					p.Printf("removed %d SessionStart hook entr(y/ies) from %s\n", res.Removed, res.Path)
-				} else {
-					p.Printf("no uzi SessionStart hook found in %s\n", res.Path)
+			for i, res := range results {
+				t := targets[i]
+				if res.BackedUp {
+					_, _ = fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
+				}
+				if !gf.quiet {
+					if res.Changed {
+						p.Printf("removed %d %s session-start hook entr(y/ies) from %s\n", res.Removed, t.Name, res.Path)
+					} else {
+						p.Printf("no uzi session-start hook found in %s\n", res.Path)
+					}
+				}
+				// A Codex removal that shifted a later entry's trust index warrants a
+				// re-review via /hooks (uzi never writes trust).
+				if t.Name == "codex" && res.Changed && res.NonTerminalRemoval {
+					_, _ = fmt.Fprintf(env.Stderr,
+						"a later hook entry followed the one removed from %s; its Codex trust may need re-review via /hooks\n", res.Path)
 				}
 			}
 			return nil
@@ -276,36 +307,34 @@ func installerForTarget(env Env, t uzicli.SkillTarget) (*uzicli.SkillInstaller, 
 	return uzicli.NewSkillInstallerForTarget(t, version), nil
 }
 
-// skillAndHookStatus reports the skill status for a target plus, for Claude only
-// (the hook manager is Claude-only until M2), its SessionStart-hook status.
+// skillAndHookStatus reports the skill status for a target plus its session-start
+// hook status, using the per-target hook manager (Claude settings.json / Codex
+// hooks.json).
 func skillAndHookStatus(env Env, t uzicli.SkillTarget) (uzicli.SkillStatusResult, uzicli.HookStatusResult, error) {
 	inst, err := installerForTarget(env, t)
 	if err != nil {
 		return uzicli.SkillStatusResult{}, uzicli.HookStatusResult{}, uzicli.Exitf(uzicli.ExitGeneric, "no home directory available: %v", err)
 	}
 	st := inst.Status()
-	if t.Name != "claude" {
-		return st, uzicli.HookStatusResult{}, nil
-	}
-	hm, err := hookManager(env)
+	hm, err := hookManagerForTarget(env, t)
 	if err != nil {
-		return st, uzicli.HookStatusResult{}, uzicli.Exitf(uzicli.ExitGeneric, "no home directory available: %v", err)
+		return st, uzicli.HookStatusResult{}, err
 	}
 	return st, hm.HookStatus(), nil
 }
 
-// guardHookTarget rejects the hook verbs' Codex/all selection: the Codex hook
-// manager lands in M2. Omitted or explicit claude operate on Claude exactly as
-// before; any other value is the standard invalid-target usage error.
-func guardHookTarget(target string) error {
-	switch target {
-	case "", "claude":
-		return nil
-	case "codex", "all":
-		return uzicli.Exitf(uzicli.ExitUsage, "Codex hook target is not yet available")
-	default:
-		return uzicli.Exitf(uzicli.ExitUsage, "invalid --target %q (want claude, codex, or all)", target)
+// hookManagerForTarget builds the session-start hook manager for a selected target.
+// Claude routes through the existing hookManager seam (unchanged real-home/test-home
+// behaviour); Codex builds one straight from the resolved absolute hooks.json path.
+func hookManagerForTarget(env Env, t uzicli.SkillTarget) (*uzicli.HookManager, error) {
+	if t.Name == "claude" {
+		hm, err := hookManager(env)
+		if err != nil {
+			return nil, uzicli.Exitf(uzicli.ExitGeneric, "no home directory available: %v", err)
+		}
+		return hm, nil
 	}
+	return uzicli.NewCodexHookManager(t.HookPath), nil
 }
 
 // targetFlag reads the shared --target value (registered as a persistent flag on

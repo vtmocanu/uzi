@@ -44,8 +44,8 @@ func TestSkillInstallTargetCodexCreatesCopy(t *testing.T) {
 }
 
 // `skill status --target codex` and `skill uninstall-hook --target codex` create
-// NOTHING when no Codex home exists (status is read-only; the hook verb is guarded
-// until M2 and returns a usage error).
+// NOTHING when no Codex home exists: status is read-only, and uninstall-hook over a
+// missing hooks.json is a clean no-op (never writes, never MkdirAll).
 func TestSkillCodexReadOnlyVerbsCreateNothing(t *testing.T) {
 	home := t.TempDir()
 	env := fakeEnv(&uzicli.FakeClient{})
@@ -59,11 +59,70 @@ func TestSkillCodexReadOnlyVerbsCreateNothing(t *testing.T) {
 	}
 
 	_, _, code := runCLI(t, env, "skill", "uninstall-hook", "--target", "codex")
-	if code != uzicli.ExitUsage {
-		t.Fatalf("uninstall-hook --target codex exit = %d, want %d (guarded until M2)", code, uzicli.ExitUsage)
+	if code != uzicli.ExitOK {
+		t.Fatalf("uninstall-hook --target codex exit = %d, want 0 (no-op over a missing hooks.json)", code)
 	}
 	if pathExists(filepath.Join(home, ".codex")) || pathExists(filepath.Join(home, ".agents")) {
-		t.Errorf("a guarded/read-only Codex verb must create no directories")
+		t.Errorf("a read-only/no-op Codex verb must create no directories")
+	}
+}
+
+// codexHooksFilePath is the Codex hooks.json under the default ~/.codex config home.
+func codexHooksFilePath(home string) string {
+	return filepath.Join(home, ".codex", "hooks.json")
+}
+
+// `skill install-hook --target codex` writes ~/.codex/hooks.json with the codex
+// command and matcher, and prints the /hooks stderr guidance.
+func TestSkillInstallHookTargetCodex(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.SkillHome = home
+
+	out, errb, code := runCLI(t, env, "skill", "install-hook", "--target", "codex")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	b, err := os.ReadFile(codexHooksFilePath(home))
+	if err != nil {
+		t.Fatalf("hooks.json not written: %v", err)
+	}
+	s := string(b)
+	if !strings.Contains(s, "uzi skill install --target codex") {
+		t.Errorf("hooks.json missing the codex command:\n%s", s)
+	}
+	if !strings.Contains(s, "startup|resume") {
+		t.Errorf("hooks.json missing the codex matcher:\n%s", s)
+	}
+	if !strings.Contains(out, "codex") {
+		t.Errorf("stdout = %q, want a codex line", out)
+	}
+	if !strings.Contains(errb, "/hooks") {
+		t.Errorf("stderr = %q, want the /hooks trust guidance", errb)
+	}
+	// uzi never writes Codex config or trust state.
+	if pathExists(filepath.Join(home, ".codex", "config.toml")) {
+		t.Errorf("install-hook must never create config.toml")
+	}
+}
+
+// `skill status --target all` shows hook rows for BOTH targets.
+func TestSkillStatusTargetAllShowsHookRows(t *testing.T) {
+	home := t.TempDir()
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.SkillHome = home
+	out, _, code := runCLI(t, env, "skill", "status", "--target", "all")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Count(out, "HOOK_INSTALLED") != 2 {
+		t.Errorf("status --target all should show HOOK_INSTALLED for both targets:\n%s", out)
+	}
+	if !strings.Contains(out, "claude") || !strings.Contains(out, "codex") {
+		t.Errorf("status --target all should name both targets:\n%s", out)
 	}
 }
 

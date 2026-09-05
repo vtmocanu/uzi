@@ -44,7 +44,6 @@ const (
 // resolved SkillTarget for a specific harness) and never from user input.
 type SkillInstaller struct {
 	skillDir string // absolute dir the skill lives in (e.g. home/.claude/skills/uzi-cli)
-	name     string // target name for reporting ("claude" | "codex")
 	version  string // CLI version, recorded in the sidecar (informational only)
 }
 
@@ -59,14 +58,13 @@ func NewSkillInstaller(version string) (*SkillInstaller, error) {
 }
 
 // NewSkillInstallerAt builds a Claude installer rooted at an explicit home directory
-// (dir = home/.claude/skills/uzi-cli, name "claude").
+// (dir = home/.claude/skills/uzi-cli).
 // TEST/INJECTION SEAM ONLY: the real CLI always goes through NewSkillInstaller
 // (os.UserHomeDir); this exists so tests can point the install at a temp dir and
 // never touch the developer's real ~/.claude. It is not wired to any flag/env.
 func NewSkillInstallerAt(home, version string) *SkillInstaller {
 	return &SkillInstaller{
 		skillDir: filepath.Join(append([]string{home}, skillDirParts...)...),
-		name:     "claude",
 		version:  version,
 	}
 }
@@ -75,7 +73,7 @@ func NewSkillInstallerAt(home, version string) *SkillInstaller {
 // under the target's own SkillDir with its own sidecar/backup. This is the
 // multi-target constructor the CLI uses once targets are resolved.
 func NewSkillInstallerForTarget(t SkillTarget, version string) *SkillInstaller {
-	return &SkillInstaller{skillDir: t.SkillDir, name: t.Name, version: version}
+	return &SkillInstaller{skillDir: t.SkillDir, version: version}
 }
 
 func (si *SkillInstaller) dir() string        { return si.skillDir }
