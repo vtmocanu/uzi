@@ -30,6 +30,18 @@
 # Those RELAX a table and are additive-compatible for a reader (there are ~25 legit ones
 # in history). Only column/table removal, rename, or retype breaks an old reader.
 #
+# 🔴 ALLOW-DROP MARKER (contract-phase exemption, issue #1087). A CONTRACT step of an
+# expand/contract change legitimately drops a now-dead worker-facing column a release AFTER
+# its last reader is gone. To let that one drop through without disarming the guard for
+# everything else, put a marker in the SAME Up section naming the EXACT table.column:
+#     -- migration-additive:allow-drop runs.lineage_epoch
+#     ALTER TABLE runs DROP COLUMN lineage_epoch;
+# The marker exempts ONLY that table.column: an unmarked drop still fails, a marker naming a
+# DIFFERENT column does not exempt the actual drop, and a second unmarked drop in the same
+# statement still fails. Only DROP COLUMN is markerable; RENAME / ALTER ... TYPE / DROP
+# TABLE are never exempted. Mirrors the check-docs:ignore-path marker-comment convention.
+# The marker/mismatch self-check canaries below prove the match stays exact (both directions).
+#
 # 🔴 SELF-CHECK (canary), the check-spec-numbering convention. A silent pass is the
 # failure mode: if the awk parse ever matches nothing, every migration reads "clean" and
 # this gate passes vacuously. The canary ($1) carries a deliberately planted worker-facing
@@ -37,6 +49,12 @@
 # The scanner is run over it first and MUST report EXACTLY ONE finding — the Up one. Zero
 # means the detector is blind (instrument broken); two means it wrongly scanned the Down
 # section (a false positive the canary is built to expose). Either way: exit 2.
+#
+# Two sibling fixtures beside $1 extend the self-check to the allow-drop marker (#1087):
+# migration-additive-marker-canary.sql (a worker-table drop WITH a matching marker) MUST
+# yield 0, and migration-additive-mismatch-canary.sql (a drop whose marker names a DIFFERENT
+# column) MUST yield 1. Together they prove the exemption is exact in both directions: a
+# broken marker match reddens the marker canary, an over-broad one reddens the mismatch canary.
 #
 # EXIT CODES (the lint-yaml.sh / scan-secrets.sh / check-spec-numbering.sh convention):
 #     2 = the instrument is broken (a file/dir missing, or the canary did not detect
@@ -115,6 +133,33 @@ scan() {
       }
       return 0
     }
+    # Exact-match exemption for a DROP COLUMN (issue #1087). Returns 1 iff the statement
+    # drops at least one column AND EVERY dropped column is named by an
+    # `-- migration-additive:allow-drop <table>.<column>` marker seen earlier in this Up
+    # section (recorded in allow[]). It mirrors col_drop`s notion of "a column drop"
+    # (DROP [COLUMN] <name>, minus the drop-constraint/default/not-null relaxations), so an
+    # exemption can never be broader than what col_drop flags. A marker naming a different
+    # column, or a second unmarked drop in the same statement, leaves this 0 -> still flagged.
+    function drop_exempted(rest, tbl,   tmp, tail, word, rem, col, anycol){
+      tmp = rest; anycol = 0
+      while (match(tmp, /(^| )drop /)){
+        tail = substr(tmp, RSTART + RLENGTH)
+        if (match(tail, /^[a-z_"][a-z0-9_"]*/)){
+          word = substr(tail, RSTART, RLENGTH); gsub(/"/, "", word)
+          if (word == "column"){
+            rem = substr(tail, RLENGTH + 1); sub(/^[ \t]+/, "", rem); col = ""
+            if (match(rem, /^[a-z_"][a-z0-9_"]*/)){ col = substr(rem, RSTART, RLENGTH); gsub(/"/, "", col) }
+            anycol = 1
+            if (!((tbl "." col) in allow)) return 0
+          } else if (word != "constraint" && word != "default" && word != "not"){
+            anycol = 1
+            if (!((tbl "." word) in allow)) return 0
+          }
+        }
+        tmp = tail
+      }
+      return anycol
+    }
     function check(raw,   stmt, rest, w, tbl, verb, m, parts, k, tw){
       stmt = norm(raw)
       if (stmt == "") return
@@ -136,18 +181,30 @@ scan() {
         else if (rest ~ /(^| )rename column /)         verb = "RENAME COLUMN"
         else if (rest ~ /(^| )rename to /)             verb = "RENAME TO"
         else if (rest ~ /(^| )alter column .* type /)  verb = "ALTER COLUMN ... TYPE"
-        if (verb != "" && (tbl in wf)) report(tbl, verb, stmt)
+        if (verb != "" && (tbl in wf)){
+          if (verb == "DROP COLUMN" && drop_exempted(rest, tbl)) return
+          report(tbl, verb, stmt)
+        }
         return
       }
     }
     BEGIN { n = split(tables, a, " "); for (i = 1; i <= n; i++) wf[a[i]] = 1 }
-    FNR == 1 { state = "pre"; buf = "" }
+    FNR == 1 { state = "pre"; buf = ""; split("", allow) }
     {
       lc = tolower($0)
       # Detect goose section markers BEFORE stripping comments (the marker IS a comment).
-      if (lc ~ /\+goose[ \t]+up/)   { state = "up";   buf = ""; next }
+      # allow[] (the approved-drop set) resets per Up section, so a marker can never leak
+      # across sections or in from a Down. split("", allow) empties it portably.
+      if (lc ~ /\+goose[ \t]+up/)   { state = "up";   buf = ""; split("", allow); next }
       if (lc ~ /\+goose[ \t]+down/) { state = "down"; buf = ""; next }
       if (state != "up") next
+      # Capture an approval marker BEFORE the comment strip below (the marker IS a comment).
+      # `-- migration-additive:allow-drop <table>.<column>` exempts exactly that
+      # table.column from the DROP COLUMN check (issue #1087), and nothing else.
+      if (match(lc, /migration-additive:allow-drop[ \t]+[a-z0-9_".]+/)){
+        mk = substr(lc, RSTART, RLENGTH); sub(/^.*allow-drop[ \t]+/, "", mk); gsub(/"/, "", mk)
+        allow[mk] = 1
+      }
       line = $0
       sub(/--.*/, "", line)          # strip an end-of-line SQL comment
       buf = buf " " tolower(line)
@@ -159,21 +216,44 @@ scan() {
   ' "$@"
 }
 
-# 🔴 CANARY FIRST: prove the detector fires (and fires ONLY on the Up section) before
-# trusting any verdict over the real corpus.
-canary_hits="$(scan "$CANARY")"
-canary_count="$(printf '%s' "$canary_hits" | awk 'NF{n++} END{print n+0}')"
-if [ "$canary_count" -ne 1 ]; then
+# 🔴 CANARIES FIRST: prove the detector fires (Up only) AND that the allow-drop marker
+# exemption is EXACT -- before trusting any verdict over the real corpus. Three fixtures,
+# all beside $CANARY, each run through the same scan():
+#   canary            (no marker)                  -> MUST be 1  (detector live, Up-only)
+#   marker canary     (matching allow-drop)        -> MUST be 0  (exact marker exempts)
+#   mismatch canary   (allow-drop names OTHER col) -> MUST be 1  (marker cannot over-exempt)
+# The marker/mismatch pair is the both-directions mutation guard on the exemption (#1087):
+# delete the marker logic and the marker canary jumps to 1; loosen it to "any marker
+# exempts any drop" and the mismatch canary falls to 0. Either way this self-check exits 2.
+CANARY_DIR="$(dirname "$CANARY")"
+MARKER_CANARY="$CANARY_DIR/migration-additive-marker-canary.sql"
+MISMATCH_CANARY="$CANARY_DIR/migration-additive-mismatch-canary.sql"
+for f in "$MARKER_CANARY" "$MISMATCH_CANARY"; do
+  if [ ! -f "$f" ]; then
+    echo "check-migration-additive: self-check fixture not found: $f" >&2
+    echo "  The marker/mismatch canaries prove the allow-drop exemption is exact; without" >&2
+    echo "  them a broken or over-broad marker match could not be told from a working one." >&2
+    exit 2
+  fi
+done
+
+count_hits() { printf '%s' "$1" | awk 'NF{n++} END{print n+0}'; }
+canary_count="$(count_hits "$(scan "$CANARY")")"
+marker_count="$(count_hits "$(scan "$MARKER_CANARY")")"
+mismatch_count="$(count_hits "$(scan "$MISMATCH_CANARY")")"
+if [ "$canary_count" -ne 1 ] || [ "$marker_count" -ne 0 ] || [ "$mismatch_count" -ne 1 ]; then
   echo "check-migration-additive: ================================================================" >&2
-  echo "check-migration-additive: INSTRUMENT BROKEN -- the canary ($CANARY) did not yield exactly" >&2
-  echo "check-migration-additive: one finding (got $canary_count)." >&2
+  echo "check-migration-additive: INSTRUMENT BROKEN -- a self-check fixture did not yield its" >&2
+  echo "check-migration-additive: expected count (canary=$canary_count want 1, marker=$marker_count want 0," >&2
+  echo "check-migration-additive: mismatch=$mismatch_count want 1)." >&2
   echo "check-migration-additive:" >&2
-  echo "check-migration-additive: The canary plants ONE worker-facing destructive statement in its" >&2
-  echo "check-migration-additive: Up section and one in its Down section. Zero findings means the awk" >&2
-  echo "check-migration-additive: parse matched nothing (a changed pattern, a mangled canary), so a" >&2
-  echo "check-migration-additive: \"clean\" corpus would mean nothing. Two means the scanner wrongly" >&2
-  echo "check-migration-additive: read the Down section, which would false-positive on every legit" >&2
-  echo "check-migration-additive: additive rollback. Fix scan() or the canary." >&2
+  echo "check-migration-additive:   canary   ($CANARY): one Up + one Down destructive stmt;" >&2
+  echo "check-migration-additive:            want 1 (0 = parse matched nothing; 2 = wrongly read Down)." >&2
+  echo "check-migration-additive:   marker   ($MARKER_CANARY): a worker-table DROP" >&2
+  echo "check-migration-additive:            COLUMN with a MATCHING allow-drop marker; want 0." >&2
+  echo "check-migration-additive:   mismatch ($MISMATCH_CANARY): a worker-table DROP" >&2
+  echo "check-migration-additive:            COLUMN whose allow-drop marker names a DIFFERENT column;" >&2
+  echo "check-migration-additive:            want 1 (a marker must never over-exempt). Fix scan() or the fixtures." >&2
   echo "check-migration-additive: ================================================================" >&2
   exit 2
 fi
