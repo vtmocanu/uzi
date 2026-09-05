@@ -35,7 +35,12 @@ const (
 // transcript, fed by the REST replay for history and StreamRun for live frames.
 type detailState struct {
 	runID string
-	run   apitypes.RunDTO
+	// gen is this detail session's generation (stamped from tuiModel.detailGen on each drill-in
+	// from the board; the `--run` start session keeps 0). Every run/page command captures it
+	// and every reply is checked against it, because exitToBoard cannot cancel a command in
+	// flight and reopening the SAME run would otherwise let the old session's replies through.
+	gen uint64
+	run apitypes.RunDTO
 	// frames is the merged, seq-ordered message log — replay and live frames land in
 	// the same slice, deduped by seq, because the lane logic must not care which
 	// transport a frame arrived on.

@@ -15,8 +15,10 @@ import (
 // It takes no *testing.T so the non-test uxlab fixtures (detailBase et al., which have no t in
 // scope) can call it too; it never asserts, it only drives the two Update calls.
 func applyDetail(m tuiModel, run apitypes.RunDTO, msgs []apitypes.MessageDTO) tuiModel {
-	nm, _ := m.Update(detailRunMsg{runID: run.ID, run: run})
+	// Stamped with the model's current session generation, so the helper works after a
+	// drill-in from the board (gen ≥ 1) as well as on a `--run` start session (gen 0).
+	nm, _ := m.Update(detailRunMsg{runID: run.ID, run: run, gen: m.detail.gen})
 	m = nm.(tuiModel)
-	nm, _ = m.Update(detailPageMsg{runID: run.ID, kind: pageTail, msgs: msgs})
+	nm, _ = m.Update(detailPageMsg{runID: run.ID, kind: pageTail, msgs: msgs, gen: m.detail.gen})
 	return nm.(tuiModel)
 }

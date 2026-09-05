@@ -133,6 +133,10 @@ type detailRunMsg struct {
 	runID string
 	run   apitypes.RunDTO
 	err   error
+	// gen is the detail SESSION generation the request was issued under (detailState.gen).
+	// exitToBoard cannot cancel an in-flight command, and reopening the SAME run passes the
+	// runID guard, so a reply from the previous session is rejected on gen instead.
+	gen uint64
 }
 
 // detailPageKind tags a transcript page. pageTail is the newest page; pageBackfill is the
@@ -155,6 +159,10 @@ type detailPageMsg struct {
 	// reqID is the catch-up chain generation this page belongs to (M7), used only by pageCatchup
 	// so a superseded chain's reply is dropped; pageTail/pageBackfill leave it zero.
 	reqID uint64
+	// gen is the detail SESSION generation (detailState.gen) the page was requested under. A
+	// page from a session the user has since left — even for the same run, which passes the
+	// runID guard — must not touch the new session's cursor, guards or pane state.
+	gen uint64
 }
 
 type streamReadyMsg struct {
@@ -208,6 +216,10 @@ type tuiModel struct {
 	view   tuiView
 	board  boardState
 	detail detailState
+	// detailGen counts detail sessions opened from the board; each drill-in stamps the new
+	// detailState.gen from it, so a reply issued under an earlier session (same run reopened)
+	// is rejected by the gen check in the detailRunMsg / detailPageMsg cases.
+	detailGen uint64
 
 	// quitting is the ctrl+c confirm modal (q quits immediately and does NOT route through
 	// it); ctrlCSeen makes a second ctrl+c quit immediately, which is the escape hatch a user
@@ -494,18 +506,18 @@ var (
 )
 
 func (m tuiModel) loadRunCmd(runID string) tea.Cmd {
-	c, ctx := m.client, m.ctx
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
 		run, err := c.GetRun(ctx, runID)
-		return detailRunMsg{runID: runID, run: run, err: err}
+		return detailRunMsg{runID: runID, run: run, err: err, gen: gen}
 	}
 }
 
 func (m tuiModel) loadTailCmd(runID string) tea.Cmd {
-	c, ctx := m.client, m.ctx
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
 		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{Tail: detailPageSize, PayloadMax: detailPayloadMax})
-		return detailPageMsg{runID: runID, kind: pageTail, msgs: msgs, err: err}
+		return detailPageMsg{runID: runID, kind: pageTail, msgs: msgs, err: err, gen: gen}
 	}
 }
 
@@ -513,10 +525,10 @@ func (m tuiModel) loadTailCmd(runID string) tea.Cmd {
 // background walk that fills the transcript after the tail (PRD #1137 D1). One page; the
 // reply chains the next.
 func (m tuiModel) backfillCmd(runID string, before int32) tea.Cmd {
-	c, ctx := m.client, m.ctx
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
 		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{Before: before, Limit: detailPageSize, PayloadMax: detailPayloadMax})
-		return detailPageMsg{runID: runID, kind: pageBackfill, msgs: msgs, err: err}
+		return detailPageMsg{runID: runID, kind: pageBackfill, msgs: msgs, err: err, gen: gen}
 	}
 }
 
@@ -524,10 +536,10 @@ func (m tuiModel) backfillCmd(runID string, before int32) tea.Cmd {
 // down / manual-refresh path that recovers frames the dead stream would have carried. reqID tags
 // the reply so a superseded chain is dropped.
 func (m tuiModel) catchupCmd(runID string, after int32, reqID uint64) tea.Cmd {
-	c, ctx := m.client, m.ctx
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
 		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{After: after, Limit: detailPageSize, PayloadMax: detailPayloadMax})
-		return detailPageMsg{runID: runID, kind: pageCatchup, reqID: reqID, msgs: msgs, err: err}
+		return detailPageMsg{runID: runID, kind: pageCatchup, reqID: reqID, msgs: msgs, err: err, gen: gen}
 	}
 }
 
@@ -739,6 +751,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if id != m.detail.runID {
 			return m, nil
 		}
+		if msg.gen != m.detail.gen {
+			return m, nil // a reply from a detail session the user has since left (same run reopened)
+		}
 		m.detail.applyRun(msg.run, msg.err)
 		// The ownership probe + queue indicator and the in-progress-milestone blink both
 		// key off the run DTO, so they ride the run load (as the old full-load did).
@@ -746,6 +761,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case detailPageMsg:
 		if msg.runID != m.detail.runID {
+			return m, nil
+		}
+		// Session guard: exitToBoard cannot cancel an in-flight page command, and reopening the
+		// SAME run passes the runID check above. A stale page would clear tailInFlight, start a
+		// second backfill chain from an obsolete cursor, or paint an old error over the new pane
+		// — so it is rejected on the session generation before touching any state.
+		if msg.gen != m.detail.gen {
 			return m, nil
 		}
 		switch msg.kind {
