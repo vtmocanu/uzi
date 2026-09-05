@@ -595,6 +595,45 @@ func TestWorkerHeartbeatDropsNegativeDiskFieldOnly(t *testing.T) {
 	}
 }
 
+func TestWorkerHeartbeatDropsOverflowDiskFieldOnly(t *testing.T) {
+	// PRD #837 M1 — an int64-OVERFLOW disk value (a JSON number exceeding int64 range)
+	// must drop ONLY that field, exactly like a negative one. Before the *json.Number
+	// decode, the overflow failed the single stats json.Unmarshal and took the whole-
+	// object drop() path, nulling cpu/mem/source too — contradicting M1. The rest of the
+	// stats object and the sibling valid disk field must survive.
+	st := &protocolStore{}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	body := `{"version":"1","stats":{"cpu_pct":12,"mem_bytes":555,"source":"cgroup",` +
+		`"disk_nix_bytes":99999999999999999999,"disk_nix_total_bytes":4096000,` +
+		`"disk_data_bytes":2048000,"disk_data_total_bytes":8192000}}`
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	// The whole stats object survives: mem + source + cpu still stored. (This is what the
+	// old whole-object drop broke — the overflow field discarded these too.)
+	if !st.heartbeatArg.StatsMemBytes.Valid || st.heartbeatArg.StatsMemBytes.Int64 != 555 {
+		t.Fatalf("an overflow disk field must not drop mem, got %+v", st.heartbeatArg.StatsMemBytes)
+	}
+	if !st.heartbeatArg.StatsSource.Valid || st.heartbeatArg.StatsSource.String != "cgroup" {
+		t.Fatalf("an overflow disk field must not drop source, got %+v", st.heartbeatArg.StatsSource)
+	}
+	if !st.heartbeatArg.StatsCpuPct.Valid {
+		t.Fatalf("an overflow disk field must not drop cpu, got %+v", st.heartbeatArg.StatsCpuPct)
+	}
+	// Only the overflow field is dropped; its still-valid pair and the sibling volume survive.
+	if st.heartbeatArg.StatsDiskNixBytes.Valid {
+		t.Fatalf("overflow disk_nix_bytes must be dropped (NULL), got %+v", st.heartbeatArg.StatsDiskNixBytes)
+	}
+	if !st.heartbeatArg.StatsDiskNixTotalBytes.Valid || st.heartbeatArg.StatsDiskNixTotalBytes.Int64 != 4096000 {
+		t.Fatalf("the valid nix total must survive its overflow pair, got %+v", st.heartbeatArg.StatsDiskNixTotalBytes)
+	}
+	if !st.heartbeatArg.StatsDiskDataBytes.Valid || st.heartbeatArg.StatsDiskDataBytes.Int64 != 2048000 {
+		t.Fatalf("the sibling data volume must survive, got %+v", st.heartbeatArg.StatsDiskDataBytes)
+	}
+}
+
 func TestAdminWorkerDTOIncludesStats(t *testing.T) {
 	// The stats fields ride the shared apitypes.WorkerDTO, so the admin worker DTO
 	// inherits them for free (PRD #49 Decision 6). A worker row with a sample marshals
