@@ -144,6 +144,7 @@ function schedFixture(over: Partial<Schedule> = {}): Schedule {
     guidance: null,
     baked_guidance: null,
     model: "fable",
+    output_mode: null,
     override_subagent_model: false,
     enabled: true,
     status: "active",

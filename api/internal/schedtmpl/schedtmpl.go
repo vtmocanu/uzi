@@ -22,6 +22,7 @@
 //	cron: 0 8 * * 1           # 5-field standard cron
 //	timezone: UTC             # optional, defaults to UTC
 //	model: fable              # optional, empty => inherit the owner default
+//	output: mr                # prompt only, "mr" (default) | "issues"
 //	selector: label           # sweep only, "label" (default) | "assigned"
 //	labels: bug, Planned      # sweep only, comma-separated (label selector)
 //	max_issues: 3             # sweep only, 0/absent => unset
@@ -71,6 +72,17 @@ const (
 	SelectorAssigned = "assigned"
 )
 
+// OutputModeMR and OutputModeIssues are the two per-schedule output modes (PRD #929
+// M1), honored for a "prompt" target only. OutputModeMR (the default) writes an idea
+// file and opens a merge request — today's behavior; OutputModeIssues files the
+// proposal as a forge issue server-side. A prompt catalog entry whose frontmatter omits
+// `output` resolves to DefaultOutputMode via DefaultJob.OutputMode.
+const (
+	OutputModeMR      = "mr"
+	OutputModeIssues  = "issues"
+	DefaultOutputMode = OutputModeMR
+)
+
 // DefaultJob is one entry of the builtin default-schedule catalog.
 type DefaultJob struct {
 	Slug        string
@@ -84,6 +96,12 @@ type DefaultJob struct {
 	// Prompt is the run prompt for a "prompt" target (the file body). Empty for
 	// a "sweep" target.
 	Prompt string
+
+	// Output is a "prompt" target's output mode (PRD #929 M1): OutputModeMR (the
+	// default) or OutputModeIssues. An empty/absent value means the default —
+	// resolve it via OutputMode, never read this field directly. Empty for a
+	// non-prompt target (parse rejects a set `output` there).
+	Output string
 
 	// SelectorKind is a "sweep" target's selector kind (PRD #767 M4):
 	// SelectorLabel (the default) selects by Labels, SelectorAssigned selects
@@ -153,6 +171,17 @@ func BySlug(slug string) (DefaultJob, bool) {
 	return DefaultJob{}, false
 }
 
+// OutputMode resolves a prompt job's output mode (PRD #929 M1): the frontmatter
+// `output:` value, or DefaultOutputMode ("mr") when it is empty/absent. Callers use
+// this to resolve a NULL run_schedules.output_mode to the catalog default and to seed a
+// default row's stored mode, so an unset job always reads as "mr" rather than "".
+func (j DefaultJob) OutputMode() string {
+	if j.Output == "" {
+		return DefaultOutputMode
+	}
+	return j.Output
+}
+
 // cloneJob deep-copies the mutable Labels slice so a returned job shares nothing
 // with the package-level catalog.
 func cloneJob(j DefaultJob) DefaultJob {
@@ -212,6 +241,8 @@ func parse(raw []byte) (DefaultJob, error) {
 			}
 		case "model":
 			j.Model = val
+		case "output":
+			j.Output = val
 		case "selector":
 			j.SelectorKind = val
 			selectorSet = true
@@ -257,6 +288,17 @@ func parse(raw []byte) (DefaultJob, error) {
 		return DefaultJob{}, fmt.Errorf("catalog %q has unknown selector %q (want %q or %q)", j.Slug, j.SelectorKind, SelectorLabel, SelectorAssigned)
 	}
 
+	// Output mode applies only to a prompt target (PRD #929 M1). Validate the enum
+	// target-agnostically — an unknown value is always a bug, whatever the target — then
+	// reject a SET value on a non-prompt target in the switch below. An empty/absent value
+	// is valid everywhere and resolves to DefaultOutputMode via DefaultJob.OutputMode.
+	switch j.Output {
+	case "", OutputModeMR, OutputModeIssues:
+		// valid; per-target scoping enforced below
+	default:
+		return DefaultJob{}, fmt.Errorf("catalog %q has unknown output %q (want %q or %q)", j.Slug, j.Output, OutputModeMR, OutputModeIssues)
+	}
+
 	switch j.Target {
 	case "prompt":
 		if body == "" {
@@ -265,8 +307,13 @@ func parse(raw []byte) (DefaultJob, error) {
 		if selectorSet {
 			return DefaultJob{}, fmt.Errorf("catalog %q (prompt) must not set a selector", j.Slug)
 		}
+		// A prompt target's output mode is enum-validated above; an empty value defaults
+		// to OutputModeMR (resolved via OutputMode). Nothing more to enforce here.
 		j.Prompt = body
 	case "sweep":
+		if j.Output != "" {
+			return DefaultJob{}, fmt.Errorf("catalog %q (sweep) must not set output (it is prompt-only)", j.Slug)
+		}
 		switch j.SelectorKind {
 		case SelectorAssigned:
 			// An assigned sweep is assignment-selected, never label-selected: labels
@@ -283,6 +330,9 @@ func parse(raw []byte) (DefaultJob, error) {
 	case "self_improve":
 		if selectorSet {
 			return DefaultJob{}, fmt.Errorf("catalog %q (self_improve) must not set a selector", j.Slug)
+		}
+		if j.Output != "" {
+			return DefaultJob{}, fmt.Errorf("catalog %q (self_improve) must not set output (it is prompt-only)", j.Slug)
 		}
 		// Promptless and label-less: the whole directive is worker-side and the tracking
 		// issue is resolved at fire time (PRD #590 M1). A self_improve entry carries neither

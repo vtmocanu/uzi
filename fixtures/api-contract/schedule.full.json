@@ -22,6 +22,7 @@
   "guidance": "x",
   "baked_guidance": "x",
   "model": "x",
+  "output_mode": "x",
   "override_subagent_model": true,
   "status": "x",
   "origin": "x",

@@ -107,6 +107,14 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 		v := s.Model.String
 		dto.Model = &v
 	}
+	// output_mode (PRD #929 M1): NULL/empty ⇒ inherit the catalog default (leave nil), a
+	// stored value ("mr"/"issues") surfaces as an explicit override. For a default prompt
+	// row the seeded resolved value travels through here, so the modal shows the effective
+	// mode.
+	if s.OutputMode.Valid && s.OutputMode.String != "" {
+		v := s.OutputMode.String
+		dto.OutputMode = &v
+	}
 	// override_subagent_model is a plain bool column (never NULL, PRD #305), so always set it.
 	ov := s.OverrideSubagentModel
 	dto.OverrideSubagentModel = &ov

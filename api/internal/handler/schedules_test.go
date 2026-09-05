@@ -681,3 +681,52 @@ func TestScheduleDTOOverrideSubagentModel(t *testing.T) {
 		t.Fatalf("DTO override_subagent_model = %v, want *false (default off is always set, never nil)", dto.OverrideSubagentModel)
 	}
 }
+
+// TestValidateScheduleConfigOutputMode pins PRD #929 M1's per-target output_mode
+// validation: it is honored ONLY for a prompt target (enum mr/issues), and rejected on
+// issue/sweep/self_improve targets (their output is a run on an existing issue, not a
+// proposal) with the 422-class status D6 requires.
+func TestValidateScheduleConfigOutputMode(t *testing.T) {
+	// A valid mode on a prompt target is accepted and preserved.
+	for _, mode := range []string{"mr", "issues"} {
+		if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+			Target: "prompt", Prompt: "do the thing", OutputMode: sptr(mode), Timing: "recurring", CronExpr: "0 9 * * 1",
+		}, fixedNow, false); status != 0 || n.OutputMode == nil || *n.OutputMode != mode {
+			t.Fatalf("output_mode %q on prompt: status=%d output=%v, want status 0 and preserved value", mode, status, n.OutputMode)
+		}
+	}
+
+	// An omitted output_mode on a prompt is fine (inherits the catalog default at fire time).
+	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "prompt", Prompt: "do the thing", Timing: "recurring", CronExpr: "0 9 * * 1",
+	}, fixedNow, false); status != 0 || n.OutputMode != nil {
+		t.Fatalf("omitted output_mode on prompt: status=%d output=%v, want status 0 and nil", status, n.OutputMode)
+	}
+
+	// A blank/whitespace output_mode on a prompt normalizes to nil (inherit), status 0.
+	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "prompt", Prompt: "do the thing", OutputMode: sptr("  \n\t "), Timing: "recurring", CronExpr: "0 9 * * 1",
+	}, fixedNow, false); status != 0 || n.OutputMode != nil {
+		t.Fatalf("blank output_mode on prompt: status=%d output=%v, want status 0 and nil", status, n.OutputMode)
+	}
+
+	// An invalid enum value on a prompt is a 400.
+	if _, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "prompt", Prompt: "do the thing", OutputMode: sptr("both"), Timing: "recurring", CronExpr: "0 9 * * 1",
+	}, fixedNow, false); status != http.StatusBadRequest {
+		t.Fatalf("invalid output_mode on prompt: status=%d, want 400", status)
+	}
+
+	// output_mode on a non-prompt target is a 422 (prompt-only, D6).
+	for _, tc := range []struct {
+		name string
+		req  apitypes.ScheduleRequest
+	}{
+		{"issue", apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), OutputMode: sptr("issues"), Timing: "recurring", CronExpr: "0 2 * * *"}},
+		{"sweep", apitypes.ScheduleRequest{Target: "sweep", OutputMode: sptr("mr"), Timing: "recurring", CronExpr: "0 9 * * 1"}},
+	} {
+		if _, status, _ := validateScheduleConfig(tc.req, fixedNow, false); status != http.StatusUnprocessableEntity {
+			t.Fatalf("output_mode on %s target: status=%d, want 422", tc.name, status)
+		}
+	}
+}
