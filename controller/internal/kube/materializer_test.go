@@ -1405,6 +1405,56 @@ func TestNixSizeEqualOrGreaterIsNeverRecycled(t *testing.T) {
 	}
 }
 
+// Guard-equality gap: a worker whose nix PVC is LIVE at EXACTLY the desired size (20Gi)
+// but whose Deployment is ABSENT — reachable after a transient Deployment-create failure
+// (PVCs created, the Deployment create errored, next tick must retry) — must still get
+// its Deployment created. The create-gate's nixLiveAtSize check uses Cmp(...) >= 0
+// specifically so equality does NOT suppress the create; only a nix PVC that is NOT YET
+// live at the desired size (Terminating, or mid-recycle — T2) suppresses it.
+//
+// Positive control: mutate the guard's `nixLiveAtSize := ... Cmp(spec.NixSize) >= 0` to
+// `> 0` and this test goes RED — the Deployment is never created, permanently stranding
+// a worker whose nix PVC sits exactly at spec.NixSize.
+func TestNixLiveAtDesiredSizeWithoutDeploymentRecreatesDeployment(t *testing.T) {
+	ctx := context.Background()
+	ns := testConfig().Namespace
+	// No Deployment; nix PVC LIVE (not Terminating) at exactly the desired 20Gi; data intact.
+	m, client := newMat(t, pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("Observe = %+v, want one worker", observed)
+	}
+	o := observed[0]
+	if o.HasDeployment || !o.HasNixPVC || !o.HasDataPVC || o.NixPVCSize == nil || o.NixPVCSize.Cmp(resource.MustParse("20Gi")) != 0 {
+		t.Fatalf("observed = %+v; want {HasDeployment:false HasNixPVC:true HasDataPVC:true NixPVCSize:20Gi (live)}", o)
+	}
+
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, JoinToken: nil}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if got := createdDeploymentNames(client); !equalStrings(got, []string{"uzi-hw-w1"}) {
+		t.Fatalf("deployment creates = %v, want exactly [uzi-hw-w1]; the guard must NOT suppress at equality", got)
+	}
+	if _, err := client.AppsV1().Deployments(ns).Get(ctx, "uzi-hw-w1", metav1.GetOptions{}); err != nil {
+		t.Errorf("the Deployment must be created when the nix PVC is live at exactly the desired size: %v", err)
+	}
+	// Not a size-drift case (Cmp==0, not <0): no recycle delete.
+	if got := deletedSet(client); len(got) != 0 {
+		t.Fatalf("unexpected deletes %v; a nix PVC live at exactly the desired size is not size-drift", keysOf(got))
+	}
+	// HasNixPVC is true, so the create-gate must skip re-issuing the nix PVC create.
+	if got := pvcCreateNames(t, client); len(got) != 0 {
+		t.Fatalf("unexpected pvc creates %v; HasNixPVC true must gate the create", got)
+	}
+	assertNoSecretReads(t, client)
+}
+
 // T4: the recycle honors the SAME busy-guard as the roll path. A busy worker (not yet
 // draining, a generous 24h deadline, no force-roll) whose /nix is undersized is cordoned
 // and DEFERRED — its Deployment and PVC are NOT torn out from under a live run.
