@@ -132,6 +132,84 @@ export interface SignalServerOptions {
   reportOnly?: boolean;
 }
 
+/** The terse ack object each signalling tool returns to the model. The AUTHORITATIVE
+ *  capture is the worker observing the tool_use in scanSignals; these handler returns
+ *  are only guidance. `type: "text"` is a literal so the shape stays assignable to the
+ *  SDK tool() callback's result type when the handler is wrapped separately. */
+type SignalAck = { content: Array<{ type: "text"; text: string }> };
+
+/** The raw signalling tool handlers (mirrors makeMemoryToolHandlers /
+ *  makeFindingsToolHandlers). Each handler takes no arguments and returns a fixed ack —
+ *  the workflow is driven by scanSignals observing the tool_use, not by these returns.
+ *  ALL five are always built; buildSignalMcpServer decides which to REGISTER based on
+ *  the conditional gating in opts, so the ack text/timing stays identical whether or not
+ *  a tool is exposed.
+ *
+ *  Module-private (not exported): the test suite reaches these handlers through the
+ *  built server's `_registeredTools`, and no other module imports the factory, so
+ *  exporting it would trip the knip `exports` gate (its `ignoreExportsUsedInFile` covers
+ *  only interfaces/types, not functions). The split is achieved either way. */
+function makeSignalToolHandlers(): {
+  submitPlan(): Promise<SignalAck>;
+  askUser(): Promise<SignalAck>;
+  signalDone(): Promise<SignalAck>;
+  reportProgress(): Promise<SignalAck>;
+  checkpoint(): Promise<SignalAck>;
+} {
+  return {
+    async submitPlan() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Plan submitted for human approval. Stop now and end your turn — do not implement until you are re-prompted with the approval.",
+          },
+        ],
+      };
+    },
+    async askUser() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Question sent to the human. Stop now and end your turn — their answer will arrive as a new message.",
+          },
+        ],
+      };
+    },
+    async signalDone() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Completion recorded. The worker will finalize the run — pushing the branch and opening the merge request, unless you set report_only, in which case it records your summary and transcript and opens no merge request. End your turn.",
+          },
+        ],
+      };
+    },
+    async reportProgress() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Progress recorded. Keep working — this did not end your turn.",
+          },
+        ],
+      };
+    },
+    async checkpoint() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Checkpoint saved. Stop now and end your turn.",
+          },
+        ],
+      };
+    },
+  };
+}
+
 /**
  * Build the in-process MCP server exposing the two signalling tools. Passed to
  * the SDK via `options.mcpServers`. The handlers return terse guidance; the
@@ -234,6 +312,7 @@ export function buildSignalMcpServer(
           "Omit it entirely for small single-unit work.",
       );
   }
+  const h = makeSignalToolHandlers();
   return createSdkMcpServer({
     name: SIGNAL_SERVER_NAME,
     version: "1.0.0",
@@ -242,14 +321,7 @@ export function buildSignalMcpServer(
         SUBMIT_PLAN_TOOL,
         "Submit your implementation plan for human approval. Call this EXACTLY ONCE when the plan is ready, then STOP and end your turn — do not begin implementing. A human approves or rejects the plan out of band; you will be re-prompted to implement only after approval. Pass the plan as the 'plan_md' argument (Markdown).",
         planShape,
-        async () => ({
-          content: [
-            {
-              type: "text",
-              text: "Plan submitted for human approval. Stop now and end your turn — do not implement until you are re-prompted with the approval.",
-            },
-          ],
-        }),
+        () => h.submitPlan(),
       ),
       tool(
         ASK_USER_TOOL,
@@ -296,27 +368,13 @@ export function buildSignalMcpServer(
               "The questions to ask. Keep the list short and each question self-contained.",
             ),
         },
-        async () => ({
-          content: [
-            {
-              type: "text",
-              text: "Question sent to the human. Stop now and end your turn — their answer will arrive as a new message.",
-            },
-          ],
-        }),
+        () => h.askUser(),
       ),
       tool(
         SIGNAL_DONE_TOOL,
         "Signal that the implementation is complete and has passed review. Call this once — and only once — the work is committed locally and the reviewer is satisfied. The worker then finalizes the run — pushing the branch and opening the merge request, UNLESS you set report_only, in which case it records your summary and transcript and opens no merge request; you never push.",
         doneShape,
-        async () => ({
-          content: [
-            {
-              type: "text",
-              text: "Completion recorded. The worker will finalize the run — pushing the branch and opening the merge request, unless you set report_only, in which case it records your summary and transcript and opens no merge request. End your turn.",
-            },
-          ],
-        }),
+        () => h.signalDone(),
       ),
       // PRD #122 M2. Issue runs only (opts.progress, gated on kind==="issue"). Unlike
       // submit_plan/signal_done, this does NOT end the turn — it is a pure progress
@@ -343,14 +401,7 @@ export function buildSignalMcpServer(
                   .default([])
                   .describe("Milestone ids currently being worked on (a snapshot, replaced each call)."),
               },
-              async () => ({
-                content: [
-                  {
-                    type: "text",
-                    text: "Progress recorded. Keep working — this did not end your turn.",
-                  },
-                ],
-              }),
+              () => h.reportProgress(),
             ),
           ]
         : []),
@@ -370,14 +421,7 @@ export function buildSignalMcpServer(
                 "re-prompted to continue with the next milestone. This is a durability checkpoint, NOT a quality gate: " +
                 "it does not run tests or verify that review passed.",
               {},
-              async () => ({
-                content: [
-                  {
-                    type: "text",
-                    text: "Checkpoint saved. Stop now and end your turn.",
-                  },
-                ],
-              }),
+              () => h.checkpoint(),
             ),
           ]
         : []),
