@@ -167,9 +167,7 @@ func TestTUIDetailMilestoneRowBlinkAlternates(t *testing.T) {
 	run := milestoneDetailRun("77777777-2222", 1, "m2") // m1 done, m2 in progress, m3 not started
 	render := func(on bool) string {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
-		next, _ := m.Update(detailLoadedMsg{run: run,
-			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
-		m = next.(tuiModel)
+		m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
 		m.blinkOn = on
 		return m.View().Content
 	}
@@ -199,9 +197,7 @@ func TestTUIDetailMilestoneRowAsciiShape(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
 	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	m = next.(tuiModel)
-	next, _ = m.Update(detailLoadedMsg{run: run,
-		msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
-	m = next.(tuiModel)
+	m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
 	// blinkOn defaults false → the static/presence frame; Ascii strips colour, so only shape carries state.
 	out := stripANSI(m.View().Content)
 	if !strings.Contains(out, "◐") {
@@ -226,9 +222,7 @@ func TestTUIDetailMilestoneRowTerminalStaysStatic(t *testing.T) {
 	run := milestoneDetailRun("77777777-4444", 1, "m2")
 	run.Status = "completed" // terminal — the in-progress snapshot is stale (run.go terminalRunStatuses)
 	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
-	next, _ := m.Update(detailLoadedMsg{run: run,
-		msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
-	m = next.(tuiModel)
+	m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
 	m.blinkOn = true // the phase that would expose a bare ○ if the row weren't gated on !terminal
 	out := m.View().Content
 	pal := newPalette(true)
