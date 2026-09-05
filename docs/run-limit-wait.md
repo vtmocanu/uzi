@@ -28,8 +28,10 @@ Starting a run by hand stays one click and inherits the Settings default; there'
   `⏸️ Paused · usage limit` reply when it parks, and a `▶️ Resumed · usage
   limit cleared` reply the first time it's working again — the resume
   carrying how long it waited and, from the second pause on, the pause
-  count. (A Slack *edit* raises no notification, which is why the resume is
-  a fresh reply, not the root line quietly flipping back to running.)
+  count. If it comes back straight into the plan gate, a question, or a
+  finished state, that reply carries the news and no separate resume reply
+  is posted. (A Slack *edit* raises no notification, which is why the resume
+  is a fresh reply, not the root line quietly flipping back to running.)
 
 The run's status stays visibly "waiting" the whole time — never "stalled" — and it is never killed by its own run timeout while paused.
 

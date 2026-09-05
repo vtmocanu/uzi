@@ -207,8 +207,11 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   the same message, carrying how long it waited and — from the second pause
   on — the pause count. A Slack *edit* raises no notification, so the resume
   is a new reply rather than just the root line flipping back to `▶️ Running`.
-  One pause episode is one pause reply plus one resume reply (bounded by the
-  per-run retry cap).
+  The separate resume reply is posted only when the run goes back to
+  `running`; if it comes back straight into the plan gate, a question, or a
+  finished state, that reply carries the news and no resume reply is added.
+  So one pause episode is at most one pause reply plus one resume reply
+  (bounded by the per-run retry cap).
 - **Scope-capped completions** (PRD #634): if you or a teammate stopped or
   narrowed a milestone-structured issue run's scope from the CLI or web (`uzi
   run stop` / `uzi run scope --through N` — see [Stopping or narrowing a
