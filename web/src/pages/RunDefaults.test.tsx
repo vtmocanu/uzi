@@ -624,9 +624,10 @@ describe("Run defaults — early-limit-reset alert (PRD #1020 M5)", () => {
   });
 });
 
-// Issue #916 M4: the per-user AI-attribution opt-out. DEFAULT ON (opt-out), the
-// OPPOSITE of ci_autofix — so a field-absent user renders CHECKED, and the copy must
-// describe the commit trailer, never the MR description.
+// Issue #916 M4: the per-user AI-attribution opt-out. DEFAULT ON (opt-out) — so a
+// field-absent user renders CHECKED, and the copy must describe the commit trailer,
+// never the MR description. (Post-PRD-#914-M3 ci_autofix is likewise default-on when
+// its value is absent/null, so this is no longer the opposite of ci_autofix.)
 describe("Run defaults — AI attribution opt-out (issue #916 M4)", () => {
   const attributionToggle = () =>
     screen.getByLabelText(
@@ -725,5 +726,50 @@ describe("Run defaults — AI attribution opt-out (issue #916 M4)", () => {
 
     expect(await screen.findByText("internal error")).toBeTruthy();
     expect(attributionToggle().disabled).toBe(false);
+  });
+});
+
+// PRD #914 M2/M3: the per-user CI-autofix opt-in is now TRI-STATE (boolean | null).
+// The DISPLAY collapses inherit (null) and explicit true to CHECKED, and only an
+// explicit false to UNCHECKED — checked={user?.ci_autofix_enabled !== false}. The null
+// (inherit) branch was previously untested (every fixture pinned false), so a `?? false`
+// or plain-bool display would render null as UNCHECKED and still pass the old suite; the
+// null→CHECKED assertion below is what pins the tri-state semantics.
+describe("Run defaults — CI autofix tri-state display (PRD #914 M3)", () => {
+  const ciAutofixToggle = () =>
+    screen.getByLabelText(
+      "Automatically fix my failed CI pipelines",
+    ) as HTMLInputElement;
+
+  it("renders CHECKED when ci_autofix_enabled is null (inherit → on)", () => {
+    mockAuth({ ...baseUser, ci_autofix_enabled: null });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    // Under the old `?? false` display this would be UNCHECKED; the tri-state
+    // `!== false` renders inherit as on.
+    expect(ciAutofixToggle().checked).toBe(true);
+  });
+
+  it("renders CHECKED when ci_autofix_enabled is true", () => {
+    mockAuth({ ...baseUser, ci_autofix_enabled: true });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(ciAutofixToggle().checked).toBe(true);
+  });
+
+  it("renders UNCHECKED when ci_autofix_enabled is explicitly false", () => {
+    mockAuth({ ...baseUser, ci_autofix_enabled: false });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(ciAutofixToggle().checked).toBe(false);
   });
 });

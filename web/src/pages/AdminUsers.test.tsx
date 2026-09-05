@@ -129,6 +129,35 @@ describe("AdminUsers judge enforced mode (PRD #69 M4)", () => {
   });
 });
 
+// PRD #914 M2/M3: the admin CI-autofix column is now tri-state (boolean | null). A null
+// (inherit) user collapses to On/Disable, exactly as an explicit true does; only an
+// explicit false shows Off/Enable. Every existing fixture pins false, so this null→On
+// flip was untested — a plain-bool / `?? false` read would render null as Off/Enable and
+// still pass the old suite, so this test is what pins the inherit-renders-on semantics.
+describe("AdminUsers CI autofix tri-state display (PRD #914 M3)", () => {
+  it("shows a null (inherit) user's CI-autofix badge as On and the action as Disable", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser({ ci_autofix_enabled: null })] });
+
+    render(
+      <MemoryRouter>
+        <AdminUsers />
+      </MemoryRouter>,
+    );
+
+    const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
+    // CI autofix is cell index 5 (0 Email, 1 Name, 2 Role, 3 Status, 4 Judge, 5 CI
+    // autofix, 6 Last login, 7 Action). Scope to it so the Judge column's own On/Off
+    // badge and Enable/Disable button don't collide.
+    const ciCell = () => within(within(row).getAllByRole("cell")[5]);
+    // Inherit (null) collapses to On/Disable, NOT Off/Enable — a `?? false` or
+    // plain-bool read would show Off/Enable here.
+    expect(ciCell().getByText("On")).toBeTruthy();
+    expect(ciCell().getByText("Disable")).toBeTruthy();
+    expect(ciCell().queryByText("Off")).toBeNull();
+    expect(ciCell().queryByText("Enable")).toBeNull();
+  });
+});
+
 describe("AdminUsers name fallback (PRD #54)", () => {
   it("renders an em-dash for an empty-string display_name (?? missed it)", async () => {
     mockApi.listUsers.mockResolvedValue({ users: [aUser({ display_name: "" })] });

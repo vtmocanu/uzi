@@ -420,10 +420,12 @@ issue runs open:
   schedule's runs. See [that page's Enablement
   section](./mr-review-watcher.md#enablement) for the full resolution order.
 - **[Automatic CI fixes](./ci-autofix.md)** react to a failed head pipeline on a
-  scheduled-run MR branch. This lane stays **opt-in, off by default**, on the
-  same account-wide **Settings → Automatic CI fixes** toggle your issue runs use
-  — a scheduled run inherits the owner's opt-in; there is no separate
-  per-schedule switch for it.
+  scheduled-run MR branch. This lane is **on by default**, on the same
+  account-wide **Settings → Automatic CI fixes** toggle your issue runs use —
+  a scheduled run inherits the owner's setting; there is no separate
+  per-schedule switch for it. An instance-wide admin kill-switch can turn it
+  off for everyone regardless of any owner's own setting; see [Automatic CI
+  fixes](./ci-autofix.md#1-opt-in) for both.
 
 Both lanes act only on a **still-open** MR and spend the schedule owner's own
 Anthropic token, the same as any other run. A prompt schedule's MR has no
