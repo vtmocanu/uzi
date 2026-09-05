@@ -31,7 +31,7 @@ func TestTUIBoardPollDerivesShortDeadline(t *testing.T) {
 
 	before := time.Now()
 	// Execute the board fetch closure directly; this is what hands the fake its ctx.
-	msg := m.fetchRunsCmd(false)()
+	msg := m.fetchRunsCmd(false, 0)()
 	if _, ok := msg.(boardRunsMsg); !ok {
 		t.Fatalf("fetchRunsCmd produced %T, want boardRunsMsg", msg)
 	}
@@ -74,7 +74,7 @@ func TestTUIDetailMetaPollDerivesShortDeadline(t *testing.T) {
 	m := tuiTestModel(t, fake, runID)
 
 	before := time.Now()
-	msg := m.refreshRunMetaCmd(runID)()
+	msg := m.refreshRunMetaCmd(runID, 0)()
 	if _, ok := msg.(detailMetaMsg); !ok {
 		t.Fatalf("refreshRunMetaCmd produced %T, want detailMetaMsg", msg)
 	}

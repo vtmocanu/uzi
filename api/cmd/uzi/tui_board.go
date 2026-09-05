@@ -25,12 +25,26 @@ type boardState struct {
 	admin       bool
 	adminDenied bool
 
-	// boardInFlight marks a periodic board ListRuns poll as pending (PRD #1130 M1 D1):
-	// a boardTickMsg skips issuing a new fetch while it is set, so a slow link cannot
-	// stack overlapping requests. It is cleared in the boardRunsMsg case on EVERY reply
-	// (D2 — not behind apply's admin-mismatch early return, so a mid-flight admin toggle
-	// cannot latch it). User-initiated r/a fetches set it but are never gated on it.
-	boardInFlight bool
+	// reqSeq / waitID / tickGen implement the request-generation guard (PRD #1130 M1 D2).
+	//
+	// reqSeq is the monotonic id minted for each board fetch (startBoardReq bumps it). waitID
+	// is the id of the request the model is currently waiting on: waitID == 0 means idle, and a
+	// boardTickMsg issues a new periodic poll ONLY while idle — that is the in-flight guard. A
+	// boardRunsMsg is honoured only when its reqID == waitID, so an older reply that resolves
+	// after a newer request was minted (bubbletea delivers replies in completion order, not
+	// request order) is dropped instead of clearing the newer request's guard — the
+	// out-of-order defence. User r/a and exit-to-board go through startBoardReq too: they mint
+	// a fresh id (so they are never gated) and, because that id becomes the new waitID, any
+	// periodic reply still in flight is superseded rather than mistaken for theirs.
+	//
+	// tickGen is the tick-chain generation. The reply re-arms the next tick and bumps tickGen;
+	// a boardTickMsg whose gen != tickGen belongs to a superseded chain (e.g. a tick left
+	// pending when a manual refresh reply already re-armed) and is dropped, so exactly one tick
+	// chain is live. newTUIModel seeds all three to count the Init fetch as in flight (reqSeq
+	// 1 / waitID 1 / tickGen 1).
+	reqSeq  uint64
+	waitID  uint64
+	tickGen uint64
 
 	// errStreak is the consecutive-failure counter driving the tick backoff (PRD #1130 M3 D4):
 	// each consecutive failed board poll widens the reschedule interval via boardTickInterval,
@@ -229,19 +243,20 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case keyRefresh:
 		// User-initiated fetch (PRD #1130 M1 D1): NEVER gated on the in-flight guard — a
-		// keypress is intent and always issues a fetch. It sets the marker so the next
-		// periodic tick does not stack a second poll on top of this one; the reply clears it.
-		m.board.boardInFlight = true
-		return m, tea.Batch(m.fetchRunsCmd(m.board.admin), m.fetchRateLimitsCmd(), m.fetchSettingsCmd())
+		// keypress is intent and always issues a fetch. startBoardReq mints a fresh id that
+		// becomes the new waitID, so the next periodic tick does not stack a second poll on top
+		// of this one and any periodic reply still in flight is superseded (its stale reqID is
+		// dropped); this reply's own reqID clears the guard.
+		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchSettingsCmd())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
 		m.board.cursor = 0
 		m.board.scroll = 0
-		// Same as keyRefresh (D1): always fetch, and set the marker so the next tick does not
-		// stack. The subsequent boardRunsMsg for the new admin value clears it in that case.
-		m.board.boardInFlight = true
-		return m, m.fetchRunsCmd(m.board.admin)
+		// Same as keyRefresh (D1): always fetch, minting a fresh id via startBoardReq so the next
+		// tick does not stack and any pre-toggle periodic reply is superseded. The subsequent
+		// boardRunsMsg for the new admin value carries the matching reqID and clears the guard.
+		return m, (&m).startBoardReq()
 	case keyHideDone:
 		// No-op on the admin board: AdminListRuns already returns non-terminal runs only, so
 		// hiding "finished" runs would change no rows — flipping the label there reads as a

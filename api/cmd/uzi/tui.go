@@ -68,9 +68,18 @@ type boardRunsMsg struct {
 	runs  []apitypes.RunListItemDTO
 	admin bool
 	err   error
+	// reqID is the request-generation id this reply belongs to (PRD #1130 M1 D2). The board
+	// honours it only when reqID == m.board.waitID, so an older reply that resolves after a
+	// newer request was minted (bubbletea runs each Cmd in its own goroutine and delivers in
+	// completion order) is dropped instead of clearing the newer request's guard.
+	reqID uint64
 }
 
-type boardTickMsg struct{}
+// boardTickMsg carries the tick-chain generation it was scheduled under (PRD #1130 M1). A tick
+// whose gen != m.board.tickGen belongs to a superseded chain (a manual/admin refresh or a
+// reply-driven reschedule bumped the generation) and is dropped, so only one tick chain is ever
+// live at once.
+type boardTickMsg struct{ gen uint64 }
 
 // stripTickMsg fires on the 60s rateLimitPollInterval to refresh the rate-limit strip's
 // meters + settings, independently of the 2s boardTickMsg runs cadence.
@@ -155,6 +164,11 @@ type detailMetaMsg struct {
 	runID string
 	run   apitypes.RunDTO
 	err   error
+	// reqID is the per-run request-generation id this reply belongs to (PRD #1130 M1 D2). The
+	// detail honours it only when reqID == m.detail.metaWaitID AND runID matches the current
+	// run, so a stale/superseded meta poll cannot clear a newer poll's guard. metaSeq restarts
+	// per run (newDetailState), which is safe because the case checks runID first.
+	reqID uint64
 }
 
 // ---- model ----------------------------------------------------------------
@@ -251,6 +265,14 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	}
 	m.renderer, _ = newTUIRenderer(m.width, m.dark)
 	m.board = newBoardState()
+	// Seed the Init board request as already in flight (PRD #1130 M1 D2): initCmds issues the
+	// first fetchRunsCmd tagged with reqID 1, so its reply carries reqID 1 and clears the guard.
+	// The tick chain starts at generation 1 too, so the Init tick (armed with tickGen 1) is
+	// honoured. Without this, the first periodic tick would stack a second board poll on top of
+	// the Init fetch, and an out-of-order Init reply could clear a newer request's guard.
+	m.board.reqSeq = 1
+	m.board.waitID = 1
+	m.board.tickGen = 1
 	if startRun != "" {
 		m.view = viewDetail
 		m.detail = newDetailState(startRun)
@@ -265,8 +287,8 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 // tea.BackgroundColorMsg handler in Update that flips m.dark and rebuilds the palette —
 // so a light terminal actually gets the light theme instead of the dark default.
 func (m tuiModel) initCmds() []tea.Cmd {
-	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), m.fetchSecretsCmd(),
-		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickCmd(), stripTickCmd(),
+	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin, m.board.waitID), m.fetchSecretsCmd(),
+		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
 		tea.RequestBackgroundColor}
 	if m.skewCheck {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
@@ -279,14 +301,13 @@ func (m tuiModel) initCmds() []tea.Cmd {
 
 func (m tuiModel) Init() tea.Cmd { return tea.Batch(m.initCmds()...) }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(boardPollInterval, func(time.Time) tea.Msg { return boardTickMsg{} })
-}
-
-// tickAfter re-arms the board tick after an explicit delay, used by the backoff reschedule so a
-// confirmed-bad link is polled at boardTickInterval(streak) rather than the flat 2s cadence.
-func tickAfter(d time.Duration) tea.Cmd {
-	return tea.Tick(d, func(time.Time) tea.Msg { return boardTickMsg{} })
+// tickAfter arms the board tick after delay d, stamping the produced boardTickMsg with the
+// tick-chain generation gen. The reply owns rescheduling (boardRunsMsg re-arms with the
+// post-reply streak via boardTickInterval), so a confirmed-bad link is polled at the backed-off
+// cadence rather than the flat 2s one; gen lets the model drop a tick from a superseded chain
+// (a manual/admin refresh or a reply-driven reschedule bumps tickGen).
+func tickAfter(d time.Duration, gen uint64) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg { return boardTickMsg{gen: gen} })
 }
 
 // boardTickInterval maps the consecutive board-poll error streak to the reschedule
@@ -358,7 +379,7 @@ func (m *tuiModel) maybeArmBlink() tea.Cmd {
 	return blinkCmd()
 }
 
-func (m tuiModel) fetchRunsCmd(admin bool) tea.Cmd {
+func (m tuiModel) fetchRunsCmd(admin bool, reqID uint64) tea.Cmd {
 	c, parent := m.client, m.ctx
 	return func() tea.Msg {
 		// Per-poll deadline (PRD #1130 D3): a stalled poll fails within boardPollTimeout
@@ -373,8 +394,29 @@ func (m tuiModel) fetchRunsCmd(admin bool) tea.Cmd {
 		} else {
 			runs, err = c.ListRuns(ctx)
 		}
-		return boardRunsMsg{runs: runs, admin: admin, err: err}
+		return boardRunsMsg{runs: runs, admin: admin, err: err, reqID: reqID}
 	}
+}
+
+// startBoardReq mints the next board request id, records it as the one the model is waiting on,
+// and returns the tagged fetch. It centralizes the "every board fetch is id-tagged and supersedes
+// any older outstanding request" invariant (PRD #1130 M1 D2): the periodic tick, manual r, admin
+// toggle and exit-to-board all go through it, so a reply is honoured only when its reqID matches
+// the latest waitID and an out-of-order older reply can never clear a newer request's guard.
+func (m *tuiModel) startBoardReq() tea.Cmd {
+	m.board.reqSeq++
+	m.board.waitID = m.board.reqSeq
+	return m.fetchRunsCmd(m.board.admin, m.board.waitID)
+}
+
+// startDetailMetaReq is the detail-meta analogue of startBoardReq: it mints the next per-run
+// meta request id, records it as the one the detail is waiting on, and returns the tagged
+// refresh. Same invariant — every meta fetch is id-tagged and supersedes any older outstanding
+// meta poll — so an out-of-order reply cannot clear a newer poll's guard.
+func (m *tuiModel) startDetailMetaReq() tea.Cmd {
+	m.detail.metaSeq++
+	m.detail.metaWaitID = m.detail.metaSeq
+	return m.refreshRunMetaCmd(m.detail.runID, m.detail.metaWaitID)
 }
 
 // fetchSecretsCmd reads the viewer's Anthropic tokens once so the board can gate the
@@ -435,7 +477,7 @@ func (m tuiModel) loadDetailCmd(runID string) tea.Cmd {
 // refreshRunMetaCmd re-reads only the run DTO (no transcript replay), so the periodic
 // detail refresh is cheap: the socket already carries the frames, this just refreshes the
 // milestone / health / duration fields the stream does not send.
-func (m tuiModel) refreshRunMetaCmd(runID string) tea.Cmd {
+func (m tuiModel) refreshRunMetaCmd(runID string, reqID uint64) tea.Cmd {
 	c, parent := m.client, m.ctx
 	return func() tea.Msg {
 		// Per-poll deadline (PRD #1130 D3): same short bound as the board poll, derived
@@ -443,7 +485,7 @@ func (m tuiModel) refreshRunMetaCmd(runID string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
 		defer cancel()
 		run, err := c.GetRun(ctx, runID)
-		return detailMetaMsg{runID: runID, run: run, err: err}
+		return detailMetaMsg{runID: runID, run: run, err: err, reqID: reqID}
 	}
 }
 
@@ -508,30 +550,35 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(keyString(msg))
 
 	case boardTickMsg:
-		if m.quitting {
-			return m, tickCmd()
+		// Drop a tick from a superseded chain (PRD #1130 M1): a manual/admin refresh or a
+		// reply-driven reschedule bumps m.board.tickGen, leaving any tick already pending under
+		// the old generation stale. Honouring it would run two overlapping tick chains.
+		if msg.gen != m.board.tickGen {
+			return m, nil
 		}
-		// The in-flight guard (PRD #1130 M1 D1): a periodic tick never starts a new board
-		// poll while one is still pending, so a link where a ListRuns takes longer than the
-		// 2s cadence cannot pile up overlapping concurrent requests. The pending poll's reply
-		// clears the marker (boardRunsMsg case). The tick is ALWAYS re-armed regardless.
-		//
-		// Error backoff (PRD #1130 M3 D4): the reschedule interval widens with the consecutive
-		// error streak (boardTickInterval), so a confirmed-bad link is not hammered at the full
-		// 2s cadence; the first success resets the streak, snapping the cadence back to base.
-		cmds := []tea.Cmd{tickAfter(boardTickInterval(m.board.errStreak))}
-		if !m.board.boardInFlight {
-			m.board.boardInFlight = true
-			cmds = append(cmds, m.fetchRunsCmd(m.board.admin))
+		// Stop polling at teardown: no re-arm, so the tick chain lapses (the reply owns
+		// rescheduling, and there is no reply to come once we are quitting).
+		if m.quitting {
+			return m, nil
+		}
+		// The in-flight guard (PRD #1130 M1 D1): a periodic tick starts a new board poll ONLY
+		// when none is outstanding (waitID == 0), so a link where a ListRuns takes longer than
+		// the 2s cadence cannot pile up overlapping concurrent requests. This case NO LONGER
+		// re-arms the tick — rescheduling moved to boardRunsMsg, which re-arms using the
+		// post-reply error streak (so the first retry after a failure uses the backed-off
+		// interval, not the stale pre-failure one) and bumps tickGen to supersede any tick a
+		// manual/admin refresh left pending.
+		var cmds []tea.Cmd
+		if m.board.waitID == 0 {
+			cmds = append(cmds, (&m).startBoardReq())
 		}
 		// Keep the drilled-in run's non-streamed fields (milestones, health, duration) fresh
-		// on the same 2s cadence the board polls at: the live socket carries transcript frames
-		// and status only. Skipped while the D8 fallback (pollFallbackMsg) is already reloading
-		// the whole DTO every 2s, so the two never double up — and guarded by its own in-flight
-		// marker so a slow meta poll does not stack either.
-		if m.view == viewDetail && !m.detail.polling && m.detail.run.ID != "" && !m.detail.metaInFlight {
-			m.detail.metaInFlight = true
-			cmds = append(cmds, m.refreshRunMetaCmd(m.detail.runID))
+		// on the same cadence the board polls at: the live socket carries transcript frames and
+		// status only. Skipped while the D8 fallback (pollFallbackMsg) is already reloading the
+		// whole DTO every 2s, so the two never double up — and guarded by its own request id so
+		// a slow meta poll does not stack either.
+		if m.view == viewDetail && !m.detail.polling && m.detail.run.ID != "" && m.detail.metaWaitID == 0 {
+			cmds = append(cmds, (&m).startDetailMetaReq())
 		}
 		return m, tea.Batch(cmds...)
 
@@ -548,15 +595,22 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchBuildInfoCmd(), skewTickCmd())
 
 	case boardRunsMsg:
-		// Clear the in-flight guard on EVERY board reply (PRD #1130 M1 D2), independently of
-		// apply — which early-returns on an admin/own-runs mismatch (tui_board.go). A clear
-		// placed behind that early return would leave the marker latched on a mid-flight admin
-		// toggle, wedging the periodic poll.
-		m.board.boardInFlight = false
+		// Drop a stale/out-of-order reply (PRD #1130 M1 D2): bubbletea runs each Cmd in its own
+		// goroutine and delivers in completion order, so an older board poll can resolve after a
+		// newer request was minted. Honour only the reply whose reqID matches the request we are
+		// waiting on — do not clear the guard, do not apply, do not reschedule for any other.
+		if msg.reqID != m.board.waitID {
+			return m, nil
+		}
+		m.board.waitID = 0
 		m.board.apply(msg)
-		// A refresh that first reveals a visible in-progress run arms the blink; blinkArmed
-		// keeps a later refresh from stacking a second tick.
-		return m, m.maybeArmBlink()
+		// Reschedule the tick HERE, after apply updated errStreak (PRD #1130 M3): this is what
+		// makes the first retry after a failed poll use the backed-off interval
+		// (boardTickInterval of the fresh streak) rather than the stale pre-failure one. Bump
+		// tickGen first so this new chain supersedes any tick a manual/admin refresh left
+		// pending — only one tick chain stays live.
+		m.board.tickGen++
+		return m, tea.Batch(tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen), m.maybeArmBlink())
 
 	case blinkTickMsg:
 		if !m.blinkWanted() {
@@ -617,13 +671,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchInputsCmd(m.detail.runID), m.maybeArmBlink())
 
 	case detailMetaMsg:
-		// Clear the in-flight guard at the TOP of the case, ABOVE the guard (PRD #1130 M1 D2):
-		// this case early-returns on runID-mismatch OR err != nil, and the err branch is exactly
-		// the flaky-connection path this milestone targets. A clear placed after the guard would
-		// leave the marker latched on a failed poll, wedging the detail-meta poll forever.
-		m.detail.metaInFlight = false
-		if msg.runID != m.detail.runID || msg.err != nil {
-			return m, nil
+		// runID is checked FIRST (PRD #1130 M1 D2): metaSeq restarts per run (newDetailState),
+		// so a reply for a run we have navigated away from could otherwise collide with the new
+		// run's id. A run-mismatched reply must never touch the current run's guard.
+		if msg.runID != m.detail.runID {
+			return m, nil // a reply for a run we've navigated away from — never touches the current guard
+		}
+		if msg.reqID != m.detail.metaWaitID {
+			return m, nil // a stale/superseded poll for this run
+		}
+		m.detail.metaWaitID = 0
+		if msg.err != nil {
+			return m, nil // failed poll: guard cleared above so the next tick retries (D2)
 		}
 		m.detail.applyMeta(msg.run)
 		// A poll that first reveals the drilled-in run's in-progress milestone arms the blink.

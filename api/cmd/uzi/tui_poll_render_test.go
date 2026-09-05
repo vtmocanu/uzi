@@ -21,8 +21,9 @@ func TestBoardErrorLineKeepsLastGoodRuns(t *testing.T) {
 	}}
 	m := tuiTestModel(t, fake, "")
 
-	// Populate the board with a successful reply so the run list is rendered (baseline).
-	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	// Populate the board with a successful reply so the run list is rendered (baseline). The reply
+	// must carry the outstanding request's id (the seeded Init poll's waitID) to be honored.
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
 	m = next.(tuiModel)
 
 	baseline := m.View().Content
@@ -35,9 +36,14 @@ func TestBoardErrorLineKeepsLastGoodRuns(t *testing.T) {
 		t.Fatalf("baseline board already shows the error banner before any failed poll\n%s", baseline)
 	}
 
-	// A FAILED board poll: match m.board.admin (default false) so apply does not
-	// early-return on an admin mismatch, and set an error like the bug report's.
-	next, _ = m.Update(boardRunsMsg{admin: m.board.admin, err: errors.New("reading response from uzi: context deadline exceeded")})
+	// Mint a fresh outstanding request (a periodic tick) so the failed reply below has a matching
+	// reqID to be honored on.
+	next, _ = m.Update(boardTickMsg{gen: m.board.tickGen})
+	m = next.(tuiModel)
+
+	// A FAILED board poll: carry the outstanding request's id, match m.board.admin (default false)
+	// so apply does not early-return on an admin mismatch, and set an error like the bug report's.
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, admin: m.board.admin, err: errors.New("reading response from uzi: context deadline exceeded")})
 	m = next.(tuiModel)
 
 	out := m.View().Content

@@ -250,7 +250,7 @@ func boardMeters() []apitypes.TokenRateLimitDTO {
 func boardPopulated(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{Runs: boardRuns(now)}
 	m := uxModel(fake, "", dark)
-	m = step(m, boardRunsMsg{runs: fake.Runs})
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
 	// >1 token so the own board clears the credential gate (PRD #295) and the column renders.
 	m = step(m, secretsMsg{count: 2})
 	// The viewer's own rate-limit meters + the sidebar selection so the rate-limit strip renders
@@ -262,7 +262,7 @@ func boardPopulated(dark bool, now time.Time) string {
 
 func boardEmpty(dark bool) string {
 	m := uxModel(&uzicli.FakeClient{}, "", dark)
-	m = step(m, boardRunsMsg{runs: nil})
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: nil})
 	return m.View().Content
 }
 
@@ -273,7 +273,7 @@ func boardAdmin(dark bool) string {
 	m = key(m, keyAdmin)
 	// The admin factory board ALWAYS shows the credential column (PRD #295), naming which account
 	// each user's run billed — meta / personal labels, drawn muted with no dot.
-	m = step(m, boardRunsMsg{admin: true, runs: []apitypes.RunListItemDTO{
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, admin: true, runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), AnthropicSecretID: sp("sec-meta"), AnthropicSecretLabel: sp("meta"), AnthropicSelectReason: sp("auto")}, OwnerEmail: sp("dana@example.com")},
 		{RunDTO: apitypes.RunDTO{ID: "c3d4e5f6-1111", Kind: "issue", Status: "claimed", IssueTitle: "Refactor the forge sync loop", Health: "stalled", CreatedAt: now.Add(-51 * time.Minute), AnthropicSecretID: sp("sec-personal"), AnthropicSecretLabel: sp("personal"), AnthropicSelectReason: sp("pool_stale")}, OwnerEmail: sp("priya@example.com")},
 		{RunDTO: apitypes.RunDTO{ID: "b2c3d4e5-1111", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "Fix flaky pipeline on main", CreatedAt: now.Add(-2 * time.Minute), AnthropicSecretID: sp("sec-meta"), AnthropicSecretLabel: sp("meta"), AnthropicSelectReason: sp("auto")}, OwnerEmail: sp("sam@example.com")},
@@ -284,7 +284,7 @@ func boardAdmin(dark bool) string {
 func boardFilter(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{Runs: boardRuns(now)}
 	m := uxModel(fake, "", dark)
-	m = step(m, boardRunsMsg{runs: fake.Runs})
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
 	m = key(m, keyFilter)
 	for _, k := range []string{"f", "i", "x"} {
 		m = key(m, k)
@@ -298,7 +298,7 @@ func boardFilter(dark bool, now time.Time) string {
 func boardPlanning(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
-	m = step(m, boardRunsMsg{runs: []apitypes.RunListItemDTO{
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second)}},
 		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}},
 		{RunDTO: apitypes.RunDTO{ID: "c3d4e5f6-1111-2222-3333-444444444444", Kind: "issue", Status: "running", Health: "stalled", IssueTitle: "Refactor the forge sync loop for the GitHub driver", CreatedAt: now.Add(-51 * time.Minute)}},
@@ -313,7 +313,7 @@ func boardPlanning(dark bool, now time.Time) string {
 func boardRevising(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
-	m = step(m, boardRunsMsg{runs: []apitypes.RunListItemDTO{
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "b2c3d4e5-1111-2222-3333-444444444444", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "Fix flaky pipeline on main", CreatedAt: now.Add(-2 * time.Minute)}},
 		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "awaiting_approval", IssueTitle: "Re-plan webhook delivery retries after steer", CreatedAt: now.Add(-90 * time.Second)}, IsRevising: true},
 		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}},
@@ -328,7 +328,7 @@ func boardRevising(dark bool, now time.Time) string {
 func boardMilestones(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
-	m = step(m, boardRunsMsg{runs: []apitypes.RunListItemDTO{
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"}}},
 		{RunDTO: apitypes.RunDTO{ID: "d4e5f6a7-1111", Kind: "issue", Status: "running", IssueTitle: "Port the judge to per-model usage folding", CreatedAt: now.Add(-1 * time.Minute), Milestones: []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}}}, // nil completed ⇒ never reported
 		{RunDTO: apitypes.RunDTO{ID: "c9d0e1f2-1111", Kind: "issue", Status: "running", IssueTitle: "Tighten the retry backoff jitter", CreatedAt: now.Add(-12 * time.Minute)}},                                                                               // no frozen list ⇒ no bar
