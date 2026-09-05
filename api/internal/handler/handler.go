@@ -474,7 +474,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		WaitOnLimit:             u.WaitOnLimit,
 		NotifyEarlyLimitReset:   u.NotifyEarlyLimitReset,
 		JudgeEnabled:            u.JudgeEnabled,
-		CIAutofixEnabled:        u.CiAutofixEnabled,
+		CIAutofixEnabled:        boolPtrValue(u.CiAutofixEnabled),
 		AttributionEnabled:      u.AttributionEnabled,
 		EphemeralWorkersEnabled: u.EphemeralWorkersEnabled,
 		CreatedAt:               u.CreatedAt.Time,
