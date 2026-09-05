@@ -105,8 +105,9 @@ Two things now self-heal without you deleting and re-provisioning by hand:
   bump, like the one above) gets reconciled to the current size automatically.
 - **A volume that fills up** (at or above 90% used, sustained across a couple
   of heartbeats) gets recycled: the worker is drained first if it's busy —
-  same cordon behavior as above — then its disk is deleted and re-provisioned
-  fresh, which re-downloads its tools cache. A worker recycled this way shows
+  same cordon behavior as above — then **both** its volumes are deleted and
+  re-provisioned fresh: the `/nix` tools cache re-downloads, and everything on
+  the `/data` workspace is permanently lost. A worker recycled this way shows
   the same draining/cordoned pills while it happens.
 
 Both are cluster-driven, like cordoning; there's no button for either. An
