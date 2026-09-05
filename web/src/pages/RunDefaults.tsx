@@ -8,6 +8,7 @@
 import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api } from "../lib/api";
+import type { BindMode } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
@@ -15,6 +16,12 @@ import { ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
+
+// The judge picker's "Auto-select from the pool" sentinel — the SAME value
+// WorkersSettings.tsx uses for its worker picker, deliberately a string no
+// user-authored token label can collide with. Module scope, not inside the
+// component, so it is one stable <option> identity rather than a new string per render.
+const AUTO_OPTION = "\u0000auto";
 
 export function RunDefaults() {
   const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel, uziLabel } = useAuth();
@@ -100,14 +107,16 @@ export function RunDefaults() {
     }
   };
 
-  // setJudgeToken points the JUDGE lane at one of the user's tokens, or clears it
-  // back to the default. Separate from the opt-in above so each sends only what it
-  // changes — the whole point of the three-way token field.
-  const setJudgeToken = async (label: string) => {
+  // setJudgeBinding maps the picker choice to the judge lane's (mode, token): the
+  // auto sentinel -> auto (pool), "" -> default, a label -> pinned. Sends the mode
+  // so clearing means "your default token", never the pool (PRD #1140). Separate from
+  // the opt-in above so each sends only what it changes.
+  const setJudgeBinding = async (value: string) => {
     setJudgeError("");
     setJudgeBusy(true);
     try {
-      await api.setJudgeEnabled(user?.judge_enabled ?? false, label === "" ? null : label);
+      const mode: BindMode = value === AUTO_OPTION ? "auto" : value === "" ? "default" : "pinned";
+      await api.setJudgeEnabled(user?.judge_enabled ?? false, mode === "pinned" ? value : null, mode);
       await refresh();
     } catch (err) {
       setJudgeError(errorMessage(err, "Failed to change the judge's token"));
@@ -237,6 +246,11 @@ export function RunDefaults() {
     { fallback: "Failed to load settings" },
   );
   const secrets = data?.secrets ?? [];
+  // How many of the user's tokens are opted into the auto-selection pool. A judge
+  // lane in "auto" with ZERO pooled tokens spends the DEFAULT token (D4), unlike a
+  // worker which holds — so the empty-pool warning below is worded for that fallback.
+  // Derived rather than fetched: auto_eligible already rides SecretMeta.
+  const pooledCount = secrets.filter((s) => s.auto_eligible).length;
 
   const modelWarning = modelFieldWarning(defaultModel);
   const modelDirty = defaultModel.trim() !== savedModel;
@@ -483,30 +497,45 @@ export function RunDefaults() {
           <span className="text-fg">Judge my finished runs</span>
         </label>
 
-        {/* The judge token picker (PRD #104 M4/M6). Without it "the judge lane can
-            burn a different token, set from the web UI" is unreachable, which is
-            why it is required and not a nicety. Shown only with more than one
-            token — with a single credential there is nothing to choose. */}
-        {secrets.length > 1 && (
+        {/* The judge token picker (PRD #104 M4/M6, #1140 M3). Without it "the judge
+            lane can burn a different token, set from the web UI" is unreachable, which
+            is why it is required and not a nicety. Shown with one OR more tokens: with
+            a single token the pool and the default coincide, but the MODE is now worth
+            showing since auto is the default. Hidden only at zero tokens. */}
+        {secrets.length >= 1 && (
           <Field label="Token the judge spends">
             <Select
               aria-label="Token the judge spends"
-              value={user?.judge_anthropic_secret_label ?? ""}
+              // Driven by the MODE first (mirroring the worker picker): an auto judge
+              // lane selects the sentinel, everything else falls back to the label, and
+              // a pinned binding whose token was deleted arrives here as effective mode
+              // "default" with a null label — so it shows "your default token".
+              value={user?.judge_anthropic_bind_mode === "auto" ? AUTO_OPTION : (user?.judge_anthropic_secret_label ?? "")}
               disabled={judgeBusy}
-              onChange={(e) => setJudgeToken(e.target.value)}
+              onChange={(e) => setJudgeBinding(e.target.value)}
             >
               <option value="">your default token</option>
-              {secrets.map((s) => (
-                <option key={s.id} value={s.label}>
-                  {s.label}
-                  {s.is_default ? " (default)" : ""}
-                </option>
-              ))}
+              <option value={AUTO_OPTION}>Auto-select from the pool</option>
+              <optgroup label="Pin to a token">
+                {secrets.map((s) => (
+                  <option key={s.id} value={s.label}>
+                    {s.label}
+                    {s.is_default ? " (default)" : ""}
+                  </option>
+                ))}
+              </optgroup>
             </Select>
             <p className="mt-1.5 text-xs text-faint">
               Retrospectives can bill a different account from the runs they review — point them at
               a cheaper console key while your runs stay on a subscription.
             </p>
+            {/* Empty-pool warning, D4 wording: unlike a worker (which holds), an auto
+                judge lane with an empty pool spends the default token. */}
+            {user?.judge_anthropic_bind_mode === "auto" && pooledCount === 0 && (
+              <p className="mt-1.5 text-xs text-warn">
+                Your pool is empty, so retrospectives spend your default token until you add a token to the pool.
+              </p>
+            )}
           </Field>
         )}
 
