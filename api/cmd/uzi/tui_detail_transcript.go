@@ -35,6 +35,41 @@ import (
 // Every model-authored string is UNTRUSTED and passes through Plain/Markdown (D7); the whole
 // palette stays ANDON's two intensities (tungsten accent over faint body), no per-frame colour.
 func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
+	return flattenBlocks(m.buildFrameBlocks(lane))
+}
+
+// frameBlock is one frame's rendered transcript lines plus whether it pairs TIGHT to the next
+// block (a tool_use and its own result: a single blank line becomes none). flattenBlocks turns a
+// slice of these back into the exact []string buildTranscriptLines produced.
+type frameBlock struct {
+	lines []string
+	tight bool // tightNext for this frame: the separator to the NEXT block is "\n" not "\n\n"
+}
+
+// flattenBlocks joins per-frame blocks into display lines, reproducing buildTranscriptLines'
+// separators: a tight block abuts the next, a non-tight one gets a blank line between.
+func flattenBlocks(blocks []frameBlock) []string {
+	var out []string
+	for i, b := range blocks {
+		out = append(out, b.lines...)
+		if i < len(blocks)-1 && !b.tight {
+			out = append(out, "") // the blank line from "\n\n"
+		}
+	}
+	// buildTranscriptLines did strings.TrimRight(join, "\n") before splitting, so any trailing
+	// blank lines the LAST block ended with were dropped; reproduce that so a memoized flatten is
+	// byte-identical to the old direct build (interior blank lines are significant and kept).
+	for len(out) > 0 && out[len(out)-1] == "" {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+// buildFrameBlocks renders each frame of a lane to its own frameBlock, the per-frame granularity
+// the transcript memo (PRD #1137 M6) splices at: flattenBlocks(m.buildFrameBlocks(lane)) is
+// output-identical to the old buildTranscriptLines body. The tightNext/names/who/aggregated logic
+// operates over the given lane.Frames, so it works over any sub-slice the append fast path passes.
+func (m tuiModel) buildFrameBlocks(lane agentLane) []frameBlock {
 	aggregated := lane.Key == laneAllKey
 	var ids map[string]string
 	if aggregated {
@@ -79,7 +114,7 @@ func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 			}
 		}
 	}
-	var sb strings.Builder
+	blocks := make([]frameBlock, 0, len(lane.Frames))
 	for i, f := range lane.Frames {
 		var block string
 		switch f.Kind {
@@ -168,13 +203,57 @@ func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 		}
 		// Blocks are blank-line separated, EXCEPT a tool_use and ITS OWN result (tightNext, matched
 		// by id) pair tight (a single newline), so a call and its output read as one unit.
-		sep := "\n\n"
-		if tightNext[i] {
-			sep = "\n"
-		}
-		sb.WriteString(block + sep)
+		// flattenBlocks re-applies that separator: a tight block abuts the next, else a blank line.
+		blocks = append(blocks, frameBlock{lines: strings.Split(block, "\n"), tight: tightNext[i]})
 	}
-	return strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
+	return blocks
+}
+
+// transcriptLines returns the selected lane's display lines through the memo: a full-key hit is a
+// map lookup (zero builds), an append (same prefix, more frames) re-renders only from the previous
+// last frame (whose tight pairing may have flipped when its result landed), and anything else — a
+// resize, theme flip, re-suffixed identity, or a prepend (firstSeq changed) — rebuilds. builds is
+// bumped on every miss.
+func (m tuiModel) transcriptLines(lane agentLane) []string {
+	tc := m.detail.tcache
+	if tc == nil {
+		return m.buildTranscriptLines(lane) // nil-safe: zero-value detail (post-exit)
+	}
+	key := lane.Key
+	width := m.transcriptWidth()
+	sig := ""
+	if lane.Key == laneAllKey {
+		sig = m.identitiesSig() // only the aggregated lane's blocks depend on identities
+	}
+	n := len(lane.Frames)
+	var firstSeq, lastSeq int32
+	if n > 0 {
+		firstSeq = lane.Frames[0].Seq
+		lastSeq = lane.Frames[n-1].Seq
+	}
+	e, ok := tc.entries[key]
+	if ok && e.width == width && e.dark == m.dark && e.profile == m.profile && e.identitiesSig == sig && e.firstSeq == firstSeq {
+		if e.n == n && e.lastSeq == lastSeq {
+			return e.lines // full-key hit
+		}
+		// Append fast path: the cached prefix is unchanged (the frame at the cached count still
+		// carries the cached lastSeq) and only newer frames were added. Re-render from the previous
+		// last frame so its tight pairing recomputes, then splice.
+		if e.n >= 1 && e.n < n && lane.Frames[e.n-1].Seq == e.lastSeq {
+			tc.builds++
+			tail := m.buildFrameBlocks(agentLane{Key: lane.Key, Role: lane.Role, Frames: lane.Frames[e.n-1:]})
+			blocks := append(append([]frameBlock{}, e.blocks[:e.n-1]...), tail...)
+			lines := flattenBlocks(blocks)
+			tc.entries[key] = transcriptCacheEntry{width, m.dark, m.profile, sig, n, firstSeq, lastSeq, blocks, lines}
+			return lines
+		}
+	}
+	// Full rebuild.
+	tc.builds++
+	blocks := m.buildFrameBlocks(lane)
+	lines := flattenBlocks(blocks)
+	tc.entries[key] = transcriptCacheEntry{width, m.dark, m.profile, sig, n, firstSeq, lastSeq, blocks, lines}
+	return lines
 }
 
 // toolFrameName pulls a tool-use frame's tool name from its payload, so the transcript can
@@ -348,7 +427,7 @@ func padLinesToViewport(lines []string, vp int) string {
 func (m tuiModel) transcriptExtent() (total, viewport int) {
 	viewport = m.transcriptViewport()
 	if lane, ok := m.detail.selectedLane(); ok {
-		total = len(m.buildTranscriptLines(lane))
+		total = len(m.transcriptLines(lane))
 	}
 	return total, viewport
 }
@@ -385,7 +464,7 @@ func (m tuiModel) renderTranscript() string {
 		return m.padPaneTitle(title, "") + "\n" +
 			padLinesToViewport([]string{m.pal.faint.Render("no lane selected")}, m.transcriptViewport())
 	}
-	lines := m.buildTranscriptLines(lane)
+	lines := m.transcriptLines(lane)
 	vp := m.transcriptViewport()
 
 	// Bottom-anchored window (PRD #325 M5). Following pins the window to the bottom

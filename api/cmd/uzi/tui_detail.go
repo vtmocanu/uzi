@@ -7,6 +7,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
+	"github.com/charmbracelet/colorprofile"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -103,10 +104,61 @@ type detailState struct {
 	// review is the [v] overlay.
 	steer  steerState2
 	review reviewState
+
+	// tcache memoizes the per-lane transcript line build (PRD #1137 M6). It is a POINTER because
+	// View has a value receiver — a value-field cache written in View is lost on the copy (D6) —
+	// and is never shared across goroutines (Update/View run on the one event-loop goroutine). Nil
+	// on a zero-value detailState (post-exitToBoard); transcriptLines falls back to a direct build.
+	tcache *transcriptCache
 }
 
 func newDetailState(runID string) detailState {
-	return detailState{runID: runID, seen: map[int32]bool{}, follow: true}
+	return detailState{
+		runID:  runID,
+		seen:   map[int32]bool{},
+		follow: true,
+		tcache: &transcriptCache{entries: map[string]transcriptCacheEntry{}},
+	}
+}
+
+// transcriptCache memoizes buildFrameBlocks per lane keyed on every render input, so an unchanged
+// View is a map lookup and a live-frame append re-renders only the tail (PRD #1137 D6). builds
+// counts misses (full rebuilds AND tail appends); it is the tests' only channel, since View cannot
+// report through the value-receiver model.
+type transcriptCache struct {
+	builds  int
+	entries map[string]transcriptCacheEntry // keyed by lane.Key
+}
+
+type transcriptCacheEntry struct {
+	width         int
+	dark          bool
+	profile       colorprofile.Profile
+	identitiesSig string
+	n             int
+	firstSeq      int32
+	lastSeq       int32 // seq of the LAST cached frame (frame n-1)
+	blocks        []frameBlock
+	lines         []string
+}
+
+// identitiesSig is the sorted key=tag join of laneIdentities(), so a re-suffixed role
+// (tester → tester·1) changes the signature and invalidates the aggregated lane's cache.
+func (m tuiModel) identitiesSig() string {
+	ids := m.laneIdentities()
+	keys := make([]string, 0, len(ids))
+	for k := range ids {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(ids[k])
+		b.WriteByte(';')
+	}
+	return b.String()
 }
 
 // applyRun folds the first GetRun in: the header, the crew-rail milestones/accounts and
