@@ -29,6 +29,10 @@
   "stats_mem_bytes": 1,
   "stats_mem_limit_bytes": 1,
   "stats_source": "x",
+  "stats_disk_nix_bytes": 1,
+  "stats_disk_nix_total_bytes": 1,
+  "stats_disk_data_bytes": 1,
+  "stats_disk_data_total_bytes": 1,
   "anthropic_secret_id": "x",
   "anthropic_secret_label": "x",
   "anthropic_bind_mode": "x"

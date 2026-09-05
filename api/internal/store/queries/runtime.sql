@@ -276,6 +276,12 @@ UPDATE workers SET
     stats_mem_bytes       = sqlc.narg('stats_mem_bytes'),
     stats_mem_limit_bytes = sqlc.narg('stats_mem_limit_bytes'),
     stats_source          = sqlc.narg('stats_source'),
+    -- Per-volume disk sample (PRD #837 M1), same write-every-tick-incl-NULL discipline
+    -- as the mem columns; display-only.
+    stats_disk_nix_bytes        = sqlc.narg('stats_disk_nix_bytes'),
+    stats_disk_nix_total_bytes  = sqlc.narg('stats_disk_nix_total_bytes'),
+    stats_disk_data_bytes       = sqlc.narg('stats_disk_data_bytes'),
+    stats_disk_data_total_bytes = sqlc.narg('stats_disk_data_total_bytes'),
     updated_at            = now()
 WHERE id = @id
 RETURNING *;

@@ -310,6 +310,19 @@ export interface WorkerStats {
   /** Which mechanism produced the sample: "cgroup" (container-wide, covers children)
    *  or "process" (this worker process only, children-blind — the UI labels it). */
   source: "cgroup" | "process";
+  /** Used bytes on the `/nix` volume (`(blocks − bfree) × bsize` from statfs).
+   *  Omitted when the statfs call fails or the mount is absent (dev/compose has no
+   *  `/nix`) — never emitted as 0, so an absent field is distinct from an empty
+   *  volume, and a statfs failure never fails the heartbeat (PRD #837 M1). */
+  disk_nix_bytes?: number;
+  /** Total bytes on the `/nix` volume (`blocks × bsize`). Paired with disk_nix_bytes:
+   *  both present or both absent. */
+  disk_nix_total_bytes?: number;
+  /** Used bytes on the data volume (`config.dataDir`, default `/data`). Same
+   *  absent-on-failure convention as the `/nix` fields, guarded independently. */
+  disk_data_bytes?: number;
+  /** Total bytes on the data volume. Paired with disk_data_bytes. */
+  disk_data_total_bytes?: number;
 }
 
 export interface HeartbeatRequest {

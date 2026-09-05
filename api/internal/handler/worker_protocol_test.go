@@ -64,12 +64,16 @@ func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWork
 func (p *protocolStore) HeartbeatWorker(_ context.Context, arg store.HeartbeatWorkerParams) (store.Worker, error) {
 	p.heartbeatArg = arg
 	return store.Worker{
-		ID:                 arg.ID,
-		Status:             "online",
-		StatsCpuPct:        arg.StatsCpuPct,
-		StatsMemBytes:      arg.StatsMemBytes,
-		StatsMemLimitBytes: arg.StatsMemLimitBytes,
-		StatsSource:        arg.StatsSource,
+		ID:                      arg.ID,
+		Status:                  "online",
+		StatsCpuPct:             arg.StatsCpuPct,
+		StatsMemBytes:           arg.StatsMemBytes,
+		StatsMemLimitBytes:      arg.StatsMemLimitBytes,
+		StatsSource:             arg.StatsSource,
+		StatsDiskNixBytes:       arg.StatsDiskNixBytes,
+		StatsDiskNixTotalBytes:  arg.StatsDiskNixTotalBytes,
+		StatsDiskDataBytes:      arg.StatsDiskDataBytes,
+		StatsDiskDataTotalBytes: arg.StatsDiskDataTotalBytes,
 	}, nil
 }
 
@@ -529,6 +533,68 @@ func TestWorkerHeartbeatDropsInvalidStats(t *testing.T) {
 	}
 }
 
+func TestWorkerHeartbeatStoresValidDiskStats(t *testing.T) {
+	// PRD #837 M1 — a heartbeat carrying both volumes' used/total persists all four
+	// disk columns and echoes them in the worker DTO.
+	st := &protocolStore{}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	body := `{"version":"1","stats":{"mem_bytes":100,"source":"cgroup",` +
+		`"disk_nix_bytes":3072000,"disk_nix_total_bytes":4096000,` +
+		`"disk_data_bytes":2048000,"disk_data_total_bytes":8192000}}`
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{
+		`"stats_disk_nix_bytes":3072000`, `"stats_disk_nix_total_bytes":4096000`,
+		`"stats_disk_data_bytes":2048000`, `"stats_disk_data_total_bytes":8192000`,
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("expected %s in DTO, got %q", want, rec.Body.String())
+		}
+	}
+	if !st.heartbeatArg.StatsDiskNixBytes.Valid || st.heartbeatArg.StatsDiskNixBytes.Int64 != 3072000 {
+		t.Fatalf("disk nix used must reach the store, got %+v", st.heartbeatArg.StatsDiskNixBytes)
+	}
+	if !st.heartbeatArg.StatsDiskDataTotalBytes.Valid || st.heartbeatArg.StatsDiskDataTotalBytes.Int64 != 8192000 {
+		t.Fatalf("disk data total must reach the store, got %+v", st.heartbeatArg.StatsDiskDataTotalBytes)
+	}
+}
+
+func TestWorkerHeartbeatDropsNegativeDiskFieldOnly(t *testing.T) {
+	// PRD #837 M1 — a negative on a DISK field drops ONLY that field (written NULL); it
+	// must NOT discard the whole stats object the way a negative mem does. The mem/cpu
+	// gauge and the sibling volume survive.
+	st := &protocolStore{}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	body := `{"version":"1","stats":{"cpu_pct":12,"mem_bytes":555,"source":"cgroup",` +
+		`"disk_nix_bytes":-1,"disk_nix_total_bytes":4096000,` +
+		`"disk_data_bytes":2048000,"disk_data_total_bytes":8192000}}`
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	// The whole stats object is intact: mem + cpu still stored.
+	if !st.heartbeatArg.StatsMemBytes.Valid || st.heartbeatArg.StatsMemBytes.Int64 != 555 {
+		t.Fatalf("a negative disk field must not drop mem, got %+v", st.heartbeatArg.StatsMemBytes)
+	}
+	if !st.heartbeatArg.StatsCpuPct.Valid {
+		t.Fatalf("a negative disk field must not drop cpu, got %+v", st.heartbeatArg.StatsCpuPct)
+	}
+	// Only the negative field is dropped; its still-valid pair and the sibling volume survive.
+	if st.heartbeatArg.StatsDiskNixBytes.Valid {
+		t.Fatalf("negative disk_nix_bytes must be dropped (NULL), got %+v", st.heartbeatArg.StatsDiskNixBytes)
+	}
+	if !st.heartbeatArg.StatsDiskNixTotalBytes.Valid || st.heartbeatArg.StatsDiskNixTotalBytes.Int64 != 4096000 {
+		t.Fatalf("the valid nix total must survive its negative pair, got %+v", st.heartbeatArg.StatsDiskNixTotalBytes)
+	}
+	if !st.heartbeatArg.StatsDiskDataBytes.Valid || st.heartbeatArg.StatsDiskDataBytes.Int64 != 2048000 {
+		t.Fatalf("the sibling data volume must survive, got %+v", st.heartbeatArg.StatsDiskDataBytes)
+	}
+}
+
 func TestAdminWorkerDTOIncludesStats(t *testing.T) {
 	// The stats fields ride the shared apitypes.WorkerDTO, so the admin worker DTO
 	// inherits them for free (PRD #49 Decision 6). A worker row with a sample marshals
@@ -572,7 +638,7 @@ func TestNoStatsColumnsInSchedulingQueries(t *testing.T) {
 		t.Fatalf("glob queries: %v (matched %d files)", err, len(files))
 	}
 	for _, f := range files {
-		raw, err := os.ReadFile(f)
+		raw, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a fixed repo-relative queries/*.sql glob, never external input.
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)
 		}
@@ -586,6 +652,56 @@ func TestNoStatsColumnsInSchedulingQueries(t *testing.T) {
 				t.Fatalf("query %s in %s references a stats_ column; stats_* are display-only (Decision 5) and may appear only in HeartbeatWorker or the worker-list DTO queries", name, filepath.Base(f))
 			}
 		}
+	}
+}
+
+func TestNoDiskStatsColumnsInSchedulingQueries(t *testing.T) {
+	// PRD #837 M1 — the new stats_disk_* columns inherit the same display-only invariant
+	// as the other stats_ columns: written by HeartbeatWorker, read only via the
+	// worker-list DTO SELECTs' w.* expansion, NEVER by a claim/scheduling/sweeper query.
+	// The broader TestNoStatsColumnsInSchedulingQueries already guards the stats_ prefix;
+	// this sibling pins the disk columns SPECIFICALLY so the invariant is self-documenting
+	// and so a future reader (e.g. M4's ListHostedWorkersForController poll derivation) is
+	// added deliberately, with a note, rather than slipping in under the generic guard.
+	allowed := map[string]bool{
+		"HeartbeatWorker":   true, // the sole writer of the stats_disk_ columns
+		"ListWorkersByUser": true, // DTO read; today via w.*, allowlisted for a future explicit select
+		"ListAllWorkers":    true, // DTO read (admin); same rationale
+		// NOTE: M4 will add "ListHostedWorkersForController" here (the poll's disk_pressure
+		// derivation is the one allowed lifecycle reader, like ReapEphemeralWorkers is for
+		// online_since) — until then, no query but HeartbeatWorker even names stats_disk_.
+	}
+	files, err := filepath.Glob("../store/queries/*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("glob queries: %v (matched %d files)", err, len(files))
+	}
+	sawWriter := false
+	for _, f := range files {
+		raw, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a fixed repo-relative queries/*.sql glob, never external input.
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		blocks := strings.Split(string(raw), "-- name:")
+		for _, block := range blocks[1:] { // blocks[0] is the file preamble
+			name := strings.Fields(block)[0]
+			if !strings.Contains(block, "stats_disk_") {
+				continue
+			}
+			if name == "HeartbeatWorker" {
+				sawWriter = true
+			}
+			if allowed[name] {
+				continue
+			}
+			t.Fatalf("query %s in %s references a stats_disk_ column; stats_disk_* are display-only "+
+				"(PRD #837 D5) and may appear only in HeartbeatWorker or the worker-list DTO queries", name, filepath.Base(f))
+		}
+	}
+	// Positive control: HeartbeatWorker MUST name the disk columns, else a rename/removal
+	// would make this guard vacuously green while the columns stopped being written.
+	if !sawWriter {
+		t.Fatal("HeartbeatWorker no longer references stats_disk_; the disk write path may have been " +
+			"renamed or dropped, making this guard vacuous")
 	}
 }
 

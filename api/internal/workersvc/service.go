@@ -1245,6 +1245,13 @@ type WorkerStats struct {
 	MemLimit *int64
 	// Source is the validated enum: "cgroup" or "process".
 	Source string
+	// Disk usage per volume (PRD #837 M1), each nil when the worker's statfs failed or
+	// the mount was absent. Used and total bytes for the /nix and data volumes; a nil
+	// pointer writes NULL, exactly like the mem fields. Display-only, same as the rest.
+	DiskNixBytes       *int64
+	DiskNixTotalBytes  *int64
+	DiskDataBytes      *int64
+	DiskDataTotalBytes *int64
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
@@ -1257,6 +1264,10 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		arg.StatsMemBytes = pgtype.Int8{Int64: stats.MemBytes, Valid: true}
 		arg.StatsMemLimitBytes = pgconv.Int8Ptr(stats.MemLimit)
 		arg.StatsSource = pgconv.TextOrNull(stats.Source)
+		arg.StatsDiskNixBytes = pgconv.Int8Ptr(stats.DiskNixBytes)
+		arg.StatsDiskNixTotalBytes = pgconv.Int8Ptr(stats.DiskNixTotalBytes)
+		arg.StatsDiskDataBytes = pgconv.Int8Ptr(stats.DiskDataBytes)
+		arg.StatsDiskDataTotalBytes = pgconv.Int8Ptr(stats.DiskDataTotalBytes)
 	}
 	return s.q.HeartbeatWorker(ctx, arg)
 }

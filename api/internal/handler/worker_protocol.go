@@ -362,10 +362,14 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 	// or an int64-overflow mem value errors HERE only, dropping the stats without
 	// touching the outer heartbeat decode.
 	var s struct {
-		CPUPct   *float64 `json:"cpu_pct"`
-		MemBytes *int64   `json:"mem_bytes"`
-		MemLimit *int64   `json:"mem_limit_bytes"`
-		Source   string   `json:"source"`
+		CPUPct             *float64 `json:"cpu_pct"`
+		MemBytes           *int64   `json:"mem_bytes"`
+		MemLimit           *int64   `json:"mem_limit_bytes"`
+		Source             string   `json:"source"`
+		DiskNixBytes       *int64   `json:"disk_nix_bytes"`
+		DiskNixTotalBytes  *int64   `json:"disk_nix_total_bytes"`
+		DiskDataBytes      *int64   `json:"disk_data_bytes"`
+		DiskDataTotalBytes *int64   `json:"disk_data_total_bytes"`
 	}
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return drop()
@@ -396,7 +400,25 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 		}
 		out.CPUPct = &v
 	}
+	// Disk fields (PRD #837 M1) are per-volume used/total, each optional (omitted when
+	// the worker's statfs failed or the mount was absent). Unlike mem, a bad DISK value
+	// drops ONLY that field — never the whole stats object — so a negative on one volume
+	// cannot discard the cpu/mem gauge. A negative is dropped by leaving the pointer nil.
+	out.DiskNixBytes = nonNegOrNil(s.DiskNixBytes)
+	out.DiskNixTotalBytes = nonNegOrNil(s.DiskNixTotalBytes)
+	out.DiskDataBytes = nonNegOrNil(s.DiskDataBytes)
+	out.DiskDataTotalBytes = nonNegOrNil(s.DiskDataTotalBytes)
 	return out
+}
+
+// nonNegOrNil passes through a non-negative *int64 and drops (nil) a negative one. Used
+// for the display-only disk fields, where a single bad value must not poison the rest of
+// the stats sample (PRD #837 M1).
+func nonNegOrNil(p *int64) *int64 {
+	if p == nil || *p < 0 {
+		return nil
+	}
+	return p
 }
 
 // WorkerClaim atomically claims the next run for the worker's user. 204 when the
