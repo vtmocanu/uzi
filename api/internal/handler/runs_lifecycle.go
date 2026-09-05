@@ -439,10 +439,12 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 	limitRaw := strings.TrimSpace(q.Get("limit"))
 	tailRaw := strings.TrimSpace(q.Get("tail"))
 	beforeRaw := strings.TrimSpace(q.Get("before"))
+	payloadMaxRaw := strings.TrimSpace(q.Get("payload_max"))
 	hasAfter := afterRaw != ""
 	hasLimit := limitRaw != ""
 	hasTail := tailRaw != ""
 	hasBefore := beforeRaw != ""
+	hasPayloadMax := payloadMaxRaw != ""
 
 	// Parse each present value into a 400 on malformed input before enforcing the
 	// exclusivity matrix, so no store call happens on any bad request.
@@ -488,6 +490,18 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		before = int32(n)
 	}
+	// payload_max is combinable with every form (it never changes which rows are
+	// returned, only trims the payload of the rows returned), so it is NOT part of the
+	// exclusivity matrix below — just parsed here.
+	payloadMax := 0
+	if hasPayloadMax {
+		n, err := strconv.ParseInt(payloadMaxRaw, 10, 32)
+		if err != nil || n < 1 {
+			httpx.Error(w, http.StatusBadRequest, "payload_max must be a positive integer")
+			return
+		}
+		payloadMax = int(n)
+	}
 
 	// Exclusivity matrix (all 400s, zero store calls on violation).
 	if hasTail && (hasAfter || hasBefore || hasLimit) {
@@ -529,7 +543,13 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.MessageDTO, 0, len(msgs))
 	for _, m := range msgs {
-		out = append(out, messageToDTO(m))
+		dto := messageToDTO(m)
+		if hasPayloadMax && len(dto.Payload) > payloadMax {
+			// Skip the call when the payload already fits (nothing can exceed the cap);
+			// trimPayload is still correct if called on an under-cap payload.
+			dto.Payload, dto.PayloadTruncated = trimPayload(dto.Payload, dto.Kind, payloadMax)
+		}
+		out = append(out, dto)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"messages": out})
 }

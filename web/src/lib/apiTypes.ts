@@ -2741,6 +2741,10 @@ export interface RunMessage {
   agent_label: string | null;
   payload: unknown;
   created_at: string;
+  // payload_truncated is true only when a ?payload_max= trim actually removed bytes
+  // from this message's payload (PRD #1137). Absent on every untrimmed message; the
+  // web SPA never sends payload_max, so it never sees this key.
+  payload_truncated?: boolean;
 }
 
 /** PRD #88 adds "answer": the reply to an ask_user question. Unlike every other kind

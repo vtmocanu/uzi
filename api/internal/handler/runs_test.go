@@ -771,6 +771,114 @@ func TestListRunMessagesTailViewerAuthz(t *testing.T) {
 	}
 }
 
+// decodeMessageTruncation decodes the response into a seq -> payload_truncated map. The
+// key is absent (defaults false) on any message whose payload was not trimmed, so this
+// captures the omitempty behaviour: a false flag never rides the wire.
+func decodeMessageTruncation(t *testing.T, body string) map[int32]bool {
+	t.Helper()
+	var env struct {
+		Messages []struct {
+			Seq              int32 `json:"seq"`
+			PayloadTruncated bool  `json:"payload_truncated"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		t.Fatalf("decode messages: %v (body %q)", err, body)
+	}
+	out := make(map[int32]bool, len(env.Messages))
+	for _, m := range env.Messages {
+		out[m.Seq] = m.PayloadTruncated
+	}
+	return out
+}
+
+// TestListRunMessagesPayloadMax covers PRD #1137 M2 at the handler seam: ?payload_max=
+// returns the SAME rows (never a different window), flags only the oversized
+// tool_result / tool_use messages payload_truncated:true, and leaves small messages
+// unflagged (the omitempty key absent from their JSON).
+func TestListRunMessagesPayloadMax(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+
+	longStr := strings.Repeat("x", 300)
+	msgs := []store.RunMessage{
+		{Seq: 1, Kind: "text", Payload: []byte(`{"text":"hi"}`)},
+		{Seq: 2, Kind: "tool_result", Payload: []byte(`{"content":"` + longStr + `","tool_use_id":"tu_2"}`)},
+		{Seq: 3, Kind: "text", Payload: []byte(`{"text":"ok"}`)},
+		{Seq: 4, Kind: "tool_use", Payload: []byte(`{"name":"Bash","input":{"command":"` + longStr + `"}}`)},
+		{Seq: 5, Kind: "status", Payload: []byte(`{"status":"running"}`)},
+	}
+	st := &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		msgs:    msgs,
+	}
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "payload_max=64"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("payload_max=64 status = %d, want 200", rec.Code)
+	}
+
+	// Same rows, same order: payload_max never changes the returned window.
+	if got := decodeMessageSeqs(t, rec.Body.String()); len(got) != 5 ||
+		got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
+		t.Fatalf("payload_max seqs = %v, want [1 2 3 4 5]", got)
+	}
+
+	trunc := decodeMessageTruncation(t, rec.Body.String())
+	// Only the oversized tool_result (2) and tool_use (4) are flagged.
+	if !trunc[2] {
+		t.Fatalf("seq 2 (big tool_result) should be payload_truncated")
+	}
+	if !trunc[4] {
+		t.Fatalf("seq 4 (big tool_use) should be payload_truncated")
+	}
+	// Small messages are unflagged — the key must be absent (omitempty), so it does not
+	// appear in the raw JSON at all for the untrimmed messages.
+	for _, seq := range []int32{1, 3, 5} {
+		if trunc[seq] {
+			t.Fatalf("seq %d (small message) must not be payload_truncated", seq)
+		}
+	}
+	if strings.Count(rec.Body.String(), `"payload_truncated"`) != 2 {
+		t.Fatalf("payload_truncated key should appear exactly twice, body = %q", rec.Body.String())
+	}
+
+	// Without the param the flag never appears and payloads are verbatim (the web path).
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no-param status = %d, want 200", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), `"payload_truncated"`) {
+		t.Fatalf("payload_truncated must be absent without the param, body = %q", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), longStr) {
+		t.Fatalf("no-param response must carry the full untrimmed payload")
+	}
+
+	// payload_max is combinable with tail and never changes the window.
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "tail=2&payload_max=64"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tail+payload_max status = %d, want 200", rec.Code)
+	}
+	if got := decodeMessageSeqs(t, rec.Body.String()); len(got) != 2 || got[0] != 4 || got[1] != 5 {
+		t.Fatalf("tail=2 seqs = %v, want [4 5]", got)
+	}
+
+	// Invalid payload_max values are 400.
+	for _, raw := range []string{"payload_max=0", "payload_max=-1", "payload_max=abc"} {
+		rec = httptest.NewRecorder()
+		h.ListRunMessages(rec, runReqQuery(owner, runID, raw))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400", raw, rec.Code)
+		}
+	}
+}
+
 // gzipAuthDB is a store.DBTX that lets a request clear RequireUser's cookie branch
 // without a live database: it answers getUserByID ("FROM users") with a single active
 // user and returns no rows for anything else. It exists so TestListRunMessagesGzip can
