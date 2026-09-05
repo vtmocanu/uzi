@@ -186,7 +186,7 @@ brew tap vtmocanu/tap
 brew trust --tap vtmocanu/tap       # one-time: Homebrew 6+ requires trusting third-party taps
 brew install vtmocanu/tap/uzi-cli
 uzi login                            # humans; or set UZI_TOKEN from Settings → Access
-uzi skill install-hook               # Claude Code users: refresh the bundled skill each session
+uzi skill install-hook               # refresh the bundled skill each session (Claude Code and Codex CLI; --target picks the harness)
 uzi run list                         # the board, as a table
 uzi run get <id>                     # one run's state
 uzi run logs <id> -f                 # follow the transcript live

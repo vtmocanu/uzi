@@ -18,10 +18,12 @@ written from the CLI's own command tree and shipped inside it, so it never drift
 from the installed surface.
 
 > **Generated artifact: do not edit the installed copy.** `uzi skill install`
-> (and the session refresh hook) rewrite `~/.claude/skills/uzi-cli/SKILL.md`
-> byte-for-byte from the binary on every CLI update, so a local edit is silently
-> lost. Change it at the source in the uzi repo
-> (`api/internal/uzicli/skill/SKILL.md`) and ship a new CLI.
+> (and the session refresh hook) rewrite this file byte-for-byte from the
+> binary — at `~/.claude/skills/uzi-cli/SKILL.md` for Claude Code and at
+> `~/.agents/skills/uzi-cli/SKILL.md` for Codex CLI — every executing
+> non-skill `uzi` command, so a local edit is silently lost. Change it at the
+> source in the uzi repo (`api/internal/uzicli/skill/SKILL.md`) and ship a new
+> CLI.
 
 ## Talking to it as an agent
 
@@ -216,10 +218,10 @@ uzi admin guardrail-impact
 uzi admin blocked-repos
 uzi admin agent-source get
 uzi admin agent-source status
-uzi skill status
-uzi skill install [--force]
-uzi skill install-hook
-uzi skill uninstall-hook
+uzi skill status [--target claude|codex|all]
+uzi skill install [--force] [--target claude|codex|all]
+uzi skill install-hook [--target claude|codex|all]
+uzi skill uninstall-hook [--target claude|codex|all]
 uzi version
 ```
 
@@ -1228,25 +1230,44 @@ the binary, not in this skill — retrieve on demand rather than expecting it in
 
 ### The skill itself
 
-- `uzi skill status` — where this skill is installed and whether it is current;
-  also reports whether the `SessionStart` hook is installed and current.
-- `uzi skill install [--force]` — (re)install the bundled skill. The CLI does
-  this best-effort on every command already; `--force` reinstalls even over a
-  file you edited (your edit is copied to `SKILL.md.bak` first). Set
+This CLI ships **two** targets for the same embedded skill body: **Claude Code**
+(`~/.claude/skills/uzi-cli/SKILL.md`) and **Codex CLI**
+(`~/.agents/skills/uzi-cli/SKILL.md`, independent of `$CODEX_HOME`). All four
+verbs below take `--target claude|codex|all`; omitting it means "every
+auto-detected target" — Claude is always detected, Codex only when its config
+home (`$CODEX_HOME`, or `~/.codex` when unset) already exists as a directory.
+Passing `--target codex` or `--target all` explicitly acts on Codex even when
+it is not yet auto-detected; `install`/`install-hook` then create the
+directories Codex needs, while `status`/`uninstall-hook` stay read-only/no-op.
+
+- `uzi skill status [--target ...]` — where the selected skill(s) are
+  installed and whether each is current; also reports, per target, whether its
+  `SessionStart` hook is installed and current.
+- `uzi skill install [--force] [--target ...]` — (re)install the bundled skill
+  for the selected target(s). The CLI does this best-effort on every
+  non-skill command already; `--force` reinstalls even over a file you edited
+  (your edit is copied to `SKILL.md.bak` first). Set
   `UZI_SKILL_AUTO_UPGRADE=0` to disable the automatic install.
-- `uzi skill install-hook` — opt-in: wire a Claude Code `SessionStart` hook into
-  `~/.claude/settings.json` that runs `uzi skill install` at session start, so
-  the skill auto-refreshes without waiting for the next `uzi` command. Idempotent;
-  backs up `settings.json` first; aborts on malformed JSON rather than clobber it.
-- `uzi skill uninstall-hook` — remove that hook, leaving sibling hooks intact.
+- `uzi skill install-hook [--target ...]` — opt-in: wire a `SessionStart` hook
+  for the selected target(s) so the skill auto-refreshes without waiting for
+  the next `uzi` command. For Claude Code this is `~/.claude/settings.json`
+  running `uzi skill install --target claude` on the `startup` matcher. For
+  Codex CLI this is `$CODEX_HOME/hooks.json` running
+  `uzi skill install --target codex` on the `startup|resume` matcher — Codex
+  requires you to review and trust a new hook once via `/hooks` before it
+  runs; uzi never writes Codex trust state or `config.toml`. Idempotent; backs
+  up the hook file first; aborts on malformed JSON rather than clobber it.
+- `uzi skill uninstall-hook [--target ...]` — remove the selected target's
+  hook, leaving sibling hooks (and the other target's hook) intact.
 
 **Source of truth — where to change this skill.** These bytes are generated from
 the embedded copy at `api/internal/uzicli/skill/SKILL.md` in the uzi repo and
-reinstalled from the binary on **every** `uzi` command (and by the optional
-SessionStart hook). Editing the installed `~/.claude/skills/uzi-cli/SKILL.md`
-directly is futile: your change is copied to `SKILL.md.bak` and then overwritten
-on the next command. To change the skill for real, edit the embedded source and
-ship it.
+reinstalled from the binary on **every executing non-skill** `uzi` command (and
+by the optional SessionStart hook, for whichever target(s) it is wired into).
+Editing an installed copy directly — `~/.claude/skills/uzi-cli/SKILL.md` or
+`~/.agents/skills/uzi-cli/SKILL.md` — is futile: your change is copied to
+`SKILL.md.bak` and then overwritten on the next command. To change the skill
+for real, edit the embedded source and ship it.
 
 **Improving this skill — a nudge, not a gate.** After a session spent driving the
 CLI, if you hit a gap, friction, an inaccuracy, or an undocumented behaviour,
