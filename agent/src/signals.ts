@@ -568,7 +568,7 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
  * main thread. Narrow probes only, so an SDK reshape degrades to "treat as main
  * thread" (fail toward the existing behavior) rather than throwing.
  */
-function isSubagentFrame(msg: Record<string, unknown>): boolean {
+export function isSubagentFrame(msg: Record<string, unknown>): boolean {
   const subagentType = msg["subagent_type"];
   if (typeof subagentType === "string" && subagentType.length > 0) return true;
   const parentToolUseId = msg["parent_tool_use_id"];

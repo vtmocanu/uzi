@@ -44,6 +44,8 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { EmittedMessage } from "./executor.js";
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
+import type { HarnessAttribution, HarnessItem } from "./harness.js";
+import { projectInit, projectItem, projectResult } from "./harness-messages.js";
 
 /** One-shot user-turn prompt stream: the SDK consumes a single user message. */
 export async function* promptStream(text: string): AsyncGenerator<unknown> {
@@ -91,19 +93,21 @@ function agentOf(msg: Record<string, unknown>): string {
  * carry a `parent_tool_use_id` (see `orphanInstanceKind` below for why the two
  * must never be conflated).
  */
-interface FrameAttribution {
-  agent: string;
-  agentInstance?: string;
-  agentLabel?: string;
-}
-
-function attributionOf(msg: Record<string, unknown>): FrameAttribution {
-  const at: FrameAttribution = { agent: agentOf(msg) };
-  // Assigned conditionally, never as an explicit `undefined`: the batcher copies
-  // a field onto the wire only when it is `!== undefined`, and the API maps an
-  // absent field to SQL NULL. Writing `agentInstance: undefined` would still be
-  // absent on the JSON wire, but the conditional keeps the emitted object's shape
-  // honest for the node --test assertions that check key presence.
+/**
+ * Decode a frame's attribution into the neutral {@link HarnessAttribution} (PRD
+ * #1146 M2). `agent` is always present (agentOf's string-or-lead projection);
+ * `agentInstance`/`agentLabel` are assigned conditionally, never as an explicit
+ * `undefined` — the batcher copies a field onto the wire only when it is
+ * `!== undefined`, and the API maps an absent field to SQL NULL. Writing
+ * `agentInstance: undefined` would still be absent on the JSON wire, but the
+ * conditional keeps the emitted object's shape honest for the node --test
+ * assertions that check key presence. Exported so the run-lane adapter
+ * (claude-harness.ts) reuses this exact decode rather than a second copy.
+ */
+export function decodeAttribution(
+  msg: Record<string, unknown>,
+): HarnessAttribution {
+  const at: HarnessAttribution = { agent: agentOf(msg) };
   const instance = asString(msg["parent_tool_use_id"]);
   if (instance !== undefined) at.agentInstance = instance;
   const label = asString(msg["task_description"]);
@@ -119,31 +123,35 @@ function contentBlocks(message: unknown): Record<string, unknown>[] {
   return content.filter((b): b is Record<string, unknown> => asRecord(b) !== undefined);
 }
 
-/** Map an assistant frame's content blocks (text / thinking / tool_use). */
-function mapAssistant(msg: Record<string, unknown>): EmittedMessage[] {
-  const at = attributionOf(msg);
-  const out: EmittedMessage[] = [];
+/**
+ * Decode an assistant frame's content blocks into neutral {@link HarnessItem}s
+ * (text / thinking / started-tool). Empty text/thinking blocks are omitted here
+ * (the emptiness test that mapAssistant applied); unknown block types
+ * (redacted_thinking, server_tool_use, etc.) are dropped — not surfaced in M3.
+ * Exported so the run-lane adapter reuses the SAME decode as chat/tests. The
+ * neutral items are projected to EmittedMessages by harness-messages.projectItem.
+ */
+export function decodeAssistantItems(msg: Record<string, unknown>): HarnessItem[] {
+  const out: HarnessItem[] = [];
   for (const block of contentBlocks(msg["message"])) {
     switch (block["type"]) {
       case "text": {
         const text = asString(block["text"]);
-        if (text) out.push({ kind: "text", ...at, payload: { text } });
+        if (text) out.push({ kind: "text", text });
         break;
       }
       case "thinking": {
         const thinking = asString(block["thinking"]);
-        if (thinking) out.push({ kind: "thinking", ...at, payload: { text: thinking } });
+        if (thinking) out.push({ kind: "thinking", text: thinking });
         break;
       }
       case "tool_use": {
         out.push({
-          kind: "tool_use",
-          ...at,
-          payload: {
-            id: asString(block["id"]),
-            name: asString(block["name"]),
-            input: block["input"],
-          },
+          kind: "tool",
+          phase: "started",
+          id: asString(block["id"]),
+          name: asString(block["name"]),
+          input: block["input"],
         });
         break;
       }
@@ -155,85 +163,91 @@ function mapAssistant(msg: Record<string, unknown>): EmittedMessage[] {
 }
 
 /**
- * Map a user frame — only tool_result blocks are surfaced (the agent's own
- * prompt echoes and synthetic user turns are noise for the run stream). A
- * tool_result may carry structured content; it is passed through as-is.
+ * Decode a user frame's tool_result blocks into neutral finished-tool
+ * {@link HarnessItem}s. Only tool_result blocks are surfaced (the agent's own
+ * prompt echoes and synthetic user turns are noise for the run stream); a
+ * tool_result may carry structured content and it is passed through as-is.
  */
-function mapUser(msg: Record<string, unknown>): EmittedMessage[] {
-  const at = attributionOf(msg);
-  const out: EmittedMessage[] = [];
+export function decodeUserItems(msg: Record<string, unknown>): HarnessItem[] {
+  const out: HarnessItem[] = [];
   for (const block of contentBlocks(msg["message"])) {
     if (block["type"] !== "tool_result") continue;
     out.push({
-      kind: "tool_result",
-      ...at,
-      payload: {
-        tool_use_id: asString(block["tool_use_id"]),
-        content: block["content"],
-        is_error: block["is_error"] === true,
-      },
+      kind: "tool",
+      phase: "finished",
+      id: asString(block["tool_use_id"]),
+      output: block["content"],
+      isError: block["is_error"] === true,
     });
   }
   return out;
 }
 
+/**
+ * The input to harness-messages.projectResult — the terminal `result` frame's
+ * outcome, display subtype, String-mapped error array and the opaque uzi wire
+ * capsule. The accounting fields are forwarded UNGUARDED (duration_ms/
+ * total_cost_usd feed the finish line's duration and cost, PRD #11; usage/
+ * modelUsage carry the token accounting the API folds into run_usage, PRD #40 M1)
+ * — when the SDK frame omits one it lands as `undefined` and projectResult still
+ * constructs the key, so the shape is preserved before JSON serialization drops
+ * it. Result totals are CUMULATIVE-across-resume (PRD #40 Decision 3 verdict b);
+ * the server merges with GREATEST per (run_id, session_id, model), never a sum
+ * across a model's sessions, then SUMs across models. The SDKResultError carries
+ * the same accounting as a success frame, so a failed run's pre-death spend is
+ * still forwarded (Decision 4). Exported so the adapter reuses this exact decode.
+ */
+export function decodeResult(msg: Record<string, unknown>): {
+  outcome: "success" | "failed";
+  subtype: string;
+  errors: readonly string[];
+  wire: {
+    usage: unknown;
+    modelUsage: unknown;
+    num_turns: unknown;
+    duration_ms: unknown;
+    total_cost_usd: unknown;
+  };
+} {
+  const subtype = asString(msg["subtype"]) ?? "unknown";
+  const outcome: "success" | "failed" =
+    subtype === "success" && msg["is_error"] !== true ? "success" : "failed";
+  const errors = Array.isArray(msg["errors"])
+    ? (msg["errors"] as unknown[]).map(String)
+    : [];
+  return {
+    outcome,
+    subtype,
+    errors,
+    wire: {
+      usage: msg["usage"],
+      modelUsage: msg["modelUsage"],
+      num_turns: msg["num_turns"],
+      duration_ms: msg["duration_ms"],
+      total_cost_usd: msg["total_cost_usd"],
+    },
+  };
+}
+
+/** Map an assistant frame's content blocks (text / thinking / tool_use). */
+function mapAssistant(msg: Record<string, unknown>): EmittedMessage[] {
+  const at = decodeAttribution(msg);
+  return decodeAssistantItems(msg).map((item) => projectItem(item, at));
+}
+
+/**
+ * Map a user frame — only tool_result blocks are surfaced (the agent's own
+ * prompt echoes and synthetic user turns are noise for the run stream). A
+ * tool_result may carry structured content; it is passed through as-is.
+ */
+function mapUser(msg: Record<string, unknown>): EmittedMessage[] {
+  const at = decodeAttribution(msg);
+  return decodeUserItems(msg).map((item) => projectItem(item, at));
+}
+
 /** Map the terminal `result` frame to a status (success) or error message. */
 function mapResult(msg: Record<string, unknown>): EmittedMessage[] {
-  const subtype = asString(msg["subtype"]) ?? "unknown";
-  if (subtype === "success" && msg["is_error"] !== true) {
-    // duration_ms/total_cost_usd are forwarded for the finish line's duration and
-    // cost (PRD #11); usage/modelUsage carry the full token accounting the API
-    // folds into run_usage (PRD #40 M1). Unguarded passthrough, same style as
-    // num_turns: when the SDK frame omits a field it lands as undefined and
-    // JSON-serialization drops it, so nothing surfaces on the wire. These result
-    // totals are CUMULATIVE-across-resume (PRD #40 Decision 3 verdict b), so the
-    // server never sums the snapshots for one model: UpsertRunUsage merges with
-    // GREATEST per (run_id, session_id, model) — NOT latest-wins, so a re-delivered
-    // earlier frame cannot regress the row — and run_usage_totals then takes MAX
-    // across that model's sessions before SUMming ACROSS models.
-    //
-    // Corrected 2026-08-02 (issue #195): this said "latest-wins per (run_id, model),
-    // never a sum", which was wrong on all three counts — the merge is GREATEST, the
-    // write key includes session_id, and the run total IS a sum across models. Only
-    // `usage` is read by anything else; `modelUsage` is the field every rollup and,
-    // since #195, the run page itself fold from.
-    return [
-      {
-        kind: "status",
-        agent: LEAD,
-        payload: {
-          event: "result",
-          subtype,
-          num_turns: msg["num_turns"],
-          duration_ms: msg["duration_ms"],
-          total_cost_usd: msg["total_cost_usd"],
-          usage: msg["usage"],
-          modelUsage: msg["modelUsage"],
-        },
-      },
-    ];
-  }
-  // error_during_execution / error_max_turns / error_max_budget_usd / etc. The
-  // SDK's SDKResultError carries the same accounting as a success frame, so a
-  // failed/cancelled run's pre-death spend is still forwarded (PRD #40 Decision 4)
-  // — the runs most worth auditing must not report nothing.
-  const errors = Array.isArray(msg["errors"]) ? (msg["errors"] as unknown[]).map(String) : [];
-  return [
-    {
-      kind: "error",
-      agent: LEAD,
-      payload: {
-        event: "result",
-        subtype,
-        errors,
-        usage: msg["usage"],
-        modelUsage: msg["modelUsage"],
-        total_cost_usd: msg["total_cost_usd"],
-        num_turns: msg["num_turns"],
-        duration_ms: msg["duration_ms"],
-      },
-    },
-  ];
+  return [projectResult(decodeResult(msg))];
 }
 
 /**
@@ -260,13 +274,7 @@ export function mapSdkMessage(message: unknown): EmittedMessage[] {
       // Only the init frame is useful as a status heartbeat; other system
       // subtypes (task_*, hook_*, status) are not persisted in M3.
       if (msg["subtype"] === "init") {
-        return [
-          {
-            kind: "status",
-            agent: LEAD,
-            payload: { event: "init", model: asString(msg["model"]) },
-          },
-        ];
+        return [projectInit(asString(msg["model"]))];
       }
       return [];
     default:
