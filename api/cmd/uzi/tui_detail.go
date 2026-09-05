@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -60,6 +61,19 @@ type detailState struct {
 	railCollapsed bool
 	runLoaded     bool // the first GetRun has landed: header/milestones/accounts can render
 	tailLoaded    bool // the newest transcript page has landed
+	// lowSeq / highSeq bound the seq-carrying frames held (0 = none). lowSeq is the backfill
+	// cursor: the background walk requests the newest page strictly below it and the reply
+	// lowers it, until the start of history is reached. highSeq is the total, since seq is
+	// gapless from 1 (D5), so the progress badge reads `<held> of <highSeq>`.
+	lowSeq  int32
+	highSeq int32
+	// backfilling / historyComplete / backfillFailed drive the background history walk (M5).
+	// backfilling is true while a page is in flight; historyComplete is set once the walk
+	// reaches the start (an empty page, or a page holding seq 1); backfillFailed is set when a
+	// page errored or did not advance the cursor, and the badge then invites `r` to resume.
+	backfilling     bool
+	historyComplete bool
+	backfillFailed  bool
 	// loadErr is the RUN-load error only (GetRun) — fatal to the whole view, since the
 	// header/rail have no DTO to render from. pageErr is the transcript-page error,
 	// scoped to the pane so a failed tail leaves the header up (PRD #1137: the header is
@@ -120,11 +134,60 @@ func (d *detailState) applyTailPage(msgs []apitypes.MessageDTO, err error) {
 		return
 	}
 	d.pageErr = nil
-	for _, m := range msgs {
-		d.addFrame(laneFrameFromMessage(m))
-	}
+	d.addFrames(framesFromMessages(msgs))
 	d.tailLoaded = true
 	d.rebuild()
+}
+
+// applyBackfillPage folds one background history page in and returns the Cmd that chains the
+// next page (or nil when the walk has stopped). A backfill failure is a badge, not a full-pane
+// error: it never touches pageErr. The chain stops on an error, an empty page (start reached),
+// a page that did not lower the cursor (a hostile/broken server or an all-duplicate page — the
+// mirror of RunLogs' "did not advance" guard), or a page reaching seq 1. It is a *tuiModel
+// method, not a *detailState one, because the scroll anchoring below reads the rendered
+// line-count through the model's buildTranscriptLines.
+func (m *tuiModel) applyBackfillPage(msgs []apitypes.MessageDTO, err error) tea.Cmd {
+	if err != nil {
+		m.detail.backfilling = false
+		m.detail.backfillFailed = true
+		return nil
+	}
+	before := m.detail.lowSeq // the page's `before`; the reply must lower it
+	// Anchor the paused viewport: measure the selected lane's rendered line count before and
+	// after the prepend, and push scroll down by the delta so the user's top line does not
+	// jump. With follow the window is bottom-anchored and nothing moves.
+	var linesBefore int
+	if !m.detail.follow {
+		if lane, ok := m.detail.selectedLane(); ok {
+			linesBefore = len(m.buildTranscriptLines(lane))
+		}
+	}
+	m.detail.addFrames(framesFromMessages(msgs))
+	m.detail.rebuild()
+	if !m.detail.follow {
+		if lane, ok := m.detail.selectedLane(); ok {
+			if delta := len(m.buildTranscriptLines(lane)) - linesBefore; delta > 0 {
+				m.detail.scroll += delta
+			}
+		}
+	}
+	if len(msgs) == 0 { // the start of history: nothing older
+		m.detail.historyComplete = true
+		m.detail.backfilling = false
+		return nil
+	}
+	if m.detail.lowSeq >= before { // did not advance: stop, invite `r`
+		m.detail.backfilling = false
+		m.detail.backfillFailed = true
+		return nil
+	}
+	if m.detail.lowSeq <= 1 { // reached seq 1: the whole history is held
+		m.detail.historyComplete = true
+		m.detail.backfilling = false
+		return nil
+	}
+	m.detail.backfillFailed = false
+	return m.backfillCmd(m.detail.runID, m.detail.lowSeq)
 }
 
 // applyMeta refreshes the run DTO from a periodic GetRun poll WITHOUT touching the frame
@@ -175,23 +238,68 @@ func (d *detailState) applyEvents(evs []apitypes.RunEventDTO) bool {
 	return inputChanged
 }
 
-// addFrame appends a message frame, deduped by seq. Dedup is required, not defensive:
-// a reconnect replays from the last seq seen and the live socket may deliver the same
-// frame, and a duplicate would double a lane's contribution.
+// addFrame appends a single (live) message frame, deduped by seq, keeping frames seq-sorted
+// and the seq bounds current. Dedup is required, not defensive: a reconnect replays from the
+// last seq seen and the live socket may deliver the same frame, and a duplicate would double a
+// lane's contribution. It routes through addFrames so the sort + bounds invariant has one owner.
 func (d *detailState) addFrame(f laneFrame) {
+	d.addFrames([]laneFrame{f})
+}
+
+// framesFromMessages maps a page of MessageDTOs to laneFrames, the shape addFrames folds in.
+func framesFromMessages(msgs []apitypes.MessageDTO) []laneFrame {
+	out := make([]laneFrame, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, laneFrameFromMessage(m))
+	}
+	return out
+}
+
+// addFrames folds a page of frames into the seq-sorted log, deduped by seq. frames stays
+// ascending by seq so the transcript renders oldest→newest regardless of which transport
+// (tail, backfill, live) delivered a frame. A page below the held range prepends, above
+// appends, overlapping merges — all handled by a stable sort after the dedup append (M5 is not
+// the perf milestone; M6 memoizes rendering). The backfill "did not advance" guard reads the
+// seq bounds after this returns, not a count, so nothing here returns one.
+func (d *detailState) addFrames(page []laneFrame) {
 	if d.seen == nil {
-		// Total on a zero-value detailState: newDetailState seeds this map, but the
-		// handler guard is the load-bearing fix — this keeps a nil map from panicking
-		// the program if any future path reaches addFrame without the constructor.
+		// Total on a zero-value detailState: newDetailState seeds this map, but the handler
+		// guard is the load-bearing fix — this keeps a nil map from panicking the program if
+		// any future path reaches addFrames without the constructor.
 		d.seen = map[int32]bool{}
 	}
-	if f.Seq > 0 {
-		if d.seen[f.Seq] {
-			return
+	added := 0
+	for _, f := range page {
+		if f.Seq > 0 {
+			if d.seen[f.Seq] {
+				continue
+			}
+			d.seen[f.Seq] = true
 		}
-		d.seen[f.Seq] = true
+		d.frames = append(d.frames, f)
+		added++
 	}
-	d.frames = append(d.frames, f)
+	if added > 0 {
+		sort.SliceStable(d.frames, func(i, j int) bool { return d.frames[i].Seq < d.frames[j].Seq })
+	}
+	d.recomputeSeqBounds()
+}
+
+// recomputeSeqBounds sets lowSeq/highSeq from the seq-carrying frames (seq>0), ignoring any
+// seq-less infra frame.
+func (d *detailState) recomputeSeqBounds() {
+	d.lowSeq, d.highSeq = 0, 0
+	for _, f := range d.frames {
+		if f.Seq <= 0 {
+			continue
+		}
+		if d.lowSeq == 0 || f.Seq < d.lowSeq {
+			d.lowSeq = f.Seq
+		}
+		if f.Seq > d.highSeq {
+			d.highSeq = f.Seq
+		}
+	}
 }
 
 func (d *detailState) rebuild() {
@@ -274,7 +382,17 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	case keyEsc:
 		return m.exitToBoard()
 	case keyRefresh:
-		return m, tea.Batch(m.loadRunCmd(m.detail.runID), m.loadTailCmd(m.detail.runID))
+		cmds := []tea.Cmd{m.loadRunCmd(m.detail.runID), m.loadTailCmd(m.detail.runID)}
+		// Resume a stalled or failed background backfill (M5): clear the failed flag and
+		// re-arm the walk from the current cursor. M7 reworks `r` to be fully incremental;
+		// this is the M5 resume. Skipped when the walk is already complete or in flight so a
+		// refresh never stacks a second backfill chain on the one already running.
+		if !m.detail.historyComplete && !m.detail.backfilling && m.detail.lowSeq > 1 {
+			m.detail.backfillFailed = false
+			m.detail.backfilling = true
+			cmds = append(cmds, m.backfillCmd(m.detail.runID, m.detail.lowSeq))
+		}
+		return m, tea.Batch(cmds...)
 	case keyCollapseCrew:
 		// Fold / unfold the crew list so the milestone block below it is always reachable
 		// (the rail is height-clamped and does not scroll). No-op with no lanes: there is

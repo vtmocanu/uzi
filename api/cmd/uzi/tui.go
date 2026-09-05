@@ -135,11 +135,14 @@ type detailRunMsg struct {
 	err   error
 }
 
-// detailPageKind tags a transcript page. M4 uses only pageTail (the newest page);
-// pageBackfill/pageCatchup are added by later milestones.
+// detailPageKind tags a transcript page. pageTail is the newest page; pageBackfill is the
+// background walk toward older history (M5). pageCatchup is added by a later milestone.
 type detailPageKind int
 
-const pageTail detailPageKind = iota
+const (
+	pageTail detailPageKind = iota
+	pageBackfill
+)
 
 // detailPageMsg carries one page of transcript messages for the drilled-in run.
 type detailPageMsg struct {
@@ -501,6 +504,17 @@ func (m tuiModel) loadTailCmd(runID string) tea.Cmd {
 	}
 }
 
+// backfillCmd fetches the newest page strictly below `before` (older history), for the
+// background walk that fills the transcript after the tail (PRD #1137 D1). One page; the
+// reply chains the next.
+func (m tuiModel) backfillCmd(runID string, before int32) tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{Before: before, Limit: detailPageSize, PayloadMax: detailPayloadMax})
+		return detailPageMsg{runID: runID, kind: pageBackfill, msgs: msgs, err: err}
+	}
+}
+
 // refreshRunMetaCmd re-reads only the run DTO (no transcript replay), so the periodic
 // detail refresh is cheap: the socket already carries the frames, this just refreshes the
 // milestone / health / duration fields the stream does not send.
@@ -708,6 +722,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.kind {
 		case pageTail:
 			m.detail.applyTailPage(msg.msgs, msg.err)
+			// Start the background backfill once the tail is in, if there is older history to
+			// walk (PRD #1137 D1). The reply chains the next page.
+			if msg.err == nil && !m.detail.historyComplete && m.detail.lowSeq > 1 {
+				m.detail.backfilling = true
+				return m, m.backfillCmd(m.detail.runID, m.detail.lowSeq)
+			}
+			if m.detail.lowSeq <= 1 { // 0 (empty run) or 1 (start already held): nothing older
+				m.detail.historyComplete = true
+			}
+			return m, nil
+		case pageBackfill:
+			return m, (&m).applyBackfillPage(msg.msgs, msg.err)
 		}
 		return m, nil
 

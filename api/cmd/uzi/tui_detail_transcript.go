@@ -410,7 +410,32 @@ func (m tuiModel) renderTranscript() string {
 	// reach the bottom of the screen even when the content is shorter than the viewport (#379).
 	window := padLinesToViewport(lines[top:end], vp)
 
-	return m.padPaneTitle(title, m.followBadge(top, maxTop)) + "\n" + window
+	badge := m.followBadge(top, maxTop)
+	if bf := m.backfillBadge(); bf != "" {
+		if badge != "" {
+			badge = bf + m.pal.faint.Render("  ") + badge
+		} else {
+			badge = bf
+		}
+	}
+	return m.padPaneTitle(title, badge) + "\n" + window
+}
+
+// backfillBadge reports the background history walk in the pane title, left of the follow badge
+// (PRD #1137 M5). held/total are free because seq is gapless from 1 (D5), so highSeq is the
+// total. It says nothing once the walk is complete; on a failed/stalled page it invites `r`.
+func (m tuiModel) backfillBadge() string {
+	if m.detail.historyComplete {
+		return ""
+	}
+	if m.detail.backfillFailed {
+		return lipgloss.NewStyle().Foreground(m.pal.amber).Render("⇡ earlier history unavailable · r")
+	}
+	if m.detail.backfilling {
+		held := len(m.detail.frames)
+		return m.pal.faint.Render("⇡ loading earlier · " + itoa(held) + " of " + itoa(int(m.detail.highSeq)))
+	}
+	return ""
 }
 
 // followBadge is the transcript's live-follow affordance (M5) — distinct from the transport
