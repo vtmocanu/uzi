@@ -509,18 +509,21 @@ export function RunDefaults() {
               // Driven by the MODE first (mirroring the worker picker): an auto judge
               // lane selects the sentinel, everything else falls back to the label, and
               // a pinned binding whose token was deleted arrives here as effective mode
-              // "default" with a null label — so it shows "your default token".
+              // "default" with a null label — so it shows the default-token option.
               value={user?.judge_anthropic_bind_mode === "auto" ? AUTO_OPTION : (user?.judge_anthropic_secret_label ?? "")}
               disabled={judgeBusy}
               onChange={(e) => setJudgeBinding(e.target.value)}
             >
-              <option value="">your default token</option>
+              {/* Copy mirrors the worker picker (WorkersSettings.tsx, F15): the two
+                  account-level choices read as sentences, and a token NAMED "default"
+                  shows "(your default)" so "default (default)" never appears. */}
+              <option value="">Use my default token</option>
               <option value={AUTO_OPTION}>Auto-select from the pool</option>
               <optgroup label="Pin to a token">
                 {secrets.map((s) => (
                   <option key={s.id} value={s.label}>
                     {s.label}
-                    {s.is_default ? " (default)" : ""}
+                    {s.is_default ? " (your default)" : ""}
                   </option>
                 ))}
               </optgroup>
@@ -530,9 +533,11 @@ export function RunDefaults() {
               a cheaper console key while your runs stay on a subscription.
             </p>
             {/* Empty-pool warning, D4 wording: unlike a worker (which holds), an auto
-                judge lane with an empty pool spends the default token. */}
+                judge lane with an empty pool spends the default token. role=status /
+                aria-live mirrors the worker picker's announce() so a screen-reader user
+                who selects Auto with an empty pool hears the fallback. */}
             {user?.judge_anthropic_bind_mode === "auto" && pooledCount === 0 && (
-              <p className="mt-1.5 text-xs text-warn">
+              <p className="mt-1.5 text-xs text-warn" role="status" aria-live="polite">
                 Your pool is empty, so retrospectives spend your default token until you add a token to the pool.
               </p>
             )}
