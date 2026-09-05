@@ -757,9 +757,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				s.NoteSeen(m.detail.highSeq)
 			}
 			// Start the background backfill once the tail is in, if there is older history to
-			// walk (PRD #1137 D1). The reply chains the next page. The !backfilling guard keeps
-			// a mid-walk `r` (which re-issues loadTailCmd) from starting a SECOND parallel chain
-			// over the shared lowSeq cursor.
+			// walk (PRD #1137 D1). The reply chains the next page. The !backfilling guard keeps a
+			// second tail page (e.g. an `r` retry of a failed initial tail) from starting a SECOND
+			// parallel backfill chain over the shared lowSeq cursor.
 			if msg.err == nil && !m.detail.historyComplete && !m.detail.backfilling && m.detail.lowSeq > 1 {
 				m.detail.backfilling = true
 				return m, m.backfillCmd(m.detail.runID, m.detail.lowSeq)
@@ -782,12 +782,16 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.detail.catchupWaitID = 0 // chain ends; the next tick may retry
 				return m, nil
 			}
+			before := m.detail.highSeq
 			m.detail.applyCatchupPage(msg.msgs)
 			if s := m.detail.stream; s != nil {
 				s.NoteSeen(m.detail.highSeq)
 			}
-			if len(msg.msgs) == 0 {
-				m.detail.catchupWaitID = 0 // caught up: chain done
+			// Stop on an empty page (caught up) OR a page that did not advance the cursor (a
+			// hostile/broken server or an all-duplicate page — the mirror of the backfill
+			// did-not-advance guard), so the chain can never spin without clearing its guard.
+			if len(msg.msgs) == 0 || m.detail.highSeq <= before {
+				m.detail.catchupWaitID = 0 // caught up (or cannot advance): chain done
 				return m, nil
 			}
 			return m, m.catchupCmd(m.detail.runID, m.detail.highSeq, msg.reqID) // chain the next page (same id)
@@ -911,7 +915,14 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.detail.metaWaitID == 0 {
 			cmds = append(cmds, (&m).startDetailMetaReq()) // one meta refresh, guarded (#1135)
 		}
-		if m.detail.catchupWaitID == 0 && m.detail.highSeq > 0 {
+		switch {
+		case m.detail.pageErr != nil && m.detail.highSeq == 0:
+			// The initial tail failed and the socket is also down, so nothing ever loaded the
+			// transcript: retry the tail. Bounded to this stuck state (a held page moves to the
+			// guarded catch-up below), so it never reintroduces the per-tick whole-transcript
+			// refetch M7 removed.
+			cmds = append(cmds, m.loadTailCmd(m.detail.runID))
+		case m.detail.catchupWaitID == 0 && m.detail.highSeq > 0:
 			cmds = append(cmds, (&m).startDetailCatchupReq()) // one catch-up chain, guarded
 		}
 		return m, tea.Batch(cmds...)

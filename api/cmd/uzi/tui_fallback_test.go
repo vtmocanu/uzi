@@ -279,3 +279,99 @@ func TestTUIDetailCatchupChain(t *testing.T) {
 		t.Error("an empty catch-up page must not chain another page")
 	}
 }
+
+// M7 regression (review Finding 1): when the INITIAL tail page fails and the socket is also down,
+// nothing ever loaded the transcript (highSeq stays 0), so catch-up (gated on highSeq>0) and
+// backfill (gated on lowSeq>1) are both inapplicable. `r` — the "· r to retry" the pane offers —
+// and the poll fallback must RETRY the tail (loadTailCmd), not just spin a meta refresh. This is
+// not a "tail after the first load" (SC4): the first load never completed, nothing is held.
+func TestTUIDetailTailRetryAfterFailedInitialTail(t *testing.T) {
+	shrinkPollInterval(t, time.Millisecond)
+	now := time.Now()
+	runID := "tail-retry"
+	fake := &uzicli.FakeClient{
+		LogsByID: map[string][]apitypes.MessageDTO{runID: {
+			msgDTO(1, "text", "lead", "", "", "body-1", now),
+			msgDTO(2, "text", "lead", "", "", "body-2", now),
+		}},
+	}
+	fake.GetRunHook = func(id string) (apitypes.RunDTO, error) { return apitypes.RunDTO{ID: id, Status: "running"}, nil }
+
+	m := tuiTestModel(t, fake, runID)
+	next, _ := m.Update(detailRunMsg{runID: runID, run: apitypes.RunDTO{ID: runID, Status: "running"}})
+	m = next.(tuiModel)
+	// The initial tail fails and the socket is down: the stuck state.
+	next, _ = m.Update(detailPageMsg{runID: runID, kind: pageTail, err: errFake("tail boom")})
+	m = next.(tuiModel)
+	next, _ = m.Update(streamReadyMsg{runID: runID, err: errFake("stream down")})
+	m = next.(tuiModel)
+	if m.detail.highSeq != 0 || m.detail.pageErr == nil || !m.detail.polling {
+		t.Fatalf("setup: want highSeq 0, pageErr set, polling; got highSeq=%d pageErr=%v polling=%v", m.detail.highSeq, m.detail.pageErr, m.detail.polling)
+	}
+
+	// `r` must retry the tail.
+	before := len(fake.RunLogsPageCalls)
+	nm, cmd := m.detailKey(keyRefresh)
+	m = nm.(tuiModel)
+	drainCmd(cmd)
+	var sawTail bool
+	for _, q := range fake.RunLogsPageCalls[before:] {
+		if q.Tail == detailPageSize {
+			sawTail = true
+		}
+		if q.After == 0 && q.Tail == 0 && q.Before == 0 {
+			t.Errorf("r issued an After:0 whole-transcript fetch %+v", q)
+		}
+	}
+	if !sawTail {
+		t.Fatalf("r did not retry the failed initial tail; calls = %+v", fake.RunLogsPageCalls[before:])
+	}
+
+	// The poll fallback must retry it too.
+	before = len(fake.RunLogsPageCalls)
+	next, cmd = m.Update(pollFallbackMsg{})
+	m = next.(tuiModel)
+	drainCmd(cmd)
+	sawTail = false
+	for _, q := range fake.RunLogsPageCalls[before:] {
+		if q.Tail == detailPageSize {
+			sawTail = true
+		}
+	}
+	if !sawTail {
+		t.Fatalf("the poll fallback did not retry the failed initial tail; calls = %+v", fake.RunLogsPageCalls[before:])
+	}
+}
+
+// M7 regression (review Finding 3): a catch-up page that does NOT advance the cursor (a hostile /
+// broken server returning non-empty but already-held frames) stops the chain and clears
+// catchupWaitID, the mirror of the backfill did-not-advance guard — so it can never spin.
+func TestTUIDetailCatchupDidNotAdvanceStops(t *testing.T) {
+	now := time.Now()
+	runID := "catchup-noadvance"
+	fake := &uzicli.FakeClient{}
+	m := tuiTestModel(t, fake, runID)
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running"}, []apitypes.MessageDTO{
+		msgDTO(1, "text", "lead", "", "", "body-1", now),
+		msgDTO(2, "text", "lead", "", "", "body-2", now),
+	})
+	// Force a catch-up chain in flight.
+	m.detail.polling = true
+	cmd := (&m).startDetailCatchupReq()
+	_ = cmd
+	if m.detail.catchupWaitID == 0 {
+		t.Fatal("setup: catch-up chain did not start")
+	}
+	// A non-empty page whose frames are all already held (seq <= highSeq): the cursor does not
+	// advance, so the chain must stop and clear its guard rather than re-issuing forever.
+	next, cmd := m.Update(detailPageMsg{runID: runID, kind: pageCatchup, reqID: m.detail.catchupWaitID, msgs: []apitypes.MessageDTO{
+		msgDTO(2, "text", "lead", "", "", "body-2", now), // already held
+	}})
+	m = next.(tuiModel)
+	if m.detail.catchupWaitID != 0 {
+		t.Fatal("a non-advancing catch-up page must clear catchupWaitID")
+	}
+	if cmd != nil {
+		t.Errorf("a non-advancing catch-up page must not chain another; got %T", cmd())
+	}
+}

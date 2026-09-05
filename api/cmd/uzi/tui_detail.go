@@ -457,7 +457,13 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		if m.detail.metaWaitID == 0 {
 			cmds = append(cmds, (&m).startDetailMetaReq())
 		}
-		if m.detail.catchupWaitID == 0 && m.detail.highSeq > 0 {
+		switch {
+		case m.detail.pageErr != nil && m.detail.highSeq == 0:
+			// The initial tail never loaded (it errored, so no frames are held): retry it. This
+			// is the "· r to retry" the pane offers, and it is NOT a "tail after the first load"
+			// (SC4) — the first load has not completed, nothing is held.
+			cmds = append(cmds, m.loadTailCmd(m.detail.runID))
+		case m.detail.catchupWaitID == 0 && m.detail.highSeq > 0:
 			cmds = append(cmds, (&m).startDetailCatchupReq())
 		}
 		// Resume a stalled/failed background backfill from the current cursor (M5), guarded so a
