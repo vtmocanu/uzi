@@ -32,6 +32,13 @@ type boardState struct {
 	// cannot latch it). User-initiated r/a fetches set it but are never gated on it.
 	boardInFlight bool
 
+	// errStreak is the consecutive-failure counter driving the tick backoff (PRD #1130 M3 D4):
+	// each consecutive failed board poll widens the reschedule interval via boardTickInterval,
+	// and the first success resets it to 0 so the cadence snaps back to the 2s base. Updated
+	// inside apply, so it honours the same admin-mismatch early return (a stale reply leaves it
+	// unchanged).
+	errStreak int
+
 	filtering bool
 	filter    string
 
@@ -62,9 +69,15 @@ func (b *boardState) apply(msg boardRunsMsg) {
 			b.adminDenied = true
 		}
 		b.err = msg.err
+		// A genuine failed poll for the board this reply belongs to: widen the backoff
+		// (PRD #1130 M3 D4). Placed after the admin-mismatch early return, so a stale reply
+		// leaves the streak untouched. The admin-refusal sub-branch above is still an error
+		// reply for the own board that follows, so incrementing here is correct for it too.
+		b.errStreak++
 		return
 	}
 	b.err = nil
+	b.errStreak = 0
 	b.runs = msg.runs
 	b.clampCursor()
 }

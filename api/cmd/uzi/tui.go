@@ -37,6 +37,11 @@ var boardPollInterval = 2 * time.Second
 // too long for a 2s-cadence poll (PRD #1130 D3). A var (not const) so a test can shrink it.
 var boardPollTimeout = 10 * time.Second
 
+// boardBackoffCap caps the board's error-backoff reschedule interval (PRD #1130 M3 D4): the
+// tick interval doubles from boardPollInterval per consecutive failed poll but never exceeds
+// this. A var (not const) so a test can shrink it and so the cap is explicit.
+var boardBackoffCap = 30 * time.Second
+
 // rateLimitPollInterval is the strip's own cadence: re-fetch the per-token meters and
 // settings on ~60s, matching the web sidebar's useMyRateLimits(60_000). The server
 // recomputes meters only every ~5m (UZI_USAGE_POLL_INTERVAL), so polling faster
@@ -278,6 +283,34 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(boardPollInterval, func(time.Time) tea.Msg { return boardTickMsg{} })
 }
 
+// tickAfter re-arms the board tick after an explicit delay, used by the backoff reschedule so a
+// confirmed-bad link is polled at boardTickInterval(streak) rather than the flat 2s cadence.
+func tickAfter(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg { return boardTickMsg{} })
+}
+
+// boardTickInterval maps the consecutive board-poll error streak to the reschedule
+// interval (PRD #1130 M3 D4): boardPollInterval at streak 0, doubling per consecutive
+// failure, clamped at boardBackoffCap. A pure function so the backoff is unit-assertable
+// without inspecting an opaque tea.Tick. Reset-on-success (streak→0) snaps back to base.
+func boardTickInterval(streak int) time.Duration {
+	if streak <= 0 {
+		return boardPollInterval
+	}
+	// Clamp the shift so a large streak cannot overflow the Duration; the cap clamp below
+	// governs the real ceiling, this only bounds the arithmetic.
+	if streak > 16 {
+		streak = 16
+	}
+	d := boardPollInterval << uint(streak)
+	// A left shift can also overflow into a negative Duration on a large base; treat any
+	// non-positive or over-cap result as the cap.
+	if d <= 0 || d > boardBackoffCap {
+		return boardBackoffCap
+	}
+	return d
+}
+
 func stripTickCmd() tea.Cmd {
 	return tea.Tick(rateLimitPollInterval, func(time.Time) tea.Msg { return stripTickMsg{} })
 }
@@ -482,7 +515,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// poll while one is still pending, so a link where a ListRuns takes longer than the
 		// 2s cadence cannot pile up overlapping concurrent requests. The pending poll's reply
 		// clears the marker (boardRunsMsg case). The tick is ALWAYS re-armed regardless.
-		cmds := []tea.Cmd{tickCmd()}
+		//
+		// Error backoff (PRD #1130 M3 D4): the reschedule interval widens with the consecutive
+		// error streak (boardTickInterval), so a confirmed-bad link is not hammered at the full
+		// 2s cadence; the first success resets the streak, snapping the cadence back to base.
+		cmds := []tea.Cmd{tickAfter(boardTickInterval(m.board.errStreak))}
 		if !m.board.boardInFlight {
 			m.board.boardInFlight = true
 			cmds = append(cmds, m.fetchRunsCmd(m.board.admin))
