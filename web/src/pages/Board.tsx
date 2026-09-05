@@ -338,10 +338,11 @@ export function Board() {
   const [reordering, setReordering] = useState(false);
   const reorderRef = useRef(false);
   // Mutation-generation counter (#1060): bumped whenever a board mutation
-  // (reorder, column move, close/reopen) acquires OR releases the reorderRef lock
-  // below. poll() captures it before its await and discards a response if it
-  // changed since — so a background poll whose getBoard was in flight when a
-  // mutation applied its authoritative card cannot overwrite it with stale state.
+  // (reorder, column move, close/reopen via applyDrop, plus promote() and
+  // refresh() below) starts OR settles. poll() captures it before its await and
+  // discards a response if it changed since — so a background poll whose getBoard
+  // was in flight when a mutation applied its authoritative card (or board)
+  // cannot overwrite it with stale state.
   const mutationGenRef = useRef(0);
   // B1. `reordering` drives the buttons' `disabled`, and DISABLING A FOCUSED BUTTON
   // BLURS IT — the browser moves focus to <body> and never brings it back. Measured by
@@ -659,12 +660,17 @@ export function Board() {
   const refresh = async () => {
     setSyncing(true);
     setError("");
+    // #1060: refresh replaces the whole board with syncRepo's authoritative
+    // payload, so a poll already in flight must not clobber it — bump the
+    // generation at the start and settle, matching applyDrop.
+    mutationGenRef.current++;
     try {
       const { board } = await api.syncRepo(repoId);
       setBoard(board);
     } catch (err) {
       setError(errorMessage(err, "Refresh failed"));
     } finally {
+      mutationGenRef.current++;
       setSyncing(false);
     }
   };
@@ -709,12 +715,17 @@ export function Board() {
   const promote = async (card: CardData) => {
     if (promoting != null) return;
     setPromoting(card.iid);
+    // #1060: promote replaces the card in place with promoteIssue's authoritative
+    // response (now carrying the uzi label), so a poll already in flight must not
+    // clobber it — bump the generation at the start and settle, matching applyDrop.
+    mutationGenRef.current++;
     try {
       const { card: updated } = await api.promoteIssue(repoId, card.iid);
       setBoard((b) => (b ? { ...b, cards: b.cards.map((c) => (c.iid === updated.iid ? updated : c)) } : b));
     } catch (err) {
       setError(errorMessage(err, "Could not promote the issue"));
     } finally {
+      mutationGenRef.current++;
       setPromoting(null);
     }
   };
