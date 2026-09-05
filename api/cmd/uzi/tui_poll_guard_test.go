@@ -207,6 +207,56 @@ func TestTUIDetailMetaGuardClearsOnError(t *testing.T) {
 	}
 }
 
+// The ctrl+c confirm modal (m.quitting) is CANCELLABLE, so it must not kill automatic polling.
+// A board tick that fires while the modal is open re-arms the tick chain (skipping the poll) so
+// that dismissing the modal resumes polling. Regression guard: the rework moved rescheduling into
+// the reply, so a quitting branch that returned nil would drop the only pending tick with no reply
+// to revive it — wedging the board once the modal is cancelled.
+func TestTUIBoardTickReArmsWhileQuittingModalOpen(t *testing.T) {
+	origInterval := boardPollInterval
+	boardPollInterval = time.Millisecond
+	t.Cleanup(func() { boardPollInterval = origInterval })
+
+	runs := []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1111-2222-3333-444444444444", Kind: "issue", Status: "running"}},
+	}
+	fake := &uzicli.FakeClient{Runs: runs}
+	m := tuiTestModel(t, fake, "")
+	m = idleBoard(t, m, runs) // waitID == 0, one tick pending under the current gen
+
+	// Open the ctrl+c confirm modal (cancellable — no tea.Quit on this path).
+	next, _ := m.handleKey(keyCtrlC)
+	m = next.(tuiModel)
+	if !m.quitting {
+		t.Fatal("ctrl+c did not open the quitting confirm modal")
+	}
+
+	// A board tick fires while the modal is open: it must NOT poll (no work while the user decides)
+	// but MUST re-arm the tick chain so polling survives the modal.
+	callsBefore := fake.ListRunsCalls
+	m, cmd := tick(t, m)
+	if !hasMsg[boardTickMsg](drainCmd(cmd)) {
+		t.Fatal("a board tick during the quitting modal did not re-arm the tick chain; cancelling the modal would leave polling dead")
+	}
+	if fake.ListRunsCalls != callsBefore {
+		t.Fatalf("a board tick during the quitting modal issued a poll (calls %d → %d); no work should happen while the modal is open", callsBefore, fake.ListRunsCalls)
+	}
+
+	// Cancel the modal with a non-confirming key: the model keeps running.
+	next, _ = m.handleKey("j")
+	m = next.(tuiModel)
+	if m.quitting {
+		t.Fatal("a non-confirming key did not cancel the quitting modal")
+	}
+
+	// Proof polling is alive: the re-armed tick (current gen) fetches again from idle.
+	m, cmd = tick(t, m)
+	drainCmd(cmd)
+	if fake.ListRunsCalls != callsBefore+1 {
+		t.Fatalf("after cancelling the modal the board did not resume polling (ListRuns %d, want %d)", fake.ListRunsCalls, callsBefore+1)
+	}
+}
+
 // D1: a user-initiated manual refresh (r) is NEVER blocked by the in-flight guard, even while a
 // periodic poll is pending. It issues its fetch and (so the next tick does not stack on it) mints a
 // fresh id that becomes the new waitID.

@@ -556,10 +556,14 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen != m.board.tickGen {
 			return m, nil
 		}
-		// Stop polling at teardown: no re-arm, so the tick chain lapses (the reply owns
-		// rescheduling, and there is no reply to come once we are quitting).
+		// The ctrl+c confirm modal (m.quitting) is CANCELLABLE — any non-confirming key clears it
+		// and the model keeps running (handleKey), so this is NOT teardown. Keep the tick chain
+		// alive across the modal by re-arming at the current generation while skipping the poll (no
+		// work while the user is deciding to quit), mirroring the strip/skew ticks. Since the reply
+		// is now the only OTHER re-arm site, dropping the tick here would wedge automatic polling
+		// once the modal is dismissed.
 		if m.quitting {
-			return m, nil
+			return m, tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen)
 		}
 		// The in-flight guard (PRD #1130 M1 D1): a periodic tick starts a new board poll ONLY
 		// when none is outstanding (waitID == 0), so a link where a ListRuns takes longer than
