@@ -152,7 +152,7 @@ describe("SummaryRunner.generatePlanSummary", () => {
   it("skips a brace example in prose before the real JSON (scans later candidates)", async () => {
     const json = JSON.stringify({ summary: "Plan looks fine.", deltas: [{ kind: "added", text: "a change" }] });
     const { runner } = await makeRunner(
-      replyingQueryFn("Use {summary, deltas} here.\n```json\n" + json + "\n```"),
+      replyingQueryFn("```json\nUse {summary, deltas} here.\n" + json + "\n```"),
     );
     const out = await runner.generatePlanSummary(planInput);
     assert.ok(out);
