@@ -64,13 +64,13 @@ func TestUserJudgeBindingLiveDB(t *testing.T) {
 	strangerToken := mkSecret(stranger, "default", true)
 
 	// A user starts unbound: their retrospectives spend their default.
-	if bound, berr := q.GetUserJudgeAnthropicSecret(ctx, owner); berr != nil || bound.Valid {
+	if bound, berr := q.GetUserJudgeAnthropicBinding(ctx, owner); berr != nil || bound.JudgeAnthropicSecretID.Valid {
 		t.Fatalf("fresh user judge binding = (%+v,%v), want NULL", bound, berr)
 	}
 
 	// --- Cross-user binding refused by the SCHEMA ---
-	if _, err := q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
-		ID: owner, JudgeAnthropicSecretID: pgtype.UUID{Bytes: strangerToken, Valid: true},
+	if _, err := q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
+		ID: owner, JudgeAnthropicBindMode: "pinned", JudgeAnthropicSecretID: pgtype.UUID{Bytes: strangerToken, Valid: true},
 	}); err == nil {
 		t.Fatal("binding the judge lane to ANOTHER user's secret succeeded — the composite FK is not enforcing, " +
 			"and a crafted request would spend that user's Anthropic account on retrospectives")
@@ -79,16 +79,16 @@ func TestUserJudgeBindingLiveDB(t *testing.T) {
 	}
 
 	// --- The user's own secret binds, and reads back ---
-	if _, err := q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
-		ID: owner, JudgeAnthropicSecretID: pgtype.UUID{Bytes: ownerCheap, Valid: true},
+	if _, err := q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
+		ID: owner, JudgeAnthropicBindMode: "pinned", JudgeAnthropicSecretID: pgtype.UUID{Bytes: ownerCheap, Valid: true},
 	}); err != nil {
 		t.Fatalf("bind judge to own secret: %v", err)
 	}
-	bound, err := q.GetUserJudgeAnthropicSecret(ctx, owner)
+	bound, err := q.GetUserJudgeAnthropicBinding(ctx, owner)
 	if err != nil {
 		t.Fatalf("read judge binding: %v", err)
 	}
-	if !bound.Valid || uuid.UUID(bound.Bytes) != ownerCheap {
+	if !bound.JudgeAnthropicSecretID.Valid || uuid.UUID(bound.JudgeAnthropicSecretID.Bytes) != ownerCheap {
 		t.Fatalf("judge binding = %+v, want %v", bound, ownerCheap)
 	}
 
@@ -98,11 +98,11 @@ func TestUserJudgeBindingLiveDB(t *testing.T) {
 		t.Fatalf("deleting a JUDGE-BOUND token must succeed and unbind (D5); it failed: %v — "+
 			"a bare ON DELETE SET NULL on this composite FK would try to null users.id, the PRIMARY KEY", err)
 	}
-	after, err := q.GetUserJudgeAnthropicSecret(ctx, owner)
+	after, err := q.GetUserJudgeAnthropicBinding(ctx, owner)
 	if err != nil {
 		t.Fatalf("read judge binding after delete: %v", err)
 	}
-	if after.Valid {
+	if after.JudgeAnthropicSecretID.Valid {
 		t.Fatal("judge binding survived its token's deletion — ON DELETE SET NULL did not fire")
 	}
 	// The user must still exist, with the same id. If SET NULL had targeted users.id
@@ -117,17 +117,17 @@ func TestUserJudgeBindingLiveDB(t *testing.T) {
 	}
 
 	// --- Clearing the binding explicitly is legal (MATCH SIMPLE) ---
-	if _, err := q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
-		ID: owner, JudgeAnthropicSecretID: pgtype.UUID{Bytes: ownerDefault, Valid: true},
+	if _, err := q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
+		ID: owner, JudgeAnthropicBindMode: "pinned", JudgeAnthropicSecretID: pgtype.UUID{Bytes: ownerDefault, Valid: true},
 	}); err != nil {
 		t.Fatalf("re-bind to the default token: %v", err)
 	}
-	if _, err := q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
-		ID: owner, JudgeAnthropicSecretID: pgtype.UUID{},
+	if _, err := q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
+		ID: owner, JudgeAnthropicBindMode: "default", JudgeAnthropicSecretID: pgtype.UUID{},
 	}); err != nil {
 		t.Fatalf("clearing the judge binding must be legal: %v", err)
 	}
-	if cleared, _ := q.GetUserJudgeAnthropicSecret(ctx, owner); cleared.Valid {
+	if cleared, _ := q.GetUserJudgeAnthropicBinding(ctx, owner); cleared.JudgeAnthropicSecretID.Valid {
 		t.Fatal("judge binding not cleared")
 	}
 
@@ -145,8 +145,8 @@ func TestUserJudgeBindingLiveDB(t *testing.T) {
 		t.Fatalf("create bound worker: %v", err)
 	}
 	second := mkSecret(owner, "judge-key", false)
-	if _, err := q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
-		ID: owner, JudgeAnthropicSecretID: pgtype.UUID{Bytes: second, Valid: true},
+	if _, err := q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
+		ID: owner, JudgeAnthropicBindMode: "pinned", JudgeAnthropicSecretID: pgtype.UUID{Bytes: second, Valid: true},
 	}); err != nil {
 		t.Fatalf("bind judge while a worker is bound elsewhere: %v", err)
 	}
@@ -157,8 +157,8 @@ func TestUserJudgeBindingLiveDB(t *testing.T) {
 	if uuid.UUID(reread.AnthropicSecretID.Bytes) != ownerDefault {
 		t.Fatalf("the worker's binding changed when the judge binding was set: %+v", reread.AnthropicSecretID)
 	}
-	judgeNow, _ := q.GetUserJudgeAnthropicSecret(ctx, owner)
-	if uuid.UUID(judgeNow.Bytes) != second {
+	judgeNow, _ := q.GetUserJudgeAnthropicBinding(ctx, owner)
+	if uuid.UUID(judgeNow.JudgeAnthropicSecretID.Bytes) != second {
 		t.Fatalf("judge binding = %+v, want %v", judgeNow, second)
 	}
 }
