@@ -3,7 +3,7 @@
 > Anchors verified against main at 7d133e4 on 2026-09-05.
 
 **GitHub Issue**: [#1130](https://github.com/vtmocanu/uzi/issues/1130)
-**Status**: Draft (created 2026-09-05)
+**Status**: Complete (created 2026-09-05, completed 2026-09-05)
 **Priority**: Medium
 **Related**:
 - `api/cmd/uzi/tui.go:33` — `boardPollInterval = 2 * time.Second`, the board's `ListRuns` cadence (D3: the board polls; only a drilled-in run opens a socket).
