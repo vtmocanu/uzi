@@ -32,41 +32,60 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			p := env.printer(gf)
-			// M1 keeps the legacy single-object JSON ({skill,hook}) for the first
-			// selected target so existing consumers/tests are unchanged; M3 replaces it
-			// with the full targets[] envelope.
-			if p.Format == uzicli.FormatJSON {
-				st, hst, err := skillAndHookStatus(env, targets[0])
-				if err != nil {
-					return err
-				}
-				return p.JSON(skillStatusJSON{Skill: st, Hook: hst})
-			}
+			// Attempt EVERY selected target — never stop after the first failure — and
+			// capture each into a per-target envelope item (PRD #1143 D6 / SC3).
+			results := make([]skillTargetResult, 0, len(targets))
 			for _, t := range targets {
-				st, hst, err := skillAndHookStatus(env, t)
-				if err != nil {
+				r := skillTargetResult{Target: t.Name, Result: skillStatusJSON{}}
+				st, hst, serr := skillAndHookStatus(env, t)
+				r.Result = skillStatusJSON{Skill: st, Hook: hst}
+				if serr != nil {
+					r.Error = serr.Error()
+					r.ExitCode = uzicli.ExitCodeFor(serr)
+				}
+				results = append(results, r)
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				// --target set ⇒ envelope only; omitted ⇒ legacy top-level (first/claude
+				// target's fields) PLUS the targets[] array, byte-identical for a
+				// successful no-target run (SC3).
+				var payload any
+				if cmd.Flags().Changed("target") {
+					payload = skillTargetsEnvelope{Targets: results}
+				} else {
+					first, _ := results[0].Result.(skillStatusJSON)
+					payload = legacyStatusJSON{skillStatusJSON: first, Targets: results}
+				}
+				if err := p.JSON(payload); err != nil {
 					return err
 				}
+				return firstTargetFailure(results)
+			}
+			for _, r := range results {
+				st, _ := statusOf(r)
 				rows := [][]string{
-					{"TARGET", t.Name},
-					{"PATH", st.Path},
-					{"INSTALLED", boolStr(st.Installed)},
-					{"UP_TO_DATE", boolStr(st.UpToDate)},
-					{"USER_EDITED", boolStr(st.UserEdited)},
-					{"HOOK_INSTALLED", boolStr(hst.Installed)},
-					{"HOOK_CURRENT", boolStr(hst.Current)},
+					{"TARGET", r.Target},
+					{"PATH", st.Skill.Path},
+					{"INSTALLED", boolStr(st.Skill.Installed)},
+					{"UP_TO_DATE", boolStr(st.Skill.UpToDate)},
+					{"USER_EDITED", boolStr(st.Skill.UserEdited)},
+					{"HOOK_INSTALLED", boolStr(st.Hook.Installed)},
+					{"HOOK_CURRENT", boolStr(st.Hook.Current)},
 				}
 				// Codex's mixed inline-[hooks]/hooks.json representation is surfaced only
 				// when detected (the row is absent for Claude and for a clean Codex tree).
-				if hst.HookConfigConflict {
+				if st.Hook.HookConfigConflict {
 					rows = append(rows, []string{"HOOK_CONFIG_CONFLICT", boolStr(true)})
 				}
 				if err := p.Table(nil, rows); err != nil {
 					return err
 				}
+				if r.Error != "" {
+					_, _ = fmt.Fprintf(env.Stderr, "reading %s skill status: %s\n", r.Target, r.Error)
+				}
 			}
-			return nil
+			return firstTargetFailure(results)
 		},
 	}
 
@@ -80,44 +99,61 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Attempt every selected target for its filesystem effect, then render.
-			results := make([]uzicli.SkillInstallResult, 0, len(targets))
+			// Attempt EVERY selected target for its filesystem effect, capturing each
+			// (success or failure) into an envelope item; explicit install failures ARE
+			// real errors, so the first one drives a non-zero exit AFTER the envelope
+			// prints (PRD #1143 D6). The best-effort auto path (root) still swallows.
+			results := make([]skillTargetResult, 0, len(targets))
 			for _, t := range targets {
+				r := skillTargetResult{Target: t.Name, Result: uzicli.SkillInstallResult{}}
 				inst, err := installerForTarget(env, t)
 				if err != nil {
-					return uzicli.Exitf(uzicli.ExitGeneric, "no home directory available: %v", err)
+					setTargetErr(&r, uzicli.Exitf(uzicli.ExitGeneric, "no home directory available: %v", err))
+					results = append(results, r)
+					continue
 				}
-				// Explicit install: a failure here IS a real error (exit non-zero) — the
-				// user asked for it. The best-effort auto path (root) swallows errors.
 				res, err := inst.Install(force)
+				r.Result = res
 				if err != nil {
-					return uzicli.Exitf(uzicli.ExitGeneric, "installing %s skill: %v", t.Name, err)
+					setTargetErr(&r, uzicli.Exitf(uzicli.ExitGeneric, "installing %s skill: %v", t.Name, err))
 				}
-				results = append(results, res)
+				results = append(results, r)
 			}
 			p := env.printer(gf)
-			// M1 keeps the legacy single-object result for the first selected target so
-			// existing consumers/tests are unchanged; M3 replaces it with targets[].
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(results[0])
+				var payload any
+				if cmd.Flags().Changed("target") {
+					payload = skillTargetsEnvelope{Targets: results}
+				} else {
+					first, _ := results[0].Result.(uzicli.SkillInstallResult)
+					payload = legacyInstallJSON{SkillInstallResult: first, Targets: results}
+				}
+				if err := p.JSON(payload); err != nil {
+					return err
+				}
+				return firstTargetFailure(results)
 			}
-			for i, res := range results {
-				t := targets[i]
+			for _, r := range results {
+				res, _ := r.Result.(uzicli.SkillInstallResult)
 				if res.BackedUp {
 					_, _ = fmt.Fprintf(env.Stderr, "your edited %s was preserved as %s\n", res.Path, res.BackupPath)
+				}
+				if r.Error != "" {
+					_, _ = fmt.Fprintf(env.Stderr, "%s: %s\n", r.Target, r.Error)
+					continue
 				}
 				if !gf.quiet {
 					switch {
 					case res.AlreadyCurrent:
-						p.Printf("%s skill already up to date at %s\n", t.Name, res.Path)
+						p.Printf("%s skill already up to date at %s\n", r.Target, res.Path)
 					case res.Wrote:
-						p.Printf("%s skill installed at %s\n", t.Name, res.Path)
+						p.Printf("%s skill installed at %s\n", r.Target, res.Path)
 					default:
-						p.Printf("%s skill state refreshed at %s\n", t.Name, res.Path)
+						p.Printf("%s skill state refreshed at %s\n", r.Target, res.Path)
 					}
 				}
 			}
-			return nil
+			return firstTargetFailure(results)
 		},
 	}
 	install.Flags().Bool("force", false, "overwrite an edited skill without prompting")
@@ -135,48 +171,66 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Attempt every selected target for its filesystem effect, then render.
-			results := make([]uzicli.HookInstallResult, 0, len(targets))
+			// Attempt EVERY selected target for its filesystem effect, capturing each
+			// into an envelope item; the first failure drives the exit AFTER the
+			// envelope prints (PRD #1143 D6).
+			results := make([]skillTargetResult, 0, len(targets))
 			for _, t := range targets {
+				r := skillTargetResult{Target: t.Name, Result: uzicli.HookInstallResult{}}
 				hm, err := hookManagerForTarget(env, t)
 				if err != nil {
-					return err
+					setTargetErr(&r, err)
+					results = append(results, r)
+					continue
 				}
 				res, err := hm.InstallHook()
+				r.Result = res
 				if err != nil {
-					return err
+					setTargetErr(&r, err)
 				}
-				results = append(results, res)
+				results = append(results, r)
 			}
 			p := env.printer(gf)
-			// M1/M2 keep the legacy single-object result for the first selected target;
-			// M3 replaces it with the full targets[] envelope.
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(results[0])
+				var payload any
+				if cmd.Flags().Changed("target") {
+					payload = skillTargetsEnvelope{Targets: results}
+				} else {
+					first, _ := results[0].Result.(uzicli.HookInstallResult)
+					payload = legacyHookInstallJSON{HookInstallResult: first, Targets: results}
+				}
+				if err := p.JSON(payload); err != nil {
+					return err
+				}
+				return firstTargetFailure(results)
 			}
-			for i, res := range results {
-				t := targets[i]
+			for _, r := range results {
+				res, _ := r.Result.(uzicli.HookInstallResult)
 				if res.BackedUp {
 					_, _ = fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
+				}
+				if r.Error != "" {
+					_, _ = fmt.Fprintf(env.Stderr, "%s: %s\n", r.Target, r.Error)
+					continue
 				}
 				if !gf.quiet {
 					switch {
 					case res.AlreadyPresent:
-						p.Printf("%s session-start hook already present in %s\n", t.Name, res.Path)
+						p.Printf("%s session-start hook already present in %s\n", r.Target, res.Path)
 					case res.Changed:
-						p.Printf("%s session-start hook installed in %s\n", t.Name, res.Path)
+						p.Printf("%s session-start hook installed in %s\n", r.Target, res.Path)
 					default:
-						p.Printf("%s session-start hook unchanged in %s\n", t.Name, res.Path)
+						p.Printf("%s session-start hook unchanged in %s\n", r.Target, res.Path)
 					}
 				}
 				// Codex never writes trust: after a change, point the user at /hooks to
 				// review and trust the freshly written hook.
-				if t.Name == "codex" && res.Changed {
+				if r.Target == "codex" && res.Changed {
 					_, _ = fmt.Fprintf(env.Stderr,
 						"run /hooks in Codex to review and trust this hook (uzi never writes Codex trust state)\n")
 				}
 			}
-			return nil
+			return firstTargetFailure(results)
 		},
 	}
 
@@ -189,42 +243,63 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			results := make([]uzicli.HookUninstallResult, 0, len(targets))
+			// Attempt EVERY selected target for its filesystem effect, capturing each
+			// into an envelope item; the first failure drives the exit AFTER the
+			// envelope prints (PRD #1143 D6).
+			results := make([]skillTargetResult, 0, len(targets))
 			for _, t := range targets {
+				r := skillTargetResult{Target: t.Name, Result: uzicli.HookUninstallResult{}}
 				hm, err := hookManagerForTarget(env, t)
 				if err != nil {
-					return err
+					setTargetErr(&r, err)
+					results = append(results, r)
+					continue
 				}
 				res, err := hm.UninstallHook()
+				r.Result = res
 				if err != nil {
-					return err
+					setTargetErr(&r, err)
 				}
-				results = append(results, res)
+				results = append(results, r)
 			}
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(results[0])
+				var payload any
+				if cmd.Flags().Changed("target") {
+					payload = skillTargetsEnvelope{Targets: results}
+				} else {
+					first, _ := results[0].Result.(uzicli.HookUninstallResult)
+					payload = legacyHookUninstallJSON{HookUninstallResult: first, Targets: results}
+				}
+				if err := p.JSON(payload); err != nil {
+					return err
+				}
+				return firstTargetFailure(results)
 			}
-			for i, res := range results {
-				t := targets[i]
+			for _, r := range results {
+				res, _ := r.Result.(uzicli.HookUninstallResult)
 				if res.BackedUp {
 					_, _ = fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
 				}
+				if r.Error != "" {
+					_, _ = fmt.Fprintf(env.Stderr, "%s: %s\n", r.Target, r.Error)
+					continue
+				}
 				if !gf.quiet {
 					if res.Changed {
-						p.Printf("removed %d %s session-start hook entr(y/ies) from %s\n", res.Removed, t.Name, res.Path)
+						p.Printf("removed %d %s session-start hook entr(y/ies) from %s\n", res.Removed, r.Target, res.Path)
 					} else {
 						p.Printf("no uzi session-start hook found in %s\n", res.Path)
 					}
 				}
 				// A Codex removal that shifted a later entry's trust index warrants a
 				// re-review via /hooks (uzi never writes trust).
-				if t.Name == "codex" && res.Changed && res.NonTerminalRemoval {
+				if r.Target == "codex" && res.Changed && res.NonTerminalRemoval {
 					_, _ = fmt.Fprintf(env.Stderr,
 						"a later hook entry followed the one removed from %s; its Codex trust may need re-review via /hooks\n", res.Path)
 				}
 			}
-			return nil
+			return firstTargetFailure(results)
 		},
 	}
 
@@ -237,6 +312,76 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 type skillStatusJSON struct {
 	Skill uzicli.SkillStatusResult `json:"skill"`
 	Hook  uzicli.HookStatusResult  `json:"hook"`
+}
+
+// skillTargetResult is one element of the per-verb `targets` envelope (PRD #1143
+// D6 / SC3): the harness name, its per-verb DTO (skillStatusJSON for status; the
+// uzicli install/hook result for the others), and — on a target failure — the
+// error message and the exit code it maps to. On success Error is empty and
+// ExitCode is 0.
+type skillTargetResult struct {
+	Target   string `json:"target"`
+	Result   any    `json:"result"`
+	Error    string `json:"error,omitempty"`
+	ExitCode int    `json:"exit_code"`
+}
+
+// skillTargetsEnvelope is the `--target`-set output shape: the targets[] array
+// alone, with NO promoted legacy top-level fields.
+type skillTargetsEnvelope struct {
+	Targets []skillTargetResult `json:"targets"`
+}
+
+// The legacy*JSON shapes are the `--target`-omitted output: the FIRST (always
+// claude) target's DTO fields promoted to the top level via anonymous embedding —
+// byte-identical to the pre-M3 single-object JSON for a successful run — PLUS the
+// additive targets[] array. A failed first target embeds the zero DTO, which is
+// the intended D6 behaviour (SC3 pins only the SUCCESSFUL legacy shape).
+type legacyStatusJSON struct {
+	skillStatusJSON
+	Targets []skillTargetResult `json:"targets"`
+}
+
+type legacyInstallJSON struct {
+	uzicli.SkillInstallResult
+	Targets []skillTargetResult `json:"targets"`
+}
+
+type legacyHookInstallJSON struct {
+	uzicli.HookInstallResult
+	Targets []skillTargetResult `json:"targets"`
+}
+
+type legacyHookUninstallJSON struct {
+	uzicli.HookUninstallResult
+	Targets []skillTargetResult `json:"targets"`
+}
+
+// setTargetErr records a target failure on its envelope item: the message and the
+// exit code the error maps to. The per-target Result is left as whatever the call
+// returned (a partial or zero DTO).
+func setTargetErr(r *skillTargetResult, err error) {
+	r.Error = err.Error()
+	r.ExitCode = uzicli.ExitCodeFor(err)
+}
+
+// firstTargetFailure returns an *ExitError carrying the FIRST failing target's
+// exit code and message, so the process exits non-zero AFTER the full envelope has
+// already been emitted. It returns nil when every target succeeded.
+func firstTargetFailure(results []skillTargetResult) error {
+	for _, r := range results {
+		if r.Error != "" {
+			return uzicli.Exitf(r.ExitCode, "%s", r.Error)
+		}
+	}
+	return nil
+}
+
+// statusOf extracts the skillStatusJSON a status target carries, so the text
+// renderer can read the typed fields back out of the envelope item.
+func statusOf(r skillTargetResult) (skillStatusJSON, bool) {
+	st, ok := r.Result.(skillStatusJSON)
+	return st, ok
 }
 
 // skillHome resolves the base home dir the bundled skill installs under: the
