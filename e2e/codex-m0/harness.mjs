@@ -103,7 +103,15 @@ export class Probe {
 
   async start({ respond = () => [message()], approval = () => ({ decision: "decline" }),
     rules, hookConfig = "", stdinApproval = false, multiAgent = false, unifiedExec = true,
-    dynamicTool } = {}) {
+    model = "gpt-5.5", codeMode = false, codeModeOnly = false, codeModeHost = false,
+    agentsEnabled, environments, dynamicTool } = {}) {
+    assert.equal(typeof model, "string");
+    assert.ok(model.length > 0, "M0 model must be explicit and non-empty");
+    for (const option of [codeMode, codeModeOnly, codeModeHost]) assert.equal(typeof option, "boolean");
+    this.model = model;
+    if (agentsEnabled !== undefined) assert.equal(typeof agentsEnabled, "boolean");
+    if (environments !== undefined) assert.ok(Array.isArray(environments));
+    this.environments = environments;
     const bin = process.env.M0_CODEX_BIN;
     assert.ok(bin && path.isAbsolute(bin), "set M0_CODEX_BIN to an external absolute Codex binary path");
     // Fresh homes do not override these fixed system paths. Managed tests
@@ -198,7 +206,7 @@ export class Probe {
       await writeFile(path.join(this.codexHome, "rules", "m0.rules"), rules);
     }
     await writeFile(path.join(this.codexHome, "config.toml"), `
-model = "gpt-5.5"
+model = ${JSON.stringify(model)}
 model_provider = "m0"
 project_doc_max_bytes = 0
 check_for_update_on_startup = false
@@ -213,9 +221,9 @@ apps = false
 plugins = false
 shell_snapshot = false
 shell_snapshot_v2 = false
-code_mode = false
-code_mode_only = false
-code_mode_host = false
+code_mode = ${codeMode}
+code_mode_only = ${codeModeOnly}
+code_mode_host = ${codeModeHost}
 code_mode_prewarm = false
 remote_models = false
 unified_exec = ${unifiedExec}
@@ -224,6 +232,7 @@ multi_agent = ${multiAgent}
 multi_agent_v2 = ${multiAgent}
 enable_request_compression = false
 write_stdin_approval = ${stdinApproval}
+${agentsEnabled === undefined ? "" : `\n[agents]\nenabled = ${agentsEnabled}\n`}
 
 [model_providers.m0]
 name = "M0 localhost fixture"
@@ -342,11 +351,12 @@ ${typeof hookConfig === "function" ? hookConfig(this) : hookConfig}
 
   async thread(approvalPolicy = "on-request", dynamicTools) {
     const result = await this.rpc("thread/start", {
-      model: "gpt-5.5", modelProvider: "m0", cwd: this.workspace,
+      model: this.model, modelProvider: "m0", cwd: this.workspace,
       approvalPolicy, approvalsReviewer: "user", sandbox: "danger-full-access", ephemeral: true,
       // app-server resolves each thread's config independently; the CLI's
       // global hook-trust flag alone does not arm these fixture hooks.
       config: { bypass_hook_trust: true },
+      ...(this.environments === undefined ? {} : { environments: this.environments }),
       ...(dynamicTools ? { dynamicTools } : {}),
     });
     return result.thread.id;

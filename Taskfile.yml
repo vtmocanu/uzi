@@ -2000,6 +2000,23 @@ tasks:
       - node --check e2e/codex-m0/managed-one-shot.test.mjs
       - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/managed-one-shot.test.mjs
 
+  test:codex-m0:code-mode:
+    desc: Opt-in container-only Codex intended-model code-mode characterization
+    cmds:
+      # The managed fixture and packaged codex-code-mode-host sibling are both
+      # required. Keep the two intended models serial in the isolated container.
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/managed-code-mode.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/managed-code-mode.test.mjs
+
+  test:codex-m0:native-isolation:
+    desc: Opt-in container-only Codex native capability removal characterization
+    cmds:
+      # Same isolated managed container and sibling code-mode host as above.
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/native-isolation.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/native-isolation.test.mjs
+
   # --------------------------------------------------------------------- docs --
   # docs:sync mirrors the root docs/*.md corpus into the api module tree so
   # api/internal/uzidocs can reach it with //go:embed (which cannot reference `..`,
