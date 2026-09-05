@@ -2,6 +2,7 @@ package uzicli
 
 import (
 	"context"
+	"sort"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -51,6 +52,66 @@ func (f *FakeClient) RunLogs(_ context.Context, id string, after int32) ([]apity
 	for _, m := range msgs {
 		if m.Seq > after {
 			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+// RunLogsPage mirrors the live single-request paging verb: it runs the SAME
+// client-side exclusivity validation as the real client (a forbidden combination
+// returns ExitUsage and is NOT recorded, matching the real client which validates
+// before the request), then records the query in RunLogsPageCalls and filters the
+// seeded LogsByID[id] slice — the same source RunLogs filters — by the query window.
+// PayloadMax has no fake behaviour: the fake returns untrimmed DTOs (a test that
+// cares seeds PayloadTruncated itself).
+func (f *FakeClient) RunLogsPage(_ context.Context, id string, q LogsPageQuery) ([]apitypes.MessageDTO, error) {
+	if err := q.validate(); err != nil {
+		// A forbidden combination is rejected before any request would be made, so it
+		// is NOT recorded — a test asserts zero calls on the bad combo.
+		return nil, err
+	}
+	f.RunLogsPageCalls = append(f.RunLogsPageCalls, q)
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	// Work on a seq-sorted copy so the tail / before windows are correct regardless of
+	// the seeded order.
+	src := f.LogsByID[id]
+	sorted := make([]apitypes.MessageDTO, len(src))
+	copy(sorted, src)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Seq < sorted[j].Seq })
+
+	var out []apitypes.MessageDTO
+	switch {
+	case q.Tail > 0:
+		// The newest Tail messages, ascending.
+		start := len(sorted) - int(q.Tail)
+		if start < 0 {
+			start = 0
+		}
+		out = append(out, sorted[start:]...)
+	case q.Before > 0:
+		// The newest Limit messages with seq < Before, ascending.
+		var below []apitypes.MessageDTO
+		for _, m := range sorted {
+			if m.Seq < q.Before {
+				below = append(below, m)
+			}
+		}
+		start := 0
+		if q.Limit > 0 && len(below) > int(q.Limit) {
+			start = len(below) - int(q.Limit)
+		}
+		out = append(out, below[start:]...)
+	default:
+		// After path: messages with seq > After, ascending, capped to Limit if set.
+		for _, m := range sorted {
+			if m.Seq > q.After {
+				out = append(out, m)
+			}
+			if q.Limit > 0 && len(out) >= int(q.Limit) {
+				break
+			}
 		}
 	}
 	return out, nil

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -177,8 +178,11 @@ type RunStream struct {
 	wg sync.WaitGroup
 
 	// lastSeq is the highest message seq emitted, and is what a reconnect replays
-	// from. Only message frames carry one.
-	lastSeq int32
+	// from. Only message frames carry one. It is atomic because both the pump
+	// goroutine (live frames, replay) and any consumer goroutine (NoteSeen, e.g. the
+	// TUI) raise it; a plain load-then-store would race and could lose an update,
+	// which -race in gate:api catches.
+	lastSeq atomic.Int32
 	// lastStatus is the last run status emitted, so the reconcile emits only on a
 	// real change rather than every tick.
 	lastStatus string
@@ -199,6 +203,25 @@ func (s *RunStream) Err() error {
 // Close stops the stream and releases its goroutine and socket. Safe to call more
 // than once, and safe to call without draining Events.
 func (s *RunStream) Close() { s.cancel() }
+
+// raiseLastSeq lifts lastSeq to max(lastSeq, n). Safe against a concurrent NoteSeen
+// (TUI goroutine) and the pump's own live-frame updates via a CAS-max loop.
+func (s *RunStream) raiseLastSeq(n int32) {
+	for {
+		cur := s.lastSeq.Load()
+		if n <= cur {
+			return
+		}
+		if s.lastSeq.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
+// NoteSeen raises the stream's replay floor to seq, so a reconnect replays only what
+// the consumer has NOT already fetched by other means (the TUI's tail/catch-up pages,
+// PRD #1137). Idempotent and monotonic; safe from any goroutine.
+func (s *RunStream) NoteSeen(seq int32) { s.raiseLastSeq(seq) }
 
 func (s *RunStream) setErr(err error) {
 	s.mu.Lock()
@@ -242,7 +265,7 @@ func (c *HTTPClient) backoff(attempt int) time.Duration {
 	}
 	// Full jitter over [d/2, d): spreads a fleet's reconnects without ever waiting
 	// longer than the computed ceiling.
-	return d/2 + time.Duration(rand.Int63n(int64(d/2)+1))
+	return d/2 + time.Duration(rand.Int63n(int64(d/2)+1)) //nolint:gosec // G404: reconnect-backoff jitter to de-synchronize a fleet's retries, not a security primitive
 }
 
 // wsURL maps the validated API base onto the /api/ws endpoint for one run. It goes
@@ -422,8 +445,8 @@ func (s *RunStream) pump(ctx context.Context, c *HTTPClient, runID string, conn 
 					continue
 				}
 				ev = NormalizeRunEvent(ev)
-				if ev.Type == RunEventTypeMessage && ev.Seq > s.lastSeq {
-					s.lastSeq = ev.Seq
+				if ev.Type == RunEventTypeMessage {
+					s.raiseLastSeq(ev.Seq)
 				}
 				if ev.Type == RunEventTypeState && ev.Status != "" {
 					s.lastStatus = ev.Status
@@ -471,10 +494,10 @@ func readFrames(connCtx context.Context, conn *websocket.Conn, out chan<- []byte
 // which carries NO seq — nothing in the message replay would reveal that the run
 // finished while the socket was down.
 func (s *RunStream) replay(ctx context.Context, c *HTTPClient, runID string) bool {
-	msgs, err := c.RunLogs(ctx, runID, s.lastSeq)
+	msgs, err := c.RunLogs(ctx, runID, s.lastSeq.Load())
 	if err == nil {
 		for _, m := range msgs {
-			if m.Seq <= s.lastSeq {
+			if m.Seq <= s.lastSeq.Load() {
 				continue
 			}
 			created := m.CreatedAt
@@ -490,7 +513,7 @@ func (s *RunStream) replay(ctx context.Context, c *HTTPClient, runID string) boo
 			}) {
 				return false
 			}
-			s.lastSeq = m.Seq
+			s.raiseLastSeq(m.Seq)
 		}
 	}
 	// A failed replay is not fatal — the next reconcile tick and the live socket both

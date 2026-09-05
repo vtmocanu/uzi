@@ -504,6 +504,12 @@ A few worth knowing:
   not a reliable (or complete) transcript. A `--json` consumer should gate on
   the exit code before parsing NDJSON, not infer "empty run" from empty output
   alone.
+- **`run logs --tail N` prints only the newest N messages** (in ascending
+  sequence order), fetched in one request rather than the full-history walk.
+  Combine it with `--follow` to tail-then-follow: the newest N are printed and
+  then polling continues from the highest sequence just printed. `--tail` is
+  mutually exclusive with `--after` (one selects a window, the other a starting
+  point) — combining them is a usage error (exit 2).
 - **`admin` needs an admin-scoped token.** A default (`uzc_`) token gets
   exit 3 with an actionable message; mint an `admin_ro` (`uza_`) token in
   Settings → Access to use it. `uzi whoami` over a `uzc_` token reports

@@ -518,6 +518,84 @@ func TestRunLogsAfterFilter(t *testing.T) {
 	}
 }
 
+// TestRunLogsTail (PRD #1137 M3) covers `run logs --tail N`: it fetches the newest N
+// via ONE RunLogsPage{Tail:N} (not the full-history RunLogs walk) and renders them.
+func TestRunLogsTail(t *testing.T) {
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {
+			{Seq: 1, Kind: "assistant", Payload: []byte(`{"text":"one"}`)},
+			{Seq: 2, Kind: "assistant", Payload: []byte(`{"text":"two"}`)},
+			{Seq: 3, Kind: "assistant", Payload: []byte(`{"text":"three"}`)},
+		},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--tail", "2")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out, "one") || !strings.Contains(out, "two") || !strings.Contains(out, "three") {
+		t.Errorf("--tail 2 should show only the newest 2:\n%s", out)
+	}
+	if len(fc.RunLogsPageCalls) != 1 || fc.RunLogsPageCalls[0] != (uzicli.LogsPageQuery{Tail: 2}) {
+		t.Errorf("RunLogsPageCalls = %+v, want exactly one {Tail:2}", fc.RunLogsPageCalls)
+	}
+}
+
+// TestRunLogsTailWithAfterIsUsageError: the two flags select incompatible windows,
+// so combining them is rejected before any request (ExitUsage, exit 2).
+func TestRunLogsTailWithAfterIsUsageError(t *testing.T) {
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {{Seq: 1, Kind: "assistant", Payload: []byte(`{"text":"one"}`)}},
+	}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--tail", "2", "--after", "1")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want ExitUsage(%d)", code, uzicli.ExitUsage)
+	}
+	if len(fc.RunLogsPageCalls) != 0 {
+		t.Errorf("a usage error should make no page request, got %+v", fc.RunLogsPageCalls)
+	}
+}
+
+// TestRunLogsTailThenFollow: with --follow, --tail N renders the newest N and then the
+// drain loop continues polling from the HIGHEST tail seq (never re-fetching from 0).
+func TestRunLogsTailThenFollow(t *testing.T) {
+	var followAfters []int32
+	fc := &uzicli.FakeClient{
+		LogsByID: map[string][]apitypes.MessageDTO{
+			"r1": {
+				{Seq: 1, Kind: "assistant", Payload: []byte(`{"text":"one"}`)},
+				{Seq: 2, Kind: "assistant", Payload: []byte(`{"text":"two"}`)},
+				{Seq: 3, Kind: "assistant", Payload: []byte(`{"text":"three"}`)},
+			},
+		},
+		// A completed run so --follow exits rather than polling forever.
+		RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Status: "completed"}},
+		// RunLogsHook drives the follow drain (RunLogsPage reads LogsByID directly and
+		// is untouched by the hook), recording every `after` it is polled with.
+		RunLogsHook: func(_ string, after int32) ([]apitypes.MessageDTO, error) {
+			followAfters = append(followAfters, after)
+			return nil, nil
+		},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--tail", "2", "--follow")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out, "one") || !strings.Contains(out, "two") || !strings.Contains(out, "three") {
+		t.Errorf("--tail 2 --follow should print the newest 2 first:\n%s", out)
+	}
+	if len(fc.RunLogsPageCalls) != 1 || fc.RunLogsPageCalls[0] != (uzicli.LogsPageQuery{Tail: 2}) {
+		t.Errorf("RunLogsPageCalls = %+v, want exactly one {Tail:2}", fc.RunLogsPageCalls)
+	}
+	if len(followAfters) == 0 {
+		t.Fatal("--follow never polled RunLogs after the tail page")
+	}
+	for _, a := range followAfters {
+		if a != 3 {
+			t.Errorf("follow polled RunLogs from after=%d, want 3 (the highest tail seq) — never 0", a)
+		}
+	}
+}
+
 // ── PRD #99 M4: instance + label on the human line ───────────────────────────
 
 // twoCoderLogs is the shape this milestone exists for: one lead frame with neither

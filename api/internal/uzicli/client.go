@@ -32,6 +32,10 @@ type Client interface {
 	// (issue #160), transparently to callers, and is ALL-OR-NOTHING: it returns the
 	// complete history or an error, never a partial slice that looks complete.
 	RunLogs(ctx context.Context, id string, after int32) ([]apitypes.MessageDTO, error)
+	// RunLogsPage fetches ONE page of a run's messages per the query — no loop, unlike
+	// RunLogs. It mirrors the server's mutual-exclusion rules client-side, returning
+	// *ExitError{ExitUsage} before any request on a forbidden combination.
+	RunLogsPage(ctx context.Context, id string, q LogsPageQuery) ([]apitypes.MessageDTO, error)
 	// RunReview returns the judge's review for a run, or nil when the run is visible
 	// but unjudged (the endpoint answers 200 {"review":null}). A run that is absent
 	// or not visible is a real 404 → *ExitError{ExitNotFound}. The two cases are
@@ -486,6 +490,19 @@ const maxRespBytes = 32 << 20
 // reassembles the full slice before returning, so the Client interface and every
 // caller see the same all-or-nothing "complete history or an error" contract.
 const logsPageSize = 200
+
+// LogsPageQuery is one page request for RunLogsPage (PRD #1137). Exactly one of the
+// three window forms is used: After (ascending from seq, the legacy page), Tail (the
+// newest n, ascending), or Before+Limit (the newest <=Limit with seq < Before,
+// ascending). PayloadMax (when > 0) trims the two bulky payload fields server-side and
+// is combinable with any form. Zero fields are omitted from the request.
+type LogsPageQuery struct {
+	After      int32
+	Before     int32
+	Tail       int32
+	Limit      int32
+	PayloadMax int32
+}
 
 // maxLogsMessages is a hostile/compromised-server backstop for RunLogs: the loop
 // stops on an EMPTY page, so a server that always returns a full page with

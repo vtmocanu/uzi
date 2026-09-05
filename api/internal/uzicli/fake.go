@@ -404,6 +404,11 @@ type FakeClient struct {
 	// returning different slices across calls. A nil hook keeps the static filter.
 	RunLogsHook func(id string, after int32) ([]apitypes.MessageDTO, error)
 
+	// RunLogsPageCalls records every RunLogsPage query in order, so a test asserts
+	// POSITIVE counts and EXACT queries (the #1130 ListRunsCalls style), never a
+	// vacuous "not called".
+	RunLogsPageCalls []LogsPageQuery
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }
