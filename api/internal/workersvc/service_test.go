@@ -415,6 +415,11 @@ type fakeStore struct {
 	// Create worker.
 	createWorkerResult store.Worker
 	createWorkerParams *store.CreateWorkerParams
+	// hasAutoPool is the auto-select pool answer CreateWorker reads when no label
+	// resolved (PRD #1140 M1). Defaults false → the unbound mint derives `default`,
+	// which is the state these token/template tests assert; a test that cares about
+	// the `auto` derivation sets it true.
+	hasAutoPool bool
 
 	// Tool provisioning (PRD #18 M4). Defaults (zero profile, nil error, empty
 	// allowlist) resolve to no provisioning, so claim tests that don't opt in are
@@ -1197,6 +1202,13 @@ func (f *fakeStore) CountActiveCIFixForRef(context.Context, store.CountActiveCIF
 func (f *fakeStore) CreateWorker(_ context.Context, arg store.CreateWorkerParams) (store.Worker, error) {
 	f.createWorkerParams = &arg
 	return f.createWorkerResult, nil
+}
+
+// UserHasAutoEligibleAnthropicToken is the pool read CreateWorker performs on the
+// no-label path (PRD #1140 M1). fakeStore embeds Store so an unimplemented method
+// panics; this one is reached by every unbound mint, so it must be a real stub.
+func (f *fakeStore) UserHasAutoEligibleAnthropicToken(_ context.Context, _ uuid.UUID) (bool, error) {
+	return f.hasAutoPool, nil
 }
 func (f *fakeStore) CountWorkerNonTerminalRuns(_ context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error) {
 	f.countActiveParams = &arg

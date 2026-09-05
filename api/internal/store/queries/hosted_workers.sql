@@ -221,8 +221,15 @@ WHERE w.ephemeral
 -- plain parameter here, not defaulted, because the provision handler decides it from
 -- the request and passes an explicit true/false — a false is a real "no sidecar",
 -- distinct from an external worker's NULL.
-INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled)
-VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size, @docker_enabled)
+--
+-- anthropic_bind_mode is caller-supplied (issue #1140 / PRD #111 D3): once M1 makes the
+-- mode a create-time decision, the INSERT must name the column, or a hosted worker
+-- silently ships the SQL default 'default' for every provision — green at every gate.
+-- The provision handler derives it (auto when the owner's pool is non-empty, else
+-- default) and writes it in the same statement, as CreateWorker and
+-- CreateEphemeralHostedWorker do.
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, anthropic_bind_mode)
+VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size, @docker_enabled, @anthropic_bind_mode)
 RETURNING *;
 
 -- name: UpsertHostedWorkerToken :exec
