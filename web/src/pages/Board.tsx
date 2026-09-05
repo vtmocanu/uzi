@@ -337,6 +337,12 @@ export function Board() {
   // the second. `reordering` no longer disables anything (see B1 below).
   const [reordering, setReordering] = useState(false);
   const reorderRef = useRef(false);
+  // Mutation-generation counter (#1060): bumped whenever a board mutation
+  // (reorder, column move, close/reopen) acquires OR releases the reorderRef lock
+  // below. poll() captures it before its await and discards a response if it
+  // changed since — so a background poll whose getBoard was in flight when a
+  // mutation applied its authoritative card cannot overwrite it with stale state.
+  const mutationGenRef = useRef(0);
   // B1. `reordering` drives the buttons' `disabled`, and DISABLING A FOCUSED BUTTON
   // BLURS IT — the browser moves focus to <body> and never brings it back. Measured by
   // the browser pass every 100ms from 101ms to 901ms: `disabled=true active=BODY`,
@@ -550,8 +556,13 @@ export function Board() {
   // the user did not make, and refresh preconditions. Errors are swallowed (keep the
   // last good board; the next tick retries) — only the foreground load surfaces them.
   const poll = useCallback(async () => {
+    const gen = mutationGenRef.current;
     try {
       const { board: fresh } = await api.getBoard(repoId);
+      // #1060: a mutation started or settled while this poll's getBoard was in
+      // flight — its payload predates the mutation's authoritative card, so drop
+      // it (toasts included) rather than clobber the just-applied local state.
+      if (mutationGenRef.current !== gen) return;
       const prev = boardRef.current;
       if (prev) {
         for (const card of fresh.cards) {
@@ -942,12 +953,14 @@ export function Board() {
       // pending forge write. dropIntent's own `dragged.closed` bail stays a safety net.
       if (toClosed || draggedCard.closed) {
         reorderRef.current = true;
+        mutationGenRef.current++;
         setReordering(true);
         try {
           // open → Closed = close (state only); closed → open lane = reopen + move (bottom).
           return await move(toClosed ? CLOSED_KEY : destKey, dragIid);
         } finally {
           reorderRef.current = false;
+          mutationGenRef.current++;
           setReordering(false);
         }
       }
@@ -962,6 +975,7 @@ export function Board() {
       });
       if (!intent) return false;
       reorderRef.current = true;
+      mutationGenRef.current++;
       setReordering(true);
       try {
         if (intent.columnChanged && !(await move(destKey, dragIid))) {
@@ -987,6 +1001,7 @@ export function Board() {
         return false;
       } finally {
         reorderRef.current = false;
+        mutationGenRef.current++;
         setReordering(false);
       }
     },
