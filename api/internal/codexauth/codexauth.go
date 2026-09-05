@@ -176,7 +176,7 @@ func (c *Client) DiscoverIdentity(ctx context.Context, accessToken string) (Iden
 	if err != nil {
 		return Identity{}, fmt.Errorf("codexauth: identity request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // best-effort close of a drained response body
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
@@ -219,7 +219,7 @@ type refreshResponse struct {
 //   - 2xx without an access_token → ErrNoAccessToken.
 //   - non-2xx (including 401) → *AuthError carrying the status.
 func (c *Client) Refresh(ctx context.Context, refreshToken string) (RefreshResult, error) {
-	payload, err := json.Marshal(refreshRequest{
+	payload, err := json.Marshal(refreshRequest{ //nolint:gosec // G117: the refresh request must carry the refresh token to the provider token endpoint
 		ClientID:     c.clientID,
 		GrantType:    "refresh_token",
 		RefreshToken: refreshToken,
@@ -238,7 +238,7 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (RefreshResul
 	if err != nil {
 		return RefreshResult{}, fmt.Errorf("codexauth: refresh request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // best-effort close of a drained response body
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))

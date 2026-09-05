@@ -10,12 +10,12 @@ package store
 // KindAnthropicToken is user_secrets.kind for the per-user Anthropic token
 // (migration 00010). Adding a kind is one ALTER-CHECK migration; the table shape
 // never changes.
-const KindAnthropicToken = "anthropic_token"
+const KindAnthropicToken = "anthropic_token" //nolint:gosec // G101: a user_secrets.kind discriminator string, not a credential
 
 // KindOpenAIAPIKey is user_secrets.kind for a static OpenAI API key (migration
 // 00197): a pasted key with no subscription lifecycle behind it. Its per-alias
 // codex_credential_state is 'static'.
-const KindOpenAIAPIKey = "openai_api_key"
+const KindOpenAIAPIKey = "openai_api_key" //nolint:gosec // G101: a user_secrets.kind discriminator string, not a credential
 
 // KindCodexAuth is user_secrets.kind for a Codex subscription login (migration
 // 00197): its authoritative account state lives in codex_provider_account and its

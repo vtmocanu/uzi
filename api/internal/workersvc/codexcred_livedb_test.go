@@ -124,7 +124,7 @@ func (e codexTestEnv) seedUser(t *testing.T) uuid.UUID {
 // returns the alias id. label must be unique per (user, kind).
 func (e codexTestEnv) seedStagingAlias(t *testing.T, userID uuid.UUID, label string, blob codexLoginBlob) uuid.UUID {
 	t.Helper()
-	raw, err := json.Marshal(blob)
+	raw, err := json.Marshal(blob) //nolint:gosec // G117: test helper marshals a synthetic login-blob fixture, not a real credential
 	if err != nil {
 		t.Fatalf("marshal blob: %v", err)
 	}
