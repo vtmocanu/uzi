@@ -241,12 +241,16 @@ const userSchedules: Omit<
 // `prompt` (labels/guidance empty, max_issues 0); a sweep entry carries its selector
 // `labels` plus the body as `guidance` (prompt empty). auto_approve/wait_on_limit are
 // the fixed run flags every default is seeded with (schedtmpl.AutoApprove/WaitOnLimit).
+// PRD #929 M1: no builtin catalog file declares an `output:` key, so the server resolves
+// every prompt entry's output_mode to the "mr" default (DefaultJob.OutputMode); mirror that
+// here — a prompt entry reads "mr", a non-prompt entry "" (no output channel). M4 defers
+// switching feature-bingo/refactor-scout to "issues", so they too read "mr" for now.
 const scheduleCatalog: CatalogEntry[] = [
   {
     slug: "test-improvement",
     name: "Weekly test improvement",
     description: "Weekly pass that finds one under-tested area and strengthens its tests.",
-    target: "prompt", cron: "0 8 * * 1", timezone: "UTC", model: "", output_mode: "",
+    target: "prompt", cron: "0 8 * * 1", timezone: "UTC", model: "", output_mode: "mr",
     prompt:
       "Spend this run improving the project's automated tests. Pick ONE area that is meaningfully under-tested — a module with thin coverage, an important branch with no assertion, or a bug-prone path — and add focused, genuinely useful tests for it. Prefer a small number of high-value tests over many shallow ones, and run the project's test suite to confirm your additions pass.\n\nMake every test earn its place: prove each assertion is non-vacuous by identifying a plausible defect that would make it fail (if you sanity-check by mutating the code under test, do it in a throwaway copy and never a production file, and change it to a value another case already produces, not a fresh sentinel); assert the observable end-state, not an intermediate call; prefer positive assertions over negative ones; never weaken or delete an existing assertion to make a suite pass; and do not re-touch a test another recent run just changed — pick a different area so parallel runs do not collide.\n\nGuardrail: change TEST files only — no production (non-test) file; a behavior needing a production change to be testable is out of scope (pick another area), and a real production bug found while testing is reported, not fixed. Commit your new tests and open a merge request; if nothing worthwhile this week an empty week is acceptable — do not invent low-value tests to hit a number — open no MR and leave a note on what you looked at.",
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
@@ -255,7 +259,7 @@ const scheduleCatalog: CatalogEntry[] = [
     slug: "docs-hygiene",
     name: "Docs hygiene",
     description: "Weekly sweep for mechanical documentation defects — dead links, stale references, drift.",
-    target: "prompt", cron: "0 3 * * 1", timezone: "UTC", model: "", output_mode: "",
+    target: "prompt", cron: "0 3 * * 1", timezone: "UTC", model: "", output_mode: "mr",
     prompt:
       "Audit the project's documentation for mechanical defects: broken or moved links, references to files or commands that no longer exist, stale frontmatter, and obvious typos. Focus on correctness, not rewriting for style. Verify each problem against the actual repository before fixing it; when a broken link has more than one plausible target, describe it rather than guessing the repoint.\n\nApply the mechanical corrections and open a merge request. Guardrail: mechanical fixes only (links, stale refs, frontmatter, typos), documentation files only — no prose rewrites and no source/build/CI/agent-config edits, keep the diff to mechanical corrections. If there is nothing to fix, open no MR and leave a note.",
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
@@ -264,7 +268,7 @@ const scheduleCatalog: CatalogEntry[] = [
     slug: "bug-hunt",
     name: "Bug hunt — deep audit",
     description: "Deep audit of one subsystem for correctness bugs, confirmed by a reviewer and an auditor.",
-    target: "prompt", cron: "0 4 * * 3", timezone: "UTC", model: "", output_mode: "",
+    target: "prompt", cron: "0 4 * * 3", timezone: "UTC", model: "", output_mode: "mr",
     prompt:
       "Pick ONE subsystem and audit it deeply for real correctness bugs: unhandled errors, race conditions, off-by-one and boundary mistakes, incorrect edge-case handling, and broken invariants. For every candidate bug, construct the concrete input or state that triggers it and confirm the wrong behavior by reading the code carefully; have a reviewer and an auditor confirm each finding before you rely on it, and discard anything you cannot substantiate.\n\nFor the single highest-confidence bug, apply the smallest correct fix backed by a deterministic test that would have caught it (fails reliably before, passes after; skip the test only for a non-code fix or a genuinely contrived reproduction, and say why), commit it, and open one merge request. If you find no clearly-real bug, open no MR and leave your audit notes as a report.",
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
@@ -273,7 +277,7 @@ const scheduleCatalog: CatalogEntry[] = [
     slug: "feature-bingo",
     name: "Feature bingo",
     description: "Weekly brainstorm that proposes one concrete new feature and opens an MR adding it as an idea file.",
-    target: "prompt", cron: "0 3 * * 2", timezone: "UTC", model: "fable", output_mode: "issues",
+    target: "prompt", cron: "0 3 * * 2", timezone: "UTC", model: "fable", output_mode: "mr",
     prompt:
       "Brainstorm ONE concrete, genuinely useful new feature or improvement for this project. Ground it in what the codebase actually does: name the problem it solves, sketch how it would work, and note roughly where it would live and what it would touch.\n\nFirst read the existing files under the `ideas/` folder to avoid duplicates, and check the codebase so you do not propose something that already exists. Write your proposal to a single new idea file under the `ideas/` folder at the repository root, commit it, and open a merge request titled `bingo: <feature>`. If nothing worthwhile comes to mind, open no MR and leave a note.",
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
@@ -282,7 +286,7 @@ const scheduleCatalog: CatalogEntry[] = [
     slug: "refactor-scout",
     name: "Refactor scout",
     description: "Biweekly propose-only scout that surveys the repo for one high-value structural refactor and opens an MR adding it as a proposal file.",
-    target: "prompt", cron: "0 5 1,15 * *", timezone: "UTC", model: "fable", output_mode: "issues",
+    target: "prompt", cron: "0 5 1,15 * *", timezone: "UTC", model: "fable", output_mode: "mr",
     prompt:
       "Survey this repository for ONE high-value structural refactor worth proposing — and PROPOSE it, never implement it. This job never changes the code under refactor; its only output is a single proposal file. Pick a candidate from these shapes: duplication with 3+ occurrences of the same responsibility, an oversized file with a natural cohesion seam, dead branches or config the gates cannot see, or a costly consistency defect — the one with the best impact-to-effort ratio.\n\nDedup before you propose: read the existing `ideas/refactors/` folder INCLUDING already-declined proposals and their decline reasons, and do not re-propose a recorded idea unless the evidence has materially changed (say exactly what changed). Carry your own rigour — derive every count from a named command you ran, cite each claim as `file:line @ <sha>`, and mark it verified or plausible. File it ONLY if it passes its own rubric (impact >= effort, behavior-preserving or flagged, a dedup needs 3+ same-responsibility occurrences, a split needs a real seam).\n\nStay on the propose-only, structural side of the self-improvement job, which IMPLEMENTS small fixes — this one proposes refactors too big or risky for one unattended MR. Write the proposal to a single new file `ideas/refactors/YYYY-MM-DD-<slug>.md` (create the folder if needed), commit it, and open a merge request titled `refactor-scout: <slug>`. If nothing clears the bar this cycle, make no change and open no MR: leave a short note on what you surveyed and why nothing qualified.",
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
@@ -366,7 +370,11 @@ function materializeDefault(
     // Resolved catalog guidance for a sweep default, shown read-only (issue #675).
     baked_guidance: entry.target === "sweep" ? entry.guidance || null : null,
     model: entry.model || null,
-    // PRD #929 M1: null (inherit the job default) until an override sets it via `...over`.
+    // PRD #929 M1: seed the RESOLVED catalog output mode (prompt entries carry "mr"), so a
+    // freshly-enabled prompt default shows the "mr" badge exactly as production does (the
+    // server seeds the resolved value via catalogOutputMode, never NULL, for a prompt job).
+    // A non-prompt entry's "" yields null (inherit / no output channel). A seed override may
+    // still replace it via `...over`.
     output_mode: entry.output_mode || null,
     override_subagent_model: false,
     enabled: true,

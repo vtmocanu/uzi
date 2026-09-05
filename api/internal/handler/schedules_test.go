@@ -717,15 +717,19 @@ func TestValidateScheduleConfigOutputMode(t *testing.T) {
 		t.Fatalf("invalid output_mode on prompt: status=%d, want 400", status)
 	}
 
-	// output_mode on a non-prompt target is a 422 (prompt-only, D6).
+	// output_mode on a non-prompt target is a 422 (prompt-only, D6). self_improve needs
+	// allowSelfImprove=true so validation reaches (not short-circuits before) the output_mode
+	// arm — a direct create rejects the target itself with a 400.
 	for _, tc := range []struct {
-		name string
-		req  apitypes.ScheduleRequest
+		name             string
+		req              apitypes.ScheduleRequest
+		allowSelfImprove bool
 	}{
-		{"issue", apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), OutputMode: sptr("issues"), Timing: "recurring", CronExpr: "0 2 * * *"}},
-		{"sweep", apitypes.ScheduleRequest{Target: "sweep", OutputMode: sptr("mr"), Timing: "recurring", CronExpr: "0 9 * * 1"}},
+		{"issue", apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), OutputMode: sptr("issues"), Timing: "recurring", CronExpr: "0 2 * * *"}, false},
+		{"sweep", apitypes.ScheduleRequest{Target: "sweep", OutputMode: sptr("mr"), Timing: "recurring", CronExpr: "0 9 * * 1"}, false},
+		{"self_improve", apitypes.ScheduleRequest{Target: "self_improve", OutputMode: sptr("issues"), Timing: "recurring", CronExpr: "0 9 * * 1"}, true},
 	} {
-		if _, status, _ := validateScheduleConfig(tc.req, fixedNow, false); status != http.StatusUnprocessableEntity {
+		if _, status, _ := validateScheduleConfig(tc.req, fixedNow, tc.allowSelfImprove); status != http.StatusUnprocessableEntity {
 			t.Fatalf("output_mode on %s target: status=%d, want 422", tc.name, status)
 		}
 	}

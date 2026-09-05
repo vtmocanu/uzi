@@ -1387,6 +1387,26 @@ func TestScheduleEditDefaultPromptSendsMinimal(t *testing.T) {
 	}
 }
 
+// TestScheduleEditDefaultRestatesOutput (PRD #929 M1): the default-origin sibling of
+// TestScheduleEditRestatesOutput. A --cron-only edit of a prompt-target DEFAULT schedule —
+// one that never touches --output — must RESTATE the fetched schedule's stored OutputMode on
+// the PATCH through buildDefaultScheduleEditRequest, so a partial retime does not wipe the
+// stored output mode (patchDefaultScheduleConfig replace-semantics).
+func TestScheduleEditDefaultRestatesOutput(t *testing.T) {
+	fc := editDefaultPromptFixture("sch_dp")
+	stored := fc.ScheduleByID["sch_dp"]
+	stored.OutputMode = sptr("issues")
+	fc.ScheduleByID["sch_dp"] = stored
+
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_dp", "--cron", "0 4 * * 2")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if req := fc.LastPatchSchedReq; req.OutputMode == nil || *req.OutputMode != "issues" {
+		t.Errorf("output_mode = %v, want the original \"issues\" re-sent, not wiped", req.OutputMode)
+	}
+}
+
 // TestScheduleEditDefaultSweepPreservesMaxIssues (PRD #589): a --tz-only edit of a default
 // sweep restates the stored cap rather than clearing it to unlimited (server replace-semantics).
 func TestScheduleEditDefaultSweepPreservesMaxIssues(t *testing.T) {

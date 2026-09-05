@@ -1000,6 +1000,9 @@ type ResetDefaultScheduleParams struct {
 // catalog baseline (false) because a default now carries it as an owner-editable run option
 // (issue #691). Both are written as SQL literals rather than left to the column's DB DEFAULT:
 // a Reset is an UPDATE, so the DEFAULT never re-applies and the field must be set explicitly.
+// output_mode is likewise reset to the catalog baseline (PRD #929 M1): a prompt default can
+// carry an owner-editable output mode, so the resolved catalog value is passed in and written
+// here (nil for a non-prompt default, which stores NULL = inherit).
 // next_fire_at is recomputed in Go from the catalog cron+timezone and passed in.
 func (q *Queries) ResetDefaultSchedule(ctx context.Context, arg ResetDefaultScheduleParams) (RunSchedule, error) {
 	row := q.db.QueryRow(ctx, resetDefaultSchedule,

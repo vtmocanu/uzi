@@ -82,6 +82,46 @@ describe("target switching swaps the fields", () => {
   });
 });
 
+describe("the per-schedule output mode control (PRD #929 M1)", () => {
+  it("renders the output-mode select for a prompt target and hides it for a non-prompt target", () => {
+    renderModal();
+    // Default target = issue: no output-mode control (output mode is prompt-only).
+    expect(screen.queryByLabelText("Output mode (optional)")).toBeNull();
+    // Sweep target: still absent — a sweep run has no proposal channel to steer.
+    fireEvent.click(screen.getByRole("radio", { name: /Label sweep/ }));
+    expect(screen.queryByLabelText("Output mode (optional)")).toBeNull();
+    // Prompt target: the output-mode select appears.
+    fireEvent.click(screen.getByRole("radio", { name: /Prompt/ }));
+    expect(screen.getByLabelText("Output mode (optional)")).toBeTruthy();
+  });
+
+  it("flows a selected output mode into output_mode on a create submit", async () => {
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as Awaited<
+        ReturnType<typeof api.listRepos>
+      >["repos"],
+    });
+    mockApi.createSchedule.mockResolvedValue(schedFixture({ target: "prompt", output_mode: "issues" }));
+    renderModal();
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+
+    // Switch to the prompt target, give it a prompt (required to submit), then pick "Issues".
+    fireEvent.click(screen.getByRole("radio", { name: /Prompt/ }));
+    fireEvent.change(screen.getByPlaceholderText("hunt for flaky tests and open an MR"), {
+      target: { value: "hunt for flaky tests and open an MR" },
+    });
+    fireEvent.change(screen.getByLabelText("Output mode (optional)"), { target: { value: "issues" } });
+
+    const createBtn = screen.getByRole("button", { name: "Create schedule" });
+    await waitFor(() => expect(createBtn.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(createBtn);
+
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+    // The chosen mode rides through to ScheduleInput.output_mode (2nd arg of createSchedule).
+    expect(mockApi.createSchedule.mock.calls[0]?.[1]?.output_mode).toBe("issues");
+  });
+});
+
 describe("timing switching swaps the cadence fields", () => {
   it("recurring shows the preset/cron; once shows the datetime picker", async () => {
     renderModal();
