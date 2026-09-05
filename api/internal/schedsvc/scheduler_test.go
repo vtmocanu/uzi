@@ -2486,6 +2486,19 @@ func TestFirePromptIssuesModeInjectsDigest(t *testing.T) {
 	if !strings.Contains(got, "(closed) "+closedTitle) {
 		t.Fatalf("digest missing the CLOSED proposal line (M3 requires closed proposals appear); prompt=%q", got)
 	}
+	// M4: the generic issues-mode delivery-override is injected alongside the digest. Assert
+	// two distinctive phrases (the signal_done channel and the mr-disavowal) plus the whole
+	// constant, so a reword of the body of the instruction is caught.
+	if !strings.Contains(got, "signal_done") || !strings.Contains(got, "do NOT open a merge request") {
+		t.Fatalf("issues-mode prompt missing the delivery-override phrasing; prompt=%q", got)
+	}
+	if !strings.Contains(got, issuesDeliveryInstruction) {
+		t.Fatalf("issues-mode prompt missing the full delivery instruction; prompt=%q", got)
+	}
+	// The delivery override precedes the digest (delivery first, then "proposals already filed").
+	if strings.Index(got, issuesDeliveryInstruction) > strings.Index(got, "Proposals already filed for this job") {
+		t.Fatalf("delivery instruction must come BEFORE the digest; prompt=%q", got)
+	}
 }
 
 // TestFirePromptMrModeNoDigestNoForgeCall proves an mr-mode (here NULL, slugless, user)
@@ -2527,6 +2540,79 @@ func TestFirePromptMrModeNoDigestNoForgeCall(t *testing.T) {
 	if strings.Contains(got, "Proposals already filed for this job") {
 		t.Fatalf("mr-mode prompt must carry no dedup header; prompt=%q", got)
 	}
+	// M4: mr mode injects NOTHING — no delivery-override either (the body drives delivery).
+	if strings.Contains(got, issuesDeliveryInstruction) {
+		t.Fatalf("mr-mode prompt must carry no delivery instruction; prompt=%q", got)
+	}
+}
+
+// TestFirePromptMrModeFeatureBingoNoDeliveryInjection proves the SHIPPED feature-bingo
+// default (output: mr) fires byte-identical to its catalog body: no delivery override, no
+// digest, no forge call. This is success criterion 1 (mr mode stays byte-identical) for the
+// exact catalog prompt whose body carries the idea-file/MR mechanics.
+func TestFirePromptMrModeFeatureBingoNoDeliveryInjection(t *testing.T) {
+	h := newHarness()
+	h.fb.f.listResult = []forge.Issue{{IID: 10, Title: "SHOULD-NOT-APPEAR", State: "opened"}}
+	want, ok := schedtmpl.BySlug("feature-bingo")
+	if !ok {
+		t.Fatal("feature-bingo catalog entry missing")
+	}
+	sched := store.RunSchedule{
+		ID:          uuid.New(),
+		UserID:      h.owner,
+		RepoID:      h.repoID,
+		Target:      "prompt",
+		Origin:      "default",
+		CatalogSlug: pgtype.Text{String: "feature-bingo", Valid: true},
+		OutputMode:  pgtype.Text{}, // NULL → resolves to the catalog default (mr)
+		Timing:      "recurring",
+		CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
+		Timezone:    "UTC",
+		AutoApprove: true,
+		Status:      "active",
+		Enabled:     true,
+	}
+
+	if _, err := h.sched.firePrompt(context.Background(), sched); err != nil {
+		t.Fatalf("firePrompt: %v", err)
+	}
+	if len(h.runs.prompts) != 1 {
+		t.Fatalf("CreatePromptRun calls = %d, want 1", len(h.runs.prompts))
+	}
+	if h.fb.f.listCount != 0 {
+		t.Fatalf("mr-mode feature-bingo made %d ListIssues call(s); it must make NONE", h.fb.f.listCount)
+	}
+	got := h.runs.prompts[0].prompt
+	if got != want.Prompt {
+		t.Fatalf("mr-mode feature-bingo prompt = %q, want the catalog body byte-for-byte", got)
+	}
+	if strings.Contains(got, issuesDeliveryInstruction) {
+		t.Fatalf("mr-mode feature-bingo must carry no delivery instruction; prompt=%q", got)
+	}
+}
+
+// TestFirePromptIssuesModeActiveRunSkipsForgeCall proves the M3 reviewer finding fix: an
+// issues-mode schedule with an ACTIVE run returns SkipAlreadyRunning and makes NO forge call,
+// because the active-run pre-check now runs BEFORE the digest/delivery section assembly.
+func TestFirePromptIssuesModeActiveRunSkipsForgeCall(t *testing.T) {
+	h := newHarness()
+	h.st.activeSchedule = true
+	h.fb.f.listResult = []forge.Issue{{IID: 10, Title: "SHOULD-NOT-BE-LISTED", State: "opened"}}
+	sched := h.issuesModePromptSchedule()
+
+	out, err := h.sched.firePrompt(context.Background(), sched)
+	if err != nil {
+		t.Fatalf("firePrompt: %v", err)
+	}
+	if len(out.Started) != 0 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipAlreadyRunning {
+		t.Fatalf("want a single already_running skip, got started=%d skips=%+v", len(out.Started), out.Skips)
+	}
+	if len(h.runs.prompts) != 0 {
+		t.Fatalf("an active-run tick must create no run, got %d", len(h.runs.prompts))
+	}
+	if h.fb.f.listCount != 0 {
+		t.Fatalf("a skipped issues-mode tick made %d ListIssues call(s); the forge round-trip must be skipped when the tick is skipped", h.fb.f.listCount)
+	}
 }
 
 // TestFirePromptIssuesModeDigestIsBestEffort proves a forge listing error does NOT block the
@@ -2548,8 +2634,14 @@ func TestFirePromptIssuesModeDigestIsBestEffort(t *testing.T) {
 	if strings.Contains(got, "Proposals already filed for this job") {
 		t.Fatalf("a failed listing must yield NO digest; prompt=%q", got)
 	}
-	if got != sched.Prompt.String {
-		t.Fatalf("with no digest and no guidance the prompt should be the raw prompt, got %q", got)
+	// M4: issues mode ALWAYS injects the generic delivery-override, independent of the digest.
+	// A failed listing drops only the digest — the delivery instruction still lands, so the
+	// composed prompt is the raw body + delivery section (not the bare raw body).
+	if !strings.Contains(got, issuesDeliveryInstruction) {
+		t.Fatalf("issues-mode prompt must carry the delivery instruction even when the digest fails; prompt=%q", got)
+	}
+	if got != sched.Prompt.String+issuesDeliverySection {
+		t.Fatalf("with the digest dropped the prompt should be raw body + delivery section, got %q", got)
 	}
 }
 

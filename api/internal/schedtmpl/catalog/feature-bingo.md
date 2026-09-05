@@ -13,10 +13,8 @@ project. Ground it in what the codebase actually does: name the problem it solve
 sketch how it would work, and note roughly where it would live and what it would
 touch. Aim for something a maintainer could pick up and scope, not a vague wish.
 
-First read the existing idea files under the `ideas/` folder at the repository
-root (if the folder exists) so you do not repeat one already recorded, and check
-the codebase so you do not propose something that already exists — pick a
-different, non-duplicate idea.
+Check the codebase, and the proposals already made for this schedule, so you do
+not repeat one — pick a genuinely new, non-duplicate idea.
 
 Write your proposal to a single new idea file under the `ideas/` folder — create
 the `ideas/` folder if it does not exist yet — using a short descriptive filename
@@ -24,5 +22,5 @@ the `ideas/` folder if it does not exist yet — using a short descriptive filen
 it, and open a merge request titled `bingo: <feature>`. That idea file is the only
 change this run makes — do NOT modify any other code.
 
-If nothing worthwhile comes to mind this week, make no change and open no merge
-request: leave a short note explaining why instead.
+If nothing worthwhile comes to mind this cycle, propose nothing and leave a short
+note explaining why instead.

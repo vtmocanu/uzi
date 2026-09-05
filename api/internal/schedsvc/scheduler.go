@@ -622,20 +622,10 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 	// only for default-origin prompt schedules, so guidanceOf(sched) returns "" for a
 	// user-origin row, and composeRunDescription returns the body unchanged when guidance
 	// trims to empty — so the user path stays byte-for-byte identical to before.
-	// Output-mode resolution (PRD #929 M3): resolve the effective mode via the shared
-	// resolver so the fire side and the completion-filing side (workersvc) agree on how a
-	// NULL output_mode maps to the catalog default. Only an issues-mode schedule gets the
-	// fire-time dedup digest; an mr-mode (or NULL, slugless) schedule takes exactly today's
-	// path — no forge call, byte-identical instruction. M4 will append a second,
-	// mode-specific DELIVERY section here through the same sections seam.
-	mode := schedtmpl.ResolveOutputMode(sched.OutputMode.String, sched.OutputMode.Valid, catalogSlugOf(sched))
-	var sections []string
-	if mode == schedtmpl.OutputModeIssues {
-		if digest := e.proposalDigestSection(ctx, sched); digest != "" {
-			sections = append(sections, digest)
-		}
-	}
-	instruction := composeRunDescriptionWithSections(prompt, guidanceOf(sched), sections...)
+	// Active-run pre-check FIRST (M3 reviewer finding): a skipped (already-running) tick must
+	// not pay for the mode-specific section assembly below, which for issues mode makes a
+	// forge round-trip (proposalDigestSection). Checking dedup before computing the sections
+	// means an issues-mode tick that is going to skip spends no forge call at all.
 	active, err := e.store.HasActiveRunForSchedule(ctx, pgconv.UUID(sched.ID))
 	if err != nil {
 		return FireOutcome{}, err // transient DB error
@@ -644,6 +634,25 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 		e.logger.Info("scheduler: prompt schedule has active run, skipping fire", "schedule", sched.ID.String())
 		return FireOutcome{Matched: 1, Skips: []Skip{{Title: title, Reason: SkipAlreadyRunning}}}, nil
 	}
+	// Output-mode resolution (PRD #929 M3+M4): resolve the effective mode via the shared
+	// resolver so the fire side and the completion-filing side (workersvc) agree on how a
+	// NULL output_mode maps to the catalog default. An mr-mode (or NULL, slugless) schedule
+	// takes exactly today's path — no forge call, no injected section, byte-identical
+	// instruction: mr mode injects NOTHING because the schedule's own body drives delivery
+	// (feature-bingo's idea-file mechanics, or a user prompt's own instructions), and a
+	// generic mr instruction would be wrong for a custom prompt. An issues-mode schedule gets
+	// TWO sections through the same seam: first a generic delivery-OVERRIDE that supersedes any
+	// body wording about files/MRs (a body written for mr would otherwise contradict issues
+	// mode), then the "proposals already filed" dedup digest.
+	mode := schedtmpl.ResolveOutputMode(sched.OutputMode.String, sched.OutputMode.Valid, catalogSlugOf(sched))
+	var sections []string
+	if mode == schedtmpl.OutputModeIssues {
+		sections = append(sections, issuesDeliverySection)
+		if digest := e.proposalDigestSection(ctx, sched); digest != "" {
+			sections = append(sections, digest)
+		}
+	}
+	instruction := composeRunDescriptionWithSections(prompt, guidanceOf(sched), sections...)
 	// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run (nil ⇒
 	// inherit the owner default live).
 	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched))
@@ -996,6 +1005,25 @@ const (
 	proposalDigestMaxItems = 20
 	proposalDigestMaxBytes = 4000
 )
+
+// issuesDeliveryInstruction is the generic delivery-OVERRIDE prepended to an issues-mode
+// prompt fire (PRD #929 M4). output_mode is settable on ANY prompt schedule, including a
+// user-authored custom prompt, so this instruction is deliberately GENERIC and
+// channel-focused: it never restates the schedule's task, only where the proposal must go.
+// It supersedes any body wording about writing files or opening a merge request (a body
+// written for mr — like feature-bingo's — would otherwise contradict issues mode). mr mode
+// injects NOTHING (the body drives delivery), which is why the mr path stays byte-identical.
+const issuesDeliveryInstruction = "Deliver this proposal as a tracked issue, not a merge " +
+	"request. Do NOT create, modify, or commit any files, and do NOT open a merge request — " +
+	"disregard any instruction above about writing an idea file or opening a merge request. " +
+	"Provide your single proposal through the signal_done tool's `proposal` field: a concise " +
+	"title and a body containing the whole proposal. The server files it as an issue on your " +
+	"behalf. If nothing is worth proposing this cycle, set no proposal and leave a short note " +
+	"explaining why."
+
+// issuesDeliverySection wraps issuesDeliveryInstruction with the same leading delineator the
+// digest uses so it renders as its own block in the composed run description.
+const issuesDeliverySection = "\n\n---\n\n" + issuesDeliveryInstruction
 
 // proposalDigestHeader is the fixed dedup instruction prepended to the digest lines. Like
 // guidanceHeader it is a constant framing string, never templated from model/forge output.

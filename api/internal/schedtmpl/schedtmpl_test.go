@@ -230,3 +230,32 @@ func TestResolveOutputMode(t *testing.T) {
 		t.Errorf("NULL + empty slug = %q, want %q", got, schedtmpl.DefaultOutputMode)
 	}
 }
+
+// TestFeatureBingoBodyModeNeutral pins the PRD #929 M4 body trim: the dedup para no longer
+// names the mr-only "read the idea files under ideas/", and the close-out no longer says
+// "open no merge request" (both would contradict issues mode, where delivery is overridden).
+// The mr-delivery para 3 ("open a merge request") STAYS — mr mode relies on it verbatim and
+// injects nothing. The catalog default remains mr, and the body still parses non-empty.
+func TestFeatureBingoBodyModeNeutral(t *testing.T) {
+	job, ok := schedtmpl.BySlug("feature-bingo")
+	if !ok {
+		t.Fatal("feature-bingo catalog entry missing")
+	}
+	if strings.TrimSpace(job.Prompt) == "" {
+		t.Fatal("feature-bingo body is empty after the trim")
+	}
+	if job.OutputMode() != "mr" {
+		t.Fatalf("feature-bingo catalog default = %q, want mr (unchanged)", job.OutputMode())
+	}
+	// The trimmed mode-contradicting phrasings must be gone.
+	if strings.Contains(job.Prompt, "open no merge request") {
+		t.Fatalf("feature-bingo body still carries the trimmed mr-only phrase %q", "open no merge request")
+	}
+	if strings.Contains(job.Prompt, "read the existing idea files") {
+		t.Fatalf("feature-bingo body still carries the mr-only dedup phrasing %q", "read the existing idea files")
+	}
+	// The mr-delivery para that mr mode relies on verbatim must remain.
+	if !strings.Contains(job.Prompt, "open a merge request") {
+		t.Fatal("feature-bingo body lost its mr-delivery instruction (mr mode relies on it verbatim)")
+	}
+}
