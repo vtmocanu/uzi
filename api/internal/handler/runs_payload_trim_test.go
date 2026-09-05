@@ -104,6 +104,24 @@ func TestTrimPayload(t *testing.T) {
 			},
 		},
 		{
+			// A malformed text block (text is not a JSON string) must be preserved
+			// verbatim even when a sibling block triggers a re-marshal of the array —
+			// the trim only ever rewrites valid string content, never corrupts it to "".
+			name:          "tool_result block array preserves non-string text block",
+			kind:          "tool_result",
+			in:            `{"content":[{"type":"text","text":42},{"type":"image","source":"x"}],"tool_use_id":"tu_5"}`,
+			max:           max,
+			wantTruncated: true, // the image block is dropped, so the array is re-marshalled
+			check: func(t *testing.T, obj map[string]json.RawMessage) {
+				var blocks []map[string]json.RawMessage
+				mustUnmarshal(t, obj["content"], &blocks)
+				if len(blocks) != 1 {
+					t.Fatalf("kept %d blocks, want 1 (image dropped, non-string text kept)", len(blocks))
+				}
+				assertRawEquals(t, blocks[0]["text"], `42`)
+			},
+		},
+		{
 			name:          "tool_result content already short not trimmed",
 			kind:          "tool_result",
 			in:            `{"content":"short","tool_use_id":"tu_3"}`,

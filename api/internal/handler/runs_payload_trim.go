@@ -8,10 +8,13 @@ import (
 // runs_payload_trim.go holds trimPayload, the pure ?payload_max= trim applied per
 // message on GET /api/runs/{id}/messages (PRD #1137 M2). It shrinks the two bulky
 // payload fields the TUI never draws in full — tool_result.content and tool_use.input
-// string values — while preserving every other key byte-for-byte and leaving the
-// three identity keys runactivity.FromFrame reads (subagent_type, description,
-// file_path) untouched. Output is always valid JSON; a malformed payload is returned
-// verbatim so a model-authored payload never fails the request.
+// string values — while preserving every other key's value and leaving the three
+// identity keys runactivity.FromFrame reads (subagent_type, description, file_path)
+// untouched. Preservation is JSON-semantic, not byte-for-byte: a trimmed payload is
+// re-marshalled from a map, so retained keys may be reordered and <>& escaped, but
+// every retained value decodes identically. An untrimmed payload is returned byte-
+// identical (the original raw). Output is always valid JSON; a malformed payload is
+// returned verbatim so a model-authored payload never fails the request.
 
 // trimIdentityKeys are the tool_use.input string keys that are NEVER cut:
 // runactivity.FromFrame reads them verbatim for the "now" line (see
@@ -112,20 +115,30 @@ func trimContentBlocks(blocks []json.RawMessage, max int) (json.RawMessage, bool
 			dropped = true
 			continue
 		}
+		rawText, ok := block["text"]
+		if !ok {
+			// A text block with no text field: keep it verbatim.
+			kept = append(kept, b)
+			continue
+		}
 		var text string
-		if rawText, ok := block["text"]; ok {
-			if err := json.Unmarshal(rawText, &text); err != nil {
-				text = ""
-			}
+		if err := json.Unmarshal(rawText, &text); err != nil {
+			// text is not a JSON string (a malformed block): preserve it verbatim
+			// rather than silently corrupting it to "". The trim only ever touches
+			// valid string content.
+			kept = append(kept, b)
+			continue
 		}
 		cut, did := cutRunes(text, remaining)
-		if did {
-			cutAny = true
-			cut += "…"
-		}
+		// Budget the retained text against the cap, NOT the ellipsis marker, so a
+		// cut block does not over-trim the text blocks that follow it.
 		remaining -= len(cut)
 		if remaining < 0 {
 			remaining = 0
+		}
+		if did {
+			cutAny = true
+			cut += "…"
 		}
 		block["text"] = mustMarshalString(cut)
 		reblock, err := json.Marshal(block)
