@@ -87,6 +87,15 @@ type RecyclePolicy struct {
 	Cooldown time.Duration
 }
 
+// pvcBindTimeout bounds how long a (re-minted) worker PVC may sit Pending before the
+// controller treats it as STRANDED and surfaces it (PRD #837 D6/D7, #1115). The recycle
+// machine deletes the old PVC before the create-gate re-mints it, so a re-mint that never
+// binds (storageclass unavailable, quota exhausted, no schedulable node) leaves the worker
+// with no volume and nothing to roll back to — detection, not prevention. 10m is comfortably
+// beyond any healthy dynamic-provision + node-schedule bind while surfacing a genuine strand
+// promptly. Deliberately a constant, not an env/RecyclePolicy knob, in v1.
+const pvcBindTimeout = 10 * time.Minute
+
 type Materializer struct {
 	client   kubernetes.Interface
 	cfg      RenderConfig
@@ -148,7 +157,60 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 	for _, o := range byID {
 		out = append(out, *o)
 	}
+	// Strand synthesis runs over the ASSEMBLED slice, after every observeNamespace fold
+	// is done — the POD pass replaces .Roll wholesale, so a strand flagged inside the PVC
+	// pass would be clobbered. It mutates out in place (see flagStrandedPVCs).
+	m.flagStrandedPVCs(out)
 	return out, nil
+}
+
+// flagStrandedPVCs surfaces a worker whose re-minted /nix or /data PVC has sat Pending past
+// pvcBindTimeout (PRD #837 D6/D7, #1115). Stateless: Pending-age is now - the PVC's own
+// creationTimestamp (the create-gate re-mint event), the same signal the recycle cooldown
+// uses. Detection is display-only — it issues NO create/delete/patch and no rollback — so it
+// is ungated by the recycle toggle. It emits a stable, greppable log token per stranded
+// volume and synthesizes a `stuck` roll-health entry (naming /nix first when both are
+// stranded) so the existing display-only report path surfaces it to an operator.
+func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
+	for i := range workers {
+		w := &workers[i]
+		type target struct {
+			name    string
+			phase   string
+			created *time.Time
+		}
+		targets := []target{
+			{nixPVCName(w.ID), w.NixPVCPhase, w.NixPVCCreatedAt},
+			{dataPVCName(w.ID), w.DataPVCPhase, w.DataPVCCreatedAt},
+		}
+		var flagged bool
+		for _, t := range targets {
+			if t.phase != string(corev1.ClaimPending) || t.created == nil {
+				continue
+			}
+			age := m.now().Sub(*t.created)
+			if age < pvcBindTimeout {
+				continue
+			}
+			m.log.Warn(fmt.Sprintf("pvc-bind-timeout worker=%s pvc=%s pending_for=%s", w.ID, t.name, age))
+			if !flagged {
+				flagged = true
+				since := *t.created
+				w.Roll = reconcile.RollHealth{
+					Phase:             protocol.PhaseStuck,
+					PhaseSince:        since,
+					PodPhase:          string(corev1.ClaimPending),
+					BlockingContainer: t.name,
+					// Kept within the api's 64-byte self-reported display cap
+					// (handler.maxSelfReportedBytes) so the failed-worker strip renders the
+					// cause in full rather than truncating it mid-word. The PVC name rides
+					// BlockingContainer; "no auto-rollback" is the operator's cue that manual
+					// intervention (not a controller retry) is the remedy (ADR-0837 D6/D7).
+					BlockingReason: fmt.Sprintf("stranded Pending past %s bind-timeout; no auto-rollback", pvcBindTimeout),
+				}
+			}
+		}
+	}
 }
 
 // observeNamespace folds one namespace's stamped Deployments and PVCs into byID,
@@ -240,6 +302,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 				o.DataPVCLive = true
 				t := p.CreationTimestamp.Time
 				o.DataPVCCreatedAt = &t
+				o.DataPVCPhase = string(p.Status.Phase) // raw phase for the #1115 bind-timeout detector
 			}
 		case nixPVCName(id):
 			o.HasNixPVC = true // exists-in-ANY-state (UNCHANGED)
@@ -248,6 +311,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 				o.NixPVCSize = &sz // live nix size; nil while absent OR Terminating
 				t := p.CreationTimestamp.Time
 				o.NixPVCCreatedAt = &t
+				o.NixPVCPhase = string(p.Status.Phase) // raw phase for the #1115 bind-timeout detector
 			}
 		case dindDataPVCName(id):
 			// Docker workers only (issue #224 M-a). Matched unconditionally rather than
