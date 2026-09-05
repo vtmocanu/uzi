@@ -20,6 +20,7 @@ import type {
   AskUserQuestion,
   Milestone,
   MilestoneProgress,
+  Proposal,
 } from "./protocol.js";
 
 /** The in-process MCP server name; tools surface as `mcp__uzi__<tool>`. */
@@ -71,6 +72,13 @@ export interface ScannedSignals {
    *  run that completes with NO push/MR. Present only when signal_done carried `report_only:
    *  true`; absent otherwise so a plain signal_done still scans to exactly `{ done: true }`. */
   reportOnly?: boolean;
+  /** PRD #929 M2: the structured proposal (title + body) a signal_done call carried, for a
+   *  scheduled `prompt` run to convey a filing-ready issue to the server. MAIN-THREAD-ONLY,
+   *  behind the same isSubagentFrame guard as `summary`. Set ONLY when signal_done carried a
+   *  `proposal` object with two non-empty string members (defensively parsed — a malformed or
+   *  absent value leaves it undefined and never throws), so a plain signal_done still scans to
+   *  exactly `{ done: true }`. */
+  proposal?: Proposal;
   /** PRD #88: the questions an ask_user call carried, if the message made one.
    *  Present and non-empty ⇒ the executor parks the run. */
   questions?: AskUserQuestion[];
@@ -141,6 +149,25 @@ export function buildSignalMcpServer(
       .string()
       .optional()
       .describe("One-line summary of what was implemented."),
+    // PRD #929 M2: how an ISSUES-MODE scheduled prompt run delivers its proposal for
+    // server-side filing as a forge issue. UNGATED on run kind on purpose (unlike
+    // prd_done_path/report_only): the fire-time delivery instruction (a later milestone)
+    // is what tells the agent to fill it, so the field is always present-and-optional and
+    // the agent leaves it unset on every other run. Non-empty title + body are required
+    // WHEN the object is present; the whole object stays optional.
+    proposal: z
+      .object({
+        title: z.string().min(1).describe("The proposed issue's title."),
+        body: z
+          .string()
+          .min(1)
+          .describe("The proposed issue's body, as Markdown."),
+      })
+      .optional()
+      .describe(
+        "ONLY on an issues-mode scheduled prompt run instructed to deliver a proposal: the " +
+          "title + body of the issue to file on the server's behalf. Omit it entirely otherwise.",
+      ),
   };
   if (opts.prdDonePath) {
     doneShape["prd_done_path"] = z
@@ -509,6 +536,23 @@ function parseProgressIds(raw: unknown): string[] {
   return out;
 }
 
+/**
+ * Parse the `proposal` argument of a signal_done call (PRD #929 M2). Defensive in the
+ * same register as the other extractions: a non-object, or one missing a non-empty
+ * string `title` or `body`, yields undefined and never throws — so a malformed proposal
+ * is dropped rather than half-forwarded, and the api never files a titleless/bodyless
+ * issue. Length is left to the api (the authoritative control validates/scrubs); no
+ * worker-side clamp is applied here, matching how the api owns the grammar for the other
+ * model-authored declarations. */
+function parseProposal(raw: unknown): Proposal | undefined {
+  const p = asRecord(raw);
+  if (!p) return undefined;
+  const title = typeof p["title"] === "string" ? p["title"].trim() : "";
+  const body = typeof p["body"] === "string" ? p["body"].trim() : "";
+  if (title === "" || body === "") return undefined;
+  return { title, body };
+}
+
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === "object"
     ? (v as Record<string, unknown>)
@@ -611,6 +655,14 @@ export function scanSignals(message: unknown): ScannedSignals {
       if (typeof summary === "string")
         out.summary = summary.slice(0, REPORT_MD_MAX_LEN);
       if (input?.["report_only"] === true) out.reportOnly = true;
+      // PRD #929 M2. Extracted HERE, in the same signal_done branch and therefore behind the
+      // same main-thread guard as summary above: a scheduled prompt run's proposal is filed
+      // as a forge issue server-side, so a subagent frame must never be able to declare it.
+      // Set ONLY when a well-formed {title, body} parsed (parseProposal drops anything else),
+      // so a plain signal_done still scans to exactly `{ done: true }` and never affects
+      // `done` — a malformed declaration still means the run finished.
+      const proposal = parseProposal(input?.["proposal"]);
+      if (proposal !== undefined) out.proposal = proposal;
     } else if (name === ASK_USER_QUALIFIED) {
       // PRD #88. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards, for the same reason prd_done_path is nested inside signal_done's
