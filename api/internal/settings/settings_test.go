@@ -299,6 +299,78 @@ func TestMrReworkValidation(t *testing.T) {
 	}
 }
 
+// TestCiAutofixAccessors pins the PRD #914 admin global kill-switch (mirrors
+// MrRework): the switch defaults ON (the OPPOSITE of the judge's default-off), a
+// stored value is honored, and a junk bool row falls back to the default ON — a
+// malformed row never silently turns a default-on feature off.
+func TestCiAutofixAccessors(t *testing.T) {
+	ctx := context.Background()
+
+	// Empty table → compiled-in default: ON (absent → ON).
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.CiAutofixEnabled(ctx); err != nil || got != true {
+		t.Fatalf("CiAutofixEnabled default = %v, %v; want true (absent → ON)", got, err)
+	}
+	// Pin the literal default so an accidental flip is caught: default-ON is an
+	// announced behavior change, and a silent flip to off would be a regression.
+	if DefaultCiAutofixEnabled != "true" {
+		t.Fatalf("DefaultCiAutofixEnabled = %q, want \"true\"", DefaultCiAutofixEnabled)
+	}
+
+	// present-true / present-false honored; any OTHER value → default ON.
+	for _, tc := range []struct {
+		stored string
+		want   bool
+	}{
+		{"true", true},
+		{"false", false},
+		{"", true},       // empty → default ON
+		{"banana", true}, // junk → default ON
+		{"TRUE", true},   // non-canonical → default, not a lenient parse
+		{"0", true},
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyCiAutofixEnabled, tc.stored)}}, time.Minute)
+		if got, _ := c.CiAutofixEnabled(ctx); got != tc.want {
+			t.Errorf("CiAutofixEnabled(stored=%q) = %v, want %v", tc.stored, got, tc.want)
+		}
+	}
+}
+
+// TestCiAutofixEnabledFailClosed pins the PRD #914 fail-closed reconciliation: a
+// genuine store READ ERROR must be PROPAGATED, not collapsed into the value. An
+// absent row reads ON (default), but the caller (the detector) must be able to tell
+// an error apart from absent so it maps error → OFF. This exercises a REAL
+// cold-cache read error, not merely an absent row.
+func TestCiAutofixEnabledFailClosed(t *testing.T) {
+	ctx := context.Background()
+
+	// Cold cache + store error: the reader RETURNS the error so the caller fails
+	// closed. Contrast with the absent-row case above, which returns (true, nil).
+	c := New(&fakeStore{err: errors.New("db down")}, time.Minute)
+	if _, err := c.CiAutofixEnabled(ctx); err == nil {
+		t.Fatal("CiAutofixEnabled on a cold store error must propagate the error (caller maps it to OFF)")
+	}
+}
+
+// TestCiAutofixValidation pins the PRD #914 write-time gate: the key routes to the
+// strict bool parse. It MUST have an explicit Validate case — the default branch
+// (ValidateLabel) would accept junk that then reads as the default (ON).
+func TestCiAutofixValidation(t *testing.T) {
+	for _, ok := range []string{"true", "false"} {
+		if err := Validate(KeyCiAutofixEnabled, ok); err != nil {
+			t.Errorf("Validate(ci_autofix_enabled, %q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "yes", "1", "TRUE", "on"} {
+		if err := Validate(KeyCiAutofixEnabled, bad); err == nil {
+			t.Errorf("Validate(ci_autofix_enabled, %q) = nil, want a non-bool rejection", bad)
+		}
+	}
+	if !Known(KeyCiAutofixEnabled) {
+		t.Errorf("%s should be Known (admin-writable)", KeyCiAutofixEnabled)
+	}
+}
+
 // TestJudgeSpendGuardAccessors pins the PRD #69 M5 Decision 9 per-user spend-guard
 // accessors: the cooldown defaults ON (60s), the daily budget OFF (0), and a stored
 // value is returned verbatim while an unparseable row falls back to the default

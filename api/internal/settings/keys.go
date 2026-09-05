@@ -223,6 +223,12 @@ const (
 	// opt-in lives on users.mr_rework_enabled, not here.
 	KeyMrReworkEnabled = "mr_rework_enabled"
 	KeyMrReworkCap     = "mr_rework_cap"
+	// CI-autofix admin gate (PRD #914). ci_autofix_enabled is the instance-wide admin
+	// kill-switch for CI autofix (text "true"/"false"): a THREE-STATE, error-propagating
+	// read (present-true / present-false / absent → the default) that ships ON — a
+	// settings blip must not silently disable a default-on feature. The per-user opt-in
+	// lives on users.ci_autofix_enabled, not here.
+	KeyCiAutofixEnabled = "ci_autofix_enabled"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -338,6 +344,9 @@ const (
 	// (also default-on) lives on users.mr_rework_enabled.
 	DefaultMrReworkEnabled = "true"
 	DefaultMrReworkCap     = "5"
+	// PRD #914. CI autofix ships ON: an admin global kill-switch (default true), the
+	// admin-side gate. The per-user opt-in (users.ci_autofix_enabled) is separate.
+	DefaultCiAutofixEnabled = "true"
 )
 
 // Defaults maps every known key to its compiled-in default. This is the single
@@ -448,6 +457,10 @@ var Defaults = map[string]string{
 	// surface them to the settings page on every instance and no migration seeds them.
 	KeyMrReworkEnabled: DefaultMrReworkEnabled,
 	KeyMrReworkCap:     DefaultMrReworkCap,
+	// PRD #914 CI-autofix admin kill-switch. Same no-seeded-row pattern as the judge
+	// keys: an absent row synthesizes to the default (true), so All/AdminView surface it
+	// to the settings page on every instance and no migration seeds it.
+	KeyCiAutofixEnabled: DefaultCiAutofixEnabled,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed

@@ -20237,12 +20237,17 @@ also reach — those must never spawn runs).
 - **Sibling of the PRD #19 autopilot detector** (`api/internal/poller/ci_autofix.go`): runs
   each tick **after** the pipeline-status sync, on the freshly-refreshed `pipeline_statuses`
   cache — the same "detect only in the poller" placement as §98. Nil-optional-wired via
-  `engine.SetCIAutoFix(...)` in `api/cmd/server/main.go`; **not wiring it is the instance
-  kill-switch** (the autopilot nil pattern), and it can only run where the pipeline watch is
-  on (`CI_WATCH_MAX_REFS>0`), since it reads that cache.
-- **Global `app_settings.ci_autofix_enabled` (full judge parity) deliberately deferred** —
-  the optional-wiring is the instance switch, per-user opt-in is the consent gate; a global
-  KV kill-switch is a documented follow-up (Decision Log Q4), not shipped.
+  `engine.SetCIAutoFix(...)` in `api/cmd/server/main.go`; leaving it un-wired disables the
+  detector (the autopilot nil pattern), and it can only run where the pipeline watch is
+  on (`CI_WATCH_MAX_REFS>0`), since it reads that cache. The runtime kill-switch is the
+  admin global below, not the wiring.
+- **Global `settings.ci_autofix_enabled` admin kill-switch shipped in PRD #914** (was
+  deferred under PRD #71) — a text `"true"`/`"false"` KV, compiled default `"true"`, so the
+  feature ships ON. The accessor `settings.CiAutofixEnabled` (`settings/settings_ci_autofix.go`,
+  key `settings/keys.go#KeyCiAutofixEnabled`) is DELIBERATELY three-state and
+  error-propagating, mirroring `MrReworkEnabled`: absent/malformed → default ON, but a store
+  READ ERROR must not be misread as absent; the accessor propagates the error and the detector
+  (`poller/ci_autofix.go`) is the caller that maps a non-nil error to OFF (**fail closed**).
 
 ## 513. PRD #71 — durable `ci_autofix_attempts` ledger: the `autopilot_triggers` analogue, keyed `(repo_id, ref)`
 
@@ -20380,12 +20385,19 @@ Serves human: "on giving up, uzi comments + notifies"; the notification story PR
 
 ## 519. PRD #71 — scope, opt-in, and cross-forge posture
 
-Serves human: "opt-in per-user default OFF, admin can force-toggle; agent-owned MR branches
-only; never main/protected."
+Serves human: "on by default per user (tri-state opt-out, NULL=inherit=on), admin can
+force-toggle; agent-owned MR branches only; never main/protected." (Updated PRD #914; PRD
+#71 originally shipped this per-user default OFF.)
 
-- **Per-user `ci_autofix_enabled`, default OFF** (migration `00115_user_ci_autofix_enabled`,
-  mirrors the judge/autopilot boolean): self-service PUT + an **admin force-toggle** (judge
-  parity). Surfaced on the user DTO and web `Settings.tsx` / `AdminUsers.tsx`.
+- **Per-user `ci_autofix_enabled` is a NULLABLE tri-state, default ON** (PRD #914, migration
+  `00190_user_ci_autofix_tristate`): NULL = inherit = on, `true` = explicit opt-in, `false` =
+  explicit opt-out. The candidate gate is `AND u.ci_autofix_enabled IS NOT FALSE`
+  (`store/ci_autofix.sql.go`), so only an explicit `false` suppresses. PRD #71's original
+  `00115_user_ci_autofix_enabled` column was `NOT NULL DEFAULT false`; 00190 does a one-time
+  `false → NULL` fold (down-migration re-folds `NULL → false` and restores NOT NULL/default)
+  so the pre-914 default-off rows become inherit-on rather than staying silently opted out.
+  Self-service PUT + an **admin force-toggle** (judge parity). Surfaced on the user DTO and
+  web `Settings.tsx` / `AdminUsers.tsx`.
 - **MR-branch pipelines only** (`refs/merge-requests/*` of `agent/issue-N` branches); `main`,
   default, and protected branches are **never** auto-touched — a fix lands on the MR branch
   and a human still merges (the primary directive). The four `main`-untouched guardrail layers

@@ -30,10 +30,12 @@ type UserDTO struct {
 	// Decision 7). Default false; the user toggles their own from Settings, and an
 	// admin can force-toggle any user's from the admin users surface.
 	JudgeEnabled bool `json:"judge_enabled"`
-	// CIAutofixEnabled is the user's per-user opt-in to automatic CI fixes (PRD
-	// #71). Default false; the user toggles their own from Settings, and an admin
-	// can force-toggle any user's from the admin users surface.
-	CIAutofixEnabled bool `json:"ci_autofix_enabled"`
+	// CIAutofixEnabled is the user's per-user tri-state opt for automatic CI fixes
+	// (PRD #71, tri-state per #914): nil = inherit the admin global default (which is
+	// ON), true = explicit on, false = explicit off. Serializes as JSON null / true /
+	// false. The user toggles their own from Settings, and an admin can force-toggle
+	// any user's from the admin users surface.
+	CIAutofixEnabled *bool `json:"ci_autofix_enabled"`
 	// AttributionEnabled is the user's opt-out for AI attribution in worker commits
 	// (issue #916). Default true (current behavior); when false the worker suppresses
 	// the SDK's Co-Authored-By: Claude commit trailer.

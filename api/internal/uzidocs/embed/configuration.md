@@ -150,12 +150,15 @@ one operator-only piece is the SSRF allowlist for the clone target, a
 
 uzi caches the latest pipeline per **watched ref** (a repo's default branch, plus the branches of that repo's recent agent runs) on the same poll tick as the issue sync — no second loop or interval — and renders it as a status badge on the repos list, the board header, and each card. A failed pipeline offers a **Fix CI** button that queues a plan-gated `ci_fix` agent run; when that run's fix branch pipeline concludes, the sync stamps the run `verified` or `fix_failed` ("uzi verifies its work"). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full pipeline-sync + verification design.
 
-On top of the manual button, a per-user opt-in can queue that same `ci_fix`
+On top of the manual button, a per-user setting queues that same `ci_fix`
 run **automatically** when one of a user's own agent MR branches goes red —
 see [Automatic CI fixes](./ci-autofix.md) for the feature and its loop
-guard. It's off for every user until they opt in in Settings (or an admin
-force-enables them from Admin → Users), so the two `CI_AUTOFIX_*` vars
-below have no effect on an instance where nobody has opted in yet.
+guard. It ships **on for every user** by default (a tri-state opt-out: unset
+inherits the instance default, which is on); an admin can force it on or
+off for an individual user from Admin → Users, or flip a separate
+instance-wide kill-switch (`ci_autofix_enabled`, default on) that overrides
+everyone's own setting at once. The two `CI_AUTOFIX_*` vars below apply
+whenever the feature is enabled for a given user.
 
 | Var | Default | Notes |
 |---|---|---|
