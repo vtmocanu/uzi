@@ -69,6 +69,7 @@ const baseUser: User = {
   notify_early_limit_reset: false,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,
+  judge_anthropic_bind_mode: "default",
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -389,9 +390,27 @@ describe("Run defaults judge token picker (PRD #104)", () => {
     },
   ];
 
-  it("offers no judge picker when the user holds a single token", async () => {
+  // PRD #1140 M3 flipped the visibility guard from `> 1` to `>= 1`: with one token
+  // the pool and the default coincide, but auto is now the default, so the MODE is
+  // worth showing. The picker is hidden only at zero tokens.
+  it("renders the judge picker (with the auto option) when the user holds a single token", async () => {
     mockAuth(baseUser);
     mockApi.listSecrets.mockResolvedValue({ secrets: [twoTokens[0]] });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Run judge");
+    expect(screen.getByLabelText("Token the judge spends")).toBeTruthy();
+    expect(
+      screen.getByRole("option", { name: "Auto-select from the pool" }),
+    ).toBeTruthy();
+  });
+
+  it("hides the judge picker when the user holds no tokens", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
     render(
       <MemoryRouter>
         <RunDefaults />
@@ -401,7 +420,7 @@ describe("Run defaults judge token picker (PRD #104)", () => {
     expect(screen.queryByLabelText("Token the judge spends")).toBeNull();
   });
 
-  it("points the judge lane at a named token, sending the label", async () => {
+  it("points the judge lane at a named token, sending the label and mode pinned", async () => {
     mockAuth(baseUser);
     mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
     mockApi.setJudgeEnabled.mockResolvedValue({ user: baseUser });
@@ -413,13 +432,14 @@ describe("Run defaults judge token picker (PRD #104)", () => {
     const picker = await screen.findByLabelText("Token the judge spends");
     fireEvent.change(picker, { target: { value: "cheap-console" } });
     await waitFor(() =>
-      // enabled rides along unchanged; the token is the label, not an id.
-      expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(false, "cheap-console"),
+      // enabled rides along unchanged; the token is the label, not an id, and the
+      // third arg is the derived mode.
+      expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(false, "cheap-console", "pinned"),
     );
   });
 
-  it("clears the judge binding back to the default by sending null", async () => {
-    mockAuth({ ...baseUser, judge_anthropic_secret_id: "sec-cheap", judge_anthropic_secret_label: "cheap-console" });
+  it("clears the judge binding back to the default by sending null and mode default", async () => {
+    mockAuth({ ...baseUser, judge_anthropic_secret_id: "sec-cheap", judge_anthropic_secret_label: "cheap-console", judge_anthropic_bind_mode: "pinned" });
     mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
     mockApi.setJudgeEnabled.mockResolvedValue({ user: baseUser });
     render(
@@ -429,7 +449,55 @@ describe("Run defaults judge token picker (PRD #104)", () => {
     );
     const picker = await screen.findByLabelText("Token the judge spends");
     fireEvent.change(picker, { target: { value: "" } });
-    await waitFor(() => expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(false, null));
+    await waitFor(() => expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(false, null, "default"));
+  });
+
+  // The auto sentinel maps to mode "auto" with a null token — clearing (default) and
+  // auto (the pool) are distinct, so the pool is never reached by an empty value.
+  it("selecting Auto-select from the pool sends mode auto with a null token", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    mockApi.setJudgeEnabled.mockResolvedValue({ user: baseUser });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const picker = await screen.findByLabelText("Token the judge spends");
+    // AUTO_OPTION is the NUL-prefixed sentinel WorkersSettings uses, not a readable value.
+    fireEvent.change(picker, { target: { value: "\u0000auto" } });
+    await waitFor(() =>
+      expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(false, null, "auto"),
+    );
+  });
+
+  it("renders the effective mode from judge_anthropic_bind_mode (auto → the auto option is selected)", async () => {
+    mockAuth({ ...baseUser, judge_anthropic_bind_mode: "auto" });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Token the judge spends")) as HTMLSelectElement;
+    expect(picker.value).toBe("\u0000auto");
+  });
+
+  // D4: an auto judge lane with an EMPTY pool spends the default token (unlike a
+  // worker, which holds), so the warning names the default-token fallback.
+  it("warns that an empty pool falls back to the default token in auto mode", async () => {
+    mockAuth({ ...baseUser, judge_anthropic_bind_mode: "auto" });
+    // Both tokens are un-pooled (auto_eligible: false), so pooledCount is 0.
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    const { container } = render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByLabelText("Token the judge spends");
+    expect(container.textContent ?? "").toMatch(
+      /your pool is empty, so retrospectives spend your default token/i,
+    );
   });
 
   // Toggling the opt-in must NOT touch the binding: the token field is omitted,

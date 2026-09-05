@@ -462,15 +462,15 @@ const realApi = {
   // enabled is required; anthropicToken is the three-way token field (PRD #104 M4):
   // omitted leaves the binding alone, null clears it back to the default, a label
   // binds it. Omitting it is what every pre-#104 caller did, and must stay a no-op
-  // on the binding.
-  setJudgeEnabled: (enabled: boolean, anthropicToken?: string | null) =>
-    request<{ user: User }>(
-      "PUT",
-      "/me/judge",
-      anthropicToken === undefined
-        ? { enabled }
-        : { enabled, anthropic_token: anthropicToken },
-    ),
+  // on the binding. judgeBindMode (PRD #1140 M3) is the three-valued bind mode
+  // (default / pinned / auto), sent as judge_bind_mode only when provided, so every
+  // existing caller's body shape is unchanged.
+  setJudgeEnabled: (enabled: boolean, anthropicToken?: string | null, judgeBindMode?: BindMode) => {
+    const body: Record<string, unknown> = { enabled };
+    if (anthropicToken !== undefined) body.anthropic_token = anthropicToken;
+    if (judgeBindMode !== undefined) body.judge_bind_mode = judgeBindMode;
+    return request<{ user: User }>("PUT", "/me/judge", body);
+  },
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
   // PRD #104 M2 token CRUD. create/rename/set-default/rotate/delete are all
   // cookie-only (D8) — the SPA is the only client that can reach them.
