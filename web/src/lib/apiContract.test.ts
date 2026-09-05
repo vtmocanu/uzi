@@ -199,19 +199,15 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // sets (handler/schedules.go:1598-1600, "plain bool column ... so always set it"),
 // so the wire is a real boolean though the *bool zero marshals null.
 //
-// 🔴 DISCOVERED DRIFT (not in the M2 plan): schedule.next_fires. The mapper only sets
-// NextFires for a recurring schedule with a valid cron (handler/schedules.go:1612-1614);
-// a once (or invalid-cron) schedule leaves it nil, so the wire emits `null`, but TS
-// types it `next_fires: string[]` (never-null). This is the ONE directive M4 deliberately
-// KEEPS (every other #982 directive is removed): widening to `string[] | null` would
-// surface two UNGUARDED `next_fires[0]` index sites (DefaultJobs.tsx / Schedules.tsx) as a
-// red gate — a latent crash-on-once-schedule that is a BEHAVIOUR fix needing its own
-// regression test (filed as its own bug), out of scope for this type-only PRD. labels is
-// already typed `string[] | null` in TS, so it needs NO exemption.
+// schedule.next_fires reconciliation (issue #1003): the mapper only sets NextFires for a
+// recurring schedule with a valid cron (handler/schedules.go:1612-1614); a once (or
+// invalid-cron) schedule leaves it nil, so the wire emits `null`. The type is now widened
+// to `string[] | null` and both `next_fires[0]` index sites (components/DefaultJobs.tsx,
+// pages/Schedules.tsx) are guarded with `?.`, so `_scheduleZero` type-checks positively
+// against the fixture with no directive. labels is likewise typed `string[] | null`.
 {
   const _scheduleMissing: never = null as unknown as Exclude<keyof Schedule, keyof typeof scheduleFull>;
   const _scheduleExtra: never = null as unknown as Exclude<keyof typeof scheduleFull, keyof Schedule>;
-  // @ts-expect-error #982: next_fires is null on the wire for once/invalid-cron schedules; widening to string[] | null is deferred to its own bug (two unguarded next_fires[0] index sites, DefaultJobs.tsx / Schedules.tsx, would crash — a behaviour fix with a regression test, not this type-only PRD)
   const _scheduleZero: ZeroOf<Schedule, "override_subagent_model"> = scheduleZero;
   const _scheduleFull: Widen<Schedule> = scheduleFull;
   void _scheduleMissing;

@@ -95,9 +95,10 @@ the directive — the same-line caveat M1 documents for `_runExtra`.
 | `Worker` / `AdminWorker` | `docker?: boolean` | `boolPtrValue(w.DockerEnabled)` is nil for an EXTERNAL worker (`handler/workers.go:120` / `:169`) | `error TS2322: Type '{ … docker: null; … }' is not assignable to type 'ZeroOf<Worker, "capabilities">'. Types of property 'docker' are incompatible.` |
 | `Schedule` | `next_fires: string[]` | the mapper only sets `NextFires` for a recurring+valid-cron schedule (`handler/schedules_dto.go:125-126`); a once schedule leaves it nil (→ `null`) | `error TS2322: Type '{ … next_fires: null; … }' is not assignable to type 'ZeroOf<Schedule, "override_subagent_model">'. Types of property 'next_fires' are incompatible.` |
 
-M4 reconciliation (type-only): `Worker.docker` → `docker?: boolean | null`; `Schedule.next_fires`
-→ `next_fires: string[] | null` (or, out of scope for a type-only PRD, the Go mapper normalizes
-`next_fires` to `[]`).
+M4 reconciliation (type-only): `Worker.docker` → `docker?: boolean | null`. `Schedule.next_fires`
+was reconciled later by issue #1003: the type widened `string[]` → `string[] | null` and both
+`next_fires[0]` index sites (`components/DefaultJobs.tsx:400`, `pages/Schedules.tsx:1014`) were
+guarded with `?.`, so its `@ts-expect-error` is gone.
 
 M3 adds the handler-package hot set (the DTOs are UNEXPORTED, served by cookie-only
 routes, so their Go half is `api/internal/handler/contract_test.go`, an in-package test):
@@ -194,14 +195,12 @@ cli-tokens` CLI; the web's `CliTokens.tsx` reads the per-user `GET /me/cli-token
 `CliToken`). So `AdminCliToken` was added for the contract pin, no production fetch changed,
 and no mock fixture needed editing.
 
-**The `next_fires` directive is the ONE that REMAINS** (every other `@ts-expect-error #982`
-is gone). `Schedule.next_fires` is `null` on the wire for a once/invalid-cron schedule, but
-widening `string[]` → `string[] | null` would surface two UNGUARDED `next_fires[0]` index
-sites (`DefaultJobs.tsx:383`, `Schedules.tsx:855`) as a red gate — a latent
-crash-on-once-schedule. That is a BEHAVIOUR fix that needs its own regression test (filed as
-its own bug), out of scope for this type-only PRD, so its directive stays with a reason
-naming the deferral. `Worker.docker` was reconciled (no unguarded index site), so only
-`next_fires` remains.
+**The `next_fires` directive has since been reconciled by issue #1003** (every `@ts-expect-error #982`
+is now gone). `Schedule.next_fires` is `null` on the wire for a once/invalid-cron schedule; #1003
+widened `string[]` → `string[] | null` and guarded both `next_fires[0]` index sites
+(`components/DefaultJobs.tsx:400`, `pages/Schedules.tsx:1014`) with `?.`, adding a render
+regression test per site so the crash-on-once-schedule can't return. `Worker.docker` was
+reconciled in M4 (no unguarded index site).
 
 ## What the TS half pins (three compile-time assertions per DTO)
 

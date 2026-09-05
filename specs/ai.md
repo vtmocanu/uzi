@@ -23621,16 +23621,15 @@ the exemption table, what the contract cannot catch).
   retyped). A field-anchored grep over `web/src` found **zero** consumer hits for the 7 `Run` fields
   and `selector_kind`, so the reconciliation is purely additive; the two `docker` consumers already
   read `w.docker === true`, which is null-safe. Every `@ts-expect-error #982` directive this landed
-  is now gone except one.
-- **`Schedule.next_fires` is the one directive left, deliberately deferred, not reconciled.** The wire
-  sends `null` for a once/invalid-cron schedule (the mapper only sets `NextFires` for
-  recurring+valid-cron), so the TS type is drifted the same way `docker` was — but widening
-  `next_fires: string[]` to `string[] | null` surfaces two **unguarded** `next_fires[0]` index sites
-  (`DefaultJobs.tsx:383`, `Schedules.tsx:855`) as a red gate: a latent crash-on-once-schedule. That is
-  a **behaviour** fix needing its own regression test, out of scope for a type-only PRD, so it was
-  filed as its own bug and the directive stays, its reason rewritten to name the deferral rather than
-  "reconciled in M4". Do not read this PRD as having closed `next_fires` — it is the one documented
-  exception.
+  is now gone. (AI-synced 2026-09-05: the last one, `next_fires`, was reconciled by issue #1003; see below.)
+- **`Schedule.next_fires` was the one directive #982 deliberately deferred; issue #1003 reconciled it
+  (AI-synced 2026-09-05).** The wire sends `null` for a once/invalid-cron schedule (the mapper only
+  sets `NextFires` for recurring+valid-cron), so the TS type drifted the same way `docker` did. #982
+  left it because widening `next_fires: string[]` to `string[] | null` surfaced two **unguarded**
+  `next_fires[0]` index sites (a latent crash-on-once-schedule) — a **behaviour** fix out of scope for
+  a type-only PRD. #1003 widened the type to `string[] | null` and guarded both sites with `?.`
+  (`components/DefaultJobs.tsx:400`, `pages/Schedules.tsx:1014`), removed the `@ts-expect-error #982`
+  directive, and added failing-first render regression tests for the `next_fires: null` payload.
 
 Cross-refs: `fixtures/run-usage`/`fixtures/judge-fidelity` precedent for the differential-fixture shape
 and the "recorded, not authored, no `-update` flag" house rule (`.claude/rules/go.md`); PRD #700 MR
