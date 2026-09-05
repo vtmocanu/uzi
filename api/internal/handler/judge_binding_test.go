@@ -29,7 +29,7 @@ type judgeBindStore struct {
 	labels  map[string]uuid.UUID    // "owner|label" → secret id
 
 	setCalled bool
-	setArg    store.SetUserJudgeAnthropicSecretParams
+	setArg    store.SetUserJudgeAnthropicBindingParams
 }
 
 func (j *judgeBindStore) GetUserSecretIDByLabel(_ context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error) {
@@ -48,10 +48,14 @@ func (j *judgeBindStore) GetUserSecretCiphertextByID(_ context.Context, arg stor
 	return store.GetUserSecretCiphertextByIDRow{UserID: owner, Kind: store.KindAnthropicToken}, nil
 }
 
-func (j *judgeBindStore) SetUserJudgeAnthropicSecret(_ context.Context, arg store.SetUserJudgeAnthropicSecretParams) (store.User, error) {
+func (j *judgeBindStore) SetUserJudgeAnthropicBinding(_ context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error) {
 	j.setCalled = true
 	j.setArg = arg
-	return store.User{ID: arg.ID, JudgeAnthropicSecretID: arg.JudgeAnthropicSecretID}, nil
+	return store.User{
+		ID:                     arg.ID,
+		JudgeAnthropicBindMode: arg.JudgeAnthropicBindMode,
+		JudgeAnthropicSecretID: arg.JudgeAnthropicSecretID,
+	}, nil
 }
 
 func newJudgeBindHandler(t *testing.T, db *fakeUserDB, st *judgeBindStore) *Handler {
@@ -227,6 +231,115 @@ func TestSetJudgeUnknownLabelIs400(t *testing.T) {
 	}
 	if st.setCalled {
 		t.Fatal("an unknown label must not reach the UPDATE")
+	}
+}
+
+// TestSetJudgeAutoModeWritesAutoWithNullPointer (PRD #1140 M2): judge_bind_mode:"auto"
+// with no token writes mode 'auto' and a NULL pointer — the pool, not the default.
+func TestSetJudgeAutoModeWritesAutoWithNullPointer(t *testing.T) {
+	owner := uuid.New()
+	st := &judgeBindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+	h := newJudgeBindHandler(t, &fakeUserDB{}, st)
+
+	rec := httptest.NewRecorder()
+	h.SetJudgeEnabled(rec, judgeReq(owner, `{"enabled":true,"judge_bind_mode":"auto"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !st.setCalled {
+		t.Fatal("a judge_bind_mode with no token must still write the binding")
+	}
+	if st.setArg.JudgeAnthropicBindMode != workersvc.BindModeAuto {
+		t.Fatalf("mode = %q, want auto", st.setArg.JudgeAnthropicBindMode)
+	}
+	if st.setArg.JudgeAnthropicSecretID.Valid {
+		t.Fatalf("auto mode wrote a pointer %+v, want NULL", st.setArg.JudgeAnthropicSecretID)
+	}
+}
+
+// TestSetJudgePinnedModeNeedsLabel: judge_bind_mode:"pinned" with no token label is a
+// 400 (mirrors PatchWorker), before any write.
+func TestSetJudgePinnedModeNeedsLabel(t *testing.T) {
+	owner := uuid.New()
+	st := &judgeBindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+	h := newJudgeBindHandler(t, &fakeUserDB{}, st)
+
+	rec := httptest.NewRecorder()
+	h.SetJudgeEnabled(rec, judgeReq(owner, `{"enabled":true,"judge_bind_mode":"pinned","anthropic_token":null}`))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if st.setCalled {
+		t.Fatal("pinned-without-a-label must not reach the UPDATE")
+	}
+}
+
+// TestSetJudgeAutoModeRejectsLabel: judge_bind_mode:"auto" (or default) WITH a token
+// label is a 400 — the two contradict.
+func TestSetJudgeAutoModeRejectsLabel(t *testing.T) {
+	owner, secretID := uuid.New(), uuid.New()
+	st := &judgeBindStore{
+		secrets: map[uuid.UUID]uuid.UUID{secretID: owner},
+		labels:  map[string]uuid.UUID{owner.String() + "|cheap-console": secretID},
+	}
+	h := newJudgeBindHandler(t, &fakeUserDB{}, st)
+
+	rec := httptest.NewRecorder()
+	h.SetJudgeEnabled(rec, judgeReq(owner, `{"enabled":true,"judge_bind_mode":"auto","anthropic_token":"cheap-console"}`))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if st.setCalled {
+		t.Fatal("auto-with-a-label must not reach the UPDATE")
+	}
+}
+
+// TestSetJudgeInvalidModeIs400: a mode outside the closed set is a named 400, not a 500
+// from the CHECK.
+func TestSetJudgeInvalidModeIs400(t *testing.T) {
+	owner := uuid.New()
+	st := &judgeBindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+	h := newJudgeBindHandler(t, &fakeUserDB{}, st)
+
+	rec := httptest.NewRecorder()
+	h.SetJudgeEnabled(rec, judgeReq(owner, `{"enabled":true,"judge_bind_mode":"sometimes"}`))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if st.setCalled {
+		t.Fatal("an invalid mode must not reach the UPDATE")
+	}
+}
+
+// TestAdminJudgeToggleIgnoresMode is the admin-route half of D-audit-H3 for the mode:
+// an admin body carrying judge_bind_mode must leave the target's binding untouched, the
+// same way it ignores anthropic_token.
+func TestAdminJudgeToggleIgnoresMode(t *testing.T) {
+	target := uuid.New()
+	st := &judgeBindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+	db := &fakeUserDB{}
+	h := newJudgeBindHandler(t, db, st)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/users/x/judge",
+		strings.NewReader(`{"enabled":true,"judge_bind_mode":"auto"}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", target.String())
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rec := httptest.NewRecorder()
+	h.SetUserJudgeEnabled(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.called {
+		t.Fatal("the admin toggle should still flip judge_enabled")
+	}
+	if st.setCalled {
+		t.Fatal("the admin toggle honored judge_bind_mode — an admin must not switch a user onto the pool")
 	}
 }
 

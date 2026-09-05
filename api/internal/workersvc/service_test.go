@@ -102,10 +102,14 @@ type fakeStore struct {
 	// Sweep). A user absent from the map returns an empty candidate slice; nil map falls
 	// back to the blanket autoCandidates so every existing fixture is unchanged.
 	autoCandidatesByUser map[uuid.UUID][]store.ListAutoSelectCandidatesRow
-	// judgeSecret is the user's judge-lane binding (PRD #104 M4); the zero value is
-	// "unbound", which is every user's state until they choose otherwise, so existing
-	// judge fixtures keep resolving the default with no change.
+	// judgeSecret is the user's judge-lane pointer (PRD #104 M4); the zero value is a
+	// NULL pointer. judgeBindMode is the three-valued mode (PRD #1140 M2); the zero
+	// value "" falls into judgeChoice's default arm (resolves the owner's default), so
+	// an unbound judge fixture keeps resolving the default with no change. A fixture
+	// staging a Valid judgeSecret must set judgeBindMode: BindModePinned to spend it —
+	// the same coupling the migration's backfill produces on real rows.
 	judgeSecret    pgtype.UUID
+	judgeBindMode  string
 	judgeSecretErr error
 	// anthropicSealedWith is the row's sealed_with (defaults to 'master' when
 	// empty, so existing fixtures are unchanged); set to 'dek' for vault tests.
@@ -626,8 +630,11 @@ func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecret
 	}
 	return store.GetUserSecretCiphertextRow{Ciphertext: f.anthropic, SealedWith: sealedWith}, f.anthropicErr
 }
-func (f *fakeStore) GetUserJudgeAnthropicSecret(context.Context, uuid.UUID) (pgtype.UUID, error) {
-	return f.judgeSecret, f.judgeSecretErr
+func (f *fakeStore) GetUserJudgeAnthropicBinding(context.Context, uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error) {
+	return store.GetUserJudgeAnthropicBindingRow{
+		JudgeAnthropicBindMode: f.judgeBindMode,
+		JudgeAnthropicSecretID: f.judgeSecret,
+	}, f.judgeSecretErr
 }
 func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
 	f.byIDLookups = append(f.byIDLookups, arg)
@@ -4645,8 +4652,9 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 			ID: uuid.New(), Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
-		anthropic:   sealedDefault,
-		judgeSecret: pgtype.UUID{Bytes: judgeID, Valid: true},
+		anthropic:     sealedDefault,
+		judgeSecret:   pgtype.UUID{Bytes: judgeID, Valid: true},
+		judgeBindMode: BindModePinned,
 		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
 			judgeID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedJudge, SealedWith: store.SealedWithMaster},
 		},
@@ -4747,7 +4755,7 @@ func TestJudgeBindingLookupErrorFailsClaim(t *testing.T) {
 	if err == nil {
 		t.Fatal("a failed judge-binding lookup must fail the claim, never silently fall back to the default")
 	}
-	if !strings.Contains(err.Error(), "judge token binding lookup") {
+	if !strings.Contains(err.Error(), "judge binding lookup") {
 		t.Fatalf("error should name the binding lookup, got: %v", err)
 	}
 }
@@ -4763,9 +4771,10 @@ func TestJudgeBoundToVanishedSecretFailsClosed(t *testing.T) {
 			ID: uuid.New(), Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
-		anthropic:   sealedDefault,
-		judgeSecret: pgtype.UUID{Bytes: uuid.New(), Valid: true},
-		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{}, // resolves to nothing
+		anthropic:     sealedDefault,
+		judgeSecret:   pgtype.UUID{Bytes: uuid.New(), Valid: true},
+		judgeBindMode: BindModePinned,
+		byIDSecrets:   map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{}, // resolves to nothing
 	}
 	svc := New(fs, box, testParams())
 
@@ -4805,8 +4814,9 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
-		anthropic:   sealedDefault,
-		judgeSecret: pgtype.UUID{Bytes: judgeID, Valid: true},
+		anthropic:     sealedDefault,
+		judgeSecret:   pgtype.UUID{Bytes: judgeID, Valid: true},
+		judgeBindMode: BindModePinned,
 		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
 			judgeID:  {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedJudge, SealedWith: store.SealedWithMaster},
 			workerID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedDefault, SealedWith: store.SealedWithMaster},

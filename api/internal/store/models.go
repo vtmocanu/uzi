@@ -649,6 +649,7 @@ type User struct {
 	NotifyEarlyLimitReset   bool               `json:"notify_early_limit_reset"`
 	SchedulesPaused         bool               `json:"schedules_paused"`
 	SchedulesPausedUntil    pgtype.Timestamptz `json:"schedules_paused_until"`
+	JudgeAnthropicBindMode  string             `json:"judge_anthropic_bind_mode"`
 }
 
 type UserSecret struct {

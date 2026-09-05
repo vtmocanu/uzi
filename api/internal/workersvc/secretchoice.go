@@ -299,11 +299,11 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 // Judge runs never reach here; they fork to assembleJudgeClaim earlier.
 func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
 	if run.Kind == runkind.SelfImprove {
-		id, err := s.judgeSecretID(ctx, run.UserID)
-		if err != nil {
-			return secretChoice{}, err
-		}
-		return staticChoice(id, selectReasonJudge), nil
+		// Full judge resolution, including the `auto` pool ranker and D4's empty-pool
+		// fallback (PRD #1140 M2): self_improve is uzi reviewing itself and follows the
+		// judge's credential, not a worker's. The run-lane open-failed retry still wraps
+		// this because self_improve rides assembleClaim (via openWithAutoRetry).
+		return s.judgeChoice(ctx, run)
 	}
 	if wkr.AnthropicBindMode == BindModeAuto {
 		return s.autoChoice(ctx, run)
@@ -357,7 +357,7 @@ func (s *Service) claimExclude(run store.Run) uuid.UUID {
 // against hand-written fixtures with no database.
 //
 // A query error FAILS the claim rather than degrading to the owner default, and that
-// is deliberate in the same way judgeSecretID's is: "the database was unreachable for
+// is deliberate in the same way judgeChoice's is: "the database was unreachable for
 // a moment" and "you have no pooled tokens" are different facts, and quietly treating
 // the first as the second spends an account the user did not choose while raising
 // nothing. The run is retried; a silent mis-spend is not retried, because nobody

@@ -697,10 +697,10 @@ type Store interface {
 	// new worker's bind mode the #804 way (PRD #1140 M1): no label + non-empty pool → auto.
 	UserHasAutoEligibleAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
-	// Judge-lane → token binding (PRD #104 M4): read at judge-claim time, written by
-	// PUT /api/me/judge.
-	GetUserJudgeAnthropicSecret(ctx context.Context, id uuid.UUID) (pgtype.UUID, error)
-	SetUserJudgeAnthropicSecret(ctx context.Context, arg store.SetUserJudgeAnthropicSecretParams) (store.User, error)
+	// Judge-lane bind mode + pointer (PRD #104 M4, three-valued per PRD #1140 M2): read
+	// at judge-claim time, written by PUT /api/me/judge in one statement (D6).
+	GetUserJudgeAnthropicBinding(ctx context.Context, id uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error)
+	SetUserJudgeAnthropicBinding(ctx context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// Per-user default reasoning effort (PRD #617): read at issue- and chat-run
 	// claim assembly, keyed on the run owner. NULL ⇒ inherit (worker omits the SDK
@@ -3189,15 +3189,27 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 	return wkr, nil
 }
 
-// SetUserJudgeToken points the user's JUDGE lane at one of their own Anthropic
-// credentials, or clears it back to their default when secretID is nil (PRD #104
-// M4). Per-user, not per-worker: which credential reviews your work is a property
-// of you, not of whichever worker claims the retrospective.
+// SetUserJudgeBinding sets the user's JUDGE-lane bind MODE and pointer in one write
+// (PRD #104 M4, three-valued per PRD #1140 M2, D6), mirroring SetWorkerAnthropicToken's
+// rules: 'pinned' requires an owned secret; 'default' and 'auto' carry no id and write
+// NULL. Per-user, not per-worker: which credential reviews your work is a property of
+// you, not of whichever worker claims the retrospective. A 'default' user spends their
+// default token; an 'auto' user has the judge lane run the same pool ranker the run
+// lane uses, falling to the default only when the pool is genuinely empty (D4).
 //
 // Ownership is checked here so the caller gets a 404 rather than a constraint
 // violation; 00079's composite FK refuses the same binding independently, and is
 // the layer that holds if this check is ever bypassed (D11).
-func (s *Service) SetUserJudgeToken(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) (store.User, error) {
+func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mode string, secretID *uuid.UUID) (store.User, error) {
+	if !ValidBindMode(mode) {
+		return store.User{}, ErrInvalidBindMode
+	}
+	// A non-pinned mode never carries an id (the same rule SetWorkerAnthropicToken
+	// enforces): 'default' and 'auto' resolve without a pointer, so a stale id left
+	// beside them cannot leak into a claim.
+	if mode != BindModePinned {
+		secretID = nil
+	}
 	var bind pgtype.UUID
 	if secretID != nil {
 		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
@@ -3211,8 +3223,9 @@ func (s *Service) SetUserJudgeToken(ctx context.Context, userID uuid.UUID, secre
 		}
 		bind = pgconv.UUID(*secretID)
 	}
-	return s.q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
+	return s.q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
 		ID:                     userID,
+		JudgeAnthropicBindMode: mode,
 		JudgeAnthropicSecretID: bind,
 	})
 }
