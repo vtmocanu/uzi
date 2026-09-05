@@ -172,9 +172,8 @@ func TestTUIBlinkNullMilestoneByteIdentical(t *testing.T) {
 	// Detail rail: a plain run with a live frame, phase off vs on.
 	detailFrame := func(on bool) string {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, plainRun.ID)
-		next, _ := m.Update(detailLoadedMsg{run: plainRun,
-			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
-		m = next.(tuiModel)
+		m = applyDetail(m, plainRun,
+			[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
 		m.blinkOn = on
 		return m.View().Content
 	}
@@ -198,10 +197,9 @@ func TestTUIRailNowLineFromFrames(t *testing.T) {
 	// is the dispatch task label.
 	editPayload := json.RawMessage(`{"name":"Edit","input":{"file_path":"api/internal/poller/ci_autofix.go"}}`)
 	agent, label, at := "coder", "Decouple ci_fix detector from branch naming", now
-	next, _ := m.Update(detailLoadedMsg{run: run, msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, run, []apitypes.MessageDTO{
 		{Seq: 1, Kind: "tool_use", Agent: &agent, AgentLabel: &label, CreatedAt: at, Payload: editPayload},
-	}})
-	m = next.(tuiModel)
+	})
 	out := stripANSI(m.View().Content)
 	// The `↳ <role> · <age>` line and the italic task label sit under the in-progress milestone.
 	if !strings.Contains(out, "↳ coder") {
@@ -227,11 +225,10 @@ func TestTUIRailUnattachedNowLine(t *testing.T) {
 		MilestonesCompleted: []string{"m1"}} // nothing in progress
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 	agent, at := "lead", now
-	next, _ := m.Update(detailLoadedMsg{run: run, msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, run, []apitypes.MessageDTO{
 		{Seq: 1, Kind: "tool_use", Agent: &agent, CreatedAt: at,
 			Payload: json.RawMessage(`{"name":"Read","input":{"file_path":"api/internal/poller/mr_rework.go"}}`)},
-	}})
-	m = next.(tuiModel)
+	})
 	out := stripANSI(m.View().Content)
 	if !strings.Contains(out, "↳ lead") {
 		t.Errorf("an unattached now line should show under the eyebrow when activity exists but nothing is declared\n%s", out)

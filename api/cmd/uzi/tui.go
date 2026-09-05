@@ -127,9 +127,24 @@ type buildInfoMsg struct {
 	err     error
 }
 
-type detailLoadedMsg struct {
+// detailRunMsg carries the first GetRun for the drilled-in run (PRD #1137). The header,
+// crew-rail milestones/accounts and now-line render from it, before the transcript.
+type detailRunMsg struct {
 	runID string
 	run   apitypes.RunDTO
+	err   error
+}
+
+// detailPageKind tags a transcript page. M4 uses only pageTail (the newest page);
+// pageBackfill/pageCatchup are added by later milestones.
+type detailPageKind int
+
+const pageTail detailPageKind = iota
+
+// detailPageMsg carries one page of transcript messages for the drilled-in run.
+type detailPageMsg struct {
+	runID string
+	kind  detailPageKind
 	msgs  []apitypes.MessageDTO
 	err   error
 }
@@ -294,7 +309,7 @@ func (m tuiModel) initCmds() []tea.Cmd {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
 	}
 	if m.view == viewDetail {
-		cmds = append(cmds, m.loadDetailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
+		cmds = append(cmds, m.loadRunCmd(m.detail.runID), m.loadTailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
 	}
 	return cmds
 }
@@ -462,15 +477,27 @@ func (m tuiModel) fetchBuildInfoCmd() tea.Cmd {
 	}
 }
 
-func (m tuiModel) loadDetailCmd(runID string) tea.Cmd {
+// detailPageSize is the transcript page size (matches uzicli's logsPageSize). detailPayloadMax
+// is the ?payload_max the TUI asks for — the two bulky fields it never draws in full are
+// trimmed on the wire (PRD #1137 D4). Both are vars so tests can shrink them.
+var (
+	detailPageSize   int32 = 200
+	detailPayloadMax int32 = 2048
+)
+
+func (m tuiModel) loadRunCmd(runID string) tea.Cmd {
 	c, ctx := m.client, m.ctx
 	return func() tea.Msg {
 		run, err := c.GetRun(ctx, runID)
-		if err != nil {
-			return detailLoadedMsg{runID: runID, err: err}
-		}
-		msgs, err := c.RunLogs(ctx, runID, 0)
-		return detailLoadedMsg{runID: runID, run: run, msgs: msgs, err: err}
+		return detailRunMsg{runID: runID, run: run, err: err}
+	}
+}
+
+func (m tuiModel) loadTailCmd(runID string) tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{Tail: detailPageSize, PayloadMax: detailPayloadMax})
+		return detailPageMsg{runID: runID, kind: pageTail, msgs: msgs, err: err}
 	}
 }
 
@@ -653,15 +680,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case detailLoadedMsg:
+	case detailRunMsg:
 		// Drop a load that resolved for a run the user has since navigated away from:
 		// esc/exitToBoard resets m.detail to its zero value (runID "", nil `seen` map), and
-		// drilling into another run swaps runID — a late applyLoaded from the previous run
-		// would splice the wrong transcript in, and against the zero value it would write the
-		// nil map and panic. Same runID guard every sibling detail message carries. runID is
-		// set by loadDetailCmd on both the success and error paths; run.ID is the fallback for
-		// a message that carries only the run (the error path leaves run zero, which is why the
-		// explicit field exists).
+		// drilling into another run swaps runID — a late applyRun from the previous run would
+		// flip the wrong header in, and against the zero value it would write the nil map and
+		// panic. Same runID guard every sibling detail message carries. runID is set by
+		// loadRunCmd on both the success and error paths; run.ID is the fallback for a message
+		// that carries only the run (the error path leaves run zero, which is why the explicit
+		// field exists).
 		id := msg.runID
 		if id == "" {
 			id = msg.run.ID
@@ -669,10 +696,20 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if id != m.detail.runID {
 			return m, nil
 		}
-		m.detail.applyLoaded(msg)
-		// The ownership probe rides the same call the queue indicator needs; a milestone run
-		// that opens with work in progress arms the blink too.
+		m.detail.applyRun(msg.run, msg.err)
+		// The ownership probe + queue indicator and the in-progress-milestone blink both
+		// key off the run DTO, so they ride the run load (as the old full-load did).
 		return m, tea.Batch(m.fetchInputsCmd(m.detail.runID), m.maybeArmBlink())
+
+	case detailPageMsg:
+		if msg.runID != m.detail.runID {
+			return m, nil
+		}
+		switch msg.kind {
+		case pageTail:
+			m.detail.applyTailPage(msg.msgs, msg.err)
+		}
+		return m, nil
 
 	case detailMetaMsg:
 		// runID is checked FIRST (PRD #1130 M1 D2): metaSeq restarts per run (newDetailState),
@@ -783,7 +820,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.view != viewDetail || !m.detail.polling {
 			return m, nil
 		}
-		return m, tea.Batch(m.loadDetailCmd(m.detail.runID), pollFallbackCmd())
+		return m, tea.Batch(m.loadRunCmd(m.detail.runID), m.loadTailCmd(m.detail.runID), pollFallbackCmd())
 	}
 	return m, nil
 }

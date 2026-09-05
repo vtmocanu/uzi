@@ -58,7 +58,8 @@ type detailState struct {
 	// tall roster cannot push the milestone block below the fold — the rail does not scroll,
 	// it is clamped to the transcript height (issue #379).
 	railCollapsed bool
-	loaded        bool
+	runLoaded     bool // the first GetRun has landed: header/milestones/accounts can render
+	tailLoaded    bool // the newest transcript page has landed
 	loadErr       error
 	stream        *uzicli.RunStream
 	streamErr     error
@@ -87,25 +88,40 @@ func newDetailState(runID string) detailState {
 	return detailState{runID: runID, seen: map[int32]bool{}, follow: true}
 }
 
-func (d *detailState) applyLoaded(msg detailLoadedMsg) {
-	if msg.err != nil {
-		d.loadErr = msg.err
-		d.loaded = true
+// applyRun folds the first GetRun in: the header, the crew-rail milestones/accounts and
+// the "now" line render from this alone, one round trip before the transcript. Status is
+// taken wholesale (nothing to preserve yet, unlike applyMeta).
+func (d *detailState) applyRun(run apitypes.RunDTO, err error) {
+	if err != nil {
+		d.loadErr = err
+		d.runLoaded = true
 		return
 	}
 	d.loadErr = nil
-	d.run = msg.run
-	for _, m := range msg.msgs {
+	d.run = run
+	d.runLoaded = true
+}
+
+// applyTailPage folds the newest transcript page in and marks the pane loaded. Frames are
+// deduped by seq (addFrame), so a live frame that beat the tail is not doubled.
+func (d *detailState) applyTailPage(msgs []apitypes.MessageDTO, err error) {
+	if err != nil {
+		d.loadErr = err
+		d.tailLoaded = true
+		return
+	}
+	d.loadErr = nil
+	for _, m := range msgs {
 		d.addFrame(laneFrameFromMessage(m))
 	}
-	d.loaded = true
+	d.tailLoaded = true
 	d.rebuild()
 }
 
 // applyMeta refreshes the run DTO from a periodic GetRun poll WITHOUT touching the frame
 // log — the transcript is fed by the stream/replay, this only refreshes the non-streamed
 // fields (milestones, health, kind, title, lifecycle stamps). Ignored until the initial
-// load has set the baseline, so a poll racing the first full load cannot flip `loaded`.
+// load has set the baseline, so a poll racing the first run load cannot flip `runLoaded`.
 //
 // Status is DELIBERATELY preserved rather than overwritten: the live stream owns it
 // (applyEvents sets it from authoritative `state` frames, including StreamRun's reconcile),
@@ -113,10 +129,10 @@ func (d *detailState) applyLoaded(msg detailLoadedMsg) {
 // Overwriting it would let a GetRun response that was in flight across a status transition
 // revert the status for up to one 2s tick — e.g. dropping the plan-gate banner and its owner
 // keys the instant a run enters awaiting_approval, or flipping a just-finished run back to
-// running. When the stream is down the poll-fallback path (loadDetailCmd/applyLoaded) owns
+// running. When the stream is down the poll-fallback path (loadRunCmd/applyRun) owns
 // status instead, so nothing goes stale.
 func (d *detailState) applyMeta(run apitypes.RunDTO) {
-	if !d.loaded {
+	if !d.runLoaded {
 		return
 	}
 	status := d.run.Status
@@ -249,7 +265,7 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	case keyEsc:
 		return m.exitToBoard()
 	case keyRefresh:
-		return m, m.loadDetailCmd(m.detail.runID)
+		return m, tea.Batch(m.loadRunCmd(m.detail.runID), m.loadTailCmd(m.detail.runID))
 	case keyCollapseCrew:
 		// Fold / unfold the crew list so the milestone block below it is always reachable
 		// (the rail is height-clamped and does not scroll). No-op with no lanes: there is
@@ -488,7 +504,10 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(m.pal.faint.Render("could not load this run: " + fmtErr(d.loadErr)))
 		return sb.String()
 	}
-	if !d.loaded {
+	// Nothing renders before the first GetRun lands — the header/rail/milestones all read
+	// from d.run. Once runLoaded, the header and rail render even while the transcript pane
+	// is still waiting on its tail page (gated separately in renderTranscript).
+	if !d.runLoaded {
 		sb.WriteString(m.pal.faint.Render("loading…"))
 		return sb.String()
 	}

@@ -361,6 +361,14 @@ func (m tuiModel) renderTranscript() string {
 	if ok && lane.Role != "" {
 		title += m.pal.faint.Render(" · " + m.renderer.Plain(lane.Role, 16))
 	}
+	// The transcript pane waits on its own tail page while the header/rail are already up
+	// (PRD #1137 M4): before the newest page lands and with no live frame yet, show the
+	// placeholder here alone. A live frame that beat the tail (len(frames) > 0) renders
+	// instead of hiding — the gate is tailLoaded || len(frames) > 0.
+	if !m.detail.tailLoaded && len(m.detail.frames) == 0 {
+		return m.padPaneTitle(title, "") + "\n" +
+			padLinesToViewport([]string{m.pal.faint.Render("loading…")}, m.transcriptViewport())
+	}
 	if !ok {
 		return m.padPaneTitle(title, "") + "\n" +
 			padLinesToViewport([]string{m.pal.faint.Render("no lane selected")}, m.transcriptViewport())

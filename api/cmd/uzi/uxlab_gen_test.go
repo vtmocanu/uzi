@@ -360,7 +360,7 @@ func laneMsgs(now time.Time) []apitypes.MessageDTO {
 func detailBase(dark bool, run apitypes.RunDTO, now time.Time, allow bool) tuiModel {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
-	m = step(m, detailLoadedMsg{run: run, msgs: laneMsgs(now)})
+	m = applyDetail(m, run, laneMsgs(now))
 	// The viewer's own rate-limit meters + sidebar selection so the crew rail's stacked
 	// account block renders under the milestones (#530). Reuses the board fixture's meters
 	// (boardMeters) and the same sidebar selection, so the detail rail and the board strip
@@ -441,7 +441,7 @@ func detailPaused(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
 	m.height = 22 // smaller viewport so the transcript overflows and can be scrolled back
-	m = step(m, detailLoadedMsg{run: run, msgs: msgs})
+	m = applyDetail(m, run, msgs)
 	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
 	m = withLiveStream(m)
 	m = key(m, "l") // focus the transcript
@@ -469,7 +469,7 @@ func detailAwaitingApproval(dark bool, now time.Time) string {
 	}
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
-	m = step(m, detailLoadedMsg{run: run, msgs: msgs})
+	m = applyDetail(m, run, msgs)
 	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
 	m = withLiveStream(m)
 	return m.View().Content
@@ -484,7 +484,7 @@ func detailAwaitingInput(dark bool, now time.Time) string {
 	}
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
-	m = step(m, detailLoadedMsg{run: run, msgs: msgs})
+	m = applyDetail(m, run, msgs)
 	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
 	m = withLiveStream(m)
 	return m.View().Content
@@ -569,7 +569,7 @@ func reviewOverlay(dark bool, now time.Time) string {
 	}
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
-	m = step(m, detailLoadedMsg{run: run, msgs: laneMsgs(now)})
+	m = applyDetail(m, run, laneMsgs(now))
 	m = key(m, "v")
 	m = step(m, reviewLoadedMsg{runID: detailRunID, review: review})
 	return m.View().Content
@@ -580,7 +580,7 @@ func reviewPending(dark bool, now time.Time) string {
 		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
-	m = step(m, detailLoadedMsg{run: run, msgs: laneMsgs(now)})
+	m = applyDetail(m, run, laneMsgs(now))
 	m = key(m, "v")
 	m = step(m, reviewLoadedMsg{runID: detailRunID, review: nil, pendingJudge: &apitypes.PendingJudgeDTO{State: "running", EnqueuedAt: now.Add(-30 * time.Second)}})
 	return m.View().Content

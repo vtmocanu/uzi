@@ -280,7 +280,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		}
 		m.view = viewDetail
 		m.detail = newDetailState(sel.ID)
-		return m, tea.Batch(m.loadDetailCmd(sel.ID), m.openStreamCmd(sel.ID))
+		return m, tea.Batch(m.loadRunCmd(sel.ID), m.loadTailCmd(sel.ID), m.openStreamCmd(sel.ID))
 	}
 	return m, nil
 }

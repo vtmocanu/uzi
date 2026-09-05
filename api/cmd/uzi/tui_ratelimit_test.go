@@ -322,10 +322,9 @@ func railModel(t *testing.T, meters []apitypes.TokenRateLimitDTO, sidebar []stri
 	m = next.(tuiModel)
 	next, _ = m.Update(settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: sidebar}})
 	m = next.(tuiModel)
-	next, _ = m.Update(detailLoadedMsg{run: apitypes.RunDTO{
+	m = applyDetail(m, apitypes.RunDTO{
 		ID: "run-detail", Status: "running", Health: "ok", Milestones: twoMilestones(),
-	}})
-	m = next.(tuiModel)
+	}, nil)
 	return m
 }
 
@@ -471,11 +470,10 @@ func railRunModel(t *testing.T, meters []apitypes.TokenRateLimitDTO, sidebar []s
 	next, _ = m.Update(settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: sidebar}})
 	m = next.(tuiModel)
 	sid, lbl := runSecretID, runLabel
-	next, _ = m.Update(detailLoadedMsg{run: apitypes.RunDTO{
+	m = applyDetail(m, apitypes.RunDTO{
 		ID: "run-detail", Status: "running", Health: "ok", Milestones: twoMilestones(),
 		AnthropicSecretID: &sid, AnthropicSecretLabel: &lbl,
-	}})
-	m = next.(tuiModel)
+	}, nil)
 	return m
 }
 
@@ -552,11 +550,10 @@ func TestDetailHeaderDropsCredentialLabel(t *testing.T) {
 	secretID, label := "sec-cred", "credlabel"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 	m.width = 200 // wide enough to combine into a single header row where the tag used to pin right
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{
+	m = applyDetail(m, apitypes.RunDTO{
 		ID: runID, Kind: "issue", Status: "running", IssueTitle: "Short title",
 		AnthropicSecretID: &secretID, AnthropicSecretLabel: &label,
-	}})
-	m = next.(tuiModel)
+	}, nil)
 	for i, line := range m.detailHeaderLines() {
 		if strings.Contains(stripANSI(line), label) {
 			t.Errorf("header line %d still renders the credential label %q (PRD #623 removed it):\n%s", i, label, stripANSI(line))
