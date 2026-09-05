@@ -21,6 +21,22 @@ const DEFAULT_CGROUP_ROOT = "/sys/fs/cgroup";
 /** The cgroup v2 membership file. Its `0::<path>` entry tells us whether
  *  /sys/fs/cgroup reflects THIS container (see cgroupIsNamespaceRoot). */
 const DEFAULT_PROC_CGROUP = "/proc/self/cgroup";
+/** The nix-store volume mount, a fixed path in the worker image (no env var) — the
+ *  volume the incident filled (PRD #837). Overridable only so the test can inject. */
+const DEFAULT_NIX_PATH = "/nix";
+/** The data volume mount when the collector is constructed without a dataDir; the
+ *  real worker passes config.dataDir (default /data). */
+const DEFAULT_DATA_PATH = "/data";
+
+/** The subset of fs.StatFsBase this collector needs. Injected in tests as a fake so
+ *  the disk math is exercised without a real filesystem, mirroring the now/cpuCount
+ *  seams. `blocks`/`bfree`/`bavail` are in units of `bsize` bytes. */
+export interface StatfsSample {
+  bsize: number;
+  blocks: number;
+  bfree: number;
+  bavail: number;
+}
 
 export interface StatsCollectorOptions {
   /** cgroup v2 hierarchy root; overridden in tests with a fixture tree. */
@@ -35,6 +51,14 @@ export interface StatsCollectorOptions {
   processCpuUsage?: () => { user: number; system: number };
   /** process.memoryUsage().rss passthrough for the process fallback. */
   processRss?: () => number;
+  /** statfs passthrough, injected in tests. Defaults to fs.statfsSync (Node 24, the
+   *  `node:24-alpine` base image). Throws on a missing mount; each volume is guarded
+   *  independently so one failure never drops the other or fails the heartbeat. */
+  statfs?: (path: string) => StatfsSample;
+  /** The nix-store mount to sample (PRD #837); defaults to the fixed /nix constant. */
+  nixPath?: string;
+  /** The data volume to sample; the real worker passes config.dataDir (default /data). */
+  dataDir?: string;
 }
 
 /** A resolved cgroup reading before CPU% (which needs the prior sample). */
@@ -61,6 +85,9 @@ export class StatsCollector {
   private readonly cpuCount: () => number;
   private readonly processCpuUsage: () => { user: number; system: number };
   private readonly processRss: () => number;
+  private readonly statfs: (path: string) => StatfsSample;
+  private readonly nixPath: string;
+  private readonly dataDir: string;
 
   private prevSource?: WorkerStats["source"];
   private prevCpuUsec?: bigint;
@@ -73,6 +100,9 @@ export class StatsCollector {
     this.cpuCount = opts.cpuCount ?? (() => os.cpus().length);
     this.processCpuUsage = opts.processCpuUsage ?? (() => process.cpuUsage());
     this.processRss = opts.processRss ?? (() => process.memoryUsage().rss);
+    this.statfs = opts.statfs ?? ((p) => fs.statfsSync(p));
+    this.nixPath = opts.nixPath ?? DEFAULT_NIX_PATH;
+    this.dataDir = opts.dataDir ?? DEFAULT_DATA_PATH;
   }
 
   /**
@@ -94,11 +124,43 @@ export class StatsCollector {
         source,
       };
       if (cpuPct !== undefined) stats.cpu_pct = cpuPct;
+      // Disk is an additive, independently-guarded sample (PRD #837 M1): a statfs
+      // failure or an absent mount OMITS that volume's two fields and never disturbs
+      // the mem/cpu reading above nor throws out of collect(). The mem reading is the
+      // only thing whose failure returns undefined (drops the whole heartbeat).
+      this.attachDisk(stats, "disk_nix_bytes", "disk_nix_total_bytes", this.nixPath);
+      this.attachDisk(stats, "disk_data_bytes", "disk_data_total_bytes", this.dataDir);
       return stats;
     } catch {
       // The process fallback should not reach here; if it somehow did, drop the
       // sample rather than let the heartbeat fail.
       return undefined;
+    }
+  }
+
+  /**
+   * Sample one volume via statfs and, on success, set its used/total fields on the
+   * stats object. total = blocks×bsize, used = (blocks−bfree)×bsize (both derived
+   * from statfs's `bsize`-unit counts). We store used + total only — unprivileged-free
+   * (bavail) is not needed by the DTO. On ANY failure (statfs throws for a missing
+   * mount, or a non-finite/negative derivation) the two keys are left ABSENT, never
+   * emitted as 0, so an absent field is distinct from an empty volume. Never throws.
+   */
+  private attachDisk(
+    stats: WorkerStats,
+    usedKey: "disk_nix_bytes" | "disk_data_bytes",
+    totalKey: "disk_nix_total_bytes" | "disk_data_total_bytes",
+    path: string,
+  ): void {
+    try {
+      const { bsize, blocks, bfree } = this.statfs(path);
+      const total = blocks * bsize;
+      const used = (blocks - bfree) * bsize;
+      if (!Number.isFinite(total) || !Number.isFinite(used) || total < 0 || used < 0) return;
+      stats[usedKey] = used;
+      stats[totalKey] = total;
+    } catch {
+      // Missing mount (dev/compose has no /nix) or a malformed statfs → omit the pair.
     }
   }
 

@@ -1535,7 +1535,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak
 `
 
 type CreateWorkerParams struct {
@@ -1606,6 +1606,11 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.Capabilities,
 		&i.Ephemeral,
 		&i.EphemeralRunID,
+		&i.StatsDiskNixBytes,
+		&i.StatsDiskNixTotalBytes,
+		&i.StatsDiskDataBytes,
+		&i.StatsDiskDataTotalBytes,
+		&i.StatsDiskPressureStreak,
 	)
 	return i, err
 }
@@ -2699,7 +2704,7 @@ func (q *Queries) GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (GetRun
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -2733,12 +2738,17 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.Capabilities,
 		&i.Ephemeral,
 		&i.EphemeralRunID,
+		&i.StatsDiskNixBytes,
+		&i.StatsDiskNixTotalBytes,
+		&i.StatsDiskDataBytes,
+		&i.StatsDiskDataTotalBytes,
+		&i.StatsDiskPressureStreak,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -2777,12 +2787,17 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.Capabilities,
 		&i.Ephemeral,
 		&i.EphemeralRunID,
+		&i.StatsDiskNixBytes,
+		&i.StatsDiskNixTotalBytes,
+		&i.StatsDiskDataBytes,
+		&i.StatsDiskDataTotalBytes,
+		&i.StatsDiskPressureStreak,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -2817,6 +2832,11 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.Capabilities,
 		&i.Ephemeral,
 		&i.EphemeralRunID,
+		&i.StatsDiskNixBytes,
+		&i.StatsDiskNixTotalBytes,
+		&i.StatsDiskDataBytes,
+		&i.StatsDiskDataTotalBytes,
+		&i.StatsDiskPressureStreak,
 	)
 	return i, err
 }
@@ -2835,17 +2855,39 @@ UPDATE workers SET
     stats_mem_bytes       = $2,
     stats_mem_limit_bytes = $3,
     stats_source          = $4,
+    -- Per-volume disk sample (PRD #837 M1), same write-every-tick-incl-NULL discipline
+    -- as the mem columns; display-only.
+    stats_disk_nix_bytes        = $5,
+    stats_disk_nix_total_bytes  = $6,
+    stats_disk_data_bytes       = $7,
+    stats_disk_data_total_bytes = $8,
+    -- Disk-pressure debounce streak (PRD #837 M4). Increment (bounded to 100 so a
+    -- perpetually-full worker can't overflow the counter) when THIS tick's sample is
+    -- over threshold, else reset to 0 — so a single under-threshold (or absent) sample
+    -- breaks the streak. @disk_over_threshold is a NON-narg bool computed in the Go
+    -- service (diskOverThreshold): a nil/absent stats sample lands here as false, which
+    -- correctly resets. The poll derives disk_pressure = streak>=2 AND fresh; this column
+    -- is display/lifecycle-only and never a scheduling input (Decision 5).
+    stats_disk_pressure_streak = CASE
+        WHEN $9::boolean THEN LEAST(workers.stats_disk_pressure_streak + 1, 100)
+        ELSE 0
+    END,
     updated_at            = now()
-WHERE id = $5
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id
+WHERE id = $10
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak
 `
 
 type HeartbeatWorkerParams struct {
-	StatsCpuPct        pgtype.Float4 `json:"stats_cpu_pct"`
-	StatsMemBytes      pgtype.Int8   `json:"stats_mem_bytes"`
-	StatsMemLimitBytes pgtype.Int8   `json:"stats_mem_limit_bytes"`
-	StatsSource        pgtype.Text   `json:"stats_source"`
-	ID                 uuid.UUID     `json:"id"`
+	StatsCpuPct             pgtype.Float4 `json:"stats_cpu_pct"`
+	StatsMemBytes           pgtype.Int8   `json:"stats_mem_bytes"`
+	StatsMemLimitBytes      pgtype.Int8   `json:"stats_mem_limit_bytes"`
+	StatsSource             pgtype.Text   `json:"stats_source"`
+	StatsDiskNixBytes       pgtype.Int8   `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes  pgtype.Int8   `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes      pgtype.Int8   `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes pgtype.Int8   `json:"stats_disk_data_total_bytes"`
+	DiskOverThreshold       bool          `json:"disk_over_threshold"`
+	ID                      uuid.UUID     `json:"id"`
 }
 
 // Refresh liveness AND overwrite the worker's latest resource sample (PRD #49). The
@@ -2861,6 +2903,11 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		arg.StatsMemBytes,
 		arg.StatsMemLimitBytes,
 		arg.StatsSource,
+		arg.StatsDiskNixBytes,
+		arg.StatsDiskNixTotalBytes,
+		arg.StatsDiskDataBytes,
+		arg.StatsDiskDataTotalBytes,
+		arg.DiskOverThreshold,
 		arg.ID,
 	)
 	var i Worker
@@ -2892,6 +2939,11 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.Capabilities,
 		&i.Ephemeral,
 		&i.EphemeralRunID,
+		&i.StatsDiskNixBytes,
+		&i.StatsDiskNixTotalBytes,
+		&i.StatsDiskDataBytes,
+		&i.StatsDiskDataTotalBytes,
+		&i.StatsDiskPressureStreak,
 	)
 	return i, err
 }
@@ -3237,7 +3289,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -3305,6 +3357,11 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.Capabilities,
 			&i.Worker.Ephemeral,
 			&i.Worker.EphemeralRunID,
+			&i.Worker.StatsDiskNixBytes,
+			&i.Worker.StatsDiskNixTotalBytes,
+			&i.Worker.StatsDiskDataBytes,
+			&i.Worker.StatsDiskDataTotalBytes,
+			&i.Worker.StatsDiskPressureStreak,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -4555,7 +4612,7 @@ func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -4594,46 +4651,51 @@ ORDER BY w.created_at ASC
 `
 
 type ListWorkersByUserRow struct {
-	ID                    uuid.UUID          `json:"id"`
-	UserID                uuid.UUID          `json:"user_id"`
-	Name                  string             `json:"name"`
-	TokenHash             []byte             `json:"token_hash"`
-	Status                string             `json:"status"`
-	LastHeartbeatAt       pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version               pgtype.Text        `json:"version"`
-	CreatedAt             pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared      pgtype.Text        `json:"template_declared"`
-	TemplateReported      pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns     pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct           pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes         pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes    pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource           pgtype.Text        `json:"stats_source"`
-	Kind                  string             `json:"kind"`
-	HostedSize            pgtype.Text        `json:"hosted_size"`
-	HostedGeneration      int64              `json:"hosted_generation"`
-	DockerEnabled         pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID     pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode     string             `json:"anthropic_bind_mode"`
-	OnlineSince           pgtype.Timestamptz `json:"online_since"`
-	DrainingSince         pgtype.Timestamptz `json:"draining_since"`
-	Capabilities          []string           `json:"capabilities"`
-	Ephemeral             bool               `json:"ephemeral"`
-	EphemeralRunID        pgtype.UUID        `json:"ephemeral_run_id"`
-	AnthropicSecretLabel  pgtype.Text        `json:"anthropic_secret_label"`
-	Busy                  bool               `json:"busy"`
-	ActiveRuns            int64              `json:"active_runs"`
-	RollPhase             pgtype.Text        `json:"roll_phase"`
-	RollPhaseSince        pgtype.Timestamptz `json:"roll_phase_since"`
-	RollPodPhase          pgtype.Text        `json:"roll_pod_phase"`
-	RollBlockingContainer pgtype.Text        `json:"roll_blocking_container"`
-	RollBlockingReason    pgtype.Text        `json:"roll_blocking_reason"`
-	RollRestartCount      pgtype.Int4        `json:"roll_restart_count"`
-	RollLastExitCode      pgtype.Int4        `json:"roll_last_exit_code"`
-	RollObservedAt        pgtype.Timestamptz `json:"roll_observed_at"`
-	RollUpgradingSince    pgtype.Timestamptz `json:"roll_upgrading_since"`
-	RollWorkerImageTag    pgtype.Text        `json:"roll_worker_image_tag"`
+	ID                      uuid.UUID          `json:"id"`
+	UserID                  uuid.UUID          `json:"user_id"`
+	Name                    string             `json:"name"`
+	TokenHash               []byte             `json:"token_hash"`
+	Status                  string             `json:"status"`
+	LastHeartbeatAt         pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                 pgtype.Text        `json:"version"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared        pgtype.Text        `json:"template_declared"`
+	TemplateReported        pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns       pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct             pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes           pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes      pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource             pgtype.Text        `json:"stats_source"`
+	Kind                    string             `json:"kind"`
+	HostedSize              pgtype.Text        `json:"hosted_size"`
+	HostedGeneration        int64              `json:"hosted_generation"`
+	DockerEnabled           pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID       pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode       string             `json:"anthropic_bind_mode"`
+	OnlineSince             pgtype.Timestamptz `json:"online_since"`
+	DrainingSince           pgtype.Timestamptz `json:"draining_since"`
+	Capabilities            []string           `json:"capabilities"`
+	Ephemeral               bool               `json:"ephemeral"`
+	EphemeralRunID          pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes       pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes  pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes      pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak int32              `json:"stats_disk_pressure_streak"`
+	AnthropicSecretLabel    pgtype.Text        `json:"anthropic_secret_label"`
+	Busy                    bool               `json:"busy"`
+	ActiveRuns              int64              `json:"active_runs"`
+	RollPhase               pgtype.Text        `json:"roll_phase"`
+	RollPhaseSince          pgtype.Timestamptz `json:"roll_phase_since"`
+	RollPodPhase            pgtype.Text        `json:"roll_pod_phase"`
+	RollBlockingContainer   pgtype.Text        `json:"roll_blocking_container"`
+	RollBlockingReason      pgtype.Text        `json:"roll_blocking_reason"`
+	RollRestartCount        pgtype.Int4        `json:"roll_restart_count"`
+	RollLastExitCode        pgtype.Int4        `json:"roll_last_exit_code"`
+	RollObservedAt          pgtype.Timestamptz `json:"roll_observed_at"`
+	RollUpgradingSince      pgtype.Timestamptz `json:"roll_upgrading_since"`
+	RollWorkerImageTag      pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
 // Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
@@ -4692,6 +4754,11 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.Capabilities,
 			&i.Ephemeral,
 			&i.EphemeralRunID,
+			&i.StatsDiskNixBytes,
+			&i.StatsDiskNixTotalBytes,
+			&i.StatsDiskDataBytes,
+			&i.StatsDiskDataTotalBytes,
+			&i.StatsDiskPressureStreak,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -5007,10 +5074,16 @@ WITH prev AS (
         -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
         -- until it actually rolls.
         draining_since      = NULL,
+        -- Reset the disk-pressure debounce streak (PRD #837 M4): a register is a FRESH
+        -- pod incarnation, so a prior incarnation's streak must never carry forward — a
+        -- rolled/restarted worker starts clean and must re-earn its >=2-heartbeat streak
+        -- before the poll re-derives disk_pressure. (Distinct from HeartbeatWorker's
+        -- increment/reset CASE: this is reset-on-action, unconditional.)
+        stats_disk_pressure_streak = 0,
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -5062,7 +5135,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -5074,33 +5147,38 @@ type RegisterWorkerParams struct {
 }
 
 type RegisterWorkerRow struct {
-	ID                 uuid.UUID          `json:"id"`
-	UserID             uuid.UUID          `json:"user_id"`
-	Name               string             `json:"name"`
-	TokenHash          []byte             `json:"token_hash"`
-	Status             string             `json:"status"`
-	LastHeartbeatAt    pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version            pgtype.Text        `json:"version"`
-	CreatedAt          pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared   pgtype.Text        `json:"template_declared"`
-	TemplateReported   pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns  pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct        pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes      pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource        pgtype.Text        `json:"stats_source"`
-	Kind               string             `json:"kind"`
-	HostedSize         pgtype.Text        `json:"hosted_size"`
-	HostedGeneration   int64              `json:"hosted_generation"`
-	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode  string             `json:"anthropic_bind_mode"`
-	OnlineSince        pgtype.Timestamptz `json:"online_since"`
-	DrainingSince      pgtype.Timestamptz `json:"draining_since"`
-	Capabilities       []string           `json:"capabilities"`
-	Ephemeral          bool               `json:"ephemeral"`
-	EphemeralRunID     pgtype.UUID        `json:"ephemeral_run_id"`
+	ID                      uuid.UUID          `json:"id"`
+	UserID                  uuid.UUID          `json:"user_id"`
+	Name                    string             `json:"name"`
+	TokenHash               []byte             `json:"token_hash"`
+	Status                  string             `json:"status"`
+	LastHeartbeatAt         pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                 pgtype.Text        `json:"version"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared        pgtype.Text        `json:"template_declared"`
+	TemplateReported        pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns       pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct             pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes           pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes      pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource             pgtype.Text        `json:"stats_source"`
+	Kind                    string             `json:"kind"`
+	HostedSize              pgtype.Text        `json:"hosted_size"`
+	HostedGeneration        int64              `json:"hosted_generation"`
+	DockerEnabled           pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID       pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode       string             `json:"anthropic_bind_mode"`
+	OnlineSince             pgtype.Timestamptz `json:"online_since"`
+	DrainingSince           pgtype.Timestamptz `json:"draining_since"`
+	Capabilities            []string           `json:"capabilities"`
+	Ephemeral               bool               `json:"ephemeral"`
+	EphemeralRunID          pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes       pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes  pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes      pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak int32              `json:"stats_disk_pressure_streak"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -5187,6 +5265,11 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.Capabilities,
 		&i.Ephemeral,
 		&i.EphemeralRunID,
+		&i.StatsDiskNixBytes,
+		&i.StatsDiskNixTotalBytes,
+		&i.StatsDiskDataBytes,
+		&i.StatsDiskDataTotalBytes,
+		&i.StatsDiskPressureStreak,
 	)
 	return i, err
 }
@@ -6894,7 +6977,7 @@ SET anthropic_secret_id = $1,
     anthropic_bind_mode = $2,
     updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak
 `
 
 type SetWorkerAnthropicSecretParams struct {
@@ -6962,6 +7045,11 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.Capabilities,
 		&i.Ephemeral,
 		&i.EphemeralRunID,
+		&i.StatsDiskNixBytes,
+		&i.StatsDiskNixTotalBytes,
+		&i.StatsDiskDataBytes,
+		&i.StatsDiskDataTotalBytes,
+		&i.StatsDiskPressureStreak,
 	)
 	return i, err
 }

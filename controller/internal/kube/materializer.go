@@ -72,6 +72,21 @@ type DrainPolicy struct {
 	ForceRoll bool
 }
 
+// RecyclePolicy carries the controller-side toggle + cooldown for the disk self-heal
+// (PRD #837 M4). Both are controller config (a chart value + a controller env), not
+// wire data:
+//
+//   - Enabled is the master switch. False disables BOTH recycle arms (the M3 /nix
+//     size-drift arm and the M4 disk-pressure arm), so a drifted/pressured worker is
+//     left exactly as it is. Default true (self-heal on unless disabled).
+//   - Cooldown bounds how soon after a recycle the same worker may be recycled again.
+//     A worker back at disk pressure within the cooldown is a capacity signal, not a
+//     transient — it is surfaced (a fixed log token) rather than thrashed.
+type RecyclePolicy struct {
+	Enabled  bool
+	Cooldown time.Duration
+}
+
 type Materializer struct {
 	client   kubernetes.Interface
 	cfg      RenderConfig
@@ -81,7 +96,9 @@ type Materializer struct {
 	cordoner Cordoner
 	// drain is the bounded-deadline + force-roll policy (PRD #422 M5). See DrainPolicy.
 	drain DrainPolicy
-	log   *slog.Logger
+	// recycle is the disk self-heal toggle + cooldown (PRD #837 M4). See RecyclePolicy.
+	recycle RecyclePolicy
+	log     *slog.Logger
 	// now is the clock seam for roll-health's age arm (PRD #113 M3). A bare
 	// time.Now() at the comparison site would make stuckAge testable only by
 	// sleeping for ten minutes. Defaulted in New; overridden directly by tests,
@@ -92,8 +109,9 @@ type Materializer struct {
 // New builds a Materializer. cordoner may be nil, which disables cordoning (a busy
 // drifted worker is then deferred rather than rolled — still fail-safe); see Cordoner.
 // drain carries the M5 bounded-deadline + force-roll policy (see DrainPolicy).
-func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, cordoner Cordoner, drain DrainPolicy, log *slog.Logger) *Materializer {
-	return &Materializer{client: client, cfg: cfg, resolver: resolver, cordoner: cordoner, drain: drain, log: log, now: time.Now}
+// recycle carries the M4 disk self-heal toggle + cooldown (see RecyclePolicy).
+func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, cordoner Cordoner, drain DrainPolicy, recycle RecyclePolicy, log *slog.Logger) *Materializer {
+	return &Materializer{client: client, cfg: cfg, resolver: resolver, cordoner: cordoner, drain: drain, recycle: recycle, log: log, now: time.Now}
 }
 
 // Observe lists the worker namespace and partitions it by PROVENANCE.
@@ -210,11 +228,27 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			continue
 		}
 		o := get(id)
+		// A Terminating PVC still EXISTS (it counts against the create-gate and must
+		// not be re-created), but its size must never be sourced from it — a recycle in
+		// flight would otherwise read the doomed volume's size as live. Compute the flag
+		// once and let each case decide what it means for that claim.
+		terminating := p.DeletionTimestamp != nil
 		switch p.Name {
 		case dataPVCName(id):
-			o.HasDataPVC = true
+			o.HasDataPVC = true // exists-in-ANY-state (gates the create, UNCHANGED)
+			if !terminating {   // a LIVE data PVC: liveness proxy + mint time for the M4 recycle
+				o.DataPVCLive = true
+				t := p.CreationTimestamp.Time
+				o.DataPVCCreatedAt = &t
+			}
 		case nixPVCName(id):
-			o.HasNixPVC = true
+			o.HasNixPVC = true // exists-in-ANY-state (UNCHANGED)
+			if !terminating {  // never source size or mint time from a Terminating PVC
+				sz := p.Spec.Resources.Requests[corev1.ResourceStorage]
+				o.NixPVCSize = &sz // live nix size; nil while absent OR Terminating
+				t := p.CreationTimestamp.Time
+				o.NixPVCCreatedAt = &t
+			}
 		case dindDataPVCName(id):
 			// Docker workers only (issue #224 M-a). Matched unconditionally rather than
 			// behind a docker check because this loop sees only a NAME and a stamp: the
@@ -480,6 +514,107 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	return errors.Join(errs...)
 }
 
+// recycleVolumes selects which of a worker's PVCs a recycle tears down: {Nix} for the
+// M3 size-drift arm, {Nix, Data} for the M4 disk-pressure arm. dind is never recycled.
+type recycleVolumes struct {
+	Nix  bool
+	Data bool
+}
+
+// recycleWorkerVolumes tears a worker's Deployment and the selected PVC(s) down so the
+// next tick reprovisions them in place — a delete + recreate, NOT a live PVC resize
+// (PVC specs are near-immutable). It keeps the Secret, the worker row/uuid, and any
+// PVC not named in vols.
+//
+// It implements PHASES 0-2 only. The reprovision itself (phase 3, the PVC-create gate)
+// and the strengthened Deployment guard (phases 4-5) live in reconcileWorker and run on
+// a LATER tick, once Observe has seen the volumes gone — the fake clientset removes a
+// deleted object immediately, which is what makes that two-tick property testable.
+//
+//   - Phase 0 reuses reconcileWorker's EXACT busy-guard: a busy worker with no roll
+//     override is cordoned (if not already draining) and the recycle DEFERRED — nothing
+//     is deleted this tick. Fail-safe on every cordoner outcome, exactly as the roll path.
+//   - Phase 1 deletes the Deployment (so nothing mounts the doomed volume mid-delete).
+//   - Phase 2 deletes each selected, LIVE PVC. A nil NixPVCSize means the nix PVC is
+//     already Terminating or absent, so it is skipped rather than re-deleted.
+func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, vols recycleVolumes) error {
+	// Phase 0: drain-if-busy. Identical guard to reconcileWorker's roll path — a busy
+	// worker is cordoned + deferred rather than having its volumes torn out from under a
+	// live run, unless an override (force-roll, or the elapsed drain deadline) says roll.
+	rollDespiteBusy := m.drain.ForceRoll ||
+		(w.DrainingSince != nil && m.now().Sub(*w.DrainingSince) >= m.drain.Deadline)
+	if w.Busy && !rollDespiteBusy {
+		if w.DrainingSince == nil {
+			if m.cordoner != nil {
+				if err := m.cordoner.RequestDrain(ctx, w.ID); err != nil {
+					m.log.Warn("cordon request failed; deferring recycle (fail-safe)", "worker_id", w.ID, "error", err)
+				} else {
+					m.log.Info("hosted worker needs a volume recycle but is busy; cordoned, deferring", "worker_id", w.ID)
+				}
+			} else {
+				m.log.Warn("hosted worker needs a volume recycle but is busy and no cordon channel; deferring", "worker_id", w.ID)
+			}
+		} else {
+			m.log.Info("hosted worker needs a volume recycle, busy, already draining; deferring", "worker_id", w.ID)
+		}
+		return nil
+	}
+
+	var errs []error
+
+	// Phase 1: delete the Deployment so no pod mounts the volume while it is being
+	// reprovisioned. NotFound is success — a partial recycle converges next tick.
+	if obs.HasDeployment {
+		if err := m.client.AppsV1().Deployments(ns).Delete(ctx, deploymentName(w.ID), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("delete deployment for recycle: %w", err))
+		} else {
+			m.log.Info("recycling hosted worker volumes: deleted deployment", "worker_id", w.ID, "namespace", ns)
+		}
+	}
+
+	// Phase 2: delete the selected PVC(s). Nix only when a LIVE one was observed
+	// (NixPVCSize != nil); a nil means it is already Terminating/absent, so skip it
+	// rather than issue a redundant delete.
+	var names []string
+	if vols.Nix && obs.HasNixPVC && obs.NixPVCSize != nil {
+		names = append(names, nixPVCName(w.ID))
+	}
+	// M4: the disk-pressure arm also recycles /data. Only a LIVE data PVC — a Terminating
+	// one is already being reaped, so re-deleting it is a redundant call (matching the nix
+	// arm's NixPVCSize != nil liveness gate above; /data has no size, so DataPVCLive is its
+	// proxy).
+	if vols.Data && obs.HasDataPVC && obs.DataPVCLive {
+		names = append(names, dataPVCName(w.ID))
+	}
+	for _, name := range names {
+		if err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("delete pvc %s for recycle: %w", name, err))
+		} else {
+			m.log.Info("recycling hosted worker volumes: deleted pvc", "worker_id", w.ID, "pvc", name, "namespace", ns)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// withinRecycleCooldown reports whether the worker's disk volumes were minted too
+// recently to recycle again (PRD #837 M4). It takes the YOUNGEST CreationTimestamp of
+// the target volumes: a recent mint of EITHER means a recent recycle, and using the
+// older would let a genuinely-old sibling volume defeat the cooldown and thrash. A nil
+// timestamp everywhere (no live PVC observed) allows the recycle — there is nothing to
+// prove a recent one.
+func (m *Materializer) withinRecycleCooldown(obs reconcile.ObservedWorker) bool {
+	var youngest *time.Time
+	for _, t := range []*time.Time{obs.NixPVCCreatedAt, obs.DataPVCCreatedAt} {
+		if t != nil && (youngest == nil || t.After(*youngest)) {
+			youngest = t
+		}
+	}
+	if youngest == nil {
+		return false // no observed timestamp → allow
+	}
+	return m.now().Sub(*youngest) < m.recycle.Cooldown
+}
+
 // reconcileWorker converges one desired worker.
 func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) error {
 	// A docker worker needs the privileged docker namespace, and this controller is
@@ -530,6 +665,29 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 		}
 	}
 
+	// M3: /nix size-drift recycle. Teardown + reprovision in place, NOT expansion. Trigger
+	// STRICTLY less-than only (a PVC cannot shrink; >= must never recycle). NixPVCSize==nil
+	// (absent or Terminating nix PVC) never triggers — a mid-recycle tick falls through to the
+	// create-gate and the Deployment guard below. Keeps the Secret, the worker row/uuid, /data.
+	// M4: gated on the recycle toggle, and Ephemeral (run-bound) workers are excluded — their
+	// volumes are torn down when the run ends anyway, so recycling them is pointless churn.
+	if m.recycle.Enabled && !w.Ephemeral &&
+		obs.HasNixPVC && obs.NixPVCSize != nil && obs.NixPVCSize.Cmp(spec.NixSize) < 0 {
+		return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true})
+	}
+
+	// M4: disk-pressure recycle (nix + data). Ephemeral (run-bound) workers excluded.
+	// Within-cooldown = a just-recycled worker back at pressure = a CAPACITY signal, surfaced
+	// via a fixed token, NOT recycled again. Otherwise drain-then-recycle both volumes.
+	if m.recycle.Enabled && w.DiskPressure && !w.Ephemeral {
+		if m.withinRecycleCooldown(obs) {
+			m.log.Info(fmt.Sprintf("disk-recycle-skipped-cooldown worker=%s", w.ID))
+			// display-only capacity-warn: fall through to normal reconcile; do NOT return.
+		} else {
+			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: true})
+		}
+	}
+
 	// The PVCs. Same create/AlreadyExists shape as the Deployment below, and never
 	// patched: PVC specs are near-immutable, so a size change is delete + reprovision,
 	// not a live edit.
@@ -574,6 +732,20 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	// The Deployment.
 	dep := RenderDeployment(m.cfg, w, spec)
 	if !obs.HasDeployment {
+		// Suppress the (re)create while a nix PVC EXISTS but is not LIVE-at-desired-size
+		// (Terminating, or mid-recycle). Never place the Deployment over a doomed/undersized
+		// volume. When the nix PVC is ABSENT (HasNixPVC==false: first-create or post-reap
+		// re-mint tick) this is false, so first-provision and re-mint still create in one tick.
+		//
+		// M4: a Terminating /data PVC (present but not live) mid disk-pressure recycle also
+		// suppresses the recreate — /data has no size, so its liveness is the gate. dataBlocking
+		// is false when /data is ABSENT (first-provision) or LIVE (steady state), so neither is
+		// affected; it fires only for a present-but-Terminating /data volume.
+		nixLiveAtSize := obs.NixPVCSize != nil && obs.NixPVCSize.Cmp(spec.NixSize) >= 0
+		dataBlocking := obs.HasDataPVC && !obs.DataPVCLive // present but Terminating
+		if (obs.HasNixPVC && !nixLiveAtSize) || dataBlocking {
+			return nil
+		}
 		_, err := m.client.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create deployment: %w", err)

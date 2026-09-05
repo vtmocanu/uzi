@@ -102,6 +102,10 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     stats_mem_bytes: null,
     stats_mem_limit_bytes: null,
     stats_source: null,
+    stats_disk_nix_bytes: null,
+    stats_disk_nix_total_bytes: null,
+    stats_disk_data_bytes: null,
+    stats_disk_data_total_bytes: null,
     draining_since: null,
     ...over,
   };

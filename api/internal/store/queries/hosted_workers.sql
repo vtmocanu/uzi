@@ -38,6 +38,29 @@ SELECT w.id,
        -- compute `now - draining_since >= deadline` to enforce the bounded drain deadline; the
        -- bool it replaces could only answer "draining y/n", not "for how long".
        w.draining_since,
+       -- disk_pressure (PRD #837 M4): the ONE lifecycle reader of the display-only disk
+       -- telemetry, allow-listed exactly like ReapEphemeralWorkers is for the uptime anchor. It
+       -- is a DEBOUNCED, FRESHNESS-GATED derivation, never the raw sample:
+       --   * streak >= @disk_pressure_min_streak (2): HeartbeatWorker only increments the
+       --     streak on a fresh tick whose sample is over threshold and resets it otherwise,
+       --     so >=2 means "the last two consecutive heartbeats both saw pressure" — a single
+       --     spike or a transient statfs blip never fires the controller's roll/teardown.
+       --   * last_heartbeat_at fresh (IS NOT NULL AND >= @heartbeat_cutoff): a worker that
+       --     went silent must not keep asserting pressure off a frozen streak. The cutoff is
+       --     the same now()-WORKER_HEARTBEAT_STALE the claim path uses.
+       -- Purely "under pressure": ephemeral is selected SEPARATELY below and NOT baked in
+       -- here — the controller composes the two. This stays lifecycle-only; a hostile worker
+       -- drives its own streak, so this value never reaches claim/scheduling.
+       -- COALESCE(...,false)::boolean pins this to a NON-NULL Go bool. The last_heartbeat_at
+       -- comparison makes sqlc infer a nullable expression (and COALESCE alone types as
+       -- interface{}), but the `IS NOT NULL` conjunct means the value is FALSE — never NULL —
+       -- for a never-heartbeated worker, so the COALESCE is a typing aid the runtime never
+       -- exercises. The explicit ::boolean is what makes sqlc emit `bool`, so
+       -- DesiredWorker.DiskPressure stays a plain bool like Busy.
+       COALESCE(w.stats_disk_pressure_streak >= @disk_pressure_min_streak::int
+        AND w.last_heartbeat_at IS NOT NULL
+        AND w.last_heartbeat_at >= @heartbeat_cutoff, false)::boolean AS disk_pressure,
+       w.ephemeral,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id

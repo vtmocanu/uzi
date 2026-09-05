@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -26,7 +28,7 @@ import (
 func newMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
 	client := fake.NewSimpleClientset(objs...)
-	m := New(client, testConfig(), testResolver(t), nil, DrainPolicy{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(client, testConfig(), testResolver(t), nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return m, client
 }
 
@@ -276,7 +278,7 @@ func TestAnUnstampedUziHwObjectIsFlaggedAndNeverTouched(t *testing.T) {
 	}}
 	var logs strings.Builder
 	client := fake.NewSimpleClientset(orphan)
-	m := New(client, testConfig(), testResolver(t), nil, DrainPolicy{}, slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(client, testConfig(), testResolver(t), nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(&logs, nil)))
 
 	observed, err := m.Observe(context.Background())
 	if err != nil {
@@ -449,7 +451,7 @@ func TestNoSecretReadAcrossAFullFleetReconcile(t *testing.T) {
 func newDockerMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
 	client := fake.NewSimpleClientset(objs...)
-	m := New(client, dockerTestConfig(), testResolver(t), nil, DrainPolicy{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(client, dockerTestConfig(), testResolver(t), nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return m, client
 }
 
@@ -583,15 +585,7 @@ func TestTeardownRemovesTheDinDDataPVC(t *testing.T) {
 }
 
 func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(a, b)
 }
 
 func deployedWorkerNS(id, ns string, generation int64, hash string) *appsv1.Deployment {
@@ -691,7 +685,7 @@ func TestOrphanInDockerNamespaceIsFlaggedNotDeleted(t *testing.T) {
 	}}
 	var logs strings.Builder
 	client := fake.NewSimpleClientset(orphan)
-	m := New(client, dockerTestConfig(), testResolver(t), nil, DrainPolicy{}, slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(client, dockerTestConfig(), testResolver(t), nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(&logs, nil)))
 	ctx := context.Background()
 
 	observed, err := m.Observe(ctx)
@@ -796,6 +790,60 @@ func pvcFor(id, kind string) *corev1.PersistentVolumeClaim {
 	}}
 }
 
+// pvcNix builds a /nix claim carrying an explicit requested storage size, so a test
+// can seed a worker whose /nix PVC is SMALLER than the current flat nixSize (20Gi) and
+// exercise the M3 size-drift recycle.
+func pvcNix(id, size string) *corev1.PersistentVolumeClaim {
+	p := pvcFor(id, "nix")
+	p.Spec.Resources.Requests = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)}
+	return p
+}
+
+// pvcTerminating builds a claim already carrying a DeletionTimestamp — a PVC mid-delete.
+// Observe must record it as EXISTING (HasNixPVC true, gating the create) yet source NO
+// size from it (NixPVCSize stays nil), which is what keeps a mid-recycle tick from
+// reading the doomed volume's size as live.
+func pvcTerminating(id, kind string) *corev1.PersistentVolumeClaim {
+	p := pvcFor(id, kind)
+	now := metav1.Now()
+	p.DeletionTimestamp = &now
+	return p
+}
+
+// pvcCreatedAt stamps a claim's CreationTimestamp, so an M4 cooldown test can seed a
+// just-recycled volume (minted within the cooldown of the pinned clock) versus an old
+// one (the unstamped epoch, far outside any cooldown).
+func pvcCreatedAt(p *corev1.PersistentVolumeClaim, at time.Time) *corev1.PersistentVolumeClaim {
+	p.CreationTimestamp = metav1.NewTime(at)
+	return p
+}
+
+// deletedSet collects every delete the fake apiserver saw, keyed "resource/name", so a
+// test can assert exactly which objects a recycle tore down.
+func deletedSet(client *fake.Clientset) map[string]bool {
+	deleted := map[string]bool{}
+	for _, a := range client.Actions() {
+		if d, ok := a.(k8stesting.DeleteAction); ok {
+			deleted[a.GetResource().Resource+"/"+d.GetName()] = true
+		}
+	}
+	return deleted
+}
+
+// createdDeploymentNames lists the deployments a reconcile asked the apiserver to create.
+func createdDeploymentNames(client *fake.Clientset) []string {
+	var out []string
+	for _, a := range client.Actions() {
+		if a.GetResource().Resource != "deployments" || a.GetVerb() != "create" {
+			continue
+		}
+		if c, ok := a.(k8stesting.CreateAction); ok {
+			out = append(out, c.GetObject().(*appsv1.Deployment).Name)
+		}
+	}
+	return out
+}
+
 func keysOf(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -837,8 +885,20 @@ var m5Now = time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 // deadline branch is deterministic.
 func newMatWithDrain(t *testing.T, c Cordoner, drain DrainPolicy, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
+	// M3/M5 tests: disk self-heal ON (so the M3 size-drift arm still fires) with a zero
+	// cooldown that is irrelevant to them (none set DiskPressure). The M4 disk-pressure
+	// tests use newMatWithRecycle to drive the toggle and cooldown directly.
+	return newMatWithRecycle(t, c, drain, RecyclePolicy{Enabled: true}, io.Discard, objs...)
+}
+
+// newMatWithRecycle is newMatWithDrain with an explicit RecyclePolicy and a log sink
+// (PRD #837 M4), so a test can toggle the disk self-heal, set its cooldown, and read the
+// within-cooldown token off the logs. The clock is pinned to m5Now so a cooldown
+// comparison (now - CreationTimestamp < Cooldown) is deterministic.
+func newMatWithRecycle(t *testing.T, c Cordoner, drain DrainPolicy, recycle RecyclePolicy, logw io.Writer, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
+	t.Helper()
 	client := fake.NewSimpleClientset(objs...)
-	m := New(client, testConfig(), testResolver(t), c, drain, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(client, testConfig(), testResolver(t), c, drain, recycle, slog.New(slog.NewTextHandler(logw, nil)))
 	m.now = func() time.Time { return m5Now }
 	return m, client
 }
@@ -1197,4 +1257,502 @@ func TestNoDriftForceRollDoesNothing(t *testing.T) {
 	if len(c.calls) != 0 {
 		t.Fatalf("RequestDrain calls = %v, want none (no drift)", c.calls)
 	}
+}
+
+// --- /nix size-drift recycle (PRD #837 M3) ---------------------------------
+
+// T1, the headline: a worker whose /nix PVC is SMALLER than the flat nixSize (20Gi) is
+// recycled in place — tick 1 tears down its Deployment + nix PVC (keeping the Secret and
+// /data), tick 2 (re-Observing the fake, where the deleted objects are already gone)
+// reprovisions the nix PVC AT the new 20Gi and recreates the Deployment. The whole point
+// is the two-tick re-mint: teardown then reprovision, never a live PVC resize.
+//
+// Positive control: delete EDIT A (the size-drift arm in reconcileWorker) and tick 1's
+// delete assertions go RED — nothing tears the undersized volume down.
+func TestNixSizeDriftRecyclesThenReMintsAtNewSize(t *testing.T) {
+	ctx := context.Background()
+	ns := testConfig().Namespace
+	hash := currentHash(t, "w1", 0)
+	// The worker is deployed with a 4Gi /nix — below the current flat 20Gi.
+	m, client := newMat(t, deployedWorker("w1", 0, hash), pvcNix("w1", "4Gi"), pvcFor("w1", "data"))
+
+	// Steady state: the pod holds its token, so join_token is nil (write no Secret).
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, JoinToken: nil}
+
+	// --- Tick 1: recycle ---
+	tick1 := []reconcile.ObservedWorker{{
+		ID: "w1", HasDeployment: true, SpecHash: hash,
+		HasDataPVC: true, HasNixPVC: true, NixPVCSize: quantityPtr("4Gi"),
+	}}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, tick1); err != nil {
+		t.Fatalf("tick 1 Reconcile: %v", err)
+	}
+	del := deletedSet(client)
+	if !del["deployments/uzi-hw-w1"] {
+		t.Errorf("tick 1 must delete the Deployment for the recycle; got %v", keysOf(del))
+	}
+	if !del["persistentvolumeclaims/uzi-hw-w1-nix"] {
+		t.Errorf("tick 1 must delete the undersized nix PVC; got %v", keysOf(del))
+	}
+	// NEGATIVE: the Secret, the data PVC, and any create are untouched this tick.
+	if del["persistentvolumeclaims/uzi-hw-w1-data"] {
+		t.Error("tick 1 deleted the DATA pvc; the M3 arm recycles /nix only, never /data")
+	}
+	for _, a := range client.Actions() {
+		if a.GetResource().Resource == "secrets" && a.GetVerb() == "delete" {
+			t.Error("tick 1 deleted the Secret; a recycle keeps the delivered token")
+		}
+		if a.GetVerb() == "create" {
+			t.Errorf("tick 1 issued a %s create; the recycle only DELETES, reprovision is next tick",
+				a.GetResource().Resource)
+		}
+	}
+	assertNoSecretReads(t, client)
+
+	// --- Tick 2: re-mint. Re-Observe the fake (Deployment + nix PVC now gone, data
+	// intact — the fake removes deleted objects immediately, which is what makes the
+	// two-tick property hold). ---
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("re-Observe between ticks: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("re-Observe = %+v, want exactly one worker (the data PVC alone)", observed)
+	}
+	o := observed[0]
+	if o.HasDeployment || o.HasNixPVC || o.NixPVCSize != nil || !o.HasDataPVC {
+		t.Fatalf("after the recycle, observed = %+v; want {HasDeployment:false HasNixPVC:false NixPVCSize:nil HasDataPVC:true}", o)
+	}
+
+	client.ClearActions()
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("tick 2 Reconcile: %v", err)
+	}
+	// Exactly one nix PVC create, AT the new 20Gi, and NO data PVC create (still observed).
+	created := pvcCreateNames(t, client)
+	if !equalStrings(created, []string{"uzi-hw-w1-nix"}) {
+		t.Fatalf("tick 2 pvc creates = %v, want exactly [uzi-hw-w1-nix] (data still observed, so no data create)", created)
+	}
+	var nixReq resource.Quantity
+	for _, a := range client.Actions() {
+		if a.GetResource().Resource != "persistentvolumeclaims" || a.GetVerb() != "create" {
+			continue
+		}
+		p := a.(k8stesting.CreateAction).GetObject().(*corev1.PersistentVolumeClaim)
+		if p.Name == "uzi-hw-w1-nix" {
+			nixReq = p.Spec.Resources.Requests[corev1.ResourceStorage]
+		}
+	}
+	if want := resource.MustParse("20Gi"); nixReq.Cmp(want) != 0 {
+		t.Errorf("re-minted nix PVC requests %s, want the new flat %s", nixReq.String(), want.String())
+	}
+	// And the Deployment is recreated in the same tick.
+	if got := createdDeploymentNames(client); !equalStrings(got, []string{"uzi-hw-w1"}) {
+		t.Errorf("tick 2 deployment creates = %v, want exactly [uzi-hw-w1]", got)
+	}
+	if _, err := client.AppsV1().Deployments(ns).Get(ctx, "uzi-hw-w1", metav1.GetOptions{}); err != nil {
+		t.Errorf("the Deployment must be recreated on tick 2: %v", err)
+	}
+	assertNoSecretReads(t, client)
+}
+
+// T2: a worker mid-recycle — its nix PVC is Terminating and its Deployment already gone —
+// is a pure WAIT tick. Observe records the Terminating PVC as EXISTING (so the create-gate
+// skips it) but sources NO size from it (NixPVCSize nil), and EDIT B suppresses the
+// Deployment (re)create over the doomed volume. So nothing is created: neither a nix PVC
+// (create-gate skips on HasNixPVC) nor the Deployment (EDIT B guard).
+//
+// Positive control: remove EDIT B's `if obs.HasNixPVC && !nixLiveAtSize { return nil }`
+// guard and a create deployments/uzi-hw-w1 appears — the Deployment lands over a
+// Terminating volume.
+func TestNixRecycleMidTerminationIsAPureWaitTick(t *testing.T) {
+	ctx := context.Background()
+	// No Deployment; nix PVC Terminating; data intact.
+	m, client := newMat(t, pvcTerminating("w1", "nix"), pvcFor("w1", "data"))
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("Observe = %+v, want one worker", observed)
+	}
+	o := observed[0]
+	if o.HasDeployment || !o.HasNixPVC || o.NixPVCSize != nil || !o.HasDataPVC {
+		t.Fatalf("observed = %+v; want {HasDeployment:false HasNixPVC:true NixPVCSize:nil HasDataPVC:true} for a Terminating nix PVC", o)
+	}
+
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, JoinToken: nil}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := createdDeploymentNames(client); len(got) != 0 {
+		t.Fatalf("mid-termination created deployments %v; EDIT B must suppress the create over a doomed nix PVC", got)
+	}
+	if got := pvcCreateNames(t, client); len(got) != 0 {
+		t.Fatalf("mid-termination created PVCs %v; the create-gate skips nix (HasNixPVC) and data (HasDataPVC)", got)
+	}
+	assertNoSecretReads(t, client)
+}
+
+// T3: a worker whose /nix PVC EQUALS the desired size, and a variant where it is LARGER,
+// are both left completely untouched — the trigger is STRICTLY less-than (a PVC cannot
+// shrink; a >= must never recycle). No deletes, no creates, no patch.
+func TestNixSizeEqualOrGreaterIsNeverRecycled(t *testing.T) {
+	for _, size := range []string{"20Gi", "25Gi"} {
+		t.Run(size, func(t *testing.T) {
+			ctx := context.Background()
+			hash := currentHash(t, "w1", 0)
+			m, client := newMat(t, deployedWorker("w1", 0, hash), pvcNix("w1", size), pvcFor("w1", "data"))
+
+			observed, err := m.Observe(ctx)
+			if err != nil {
+				t.Fatalf("Observe: %v", err)
+			}
+			w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, JoinToken: nil}
+			if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			for _, a := range client.Actions() {
+				switch a.GetVerb() {
+				case "delete", "create", "patch":
+					t.Fatalf("a nix PVC at %s (>= the desired 20Gi) triggered a %s on %s; only STRICTLY-less-than recycles",
+						size, a.GetVerb(), a.GetResource().Resource)
+				}
+			}
+			assertNoSecretReads(t, client)
+		})
+	}
+}
+
+// Guard-equality gap: a worker whose nix PVC is LIVE at EXACTLY the desired size (20Gi)
+// but whose Deployment is ABSENT — reachable after a transient Deployment-create failure
+// (PVCs created, the Deployment create errored, next tick must retry) — must still get
+// its Deployment created. The create-gate's nixLiveAtSize check uses Cmp(...) >= 0
+// specifically so equality does NOT suppress the create; only a nix PVC that is NOT YET
+// live at the desired size (Terminating, or mid-recycle — T2) suppresses it.
+//
+// Positive control: mutate the guard's `nixLiveAtSize := ... Cmp(spec.NixSize) >= 0` to
+// `> 0` and this test goes RED — the Deployment is never created, permanently stranding
+// a worker whose nix PVC sits exactly at spec.NixSize.
+func TestNixLiveAtDesiredSizeWithoutDeploymentRecreatesDeployment(t *testing.T) {
+	ctx := context.Background()
+	ns := testConfig().Namespace
+	// No Deployment; nix PVC LIVE (not Terminating) at exactly the desired 20Gi; data intact.
+	m, client := newMat(t, pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("Observe = %+v, want one worker", observed)
+	}
+	o := observed[0]
+	if o.HasDeployment || !o.HasNixPVC || !o.HasDataPVC || o.NixPVCSize == nil || o.NixPVCSize.Cmp(resource.MustParse("20Gi")) != 0 {
+		t.Fatalf("observed = %+v; want {HasDeployment:false HasNixPVC:true HasDataPVC:true NixPVCSize:20Gi (live)}", o)
+	}
+
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, JoinToken: nil}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if got := createdDeploymentNames(client); !equalStrings(got, []string{"uzi-hw-w1"}) {
+		t.Fatalf("deployment creates = %v, want exactly [uzi-hw-w1]; the guard must NOT suppress at equality", got)
+	}
+	if _, err := client.AppsV1().Deployments(ns).Get(ctx, "uzi-hw-w1", metav1.GetOptions{}); err != nil {
+		t.Errorf("the Deployment must be created when the nix PVC is live at exactly the desired size: %v", err)
+	}
+	// Not a size-drift case (Cmp==0, not <0): no recycle delete.
+	if got := deletedSet(client); len(got) != 0 {
+		t.Fatalf("unexpected deletes %v; a nix PVC live at exactly the desired size is not size-drift", keysOf(got))
+	}
+	// HasNixPVC is true, so the create-gate must skip re-issuing the nix PVC create.
+	if got := pvcCreateNames(t, client); len(got) != 0 {
+		t.Fatalf("unexpected pvc creates %v; HasNixPVC true must gate the create", got)
+	}
+	assertNoSecretReads(t, client)
+}
+
+// T4: the recycle honors the SAME busy-guard as the roll path. A busy worker (not yet
+// draining, a generous 24h deadline, no force-roll) whose /nix is undersized is cordoned
+// and DEFERRED — its Deployment and PVC are NOT torn out from under a live run.
+func TestNixSizeDriftBusyWorkerIsCordonedNotRecycled(t *testing.T) {
+	ctx := context.Background()
+	c := &fakeCordoner{}
+	hash := currentHash(t, "w1", 0)
+	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: 24 * time.Hour},
+		deployedWorker("w1", 0, hash), pvcNix("w1", "4Gi"), pvcFor("w1", "data"))
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: true, DrainingSince: nil}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(c.calls) != 1 || c.calls[0] != "w1" {
+		t.Fatalf("RequestDrain calls = %v, want exactly [w1] (busy recycle is cordoned + deferred)", c.calls)
+	}
+	del := deletedSet(client)
+	if del["deployments/uzi-hw-w1"] || del["persistentvolumeclaims/uzi-hw-w1-nix"] {
+		t.Fatalf("a busy worker's volumes were recycled; the recycle must defer while busy. deletes: %v", keysOf(del))
+	}
+}
+
+// --- disk-pressure recycle (PRD #837 M4) -----------------------------------
+
+// M4-T1, the headline: an idle worker under disk pressure, whose /nix is LIVE at the
+// desired size (so the M3 size-drift arm does NOT fire — the discriminator is the
+// disk-pressure arm), has BOTH its /nix and /data volumes recycled. Tick 1 tears down
+// the Deployment + BOTH PVCs (the discriminator vs M3, which preserves /data), keeping
+// the Secret; tick 2 re-mints both PVCs and the Deployment. The unstamped PVC
+// CreationTimestamps are the epoch — far outside the cooldown — so the recycle is allowed.
+//
+// Positive control: remove the M4 disk-pressure arm and tick 1's data-PVC delete goes
+// RED (nothing recycles /data on pressure).
+func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
+	ctx := context.Background()
+	ns := testConfig().Namespace
+	hash := currentHash(t, "w1", 0)
+	m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+		RecyclePolicy{Enabled: true, Cooldown: time.Hour}, io.Discard,
+		deployedWorker("w1", 0, hash), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	// Idle worker reporting disk pressure; the pod holds its token, so join_token is nil.
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: true, JoinToken: nil}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("tick 1 Reconcile: %v", err)
+	}
+	del := deletedSet(client)
+	if !del["deployments/uzi-hw-w1"] {
+		t.Errorf("tick 1 must delete the Deployment for the disk-pressure recycle; got %v", keysOf(del))
+	}
+	if !del["persistentvolumeclaims/uzi-hw-w1-nix"] {
+		t.Errorf("tick 1 must delete the nix PVC; got %v", keysOf(del))
+	}
+	// THE DISCRIMINATOR vs M3: the disk-pressure arm ALSO recycles /data.
+	if !del["persistentvolumeclaims/uzi-hw-w1-data"] {
+		t.Errorf("tick 1 must delete the DATA pvc; the M4 disk-pressure arm recycles /nix AND /data; got %v", keysOf(del))
+	}
+	// NEGATIVE: the Secret is untouched, and the recycle only DELETES this tick.
+	for _, a := range client.Actions() {
+		if a.GetResource().Resource == "secrets" && a.GetVerb() == "delete" {
+			t.Error("tick 1 deleted the Secret; a recycle keeps the delivered token")
+		}
+		if a.GetVerb() == "create" {
+			t.Errorf("tick 1 issued a %s create; the recycle only DELETES, reprovision is next tick", a.GetResource().Resource)
+		}
+	}
+	assertNoSecretReads(t, client)
+
+	// --- Tick 2: re-mint. Re-Observe the fake (Deployment + both PVCs now gone). The
+	// worker is no longer under pressure — once its pod is torn down it stops reporting a
+	// disk metric, so the api's stale pressure signal clears, which is what lets the
+	// reprovision proceed (the disk-pressure arm is gated on DiskPressure). ---
+	observed2, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("re-Observe between ticks: %v", err)
+	}
+	// Deployment + BOTH PVCs gone, and the Secret is never observed — so NOTHING remains
+	// stamped for this worker. It reprovisions off the DESIRED set (Reconcile iterates
+	// desired, not observed), the whole point of the recycle being a full re-mint.
+	if len(observed2) != 0 {
+		t.Fatalf("after recycling both volumes + the Deployment, observed = %+v; want nothing left for the worker", observed2)
+	}
+	client.ClearActions()
+	w2 := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: false, JoinToken: nil}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w2}, observed2); err != nil {
+		t.Fatalf("tick 2 Reconcile: %v", err)
+	}
+	created := pvcCreateNames(t, client)
+	sort.Strings(created)
+	if !equalStrings(created, []string{"uzi-hw-w1-data", "uzi-hw-w1-nix"}) {
+		t.Fatalf("tick 2 pvc creates = %v, want BOTH re-minted [uzi-hw-w1-data uzi-hw-w1-nix]", created)
+	}
+	if got := createdDeploymentNames(client); !equalStrings(got, []string{"uzi-hw-w1"}) {
+		t.Errorf("tick 2 deployment creates = %v, want exactly [uzi-hw-w1]", got)
+	}
+	if _, err := client.AppsV1().Deployments(ns).Get(ctx, "uzi-hw-w1", metav1.GetOptions{}); err != nil {
+		t.Errorf("the Deployment must be recreated on tick 2: %v", err)
+	}
+	assertNoSecretReads(t, client)
+}
+
+// M4-T2: a worker back at disk pressure whose volumes were minted WITHIN the cooldown was
+// just recycled — recycling again would thrash, so it is a CAPACITY signal instead:
+// nothing is deleted, and the fixed token `disk-recycle-skipped-cooldown worker=<id>` is
+// logged. BOTH halves are asserted; either alone is vacuous (zero deletes could just be a
+// worker that never qualified, and the token without the no-delete could sit beside a
+// recycle).
+//
+// Positive control: remove the withinRecycleCooldown guard (always recycle) and the
+// deletes-are-zero assertion goes RED — a just-recycled worker is torn down again.
+func TestDiskPressureWithinCooldownIsSkippedNotRecycled(t *testing.T) {
+	ctx := context.Background()
+	hash := currentHash(t, "w1", 0)
+	var logs strings.Builder
+	// nix + data minted one minute before the pinned clock — well within the 1h cooldown.
+	recent := m5Now.Add(-time.Minute)
+	m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+		RecyclePolicy{Enabled: true, Cooldown: time.Hour}, &logs,
+		deployedWorker("w1", 0, hash),
+		pvcCreatedAt(pvcNix("w1", "20Gi"), recent),
+		pvcCreatedAt(pvcFor("w1", "data"), recent))
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	// Sanity: the mint times must have been observed, or the cooldown check is vacuous.
+	if o := observed[0]; o.NixPVCCreatedAt == nil || o.DataPVCCreatedAt == nil {
+		t.Fatalf("observed = %+v; want both PVC CreationTimestamps recorded for the cooldown check", o)
+	}
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: true, JoinToken: nil}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if del := deletedSet(client); len(del) != 0 {
+		t.Fatalf("within-cooldown worker was recycled (deletes %v); a just-recycled worker back at pressure is a capacity signal, not a re-recycle", keysOf(del))
+	}
+	if tok := "disk-recycle-skipped-cooldown worker=w1"; !strings.Contains(logs.String(), tok) {
+		t.Fatalf("logs missing the exact capacity token %q; got:\n%s", tok, logs.String())
+	}
+	assertNoSecretReads(t, client)
+}
+
+// M4-T3: an Ephemeral (run-bound) worker is excluded from BOTH recycle arms — its
+// volumes are torn down when its run ends anyway, so recycling them is pointless churn.
+func TestEphemeralWorkerIsExcludedFromBothRecycleArms(t *testing.T) {
+	t.Run("disk-pressure arm skips an ephemeral worker", func(t *testing.T) {
+		ctx := context.Background()
+		hash := currentHash(t, "w1", 0)
+		m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+			RecyclePolicy{Enabled: true, Cooldown: time.Hour}, io.Discard,
+			deployedWorker("w1", 0, hash), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: true, Ephemeral: true}
+		if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if del := deletedSet(client); len(del) != 0 {
+			t.Fatalf("an ephemeral worker under disk pressure was recycled (deletes %v); run-bound workers are excluded", keysOf(del))
+		}
+	})
+
+	// The M3 size-drift arm excludes ephemeral too (EDIT A's `!w.Ephemeral`): an undersized
+	// nix PVC on a run-bound worker is left alone.
+	t.Run("size-drift arm skips an ephemeral worker", func(t *testing.T) {
+		ctx := context.Background()
+		hash := currentHash(t, "w1", 0)
+		m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+			RecyclePolicy{Enabled: true, Cooldown: time.Hour}, io.Discard,
+			deployedWorker("w1", 0, hash), pvcNix("w1", "4Gi"), pvcFor("w1", "data"))
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Ephemeral: true}
+		if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if del := deletedSet(client); len(del) != 0 {
+			t.Fatalf("an ephemeral worker with an undersized nix PVC was recycled (deletes %v); the size arm excludes ephemeral too", keysOf(del))
+		}
+	})
+}
+
+// M4-T4: RecyclePolicy{Enabled: false} suppresses BOTH arms — an undersized-nix worker
+// and a disk-pressure worker each produce zero deletes.
+//
+// Positive control: flip the guard back to always-on (drop `m.recycle.Enabled &&`) and
+// both sub-tests go RED.
+func TestRecycleToggleOffSuppressesBothArms(t *testing.T) {
+	t.Run("size-drift arm suppressed when disabled", func(t *testing.T) {
+		ctx := context.Background()
+		hash := currentHash(t, "w1", 0)
+		m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+			RecyclePolicy{Enabled: false, Cooldown: time.Hour}, io.Discard,
+			deployedWorker("w1", 0, hash), pvcNix("w1", "4Gi"), pvcFor("w1", "data"))
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0}
+		if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if del := deletedSet(client); len(del) != 0 {
+			t.Fatalf("an undersized nix PVC was recycled with self-heal DISABLED (deletes %v)", keysOf(del))
+		}
+	})
+
+	t.Run("disk-pressure arm suppressed when disabled", func(t *testing.T) {
+		ctx := context.Background()
+		hash := currentHash(t, "w1", 0)
+		m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+			RecyclePolicy{Enabled: false, Cooldown: time.Hour}, io.Discard,
+			deployedWorker("w1", 0, hash), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: true}
+		if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if del := deletedSet(client); len(del) != 0 {
+			t.Fatalf("a disk-pressure worker was recycled with self-heal DISABLED (deletes %v)", keysOf(del))
+		}
+	})
+}
+
+// M4-T5, the data-strand guard: mid disk-pressure recycle, the /data PVC is Terminating
+// and the Deployment is already gone. The Deployment must NOT be recreated over the doomed
+// /data volume — /data has no size, so its liveness (DataPVCLive) is the gate, mirroring
+// the nix guard. First-provision (data ABSENT) and steady state (data LIVE) are unaffected:
+// both leave dataBlocking false.
+//
+// Positive control: drop `|| dataBlocking` from the create-gate and a create
+// deployments/uzi-hw-w1 appears — the Deployment lands over a Terminating /data volume.
+func TestDiskRecycleDataTerminatingSuppressesDeploymentCreate(t *testing.T) {
+	ctx := context.Background()
+	// nix LIVE at the desired 20Gi (not size-drift), data Terminating, Deployment absent.
+	m, client := newMat(t, pvcNix("w1", "20Gi"), pvcTerminating("w1", "data"))
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("Observe = %+v, want one worker", observed)
+	}
+	o := observed[0]
+	if o.HasDeployment || !o.HasDataPVC || o.DataPVCLive {
+		t.Fatalf("observed = %+v; want {HasDeployment:false HasDataPVC:true DataPVCLive:false} for a Terminating data PVC", o)
+	}
+
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, JoinToken: nil}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := createdDeploymentNames(client); len(got) != 0 {
+		t.Fatalf("mid-recycle created deployments %v; the guard must suppress the create over a Terminating /data PVC", got)
+	}
+	assertNoSecretReads(t, client)
+}
+
+// quantityPtr is the test-side constructor of an ObservedWorker.NixPVCSize.
+func quantityPtr(s string) *resource.Quantity {
+	q := resource.MustParse(s)
+	return &q
 }

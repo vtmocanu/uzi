@@ -578,7 +578,7 @@ func TestObserveWarnsAboutAnUnmanagedPodInAWorkerNamespace(t *testing.T) {
 			Namespace: testConfig().Namespace,
 		},
 	})
-	m := New(client, testConfig(), testResolver(t), nil, DrainPolicy{}, slog.New(slog.NewTextHandler(&logged, nil)))
+	m := New(client, testConfig(), testResolver(t), nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(&logged, nil)))
 
 	observed, err := m.Observe(ctx)
 	if err != nil {

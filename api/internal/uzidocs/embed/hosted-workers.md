@@ -33,7 +33,7 @@ available if your admin has turned hosting on for this instance.
 (the default), or **L**, each step roughly doubling the last. The provision
 form shows the exact numbers next to each option when you pick — they live
 there, not here, so they can't say something different from what you'll
-actually get. Every size also gets the same 4Gi tools cache (`/nix`),
+actually get. Every size also gets the same 20Gi tools cache (`/nix`),
 regardless of size or type — the one number that doesn't change with your
 choice.
 
@@ -91,6 +91,29 @@ and shows a free run slot, but isn't picking up a run sitting in the queue.
 That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
 resumes claiming runs on its own once the roll finishes. There's no manual
 way to cordon a worker yourself; it's driven entirely by the cluster.
+
+## Disk self-heal
+
+A hosted worker also reports its disk usage now — the same CPU/memory gauges
+in **Settings → Workers** and the Dashboard's "Worker load" card gain a Disk
+bar per volume (`/nix`, `/data`); see [Resource stats and
+sizing](./worker-setup.md#resource-stats-and-sizing).
+
+Two things now self-heal without you deleting and re-provisioning by hand:
+
+- **A tools cache smaller than the current size** (provisioned before a size
+  bump, like the one above) gets reconciled to the current size automatically:
+  only the `/nix` cache is recycled, and the `/data` workspace is preserved.
+- **A volume that fills up** (at or above 90% used, sustained across a couple
+  of heartbeats) gets recycled: the worker is drained first if it's busy —
+  same cordon behavior as above — then **both** its volumes are deleted and
+  re-provisioned fresh: the `/nix` tools cache re-downloads, and everything on
+  the `/data` workspace is permanently lost. A worker recycled this way shows
+  the same draining/cordoned pills while it happens.
+
+Both are cluster-driven, like cordoning; there's no button for either. An
+admin can turn the self-heal off entirely via chart config if it's ever not
+wanted.
 
 ## How this differs from running your own worker
 

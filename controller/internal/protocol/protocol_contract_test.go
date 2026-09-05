@@ -71,6 +71,17 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if pending.DrainingSince != nil {
 		t.Fatal("draining_since must parse as nil for the golden's first worker (not cordoned)")
 	}
+	// DiskPressure and Ephemeral (PRD #837 M4) are distinct bool fields and must
+	// round-trip to their own fields: the golden's first worker has disk pressure
+	// but is not ephemeral. Asserting both (not just one) fails a swapped tag — a
+	// DiskPressure field tagged json:"ephemeral" would misparse and still satisfy
+	// DisallowUnknownFields, so only pinning the value catches it.
+	if !pending.DiskPressure {
+		t.Fatal("disk_pressure must parse as true for the golden's first worker (under pressure)")
+	}
+	if pending.Ephemeral {
+		t.Fatal("ephemeral must parse as false for the golden's first worker (not run-bound)")
+	}
 
 	// A worker needing no Secret written: null token, still fully desired state. The
 	// nil is load-bearing — it means "write nothing", not "this worker has no token"
@@ -96,6 +107,15 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	}
 	if want := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC); !noToken.DrainingSince.Equal(want) {
 		t.Fatalf("draining_since = %v, want the golden's fixed %v", noToken.DrainingSince, want)
+	}
+	// The mirror of the first worker's disk fields: this one is ephemeral and not
+	// under disk pressure, so the two assertions together fail either a swapped tag
+	// or a field collapse.
+	if noToken.DiskPressure {
+		t.Fatal("disk_pressure must parse as false for the golden's second worker (not under pressure)")
+	}
+	if !noToken.Ephemeral {
+		t.Fatal("ephemeral must parse as true for the golden's second worker (run-bound)")
 	}
 }
 
