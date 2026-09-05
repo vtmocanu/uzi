@@ -13,11 +13,11 @@ the unattended sibling of the manual **Fix CI** button described in
 [Configuration](./configuration.md#ci-status-integration-prd-6) — same
 `ci_fix` run type, same verification, just started for you. **On by
 default** for every user, capped by `CI_AUTOFIX_MAX_ATTEMPTS` and bounded to
-your own branches — see [Opting out](#1-opt-in) below, and [Upgrading from
+your own branches — see [Opting out](#1-opt-out) below, and [Upgrading from
 an older uzi](#upgrading-from-an-older-uzi) if this instance predates the
 change.
 
-## 1. Opt in
+## 1. Opt out
 
 Automatic CI fixes ship **on** for every user — there is nothing to turn on.
 Your per-user setting is really a tri-state opt-**out**: leaving it alone
@@ -67,7 +67,7 @@ inherits your account-wide setting; there is no separate per-schedule switch.
 this fires at all unless the pipeline watch itself is on (`CI_WATCH_MAX_REFS`
 > 0 — see [Configuration](./configuration.md#ci-status-integration-prd-6));
 with the watch off, there are no CI badges and no automatic fixes. It also
-doesn't fire while the [instance-wide kill-switch](#1-opt-in) is off,
+doesn't fire while the [instance-wide kill-switch](#1-opt-out) is off,
 regardless of anyone's own setting — and, fail-closed, a settings-read
 hiccup on that admin gate is treated the same as off.
 

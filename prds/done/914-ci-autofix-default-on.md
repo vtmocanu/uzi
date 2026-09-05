@@ -131,7 +131,7 @@ mr_rework is the template, but ci_autofix differs in ways that make this more th
   (default-OFF)" and "kill-switch is simply NOT wiring it") — both become false once the global exists.
 
 - [x] **M2 — User column → nullable tri-state + candidate gate + Go-type ripple.** *(Offline + LiveDB)*
-  New migration (number at merge time; live head 00185, so this lands at 00186):
+  New migration (number at merge time; live head 00185, so this lands at 00186): (Superseded — see As-built deltas above: landed as 00190.)
   - Up: `ALTER TABLE users ALTER COLUMN ci_autofix_enabled DROP NOT NULL, DROP DEFAULT;` then
     `UPDATE users SET ci_autofix_enabled = NULL WHERE ci_autofix_enabled = false;` (existing `true`
     preserved).
@@ -144,7 +144,7 @@ mr_rework is the template, but ci_autofix differs in ways that make this more th
 
   Change `ci_autofix.sql:76` `AND u.ci_autofix_enabled` → `AND u.ci_autofix_enabled IS NOT FALSE`.
   Regenerate sqlc; `store.User.CiAutofixEnabled` flips `bool` → `pgtype.Bool` — fix `handler/handler.go:477`
-  (`toDTO`, resolve inherit→true) and the `SetUserCIAutofixEnabled` param.
+  (`toDTO`, resolve inherit→true) and the `SetUserCIAutofixEnabled` param. (Superseded — see As-built deltas above: the DTO is nullable `*bool` / `boolean|null` end-to-end, preserving the null clear-to-inherit path.)
 
 - [x] **M3 — Tri-state over the API + web toggles.** *(Offline; web)*
   Retrofit the dedicated endpoints to carry inherit/clear: `handler/ci_autofix_toggle.go`
