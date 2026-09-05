@@ -547,19 +547,37 @@ export function calibrateReview(review: ReviewRequest, failureClass: string | nu
   return { ...review, recommendations };
 }
 
-// extractJsonObject pulls the first balanced {...} object out of the model text
-// (tolerating a ```json fence or surrounding prose). Exported for reuse by the inline
-// summary runner (PRD #362 M3a), which parses the same fenced/prose-wrapped JSON shape.
+// extractJsonObject pulls a balanced {...} object out of the model text (tolerating a
+// ```json fence or surrounding prose). Exported for reuse by the inline summary runner
+// (PRD #362 M3a) and the task review runner, which parse the same fenced/prose-wrapped
+// JSON shape. The FIRST balanced candidate is not always the JSON: a brace example in
+// prose before it (e.g. `Use {verdict, summary} here`, possibly inside the fence) slices
+// first but does not parse. So on a JSON.parse failure we advance past that candidate and
+// try the next one, keeping the throw (→ caller's deterministic fallback) only when no
+// balanced candidate parses.
 export function extractJsonObject(text: string): unknown {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const inner = fence ? fence[1]! : text;
-  const candidate = sliceFirstObject(inner);
-  if (!candidate) throw new Error("no JSON object found in the model output");
-  return JSON.parse(candidate);
+  let from = 0;
+  let sawCandidate = false;
+  let lastErr: unknown;
+  for (;;) {
+    const candidate = sliceFirstObject(inner, from);
+    if (!candidate) break;
+    sawCandidate = true;
+    try {
+      return JSON.parse(candidate.slice);
+    } catch (err) {
+      lastErr = err;
+      from = candidate.start + 1; // skip this '{' and look for the next balanced candidate
+    }
+  }
+  if (!sawCandidate) throw new Error("no JSON object found in the model output");
+  throw new Error(`no parseable JSON object found in the model output: ${errMessage(lastErr)}`);
 }
 
-function sliceFirstObject(text: string): string | null {
-  const start = text.indexOf("{");
+function sliceFirstObject(text: string, from = 0): { start: number; slice: string } | null {
+  const start = text.indexOf("{", from);
   if (start < 0) return null;
   let depth = 0;
   let inStr = false;
@@ -576,7 +594,7 @@ function sliceFirstObject(text: string): string | null {
     else if (c === "{") depth++;
     else if (c === "}") {
       depth--;
-      if (depth === 0) return text.slice(start, i + 1);
+      if (depth === 0) return { start, slice: text.slice(start, i + 1) };
     }
   }
   return null;

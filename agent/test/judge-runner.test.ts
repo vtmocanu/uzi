@@ -373,6 +373,19 @@ describe("parseReview", () => {
     assert.equal(r.verdict, "ok");
   });
 
+  it("skips a brace example in prose before the real JSON (scans later candidates)", () => {
+    const text = 'Use {verdict, summary} here\n{"verdict":"ok","summary":"s","recommendations":[]}';
+    const r = parseReview(text, "haiku");
+    assert.equal(r.verdict, "ok");
+  });
+
+  it("skips a brace example inside the fence before the real JSON", () => {
+    const text =
+      '```json\nUse {verdict, summary} here\n{"verdict":"ok","summary":"s","recommendations":[]}\n```';
+    const r = parseReview(text, "haiku");
+    assert.equal(r.verdict, "ok");
+  });
+
   it("parses JSON embedded in prose and drops unknown categories", () => {
     const text =
       'Here is my assessment: {"verdict":"issues","summary":"s","recommendations":[' +
