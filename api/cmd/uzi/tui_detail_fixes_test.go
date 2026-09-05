@@ -69,7 +69,7 @@ func TestRunDuration(t *testing.T) {
 // stream-owned Status, so a stale GetRun response cannot revert a status the live socket just
 // advanced. It is also a no-op before the initial load has set the baseline.
 func TestApplyMetaPreservesStatus(t *testing.T) {
-	d := &detailState{loaded: true, run: apitypes.RunDTO{ID: "r1", Status: "awaiting_approval", Health: "ok"}}
+	d := &detailState{runLoaded: true, run: apitypes.RunDTO{ID: "r1", Status: "awaiting_approval", Health: "ok"}}
 	d.applyMeta(apitypes.RunDTO{ID: "r1", Status: "running", Health: "stalled",
 		Milestones:          []apitypes.Milestone{{ID: "m1", Title: "A"}},
 		MilestonesCompleted: []string{"m1"}})
@@ -80,7 +80,7 @@ func TestApplyMetaPreservesStatus(t *testing.T) {
 		t.Errorf("applyMeta did not refresh non-streamed fields: health=%q milestones=%d", d.run.Health, len(d.run.Milestones))
 	}
 
-	notLoaded := &detailState{loaded: false, run: apitypes.RunDTO{Status: "queued"}}
+	notLoaded := &detailState{runLoaded: false, run: apitypes.RunDTO{Status: "queued"}}
 	notLoaded.applyMeta(apitypes.RunDTO{Status: "running", Health: "stalled"})
 	if notLoaded.run.Status != "queued" || notLoaded.run.Health != "" {
 		t.Errorf("applyMeta ran before the initial load: %+v", notLoaded.run)
@@ -94,7 +94,8 @@ func TestTransportChrome(t *testing.T) {
 	mk := func(status string, mut func(d *detailState)) tuiModel {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, "r1")
 		m.detail.run = apitypes.RunDTO{ID: "r1", Status: status}
-		m.detail.loaded = true
+		m.detail.runLoaded = true
+		m.detail.tailLoaded = true
 		if mut != nil {
 			mut(&m.detail)
 		}
@@ -170,9 +171,8 @@ func TestDetailHeaderFitsWidthWithDuration(t *testing.T) {
 	render := func(w int) []string {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 		m.width, m.height = w, 34
-		next, _ := m.Update(detailLoadedMsg{run: run,
-			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
-		m = next.(tuiModel)
+		m = applyDetail(m, run,
+			[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
 		m.detail.stream = &uzicli.RunStream{} // live socket → the "● live" tag is folded into the header too
 		return strings.Split(m.View().Content, "\n")
 	}
@@ -229,8 +229,7 @@ func TestDetailCollapsibleCrewRevealsMilestones(t *testing.T) {
 	}
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 	m.width, m.height = 100, 20
-	next, _ := m.Update(detailLoadedMsg{run: run, msgs: msgs})
-	m = next.(tuiModel)
+	m = applyDetail(m, run, msgs)
 
 	expanded := m.View().Content
 	if strings.Contains(expanded, "MILESTONES") {
@@ -254,8 +253,8 @@ func TestDetailCollapsibleCrewRevealsMilestones(t *testing.T) {
 
 	// Toggling with no lanes is a no-op (the caret and footer hint are hidden there).
 	m0 := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	n0, _ := m0.Update(detailLoadedMsg{run: run})
-	if press(t, n0.(tuiModel), keyCollapseCrew).detail.railCollapsed {
+	m0 = applyDetail(m0, run, nil)
+	if press(t, m0, keyCollapseCrew).detail.railCollapsed {
 		t.Errorf("collapse toggled with no lanes; should be a no-op")
 	}
 }

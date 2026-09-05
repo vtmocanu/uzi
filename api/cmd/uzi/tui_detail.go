@@ -1,11 +1,13 @@
 package main
 
 import (
+	"sort"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
+	"github.com/charmbracelet/colorprofile"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -33,7 +35,12 @@ const (
 // transcript, fed by the REST replay for history and StreamRun for live frames.
 type detailState struct {
 	runID string
-	run   apitypes.RunDTO
+	// gen is this detail session's generation (stamped from tuiModel.detailGen on each drill-in
+	// from the board; the `--run` start session keeps 0). Every run/page command captures it
+	// and every reply is checked against it, because exitToBoard cannot cancel a command in
+	// flight and reopening the SAME run would otherwise let the old session's replies through.
+	gen uint64
+	run apitypes.RunDTO
 	// frames is the merged, seq-ordered message log — replay and live frames land in
 	// the same slice, deduped by seq, because the lane logic must not care which
 	// transport a frame arrived on.
@@ -58,10 +65,38 @@ type detailState struct {
 	// tall roster cannot push the milestone block below the fold — the rail does not scroll,
 	// it is clamped to the transcript height (issue #379).
 	railCollapsed bool
-	loaded        bool
-	loadErr       error
-	stream        *uzicli.RunStream
-	streamErr     error
+	runLoaded     bool // the first GetRun has landed: header/milestones/accounts can render
+	tailLoaded    bool // the newest transcript page has landed
+	// lowSeq / highSeq bound the seq-carrying frames held (0 = none). lowSeq is the backfill
+	// cursor: the background walk requests the newest page strictly below it and the reply
+	// lowers it, until the start of history is reached. highSeq is the total, since seq is
+	// gapless from 1 (D5), so the progress badge reads `<held> of <highSeq>`.
+	lowSeq  int32
+	highSeq int32
+	// backfilling / historyComplete / backfillFailed drive the background history walk (M5).
+	// backfilling is true while a page is in flight; historyComplete is set once the walk
+	// reaches the start (an empty page, or a page holding seq 1); backfillFailed is set when a
+	// page errored or did not advance the cursor, and the badge then invites `r` to resume.
+	backfilling     bool
+	historyComplete bool
+	backfillFailed  bool
+	// tailInFlight guards the initial-tail RETRY (the stuck state: the tail errored, nothing is
+	// held, the socket is down). `r` and the 2s poll fallback both retry loadTailCmd from that
+	// state; without this marker every tick would stack another tail request on a slow link —
+	// the #1130 pile-up, on the one page that is not otherwise guarded. Set when a retry is
+	// dispatched, cleared when ANY pageTail reply lands (success or error), so a failed retry
+	// re-enables the next tick rather than wedging.
+	tailInFlight bool
+	// loadErr is the RUN-load error only (GetRun) — fatal to the whole view, since the
+	// header/rail have no DTO to render from. pageErr is the transcript-page error,
+	// scoped to the pane so a failed tail leaves the header up (PRD #1137: the header is
+	// independent of the history). The two are separate fields precisely because the two
+	// commands are dispatched concurrently and share nothing else — folding both into one
+	// field let a tail success clear a run error (or a tail error erase a live header).
+	loadErr   error
+	pageErr   error
+	stream    *uzicli.RunStream
+	streamErr error
 	// polling is the D8 fallback: the socket is unusable, so the view re-reads over
 	// REST on the same 2s cadence `uzi run logs --follow` uses.
 	polling bool
@@ -77,46 +112,182 @@ type detailState struct {
 	metaSeq    uint64
 	metaWaitID uint64
 
+	// catchupSeq / catchupWaitID guard the incremental catch-up chain the poll fallback and `r`
+	// drive (PRD #1137 M7): catchupWaitID == 0 means no chain in flight, so a 2s tick never stacks a
+	// second chain on a slow link (the #1130 anti-stack property, applied to the catch-up). Each
+	// catch-up page carries the id; a reply is honoured only when it matches.
+	catchupSeq    uint64
+	catchupWaitID uint64
+
 	// M4 surfaces. steer is gated on OWNERSHIP, not visibility (see steerAccessFor);
 	// review is the [v] overlay.
 	steer  steerState2
 	review reviewState
+
+	// tcache memoizes the per-lane transcript line build (PRD #1137 M6). It is a POINTER because
+	// View has a value receiver — a value-field cache written in View is lost on the copy (D6) —
+	// and is never shared across goroutines (Update/View run on the one event-loop goroutine). Nil
+	// on a zero-value detailState (post-exitToBoard); transcriptLines falls back to a direct build.
+	tcache *transcriptCache
 }
 
 func newDetailState(runID string) detailState {
-	return detailState{runID: runID, seen: map[int32]bool{}, follow: true}
+	return detailState{
+		runID:  runID,
+		seen:   map[int32]bool{},
+		follow: true,
+		tcache: &transcriptCache{entries: map[string]transcriptCacheEntry{}},
+	}
 }
 
-func (d *detailState) applyLoaded(msg detailLoadedMsg) {
-	if msg.err != nil {
-		d.loadErr = msg.err
-		d.loaded = true
+// transcriptCache memoizes buildFrameBlocks per lane keyed on every render input, so an unchanged
+// View is a map lookup and a live-frame append re-renders only the tail (PRD #1137 D6). builds
+// counts misses (full rebuilds AND tail appends); it is the tests' only channel, since View cannot
+// report through the value-receiver model.
+type transcriptCache struct {
+	builds  int
+	entries map[string]transcriptCacheEntry // keyed by lane.Key
+}
+
+type transcriptCacheEntry struct {
+	width         int
+	dark          bool
+	profile       colorprofile.Profile
+	identitiesSig string
+	n             int
+	firstSeq      int32
+	lastSeq       int32 // seq of the LAST cached frame (frame n-1)
+	blocks        []frameBlock
+	lines         []string
+}
+
+// identitiesSig is the sorted key=tag join of laneIdentities(), so a re-suffixed role
+// (tester → tester·1) changes the signature and invalidates the aggregated lane's cache.
+func (m tuiModel) identitiesSig() string {
+	ids := m.laneIdentities()
+	keys := make([]string, 0, len(ids))
+	for k := range ids {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(ids[k])
+		b.WriteByte(';')
+	}
+	return b.String()
+}
+
+// applyRun folds the first GetRun in: the header, the crew-rail milestones/accounts and
+// the "now" line render from this alone, one round trip before the transcript. Status is
+// taken wholesale (nothing to preserve yet, unlike applyMeta).
+func (d *detailState) applyRun(run apitypes.RunDTO, err error) {
+	if err != nil {
+		d.loadErr = err
+		d.runLoaded = true
 		return
 	}
 	d.loadErr = nil
-	d.run = msg.run
-	for _, m := range msg.msgs {
-		d.addFrame(laneFrameFromMessage(m))
+	d.run = run
+	d.runLoaded = true
+}
+
+// applyTailPage folds the newest transcript page in and marks the pane loaded. Frames are
+// deduped by seq (addFrame), so a live frame that beat the tail is not doubled. A page
+// error is recorded in pageErr — NOT loadErr — so it stays scoped to the transcript pane
+// and never swallows (or is swallowed by) the concurrent run-load result.
+func (d *detailState) applyTailPage(msgs []apitypes.MessageDTO, err error) {
+	if err != nil {
+		d.pageErr = err
+		d.tailLoaded = true
+		return
 	}
-	d.loaded = true
+	d.pageErr = nil
+	d.addFrames(framesFromMessages(msgs))
+	d.tailLoaded = true
+	d.rebuild()
+}
+
+// applyBackfillPage folds one background history page in and returns the Cmd that chains the
+// next page (or nil when the walk has stopped). A backfill failure is a badge, not a full-pane
+// error: it never touches pageErr. The chain stops on an error, an empty page (start reached),
+// a page that did not lower the cursor (a hostile/broken server or an all-duplicate page — the
+// mirror of RunLogs' "did not advance" guard), or a page reaching seq 1. It is a *tuiModel
+// method, not a *detailState one, because the scroll anchoring below reads the rendered
+// line-count through the model's buildTranscriptLines.
+func (m *tuiModel) applyBackfillPage(msgs []apitypes.MessageDTO, err error) tea.Cmd {
+	if err != nil {
+		m.detail.backfilling = false
+		m.detail.backfillFailed = true
+		return nil
+	}
+	before := m.detail.lowSeq // the page's `before`; the reply must lower it
+	// Anchor the paused viewport: measure the selected lane's rendered line count before and
+	// after the prepend, and push scroll down by the delta so the user's top line does not
+	// jump. With follow the window is bottom-anchored and nothing moves.
+	var linesBefore int
+	if !m.detail.follow {
+		if lane, ok := m.detail.selectedLane(); ok {
+			linesBefore = len(m.buildTranscriptLines(lane))
+		}
+	}
+	m.detail.addFrames(framesFromMessages(msgs))
+	m.detail.rebuild()
+	if !m.detail.follow {
+		if lane, ok := m.detail.selectedLane(); ok {
+			if delta := len(m.buildTranscriptLines(lane)) - linesBefore; delta > 0 {
+				m.detail.scroll += delta
+			}
+		}
+	}
+	if len(msgs) == 0 { // the start of history: nothing older
+		m.detail.historyComplete = true
+		m.detail.backfilling = false
+		return nil
+	}
+	if m.detail.lowSeq >= before { // did not advance: stop, invite `r`
+		m.detail.backfilling = false
+		m.detail.backfillFailed = true
+		return nil
+	}
+	if m.detail.lowSeq <= 1 { // reached seq 1: the whole history is held
+		m.detail.historyComplete = true
+		m.detail.backfilling = false
+		return nil
+	}
+	m.detail.backfillFailed = false
+	return m.backfillCmd(m.detail.runID, m.detail.lowSeq)
+}
+
+// applyCatchupPage folds a catch-up page's frames in (append + dedup + rebuild). No tailLoaded /
+// pageErr — a catch-up is incremental recovery, not the initial pane load.
+func (d *detailState) applyCatchupPage(msgs []apitypes.MessageDTO) {
+	d.addFrames(framesFromMessages(msgs))
 	d.rebuild()
 }
 
 // applyMeta refreshes the run DTO from a periodic GetRun poll WITHOUT touching the frame
 // log — the transcript is fed by the stream/replay, this only refreshes the non-streamed
 // fields (milestones, health, kind, title, lifecycle stamps). Ignored until the initial
-// load has set the baseline, so a poll racing the first full load cannot flip `loaded`.
+// load has set the baseline, so a poll racing the first run load cannot flip `runLoaded`.
 //
-// Status is DELIBERATELY preserved rather than overwritten: the live stream owns it
-// (applyEvents sets it from authoritative `state` frames, including StreamRun's reconcile),
-// and applyMeta only runs while the stream is healthy (the dispatch guards on !polling).
+// While STREAMING, status is DELIBERATELY preserved rather than overwritten: the live stream owns
+// it (applyEvents sets it from authoritative `state` frames, including StreamRun's reconcile).
 // Overwriting it would let a GetRun response that was in flight across a status transition
 // revert the status for up to one 2s tick — e.g. dropping the plan-gate banner and its owner
 // keys the instant a run enters awaiting_approval, or flipping a just-finished run back to
-// running. When the stream is down the poll-fallback path (loadDetailCmd/applyLoaded) owns
-// status instead, so nothing goes stale.
+// running. While POLLING (the D8 fallback, M7) the stream is gone and the DTO is the only status
+// source, so it is adopted wholesale instead.
 func (d *detailState) applyMeta(run apitypes.RunDTO) {
-	if !d.loaded {
+	if !d.runLoaded {
+		return
+	}
+	if d.polling {
+		// The live stream that normally owns status is gone; while polling the DTO is the only
+		// status source, so adopt it wholesale (PRD #1137 M7). Streaming keeps preserving it below.
+		d.run = run
 		return
 	}
 	status := d.run.Status
@@ -150,23 +321,68 @@ func (d *detailState) applyEvents(evs []apitypes.RunEventDTO) bool {
 	return inputChanged
 }
 
-// addFrame appends a message frame, deduped by seq. Dedup is required, not defensive:
-// a reconnect replays from the last seq seen and the live socket may deliver the same
-// frame, and a duplicate would double a lane's contribution.
+// addFrame appends a single (live) message frame, deduped by seq, keeping frames seq-sorted
+// and the seq bounds current. Dedup is required, not defensive: a reconnect replays from the
+// last seq seen and the live socket may deliver the same frame, and a duplicate would double a
+// lane's contribution. It routes through addFrames so the sort + bounds invariant has one owner.
 func (d *detailState) addFrame(f laneFrame) {
+	d.addFrames([]laneFrame{f})
+}
+
+// framesFromMessages maps a page of MessageDTOs to laneFrames, the shape addFrames folds in.
+func framesFromMessages(msgs []apitypes.MessageDTO) []laneFrame {
+	out := make([]laneFrame, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, laneFrameFromMessage(m))
+	}
+	return out
+}
+
+// addFrames folds a page of frames into the seq-sorted log, deduped by seq. frames stays
+// ascending by seq so the transcript renders oldest→newest regardless of which transport
+// (tail, backfill, live) delivered a frame. A page below the held range prepends, above
+// appends, overlapping merges — all handled by a stable sort after the dedup append (M5 is not
+// the perf milestone; M6 memoizes rendering). The backfill "did not advance" guard reads the
+// seq bounds after this returns, not a count, so nothing here returns one.
+func (d *detailState) addFrames(page []laneFrame) {
 	if d.seen == nil {
-		// Total on a zero-value detailState: newDetailState seeds this map, but the
-		// handler guard is the load-bearing fix — this keeps a nil map from panicking
-		// the program if any future path reaches addFrame without the constructor.
+		// Total on a zero-value detailState: newDetailState seeds this map, but the handler
+		// guard is the load-bearing fix — this keeps a nil map from panicking the program if
+		// any future path reaches addFrames without the constructor.
 		d.seen = map[int32]bool{}
 	}
-	if f.Seq > 0 {
-		if d.seen[f.Seq] {
-			return
+	added := 0
+	for _, f := range page {
+		if f.Seq > 0 {
+			if d.seen[f.Seq] {
+				continue
+			}
+			d.seen[f.Seq] = true
 		}
-		d.seen[f.Seq] = true
+		d.frames = append(d.frames, f)
+		added++
 	}
-	d.frames = append(d.frames, f)
+	if added > 0 {
+		sort.SliceStable(d.frames, func(i, j int) bool { return d.frames[i].Seq < d.frames[j].Seq })
+	}
+	d.recomputeSeqBounds()
+}
+
+// recomputeSeqBounds sets lowSeq/highSeq from the seq-carrying frames (seq>0), ignoring any
+// seq-less infra frame.
+func (d *detailState) recomputeSeqBounds() {
+	d.lowSeq, d.highSeq = 0, 0
+	for _, f := range d.frames {
+		if f.Seq <= 0 {
+			continue
+		}
+		if d.lowSeq == 0 || f.Seq < d.lowSeq {
+			d.lowSeq = f.Seq
+		}
+		if f.Seq > d.highSeq {
+			d.highSeq = f.Seq
+		}
+	}
 }
 
 func (d *detailState) rebuild() {
@@ -249,7 +465,29 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	case keyEsc:
 		return m.exitToBoard()
 	case keyRefresh:
-		return m, m.loadDetailCmd(m.detail.runID)
+		var cmds []tea.Cmd
+		if m.detail.metaWaitID == 0 {
+			cmds = append(cmds, (&m).startDetailMetaReq())
+		}
+		switch {
+		case m.detail.pageErr != nil && m.detail.highSeq == 0 && !m.detail.tailInFlight:
+			// The initial tail never loaded (it errored, so no frames are held): retry it. This
+			// is the "· r to retry" the pane offers, and it is NOT a "tail after the first load"
+			// (SC4) — the first load has not completed, nothing is held. Guarded by tailInFlight
+			// so a refresh never stacks a second tail on one already in flight.
+			m.detail.tailInFlight = true
+			cmds = append(cmds, m.loadTailCmd(m.detail.runID))
+		case m.detail.catchupWaitID == 0 && m.detail.highSeq > 0:
+			cmds = append(cmds, (&m).startDetailCatchupReq())
+		}
+		// Resume a stalled/failed background backfill from the current cursor (M5), guarded so a
+		// refresh never stacks a second chain on the one already running.
+		if !m.detail.historyComplete && !m.detail.backfilling && m.detail.lowSeq > 1 {
+			m.detail.backfillFailed = false
+			m.detail.backfilling = true
+			cmds = append(cmds, m.backfillCmd(m.detail.runID, m.detail.lowSeq))
+		}
+		return m, tea.Batch(cmds...)
 	case keyCollapseCrew:
 		// Fold / unfold the crew list so the milestone block below it is always reachable
 		// (the rail is height-clamped and does not scroll). No-op with no lanes: there is
@@ -488,7 +726,10 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(m.pal.faint.Render("could not load this run: " + fmtErr(d.loadErr)))
 		return sb.String()
 	}
-	if !d.loaded {
+	// Nothing renders before the first GetRun lands — the header/rail/milestones all read
+	// from d.run. Once runLoaded, the header and rail render even while the transcript pane
+	// is still waiting on its tail page (gated separately in renderTranscript).
+	if !d.runLoaded {
 		sb.WriteString(m.pal.faint.Render("loading…"))
 		return sb.String()
 	}

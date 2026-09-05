@@ -35,6 +35,52 @@ import (
 // Every model-authored string is UNTRUSTED and passes through Plain/Markdown (D7); the whole
 // palette stays ANDON's two intensities (tungsten accent over faint body), no per-frame colour.
 func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
+	return flattenBlocks(m.buildFrameBlocks(lane))
+}
+
+// frameBlock is one frame's rendered transcript lines plus whether it pairs TIGHT to the next
+// block (a tool_use and its own result: a single blank line becomes none). flattenBlocks turns a
+// slice of these back into the exact []string buildTranscriptLines produced.
+type frameBlock struct {
+	lines []string
+	tight bool // tightNext for this frame: the separator to the NEXT block is "\n" not "\n\n"
+}
+
+// flattenBlocks joins per-frame blocks into display lines, reproducing buildTranscriptLines'
+// separators: a tight block abuts the next, a non-tight one gets a blank line between.
+func flattenBlocks(blocks []frameBlock) []string {
+	var out []string
+	for i, b := range blocks {
+		out = append(out, b.lines...)
+		if i < len(blocks)-1 && !b.tight {
+			out = append(out, "") // the blank line from "\n\n"
+		}
+	}
+	// buildTranscriptLines did strings.TrimRight(join, "\n") before splitting, so any trailing
+	// blank lines the LAST block ended with were dropped; reproduce that so a memoized flatten is
+	// byte-identical to the old direct build (interior blank lines are significant and kept).
+	for len(out) > 0 && out[len(out)-1] == "" {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+// buildFrameBlocks renders each frame of a lane to its own frameBlock, the per-frame granularity
+// the transcript memo (PRD #1137 M6) splices at: flattenBlocks(m.buildFrameBlocks(lane)) is
+// output-identical to the old buildTranscriptLines body.
+func (m tuiModel) buildFrameBlocks(lane agentLane) []frameBlock {
+	return m.buildFrameBlocksFrom(lane, 0)
+}
+
+// buildFrameBlocksFrom renders blocks for lane.Frames[start:] BUT computes the cross-frame context
+// (tightNext, and the tool-id→name map that lets an ORPHAN result name its own tool) over the WHOLE
+// lane.Frames — so the append fast path can re-render just the tail without losing context that
+// lives in the frozen prefix. Only the cheap context scan is O(n); the expensive per-frame render
+// (markdown, clampVisual) runs solely for [start:], which is the whole point of the memo. A result
+// whose matching tool_use sits below `start` still resolves its name (names is global), and a
+// result at `start` that is folded under the prefix's last frame still folds (tightNext[start-1] is
+// available). start==0 is the full build.
+func (m tuiModel) buildFrameBlocksFrom(lane agentLane, start int) []frameBlock {
 	aggregated := lane.Key == laneAllKey
 	var ids map[string]string
 	if aggregated {
@@ -79,8 +125,9 @@ func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 			}
 		}
 	}
-	var sb strings.Builder
-	for i, f := range lane.Frames {
+	blocks := make([]frameBlock, 0, len(lane.Frames)-start)
+	for i := start; i < len(lane.Frames); i++ {
+		f := lane.Frames[i]
 		var block string
 		switch f.Kind {
 		case "tool_use":
@@ -168,13 +215,60 @@ func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 		}
 		// Blocks are blank-line separated, EXCEPT a tool_use and ITS OWN result (tightNext, matched
 		// by id) pair tight (a single newline), so a call and its output read as one unit.
-		sep := "\n\n"
-		if tightNext[i] {
-			sep = "\n"
-		}
-		sb.WriteString(block + sep)
+		// flattenBlocks re-applies that separator: a tight block abuts the next, else a blank line.
+		blocks = append(blocks, frameBlock{lines: strings.Split(block, "\n"), tight: tightNext[i]})
 	}
-	return strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
+	return blocks
+}
+
+// transcriptLines returns the selected lane's display lines through the memo: a full-key hit is a
+// map lookup (zero builds), an append (same prefix, more frames) re-renders only from the previous
+// last frame (whose tight pairing may have flipped when its result landed), and anything else — a
+// resize, theme flip, re-suffixed identity, or a prepend (firstSeq changed) — rebuilds. builds is
+// bumped on every miss.
+func (m tuiModel) transcriptLines(lane agentLane) []string {
+	tc := m.detail.tcache
+	if tc == nil {
+		return m.buildTranscriptLines(lane) // nil-safe: zero-value detail (post-exit)
+	}
+	key := lane.Key
+	width := m.transcriptWidth()
+	sig := ""
+	if lane.Key == laneAllKey {
+		sig = m.identitiesSig() // only the aggregated lane's blocks depend on identities
+	}
+	n := len(lane.Frames)
+	var firstSeq, lastSeq int32
+	if n > 0 {
+		firstSeq = lane.Frames[0].Seq
+		lastSeq = lane.Frames[n-1].Seq
+	}
+	e, ok := tc.entries[key]
+	if ok && e.width == width && e.dark == m.dark && e.profile == m.profile && e.identitiesSig == sig && e.firstSeq == firstSeq {
+		if e.n == n && e.lastSeq == lastSeq {
+			return e.lines // full-key hit
+		}
+		// Append fast path: the cached prefix is unchanged (the frame at the cached count still
+		// carries the cached lastSeq) and only newer frames were added. Re-render from the previous
+		// last frame so its tight pairing recomputes, then splice.
+		if e.n >= 1 && e.n < n && lane.Frames[e.n-1].Seq == e.lastSeq {
+			tc.builds++
+			// Re-render from the previous last frame with FULL context (buildFrameBlocksFrom scans
+			// all frames for names/tightNext), so an orphan result in the tail still names its tool
+			// and a folded result at the boundary still folds — only the markdown render is tail-only.
+			tail := m.buildFrameBlocksFrom(lane, e.n-1)
+			blocks := append(append([]frameBlock{}, e.blocks[:e.n-1]...), tail...)
+			lines := flattenBlocks(blocks)
+			tc.entries[key] = transcriptCacheEntry{width, m.dark, m.profile, sig, n, firstSeq, lastSeq, blocks, lines}
+			return lines
+		}
+	}
+	// Full rebuild.
+	tc.builds++
+	blocks := m.buildFrameBlocks(lane)
+	lines := flattenBlocks(blocks)
+	tc.entries[key] = transcriptCacheEntry{width, m.dark, m.profile, sig, n, firstSeq, lastSeq, blocks, lines}
+	return lines
 }
 
 // toolFrameName pulls a tool-use frame's tool name from its payload, so the transcript can
@@ -348,7 +442,7 @@ func padLinesToViewport(lines []string, vp int) string {
 func (m tuiModel) transcriptExtent() (total, viewport int) {
 	viewport = m.transcriptViewport()
 	if lane, ok := m.detail.selectedLane(); ok {
-		total = len(m.buildTranscriptLines(lane))
+		total = len(m.transcriptLines(lane))
 	}
 	return total, viewport
 }
@@ -361,11 +455,31 @@ func (m tuiModel) renderTranscript() string {
 	if ok && lane.Role != "" {
 		title += m.pal.faint.Render(" · " + m.renderer.Plain(lane.Role, 16))
 	}
+	// The transcript pane waits on its own tail page while the header/rail are already up
+	// (PRD #1137 M4). With no frame to show yet, the pane alone reports its state: a failed
+	// tail page shows the error HERE (the header stays up — a page error never collapses the
+	// whole view), otherwise the loading placeholder until the newest page lands. A live
+	// frame that beat the tail (len(frames) > 0) renders instead of hiding.
+	if len(m.detail.frames) == 0 {
+		var placeholder string
+		switch {
+		case m.detail.pageErr != nil:
+			placeholder = "could not load transcript: " + fmtErr(m.detail.pageErr) + " · r to retry"
+		case !m.detail.tailLoaded:
+			placeholder = "loading…"
+		}
+		if placeholder != "" {
+			return m.padPaneTitle(title, "") + "\n" +
+				padLinesToViewport([]string{m.pal.faint.Render(placeholder)}, m.transcriptViewport())
+		}
+		// tailLoaded with no frames and no error: a genuinely empty run — fall through to
+		// the normal (empty) transcript render below.
+	}
 	if !ok {
 		return m.padPaneTitle(title, "") + "\n" +
 			padLinesToViewport([]string{m.pal.faint.Render("no lane selected")}, m.transcriptViewport())
 	}
-	lines := m.buildTranscriptLines(lane)
+	lines := m.transcriptLines(lane)
 	vp := m.transcriptViewport()
 
 	// Bottom-anchored window (PRD #325 M5). Following pins the window to the bottom
@@ -390,7 +504,35 @@ func (m tuiModel) renderTranscript() string {
 	// reach the bottom of the screen even when the content is shorter than the viewport (#379).
 	window := padLinesToViewport(lines[top:end], vp)
 
-	return m.padPaneTitle(title, m.followBadge(top, maxTop)) + "\n" + window
+	badge := m.followBadge(top, maxTop)
+	if bf := m.backfillBadge(); bf != "" {
+		if badge != "" {
+			badge = bf + m.pal.faint.Render("  ") + badge
+		} else {
+			badge = bf
+		}
+	}
+	return m.padPaneTitle(title, badge) + "\n" + window
+}
+
+// backfillBadge reports the background history walk in the pane title, left of the follow badge
+// (PRD #1137 M5). held/total are free because seq is gapless from 1 (D5), so highSeq is the
+// total. It says nothing once the walk is complete; on a failed/stalled page it invites `r`.
+func (m tuiModel) backfillBadge() string {
+	if m.detail.historyComplete {
+		return ""
+	}
+	if m.detail.backfillFailed {
+		return lipgloss.NewStyle().Foreground(m.pal.amber).Render("⇡ earlier history unavailable · r")
+	}
+	if m.detail.backfilling {
+		// held is derived from the seq bounds, not len(frames): seq is gapless from 1 (D5), so
+		// highSeq-lowSeq+1 is the count of message frames held and never exceeds the highSeq
+		// total, whereas len(frames) would also count any seq-less infra frame (N > M).
+		held := int(m.detail.highSeq - m.detail.lowSeq + 1)
+		return m.pal.faint.Render("⇡ loading earlier · " + itoa(held) + " of " + itoa(int(m.detail.highSeq)))
+	}
+	return ""
 }
 
 // followBadge is the transcript's live-follow affordance (M5) — distinct from the transport

@@ -15,11 +15,7 @@ import (
 func loadDetail(t *testing.T, runID, health string, msgs []apitypes.MessageDTO) tuiModel {
 	t.Helper()
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{
-		run:  apitypes.RunDTO{ID: runID, Status: "running", Health: health},
-		msgs: msgs,
-	})
-	return next.(tuiModel)
+	return applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", Health: health}, msgs)
 }
 
 // The aggregated "all agents" lane is gated on ≥2 real lanes (a single-actor run would only

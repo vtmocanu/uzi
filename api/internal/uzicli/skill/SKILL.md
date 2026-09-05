@@ -144,7 +144,7 @@ uzi context rm <name>
 
 uzi run list
 uzi run get <run-id> [--field <name>]...
-uzi run logs <run-id> [--follow] [--after <seq>]
+uzi run logs <run-id> [--follow] [--after <seq>] [--tail <n>]
 uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run review <run-id>
 uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base]

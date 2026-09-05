@@ -127,11 +127,42 @@ type buildInfoMsg struct {
 	err     error
 }
 
-type detailLoadedMsg struct {
+// detailRunMsg carries the first GetRun for the drilled-in run (PRD #1137). The header,
+// crew-rail milestones/accounts and now-line render from it, before the transcript.
+type detailRunMsg struct {
 	runID string
 	run   apitypes.RunDTO
+	err   error
+	// gen is the detail SESSION generation the request was issued under (detailState.gen).
+	// exitToBoard cannot cancel an in-flight command, and reopening the SAME run passes the
+	// runID guard, so a reply from the previous session is rejected on gen instead.
+	gen uint64
+}
+
+// detailPageKind tags a transcript page. pageTail is the newest page; pageBackfill is the
+// background walk toward older history (M5); pageCatchup is the incremental socket-down /
+// manual-refresh recovery of frames after the highest seq held (M7).
+type detailPageKind int
+
+const (
+	pageTail detailPageKind = iota
+	pageBackfill
+	pageCatchup
+)
+
+// detailPageMsg carries one page of transcript messages for the drilled-in run.
+type detailPageMsg struct {
+	runID string
+	kind  detailPageKind
 	msgs  []apitypes.MessageDTO
 	err   error
+	// reqID is the catch-up chain generation this page belongs to (M7), used only by pageCatchup
+	// so a superseded chain's reply is dropped; pageTail/pageBackfill leave it zero.
+	reqID uint64
+	// gen is the detail SESSION generation (detailState.gen) the page was requested under. A
+	// page from a session the user has since left — even for the same run, which passes the
+	// runID guard — must not touch the new session's cursor, guards or pane state.
+	gen uint64
 }
 
 type streamReadyMsg struct {
@@ -185,6 +216,10 @@ type tuiModel struct {
 	view   tuiView
 	board  boardState
 	detail detailState
+	// detailGen counts detail sessions opened from the board; each drill-in stamps the new
+	// detailState.gen from it, so a reply issued under an earlier session (same run reopened)
+	// is rejected by the gen check in the detailRunMsg / detailPageMsg cases.
+	detailGen uint64
 
 	// quitting is the ctrl+c confirm modal (q quits immediately and does NOT route through
 	// it); ctrlCSeen makes a second ctrl+c quit immediately, which is the escape hatch a user
@@ -294,7 +329,7 @@ func (m tuiModel) initCmds() []tea.Cmd {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
 	}
 	if m.view == viewDetail {
-		cmds = append(cmds, m.loadDetailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
+		cmds = append(cmds, m.loadRunCmd(m.detail.runID), m.loadTailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
 	}
 	return cmds
 }
@@ -462,16 +497,59 @@ func (m tuiModel) fetchBuildInfoCmd() tea.Cmd {
 	}
 }
 
-func (m tuiModel) loadDetailCmd(runID string) tea.Cmd {
-	c, ctx := m.client, m.ctx
+// detailPageSize is the transcript page size (matches uzicli's logsPageSize). detailPayloadMax
+// is the ?payload_max the TUI asks for — the two bulky fields it never draws in full are
+// trimmed on the wire (PRD #1137 D4). Both are vars so tests can shrink them.
+var (
+	detailPageSize   int32 = 200
+	detailPayloadMax int32 = 2048
+)
+
+func (m tuiModel) loadRunCmd(runID string) tea.Cmd {
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
 		run, err := c.GetRun(ctx, runID)
-		if err != nil {
-			return detailLoadedMsg{runID: runID, err: err}
-		}
-		msgs, err := c.RunLogs(ctx, runID, 0)
-		return detailLoadedMsg{runID: runID, run: run, msgs: msgs, err: err}
+		return detailRunMsg{runID: runID, run: run, err: err, gen: gen}
 	}
+}
+
+func (m tuiModel) loadTailCmd(runID string) tea.Cmd {
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
+	return func() tea.Msg {
+		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{Tail: detailPageSize, PayloadMax: detailPayloadMax})
+		return detailPageMsg{runID: runID, kind: pageTail, msgs: msgs, err: err, gen: gen}
+	}
+}
+
+// backfillCmd fetches the newest page strictly below `before` (older history), for the
+// background walk that fills the transcript after the tail (PRD #1137 D1). One page; the
+// reply chains the next.
+func (m tuiModel) backfillCmd(runID string, before int32) tea.Cmd {
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
+	return func() tea.Msg {
+		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{Before: before, Limit: detailPageSize, PayloadMax: detailPayloadMax})
+		return detailPageMsg{runID: runID, kind: pageBackfill, msgs: msgs, err: err, gen: gen}
+	}
+}
+
+// catchupCmd fetches the page of messages AFTER `after` (seq the view already holds), the socket-
+// down / manual-refresh path that recovers frames the dead stream would have carried. reqID tags
+// the reply so a superseded chain is dropped.
+func (m tuiModel) catchupCmd(runID string, after int32, reqID uint64) tea.Cmd {
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
+	return func() tea.Msg {
+		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{After: after, Limit: detailPageSize, PayloadMax: detailPayloadMax})
+		return detailPageMsg{runID: runID, kind: pageCatchup, reqID: reqID, msgs: msgs, err: err, gen: gen}
+	}
+}
+
+// startDetailCatchupReq mints the next catch-up id and returns the first page from the highest seq
+// held. The caller must gate on catchupWaitID == 0 (no chain in flight) AND highSeq > 0 (never an
+// after=0 whole-transcript fetch — SC4).
+func (m *tuiModel) startDetailCatchupReq() tea.Cmd {
+	m.detail.catchupSeq++
+	m.detail.catchupWaitID = m.detail.catchupSeq
+	return m.catchupCmd(m.detail.runID, m.detail.highSeq, m.detail.catchupWaitID)
 }
 
 // refreshRunMetaCmd re-reads only the run DTO (no transcript replay), so the periodic
@@ -522,8 +600,12 @@ func readStreamCmd(runID string, s *uzicli.RunStream) tea.Cmd {
 	}
 }
 
+// pollFallbackInterval is the D8 REST-poll cadence (the same 2s `uzi run logs --follow` uses). A
+// var so a test can shrink it and drain the re-armed tick without blocking on the real 2s.
+var pollFallbackInterval = 2 * time.Second
+
 func pollFallbackCmd() tea.Cmd {
-	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return pollFallbackMsg{} })
+	return tea.Tick(pollFallbackInterval, func(time.Time) tea.Msg { return pollFallbackMsg{} })
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -653,15 +735,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case detailLoadedMsg:
+	case detailRunMsg:
 		// Drop a load that resolved for a run the user has since navigated away from:
 		// esc/exitToBoard resets m.detail to its zero value (runID "", nil `seen` map), and
-		// drilling into another run swaps runID — a late applyLoaded from the previous run
-		// would splice the wrong transcript in, and against the zero value it would write the
-		// nil map and panic. Same runID guard every sibling detail message carries. runID is
-		// set by loadDetailCmd on both the success and error paths; run.ID is the fallback for
-		// a message that carries only the run (the error path leaves run zero, which is why the
-		// explicit field exists).
+		// drilling into another run swaps runID — a late applyRun from the previous run would
+		// flip the wrong header in, and against the zero value it would write the nil map and
+		// panic. Same runID guard every sibling detail message carries. runID is set by
+		// loadRunCmd on both the success and error paths; run.ID is the fallback for a message
+		// that carries only the run (the error path leaves run zero, which is why the explicit
+		// field exists).
 		id := msg.runID
 		if id == "" {
 			id = msg.run.ID
@@ -669,10 +751,77 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if id != m.detail.runID {
 			return m, nil
 		}
-		m.detail.applyLoaded(msg)
-		// The ownership probe rides the same call the queue indicator needs; a milestone run
-		// that opens with work in progress arms the blink too.
+		if msg.gen != m.detail.gen {
+			return m, nil // a reply from a detail session the user has since left (same run reopened)
+		}
+		m.detail.applyRun(msg.run, msg.err)
+		// The ownership probe + queue indicator and the in-progress-milestone blink both
+		// key off the run DTO, so they ride the run load (as the old full-load did).
 		return m, tea.Batch(m.fetchInputsCmd(m.detail.runID), m.maybeArmBlink())
+
+	case detailPageMsg:
+		if msg.runID != m.detail.runID {
+			return m, nil
+		}
+		// Session guard: exitToBoard cannot cancel an in-flight page command, and reopening the
+		// SAME run passes the runID check above. A stale page would clear tailInFlight, start a
+		// second backfill chain from an obsolete cursor, or paint an old error over the new pane
+		// — so it is rejected on the session generation before touching any state.
+		if msg.gen != m.detail.gen {
+			return m, nil
+		}
+		switch msg.kind {
+		case pageTail:
+			// Any tail reply — success or error — releases the retry guard, so a failed retry
+			// re-enables the next `r` / fallback tick instead of wedging the stuck state.
+			m.detail.tailInFlight = false
+			m.detail.applyTailPage(msg.msgs, msg.err)
+			// Raise the stream's replay floor to the highest seq now held, so a reconnect replays
+			// only frames after the tail rather than the whole history (PRD #1137 M7).
+			if s := m.detail.stream; s != nil {
+				s.NoteSeen(m.detail.highSeq)
+			}
+			// Start the background backfill once the tail is in, if there is older history to
+			// walk (PRD #1137 D1). The reply chains the next page. The !backfilling guard keeps a
+			// second tail page (e.g. an `r` retry of a failed initial tail) from starting a SECOND
+			// parallel backfill chain over the shared lowSeq cursor.
+			if msg.err == nil && !m.detail.historyComplete && !m.detail.backfilling && m.detail.lowSeq > 1 {
+				m.detail.backfilling = true
+				return m, m.backfillCmd(m.detail.runID, m.detail.lowSeq)
+			}
+			// Only a SUCCESSFUL tail with nothing older is complete. A tail ERROR adds no frames
+			// (lowSeq stays 0), so it must NOT latch historyComplete — otherwise a later `r`
+			// retry that loads real history would never start the backfill (the start guard
+			// requires !historyComplete).
+			if msg.err == nil && m.detail.lowSeq <= 1 { // 0 (empty run) or 1 (start already held)
+				m.detail.historyComplete = true
+			}
+			return m, nil
+		case pageBackfill:
+			return m, (&m).applyBackfillPage(msg.msgs, msg.err)
+		case pageCatchup:
+			if msg.reqID != m.detail.catchupWaitID {
+				return m, nil // a superseded / stale catch-up reply
+			}
+			if msg.err != nil {
+				m.detail.catchupWaitID = 0 // chain ends; the next tick may retry
+				return m, nil
+			}
+			before := m.detail.highSeq
+			m.detail.applyCatchupPage(msg.msgs)
+			if s := m.detail.stream; s != nil {
+				s.NoteSeen(m.detail.highSeq)
+			}
+			// Stop on an empty page (caught up) OR a page that did not advance the cursor (a
+			// hostile/broken server or an all-duplicate page — the mirror of the backfill
+			// did-not-advance guard), so the chain can never spin without clearing its guard.
+			if len(msg.msgs) == 0 || m.detail.highSeq <= before {
+				m.detail.catchupWaitID = 0 // caught up (or cannot advance): chain done
+				return m, nil
+			}
+			return m, m.catchupCmd(m.detail.runID, m.detail.highSeq, msg.reqID) // chain the next page (same id)
+		}
+		return m, nil
 
 	case detailMetaMsg:
 		// runID is checked FIRST (PRD #1130 M1 D2): metaSeq restarts per run (newDetailState),
@@ -752,6 +901,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detail.stream = msg.stream
 		m.detail.streamErr = nil
 		m.detail.polling = false
+		// Seed the replay floor with the highest seq already held (from a tail/catch-up page that
+		// landed before the socket opened), so this stream's first reconnect replays only newer
+		// frames rather than the whole history (PRD #1137 M7).
+		m.detail.stream.NoteSeen(m.detail.highSeq)
 		return m, readStreamCmd(msg.runID, msg.stream)
 
 	case streamEventsMsg:
@@ -783,7 +936,23 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.view != viewDetail || !m.detail.polling {
 			return m, nil
 		}
-		return m, tea.Batch(m.loadDetailCmd(m.detail.runID), pollFallbackCmd())
+		cmds := []tea.Cmd{pollFallbackCmd()} // always re-arm the 2s tick while polling
+		if m.detail.metaWaitID == 0 {
+			cmds = append(cmds, (&m).startDetailMetaReq()) // one meta refresh, guarded (#1135)
+		}
+		switch {
+		case m.detail.pageErr != nil && m.detail.highSeq == 0 && !m.detail.tailInFlight:
+			// The initial tail failed and the socket is also down, so nothing ever loaded the
+			// transcript: retry the tail. Bounded to this stuck state (a held page moves to the
+			// guarded catch-up below), so it never reintroduces the per-tick whole-transcript
+			// refetch M7 removed — and guarded by tailInFlight so a slow link cannot stack a
+			// second tail request per tick on one still in flight (the #1130 anti-stack property).
+			m.detail.tailInFlight = true
+			cmds = append(cmds, m.loadTailCmd(m.detail.runID))
+		case m.detail.catchupWaitID == 0 && m.detail.highSeq > 0:
+			cmds = append(cmds, (&m).startDetailCatchupReq()) // one catch-up chain, guarded
+		}
+		return m, tea.Batch(cmds...)
 	}
 	return m, nil
 }

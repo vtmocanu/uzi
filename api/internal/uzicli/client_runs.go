@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strconv"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -80,6 +81,81 @@ func (c *HTTPClient) RunLogs(ctx context.Context, id string, after int32) ([]api
 		}
 		seq = next
 	}
+}
+
+// validate mirrors the server's exclusivity matrix (runs_lifecycle.go
+// ListRunMessages) client-side, so a forbidden combination is an ExitUsage error
+// before any request leaves the process. It does NOT clamp Tail/Limit — the server
+// clamps to maxRunMessagesPage; the client forwards what the caller asked.
+func (q LogsPageQuery) validate() error {
+	hasAfter := q.After > 0
+	hasTail := q.Tail != 0
+	hasBefore := q.Before != 0
+	hasLimit := q.Limit != 0
+	if q.After < 0 {
+		return Exitf(ExitUsage, "after must be a non-negative integer")
+	}
+	if hasTail && q.Tail < 1 {
+		return Exitf(ExitUsage, "tail must be a positive integer")
+	}
+	if hasBefore && q.Before < 1 {
+		return Exitf(ExitUsage, "before must be a positive integer")
+	}
+	if hasLimit && q.Limit < 1 {
+		return Exitf(ExitUsage, "limit must be a positive integer")
+	}
+	if q.PayloadMax < 0 {
+		return Exitf(ExitUsage, "payload_max must be a positive integer")
+	}
+	if hasTail && (hasAfter || hasBefore || hasLimit) {
+		return Exitf(ExitUsage, "tail cannot be combined with after, before or limit")
+	}
+	if hasBefore {
+		if hasAfter || hasTail {
+			return Exitf(ExitUsage, "before cannot be combined with after or tail")
+		}
+		if !hasLimit {
+			return Exitf(ExitUsage, "before requires limit")
+		}
+	}
+	return nil
+}
+
+// RunLogsPage fetches exactly ONE page of a run's messages per q (?after / ?tail /
+// ?before+?limit, plus the combinable ?payload_max), unlike RunLogs' internal loop
+// (D10). The query is validated client-side against the server's mutual-exclusion
+// rules first, so a forbidden combination returns ExitUsage before any request.
+func (c *HTTPClient) RunLogsPage(ctx context.Context, id string, q LogsPageQuery) ([]apitypes.MessageDTO, error) {
+	if err := q.validate(); err != nil {
+		return nil, err
+	}
+	vals := url.Values{}
+	if q.After > 0 {
+		vals.Set("after", strconv.FormatInt(int64(q.After), 10))
+	}
+	if q.Before != 0 {
+		vals.Set("before", strconv.FormatInt(int64(q.Before), 10))
+	}
+	if q.Tail != 0 {
+		vals.Set("tail", strconv.FormatInt(int64(q.Tail), 10))
+	}
+	if q.Limit != 0 {
+		vals.Set("limit", strconv.FormatInt(int64(q.Limit), 10))
+	}
+	if q.PayloadMax != 0 {
+		vals.Set("payload_max", strconv.FormatInt(int64(q.PayloadMax), 10))
+	}
+	path := "/api/runs/" + url.PathEscape(id) + "/messages"
+	if enc := vals.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	var env struct {
+		Messages []apitypes.MessageDTO `json:"messages"`
+	}
+	if err := c.get(ctx, path, &env); err != nil {
+		return nil, err
+	}
+	return env.Messages, nil
 }
 
 func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, error) {

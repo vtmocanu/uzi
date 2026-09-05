@@ -235,9 +235,8 @@ func TestTUIQuitKeys(t *testing.T) {
 func TestTUIDetailPlanGateBanner(t *testing.T) {
 	runID := "pg-1"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_approval"}})
-	m = next.(tuiModel)
-	next, _ = m.Update(runInputsMsg{runID: runID}) // err nil → owner → steerAllowed
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_approval"}, nil)
+	next, _ := m.Update(runInputsMsg{runID: runID}) // err nil → owner → steerAllowed
 	m = next.(tuiModel)
 	out := m.View().Content
 
@@ -261,9 +260,8 @@ func TestTUIDetailPlanGateBanner(t *testing.T) {
 func TestTUIDetailInputBannerIsDistinctAndHasNoYesNo(t *testing.T) {
 	runID := "in-1"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_input"}})
-	m = next.(tuiModel)
-	next, _ = m.Update(runInputsMsg{runID: runID}) // owner
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_input"}, nil)
+	next, _ := m.Update(runInputsMsg{runID: runID}) // owner
 	m = next.(tuiModel)
 	out := m.View().Content
 
@@ -283,10 +281,9 @@ func TestTUIDetailInputBannerIsDistinctAndHasNoYesNo(t *testing.T) {
 func TestTUIDetailPlanGateBannerNonOwnerHasNoKeys(t *testing.T) {
 	runID := "pg-2"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_approval"}})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_approval"}, nil)
 	// RunInputs 404 → steerNotOwner (an admin observing another user's run).
-	next, _ = m.Update(runInputsMsg{runID: runID, err: uzicli.Exitf(uzicli.ExitNotFound, "not found")})
+	next, _ := m.Update(runInputsMsg{runID: runID, err: uzicli.Exitf(uzicli.ExitNotFound, "not found")})
 	m = next.(tuiModel)
 	out := m.View().Content
 
@@ -310,9 +307,8 @@ func TestTUIDetailFollowupBanner(t *testing.T) {
 
 	// Owner: nil-err runInputs → steerAllowed.
 	mo := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := mo.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_followup"}})
-	mo = next.(tuiModel)
-	next, _ = mo.Update(runInputsMsg{runID: runID})
+	mo = applyDetail(mo, apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_followup"}, nil)
+	next, _ := mo.Update(runInputsMsg{runID: runID})
 	mo = next.(tuiModel)
 	mo.width = 100 // the reference frame width the TUI-UX validator measured against
 	ob := mo.detailBanner()
@@ -331,8 +327,7 @@ func TestTUIDetailFollowupBanner(t *testing.T) {
 
 	// Non-owner: 404 runInputs → steerNotOwner. Same band, but no inert `f` hint.
 	mn := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ = mn.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_followup"}})
-	mn = next.(tuiModel)
+	mn = applyDetail(mn, apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_followup"}, nil)
 	next, _ = mn.Update(runInputsMsg{runID: runID, err: uzicli.Exitf(uzicli.ExitNotFound, "not found")})
 	mn = next.(tuiModel)
 	mn.width = 100
@@ -352,10 +347,9 @@ func TestTUIReviewVerdictSeverityColour(t *testing.T) {
 	render := func(verdict string) string {
 		runID := "rv-" + verdict
 		m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-		next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Status: "completed"}})
-		m = next.(tuiModel)
+		m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "completed"}, nil)
 		m = press(t, m, "v")
-		next, _ = m.Update(reviewLoadedMsg{runID: runID, review: &apitypes.ReviewDTO{Verdict: verdict}})
+		next, _ := m.Update(reviewLoadedMsg{runID: runID, review: &apitypes.ReviewDTO{Verdict: verdict}})
 		m = next.(tuiModel)
 		return m.View().Content
 	}
@@ -398,14 +392,11 @@ func TestTUIDetailBuildsLanesFromReplayThenLiveFrames(t *testing.T) {
 	fake := &uzicli.FakeClient{}
 	m := tuiTestModel(t, fake, runID)
 
-	next, _ := m.Update(detailLoadedMsg{
-		run: apitypes.RunDTO{ID: runID, Status: "running", Health: "ok"},
-		msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", Health: "ok"},
+		[]apitypes.MessageDTO{
 			msgDTO(1, "text", "lead", "", "", "planning", now.Add(-2*time.Minute)),
 			msgDTO(2, "text", "coder", "toolu_aaa111", "write the tests", "writing", now.Add(-time.Minute)),
-		},
-	})
-	m = next.(tuiModel)
+		})
 
 	// 2 real lanes (lead, coder) plus the prepended aggregated "all agents" lane = 3.
 	if len(m.detail.lanes) != 3 {
@@ -421,7 +412,7 @@ func TestTUIDetailBuildsLanesFromReplayThenLiveFrames(t *testing.T) {
 	// A live frame for a NEW invocation opens a third lane.
 	inst, agent := "toolu_bbb222", "tester"
 	at := now
-	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+	next, _ := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
 		Type: uzicli.RunEventTypeMessage, Seq: 3, Kind: "text",
 		Agent: &agent, AgentInstance: &inst, CreatedAt: &at,
 		Payload: json.RawMessage(`{"text":"testing"}`),
@@ -440,14 +431,11 @@ func TestTUIDetailDedupesBySeqAcrossTransports(t *testing.T) {
 	runID := "eeeeeeee-1111"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 
-	next, _ := m.Update(detailLoadedMsg{
-		run:  apitypes.RunDTO{ID: runID, Status: "running"},
-		msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hello", now)},
-	})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running"},
+		[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hello", now)})
 
 	agent, at := "lead", now
-	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+	next, _ := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
 		Type: uzicli.RunEventTypeMessage, Seq: 1, Kind: "text", Agent: &agent, CreatedAt: &at,
 		Payload: json.RawMessage(`{"text":"hello"}`),
 	}}})
@@ -463,10 +451,9 @@ func TestTUIDetailDedupesBySeqAcrossTransports(t *testing.T) {
 func TestTUIDetailAppliesStateFrames(t *testing.T) {
 	runID := "ffffffff-1111"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Status: "running"}})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running"}, nil)
 
-	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{
+	next, _ := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{
 		{Type: uzicli.RunEventTypeState, Status: "completed"},
 	}})
 	m = next.(tuiModel)
@@ -488,8 +475,7 @@ func TestTUIDetailDegradesWhenTheStreamCannotOpen(t *testing.T) {
 		RunByID:   map[string]apitypes.RunDTO{runID: {ID: runID, Status: "running"}},
 	}
 	m := tuiTestModel(t, fake, runID)
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Status: "running"}})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running"}, nil)
 
 	next, cmd := m.Update(streamReadyMsg{runID: runID, err: fake.StreamErr})
 	m = next.(tuiModel)
@@ -509,11 +495,10 @@ func TestTUIDetailDegradesWhenTheStreamCannotOpen(t *testing.T) {
 // overwrite the run they are now looking at.
 func TestTUIDetailIgnoresRepliesForAnotherRun(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "run-current")
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: "run-current", Status: "running"}})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: "run-current", Status: "running"}, nil)
 
 	agent, at := "coder", time.Now()
-	next, _ = m.Update(streamEventsMsg{runID: "run-OTHER", events: []apitypes.RunEventDTO{{
+	next, _ := m.Update(streamEventsMsg{runID: "run-OTHER", events: []apitypes.RunEventDTO{{
 		Type: uzicli.RunEventTypeMessage, Seq: 9, Kind: "text", Agent: &agent, CreatedAt: &at,
 		Payload: json.RawMessage(`{"text":"from another run"}`),
 	}}})
@@ -531,15 +516,12 @@ func TestTUIDetailFocusPaneNavigation(t *testing.T) {
 	now := time.Now()
 	runID := "77777777-1111"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{
-		run: apitypes.RunDTO{ID: runID, Status: "running"},
-		msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running"},
+		[]apitypes.MessageDTO{
 			msgDTO(1, "text", "lead", "", "", "a", now),
 			msgDTO(2, "text", "coder", "toolu_a", "", "b", now),
 			msgDTO(3, "text", "tester", "toolu_b", "", "c", now),
-		},
-	})
-	m = next.(tuiModel)
+		})
 
 	// Detail opens focused on the crew rail.
 	if m.detail.focus != focusRail {
@@ -600,9 +582,8 @@ func TestTUIDetailFocusPaneNavigation(t *testing.T) {
 func TestTUIDetailFooterIsOneLine(t *testing.T) {
 	runID := "foot-1"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}})
-	m = next.(tuiModel)
-	next, _ = m.Update(runInputsMsg{runID: runID}) // owner → steerAllowed
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}, nil)
+	next, _ := m.Update(runInputsMsg{runID: runID}) // owner → steerAllowed
 	m = next.(tuiModel)
 
 	lines := strings.Split(strings.TrimRight(m.View().Content, "\n"), "\n")
@@ -627,8 +608,7 @@ func TestTUIDetailFollowLive(t *testing.T) {
 	for i := int32(1); i <= 8; i++ {
 		msgs = append(msgs, msgDTO(i, "text", "lead", "", "", fmt.Sprintf("frame %d body", i), now))
 	}
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}, msgs: msgs})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}, msgs)
 	m = press(t, m, keyRight) // focus the transcript so ↑/↓ scroll it
 
 	// A live run opens following, bottom-anchored: the newest frame shows, the oldest does not.
@@ -651,7 +631,7 @@ func TestTUIDetailFollowLive(t *testing.T) {
 
 	// A new frame while following auto-tails to the newest.
 	agent, at := "lead", now
-	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+	next, _ := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
 		Type: uzicli.RunEventTypeMessage, Seq: 9, Kind: "text", Agent: &agent, CreatedAt: &at,
 		Payload: json.RawMessage(`{"text":"frame 9 body"}`),
 	}}})
@@ -696,8 +676,7 @@ func TestTUIDetailPausedScrollSurvivesResize(t *testing.T) {
 	for i := int32(1); i <= 8; i++ {
 		msgs = append(msgs, msgDTO(i, "text", "lead", "", "", fmt.Sprintf("frame %d body", i), now))
 	}
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}, msgs: msgs})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}, msgs)
 	m = press(t, m, keyRight) // focus the transcript
 
 	m = press(t, m, "k") // one scroll up → paused, scroll = maxTop-1
@@ -707,7 +686,7 @@ func TestTUIDetailPausedScrollSurvivesResize(t *testing.T) {
 	pausedScroll := m.detail.scroll
 
 	// Resize taller: the viewport grows, so maxTop shrinks below the stored scroll.
-	next, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 19})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 19})
 	m = next.(tuiModel)
 
 	m = press(t, m, "k") // UP: scroll toward older output, stay paused
@@ -723,8 +702,7 @@ func TestTUIDetailPausedScrollSurvivesResize(t *testing.T) {
 // leaks a socket and a goroutine for the life of the session.
 func TestTUIDetailEscReturnsToBoard(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "run-1")
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: "run-1", Status: "running"}})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: "run-1", Status: "running"}, nil)
 
 	stream := uzicli.NewRunStream(context.Background(), nil)
 	m.detail.stream = stream
@@ -818,18 +796,17 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// "credsafe" carries the same hostile control/bidi bytes but a tail that only the rail's
 	// account-label render can put into the frame.
 	detailCredLabel := "\x1b[2J\u202E\x07\x01credsafe" //nolint:gosec // G101: not a credential - a hostile control/bidi-byte sanitization fixture whose display label happens to contain "cred"; the test asserts it is stripped, never a secret.
-	next, _ = detail.Update(detailLoadedMsg{
-		// A hostile milestone title exercises renderMilestones' crew-rail draw (D7): the
-		// in-progress id makes the row render its title through renderer.Plain. The hostile
-		// AnthropicSecretLabel exercises the detail rail ACCOUNTS label (railRateMeters →
-		// renderer.Plain, PRD #623 — the header credential tag was removed). AnthropicSecretID
-		// is set so the label force-shows in the rail; with no rateLimits seeded this drives the
-		// synthesis path (a label-only entry from AnthropicSecretLabel).
-		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: nasty,
-			AnthropicSecretID: &secretID, AnthropicSecretLabel: &detailCredLabel,
-			Milestones:           []apitypes.Milestone{{ID: "m1", Title: nasty}},
-			MilestonesInProgress: []string{"m1"}},
-		msgs: []apitypes.MessageDTO{
+	// A hostile milestone title exercises renderMilestones' crew-rail draw (D7): the
+	// in-progress id makes the row render its title through renderer.Plain. The hostile
+	// AnthropicSecretLabel exercises the detail rail ACCOUNTS label (railRateMeters →
+	// renderer.Plain, PRD #623 — the header credential tag was removed). AnthropicSecretID
+	// is set so the label force-shows in the rail; with no rateLimits seeded this drives the
+	// synthesis path (a label-only entry from AnthropicSecretLabel).
+	detail = applyDetail(detail, apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: nasty,
+		AnthropicSecretID: &secretID, AnthropicSecretLabel: &detailCredLabel,
+		Milestones:           []apitypes.Milestone{{ID: "m1", Title: nasty}},
+		MilestonesInProgress: []string{"m1"}},
+		[]apitypes.MessageDTO{
 			msgDTO(1, "text", nasty, "toolu_"+nasty, nasty, nasty, now),
 			// A hostile tool_use frame drives the crew rail's now line (renderMilestones →
 			// railNowLines, PRD #1064 D4): the role (Agent) and the italic task label
@@ -837,9 +814,7 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 			// wire, and must be drawn through renderer.Plain.
 			{Seq: 2, Kind: "tool_use", Agent: ptr(nasty), AgentLabel: ptr(nasty), CreatedAt: now,
 				Payload: json.RawMessage(`{"name":"Bash","input":{"description":` + quoteJSON(nasty) + `}}`)},
-		},
-	})
-	detail = next.(tuiModel)
+		})
 	detailOut := detail.View().Content
 	assertNoRawControls(t, "detail", detailOut)
 	// The hostile AnthropicSecretLabel sanitizes to "credsafe", which can ONLY reach detailOut via
@@ -959,14 +934,11 @@ func TestTUIDetailLeftExitsAtBoundaryNotBefore(t *testing.T) {
 	runID := "bbbbbbbb-1111"
 	now := time.Now()
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{
-		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "multi-lane"},
-		msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "multi-lane"},
+		[]apitypes.MessageDTO{
 			msgDTO(1, "text", "lead", "toolu_a", "impl", "hi", now),
 			msgDTO(2, "text", "coder", "toolu_b", "impl", "yo", now),
-		},
-	})
-	m = next.(tuiModel)
+		})
 	m.detail.focus = focusTranscript
 
 	// First ← focuses the rail, still inside the detail view.
@@ -1026,9 +998,8 @@ func TestTUIDetailHeaderIsAlwaysOneRow(t *testing.T) {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 		m.width = w
 		run := apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: title}
-		next, _ := m.Update(detailLoadedMsg{run: run,
-			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hi", time.Now())}})
-		return next.(tuiModel)
+		return applyDetail(m, run,
+			[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hi", time.Now())})
 	}
 
 	// Wide + short title: one row carrying the full title AND the status word.
@@ -1079,16 +1050,13 @@ func TestTUITranscriptStripsControlBytesFromToolName(t *testing.T) {
 	runID := "77777777-2222"
 
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{
-		run: apitypes.RunDTO{ID: runID, Status: "running"},
-		msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running"},
+		[]apitypes.MessageDTO{
 			// A benign text frame opens the lane; the tool_use frame (same instance) is what the
 			// toolFrameName path compresses to `⚙ <name>`.
 			msgDTO(1, "text", "coder", "toolu_aaa111", "impl", "hello", now),
 			toolUseMsg(2, "coder", "toolu_aaa111", nasty, now),
-		},
-	})
-	m = next.(tuiModel)
+		})
 
 	out := m.View().Content
 	// The sanitized tool name's "safe" tail proves the `⚙ <name>` path ran — otherwise this test
@@ -1117,9 +1085,8 @@ func TestTUIDetailMilestoneBlock(t *testing.T) {
 	}
 	load := func(run apitypes.RunDTO) string {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
-		next, _ := m.Update(detailLoadedMsg{run: run,
-			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
-		return next.(tuiModel).View().Content
+		return applyDetail(m, run,
+			[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}).View().Content
 	}
 
 	out := load(milestoneRun)
@@ -1171,8 +1138,7 @@ func TestTUIDetailMilestoneBlock(t *testing.T) {
 	// early return once made that branch dead, so a milestone run showed no block before its
 	// first frame. `load` seeds a frame, so this case loads with none.
 	noAct := tuiTestModel(t, &uzicli.FakeClient{}, milestoneRun.ID)
-	nextNA, _ := noAct.Update(detailLoadedMsg{run: milestoneRun})
-	na := nextNA.(tuiModel).View().Content
+	na := applyDetail(noAct, milestoneRun, nil).View().Content
 	if !strings.Contains(na, "MILESTONES") || !strings.Contains(na, "no activity yet") {
 		t.Errorf("a milestone run with no activity yet should show the block AND '(no activity yet)'\n%s", na)
 	}
@@ -1187,11 +1153,9 @@ func TestTUIDetailFillsHeight(t *testing.T) {
 	runID := "55555555-1111"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 	m.width, m.height = 100, 40
-	next, _ := m.Update(detailLoadedMsg{
-		run:  apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "short"},
-		msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "one short line", now)},
-	})
-	rows := strings.Split(next.(tuiModel).View().Content, "\n")
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "short"},
+		[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "one short line", now)})
+	rows := strings.Split(m.View().Content, "\n")
 	if len(rows) != 40 {
 		t.Fatalf("detail view rendered %d rows, want exactly the terminal height 40\n%s", len(rows), strings.Join(rows, "\n"))
 	}
@@ -1214,20 +1178,18 @@ func TestTUIDetailFooterSurvivesTallRail(t *testing.T) {
 	runID := "44444444-1111"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 	m.width, m.height = 100, 20
-	next, _ := m.Update(detailLoadedMsg{
-		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "many lanes",
-			Milestones: []apitypes.Milestone{{ID: "m1", Title: "a"}, {ID: "m2", Title: "b"},
-				{ID: "m3", Title: "c"}, {ID: "m4", Title: "d"}},
-			MilestonesCompleted: []string{"m1"}, MilestonesInProgress: []string{"m2"}},
-		msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "many lanes",
+		Milestones: []apitypes.Milestone{{ID: "m1", Title: "a"}, {ID: "m2", Title: "b"},
+			{ID: "m3", Title: "c"}, {ID: "m4", Title: "d"}},
+		MilestonesCompleted: []string{"m1"}, MilestonesInProgress: []string{"m2"}},
+		[]apitypes.MessageDTO{
 			msgDTO(1, "text", "lead", "", "", "planning", now),
 			msgDTO(2, "text", "coder", "toolu_a", "impl", "a", now),
 			msgDTO(3, "text", "tester", "toolu_b", "sweep", "b", now),
 			msgDTO(4, "text", "reviewer", "toolu_c", "review", "c", now),
 			msgDTO(5, "text", "auditor", "toolu_d", "audit", "d", now),
-		},
-	})
-	out := next.(tuiModel).View().Content
+		})
+	out := m.View().Content
 	if rows := strings.Split(out, "\n"); len(rows) > 20 {
 		t.Fatalf("detail rendered %d rows at height 20; a tall rail must clamp, not overflow\n%s", len(rows), out)
 	}
@@ -2063,10 +2025,9 @@ func spendModel(t *testing.T, usage *apitypes.UsageDTO) tuiModel {
 	t.Helper()
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "run-detail")
 	m.width, m.height = 100, 40
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{
+	return applyDetail(m, apitypes.RunDTO{
 		ID: "run-detail", Status: "running", IssueTitle: "cost run", Usage: usage,
-	}})
-	return next.(tuiModel)
+	}, nil)
 }
 
 // TestTUIDetailHeadlineCost — PRD #650 M3 Part A: the run-view status tag carries the run's
@@ -2108,11 +2069,10 @@ func TestTUIDetailSpendBlock(t *testing.T) {
 	}})
 	m = next.(tuiModel)
 	sid, lbl := "sec-run", "runacct"
-	next, _ = m.Update(detailLoadedMsg{run: apitypes.RunDTO{
+	m = applyDetail(m, apitypes.RunDTO{
 		ID: "run-detail", Status: "running", Health: "ok", IssueTitle: "cost run",
 		AnthropicSecretID: &sid, AnthropicSecretLabel: &lbl, Usage: spendUsage(),
-	}})
-	m = next.(tuiModel)
+	}, nil)
 
 	out := stripANSI(m.renderLaneRail())
 	pct := cacheDisplayPct(2_400_000, 14_200_000, 0)
@@ -2160,13 +2120,13 @@ func TestTUIDetailSpendDropsWhole(t *testing.T) {
 	// own "cache" line (no half-drawn block).
 	short := tuiTestModel(t, &uzicli.FakeClient{}, "run-detail")
 	short.width, short.height = 100, 12
-	nx, _ := short.Update(detailLoadedMsg{run: apitypes.RunDTO{
+	nx := applyDetail(short, apitypes.RunDTO{
 		ID: "run-detail", Status: "running", IssueTitle: "cost run",
 		Milestones:          []apitypes.Milestone{{ID: "m1", Title: "a"}, {ID: "m2", Title: "b"}, {ID: "m3", Title: "c"}},
 		MilestonesCompleted: []string{"m1"},
 		Usage:               spendUsage(),
-	}})
-	rail := stripANSI(nx.(tuiModel).renderLaneRail())
+	}, nil)
+	rail := stripANSI(nx.renderLaneRail())
 	if strings.Contains(rail, "SPEND") {
 		t.Fatalf("SPEND should be dropped whole at a short height:\n%s", rail)
 	}
@@ -2233,16 +2193,15 @@ func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 func TestTUIDetailCostAsciiSurvives(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "run-detail")
 	m.width, m.height = 100, 40
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{
+	m = applyDetail(m, apitypes.RunDTO{
 		ID: "run-detail", Status: "running", Health: "ok", IssueTitle: "cost run",
 		Usage: &apitypes.UsageDTO{
 			CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000,
 			CacheCreationTokens: 0, OutputTokens: 88_400,
 		},
-	}})
-	m = next.(tuiModel)
+	}, nil)
 
-	next, _ = m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	m = next.(tuiModel)
 
 	// The header carries the faint headline cost even with colour gone.
@@ -2262,8 +2221,8 @@ func TestTUIDetailCostAsciiSurvives(t *testing.T) {
 }
 
 // A detail load that resolves AFTER the user has left the run must be dropped, not applied:
-// exitToBoard resets m.detail to its zero value (nil `seen` map), so a late applyLoaded would
-// write the nil map and panic (observed in the field). The runID guard drops it.
+// exitToBoard resets m.detail to its zero value (nil `seen` map), so a late applyRun/applyTailPage
+// would write the nil map and panic (observed in the field). The runID guard drops it.
 func TestTUIDetailLateLoadAfterExitIsDropped(t *testing.T) {
 	now := time.Now()
 	runID := "late-1"
@@ -2275,13 +2234,9 @@ func TestTUIDetailLateLoadAfterExitIsDropped(t *testing.T) {
 	}
 	// The in-flight load lands now, for the run just left. It must be dropped, and must not
 	// panic against the torn-down (nil-seen) detail.
-	next, _ := m.Update(detailLoadedMsg{
-		runID: runID,
-		run:   apitypes.RunDTO{ID: runID, Status: "running", Health: "ok"},
-		msgs:  []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hello", now)},
-	})
-	m = next.(tuiModel)
-	if m.detail.loaded {
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", Health: "ok"},
+		[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hello", now)})
+	if m.detail.runLoaded {
 		t.Error("a load for a run the user has left must not populate the detail")
 	}
 	if len(m.detail.frames) != 0 {
@@ -2294,12 +2249,8 @@ func TestTUIDetailLateLoadAfterExitIsDropped(t *testing.T) {
 func TestTUIDetailStaleLoadForOtherRunIsDropped(t *testing.T) {
 	now := time.Now()
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "run-b")
-	next, _ := m.Update(detailLoadedMsg{
-		runID: "run-a",
-		run:   apitypes.RunDTO{ID: "run-a", Status: "running", Health: "ok"},
-		msgs:  []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "from A", now)},
-	})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: "run-a", Status: "running", Health: "ok"},
+		[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "from A", now)})
 	if m.detail.run.ID == "run-a" {
 		t.Error("a load for run-a overwrote the open run-b detail")
 	}
