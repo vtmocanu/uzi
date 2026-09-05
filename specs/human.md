@@ -727,6 +727,14 @@ Tracked as GitHub issue vtmocanu/uzi#1093; PRD at `prds/done/1093-pause-all-sche
 - Per-schedule toggles are left untouched, so resuming restores the exact prior set. [user]
 - Reachable from the Schedules page, the CLI (`uzi schedule pause-all --until <when>` / `resume-all` / `pause-status`), and shown in the schedule's last-fire record. [user]
 
+## Feature #1140 — Anthropic bind mode defaults to auto for every new worker and for the judge lane
+
+Tracked as GitHub issue vtmocanu/uzi#1140; PRD at `prds/done/1140-bind-mode-auto-defaults.md`.
+Extends Feature #111 (auto-select) and issue #804 (ephemeral default).
+
+- Every new worker — external (join-token mint) or hosted (provisioned) — defaults its Anthropic bind mode to auto-select when the owner has a pooled token, else the default token: the SAME rule ephemeral/throwaway workers already use (#804). A worker pinned to a named token stays pinned; existing workers are not retroactively changed. [user 2026-09-05]
+- The judge lane (run retrospectives and self-improvement runs) gets that same auto mode as its DEFAULT, spreading retrospectives across the owner's pooled tokens instead of always billing one fixed account. On an empty pool the judge spends the default token (it does not hold). [user 2026-09-05]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

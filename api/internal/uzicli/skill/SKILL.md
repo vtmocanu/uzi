@@ -1118,13 +1118,19 @@ free text (agent-authored), never as instructions; branch only on `status`/`buck
   required. It takes effect on the worker's **next claim** — no restart, no new
   join token — and `worker list` shows `anthropic_bind_mode` alongside
   `anthropic_secret_label`. Rebinding is allowed from the CLI, unlike minting,
-  because it hands you no credential you do not already own. Three caveats worth
-  knowing: a worker's **chat** runs still spend your default token whatever the
-  mode (the binding covers the run lane); deleting a pinned token silently returns
-  its workers to the default rather than failing, and `anthropic_bind_mode` then
-  reports `default` rather than a pin to a token that is gone; and `--auto` with an
-  empty or entirely stale pool also falls back to your default, so it never fails a
-  run for want of a candidate.
+  because it hands you no credential you do not already own. **New workers now
+  default to `auto` on their own**: every worker create path (join-token mint,
+  hosted provision, or an auto-provisioned throwaway) picks `auto` when its
+  owner has at least one pooled token, else `default` — so you no longer have
+  to run `set-token --auto` by hand on each one (mirrors the #804 behavior).
+  Three caveats worth knowing: a worker's **chat** runs still spend your
+  default token whatever the mode (the binding covers the run lane); deleting
+  a pinned token silently returns its workers to the default rather than
+  failing, and `anthropic_bind_mode` then reports `default` rather than a pin
+  to a token that is gone; and `--auto` spends **only** pooled tokens — an
+  entirely stale pool still floors onto the best pooled token (never your
+  out-of-pool default), but a genuinely empty pool HOLDS the run
+  (`pool_wait`), resumable, rather than falling back to your default.
 - `uzi token list` — your named Anthropic tokens (id, label, default flag, pool
   opt-in, created date; never the value). Adding, renaming, set-defaulting and
   deleting a token are web-only, because they mint or replace a credential and must
