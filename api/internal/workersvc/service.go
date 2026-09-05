@@ -692,6 +692,10 @@ type Store interface {
 	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
+	// UserHasAutoEligibleAnthropicToken reports whether the owner has ≥1 auto_eligible
+	// anthropic_token (a non-empty auto-select pool). CreateWorker reads it to derive a
+	// new worker's bind mode the #804 way (PRD #1140 M1): no label + non-empty pool → auto.
+	UserHasAutoEligibleAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
 	// Judge-lane → token binding (PRD #104 M4): read at judge-claim time, written by
 	// PUT /api/me/judge.
@@ -3074,9 +3078,26 @@ func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, temp
 	// silently dead. Deriving it here rather than defaulting it in SQL is the same
 	// rule PatchWorker applies and the same one 00088's backfill applied to existing
 	// rows: a resolved label is `pinned`, its absence is `default`.
+	//
+	// The pool read (PRD #1140 M1) is the SECOND input to that same derivation, making
+	// every worker create path agree with the #804 ephemeral path (ephemeral.go:263):
+	// a resolved label is `pinned` regardless of the pool; its absence is `auto` when
+	// the owner has ≥1 auto_eligible anthropic_token (a non-empty auto-select pool),
+	// else `default`. So a pooled-up owner's new worker spends the pool by default
+	// instead of the owner's single default token, and it never parks a run in
+	// pool_wait because `auto` is only chosen when the pool is non-empty.
 	bindMode := BindModeDefault
-	if secretID.Valid {
+	switch {
+	case secretID.Valid:
 		bindMode = BindModePinned
+	default:
+		hasPool, err := s.q.UserHasAutoEligibleAnthropicToken(ctx, userID)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		if hasPool {
+			bindMode = BindModeAuto
+		}
 	}
 	// templateDeclared is the UI-chosen worker template (PRD #18), validated
 	// against the registry by the caller; empty → NULL (no choice made).

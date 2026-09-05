@@ -187,18 +187,19 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 }
 
 const createHostedWorker = `-- name: CreateHostedWorker :one
-INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled)
-VALUES ($1, $2, $3, $4, 'hosted', $5, $6)
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, anthropic_bind_mode)
+VALUES ($1, $2, $3, $4, 'hosted', $5, $6, $7)
 RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak
 `
 
 type CreateHostedWorkerParams struct {
-	UserID           uuid.UUID   `json:"user_id"`
-	Name             string      `json:"name"`
-	TokenHash        []byte      `json:"token_hash"`
-	TemplateDeclared pgtype.Text `json:"template_declared"`
-	HostedSize       pgtype.Text `json:"hosted_size"`
-	DockerEnabled    pgtype.Bool `json:"docker_enabled"`
+	UserID            uuid.UUID   `json:"user_id"`
+	Name              string      `json:"name"`
+	TokenHash         []byte      `json:"token_hash"`
+	TemplateDeclared  pgtype.Text `json:"template_declared"`
+	HostedSize        pgtype.Text `json:"hosted_size"`
+	DockerEnabled     pgtype.Bool `json:"docker_enabled"`
+	AnthropicBindMode string      `json:"anthropic_bind_mode"`
 }
 
 // Insert a hosted worker. Deliberately UNGUARDED: the quota decision belongs to the
@@ -218,6 +219,13 @@ type CreateHostedWorkerParams struct {
 // plain parameter here, not defaulted, because the provision handler decides it from
 // the request and passes an explicit true/false — a false is a real "no sidecar",
 // distinct from an external worker's NULL.
+//
+// anthropic_bind_mode is caller-supplied (issue #1140 / PRD #111 D3): once M1 makes the
+// mode a create-time decision, the INSERT must name the column, or a hosted worker
+// silently ships the SQL default 'default' for every provision — green at every gate.
+// The provision handler derives it (auto when the owner's pool is non-empty, else
+// default) and writes it in the same statement, as CreateWorker and
+// CreateEphemeralHostedWorker do.
 func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorkerParams) (Worker, error) {
 	row := q.db.QueryRow(ctx, createHostedWorker,
 		arg.UserID,
@@ -226,6 +234,7 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		arg.TemplateDeclared,
 		arg.HostedSize,
 		arg.DockerEnabled,
+		arg.AnthropicBindMode,
 	)
 	var i Worker
 	err := row.Scan(
