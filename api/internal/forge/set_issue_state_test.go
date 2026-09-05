@@ -138,6 +138,9 @@ func TestForgejoSetIssueStateSendsState(t *testing.T) {
 			if got := patched["state"]; got != tc.want {
 				t.Errorf("state = %v, want %q", got, tc.want)
 			}
+			if len(patched) != 1 {
+				t.Errorf("SetIssueState must PATCH ONLY state — a stray field clobbers an unrelated attribute: %v", patched)
+			}
 			// Parity with the GitLab and GitHub tests: a state-only PATCH must not
 			// carry a title, so a concurrent title edit cannot be clobbered.
 			if _, sent := patched["title"]; sent {

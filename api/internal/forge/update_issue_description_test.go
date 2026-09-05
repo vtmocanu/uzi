@@ -90,6 +90,9 @@ func TestForgejoUpdateIssueDescriptionPreservesTheTitle(t *testing.T) {
 	if got := patched["body"]; got != "the new body" {
 		t.Errorf("body = %v, want %q", got, "the new body")
 	}
+	if len(patched) != 1 {
+		t.Errorf("the PATCH must carry ONLY body — a stray field overwrites an unrelated issue attribute: %v", patched)
+	}
 	if _, sent := patched["title"]; sent {
 		t.Errorf("the PATCH carried a title, which clobbers a concurrent rename (lost update) — "+
 			"a body-only PATCH must omit \"title\"; body = %v", patched)
