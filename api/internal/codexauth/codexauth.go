@@ -43,7 +43,8 @@ const (
 // DefaultClientID is the PUBLIC OAuth client identifier the Codex CLI ships with
 // (it appears verbatim in the open-source Codex client). It is a public
 // application id, not a secret, and is sent as `client_id` on the refresh
-// exchange. Override it with WithClientID for a different deployment.
+// exchange. It is the fixed provider default; a later unit that must target a
+// different deployment can add a construction override (with a caller) then.
 const DefaultClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 // maxBodyBytes bounds a provider response body read into memory. Identity and
