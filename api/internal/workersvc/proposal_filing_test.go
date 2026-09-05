@@ -277,3 +277,30 @@ func TestClampWireProposalScrubsSecrets(t *testing.T) {
 		}
 	}
 }
+
+// TestClampWireProposalScrubsSecretStraddlingCap pins the scrub-BEFORE-cap ordering (F4
+// from PR #1122 review): a credential positioned so it straddles the byte cap must be
+// scrubbed WHOLE, never truncated first into a sub-match-length prefix that Scrub misses
+// and that then leaks into the filed forge issue. This FAILS on a truncate-then-scrub
+// order (the tail is cut, "glpat-<few>" survives) and PASSES on scrub-then-cap.
+func TestClampWireProposalScrubsSecretStraddlingCap(t *testing.T) {
+	// Assembled from parts (.claude/rules/prds.md): a contiguous glpat-<20> literal in
+	// tracked source is rejected by GitHub Push Protection. glpat- + 20 chars = 26 bytes.
+	secret := "glpat-" + "straddlethecap000000"
+	// Place the secret so it STARTS before the cap and ENDS past it: 10 bytes of the token
+	// sit beyond ProposalTitleMaxBytes, so a truncate-first order would cut it mid-token.
+	pad := strings.Repeat("A", ProposalTitleMaxBytes-(len(secret)-10))
+	got := clampWireProposal(schedRun(), &ProposalPayload{Title: pad + secret, Body: "ok"})
+	if got == nil {
+		t.Fatal("expected a clamped payload")
+	}
+	if strings.Contains(got.Title, "glpat-") {
+		t.Errorf("a credential prefix leaked past the cap (truncate-before-scrub): title=%q", got.Title)
+	}
+	if strings.Contains(got.Title, secret) {
+		t.Errorf("full secret survived: title=%q", got.Title)
+	}
+	if len(got.Title) > ProposalTitleMaxBytes {
+		t.Errorf("title = %d bytes, want <= %d", len(got.Title), ProposalTitleMaxBytes)
+	}
+}

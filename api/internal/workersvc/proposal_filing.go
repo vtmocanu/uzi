@@ -63,9 +63,9 @@ func catalogSlugString(sched store.RunSchedule) string {
 // the deeper output-mode/target gates run in maybeFileProposal once the schedule is
 // loaded) carrying a non-empty title. Title and Body are untrusted worker output — the
 // agent may have seen repo secrets during the run — so each is control-char/format
-// stripped, length-bounded, then secret-scrubbed (same order as clampWireReportMd:
-// SanitizeBounded THEN Scrub, so the scrubber sees whole runes and the cap is applied
-// to structural text before redaction rewrites it).
+// stripped, secret-scrubbed, and ONLY THEN length-bounded (see scrubThenBound: the cap
+// is applied LAST so the scrubber sees the whole field; a credential straddling the cap
+// must not be truncated into an unmatched prefix that leaks into the filed forge issue).
 //
 // Like the other clampWire* helpers this DROPS (returns nil), never errors: it feeds a
 // best-effort side effect on the terminal `completed` report and must not be able to
@@ -78,12 +78,24 @@ func clampWireProposal(run store.Run, p *ProposalPayload) *ProposalPayload {
 		slog.Warn("dropping proposal: not a scheduled prompt run", "run_id", run.ID, "kind", run.Kind)
 		return nil
 	}
-	title := secretscrub.Scrub(termsafe.SanitizeBounded(p.Title, ProposalTitleMaxBytes))
+	title := scrubThenBound(p.Title, ProposalTitleMaxBytes)
 	if title == "" {
 		return nil
 	}
-	body := secretscrub.Scrub(termsafe.SanitizeBounded(p.Body, ProposalBodyMaxBytes))
+	body := scrubThenBound(p.Body, ProposalBodyMaxBytes)
 	return &ProposalPayload{Title: title, Body: body}
+}
+
+// scrubThenBound sanitizes the FULL untrusted field, secret-scrubs the whole value, and
+// ONLY THEN applies the byte cap. The order is a security property: secretscrub.Scrub
+// matches a credential only when it sees the WHOLE token, so truncating first can leave a
+// sub-match-length prefix that Scrub misses, leaking it into the filed forge issue (a
+// public artifact). The first SanitizeBounded is effectively unbounded — a cap past the
+// input length never truncates, since sanitizing only removes runes — so no cut happens
+// before Scrub; the second applies the real, rune-safe cap to the already-scrubbed text.
+func scrubThenBound(s string, max int) string {
+	sanitized := termsafe.SanitizeBounded(s, len(s)+1)
+	return termsafe.SanitizeBounded(secretscrub.Scrub(sanitized), max)
 }
 
 // maybeFileProposal files a scheduled issues-mode prompt run's proposal as a forge

@@ -13,7 +13,12 @@
 -- NOTE (goose numbering): number assigned at the landing merge; renumber to the next free
 -- number above the live head if it drifts, per the CLAUDE.md convention.
 ALTER TABLE run_schedules ADD COLUMN output_mode text;
-ALTER TABLE run_schedules ADD CONSTRAINT run_schedules_output_mode_check CHECK (output_mode IS NULL OR output_mode IN ('mr','issues'));
+-- Added NOT VALID: the CHECK enforces the enum on all NEW/updated rows immediately, but
+-- skips the validating table scan (and the ACCESS EXCLUSIVE lock it holds) at add time. A
+-- separate later migration (00194) runs VALIDATE CONSTRAINT under a write-compatible lock.
+-- (Existing rows are all NULL here — the column is added in this same migration — so the
+-- validation is trivially satisfied; the two-step is the safe pattern regardless.)
+ALTER TABLE run_schedules ADD CONSTRAINT run_schedules_output_mode_check CHECK (output_mode IS NULL OR output_mode IN ('mr','issues')) NOT VALID;
 
 -- +goose Down
 ALTER TABLE run_schedules DROP CONSTRAINT run_schedules_output_mode_check;

@@ -235,6 +235,43 @@ describe("the per-schedule model control (PRD #300)", () => {
   });
 });
 
+describe("the output-mode control on a DEFAULT prompt schedule (PRD #929, F5)", () => {
+  const defaultPrompt = (over: Partial<Schedule> = {}) =>
+    schedFixture({ origin: "default", target: "prompt", catalog_slug: "feature-bingo", ...over });
+
+  it("prefills from the RAW override and flows a change into output_mode on save", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={defaultPrompt({ output_mode: "issues" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    // The selector is rendered for a default prompt (regression: it was omitted) and seeded
+    // from the raw override, not the resolved catalog mode.
+    const select = screen.getByLabelText("Output mode (optional)") as HTMLSelectElement;
+    expect(select.value).toBe("issues");
+
+    fireEvent.change(select, { target: { value: "mr" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.output_mode).toBe("mr");
+  });
+
+  it("clearing to Job default sends explicit null (clear-to-inherit)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={defaultPrompt({ output_mode: "issues" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const select = screen.getByLabelText("Output mode (optional)") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.output_mode).toBeNull();
+  });
+});
+
 describe('the "apply model also to agents" toggle (PRD #305)', () => {
   it("renders always enabled, including when Model is Inherit/empty", () => {
     renderModal();

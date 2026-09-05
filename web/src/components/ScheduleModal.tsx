@@ -911,6 +911,28 @@ export function ScheduleModal({
             </Field>
           )}
 
+          {/* A default prompt job's output mode IS editable (like max_issues for a default
+              sweep). buildDefaultInput() sends output_mode for a prompt default, so without
+              this control it could only ever re-send its initial value. outputMode seeds from
+              the RAW override (editing?.output_mode, null → ""), never the resolved catalog
+              mode, so "Job default" reflects an actually-cleared override. */}
+          {isDefault && target === "prompt" && (
+            <Field label="Output mode (optional)" htmlFor="sched-output-mode">
+              <Select
+                id="sched-output-mode"
+                value={outputMode}
+                onChange={(e) => setOutputMode(e.target.value)}
+              >
+                <option value="">Job default</option>
+                <option value="mr">MR (idea file)</option>
+                <option value="issues">Issues</option>
+              </Select>
+              <p className="mt-1 text-[11px] text-faint">
+                How a prompt run delivers: MR opens a merge request from an idea file; Issues files a labeled <code className="rounded bg-raised px-1">proposal::&lt;slug&gt;</code> issue (not sweep-eligible until promoted). Leave as job default to inherit.
+              </p>
+            </Field>
+          )}
+
           {/* Timing */}
           <SegmentedControl label="Timing" value={timing} onChange={setTiming} options={TIMING_OPTIONS} />
 
