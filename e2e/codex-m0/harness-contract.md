@@ -1,16 +1,19 @@
-# Proposed neutral harness contract
+# Neutral harness contract
 
-**Status:** proposed for [ADR-1106](../../adr/1106-codex-harness.md); M0 remains incomplete.
+**Status:** accepted for the M2 extraction under [ADR-1106](../../adr/1106-codex-harness.md); M0 design/feasibility is complete.
 **Source inventory:** `bc5a0a8b11f5c98a7067c1fc4202d37a0f27f92e`, paths and symbols below.
 This is an M2 extraction contract, not a production adapter or new test result.
 The Claude preservation rules describe source behavior; Codex obligations require
 separate implementation and characterization. Both subscription and API-key
 support remain required, with credential identity/CAS/routing/pricing still open.
 
-The Codex advice policy is awaiting the user's choice between isolated calculations
-and literally no tools. Neither choice may grant shell, filesystem, network,
-delegation or worker callbacks. The type surface below grants no such authority;
-its final construction policy remains pending. Claude advice stays unchanged.
+The user-approved advice ceiling is the same for **Claude and Codex**: isolated
+pure in-memory calculation may run; shell/commands, filesystem access, network
+tools, delegation, run/worker callbacks and credential access may not. This grants
+no new tool in M0/M2: Claude's current `buildDenyAllHook` denies every tool and
+exposes no calculator, unchanged under D0. A future Claude calculation capability
+would require its own isolated implementation and conformance, never a shell-based
+calculator. Only the Codex pure-cell surface has calculation evidence here.
 
 ## Approach
 
@@ -37,7 +40,7 @@ Two rejected alternatives:
   Retain an opaque **uzi wire projection**, alongside normalized measurements.
   It contains existing outgoing payload data, never an SDK message/discriminant.
 
-The code below is the proposed type surface for `agent/src/harness.ts` in M2.
+The code below is the accepted type surface for `agent/src/harness.ts` in M2.
 Existing domain imports are intentional; these types already exist and remain
 owned by `protocol.ts` / `executor.ts`. The artifact itself adds no M2 code.
 
@@ -302,7 +305,7 @@ export interface RunHarness {
   // Successful quiescence freezes the epoch until an explicit later startTurn.
   quiesceChildren(request: BoundaryRequest): Promise<ChildQuiescence>;
   // OS operation over recorded ownership only; cannot establish remote child
-  // quiescence. The proposed supervisor must observe ECHILD, using __WALL where
+  // quiescence. Every registered supervisor must observe ECHILD, using __WALL where
   // required, rather than infer emptiness from CLI exit or its original PGID.
   // Must never select unrelated processes by namespace/glob.
   reapProcesses(request: BoundaryRequest, closedEpoch: number): Promise<ProcessReap>;
@@ -328,7 +331,7 @@ export interface CodexExecutionSafety {
   ): Promise<T>;
 }
 
-// Proposed addition to the existing outer Executor contract in executor.ts:
+// M3 addition required on the existing outer Executor contract in executor.ts:
 // safety?: CodexExecutionSafety;
 // This facade is owned by uzi, so the adapter does not gain git/workflow policy.
 
@@ -396,7 +399,8 @@ export interface AdviceResult {
 export interface AdviceHarness {
   readonly kind: HarnessKind;
   // One isolated pass, with its own disposable HOME and no run-tool authority.
-  // Codex calculation policy is pending; Claude remains tool-less. Terminal
+  // Both permit isolated pure calculation; current Claude stays tool-less.
+  // This interface requires no new Claude calculator. Terminal
   // provider failures are data; setup/transport/timeout failures are thrown.
   run(request: AdviceRequest, policy: AdviceResultPolicy): Promise<AdviceResult>;
 }
@@ -612,15 +616,15 @@ The capability and trust provisioning policy is in
 
 ### Lifecycle operation order and evidence
 
-The candidate policy and measured limits live in
-[ADR-1106](../../adr/1106-codex-harness.md#proposed-execution-policy).
-The proposed outer `Executor.safety.withBoundary` is a uzi facade over adapter
+The accepted policy and measured limits live in
+[ADR-1106](../../adr/1106-codex-harness.md#execution-policy).
+The specified outer `Executor.safety.withBoundary` is a uzi facade over adapter
 operations; the runner still owns the action and its git/workflow policy.
 An internal poisoned adapter alone cannot guard the runner's exception recovery.
 A Codex-selected executor must provide this safety facade or fail before execution;
 optional absence preserves existing Claude/stub callers, never a Codex fallback.
 
-| Boundary | Proposed operation and acceptance evidence |
+| Boundary | Required operation and acceptance evidence |
 |---|---|
 | Ordinary root turn end | Request root stop and close its iterator. Synchronous Codex delegation must prevent a child escaping the parent turn. This alone grants no checkpoint/publication permit. |
 | Codex checkpoint, park, shutdown, terminal/finalize or credentialed git | Enter the outer gate; close admission before discovery; settle accepted starts/callbacks; freeze child quiescence at one epoch; reap processes for that same epoch; invoke the runner action only after joint acceptance. |
@@ -656,7 +660,8 @@ Supervisor evidence now includes actual app-server/code-mode hosts, active and
 yielded cells, and separate setsid/double-fork/non-SIGCHLD-clone controls.
 `supervisor_echild` denotes observed `ECHILD` with `__WALL` over recorded owned
 descendants, not leader exit or RPC acknowledgement. The broader outer gate and
-its runner sinks are still a proposed production contract, not implemented M0 code.
+its runner sinks are an accepted production contract for M3/M4, not implemented
+M0 code.
 
 ## Exact source map and M2 handoff
 
@@ -690,7 +695,7 @@ git grep -n -E 'mapSdkMessage|isErrorResult|assistantUsageOf|assistantModelOf|or
 Besides the files above it finds `judge-runner-stub.ts`; keep its queryFn seam.
 Do not replace the stub's existing injection shape as collateral cleanup.
 
-Suggested eventual file ownership, with names provisional until M0 acceptance:
+M2 file ownership guidance (filenames may follow the implementation):
 
 * Create `agent/src/harness.ts`: neutral contracts above, no SDK imports.
 * Create `agent/src/harness-reducer.ts`: move signal/grouped-emission/turn-result
@@ -702,8 +707,8 @@ Suggested eventual file ownership, with names provisional until M0 acceptance:
   have compatibility exports; it must not leave two independent mappers.
 * Keep `model-pass.ts` as advice timeout/callback compatibility owner around the
   new advice adapter; judge/review/summary keep their exact outer policies.
-* Defer production Codex adapter/tool transport implementation to M3. M0 only
-  resolves these contracts and supplies the missing characterization evidence.
+* Defer production Codex adapter/tool transport implementation to M3. M0 resolved
+  the architecture/contracts and supplied bounded characterization evidence.
 
 Acceptance for later M2: all existing `agent/test` files unchanged; the existing
 agent gate passes; source options and old emitted-message objects match current
@@ -714,18 +719,17 @@ them, but do not weaken or rewrite a current test to fit this proposal.
 
 ## Risks and open questions
 
-* The corrected neutral contract passed independent review. M0 now awaits the
-  final advice choice and design signoff. The ADR bounds the fixture evidence;
-  production handlers, root-registry coordination and the outer runner permit
-  are M3/M4 code work, not implementation prerequisites for accepting M0.
+* The corrected neutral contract and shared advice ceiling are accepted, closing
+  M0 design/feasibility. The ADR bounds the fixture evidence; production handlers,
+  root-registry coordination and the outer runner permit remain M3/M4 code work.
 * The wider PRD's credential identity/CAS/routing/API-key pricing blockers remain.
   The credential union and cost representation must not be mistaken for solved
   row-selection, refresh-writeback or metering contracts.
 * M2 cannot both promise unchanged Claude behavior and impose a newly observed
   process-death guarantee on the old `killAgentTree` path. The explicit legacy
   result states expose that boundary; they are not accepted Codex fallbacks.
-* M0 review must accept or revise the uzi wire-preservation capsule. Removing it
+* The accepted extraction retains the uzi wire-preservation capsule. Removing it
   requires a scoped message/accounting contract migration, which is beyond D0.
 * Existing server folds are still coupled to current usage payloads. This M0
-  type proposal avoids changing them; per-turn Codex idempotence and metered-cost
+  contract avoids changing them; per-turn Codex idempotence and metered-cost
   folding need the separately tracked API design before M3/M5 can ship.

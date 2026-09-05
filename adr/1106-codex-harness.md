@@ -1,6 +1,6 @@
 # ADR-1106: Codex harness boundary and SDK feasibility evidence
 
-**Status**: Proposed (M0 reopened by whole-PRD review)
+**Status**: Accepted (M0 design and feasibility; production implementation/conformance remain M3/M4)
 **Date**: 2026-09-05
 **PRD**: [PRD #1106](../prds/1106-codex-harness-phase1.md)
 
@@ -11,9 +11,11 @@ path. Its first milestone is a maintainer-local spike against pinned
 `@openai/codex@0.153.2` and `@openai/codex-sdk@0.153.2`. The spike measured
 process control, resume behaviour, subagent visibility, hook names, credential
 refresh handling, and the initial model vocabulary. A subsequent whole-PRD
-review found that those measurements do not yet establish a fail-closed
-execution design or a complete provider-neutral boundary. The evidence below
-stands; the boundary is not accepted and M0 is reopened.
+review found that the initial measurements did not establish a fail-closed
+execution design or a complete provider-neutral boundary and reopened M0. The
+continuation below resolved those design gaps; independent technical review and
+the user's shared advice-policy decision on 2026-09-05 close M0. Acceptance covers
+architecture and feasibility, not shipped adapters or production guardrail parity.
 
 The initial probe harness and packages lived only in private temporary storage.
 The credential-free app-server continuation is now committed in
@@ -288,28 +290,28 @@ exercise:
 
 Therefore hook success on the measured happy path is not a fail-closed guardrail
 design. The continuation measures bounded child/terminal cleanup and managed
-one-shot enforcement on native and intended-model code-mode fixtures, but M0
-cannot close until those candidates form a complete
-fail-closed execution and ownership design. No alias-only reuse of Claude hooks,
+one-shot enforcement on native and intended-model code-mode fixtures. The
+accepted execution and ownership design below incorporates those bounded results;
+production enforcement remains M3/M4 work. No alias-only reuse of Claude hooks,
 inferred role-file restriction, or process-group kill substitutes for those proofs.
 
-## Proposed execution policy
+## Execution policy
 
-**Unaccepted candidate.** Use the stock app-server with `environments: []`,
+**Accepted architecture.** Use the stock app-server with `environments: []`,
 `agents.enabled = false` and `multi_agent_v2 = false`, with native tools and
-extensions disabled. Worker-owned dynamic callbacks would provide the permitted
-run tools; worker-created child threads would implement synchronous delegation.
+extensions disabled. Worker-owned dynamic callbacks provide the permitted run-tool boundary;
+worker-created child threads define synchronous delegation in the M3 adapter.
 This replaces the earlier loopback-MCP/native-role candidate. Native authority
 removal, representative role/phase callbacks and actual-host disposal now have
-separate fixture evidence above. M0 requires acceptance of this design and the
-final advice choice; production adapters and enforcement tests belong to M3/M4.
+separate fixture evidence above. M0 is complete at the design/feasibility level;
+production adapters and enforcement tests belong to M3/M4.
 
-The worker would bind runtime thread/turn identity to an immutable run, role and
+The worker must bind runtime thread/turn identity to an immutable run, role and
 phase registry. Callback arguments never select their own authority. Admission
-would check that registry before any action, reject unknown origins and stale
+must check that registry before any action, reject unknown origins and stale
 turns, allow lead-only signals only on the root, deny nested or unknown roles,
 and apply each role's tool/skill allocation and plan/implement policy. A child
-callback would resolve only after its owned child turn finishes; root completion
+callback must resolve only after its owned child turn finishes; root completion
 alone cannot establish that condition. Role TOML and healthy hook behavior are
 not substitutes for these checks.
 
@@ -318,7 +320,7 @@ not substitutes for these checks.
 These are design obligations for the worker-owned adapter, not existing production
 handlers. M3 implements them; M4 exercises the full adversarial clause map.
 
-| Capability | Proposed owner and rule |
+| Capability | Owner and required rule |
 |---|---|
 | Shell | Worker validates its own explicit tool schema and applies `screenBashCommand`; unknown input/tool and screening exceptions deny. Native execution is disabled. |
 | Files and patches | Worker parses its own file/patch schema and applies the path jail to canonical paths, including symlink resolution; secret paths, `.git` and outside-worktree paths deny. |
@@ -339,7 +341,7 @@ instructions/config/role/rules tests remain M4 production-builder conformance.
 
 ### Process-root ownership
 
-The proposed worker keeps a **per-run registry of supervisor roots**. Every
+The worker must keep a **per-run registry of supervisor roots**. Every
 provider or command root uses the measured generic-argv Linux subreaper wrapper
 and is registered to an immutable run and epoch before launch admission. Pending
 launch reservations belong to that epoch. Codex effects may not spawn direct
@@ -361,23 +363,36 @@ separate process controls. M0 needs no different process primitive for command
 roots; registry coordination, environment enforcement and combined runner/handler
 tests are M3/M4 work, not prerequisites requiring their implementation in M0.
 
-Run and advice construction would be separately gated. Advice has no shell,
-filesystem, network, delegation or worker callbacks and receives neither a run
-workspace nor a run handler registry. Whether Codex advice may use isolated
-calculations or must expose literally no tools awaits the user's decision and
-final design signoff. The bounded pure-cell evidence above informs that choice;
-no unanswered question is treated as approval. Claude advice remains unchanged. Subscription and
-API-key credentials stay separate private construction inputs with no fallback;
-credential selection, refresh/CAS and pricing remain wider PRD blockers.
+### Shared advice capability ceiling
 
-## Proposed neutral harness boundary
+**User-approved 2026-09-05, for both Claude and Codex:** isolated pure in-memory
+calculation is permitted. Shell/commands, filesystem access, network tools,
+delegation, run/worker callbacks and credential access are denied. Run and advice
+construction remain separately gated; advice receives no run workspace or run
+handler registry. Provider authentication stays an isolated runtime input, never
+a model-accessible calculation capability.
 
-The complete proposed interfaces and exact Claude preservation rules live in
+Permission is a ceiling, not a promise that both adapters expose a calculator.
+Today's Claude `model-pass.ts` uses `buildDenyAllHook` for every tool and exposes
+no calculator. M0/M2 leave that path and hook unchanged under D0. Any future
+Claude calculation tool needs its own isolated implementation and conformance;
+this decision adds no such feature and permits no shell-based calculator. Codex
+pure-cell fixtures supply the bounded calculation evidence above; no Claude
+calculator or live API-key calculation path was exercised.
+
+Subscription and API-key credentials remain separate private construction inputs
+with no fallback. Credential selection, refresh/CAS, routing and pricing remain
+wider PRD blockers, independent of M0 architecture acceptance.
+
+## Neutral harness boundary
+
+The complete accepted interfaces and exact Claude preservation rules live in
 [the contract companion](../e2e/codex-m0/harness-contract.md). It defines usage,
 context, metrics, rate limits, errors, grouped events, skills, run/advice handles
 and distinct bounded child-quiescence, process-reap and tool-disposal operations.
 The earlier undefined contract types and lifecycle placeholder now have explicit
-proposed shapes. Their presence does not accept the policy or complete M0.
+shapes accepted for the M2 extraction. Implementation must preserve D0; these
+interfaces do not claim production code already exists.
 
 The adapter owns immutable provider/isolation inputs, query construction,
 wire decoding, session inspection and process ownership. Uzi retains planning,
@@ -411,9 +426,9 @@ The source inventory is pinned to `bc5a0a8b11f5c98a7067c1fc4202d37a0f27f92e`:
 
 ## Consequences
 
-- M0 remains unchecked and this ADR Proposed pending only the final advice
-  choice and design signoff. The corrected neutral contract passed independent
-  review; production handler and outer-gate implementation belong to M3/M4.
+- M0 is complete and this ADR accepted for architecture and feasibility. The
+  corrected neutral contract is accepted for M2; production handlers and the
+  outer-gate implementation/conformance remain M3/M4 work.
 - Intended-model native-authority controls, representative role/phase callbacks
   and actual-host disposal have bounded evidence. The complete production
   guardrail suite and outer runner permit are not implemented by those fixtures;

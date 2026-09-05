@@ -5,7 +5,8 @@ They run the real **Codex CLI 0.153.2** app-server against deterministic Respons
 fixtures served only on `127.0.0.1` at an ephemeral port. No model makes decisions:
 the fixture emits fixed harmless tools and checks their real effects in its own
 temporary directory. A passing characterization can demonstrate a stock weakness.
-It does not mean guardrail parity is satisfied or M0 is complete.
+A passing case alone does not establish guardrail parity. M0 design/feasibility
+is accepted under ADR-1106; production conformance remains M3/M4 work.
 
 ## Run
 
@@ -137,7 +138,7 @@ the named test runner output, not a fixed pass-count claim in this document.
 | Group | Discriminating observation and boundary |
 |---|---|
 | Native authority disabled | Enabled controls perform direct/nested shell/patch, return real PNG output and start a native child. With no environments and agents disabled, the matching dispatches are unsupported and marker/child effects absent. Nested collaboration is unavailable in both states, so it is not disablement evidence. |
-| Pure cells | A cell computes 42 while runtime I/O globals are undefined and module import/file/env/fetch attempts reject. This bounds the measured runtime surface, not arbitrary VM exploits or the still-pending advice policy. |
+| Pure cells | A cell computes 42 while runtime I/O globals are undefined and module import/file/env/fetch attempts reject. This bounds the measured runtime surface, not arbitrary VM exploits or an executable Claude calculator. |
 | Policy broker transport | Real code-mode callbacks enforce representative root/role/phase grants and synchronous worker-created delegation. Held allow/revoke/throw/invalid-policy controls establish fail-closed marker effects and handler settlement before disposal. These are fixed markers, not production shell/path/forge handlers. |
 | Broker identity injection | Unknown/stale/replayed identities are injected directly into the broker using real captured callback IDs; these cases do not forge upstream transport frames. |
 | Actual-host supervisor | Active/yielded cells on both intended models have positive delayed-effect controls. Revoke/settle/interrupt/dispose reaps the actual app-server and its differently grouped code-mode host with `ECHILD+__WALL`, then observes no late callback or marker beyond the control delay. |
@@ -145,18 +146,18 @@ the named test runner output, not a fixed pass-count claim in this document.
 
 The ordinary `Probe` cleanup described above is distinct from `SupervisorProbe`:
 the latter launches the real app-server beneath its own subreaper and records
-owned process identities. Neither fixture implements the proposed runner permit
+owned process identities. Neither fixture implements the specified runner permit
 held across a credentialed git/checkpoint publication action.
 
-## Proposed adapter boundary
+## Accepted adapter design
 
-[ADR-1106](../../adr/1106-codex-harness.md#proposed-execution-policy) describes the
-unaccepted stock app-server candidate: native environments/agents disabled,
+[ADR-1106](../../adr/1106-codex-harness.md#execution-policy) describes the
+accepted stock app-server architecture: native environments/agents disabled,
 worker-owned callbacks and synchronous worker-created child threads, with a
 per-run registry of Linux supervisor roots. It replaces the earlier loopback-MCP/native-role
 candidate; this characterization harness is not its production implementation.
-The [neutral contract companion](harness-contract.md) defines the proposed M2
-interfaces and Claude preservation rules. M0 remains incomplete; both subscription
+The [neutral contract companion](harness-contract.md) defines the accepted M2
+interfaces and Claude preservation rules. M0 design/feasibility is complete; both subscription
 and API-key support remain required, and dummy-key fixtures prove neither live
 API-key authentication nor entitlement.
 
@@ -165,5 +166,9 @@ production handler or runner-gate implementation. Those, the all-roots registry
 coordination and combined adversarial enforcement tests belong to M3/M4. The
 [capability/trust policy](../../adr/1106-codex-harness.md#capability-policy-owners)
 and [root ownership](../../adr/1106-codex-harness.md#process-root-ownership)
-define those obligations. M0 remains unchecked pending the final advice choice
-and design signoff.
+define those obligations. The user approved the same advice ceiling for Claude
+and Codex: isolated pure in-memory calculation is allowed; shell/commands,
+filesystem access, network tools, delegation, run/worker callbacks and credential
+access are denied. Claude's current deny-all-tools advice path exposes no
+calculator and stays unchanged in M0/M2. A future Claude calculator needs its own
+isolated implementation/conformance; none was added or tested here.
