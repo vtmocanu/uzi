@@ -249,6 +249,38 @@ describe("runReadOnlyModelPass — HOME cleanup vs the aborted CLI (issue #933)"
     await assert.rejects(pass, /review model call exceeded 5ms/);
   });
 
+  // Grace-expiry branch, the complement of the preceding "does not settle until the query
+  // settles" case: here the query stays pending forever after abort, so the bounded grace
+  // (not the query settling) is what unblocks cleanup — HOME is removed once the small
+  // graceMs elapses, and the authoritative timeout error still propagates.
+  it("timeout path: the grace expiry (not the query settling) unblocks HOME cleanup when the query never settles", async () => {
+    let capturedHome: string | undefined;
+
+    // Never settles after abort: models an aborted CLI that hangs. The finally's
+    // awaitQuerySettled must fall back to the grace timer to proceed with cleanup.
+    const queryFn: SdkQueryFn = (params) => {
+      const fixtureOpts = (params as { options: FixtureOptions }).options;
+      capturedHome = fixtureOpts.env?.HOME;
+      const signal = fixtureOpts.abortController?.signal;
+      // eslint-disable-next-line require-yield
+      return (async function* () {
+        await whenAborted(signal);
+        await new Promise<void>(() => {});
+      })() as never;
+    };
+
+    await assert.rejects(
+      runReadOnlyModelPass(baseOpts({ queryFn, timeoutMs: 5, graceMs: 20 })),
+      /review model call exceeded 5ms/,
+    );
+    assert.ok(capturedHome, "the query must have received an ephemeral HOME");
+    assert.equal(
+      existsSync(capturedHome!),
+      false,
+      "HOME must be removed after the grace expires even though the query never settled",
+    );
+  });
+
   it("timeout path: a query that rejects after abort is swallowed — the run still cleans HOME", async () => {
     let capturedHome: string | undefined;
     let homeExistedAtSettle: boolean | undefined;
