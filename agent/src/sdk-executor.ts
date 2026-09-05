@@ -97,7 +97,6 @@ import { RunTurnReducerImpl } from "./harness-reducer.js";
 import type {
   HarnessTerminal,
   RunTurnRequest,
-  RunTurnReducer,
   TurnStreamEnd,
 } from "./harness.js";
 import { PlanRejectedError } from "./executor.js";
@@ -444,9 +443,11 @@ export class SdkExecutor implements Executor {
    *  frame decode, the lead context read, process ownership and terminal building;
    *  driveTurn drives it and the per-run reducer. */
   private readonly harness: ClaudeHarness;
-  /** The per-run turn reducer. Recreated per run in phaseSetup (the first-session
-   *  latch it holds must not survive into a second run() on the same instance). */
-  private reducer: RunTurnReducer;
+  /** The per-run turn reducer, REUSED across every turn of the run (so its run-level
+   *  session latch persists). Recreated per run in run() (the latch must not survive
+   *  into a second run() on the same instance). The concrete type is held so the owner
+   *  can call `beginTurn()` at each turn boundary. */
+  private reducer: RunTurnReducerImpl;
 
   /**
    * @param homeDir per-run SDK HOME (`agent-home/<runId>` on $UZI_DATA_DIR, PRD #42
@@ -2506,6 +2507,13 @@ export class SdkExecutor implements Executor {
     // ctx.onSessionId / orphan-warn from each reduction. The adapter decodes raw
     // SDK frames into those neutral events and owns the lead context read.
     const reducer = this.reducer;
+    // Per-run reducer, REUSED across turns: reset its per-turn accumulators at the TOP
+    // of every turn — unconditionally, before any event is accepted — so a prior turn
+    // that ended by throw (skipping the reducer's `finish`) cannot leak stale per-turn
+    // state (leadText / turnSessionId / result / signals) into this one. The run-level
+    // session latch is preserved (beginTurn does not touch it). Observable no-op on the
+    // clean path, where the state is already fresh from construction or the prior turn.
+    reducer.beginTurn();
     let sawTerminal = false;
     let terminal: HarnessTerminal | undefined;
 

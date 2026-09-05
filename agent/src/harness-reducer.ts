@@ -10,7 +10,9 @@
 // Lifetime is PER RUN: `reportedSessionId` (the first-truthy-once-per-run latch)
 // persists across turns, while the signal accumulator, lead-text buffer,
 // subagent-activity flag, per-turn session id and the context-requested guard all
-// RESET at each turn boundary (`finish`). The reducer does NOT own
+// RESET at each turn boundary — driven by the owner's `beginTurn` at the top of every
+// turn, so a prior turn that ended by throw (skipping `finish`) cannot leak per-turn
+// state into the next. The reducer does NOT own
 // trip/precedence/limit-classify/materialize — those stay with the workflow owner,
 // which also delivers ctx.emit / onProgress / ctx.onSessionId / orphan-warn from
 // the reductions this returns.
@@ -34,11 +36,7 @@ export class RunTurnReducerImpl implements RunTurnReducer {
   /** First-truthy-once-per-run latch (run-level; persists across turns). */
   private reportedSessionId = false;
 
-  /** True once a turn's first event has been accepted, until `finish`; gates the
-   *  turn-start reset below. Run-level, NOT reset per turn. */
-  private turnActive = false;
-
-  // --- Per-turn state, reset at each turn boundary (turn start / finish). ---
+  // --- Per-turn state, reset at each turn boundary by the owner's `beginTurn`. ---
   private result: ReducedTurnResult = { done: false };
   /** The lead's own text this turn, in emit order (no-progress detector input). */
   private leadText: string[] = [];
@@ -50,16 +48,16 @@ export class RunTurnReducerImpl implements RunTurnReducer {
 
   constructor(private readonly context: HarnessContextHook) {}
 
-  async accept(event: HarnessEvent): Promise<TurnReduction> {
-    // Reset per-turn state at TURN START (first event of a new turn), making "each
-    // turn begins clean" structural again — robust to a future throw path that skips
-    // `finish` and then reuses this reducer for the next turn. The run-level
-    // `reportedSessionId` latch is deliberately NOT reset here.
-    if (!this.turnActive) {
-      this.turnActive = true;
-      this.resetPerTurn();
-    }
+  /** Reset the per-turn accumulators for the turn about to stream. The OWNER calls
+   *  this at the top of every turn (before the first `accept`), on its normal path
+   *  AND on its throw/finally recovery — so each turn begins with clean per-turn state
+   *  structurally, robust to a prior turn that ended by throw and SKIPPED `finish`.
+   *  The run-level `reportedSessionId` latch is deliberately NOT reset here. */
+  beginTurn(): void {
+    this.resetPerTurn();
+  }
 
+  async accept(event: HarnessEvent): Promise<TurnReduction> {
     const reduction: TurnReduction = { messages: [], diagnostics: [] };
 
     // Session id is accepted lazily off ANY event (including ignored/partial
@@ -205,17 +203,15 @@ export class RunTurnReducerImpl implements RunTurnReducer {
     if (this.leadText.length > 0) this.result.finalText = this.leadText.join("\n");
     const result = this.result;
 
-    // End the turn; keep the run-level session latch. The reset is redundant with the
-    // turn-start reset in `accept` on the clean path, but harmless, and closes the
-    // turn so the next `accept` re-arms the turn-start reset.
-    this.turnActive = false;
-    this.resetPerTurn();
-
+    // Return the accumulated per-turn result; keep the run-level session latch. The
+    // per-turn accumulators are NOT reset here — the owner's `beginTurn` is the single
+    // source of truth for that, firing at the top of the next turn regardless of how
+    // this one ended (clean finish, or a throw path that skips `finish` entirely).
     return { result, end };
   }
 
-  /** Reset the per-turn accumulators; leaves the run-level latches (`reportedSessionId`,
-   *  `turnActive`) untouched. */
+  /** Reset the per-turn accumulators; leaves the run-level `reportedSessionId` latch
+   *  untouched. */
   private resetPerTurn(): void {
     this.result = { done: false };
     this.leadText = [];
