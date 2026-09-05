@@ -66,6 +66,17 @@ type detailState struct {
 	// REST on the same 2s cadence `uzi run logs --follow` uses.
 	polling bool
 
+	// metaSeq / metaWaitID are the detail-meta analogue of the board's reqSeq / waitID (PRD
+	// #1130 M1 D2). metaSeq is the monotonic id minted for each meta GetRun poll
+	// (startDetailMetaReq bumps it); metaWaitID is the id the detail is waiting on, with
+	// metaWaitID == 0 meaning idle — a boardTickMsg issues a new meta refresh only while idle.
+	// A detailMetaMsg is honoured only when its reqID == metaWaitID (and its runID matches),
+	// and a failed poll clears metaWaitID so the next tick retries (the D2 anti-wedge property).
+	// metaSeq restarts per run (newDetailState), which is safe because the detailMetaMsg case
+	// checks runID BEFORE comparing the id, so a reply for an old run can never match.
+	metaSeq    uint64
+	metaWaitID uint64
+
 	// M4 surfaces. steer is gated on OWNERSHIP, not visibility (see steerAccessFor);
 	// review is the [v] overlay.
 	steer  steerState2
@@ -210,7 +221,10 @@ func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
 	}
 	m.view = viewBoard
 	m.detail = detailState{}
-	return m, m.fetchRunsCmd(m.board.admin)
+	// Mint a new id via startBoardReq so this refetch can't clear a periodic poll's guard: a
+	// board poll may be outstanding when the user backs out, and reusing its id would let this
+	// reply (or that stale one) be mistaken for the other (PRD #1130 M1 D2).
+	return m, (&m).startBoardReq()
 }
 
 func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {

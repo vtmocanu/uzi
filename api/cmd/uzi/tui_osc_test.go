@@ -64,7 +64,7 @@ func TestIssueLinkDegradesByProfile(t *testing.T) {
 
 	// Default test profile is TrueColor → link emitted, with the issue URL as target.
 	m := tuiTestModel(t, fake, "")
-	next, _ := m.Update(boardRunsMsg{runs: runs})
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	m = next.(tuiModel)
 	out := m.View().Content
 	if !strings.Contains(out, "\x1b]8") {
@@ -77,7 +77,7 @@ func TestIssueLinkDegradesByProfile(t *testing.T) {
 	// Ascii profile → no OSC-8 escape at all (plain #519 text instead).
 	next, _ = m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	m = next.(tuiModel)
-	next, _ = m.Update(boardRunsMsg{runs: runs})
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	m = next.(tuiModel)
 	degraded := m.View().Content
 	if strings.Contains(degraded, "\x1b]8") {
@@ -90,7 +90,7 @@ func TestIssueLinkDegradesByProfile(t *testing.T) {
 	// Back to TrueColor via an explicit message → link re-emitted.
 	next, _ = m.Update(tea.ColorProfileMsg{Profile: colorprofile.TrueColor})
 	m = next.(tuiModel)
-	next, _ = m.Update(boardRunsMsg{runs: runs})
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	m = next.(tuiModel)
 	if !strings.Contains(m.View().Content, "\x1b]8") {
 		t.Errorf("TrueColor board should re-emit the OSC-8 link after degrade")
@@ -110,7 +110,7 @@ func TestIssueIDRendersInBoardAndDetail(t *testing.T) {
 	fake := &uzicli.FakeClient{Runs: runs}
 
 	board := tuiTestModel(t, fake, "")
-	next, _ := board.Update(boardRunsMsg{runs: runs})
+	next, _ := board.Update(boardRunsMsg{reqID: board.board.waitID, runs: runs})
 	board = next.(tuiModel)
 	out := board.View().Content
 	if !strings.Contains(out, "#463") {

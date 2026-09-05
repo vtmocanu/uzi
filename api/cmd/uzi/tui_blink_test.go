@@ -38,30 +38,37 @@ func milestoneRunItem(id, status string, done int, inProg string) apitypes.RunLi
 // with a non-empty MilestonesInProgress, is NEVER double-armed across a 2s board refresh
 // (blinkArmed), and disarms — dropping to the static frame — when nothing is in progress.
 func TestTUIBlinkArmOnlyWithInProgress(t *testing.T) {
+	// The board reply now ALWAYS re-arms the board tick (PRD #1130: rescheduling moved to the
+	// reply), so `cmd != nil` no longer distinguishes "blink armed" — detect the blinkTickMsg
+	// itself. Shrink both cadences so draining the reply's ticks does not block on the real 2s/500ms.
+	origBoard, origBlink := boardPollInterval, blinkInterval
+	boardPollInterval, blinkInterval = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { boardPollInterval, blinkInterval = origBoard, origBlink })
+
 	fake := &uzicli.FakeClient{}
 	m := tuiTestModel(t, fake, "")
 
 	// A board with no in-progress run arms nothing.
 	plain := []apitypes.RunListItemDTO{milestoneRunItem("aaaaaaaa-1", "running", 2, "")}
-	next, cmd := m.Update(boardRunsMsg{runs: plain})
+	next, cmd := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: plain})
 	m = next.(tuiModel)
-	if m.blinkArmed || cmd != nil {
-		t.Fatalf("a board with no in-progress run must not arm the blink (armed=%v cmd=%v)", m.blinkArmed, cmd != nil)
+	if m.blinkArmed || hasMsg[blinkTickMsg](drainCmd(cmd)) {
+		t.Fatalf("a board with no in-progress run must not arm the blink (armed=%v)", m.blinkArmed)
 	}
 
 	// A refresh that reveals an in-progress run arms exactly one tick.
 	inprog := []apitypes.RunListItemDTO{milestoneRunItem("aaaaaaaa-1", "running", 1, "m2")}
-	next, cmd = m.Update(boardRunsMsg{runs: inprog})
+	next, cmd = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: inprog})
 	m = next.(tuiModel)
-	if !m.blinkArmed || cmd == nil {
-		t.Fatalf("revealing an in-progress run must arm the blink (armed=%v cmd=%v)", m.blinkArmed, cmd != nil)
+	if !m.blinkArmed || !hasMsg[blinkTickMsg](drainCmd(cmd)) {
+		t.Fatalf("revealing an in-progress run must arm the blink (armed=%v)", m.blinkArmed)
 	}
 
-	// A SECOND refresh while already armed must NOT stack another tick (double renders).
-	next, cmd = m.Update(boardRunsMsg{runs: inprog})
+	// A SECOND refresh while already armed must NOT stack another blink tick (double renders).
+	next, cmd = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: inprog})
 	m = next.(tuiModel)
-	if !m.blinkArmed || cmd != nil {
-		t.Fatalf("a refresh while already armed must not re-arm (armed=%v cmd=%v)", m.blinkArmed, cmd != nil)
+	if !m.blinkArmed || hasMsg[blinkTickMsg](drainCmd(cmd)) {
+		t.Fatalf("a refresh while already armed must not re-arm the blink (armed=%v)", m.blinkArmed)
 	}
 
 	// The tick toggles the phase and re-arms itself while a run is still in progress.
@@ -73,7 +80,7 @@ func TestTUIBlinkArmOnlyWithInProgress(t *testing.T) {
 
 	// When nothing is in progress any more, the run row still exists but the tick lapses and the
 	// phase resets to the static frame.
-	next, _ = m.Update(boardRunsMsg{runs: plain})
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: plain})
 	m = next.(tuiModel)
 	next, cmd = m.Update(blinkTickMsg{})
 	m = next.(tuiModel)
@@ -85,13 +92,19 @@ func TestTUIBlinkArmOnlyWithInProgress(t *testing.T) {
 // UZI_TUI_NO_BLINK=1 (noBlink) pins the static frame: the tick is never armed and blinkOn stays
 // false, even on a board with an in-progress run.
 func TestTUIBlinkNoBlinkPinsStaticFrame(t *testing.T) {
+	// The board reply always re-arms the board tick now (PRD #1130), so detect the blinkTickMsg
+	// itself rather than a non-nil cmd; shrink the cadences so draining does not block.
+	origBoard, origBlink := boardPollInterval, blinkInterval
+	boardPollInterval, blinkInterval = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { boardPollInterval, blinkInterval = origBoard, origBlink })
+
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	m.noBlink = true
 	inprog := []apitypes.RunListItemDTO{milestoneRunItem("aaaaaaaa-1", "running", 1, "m2")}
-	next, cmd := m.Update(boardRunsMsg{runs: inprog})
+	next, cmd := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: inprog})
 	m = next.(tuiModel)
-	if m.blinkArmed || cmd != nil {
-		t.Fatalf("UZI_TUI_NO_BLINK must never arm the blink (armed=%v cmd=%v)", m.blinkArmed, cmd != nil)
+	if m.blinkArmed || hasMsg[blinkTickMsg](drainCmd(cmd)) {
+		t.Fatalf("UZI_TUI_NO_BLINK must never arm the blink (armed=%v)", m.blinkArmed)
 	}
 	// A stray tick cannot flip the phase on.
 	next, _ = m.Update(blinkTickMsg{})
@@ -111,7 +124,7 @@ func TestTUIBlinkAsciiShapeAlternates(t *testing.T) {
 		m.width = 120
 		next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 		m = next.(tuiModel)
-		next, _ = m.Update(boardRunsMsg{runs: inprog})
+		next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: inprog})
 		m = next.(tuiModel)
 		m.blinkOn = on
 		return stripANSI(m.View().Content)
@@ -142,7 +155,7 @@ func TestTUIBlinkNullMilestoneByteIdentical(t *testing.T) {
 	boardFrame := func(on, noBlink bool) string {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 		m.noBlink = noBlink
-		next, _ := m.Update(boardRunsMsg{runs: []apitypes.RunListItemDTO{{RunDTO: plainRun}}})
+		next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{{RunDTO: plainRun}}})
 		m = next.(tuiModel)
 		m.blinkOn = on
 		return m.View().Content
@@ -250,7 +263,7 @@ func TestTUIBoardSecondLineTopAndBottom(t *testing.T) {
 	}
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	m.width, m.height = 120, 16
-	next, _ := m.Update(boardRunsMsg{runs: runs})
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	m = next.(tuiModel)
 
 	fits := func(label string) {
@@ -311,7 +324,7 @@ func TestTUIBoardSecondLineWindowReservesLine(t *testing.T) {
 	}
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	m.width, m.height = 120, 16
-	next, _ := m.Update(boardRunsMsg{runs: runs})
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	m = next.(tuiModel)
 
 	// Select the BOTTOM row, whose second line rides the very bottom of the window — exactly the
@@ -352,7 +365,7 @@ func TestTUIBoardSecondLineGainsAndLosesActivity(t *testing.T) {
 	withAct[1].CurrentActivity = activityFor("coder", "task-coder", now)
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	m.width, m.height = 120, 20
-	next, _ := m.Update(boardRunsMsg{runs: withAct})
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: withAct})
 	m = next.(tuiModel)
 	m = press(t, m, "j") // select the run WITH activity
 
@@ -366,7 +379,7 @@ func TestTUIBoardSecondLineGainsAndLosesActivity(t *testing.T) {
 		milestoneRunItem("aaaaaaaa-0", "running", 1, "m2"),
 		milestoneRunItem("aaaaaaaa-1", "running", 1, "m2"),
 	}
-	next, _ = m.Update(boardRunsMsg{runs: lost})
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: lost})
 	m = next.(tuiModel)
 	if strings.Contains(m.View().Content, "task-coder") {
 		t.Errorf("the selected run lost its activity but the second line is still drawn\n%s", m.View().Content)
@@ -376,7 +389,7 @@ func TestTUIBoardSecondLineGainsAndLosesActivity(t *testing.T) {
 	}
 
 	// Next poll: it gains activity again. The second line returns.
-	next, _ = m.Update(boardRunsMsg{runs: withAct})
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: withAct})
 	m = next.(tuiModel)
 	if !strings.Contains(m.View().Content, "task-coder") {
 		t.Errorf("the selected run regained activity but the second line did not return\n%s", m.View().Content)
