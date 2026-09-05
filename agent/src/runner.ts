@@ -361,6 +361,14 @@ interface RunFlight {
    *  second sequential overlay carries the prior tip as parent[0] (base-first) and the broker
    *  accepts it as a fast-forward. */
   lastCheckpointRefTip: string | undefined;
+  /** issue #1086 (F2 from #1036): the tip of the LAST overlay/real tip we ATTEMPTED to publish
+   *  when the publish result was AMBIGUOUS (a thrown error or a non-2xx — the broker may have
+   *  ACCEPTED the push before the HTTP ACK was lost). Undefined when no attempt is pending. The
+   *  next overlay chains from this (as parent[0]) via `attempted ?? confirmed`, so the chain
+   *  reaches the broker's actual ref whether or not the prior push landed; a CONFIRMED publish
+   *  clears it. In-memory only — NOT seeded from the claim: `claim.checkpoint_tip` is a
+   *  server-confirmed anchor, and a resume self-heals via `lastCheckpointRefTip`. */
+  lastAttemptedCheckpointRefTip: string | undefined;
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -2058,6 +2066,7 @@ export class RunRunner {
       // prevCheckpointTip. Seeded from the persisted tip on the claim (a resume already has an
       // overlay on the ref), advanced on every confirmed publish.
       lastCheckpointRefTip: claim.checkpoint_tip ?? undefined,
+      lastAttemptedCheckpointRefTip: undefined,
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
@@ -3164,7 +3173,10 @@ export class RunRunner {
       pat: claim.secrets.forge_pat,
       cloneUrl: claim.repo.clone_url,
       username: claim.secrets.forge_username,
-      prevCheckpointTip: flight.lastCheckpointRefTip,
+      // issue #1086 (F2): chain from the ATTEMPTED tip when one is pending (an ambiguous prior
+      // publish), else the CONFIRMED tip, so the next overlay descends the broker's actual ref
+      // whether or not the prior push landed.
+      prevCheckpointTip: flight.lastAttemptedCheckpointRefTip ?? flight.lastCheckpointRefTip,
     };
   }
 
@@ -3174,22 +3186,38 @@ export class RunRunner {
     branch: string,
     overlay?: CheckpointOverlayContext,
   ): Promise<boolean> {
+    // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an
+    // ambiguous result (non-2xx, or a throw after the pack tip is known) records the ATTEMPTED tip
+    // so the next overlay chains from it. Caveat: under PERSISTENT consecutive ACK loss the
+    // confirmed tip never advances while attempted marches forward, so each pack re-includes the
+    // whole un-landed overlay chain; this is bounded by the broker's object cap and self-clears on
+    // the first landed ACK.
+    let packedTip: string | undefined;
     try {
       const packed = await this.git.checkpointPack(barePath, branch, overlay);
       if (!packed) return false; // nothing to publish — not a failure, stay silent
+      packedTip = packed.tipOid;
       const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack);
       if (res.ok && res.body.published === true) {
         // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
         // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.
         flight.lastCheckpointRefTip = packed.tipOid;
+        // issue #1086 (F2): a confirmed publish reconciles the broker's ref, so clear any pending
+        // attempted tip — the confirmed tip is now authoritative.
+        flight.lastAttemptedCheckpointRefTip = undefined;
         return true;
       }
       if (res.ok) {
         // A 2xx that did NOT publish: a best-effort server-side skip. Name the reason.
+        // issue #1086 (F2): record NOTHING as attempted — the server definitively did not advance
+        // its ref, so the next overlay must keep chaining from the confirmed tip.
         const reason = res.body.skipped ?? "unknown";
         this.reportPublishOutcome(flight, `skip:${reason}`, `checkpoint publish skipped: ${reason}`);
       } else {
+        // issue #1086 (F2): a non-2xx is AMBIGUOUS — the broker may have accepted the push before
+        // the ACK was lost — so record the attempted tip for the next overlay to chain from.
+        flight.lastAttemptedCheckpointRefTip = packed.tipOid;
         this.reportPublishOutcome(
           flight,
           `http:${res.httpStatus}`,
@@ -3198,6 +3226,9 @@ export class RunRunner {
       }
       return false;
     } catch (e) {
+      // issue #1086 (F2): a throw is AMBIGUOUS too, but only after the pack tip was obtained — a
+      // throw DURING checkpointPack leaves packedTip undefined and records nothing.
+      if (packedTip !== undefined) flight.lastAttemptedCheckpointRefTip = packedTip;
       this.reportPublishOutcome(flight, "error", `checkpoint publish failed: ${errMessage(e)}`);
       return false;
     }
