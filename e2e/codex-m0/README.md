@@ -103,7 +103,8 @@ API compatibility suite. Managed native one-shot results do not establish
 code-mode, MCP/dynamic-tool, arbitrary detached-process or complete production
 guardrail coverage. Those remain separate questions.
 
-Baseline observations were reproduced on macOS arm64 and Linux arm64 with Node
-24 in the isolated container described above. The managed one-shot observations
-were measured in that Linux container. Exact cases and current totals come from
+Baseline observations were reproduced on the macOS arm64 host with Node 26 and
+on Linux arm64 with Node 24 in the isolated container described above. The managed
+one-shot observations were measured only in that Linux arm64 container with Node
+24. Exact cases and current totals come from
 the named test runner output, not a fixed pass-count claim in this document.
