@@ -12,6 +12,16 @@ package store
 // never changes.
 const KindAnthropicToken = "anthropic_token"
 
+// KindOpenAIAPIKey is user_secrets.kind for a static OpenAI API key (migration
+// 00197): a pasted key with no subscription lifecycle behind it. Its per-alias
+// codex_credential_state is 'static'.
+const KindOpenAIAPIKey = "openai_api_key"
+
+// KindCodexAuth is user_secrets.kind for a Codex subscription login (migration
+// 00197): its authoritative account state lives in codex_provider_account and its
+// per-alias link status in codex_credential_state.
+const KindCodexAuth = "codex_auth"
+
 // LabelDefaultSecret is the label 00077 backfills onto every pre-existing
 // user_secrets row, and the one the kind-path compatibility routes and the seed
 // create a user's first secret under (PRD #104 D2/D14). It is a conventional name,

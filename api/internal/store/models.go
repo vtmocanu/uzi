@@ -151,6 +151,36 @@ type CliToken struct {
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
+type CodexCredentialState struct {
+	UserSecretID      uuid.UUID          `json:"user_secret_id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	Status            string             `json:"status"`
+	ProviderAccountID pgtype.UUID        `json:"provider_account_id"`
+	MaterialRevision  int64              `json:"material_revision"`
+	LastError         pgtype.Text        `json:"last_error"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type CodexProviderAccount struct {
+	ID                  uuid.UUID          `json:"id"`
+	UserID              uuid.UUID          `json:"user_id"`
+	ProviderUserID      string             `json:"provider_user_id"`
+	WorkspaceAccountID  string             `json:"workspace_account_id"`
+	SealedLogin         []byte             `json:"sealed_login"`
+	SealedWith          string             `json:"sealed_with"`
+	Generation          int64              `json:"generation"`
+	CredentialRevision  int64              `json:"credential_revision"`
+	RecoverySealed      []byte             `json:"recovery_sealed"`
+	RecoveryGeneration  pgtype.Int8        `json:"recovery_generation"`
+	CoordState          string             `json:"coord_state"`
+	CoordOperationID    pgtype.UUID        `json:"coord_operation_id"`
+	LeaseDeadline       pgtype.Timestamptz `json:"lease_deadline"`
+	CommittedGeneration pgtype.Int8        `json:"committed_generation"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
 type FindingDisposition struct {
 	ID            uuid.UUID          `json:"id"`
 	UserID        uuid.UUID          `json:"user_id"`
