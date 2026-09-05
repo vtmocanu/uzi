@@ -230,16 +230,18 @@ func milestoneInProgress(run apitypes.RunDTO) (id, title string) {
 	return "", ""
 }
 
-// milestoneCell renders the blinking in-progress milestone cell (PRD #1064 D4): ▰ when the
-// model's blink phase is on, ▱ when off, in the wait colour. The alternation is SHAPE-based
-// (▰ vs ▱), so it still reads under an Ascii/NO_COLOR profile that strips the tint; the initial
-// phase is ▱ (the static frame). bg carries a selection background when the cell rides one.
+// milestoneCell renders the blinking in-progress milestone micro-bar cell (PRD #1136, recoloring
+// #1064 D4): ▰ when the model's blink phase is on, ▱ when off, in the tungsten colour (matching
+// the done fill; the blink and the empty ▱ off-frame, not the hue, set it apart — PRD #1136 D2).
+// The alternation is SHAPE-based (▰ vs ▱), so it still reads under an Ascii/NO_COLOR profile that
+// strips the tint; the initial phase is ▱ (the static frame). bg carries a selection background
+// when the cell rides one.
 func (m tuiModel) milestoneCell(bg color.Color) string {
 	g := "▱"
 	if m.blinkOn {
 		g = "▰"
 	}
-	return paintSeg(m.pal.wait, bg, false, g)
+	return paintSeg(m.pal.tungsten, bg, false, g)
 }
 
 // railActivity folds the crew rail's OWN frames into the run's "now" line via runactivity.Latest
