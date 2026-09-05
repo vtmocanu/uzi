@@ -552,8 +552,9 @@ export function calibrateReview(review: ReviewRequest, failureClass: string | nu
 // (PRD #362 M3a) and the task review runner, which parse the same fenced/prose-wrapped
 // JSON shape. The FIRST balanced candidate is not always the JSON: a brace example in
 // prose before it (e.g. `Use {verdict, summary} here`, possibly inside the fence) slices
-// first but does not parse. So on a JSON.parse failure we advance past that candidate and
-// try the next one, keeping the throw (→ caller's deterministic fallback) only when no
+// first but does not parse. So on a JSON.parse failure we advance past that WHOLE candidate
+// (not just its opening brace, which would re-enter a valid object nested inside the bad one)
+// and try the next one, keeping the throw (→ caller's deterministic fallback) only when no
 // balanced candidate parses.
 export function extractJsonObject(text: string): unknown {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -569,7 +570,10 @@ export function extractJsonObject(text: string): unknown {
       return JSON.parse(candidate.slice);
     } catch (err) {
       lastErr = err;
-      from = candidate.start + 1; // skip this '{' and look for the next balanced candidate
+      // Skip the ENTIRE rejected candidate, not just its opening '{': candidate.start +
+      // candidate.slice.length is the offset one past its closing brace, so a valid object
+      // NESTED inside the rejected one is not mistaken for the real later JSON.
+      from = candidate.start + candidate.slice.length;
     }
   }
   if (!sawCandidate) throw new Error("no JSON object found in the model output");

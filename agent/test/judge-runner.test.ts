@@ -386,6 +386,18 @@ describe("parseReview", () => {
     assert.equal(r.verdict, "ok");
   });
 
+  it("skips a malformed candidate that CONTAINS a nested valid object, then parses the real JSON", () => {
+    // The first balanced candidate is malformed (unquoted `example:`) yet contains a nested
+    // valid object. Advancing past the whole rejected candidate (not just its '{') must skip
+    // that nested object and reach the real, later JSON — otherwise the wrong verdict wins.
+    const text =
+      'Use {example: {"verdict":"ok","summary":"wrong","recommendations":[]}} here\n' +
+      '{"verdict":"issues","summary":"right","recommendations":[]}';
+    const r = parseReview(text, "haiku");
+    assert.equal(r.verdict, "issues");
+    assert.equal(r.summary, "right");
+  });
+
   it("parses JSON embedded in prose and drops unknown categories", () => {
     const text =
       'Here is my assessment: {"verdict":"issues","summary":"s","recommendations":[' +
