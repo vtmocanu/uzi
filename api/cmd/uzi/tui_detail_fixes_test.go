@@ -275,7 +275,7 @@ func TestTUIAdminBoardRowsFitNarrowWidth(t *testing.T) {
 		m := tuiTestModel(t, fake, "")
 		m.board.admin = true
 		m.width, m.height = w, 34
-		next, _ := m.Update(boardRunsMsg{runs: fake.Runs, admin: true})
+		next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs, admin: true})
 		return next.(tuiModel).View().Content
 	}
 	for _, w := range []int{90, 91} {
