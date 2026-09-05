@@ -375,6 +375,7 @@ func Validate(key, value string) error {
 	case KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
 		KeyCapabilityAwareScheduling, KeyGithubProjectSyncEnabled,
 		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled,
+		KeyCiAutofixEnabled,
 		KeyReleaseCheckEnabled, KeyReleaseCheckBannerEnabled,
 		KeyAppLogoKeepName, KeyBrandPlaque:
 		return validateBool(value)

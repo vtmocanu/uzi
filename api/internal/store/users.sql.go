@@ -783,8 +783,8 @@ RETURNING id, email, password_hash, display_name, is_admin, is_active, token_ver
 `
 
 type SetUserCIAutofixEnabledParams struct {
-	ID               uuid.UUID `json:"id"`
-	CiAutofixEnabled bool      `json:"ci_autofix_enabled"`
+	ID               uuid.UUID   `json:"id"`
+	CiAutofixEnabled pgtype.Bool `json:"ci_autofix_enabled"`
 }
 
 // Flip a user's automatic CI-fix opt-in (PRD #71). Per-user consent to spend the

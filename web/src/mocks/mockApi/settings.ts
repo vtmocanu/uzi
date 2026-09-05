@@ -55,6 +55,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
+  // PRD #914: instance-wide CI-autofix kill-switch, default ON.
+  ci_autofix_enabled: "true",
   // PRD #529 / #649 M1: ephemeral worker auto-provisioning instance kill-switch, default OFF.
   ephemeral_workers_enabled: "false",
   // PRD #836: upstream release-check toggles, both default ON (the master air-gap
@@ -503,7 +505,10 @@ export const settingsApi = {
         key === "judge_enforce_all" ||
         key === "ephemeral_workers_enabled" ||
         key === "release_check_enabled" ||
-        key === "release_check_banner_enabled"
+        key === "release_check_banner_enabled" ||
+        key === "health_enabled" ||
+        key === "capability_aware_scheduling" ||
+        key === "github_project_sync_enabled"
       ) {
         if (value !== "true" && value !== "false") {
           throw new ApiError(400, `${key}: must be "true" or "false"`);
@@ -597,6 +602,46 @@ export const settingsApi = {
         nonSecret.brand_company = value;
         continue;
       }
+      // Run-health detector thresholds (PRD #47), mirroring the server's
+      // validateHealthSeconds: a whole number of seconds, accept 0 (off), otherwise the
+      // inclusive range [60, 86400].
+      if (
+        key === "health_stall_seconds" ||
+        key === "health_slow_seconds" ||
+        key === "health_queued_seconds" ||
+        key === "health_approval_seconds" ||
+        key === "health_nudge_cooldown_seconds"
+      ) {
+        if (!/^\d+$/.test(value)) {
+          throw new ApiError(400, `${key}: must be a whole number of seconds`);
+        }
+        const n = Number(value);
+        if (n !== 0 && (n < 60 || n > 86400)) {
+          throw new ApiError(400, `${key}: must be 0 (off) or between 60 and 86400`);
+        }
+        (nonSecret as Record<string, string>)[key] = String(n);
+        continue;
+      }
+      // docker_repo_allowlist (PRD #957): a comma-separated list of repo ids, mirroring the
+      // server's validateRepoAllowlist. Empty is allowed (fail-closed empty); every
+      // non-empty token must be a valid UUID. The raw (untrimmed) value is stored.
+      if (key === "docker_repo_allowlist") {
+        const ok = value
+          .split(",")
+          .map((t) => t.trim())
+          .filter((t) => t !== "")
+          .every((t) =>
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t),
+          );
+        if (!ok) {
+          throw new ApiError(
+            400,
+            "docker_repo_allowlist: must be a comma-separated list of repo ids (UUIDs)",
+          );
+        }
+        nonSecret.docker_repo_allowlist = value;
+        continue;
+      }
       if (key !== "autopilot_label" && key !== "uzi_label") {
         throw new ApiError(400, `unknown setting: ${key}`);
       }
@@ -676,13 +721,13 @@ export const settingsApi = {
 
   // ── CI-autofix opt-in (PRD #71) ──────────────────────────────────────────────
   // Own-user (session identity, never a body id, mirroring the server).
-  setCIAutofixEnabled: async (enabled: boolean) => {
+  setCIAutofixEnabled: async (enabled: boolean | null) => {
     const u = requireSession();
     u.ci_autofix_enabled = enabled;
     return delay({ user: { ...u } }, 200);
   },
   // Admin per-user toggle: target from the id argument (the path on the server).
-  setUserCIAutofixEnabled: async (id: string, enabled: boolean) => {
+  setUserCIAutofixEnabled: async (id: string, enabled: boolean | null) => {
     const u = users.find((x) => x.id === id);
     if (!u) throw new ApiError(404, "user not found");
     u.ci_autofix_enabled = enabled;

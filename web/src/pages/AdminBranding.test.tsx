@@ -37,6 +37,7 @@ const settings = (over: Partial<AppSettings> = {}): AppSettings => ({
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
   ephemeral_workers_enabled: "false",
+  ci_autofix_enabled: "true",
   release_check_enabled: "true",
   release_check_banner_enabled: "true",
   summary_model: "haiku",

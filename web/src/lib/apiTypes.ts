@@ -17,10 +17,11 @@ export interface User {
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
-  // ci_autofix_enabled is the per-user opt-in to automatic CI fixes (PRD #71).
-  // Default false; the user toggles their own from Settings, an admin can force any
-  // user's.
-  ci_autofix_enabled: boolean;
+  // ci_autofix_enabled is the per-user opt-in to automatic CI fixes (PRD #71, made
+  // a tri-state in #914 M3): true = explicit on, false = explicit off, null =
+  // inherit the admin global default (on). The user toggles their own from
+  // Settings, an admin can force any user's.
+  ci_autofix_enabled: boolean | null;
   // attribution_enabled is the per-user opt-out for AI attribution in worker commits
   // (issue #916). Default TRUE (today's behavior): when true the worker's commits keep
   // the Co-Authored-By: Claude trailer; when false it is suppressed on the user's next
@@ -716,6 +717,10 @@ export interface AppSettings {
   judge_enforce_all: string;
   judge_cooldown_seconds: string;
   judge_daily_budget: string;
+  // Instance-wide CI-autofix kill-switch (PRD #914). The text "true"/"false" (default
+  // "true"). When OFF, no user's failed pipeline is auto-fixed regardless of their
+  // per-user opt-in — the admin per-user CI-autofix toggle is inert while it is off.
+  ci_autofix_enabled: string;
   // Ephemeral worker auto-provisioning instance kill-switch (PRD #529 / #649 M1).
   // The text "true"/"false" (default "false"). When OFF, no run ever auto-provisions
   // a throwaway hosted worker regardless of a user's per-account opt-in; when ON,
@@ -1359,7 +1364,7 @@ export interface Schedule {
   updated_at: string;
   // The live "next N fires" preview (up to 3), computed server-side from the same
   // cron logic the modal preview uses so the list and the modal agree.
-  next_fires: string[];
+  next_fires: string[] | null;
 }
 
 // A schedule's provenance (PRD #589): owner-authored vs enabled from the catalog.

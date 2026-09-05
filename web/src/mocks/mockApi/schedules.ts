@@ -814,13 +814,20 @@ export const schedulesApi = {
     // Coalesce a group id onto the source (the server does this under a row lock so two
     // racing calls settle on one id; a single-writer mock just assigns it once).
     const groupId = src.sibling_group_id ?? crypto.randomUUID();
+    // The partial unique index (sibling_group_id, repo_id) rejects a second sibling on a
+    // repo already in the group — an idempotent-safe 409, no duplicate row created. The
+    // server does the group-coalesce and sibling insert in ONE transaction
+    // (handler/schedules_clone.go AddScheduleRepo: CoalesceScheduleSiblingGroup then
+    // CreateRunSchedule under tx.Begin/defer tx.Rollback), so a partial-unique-index
+    // conflict rolls the group stamp back. Mirror that by running the duplicate check
+    // BEFORE stamping the source: treat the source as a (post-coalesce) group member, so a
+    // collision exists when the source itself already carries that repo_id (adding its own
+    // repo) OR an existing row already in the group does.
+    if (schedules.some((x) => (x.id === src.id || x.sibling_group_id === groupId) && x.repo_id === repoId)) {
+      throw new ApiError(409, "that schedule is already on that repo");
+    }
     if (!src.sibling_group_id) {
       schedules = schedules.map((x) => (x.id === src.id ? { ...x, sibling_group_id: groupId } : x));
-    }
-    // The partial unique index (sibling_group_id, repo_id) rejects a second sibling on a
-    // repo already in the group — an idempotent-safe 409, no duplicate row created.
-    if (schedules.some((x) => x.sibling_group_id === groupId && x.repo_id === repoId)) {
-      throw new ApiError(409, "that schedule is already on that repo");
     }
     const now = new Date().toISOString();
     // Copy the source's current config onto the new repo as an independent sibling. The

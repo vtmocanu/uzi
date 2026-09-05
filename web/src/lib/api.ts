@@ -367,7 +367,7 @@ const realApi = {
     request<{ user: User }>("PUT", `/admin/users/${id}/judge`, { enabled }),
   // Admin per-user CI-autofix toggle (PRD #71): force any user's opt-in. Actor is
   // admin (route-gated); target is the path id, never the body. Returns the user.
-  setUserCIAutofixEnabled: (id: string, enabled: boolean) =>
+  setUserCIAutofixEnabled: (id: string, enabled: boolean | null) =>
     request<{ user: User }>("PUT", `/admin/users/${id}/ci-autofix`, { enabled }),
   getSettings: () => request<SettingsResponse>("GET", "/admin/settings"),
   updateSettings: (settings: UpdateSettingsPayload) =>
@@ -425,7 +425,7 @@ const realApi = {
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
   // Flip the current user's CI-autofix opt-in (PRD #71). Session identity only —
   // the body carries no user id. Returns the updated user.
-  setCIAutofixEnabled: (enabled: boolean) =>
+  setCIAutofixEnabled: (enabled: boolean | null) =>
     request<{ user: User }>("PUT", "/me/ci-autofix", { enabled }),
   // Flip the current user's AI-attribution opt-out (issue #916). Session identity only —
   // the body carries no user id. Returns the updated user.

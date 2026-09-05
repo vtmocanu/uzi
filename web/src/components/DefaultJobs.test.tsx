@@ -434,3 +434,19 @@ describe("DefaultJobs — pause-all Next-run note (PRD #1093)", () => {
     expect(screen.queryByText(/paused until/)).toBeNull();
   });
 });
+
+// issue #1003: a once/invalid-cron schedule ships `next_fires: null` on the wire, and the
+// SubRow's `s.next_fires?.[0]` nextFire read (DefaultJobs.tsx:400) must not crash on it.
+describe("DefaultJobs — next_fires null (issue #1003)", () => {
+  it("renders a sub-row whose schedule has next_fires: null without crashing", () => {
+    renderTab({
+      schedules: [defRow({ id: "sch-uzi", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", next_fires: null })],
+    });
+    // Expand the group so its per-repo SubRow mounts (children render only while expanded),
+    // which is what exercises the DefaultJobs.tsx:400 nextFire read on a null next_fires.
+    fireEvent.click(screen.getByRole("button", { name: "Show repos for Bug triage sweep" }));
+    // The SubRow mounted (its per-repo Run-now action carries the repo path), which means the
+    // DefaultJobs.tsx:400 nextFire read ran on a null next_fires without throwing.
+    expect(screen.getByRole("button", { name: "Run now on vtmocanu/uzi" })).toBeTruthy();
+  });
+});

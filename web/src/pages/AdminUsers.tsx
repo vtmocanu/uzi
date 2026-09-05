@@ -27,6 +27,13 @@ export function AdminUsers() {
   // best-effort from the admin settings alongside the user list; a failed read leaves
   // it false so the toggle stays live rather than falsely claiming to be inert.
   const [judgeEnforceAll, setJudgeEnforceAll] = useState(false);
+  // Whether the instance-wide CI-autofix kill-switch is OFF (PRD #914 M1). When the
+  // global ci_autofix_enabled is "false" no user's pipeline is auto-fixed regardless
+  // of their per-user flag, so the per-user toggle in this table is INERT — greyed and
+  // annotated, not removed, exactly like judgeEnforceAll above. Read best-effort from
+  // the admin settings; a failed read leaves it false so the toggle stays live rather
+  // than falsely claiming to be inert.
+  const [ciAutofixInstanceOff, setCiAutofixInstanceOff] = useState(false);
 
   const { loading, error: loadError } = useAsyncData(
     async ({ isCurrent }) => {
@@ -40,9 +47,15 @@ export function AdminUsers() {
       setUsers(users);
       try {
         const { settings } = await api.getSettings();
-        if (isCurrent()) setJudgeEnforceAll(settings.judge_enforce_all === "true");
+        if (isCurrent()) {
+          setJudgeEnforceAll(settings.judge_enforce_all === "true");
+          setCiAutofixInstanceOff(settings.ci_autofix_enabled === "false");
+        }
       } catch {
-        if (isCurrent()) setJudgeEnforceAll(false);
+        if (isCurrent()) {
+          setJudgeEnforceAll(false);
+          setCiAutofixInstanceOff(false);
+        }
       }
     },
     [],
@@ -85,7 +98,11 @@ export function AdminUsers() {
     setError("");
     setCiAutofixBusyId(u.id);
     try {
-      const { user } = await api.setUserCIAutofixEnabled(u.id, !u.ci_autofix_enabled);
+      // NULL (inherit) and true both read as currently-on (PRD #914 M3); the admin
+      // control is an explicit force-toggle, so it always sends the opposite bool
+      // (never clears to inherit — that is a self-service capability only).
+      const currentlyOn = u.ci_autofix_enabled !== false;
+      const { user } = await api.setUserCIAutofixEnabled(u.id, !currentlyOn);
       setUsers((prev) => prev.map((x) => (x.id === user.id ? user : x)));
     } catch (err) {
       setError(errorMessage(err, "Update failed"));
@@ -155,19 +172,27 @@ export function AdminUsers() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
-                        <Badge tone={u.ci_autofix_enabled ? "ok" : "neutral"} dot>
-                          {u.ci_autofix_enabled ? "On" : "Off"}
+                      <div className={`flex items-center gap-2 ${ciAutofixInstanceOff ? "opacity-50" : ""}`}>
+                        <Badge
+                          tone={!ciAutofixInstanceOff && u.ci_autofix_enabled !== false ? "ok" : "neutral"}
+                          dot
+                        >
+                          {!ciAutofixInstanceOff && u.ci_autofix_enabled !== false ? "On" : "Off"}
                         </Badge>
                         <Button
                           variant="ghost"
                           size="sm"
-                          disabled={ciAutofixBusyId === u.id}
+                          disabled={ciAutofixBusyId === u.id || ciAutofixInstanceOff}
                           onClick={() => toggleCIAutofix(u)}
                         >
-                          {u.ci_autofix_enabled ? "Disable" : "Enable"}
+                          {!ciAutofixInstanceOff && u.ci_autofix_enabled !== false ? "Disable" : "Enable"}
                         </Button>
                       </div>
+                      {ciAutofixInstanceOff && (
+                        <p className="mt-1 text-xs text-faint">
+                          Inert: the instance kill-switch is off; autofix is disabled for every user.
+                        </p>
+                      )}
                     </td>
                     <td className="px-4 py-3 text-muted">
                       {u.last_login ? new Date(u.last_login).toLocaleString() : "—"}
