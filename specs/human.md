@@ -604,6 +604,7 @@ ADR at `adr/0035-run-limit-retry.md`.
   runs, which have no start affordance at all]
 - `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
+- When a run parked on a usage limit resumes, the owner gets a Slack message in the run's thread. [user 2026-09-05, PRD #1116]
 
 ## Feature #218 — A park or shutdown must not lose the agent's committed work
 

@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Slack DM when a usage-limit-paused run resumes ([#1116](https://github.com/vtmocanu/uzi/issues/1116)).**
+  A run parked on an Anthropic usage limit already posts a ⏸️ Paused reply into its Slack DM thread; now the first time it is running again it posts a single ▶️ Resumed reply into the same thread, carrying how long it waited and (from the second pause) the pause count, deduped through the per-run Slack anchor so a redelivered running report never re-posts.
+
 ## [0.78.0] - 2026-09-03
 
 ### Added
