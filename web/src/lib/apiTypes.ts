@@ -1359,7 +1359,7 @@ export interface Schedule {
   updated_at: string;
   // The live "next N fires" preview (up to 3), computed server-side from the same
   // cron logic the modal preview uses so the list and the modal agree.
-  next_fires: string[];
+  next_fires: string[] | null;
 }
 
 // A schedule's provenance (PRD #589): owner-authored vs enabled from the catalog.

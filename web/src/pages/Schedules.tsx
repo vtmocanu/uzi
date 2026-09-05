@@ -1011,7 +1011,7 @@ function MyScheduleSubRow({
 }) {
   const demo = useDemoMode();
   const repoLabel = s.repo_path ? maskRepoPath(s.repo_path, demo) : "repo unavailable";
-  const nextFire = s.next_fires[0] ?? s.next_fire_at;
+  const nextFire = s.next_fires?.[0] ?? s.next_fire_at;
   const [expanded, setExpanded] = useState(false);
   const panelId = `last-fire-${s.id}`;
   return (
