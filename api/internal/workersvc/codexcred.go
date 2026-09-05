@@ -221,6 +221,22 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 			SealedWith:         sealedWith,
 		})
 		if ierr != nil {
+			// Concurrent enrollment of the same tuple: another alias won the
+			// insert between our tuple read and this write, tripping
+			// codex_provider_account_tuple_key (23505). That is the convergence
+			// case, not a failure — re-resolve the now-existing account and link
+			// to it rather than creating a second copy. Any other error is real.
+			if uniqueViolationOn(ierr, "codex_provider_account_tuple_key") {
+				existing, gerr := r.q.GetCodexProviderAccountByTuple(ctx, store.GetCodexProviderAccountByTupleParams{
+					UserID:             userID,
+					ProviderUserID:     id.ProviderUserID,
+					WorkspaceAccountID: id.WorkspaceAccountID,
+				})
+				if gerr != nil {
+					return fmt.Errorf("codex reconcile: resolve after insert race: %w", gerr)
+				}
+				return r.link(ctx, userID, userSecretID, existing.ID)
+			}
 			return fmt.Errorf("codex reconcile: insert account: %w", ierr)
 		}
 		if lerr := r.link(ctx, userID, userSecretID, acct.ID); lerr != nil {

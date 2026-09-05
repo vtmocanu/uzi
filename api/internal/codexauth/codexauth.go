@@ -128,37 +128,11 @@ func WithHTTPDoer(d httpDoer) Option {
 	}
 }
 
-// WithUsageBaseURL overrides the usage/identity base URL (default
-// DefaultUsageBaseURL). An empty value is ignored.
-func WithUsageBaseURL(u string) Option {
-	return func(c *Client) {
-		if u != "" {
-			c.usageBase = u
-		}
-	}
-}
-
-// WithOAuthBaseURL overrides the oauth base URL (default DefaultOAuthBaseURL). An
-// empty value is ignored.
-func WithOAuthBaseURL(u string) Option {
-	return func(c *Client) {
-		if u != "" {
-			c.oauthBase = u
-		}
-	}
-}
-
-// WithClientID overrides the oauth client id sent on the refresh exchange (default
-// DefaultClientID). An empty value is ignored.
-func WithClientID(id string) Option {
-	return func(c *Client) {
-		if id != "" {
-			c.clientID = id
-		}
-	}
-}
-
-// NewClient builds a Client with the provider defaults, then applies opts.
+// NewClient builds a Client with the provider defaults, then applies opts. The
+// only option the dark M1 layer needs is WithHTTPDoer (tests inject a fake
+// transport); the base URLs and client id are the fixed provider defaults. A later
+// unit that must point at a non-default endpoint can add the override option then,
+// with a caller — an unused exported option would redden the deadcode gate now.
 func NewClient(opts ...Option) *Client {
 	c := &Client{
 		doer:      http.DefaultClient,
