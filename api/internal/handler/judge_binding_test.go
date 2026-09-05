@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -30,6 +31,12 @@ type judgeBindStore struct {
 
 	setCalled bool
 	setArg    store.SetUserJudgeAnthropicBindingParams
+
+	// retUser, when non-nil, is the store.User SetUserJudgeAnthropicBinding hands back
+	// INSTEAD of echoing arg. It lets a test stage the exact stored row toDTO must
+	// render — in particular the FK-nulled 'pinned'+NULL state a coupling CHECK cannot
+	// forbid (00088), which no valid request can otherwise produce.
+	retUser *store.User
 }
 
 func (j *judgeBindStore) GetUserSecretIDByLabel(_ context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error) {
@@ -51,6 +58,9 @@ func (j *judgeBindStore) GetUserSecretCiphertextByID(_ context.Context, arg stor
 func (j *judgeBindStore) SetUserJudgeAnthropicBinding(_ context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error) {
 	j.setCalled = true
 	j.setArg = arg
+	if j.retUser != nil {
+		return *j.retUser, nil
+	}
 	return store.User{
 		ID:                     arg.ID,
 		JudgeAnthropicBindMode: arg.JudgeAnthropicBindMode,
@@ -151,6 +161,12 @@ func TestSetJudgeNullTokenClears(t *testing.T) {
 	if st.setArg.JudgeAnthropicSecretID.Valid {
 		t.Fatalf("wrote %+v, want a NULL binding", st.setArg.JudgeAnthropicSecretID)
 	}
+	// A clear must write mode `default`, NOT `auto` — `auto` also carries a NULL
+	// pointer, so without this a pre-M2 client clearing its judge token would
+	// silently land on the pool (PRD #1140 success criterion 5).
+	if st.setArg.JudgeAnthropicBindMode != workersvc.BindModeDefault {
+		t.Fatalf("clear wrote mode %q, want default", st.setArg.JudgeAnthropicBindMode)
+	}
 }
 
 // TestSetJudgeMalformedTokenIs400: a number or an object is a client bug, and must
@@ -189,6 +205,10 @@ func TestSetJudgeEmptyTokenClears(t *testing.T) {
 	}
 	if st.setArg.JudgeAnthropicSecretID.Valid {
 		t.Fatalf("wrote %+v, want a NULL binding", st.setArg.JudgeAnthropicSecretID)
+	}
+	// A clear writes mode `default`, not `auto` (see TestSetJudgeNullTokenClears).
+	if st.setArg.JudgeAnthropicBindMode != workersvc.BindModeDefault {
+		t.Fatalf("clear wrote mode %q, want default", st.setArg.JudgeAnthropicBindMode)
 	}
 }
 
@@ -255,6 +275,99 @@ func TestSetJudgeAutoModeWritesAutoWithNullPointer(t *testing.T) {
 	}
 	if st.setArg.JudgeAnthropicSecretID.Valid {
 		t.Fatalf("auto mode wrote a pointer %+v, want NULL", st.setArg.JudgeAnthropicSecretID)
+	}
+}
+
+// decodeJudgeBindMode reads the RESPONSE envelope of PUT /api/me/judge and returns the
+// judge_anthropic_bind_mode field toDTO emitted — the effective mode a client sees, not
+// the raw stored column.
+func decodeJudgeBindMode(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var env struct {
+		User struct {
+			JudgeAnthropicBindMode string `json:"judge_anthropic_bind_mode"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode response envelope: %v; body=%s", err, rec.Body.String())
+	}
+	return env.User.JudgeAnthropicBindMode
+}
+
+// TestSetJudgeResponseReportsEffectiveModeForNulledPin (PRD #1140 M2, D6) is the
+// response-layer guard on toDTO's effectiveBindMode correction. It stages the row a
+// coupling CHECK cannot forbid (00088): a 'pinned' binding whose secret pointer was
+// nulled by the FK's ON DELETE SET NULL. The stored column still reads "pinned", but the
+// pointer is gone, so the effective mode is "default" — and the RESPONSE must report
+// "default", never the stale "pinned". Dropping the effectiveBindMode call in toDTO
+// (rendering u.JudgeAnthropicBindMode raw) leaks "pinned" here and turns this red.
+func TestSetJudgeResponseReportsEffectiveModeForNulledPin(t *testing.T) {
+	owner := uuid.New()
+	st := &judgeBindStore{
+		secrets: map[uuid.UUID]uuid.UUID{},
+		labels:  map[string]uuid.UUID{},
+		// The FK-nulled state: mode still 'pinned', pointer NULL. No valid PUT can write
+		// this (pinned-without-a-label is a 400), so it is staged as the stored row the
+		// write returns; the request below only needs to reach the binding path.
+		retUser: &store.User{
+			ID:                     owner,
+			JudgeAnthropicBindMode: workersvc.BindModePinned,
+			JudgeAnthropicSecretID: pgtype.UUID{Valid: false},
+		},
+	}
+	h := newJudgeBindHandler(t, &fakeUserDB{}, st)
+
+	rec := httptest.NewRecorder()
+	h.SetJudgeEnabled(rec, judgeReq(owner, `{"enabled":true,"judge_bind_mode":"auto"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeJudgeBindMode(t, rec); got != workersvc.BindModeDefault {
+		t.Fatalf("response judge_anthropic_bind_mode = %q, want %q — a 'pinned' row with a "+
+			"NULL pointer must render as the effective mode, not the stale stored value",
+			got, workersvc.BindModeDefault)
+	}
+}
+
+// TestSetJudgeResponseReportsAutoMode is the pass-through direction: a row whose mode is
+// 'auto' (pointer NULL) renders unchanged as "auto" in the response — effectiveBindMode
+// only corrects the pinned+NULL contradiction, everything else is reported verbatim.
+func TestSetJudgeResponseReportsAutoMode(t *testing.T) {
+	owner := uuid.New()
+	st := &judgeBindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+	h := newJudgeBindHandler(t, &fakeUserDB{}, st)
+
+	rec := httptest.NewRecorder()
+	h.SetJudgeEnabled(rec, judgeReq(owner, `{"enabled":true,"judge_bind_mode":"auto"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeJudgeBindMode(t, rec); got != workersvc.BindModeAuto {
+		t.Fatalf("response judge_anthropic_bind_mode = %q, want %q", got, workersvc.BindModeAuto)
+	}
+}
+
+// TestSetJudgeResponseReportsPinnedMode: a genuinely pinned row (mode 'pinned' WITH a
+// live pointer) renders as "pinned" — the effective mode and the stored mode agree, so
+// the correction is a no-op and the response reports the real binding.
+func TestSetJudgeResponseReportsPinnedMode(t *testing.T) {
+	owner, secretID := uuid.New(), uuid.New()
+	st := &judgeBindStore{
+		secrets: map[uuid.UUID]uuid.UUID{secretID: owner},
+		labels:  map[string]uuid.UUID{owner.String() + "|cheap-console": secretID},
+	}
+	h := newJudgeBindHandler(t, &fakeUserDB{}, st)
+
+	rec := httptest.NewRecorder()
+	h.SetJudgeEnabled(rec, judgeReq(owner, `{"enabled":true,"judge_bind_mode":"pinned","anthropic_token":"cheap-console"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeJudgeBindMode(t, rec); got != workersvc.BindModePinned {
+		t.Fatalf("response judge_anthropic_bind_mode = %q, want %q", got, workersvc.BindModePinned)
 	}
 }
 
