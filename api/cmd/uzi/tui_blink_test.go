@@ -102,7 +102,7 @@ func TestTUIBlinkNoBlinkPinsStaticFrame(t *testing.T) {
 }
 
 // The board micro-bar's in-progress cell alternates by SHAPE (▰ vs ▱), so it survives an Ascii
-// (NO_COLOR) profile that strips the wait tint. The done fill stays ▰ and the in-progress cell
+// (NO_COLOR) profile that strips the tungsten tint. The done fill stays ▰ and the in-progress cell
 // is the one that flips between the two phases.
 func TestTUIBlinkAsciiShapeAlternates(t *testing.T) {
 	inprog := []apitypes.RunListItemDTO{milestoneRunItem("aaaaaaaa-1", "running", 1, "m2")}
@@ -128,6 +128,77 @@ func TestTUIBlinkAsciiShapeAlternates(t *testing.T) {
 	}
 	if off == onFrame {
 		t.Error("the in-progress cell did not alternate by shape under the Ascii profile")
+	}
+}
+
+// milestoneDetailRun builds a milestone-structured RunDTO for the crew-rail detail rail: `done`
+// completed, one in progress, the rest not started.
+func milestoneDetailRun(id string, done int, inProg string) apitypes.RunDTO {
+	ms := []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}, {ID: "m3", Title: "Gamma"}}
+	var completed []string
+	for i := 0; i < done && i < len(ms); i++ {
+		completed = append(completed, ms[i].ID)
+	}
+	return apitypes.RunDTO{ID: id, Kind: "issue", Status: "running", IssueTitle: "structured run",
+		Milestones: ms, MilestonesCompleted: completed, MilestonesInProgress: []string{inProg}}
+}
+
+// PRD #1136 SC1: the crew-rail in-progress milestone ROW is a ◐ ⇄ ○ blink in the faint colour,
+// in ANTI-PHASE to the micro-bar. blinkOn==false → ◐ (the presence/static frame); blinkOn==true →
+// ○. This pins the alternation AND the inverted polarity — every OTHER rail test renders at the
+// default blinkOn==false (the static frame), so without this the toggle is unproven and green.
+// ◐ is the in-progress row's ONLY occurrence in the rail (the micro-bar uses ▰/▱, never ◐), so a
+// ◐-count of 1↔0 across the phases is a clean channel for the flip.
+func TestTUIDetailMilestoneRowBlinkAlternates(t *testing.T) {
+	now := time.Now()
+	run := milestoneDetailRun("77777777-2222", 1, "m2") // m1 done, m2 in progress, m3 not started
+	render := func(on bool) string {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+		next, _ := m.Update(detailLoadedMsg{run: run,
+			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
+		m = next.(tuiModel)
+		m.blinkOn = on
+		return m.View().Content
+	}
+	pal := newPalette(true)
+	off := render(false)
+	on := render(true)
+	// blinkOn==false (also the static / non-tty / NO_BLINK frame): the in-progress row is ◐ in faint.
+	if !strings.Contains(off, paintSeg(pal.faintC, nil, false, "◐")) {
+		t.Errorf("blinkOn=false: in-progress row is not ◐ in faint\n%s", stripANSI(off))
+	}
+	// blinkOn==true: the row flips to ○; no ◐ remains anywhere in the rail.
+	if strings.Contains(on, "◐") {
+		t.Errorf("blinkOn=true: in-progress row did not flip away from ◐\n%s", stripANSI(on))
+	}
+	if !strings.Contains(on, paintSeg(pal.faintC, nil, false, "○")) {
+		t.Errorf("blinkOn=true: in-progress row is not ○ in faint\n%s", stripANSI(on))
+	}
+}
+
+// PRD #1136 SC4: under an Ascii/NO_COLOR profile (tint stripped) the crew-rail in-progress row
+// stays legible by SHAPE — a static ◐, distinct from a not-started ○ and a done ✓. The board
+// micro-bar's Ascii test above covers only the micro-bar; this covers the rail rows (the case D4
+// exists for, doubly so now the row's ◐ shares faintC with a not-started ○).
+func TestTUIDetailMilestoneRowAsciiShape(t *testing.T) {
+	now := time.Now()
+	run := milestoneDetailRun("77777777-3333", 1, "m2") // m1 done (✓), m2 in progress (◐), m3 not started (○)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	m = next.(tuiModel)
+	next, _ = m.Update(detailLoadedMsg{run: run,
+		msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
+	m = next.(tuiModel)
+	// blinkOn defaults false → the static/presence frame; Ascii strips colour, so only shape carries state.
+	out := stripANSI(m.View().Content)
+	if !strings.Contains(out, "◐") {
+		t.Errorf("Ascii in-progress row is not the ◐ shape\n%s", out)
+	}
+	if !strings.Contains(out, "○") {
+		t.Errorf("Ascii not-started row is not the ○ shape\n%s", out)
+	}
+	if !strings.Contains(out, "✓") {
+		t.Errorf("Ascii done row is not the ✓ shape\n%s", out)
 	}
 }
 

@@ -1123,21 +1123,34 @@ func TestTUIDetailMilestoneBlock(t *testing.T) {
 	}
 
 	out := load(milestoneRun)
-	// PRD #1064 D4: the in-progress row's mark is the blinking cell (▰/▱ in the wait colour),
-	// NOT the old ◐, and the eyebrow gains a `· <id>` suffix naming the in-progress milestone.
+	// PRD #1136 (superseding the TUI half of #1064 D4): the in-progress row is a ◐ ⇄ ○ half-circle
+	// blink in the faint/grey colour (static ◐ here, since blinkOn defaults false), the eyebrow
+	// micro-bar's in-progress cell is ▱ in TUNGSTEN, and the eyebrow still gains the `· <id>` suffix.
 	for _, want := range []string{"MILESTONES", "2/4", "✓", "○", "Alpha", "Gamma", "· m3"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("milestone block missing %q\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "◐") {
-		t.Errorf("the in-progress row must use the blinking cell, not the retired ◐ glyph\n%s", out)
+	// The in-progress row now shows ◐ (its static/presence frame). Assert by SHAPE — the row's ◐
+	// shares faintC with the not-started ○, so colour cannot tell them apart (PRD #1136 D5). ◐ is
+	// the in-progress row's ONLY occurrence in the rail (the micro-bar uses ▰/▱, never ◐).
+	if !strings.Contains(out, "◐") {
+		t.Errorf("the in-progress row must render the ◐ half-circle (static frame)\n%s", out)
 	}
-	// blinkOn defaults false, so the static frame shows the in-progress cell as ▱ in the wait
-	// colour — the same span the eyebrow micro-bar's in-progress cell uses.
-	waitCell := paintSeg(newPalette(true).wait, nil, false, "▱")
-	if !strings.Contains(out, waitCell) {
-		t.Errorf("the in-progress cell (▱ in the wait colour) is not rendered in the static frame\n%s", out)
+	pal := newPalette(true)
+	// The row's static in-progress cell is ◐ in the FAINT colour (same colour as a not-started ○).
+	if rowCell := paintSeg(pal.faintC, nil, false, "◐"); !strings.Contains(out, rowCell) {
+		t.Errorf("the in-progress row cell (◐ in the faint colour) is not rendered in the static frame\n%s", out)
+	}
+	// The eyebrow micro-bar's static in-progress cell is ▱ in TUNGSTEN (was wait) — a different
+	// surface and colour from the row cell above (PRD #1136 D2 vs D5).
+	if microCell := paintSeg(pal.tungsten, nil, false, "▱"); !strings.Contains(out, microCell) {
+		t.Errorf("the eyebrow micro-bar in-progress cell (▱ in tungsten) is not rendered in the static frame\n%s", out)
+	}
+	// Shape — never colour — separates the in-progress row (◐) from a not-started row (○): both are
+	// faintC. The not-started ○ (Delta) must still render in faint.
+	if notStarted := paintSeg(pal.faintC, nil, false, "○"); !strings.Contains(out, notStarted) {
+		t.Errorf("a not-started row (○ in faint) is missing\n%s", out)
 	}
 
 	// A run with no frozen list draws no block at all (back-compat: pre-#122 runs unchanged).
