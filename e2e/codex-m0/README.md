@@ -67,6 +67,7 @@ up only that exact container.
 
 Run `task test:codex-m0:harness-errors` in the same Node 24 Debian/Python 3.11
 Linux profile for cleanup, callback reply, and child startup failure regressions.
+It also requires GNU `timeout` from coreutils (included in the Debian image).
 This target needs no Codex binary, provider, or requirements fixture.
 
 ## What the tests distinguish
