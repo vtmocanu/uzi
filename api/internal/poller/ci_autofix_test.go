@@ -35,6 +35,11 @@ type cfStore struct {
 	candidates []store.ListCIAutofixCandidateRefsRow
 	candErr    error
 
+	// listed records whether ListCIAutofixCandidateRefs was ever called, so a test
+	// can prove the detector's PRD #914 admin gate returns BEFORE enumerating
+	// candidates (not merely that nothing downstream fired).
+	listed bool
+
 	attempts map[string]store.CiAutofixAttempt
 
 	// activeTarget[ref] = the target pipeline id of an active ci_fix run on the ref.
@@ -54,6 +59,7 @@ type cfStore struct {
 }
 
 func (s *cfStore) ListCIAutofixCandidateRefs(context.Context, uuid.UUID) ([]store.ListCIAutofixCandidateRefsRow, error) {
+	s.listed = true
 	return s.candidates, s.candErr
 }
 
@@ -253,15 +259,67 @@ func cfJob() forge.Job {
 	return forge.Job{ID: 1, Name: "build", Stage: "build", Status: "failed", WebURL: "https://forge/job/1"}
 }
 
+// cfSettings is a CIAutofixSettings stub whose admin kill-switch read is
+// parameterized: enabled is the value returned and enabledErr the (three-state)
+// store error, so a test can exercise the detector's PRD #914 fail-closed gate in
+// all three states. The zero value reads OFF; newCF constructs it ON.
+type cfSettings struct {
+	enabled    bool
+	enabledErr error
+}
+
+func (s cfSettings) CiAutofixEnabled(context.Context) (bool, error) { return s.enabled, s.enabledErr }
+
 func newCF(st *cfStore, runs *cfRuns, notifier *cfNotifier) *CIAutoFix {
+	return newCFSet(st, runs, notifier, cfSettings{enabled: true})
+}
+
+// newCFSet is newCF with an explicit settings stub, for the admin-gate tests.
+func newCFSet(st *cfStore, runs *cfRuns, notifier *cfNotifier, set cfSettings) *CIAutoFix {
 	var n CIAutofixNotifier
 	if notifier != nil {
 		n = notifier
 	}
-	return NewCIAutoFix(st, runs, n, 5, 4096, 2, []string{".gitlab-ci.yml"})
+	return NewCIAutoFix(st, runs, n, set, 5, 4096, 2, []string{".gitlab-ci.yml"})
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+func TestCIAutofixAdminGateOffNoFire(t *testing.T) {
+	// PRD #914: the admin kill-switch is off, so the detector returns before it even
+	// lists candidates — a full no-op (no candidate query, no run, no ledger write).
+	var ops []string
+	st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9001)}, ops: &ops}
+	runs := &cfRuns{ops: &ops}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "panic: boom\nexit 1", ops: &ops}
+
+	newCFSet(st, runs, nil, cfSettings{enabled: false}).detect(context.Background(), cfRepoRow(), f)
+
+	if st.listed {
+		t.Fatalf("admin gate off must return before listing candidates")
+	}
+	if len(runs.calls) != 0 || len(st.upserts) != 0 {
+		t.Fatalf("admin gate off must be a full no-op: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
+	}
+}
+
+func TestCIAutofixAdminGateErrorFailsClosed(t *testing.T) {
+	// PRD #914 Decision-5 mirror: a genuine settings READ ERROR disables rather than
+	// enables (fail closed), so the detector never lists candidates or fires.
+	var ops []string
+	st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9001)}, ops: &ops}
+	runs := &cfRuns{ops: &ops}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "panic: boom\nexit 1", ops: &ops}
+
+	newCFSet(st, runs, nil, cfSettings{enabled: true, enabledErr: context.DeadlineExceeded}).detect(context.Background(), cfRepoRow(), f)
+
+	if st.listed {
+		t.Fatalf("a settings read error must fail closed before listing candidates")
+	}
+	if len(runs.calls) != 0 {
+		t.Fatalf("a settings read error must fail closed (no fire), got %d runs", len(runs.calls))
+	}
+}
 
 func TestCIAutofixProceedStartsRun(t *testing.T) {
 	var ops []string

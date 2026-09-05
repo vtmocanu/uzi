@@ -50,6 +50,13 @@ type CIAutofixNotifier interface {
 	Notify(ctx context.Context, n notifysvc.Notification) (store.Notification, error)
 }
 
+// CIAutofixSettings resolves the admin kill-switch (PRD #914). *settings.Cache
+// satisfies it. CiAutofixEnabled is three-state and error-propagating (see its doc);
+// the detector maps a non-nil error to OFF (fail closed).
+type CIAutofixSettings interface {
+	CiAutofixEnabled(ctx context.Context) (bool, error)
+}
+
 // CIAutoFix is the poller's post-pipeline-sync CI-autofix detector (PRD #71 M6),
 // the sibling of the autopilot detector. It is stateless and safe for concurrent
 // use across the per-repo sync goroutines: it only reads its injected collaborators
@@ -60,6 +67,7 @@ type CIAutoFix struct {
 	q        ciAutofixStore
 	runs     CIAutoFixRunStarter
 	notifier CIAutofixNotifier
+	set      CIAutofixSettings
 
 	maxJobs      int
 	logTailBytes int
@@ -68,14 +76,15 @@ type CIAutoFix struct {
 }
 
 // NewCIAutoFix builds a detector. q is the store, runs creates the automatic ci_fix
-// runs (workersvc), notifier lands the inbox rows (notifysvc, nil-safe). maxJobs /
-// logTailBytes bound the failure snapshot; maxAttempts is the auto-fix cap;
-// configPaths is the guard's default CI-config watch set.
-func NewCIAutoFix(q ciAutofixStore, runs CIAutoFixRunStarter, notifier CIAutofixNotifier, maxJobs, logTailBytes, maxAttempts int, configPaths []string) *CIAutoFix {
+// runs (workersvc), notifier lands the inbox rows (notifysvc, nil-safe), set resolves
+// the admin kill-switch (settings). maxJobs / logTailBytes bound the failure snapshot;
+// maxAttempts is the auto-fix cap; configPaths is the guard's default CI-config watch set.
+func NewCIAutoFix(q ciAutofixStore, runs CIAutoFixRunStarter, notifier CIAutofixNotifier, set CIAutofixSettings, maxJobs, logTailBytes, maxAttempts int, configPaths []string) *CIAutoFix {
 	return &CIAutoFix{
 		q:            q,
 		runs:         runs,
 		notifier:     notifier,
+		set:          set,
 		maxJobs:      maxJobs,
 		logTailBytes: logTailBytes,
 		maxAttempts:  maxAttempts,
@@ -93,6 +102,19 @@ func NewCIAutoFix(q ciAutofixStore, runs CIAutoFixRunStarter, notifier CIAutofix
 // blip or a DB error on one ref must not stall the tick or the other refs, and an
 // unrecorded pipeline simply re-evaluates next tick.
 func (d *CIAutoFix) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge) {
+	// PRD #914 fail-closed admin gate: CiAutofixEnabled propagates its store error
+	// (three-state read), and the detector — the caller that owns the fail-closed
+	// decision — maps a non-nil error to OFF. Absent → ON is resolved inside
+	// CiAutofixEnabled.
+	enabled, err := d.set.CiAutofixEnabled(ctx)
+	if err != nil {
+		slog.Error("poller: ci-autofix admin gate read", "repo", r.PathWithNamespace, "error", err)
+		return // fail closed
+	}
+	if !enabled {
+		return
+	}
+
 	cands, err := d.q.ListCIAutofixCandidateRefs(ctx, r.ID)
 	if err != nil {
 		slog.Error("poller: list ci-autofix candidates", "repo", r.PathWithNamespace, "error", err)
