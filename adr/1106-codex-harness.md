@@ -301,7 +301,8 @@ extensions disabled. Worker-owned dynamic callbacks would provide the permitted
 run tools; worker-created child threads would implement synchronous delegation.
 This replaces the earlier loopback-MCP/native-role candidate. Native authority
 removal, representative role/phase callbacks and actual-host disposal now have
-separate fixture evidence above; integrated production policy remains unaccepted.
+separate fixture evidence above. M0 requires acceptance of this design and the
+final advice choice; production adapters and enforcement tests belong to M3/M4.
 
 The worker would bind runtime thread/turn identity to an immutable run, role and
 phase registry. Callback arguments never select their own authority. Admission
@@ -312,26 +313,60 @@ callback would resolve only after its owned child turn finishes; root completion
 alone cannot establish that condition. Role TOML and healthy hook behavior are
 not substitutes for these checks.
 
-The proposed process owner is a per-run unprivileged Linux subreaper supervisor,
-covering the app-server, code-mode host and local command descendants even when
-they change process groups. Before a safety-sensitive checkpoint or credentialed
-git, the worker would close admission, settle in-flight starts/callbacks, quiesce
-owned child turns/cells/terminals, then await the supervisor's `ECHILD` result
-with `__WALL`. An incomplete stage poisons the harness and blocks subsequent
-turns, checkpoint publication and credentialed git; cleanup still attempts the
-remaining stages without replacing the primary failure. A registry-empty result,
-RPC acknowledgement or leader exit cannot satisfy the OS ownership predicate. The outer
-`Executor.safety.withBoundary` facade must hold a joint child-quiescence/process-
-reap epoch through the runner-owned sink, including recovery and parking. Poison
-survives independently of the primary exception; a timed-out action cannot
-release admission while its owned work still runs. Claude's absent/legacy branch
-keeps the current synchronous calls and `reap:false` behavior unchanged.
+### Capability policy owners
+
+These are design obligations for the worker-owned adapter, not existing production
+handlers. M3 implements them; M4 exercises the full adversarial clause map.
+
+| Capability | Proposed owner and rule |
+|---|---|
+| Shell | Worker validates its own explicit tool schema and applies `screenBashCommand`; unknown input/tool and screening exceptions deny. Native execution is disabled. |
+| Files and patches | Worker parses its own file/patch schema and applies the path jail to canonical paths, including symlink resolution; secret paths, `.git` and outside-worktree paths deny. |
+| Role and phase | Worker registry binds immutable runtime thread/turn identity to run, role and plan/implement grants; callback arguments cannot widen them. |
+| Workflow signals | Worker admits root-only signals before invocation and retains unknown-origin denial in the reducer. |
+| Delegation | Worker creates and awaits child threads synchronously; unknown roles and nested delegation deny. |
+| Skills and instructions | Worker delivers only approved, sanitized skill content and instructions with the allocated per-agent grants; cloned-repo discovery supplies no authority. |
+| Native extensions | Native web, MCP, plugins, apps and hooks are off; no hook-bypass dependency. Needed run capabilities use worker callbacks. |
+
+Every run/advice thread start or resume builder must explicitly provision the
+canonical project as `untrusted`, set `project_doc_max_bytes = 0`, and disable
+native extensions and hooks. This cannot rely on an unset trust value: pinned
+0.153.2 `app-server/src/request_processors/thread_processor.rs` promotes trust
+only when `active_project.trust_level.is_none()` (with a requested cwd and the
+applicable permission profile). Explicit untrusted state avoids that branch.
+The characterization `Probe` hook bypass is fixture-only. Malicious-repo
+instructions/config/role/rules tests remain M4 production-builder conformance.
+
+### Process-root ownership
+
+The proposed worker keeps a **per-run registry of supervisor roots**. Every
+provider or command root uses the measured generic-argv Linux subreaper wrapper
+and is registered to an immutable run and epoch before launch admission. Pending
+launch reservations belong to that epoch. Codex effects may not spawn direct
+worker subprocesses outside this registry. An app-server/code-mode host and a
+worker-launched command are different roots: each root's supervisor owns its own
+descendants, including daemons that change process groups. A command is not an
+app-server descendant merely because a callback requested it.
+
+Provider roots receive only their own provider credential; command roots receive
+a sparse credential-free environment. At a boundary, close admission, settle
+accepted launches and callbacks, then drain and verify **every** root for that
+frozen epoch. Lost supervision or an unconfirmed result poisons the run. The
+[outer safety gate](../e2e/codex-m0/harness-contract.md#lifecycle-operation-order-and-evidence)
+owns the matching-epoch permit and holds it through every runner sink; it also
+preserves primary-error independence and the unchanged Claude branch.
+
+The same supervisor mechanism has been measured with actual provider roots and
+separate process controls. M0 needs no different process primitive for command
+roots; registry coordination, environment enforcement and combined runner/handler
+tests are M3/M4 work, not prerequisites requiring their implementation in M0.
 
 Run and advice construction would be separately gated. Advice has no shell,
 filesystem, network, delegation or worker callbacks and receives neither a run
 workspace nor a run handler registry. Whether Codex advice may use isolated
 calculations or must expose literally no tools awaits the user's decision and
-its discriminating experiment. Claude advice remains unchanged. Subscription and
+final design signoff. The bounded pure-cell evidence above informs that choice;
+no unanswered question is treated as approval. Claude advice remains unchanged. Subscription and
 API-key credentials stay separate private construction inputs with no fallback;
 credential selection, refresh/CAS and pricing remain wider PRD blockers.
 
@@ -376,12 +411,13 @@ The source inventory is pinned to `bc5a0a8b11f5c98a7067c1fc4202d37a0f27f92e`:
 
 ## Consequences
 
-- M0 remains incomplete and this ADR Proposed. M2 may use the companion only
-  after review accepts its extraction contract; M3 awaits the integrated policy.
+- M0 remains unchecked and this ADR Proposed pending only the final advice
+  choice and design signoff. The corrected neutral contract passed independent
+  review; production handler and outer-gate implementation belong to M3/M4.
 - Intended-model native-authority controls, representative role/phase callbacks
   and actual-host disposal have bounded evidence. The complete production
   guardrail suite and outer runner permit are not implemented by those fixtures;
-  advice policy and integrated review remain open.
+  their absence is a downstream implementation boundary, not an M0 dependency.
 - Exec/SDK root-only visibility remains historical protocol evidence. An
   app-server adapter must use actual runtime identity and observed content,
   without fabricating child messages or treating hook identity as attribution.

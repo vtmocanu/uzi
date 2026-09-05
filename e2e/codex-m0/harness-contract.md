@@ -279,8 +279,8 @@ export type ChildQuiescence =
 export type ProcessReap =
   | {
       kind: "observed_empty";
-      // The proposed Linux supervisor supplies this only after owning and
-      // reaping every descendant, including process-group escapees.
+      // The safety owner supplies this only after every registered supervisor
+      // root has reaped its descendants, including process-group escapees.
       evidence: "supervisor_echild";
       epoch: number; // must match the quiescent epoch held by the safety owner
     }
@@ -590,6 +590,26 @@ The per-run home/workspace/process launcher/secret paths and handler registry ar
 immutable construction inputs. Credential row selection and refresh write-back
 remain the unresolved wider PRD contracts, not guessed constructor defaults.
 
+### Registered supervisor roots
+
+The worker owns one immutable run/epoch registry for **all** Codex provider and
+command roots, including launch reservations. Register a reservation before
+admitting launch through the measured generic-argv supervisor wrapper; a launch
+already accepted when admission closes must settle within that frozen epoch.
+Provider/code-mode descendants belong to the provider supervisor; command/daemon
+descendants belong to the command supervisor. A worker callback does not make
+its command an app-server descendant. Direct worker subprocesses for Codex
+effects are prohibited. Provider roots receive only their own provider credential;
+command roots receive sparse credential-free environments.
+
+`reapProcesses` aggregates evidence from every registered root for its closed
+epoch; one drained root cannot stand for the run. Lost supervision, unresolved
+launch reservations or any unconfirmed root poison the run independently of its
+primary exception. Registry coordination and combined command/provider barrier
+enforcement are M3/M4 implementation work over the measured supervisor mechanism.
+The capability and trust provisioning policy is in
+[ADR-1106](../../adr/1106-codex-harness.md#capability-policy-owners).
+
 ### Lifecycle operation order and evidence
 
 The candidate policy and measured limits live in
@@ -694,10 +714,10 @@ them, but do not weaken or rewrite a current test to fit this proposal.
 
 ## Risks and open questions
 
-* Code-mode, representative broker-policy and actual-host disposal fixtures now
-  provide bounded evidence in the ADR. Acceptance of the integrated design and
-  neutral contract remains M0 work; these types alone establish no enforcement.
-  Production handler coverage and the outer runner permit remain later code work.
+* The corrected neutral contract passed independent review. M0 now awaits the
+  final advice choice and design signoff. The ADR bounds the fixture evidence;
+  production handlers, root-registry coordination and the outer runner permit
+  are M3/M4 code work, not implementation prerequisites for accepting M0.
 * The wider PRD's credential identity/CAS/routing/API-key pricing blockers remain.
   The credential union and cost representation must not be mistaken for solved
   row-selection, refresh-writeback or metering contracts.

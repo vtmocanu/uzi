@@ -153,9 +153,17 @@ held across a credentialed git/checkpoint publication action.
 [ADR-1106](../../adr/1106-codex-harness.md#proposed-execution-policy) describes the
 unaccepted stock app-server candidate: native environments/agents disabled,
 worker-owned callbacks and synchronous worker-created child threads, with a
-per-run Linux supervisor. It replaces the earlier loopback-MCP/native-role
+per-run registry of Linux supervisor roots. It replaces the earlier loopback-MCP/native-role
 candidate; this characterization harness is not its production implementation.
 The [neutral contract companion](harness-contract.md) defines the proposed M2
 interfaces and Claude preservation rules. M0 remains incomplete; both subscription
 and API-key support remain required, and dummy-key fixtures prove neither live
 API-key authentication nor entitlement.
+
+M0 acceptance covers the design and measured feasibility; it does not require
+production handler or runner-gate implementation. Those, the all-roots registry
+coordination and combined adversarial enforcement tests belong to M3/M4. The
+[capability/trust policy](../../adr/1106-codex-harness.md#capability-policy-owners)
+and [root ownership](../../adr/1106-codex-harness.md#process-root-ownership)
+define those obligations. M0 remains unchecked pending the final advice choice
+and design signoff.
