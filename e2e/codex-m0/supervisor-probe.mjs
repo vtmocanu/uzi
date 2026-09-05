@@ -35,7 +35,9 @@ export class SupervisorProbe extends Probe {
   answerDynamic(request) {
     const answer = super.answerDynamic(request);
     this.callbackReplies.add(answer);
-    void answer.finally(() => this.callbackReplies.delete(answer));
+    // finally creates its own rejecting promise. Handle that derivative while
+    // preserving the original answer for callers and in-flight disposal.
+    void answer.finally(() => this.callbackReplies.delete(answer)).catch(() => {});
     return answer;
   }
 

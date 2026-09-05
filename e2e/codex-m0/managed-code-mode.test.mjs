@@ -46,7 +46,49 @@ function cellText(body, id) {
   return item.output.filter((value) => value.type === "input_text").map((value) => value.text).join("\n");
 }
 
+function assertShellSucceeded(output, nested = false) {
+  const separator = "\nOutput:\n\n";
+  assert.ok(output.includes(separator), "completed cell has an output section");
+  const result = JSON.parse(output.slice(output.indexOf(separator) + separator.length).split("\n")[0]);
+  assert.equal((nested ? result.shell : result).exit_code, 0, "shell command exited successfully");
+}
+
 for (const model of ["gpt-6-astra", "gpt-5.6-sol"]) {
+  test(`${model} code-mode shell success assertion rejects actual exit 10 in both result shapes`, async (t) => {
+    const p = await Probe.create(t, {
+      model, unifiedExec: false, codeMode: true, codeModeOnly: true, codeModeHost: true,
+      respond: (body) => {
+        assertCodeModeSchema(body, model);
+        for (const nested of [false, true]) {
+          for (const code of [0, 10]) {
+            const id = `exit-${nested}-${code}`;
+            if (callOutput(body, id)) continue;
+            const command = `await tools.exec_command({ cmd: "exit ${code}", shell: "/bin/sh", login: false, timeout_ms: 1000 })`;
+            return [exec(id, nested ? `text({ shell: ${command} });` : `text(${command});`)];
+          }
+        }
+        return [message()];
+      },
+    });
+    const threadId = await p.thread("never");
+    const turnId = await p.turn(threadId);
+    assert.equal((await p.completed(threadId, turnId)).params.turn.status, "completed");
+    assert.equal(p.requests.length, 5);
+    for (const nested of [false, true]) {
+      for (const code of [0, 10]) {
+        const id = `exit-${nested}-${code}`;
+        const body = p.requests.find((body) => callOutput(body, id));
+        const output = cellText(body, id);
+        await t.test(`actual exit ${code}, nested=${nested}`, () => {
+          if (code === 0) assertShellSucceeded(output, nested);
+          else assert.throws(() => assertShellSucceeded(output, nested), { name: "AssertionError" },
+            `actual exit ${code} must not satisfy the success assertion (nested=${nested})`);
+          t.diagnostic(JSON.stringify({ model, nested, code, output }));
+        });
+      }
+    }
+  });
+
   for (const decision of ["accept", "decline", "malformed"]) {
     test(`${model} managed code-mode shell approval ${decision}`, async (t) => {
       const p = await Probe.create(t, {
@@ -70,7 +112,7 @@ text(await tools.exec_command({
       assert.equal(await p.marker(), decision === "accept" ? "M0 marker\n" : null);
       if (decision === "accept") {
         assert.match(output, /^Script completed/);
-        assert.match(output, /exit_code.*0/);
+        assertShellSucceeded(output);
       } else {
         assert.match(output, /^Script failed/);
         assert.match(output, decision === "decline" ? /rejected by user/ : /approval request failed/);
@@ -117,7 +159,7 @@ try {
     assert.equal((await p.completed(threadId, turnId)).params.turn.status, "completed");
     assert.equal(p.requests.length, 2);
     const output = cellText(p.requests[1], "input");
-    assert.match(output, /exit_code.*0/);
+    assertShellSucceeded(output, true);
     assert.doesNotMatch(output, /session_id/);
     assert.match(output, /write_stdin is not a function/);
     assert.equal(p.approvals.length, 1);

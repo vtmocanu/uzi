@@ -105,10 +105,17 @@ def main():
     profile = establish_profile()
     child = os.fork()
     if child == 0:
-        os.close(3)
-        os.close(4)
-        os.setsid()
-        os.execv(sys.argv[1], sys.argv[1:])
+        try:
+            os.close(3)
+            os.close(4)
+            os.setsid()
+            os.execv(sys.argv[1], sys.argv[1:])
+        except OSError as error:
+            # No target path or inherited environment in the startup diagnostic.
+            os.write(2, f"M0 child startup failed (errno {error.errno})\n".encode())
+        finally:
+            # Never enter the parent's handler: fd4 was deliberately closed.
+            os._exit(127)
     emit({"event": "started", "pid": os.getpid(), "appServerPid": child, **profile})
     buffer = b""
     deadline = time.monotonic() + 30

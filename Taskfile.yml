@@ -2035,6 +2035,15 @@ tasks:
       - node --check e2e/codex-m0/supervisor.test.mjs
       - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/supervisor.test.mjs
 
+  test:codex-m0:harness-errors:
+    desc: Opt-in isolated Linux M0 cleanup and supervisor failure regressions
+    cmds:
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/supervisor-probe.mjs
+      - node --check e2e/codex-m0/harness-errors.test.mjs
+      - python3 -B -c "import ast, pathlib; ast.parse(pathlib.Path('e2e/codex-m0/supervisor.py').read_text())"
+      - node --test --test-concurrency=1 --test-timeout=30000 e2e/codex-m0/harness-errors.test.mjs
+
   test:codex-m0:supervisor-mechanism:
     desc: Opt-in Linux supervisor mechanism characterization
     cmds:

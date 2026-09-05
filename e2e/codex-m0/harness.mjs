@@ -409,31 +409,40 @@ ${typeof hookConfig === "function" ? hookConfig(this) : hookConfig}
         for (const threadId of this.threadIds) {
           await this.terminateTerminals(threadId);
         }
-      } catch (error) { cleanupError = error; }
+      } catch (error) { cleanupError ??= error; }
     }
     if (this.child && !this.exited) {
-      this.child.stdin.end();
+      try { this.child.stdin.end(); }
+      catch (error) { cleanupError ??= error; }
       try { await deadline(this.exit, "graceful app-server exit", 1000); }
-      catch {
+      catch (error) {
+        if (this.exited) cleanupError ??= error;
         for (const signal of ["SIGTERM", "SIGKILL"]) {
           if (this.exited) break;
           try { process.kill(-this.child.pid, signal); }
-          catch (error) { if (error.code !== "ESRCH") throw error; }
+          catch (error) { if (error.code !== "ESRCH") cleanupError ??= error; }
           try { await deadline(this.exit, `${signal} app-server exit`, 2000); }
-          catch { if (signal === "SIGKILL") throw new Error("owned app-server did not exit"); }
+          catch (error) { if (signal === "SIGKILL") cleanupError ??= error; }
         }
       }
     }
     if (this.versionChild?.exitCode === null && this.versionChild?.signalCode === null) {
-      this.versionChild.kill("SIGKILL");
-      await deadline(this.versionExit, "version child exit", 2000);
+      try { this.versionChild.kill("SIGKILL"); }
+      catch (error) { cleanupError ??= error; }
+      try { await deadline(this.versionExit, "version child exit", 2000); }
+      catch (error) { cleanupError ??= error; }
     }
-    this.lines?.close();
+    try { this.lines?.close(); }
+    catch (error) { cleanupError ??= error; }
     if (this.server) {
-      this.server.closeAllConnections();
-      await deadline(new Promise((resolve) => this.server.close(resolve)), "fake server close", 2000);
+      try { this.server.closeAllConnections(); }
+      catch (error) { cleanupError ??= error; }
+      try {
+        await deadline(new Promise((resolve) => this.server.close(resolve)), "fake server close", 2000);
+      } catch (error) { cleanupError ??= error; }
     }
-    // Only the exact directory created by this Probe is removed.
+    // Only the exact directory created by this Probe is removed. Any failed
+    // cleanup retains its evidence after the remaining owned cleanup is tried.
     if (cleanupError) throw new Error(`M0 cleanup failed; retained ${this.root}`, { cause: cleanupError });
     await rm(this.root, { recursive: true, force: true });
   }

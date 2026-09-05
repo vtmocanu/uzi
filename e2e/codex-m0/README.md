@@ -65,6 +65,10 @@ fixture read-only. Provide a Linux Task executable if invoking the target inside
 that image. Name the disposable container outside the `uzi-` namespace and clean
 up only that exact container.
 
+Run `task test:codex-m0:harness-errors` in the same Node 24 Debian/Python 3.11
+Linux profile for cleanup, callback reply, and child startup failure regressions.
+This target needs no Codex binary, provider, or requirements fixture.
+
 ## What the tests distinguish
 
 | Experiment | Positive control and measured limit |
