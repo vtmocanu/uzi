@@ -91,10 +91,11 @@ The worker image installs a **pinned** devbox binary and nix at build time (no f
 ## Resource stats and sizing
 
 Once a worker is running, **Settings → Workers** and the Dashboard's "Worker load"
-card show live CPU and memory gauges, self-reported by the worker from its own
-cgroup on every heartbeat. A worker under real load (running the e2e suite)
-reported `cpu 1%` / `mem 0.1/4 GiB` — a small, honest number, since the SDK
-subprocess and git were mostly idle between tool calls.
+card show live CPU, memory, and disk gauges, self-reported by the worker from its
+own cgroup and filesystem on every heartbeat. A worker under real load (running
+the e2e suite) reported `cpu 1%` / `mem 0.1/4 GiB` / `disk 7.1/20 GiB` — a small,
+honest number, since the SDK subprocess and git were mostly idle between tool
+calls.
 
 **Setting a memory limit is what makes the percentage bar appear.** With no limit,
 the gauge shows absolute memory used and no bar. CPU shows a percentage whenever
@@ -132,6 +133,10 @@ What the gauges mean:
   cry wolf.
 - **Freshness**: the worker samples every 15s (heartbeat) and the UI polls every
   10s, so a gauge can lag reality by up to ~25s — not a live feed.
+- **Disk** shows used/total bytes per reported volume — `/nix` (the tools
+  cache) and `/data`, each a separate bar when both are reported, one bar when
+  only one is. A volume that fails to report (no `/nix` mount in dev/compose,
+  for instance) shows no bar for that volume rather than a misleading zero.
 - A dropped or malformed sample self-clears the gauge for that one tick (by
   design: stale-but-plausible is worse than briefly blank) rather than holding a
   stale-looking value.
