@@ -34,13 +34,12 @@ import (
 // real CLI, an explicit dir for tests) and never from user input, mirroring
 // SkillInstaller.
 type HookManager struct {
-	name           string      // "claude" | "codex"
 	path           string      // absolute hook file path
 	matcher        string      // "startup" (claude) | "startup|resume" (codex)
 	command        string      // canonical command this manager writes
 	legacyCommands []string    // extra commands recognized as ours (claude: the M1 bare form)
 	backupPerm     os.FileMode // file+backup perm: 0o600 (claude settings.json may hold secrets) | 0o644 (codex hooks.json)
-	configTOMLPath string      // codex only: <codexHome>/config.toml, read-only inline-hooks conflict check; "" for claude
+	configTOMLPath string      // codex only: <codexHome>/config.toml, read-only [hooks]-table conflict check; "" for claude
 }
 
 const (
@@ -71,7 +70,6 @@ func NewHookManager() (*HookManager, error) {
 // developer's real ~/.claude/settings.json. It is not wired to any flag/env.
 func NewHookManagerAt(home string) *HookManager {
 	return &HookManager{
-		name:           "claude",
 		path:           filepath.Join(home, ".claude", settingsFileName),
 		matcher:        "startup",
 		command:        "uzi skill install --target claude",
@@ -85,7 +83,6 @@ func NewHookManagerAt(home string) *HookManager {
 // the sibling file in the same config home; Codex has no legacy command forms.
 func NewCodexHookManager(hookPath string) *HookManager {
 	return &HookManager{
-		name:           "codex",
 		path:           hookPath,
 		matcher:        "startup|resume",
 		command:        "uzi skill install --target codex",
@@ -126,12 +123,12 @@ type HookUninstallResult struct {
 type HookStatusResult struct {
 	Path       string `json:"path"`
 	Installed  bool   `json:"installed"`  // at least one SessionStart command is one we manage
-	Current    bool   `json:"current"`    // an entry's command == the canonical string
+	Current    bool   `json:"current"`    // an entry's command is already in canonical form (exact or canonical+flags)
 	Command    string `json:"command"`    // the canonical command we manage
 	Duplicates int    `json:"duplicates"` // matching entries beyond the first (R5 orphans)
 	Malformed  bool   `json:"malformed"`  // file exists but is not valid JSON
-	// HookConfigConflict (Codex only) is set when config.toml carries an inline
-	// [hooks] table and hooks.json does not already hold our hook — the mixed
+	// HookConfigConflict (Codex only) is set when config.toml declares a [hooks]
+	// table and hooks.json does not already hold our hook — the mixed
 	// representation Codex warns about. Additive to a READ DTO (no envelope change).
 	HookConfigConflict bool `json:"hook_config_conflict,omitempty"`
 }
@@ -231,6 +228,15 @@ func commandMatches(cmd, base string) bool {
 	return cmd == base || strings.HasPrefix(cmd, base+" ")
 }
 
+// isCanonicalCommand reports whether a command is ALREADY in this manager's
+// canonical, target-specific form: exactly the canonical command, or the canonical
+// command followed by extra user flags (e.g. `... --force`). Such an entry is
+// preserved verbatim on re-install — never rewritten — so a user's appended flags
+// are not silently dropped. Only a legacy/non-canonical isOurCommand form migrates.
+func (hm *HookManager) isCanonicalCommand(cmd string) bool {
+	return commandMatches(cmd, hm.command)
+}
+
 // commandString extracts the "command" string from an untrusted hook element,
 // type-asserting every hop with the ,ok form so a malformed shape is skipped.
 func commandString(h any) (string, bool) {
@@ -290,11 +296,13 @@ func (hm *HookManager) hasOurHook(root map[string]any) bool {
 }
 
 // configHasInlineHooks (Codex only) reports whether config.toml declares a
-// non-empty inline [hooks] table. Read-only: we NEVER write config.toml. A missing
-// file mirrors LoadConfig's ErrNotExist handling (no conflict). A parse error is
-// treated as "cannot detect → proceed": we do not block an install on someone
-// else's malformed TOML, and since we never write it a wrong guess only risks
-// Codex's own dedup warning, never data loss.
+// non-empty [hooks] table. TOML decodes both the standard-header form and the
+// inline form to the same map, so this matches ANY non-empty [hooks] table (a
+// superset that includes the inline form) — the intended, safe behavior. Read-only:
+// we NEVER write config.toml. A missing file mirrors LoadConfig's ErrNotExist
+// handling (no conflict). A parse error is treated as "cannot detect → proceed": we
+// do not block an install on someone else's malformed TOML, and since we never write
+// it a wrong guess only risks Codex's own dedup warning, never data loss.
 func (hm *HookManager) configHasInlineHooks() bool {
 	b, err := os.ReadFile(hm.configTOMLPath)
 	if err != nil {
@@ -308,18 +316,19 @@ func (hm *HookManager) configHasInlineHooks() bool {
 	return ok && len(hooks) > 0
 }
 
-// inlineHooksConflict reports the Codex mixed-representation conflict: an inline
-// [hooks] table in config.toml AND our hook not already in hooks.json. Claude
+// inlineHooksConflict reports the Codex mixed-representation conflict: a [hooks]
+// table in config.toml AND our hook not already in hooks.json. Claude
 // (configTOMLPath == "") never conflicts. hasOurHook is checked before the
 // (file-reading) configHasInlineHooks so an idempotent re-install stays cheap.
 func (hm *HookManager) inlineHooksConflict(root map[string]any) bool {
 	return hm.configTOMLPath != "" && !hm.hasOurHook(root) && hm.configHasInlineHooks()
 }
 
-// migrateLegacyCommand rewrites the FIRST legacy-form SessionStart command in place
-// to the canonical command and reports whether it did. The canonical command is
-// assumed already handled by the caller (idempotent short-circuit), so every match
-// here is a legacy form; migrating only the first avoids appending a duplicate.
+// migrateLegacyCommand rewrites the FIRST legacy/non-canonical SessionStart command
+// we manage in place to the bare canonical command and reports whether it did. An
+// entry ALREADY in canonical form (exact or canonical+flags) is skipped so a user's
+// appended flags survive — those are handled by the caller's idempotent
+// short-circuit. Migrating only the first match avoids appending a duplicate.
 func (hm *HookManager) migrateLegacyCommand(root map[string]any) bool {
 	for _, mo := range sessionStartArray(root) {
 		m, ok := mo.(map[string]any)
@@ -339,7 +348,7 @@ func (hm *HookManager) migrateLegacyCommand(root map[string]any) bool {
 			if !ok {
 				continue
 			}
-			if hm.isOurCommand(cmd) {
+			if hm.isOurCommand(cmd) && !hm.isCanonicalCommand(cmd) {
 				hmap["command"] = hm.command
 				return true
 			}
@@ -350,10 +359,11 @@ func (hm *HookManager) migrateLegacyCommand(root map[string]any) bool {
 
 // InstallHook ensures our SessionStart hook is present in the hook file. It
 // preserves every unrelated key and foreign hook and their order, refuses to touch
-// a malformed file, and classifies the existing entries three ways: the canonical
-// command already present is an idempotent no-op; a legacy form is MIGRATED in place
-// (no duplicate); otherwise the canonical matcher-object is appended. For Codex it
-// first refuses (read-only) a mixed inline-[hooks]/hooks.json representation.
+// a malformed file, and classifies the existing entries three ways: an entry already
+// in canonical form (exact OR canonical+flags) is an idempotent no-op preserved
+// verbatim; a legacy/non-canonical form is MIGRATED in place to the bare canonical
+// command (no duplicate); otherwise the canonical matcher-object is appended. For
+// Codex it first refuses (read-only) a mixed [hooks]-table/hooks.json representation.
 func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 	res := HookInstallResult{Path: hm.settingsPath(), BackupPath: hm.backupPath()}
 
@@ -378,12 +388,14 @@ func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 	// trusted_hash (PRD #1143 M2).
 	if hm.inlineHooksConflict(root) {
 		return res, Exitf(ExitUsage,
-			"Codex already declares an inline [hooks] table in %s; consolidate your Codex hooks on %s "+
-				"(Codex warns when both an inline [hooks] table and a hooks.json are present) and re-run",
+			"Codex already declares a [hooks] table in %s; consolidate your Codex hooks on %s "+
+				"(Codex warns when both a [hooks] table in config.toml and a hooks.json are present) and re-run",
 			hm.configTOMLPath, hm.settingsPath())
 	}
 
-	// Canonical command already present anywhere ⇒ idempotent, no write.
+	// An entry already in canonical form (exact OR canonical+flags) is present
+	// anywhere ⇒ idempotent, no write. Such an entry is target-specific already, so
+	// we preserve it verbatim rather than normalizing away a user's appended flags.
 	for _, mo := range sessionStartArray(root) {
 		m, ok := mo.(map[string]any)
 		if !ok {
@@ -394,7 +406,7 @@ func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 			continue
 		}
 		for _, h := range inner {
-			if cmd, ok := commandString(h); ok && cmd == hm.command {
+			if cmd, ok := commandString(h); ok && hm.isCanonicalCommand(cmd) {
 				res.AlreadyPresent = true
 				return res, nil
 			}
@@ -581,7 +593,7 @@ func hasSuccessorAfterOurs(flat []bool) bool {
 // HookStatus reports whether our hook is installed, without writing. A missing file
 // reads as not installed; an unparseable file sets Malformed (so status never lies
 // "not installed" over a file we simply could not read). For Codex it also reports a
-// mixed inline-[hooks]/hooks.json config conflict.
+// mixed [hooks]-table/hooks.json config conflict.
 func (hm *HookManager) HookStatus() HookStatusResult {
 	res := HookStatusResult{Path: hm.settingsPath(), Command: hm.command}
 
@@ -616,7 +628,7 @@ func (hm *HookManager) HookStatus() HookStatusResult {
 			}
 			if hm.isOurCommand(cmd) {
 				matches++
-				if cmd == hm.command {
+				if hm.isCanonicalCommand(cmd) {
 					res.Current = true
 				}
 			}

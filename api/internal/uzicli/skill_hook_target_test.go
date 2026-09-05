@@ -129,6 +129,48 @@ func TestInstallHookLegacyMigration(t *testing.T) {
 	}
 }
 
+// TestInstallHookPreservesTargetSpecificFlags: an existing Claude entry already in
+// canonical form but carrying a user's extra flag (`--target claude --force`) is
+// ALREADY PRESENT — InstallHook is a no-op (no rewrite, no .bak, Changed=false) and
+// the flag survives verbatim; HookStatus reports Current=true (prefix-aware).
+func TestInstallHookPreservesTargetSpecificFlags(t *testing.T) {
+	home := t.TempDir()
+	const orig = `{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "startup", "hooks": [{"type": "command", "command": "uzi skill install --target claude --force", "timeout": 15}]}
+    ]
+  }
+}
+`
+	writeSettings(t, home, orig)
+	hm := NewHookManagerAt(home)
+
+	res, err := hm.InstallHook()
+	if err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	if !res.AlreadyPresent || res.Changed || res.BackedUp {
+		t.Fatalf("target-specific re-install: got %+v, want AlreadyPresent only", res)
+	}
+	// No .bak written, and the settings file is byte-unchanged (flag preserved).
+	if _, err := os.Stat(backupPathIn(home)); !os.IsNotExist(err) {
+		t.Fatalf("no-op install must not write a .bak (err=%v)", err)
+	}
+	if got, err := os.ReadFile(settingsPathIn(home)); err != nil || string(got) != orig {
+		t.Fatalf("settings.json changed on a no-op: got %q err %v", got, err)
+	}
+	// The command still carries the user's --force flag.
+	cmds := commandsFrom(t, parseSettings(t, home))
+	if len(cmds) != 1 || cmds[0] != "uzi skill install --target claude --force" {
+		t.Fatalf("commands=%v, want the --force flag preserved verbatim", cmds)
+	}
+	// Status reads Current (prefix-aware) and Installed.
+	if st := hm.HookStatus(); !st.Installed || !st.Current {
+		t.Fatalf("status: %+v, want Installed and Current", st)
+	}
+}
+
 // TestCodexInstallHookAppendsAndMatcher: a fresh Codex hooks.json gets our entry with
 // the codex command and the "startup|resume" matcher; a second install is idempotent.
 func TestCodexInstallHookAppendsAndMatcher(t *testing.T) {
