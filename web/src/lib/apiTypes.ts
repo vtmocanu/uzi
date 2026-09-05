@@ -717,6 +717,10 @@ export interface AppSettings {
   judge_enforce_all: string;
   judge_cooldown_seconds: string;
   judge_daily_budget: string;
+  // Instance-wide CI-autofix kill-switch (PRD #914). The text "true"/"false" (default
+  // "true"). When OFF, no user's failed pipeline is auto-fixed regardless of their
+  // per-user opt-in — the admin per-user CI-autofix toggle is inert while it is off.
+  ci_autofix_enabled: string;
   // Ephemeral worker auto-provisioning instance kill-switch (PRD #529 / #649 M1).
   // The text "true"/"false" (default "false"). When OFF, no run ever auto-provisions
   // a throwaway hosted worker regardless of a user's per-account opt-in; when ON,

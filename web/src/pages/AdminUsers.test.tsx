@@ -25,10 +25,17 @@ vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
 const mockApi = vi.mocked(api);
 
-// settingsResp is the minimal admin settings the AdminUsers load path reads: only
-// judge_enforce_all is consumed, so the rest is a thin cast.
-function settingsResp(enforceAll: boolean): SettingsResponse {
-  return { settings: { judge_enforce_all: enforceAll ? "true" : "false" } } as unknown as SettingsResponse;
+// settingsResp is the minimal admin settings the AdminUsers load path reads:
+// judge_enforce_all and (PRD #914) the instance-wide ci_autofix_enabled kill-switch are
+// consumed, so the rest is a thin cast. ciAutofixEnabled defaults to on, matching the
+// server default, so existing tests keep the per-user CI-autofix control live.
+function settingsResp(enforceAll: boolean, ciAutofixEnabled = true): SettingsResponse {
+  return {
+    settings: {
+      judge_enforce_all: enforceAll ? "true" : "false",
+      ci_autofix_enabled: ciAutofixEnabled ? "true" : "false",
+    },
+  } as unknown as SettingsResponse;
 }
 
 function aUser(over: Partial<User> = {}): User {
@@ -155,6 +162,55 @@ describe("AdminUsers CI autofix tri-state display (PRD #914 M3)", () => {
     expect(ciCell().getByText("Disable")).toBeTruthy();
     expect(ciCell().queryByText("Off")).toBeNull();
     expect(ciCell().queryByText("Enable")).toBeNull();
+  });
+});
+
+// PRD #914 M1: the instance-wide ci_autofix_enabled kill-switch dominates the per-user
+// column. When it is "false" every user's CI-autofix is inert regardless of their own
+// flag, so the badge must read Off and the toggle must be disabled — otherwise clicking
+// "Disable" on an inherit (null) user would persist an explicit false that survives the
+// global being re-enabled (the sticky-false trap this fix removes).
+describe("AdminUsers CI autofix instance kill-switch (PRD #914 M1)", () => {
+  it("shows Off and disables the toggle for a null user when the instance switch is off", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser({ ci_autofix_enabled: null })] });
+    mockApi.getSettings.mockResolvedValue(settingsResp(false, false));
+
+    render(
+      <MemoryRouter>
+        <AdminUsers />
+      </MemoryRouter>,
+    );
+
+    const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
+    // CI autofix is cell index 5 (0 Email, 1 Name, 2 Role, 3 Status, 4 Judge, 5 CI
+    // autofix, 6 Last login, 7 Action). Scope to it so the Judge column's own inert
+    // note and On/Off badge don't collide.
+    const ciCell = () => within(within(row).getAllByRole("cell")[5]);
+    // Wait for the best-effort settings read to land, then assert the inert state.
+    await waitFor(() => expect(ciCell().getByText(/Inert/).textContent).toContain("kill-switch"));
+    expect(ciCell().getByText("Off")).toBeTruthy();
+    expect(ciCell().queryByText("On")).toBeNull();
+    const btn = ciCell().getByText("Enable") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("keeps the null user On with an enabled toggle when the instance switch is on", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser({ ci_autofix_enabled: null })] });
+    mockApi.getSettings.mockResolvedValue(settingsResp(false, true));
+
+    render(
+      <MemoryRouter>
+        <AdminUsers />
+      </MemoryRouter>,
+    );
+
+    const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
+    const ciCell = () => within(within(row).getAllByRole("cell")[5]);
+    // Inherit (null) collapses to On/Disable; the switch being on leaves it live.
+    await waitFor(() => expect(ciCell().getByText("On")).toBeTruthy());
+    const btn = ciCell().getByText("Disable") as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    expect(ciCell().queryByText(/Inert/)).toBeNull();
   });
 });
 

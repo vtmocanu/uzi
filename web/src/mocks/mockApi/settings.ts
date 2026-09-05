@@ -55,6 +55,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
+  // PRD #914: instance-wide CI-autofix kill-switch, default ON.
+  ci_autofix_enabled: "true",
   // PRD #529 / #649 M1: ephemeral worker auto-provisioning instance kill-switch, default OFF.
   ephemeral_workers_enabled: "false",
   // PRD #836: upstream release-check toggles, both default ON (the master air-gap
