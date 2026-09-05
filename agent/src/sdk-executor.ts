@@ -96,6 +96,7 @@ import { ClaudeHarness } from "./claude-harness.js";
 import { RunTurnReducerImpl } from "./harness-reducer.js";
 import type {
   HarnessTerminal,
+  RunTurnReducer,
   RunTurnRequest,
   TurnStreamEnd,
 } from "./harness.js";
@@ -447,7 +448,7 @@ export class SdkExecutor implements Executor {
    *  session latch persists). Recreated per run in run() (the latch must not survive
    *  into a second run() on the same instance). The concrete type is held so the owner
    *  can call `beginTurn()` at each turn boundary. */
-  private reducer: RunTurnReducerImpl;
+  private reducer: RunTurnReducer;
 
   /**
    * @param homeDir per-run SDK HOME (`agent-home/<runId>` on $UZI_DATA_DIR, PRD #42

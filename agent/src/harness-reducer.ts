@@ -49,10 +49,10 @@ export class RunTurnReducerImpl implements RunTurnReducer {
   constructor(private readonly context: HarnessContextHook) {}
 
   /** Reset the per-turn accumulators for the turn about to stream. The OWNER calls
-   *  this at the top of every turn (before the first `accept`), on its normal path
-   *  AND on its throw/finally recovery — so each turn begins with clean per-turn state
-   *  structurally, robust to a prior turn that ended by throw and SKIPPED `finish`.
-   *  The run-level `reportedSessionId` latch is deliberately NOT reset here. */
+   *  this at the top of every turn, before the first `accept`. Because it fires
+   *  unconditionally each turn (not off `finish`), each turn begins with clean
+   *  per-turn state structurally, robust to a prior turn that ended by throw and
+   *  SKIPPED `finish`. The run-level `reportedSessionId` latch is NOT reset here. */
   beginTurn(): void {
     this.resetPerTurn();
   }

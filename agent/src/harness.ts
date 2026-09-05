@@ -303,6 +303,11 @@ export interface ReducedTurnCompletion {
 }
 
 export interface RunTurnReducer {
+  // Turn lifecycle: the owner calls beginTurn() at the top of every turn, before
+  // the first accept(), so per-turn state is cleared structurally regardless of
+  // how the prior turn ended. Run-scoped state (e.g. the first-session-id latch)
+  // persists across turns and is not reset here.
+  beginTurn(): void;
   accept(event: HarnessEvent): Promise<TurnReduction>;
   finish(end: TurnStreamEnd): ReducedTurnCompletion;
 }
