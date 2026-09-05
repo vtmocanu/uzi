@@ -3,7 +3,7 @@
 > Anchors verified against main at 9550deb on 2026-09-05 (the commit that merged PR #1135 / PRD #1130, whose request-id guards and `boardPollTimeout` this PRD builds on). Reviewed by three lenses (design, anchors, testability) before publishing; their findings are folded in.
 
 **GitHub Issue**: [#1137](https://github.com/vtmocanu/uzi/issues/1137)
-**Status**: Draft (created 2026-09-05)
+**Status**: Complete (created 2026-09-05; all milestones M1–M8 landed 2026-09-05). The worker-scoped implementation is done; the uxlab PNG pass, the `tui-ux` agent review, a dev-cluster slow-link timing session (SC1/SC2), and the web's adoption of `?tail` (D8) are deferred to a maintainer post-merge per M8.
 **Priority**: Medium
 **Related**: PRD #1130 / PR #1135 (board-poll resilience on slow links, merged 9550deb: the sibling for the *board*; this PRD is the *detail view* and reuses its guard shapes), issue #160 (`run logs` paging, the origin of `?limit=` and `RunLogs`' all-or-nothing loop), PRD #325 (TUI redesign, the detail view's pane model), PRD #1064 (`current_activity`, milestones on `RunDTO`: why the header/rail can render from `GetRun` alone).
 
