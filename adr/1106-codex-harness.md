@@ -118,9 +118,10 @@ Consequences for the lifecycle are explicit:
 
 ## App-server continuation evidence (2026-09-05)
 
-The committed [characterization harness](../e2e/codex-m0/README.md) drives real
-Codex 0.153.2 with fixed localhost Responses fixtures and the `gpt-5.5` native
-tool surface. No model decides which tools run. Recipes are the opt-in
+The initial committed [characterization harness](../e2e/codex-m0/README.md)
+drives real Codex 0.153.2 with fixed localhost Responses fixtures and the
+`gpt-5.5` native tool surface. The subsequent code-mode continuation below
+exercises the two intended models separately. No model decides which tools run. Recipes are the opt-in
 `task test:codex-m0` and container-only `task test:codex-m0:managed` in
 [`Taskfile.yml`](../Taskfile.yml); neither is part of `task gate`.
 At executable commit `d4e6301b5ee64ec19607c9d57f8cc76d8a74c6fa`, the lead recorded
@@ -149,15 +150,75 @@ controls those inputs and external network access.
 | One-shot timeout | The same ready-marker / sleep-two-seconds / late-marker command completed at `timeout_ms: 4000`; at 150 it returned exit 124 after writing ready, left an empty terminal registry and no late marker after another 2.5 seconds. |
 | Dynamic callback scope | `item/tool/call` supplied runtime `threadId`, `turnId` and `callId`. The handler wrote once for its known root and denied a second ordinary worker-created thread whose arguments spoofed that root. Malformed/error replies yielded failed tool results. Native-child inheritance and MCP replacement were not exercised. |
 
-App-server approval routing plus managed one-shot execution is a stock candidate
-for the native shell/patch and retained-stdin clauses. Dynamic callbacks are a
-candidate for worker-owned tool authorization. Neither candidate is an accepted
-production harness. The child observations cover known fixture children and
-registered terminals, not arbitrary detached descendants, discovery races or
-code-mode cells. M0 still needs the integrated policy on the intended models'
-code-mode surface, spawn and per-role tool authorization, MCP/dynamic routing,
-complete ownership/disposal, lane-specific isolation and the full neutral
-usage/event/error/skills contracts while preserving Claude D0.
+### Intended-model code-mode continuation
+
+At `1750eb582083d77d10ee647b016b27f0bab98cc6`, Linux/Node 24 Alpine
+passed 12 managed code-mode cases and six native-isolation cases, with baseline
+23 and managed native six cases also passing; the recorded runs exited 0 with no
+failures, skips or cancellations. These dummy-key localhost fixtures use the
+real code-mode host, the same read-only managed requirements fixture and the
+intended model names `gpt-6-astra` and `gpt-5.6-sol`; they establish no live model
+access. Reproduction targets are in the [harness README](../e2e/codex-m0/README.md).
+
+| Probe, on each intended model | Observation and limit |
+|---|---|
+| Managed shell approval through a code cell | Accept writes the marker; decline and malformed decisions prevent it; each produces one app-server approval. This is measured shell coverage, not all tools or per-role policy. |
+| Metadata-selected code mode | With `code_mode` and `code_mode_only` false and the code-mode host enabled, the request still advertises custom `exec` and executes the fixed cell. Those two feature flags are not a sufficient isolation mechanism for these model fixtures. |
+| Forced terminal/input | Forced `tty` exits without a session; `tools.write_stdin` is unavailable in the cell; the terminal registry is empty and the late-input marker absent. |
+| Dynamic callback through a code cell | Runtime `threadId`, `turnId` and `callId` reach `item/tool/call`. The known root writes once; a second ordinary worker-created thread spoofing that root in arguments receives a failed result. Full role/phase admission remains separate. |
+
+The native-isolation cases compare enabled controls against `environments: []`
+and `agents.enabled = false`, with `multi_agent_v2 = false` in both. Enabled
+controls execute direct and nested shell/patch actions, return real image output,
+and start a direct native child that makes a request and completes. Disabled
+controls return unsupported dispatch for direct shell, patch, image and native
+spawn, expose no nested shell/patch/image functions, and create no marker or
+child. Nested collaboration is unavailable in both controls, so that observation
+is not disablement evidence. Two additional cells compute 42, while `process`,
+`require`, `fetch`, `Deno`, `Bun`, `XMLHttpRequest` and `WebSocket` are undefined;
+module import, file read, process-env and fetch attempts reject. These are bounded
+runtime-input fixtures, not proof against arbitrary VM/runtime vulnerabilities.
+
+### Worker policy and process ownership continuation
+
+The committed fixture broker at `8aabd299ee98802512711134f24c352af429a697`
+passed 14 cases on Linux/Node 24 Alpine, exit 0 with no failures, skips or
+cancellations. It drives callbacks through real intended-model code-mode cells:
+root-only signals, immutable role/phase write grants, synchronous worker-created
+child completion, and denial of unknown/nested delegation. Held callback controls
+compare allow, revoke-before-effect, thrown policy and invalid policy results;
+disposal waits for admitted handlers. Unknown/stale/replayed identity checks are
+**direct broker injections using captured real identities**, not forged upstream
+notifications. The broker executes fixed marker effects, not the production
+shell/path/forge handlers; these results do not establish all D6 clauses. Nine enforcement mutations
+produced named assertion failures; this is not nine demonstrated unauthorized
+side effects (the role mutation changes denial text while other guards still
+deny). Initial malformed replay syntax and an initial drain-control survivor
+were instrument corrections, excluded from that assertion-red evidence.
+
+At `685acea`, the actual-host supervisor suite passed nine cases, and the
+separate process-mechanism suite passed four controls, all exit 0 with no
+failures, skips or cancellations in the Node test run. These ran in **Node 24
+Debian with Python 3.11**, as uid 10002 with zero capabilities,
+no-new-privileges, read-only root and mounted fixtures, writable `/tmp`, and
+`--network none`; they were not Alpine measurements.
+
+| Ownership probe | Observation and limit |
+|---|---|
+| Actual active/yielded code-mode host, both intended models | The recorded host has a different process group from its app-server. Uninterrupted controls produce the delayed dynamic marker. Revoke admission, settle the held callback, interrupt and dispose reaps both recorded PIDs with `ECHILD+__WALL`; no late callback or marker appears beyond the control delay. |
+| Actual yielded host with signals suppressed | Disposal reaches its deadline with owned children still present and reports unconfirmed, never drained. A subsequent normal disposal recovers and reaps them. |
+| Separate setsid/double-fork descendants | A PGID-only control lets the late marker through; subreaper cleanup adopts/reaps the descendants and prevents it. Repeating cleanup is idempotent. |
+| Separate non-SIGCHLD clone | Ordinary wait can report `ECHILD` with a child still live; `__WALL` observes and reaps it. An injected no-signal drain has a bounded incomplete result and a successful cleanup. |
+
+A separate reviewer control changed only the supervisor's normal exit after a
+real drained report from 0 to 2. The named normal-exit assertion failed; the
+unmutated case passed. This establishes refusal of abnormal exit after a drain
+report, not cleanup of a crash before any drain report.
+
+The supervisor owns real fixture processes; this does not implement the outer
+runner permit across checkpoint publication, recovery and credentialed git.
+The broker and supervisor are distinct characterization instruments. Their
+passing results must not be read as an end-to-end production safety barrier.
 
 The earlier subscription login/refresh evidence remains separate from these dummy-key
 localhost tests. Both subscription and API-key support remain phase-1
@@ -221,193 +282,108 @@ exercise:
   `apply_patch` paths;
 - the initial child timing evidence did not establish consumption after parent
   completion, and no public child drain had been exercised at review time; and
-- the per-run MCP transport still needs a defined disposal lifecycle and proven
-  bearer-token and shell/process isolation.
+- the proposed loopback MCP transport had no measured disposal, bearer-token
+  or shell/process isolation. The worker-callback alternative below avoids a
+  model-side bearer but still needs admission, handler and process disposal.
 
 Therefore hook success on the measured happy path is not a fail-closed guardrail
-design. The continuation now measures bounded child/terminal cleanup and native
-one-shot enforcement, but M0 cannot close until those candidates form a complete
+design. The continuation measures bounded child/terminal cleanup and managed
+one-shot enforcement on native and intended-model code-mode fixtures, but M0
+cannot close until those candidates form a complete
 fail-closed execution and ownership design. No alias-only reuse of Claude hooks,
 inferred role-file restriction, or process-group kill substitutes for those proofs.
 
-## Provisional harness boundary
+## Proposed execution policy
 
-The useful shape remains one per-run object. Construction owns immutable provider and
-isolation inputs: the credential, home, workspace and secret paths, available
-skills, MCP handlers, guardrails, and process launcher. Mutable uzi policy stays
-outside it: planning and approval, checkpoints and git operations, run-state
-transitions, and signal latches. This shape is incomplete and not an
-implementation decision.
+**Unaccepted candidate.** Use the stock app-server with `environments: []`,
+`agents.enabled = false` and `multi_agent_v2 = false`, with native tools and
+extensions disabled. Worker-owned dynamic callbacks would provide the permitted
+run tools; worker-created child threads would implement synchronous delegation.
+This replaces the earlier loopback-MCP/native-role candidate. Native authority
+removal, representative role/phase callbacks and actual-host disposal now have
+separate fixture evidence above; integrated production policy remains unaccepted.
 
-```ts
-type SessionPresence = "present" | "absent" | "unknown";
+The worker would bind runtime thread/turn identity to an immutable run, role and
+phase registry. Callback arguments never select their own authority. Admission
+would check that registry before any action, reject unknown origins and stale
+turns, allow lead-only signals only on the root, deny nested or unknown roles,
+and apply each role's tool/skill allocation and plan/implement policy. A child
+callback would resolve only after its owned child turn finishes; root completion
+alone cannot establish that condition. Role TOML and healthy hook behavior are
+not substitutes for these checks.
 
-type HarnessOrigin =
-  | { kind: "main" }
-  | {
-      kind: "subagent";
-      role?: string;
-      name?: string;
-      instanceId?: string;
-      label?: string;
-    }
-  | { kind: "unknown" };
+The proposed process owner is a per-run unprivileged Linux subreaper supervisor,
+covering the app-server, code-mode host and local command descendants even when
+they change process groups. Before a safety-sensitive checkpoint or credentialed
+git, the worker would close admission, settle in-flight starts/callbacks, quiesce
+owned child turns/cells/terminals, then await the supervisor's `ECHILD` result
+with `__WALL`. An incomplete stage poisons the harness and blocks subsequent
+turns, checkpoint publication and credentialed git; cleanup still attempts the
+remaining stages without replacing the primary failure. A registry-empty result,
+RPC acknowledgement or leader exit cannot satisfy the OS ownership predicate. The outer
+`Executor.safety.withBoundary` facade must hold a joint child-quiescence/process-
+reap epoch through the runner-owned sink, including recovery and parking. Poison
+survives independently of the primary exception; a timed-out action cannot
+release admission while its owned work still runs. Claude's absent/legacy branch
+keeps the current synchronous calls and `reap:false` behavior unchanged.
 
-interface HarnessAgent {
-  description: string;
-  prompt: string;
-  tools?: readonly string[];
-  model?: string;
-}
+Run and advice construction would be separately gated. Advice has no shell,
+filesystem, network, delegation or worker callbacks and receives neither a run
+workspace nor a run handler registry. Whether Codex advice may use isolated
+calculations or must expose literally no tools awaits the user's decision and
+its discriminating experiment. Claude advice remains unchanged. Subscription and
+API-key credentials stay separate private construction inputs with no fallback;
+credential selection, refresh/CAS and pricing remain wider PRD blockers.
 
-interface RunTurnRequest {
-  prompt: string;
-  resumeSessionId?: string;
-  signal: AbortSignal;
-  systemPrompt: string;
-  model?: string;
-  effort?: "low" | "medium" | "high" | "xhigh" | "max";
-  agents: Readonly<Record<string, HarnessAgent>>;
-}
+## Proposed neutral harness boundary
 
-type HarnessItem =
-  | { kind: "text"; text: string }
-  | { kind: "thinking"; text: string }
-  | {
-      kind: "tool";
-      phase: "started";
-      id?: string;
-      name?: string;
-      input?: unknown;
-    }
-  | {
-      kind: "tool";
-      phase: "finished";
-      id?: string;
-      name?: string;
-      output?: unknown;
-      isError?: boolean;
-    };
+The complete proposed interfaces and exact Claude preservation rules live in
+[the contract companion](../e2e/codex-m0/harness-contract.md). It defines usage,
+context, metrics, rate limits, errors, grouped events, skills, run/advice handles
+and distinct bounded child-quiescence, process-reap and tool-disposal operations.
+The earlier undefined contract types and lifecycle placeholder now have explicit
+proposed shapes. Their presence does not accept the policy or complete M0.
 
-type HarnessErrorCategory =
-  | "aborted"
-  | "authentication"
-  | "authorization"
-  | "rate_limit"
-  | "model"
-  | "effort"
-  | "transport"
-  | "tool"
-  | "protocol"
-  | "session_missing"
-  | "unknown";
+The adapter owns immutable provider/isolation inputs, query construction,
+wire decoding, session inspection and process ownership. Uzi retains planning,
+approval, signal reduction, checkpoints, git and run-state transitions. A single
+neutral reducer groups frames and preserves both the emitted uzi payload and
+workflow outcome; raw provider events stay inside the adapter.
 
-type HarnessEvent =
-  | { kind: "turn_started" }
-  | { kind: "session_id"; sessionId: string }
-  | {
-      kind: "frame";
-      origin: HarnessOrigin;
-      items: readonly HarnessItem[];
-      usage?: HarnessUsage;
-      model?: string;
-    }
-  | {
-      kind: "delegation";
-      phase: "started" | "completed" | "failed";
-      identifiers: {
-        agentId?: string;
-        agentType?: string;
-        senderId?: string;
-        receiverThreadIds?: readonly string[];
-      };
-      error?: HarnessError;
-    }
-  | {
-      kind: "turn_finished";
-      outcome: "success" | "failed";
-      usage?: { basis: "turn" | "session"; value: HarnessUsage };
-      context?: HarnessContext;
-      metrics?: HarnessMetrics;
-      error?: HarnessError;
-      rateLimit?: HarnessRateLimit;
-    };
+The source inventory is pinned to `bc5a0a8b11f5c98a7067c1fc4202d37a0f27f92e`:
 
-interface HarnessError {
-  category: HarnessErrorCategory;
-  message: string;
-}
-
-interface RunHarness {
-  inspectSession(id: string): Promise<SessionPresence>;
-  runTurn(request: RunTurnRequest): AsyncIterable<HarnessEvent>;
-  // OPEN PLACEHOLDER: an async provider-child drain/close surface belongs here.
-}
-
-interface AdviceRequest {
-  systemPrompt: string;
-  prompt: string;
-  model?: string;
-  output: { kind: "text" } | { kind: "json"; schema: unknown };
-  signal: AbortSignal;
-}
-
-interface AdviceHarness {
-  run(request: AdviceRequest): Promise<{ text: string; usage?: HarnessUsage }>;
-}
-```
-
-The interface sketch intentionally leaves contract work visible rather than
-guessing at it:
-
-- `HarnessUsage`, `HarnessContext`, `HarnessMetrics` and `HarnessRateLimit` are
-  not yet defined;
-- D0 requires exact preservation of Claude init/result/error mapping, and the
-  authority between a thrown adapter error and a terminal error event is open;
-- per-agent skill allocation is absent from `HarnessAgent`;
-- `AdviceHarness` does not yet preserve the advice lane's typed rate-limit
-  behaviour;
-- per-run MCP disposal is not represented; and
-- no signature is accepted yet for the distinct operations of reaping the CLI
-  process tree and draining/closing Codex child threads.
-
-The current runner deliberately uses `reap: false` at ordinary iteration
-boundaries. Full process-tree reap occurs only at safe checkpoint, terminal, or
-pre-credentialed-git boundaries; that process operation has not been shown to
-drain a Codex child thread. The placeholder above must become an asynchronous,
-measured lifecycle contract before this boundary can be accepted.
-
-The eventual usage, context, metrics and rate-limit shapes must be
-provider-neutral uzi contracts.
-`HarnessOrigin` carries the current message-mapping concepts: optional role/name,
-invocation instance and label. Hook `agent_id`/`agent_type` remain delegation or
-hook-lifecycle identifiers; they are not silently translated into message
-attribution. `inspectSession` is tri-state so a dropped resume id is cleared only
-on proven absence; an I/O or protocol failure returns `unknown`. `session_id` is
-lazy because Codex does not make it available at construction.
-
-Provider `item.updated` events reset liveness only; they do not become persisted
-frames. A frame keeps its mapped items grouped because the current Claude mapper
-can expand one provider assistant frame into several items, after which
-`driveTurn` filters signal tools and attaches that frame's usage/model to the
-first surviving item. One reducer consumes the normalized stream and is the sole
-producer of `EmittedMessage[]`, signal latches, the current session id, and the
-terminal turn result. Raw Claude or Codex events never reach lifecycle code.
-Origin `unknown` must be preserved and must fail closed for signals.
-
-The advice sketch follows the current judge/review/summary call shape: one
-isolated tool-less pass returning accumulated text plus optional usage.
-Structured-output validation and tolerant parsing remain with the caller, while
-typed rate-limit and terminal-error behaviour still require a contract.
+- Keep display attribution distinct from signal authorization. Unknown Codex
+  origins cannot latch signals; Claude's existing replay projections remain.
+- Preserve Claude's init/error/result payloads, including unknown accounting
+  members and explicit undefined keys before JSON serialization, through an
+  opaque uzi wire projection alongside normalized usage. Subscription cost is
+  not metered zero; API-key cost remains unreported until its source is defined.
+- For run turns, preserve first-wins local timeout/cancel, then distinct iterator throws, then
+  terminal failure authority; terminal accounting is emitted before failure.
+  Deferred failure materialization preserves runtime subtype truthiness and
+  conversion timing for the exact Claude typed-limit suffix.
+  Claude clean EOF still returns accumulated output without a fabricated result.
+- Preserve grouped signal filtering, first-surviving-item usage/model attachment,
+  context-read timing, session-ID rules, skill allocations and tool inheritance.
+- Preserve advice callback authority and existing outer fallbacks: judge catches
+  even its inner `LimitReachedError` and posts deterministic completed advice;
+  review returns a failed-review payload and summary returns null on failure.
+  The synchronous advice policy runs inside terminal consumption before iterator
+  closure, preserving its own callback-error precedence and classification clock.
+- Preserve current Claude cleanup timing. Its legacy kill-dispatch and in-process
+  tool states make no observed-empty claim and cannot satisfy a Codex barrier.
+  Ordinary iteration fetch-back continues to use `reap: false`.
 
 ## Consequences
 
-- M2 cannot treat this sketch as accepted until M0 closes the lifecycle, error,
-  usage and advice gaps without changing Claude behaviour.
-- Covering every observed normal/v1 and code-mode hook name is necessary but not
-  sufficient; the failure and `write_stdin` paths need a fail-closed design.
-- The exec/SDK feed exposes root frames and delegation lifecycle; app-server
-  exposes attributed child events in the native fixtures. Final feed mapping
-  awaits the protocol decision and must never fabricate origin or content.
-- The seat lock and checkpoint/write-back design remain conservative despite
-  proven rotation, because previous-token usability was intentionally not tested.
+- M0 remains incomplete and this ADR Proposed. M2 may use the companion only
+  after review accepts its extraction contract; M3 awaits the integrated policy.
+- Intended-model native-authority controls, representative role/phase callbacks
+  and actual-host disposal have bounded evidence. The complete production
+  guardrail suite and outer runner permit are not implemented by those fixtures;
+  advice policy and integrated review remain open.
+- Exec/SDK root-only visibility remains historical protocol evidence. An
+  app-server adapter must use actual runtime identity and observed content,
+  without fabricating child messages or treating hook identity as attribution.
+- Both credential modes remain required. The seat lock and latest-state
+  write-back remain conservative because prior-token replay was not tested.
