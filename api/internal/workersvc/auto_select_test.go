@@ -262,6 +262,7 @@ func TestSelfImproveIgnoresTheWorkerBindMode(t *testing.T) {
 	judgeID := uuid.New()
 	f.fs.claimRun.Kind = runkind.SelfImprove
 	f.fs.judgeSecret = pgtype.UUID{Bytes: judgeID, Valid: true}
+	f.fs.judgeBindMode = BindModePinned
 	f.fs.byIDSecrets[judgeID] = f.fs.byIDSecrets[f.fullID]
 	f.fs.byIDLabels[judgeID] = "review-key"
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
@@ -476,7 +477,7 @@ func TestAutoBestOfPoolSpendsAPooledToken(t *testing.T) {
 // TestAutoCandidateQueryErrorFailsTheClaim: a broken query must NOT degrade to the
 // owner default. "The database blinked" and "you pooled nothing" are different facts,
 // and treating the first as the second spends an account the user did not choose
-// while raising nothing — the same reasoning judgeSecretID's error path already uses.
+// while raising nothing — the same reasoning judgeChoice's error path already uses.
 // The run is retried; a silent mis-spend is not, because nobody learns it happened.
 //
 // MUTATION THIS CATCHES: swallowing the query error into a pool_empty fallback.

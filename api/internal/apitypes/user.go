@@ -50,8 +50,13 @@ type UserDTO struct {
 	// token, which is every user's state until they choose otherwise. The label
 	// rides so a client can render "judged by: console-key" without a second
 	// lookup — a name, never the credential.
-	JudgeAnthropicSecretID    *string    `json:"judge_anthropic_secret_id"`
-	JudgeAnthropicSecretLabel *string    `json:"judge_anthropic_secret_label"`
-	CreatedAt                 time.Time  `json:"created_at"`
-	LastLogin                 *time.Time `json:"last_login"`
+	JudgeAnthropicSecretID    *string `json:"judge_anthropic_secret_id"`
+	JudgeAnthropicSecretLabel *string `json:"judge_anthropic_secret_label"`
+	// JudgeAnthropicBindMode is the EFFECTIVE judge bind mode (PRD #1140 M2, D6):
+	// "default", "pinned", or "auto". Effective means a "pinned" row whose pointer was
+	// nulled (a deleted token) reports "default", so the mode always agrees with what
+	// the claim will actually resolve — the client never re-derives the rule.
+	JudgeAnthropicBindMode string     `json:"judge_anthropic_bind_mode"`
+	CreatedAt              time.Time  `json:"created_at"`
+	LastLogin              *time.Time `json:"last_login"`
 }

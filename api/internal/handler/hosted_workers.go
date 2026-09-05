@@ -21,6 +21,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 	"github.com/vtmocanu/uzi/api/internal/workertmpl"
 )
 
@@ -249,6 +250,21 @@ func (h *Handler) provisionHostedWorker(ctx context.Context, userID uuid.UUID, n
 		return store.Worker{}, err
 	}
 
+	// Bind mode (PRD #1140 M1), mirroring the #804 ephemeral provisioner
+	// (ephemeral.go:263): read the auto-select pool under the SAME qtx we insert with,
+	// one snapshot per transaction, and default the worker to `auto` when the owner has
+	// ≥1 auto_eligible anthropic_token, else `default`. There is no label input on this
+	// route, so the derivation is two-way (auto or default), and `auto` is only chosen
+	// on a non-empty pool so the worker never parks its run in pool_wait.
+	hasPool, err := qtx.UserHasAutoEligibleAnthropicToken(ctx, userID)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	bindMode := workersvc.BindModeDefault
+	if hasPool {
+		bindMode = workersvc.BindModeAuto
+	}
+
 	// Both are non-empty by the gates above, and ck_workers_hosted_metadata requires
 	// them NOT NULL on a hosted row — hence Valid: true unconditionally, unlike
 	// CreateWorker's "empty → NULL" for an external worker's optional template.
@@ -261,7 +277,8 @@ func (h *Handler) provisionHostedWorker(ctx context.Context, userID uuid.UUID, n
 		// Explicit true/false (Valid always), never NULL: on a hosted row a false is a
 		// real "no sidecar", and the controller renders exactly what this says. Only
 		// external rows (created via CreateWorker) leave the column NULL.
-		DockerEnabled: pgtype.Bool{Bool: docker, Valid: true},
+		DockerEnabled:     pgtype.Bool{Bool: docker, Valid: true},
+		AnthropicBindMode: bindMode,
 	})
 	if err != nil {
 		return store.Worker{}, err

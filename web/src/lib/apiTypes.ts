@@ -51,6 +51,10 @@ export interface User {
   // unbound ⇒ their default token. The label, never the value.
   judge_anthropic_secret_id: string | null;
   judge_anthropic_secret_label: string | null;
+  // Which bind mode this user's RETROSPECTIVES use (PRD #1140): default / pinned /
+  // auto. The EFFECTIVE mode (a pinned binding whose token was deleted reports
+  // default). auto spreads retrospectives across the user's pooled tokens.
+  judge_anthropic_bind_mode: BindMode;
   created_at: string;
   last_login: string | null;
 }

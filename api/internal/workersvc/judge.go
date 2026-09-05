@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 )
@@ -1037,24 +1039,57 @@ func toolResultText(payload []byte) string {
 	return b.String()
 }
 
-// judgeSecretID reads the user's judge-lane Anthropic binding as openAnthropic's
-// override: nil when they have named none, which resolves their default token
-// (PRD #104 M4).
+// judgeChoice resolves WHICH credential a JUDGE-lane claim (a judge run, or a
+// self_improve run that follows the judge binding) spends, from the user's three-valued
+// judge bind mode (PRD #1140 M2). It is the judge-lane peer of claimSecretID's run-lane
+// resolution and returns the same secretChoice, so a judge run records auto /
+// best_of_pool / pool_stale / pool_empty / open_failed with headroom exactly as an
+// issue run does — no new vocabulary.
+//
+//   - pinned + pointer → staticChoice(id, judge): that named credential, reason `judge`.
+//   - pinned + NULL pointer, or default → staticChoice(nil, judge), which records
+//     `default`: an unbound judge lane really did spend the owner's default (D6).
+//   - auto → the SAME autoChoice ranker the run lane uses (D7). On a genuinely empty
+//     pool (errAutoPoolEmpty) the judge lane does NOT hold like the run lane (D4);
+//     it spends the default, recorded honestly as `pool_empty`.
 //
 // A lookup error is propagated, never swallowed into "use the default": treating a
 // failed read as "unbound" would silently spend the wrong account, which is R4's
 // failure mode — a resolution bug that costs money and raises nothing. The claim
 // fails instead, and the run is retried.
-func (s *Service) judgeSecretID(ctx context.Context, userID uuid.UUID) (*uuid.UUID, error) {
-	bound, err := s.q.GetUserJudgeAnthropicSecret(ctx, userID)
+func (s *Service) judgeChoice(ctx context.Context, run store.Run) (secretChoice, error) {
+	bound, err := s.q.GetUserJudgeAnthropicBinding(ctx, run.UserID)
 	if err != nil {
-		return nil, fmt.Errorf("judge token binding lookup: %w", err)
+		return secretChoice{}, fmt.Errorf("judge binding lookup: %w", err)
 	}
-	if !bound.Valid {
-		return nil, nil
+	switch bound.JudgeAnthropicBindMode {
+	case BindModePinned:
+		if bound.JudgeAnthropicSecretID.Valid {
+			id := uuid.UUID(bound.JudgeAnthropicSecretID.Bytes)
+			return staticChoice(&id, selectReasonJudge), nil
+		}
+		// pinned with a NULL pointer resolves as default (D6), recorded honestly as
+		// default — staticChoice(nil, …) discards the bound reason on a nil id.
+		return staticChoice(nil, selectReasonJudge), nil
+	case BindModeAuto:
+		choice, aerr := s.autoChoice(ctx, run)
+		if aerr != nil {
+			if errors.Is(aerr, errAutoPoolEmpty) {
+				// D4: the judge lane does NOT hold on an empty pool the way the run
+				// lane does. Build the choice DIRECTLY (not via staticChoice, which
+				// would rewrite the reason to `default`) so openAnthropic(nil) resolves
+				// the owner's default and recordRunCredential logs reason=pool_empty
+				// with the default's id and NULL headroom.
+				return secretChoice{reason: string(autoselect.ReasonPoolEmpty)}, nil
+			}
+			return secretChoice{}, aerr
+		}
+		return choice, nil
+	default:
+		// BindModeDefault, and any unrecognised value: the safe direction is the
+		// owner's default token (what the judge lane spent before it had a bind mode).
+		return staticChoice(nil, selectReasonJudge), nil
 	}
-	id := uuid.UUID(bound.Bytes)
-	return &id, nil
 }
 
 // assembleJudgeClaim builds the claim payload for a judge run (PRD #46 Decisions 1, 3
@@ -1065,33 +1100,34 @@ func (s *Service) judgeSecretID(ctx context.Context, userID uuid.UUID) (*uuid.UU
 // run's id (its trace is fetched out-of-band), the judge model, and the deterministic
 // command-not-found pre-scan. The trace itself never rides the claim (it can be MB).
 func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
-	// The run owner's JUDGE binding, falling back to their default — and deliberately
-	// NOT the claiming worker's binding, even though a judge run is claimed by an
-	// ordinary worker through the same ClaimRun lane. Under PRD #104 D1 the judge
-	// lane is bound per USER: which credential reviews your work is a property of
-	// you, not of whichever worker happened to pick the retrospective up, which would
-	// otherwise bill the same retrospective to different accounts run to run for no
-	// reason a user could see. Self-improve runs ride this same path and so follow
-	// the same binding.
-	judgeSecret, err := s.judgeSecretID(ctx, run.UserID)
+	// The run owner's JUDGE binding resolves the credential — and deliberately NOT the
+	// claiming worker's binding, even though a judge run is claimed by an ordinary
+	// worker through the same ClaimRun lane. Under PRD #104 D1 the judge lane is bound
+	// per USER: which credential reviews your work is a property of you, not of
+	// whichever worker happened to pick the retrospective up, which would otherwise
+	// bill the same retrospective to different accounts run to run for no reason a user
+	// could see. judgeChoice reads the three-valued judge bind mode (PRD #1140 M2):
+	// default/pinned resolve statically, auto runs the pool ranker with D4's empty-pool
+	// fallback. Self-improve runs ride the run lane but follow this same resolution.
+	choice, err := s.judgeChoice(ctx, run)
 	if err != nil {
 		return nil, err
 	}
-	cred, err := s.openAnthropic(ctx, run.UserID, judgeSecret)
+	// Open with the SAME open-failed retry the run lane uses (PRD #1140 M2): before the
+	// extraction the judge lane opened directly, so an `auto` judge pick that would not
+	// decrypt failed terminally while the run lane floored onto another pooled token.
+	cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
 	if err != nil {
 		return nil, err
 	}
 	// The judge lane records what it spent exactly as the run lane does (PRD #111
 	// M1). It is the lane where this matters MOST: the judge binding exists so
 	// retrospectives can be billed to a different account, and until now nothing in
-	// the data said whether they actually were.
-	//
-	// Its reason is `judge`, not `pinned` (M4 closed the vocabulary). D20 makes the
-	// run view name the MODE, and "pinned" would send a user looking for a worker
-	// binding that does not exist — the choice was made by their judge setting, on a
-	// different page. An UNBOUND judge lane records `default`, honestly: the owner's
-	// default really did pay.
-	if err := s.recordRunCredential(ctx, run, cred, staticChoice(judgeSecret, selectReasonJudge)); err != nil {
+	// the data said whether they actually were. The reason is whatever judgeChoice
+	// resolved — `judge` for a pin, `default` for an unbound lane, or auto /
+	// best_of_pool / pool_stale / pool_empty / open_failed for the auto mode — so the
+	// run view names the MODE with no new vocabulary (D20).
+	if err := s.recordRunCredential(ctx, run, cred, choice); err != nil {
 		return nil, err
 	}
 	anthropic := cred.Token

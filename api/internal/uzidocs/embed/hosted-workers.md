@@ -23,6 +23,12 @@ available if your admin has turned hosting on for this instance.
 3. The new worker appears under **Your workers** right away and comes online
    on its own, usually within a few seconds — nothing to run, nothing to copy.
 
+A freshly provisioned hosted worker derives which [Anthropic
+token](./anthropic-token.md) it spends the same way any other new worker
+does: **Auto-select from the pool** if you have at least one pooled token,
+else your default token. There's no pin option on this form — bind it to a
+particular token afterwards from **Settings → Workers** if you want one.
+
 ## Type and size
 
 **Type** picks the worker image — the same choice as
