@@ -17,7 +17,7 @@ Open **Settings → Run defaults**, find the **AI attribution in commits**
 card, and uncheck **Include the Co-Authored-By: Claude trailer in my worker
 commits**. It's an account default, and it's owner-only — you can only
 change it for yourself, and there's no admin force-toggle for it (unlike
-[Automatic CI fixes](./ci-autofix.md#1-opt-in) and the [run judge](./judge.md),
+[Automatic CI fixes](./ci-autofix.md#1-opt-out) and the [run judge](./judge.md),
 which admins can enable or disable for any individual user).
 
 ## When it takes effect

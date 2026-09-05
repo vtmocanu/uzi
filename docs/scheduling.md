@@ -425,7 +425,7 @@ issue runs open:
   a scheduled run inherits the owner's setting; there is no separate
   per-schedule switch for it. An instance-wide admin kill-switch can turn it
   off for everyone regardless of any owner's own setting; see [Automatic CI
-  fixes](./ci-autofix.md#1-opt-in) for both.
+  fixes](./ci-autofix.md#1-opt-out) for both.
 
 Both lanes act only on a **still-open** MR and spend the schedule owner's own
 Anthropic token, the same as any other run. A prompt schedule's MR has no
