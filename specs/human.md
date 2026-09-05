@@ -714,6 +714,7 @@ Redesigns the shipped `uzi tui` (PRD #112). TUI/CLI-only.
 - One-line keybinding footer. [user]
 - Keep the health words visible on the board (not colour-only). [user]
 - The interactive demo is rebuilt on the shipped views (not retired, not a separate prototype). [user, D1]
+- The run detail opens on the run and its newest messages first and fills older history in the background, so a slow link never sits on an empty pane; refetches continue from what is already held. [user, #1137]
 
 ## Feature #1093 — Pause all schedules
 
