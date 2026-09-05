@@ -44,11 +44,14 @@ A run that isn't set up to wait still fails the moment it hits a limit, the same
 ## Alert when the 7-day window resets early
 
 Anthropic's 5-hour window resets like clockwork, but the 7-day (weekly) window
-sometimes reopens *earlier* than the reset time it originally advertised. uzi's
+sometimes reopens *earlier* than the reset time it originally advertised —
+whether or not your runs were ever blocked or parked on that window. uzi's
 usage poller already tracks that expected reset time per token, so it notices
-when this happens: if a token's weekly window comes back more than 8 hours
-before its previously-recorded reset, uzi can tell you right away instead of
-you finding out only when the nominal time finally arrives.
+when this happens: either the advertised reset time moves forward, or your
+weekly usage drops back to (near) zero ahead of schedule. If a token's weekly
+window comes back more than 8 hours before its previously-recorded reset, uzi
+can tell you right away instead of you finding out only when the nominal time
+finally arrives.
 
 - **On by default** — the same **Settings → Anthropic usage limits** card as
   the pause toggle above has its own checkbox, *"Alert me when my 7-day limit

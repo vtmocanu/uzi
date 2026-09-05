@@ -23914,3 +23914,9 @@ Serves human Feature #1093: one user-level switch to pause every schedule the us
 - **D11 — no notifications in v1.** The user flipped the switch; the Schedules-page banner and the skip records are the feedback. The `park()` notice shape in `scheduler.go` is the template if an auto-resume notice is wanted later.
 
 Cross-refs: PRD #396 (per-row resume re-arm, the no-replay property this pause preserves by a different mechanism); the vault-lock skip in `api/internal/schedsvc/self_improve.go` (the user-level condition consulted at fire time this copies); PRD #929 (schedule output modes — edits the same `scheduler.go` + `Schedules.tsx`, sequenced not concurrent); migration 00165 (`users.mr_rework_enabled` + `app_settings`, the admin-twin template D1 defers).
+
+## 616. PRD #1114 — early 7-day reset alert widened
+
+Serves human Feature #53's widened early-reset-alert bullet [user, #1114]. Richer rationale is PRD #1114's Decision Log; terse contract here.
+
+- **#1114 — early 7-day reset alert widened.** Dropped the "was limiting" gate (limit park with `source=limit_report`, or a poller reading with `seven_day_pct >= 95`) in usagepoller `earlyResetFires`; the alert now fires on any early 7-day clear detected by EITHER arm — boundary moved >`resetEpochMoveMargin` (1h) past the advertised reset T (rolling model) OR 7-day used% dropped from >=`pctResetFloor` (5) to <=`pctResetCeil` (1) with an unmoved boundary (fixed-grid model) — keeping the >=8h-early guard (`earlyResetThreshold`). The two jitter margins replace the gate as the false-positive backstop (PRD #1114 D5/D8). Same single opt-in toggle, 7-day window only.
