@@ -92,7 +92,7 @@ export class Probe {
 
   static async create(t, options = {}) {
     const root = await mkdtemp(path.join(tmpdir(), "cdr-codex-m0-"));
-    const probe = new Probe(root);
+    const probe = new this(root);
     t.after(async () => {
       await probe.close();
       assert.deepEqual(probe.errors, [], "harness transport/handler errors");
@@ -246,9 +246,7 @@ stream_max_retries = 0
 stream_idle_timeout_ms = ${DEADLINE_MS}
 ${typeof hookConfig === "function" ? hookConfig(this) : hookConfig}
 `, { mode: 0o600 });
-    this.child = spawn(bin, ["--dangerously-bypass-hook-trust", "app-server"], {
-      cwd: this.workspace, env: this.env, detached: true, stdio: ["pipe", "pipe", "pipe"],
-    });
+    this.child = this.spawnAppServer(bin);
     this.exit = new Promise((resolve, reject) => {
       this.child.once("error", (error) => { this.exited = true; reject(error); });
       this.child.once("exit", (code, signal) => {
@@ -305,6 +303,12 @@ ${typeof hookConfig === "function" ? hookConfig(this) : hookConfig}
     });
     await this.rpc("initialize", { clientInfo: { name: "uzi-m0", version: "0.0.0" }, capabilities: { experimentalApi: true } });
     this.send({ method: "initialized" });
+  }
+
+  spawnAppServer(bin) {
+    return spawn(bin, ["--dangerously-bypass-hook-trust", "app-server"], {
+      cwd: this.workspace, env: this.env, detached: true, stdio: ["pipe", "pipe", "pipe"],
+    });
   }
 
   send(value) {
