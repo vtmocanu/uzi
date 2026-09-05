@@ -460,7 +460,11 @@ func TestProvisionHostedWorkerBindModeLiveDB(t *testing.T) {
 	t.Run("pooled_token_auto", func(t *testing.T) {
 		h, _, q, _, userID := hostedLiveDB(t, "5")
 		ctx := context.Background()
-		insertToken(q, ctx, userID, "default", true) // first token, born auto_eligible (#804)
+		insertToken(q, ctx, userID, "default", true)      // first token, born auto_eligible (#804)
+		insertToken(q, ctx, userID, "console-key", false) // a second, non-eligible token; pool still non-empty
+		// Mirrors the ephemeral test's eligible_token_owner_auto: ≥1 auto_eligible token
+		// among several keeps the pool non-empty, so this is a distinct case from the
+		// single-token one below rather than a duplicate of it.
 
 		wkr, err := h.provisionHostedWorker(ctx, userID, "pooled", "base", "m", false, 5)
 		if err != nil {
