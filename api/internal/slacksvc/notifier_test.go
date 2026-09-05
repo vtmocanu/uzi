@@ -41,6 +41,12 @@ type fakeNotifStore struct {
 	// call is captured so a test can assert the advanced count was recorded (or that a
 	// deduped/no-milestone report recorded nothing).
 	milestoneSet []store.SetSlackRunMilestoneNotifiedParams
+	// PRD #1116: the usage-limit park anchor writes. Each set/clear is captured so a
+	// later milestone's test can assert the park marker was stamped/consumed. clearErr
+	// models the compare-and-swap refusal (pgx.ErrNoRows) when a clear does not match.
+	limitPauseSet []store.SetSlackRunLimitPauseParams
+	limitPauseClr []store.ClearSlackRunLimitPauseParams
+	clearErr      error
 	// PRD #191 M2b: the repo-less chat context the notifier falls back to. chatCtxErr
 	// defaults to pgx.ErrNoRows via the method below when no row is staged, modelling a
 	// non-chat run.
@@ -98,6 +104,17 @@ func (f *fakeNotifStore) SetSlackRunQuestion(_ context.Context, arg store.SetSla
 func (f *fakeNotifStore) SetSlackRunMilestoneNotified(_ context.Context, arg store.SetSlackRunMilestoneNotifiedParams) (store.SlackRunMessage, error) {
 	f.milestoneSet = append(f.milestoneSet, arg)
 	return store.SlackRunMessage{RunID: arg.RunID, MilestonesNotifiedCompleted: arg.Count}, nil
+}
+func (f *fakeNotifStore) SetSlackRunLimitPause(_ context.Context, arg store.SetSlackRunLimitPauseParams) (store.SlackRunMessage, error) {
+	f.limitPauseSet = append(f.limitPauseSet, arg)
+	return store.SlackRunMessage{RunID: arg.RunID, LimitPausedAt: arg.At}, nil
+}
+func (f *fakeNotifStore) ClearSlackRunLimitPause(_ context.Context, arg store.ClearSlackRunLimitPauseParams) (store.SlackRunMessage, error) {
+	f.limitPauseClr = append(f.limitPauseClr, arg)
+	if f.clearErr != nil {
+		return store.SlackRunMessage{}, f.clearErr
+	}
+	return store.SlackRunMessage{RunID: arg.RunID}, nil
 }
 
 type postCall struct{ channel, thread, text string }
