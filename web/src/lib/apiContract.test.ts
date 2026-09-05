@@ -200,7 +200,7 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // so the wire is a real boolean though the *bool zero marshals null.
 //
 // schedule.next_fires reconciliation (issue #1003): the mapper only sets NextFires for a
-// recurring schedule with a valid cron (handler/schedules.go:1612-1614); a once (or
+// recurring schedule with a valid cron (handler/schedules_dto.go:125-126); a once (or
 // invalid-cron) schedule leaves it nil, so the wire emits `null`. The type is now widened
 // to `string[] | null` and both `next_fires[0]` index sites (components/DefaultJobs.tsx,
 // pages/Schedules.tsx) are guarded with `?.`, so `_scheduleZero` type-checks positively
