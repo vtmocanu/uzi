@@ -2017,6 +2017,29 @@ tasks:
       - node --check e2e/codex-m0/native-isolation.test.mjs
       - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/native-isolation.test.mjs
 
+  test:codex-m0:policy-broker:
+    desc: Opt-in container-only Codex worker policy broker experiment
+    cmds:
+      # Fixed marker effects only. Both intended models use the managed isolated
+      # container and sibling code-mode host; serial tests bound contention.
+      - node --check e2e/codex-m0/policy-broker.mjs
+      - node --check e2e/codex-m0/policy-broker.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/policy-broker.test.mjs
+
+  test:codex-m0:supervisor:
+    desc: Opt-in container-only Codex process ownership characterization
+    cmds:
+      # Requires Python plus the same managed container and pinned Codex siblings.
+      # Serial cases and the common M0 deadline keep process tests bounded.
+      - node --check e2e/codex-m0/supervisor-probe.mjs
+      - node --check e2e/codex-m0/supervisor.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/supervisor.test.mjs
+
+  test:codex-m0:supervisor-mechanism:
+    desc: Opt-in Linux supervisor mechanism characterization
+    cmds:
+      - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
+
   # --------------------------------------------------------------------- docs --
   # docs:sync mirrors the root docs/*.md corpus into the api module tree so
   # api/internal/uzidocs can reach it with //go:embed (which cannot reference `..`,
