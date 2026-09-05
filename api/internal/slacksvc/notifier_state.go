@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -93,6 +94,9 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 			saved = store.SlackRunMessage{RunID: rc.ID, ChannelID: channel, RootTs: ts}
 		}
 		anchor = saved
+		// A park that is this run's FIRST Slack event: the root just posted IS the ⏸️ Paused
+		// line, so stamp the marker now so the eventual resume can be posted (PRD #1116).
+		n.recordLimitPause(ctx, rc)
 	case err != nil:
 		n.logf("load anchor", err)
 		return
@@ -106,11 +110,143 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 				n.logf("post thread event", perr)
 			}
 		}
+		// Resume-then-progress: consume a PRIOR park's marker (post ▶️ Resumed on the first
+		// running), then stamp THIS event's marker if it is itself a park, before the
+		// milestone line (PRD #1116). handleLimitResume reads `existing` (the marker from a
+		// prior park); recordLimitPause is a no-op unless this event IS a limit_wait, so on a
+		// resume event these do not conflict.
+		n.handleLimitResume(ctx, rc, existing, base)
+		n.recordLimitPause(ctx, rc)
 		n.handleMilestone(ctx, rc, existing)
 	}
 
 	n.handleGate(ctx, rc, anchor, base)
 	n.handleQuestion(ctx, rc, anchor, base)
+}
+
+// recordLimitPause stamps the pending park's start onto the run's anchor when this
+// event IS the park (limit_wait), so the later resume can read how long it waited and
+// dedupe against a redelivered running report (PRD #1116). Best-effort: a failure is
+// logged and never affects the run. The value is the run's own status_since — the exact
+// instant SetRunLimitWait stamped the park (runtime.sql); promotion re-stamps status_since,
+// so copying it here is what preserves the pause start. status_since is NOT NULL on runs
+// (migration 00163); the now() fallback is belt-and-braces for a row that predates it.
+func (n *Notifier) recordLimitPause(ctx context.Context, rc store.GetSlackRunContextRow) {
+	if rc.Status != "limit_wait" {
+		return
+	}
+	at := rc.StatusSince
+	if !at.Valid {
+		at = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	}
+	if _, err := n.store.SetSlackRunLimitPause(ctx, store.SetSlackRunLimitPauseParams{RunID: rc.ID, At: at}); err != nil {
+		n.logf("record limit pause", err)
+	}
+}
+
+// handleLimitResume posts the ▶️ Resumed thread reply the first time a parked run is
+// running again, then consumes the anchor's park marker with a compare-and-swap so a
+// redelivered running report (heartbeat, milestone progress, summary re-broadcast) can
+// never re-post it (PRD #1116). It is anchor-driven, NOT a renderThreadBlocks status arm:
+// a status arm would fire on every running broadcast; the durable marker is the notifier's
+// only memory that a park is still awaiting its resume line (the stateEvent carries no
+// previous status). Post-then-clear is at-least-once: a crash between the post and the CAS
+// duplicates one line on the next event rather than losing the resume.
+//
+// With the marker NULL this is a no-op. On the resume itself (running) it posts and clears;
+// on a transition that lands straight in a gate / question / terminal state it clears the
+// marker SILENTLY (that surface's own post already tells the owner the run is back — D4),
+// so the NEXT park/resume cycle still posts; on a not-yet-working status (queued, claimed,
+// re-park, pool_wait) it leaves the marker (D3).
+//
+// All best-effort: a failure is logged (redacted) and never affects the run.
+func (n *Notifier) handleLimitResume(ctx context.Context, rc store.GetSlackRunContextRow, anchor store.SlackRunMessage, base string) {
+	if !anchor.LimitPausedAt.Valid {
+		return
+	}
+	switch rc.Status {
+	case "running":
+		waited := time.Since(anchor.LimitPausedAt.Time)
+		hasWait := waited >= 0 && waited <= maxPlausibleWait
+		blocks, fallback := resumeThreadBlocks(rc, waited, hasWait, base)
+		if _, perr := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, fallback, blocks); perr != nil {
+			n.logf("post resume", perr)
+			return // leave the marker set; the next running report retries
+		}
+		if _, err := n.store.ClearSlackRunLimitPause(ctx, store.ClearSlackRunLimitPauseParams{RunID: rc.ID, At: anchor.LimitPausedAt}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			n.logf("clear limit pause", err)
+		}
+	case "awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled":
+		// The gate / question / terminal post the notifier makes on THIS same event already
+		// carries the news; a second ▶️ Resumed line would be noise (D4). Clear silently so
+		// the next park/resume cycle posts normally.
+		if _, err := n.store.ClearSlackRunLimitPause(ctx, store.ClearSlackRunLimitPauseParams{RunID: rc.ID, At: anchor.LimitPausedAt}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			n.logf("clear limit pause", err)
+		}
+	default:
+		// queued, claimed, limit_wait (re-park), pool_wait: eligible again or re-parked, but
+		// not working — leave the marker for the eventual running (D3).
+	}
+}
+
+// maxPlausibleWait bounds the rendered "waited" duration. A value above it (or negative)
+// is not a real park — it is a lost-consume-event artifact (the marker survived a dropped
+// terminal/gate event and a later running spanned it), so the waited fragment is omitted
+// rather than invented. Equal to config.RunLimitMaxPark's default (RUN_LIMIT_MAX_PARK,
+// api/internal/config/config.go — 8 days), duplicated as a constant because config is not
+// reachable from slacksvc; if that default changes this should track it.
+const maxPlausibleWait = 8 * 24 * time.Hour
+
+// resumeThreadBlocks builds the ▶️ Resumed thread event (PRD #1116): a status section plus
+// one context block carrying the waited duration, the pause count (from the second park),
+// the in-progress milestone title, and the run deep link — each omitted when absent, none
+// invented, every untrusted field escaped+scrubbed exactly like renderThreadBlocks does.
+func resumeThreadBlocks(rc store.GetSlackRunContextRow, waited time.Duration, hasWait bool, base string) (blocks []slack.Block, fallback string) {
+	repo := ScrubSecrets(EscapeMrkdwn(rc.PathWithNamespace))
+	blocks = []slack.Block{threadSectionBlock("▶️ *Resumed · usage limit cleared*")}
+
+	var detail strings.Builder
+	if hasWait {
+		detail.WriteString("waited " + humanWait(waited))
+	}
+	if rc.LimitWaitCount > 1 {
+		if detail.Len() > 0 {
+			detail.WriteString(" ")
+		}
+		fmt.Fprintf(&detail, "(pause %d)", rc.LimitWaitCount)
+	}
+	if title := inProgressTitle(rc); title != "" {
+		if detail.Len() > 0 {
+			detail.WriteString(" · ")
+		}
+		detail.WriteString("working " + EscapeMrkdwn(title))
+	}
+
+	var ctxElems []slack.MixedElement
+	if detail.Len() > 0 {
+		ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(detail.String())))
+	}
+	if u := runLink(base, rc.ID); u != "" {
+		ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets("🔗 "+u)))
+	}
+	if len(ctxElems) > 0 {
+		blocks = append(blocks, slack.NewContextBlock("slack_thread_resume_ctx", ctxElems...))
+	}
+	return blocks, fmt.Sprintf("Resumed · %s#%d", repo, iid(rc.IssueIid))
+}
+
+// humanWait renders a park duration compactly: "<1m", "45m", "2h 13m", "3d 2h".
+func humanWait(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "<1m"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		return fmt.Sprintf("%dd %dh", int(d.Hours())/24, int(d.Hours())%24)
+	}
 }
 
 // handleQuestion posts a clarification question into the run's DM thread when the run
@@ -484,10 +620,14 @@ func inProgressTitle(rc store.GetSlackRunContextRow) string {
 //
 //  1. It is bounded by construction. RUN_LIMIT_MAX_WAITS caps parks per run
 //     (default 5), so a run can post this at most that many times over its life.
-//  2. The RESUME posts nothing. `queued` falls to the default arm (ok=false), which is
-//     right — resuming is a return to normal and the edited root already shows it.
-//     Without this half, a run that parks five times would produce ten posts and the
-//     feature would read as a notification stream.
+//  2. The RESUME posts EXACTLY ONCE per park (PRD #1116 D1, reversing the #268 M3
+//     conclusion). The resume line is anchor-driven — keyed on this row's
+//     `limit_paused_at` marker in handleLimitResume, NOT a `renderThreadBlocks` status
+//     arm, because a status arm would fire on every `running` broadcast. So this
+//     function STILL returns ok=false for `running`/`queued` on purpose (the resume is
+//     posted elsewhere), and the per-run bound is now 2 × RUN_LIMIT_MAX_WAITS: one
+//     pause line + one resume line per episode. The thread reads pause → resume →
+//     (maybe) pause → resume, never a stream.
 //
 // The worker-originated failure reason is untrusted free text with no source-side
 // length bound, so it is ScrubSecrets'd, whole-blob EscapeMrkdwn'd, and length-bounded
