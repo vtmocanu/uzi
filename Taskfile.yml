@@ -1978,6 +1978,79 @@ tasks:
       # test file is a serialization point that no timeout value fixes.
       - npm test
 
+  test:codex-m0:
+    desc: Opt-in credential-free Codex 0.153.2 app-server characterization
+    cmds:
+      # External binary only; no installation or production dependency. Serial
+      # cases avoid child/process contention. The timeout catches harness hangs.
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/approvals.test.mjs
+      - node --check e2e/codex-m0/hook.mjs
+      - node --check e2e/codex-m0/hooks-stdin.test.mjs
+      - node --check e2e/codex-m0/children.test.mjs
+      - node --check e2e/codex-m0/dynamic-tools.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/approvals.test.mjs e2e/codex-m0/hooks-stdin.test.mjs e2e/codex-m0/children.test.mjs e2e/codex-m0/dynamic-tools.test.mjs
+
+  test:codex-m0:managed:
+    desc: Opt-in container-only Codex managed one-shot characterization
+    cmds:
+      # Requires the read-only /etc/codex/requirements.toml fixture inside the
+      # isolated test container. Never installs requirements on the host.
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/managed-one-shot.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/managed-one-shot.test.mjs
+
+  test:codex-m0:code-mode:
+    desc: Opt-in container-only Codex intended-model code-mode characterization
+    cmds:
+      # The managed fixture and packaged codex-code-mode-host sibling are both
+      # required. Keep the two intended models serial in the isolated container.
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/managed-code-mode.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/managed-code-mode.test.mjs
+
+  test:codex-m0:native-isolation:
+    desc: Opt-in container-only Codex native capability removal characterization
+    cmds:
+      # Same isolated managed container and sibling code-mode host as above.
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/native-isolation.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/native-isolation.test.mjs
+
+  test:codex-m0:policy-broker:
+    desc: Opt-in container-only Codex worker policy broker experiment
+    cmds:
+      # Fixed marker effects only. Both intended models use the managed isolated
+      # container and sibling code-mode host; serial tests bound contention.
+      - node --check e2e/codex-m0/policy-broker.mjs
+      - node --check e2e/codex-m0/policy-broker.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/policy-broker.test.mjs
+
+  test:codex-m0:supervisor:
+    desc: Opt-in container-only Codex process ownership characterization
+    cmds:
+      # Requires Python plus the same managed container and pinned Codex siblings.
+      # Serial cases and the common M0 deadline keep process tests bounded.
+      - node --check e2e/codex-m0/supervisor-probe.mjs
+      - node --check e2e/codex-m0/supervisor.test.mjs
+      - node --test --test-concurrency=1 --test-timeout=120000 e2e/codex-m0/supervisor.test.mjs
+
+  test:codex-m0:harness-errors:
+    desc: Opt-in isolated Linux M0 cleanup and supervisor failure regressions
+    cmds:
+      - node --check e2e/codex-m0/harness.mjs
+      - node --check e2e/codex-m0/supervisor-probe.mjs
+      - node --check e2e/codex-m0/harness-errors.test.mjs
+      - python3 -B -c "import ast, pathlib; ast.parse(pathlib.Path('e2e/codex-m0/supervisor.py').read_text())"
+      # Node's test timeout can leave leaked handles alive. GNU timeout bounds
+      # the process too, with a kill deadline if it ignores termination.
+      - timeout --kill-after=5s 35s node --test --test-concurrency=1 --test-timeout=30000 e2e/codex-m0/harness-errors.test.mjs
+
+  test:codex-m0:supervisor-mechanism:
+    desc: Opt-in Linux supervisor mechanism characterization
+    cmds:
+      - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
+
   # --------------------------------------------------------------------- docs --
   # docs:sync mirrors the root docs/*.md corpus into the api module tree so
   # api/internal/uzidocs can reach it with //go:embed (which cannot reference `..`,
