@@ -244,6 +244,22 @@ func (m tuiModel) milestoneCell(bg color.Color) string {
 	return paintSeg(m.pal.tungsten, bg, false, g)
 }
 
+// milestoneRowCell renders the crew-rail checklist's in-progress milestone ROW mark (PRD #1136
+// D4/D5): a ◐ ⇄ ○ half-circle blinking on the SAME tick as the micro-bar but in ANTI-PHASE, and
+// in the faint/grey colour (faintC) — the SAME colour a not-started ○ uses, so the ○ phase reads
+// as one of the row's not-yet-started siblings and the row reads as a single grey circle pulsing
+// toward done. The polarity is INVERTED relative to milestoneCell: blinkOn==false → ◐ (the
+// presence frame), which is therefore ALSO the static / non-tty / UZI_TUI_NO_BLINK frame, keeping
+// the in-progress state legible by SHAPE when the tint is stripped and never collapsing to a bare
+// not-started ○. Not milestoneCell (opposite mapping, different glyphs and colour).
+func (m tuiModel) milestoneRowCell() string {
+	g := "◐"
+	if m.blinkOn {
+		g = "○"
+	}
+	return paintSeg(m.pal.faintC, nil, false, g)
+}
+
 // railActivity folds the crew rail's OWN frames into the run's "now" line via runactivity.Latest
 // — the SAME rule the server runs for RunDTO.CurrentActivity — so the board DTO and the rail can
 // never disagree on what is happening now (D3). Returns nil when no tool_use frame exists.
@@ -326,14 +342,11 @@ func (m tuiModel) renderMilestones() string {
 	if !terminal {
 		act = railActivity(m.detail.frames)
 	}
-	// The static wait cell (▱, wait colour) for a non-selected in-progress milestone: the
-	// selected one blinks, the others carry today's in-progress mark (D4).
-	waitCell := paintSeg(m.pal.wait, nil, false, "▱")
-
 	var sb strings.Builder
 	// The eyebrow gets a milestone micro-bar (▰ done / ▱ remaining) beside the count, the rail
-	// twin of the board's micro-bar, with the in-progress cell blinking in the wait colour.
-	// Dropped for a very long list, where the per-milestone rows below carry the detail anyway.
+	// twin of the board's micro-bar, with the in-progress cell blinking in the tungsten colour
+	// (PRD #1136 D2). Dropped for a very long list, where the per-milestone rows below carry the
+	// detail anyway.
 	bar := ""
 	if reported && total <= boardMileCap {
 		empty := total - done
@@ -368,13 +381,10 @@ func (m tuiModel) renderMilestones() string {
 			// strikethrough (which lipgloss emits per-rune, bloating the frame for no signal).
 			style = m.pal.faint
 		case inProgress[mi.ID]:
-			// The selected in-progress row's mark is the blinking cell (D4); the others (a run
-			// with several ids in progress) carry the static in-progress mark.
-			if mi.ID == ipID && blink {
-				glyph = m.milestoneCell(nil)
-			} else {
-				glyph = waitCell
-			}
+			// Every in-progress row is a ◐ ⇄ ○ half-circle blink in the faint/grey colour (PRD
+			// #1136 D4/D5), static ◐ under non-tty / NO_BLINK. The brighter (plain-fg) title, the
+			// ◐ shape, and the motion — never the glyph colour — separate it from a not-started ○.
+			glyph = m.milestoneRowCell()
 			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
 		}
 		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
