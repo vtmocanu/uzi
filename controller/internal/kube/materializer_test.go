@@ -1768,6 +1768,15 @@ func pvcNixPending(id string, phase corev1.PersistentVolumeClaimPhase, created t
 	return p
 }
 
+// pvcDataPending is the /data analogue of pvcNixPending: a /data claim with a seeded
+// .status.phase and CreationTimestamp, so a strand test can drive the bind-timeout
+// detector on the disk-pressure arm's second recycle target (#1115).
+func pvcDataPending(id string, phase corev1.PersistentVolumeClaimPhase, created time.Time) *corev1.PersistentVolumeClaim {
+	p := pvcCreatedAt(pvcFor(id, "data"), created)
+	p.Status.Phase = phase
+	return p
+}
+
 // A /nix PVC that has sat Pending past pvcBindTimeout is a STRANDED re-mint (#1115): the
 // detector must emit the greppable log token AND synthesize a `stuck` roll-health entry so
 // the display-only report path surfaces the worker. The two negative subtests prove the
@@ -1803,8 +1812,58 @@ func TestObserveFlagsStrandedPendingPVC(t *testing.T) {
 		if !strings.Contains(o.Roll.BlockingReason, "bind-timeout") {
 			t.Errorf("Roll.BlockingReason = %q, want it to mention the bind-timeout", o.Roll.BlockingReason)
 		}
+		// The reason reaches the failed-worker strip through the api's 64-byte
+		// self-reported display cap (handler.maxSelfReportedBytes); keep it within so it
+		// renders in full rather than truncating mid-word.
+		if n := len(o.Roll.BlockingReason); n > 64 {
+			t.Errorf("Roll.BlockingReason is %d bytes (%q); must be <= 64 so the api display cap does not truncate it", n, o.Roll.BlockingReason)
+		}
 		if o.NixPVCPhase != "Pending" {
 			t.Errorf("NixPVCPhase = %q, want the raw observed Pending phase", o.NixPVCPhase)
+		}
+	})
+
+	t.Run("stranded: /data Pending past the bind-timeout", func(t *testing.T) {
+		var logs strings.Builder
+		m, _ := newMatWithRecycle(t, nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, &logs,
+			pvcDataPending("w1", corev1.ClaimPending, m5Now.Add(-15*time.Minute)))
+
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		wantToken := "pvc-bind-timeout worker=w1 pvc=" + dataPVCName("w1")
+		if !strings.Contains(logs.String(), wantToken) {
+			t.Errorf("missing stable strand token %q in logs:\n%s", wantToken, logs.String())
+		}
+		if observed[0].Roll.Phase != protocol.PhaseStuck {
+			t.Errorf("Roll.Phase = %q, want %q — a stranded /data PVC must synthesize a stuck roll", observed[0].Roll.Phase, protocol.PhaseStuck)
+		}
+		if observed[0].Roll.BlockingContainer != dataPVCName("w1") {
+			t.Errorf("Roll.BlockingContainer = %q, want the /data PVC %q", observed[0].Roll.BlockingContainer, dataPVCName("w1"))
+		}
+		if observed[0].DataPVCPhase != "Pending" {
+			t.Errorf("DataPVCPhase = %q, want the raw observed Pending phase", observed[0].DataPVCPhase)
+		}
+	})
+
+	t.Run("both stranded: /nix is named first", func(t *testing.T) {
+		var logs strings.Builder
+		m, _ := newMatWithRecycle(t, nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, &logs,
+			pvcNixPending("w1", corev1.ClaimPending, m5Now.Add(-15*time.Minute)),
+			pvcDataPending("w1", corev1.ClaimPending, m5Now.Add(-15*time.Minute)))
+
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		// A worker with only one reportable BlockingContainer: /nix wins the tie-break.
+		if observed[0].Roll.BlockingContainer != nixPVCName("w1") {
+			t.Errorf("Roll.BlockingContainer = %q, want /nix %q named first when both volumes are stranded", observed[0].Roll.BlockingContainer, nixPVCName("w1"))
+		}
+		// Both strands still log — one token per stranded volume.
+		if !strings.Contains(logs.String(), "pvc="+nixPVCName("w1")) || !strings.Contains(logs.String(), "pvc="+dataPVCName("w1")) {
+			t.Errorf("want a strand token for BOTH volumes; logs:\n%s", logs.String())
 		}
 	})
 

@@ -201,7 +201,12 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 					PhaseSince:        since,
 					PodPhase:          string(corev1.ClaimPending),
 					BlockingContainer: t.name,
-					BlockingReason:    fmt.Sprintf("PVC stranded Pending past %s bind-timeout (no auto-rollback; operator must intervene)", pvcBindTimeout),
+					// Kept within the api's 64-byte self-reported display cap
+					// (handler.maxSelfReportedBytes) so the failed-worker strip renders the
+					// cause in full rather than truncating it mid-word. The PVC name rides
+					// BlockingContainer; "no auto-rollback" is the operator's cue that manual
+					// intervention (not a controller retry) is the remedy (ADR-0837 D6/D7).
+					BlockingReason: fmt.Sprintf("stranded Pending past %s bind-timeout; no auto-rollback", pvcBindTimeout),
 				}
 			}
 		}
