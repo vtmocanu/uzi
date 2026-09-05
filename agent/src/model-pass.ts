@@ -76,6 +76,12 @@ export interface ReadOnlyModelPassOpts {
   /** "judge" | "review" | "summary" — used in the timeout + generic-error messages. */
   label: string;
   timeoutMs: number;
+  /** Bounded grace, after the wall-clock abort, to wait for the SDK query to settle
+   *  before the ephemeral HOME is removed — so cleanup does not race the aborted CLI
+   *  while it is still exiting and may still touch $HOME. Defaults to
+   *  DEFAULT_ABORT_GRACE_MS; the three runners omit it. Tests inject a value to drive
+   *  the timeout path deterministically. */
+  graceMs?: number;
   queryFn: SdkQueryFn;
   /** The deny-hook reason string (verbatim per runner). */
   denyReason: string;
@@ -87,6 +93,35 @@ export interface ReadOnlyModelPassOpts {
    *  `${label} model call returned an error result` on an error frame, return the
    *  accumulated text on success. */
   onResult?(msg: unknown, ctx: { isError: boolean; latest: RateLimitObservation | undefined }): void;
+}
+
+/** Default bounded grace (ms) for the aborted SDK CLI to finish exiting before its
+ *  ephemeral HOME is removed. Generous versus the near-immediate ProcessTransport.close()
+ *  termination scheduling, and it is a best-effort cleanup guard, not a correctness
+ *  guarantee — the grace only ever elapses on the timeout path when the query does not
+ *  settle promptly after abort (the normal success path settles the query before cleanup,
+ *  so no grace is waited). */
+const DEFAULT_ABORT_GRACE_MS = 500;
+
+/** Wait for the (possibly aborted) SDK query to settle before its HOME is removed, so the
+ *  ephemeral HOME is not rm'd while the aborted CLI is still exiting and may still touch
+ *  $HOME (the SDK's abort handler terminates the CLI asynchronously). Bounded by graceMs
+ *  so a query that never settles after abort can never wedge cleanup. NEVER rejects: the
+ *  query's own rejection was already surfaced to the caller by the race in
+ *  runReadOnlyModelPass, so it is swallowed here (attaching a rejection handler also keeps
+ *  a post-abort rejection from surfacing as an unhandled rejection) — cleanup must never
+ *  fail a run. */
+async function awaitQuerySettled(query: Promise<unknown>, graceMs: number): Promise<void> {
+  let graceTimer: NodeJS.Timeout | undefined;
+  const grace = new Promise<void>((resolve) => {
+    graceTimer = setTimeout(resolve, graceMs);
+    graceTimer.unref?.();
+  });
+  try {
+    await Promise.race([query.then(() => {}, () => {}), grace]);
+  } finally {
+    if (graceTimer) clearTimeout(graceTimer);
+  }
 }
 
 /**
@@ -117,10 +152,17 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
       reject(new Error(`${opts.label} model call exceeded ${opts.timeoutMs}ms`));
     }, opts.timeoutMs);
   });
+  const consumePromise = consume(opts, homeDir, abort);
   try {
-    return await Promise.race([consume(opts, homeDir, abort), timeout]);
+    return await Promise.race([consumePromise, timeout]);
   } finally {
     if (timer) clearTimeout(timer);
+    // Defer HOME cleanup until the query settles (bounded by a grace after abort): on the
+    // timeout path the race rejects as soon as `abort.abort()` fires, but the SDK
+    // terminates the CLI asynchronously, so removing HOME here immediately could race the
+    // aborted CLI while it is still exiting and may still touch $HOME. On the success path
+    // the query has already settled, so this returns without waiting.
+    await awaitQuerySettled(consumePromise, opts.graceMs ?? DEFAULT_ABORT_GRACE_MS);
     // Best-effort HOME cleanup. The M6 reclaim sweep will NEVER collect this directory:
     // it is named `uzi-<label>-*`, not a run UUID, so the sweep's RUN_ID_RE filter skips
     // it BY DESIGN — this warn is the only thing anywhere that will say a dir stranded.

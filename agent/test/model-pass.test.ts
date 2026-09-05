@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import { promises as fs } from "node:fs";
+import { existsSync } from "node:fs";
 
 import type { Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
 
@@ -140,5 +141,150 @@ describe("runReadOnlyModelPass — HOME lifecycle", () => {
     const after = await fs.readdir(os.tmpdir());
     const stranded = after.find((d) => d.startsWith("uzi-modelpass-cleanup-"));
     assert.equal(stranded, undefined, "the ephemeral HOME dir is cleaned up");
+  });
+});
+
+// ── issue #933: HOME cleanup must not race the aborted SDK CLI on the timeout path ──
+//
+// runReadOnlyModelPass races the query against a wall-clock timeout that calls
+// `abort.abort()`; the SDK terminates the CLI asynchronously, so cleanup must wait for the
+// query to settle (bounded by a grace) before removing the ephemeral HOME — otherwise it
+// can rm $HOME while the aborted CLI is still exiting and may still touch it. These
+// fixtures drive an aborting/gated query and read the ephemeral HOME from
+// `options.env.HOME` (buildSdkEnv pins HOME = homeDir). Assertions are timing-free (no
+// Date.now()/sleep comparisons); node's --test-timeout is the only backstop for a hang.
+
+interface FixtureOptions {
+  env?: Record<string, string | undefined>;
+  abortController?: AbortController;
+}
+
+/** Resolve once the query's abort signal has fired (or is already aborted). */
+function whenAborted(signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (!signal || signal.aborted) {
+      resolve();
+      return;
+    }
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
+describe("runReadOnlyModelPass — HOME cleanup vs the aborted CLI (issue #933)", () => {
+  it("timeout path: aborts the query, rejects, and removes HOME only after the query settles", async () => {
+    let capturedHome: string | undefined;
+    let homeExistedAtSettle: boolean | undefined;
+
+    // Never yields a terminal result, so the wall-clock timeout wins the race. On abort
+    // (the exiting CLI) it records whether HOME still exists, then ends the iteration so
+    // the consume() promise settles.
+    const queryFn: SdkQueryFn = (params) => {
+      const fixtureOpts = (params as { options: FixtureOptions }).options;
+      capturedHome = fixtureOpts.env?.HOME;
+      const signal = fixtureOpts.abortController?.signal;
+      // A hung/aborting query is the fixture: it never yields a terminal result (mirrors
+      // judge-runner.test's hung fixture), so the wall-clock timeout fires.
+      // eslint-disable-next-line require-yield
+      return (async function* () {
+        await whenAborted(signal);
+        homeExistedAtSettle = capturedHome ? existsSync(capturedHome) : undefined;
+      })() as never;
+    };
+
+    await assert.rejects(
+      runReadOnlyModelPass(baseOpts({ queryFn, timeoutMs: 5, graceMs: 1000 })),
+      /review model call exceeded 5ms/,
+    );
+    assert.equal(homeExistedAtSettle, true, "HOME must still exist when the aborted query settles");
+    assert.ok(capturedHome, "the query must have received an ephemeral HOME");
+    assert.equal(existsSync(capturedHome!), false, "HOME must be removed after the query settles");
+  });
+
+  it("timeout path: the pass does not settle (HOME is not cleaned) until the query settles", async () => {
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let sawAbort!: () => void;
+    const abortSeen = new Promise<void>((resolve) => {
+      sawAbort = resolve;
+    });
+
+    // After abort the query does NOT settle on its own — it blocks on a test-controlled
+    // gate, modelling the aborted CLI still exiting. With the fix, cleanup (and thus the
+    // returned promise) is deferred until the query settles; without it, the finally
+    // removes HOME and the promise rejects at the timeout, gate still closed.
+    const queryFn: SdkQueryFn = (params) => {
+      const signal = (params as { options: FixtureOptions }).options.abortController?.signal;
+      // eslint-disable-next-line require-yield
+      return (async function* () {
+        await whenAborted(signal);
+        sawAbort();
+        await gate;
+      })() as never;
+    };
+
+    // graceMs is an hour: the grace must not be what unblocks cleanup here — only the
+    // query settling (via the gate) may.
+    const pass = runReadOnlyModelPass(baseOpts({ queryFn, timeoutMs: 5, graceMs: 3_600_000 }));
+    let settled = false;
+    pass.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    await abortSeen;
+    // Drain the event loop so that if cleanup were NOT deferred, the finally would have
+    // removed HOME and settled the promise by now (no wall-clock wait — just event-loop
+    // yields). With the fix the query is still gated, so the pass stays pending here no
+    // matter how many turns elapse.
+    for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "the pass must not settle until the query settles");
+
+    openGate();
+    await assert.rejects(pass, /review model call exceeded 5ms/);
+  });
+
+  it("timeout path: a query that rejects after abort is swallowed — the run still cleans HOME", async () => {
+    let capturedHome: string | undefined;
+    let homeExistedAtSettle: boolean | undefined;
+
+    // On abort the query records, then rejects. The timeout error (not the query error)
+    // must propagate, cleanup must still run, and the rejection must not surface as an
+    // unhandled rejection (which node's test runner would fail on).
+    const queryFn: SdkQueryFn = (params) => {
+      const fixtureOpts = (params as { options: FixtureOptions }).options;
+      capturedHome = fixtureOpts.env?.HOME;
+      const signal = fixtureOpts.abortController?.signal;
+      // eslint-disable-next-line require-yield
+      return (async function* () {
+        await whenAborted(signal);
+        homeExistedAtSettle = capturedHome ? existsSync(capturedHome) : undefined;
+        throw new Error("aborted query boom");
+      })() as never;
+    };
+
+    await assert.rejects(
+      runReadOnlyModelPass(baseOpts({ queryFn, timeoutMs: 5, graceMs: 1000 })),
+      /review model call exceeded 5ms/,
+    );
+    assert.equal(homeExistedAtSettle, true, "HOME must still exist when the aborted query settles");
+    assert.ok(capturedHome);
+    assert.equal(existsSync(capturedHome!), false, "HOME must be removed after the query settles");
+  });
+
+  it("success path: does not wait for the grace once the query has settled", async () => {
+    // Settles immediately with text. graceMs is set to an hour: if cleanup wrongly waited
+    // on the grace instead of the settled query, the test would hang past --test-timeout.
+    const { queryFn, seen } = capturingQueryFn([assistantText("hello"), successResult()]);
+    const out = await runReadOnlyModelPass(baseOpts({ queryFn, timeoutMs: 60_000, graceMs: 3_600_000 }));
+    assert.equal(out, "hello");
+    const home = (seen.options as FixtureOptions | undefined)?.env?.HOME;
+    assert.ok(home, "the query must have received an ephemeral HOME");
+    assert.equal(existsSync(home!), false, "HOME must be cleaned without waiting for the grace");
   });
 });
