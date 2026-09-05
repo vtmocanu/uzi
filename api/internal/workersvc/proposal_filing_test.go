@@ -245,3 +245,35 @@ func TestClampWireProposalStripsControlCharsAndBounds(t *testing.T) {
 		t.Errorf("body = %d bytes, want <= %d", len(got.Body), ProposalBodyMaxBytes)
 	}
 }
+
+// TestClampWireProposalScrubsSecrets pins the secret-redaction leg of the untrusted-
+// input trust boundary: a scheduled prompt agent may have seen a repo secret during
+// its run and echoed it (accidentally or via prompt injection) into its proposal, and
+// the filed issue is a public forge artifact — so both Title and Body MUST be scrubbed
+// before filing. Mirrors TestClampWireReportMdScrubsSecrets; without it, dropping the
+// secretscrub.Scrub call left every other test green (a silent regression would leak a
+// credential into a forge issue).
+func TestClampWireProposalScrubsSecrets(t *testing.T) {
+	// Fabricated secret-shaped strings, never a real credential.
+	for _, secret := range []string{
+		"glpat-" + "fake0000000000000000", // assembled from parts (.claude/rules/prds.md): a contiguous glpat-<20> literal in tracked source is rejected by GitHub Push Protection (GH013). Joined at runtime it is glpat- + 20 chars, which secretscrub matches; never a real credential
+		"sk-ant-abcdef0123456789ABCDEF",
+	} {
+		got := clampWireProposal(schedRun(), &ProposalPayload{
+			Title: "leak " + secret + " here",
+			Body:  "the token was " + secret + " during the run",
+		})
+		if got == nil {
+			t.Fatalf("expected a clamped payload for secret %q", secret)
+		}
+		if strings.Contains(got.Title, secret) {
+			t.Errorf("secret survived scrub in title: %q", got.Title)
+		}
+		if strings.Contains(got.Body, secret) {
+			t.Errorf("secret survived scrub in body: %q", got.Body)
+		}
+		if !strings.Contains(got.Title, "[redacted]") || !strings.Contains(got.Body, "[redacted]") {
+			t.Errorf("expected redaction marker in both fields, got title=%q body=%q", got.Title, got.Body)
+		}
+	}
+}
