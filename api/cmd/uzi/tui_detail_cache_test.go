@@ -89,6 +89,49 @@ func TestTranscriptCacheAppendRerendersFromPreviousLast(t *testing.T) {
 	}
 }
 
+// TestTranscriptCacheAppendSpliceMatchesFullBuild streams frames ONE AT A TIME (the live path) and,
+// after each, asserts the memoized append splice equals a full rebuild of the same frames. It
+// covers the cross-boundary cases a naive tail re-render corrupts: an ORPHAN result whose matching
+// tool_use sits in the frozen prefix ([useA, useB, resultA, resultB] — resultA's call is not
+// adjacent), and a folded result landing before a new frame. buildFrameBlocksFrom must scan the
+// full frames for names/tightNext, so the tail still names its tools and folds correctly.
+func TestTranscriptCacheAppendSpliceMatchesFullBuild(t *testing.T) {
+	now := time.Now()
+	seqs := []apitypes.MessageDTO{
+		leadMsg(1, "tool_use", `{"id":"u1","name":"Grep","input":{"pattern":"foo"}}`, now),
+		leadMsg(2, "tool_use", `{"id":"u2","name":"Bash","input":{"command":"go test"}}`, now),
+		leadMsg(3, "tool_result", `{"tool_use_id":"u1","content":"3 matches"}`, now), // orphan: u1's call is above u2
+		leadMsg(4, "tool_result", `{"tool_use_id":"u2","content":"ok"}`, now),
+		leadMsg(5, "text", `{"text":"done"}`, now),
+	}
+	m := loadDetail(t, "cache-orphan", "ok", seqs[:1])
+	lane, _ := m.detail.selectedLane()
+	_ = m.transcriptLines(lane) // warm the cache on 1 frame
+
+	for k := 2; k <= len(seqs); k++ {
+		// The k-th frame arrives live (the append path).
+		m.detail.addFrames(framesFromMessages(seqs[k-1 : k]))
+		m.detail.rebuild()
+		lane, _ = m.detail.selectedLane()
+		got := m.transcriptLines(lane)
+
+		// A full rebuild of the same k frames from a cold cache is the oracle.
+		full := loadDetail(t, "cache-orphan-full", "ok", seqs[:k])
+		fullLane, _ := full.detail.selectedLane()
+		want := full.transcriptLines(fullLane)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("after streaming %d frames, the append splice diverged from a full rebuild:\n got=%q\nwant=%q", k, got, want)
+		}
+	}
+	// The orphan result (u1, an ORPHAN because u2's call sits between it and u1) must still name its
+	// tool — the exact attribution a subslice re-render would have dropped.
+	lane, _ = m.detail.selectedLane()
+	joined := stripANSI(strings.Join(m.transcriptLines(lane), "\n"))
+	if !strings.Contains(joined, "↳ Grep") {
+		t.Fatalf("orphan result u1 lost its tool name through the append splice\n%s", joined)
+	}
+}
+
 // TestTranscriptCacheResizeMisses: a width change invalidates the cache (line wrapping depends on
 // the transcript width).
 func TestTranscriptCacheResizeMisses(t *testing.T) {

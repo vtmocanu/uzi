@@ -67,9 +67,20 @@ func flattenBlocks(blocks []frameBlock) []string {
 
 // buildFrameBlocks renders each frame of a lane to its own frameBlock, the per-frame granularity
 // the transcript memo (PRD #1137 M6) splices at: flattenBlocks(m.buildFrameBlocks(lane)) is
-// output-identical to the old buildTranscriptLines body. The tightNext/names/who/aggregated logic
-// operates over the given lane.Frames, so it works over any sub-slice the append fast path passes.
+// output-identical to the old buildTranscriptLines body.
 func (m tuiModel) buildFrameBlocks(lane agentLane) []frameBlock {
+	return m.buildFrameBlocksFrom(lane, 0)
+}
+
+// buildFrameBlocksFrom renders blocks for lane.Frames[start:] BUT computes the cross-frame context
+// (tightNext, and the tool-id→name map that lets an ORPHAN result name its own tool) over the WHOLE
+// lane.Frames — so the append fast path can re-render just the tail without losing context that
+// lives in the frozen prefix. Only the cheap context scan is O(n); the expensive per-frame render
+// (markdown, clampVisual) runs solely for [start:], which is the whole point of the memo. A result
+// whose matching tool_use sits below `start` still resolves its name (names is global), and a
+// result at `start` that is folded under the prefix's last frame still folds (tightNext[start-1] is
+// available). start==0 is the full build.
+func (m tuiModel) buildFrameBlocksFrom(lane agentLane, start int) []frameBlock {
 	aggregated := lane.Key == laneAllKey
 	var ids map[string]string
 	if aggregated {
@@ -114,8 +125,9 @@ func (m tuiModel) buildFrameBlocks(lane agentLane) []frameBlock {
 			}
 		}
 	}
-	blocks := make([]frameBlock, 0, len(lane.Frames))
-	for i, f := range lane.Frames {
+	blocks := make([]frameBlock, 0, len(lane.Frames)-start)
+	for i := start; i < len(lane.Frames); i++ {
+		f := lane.Frames[i]
 		var block string
 		switch f.Kind {
 		case "tool_use":
@@ -241,7 +253,10 @@ func (m tuiModel) transcriptLines(lane agentLane) []string {
 		// last frame so its tight pairing recomputes, then splice.
 		if e.n >= 1 && e.n < n && lane.Frames[e.n-1].Seq == e.lastSeq {
 			tc.builds++
-			tail := m.buildFrameBlocks(agentLane{Key: lane.Key, Role: lane.Role, Frames: lane.Frames[e.n-1:]})
+			// Re-render from the previous last frame with FULL context (buildFrameBlocksFrom scans
+			// all frames for names/tightNext), so an orphan result in the tail still names its tool
+			// and a folded result at the boundary still folds — only the markdown render is tail-only.
+			tail := m.buildFrameBlocksFrom(lane, e.n-1)
 			blocks := append(append([]frameBlock{}, e.blocks[:e.n-1]...), tail...)
 			lines := flattenBlocks(blocks)
 			tc.entries[key] = transcriptCacheEntry{width, m.dark, m.profile, sig, n, firstSeq, lastSeq, blocks, lines}
