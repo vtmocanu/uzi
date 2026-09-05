@@ -630,7 +630,8 @@ func TestEarlyResetDetection(t *testing.T) {
 	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
 	synced := tReset.Add(-72 * time.Hour)
 	moved := tReset.Add(72 * time.Hour)
-	movedTiny := tReset.Add(30 * time.Minute) // +30m < resetEpochMoveMargin(1h): Arm A must stay silent
+	movedTiny := tReset.Add(30 * time.Minute)  // +30m < resetEpochMoveMargin(1h): Arm A must stay silent
+	movedBack := tReset.Add(-30 * time.Minute) // boundary earlier than T: not an unmoved fixed grid -> Arm B must stay silent
 
 	cases := []struct {
 		name       string
@@ -721,6 +722,24 @@ func TestEarlyResetDetection(t *testing.T) {
 			nextResets: &tReset, nextPct: 20, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
 			why: "next 20 > pctResetCeil(1) is a source-flip/partial delta, not a zeroing, so Arm B silent; WOULD fire if the ceil were raised",
+		},
+		{
+			name: "silent_arm_b_boundary_nil", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
+			nextResets: nil, nextPct: 0, nextSource: anthropic.SourceHeaderProbe,
+			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
+			why: "used% 12->0 but the fresh reading carries no reset boundary, so the fixed-grid model is unconfirmable -> Arm B silent; WOULD fire if Arm B dropped the ResetsAt!=nil && Equal(t) guard",
+		},
+		{
+			name: "silent_arm_b_sub_margin_move", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
+			nextResets: &movedTiny, nextPct: 0, nextSource: anthropic.SourceHeaderProbe,
+			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
+			why: "+30m < resetEpochMoveMargin(1h) so Arm A silent; boundary moved (!= T) so the grid is not unmoved -> Arm B silent even though used% 12->0; WOULD fire if Arm B ignored the boundary",
+		},
+		{
+			name: "silent_arm_b_backward_move", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
+			nextResets: &movedBack, nextPct: 0, nextSource: anthropic.SourceHeaderProbe,
+			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
+			why: "boundary earlier than T (moved backward) is not an unmoved fixed grid -> Arm B silent even though used% 12->0; WOULD fire if Arm B ignored the boundary",
 		},
 	}
 

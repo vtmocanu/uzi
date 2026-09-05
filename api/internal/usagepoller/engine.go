@@ -426,9 +426,16 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 	// Arm A — boundary moved forward (rolling model): the fresh reset epoch is set
 	// AND strictly more than resetEpochMoveMargin past T.
 	armA := next.SevenDay.ResetsAt != nil && next.SevenDay.ResetsAt.After(t.Add(resetEpochMoveMargin))
-	// Arm B — utilization zeroed ahead of schedule (fixed-grid model): prior 7-day
-	// used% >= pctResetFloor and the fresh used% <= pctResetCeil.
-	armB := prev.SevenDayPct.Valid && int(prev.SevenDayPct.Int16) >= pctResetFloor && next.SevenDay.Pct <= pctResetCeil
+	// Arm B — utilization zeroed ahead of schedule (fixed-grid model): the fresh 7-day
+	// reset epoch is PRESENT and unmoved (== T, i.e. the fixed grid did not shift — a
+	// forward move past the margin is Arm A's domain, and a nil, sub-margin, or backward
+	// boundary is jitter-ambiguous and must not fire here), AND prior 7-day used% >=
+	// pctResetFloor while the fresh used% <= pctResetCeil.
+	armB := next.SevenDay.ResetsAt != nil &&
+		next.SevenDay.ResetsAt.Equal(t) &&
+		prev.SevenDayPct.Valid &&
+		int(prev.SevenDayPct.Int16) >= pctResetFloor &&
+		next.SevenDay.Pct <= pctResetCeil
 	if !armA && !armB {
 		return false, time.Time{}
 	}

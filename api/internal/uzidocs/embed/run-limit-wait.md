@@ -51,7 +51,10 @@ when this happens: either the advertised reset time moves forward, or your
 weekly usage drops back to (near) zero ahead of schedule. If a token's weekly
 window comes back more than 8 hours before its previously-recorded reset, uzi
 can tell you right away instead of you finding out only when the nominal time
-finally arrives.
+finally arrives. One case it can't tell apart from ordinary noise, and so stays
+quiet on: a window that was barely used before it cleared (weekly usage already
+near zero), or one whose reset time the poller can't read from Anthropic at that
+moment.
 
 - **On by default** — the same **Settings → Anthropic usage limits** card as
   the pause toggle above has its own checkbox, *"Alert me when my 7-day limit
