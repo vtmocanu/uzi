@@ -64,6 +64,12 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, []strin
 	if guidanceSet && !issueSet && !sweep {
 		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--guidance is only valid with --issue or --sweep")
 	}
+	// --output is prompt-target-only (PRD #929 M1): it selects a proposal run's output shape,
+	// which is meaningless for issue/sweep (they run on an existing issue, not a proposal).
+	// Reject an EXPLICIT set on a non-prompt target, mirroring the --guidance guard above.
+	if cmd.Flags().Changed("output") && !promptSet {
+		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--output is only valid with --prompt")
+	}
 
 	req := apitypes.ScheduleRequest{}
 	switch {
@@ -101,6 +107,14 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, []strin
 	if cmd.Flags().Changed("model") {
 		model, _ := cmd.Flags().GetString("model")
 		req.Model = &model
+	}
+
+	// --output rides ONLY the prompt target (guarded above): a proposal run's output shape
+	// (PRD #929 M1). Send it only when set so an unset flag stays absent (nil), matching
+	// --model's replace-semantics; the server validates the "mr"/"issues"/"" enum.
+	if cmd.Flags().Changed("output") {
+		v, _ := cmd.Flags().GetString("output")
+		req.OutputMode = &v
 	}
 
 	// PRD #305: opt-in to override every subagent's model with the run model. Only set
@@ -200,6 +214,10 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 		// PRD #300 replace-semantics: restate or a partial edit (e.g. --cron only) wipes
 		// the stored model, since mergeSchedule does m.Model = req.Model (pre-existing bug).
 		Model: s.Model,
+		// PRD #929 M1 replace-semantics: same class as Model — restate the stored output mode
+		// (a direct pointer copy) or a partial edit wipes it. nil for a non-prompt row, so
+		// restating it is a no-op there; an explicit --output overrides below.
+		OutputMode: s.OutputMode,
 		// PRD #305 replace-semantics: same class — restate the subagent override or a
 		// partial edit wipes it. The DTO always sets this bool non-nil.
 		OverrideSubagentModel: s.OverrideSubagentModel,
@@ -239,6 +257,9 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 	// Target-scoped flags: reject an EXPLICIT set on the wrong target (mirrors create).
 	if promptSet && s.Target != schedTargetPrompt {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--prompt is only valid on a prompt-target schedule")
+	}
+	if f.Changed("output") && s.Target != schedTargetPrompt {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--output is only valid on a prompt-target schedule")
 	}
 	if labelSet && s.Target != schedTargetSweep {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--label is only valid on a sweep-target schedule")
@@ -337,6 +358,11 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 		req.Model = &v
 		changed = true
 	}
+	if f.Changed("output") {
+		v, _ := f.GetString("output")
+		req.OutputMode = &v
+		changed = true
+	}
 	if f.Changed("apply-model-to-agents") {
 		v, _ := f.GetBool("apply-model-to-agents")
 		req.OverrideSubagentModel = &v
@@ -409,6 +435,12 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	if guidanceSet && clearGuidance {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--guidance and --clear-guidance are mutually exclusive")
 	}
+	// --output is owner-editable on a PROMPT-target default (PRD #929 M1) but prompt-only:
+	// on a sweep/issue/self_improve default it is meaningless, so reject it client-side.
+	if f.Changed("output") && s.Target != schedTargetPrompt {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
+			"--output is only valid on a prompt-target schedule")
+	}
 	maxIssuesSet := f.Changed("max-issues")
 	clearMaxIssues := f.Changed("clear-max-issues")
 	clearMrRework := f.Changed("clear-mr-rework")
@@ -431,6 +463,11 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 		Timezone:              s.Timezone,
 		Model:                 s.Model,
 		OverrideSubagentModel: s.OverrideSubagentModel,
+		// PRD #929 M1: output_mode is owner-editable on a prompt-target default and uses
+		// replace-semantics server-side, so RESTATE the fetched value (nil for a non-prompt
+		// default, so restating is a no-op there) or a partial edit wipes it. An explicit
+		// --output overrides below.
+		OutputMode: s.OutputMode,
 	}
 	autoApprove := s.AutoApprove
 	waitOnLimit := s.WaitOnLimit
@@ -520,6 +557,13 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 		req.Model = &v
 		changed = true
 	}
+	// --output is owner-editable on a prompt-target default (PRD #929 M1): restated from the
+	// fetched row above; an explicit flag overrides (empty string clears back to inherit).
+	if f.Changed("output") {
+		v, _ := f.GetString("output")
+		req.OutputMode = &v
+		changed = true
+	}
 	// --apply-model-to-agents is owner-editable on a default (issue #691):
 	// patchDefaultScheduleConfig reads req.OverrideSubagentModel. Restated from the fetched
 	// row above; an explicit flag overrides.
@@ -530,7 +574,7 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	}
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
-			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --apply-model-to-agents)")
+			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents)")
 	}
 	return req, nil
 }

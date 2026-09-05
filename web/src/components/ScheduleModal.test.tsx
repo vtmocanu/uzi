@@ -82,6 +82,74 @@ describe("target switching swaps the fields", () => {
   });
 });
 
+describe("the per-schedule output mode control (PRD #929 M1)", () => {
+  it("renders the output-mode select for a prompt target and hides it for a non-prompt target", () => {
+    renderModal();
+    // Default target = issue: no output-mode control (output mode is prompt-only).
+    expect(screen.queryByLabelText("Output mode (optional)")).toBeNull();
+    // Sweep target: still absent — a sweep run has no proposal channel to steer.
+    fireEvent.click(screen.getByRole("radio", { name: /Label sweep/ }));
+    expect(screen.queryByLabelText("Output mode (optional)")).toBeNull();
+    // Prompt target: the output-mode select appears.
+    fireEvent.click(screen.getByRole("radio", { name: /Prompt/ }));
+    expect(screen.getByLabelText("Output mode (optional)")).toBeTruthy();
+  });
+
+  it("flows a selected output mode into output_mode on a create submit", async () => {
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as Awaited<
+        ReturnType<typeof api.listRepos>
+      >["repos"],
+    });
+    mockApi.createSchedule.mockResolvedValue(schedFixture({ target: "prompt", output_mode: "issues" }));
+    renderModal();
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+
+    // Switch to the prompt target, give it a prompt (required to submit), then pick "Issues".
+    fireEvent.click(screen.getByRole("radio", { name: /Prompt/ }));
+    fireEvent.change(screen.getByPlaceholderText("hunt for flaky tests and open an MR"), {
+      target: { value: "hunt for flaky tests and open an MR" },
+    });
+    fireEvent.change(screen.getByLabelText("Output mode (optional)"), { target: { value: "issues" } });
+
+    const createBtn = screen.getByRole("button", { name: "Create schedule" });
+    await waitFor(() => expect(createBtn.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(createBtn);
+
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+    // The chosen mode rides through to ScheduleInput.output_mode (2nd arg of createSchedule).
+    expect(mockApi.createSchedule.mock.calls[0]?.[1]?.output_mode).toBe("issues");
+  });
+
+  it("renders and clears the output-mode override for a DEFAULT prompt schedule (raw-override seed + clear-to-null PATCH)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture({ origin: "default", target: "prompt", output_mode: null }));
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({
+            origin: "default",
+            target: "prompt",
+            catalog_slug: "feature-bingo",
+            output_mode: "issues",
+          })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    // The selector renders for a DEFAULT prompt job (not just a new/user schedule) and is
+    // seeded from the RAW stored override, not a resolved catalog mode.
+    const select = screen.getByLabelText("Output mode (optional)") as HTMLSelectElement;
+    expect(select.value).toBe("issues");
+    // Clearing it to "Job default" sends an explicit null on the default PATCH (clear-to-inherit),
+    // which is unreachable without this control — the point of the finding.
+    fireEvent.change(select, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.output_mode).toBeNull();
+  });
+});
+
 describe("timing switching swaps the cadence fields", () => {
   it("recurring shows the preset/cron; once shows the datetime picker", async () => {
     renderModal();
@@ -144,6 +212,7 @@ function schedFixture(over: Partial<Schedule> = {}): Schedule {
     guidance: null,
     baked_guidance: null,
     model: "fable",
+    output_mode: null,
     override_subagent_model: false,
     enabled: true,
     status: "active",
@@ -191,6 +260,43 @@ describe("the per-schedule model control (PRD #300)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
     expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.model).toBeNull();
+  });
+});
+
+describe("the output-mode control on a DEFAULT prompt schedule (PRD #929, F5)", () => {
+  const defaultPrompt = (over: Partial<Schedule> = {}) =>
+    schedFixture({ origin: "default", target: "prompt", catalog_slug: "feature-bingo", ...over });
+
+  it("prefills from the RAW override and flows a change into output_mode on save", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={defaultPrompt({ output_mode: "issues" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    // The selector is rendered for a default prompt (regression: it was omitted) and seeded
+    // from the raw override, not the resolved catalog mode.
+    const select = screen.getByLabelText("Output mode (optional)") as HTMLSelectElement;
+    expect(select.value).toBe("issues");
+
+    fireEvent.change(select, { target: { value: "mr" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.output_mode).toBe("mr");
+  });
+
+  it("clearing to Job default sends explicit null (clear-to-inherit)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={defaultPrompt({ output_mode: "issues" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const select = screen.getByLabelText("Output mode (optional)") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.output_mode).toBeNull();
   });
 });
 

@@ -56,6 +56,7 @@ import {
   type ClaimConfig,
   type Milestone,
   type MilestoneProgress,
+  type Proposal,
 } from "./protocol.js";
 import {
   buildCIFixPlanPrompt,
@@ -328,6 +329,10 @@ interface TurnResult {
   /** issue #279: true when the lead declared `report_only: true` on signal_done this turn.
    *  Latched (like `done`): the run completes with NO push/MR. Issue runs only. */
   reportOnly?: boolean;
+  /** PRD #929 M2: the structured proposal (title + body) the lead passed to signal_done this
+   *  turn, if any. Last-wins within the turn (like summary); forwarded on the prompt-run
+   *  completion report so the server can file it as a forge issue. */
+  proposal?: Proposal;
   /** Issue #281: the lead's own text emitted this turn, concatenated in order — the
    *  input to the repeated-refusal check. Absent when the lead emitted no text. */
   finalText?: string;
@@ -1712,6 +1717,10 @@ export class SdkExecutor implements Executor {
       // the final ExecutorResult (and thence the runner's report-only completion path).
       let declaredReportOnly = false;
       let declaredSummary: string | undefined;
+      // PRD #929 M2: hoisted for the same reason as declaredSummary — the terminating turn's
+      // signal_done proposal must survive the `break` below to reach the final ExecutorResult
+      // (and thence the runner's prompt-run completion report).
+      let declaredProposal: Proposal | undefined;
       // PRD #634 M3: latched when the operator's scope ceiling truncates the run at the loop
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
@@ -1871,6 +1880,9 @@ export class SdkExecutor implements Executor {
         // the final ExecutorResult after the break below.
         if (turn.reportOnly) declaredReportOnly = true;
         if (turn.summary !== undefined) declaredSummary = turn.summary;
+        // PRD #929 M2: take the last-wins proposal (like summary), so a proposal declared on
+        // the terminating turn reaches the final ExecutorResult after the break below.
+        if (turn.proposal !== undefined) declaredProposal = turn.proposal;
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
@@ -2177,6 +2189,14 @@ export class SdkExecutor implements Executor {
       if (isIssueRun && declaredReportOnly) result.reportOnly = true;
       if (isIssueRun && declaredSummary !== undefined) {
         result.summary = declaredSummary;
+      }
+      // PRD #929 M2: forward the declared proposal. NOT gated on isIssueRun — it is the
+      // SCHEDULED PROMPT run that delivers a proposal, and the runner reads it only on that
+      // kind's completion path (runner.ts). OMITTED-not-undefined like the siblings above, so
+      // a run that declared none is byte-identical on the wire and every existing
+      // deepStrictEqual on this result holds. The api is the authoritative control.
+      if (declaredProposal !== undefined) {
+        result.proposal = declaredProposal;
       }
       // PRD #634 M3: forward the scope-capped disposition on `issue` runs only, OMITTED (not
       // undefined) like the siblings above so a normal completion's result shape is unchanged
@@ -2687,6 +2707,10 @@ export class SdkExecutor implements Executor {
         // report-only it stays report-only through the terminating turn's break.
         if (sig.summary !== undefined) result.summary = sig.summary;
         if (sig.reportOnly) result.reportOnly = true;
+        // PRD #929 M2: the proposal is last-wins within the turn (like summary) — if the
+        // lead signals twice, the LAST well-formed proposal is the one the worker forwards
+        // on the completion report.
+        if (sig.proposal !== undefined) result.proposal = sig.proposal;
         // PRD #88: accumulate across the turn rather than last-wins. A lead told to
         // batch its questions into one call normally makes exactly one, but if it
         // makes two we must ask both — dropping the earlier one would park the run on

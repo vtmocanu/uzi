@@ -9,12 +9,12 @@
 INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
-    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, guidance, model, override_subagent_model,
+    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, guidance, model, output_mode, override_subagent_model,
     sibling_group_id
 ) VALUES (
     @user_id, @repo_id, @target, sqlc.narg('issue_iid'), sqlc.narg('labels'), sqlc.narg('prompt'),
     @timing, sqlc.narg('cron_expr'), sqlc.narg('run_at'), @timezone, sqlc.narg('next_fire_at'),
-    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance'), sqlc.narg('model'), @override_subagent_model,
+    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance'), sqlc.narg('model'), sqlc.narg('output_mode'), @override_subagent_model,
     sqlc.narg('sibling_group_id')
 )
 RETURNING *;
@@ -36,12 +36,12 @@ INSERT INTO run_schedules (
     user_id, repo_id, target, catalog_slug, origin, customized,
     issue_iid, labels, prompt, guidance,
     timing, cron_expr, timezone, next_fire_at,
-    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, model
+    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, model, output_mode
 ) VALUES (
     @user_id, @repo_id, @target, @catalog_slug, 'default', false,
     NULL, NULL, NULL, NULL,
     'recurring', @cron_expr, @timezone, @next_fire_at,
-    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), true, sqlc.narg('max_issues'), sqlc.narg('model')
+    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), true, sqlc.narg('max_issues'), sqlc.narg('model'), sqlc.narg('output_mode')
 )
 ON CONFLICT (user_id, repo_id, catalog_slug) WHERE origin = 'default' DO NOTHING
 RETURNING *;
@@ -64,6 +64,9 @@ WHERE user_id = @user_id AND repo_id = @repo_id AND catalog_slug = @catalog_slug
 -- catalog baseline (false) because a default now carries it as an owner-editable run option
 -- (issue #691). Both are written as SQL literals rather than left to the column's DB DEFAULT:
 -- a Reset is an UPDATE, so the DEFAULT never re-applies and the field must be set explicitly.
+-- output_mode is likewise reset to the catalog baseline (PRD #929 M1): a prompt default can
+-- carry an owner-editable output mode, so the resolved catalog value is passed in and written
+-- here (nil for a non-prompt default, which stores NULL = inherit).
 -- next_fire_at is recomputed in Go from the catalog cron+timezone and passed in.
 UPDATE run_schedules
 SET cron_expr     = @cron_expr,
@@ -74,6 +77,7 @@ SET cron_expr     = @cron_expr,
     mr_rework_enabled = sqlc.narg('mr_rework_enabled'),
     max_issues    = sqlc.narg('max_issues'),
     guidance      = NULL,
+    output_mode   = sqlc.narg('output_mode'),
     override_subagent_model = false,
     next_fire_at  = @next_fire_at,
     customized    = false,
@@ -131,6 +135,7 @@ SET target        = @target,
     max_issues    = sqlc.narg('max_issues'),
     guidance      = sqlc.narg('guidance'),
     model         = sqlc.narg('model'),
+    output_mode   = sqlc.narg('output_mode'),
     override_subagent_model = @override_subagent_model,
     customized    = @customized,
     status        = 'active',

@@ -13,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
+	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -81,6 +82,14 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 		}
 	}
 
+	// output_mode (PRD #929 M1): a blank/whitespace value is "none" — normalize it to nil
+	// so a cleared control clears the stored mode back to inherit-the-catalog-default. It is
+	// prompt-only; the per-target scoping (rejected on issue/sweep/self_improve, enum-checked
+	// on prompt) is enforced in the switch below.
+	if n.OutputMode != nil && strings.TrimSpace(*n.OutputMode) == "" {
+		n.OutputMode = nil
+	}
+
 	switch n.Target {
 	case "issue":
 		if n.IssueIID == nil || *n.IssueIID <= 0 {
@@ -89,10 +98,21 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 		if n.MaxIssues != nil {
 			return n, http.StatusBadRequest, "max_issues is only valid for a sweep schedule"
 		}
+		// output_mode is prompt-only (PRD #929 M1, D6): an issue schedule's output is a run
+		// on an existing issue, not a proposal, so a set mode is a 422 rather than silently
+		// ignored (a silently-ignored option teaches the wrong mental model).
+		if n.OutputMode != nil {
+			return n, http.StatusUnprocessableEntity, "output_mode is only valid for a prompt schedule"
+		}
 	case "sweep":
 		// Labels are optional; an empty selector defaults to the PRD label at fire time
 		// (Decisions 7/9). Drop blanks so a stored [""] cannot defeat that.
 		n.Labels = nonBlankLabels(n.Labels)
+		// output_mode is prompt-only (PRD #929 M1, D6): a sweep's output is a run on an
+		// existing issue, not a proposal — reject a set mode (422).
+		if n.OutputMode != nil {
+			return n, http.StatusUnprocessableEntity, "output_mode is only valid for a prompt schedule"
+		}
 	case "prompt":
 		if strings.TrimSpace(n.Prompt) == "" {
 			return n, http.StatusBadRequest, "prompt is required for a prompt schedule"
@@ -110,6 +130,17 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 		if n.Guidance != nil {
 			return n, http.StatusBadRequest, "guidance is not valid for a prompt schedule"
 		}
+		// output_mode (PRD #929 M1) is honored ONLY for a prompt target. A blank was already
+		// normalized to nil above, so only a real value reaches here; enum-check it against
+		// the mr/issues set (a malformed value is a 400). A nil value inherits the catalog
+		// default at fire time.
+		if n.OutputMode != nil {
+			switch *n.OutputMode {
+			case schedtmpl.OutputModeMR, schedtmpl.OutputModeIssues:
+			default:
+				return n, http.StatusBadRequest, "output_mode must be one of: mr, issues"
+			}
+		}
 	case "self_improve":
 		// A self_improve schedule is catalog-enable-only: a DIRECT create (POST /schedules)
 		// stays rejected (defense in depth), but a user-origin CLONE (CloneSchedule) is a valid
@@ -123,6 +154,11 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 		// sweep cap (mirrors the issue/prompt arms rejecting a stray max_issues).
 		if n.MaxIssues != nil {
 			return n, http.StatusBadRequest, "max_issues is only valid for a sweep schedule"
+		}
+		// output_mode is prompt-only (PRD #929 M1): a self_improve run produces no proposal,
+		// so a set mode is rejected (422), like the issue/sweep arms above.
+		if n.OutputMode != nil {
+			return n, http.StatusUnprocessableEntity, "output_mode is only valid for a prompt schedule"
 		}
 		// Item 2: a self_improve run is ALWAYS auto-approved (CreateSelfImproveRun hardcodes
 		// auto_approve=true, selfimprove.sql). Force the stored flag true so it can never
@@ -192,7 +228,7 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		req.IssueIID == nil && req.Labels == nil && req.Prompt == "" &&
 		req.CronExpr == "" && req.RunAt == nil && req.Timezone == "" &&
 		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MrReworkEnabled == nil && req.MaxIssues == nil &&
-		req.Guidance == nil && req.Model == nil && req.OverrideSubagentModel == nil
+		req.Guidance == nil && req.Model == nil && req.OutputMode == nil && req.OverrideSubagentModel == nil
 }
 
 // mergeSchedule overlays the provided PATCH fields onto the current stored schedule,
@@ -279,6 +315,12 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 	// the DB as NULL = inherit. A seed-and-keep would make an explicit clear indistinguishable
 	// from omitted.
 	m.Model = req.Model
+	// output_mode (PRD #929 M1) takes the request value DIRECTLY, same replace-semantics as
+	// model/guidance/max_issues above: a config PATCH rewrites the whole row (enabled-only is
+	// short-circuited by onlyEnabled), so an `output_mode: null` (or a cleared control) must
+	// reach the DB as NULL = inherit the catalog default. A seed-and-keep would make an
+	// explicit clear indistinguishable from omitted.
+	m.OutputMode = req.OutputMode
 	// mr_rework (PRD #841 M2) takes the request value DIRECTLY, same replace-semantics as
 	// model/guidance/max_issues above: a config PATCH rewrites the whole row (enabled-only
 	// is short-circuited by onlyEnabled), so a `mr_rework_enabled: null` must reach the DB
@@ -377,6 +419,18 @@ func guidanceColumn(m apitypes.ScheduleRequest) pgtype.Text {
 func modelColumn(m apitypes.ScheduleRequest) pgtype.Text {
 	if m.Model != nil && strings.TrimSpace(*m.Model) != "" {
 		return pgtype.Text{String: *m.Model, Valid: true}
+	}
+	return pgtype.Text{}
+}
+
+// outputModeColumn maps the request's *string output_mode to the nullable store column
+// (PRD #929 M1). It is set Valid ONLY for the prompt target (mirroring guidanceColumn's
+// target scoping): a non-prompt row must carry SQL NULL, so an issue/sweep/self_improve
+// schedule never persists a stray mode even if one slipped past validation. A nil pointer
+// is SQL NULL = inherit the catalog default at fire time.
+func outputModeColumn(m apitypes.ScheduleRequest) pgtype.Text {
+	if m.Target == "prompt" && m.OutputMode != nil && strings.TrimSpace(*m.OutputMode) != "" {
+		return pgtype.Text{String: *m.OutputMode, Valid: true}
 	}
 	return pgtype.Text{}
 }

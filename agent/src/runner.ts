@@ -1153,9 +1153,18 @@ export class RunRunner {
           status: "completed",
           report_only: true,
           report_md: result.summary,
+          // PRD #929 M2: a scheduled prompt run's deliverable can be a structured proposal
+          // (title + body) the agent conveyed on signal_done, which the server files as a
+          // forge issue. Thread it through ONLY when the agent actually produced one — the
+          // key is OMITTED otherwise (spread nothing) so a normal/mr-mode prompt run's
+          // completion payload is byte-identical to before.
+          ...(result.proposal !== undefined
+            ? { proposal: result.proposal }
+            : {}),
         });
         runLog.info("prompt run completed report-only (no MR): zero-diff", {
           run_id: runId,
+          has_proposal: result.proposal !== undefined,
         });
         return;
       }

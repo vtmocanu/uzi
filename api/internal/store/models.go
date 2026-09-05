@@ -521,6 +521,7 @@ type RunSchedule struct {
 	Customized            bool               `json:"customized"`
 	SiblingGroupID        pgtype.UUID        `json:"sibling_group_id"`
 	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
+	OutputMode            pgtype.Text        `json:"output_mode"`
 }
 
 type RunUsage struct {

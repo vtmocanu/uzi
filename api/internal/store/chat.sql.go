@@ -921,6 +921,30 @@ func (q *Queries) RevertProposalToPending(ctx context.Context, id uuid.UUID) (in
 	return result.RowsAffected(), nil
 }
 
+const stampFiledProposal = `-- name: StampFiledProposal :execrows
+UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = $1, resolved_at = now()
+WHERE id = $2
+`
+
+type StampFiledProposalParams struct {
+	Iid pgtype.Int8 `json:"iid"`
+	ID  uuid.UUID   `json:"id"`
+}
+
+// PRD #929 M2: settle a SERVER-FILED proposal (a scheduled issues-mode prompt run)
+// to 'confirmed' with the created issue iid. Unlike MarkProposalConfirmed this is NOT
+// guarded on status='confirming': the auto-file path inserts the row (pending) and
+// files the issue itself with no human confirm/claim step in between, so it stamps by
+// id alone. Best-effort caller: the issue already exists when this runs, so a 0-row
+// result only logs (see maybeFileProposal).
+func (q *Queries) StampFiledProposal(ctx context.Context, arg StampFiledProposalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, stampFiledProposal, arg.Iid, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const sweepIdleChatRuns = `-- name: SweepIdleChatRuns :many
 UPDATE runs SET status = 'completed', status_since = now(), finished_at = now(), updated_at = now()
 WHERE kind = 'chat'

@@ -191,6 +191,16 @@ UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = @created_is
 WHERE id = @id AND status = 'confirming'
 RETURNING *;
 
+-- name: StampFiledProposal :execrows
+-- PRD #929 M2: settle a SERVER-FILED proposal (a scheduled issues-mode prompt run)
+-- to 'confirmed' with the created issue iid. Unlike MarkProposalConfirmed this is NOT
+-- guarded on status='confirming': the auto-file path inserts the row (pending) and
+-- files the issue itself with no human confirm/claim step in between, so it stamps by
+-- id alone. Best-effort caller: the issue already exists when this runs, so a 0-row
+-- result only logs (see maybeFileProposal).
+UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = @iid, resolved_at = now()
+WHERE id = @id;
+
 -- name: RevertProposalToPending :execrows
 -- Claim-first confirmation, failure path: return a claimed proposal to 'pending' when
 -- the forge CreateIssue (or a step after the claim) failed, so the user can retry or

@@ -113,6 +113,46 @@ A **sweep default** likewise offers owner guidance as an **overlay**: its baked
 guidance stays catalog-owned (shown read-only and auto-tracking catalog updates)
 and your overlay is composed onto it at fire time, under a single guidance header.
 
+## Proposal output: MR or issues
+
+A prompt-target schedule that *proposes* work — a brainstorm or a survey that
+suggests something a maintainer might pick up, like feature bingo or the
+refactor scout — has an **output mode**: `mr` (the default) or `issues`. It is
+**prompt-target only**: a pinned issue or a label sweep runs against an issue
+that already exists, so there is no proposal to file, and the setting is
+rejected there (HTTP 422 / a CLI usage error) rather than silently ignored.
+
+In **`mr` mode** — today's behavior, unchanged — a proposal run writes an idea
+file and opens a merge request for it (feature bingo's `bingo: <feature>` MR,
+the refactor scout's proposal file), exactly as before this setting existed.
+
+In **`issues` mode**, the run produces the proposal as structured content and,
+when it completes, uzi files it as a **forge issue** on the owner's connection.
+The api does the writing — the same trust model as [findings](./findings.md)
+and recommendation filing, so the agent never gains a forge-write tool. The
+filed issue carries **exactly one** label, the scoped marker `proposal::<slug>`
+(`proposal::feature-bingo` for a catalog job, a bare `proposal` for a custom
+prompt schedule), and **nothing else** — never `uzi`, never a sweep selector
+(`Planned`/`bug`), never a bot assignment. Because
+[eligibility](./admin-settings.md#run-eligibility) is built from that label set
+alone, a freshly filed proposal is **never sweep-eligible at creation**: an
+unattended 02:00 sweep cannot pick it up. Promoting a proposal to real work is
+a deliberate human act — add the `uzi` label (or a sweep selector), the same
+promote flow any issue uses, and it becomes runnable like anything else.
+
+**Dedup at fire time.** An issues-mode schedule does not re-file a proposal it
+already filed. Each time it fires, uzi lists that schedule's existing
+`proposal::<slug>` issues — open **and** closed, newest first, capped — and
+appends a compact digest of them to the rendered prompt, so the run sees what
+has already been proposed (and declined) and is told not to repeat it unless
+the evidence materially changed.
+
+The shipped catalog defaults all stay `mr`, so enabling a default job — or
+upgrading one you already enabled — changes nothing about how it delivers;
+switching a schedule to `issues` is a per-schedule choice its owner makes, on
+the CLI (`uzi schedule create`/`edit --output`, see [the CLI
+reference](./cli.md#commands)) or in the web schedule modal.
+
 ## Managing schedules
 
 - **Web**: the **Schedules** page lists your schedules, and a "Schedule…"

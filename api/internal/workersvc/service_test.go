@@ -455,6 +455,15 @@ type fakeStore struct {
 	pendingProposalCount int64
 	createdProposal      *store.CreateIssueProposalParams
 	sweptStuckProposals  []uuid.UUID
+	// PRD #929 M2: server-side proposal filing. runSchedule/runScheduleErr back
+	// GetRunSchedule; stampedProposal records the StampFiledProposalParams the filing
+	// path settled with (nil = never stamped); stampProposalRows/Err control its result.
+	runSchedule       store.RunSchedule
+	runScheduleErr    error
+	stampedProposal   *store.StampFiledProposalParams
+	stampProposalRows int64
+	stampProposalErr  error
+	createProposalErr error
 	// PRD #191 M1: the lifted ConfirmProposalForUser reverts a claimed proposal on a
 	// post-claim failure. revertedProposals records every RevertProposalToPending id,
 	// in order, so a test can assert the revert fired (and how many times).
@@ -549,7 +558,19 @@ func (f *fakeStore) CountPendingProposalsForRun(context.Context, uuid.UUID) (int
 }
 func (f *fakeStore) CreateIssueProposal(_ context.Context, arg store.CreateIssueProposalParams) (store.IssueProposal, error) {
 	f.createdProposal = &arg
+	if f.createProposalErr != nil {
+		return store.IssueProposal{}, f.createProposalErr
+	}
 	return store.IssueProposal{ID: uuid.New(), RunID: arg.RunID, RepoID: arg.RepoID, Title: arg.Title, Status: "pending"}, nil
+}
+
+func (f *fakeStore) GetRunSchedule(_ context.Context, _ uuid.UUID) (store.RunSchedule, error) {
+	return f.runSchedule, f.runScheduleErr
+}
+
+func (f *fakeStore) StampFiledProposal(_ context.Context, arg store.StampFiledProposalParams) (int64, error) {
+	f.stampedProposal = &arg
+	return f.stampProposalRows, f.stampProposalErr
 }
 
 func (f *fakeStore) ClaimChatRun(_ context.Context, arg store.ClaimChatRunParams) (store.Run, error) {

@@ -1337,6 +1337,10 @@ export interface Schedule {
   // Per-schedule model override; null = inherit the owner's per-user Worker model.
   // Applies to ALL targets (prompt/issue/sweep), unlike guidance which is issue/sweep-only.
   model: string | null;
+  // PRD #929 M1: per-schedule output mode for prompt-target schedules; 'mr' opens a
+  // merge request from an idea file, 'issues' files issues. null = inherit the
+  // catalog/job default. Only meaningful for target === 'prompt'.
+  output_mode: string | null;
   // PRD #305: "apply model also to agents" — when true, the run's model overrides
   // every subagent's pin (lead + all subagents on one model). Default false.
   override_subagent_model: boolean;
@@ -1395,6 +1399,9 @@ export interface CatalogEntry {
   timezone: string;
   // Per-entry model override; "" = inherit the owner's Worker default.
   model: string;
+  // PRD #929 M1: per-entry output mode for prompt entries; 'mr'/'issues', "" = the
+  // job default. Empty for non-prompt entries.
+  output_mode: string;
   // Baked prompt for a prompt entry; "" for a sweep entry.
   prompt: string;
   // Sweep selector labels; null for an assigned sweep (selects by assignee), [] for a prompt entry.
@@ -1463,6 +1470,10 @@ export interface ScheduleInput {
   // Model override for runs this schedule fires (all targets); explicit null/"" clears
   // to inherit. Unlike guidance it is sent on every target.
   model?: string | null;
+  // PRD #929 M1: per-schedule output mode for the prompt target; 'mr'/'issues', explicit
+  // null clears to the catalog default. Omitted on non-prompt targets so the server never
+  // sees a stray field.
+  output_mode?: string | null;
   // PRD #305 opt-in; omitted ≡ false (server replace-semantics). The modal always sends it.
   override_subagent_model?: boolean;
   enabled?: boolean;

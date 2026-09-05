@@ -648,6 +648,12 @@ type Store interface {
 	// user_id-scoped chat read surface.
 	CreateIssueProposal(ctx context.Context, arg store.CreateIssueProposalParams) (store.IssueProposal, error)
 	CountPendingProposalsForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	// PRD #929 M2: the server-side proposal-filing path (scheduled issues-mode prompt
+	// runs). GetRunSchedule resolves the firing schedule's target/slug/output_mode;
+	// StampFiledProposal settles the audit row (pending → confirmed + iid) with no
+	// status guard, since the api both inserts the row and files the issue.
+	GetRunSchedule(ctx context.Context, id uuid.UUID) (store.RunSchedule, error)
+	StampFiledProposal(ctx context.Context, arg store.StampFiledProposalParams) (int64, error)
 	ClaimProposalForConfirm(ctx context.Context, arg store.ClaimProposalForConfirmParams) (store.ClaimProposalForConfirmRow, error)
 	RevertProposalToPending(ctx context.Context, id uuid.UUID) (int64, error)
 	SweepStuckConfirmingProposals(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error)
@@ -1769,6 +1775,17 @@ type StateRequest struct {
 	// clampWireReportMd / clampWireReportOnly. Absent on a normal MR completion.
 	ReportOnly *bool   `json:"report_only"`
 	ReportMd   *string `json:"report_md"`
+	// Proposal (PRD #929 M2) carries a scheduled issues-mode prompt run's structured
+	// idea — a title + body — that the SERVER files as a forge issue on run completion
+	// (Design C: the agent gains no forge-write tool; the api does the writing). It is a
+	// DECLARATION by an untrusted worker on the terminal `completed` report, kind-gated
+	// (prompt/scheduled runs only) and clamped server-side (control-char stripped,
+	// secret-scrubbed, length-bounded — see clampWireProposal) before it is filed.
+	// Absent (nil) on every normal completion and on a no-proposal no-op run, so an old
+	// worker's payload and a new worker's plain completion stay byte-identical on the
+	// wire. httpx.DecodeJSON rejects unknown fields, so this field MUST exist here or a
+	// new worker's report 400s.
+	Proposal *ProposalPayload `json:"proposal"`
 	// ScopeCapped (PRD #634 M3) is the worker's DECLARATION on the terminal `completed`
 	// report that an operator scope directive truncated the run at the loop top — the run
 	// finalized the already-committed slice and started no further milestone. The server
@@ -1899,6 +1916,15 @@ type StateRequest struct {
 	RequiredCapabilities *[]string `json:"required_capabilities"`
 	RequiredTools        *[]string `json:"required_tools"`
 	SizeClass            *string   `json:"size_class"`
+}
+
+// ProposalPayload is the structured idea a scheduled issues-mode prompt run emits on
+// its terminal `completed` report (PRD #929 M2). The server files it as a forge issue
+// via clampWireProposal → maybeFileProposal. Both fields are untrusted worker output
+// and are control-char-stripped, secret-scrubbed and length-bounded before filing.
+type ProposalPayload struct {
+	Title string `json:"title"`
+	Body  string `json:"body"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -2215,6 +2241,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// PRD #46 Decision 2: enqueue a judge on the COMMITTED terminal transition
 		// (rows>0), not the lossy notify seam. Best-effort — never fails the report.
 		s.maybeEnqueueJudge(ctx, run)
+		// PRD #929 M2: file a scheduled issues-mode prompt run's proposal as a forge
+		// issue on this same committed completion. The worker's proposal is untrusted, so
+		// it is clamped (kind-gated + control-char-stripped + secret-scrubbed + bounded)
+		// at the call site with the re-read run before filing. Best-effort — like the
+		// judge it must NEVER fail the worker's terminal report (maybeFileProposal
+		// log-and-returns on every failure).
+		s.maybeFileProposal(ctx, run, clampWireProposal(run, req.Proposal))
 		// PRD #400 M4a: auto-create a diff-review run for a just-completed --review task,
 		// on the SAME committed transition. Best-effort — never fails the report.
 		s.maybeEnqueueTaskReview(ctx, run)

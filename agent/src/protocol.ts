@@ -504,6 +504,19 @@ export interface Milestone {
 }
 
 /**
+ * PRD #929 M2: a structured proposal a scheduled `prompt` run's agent conveys on
+ * `signal_done` so the server can file it as a forge issue. `title` is the issue
+ * title and `body` its Markdown body. Both are model-authored, UNTRUSTED text; the
+ * worker forwards them verbatim on the completion report and the api is the
+ * authoritative control (it validates/scrubs before filing). Omitted entirely when
+ * the run produced no proposal — a normal/mr-mode run's wire shape is unchanged.
+ */
+export interface Proposal {
+  title: string;
+  body: string;
+}
+
+/**
  * The lead's live progress over the frozen milestone list (PRD #122 M2). `completed`
  * and `in_progress` are sets of milestone ids the lead reports as it works; the server
  * unions `completed` (monotone, Decision 3) and overwrites `in_progress`. Reported on
@@ -1446,6 +1459,14 @@ export interface StateRequest {
    *  the authoritative control and validates/scrubs/clamps it. Additive + optional and
    *  OMITTED ENTIRELY when the lead declared no summary. */
   report_md?: string;
+  /** PRD #929 M2: a scheduled `prompt` run's structured proposal (title + body) from
+   *  signal_done, carried on the terminal `completed` report so the server can file it as a
+   *  forge issue. Additive + optional and OMITTED ENTIRELY when the run produced no proposal
+   *  — never `null` and never a partial `{title}` — so an old worker's payload and a new
+   *  worker's ordinary (normal/mr-mode) completion stay byte-identical on the wire. The two
+   *  fields are model-authored UNTRUSTED text forwarded verbatim; the api validates/scrubs
+   *  before filing. */
+  proposal?: Proposal;
   /** PRD #634 M3: worker→api on the `completed` report of a scope-truncated run, so the
    *  server stamps stop_kind='scope_capped'. Additive + optional, OMITTED (never `false`) on
    *  a normal completion so an old worker's payload and a normal completion stay identical on

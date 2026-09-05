@@ -97,6 +97,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		MaxIssues:             maxIssuesColumn(m),
 		Guidance:              guidanceColumn(m),
 		Model:                 modelColumn(m),
+		OutputMode:            outputModeColumn(m),
 		OverrideSubagentModel: overrideSubagentModelColumn(m),
 		SiblingGroupID:        siblingGroup,
 	})
@@ -223,6 +224,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			MaxIssues:             maxIssuesColumn(m),
 			Guidance:              guidanceColumn(m),
 			Model:                 modelColumn(m),
+			OutputMode:            outputModeColumn(m),
 			OverrideSubagentModel: overrideSubagentModelColumn(m),
 			// A user-origin row is never customized (that flag is default-only); preserve
 			// the stored value (always false here) so this write never sets it.

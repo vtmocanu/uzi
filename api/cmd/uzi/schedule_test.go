@@ -357,6 +357,54 @@ func TestScheduleCreateNoModel(t *testing.T) {
 	}
 }
 
+// TestScheduleCreatePromptOutput (PRD #929 M1): --output on the prompt target is forwarded
+// as a non-nil *string, mirroring --model's tri-state carry.
+func TestScheduleCreatePromptOutput(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_po"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "uzi", "--prompt", "do a thing", "--output", "issues",
+		"--cron", "0 9 * * 1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	req := fc.LastCreateSchedReq
+	if req.Target != "prompt" {
+		t.Errorf("target = %q, want prompt", req.Target)
+	}
+	if req.OutputMode == nil || *req.OutputMode != "issues" {
+		t.Errorf("output_mode = %v, want \"issues\"", req.OutputMode)
+	}
+}
+
+// TestScheduleCreateOutputRequiresPrompt (PRD #929 M1): --output is prompt-target-only, so
+// an explicit set on a non-prompt (issue) target is a usage error (exit 2) before any request.
+func TestScheduleCreateOutputRequiresPrompt(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "r1", "--issue", "158", "--output", "issues",
+		"--at", "2026-08-08T09:00:00Z")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateSchedRepo != "" {
+		t.Errorf("create should not have been called")
+	}
+}
+
+// TestScheduleCreateNoOutput: an unset --output stays absent (nil) rather than clearing on
+// the PATCH-shaped payload.
+func TestScheduleCreateNoOutput(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_no"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "uzi", "--prompt", "do a thing", "--cron", "0 9 * * 1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if req := fc.LastCreateSchedReq; req.OutputMode != nil {
+		t.Errorf("output_mode = %v, want nil (unset flag stays absent)", req.OutputMode)
+	}
+}
+
 // TestScheduleGetDetailShowsModel: the detail block carries a MODEL row on every target
 // — the frozen model when set, "-" when nil.
 func TestScheduleGetDetailShowsModel(t *testing.T) {
@@ -1005,6 +1053,84 @@ func TestScheduleEditApplyModelToAgentsFalse(t *testing.T) {
 	}
 }
 
+// editPromptOutputFixture seeds a prompt-target schedule whose stored output_mode is set, so
+// the edit tests can prove a partial edit RESTATES it (PRD #929 M1 replace-semantics) and
+// that --output overlays or clears it.
+func editPromptOutputFixture(id string) *uzicli.FakeClient {
+	return &uzicli.FakeClient{
+		ScheduleByID: map[string]apitypes.ScheduleDTO{
+			id: {
+				ID:          id,
+				Target:      "prompt",
+				Prompt:      "do a thing",
+				Timing:      "recurring",
+				CronExpr:    "0 9 * * 1",
+				Timezone:    "UTC",
+				AutoApprove: true,
+				WaitOnLimit: true,
+				Enabled:     true,
+				Status:      "active",
+				OutputMode:  sptr("issues"),
+			},
+		},
+		PatchedSchedule: apitypes.ScheduleDTO{ID: id, Target: "prompt", Timing: "recurring", CronExpr: "0 4 * * 2", Enabled: true},
+	}
+}
+
+// TestScheduleEditRestatesOutput (PRD #929 M1): a --cron-only edit — one that never touches
+// --output — must RESTATE the fetched schedule's stored OutputMode on the PATCH, mirroring
+// the Model restate, so a partial retime does not wipe the stored output mode.
+func TestScheduleEditRestatesOutput(t *testing.T) {
+	fc := editPromptOutputFixture("sch_eo")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_eo", "--cron", "0 4 * * 2")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if req := fc.LastPatchSchedReq; req.OutputMode == nil || *req.OutputMode != "issues" {
+		t.Errorf("output_mode = %v, want the original \"issues\" re-sent, not wiped", req.OutputMode)
+	}
+}
+
+// TestScheduleEditOverridesOutput (PRD #929 M1): --output overlays a new explicit value on
+// the restated one.
+func TestScheduleEditOverridesOutput(t *testing.T) {
+	fc := editPromptOutputFixture("sch_eo")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_eo", "--output", "mr")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if req := fc.LastPatchSchedReq; req.OutputMode == nil || *req.OutputMode != "mr" {
+		t.Errorf("output_mode = %v, want the overridden \"mr\"", req.OutputMode)
+	}
+}
+
+// TestScheduleEditClearsOutput (PRD #929 M1): --output "" sends a non-nil empty pointer so
+// the server's replace-semantics clears the stored override back to inherit (distinct from
+// the restated non-nil value a partial edit re-sends).
+func TestScheduleEditClearsOutput(t *testing.T) {
+	fc := editPromptOutputFixture("sch_eo")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_eo", "--output", "")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if req := fc.LastPatchSchedReq; req.OutputMode == nil || *req.OutputMode != "" {
+		t.Errorf("output_mode = %v, want a non-nil empty string (explicit clear)", req.OutputMode)
+	}
+}
+
+// TestScheduleEditOutputRejectsNonPrompt (PRD #929 M1): --output on a non-prompt (sweep)
+// schedule is a usage error (exit 2) before any PATCH — output mode is prompt-target-only.
+func TestScheduleEditOutputRejectsNonPrompt(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	_, _, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--output", "issues")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitUsage)
+	}
+	if fc.LastPatchSchedID != "" {
+		t.Errorf("patch should not have been called")
+	}
+}
+
 // TestScheduleEditClearGuidance: --clear-guidance nils guidance; without it, guidance is
 // preserved from the fetched schedule.
 func TestScheduleEditClearGuidance(t *testing.T) {
@@ -1258,6 +1384,26 @@ func TestScheduleEditDefaultPromptSendsMinimal(t *testing.T) {
 	}
 	if req.MaxIssues != nil {
 		t.Errorf("max_issues = %v, want nil (a prompt default has no cap)", req.MaxIssues)
+	}
+}
+
+// TestScheduleEditDefaultRestatesOutput (PRD #929 M1): the default-origin sibling of
+// TestScheduleEditRestatesOutput. A --cron-only edit of a prompt-target DEFAULT schedule —
+// one that never touches --output — must RESTATE the fetched schedule's stored OutputMode on
+// the PATCH through buildDefaultScheduleEditRequest, so a partial retime does not wipe the
+// stored output mode (patchDefaultScheduleConfig replace-semantics).
+func TestScheduleEditDefaultRestatesOutput(t *testing.T) {
+	fc := editDefaultPromptFixture("sch_dp")
+	stored := fc.ScheduleByID["sch_dp"]
+	stored.OutputMode = sptr("issues")
+	fc.ScheduleByID["sch_dp"] = stored
+
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_dp", "--cron", "0 4 * * 2")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if req := fc.LastPatchSchedReq; req.OutputMode == nil || *req.OutputMode != "issues" {
+		t.Errorf("output_mode = %v, want the original \"issues\" re-sent, not wiped", req.OutputMode)
 	}
 }
 

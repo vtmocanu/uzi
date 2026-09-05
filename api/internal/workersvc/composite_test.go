@@ -23,6 +23,12 @@ type fakeForge struct {
 	getIssueResult forge.Issue
 	getIssueErr    error
 
+	// Captured CreateIssue args from the last call (PRD #929 M2 filing asserts the
+	// exact label set — the never-sweepable D3 invariant).
+	createTitle  string
+	createBody   string
+	createLabels []string
+
 	// self_improve open-MR picker context (PRD #686 D11/D12): GetMergeRequest returns the
 	// forge state per mr_iid. mrStateByIID maps mr_iid → one of forge.MRState* (a missing
 	// key scans as ""); mrErrByIID forces a per-candidate error (best-effort skip), and
@@ -33,8 +39,11 @@ type fakeForge struct {
 	getMRIID     []int64
 }
 
-func (f *fakeForge) CreateIssue(_ context.Context, _ int64, title, _ string, _ []string) (forge.Issue, error) {
+func (f *fakeForge) CreateIssue(_ context.Context, _ int64, title, body string, labels []string) (forge.Issue, error) {
 	f.createCalls++
+	f.createTitle = title
+	f.createBody = body
+	f.createLabels = labels
 	if f.createErr != nil {
 		return forge.Issue{}, f.createErr
 	}

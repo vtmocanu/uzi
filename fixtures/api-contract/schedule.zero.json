@@ -20,6 +20,7 @@
   "guidance": null,
   "baked_guidance": null,
   "model": null,
+  "output_mode": null,
   "override_subagent_model": null,
   "status": "",
   "origin": "",

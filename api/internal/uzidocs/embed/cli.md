@@ -102,6 +102,7 @@ uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--la
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
                     [--max-issues <n>] [--guidance <text>]
+                    [--output mr|issues]
                     [--model <alias|id>] [--apply-model-to-agents[=false]]
 uzi schedule list | get <id> | pause <id> | resume <id> | run-now <id> | delete <id>
 uzi schedule pause-all --until <when> | resume-all | pause-status
@@ -110,6 +111,7 @@ uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--auto-approve[=false]] [--wait-on-limit[=false]]
                    [--guidance <text> | --clear-guidance]
                    [--max-issues <n> | --clear-max-issues]
+                   [--output mr|issues|""]
                    [--model <alias|id>] [--apply-model-to-agents[=false]] [--repo <id>]
 uzi schedule catalog list
 uzi schedule catalog enable <slug> --repo <id> [--repo <id> ...] [--create-missing-labels]
@@ -289,7 +291,14 @@ A few worth knowing:
   section separate from the issue body; it does not change which issues are
   eligible to run, is capped at 8 KiB, and is truncated — never dropped — if a
   large issue body plus guidance would otherwise push the composed instruction
-  over its size limit. `--model <alias|id>` (valid on every target) pins the
+  over its size limit. `--output mr|issues` sets a **prompt-target** schedule's
+  proposal output mode and is valid only with `--prompt` (an `--issue`/`--sweep`
+  target rejects it, exit 2): `mr` (the default) writes an idea file and opens an
+  MR, `issues` files the proposal as a `proposal::<slug>`-labelled forge issue
+  server-side (never sweep-eligible until a human promotes it). It is three-way,
+  like `--model`: omit it to inherit the job/catalog default, `--output issues`
+  (or `mr`) to set it, and `--output ""` on `edit` to clear it back to inherit;
+  shipped catalog defaults stay `mr`. `--model <alias|id>` (valid on every target) pins the
   model a fired run uses; add `--apply-model-to-agents` (default off) to also
   apply that model to every subagent, overriding each agent's own model pin.
   Both `--max-issues` and `--wait-on-limit`'s new default

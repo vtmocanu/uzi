@@ -193,3 +193,69 @@ func TestBySlug(t *testing.T) {
 		t.Error("mutating a returned job's Labels leaked back into the catalog")
 	}
 }
+
+// TestResolveOutputMode covers the shared resolver both the fire side (schedsvc) and the
+// completion-filing side (workersvc) call (PRD #929 M3): a valid stored mode wins; a NULL
+// mode with a known catalog slug resolves to that job's catalog default; a NULL mode with an
+// unknown or empty slug falls back to DefaultOutputMode ("mr").
+func TestResolveOutputMode(t *testing.T) {
+	// A valid non-empty stored mode overrides the catalog default, whatever the slug.
+	if got := schedtmpl.ResolveOutputMode("issues", true, "feature-bingo"); got != "issues" {
+		t.Errorf("stored issues override = %q, want issues", got)
+	}
+	if got := schedtmpl.ResolveOutputMode("mr", true, "feature-bingo"); got != "mr" {
+		t.Errorf("stored mr override = %q, want mr", got)
+	}
+
+	// NULL (invalid) stored mode with a KNOWN catalog slug resolves to the catalog default,
+	// routed through BySlug — proven by equality with the job's own OutputMode().
+	const knownSlug = "feature-bingo"
+	job, ok := schedtmpl.BySlug(knownSlug)
+	if !ok {
+		t.Fatalf("catalog entry %q missing", knownSlug)
+	}
+	if got := schedtmpl.ResolveOutputMode("", false, knownSlug); got != job.OutputMode() {
+		t.Errorf("NULL + known slug = %q, want the catalog default %q", got, job.OutputMode())
+	}
+	// A stored-but-empty value is treated as unset (storedValid true but "" is not a choice).
+	if got := schedtmpl.ResolveOutputMode("", true, knownSlug); got != job.OutputMode() {
+		t.Errorf("empty stored + known slug = %q, want the catalog default %q", got, job.OutputMode())
+	}
+
+	// NULL with an unknown or empty slug falls back to DefaultOutputMode.
+	if got := schedtmpl.ResolveOutputMode("", false, "no-such-slug"); got != schedtmpl.DefaultOutputMode {
+		t.Errorf("NULL + unknown slug = %q, want %q", got, schedtmpl.DefaultOutputMode)
+	}
+	if got := schedtmpl.ResolveOutputMode("", false, ""); got != schedtmpl.DefaultOutputMode {
+		t.Errorf("NULL + empty slug = %q, want %q", got, schedtmpl.DefaultOutputMode)
+	}
+}
+
+// TestFeatureBingoBodyModeNeutral pins the PRD #929 M4 body trim: the dedup para no longer
+// names the mr-only "read the idea files under ideas/", and the close-out no longer says
+// "open no merge request" (both would contradict issues mode, where delivery is overridden).
+// The mr-delivery para 3 ("open a merge request") STAYS — mr mode relies on it verbatim and
+// injects nothing. The catalog default remains mr, and the body still parses non-empty.
+func TestFeatureBingoBodyModeNeutral(t *testing.T) {
+	job, ok := schedtmpl.BySlug("feature-bingo")
+	if !ok {
+		t.Fatal("feature-bingo catalog entry missing")
+	}
+	if strings.TrimSpace(job.Prompt) == "" {
+		t.Fatal("feature-bingo body is empty after the trim")
+	}
+	if job.OutputMode() != "mr" {
+		t.Fatalf("feature-bingo catalog default = %q, want mr (unchanged)", job.OutputMode())
+	}
+	// The trimmed mode-contradicting phrasings must be gone.
+	if strings.Contains(job.Prompt, "open no merge request") {
+		t.Fatalf("feature-bingo body still carries the trimmed mr-only phrase %q", "open no merge request")
+	}
+	if strings.Contains(job.Prompt, "read the existing idea files") {
+		t.Fatalf("feature-bingo body still carries the mr-only dedup phrasing %q", "read the existing idea files")
+	}
+	// The mr-delivery para that mr mode relies on verbatim must remain.
+	if !strings.Contains(job.Prompt, "open a merge request") {
+		t.Fatal("feature-bingo body lost its mr-delivery instruction (mr mode relies on it verbatim)")
+	}
+}
