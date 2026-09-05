@@ -281,7 +281,7 @@ func TestBackupByteIdentical(t *testing.T) {
 // ours) survive semantically and in order across an install then uninstall, for both
 // managers.
 func TestForeignPreservationAndOrder(t *testing.T) {
-	run := func(t *testing.T, hookPath string, hm *HookManager) {
+	run := func(t *testing.T, hookPath string, hm *HookManager, wantCmd string) {
 		t.Helper()
 		const raw = `{
   "hooks": {
@@ -297,9 +297,11 @@ func TestForeignPreservationAndOrder(t *testing.T) {
 			t.Fatalf("InstallHook: %v", err)
 		}
 		afterInstall := commandsFrom(t, decodeFile(t, hookPath))
-		// Foreign entries keep their relative order; ours is appended at the end.
-		if len(afterInstall) != 3 || afterInstall[0] != "before-tool refresh" || afterInstall[1] != "after-tool sync" {
-			t.Fatalf("after install commands=%v, want the two foreign first in order then ours", afterInstall)
+		// Foreign entries keep their relative order; OUR target-specific command is
+		// appended at the end.
+		if len(afterInstall) != 3 || afterInstall[0] != "before-tool refresh" ||
+			afterInstall[1] != "after-tool sync" || afterInstall[2] != wantCmd {
+			t.Fatalf("after install commands=%v, want the two foreign first in order then %q", afterInstall, wantCmd)
 		}
 
 		if _, err := hm.UninstallHook(); err != nil {
@@ -313,12 +315,12 @@ func TestForeignPreservationAndOrder(t *testing.T) {
 
 	t.Run("claude", func(t *testing.T) {
 		home := t.TempDir()
-		run(t, settingsPathIn(home), NewHookManagerAt(home))
+		run(t, settingsPathIn(home), NewHookManagerAt(home), "uzi skill install --target claude")
 	})
 	t.Run("codex", func(t *testing.T) {
 		codexHome := t.TempDir()
 		hookPath := codexHooksPathIn(codexHome)
-		run(t, hookPath, NewCodexHookManager(hookPath))
+		run(t, hookPath, NewCodexHookManager(hookPath), "uzi skill install --target codex")
 	})
 }
 
@@ -531,6 +533,94 @@ func TestSiblingUnwritable(t *testing.T) {
 			t.Fatalf("codex install under a non-dir parent should fail")
 		}
 	})
+}
+
+// TestClaudeIgnoresForeignCodexCommand: a ~/.claude/settings.json whose only SessionStart
+// entry is the Codex canonical command `uzi skill install --target codex` must be treated
+// as FOREIGN by the Claude manager — the bare legacy prefix `uzi skill install` matches it,
+// but its foreign --target excludes it. Claude InstallHook appends its own command beside it
+// (never rewrites it), UninstallHook leaves it, and HookStatus does not count it as ours.
+// Fails on the pre-fix legacy match (which mis-migrated/removed/counted it).
+func TestClaudeIgnoresForeignCodexCommand(t *testing.T) {
+	home := t.TempDir()
+	const foreign = "uzi skill install --target codex"
+	const orig = `{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "startup", "hooks": [{"type": "command", "command": "uzi skill install --target codex"}]}
+    ]
+  }
+}`
+	hookPath := settingsPathIn(home)
+	writeFileFixture(t, hookPath, orig)
+	hm := NewHookManagerAt(home)
+
+	res, err := hm.InstallHook()
+	if err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	if !res.Changed {
+		t.Fatalf("install should append our claude command: got %+v", res)
+	}
+	cmds := commandsFrom(t, decodeFile(t, hookPath))
+	if len(cmds) != 2 || cmds[0] != foreign || cmds[1] != "uzi skill install --target claude" {
+		t.Fatalf("commands=%v, want the foreign codex command preserved then ours appended", cmds)
+	}
+
+	// HookStatus counts only the claude entry we just appended, not the foreign one.
+	if st := hm.HookStatus(); st.Duplicates != 0 {
+		t.Fatalf("HookStatus.Duplicates=%d, want 0 (foreign codex command must not count as ours)", st.Duplicates)
+	}
+
+	// UninstallHook removes our claude entry and leaves the foreign codex command intact.
+	if _, err := hm.UninstallHook(); err != nil {
+		t.Fatalf("UninstallHook: %v", err)
+	}
+	after := commandsFrom(t, decodeFile(t, hookPath))
+	if len(after) != 1 || after[0] != foreign {
+		t.Fatalf("after uninstall commands=%v, want the foreign codex command preserved", after)
+	}
+}
+
+// TestCodexMalformedConfigRefuses: an unparseable config.toml (with no hooks.json entry of
+// ours) makes InstallHook REFUSE with ExitUsage and write NO hooks.json — we cannot rule out
+// an inline [hooks] representation, so we must not create a possibly-mixed config. But when
+// our hook is already in hooks.json, the idempotent short-circuit skips the config read, so
+// the same malformed config.toml does not block. Fails on the pre-fix "cannot detect ⇒
+// proceed" behavior.
+func TestCodexMalformedConfigRefuses(t *testing.T) {
+	codexHome := t.TempDir()
+	hookPath := codexHooksPathIn(codexHome)
+	configPath := filepath.Join(codexHome, "config.toml")
+	const badTOML = "[hooks\nSessionStart = \"echo hi\"\n" // unterminated table header ⇒ parse error
+	writeFileFixture(t, configPath, badTOML)
+
+	hm := NewCodexHookManager(hookPath)
+	_, err := hm.InstallHook()
+	if err == nil {
+		t.Fatal("InstallHook must refuse when config.toml cannot be parsed")
+	}
+	var ee *ExitError
+	if !errors.As(err, &ee) || ee.Code != ExitUsage {
+		t.Fatalf("refusal error = %v, want ExitUsage", err)
+	}
+	if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
+		t.Fatalf("hooks.json must not be written when config inspection fails (err=%v)", err)
+	}
+	// config.toml itself is never touched.
+	if got, _ := os.ReadFile(configPath); string(got) != badTOML { //nolint:gosec // G304: test reads a test-controlled temp path
+		t.Fatalf("config.toml was modified: %q", got)
+	}
+
+	// With our hook already present, the idempotent path skips the config read entirely.
+	writeFileFixture(t, hookPath, `{"hooks":{"SessionStart":[{"matcher":"startup|resume","hooks":[{"type":"command","command":"uzi skill install --target codex","timeout":15}]}]}}`)
+	res, err := hm.InstallHook()
+	if err != nil {
+		t.Fatalf("idempotent install must not read/fail on config.toml: %v", err)
+	}
+	if !res.AlreadyPresent {
+		t.Fatalf("install with our hook already present: got %+v, want AlreadyPresent", res)
+	}
 }
 
 func pathExistsHook(path string) bool {

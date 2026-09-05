@@ -210,13 +210,16 @@ func (hm *HookManager) canonicalMatcherObject() map[string]any {
 // canonical command, or ANY legacy form, either exactly or followed by a space (so
 // appended flags like `... --force` still count, PRD R5). The match is
 // WORD-BOUNDARY aware — a longer word like the real sibling subcommand `uzi skill
-// install-hook` is NOT ours, which a bare prefix match would destroy.
+// install-hook` is NOT ours, which a bare prefix match would destroy. A legacy form
+// (Claude's bare `uzi skill install`) that carries a FOREIGN `--target` — e.g. the
+// Codex canonical `uzi skill install --target codex` — is NOT ours: without this
+// exclusion the Claude manager would migrate/remove/count another harness's hook.
 func (hm *HookManager) isOurCommand(cmd string) bool {
 	if commandMatches(cmd, hm.command) {
 		return true
 	}
 	for _, legacy := range hm.legacyCommands {
-		if commandMatches(cmd, legacy) {
+		if commandMatches(cmd, legacy) && !hasForeignTarget(cmd, hm.command) {
 			return true
 		}
 	}
@@ -226,6 +229,23 @@ func (hm *HookManager) isOurCommand(cmd string) bool {
 // commandMatches applies the word-boundary rule: exact, or base followed by a space.
 func commandMatches(cmd, base string) bool {
 	return cmd == base || strings.HasPrefix(cmd, base+" ")
+}
+
+// hasForeignTarget reports whether cmd names a --target (either `--target x` or
+// `--target=x`) other than this manager's own. It exists so a bare legacy form,
+// which matches by prefix, is not mistaken for ours when it actually addresses a
+// different harness. A command carrying no --target is never foreign.
+func hasForeignTarget(cmd, canonical string) bool {
+	fields := strings.Fields(cmd)
+	for i, f := range fields {
+		if f == "--target" && i+1 < len(fields) {
+			return !strings.HasSuffix(canonical, " "+fields[i+1])
+		}
+		if rest, ok := strings.CutPrefix(f, "--target="); ok {
+			return !strings.HasSuffix(canonical, " "+rest)
+		}
+	}
+	return false
 }
 
 // isCanonicalCommand reports whether a command is ALREADY in this manager's
@@ -322,37 +342,43 @@ var codexHookEventKeys = map[string]struct{}{
 // trust-persistence subtable `[hooks.state]` and any future non-event metadata under
 // [hooks] — otherwise a config that keeps all its hooks in hooks.json but has ever
 // trusted one would falsely conflict. Read-only: we NEVER write config.toml. A missing
-// file mirrors LoadConfig's ErrNotExist handling (no conflict). A parse error is
-// treated as "cannot detect → proceed": we do not block an install on someone else's
-// malformed TOML, and since we never write it a wrong guess only risks Codex's own
-// dedup warning, never data loss.
-func (hm *HookManager) configHasInlineHooks() bool {
+// file mirrors LoadConfig's ErrNotExist handling (no conflict, nil error). Any OTHER
+// read error, or a TOML parse error, is returned to the caller: we cannot rule out an
+// inline representation, so InstallHook must REFUSE rather than write hooks.json into a
+// possibly-mixed config (data-safety over convenience).
+func (hm *HookManager) configHasInlineHooks() (bool, error) {
 	b, err := os.ReadFile(hm.configTOMLPath)
 	if err != nil {
-		return false // missing/unreadable ⇒ cannot detect ⇒ proceed
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil // absent ⇒ no conflict
+		}
+		return false, err // unreadable ⇒ cannot detect ⇒ refuse
 	}
 	var m map[string]any
 	if err := toml.Unmarshal(b, &m); err != nil {
-		return false // malformed TOML ⇒ cannot detect ⇒ proceed
+		return false, err // malformed TOML ⇒ cannot detect ⇒ refuse
 	}
 	hooks, ok := m["hooks"].(map[string]any)
 	if !ok {
-		return false
+		return false, nil
 	}
 	for key := range hooks {
 		if _, isEvent := codexHookEventKeys[key]; isEvent {
-			return true // a real inline hook event ⇒ mixed representation
+			return true, nil // a real inline hook event ⇒ mixed representation
 		}
 	}
-	return false // only [hooks.state]/metadata ⇒ no inline hook event
+	return false, nil // only [hooks.state]/metadata ⇒ no inline hook event
 }
 
 // inlineHooksConflict reports the Codex mixed-representation conflict: a [hooks]
 // table in config.toml AND our hook not already in hooks.json. Claude
 // (configTOMLPath == "") never conflicts. hasOurHook is checked before the
 // (file-reading) configHasInlineHooks so an idempotent re-install stays cheap.
-func (hm *HookManager) inlineHooksConflict(root map[string]any) bool {
-	return hm.configTOMLPath != "" && !hm.hasOurHook(root) && hm.configHasInlineHooks()
+func (hm *HookManager) inlineHooksConflict(root map[string]any) (bool, error) {
+	if hm.configTOMLPath == "" || hm.hasOurHook(root) {
+		return false, nil
+	}
+	return hm.configHasInlineHooks()
 }
 
 // migrateLegacyCommand rewrites the FIRST legacy/non-canonical SessionStart command
@@ -384,10 +410,12 @@ func (hm *HookManager) migrateLegacyCommand(root map[string]any) bool {
 				continue // already canonical (exact or canonical+flags) — leave verbatim
 			}
 			for _, legacy := range hm.legacyCommands {
-				if commandMatches(cmd, legacy) {
+				if commandMatches(cmd, legacy) && !hasForeignTarget(cmd, hm.command) {
 					// Rewrite to the canonical command, keeping any suffix the legacy
 					// entry carried (TrimPrefix yields "" for the bare legacy form) so a
-					// user's appended flags are never silently dropped.
+					// user's appended flags are never silently dropped. A legacy form that
+					// names a foreign --target is excluded above so another harness's hook
+					// is never rewritten.
 					hmap["command"] = hm.command + strings.TrimPrefix(cmd, legacy)
 					return true
 				}
@@ -427,7 +455,13 @@ func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 	// Codex only: refuse a mixed hook representation before mutating anything. This
 	// is READ-ONLY detection — we never write config.toml, [hooks.state], or
 	// trusted_hash (PRD #1143 M2).
-	if hm.inlineHooksConflict(root) {
+	conflict, err := hm.inlineHooksConflict(root)
+	if err != nil {
+		return res, Exitf(ExitUsage,
+			"cannot inspect Codex config %s to rule out a mixed hook representation: %v; resolve it and re-run",
+			hm.configTOMLPath, err)
+	}
+	if conflict {
 		return res, Exitf(ExitUsage,
 			"Codex already declares a [hooks] table in %s; consolidate your Codex hooks on %s "+
 				"(Codex warns when both a [hooks] table in config.toml and a hooks.json are present) and re-run",
@@ -679,6 +713,8 @@ func (hm *HookManager) HookStatus() HookStatusResult {
 	if matches > 1 {
 		res.Duplicates = matches - 1
 	}
-	res.HookConfigConflict = hm.inlineHooksConflict(root)
+	// Read-only status stays non-fatal: an unreadable/malformed config.toml simply
+	// reports no conflict here (refusal is InstallHook's job, not status's).
+	res.HookConfigConflict, _ = hm.inlineHooksConflict(root)
 	return res
 }
