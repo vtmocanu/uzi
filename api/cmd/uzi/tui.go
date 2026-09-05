@@ -750,6 +750,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch msg.kind {
 		case pageTail:
+			// Any tail reply — success or error — releases the retry guard, so a failed retry
+			// re-enables the next `r` / fallback tick instead of wedging the stuck state.
+			m.detail.tailInFlight = false
 			m.detail.applyTailPage(msg.msgs, msg.err)
 			// Raise the stream's replay floor to the highest seq now held, so a reconnect replays
 			// only frames after the tail rather than the whole history (PRD #1137 M7).
@@ -916,11 +919,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, (&m).startDetailMetaReq()) // one meta refresh, guarded (#1135)
 		}
 		switch {
-		case m.detail.pageErr != nil && m.detail.highSeq == 0:
+		case m.detail.pageErr != nil && m.detail.highSeq == 0 && !m.detail.tailInFlight:
 			// The initial tail failed and the socket is also down, so nothing ever loaded the
 			// transcript: retry the tail. Bounded to this stuck state (a held page moves to the
 			// guarded catch-up below), so it never reintroduces the per-tick whole-transcript
-			// refetch M7 removed.
+			// refetch M7 removed — and guarded by tailInFlight so a slow link cannot stack a
+			// second tail request per tick on one still in flight (the #1130 anti-stack property).
+			m.detail.tailInFlight = true
 			cmds = append(cmds, m.loadTailCmd(m.detail.runID))
 		case m.detail.catchupWaitID == 0 && m.detail.highSeq > 0:
 			cmds = append(cmds, (&m).startDetailCatchupReq()) // one catch-up chain, guarded

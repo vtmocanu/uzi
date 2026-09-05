@@ -327,7 +327,12 @@ func TestTUIDetailTailRetryAfterFailedInitialTail(t *testing.T) {
 		t.Fatalf("r did not retry the failed initial tail; calls = %+v", fake.RunLogsPageCalls[before:])
 	}
 
-	// The poll fallback must retry it too.
+	// The poll fallback must retry it too — once the `r` retry's reply has landed (an error
+	// here: the stuck state persists). While that retry is still in flight the tailInFlight
+	// guard deliberately suppresses a second tail (TestTUIDetailTailRetryIsGuardedInFlight),
+	// so the reply is what re-arms the fallback's retry.
+	next, _ = m.Update(detailPageMsg{runID: runID, kind: pageTail, err: errFake("tail boom again")})
+	m = next.(tuiModel)
 	before = len(fake.RunLogsPageCalls)
 	next, cmd = m.Update(pollFallbackMsg{})
 	m = next.(tuiModel)

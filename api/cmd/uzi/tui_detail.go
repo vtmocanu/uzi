@@ -75,6 +75,13 @@ type detailState struct {
 	backfilling     bool
 	historyComplete bool
 	backfillFailed  bool
+	// tailInFlight guards the initial-tail RETRY (the stuck state: the tail errored, nothing is
+	// held, the socket is down). `r` and the 2s poll fallback both retry loadTailCmd from that
+	// state; without this marker every tick would stack another tail request on a slow link —
+	// the #1130 pile-up, on the one page that is not otherwise guarded. Set when a retry is
+	// dispatched, cleared when ANY pageTail reply lands (success or error), so a failed retry
+	// re-enables the next tick rather than wedging.
+	tailInFlight bool
 	// loadErr is the RUN-load error only (GetRun) — fatal to the whole view, since the
 	// header/rail have no DTO to render from. pageErr is the transcript-page error,
 	// scoped to the pane so a failed tail leaves the header up (PRD #1137: the header is
@@ -458,10 +465,12 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, (&m).startDetailMetaReq())
 		}
 		switch {
-		case m.detail.pageErr != nil && m.detail.highSeq == 0:
+		case m.detail.pageErr != nil && m.detail.highSeq == 0 && !m.detail.tailInFlight:
 			// The initial tail never loaded (it errored, so no frames are held): retry it. This
 			// is the "· r to retry" the pane offers, and it is NOT a "tail after the first load"
-			// (SC4) — the first load has not completed, nothing is held.
+			// (SC4) — the first load has not completed, nothing is held. Guarded by tailInFlight
+			// so a refresh never stacks a second tail on one already in flight.
+			m.detail.tailInFlight = true
 			cmds = append(cmds, m.loadTailCmd(m.detail.runID))
 		case m.detail.catchupWaitID == 0 && m.detail.highSeq > 0:
 			cmds = append(cmds, (&m).startDetailCatchupReq())
