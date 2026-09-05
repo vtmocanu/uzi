@@ -1,7 +1,9 @@
 package forge
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -243,4 +245,51 @@ func (f *forgejo) rawGetLimited(ctx context.Context, path string, limit int64) (
 		return body, f.wrapErr(fmt.Sprintf("GET %s", path), fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 	return body, nil
+}
+
+// forgejoPatchErrBodyLimit caps how much of a non-2xx PATCH response patchIssue
+// reads: the body is only ever folded into a redacted error message, never
+// parsed, so a modest ceiling is enough and keeps a hostile forge's error body
+// byte-bounded (same reasoning as rawGetLimited's LimitReader).
+const forgejoPatchErrBodyLimit = 1 << 20
+
+// patchIssue PATCHes a single issue with a caller-supplied struct, marshalling
+// ONLY the fields that struct carries. It exists to sidestep the gitea SDK's
+// gitea.EditIssueOption, whose Title field is a plain `string` tagged
+// `json:"title"` with NO `omitempty`: marshalling that struct ALWAYS emits a
+// "title" key, so any edit that goes through it round-trips (and can clobber) the
+// title, and an empty Title wipes it outright. A field-only PATCH omits "title"
+// entirely, so a field the caller does not send — including a title edited
+// concurrently by someone else — survives untouched (no read, no TOCTOU).
+//
+// Auth and redaction mirror rawGetLimited: the shared timeout client, the
+// "token " Authorization header, an io.LimitReader-bounded body read, and a
+// non-2xx error routed through f.wrapErr so a PAT echoed in the error body is
+// still redacted.
+func (f *forgejo) patchIssue(ctx context.Context, slug repoSlug, issueIID int64, op string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return f.wrapErr(op, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch,
+		f.baseURL+"/api/v1"+fmt.Sprintf("/repos/%s/%s/issues/%d", slug.owner, slug.repo, issueIID),
+		bytes.NewReader(body))
+	if err != nil {
+		return f.wrapErr(op, err)
+	}
+	req.Header.Set("Authorization", "token "+f.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return f.wrapErr(op, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, forgejoPatchErrBodyLimit))
+	if err != nil {
+		return f.wrapErr(op, err)
+	}
+	if resp.StatusCode/100 != 2 {
+		return f.wrapErr(op, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))))
+	}
+	return nil
 }
