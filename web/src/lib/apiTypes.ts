@@ -1599,6 +1599,15 @@ export interface Worker {
   stats_mem_bytes: number | null;
   stats_mem_limit_bytes: number | null;
   stats_source: string | null;
+  // Latest worker disk-space sample (PRD #837), all null until the worker reports it.
+  // Two volumes are tracked as used/total byte pairs: /nix (the shared read-only store)
+  // and /data (the writable work area). Each pair is reported together (used implies
+  // total); a volume the worker does not report leaves both its fields null. The UI
+  // renders a percentage bar per reported volume (used/total), danger tone at ≥85%.
+  stats_disk_nix_bytes: number | null;
+  stats_disk_nix_total_bytes: number | null;
+  stats_disk_data_bytes: number | null;
+  stats_disk_data_total_bytes: number | null;
   // Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
   // Both null means unbound: the worker spends its owner's default token, which is
   // every worker's state until someone binds one. The label rides alongside the id

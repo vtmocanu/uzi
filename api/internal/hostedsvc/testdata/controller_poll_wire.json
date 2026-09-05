@@ -7,6 +7,8 @@
       "docker": true,
       "busy": true,
       "draining_since": null,
+      "disk_pressure": true,
+      "ephemeral": false,
       "generation": 1,
       "join_token": "uzw_EXAMPLE-NOT-A-REAL-TOKEN"
     },
@@ -17,6 +19,8 @@
       "docker": false,
       "busy": false,
       "draining_since": "2026-01-02T03:04:05Z",
+      "disk_pressure": false,
+      "ephemeral": true,
       "generation": 4,
       "join_token": null
     }

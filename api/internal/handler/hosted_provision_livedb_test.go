@@ -304,7 +304,7 @@ func TestProvisionHostedWorkerCoWriteLiveDB(t *testing.T) {
 		t.Fatalf("docker_enabled = %+v on the provisioned row, want an explicit true", wkr.DockerEnabled)
 	}
 
-	resp, err := hostedsvc.New(q, box).Poll(ctx)
+	resp, err := hostedsvc.New(q, box, time.Now, time.Hour).Poll(ctx)
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
@@ -413,7 +413,7 @@ func TestDeleteHostedWorkerCascadesPendingTokenLiveDB(t *testing.T) {
 	// SET, so a vanished row IS the teardown cue (Decision 9/11) — there is no delete
 	// signal on the wire, which is exactly why this has to be asserted rather than
 	// assumed.
-	resp, err := hostedsvc.New(q, box).Poll(ctx)
+	resp, err := hostedsvc.New(q, box, time.Now, time.Hour).Poll(ctx)
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}

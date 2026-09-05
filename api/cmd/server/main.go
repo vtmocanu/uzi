@@ -265,6 +265,7 @@ func run() error {
 		QuestionTimeoutSeconds:      cfg.QuestionTimeoutSeconds,
 		RunMaxRequeues:              cfg.RunMaxRequeues,
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
+		DiskPressureThreshold:       cfg.DiskPressureThreshold,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerAffinityCeiling:       cfg.WorkerAffinityCeiling,
 		WorkerSpreadGrace:           cfg.WorkerSpreadGrace,
@@ -1012,7 +1013,7 @@ func run() error {
 	// no caller. Shares the same secret cipher (sole key holder) as the forge/worker
 	// services — it seals pending join tokens with it.
 	if cfg.WorkerHostingEnabled {
-		h.SetHostedSvc(hostedsvc.New(q, box))
+		h.SetHostedSvc(hostedsvc.New(q, box, time.Now, cfg.WorkerHeartbeatStale))
 		slog.Info("hosted k8s workers enabled; serving the controller protocol on /api/controller")
 	}
 	// Wire the rate-limit poller so saving/replacing an Anthropic token pokes it for

@@ -1429,6 +1429,22 @@ is unchanged by this PRD. Full rationale, the Decision Log, and what remains
 open (a CLI drain verb, live-cluster validation) are in
 [adr/0422-decouple-worker-version.md](adr/0422-decouple-worker-version.md).
 
+### Worker disk: observed on the heartbeat, self-healed by the controller (PRD #837)
+
+A worker now samples `/nix` and `/data` filesystem usage on the existing
+heartbeat and reports it display-only, alongside CPU/memory (PRD #49); no
+scheduling query reads it. The controller gained two new drift arms that both
+resolve to the same delete-and-remint mechanism (a pod roll re-attaches the
+same PVC, so it cannot reclaim disk): one reconciles a worker whose `/nix` PVC
+is smaller than the current `preset.nixSize` constant, the other recycles
+`{nix, data}` when the api derives sustained disk pressure (>=90% used,
+debounced, fresh) and flags it on the controller poll wire. Both drain a busy
+worker first and exclude ephemeral (run-bound, PRD #529) workers. Full
+rationale — the await-gone gate that keeps a re-mint from racing a
+still-Terminating PVC, the default-ON decision over reviewer dissent, and the
+thrash-cooldown-as-capacity-signal — is in
+[adr/0837-worker-disk-lifecycle.md](adr/0837-worker-disk-lifecycle.md).
+
 ## Not yet in scope
 
 WS wakeup for idle workers (a 3s poll is the MVP), **wiring PRD #84's

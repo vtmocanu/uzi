@@ -116,6 +116,7 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 		{"RunMaxRequeues", cfg.RunMaxRequeues, 1},
 		{"WorkerHeartbeatInterval", cfg.WorkerHeartbeatInterval, 15 * time.Second},
 		{"WorkerHeartbeatStale", cfg.WorkerHeartbeatStale, 45 * time.Second},
+		{"DiskPressureThreshold", cfg.DiskPressureThreshold, 0.90},
 		{"SweepInterval", cfg.SweepInterval, time.Duration(0)},
 		{"WorkerPollInterval", cfg.WorkerPollInterval, 3 * time.Second},
 		{"WorkerAffinityGrace", cfg.WorkerAffinityGrace, 2 * time.Minute},
@@ -145,6 +146,28 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 	}
 	if cfg.SweepInterval != 2*time.Second {
 		t.Errorf("SweepInterval = %v, want 2s", cfg.SweepInterval)
+	}
+
+	// UZI_DISK_PRESSURE_THRESHOLD (PRD #837 M4) is a soft-parsed float in (0,1]. A valid
+	// override is honoured; a malformed or out-of-range value falls back to the 0.90
+	// default rather than failing boot (it is a display/lifecycle tuning knob).
+	t.Setenv("UZI_DISK_PRESSURE_THRESHOLD", "0.75")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with UZI_DISK_PRESSURE_THRESHOLD=0.75: %v", err)
+	}
+	if cfg.DiskPressureThreshold != 0.75 {
+		t.Errorf("DiskPressureThreshold = %v, want 0.75 (a valid override)", cfg.DiskPressureThreshold)
+	}
+	for _, bad := range []string{"nonsense", "0", "-0.1", "1.5"} {
+		t.Setenv("UZI_DISK_PRESSURE_THRESHOLD", bad)
+		cfg, err = Load()
+		if err != nil {
+			t.Fatalf("Load() with UZI_DISK_PRESSURE_THRESHOLD=%q: %v", bad, err)
+		}
+		if cfg.DiskPressureThreshold != 0.90 {
+			t.Errorf("DiskPressureThreshold = %v for invalid override %q, want the 0.90 default", cfg.DiskPressureThreshold, bad)
+		}
 	}
 }
 

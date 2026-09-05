@@ -747,7 +747,13 @@ type Params struct {
 	QuestionTimeoutSeconds int
 	RunMaxRequeues         int
 	WorkerHeartbeatStale   time.Duration
-	WorkerAffinityGrace    time.Duration
+	// DiskPressureThreshold (PRD #837 M4, UZI_DISK_PRESSURE_THRESHOLD) is the used/total
+	// fraction in (0,1] at/above which a self-reported disk volume counts as "over
+	// threshold" for one heartbeat. Heartbeat feeds it to diskOverThreshold, which drives
+	// the debounced stats_disk_pressure_streak the poll derives disk_pressure from. Purely
+	// a display/lifecycle tuning knob — it never gates claim or scheduling.
+	DiskPressureThreshold float64
+	WorkerAffinityGrace   time.Duration
 	// WorkerAffinityCeiling (PRD #628 D3a): the run-lane affinity ceiling. ClaimRun pins
 	// a promoted run to its prior worker only while that worker is a live, non-draining
 	// claim target (the liveness leg); this ceiling bounds the live-but-wedged case. It is
@@ -1245,6 +1251,13 @@ type WorkerStats struct {
 	MemLimit *int64
 	// Source is the validated enum: "cgroup" or "process".
 	Source string
+	// Disk usage per volume (PRD #837 M1), each nil when the worker's statfs failed or
+	// the mount was absent. Used and total bytes for the /nix and data volumes; a nil
+	// pointer writes NULL, exactly like the mem fields. Display-only, same as the rest.
+	DiskNixBytes       *int64
+	DiskNixTotalBytes  *int64
+	DiskDataBytes      *int64
+	DiskDataTotalBytes *int64
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
@@ -1257,8 +1270,29 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		arg.StatsMemBytes = pgtype.Int8{Int64: stats.MemBytes, Valid: true}
 		arg.StatsMemLimitBytes = pgconv.Int8Ptr(stats.MemLimit)
 		arg.StatsSource = pgconv.TextOrNull(stats.Source)
+		arg.StatsDiskNixBytes = pgconv.Int8Ptr(stats.DiskNixBytes)
+		arg.StatsDiskNixTotalBytes = pgconv.Int8Ptr(stats.DiskNixTotalBytes)
+		arg.StatsDiskDataBytes = pgconv.Int8Ptr(stats.DiskDataBytes)
+		arg.StatsDiskDataTotalBytes = pgconv.Int8Ptr(stats.DiskDataTotalBytes)
+		// Disk-pressure debounce input (PRD #837 M4): whether THIS sample crossed the
+		// threshold. HeartbeatWorker increments the streak when true and resets it to 0
+		// when false; a nil stats leaves this false, which correctly resets the streak
+		// (the tick carried no evidence of pressure).
+		arg.DiskOverThreshold = diskOverThreshold(stats, s.p.DiskPressureThreshold)
 	}
 	return s.q.HeartbeatWorker(ctx, arg)
+}
+
+// diskOverThreshold: any reported volume at/above threshold. >= pins the comparator
+// (0.90 fires, 0.899 does not). nil pair or non-positive total => not over (no div-by-zero).
+func diskOverThreshold(stats *WorkerStats, threshold float64) bool {
+	over := func(used, total *int64) bool {
+		if used == nil || total == nil || *total <= 0 {
+			return false
+		}
+		return float64(*used)/float64(*total) >= threshold
+	}
+	return over(stats.DiskNixBytes, stats.DiskNixTotalBytes) || over(stats.DiskDataBytes, stats.DiskDataTotalBytes)
 }
 
 // Claim atomically claims the oldest claimable run for the worker's user and

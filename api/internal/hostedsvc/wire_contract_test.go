@@ -26,7 +26,7 @@ const wireContractFixture = "testdata/controller_poll_wire.json"
 // Secret"). Values are fixed (no random uuids) so the golden file is stable, and the
 // token is an obvious non-credential so secret scanners never flag the fixture.
 func samplePollResponse() PollResponse {
-	token := "uzw_EXAMPLE-NOT-A-REAL-TOKEN"
+	token := "uzw_EXAMPLE-NOT-A-REAL-TOKEN" //nolint:gosec // G101: a deliberate non-credential fixture value (see the doc comment above), not a hardcoded secret.
 	return PollResponse{Workers: []DesiredWorker{
 		{
 			ID:         "11111111-1111-1111-1111-111111111111",
@@ -42,7 +42,13 @@ func samplePollResponse() PollResponse {
 			// rationale as Docker above.
 			Busy:          true,
 			DrainingSince: nil,
-			JoinToken:     &token,
+			// DiskPressure true, Ephemeral false here; the second worker is the mirror
+			// (false/true), so BOTH states of BOTH new M4 fields ride one wire and a drop of
+			// either on either side reddens (PRD #837 M4), the same both-states rationale as
+			// Docker/Busy above.
+			DiskPressure: true,
+			Ephemeral:    false,
+			JoinToken:    &token,
 		},
 		{
 			ID:         "22222222-2222-2222-2222-222222222222",
@@ -58,6 +64,10 @@ func samplePollResponse() PollResponse {
 			// A fixed time so the golden is stable.
 			Busy:          false,
 			DrainingSince: func() *time.Time { t := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC); return &t }(),
+			// DiskPressure false, Ephemeral true: the mirror of the first worker, so both
+			// states of both M4 fields appear on one wire (PRD #837 M4).
+			DiskPressure: false,
+			Ephemeral:    true,
 			// No token to write: a pod already proved it holds one (its plaintext
 			// lives only in the cluster Secret now), or the buffer expired unread.
 			JoinToken: nil,
@@ -73,10 +83,10 @@ func TestPollResponseWireContract(t *testing.T) {
 	got = append(got, '\n')
 
 	if os.Getenv("UPDATE_GOLDEN") == "1" {
-		if err := os.MkdirAll(filepath.Dir(wireContractFixture), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(wireContractFixture), 0o755); err != nil { //nolint:gosec // G301: a checked-in test golden directory, not sensitive data; 0755 matches the repo's other testdata dirs.
 			t.Fatalf("mkdir testdata: %v", err)
 		}
-		if err := os.WriteFile(wireContractFixture, got, 0o644); err != nil {
+		if err := os.WriteFile(wireContractFixture, got, 0o644); err != nil { //nolint:gosec // G306: a committed golden fixture that must be world-readable for git/CI; 0644 is intentional.
 			t.Fatalf("write golden: %v", err)
 		}
 		t.Log("golden file updated")

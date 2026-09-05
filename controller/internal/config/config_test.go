@@ -194,6 +194,66 @@ func TestLoadParsesTheDrainPolicy(t *testing.T) {
 	})
 }
 
+// The disk self-heal policy (PRD #837 M4): WorkerDiskRecycleEnabled DEFAULTS TRUE when
+// UZI_WORKER_DISK_RECYCLE_ENABLED is unset, honours an explicit "false", and treats a
+// set-but-unparseable value as a BOOT error (an operator disabling self-heal by typo
+// must not silently leave it ON). The cooldown defaults to 1h and parses a set value.
+func TestLoadParsesTheDiskRecyclePolicy(t *testing.T) {
+	t.Run("enabled defaults true when unset", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.WorkerDiskRecycleEnabled {
+			t.Error("WorkerDiskRecycleEnabled = false, want the default true when UZI_WORKER_DISK_RECYCLE_ENABLED is unset")
+		}
+		if cfg.WorkerDiskRecycleCooldown != time.Hour {
+			t.Errorf("WorkerDiskRecycleCooldown = %v, want the default 1h", cfg.WorkerDiskRecycleCooldown)
+		}
+	})
+
+	t.Run("an explicit false disables self-heal", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_DISK_RECYCLE_ENABLED", "false")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerDiskRecycleEnabled {
+			t.Error("UZI_WORKER_DISK_RECYCLE_ENABLED=false must clear WorkerDiskRecycleEnabled")
+		}
+	})
+
+	t.Run("a set cooldown parses", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_DISK_RECYCLE_COOLDOWN", "30m")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerDiskRecycleCooldown != 30*time.Minute {
+			t.Errorf("WorkerDiskRecycleCooldown = %v, want 30m", cfg.WorkerDiskRecycleCooldown)
+		}
+	})
+
+	t.Run("an unparseable enabled value is a boot error", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_DISK_RECYCLE_ENABLED", "maybe")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DISK_RECYCLE_ENABLED") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DISK_RECYCLE_ENABLED", err)
+		}
+	})
+}
+
 // A malformed or non-positive knob falls back to the default rather than failing
 // boot: these are tuning values, not security controls, which is the same split the
 // api's config package draws.
@@ -240,7 +300,7 @@ func caPEM(t *testing.T) []byte {
 func writeCA(t *testing.T, contents []byte) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "ca.crt")
-	if err := os.WriteFile(path, contents, 0o644); err != nil {
+	if err := os.WriteFile(path, contents, 0o644); err != nil { //nolint:gosec // G306: a CA certificate is public trust material, not a secret (unlike the token file, written 0o600); this is a throwaway test fixture in t.TempDir().
 		t.Fatalf("write ca: %v", err)
 	}
 	return path

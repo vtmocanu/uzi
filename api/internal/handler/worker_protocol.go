@@ -366,6 +366,18 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 		MemBytes *int64   `json:"mem_bytes"`
 		MemLimit *int64   `json:"mem_limit_bytes"`
 		Source   string   `json:"source"`
+		// Disk fields decode as *json.Number, NOT *int64, so an out-of-range or
+		// malformed disk NUMBER (e.g. an int64-overflow like 99999999999999999999)
+		// stores its literal here instead of failing the outer Unmarshal — which would
+		// take the whole-object drop() path and null cpu/mem/source too, contradicting
+		// PRD #837 M1's "a bad DISK field drops only that field." Each is converted to
+		// *int64 below by diskBytesOrNil, which drops (nil) on parse error / overflow /
+		// negative. cpu/mem stay *int64 on purpose: their overflow-drops-the-object
+		// behavior is pre-existing and out of scope here.
+		DiskNixBytes       *json.Number `json:"disk_nix_bytes"`
+		DiskNixTotalBytes  *json.Number `json:"disk_nix_total_bytes"`
+		DiskDataBytes      *json.Number `json:"disk_data_bytes"`
+		DiskDataTotalBytes *json.Number `json:"disk_data_total_bytes"`
 	}
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return drop()
@@ -396,7 +408,33 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 		}
 		out.CPUPct = &v
 	}
+	// Disk fields (PRD #837 M1) are per-volume used/total, each optional (omitted when
+	// the worker's statfs failed or the mount was absent). Unlike mem, a bad DISK value
+	// drops ONLY that field — never the whole stats object — so a negative on one volume
+	// cannot discard the cpu/mem gauge. A negative is dropped by leaving the pointer nil.
+	out.DiskNixBytes = diskBytesOrNil(s.DiskNixBytes)
+	out.DiskNixTotalBytes = diskBytesOrNil(s.DiskNixTotalBytes)
+	out.DiskDataBytes = diskBytesOrNil(s.DiskDataBytes)
+	out.DiskDataTotalBytes = diskBytesOrNil(s.DiskDataTotalBytes)
 	return out
+}
+
+// diskBytesOrNil converts a raw disk-field JSON number to a non-negative *int64, dropping
+// (nil) on absent / parse error / int64-overflow / negative. It is the display-only disk
+// fields' tolerant per-field decode: because the field arrives as a *json.Number (its
+// literal, never coerced at Unmarshal time), a bad value drops ONLY that field here rather
+// than failing the whole stats decode and discarding the cpu/mem gauge with it (PRD #837
+// M1). Number.Int64 folds both the overflow and the malformed/non-integer cases into an
+// error, and a negative is dropped just as the previous non-negative check did.
+func diskBytesOrNil(n *json.Number) *int64 {
+	if n == nil {
+		return nil
+	}
+	v, err := n.Int64()
+	if err != nil || v < 0 {
+		return nil
+	}
+	return &v
 }
 
 // WorkerClaim atomically claims the next run for the worker's user. 204 when the
