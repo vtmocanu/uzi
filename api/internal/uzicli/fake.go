@@ -49,6 +49,14 @@ type FakeClient struct {
 	BlockedReposV  apitypes.AdminBlockedReposDTO
 	AgentSourceV   apitypes.AgentSourceDTO
 
+	// ListRunsCalls / AdminListRunsCalls count real ListRuns / AdminListRuns
+	// invocations (PRD #1130 M1). Purely additive, no mutex like the rest of this
+	// fake — every consumer is a single-goroutine command test — so the board-poll
+	// in-flight guard can be asserted with a positive count (exactly one fetch across
+	// two back-to-back periodic ticks) rather than a vacuous "not two".
+	ListRunsCalls      int
+	AdminListRunsCalls int
+
 	// Build is the canned GET /api/version reply; BuildErr fails that one call
 	// without failing the rest (see BuildInfo). BuildInfoCalls counts the calls —
 	// no mutex, like the rest of this fake, because every consumer is a

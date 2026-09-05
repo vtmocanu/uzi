@@ -25,6 +25,13 @@ type boardState struct {
 	admin       bool
 	adminDenied bool
 
+	// boardInFlight marks a periodic board ListRuns poll as pending (PRD #1130 M1 D1):
+	// a boardTickMsg skips issuing a new fetch while it is set, so a slow link cannot
+	// stack overlapping requests. It is cleared in the boardRunsMsg case on EVERY reply
+	// (D2 — not behind apply's admin-mismatch early return, so a mid-flight admin toggle
+	// cannot latch it). User-initiated r/a fetches set it but are never gated on it.
+	boardInFlight bool
+
 	filtering bool
 	filter    string
 
@@ -208,12 +215,19 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		m.board.filtering = true
 		return m, nil
 	case keyRefresh:
+		// User-initiated fetch (PRD #1130 M1 D1): NEVER gated on the in-flight guard — a
+		// keypress is intent and always issues a fetch. It sets the marker so the next
+		// periodic tick does not stack a second poll on top of this one; the reply clears it.
+		m.board.boardInFlight = true
 		return m, tea.Batch(m.fetchRunsCmd(m.board.admin), m.fetchRateLimitsCmd(), m.fetchSettingsCmd())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
 		m.board.cursor = 0
 		m.board.scroll = 0
+		// Same as keyRefresh (D1): always fetch, and set the marker so the next tick does not
+		// stack. The subsequent boardRunsMsg for the new admin value clears it in that case.
+		m.board.boardInFlight = true
 		return m, m.fetchRunsCmd(m.board.admin)
 	case keyHideDone:
 		// No-op on the admin board: AdminListRuns already returns non-terminal runs only, so

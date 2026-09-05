@@ -464,12 +464,22 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quitting {
 			return m, tickCmd()
 		}
-		cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), tickCmd()}
+		// The in-flight guard (PRD #1130 M1 D1): a periodic tick never starts a new board
+		// poll while one is still pending, so a link where a ListRuns takes longer than the
+		// 2s cadence cannot pile up overlapping concurrent requests. The pending poll's reply
+		// clears the marker (boardRunsMsg case). The tick is ALWAYS re-armed regardless.
+		cmds := []tea.Cmd{tickCmd()}
+		if !m.board.boardInFlight {
+			m.board.boardInFlight = true
+			cmds = append(cmds, m.fetchRunsCmd(m.board.admin))
+		}
 		// Keep the drilled-in run's non-streamed fields (milestones, health, duration) fresh
 		// on the same 2s cadence the board polls at: the live socket carries transcript frames
 		// and status only. Skipped while the D8 fallback (pollFallbackMsg) is already reloading
-		// the whole DTO every 2s, so the two never double up.
-		if m.view == viewDetail && !m.detail.polling && m.detail.run.ID != "" {
+		// the whole DTO every 2s, so the two never double up — and guarded by its own in-flight
+		// marker so a slow meta poll does not stack either.
+		if m.view == viewDetail && !m.detail.polling && m.detail.run.ID != "" && !m.detail.metaInFlight {
+			m.detail.metaInFlight = true
 			cmds = append(cmds, m.refreshRunMetaCmd(m.detail.runID))
 		}
 		return m, tea.Batch(cmds...)
@@ -487,6 +497,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchBuildInfoCmd(), skewTickCmd())
 
 	case boardRunsMsg:
+		// Clear the in-flight guard on EVERY board reply (PRD #1130 M1 D2), independently of
+		// apply — which early-returns on an admin/own-runs mismatch (tui_board.go). A clear
+		// placed behind that early return would leave the marker latched on a mid-flight admin
+		// toggle, wedging the periodic poll.
+		m.board.boardInFlight = false
 		m.board.apply(msg)
 		// A refresh that first reveals a visible in-progress run arms the blink; blinkArmed
 		// keeps a later refresh from stacking a second tick.
@@ -551,6 +566,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchInputsCmd(m.detail.runID), m.maybeArmBlink())
 
 	case detailMetaMsg:
+		// Clear the in-flight guard at the TOP of the case, ABOVE the guard (PRD #1130 M1 D2):
+		// this case early-returns on runID-mismatch OR err != nil, and the err branch is exactly
+		// the flaky-connection path this milestone targets. A clear placed after the guard would
+		// leave the marker latched on a failed poll, wedging the detail-meta poll forever.
+		m.detail.metaInFlight = false
 		if msg.runID != m.detail.runID || msg.err != nil {
 			return m, nil
 		}

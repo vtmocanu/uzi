@@ -10,6 +10,7 @@ import (
 // split out of fake.go (PRD #1017).
 
 func (f *FakeClient) ListRuns(context.Context) ([]apitypes.RunListItemDTO, error) {
+	f.ListRunsCalls++
 	if f.Err != nil {
 		return nil, f.Err
 	}

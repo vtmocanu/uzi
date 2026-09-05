@@ -66,6 +66,13 @@ type detailState struct {
 	// REST on the same 2s cadence `uzi run logs --follow` uses.
 	polling bool
 
+	// metaInFlight marks a periodic detail-meta GetRun poll as pending (PRD #1130 M1 D1):
+	// a boardTickMsg skips issuing refreshRunMetaCmd while it is set, so a slow link cannot
+	// stack overlapping meta re-reads. It is cleared at the TOP of the detailMetaMsg case,
+	// ABOVE the runID/err guard (D2), so a failed poll on a flaky link still unlatches it —
+	// clearing only on the applyMeta happy path would wedge the detail poll forever.
+	metaInFlight bool
+
 	// M4 surfaces. steer is gated on OWNERSHIP, not visibility (see steerAccessFor);
 	// review is the [v] overlay.
 	steer  steerState2
