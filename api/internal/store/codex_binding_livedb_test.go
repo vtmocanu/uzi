@@ -1221,14 +1221,26 @@ func TestRefreshCodexAccountLoginLiveDB(t *testing.T) {
 		t.Fatalf("RefreshCodexAccountLogin(stale generation) = (%d,%v), want (0,nil)", n, err)
 	}
 
-	// Owner-scoping: a foreign user refreshes nothing. Note the guard now yields 0 for TWO
-	// reasons here (foreign user AND the account is no longer quarantined after the refresh
-	// above); either alone suffices to reject.
+	// Owner-scoping: a foreign user refreshes nothing. Target `stale`, which is STILL
+	// quarantined at generation 0 (the stale-generation call above matched 0 rows and
+	// changed nothing), and present the MATCHING FromGeneration: 0 so both the
+	// coord_state='quarantined' guard and the generation CAS pass — the foreign user_id is
+	// then the SOLE reason the update rejects, isolating the ownership predicate.
 	if n, err := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
-		Sealed: []byte("x"), SealedWith: store.SealedWithMaster, ID: acc.ID, UserID: uuid.New(),
-		FromGeneration: 1,
+		Sealed: []byte("x"), SealedWith: store.SealedWithMaster, ID: stale.ID, UserID: uuid.New(),
+		FromGeneration: 0,
 	}); err != nil || n != 0 {
 		t.Fatalf("RefreshCodexAccountLogin(foreign user) = (%d,%v), want (0,nil)", n, err)
+	}
+	// The foreign call must leave `stale` untouched: same login, generation, and coord_state.
+	staleGot, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: user, ID: stale.ID})
+	if err != nil {
+		t.Fatalf("read stale after foreign refresh: %v", err)
+	}
+	if string(staleGot.SealedLogin) != "sealed" || staleGot.SealedWith != store.SealedWithMaster ||
+		staleGot.Generation != 0 || staleGot.CoordState != "quarantined" {
+		t.Fatalf("foreign refresh mutated stale account = (sealed=%q with=%q gen=%d state=%q), want (sealed, %q, 0, quarantined)",
+			staleGot.SealedLogin, staleGot.SealedWith, staleGot.Generation, staleGot.CoordState, store.SealedWithMaster)
 	}
 }
 
