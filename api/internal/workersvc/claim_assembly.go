@@ -438,6 +438,20 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		},
 	}
 
+	// PRD #1147 M2 (B7), ships DARK: a Codex-bound run (codex_secret_id non-null) also
+	// carries its Codex credential. This branch runs ONLY when the run is Codex-bound;
+	// for an ordinary Claude run (codex_secret_id NULL) it is skipped and the emitted
+	// JSON is byte-identical to today's (ClaimSecrets.Codex stays nil ⇒ no `codex` key).
+	// It mints the per-claim capability (worker-scoped) and opens the usable credential
+	// (subscription access_token or static api_key) — never the refresh/login blob.
+	if run.CodexSecretID.Valid {
+		codex, err := s.codexClaimSecrets(ctx, wkr, run)
+		if err != nil {
+			return nil, err
+		}
+		payload.Secrets.Codex = codex
+	}
+
 	// issue #297: a self_improve run carries the in-flight avoid-set so the picker skips
 	// a recommendation whose fix another active run is already doing. Best-effort and
 	// self_improve-only; every other kind's claim stays byte-identical to today's.
