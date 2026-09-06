@@ -63,6 +63,15 @@ func newFakeCodexDB() *fakeCodexDB {
 
 func nowTS() pgtype.Timestamptz { return pgtype.Timestamptz{Time: time.Now(), Valid: true} }
 
+// codexRotateCreatedAt/codexRotateUpdatedAt are the DISTINCTIVE, fixed timestamps the
+// fake's RotateUserSecret RETURNING row carries. They are deliberately far in the past
+// and different from each other so a test can assert the rotate-only PATCH response
+// reported THESE (i.e. came from the rotate row), not the zero values a pre-read leaves.
+var (
+	codexRotateCreatedAt = pgtype.Timestamptz{Time: time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC), Valid: true}
+	codexRotateUpdatedAt = pgtype.Timestamptz{Time: time.Date(2022, 8, 9, 10, 11, 12, 0, time.UTC), Valid: true}
+)
+
 // seed inserts a secret directly (bypassing the handler), for arranging preconditions.
 func (f *fakeCodexDB) seed(kind, label string, isDefault bool) uuid.UUID {
 	id := uuid.New()
@@ -240,7 +249,13 @@ func (f *fakeCodexDB) QueryRow(_ context.Context, sql string, args ...any) pgx.R
 		id := args[0].(uuid.UUID)
 		ct := args[2].([]byte)
 		s := f.secrets[id]
-		s.updated = nowTS()
+		// Stamp the rotate RETURNING row with DISTINCTIVE fixed timestamps, so a test can
+		// prove the PATCH response carried the rotate row's created_at/updated_at rather
+		// than the zero values a pre-read (GetUserSecretForUpdate, which RETURNs no
+		// timestamps at all) would leave. Real Postgres populates these on the RETURNING;
+		// the fake must too or a rotate-only patch's timestamps can never be pinned.
+		s.created = codexRotateCreatedAt
+		s.updated = codexRotateUpdatedAt
 		f.sealedArgs = append(f.sealedArgs, ct)
 		return fakeScanRow{scanSecretMeta(s)}
 	case strings.Contains(sql, "name: RenameUserSecret"):
@@ -312,11 +327,13 @@ func codexReq(t *testing.T, method, path, body string, userID uuid.UUID, secretI
 
 type codexSecretResp struct {
 	Secret struct {
-		ID          string `json:"id"`
-		Kind        string `json:"kind"`
-		Label       string `json:"label"`
-		IsDefault   bool   `json:"is_default"`
-		CodexStatus string `json:"codex_status"`
+		ID          string    `json:"id"`
+		Kind        string    `json:"kind"`
+		Label       string    `json:"label"`
+		IsDefault   bool      `json:"is_default"`
+		CodexStatus string    `json:"codex_status"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
 	} `json:"secret"`
 }
 
@@ -499,6 +516,43 @@ func TestPatchCodexReplaceBumpsAndResets(t *testing.T) {
 	out := decodeCodexSecret(t, rec)
 	if out.Secret.CodexStatus != codexStatusStaging {
 		t.Errorf("codex_status = %q, want reset %q", out.Secret.CodexStatus, codexStatusStaging)
+	}
+}
+
+// TestPatchCodexRotateOnlyReportsTimestamps is the regression guard for F2: a
+// rotate-only PATCH (token only, no label/default) must report the ROTATE row's
+// created_at/updated_at, not the zero values the pre-read (GetUserSecretForUpdate,
+// which RETURNs no timestamps) would leave. The handler must capture RotateUserSecret's
+// returned row into `out`; if that capture is reverted the response timestamps go zero
+// and this fails.
+func TestPatchCodexRotateOnlyReportsTimestamps(t *testing.T) {
+	db := newFakeCodexDB()
+	id := db.seed(store.KindCodexAuth, "sub", true)
+	h := newCodexHandler(t, db)
+	user := uuid.New()
+
+	body, _ := json.Marshal(map[string]any{"token": codexAuthBlob("new-acc")}) // rotate only
+	rec := httptest.NewRecorder()
+	h.PatchCodexAuth(rec, codexReq(t, http.MethodPatch, "/api/me/secrets/codex_auth/"+id.String(),
+		string(body), user, id.String()))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	out := decodeCodexSecret(t, rec)
+	if out.Secret.CreatedAt.IsZero() {
+		t.Error("created_at is zero; a rotate-only patch must report the rotate row's timestamps")
+	}
+	if out.Secret.UpdatedAt.IsZero() {
+		t.Error("updated_at is zero; a rotate-only patch must report the rotate row's timestamps")
+	}
+	// Prove the response carried the ROTATE row's distinctive timestamps, not the
+	// pre-read's zero values (nor any other row's).
+	if !out.Secret.CreatedAt.Equal(codexRotateCreatedAt.Time) {
+		t.Errorf("created_at = %s, want the rotate row's %s", out.Secret.CreatedAt, codexRotateCreatedAt.Time)
+	}
+	if !out.Secret.UpdatedAt.Equal(codexRotateUpdatedAt.Time) {
+		t.Errorf("updated_at = %s, want the rotate row's %s", out.Secret.UpdatedAt, codexRotateUpdatedAt.Time)
 	}
 }
 
