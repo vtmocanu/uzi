@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -574,6 +575,132 @@ func TestFreezeCodexBindingWriteOnceConflictLiveDB(t *testing.T) {
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasA, codexAuthModeAPIKey); err != nil {
 		t.Fatalf("identical retry must be idempotent success, got %v", err)
 	}
+}
+
+// midMintStore decorates the real Codex claim store: its SetRunCodexClaimCapability runs
+// the REAL mint and then, before returning the mint's result, fires an injected callback
+// that mutates DB state. It reproduces the exact window codexClaimSecrets defect-2 closes:
+// a concurrent quarantine/revoke/alias-swap/requeue that lands AFTER the pre-mint predicate
+// passed and the capability was minted, but BEFORE the plaintext is opened and returned.
+//
+// It embeds *store.Queries so every other method (GetRunCodexAuthContext,
+// GetCodexCredentialState, GetCodexProviderAccountByID, FreezeRunCodexBinding,
+// SetRunCodexFrozenIdentity, and the whole Store surface) is promoted unchanged — so the
+// decorated value satisfies BOTH Store (to be assigned to Service.q) and codexAuthzStore
+// (so s.codexStore()'s type assertion still succeeds).
+type midMintStore struct {
+	*store.Queries
+	afterMint func()
+}
+
+func (d *midMintStore) SetRunCodexClaimCapability(ctx context.Context, arg store.SetRunCodexClaimCapabilityParams) (int64, error) {
+	epoch, err := d.Queries.SetRunCodexClaimCapability(ctx, arg)
+	if err != nil {
+		return epoch, err
+	}
+	if d.afterMint != nil {
+		d.afterMint()
+	}
+	return epoch, nil
+}
+
+// newAPIKeyFixture seeds a fully-valid, claimed, api_key Codex run bound to a static
+// openai_api_key alias. accessToken holds the seeded static key.
+func newAPIKeyFixture(t *testing.T, env codexTestEnv) codexRunFixture {
+	t.Helper()
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	staticKey := codexToken("sk")
+	aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), staticKey)
+	runID := env.seedCodexRun(t, userID, workerID, repoID)
+	svc := &Service{q: env.q, box: env.box}
+	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); err != nil {
+		t.Fatalf("FreezeCodexBinding (api_key): %v", err)
+	}
+	return codexRunFixture{
+		userID:      userID,
+		workerID:    workerID,
+		runID:       runID,
+		aliasID:     aliasID,
+		accessToken: staticKey,
+		svc:         svc,
+		wkr:         store.Worker{ID: workerID, UserID: userID},
+	}
+}
+
+// TestCodexClaimSecretsReauthorizesAfterMintLiveDB proves codexClaimSecrets re-checks
+// authority AFTER minting the capability and AGAIN before releasing plaintext (PRD #1147 M2
+// defect-2). Each case forces a state change in the exact window BETWEEN the mint and the
+// release — via a midMintStore whose SetRunCodexClaimCapability mints for real, then mutates
+// DB state — and asserts the claim returns a non-nil error and releases NO access token.
+//
+// FAIL-OLD / PASS-FIXED: the old codexClaimSecrets read its authorization snapshot ONCE
+// (pre-mint) and never re-checked between the mint and the plaintext return, so every case
+// below minted a capability and returned the (now-wrong) access token. Barrier A (fresh
+// re-check after the mint) catches the quarantine/revoke/material-swap cases; Barrier B
+// (fresh re-check bound to the minted epoch+hash, before the return) additionally catches a
+// same-worker re-mint that leaves status 'claimed' (so worker_id + the predicate still pass)
+// but supersedes the capability. Note: a true requeue moves status to 'queued' and is caught
+// by the actively-claimed predicate, not the epoch/hash guard — case (d) below simulates the
+// status-stays-claimed re-mint, which is the case only the epoch/hash guard rejects.
+func TestCodexClaimSecretsReauthorizesAfterMintLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+
+	// runClaimWithMidMutation installs the mid-mint mutation on the fixture's service, runs
+	// the claim, and asserts it errored with no access token released.
+	runClaimWithMidMutation := func(t *testing.T, f codexRunFixture, mutate func()) {
+		t.Helper()
+		f.svc.q = &midMintStore{Queries: env.q, afterMint: mutate}
+		run := mustRun(t, env, f.runID)
+		codex, err := f.svc.codexClaimSecrets(env.ctx, f.wkr, run)
+		if err == nil {
+			t.Fatal("codexClaimSecrets released a claim despite a mid-call state change; want a non-nil error")
+		}
+		if codex != nil && codex.AccessToken != "" {
+			t.Fatalf("a re-authorization failure must release no access token, got %q", codex.AccessToken)
+		}
+	}
+
+	t.Run("(a) account quarantined mid-mint (Barrier A)", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		runClaimWithMidMutation(t, f, func() { env.quarantineAccount(t, f.aliasID) })
+	})
+
+	t.Run("(b) account credential_revision bumped mid-mint (Barrier A)", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		runClaimWithMidMutation(t, f, func() {
+			env.exec(`UPDATE codex_provider_account SET credential_revision = credential_revision + 1
+			          WHERE id = (SELECT provider_account_id FROM codex_credential_state WHERE user_secret_id = $1)`, f.aliasID)
+		})
+	})
+
+	t.Run("(c) alias material_revision bumped mid-mint (Barrier A)", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		runClaimWithMidMutation(t, f, func() {
+			env.exec(`UPDATE codex_credential_state SET material_revision = material_revision + 1 WHERE user_secret_id = $1`, f.aliasID)
+		})
+	})
+
+	t.Run("(d) same-worker re-mint mid-mint: cap_hash cleared, epoch bumped, status stays claimed (Barrier B)", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		runClaimWithMidMutation(t, f, func() {
+			// A same-worker concurrent re-mint clears the just-installed cap_hash and bumps the
+			// epoch while KEEPING worker_id and the 'claimed' status — so ownership and the
+			// release predicate both still pass; only the epoch/hash barrier (Barrier B) rejects
+			// it. (A true requeue would set status='queued' and be caught by the predicate, a
+			// different path — this case deliberately leaves status claimed.)
+			env.exec(`UPDATE runs SET codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1 WHERE id = $1`, f.runID)
+		})
+	})
+
+	t.Run("(e) api_key: static-key alias material replaced mid-mint (Barrier A)", func(t *testing.T) {
+		f := newAPIKeyFixture(t, env)
+		runClaimWithMidMutation(t, f, func() {
+			// Replacing the static key bumps the alias material_revision; the api_key release
+			// path opens strictly by secret id with no revision compare of its own, so without
+			// the re-authorization barrier the stale key would be released.
+			env.exec(`UPDATE codex_credential_state SET material_revision = material_revision + 1 WHERE user_secret_id = $1`, f.aliasID)
+		})
+	})
 }
 
 // assertAuthErr mints nothing itself; it authorizes with the given capability/scope and

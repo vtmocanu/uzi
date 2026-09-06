@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -810,6 +811,16 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 	// re-derived value: the stored epoch is authoritative.
 	wireCap := formatCodexCapability(epoch, plaintext)
 
+	// BARRIER A (PRD #1147 M2 defect-2): re-authorize against a FRESH snapshot taken AFTER
+	// the mint, before opening anything. The pre-mint predicate (l777-789) read a single
+	// unlocked snapshot; a quarantine/revoke/alias-swap/requeue that landed between that
+	// read and the mint would otherwise still open and ship a now-wrong credential. This
+	// re-check re-asserts worker-ownership + the full release predicate so a run whose
+	// authority lapsed in that window opens NOTHING.
+	if rerr := s.reauthorizeCodexRelease(ctx, q, run.ID, wkr, epoch, hash, false); rerr != nil {
+		return nil, rerr
+	}
+
 	var accessToken string
 	switch authMode {
 	case codexAuthModeSubscription:
@@ -866,5 +877,68 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		return nil, ErrCodexRunNotBound
 	}
 
+	// BARRIER B (PRD #1147 M2 defect-2): the plaintext is now decrypted but NOT yet
+	// returned. Re-authorize one last time against a FRESH snapshot AND bind the decision
+	// to the capability THIS call minted: release the plaintext only if the release
+	// predicate still holds, this worker still owns the run, and the run's live
+	// codex_claim_epoch / codex_cap_hash are still exactly the ones the mint installed. The
+	// decrypt itself opens a window (the subscription branch reads state + account and
+	// decrypts; the api_key branch opens strictly by secretID with no revision compare), so
+	// a same-worker concurrent RE-MINT (which advances codex_claim_epoch and clears/rewrites
+	// cap_hash while leaving status 'claimed' and worker_id unchanged, thus passing ownership
+	// + predicate) or an alias/account mutation that landed during the open is caught here
+	// before any plaintext leaves the function. (A true requeue moves status to 'queued' and
+	// is already rejected by the actively-claimed predicate above — Barrier A / this read's
+	// evalCodexReleasePredicate — never reaching the epoch/hash compare.)
+	if rerr := s.reauthorizeCodexRelease(ctx, q, run.ID, wkr, epoch, hash, true); rerr != nil {
+		return nil, rerr
+	}
+
 	return &ClaimCodexSecrets{AccessToken: accessToken, Capability: wireCap}, nil
+}
+
+// reauthorizeCodexRelease re-reads a FRESH GetRunCodexAuthContext snapshot and re-verifies
+// that the run still holds release authority, so codexClaimSecrets releases plaintext only
+// if the authorization that held at the pre-mint check STILL holds now (PRD #1147 M2
+// defect-2). It re-runs the full release predicate and the worker-ownership check against
+// the fresh row. When checkCapability is true it additionally binds the decision to the
+// capability THIS claim minted: the run's live codex_claim_epoch must still equal
+// mintedEpoch and its codex_cap_hash must still bytes-equal mintedHash — so a concurrent
+// same-worker re-mint (which advances the epoch and clears/rewrites the hash while leaving
+// status 'claimed' and worker_id unchanged, and therefore passes both ownership and the
+// predicate) is still rejected. This epoch/hash guard is the ONLY thing that catches that
+// case; a true requeue (status to 'queued', capability revoked) is caught a step earlier by
+// the actively-claimed predicate, so do NOT weaken that predicate assuming this covers it.
+//
+// Error mapping mirrors the initial read and stays compatible with claim_assembly.go's
+// routing: pgx.ErrNoRows → ErrCodexRunNotBound; a failed predicate returns its own
+// distinct sentinel; a lost ownership returns ErrCodexWorkerMismatch; a superseded
+// epoch/hash returns errRunVanished (the capability we minted is no longer the live one —
+// a same-worker re-mint superseded it). None of these is errVaultLocked, so a stale-state
+// rejection never masquerades as a transient vault-lock requeue.
+func (s *Service) reauthorizeCodexRelease(ctx context.Context, q codexAuthzStore, runID uuid.UUID, wkr store.Worker, mintedEpoch int64, mintedHash []byte, checkCapability bool) error {
+	row, err := q.GetRunCodexAuthContext(ctx, runID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrCodexRunNotBound
+		}
+		return fmt.Errorf("codex claim: re-read auth context: %w", err)
+	}
+	if perr := evalCodexReleasePredicate(codexReleaseInputsFromAuthRow(row)); perr != nil {
+		return perr
+	}
+	if !row.WorkerID.Valid || uuid.UUID(row.WorkerID.Bytes) != wkr.ID {
+		return ErrCodexWorkerMismatch
+	}
+	if checkCapability {
+		// The capability we minted must still be the live one. A same-worker re-mint (status
+		// stays 'claimed') advances codex_claim_epoch and clears or rewrites codex_cap_hash, so
+		// either differing means the capability was superseded after we minted — treat it as the
+		// run vanishing under us. (A true requeue is caught earlier by the actively-claimed
+		// predicate; this guard exists for the status-stays-claimed re-mint the predicate misses.)
+		if row.CodexClaimEpoch != mintedEpoch || !bytes.Equal(row.CodexCapHash, mintedHash) {
+			return errRunVanished
+		}
+	}
+	return nil
 }
