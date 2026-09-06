@@ -377,8 +377,10 @@ handler registry. Provider authentication stays an isolated runtime input, never
 a model-accessible calculation capability.
 
 Permission is a ceiling, not a promise that both adapters expose a calculator.
-Today's Claude `model-pass.ts` uses `buildDenyAllHook` for every tool and exposes
-no calculator. M0/M2 leave that path and hook unchanged under D0. Any future
+Today's Claude adapter `agent/src/claude-advice-harness.ts` uses
+`buildDenyAllHook` for every tool and exposes no calculator; `model-pass.ts`
+retains compatibility and timeout/HOME lifecycle. M2 moved construction while
+preserving that behavior under D0. Any future
 Claude calculation tool needs its own isolated implementation and conformance;
 this decision adds no such feature and permits no shell-based calculator. Codex
 pure-cell fixtures supply the bounded calculation evidence above; no Claude
