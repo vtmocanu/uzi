@@ -70,7 +70,15 @@ CREATE TABLE codex_provider_account (
     -- statement (id is already the PK) and load-bearing as the (user_id, id) target
     -- that lets codex_credential_state reference an account owner-scoped, so an alias
     -- can never link to another user's account in the schema.
-    CONSTRAINT codex_provider_account_user_id_id_key UNIQUE (user_id, id)
+    CONSTRAINT codex_provider_account_user_id_id_key UNIQUE (user_id, id),
+
+    -- Recovery-slot pairing (PRD #1147 F14): the discriminator and its bytes are written
+    -- and cleared together, so the two columns are always both NULL (empty slot) or both
+    -- non-NULL (populated slot). This is the invariant PromoteCodexRecovery relies on — it
+    -- opens recovery_sealed with recovery_sealed_with — so the schema forbids a populated
+    -- blob with no discriminator to open it under (and vice versa).
+    CONSTRAINT codex_provider_account_recovery_pairing
+        CHECK ((recovery_sealed IS NULL) = (recovery_sealed_with IS NULL))
 );
 
 -- +goose Down

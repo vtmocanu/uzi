@@ -642,12 +642,13 @@ func (q *Queries) SetCodexRefreshIntentState(ctx context.Context, arg SetCodexRe
 	return result.RowsAffected(), nil
 }
 
-const setRunCodexClaimCapability = `-- name: SetRunCodexClaimCapability :execrows
+const setRunCodexClaimCapability = `-- name: SetRunCodexClaimCapability :one
 UPDATE runs
 SET codex_cap_hash    = $1,
     codex_claim_epoch = codex_claim_epoch + 1,
     updated_at        = now()
 WHERE id = $2 AND worker_id = $3
+RETURNING codex_claim_epoch
 `
 
 type SetRunCodexClaimCapabilityParams struct {
@@ -659,7 +660,9 @@ type SetRunCodexClaimCapabilityParams struct {
 // Mint (or rotate) the per-claim Codex capability (PRD #1147 M2): store the new hash and
 // bump the epoch so a prior capability is superseded. Guarded on worker_id — only the
 // CURRENTLY-OWNING worker may mint, so a worker that already lost the claim cannot mint a
-// fresh capability. 0 rows when the caller is not the owning worker. The revocation half
+// fresh capability. RETURNING codex_claim_epoch hands back the PERSISTED post-bump epoch
+// so the caller wires the capability off the value actually stored, not a re-derived one;
+// a caller that no longer owns the run matches no row → pgx.ErrNoRows. The revocation half
 // lives in every claimed→queued path in runtime.sql (the three Requeue* queries plus
 // SweepClaimedNeverStarted), which clear the hash + bump the epoch on ownership loss.
 // PRD #1147 F7 (defense-in-depth) extends the same revoke to the park/promote paths that
@@ -669,11 +672,10 @@ type SetRunCodexClaimCapabilityParams struct {
 // keeps its live capability by design (persist-before-park), so revoking there would strip
 // a run that still legitimately holds its claim.
 func (q *Queries) SetRunCodexClaimCapability(ctx context.Context, arg SetRunCodexClaimCapabilityParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setRunCodexClaimCapability, arg.Hash, arg.ID, arg.WorkerID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	row := q.db.QueryRow(ctx, setRunCodexClaimCapability, arg.Hash, arg.ID, arg.WorkerID)
+	var codex_claim_epoch int64
+	err := row.Scan(&codex_claim_epoch)
+	return codex_claim_epoch, err
 }
 
 const setRunCodexFrozenIdentity = `-- name: SetRunCodexFrozenIdentity :execrows

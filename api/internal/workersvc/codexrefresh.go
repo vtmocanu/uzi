@@ -414,7 +414,17 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	}
 	sealed, sealedWith, err := s.sealCodexLogin(userID, raw)
 	if err != nil {
-		return CodexRefreshResult{}, fmt.Errorf("codex refresh: seal merged login: %w", err)
+		// The single-use provider exchange already SPENT account A's refresh token, but the
+		// merged login could not be sealed for durable storage. Returning bare here would
+		// strand a 'rotating' intent with a spent token and NO recovery material — and unlike
+		// the absence branch we cannot even protect the material, because the seal that failed
+		// is exactly what a recovery blob would need. So route it through the same
+		// unrecoverable resolution as an identity mismatch (codexQuarantineIdentityMismatch):
+		// mark the intent unrecoverable and quarantine the account (owner+op guarded), forcing
+		// a clean re-login. NO token is returned.
+		_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
+		_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
+		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: seal of refreshed login failed: %v", ErrCodexRefreshUnrecoverable, err)
 	}
 
 	// (6b) Post-refresh identity RE-VERIFICATION (audit #2), BEFORE the commit. A refresh
@@ -441,7 +451,7 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	case derr == nil || errors.Is(derr, codexauth.ErrIdentityIncomplete):
 		return s.codexQuarantineIdentityMismatch(ctx, q, userID, accountID, operationID)
 	default:
-		return s.codexRetainUnverifiedMaterial(ctx, q, userID, accountID, operationID, acct.Generation, sealed, derr)
+		return s.codexRetainUnverifiedMaterial(ctx, q, userID, accountID, operationID, acct.Generation, sealed, sealedWith, derr)
 	}
 
 	// (6c) Durable commit.
@@ -454,7 +464,7 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		FromGeneration: acct.Generation,
 	})
 	if cerr != nil {
-		return s.handleCodexCommitFailure(ctx, q, userID, accountID, operationID, acct.Generation, sealed, cerr)
+		return s.handleCodexCommitFailure(ctx, q, userID, accountID, operationID, acct.Generation, sealed, sealedWith, cerr)
 	}
 
 	// Commit landed. Record the intent committed, return the account to idle so the next
@@ -473,7 +483,7 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 //     non-ErrNoRows persistence error: the new material exists but is not durable, so
 //     protect it in the recovery slot and quarantine, returning a paused outcome and NO
 //     token.
-func (s *Service) handleCodexCommitFailure(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, commitErr error) (CodexRefreshResult, error) {
+func (s *Service) handleCodexCommitFailure(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, sealedWith string, commitErr error) (CodexRefreshResult, error) {
 	if errors.Is(commitErr, pgx.ErrNoRows) {
 		fresh, gerr := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID})
 		if gerr == nil && fresh.Generation > fromGeneration {
@@ -490,10 +500,12 @@ func (s *Service) handleCodexCommitFailure(ctx context.Context, q codexRefreshSt
 	// intent stays 'rotating' — a recovery scan will find the recovery copy at this
 	// from_generation and resolve it (reconciled), distinguishing it from total loss.
 	if _, rerr := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
-		Sealed: sealedMerged,
-		Gen:    fromGeneration,
-		ID:     accountID,
-		UserID: userID,
+		Sealed:             sealedMerged,
+		Gen:                fromGeneration,
+		RecoverySealedWith: pgconv.Text(sealedWith),
+		ID:                 accountID,
+		UserID:             userID,
+		Op:                 operationID,
 	}); rerr != nil {
 		// Even the recovery write failed: the outcome is now truly unknown with no
 		// protected copy. Mark unrecoverable so the account routes to re-login.
@@ -525,12 +537,14 @@ func (s *Service) codexQuarantineIdentityMismatch(ctx context.Context, q codexRe
 // quarantined outcome with NO token — but recovery is possible, not lost. Should even the
 // recovery write fail, the outcome is truly unknown with no protected copy, so the intent
 // is marked unrecoverable.
-func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, discoverErr error) (CodexRefreshResult, error) {
+func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, sealedWith string, discoverErr error) (CodexRefreshResult, error) {
 	if _, rerr := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
-		Sealed: sealedMerged,
-		Gen:    fromGeneration,
-		ID:     accountID,
-		UserID: userID,
+		Sealed:             sealedMerged,
+		Gen:                fromGeneration,
+		RecoverySealedWith: pgconv.Text(sealedWith),
+		ID:                 accountID,
+		UserID:             userID,
+		Op:                 operationID,
 	}); rerr != nil {
 		_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
 		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshQuarantined, rerr)
@@ -735,7 +749,13 @@ func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore,
 	if s.codexRefresh == nil {
 		return nil // no identity seam wired: cannot re-verify, leave for a later pass
 	}
-	blob, err := s.openCodexSealed(userID, acct.RecoverySealed, acct.SealedWith)
+	// Open the recovery blob with the key that sealed IT (recovery_sealed_with), NOT the
+	// live sealed_login's key (acct.SealedWith): a master→dek migration can advance
+	// sealed_login's discriminator while the protected recovery blob still carries the older
+	// one (or vice versa), so opening under sealed_with would try the wrong key and fail to
+	// decrypt. The store CHECK guarantees recovery_sealed_with is populated whenever
+	// recovery_sealed is, and this path is entered only with a non-empty recovery slot.
+	blob, err := s.openCodexSealed(userID, acct.RecoverySealed, acct.RecoverySealedWith.String)
 	if err != nil {
 		if errors.Is(err, errVaultLocked) {
 			return nil // transient: the recovery material stays protected for the next pass
@@ -758,9 +778,21 @@ func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore,
 		return nil
 	case derr == nil || errors.Is(derr, codexauth.ErrIdentityIncomplete):
 		// VERIFIED MISMATCH / incomplete: the recovery copy is not this account's. Correct
-		// every intent that was resolved 'reconciled' off this (now-untrusted) copy to
-		// 'unrecoverable', and leave the account quarantined — do NOT promote.
+		// ONLY the intents whose 'reconciled' verdict DEPENDED on this (now-untrusted)
+		// recovery copy — i.e. those reconciled via codexRefreshResolution's recovery-dependent
+		// branch, where it.FromGeneration == acct.RecoveryGeneration. An intent reconciled
+		// because the account's generation independently ADVANCED past its from_generation
+		// (acct.Generation > it.FromGeneration, the generation-superseded branch) reflects a
+		// committed rotation that owes nothing to this recovery blob, so it stays 'reconciled'
+		// — a bad recovery copy does not retroactively invalidate an independently-committed
+		// rotation. The filter mirrors that branch exactly: since this promotion path runs only
+		// when acct.RecoveryGeneration == acct.Generation, a generation-superseded intent has
+		// it.FromGeneration < acct.RecoveryGeneration and is excluded automatically.
 		for _, it := range intents {
+			recoveryDependent := acct.RecoveryGeneration.Valid && it.FromGeneration == acct.RecoveryGeneration.Int64
+			if !recoveryDependent {
+				continue
+			}
 			if _, serr := q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{
 				State:       codexIntentUnrecoverable,
 				OperationID: it.OperationID,

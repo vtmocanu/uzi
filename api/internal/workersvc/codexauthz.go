@@ -792,20 +792,23 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 	// 0 rows means this worker no longer owns the run (a requeue reclaimed it between the
 	// claim read and here) — treat it as the run vanishing under us.
 	plaintext, hash := mintCodexCapability()
-	n, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
+	epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
 		Hash:     hash,
 		ID:       run.ID,
 		WorkerID: pgconv.UUID(wkr.ID),
 	})
 	if err != nil {
+		// The :one mint returns pgx.ErrNoRows when no row matched — this worker no longer
+		// owns the run (a requeue reclaimed it between the claim read and here); treat it
+		// as the run vanishing under us.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, errRunVanished
+		}
 		return nil, fmt.Errorf("codex claim: mint capability: %w", err)
 	}
-	if n == 0 {
-		return nil, errRunVanished
-	}
-	// The mint bumped the epoch by exactly one from the value on the loaded run row (this
-	// worker owns the run, so no other writer advanced it in between).
-	wireCap := formatCodexCapability(run.CodexClaimEpoch+1, plaintext)
+	// Wire the capability off the PERSISTED post-bump epoch the mint returned, not a
+	// re-derived value: the stored epoch is authoritative.
+	wireCap := formatCodexCapability(epoch, plaintext)
 
 	var accessToken string
 	switch authMode {

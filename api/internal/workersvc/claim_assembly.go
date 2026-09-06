@@ -447,7 +447,17 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if run.CodexSecretID.Valid {
 		codex, err := s.codexClaimSecrets(ctx, wkr, run)
 		if err != nil {
-			return nil, err
+			// recoverClaimAssembly handles errVaultLocked (transient requeue) and
+			// errRunVanished (drop) by IDENTITY — pass those through untouched. Every other
+			// codex sentinel (ErrCodexMaterialRevisionStale, ErrCodexAccountRevisionStale,
+			// ErrCodexAccountQuarantined, ErrCodexKindModeMismatch, ErrCodexLoginBlob, and any
+			// bare store error) means the bound credential cannot be delivered right now, so
+			// wrap it as errCredentialUnavailable to fail the run cleanly (terminal), rather
+			// than propagating an unclassified error the recover switch would not handle.
+			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: %v", errCredentialUnavailable, err)
 		}
 		payload.Secrets.Codex = codex
 	}

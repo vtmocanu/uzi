@@ -114,11 +114,13 @@ LEFT JOIN codex_provider_account cpa
     ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
 WHERE r.id = @id;
 
--- name: SetRunCodexClaimCapability :execrows
+-- name: SetRunCodexClaimCapability :one
 -- Mint (or rotate) the per-claim Codex capability (PRD #1147 M2): store the new hash and
 -- bump the epoch so a prior capability is superseded. Guarded on worker_id — only the
 -- CURRENTLY-OWNING worker may mint, so a worker that already lost the claim cannot mint a
--- fresh capability. 0 rows when the caller is not the owning worker. The revocation half
+-- fresh capability. RETURNING codex_claim_epoch hands back the PERSISTED post-bump epoch
+-- so the caller wires the capability off the value actually stored, not a re-derived one;
+-- a caller that no longer owns the run matches no row → pgx.ErrNoRows. The revocation half
 -- lives in every claimed→queued path in runtime.sql (the three Requeue* queries plus
 -- SweepClaimedNeverStarted), which clear the hash + bump the epoch on ownership loss.
 -- PRD #1147 F7 (defense-in-depth) extends the same revoke to the park/promote paths that
@@ -131,7 +133,8 @@ UPDATE runs
 SET codex_cap_hash    = @hash,
     codex_claim_epoch = codex_claim_epoch + 1,
     updated_at        = now()
-WHERE id = @id AND worker_id = @worker_id;
+WHERE id = @id AND worker_id = @worker_id
+RETURNING codex_claim_epoch;
 
 -- name: AcquireCodexRefreshLease :execrows
 -- CAS-acquire the refresh lease on a provider account (PRD #1147 M2): move it to

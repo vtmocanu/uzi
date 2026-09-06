@@ -82,6 +82,10 @@ type codexCredStore interface {
 	// (the same by-id primitive openAnthropic resolves through). Returns the row's
 	// kind + sealed_with so the reconciler decrypts on the shared vault path.
 	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
+	// GetUserSecretCiphertext is the by-kind sibling; it is unused by the reconciler
+	// directly but required so this interface satisfies secretopen.Store, the surface
+	// OpenByIDOfKind resolves the kind-guarded open through.
+	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 }
 
 // codexLoginBlob is the shape of a codex_auth secret's decrypted ciphertext: a JSON
@@ -151,37 +155,27 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 		return fmt.Errorf("%w: status %q", ErrCodexStateNotReconcilable, st.Status)
 	}
 
-	// Open the alias's stored login blob, owner-scoped. GetUserSecretCiphertextByID's
-	// predicate is (id AND user_id), and we re-check the returned owner — the same
-	// defense-in-depth OpenByID applies — so a foreign or wrong-kind secret never
-	// reaches the decrypt.
-	row, err := r.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
-		ID:     userSecretID,
-		UserID: userID,
-	})
+	// Open the alias's stored login blob through the single kind-guarded path: the lookup,
+	// the owner re-check AND the kind check all live inside OpenByIDOfKind (audit #6), which
+	// folds a wrong-kind row into ErrNoSecret rather than disclosing it. The composite FK on
+	// codex_credential_state already ties this alias to a codex_auth secret, so a wrong kind
+	// is unreachable here; collapsing it into the not-found sentinel is acceptable (no test
+	// asserts the distinct ErrCodexSecretKind diagnostic).
+	plain, err := secretopen.OpenByIDOfKind(ctx, r.q, r.vlt, r.box, userID, userSecretID, store.KindCodexAuth)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		switch {
+		case errors.Is(err, secretopen.ErrNoSecret):
+			// A missing, foreign, or wrong-kind alias has nothing to reconcile.
 			return fmt.Errorf("%w: alias %s", ErrCodexStateMissing, userSecretID)
-		}
-		return fmt.Errorf("codex reconcile: read login: %w", err)
-	}
-	if row.UserID != userID {
-		return fmt.Errorf("%w: alias %s", ErrCodexStateMissing, userSecretID)
-	}
-	if row.Kind != store.KindCodexAuth {
-		return fmt.Errorf("%w: kind %q", ErrCodexSecretKind, row.Kind)
-	}
-
-	plain, err := secretopen.OpenSealed(r.vlt, r.box, userID, row.Kind, row.SealedWith, row.Ciphertext)
-	if err != nil {
-		// A locked vault is transient — never mark failed on it, the caller retries
-		// after the next unlock (the same contract secretopen gives every opener).
-		if errors.Is(err, secretopen.ErrVaultLocked) {
+		case errors.Is(err, secretopen.ErrVaultLocked):
+			// A locked vault is transient — never mark failed on it, the caller retries
+			// after the next unlock (the same contract secretopen gives every opener).
 			return err
+		default:
+			// Undecryptable material is terminal for this import.
+			r.markFailed(ctx, userID, userSecretID, "stored codex login could not be decrypted")
+			return fmt.Errorf("codex reconcile: open login: %w", err)
 		}
-		// Undecryptable material is terminal for this import.
-		r.markFailed(ctx, userID, userSecretID, "stored codex login could not be decrypted")
-		return fmt.Errorf("codex reconcile: open login: %w", err)
 	}
 
 	var blob codexLoginBlob
