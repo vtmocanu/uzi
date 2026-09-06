@@ -3,6 +3,7 @@ package workersvc
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -48,14 +49,20 @@ func TestMergeCodexLoginReplacesRefreshTokenWhenProvided(t *testing.T) {
 
 // TestCodexRefreshResolution proves the reconcile decision rule: a landed commit
 // (generation advanced) → reconciled; a surviving recovery copy at the stranded
-// generation → reconciled (recoverable, not total loss); generation unchanged with no
-// recovery copy → unrecoverable (re-login required).
+// generation → reconciled (recoverable, not total loss); a LIVE, validly-leased in-flight
+// rotation under this op → pending (leave rotating, PRD #1147 M4 defect 6); generation
+// unchanged with no recovery copy and no live lease → unrecoverable (re-login required).
 func TestCodexRefreshResolution(t *testing.T) {
-	intent := store.CodexRefreshIntent{FromGeneration: 3}
+	now := time.Unix(1_700_000_000, 0)
+	op := uuid.New()
+	intent := store.CodexRefreshIntent{OperationID: op, FromGeneration: 3}
+
+	// pgUUID mirrors how AcquireCodexRefreshLease stamps coord_operation_id.
+	pgUUID := func(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true} }
 
 	t.Run("landed commit reconciles", func(t *testing.T) {
 		acct := store.CodexProviderAccount{Generation: 4}
-		if got := codexRefreshResolution(acct, intent); got != codexIntentReconciled {
+		if got := codexRefreshResolution(now, acct, intent); got != codexIntentReconciled {
 			t.Fatalf("resolution = %q, want reconciled (generation advanced)", got)
 		}
 	})
@@ -66,14 +73,51 @@ func TestCodexRefreshResolution(t *testing.T) {
 			RecoverySealed:     []byte("sealed"),
 			RecoveryGeneration: pgtype.Int8{Int64: 3, Valid: true},
 		}
-		if got := codexRefreshResolution(acct, intent); got != codexIntentReconciled {
+		if got := codexRefreshResolution(now, acct, intent); got != codexIntentReconciled {
 			t.Fatalf("resolution = %q, want reconciled (recovery copy survives)", got)
+		}
+	})
+
+	t.Run("live lease of this op is pending", func(t *testing.T) {
+		acct := store.CodexProviderAccount{
+			Generation:       3,
+			CoordState:       codexCoordInProgress,
+			CoordOperationID: pgUUID(op),
+			LeaseDeadline:    pgtype.Timestamptz{Time: now.Add(5 * time.Second), Valid: true},
+		}
+		if got := codexRefreshResolution(now, acct, intent); got != codexIntentPending {
+			t.Fatalf("resolution = %q, want pending (live in-flight rotation of this op)", got)
+		}
+	})
+
+	t.Run("expired lease of this op is unrecoverable", func(t *testing.T) {
+		// A lease deadline in the PAST is not a live op (the reap would have quarantined it).
+		acct := store.CodexProviderAccount{
+			Generation:       3,
+			CoordState:       codexCoordInProgress,
+			CoordOperationID: pgUUID(op),
+			LeaseDeadline:    pgtype.Timestamptz{Time: now.Add(-time.Second), Valid: true},
+		}
+		if got := codexRefreshResolution(now, acct, intent); got != codexIntentUnrecoverable {
+			t.Fatalf("resolution = %q, want unrecoverable (expired lease is not live)", got)
+		}
+	})
+
+	t.Run("in_progress under a DIFFERENT op is unrecoverable", func(t *testing.T) {
+		acct := store.CodexProviderAccount{
+			Generation:       3,
+			CoordState:       codexCoordInProgress,
+			CoordOperationID: pgUUID(uuid.New()), // some other op holds the lease
+			LeaseDeadline:    pgtype.Timestamptz{Time: now.Add(5 * time.Second), Valid: true},
+		}
+		if got := codexRefreshResolution(now, acct, intent); got != codexIntentUnrecoverable {
+			t.Fatalf("resolution = %q, want unrecoverable (lease belongs to another op)", got)
 		}
 	})
 
 	t.Run("no recovery copy is unrecoverable", func(t *testing.T) {
 		acct := store.CodexProviderAccount{Generation: 3}
-		if got := codexRefreshResolution(acct, intent); got != codexIntentUnrecoverable {
+		if got := codexRefreshResolution(now, acct, intent); got != codexIntentUnrecoverable {
 			t.Fatalf("resolution = %q, want unrecoverable (no recovery, generation unchanged)", got)
 		}
 	})
@@ -84,7 +128,7 @@ func TestCodexRefreshResolution(t *testing.T) {
 			RecoverySealed:     []byte("sealed"),
 			RecoveryGeneration: pgtype.Int8{Int64: 99, Valid: true},
 		}
-		if got := codexRefreshResolution(acct, intent); got != codexIntentUnrecoverable {
+		if got := codexRefreshResolution(now, acct, intent); got != codexIntentUnrecoverable {
 			t.Fatalf("resolution = %q, want unrecoverable (recovery copy is for another generation)", got)
 		}
 	})

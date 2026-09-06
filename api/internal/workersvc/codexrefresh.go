@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // Codex COORDINATED-REFRESH state machine (PRD #1147 M2, B6), ships DARK. This is the
@@ -45,7 +47,45 @@ const (
 	codexIntentCommitted     = "committed"
 	codexIntentUnrecoverable = "unrecoverable"
 	codexIntentReconciled    = "reconciled"
+	// codexIntentPending is an IN-MEMORY sentinel, NOT a DB state value (it is deliberately
+	// the empty string so it can never satisfy the codex_refresh_intent.state CHECK). It is
+	// returned by codexRefreshResolution for a still-LIVE, validly-leased, in-flight rotation
+	// that the reconcile pass must LEAVE 'rotating' rather than resolve — the reconcile loop
+	// recognizes it and skips the SetCodexRefreshIntentState write (PRD #1147 M4, defect 6).
+	codexIntentPending = ""
 )
+
+// codexCoordInProgress is the codex_provider_account.coord_state value (migration 00199)
+// meaning a live refresh lease is held: a rotation is in flight under coord_operation_id
+// until lease_deadline. Named here so the reconcile pending predicate never spells a bare
+// literal that could drift from the schema.
+const codexCoordInProgress = "in_progress"
+
+// Recovery-slot persistence resilience bounds (PRD #1147 M4, defect 4). A freshly-rotated
+// (single-use) codex login must not be dropped because the REQUEST ctx was cancelled or a
+// single transient DB write blipped: persistCodexRecoverySlot writes on a DETACHED context
+// (context.WithoutCancel + a bounded WithTimeout) with a bounded synchronous retry, then
+// hands continued retry off to s.background rather than declaring loss.
+const (
+	// codexRecoverySlotWriteTimeout bounds ONE SetCodexRecoverySlot attempt on the detached
+	// context, so a wedged write cannot hang the caller (nor a background goroutine) forever.
+	codexRecoverySlotWriteTimeout = 5 * time.Second
+	// codexRecoverySlotSyncAttempts is how many times persistCodexRecoverySlot tries the
+	// write synchronously (on the detached ctx) before handing off to the background retrier.
+	codexRecoverySlotSyncAttempts = 2
+	// codexRecoverySlotBgAttempts is how many times the background retrier tries before it
+	// concludes loss is established and marks the intent unrecoverable.
+	codexRecoverySlotBgAttempts = 6
+	// codexRecoverySlotRetryBackoff spaces the retries; kept small so a synchronous test
+	// s.background override completes promptly.
+	codexRecoverySlotRetryBackoff = 20 * time.Millisecond
+)
+
+// errCodexRecoveryLost is the internal signal from persistCodexRecoverySlot that the
+// recovery write's loss is ESTABLISHED synchronously (e.g. no background seam is wired to
+// hand off to), so the caller must mark the intent unrecoverable. A transient/cancelled
+// write NEVER produces it — it is handed off to the background retrier instead.
+var errCodexRecoveryLost = errors.New("codex refresh: recovery material could not be persisted")
 
 // CodexRefreshOutcome names how a CoordinatedCodexRefresh resolved. It is observability
 // on top of the (result, error) contract: an ADVANCED/REPLAYED/RECONCILED outcome always
@@ -222,9 +262,16 @@ func (s *Service) openCodexAccountLogin(userID uuid.UUID, acct store.CodexProvid
 // the reconciler's sealLogin: with a vault it seals under the user's DEK
 // (sealed_with='dek', AAD user_id||codex_auth); without one (tests) it falls back to the
 // master box (sealed_with='master').
+// A locked vault surfaces as errVaultLocked (transient — the vault may unlock and a later
+// pass can seal), mirroring openCodexSealed's secretopen.ErrVaultLocked → errVaultLocked
+// mapping, so the advance path can classify a vault-locked seal as TRANSIENT and RETAIN the
+// rotated material instead of declaring it lost (PRD #1147 M4, defect 4).
 func (s *Service) sealCodexLogin(userID uuid.UUID, plaintext []byte) (sealed []byte, sealedWith string, err error) {
 	if s.vlt != nil {
 		sealed, err = s.vlt.Seal(userID, store.KindCodexAuth, plaintext)
+		if errors.Is(err, vault.ErrLocked) {
+			err = errVaultLocked
+		}
 		return sealed, store.SealedWithDEK, err
 	}
 	sealed, err = s.box.Seal(plaintext)
@@ -415,13 +462,29 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	sealed, sealedWith, err := s.sealCodexLogin(userID, raw)
 	if err != nil {
 		// The single-use provider exchange already SPENT account A's refresh token, but the
-		// merged login could not be sealed for durable storage. Returning bare here would
-		// strand a 'rotating' intent with a spent token and NO recovery material — and unlike
-		// the absence branch we cannot even protect the material, because the seal that failed
-		// is exactly what a recovery blob would need. So route it through the same
-		// unrecoverable resolution as an identity mismatch (codexQuarantineIdentityMismatch):
-		// mark the intent unrecoverable and quarantine the account (owner+op guarded), forcing
-		// a clean re-login. NO token is returned.
+		// merged login could not be sealed for durable storage — and unlike the absence branch
+		// we cannot protect the material, because the seal that failed is exactly what a
+		// recovery blob would need. The correct verdict turns on WHY the seal failed (PRD #1147
+		// M4, defect 4):
+		//
+		//   - TRANSIENT (a vault-locked seal, errVaultLocked): do NOT declare loss INLINE.
+		//     Quarantine the account (owner+op guarded) and LEAVE the intent 'rotating'. We do
+		//     NOT hold the unsealed plaintext to re-seal in the background — lingering raw login
+		//     material is a worse exposure than a re-login, and account A's single-use refresh
+		//     token was already spent by the exchange, so this specific material cannot be
+		//     recovered anyway. Leaving the intent rotating defers the verdict to the next
+		//     reconcile pass (account quarantined, generation unchanged, empty recovery slot →
+		//     unrecoverable → clean re-login) instead of racing an inline unrecoverable while the
+		//     vault is merely momentarily locked. Net effect vs the old code: same eventual
+		//     re-login, but a concurrent survivor is not told "unrecoverable" prematurely. NO
+		//     token is returned.
+		//   - PERMANENT (any other seal error): the material genuinely cannot be sealed, so route
+		//     it through the same unrecoverable resolution as an identity mismatch — mark the
+		//     intent unrecoverable and quarantine, forcing a clean re-login. NO token.
+		if errors.Is(err, errVaultLocked) {
+			_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
+			return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: seal of refreshed login temporarily unavailable: %v", ErrCodexRefreshQuarantined, err)
+		}
 		_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
 		_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
 		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: seal of refreshed login failed: %v", ErrCodexRefreshUnrecoverable, err)
@@ -435,22 +498,26 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	// DiscoverIdentity and branch on the account's FROZEN tuple:
 	//
 	//   - MATCH (both fields equal) → proceed to commit exactly as before.
-	//   - VERIFIED MISMATCH (discovery succeeded, tuple differs) OR incomplete identity
-	//     (ErrIdentityIncomplete) → the material is NOT account A's: do NOT commit and do
-	//     NOT write it to the recovery slot (it would poison a later promotion). Mark the
-	//     intent unrecoverable, quarantine (owner+op guarded), return NO token.
-	//   - ABSENCE (DiscoverIdentity itself errored transiently — network/5xx) → we ALREADY
-	//     spent account A's single-use refresh token, so the NEW material must be RETAINED,
-	//     not discarded: protect it in the recovery slot at from_generation and leave the
-	//     intent 'rotating' so a later promotion re-verifies it. Return NO token, but do NOT
-	//     claim recovery is impossible.
+	//   - VERIFIED MISMATCH (discovery succeeded, tuple positively DIFFERS) → the material is
+	//     NOT account A's: do NOT commit and do NOT write it to the recovery slot (it would
+	//     poison a later promotion). Mark the intent unrecoverable, quarantine (owner+op
+	//     guarded), return NO token.
+	//   - INCOMPLETE (ErrIdentityIncomplete — an authenticated 2xx MISSING subject/workspace,
+	//     i.e. "cannot tell", NOT a positively-different tuple) OR ABSENCE (DiscoverIdentity
+	//     itself errored transiently — network/5xx) → we ALREADY spent account A's single-use
+	//     refresh token and CANNOT yet establish a mismatch, so the NEW material must be
+	//     RETAINED, not discarded: protect it in the recovery slot at from_generation and leave
+	//     the intent 'rotating' so a later promotion re-verifies it. Return NO token, but do NOT
+	//     claim recovery is impossible (PRD #1147 M4, defect 5).
 	id, derr := s.codexRefresh.DiscoverIdentity(ctx, result.AccessToken)
 	switch {
 	case derr == nil && id.ProviderUserID == acct.ProviderUserID && id.WorkspaceAccountID == acct.WorkspaceAccountID:
 		// MATCH → fall through to the commit below.
-	case derr == nil || errors.Is(derr, codexauth.ErrIdentityIncomplete):
+	case derr == nil:
+		// VERIFIED MISMATCH: discovery succeeded and the tuple positively differs.
 		return s.codexQuarantineIdentityMismatch(ctx, q, userID, accountID, operationID)
 	default:
+		// ErrIdentityIncomplete ("cannot tell") OR a transient absence — both RETAIN.
 		return s.codexRetainUnverifiedMaterial(ctx, q, userID, accountID, operationID, acct.Generation, sealed, sealedWith, derr)
 	}
 
@@ -498,19 +565,14 @@ func (s *Service) handleCodexCommitFailure(ctx context.Context, q codexRefreshSt
 	}
 	// Protect the freshly-rotated material into the recovery slot and quarantine. The
 	// intent stays 'rotating' — a recovery scan will find the recovery copy at this
-	// from_generation and resolve it (reconciled), distinguishing it from total loss.
-	if _, rerr := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
-		Sealed:             sealedMerged,
-		Gen:                fromGeneration,
-		RecoverySealedWith: pgconv.Text(sealedWith),
-		ID:                 accountID,
-		UserID:             userID,
-		Op:                 operationID,
-	}); rerr != nil {
-		// Even the recovery write failed: the outcome is now truly unknown with no
-		// protected copy. Mark unrecoverable so the account routes to re-login.
-		_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
-		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshQuarantined, rerr)
+	// from_generation and resolve it (reconciled), distinguishing it from total loss. The
+	// write is RESILIENT (detached ctx + bounded retry + background handoff, PRD #1147 M4
+	// defect 4): a cancelled request ctx or a single transient DB blip no longer drops the
+	// single-use material. Only an ESTABLISHED loss (no background seam to hand off to)
+	// marks the intent unrecoverable.
+	if perr := s.persistCodexRecoverySlot(ctx, q, userID, accountID, operationID, fromGeneration, sealedMerged, sealedWith); perr != nil {
+		s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
+		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshQuarantined, perr)
 	}
 	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: commit failed: %v", ErrCodexRefreshQuarantined, commitErr)
 }
@@ -538,18 +600,85 @@ func (s *Service) codexQuarantineIdentityMismatch(ctx context.Context, q codexRe
 // recovery write fail, the outcome is truly unknown with no protected copy, so the intent
 // is marked unrecoverable.
 func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, sealedWith string, discoverErr error) (CodexRefreshResult, error) {
-	if _, rerr := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+	// The recovery write is RESILIENT (detached ctx + bounded retry + background handoff, PRD
+	// #1147 M4 defect 4): a cancelled request ctx or a single transient DB blip must not drop
+	// the single-use material. Only an ESTABLISHED loss marks the intent unrecoverable.
+	if perr := s.persistCodexRecoverySlot(ctx, q, userID, accountID, operationID, fromGeneration, sealedMerged, sealedWith); perr != nil {
+		s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
+		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshQuarantined, perr)
+	}
+	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: identity re-verification unavailable: %v", ErrCodexRefreshQuarantined, discoverErr)
+}
+
+// persistCodexRecoverySlot writes freshly-rotated (single-use) codex material into the
+// recovery slot RESILIENTLY (PRD #1147 M4, defect 4). It runs on a DETACHED context
+// (context.WithoutCancel of the request ctx, so a cancelled request no longer aborts the
+// write, plus a bounded WithTimeout so a wedged write cannot hang), and retries a bounded
+// number of times synchronously. If the synchronous retries are exhausted on a transient
+// error it hands continued retry off to s.background — holding the sealed material in the
+// closure — and returns nil (a RETAINED-pending outcome, NOT an established loss). It
+// returns errCodexRecoveryLost ONLY when loss is genuinely established synchronously: no
+// background seam is wired to hand off to. It preserves the store's coord_operation_id +
+// generation fences and recovery_sealed_with metadata (the SQL is unchanged).
+func (s *Service) persistCodexRecoverySlot(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, sealedWith string) error {
+	params := store.SetCodexRecoverySlotParams{
 		Sealed:             sealedMerged,
 		Gen:                fromGeneration,
 		RecoverySealedWith: pgconv.Text(sealedWith),
 		ID:                 accountID,
 		UserID:             userID,
 		Op:                 operationID,
-	}); rerr != nil {
-		_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
-		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshQuarantined, rerr)
 	}
-	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: identity re-verification unavailable: %v", ErrCodexRefreshQuarantined, discoverErr)
+
+	// Bounded synchronous retry on a detached ctx.
+	for attempt := 0; attempt < codexRecoverySlotSyncAttempts; attempt++ {
+		if s.writeCodexRecoverySlotOnce(ctx, q, params) {
+			return nil
+		}
+		if attempt < codexRecoverySlotSyncAttempts-1 {
+			time.Sleep(codexRecoverySlotRetryBackoff)
+		}
+	}
+
+	// Synchronous retries exhausted. Hand continued retry off to the background so the
+	// request no longer blocks on it and a cancelled request ctx cannot abort it. Without a
+	// background seam there is nowhere to hand off to, so loss is established here.
+	if s.background == nil {
+		return errCodexRecoveryLost
+	}
+	s.background(func() {
+		for attempt := 0; attempt < codexRecoverySlotBgAttempts; attempt++ {
+			if s.writeCodexRecoverySlotOnce(ctx, q, params) {
+				return
+			}
+			time.Sleep(codexRecoverySlotRetryBackoff)
+		}
+		// The background retrier gave up: loss is now established, so route the account to
+		// re-login by marking THIS op's intent unrecoverable, on its own fresh detached ctx.
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRecoverySlotWriteTimeout)
+		defer cancel()
+		s.markCodexIntentUnrecoverable(uctx, q, userID, operationID)
+		slog.Warn("codex refresh: recovery slot persistence gave up", "account", accountID, "operation", operationID)
+	})
+	return nil
+}
+
+// writeCodexRecoverySlotOnce performs ONE SetCodexRecoverySlot write on a detached,
+// bounded-timeout context derived from ctx, so a cancelled request ctx does not abort it.
+// It returns true when the write succeeded (a store error is a transient failure the caller
+// retries; a 0-row result preserves the store's pre-existing fence semantics).
+func (s *Service) writeCodexRecoverySlotOnce(ctx context.Context, q codexRefreshStore, params store.SetCodexRecoverySlotParams) bool {
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRecoverySlotWriteTimeout)
+	defer cancel()
+	_, err := q.SetCodexRecoverySlot(wctx, params)
+	return err == nil
+}
+
+// markCodexIntentUnrecoverable is the shared best-effort transition of an operation's intent
+// to 'unrecoverable' (the re-login-required signal). Best-effort by design: it is only ever
+// called on a path that already returns a quarantined/paused outcome with NO token.
+func (s *Service) markCodexIntentUnrecoverable(ctx context.Context, q codexRefreshStore, userID, operationID uuid.UUID) {
+	_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
 }
 
 // codexReplayAfterDuplicate resolves a 23505 on the pre-rotation intent insert: a prior
@@ -707,8 +836,16 @@ func (s *Service) ReconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 	}
 
 	resolved := 0
+	now := s.codexNow()
 	for _, it := range intents {
-		state := codexRefreshResolution(acct, it)
+		state := codexRefreshResolution(now, acct, it)
+		if state == codexIntentPending {
+			// A LIVE, validly-leased, in-flight rotation under THIS op (PRD #1147 M4, defect
+			// 6): reconciliation must NOT declare it. Leave the intent 'rotating' — no state
+			// write, not counted resolved — so the owning op can still commit, and it is not
+			// force-mutated in the intents slice passed to promoteCodexRecovery below.
+			continue
+		}
 		if _, serr := q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{
 			State:       state,
 			OperationID: it.OperationID,
@@ -740,11 +877,13 @@ func (s *Service) ReconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 // identity against the account's FROZEN tuple with a nonrotating DiscoverIdentity, and only
 // on a MATCH promotes it (PromoteCodexRecovery, CAS on from_generation) — installing the
 // recovery material as the live login, advancing the generation, clearing the quarantine.
-// A VERIFIED MISMATCH (or incomplete identity) means the recovery copy is not this
-// account's material after all, so every still-recoverable intent is corrected to
-// 'unrecoverable' and the account is left quarantined. A TRANSIENT DiscoverIdentity error
-// (or a locked vault) leaves the slot untouched for the next reconcile pass — the material
-// is retained, not lost. A nil identity seam (a Service wired without one) likewise defers.
+// A VERIFIED MISMATCH (discovery succeeded, tuple positively differs) means the recovery
+// copy is not this account's material after all, so every still-recoverable intent is
+// corrected to 'unrecoverable' and the account is left quarantined. An INCOMPLETE identity
+// (ErrIdentityIncomplete — "cannot tell", not a positively-different tuple) or a TRANSIENT
+// DiscoverIdentity error (or a locked vault) leaves the slot untouched for the next
+// reconcile pass — the material is retained, not lost (PRD #1147 M4, defect 5). A nil
+// identity seam (a Service wired without one) likewise defers.
 func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore, userID uuid.UUID, acct store.CodexProviderAccount, intents []store.CodexRefreshIntent) error {
 	if s.codexRefresh == nil {
 		return nil // no identity seam wired: cannot re-verify, leave for a later pass
@@ -776,11 +915,12 @@ func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore,
 			return fmt.Errorf("codex reconcile: promote recovery: %w", perr)
 		}
 		return nil
-	case derr == nil || errors.Is(derr, codexauth.ErrIdentityIncomplete):
-		// VERIFIED MISMATCH / incomplete: the recovery copy is not this account's. Correct
-		// ONLY the intents whose 'reconciled' verdict DEPENDED on this (now-untrusted)
-		// recovery copy — i.e. those reconciled via codexRefreshResolution's recovery-dependent
-		// branch, where it.FromGeneration == acct.RecoveryGeneration. An intent reconciled
+	case derr == nil:
+		// VERIFIED MISMATCH (tuple positively differs): the recovery copy is not this
+		// account's. Correct ONLY the intents whose 'reconciled' verdict DEPENDED on this
+		// (now-untrusted) recovery copy — i.e. those reconciled via codexRefreshResolution's
+		// recovery-dependent branch, where it.FromGeneration == acct.RecoveryGeneration. An
+		// intent reconciled
 		// because the account's generation independently ADVANCED past its from_generation
 		// (acct.Generation > it.FromGeneration, the generation-superseded branch) reflects a
 		// committed rotation that owes nothing to this recovery blob, so it stays 'reconciled'
@@ -803,13 +943,23 @@ func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore,
 		}
 		return nil
 	default:
-		return nil // transient discovery error: leave the slot for the next pass
+		// ErrIdentityIncomplete ("cannot tell") OR a transient discovery error: leave the
+		// slot untouched for the next reconcile pass, do NOT mark unrecoverable (PRD #1147 M4,
+		// defect 5).
+		return nil
 	}
 }
 
-// codexRefreshResolution decides the terminal state for a stranded 'rotating' intent given
-// the account's current facts. Pure, so the reconcile decision is unit-testable.
-func codexRefreshResolution(acct store.CodexProviderAccount, it store.CodexRefreshIntent) string {
+// codexRefreshResolution decides the state for a still-'rotating' intent given the account's
+// current facts and the reconcile clock. Pure, so the reconcile decision is unit-testable.
+//
+// It returns codexIntentPending (an IN-MEMORY sentinel, never a DB value) for a LIVE
+// in-flight rotation the reconcile pass must NOT declare (PRD #1147 M4, defect 6): the reap
+// (QuarantineExpiredCodexLease) already quarantined an EXPIRED lease before this runs, so an
+// account still 'in_progress' under this op with a valid, non-expired lease it owns and an
+// unchanged generation is a genuinely live op — declaring it unrecoverable would brick a
+// refresh that is about to commit. Every other stranded shape still resolves terminally.
+func codexRefreshResolution(now time.Time, acct store.CodexProviderAccount, it store.CodexRefreshIntent) string {
 	switch {
 	case acct.Generation > it.FromGeneration:
 		// A commit landed past this intent's starting generation → the rotation completed.
@@ -817,9 +967,15 @@ func codexRefreshResolution(acct store.CodexProviderAccount, it store.CodexRefre
 	case len(acct.RecoverySealed) > 0 && acct.RecoveryGeneration.Valid && acct.RecoveryGeneration.Int64 == it.FromGeneration:
 		// A recovery copy survives for this generation — recoverable, not total loss.
 		return codexIntentReconciled
+	case acct.CoordState == codexCoordInProgress &&
+		acct.CoordOperationID.Valid && uuid.UUID(acct.CoordOperationID.Bytes) == it.OperationID &&
+		acct.LeaseDeadline.Valid && acct.LeaseDeadline.Time.After(now) &&
+		acct.Generation == it.FromGeneration:
+		// A LIVE, validly-leased, in-flight rotation under THIS op → leave it 'rotating'.
+		return codexIntentPending
 	default:
-		// Generation unchanged, no recovery copy: the outcome is unknown and nothing
-		// survives to re-apply → re-login required.
+		// Generation unchanged, no recovery copy, no live lease of this op: the outcome is
+		// unknown and nothing survives to re-apply → re-login required.
 		return codexIntentUnrecoverable
 	}
 }

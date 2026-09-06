@@ -15,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // These tests exercise the coordinated Codex refresh state machine (PRD #1147 M2, B6,
@@ -125,6 +126,25 @@ func (h releaseHookStore) GetCodexProviderAccountByID(ctx context.Context, arg s
 		h.onAccountRead()
 	}
 	return acct, err
+}
+
+// recoverySlotHookStore wraps *store.Queries to make the FIRST failFirst
+// SetCodexRecoverySlot calls fail with a transient error, so a test can prove the resilient
+// recovery-slot persistence (PRD #1147 M4, defect 4): a bounded synchronous retry followed
+// by a background retry that eventually lands the write. Pointer receiver so `calls` counts
+// across the whole flow (sync + background attempts).
+type recoverySlotHookStore struct {
+	*store.Queries
+	failFirst int
+	calls     int
+}
+
+func (h *recoverySlotHookStore) SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error) {
+	h.calls++
+	if h.calls <= h.failFirst {
+		return 0, errors.New("recovery write blip")
+	}
+	return h.Queries.SetCodexRecoverySlot(ctx, arg)
 }
 
 // refreshFixture is a fully-seeded, linked subscription Codex run ready to refresh, with
@@ -1106,5 +1126,338 @@ func TestReleaseCodexAccessTokenAPIKeyLiveDB(t *testing.T) {
 	}
 	if tok != key {
 		t.Fatalf("released %q, want the static key %q", tok, key)
+	}
+}
+
+// ===========================================================================================
+// PRD #1147 M4 defect coverage (defects 4, 5, 6). These are LiveDB tests; the fail-old/
+// pass-fixed demonstrations revert each sub-fix in codexrefresh.go.
+// ===========================================================================================
+
+// TestCoordinatedCodexRefreshRecoverySlotRetryPersistsLiveDB (defect 4, sub-fix 2) proves the
+// recovery-slot write is RESILIENT: SetCodexRecoverySlot fails the first calls (a transient
+// blip) but the bounded synchronous retry, then the background retrier, eventually land it —
+// so the freshly-rotated single-use material is NOT dropped and the intent is NOT marked
+// unrecoverable. It drives the ABSENCE (transient DiscoverIdentity error) retain path.
+//
+// FAILS OLD: the old codexRetainUnverifiedMaterial wrote once on the request ctx and, on a
+// single write error, marked the intent unrecoverable and dropped the material.
+func TestCoordinatedCodexRefreshRecoverySlotRetryPersistsLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	// Absence: DiscoverIdentity errors transiently → the retain path writes the recovery slot.
+	fake.errByToken = map[string]error{newAccess: errors.New("codexauth: identity request: network unreachable")}
+	// The recovery write fails past the synchronous attempts, forcing the background retrier;
+	// the test's synchronous s.background runs it inline so the slot is populated by return.
+	hook := &recoverySlotHookStore{Queries: env.q, failFirst: codexRecoverySlotSyncAttempts + 1}
+	f.svc.q = hook
+	f.svc.SetBackground(func(fn func()) { fn() })
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+	if !errors.Is(err, ErrCodexRefreshQuarantined) {
+		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined", err)
+	}
+	if errors.Is(err, ErrCodexRefreshUnrecoverable) {
+		t.Fatalf("err = %v, must NOT be unrecoverable on a transient recovery-write blip", err)
+	}
+	if res.AccessToken != "" {
+		t.Fatalf("token = %q, want NO token", res.AccessToken)
+	}
+	// The write really was retried past the initial failures (sync exhausted, background landed).
+	if hook.calls <= codexRecoverySlotSyncAttempts {
+		t.Fatalf("SetCodexRecoverySlot calls = %d, want > %d (background retried past the sync attempts)", hook.calls, codexRecoverySlotSyncAttempts)
+	}
+	// The recovery slot was eventually populated despite the initial write failures.
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if len(acct.RecoverySealed) == 0 || !acct.RecoveryGeneration.Valid || acct.RecoveryGeneration.Int64 != 0 {
+		t.Fatalf("recovery slot not persisted after retry: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
+	}
+	// The intent stays 'rotating' (retained for a later promotion), NOT unrecoverable.
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
+		t.Fatalf("intent state = %q, want rotating (retained, not unrecoverable)", it.State)
+	}
+}
+
+// TestCoordinatedCodexRefreshRecoverySlotSurvivesCtxCancelLiveDB (defect 4, sub-fix 2) proves
+// a CANCELLED request ctx no longer drops the freshly-rotated material: the recovery write
+// runs on a DETACHED context (context.WithoutCancel), so it persists even though the request
+// ctx is cancelled at the exact moment the commit fails. The intent is NOT unrecoverable.
+//
+// FAILS OLD: the old recovery write reused the request ctx, so a cancelled ctx failed the
+// write and marked the intent unrecoverable, dropping the material.
+func TestCoordinatedCodexRefreshRecoverySlotSurvivesCtxCancelLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+
+	ctx, cancel := context.WithCancel(env.ctx)
+	defer cancel()
+	f.svc.q = refreshHookStore{
+		Queries:   env.q,
+		commitErr: errors.New("commit exploded"),
+		// The request ctx is cancelled as the commit fails and the recovery write is about to
+		// run: only a detached write survives it.
+		onCommit: func() { cancel() },
+	}
+
+	res, err := f.svc.CoordinatedCodexRefresh(ctx, f.wkr, f.runID, capw, op, 0)
+	if !errors.Is(err, ErrCodexRefreshQuarantined) {
+		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined", err)
+	}
+	if errors.Is(err, ErrCodexRefreshUnrecoverable) {
+		t.Fatalf("err = %v, must NOT be unrecoverable when only the request ctx was cancelled", err)
+	}
+	if res.AccessToken != "" {
+		t.Fatalf("token = %q, want NO token", res.AccessToken)
+	}
+	// The detached recovery write persisted despite the cancelled request ctx.
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if len(acct.RecoverySealed) == 0 || !acct.RecoveryGeneration.Valid || acct.RecoveryGeneration.Int64 != 0 {
+		t.Fatalf("recovery slot not persisted under a cancelled request ctx: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
+	}
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
+		t.Fatalf("intent state = %q, want rotating (retained, not unrecoverable)", it.State)
+	}
+}
+
+// TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB (defect 4, sub-fix 1) proves a
+// vault-locked seal AFTER a successful rotation is treated as TRANSIENT: the account is
+// quarantined for a survivor and the intent is LEFT 'rotating' (retried later), NOT marked
+// unrecoverable, and NO token is released.
+//
+// FAILS OLD: the old seal-failure branch marked ANY seal error unrecoverable + quarantine,
+// forcing a needless re-login on a transient vault lock.
+func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+
+	// Wire a real vault that is LOCKED for this user. The account's sealed_login is
+	// master-sealed (opens without an unlock), but the post-rotation reseal takes the dek path
+	// and returns vault.ErrLocked — a transient seal failure that must RETAIN, not brick.
+	f.svc.SetVault(vault.New(env.box, env.q))
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+	if !errors.Is(err, ErrCodexRefreshQuarantined) {
+		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined (retained)", err)
+	}
+	if errors.Is(err, ErrCodexRefreshUnrecoverable) {
+		t.Fatalf("err = %v, must NOT be unrecoverable on a transient vault-locked seal", err)
+	}
+	if res.Outcome != CodexRefreshQuarantined || res.AccessToken != "" {
+		t.Fatalf("result = %+v, want a quarantined outcome with NO token", res)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("provider calls = %d, want exactly 1", fake.calls)
+	}
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if acct.Generation != 0 {
+		t.Fatalf("generation = %d, want 0 (a vault-locked seal must not commit)", acct.Generation)
+	}
+	if acct.CoordState != codexCoordQuarantined {
+		t.Fatalf("coord_state = %q, want quarantined (retained for a survivor)", acct.CoordState)
+	}
+	// The intent stays 'rotating' — retried by a later pass, NOT marked unrecoverable.
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
+		t.Fatalf("intent state = %q, want rotating (retained, not unrecoverable)", it.State)
+	}
+}
+
+// TestCoordinatedCodexRefreshIdentityIncompleteRetainsLiveDB (defect 5, refresh-time) proves
+// an INCOMPLETE identity (an authenticated 2xx MISSING subject/workspace — "cannot tell") is
+// routed to the RETAIN path, NOT the confirmed-mismatch/unrecoverable path: the material is
+// kept in the recovery slot, the intent stays 'rotating', NO token is released, and a
+// subsequent verification (a later reconcile whose DiscoverIdentity now resolves the frozen
+// tuple) can still promote it.
+//
+// FAILS OLD: the old refresh-time switch bucketed ErrIdentityIncomplete with a confirmed
+// mismatch (codexQuarantineIdentityMismatch) — marked unrecoverable, no recovery slot.
+func TestCoordinatedCodexRefreshIdentityIncompleteRetainsLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	// The exchanged token returns an authenticated 2xx MISSING subject/workspace — not a
+	// positively-different tuple.
+	fake.errByToken = map[string]error{newAccess: codexauth.ErrIdentityIncomplete}
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+	if !errors.Is(err, ErrCodexRefreshQuarantined) {
+		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined (retained)", err)
+	}
+	if errors.Is(err, ErrCodexRefreshUnrecoverable) {
+		t.Fatalf("err = %v, must NOT be unrecoverable on an incomplete identity", err)
+	}
+	if res.Outcome != CodexRefreshQuarantined || res.AccessToken != "" {
+		t.Fatalf("result = %+v, want quarantined outcome with NO token", res)
+	}
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if acct.Generation != 0 {
+		t.Fatalf("generation = %d, want 0 (an unverified exchange must not commit)", acct.Generation)
+	}
+	// The material was RETAINED in the recovery slot, NOT discarded as a mismatch would.
+	if len(acct.RecoverySealed) == 0 || !acct.RecoveryGeneration.Valid || acct.RecoveryGeneration.Int64 != 0 {
+		t.Fatalf("recovery slot not retained on an incomplete identity: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
+	}
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
+		t.Fatalf("intent state = %q, want rotating (retained for a later promotion)", it.State)
+	}
+
+	// A subsequent verification can still succeed: once DiscoverIdentity resolves the account's
+	// frozen tuple, a reconcile pass promotes the retained material to the live login.
+	delete(fake.errByToken, newAccess)
+	fake.identityByToken = map[string]codexauth.Identity{
+		newAccess: {ProviderUserID: f.providerUserID, WorkspaceAccountID: f.workspaceAcctID},
+	}
+	if _, rerr := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID); rerr != nil {
+		t.Fatalf("reconcile after incomplete: %v", rerr)
+	}
+	acct = env.mustAccount(t, f.userID, f.accountID)
+	if acct.CoordState != "idle" || acct.Generation != 1 {
+		t.Fatalf("post-promotion account = (state=%q gen=%d), want (idle,1)", acct.CoordState, acct.Generation)
+	}
+	if blob := env.accountBlob(t, f.userID, f.accountID); blob.AccessToken != newAccess {
+		t.Fatalf("promoted login access token = %q, want the retained new %q", blob.AccessToken, newAccess)
+	}
+}
+
+// TestReconcileUnresolvedCodexRefreshIncompleteRecoveryRetainsLiveDB (defect 5, recovery
+// promotion) proves the promotion path leaves an INCOMPLETE-identity recovery slot for a
+// later pass instead of marking its recovery-dependent intents unrecoverable: the account
+// stays quarantined with its material and the intent is NOT unrecoverable.
+//
+// FAILS OLD: the old promoteCodexRecovery bucketed ErrIdentityIncomplete with a verified
+// mismatch and marked every recovery-dependent intent unrecoverable.
+func TestReconcileUnresolvedCodexRefreshIncompleteRecoveryRetainsLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fake := &fakeRefreshClient{}
+	f := newRefreshFixture(t, env, fake)
+
+	// Seed a recovery slot whose token discovers an INCOMPLETE identity ("cannot tell").
+	incompleteTok := codexToken("access-incomplete")
+	raw, merr := json.Marshal(codexLoginBlob{AccessToken: incompleteTok, RefreshToken: codexToken("r")}) //nolint:gosec // G117: synthetic recovery fixture, master-sealed below
+	if merr != nil {
+		t.Fatalf("marshal recovery blob: %v", merr)
+	}
+	sealed, serr := env.box.Seal(raw)
+	if serr != nil {
+		t.Fatalf("seal recovery blob: %v", serr)
+	}
+	op := uuid.New()
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+	if n, err := env.q.AcquireCodexRefreshLease(env.ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: op, Deadline: future, ID: f.accountID, UserID: f.userID, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
+	}
+	if _, err := env.q.SetCodexRecoverySlot(env.ctx, store.SetCodexRecoverySlotParams{
+		Sealed: sealed, Gen: 0, ID: f.accountID, UserID: f.userID,
+		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
+	}); err != nil {
+		t.Fatalf("seed recovery slot: %v", err)
+	}
+	if _, err := env.q.InsertCodexRefreshIntent(env.ctx, store.InsertCodexRefreshIntentParams{
+		OperationID: op, UserID: f.userID, ProviderAccountID: f.accountID, FromGeneration: 0,
+	}); err != nil {
+		t.Fatalf("insert intent: %v", err)
+	}
+	fake.errByToken = map[string]error{incompleteTok: codexauth.ErrIdentityIncomplete}
+
+	if _, err := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	// Incomplete ("cannot tell") must NOT promote AND must NOT mark unrecoverable: the slot is
+	// left for a later pass, the account stays quarantined with its material.
+	if acct.CoordState != codexCoordQuarantined {
+		t.Fatalf("coord_state = %q, want still quarantined (incomplete must not promote)", acct.CoordState)
+	}
+	if acct.Generation != 0 {
+		t.Fatalf("generation = %d, want 0 (incomplete must not advance)", acct.Generation)
+	}
+	if len(acct.RecoverySealed) == 0 {
+		t.Fatalf("recovery slot must be RETAINED on an incomplete identity, got empty")
+	}
+	if it := mustIntent(t, env, op, f.userID); it.State == codexIntentUnrecoverable {
+		t.Fatalf("intent state = %q, must NOT be unrecoverable on an incomplete identity", it.State)
+	}
+}
+
+// TestReconcileUnresolvedCodexRefreshLeavesLiveLeaseLiveDB (defect 6) proves reconciliation
+// does NOT declare a genuinely LIVE, validly-leased in-flight rotation unrecoverable: with a
+// non-expired lease held under its own op (in_progress, generation unchanged, empty recovery
+// slot), the intent is left 'rotating', nothing is counted resolved, and the original op can
+// still COMMIT successfully.
+//
+// FAILS OLD: the old codexRefreshResolution fell through to unrecoverable for a live op
+// (generation unchanged, no recovery slot), bricking a refresh that was about to commit.
+func TestReconcileUnresolvedCodexRefreshLeavesLiveLeaseLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	rotatedRefresh := codexToken("refresh-rotated")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess, RefreshToken: &rotatedRefresh}}
+	f := newRefreshFixture(t, env, fake)
+
+	// A LIVE op holds a valid, non-expired lease: in_progress under opX, generation unchanged,
+	// empty recovery slot — a rotation genuinely in flight.
+	opX := uuid.New()
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+	if n, err := env.q.AcquireCodexRefreshLease(env.ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: opX, Deadline: future, ID: f.accountID, UserID: f.userID, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
+	}
+	if _, err := env.q.InsertCodexRefreshIntent(env.ctx, store.InsertCodexRefreshIntentParams{
+		OperationID: opX, UserID: f.userID, ProviderAccountID: f.accountID, FromGeneration: 0,
+	}); err != nil {
+		t.Fatalf("insert intent: %v", err)
+	}
+
+	// Reconcile must NOT declare the live op: the intent is left 'rotating' and nothing counts.
+	n, err := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("resolved = %d, want 0 (a live op's intent is left untouched)", n)
+	}
+	if it := mustIntent(t, env, opX, f.userID); it.State != codexIntentRotating {
+		t.Fatalf("intent state = %q, want rotating (a live in-flight rotation must be left alone)", it.State)
+	}
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if acct.CoordState != codexCoordInProgress {
+		t.Fatalf("coord_state = %q, want in_progress (reconcile must not quarantine a live lease)", acct.CoordState)
+	}
+
+	// The original op can still COMMIT successfully: reconcile did not steal its lease nor
+	// quarantine it (no competing rotation, no premature re-login).
+	merged, mmerr := json.Marshal(codexLoginBlob{AccessToken: newAccess, RefreshToken: rotatedRefresh}) //nolint:gosec // G117: synthetic merged login fixture, master-sealed below
+	if mmerr != nil {
+		t.Fatalf("marshal merged blob: %v", mmerr)
+	}
+	sealedMerged, mserr := env.box.Seal(merged)
+	if mserr != nil {
+		t.Fatalf("seal merged blob: %v", mserr)
+	}
+	row, cerr := env.q.CommitCodexRefresh(env.ctx, store.CommitCodexRefreshParams{
+		Sealed: sealedMerged, SealedWith: store.SealedWithMaster, Op: opX, ID: f.accountID, UserID: f.userID, FromGeneration: 0,
+	})
+	if cerr != nil {
+		t.Fatalf("commit after reconcile: %v (the live op must still be able to commit)", cerr)
+	}
+	if row.Generation != 1 {
+		t.Fatalf("committed generation = %d, want 1", row.Generation)
 	}
 }
