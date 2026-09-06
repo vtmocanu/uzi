@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 )
 
 // Default provider base URLs. The usage base already includes the /backend-api
@@ -120,7 +121,7 @@ type Client struct {
 type Option func(*Client)
 
 // WithHTTPDoer injects the network seam (production: an *http.Client with sane
-// timeouts; tests: a fake). Nil is ignored, keeping the http.DefaultClient default.
+// timeouts; tests: a fake). Nil is ignored, keeping the default 15s-timeout client.
 func WithHTTPDoer(d httpDoer) Option {
 	return func(c *Client) {
 		if d != nil {
@@ -136,7 +137,7 @@ func WithHTTPDoer(d httpDoer) Option {
 // with a caller — an unused exported option would redden the deadcode gate now.
 func NewClient(opts ...Option) *Client {
 	c := &Client{
-		doer:      http.DefaultClient,
+		doer:      &http.Client{Timeout: 15 * time.Second},
 		usageBase: DefaultUsageBaseURL,
 		oauthBase: DefaultOAuthBaseURL,
 		clientID:  DefaultClientID,

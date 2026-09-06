@@ -938,11 +938,16 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 		}
 
 		if req.Token != nil {
-			if _, rerr := q.RotateUserSecret(r.Context(), store.RotateUserSecretParams{
+			rotated, rerr := q.RotateUserSecret(r.Context(), store.RotateUserSecretParams{
 				ID: secretID, UserID: user.ID, Ciphertext: sealed, SealedWith: sealedWith,
-			}); rerr != nil {
+			})
+			if rerr != nil {
 				return rerr
 			}
+			// RotateUserSecretRow is field-identical to RenameUserSecretRow (both carry
+			// CreatedAt/UpdatedAt); capture it so a rotate-only patch reports live
+			// timestamps instead of the zero values a bare cur copy would leave.
+			out = store.RenameUserSecretRow(rotated)
 			// A manual replacement invalidates the previous account binding: bump the
 			// material revision, reset the status for the kind, and drop the link.
 			if _, berr := q.BumpCodexMaterialRevision(r.Context(), store.BumpCodexMaterialRevisionParams{

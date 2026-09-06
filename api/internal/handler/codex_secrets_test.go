@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -162,6 +163,7 @@ func (f *fakeCodexDB) Exec(_ context.Context, sql string, args ...any) (pgconn.C
 		}
 	default:
 		f.unexpectedQuery = sql
+		return pgconn.CommandTag{}, fmt.Errorf("unexpected query: %s", sql)
 	}
 	return pgconn.CommandTag{}, nil
 }
@@ -179,6 +181,7 @@ func (f *fakeCodexDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, 
 		}
 	default:
 		f.unexpectedQuery = sql
+		return nil, fmt.Errorf("unexpected query: %s", sql)
 	}
 	return &fakeCodexRows{scans: scans}, nil
 }
