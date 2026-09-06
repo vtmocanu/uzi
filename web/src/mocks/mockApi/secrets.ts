@@ -113,11 +113,14 @@ function createCodexCredential(kind: CodexKind, label: string, isDefault: boolea
 }
 
 function patchCodexCredential(
+  kind: CodexKind,
   id: string,
   body: { label?: string; default?: boolean; token?: string },
 ) {
   const row = secrets.find((s) => s.id === id);
-  if (!row) throw new ApiError(404, "credential not found");
+  // The real route is kind-scoped (PATCH /me/secrets/{kind}/{id}), so an id of the
+  // wrong kind (e.g. an anthropic_token or the sibling codex kind) is a 404, not a hit.
+  if (!row || row.kind !== kind) throw new ApiError(404, "credential not found");
   if (body.token !== undefined) requireUnlockedVault();
   if (body.default === false) {
     throw new ApiError(400, "cannot clear the default; set another credential as default instead");
@@ -144,9 +147,11 @@ function patchCodexCredential(
   return delay({ secret: { ...row } });
 }
 
-function deleteCodexCredential(id: string) {
+function deleteCodexCredential(kind: CodexKind, id: string) {
   const row = secrets.find((s) => s.id === id);
-  if (!row) throw new ApiError(404, "credential not found");
+  // The real route is kind-scoped (DELETE /me/secrets/{kind}/{id}), so an id of the
+  // wrong kind (e.g. an anthropic_token or the sibling codex kind) is a 404, not a hit.
+  if (!row || row.kind !== kind) throw new ApiError(404, "credential not found");
   const codexRows = secrets.filter((s) => isCodexKind(s.kind));
   // D6, across BOTH codex kinds: the default may not be deleted while others exist.
   if (row.is_default && codexRows.length > 1) {
@@ -320,15 +325,15 @@ export const secretsApi = {
   patchCodexAuth: async (
     id: string,
     body: { label?: string; default?: boolean; token?: string },
-  ) => patchCodexCredential(id, body),
-  deleteCodexAuthById: async (id: string) => deleteCodexCredential(id),
+  ) => patchCodexCredential("codex_auth", id, body),
+  deleteCodexAuthById: async (id: string) => deleteCodexCredential("codex_auth", id),
   createOpenAIApiKey: async (_token: string, label: string, isDefault: boolean) =>
     createCodexCredential("openai_api_key", label, isDefault),
   patchOpenAIApiKey: async (
     id: string,
     body: { label?: string; default?: boolean; token?: string },
-  ) => patchCodexCredential(id, body),
-  deleteOpenAIApiKeyById: async (id: string) => deleteCodexCredential(id),
+  ) => patchCodexCredential("openai_api_key", id, body),
+  deleteOpenAIApiKeyById: async (id: string) => deleteCodexCredential("openai_api_key", id),
 
   // ── Vault (PRD #32) ───────────────────────────────────────────────────────────
   // Any non-empty password unlocks in the demo (there is no real crypto); an empty

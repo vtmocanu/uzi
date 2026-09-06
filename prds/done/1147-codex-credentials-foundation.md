@@ -1,7 +1,7 @@
 # PRD #1147: Named Codex credentials and dark run-binding foundation
 
 **Parent:** [#1106](https://github.com/vtmocanu/uzi/issues/1106), M1 only.
-**Status:** Ready for planning; implementation requires the plan gate below.
+**Status:** Complete — all four milestones implemented and landed on `agent/issue-1147` (see log below).
 **Execution:** Auto mode; MR rework enabled; implementation effort high.
 
 Users need to save named Codex subscription logins and OpenAI API keys, choose one Codex credential default and keep each run bound to its chosen credential. Implement credential management and the server/API foundation for later Codex execution. **M1 ships dark:** saving a credential does not enable provider execution. M3 owns the runtime bridge; M5 owns broad harness selection, schedules and routing.
