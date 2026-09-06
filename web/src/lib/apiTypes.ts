@@ -87,9 +87,9 @@ export interface SecretMeta {
 // #21).
 export interface UserSettings {
   default_model: string | null;
-  /** Per-user default reasoning effort (PRD #617); null means inherit — the worker
-   *  omits the SDK effort key, so the SDK default (`high`) applies. One of
-   *  low|medium|high|xhigh|max when set. */
+  /** Per-user default reasoning effort (PRD #617); null means the user has not chosen
+   *  (inherit), which resolves to the uzi default (`xhigh`) at claim assembly (issue
+   *  #1157). One of low|medium|high|xhigh|max when set. */
   default_effort: string | null;
   /** Per-user judge model override (PRD #69 M2); null means inherit the instance
    *  judge_model (which itself falls back to opus). Written through PUT /me/settings

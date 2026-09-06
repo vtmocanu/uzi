@@ -208,8 +208,8 @@ export function RunDefaults() {
   const [savedSummaryModel, setSavedSummaryModel] = useState("");
   const [summaryModelBusy, setSummaryModelBusy] = useState(false);
 
-  // Per-user default reasoning effort (PRD #617 M5): "" = inherit (the worker omits
-  // the SDK effort key, so the SDK default `high` applies). Its own saved/busy pair,
+  // Per-user default reasoning effort (PRD #617 M5): "" = inherit (a NULL/inherit value
+  // resolves to the uzi default `xhigh` at claim assembly, issue #1157). Its own saved/busy pair,
   // independent of the models above — same /me/settings endpoint, own field. Unlike
   // the model cards there is NO warning gate: the effort enum is closed, so the
   // dropdown can only ever emit a valid token or "".
@@ -345,7 +345,7 @@ export function RunDefaults() {
       setSavedEffort(eff);
       setNotice(
         eff === ""
-          ? "Reasoning effort cleared. Your runs use the SDK default (high)."
+          ? "Reasoning effort cleared. Your runs use the uzi default (xhigh)."
           : `Reasoning effort set to ${eff}. It applies to your next run.`,
       );
     } catch (err) {
@@ -736,13 +736,13 @@ export function RunDefaults() {
       {/* Per-user default reasoning effort (PRD #617 M5). A CLOSED dropdown — the SDK
           reasoning-effort levels plus Inherit — with no custom mode and no warning
           surface, because the enum is closed and the control can only emit a valid
-          level or "" (inherit). Leave it on Inherit to use the SDK default (high). */}
+          level or "" (inherit). Leave it on Inherit to use the uzi default (xhigh). */}
       <Card className="space-y-5">
         <div>
           <SectionTitle>Reasoning effort</SectionTitle>
           <p className="mt-2 text-sm text-muted">
             The Agent SDK reasoning-effort level your runs use. Leave it on{" "}
-            <em>Inherit</em> to use the SDK default (<code className="rounded bg-raised px-1 py-0.5 text-fg">high</code>).
+            <em>Inherit</em> to use the uzi default (<code className="rounded bg-raised px-1 py-0.5 text-fg">xhigh</code>).
             Higher levels reason more deeply and cost more; a level a given model does not
             support is silently downgraded to the nearest one it does. It applies to your
             own runs only; other users are unaffected.
