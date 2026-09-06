@@ -532,3 +532,270 @@ func TestCodexRefreshIntentLiveDB(t *testing.T) {
 		t.Fatalf("SetCodexRefreshIntentState(foreign user) = (%d,%v), want (0,nil)", n, err)
 	}
 }
+
+// TestSweepClaimedNeverStartedCodexRevocationLiveDB pins the sweeper's claimed→queued
+// path (PRD #1147 M2): sweeping a claimed run back to queued must ALSO revoke its
+// per-claim Codex capability — clear codex_cap_hash and bump codex_claim_epoch — so a
+// run swept off a lost claim cannot replay a live cap on its next claim. A non-codex
+// claimed run swept in the same pass keeps its unrelated columns (regression) and its
+// already-NULL cap_hash, with only the harmless epoch bump.
+func TestSweepClaimedNeverStartedCodexRevocationLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	repo, worker := codexRunFixture(ctx, t, pool, user)
+
+	// The sweep is global (status='claimed' AND claimed_at < cutoff, not owner-scoped),
+	// so key everything off a claimed_at far enough in the past that only our rows fall
+	// under our cutoff regardless of what else lives in a persistent DB.
+	old := pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Hour), Valid: true}
+	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
+
+	// A codex-bound claimed run: non-null cap_hash, a known epoch, claimed old.
+	codexRun := insertCodexRun(ctx, t, pool, user, repo, worker, 301, "claimed", "codex-marker")
+	mustExec(ctx, t, pool,
+		`UPDATE runs SET codex_cap_hash = $1, codex_claim_epoch = 5, claimed_at = $2 WHERE id = $3`,
+		[]byte("live-cap"), old, codexRun)
+
+	// A non-codex claimed run in the SAME sweep: no cap_hash, a marker to prove its
+	// unrelated columns survive.
+	plainRun := insertCodexRun(ctx, t, pool, user, repo, worker, 302, "claimed", "plain-marker")
+	mustExec(ctx, t, pool, `UPDATE runs SET claimed_at = $1 WHERE id = $2`, old, plainRun)
+	plainBefore, err := q.GetRunByID(ctx, plainRun)
+	if err != nil {
+		t.Fatalf("GetRunByID(plain before): %v", err)
+	}
+
+	if _, err := q.SweepClaimedNeverStarted(ctx, cutoff); err != nil {
+		t.Fatalf("SweepClaimedNeverStarted: %v", err)
+	}
+
+	// Codex run: queued, cap_hash revoked (NULL), epoch bumped 5 -> 6.
+	codexAfter, err := q.GetRunByID(ctx, codexRun)
+	if err != nil {
+		t.Fatalf("GetRunByID(codex after): %v", err)
+	}
+	if codexAfter.Status != "queued" {
+		t.Fatalf("codex run status = %q after sweep, want \"queued\"", codexAfter.Status)
+	}
+	if codexAfter.CodexCapHash != nil {
+		t.Fatalf("codex run cap_hash = %q after sweep, want NULL (revoked)", codexAfter.CodexCapHash)
+	}
+	if codexAfter.CodexClaimEpoch != 6 {
+		t.Fatalf("codex run epoch = %d after sweep, want 6 (5 -> 6)", codexAfter.CodexClaimEpoch)
+	}
+
+	// Non-codex run: queued, unrelated columns untouched, cap_hash stays NULL, epoch
+	// bumps harmlessly 0 -> 1 (the no-op revocation).
+	plainAfter, err := q.GetRunByID(ctx, plainRun)
+	if err != nil {
+		t.Fatalf("GetRunByID(plain after): %v", err)
+	}
+	if plainAfter.Status != "queued" {
+		t.Fatalf("plain run status = %q after sweep, want \"queued\"", plainAfter.Status)
+	}
+	if plainAfter.IssueDescription != plainBefore.IssueDescription || plainAfter.CodexSecretID.Valid {
+		t.Fatalf("non-codex run mutated by sweep: desc=%q secret_valid=%v", plainAfter.IssueDescription, plainAfter.CodexSecretID.Valid)
+	}
+	if plainAfter.CodexCapHash != nil || plainAfter.CodexClaimEpoch != 1 {
+		t.Fatalf("non-codex run after sweep: cap_hash=%q epoch=%d, want (NULL, 1)", plainAfter.CodexCapHash, plainAfter.CodexClaimEpoch)
+	}
+}
+
+// TestCommitCodexRefreshLeaseGuardLiveDB pins the lease guard the M2 review added to
+// CommitCodexRefresh (coord_state='in_progress' AND coord_operation_id=@op): a commit
+// at the unchanged generation is REFUSED unless the presenting operation still owns a
+// live in_progress lease. It covers (b) the quarantine-bypass block — a quarantined
+// lease-holder cannot commit at generation N, and the quarantine + recovery slot stay
+// intact — and (c) the wrong-op block, while confirming a genuine in_progress owner
+// still commits (advancing the generation, flipping to 'committed', clearing recovery).
+func TestCommitCodexRefreshLeaseGuardLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+
+	mkAccount := func() store.CodexProviderAccount {
+		acc, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+			UserID: user, ProviderUserID: "p-" + uuid.NewString(), WorkspaceAccountID: "w-" + uuid.NewString(),
+			SealedLogin: []byte("sealed"), SealedWith: store.SealedWithMaster,
+		})
+		if err != nil {
+			t.Fatalf("insert account: %v", err)
+		}
+		return acc
+	}
+	readAcc := func(id uuid.UUID) store.CodexProviderAccount {
+		got, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: user, ID: id})
+		if err != nil {
+			t.Fatalf("GetCodexProviderAccountByID: %v", err)
+		}
+		return got
+	}
+
+	// --- (b) quarantine-bypass: a quarantined lease-holder cannot commit at gen N. ---
+	// Acquire the lease as op (in_progress at gen 0), then quarantine via
+	// SetCodexRecoverySlot, which also parks a recovery slot. A stale/presumed-dead
+	// refresher then tries to commit at the unchanged generation with the original op.
+	qAcc := mkAccount()
+	op := uuid.New()
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: op, Deadline: future, ID: qAcc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease(quarantine case) = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+		Sealed: []byte("recovery-login"), Gen: 0, ID: qAcc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
+	}
+	if _, err := q.CommitCodexRefresh(ctx, store.CommitCodexRefreshParams{
+		Sealed: []byte("bypass"), SealedWith: store.SealedWithMaster, Op: op,
+		ID: qAcc.ID, UserID: user, FromGeneration: 0,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("CommitCodexRefresh(quarantined, gen 0) returned %v, want pgx.ErrNoRows — quarantine must not be bypassable", err)
+	}
+	// The account is untouched: still quarantined at gen 0, recovery slot intact.
+	if q1 := readAcc(qAcc.ID); q1.CoordState != "quarantined" || q1.Generation != 0 ||
+		string(q1.RecoverySealed) != "recovery-login" || !q1.RecoveryGeneration.Valid || q1.RecoveryGeneration.Int64 != 0 {
+		t.Fatalf("after refused commit: state=%q gen=%d recovery=%q recovery_gen=%+v, want (quarantined, 0, recovery-login, 0)",
+			q1.CoordState, q1.Generation, q1.RecoverySealed, q1.RecoveryGeneration)
+	}
+
+	// --- (c) wrong-op: only the lease OWNER commits, even at the right generation. ---
+	wAcc := mkAccount()
+	opA := uuid.New()
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: opA, Deadline: future, ID: wAcc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease(wrong-op case) = (%d,%v), want (1,nil)", n, err)
+	}
+	if _, err := q.CommitCodexRefresh(ctx, store.CommitCodexRefreshParams{
+		Sealed: []byte("intruder"), SealedWith: store.SealedWithMaster, Op: uuid.New(),
+		ID: wAcc.ID, UserID: user, FromGeneration: 0,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("CommitCodexRefresh(wrong op, gen 0) returned %v, want pgx.ErrNoRows — only the lease owner commits", err)
+	}
+	// Still owned by opA, in_progress, unadvanced.
+	if w1 := readAcc(wAcc.ID); w1.CoordState != "in_progress" || w1.Generation != 0 ||
+		!w1.CoordOperationID.Valid || uuid.UUID(w1.CoordOperationID.Bytes) != opA {
+		t.Fatalf("after wrong-op commit: state=%q gen=%d op=%+v, want (in_progress, 0, %s)",
+			w1.CoordState, w1.Generation, w1.CoordOperationID, opA)
+	}
+
+	// --- contrast: the genuine in_progress owner commits and the recovery slot clears. ---
+	gAcc := mkAccount()
+	opG := uuid.New()
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: opG, Deadline: future, ID: gAcc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease(genuine case) = (%d,%v), want (1,nil)", n, err)
+	}
+	// Park a recovery slot directly WITHOUT flipping coord_state (SetCodexRecoverySlot
+	// would quarantine), so we can prove a successful commit clears it.
+	mustExec(ctx, t, pool,
+		`UPDATE codex_provider_account SET recovery_sealed = $1, recovery_generation = 0 WHERE id = $2 AND user_id = $3`,
+		[]byte("stale-recovery"), gAcc.ID, user)
+	committed, err := q.CommitCodexRefresh(ctx, store.CommitCodexRefreshParams{
+		Sealed: []byte("fresh-login"), SealedWith: store.SealedWithMaster, Op: opG,
+		ID: gAcc.ID, UserID: user, FromGeneration: 0,
+	})
+	if err != nil {
+		t.Fatalf("CommitCodexRefresh(genuine owner, gen 0): %v", err)
+	}
+	if committed.Generation != 1 || committed.CoordState != "committed" ||
+		!committed.CommittedGeneration.Valid || committed.CommittedGeneration.Int64 != 1 {
+		t.Fatalf("genuine commit result = (gen=%d state=%q committed_gen=%+v), want (1, committed, 1)",
+			committed.Generation, committed.CoordState, committed.CommittedGeneration)
+	}
+	if g1 := readAcc(gAcc.ID); g1.RecoverySealed != nil || g1.RecoveryGeneration.Valid {
+		t.Fatalf("after genuine commit recovery slot = (sealed=%q gen=%+v), want cleared (NULL, NULL)",
+			g1.RecoverySealed, g1.RecoveryGeneration)
+	}
+}
+
+// TestSetCodexRecoverySlotLiveDB pins SetCodexRecoverySlot (PRD #1147 M2): from an
+// in_progress account it writes recovery_sealed/recovery_generation and flips
+// coord_state to 'quarantined', parking the account for reconciliation.
+func TestSetCodexRecoverySlotLiveDB(t *testing.T) {
+	ctx, _, q, user := codexLiveDB(t)
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+
+	acc, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+		UserID: user, ProviderUserID: "p-" + uuid.NewString(), WorkspaceAccountID: "w-" + uuid.NewString(),
+		SealedLogin: []byte("sealed"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
+	}
+
+	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+		Sealed: []byte("prior-good-login"), Gen: 3, ID: acc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
+	}
+	got, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: user, ID: acc.ID})
+	if err != nil {
+		t.Fatalf("GetCodexProviderAccountByID: %v", err)
+	}
+	if string(got.RecoverySealed) != "prior-good-login" || !got.RecoveryGeneration.Valid ||
+		got.RecoveryGeneration.Int64 != 3 || got.CoordState != "quarantined" {
+		t.Fatalf("after SetCodexRecoverySlot = (sealed=%q gen=%+v state=%q), want (prior-good-login, 3, quarantined)",
+			got.RecoverySealed, got.RecoveryGeneration, got.CoordState)
+	}
+
+	// Owner-scoping: a foreign user_id sets nothing.
+	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+		Sealed: []byte("x"), Gen: 9, ID: acc.ID, UserID: uuid.New(),
+	}); err != nil || n != 0 {
+		t.Fatalf("SetCodexRecoverySlot(foreign user) = (%d,%v), want (0,nil)", n, err)
+	}
+}
+
+// TestAcquireCodexRefreshLeaseFromCommittedLiveDB pins the committed→in_progress source
+// of AcquireCodexRefreshLease (PRD #1147 M2): an account left 'committed' after a prior
+// refresh cycle can be re-acquired for the next one, complementing the idle→in_progress
+// case already covered in TestCodexRefreshCoordinationLiveDB.
+func TestAcquireCodexRefreshLeaseFromCommittedLiveDB(t *testing.T) {
+	ctx, _, q, user := codexLiveDB(t)
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+
+	acc, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+		UserID: user, ProviderUserID: "p-" + uuid.NewString(), WorkspaceAccountID: "w-" + uuid.NewString(),
+		SealedLogin: []byte("sealed"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	// Drive it to 'committed' via a genuine acquire+commit cycle.
+	op := uuid.New()
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: op, Deadline: future, ID: acc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease(idle) = (%d,%v), want (1,nil)", n, err)
+	}
+	if _, err := q.CommitCodexRefresh(ctx, store.CommitCodexRefreshParams{
+		Sealed: []byte("committed-login"), SealedWith: store.SealedWithMaster, Op: op,
+		ID: acc.ID, UserID: user, FromGeneration: 0,
+	}); err != nil {
+		t.Fatalf("CommitCodexRefresh: %v", err)
+	}
+	if got, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: user, ID: acc.ID}); err != nil {
+		t.Fatalf("read committed: %v", err)
+	} else if got.CoordState != "committed" {
+		t.Fatalf("coord_state = %q before re-acquire, want \"committed\"", got.CoordState)
+	}
+
+	// Re-acquire from 'committed' for the next cycle.
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease(committed) = (%d,%v), want (1,nil) — a committed account is re-acquirable", n, err)
+	}
+	if got, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: user, ID: acc.ID}); err != nil {
+		t.Fatalf("read re-acquired: %v", err)
+	} else if got.CoordState != "in_progress" {
+		t.Fatalf("coord_state = %q after re-acquire, want \"in_progress\"", got.CoordState)
+	}
+}

@@ -7158,6 +7158,12 @@ UPDATE runs SET status = 'queued', status_since = now(),
     -- Exit contract (PRD #47 Decision 3): reset on the way to a fresh 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- Codex claim-capability revocation (PRD #1147 M2): this is the sweeper's
+    -- claimed→queued path (RequeueClaimedRunToQueued mirrors it) — losing the claim
+    -- must revoke the per-claim capability here too, or a run swept back to queued
+    -- would keep a live cap_hash replayable on its next claim. Clear the hash and
+    -- bump the epoch; a harmless no-op for non-codex runs (cap_hash already NULL).
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE status = 'claimed' AND claimed_at < $1
 RETURNING id, user_id, status

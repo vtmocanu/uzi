@@ -109,7 +109,13 @@ WHERE id = @id AND user_id = @user_id
 -- a no-op. committed_generation records the generation this commit produced, and the
 -- recovery slot is cleared (the commit succeeded, so there is nothing to roll back to).
 -- The immutable identity tuple (provider_user_id/workspace_account_id) is deliberately
--- NOT touched. pgx.ErrNoRows means the generation moved — the CAS was lost. Owner-scoped.
+-- NOT touched. pgx.ErrNoRows means the CAS was lost — EITHER the generation moved OR this
+-- operation no longer holds a live lease. The coord_state='in_progress' AND
+-- coord_operation_id=@op guard is load-bearing (PRD #1147 M2, B6 §9): a lease that expired
+-- and was moved to 'quarantined' must NOT be revivable into a commit by its presumed-dead
+-- refresher — that would silently bypass the quarantine (clearing the recovery slot and
+-- flipping quarantined→committed) exactly when the rotation outcome is ambiguous. Only the
+-- operation that still owns the in_progress lease may commit. Owner-scoped.
 UPDATE codex_provider_account
 SET generation           = generation + 1,
     sealed_login         = @sealed,
@@ -121,6 +127,7 @@ SET generation           = generation + 1,
     recovery_generation  = NULL,
     updated_at           = now()
 WHERE id = @id AND user_id = @user_id AND generation = @from_generation::bigint
+    AND coord_state = 'in_progress' AND coord_operation_id = @op::uuid
 RETURNING generation, coord_state, committed_generation;
 
 -- name: SetCodexRecoverySlot :execrows
