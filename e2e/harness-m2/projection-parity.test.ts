@@ -5,7 +5,9 @@
 // (projectItem/projectResult, harness-messages.ts) are the SAME core: for a
 // representative frame of each kind, mapSdkMessage(rawSdkFrame) is DEEP-EQUAL to
 // projectItem/projectResult over the equivalent HAND-BUILT neutral input — same
-// key set, same key order, same undefined-key presence. Pure and credential-free.
+// key set and same undefined-key presence (deepStrictEqual is key-order-independent;
+// exact key ORDER is pinned by the existing agent/test mapper fixtures, the D0
+// oracle these differential tests complement). Pure and credential-free.
 
 import test from "node:test";
 import assert from "node:assert/strict";

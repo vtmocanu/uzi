@@ -1,7 +1,7 @@
 # PRD #1146: Extract the Claude harness boundary with zero behavior change
 
 **Parent:** [#1106](https://github.com/vtmocanu/uzi/issues/1106), M2 only.
-**Status:** Ready; requires merged M0 contract before execution.
+**Status:** Complete (2026-09-06) — all four milestones delivered on branch `agent/issue-1146`; see the decision log. Archived to `prds/done/`.
 **Execution:** Auto mode; MR rework remains enabled.
 **Effort:** high.
 
