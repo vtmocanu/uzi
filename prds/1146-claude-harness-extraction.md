@@ -1,7 +1,7 @@
 # PRD #1146: Extract the Claude harness boundary with zero behavior change
 
 **Parent:** [#1106](https://github.com/vtmocanu/uzi/issues/1106), M2 only.
-**Status:** Ready; requires merged M0 contract before execution.
+**Status:** Complete (2026-09-06) — all four milestones delivered on branch `agent/issue-1146`, including the MR !1153 rework that moved the run-lane `SdkOptions` construction into the Claude adapter and fixed two terminal-decode regressions; see the decision log for the final validated commit and per-gate evidence. Retained at `prds/` (not archived to `prds/done/`) while parent [#1106](https://github.com/vtmocanu/uzi/issues/1106) still links to it here; archival is deferred to a follow-up on `main` that can repoint that inbound link at the same time.
 **Execution:** Auto mode; MR rework remains enabled.
 **Effort:** high.
 
@@ -29,21 +29,21 @@ The shared advice ceiling permits isolated pure in-memory calculation for both C
 
 ## Implementation milestones
 
-- [ ] **1. Extract neutral records, decoding and reduction.**
+- [x] **1. Extract neutral records, decoding and reduction.**
 
 Create the neutral contract module and reducer (the companion proposes `agent/src/harness.ts` and `agent/src/harness-reducer.ts`). Move Claude decoding behind the adapter boundary; keep `sdk-messages.ts` callable for existing chat/tests without a second independent mapper. Move existing signal parsers rather than changing their rules. Provider SDK imports and raw events must not enter the neutral reducer. Preserve the accepted uzi wire capsule; normalized fields do not replace it.
 
-- [ ] **2. Route the existing Claude run implementation through the seam.**
+- [x] **2. Route the existing Claude run implementation through the seam.**
 
 Create the Claude adapter (the companion proposes `agent/src/claude-harness.ts`) and retain `sdk-executor.ts` as the workflow/constructor compatibility owner. Move query options, process ownership and session inspection; keep planning, approval, watchdog policy, checkpoints, git and run-state transitions with their existing uzi owners.
 
 Split run tool handlers from Claude `createSdkMcpServer` registration in the signal, memory, forge and findings modules. Keep registration in-process with identical names, schemas, descriptions, response objects, error text, role reach and call timing. Reuse the existing memory/findings handler seams. Preserve the forge server's single per-run shared call budget and run-bound closures; do not reset that budget per tool or turn. Signal handlers still return guidance and the stream reducer still owns workflow capture. Chat-only `uzi-tools.ts` behavior stays intact.
 
-- [ ] **3. Extract the Claude advice adapter with existing caller policies.**
+- [x] **3. Extract the Claude advice adapter with existing caller policies.**
 
 Keep `model-pass.ts` as the timeout/callback compatibility owner around the advice adapter. Judge/review/summary retain their outer parsing, fallback, usage and reporting policies. Preserve sparse environment, no run cwd, ephemeral HOME permissions, detached runner-uid spawn, deny-all hook, literal `settingSources: []`, model omission rules and exact label/error strings. All existing advice requests remain text output; prompts requesting JSON do not gain native output-schema enforcement.
 
-- [ ] **4. Validate the extraction and stop at M2.**
+- [x] **4. Validate the extraction and stop at M2.**
 
 Run `task gate:agent` and `task sast:semgrep` against the final tree. Record the command exit status and actual executed test results; a zero failure tally alone is insufficient. Confirm dead-code analysis actually ran, and preserve literal `settingSources: []` at each Claude options construction site. Demonstrate that the Semgrep rule still detects a temporary explicit widening in each moved options site, then restore and inspect the diff; also inspect options coverage for omission, which that rule cannot detect.
 
@@ -62,3 +62,6 @@ The parent's credential-kind/row identity, per-seat identity, CAS/recovery, rout
 ## Decision and progress log
 
 - 2026-09-06: User authorized M2-only Auto mode with MR rework enabled. Scope inherits accepted M0 contracts; wider provider enablement remains blocked.
+- 2026-09-06: M2 delivered on branch `agent/issue-1146`. New neutral seam `agent/src/harness.ts` + `harness-reducer.ts` + `harness-messages.ts` + `claude-harness.ts`; `sdk-executor.ts` drives `HarnessTurn`+reducer while owning trip>throw>terminal precedence, `Date.now()` limit classification and `materialize`; forge/signal tool handlers split from `createSdkMcpServer` registration (forge single per-run budget preserved); advice lane routed through a module-local `ClaudeAdviceHarness` in `model-pass.ts`. Neutral `RunTurnReducer` is SDK-free; raw `scanSignals`/`isSubagentFrame` stay adapter-side per the accepted plan revision.
+- 2026-09-06 (MR !1153 rework): completed the run-lane query-options lift required by milestone 2 and removed the earlier (unapproved) deferral to M3. The `SdkOptions` object assembly — including the literal `settingSources: []` isolation — now lives in `claude-harness.ts` `buildSdkOptions`, assembled from an owner-computed private `ClaudeTurnConfig`; the owner still computes every ingredient (roster, prompts, hooks, live in-process MCP server instances, env, model/effort/attribution) and the live Claude bindings ride that private config, not the neutral `RunTurnRequest`. Object reuse (the one base config across plan+revise turns), phase overrides (`agents`/`systemPrompt`/`preToolUse`), option omission and per-turn resume/abort/spawn finalization are byte-identical to before the lift. Also fixed two D0 terminal-decode regressions the rework flagged: `decodeResult` (`sdk-messages.ts`) now String-maps `errors` on the failed-outcome path only (a success frame with a malformed `errors` element no longer throws before terminal accounting), and `neutralTerminal` (`model-pass.ts`) projects a non-string `subtype` to `"unknown"` without a raw `String()` coercion. Regression controls added in `e2e/harness-m2/terminal-decode-regression.test.ts`.
+- 2026-09-06: Validation against the final implementation commit `282a65a5` (base `c4eb47e6`; the PRD update commit on top is documentation-only). Per-gate results, each run once to a log on the committed tree: `task gate:agent` EXIT=0 (`typecheck:agent`/`lint:agent` clean, `deadcode:agent` knip EXIT=0 — dead-code analysis confirmed run, `test:agent` 2028 pass / 0 fail / 1 pre-existing skip); `task gate:repo` EXIT=0 (incl. `lint:yaml` clean over 27 YAML files and `sast:semgrep` 0 findings with the canary DETECTED); `task test:harness-m2` EXIT=0 (tsc `--noEmit` typecheck of the suites + 29 differential tests pass, incl. the 4 new terminal-decode controls). Semgrep guardrail-invariant-#6 positive control: temporarily widening the moved `claude-harness.ts` site to `settingSources: ["project"]` fired `settingsources-must-be-empty`, restored to `[]` returns to zero. `agent/test/` byte-identical to base and `.github/workflows/` unchanged (both verified by empty `git diff c4eb47e6..HEAD -- <path>`).
