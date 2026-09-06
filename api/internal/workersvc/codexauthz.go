@@ -42,10 +42,16 @@ const (
 //
 // parked states ARE included on purpose — 'limit_wait' and the awaiting_* parks are a
 // worker still holding the run, and D4 requires persist-before-park, so a park must be
-// able to persist recovery material. 'queued' is deliberately EXCLUDED: it is the
-// requeue gap where the run has been handed back and no worker owns it (the capability
-// is revoked and the epoch bumped on that transition), and the terminal states
-// ('completed'/'failed'/'cancelled') are excluded because a finished run spends nothing.
+// able to persist recovery material. The following are deliberately EXCLUDED, all on the
+// same principle (no worker is actively executing the run, so no live capability should
+// be honored): 'queued' — the requeue gap where the run was handed back and no worker
+// owns it (the capability is revoked and the epoch bumped on that transition);
+// 'pool_wait' — reached only when claim assembly aborts on an empty auto-pool BEFORE the
+// codex branch mints a capability, so it is a not-yet-executing wait like 'queued', not a
+// worker-attached park (a codex run therefore never carries a live cap in this state, and
+// excluding it keeps the predicate correct if codex is later wired onto the auto-pool
+// lane); and the terminal states ('completed'/'failed'/'cancelled') — a finished run
+// spends nothing.
 var codexActivelyClaimedStatuses = map[string]bool{
 	"claimed":           true,
 	"running":           true,
@@ -306,7 +312,16 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 		return CodexAuthContext{}, ErrCodexScopeNotApplicable
 	}
 
-	// (2) capability: epoch first (a stale-epoch capability is rejected even if its
+	// (2) currently-owning worker — checked BEFORE the capability so a caller who does
+	// not own the run cannot use the distinct capability/epoch sentinels as an oracle to
+	// learn another user's claim epoch (GetRunCodexAuthContext reads by run id, so the
+	// row belongs to whatever run the guessed id names; the ownership gate is the tenant
+	// boundary and must precede any capability-specific reject).
+	if !row.WorkerID.Valid || uuid.UUID(row.WorkerID.Bytes) != wkr.ID {
+		return CodexAuthContext{}, ErrCodexWorkerMismatch
+	}
+
+	// (3) capability: epoch first (a stale-epoch capability is rejected even if its
 	// hash was cleared or would otherwise match), then the constant-time hash compare.
 	presentedEpoch, secret, parsed := parseCodexCapability(presentedCapability)
 	if !parsed {
@@ -320,11 +335,6 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 	}
 	if subtle.ConstantTimeCompare(hashCodexCapability(secret), row.CodexCapHash) != 1 {
 		return CodexAuthContext{}, ErrCodexCapabilityMismatch
-	}
-
-	// (3) currently-owning worker.
-	if !row.WorkerID.Valid || uuid.UUID(row.WorkerID.Bytes) != wkr.ID {
-		return CodexAuthContext{}, ErrCodexWorkerMismatch
 	}
 
 	// (4) actively-claimed status (NOT queued, NOT terminal).
