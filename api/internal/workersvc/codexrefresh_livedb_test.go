@@ -24,23 +24,51 @@ import (
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres. All fixtures use
 // fresh UUIDs so a single-process `-run 'LiveDB$'` sweep never collides.
 
-// fakeRefreshClient is the in-process oauth-exchange seam. It counts Refresh calls
-// (proving replay/reconcile spend ZERO), records the refresh token it was handed, and
+// fakeRefreshClient is the in-process oauth-exchange + identity seam. It counts Refresh
+// calls (proving replay/reconcile spend ZERO), records the refresh token it was handed, and
 // returns a configured result (single-use rotating tokens set by the test).
+//
+// It ALSO implements DiscoverIdentity (audit #2): the coordinated refresher now re-verifies
+// the freshly-exchanged access token against the account's frozen tuple. By default
+// DiscoverIdentity returns matchIdentity (which newRefreshFixture pins to the fixture
+// account's tuple, so the happy path MATCHES); a test overrides a specific token via
+// identityByToken (a VERIFIED MISMATCH / incomplete) or errByToken (a TRANSIENT absence).
+// onRefresh, when set, fires inside Refresh after counting — a test uses it to stale
+// authority mid-exchange (audit #3b).
 type fakeRefreshClient struct {
 	calls            int
 	lastRefreshToken string
 	result           codexauth.RefreshResult
 	err              error
+
+	matchIdentity   codexauth.Identity            // default DiscoverIdentity answer
+	identityByToken map[string]codexauth.Identity // per-token identity override
+	errByToken      map[string]error              // per-token DiscoverIdentity error
+	discoverCalls   int
+	onRefresh       func() // fires inside Refresh, after counting (audit #3b hook)
 }
 
 func (f *fakeRefreshClient) Refresh(_ context.Context, refreshToken string) (codexauth.RefreshResult, error) {
 	f.calls++
 	f.lastRefreshToken = refreshToken
+	if f.onRefresh != nil {
+		f.onRefresh()
+	}
 	if f.err != nil {
 		return codexauth.RefreshResult{}, f.err
 	}
 	return f.result, nil
+}
+
+func (f *fakeRefreshClient) DiscoverIdentity(_ context.Context, accessToken string) (codexauth.Identity, error) {
+	f.discoverCalls++
+	if err, ok := f.errByToken[accessToken]; ok {
+		return codexauth.Identity{}, err
+	}
+	if id, ok := f.identityByToken[accessToken]; ok {
+		return id, nil
+	}
+	return f.matchIdentity, nil
 }
 
 // refreshHookStore wraps *store.Queries to force a CommitCodexRefresh failure path: an
@@ -109,6 +137,8 @@ type refreshFixture struct {
 	wkr              store.Worker
 	accessToken      string // the account's committed access token at generation 0
 	prevRefreshToken string // the refresh token the first exchange must be handed
+	providerUserID   string // the account's frozen identity tuple (for re-verification)
+	workspaceAcctID  string
 }
 
 // newRefreshFixture seeds a linked subscription account at generation 0 with known tokens,
@@ -144,6 +174,13 @@ func newRefreshFixture(t *testing.T, env codexTestEnv, fake CodexRefreshClient) 
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatalf("FreezeCodexBinding: %v", err)
 	}
+
+	// Pin the fake's default DiscoverIdentity answer to the account's frozen tuple so the
+	// post-refresh re-verification (audit #2) MATCHES on the happy path; a test that wants a
+	// mismatch/absence overrides a specific token via identityByToken/errByToken.
+	acct := env.mustAccount(t, userID, accountID)
+	setFakeMatchIdentity(fake, codexauth.Identity{ProviderUserID: acct.ProviderUserID, WorkspaceAccountID: acct.WorkspaceAccountID})
+
 	return refreshFixture{
 		userID:           userID,
 		workerID:         workerID,
@@ -154,6 +191,20 @@ func newRefreshFixture(t *testing.T, env codexTestEnv, fake CodexRefreshClient) 
 		wkr:              store.Worker{ID: workerID, UserID: userID},
 		accessToken:      access,
 		prevRefreshToken: refresh,
+		providerUserID:   acct.ProviderUserID,
+		workspaceAcctID:  acct.WorkspaceAccountID,
+	}
+}
+
+// setFakeMatchIdentity pins the default DiscoverIdentity answer on whichever concrete fake
+// a fixture was handed, so the post-refresh re-verification (audit #2) matches on the happy
+// path without every test re-registering the tuple.
+func setFakeMatchIdentity(fake CodexRefreshClient, id codexauth.Identity) {
+	switch c := fake.(type) {
+	case *fakeRefreshClient:
+		c.matchIdentity = id
+	case *mintingRefreshClient:
+		c.matchIdentity = id
 	}
 }
 
@@ -631,6 +682,289 @@ func mustIntent(t *testing.T, env codexTestEnv, op, userID uuid.UUID) store.Code
 		t.Fatalf("read intent: %v", err)
 	}
 	return it
+}
+
+// TestCoordinatedCodexRefreshIdentityMatchCommitsLiveDB (audit #2, MATCH) proves the
+// post-refresh re-verification does NOT reject a valid refresh: when the freshly-exchanged
+// access token discovers the SAME account tuple, the rotation commits and the token is
+// returned — a guard against a check that wrongly rejects legitimate refreshes.
+func TestCoordinatedCodexRefreshIdentityMatchCommitsLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	// Explicitly register the exchanged token → the account's frozen tuple (a MATCH).
+	fake.identityByToken = map[string]codexauth.Identity{
+		newAccess: {ProviderUserID: f.providerUserID, WorkspaceAccountID: f.workspaceAcctID},
+	}
+	capw := env.mintCap(t, f.runID, f.workerID)
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, uuid.New(), 0)
+	if err != nil {
+		t.Fatalf("match advance: %v", err)
+	}
+	if res.Outcome != CodexRefreshAdvanced || res.Generation != 1 || res.AccessToken != newAccess {
+		t.Fatalf("result = %+v, want advanced/gen1/%q", res, newAccess)
+	}
+	if fake.discoverCalls != 1 {
+		t.Fatalf("discover calls = %d, want exactly 1 (one re-verification)", fake.discoverCalls)
+	}
+	if blob := env.accountBlob(t, f.userID, f.accountID); blob.AccessToken != newAccess {
+		t.Fatalf("committed access token = %q, want %q", blob.AccessToken, newAccess)
+	}
+}
+
+// TestCoordinatedCodexRefreshIdentityMismatchQuarantinesLiveDB (audit #2, VERIFIED MISMATCH)
+// proves that when the freshly-exchanged access token discovers a DIFFERENT account tuple,
+// the material is NEITHER committed NOR written to the recovery slot: the account is
+// quarantined, the intent is unrecoverable, and NO token is returned.
+//
+// FAILS OLD: the old advance path committed whatever the exchange returned, sealing account
+// B's login under account A and handing back B's token.
+func TestCoordinatedCodexRefreshIdentityMismatchQuarantinesLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	// The exchanged token discovers a DIFFERENT account than the one we are rotating.
+	fake.identityByToken = map[string]codexauth.Identity{
+		newAccess: {ProviderUserID: "other-user-" + uuid.NewString(), WorkspaceAccountID: "other-acct-" + uuid.NewString()},
+	}
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+	if !errors.Is(err, ErrCodexRefreshUnrecoverable) {
+		t.Fatalf("err = %v, want ErrCodexRefreshUnrecoverable", err)
+	}
+	if res.Outcome != CodexRefreshQuarantined || res.AccessToken != "" {
+		t.Fatalf("result = %+v, want quarantined outcome with NO token", res)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("provider calls = %d, want exactly 1", fake.calls)
+	}
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if acct.Generation != 0 {
+		t.Fatalf("generation = %d, want 0 (a mismatch must not commit)", acct.Generation)
+	}
+	if acct.CoordState != codexCoordQuarantined {
+		t.Fatalf("coord_state = %q, want quarantined", acct.CoordState)
+	}
+	if len(acct.RecoverySealed) != 0 {
+		t.Fatalf("recovery slot must be EMPTY on a mismatch (material is not this account's), got %d bytes", len(acct.RecoverySealed))
+	}
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentUnrecoverable {
+		t.Fatalf("intent state = %q, want unrecoverable", it.State)
+	}
+}
+
+// TestCoordinatedCodexRefreshIdentityAbsenceRetainsLiveDB (audit #2, ABSENCE) proves that a
+// TRANSIENT DiscoverIdentity error after a successful exchange does NOT discard the new
+// material: the single-use refresh token was already spent, so the merged blob is RETAINED
+// in the recovery slot and the intent is LEFT 'rotating' for a later promotion to
+// re-verify. No token is returned, but recovery is possible.
+func TestCoordinatedCodexRefreshIdentityAbsenceRetainsLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	// DiscoverIdentity itself errors transiently (network/5xx) — an ABSENCE, not a verdict.
+	fake.errByToken = map[string]error{newAccess: errors.New("codexauth: identity request: network unreachable")}
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+	if !errors.Is(err, ErrCodexRefreshQuarantined) {
+		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined", err)
+	}
+	if res.Outcome != CodexRefreshQuarantined || res.AccessToken != "" {
+		t.Fatalf("result = %+v, want quarantined outcome with NO token", res)
+	}
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if acct.Generation != 0 {
+		t.Fatalf("generation = %d, want 0 (an unverified exchange must not commit)", acct.Generation)
+	}
+	if len(acct.RecoverySealed) == 0 || !acct.RecoveryGeneration.Valid || acct.RecoveryGeneration.Int64 != 0 {
+		t.Fatalf("recovery slot not retained: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
+	}
+	// The retained material really is the NEW access token, openable for a later promotion.
+	if blob := env.openSealedBlob(t, f.userID, acct.RecoverySealed, acct.SealedWith); blob.AccessToken != newAccess {
+		t.Fatalf("recovery blob access token = %q, want the retained new %q", blob.AccessToken, newAccess)
+	}
+	// The intent stays 'rotating' so a promotion pass re-verifies later — NOT unrecoverable.
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
+		t.Fatalf("intent state = %q, want rotating (retained for a later promotion)", it.State)
+	}
+}
+
+// TestCoordinatedCodexRefreshRecheckDiscardsTokenLiveDB (audit #3b) proves the post-exchange
+// release recheck: authority is staled DURING the exchange (a hook bumps the account's
+// credential_revision inside Refresh), so the durable commit STILL lands (good for the
+// account) but THIS run — whose authority was lost mid-IO — is refused the token.
+//
+// FAILS OLD: the old CoordinatedCodexRefresh authorized only before the network and returned
+// the freshly-committed token unconditionally, leaking it to a run that no longer owned it.
+func TestCoordinatedCodexRefreshRecheckDiscardsTokenLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	capw := env.mintCap(t, f.runID, f.workerID)
+
+	// During the exchange (before the commit and the outer recheck), a genuine account-level
+	// revoke bumps credential_revision, staling this run's frozen authority.
+	fake.onRefresh = func() {
+		env.exec(`UPDATE codex_provider_account SET credential_revision = credential_revision + 1 WHERE id=$1`, f.accountID)
+	}
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, uuid.New(), 0)
+	if !errors.Is(err, ErrCodexAccountRevisionStale) {
+		t.Fatalf("err = %v, want ErrCodexAccountRevisionStale from the recheck", err)
+	}
+	if res.Outcome != CodexRefreshContended || res.AccessToken != "" {
+		t.Fatalf("result = %+v, want a contended outcome with NO token", res)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("provider calls = %d, want exactly 1", fake.calls)
+	}
+	// The durable commit STANDS: the account advanced to generation 1 and settled to idle —
+	// only THIS run was refused the token, the rotation is good for the next authorized run.
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if acct.Generation != 1 {
+		t.Fatalf("generation = %d, want 1 (the durable commit must stand)", acct.Generation)
+	}
+	if blob := env.accountBlob(t, f.userID, f.accountID); blob.AccessToken != newAccess {
+		t.Fatalf("committed access token = %q, want the rotated %q", blob.AccessToken, newAccess)
+	}
+}
+
+// TestReconcileUnresolvedCodexRefreshPromotesRecoveryLiveDB (audit #5, recovery promotion)
+// proves the reconcile roll-forward: a commit-failure into the recovery slot leaves the
+// account quarantined on the OLD token; a reconcile pass with a MATCHING-identity fake
+// promotes the recovery material, so the account is coord-idle, the generation advanced, the
+// recovery slot cleared, and its sealed_login OPENS to the NEW access token (usable).
+//
+// FAILS OLD: the old reconcile only resolved intents and left the account quarantined on the
+// pre-rotation token — never promoting the protected material.
+func TestReconcileUnresolvedCodexRefreshPromotesRecoveryLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+
+	t.Run("matching recovery is promoted usable", func(t *testing.T) {
+		newAccess := codexToken("access-new")
+		fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+		f := newRefreshFixture(t, env, fake)
+		capw := env.mintCap(t, f.runID, f.workerID)
+
+		// A commit-failure after a MATCHED exchange protects the new material into recovery.
+		f.svc.q = refreshHookStore{Queries: env.q, commitErr: errors.New("commit exploded")}
+		op := uuid.New()
+		if _, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0); !errors.Is(err, ErrCodexRefreshQuarantined) {
+			t.Fatalf("seed commit-failure: err = %v, want ErrCodexRefreshQuarantined", err)
+		}
+		pre := env.mustAccount(t, f.userID, f.accountID)
+		if pre.CoordState != codexCoordQuarantined || len(pre.RecoverySealed) == 0 {
+			t.Fatalf("precondition: account not quarantined-with-recovery: state=%q sealed=%d", pre.CoordState, len(pre.RecoverySealed))
+		}
+
+		// Reconcile on the un-hooked store (the commit hook was only for the seed) with the
+		// same MATCHING-identity fake → promotion installs the recovery material.
+		f.svc.q = env.q
+		n, err := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID)
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("resolved = %d, want 1", n)
+		}
+		acct := env.mustAccount(t, f.userID, f.accountID)
+		if acct.CoordState != "idle" {
+			t.Fatalf("coord_state = %q, want idle after promotion", acct.CoordState)
+		}
+		if acct.Generation != 1 {
+			t.Fatalf("generation = %d, want 1 (promotion advances)", acct.Generation)
+		}
+		if len(acct.RecoverySealed) != 0 || acct.RecoveryGeneration.Valid {
+			t.Fatalf("recovery slot not cleared: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
+		}
+		// The account's live login now OPENS to the NEW access token — usable, not the old one.
+		if blob := env.accountBlob(t, f.userID, f.accountID); blob.AccessToken != newAccess {
+			t.Fatalf("promoted sealed_login access token = %q, want the new %q", blob.AccessToken, newAccess)
+		}
+		if it := mustIntent(t, env, op, f.userID); it.State != codexIntentReconciled {
+			t.Fatalf("intent state = %q, want reconciled", it.State)
+		}
+
+		// Idempotent: a second reconcile is a no-op (account already idle, nothing to promote).
+		n2, err := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID)
+		if err != nil {
+			t.Fatalf("second reconcile: %v", err)
+		}
+		if n2 != 0 {
+			t.Fatalf("second reconcile resolved %d, want 0 (no-op)", n2)
+		}
+		if a2 := env.mustAccount(t, f.userID, f.accountID); a2.Generation != 1 || a2.CoordState != "idle" {
+			t.Fatalf("second reconcile mutated the account: gen=%d state=%q", a2.Generation, a2.CoordState)
+		}
+	})
+
+	t.Run("mismatched recovery is not promoted, intent unrecoverable", func(t *testing.T) {
+		fake := &fakeRefreshClient{}
+		f := newRefreshFixture(t, env, fake)
+
+		// Seed a recovery slot directly with a blob whose token discovers a DIFFERENT tuple.
+		mismatchTok := codexToken("access-mismatch")
+		raw, merr := json.Marshal(codexLoginBlob{AccessToken: mismatchTok, RefreshToken: codexToken("r")}) //nolint:gosec // G117: synthetic recovery fixture, master-sealed below
+		if merr != nil {
+			t.Fatalf("marshal recovery blob: %v", merr)
+		}
+		sealed, serr := env.box.Seal(raw)
+		if serr != nil {
+			t.Fatalf("seal recovery blob: %v", serr)
+		}
+		if _, err := env.q.SetCodexRecoverySlot(env.ctx, store.SetCodexRecoverySlotParams{
+			Sealed: sealed, Gen: 0, ID: f.accountID, UserID: f.userID,
+		}); err != nil {
+			t.Fatalf("seed recovery slot: %v", err)
+		}
+		op := uuid.New()
+		if _, err := env.q.InsertCodexRefreshIntent(env.ctx, store.InsertCodexRefreshIntentParams{
+			OperationID: op, UserID: f.userID, ProviderAccountID: f.accountID, FromGeneration: 0,
+		}); err != nil {
+			t.Fatalf("insert intent: %v", err)
+		}
+		// The recovery token verifies to a DIFFERENT account than the one it sits under.
+		fake.identityByToken = map[string]codexauth.Identity{
+			mismatchTok: {ProviderUserID: "other-" + uuid.NewString(), WorkspaceAccountID: "other-" + uuid.NewString()},
+		}
+
+		if _, err := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		acct := env.mustAccount(t, f.userID, f.accountID)
+		if acct.CoordState != codexCoordQuarantined {
+			t.Fatalf("coord_state = %q, want still quarantined (mismatch must not promote)", acct.CoordState)
+		}
+		if acct.Generation != 0 {
+			t.Fatalf("generation = %d, want 0 (mismatch must not advance)", acct.Generation)
+		}
+		if it := mustIntent(t, env, op, f.userID); it.State != codexIntentUnrecoverable {
+			t.Fatalf("intent state = %q, want unrecoverable (recovery copy is bad)", it.State)
+		}
+	})
+}
+
+// openSealedBlob opens and decodes an arbitrary sealed codex login blob (master box).
+func (e codexTestEnv) openSealedBlob(t *testing.T, userID uuid.UUID, sealed []byte, sealedWith string) codexLoginBlob {
+	t.Helper()
+	plain, err := secretopen.OpenSealed(nil, e.box, userID, store.KindCodexAuth, sealedWith, sealed)
+	if err != nil {
+		t.Fatalf("open sealed blob: %v", err)
+	}
+	var b codexLoginBlob
+	if err := json.Unmarshal(plain, &b); err != nil {
+		t.Fatalf("decode sealed blob: %v", err)
+	}
+	return b
 }
 
 // TestReleaseCodexAccessTokenSubscriptionLiveDB proves release returns the subscription

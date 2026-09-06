@@ -39,6 +39,11 @@ type fakeCodexIdentity struct {
 
 	discoverCalls int
 	refreshCalls  int
+	// onDiscover, when set, fires INSIDE DiscoverIdentity after counting and before the
+	// identity is returned — the relink-CAS race hook (audit #4): a test uses it to bump the
+	// alias's material_revision in the exact window between the reconcile's state read and its
+	// link.
+	onDiscover func()
 }
 
 func newFakeCodexIdentity() *fakeCodexIdentity {
@@ -50,6 +55,9 @@ func newFakeCodexIdentity() *fakeCodexIdentity {
 
 func (f *fakeCodexIdentity) DiscoverIdentity(_ context.Context, accessToken string) (codexauth.Identity, error) {
 	f.discoverCalls++
+	if f.onDiscover != nil {
+		f.onDiscover()
+	}
 	if err, ok := f.errByToken[accessToken]; ok {
 		return codexauth.Identity{}, err
 	}
@@ -314,6 +322,115 @@ func mustState(t *testing.T, env codexTestEnv, userID, alias uuid.UUID) store.Co
 		t.Fatalf("read state %s: %v", alias, err)
 	}
 	return st
+}
+
+// TestReconcileCodexRelinkRaceLostLiveDB (audit #4) proves the material-revision CAS on the
+// relink: when the alias's material_revision advances (a manual replace) between the
+// reconcile's state read and its link, the link matches 0 rows and the reconcile surfaces
+// ErrCodexRelinkRaceLost — it does NOT flip the alias to 'linked' and does NOT re-point it
+// at the stale account it resolved.
+//
+// FAILS OLD: the old link() surfaced 0 rows as ErrCodexStateMissing (a "vanished alias"),
+// conflating a transient replace-race with a terminal not-found.
+func TestReconcileCodexRelinkRaceLostLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID := env.seedUser(t)
+
+	providerUser := "user-" + uuid.NewString()
+	workspace := "acct-" + uuid.NewString()
+	sameID := codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace}
+
+	// alias1 creates the account (plain fake, no hook).
+	tok1 := codexToken("access-1")
+	alias1 := env.seedStagingAlias(t, userID, "codex-race-a", codexLoginBlob{AccessToken: tok1, RefreshToken: codexToken("r")})
+	fakeA := newFakeCodexIdentity()
+	fakeA.idByToken[tok1] = sameID
+	if err := NewCodexReconciler(env.q, nil, env.box, fakeA).ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
+		t.Fatalf("reconcile alias1: %v", err)
+	}
+
+	// alias2 resolves to the SAME (now-existing) account. Its DiscoverIdentity hook bumps
+	// alias2's own material_revision in the window between the state read and the link.
+	tok2 := codexToken("access-2")
+	alias2 := env.seedStagingAlias(t, userID, "codex-race-b", codexLoginBlob{AccessToken: tok2, RefreshToken: codexToken("r")})
+	fakeB := newFakeCodexIdentity()
+	fakeB.idByToken[tok2] = sameID
+	fakeB.onDiscover = func() {
+		if _, err := env.q.BumpCodexMaterialRevision(env.ctx, store.BumpCodexMaterialRevisionParams{
+			Status: "staging", UserSecretID: alias2, UserID: userID,
+		}); err != nil {
+			t.Errorf("bump alias2 material: %v", err)
+		}
+	}
+
+	err := NewCodexReconciler(env.q, nil, env.box, fakeB).ReconcileCodexAuthIdentity(env.ctx, userID, alias2)
+	if !errors.Is(err, ErrCodexRelinkRaceLost) {
+		t.Fatalf("err = %v, want ErrCodexRelinkRaceLost", err)
+	}
+	st2 := mustState(t, env, userID, alias2)
+	if st2.Status == "linked" {
+		t.Fatalf("alias2 status = %q, want NOT linked (the relink lost the CAS)", st2.Status)
+	}
+	if st2.ProviderAccountID.Valid {
+		t.Fatalf("alias2 provider_account_id must be unchanged (unset), got %x", st2.ProviderAccountID.Bytes)
+	}
+}
+
+// TestReconcileCodexReLoginRestoresQuarantinedLiveDB (audit #5, verified re-login) proves the
+// existing-account restore: a same-tuple re-login of a QUARANTINED account (a dead login the
+// coordinated refresher could not roll forward) installs the freshly-verified imported blob
+// as the canonical login BEFORE linking, so the account's sealed_login now opens to the NEW
+// access token and the account is coord-idle again.
+//
+// FAILS OLD: the old existing-account branch only linked and never overwrote the sealed_login,
+// leaving the account quarantined on the dead token.
+func TestReconcileCodexReLoginRestoresQuarantinedLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID := env.seedUser(t)
+
+	providerUser := "user-" + uuid.NewString()
+	workspace := "acct-" + uuid.NewString()
+	sameID := codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace}
+
+	// alias1 creates the account (its blob becomes the canonical login).
+	tok1 := codexToken("access-1")
+	alias1 := env.seedStagingAlias(t, userID, "codex-relogin-a", codexLoginBlob{AccessToken: tok1, RefreshToken: codexToken("r")})
+	fake := newFakeCodexIdentity()
+	fake.idByToken[tok1] = sameID
+	r := NewCodexReconciler(env.q, nil, env.box, fake)
+	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
+		t.Fatalf("reconcile alias1: %v", err)
+	}
+	st1 := mustState(t, env, userID, alias1)
+	accountID := uuid.UUID(st1.ProviderAccountID.Bytes)
+
+	// The account's login goes dead → the coordinated refresher quarantines it.
+	env.exec(`UPDATE codex_provider_account SET coord_state='quarantined' WHERE id=$1`, accountID)
+
+	// A fresh re-login import (alias2) resolves to the SAME account with a NEW token.
+	tok2 := codexToken("access-2")
+	alias2 := env.seedStagingAlias(t, userID, "codex-relogin-b", codexLoginBlob{AccessToken: tok2, RefreshToken: codexToken("r2")})
+	fake.idByToken[tok2] = sameID
+	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias2); err != nil {
+		t.Fatalf("reconcile alias2 (re-login): %v", err)
+	}
+
+	acct := env.mustAccount(t, userID, accountID)
+	if acct.CoordState != "idle" {
+		t.Fatalf("coord_state = %q, want idle after a verified re-login", acct.CoordState)
+	}
+	if acct.Generation != 1 {
+		t.Fatalf("generation = %d, want 1 (re-login advances)", acct.Generation)
+	}
+	// The canonical login now OPENS to the NEW access token — the dead login was replaced.
+	if blob := env.accountBlob(t, userID, accountID); blob.AccessToken != tok2 {
+		t.Fatalf("restored sealed_login access token = %q, want the re-login %q", blob.AccessToken, tok2)
+	}
+	// alias2 is linked to the same account.
+	st2 := mustState(t, env, userID, alias2)
+	if st2.Status != "linked" || uuid.UUID(st2.ProviderAccountID.Bytes) != accountID {
+		t.Fatalf("alias2 = (status %q, account %x), want linked to %s", st2.Status, st2.ProviderAccountID.Bytes, accountID)
+	}
 }
 
 // Guard: the reconciler refuses a non-reconcilable status without touching anything.

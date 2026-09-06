@@ -43,6 +43,14 @@ var (
 	// ErrCodexLoginBlob: the stored codex_auth ciphertext did not decode to a login
 	// blob with a usable access token.
 	ErrCodexLoginBlob = errors.New("stored codex login blob is unusable")
+	// ErrCodexRelinkRaceLost: the alias's material_revision advanced between the
+	// reconcile's state read and its CAS relink (a manual replace raced a slow discovery),
+	// so LinkCodexCredentialState matched 0 rows. TRANSIENT and distinct from
+	// ErrCodexStateMissing (the alias genuinely vanished): the replacement's own material
+	// bump re-triggers reconcile on the NEW material, which will relink correctly. The
+	// reconcile must NOT mark the alias failed on this — it is not a failure, it is a
+	// superseded attempt.
+	ErrCodexRelinkRaceLost = errors.New("codex relink lost a material-revision race")
 )
 
 // CodexIdentityClient is the injectable identity seam the reconciler depends on
@@ -66,6 +74,10 @@ type codexCredStore interface {
 	LinkCodexCredentialState(ctx context.Context, arg store.LinkCodexCredentialStateParams) (int64, error)
 	GetCodexProviderAccountByTuple(ctx context.Context, arg store.GetCodexProviderAccountByTupleParams) (store.CodexProviderAccount, error)
 	InsertCodexProviderAccount(ctx context.Context, arg store.InsertCodexProviderAccountParams) (store.CodexProviderAccount, error)
+	// RefreshCodexAccountLogin installs a freshly-sealed, VERIFIED login on an account and
+	// advances its generation — the verified re-login restore for a quarantined (dead-login)
+	// account whose canonical login must be replaced from a freshly imported blob (audit #5).
+	RefreshCodexAccountLogin(ctx context.Context, arg store.RefreshCodexAccountLoginParams) (int64, error)
 	// GetUserSecretCiphertextByID opens the alias's stored login blob, owner-scoped
 	// (the same by-id primitive openAnthropic resolves through). Returns the row's
 	// kind + sealed_with so the reconciler decrypts on the shared vault path.
@@ -198,10 +210,30 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 	})
 	switch {
 	case err == nil:
-		// Existing account for this tuple: link to it. Do NOT overwrite its
-		// sealed_login — the account is authoritative and another alias may already
-		// have sealed the canonical material.
-		if lerr := r.link(ctx, userID, userSecretID, acct.ID); lerr != nil {
+		// Existing account for this tuple. The imported blob's identity is freshly VERIFIED
+		// (that is how we resolved THIS account), so:
+		//   - if the account is QUARANTINED (a dead login the coordinated refresher could not
+		//     roll forward), RESTORE the canonical login from this verified blob BEFORE
+		//     linking (audit #5): RefreshCodexAccountLogin installs it, advances the
+		//     generation, and clears the quarantine, so the account is usable again;
+		//   - if the account is HEALTHY (idle/committed), keep the no-overwrite converge — it
+		//     is authoritative and another alias may already hold the canonical material.
+		// Order: verify identity → (if quarantined) restore login → CAS-link.
+		if acct.CoordState == codexCoordQuarantined {
+			sealed, sealedWith, serr := r.sealLogin(userID, plain)
+			if serr != nil {
+				return fmt.Errorf("codex reconcile: seal re-login: %w", serr)
+			}
+			if _, rerr := r.q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
+				Sealed:     sealed,
+				SealedWith: sealedWith,
+				ID:         acct.ID,
+				UserID:     userID,
+			}); rerr != nil {
+				return fmt.Errorf("codex reconcile: restore re-login: %w", rerr)
+			}
+		}
+		if lerr := r.link(ctx, userID, userSecretID, acct.ID, st.MaterialRevision); lerr != nil {
 			return lerr
 		}
 		return nil
@@ -235,11 +267,11 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 				if gerr != nil {
 					return fmt.Errorf("codex reconcile: resolve after insert race: %w", gerr)
 				}
-				return r.link(ctx, userID, userSecretID, existing.ID)
+				return r.link(ctx, userID, userSecretID, existing.ID, st.MaterialRevision)
 			}
 			return fmt.Errorf("codex reconcile: insert account: %w", ierr)
 		}
-		if lerr := r.link(ctx, userID, userSecretID, acct.ID); lerr != nil {
+		if lerr := r.link(ctx, userID, userSecretID, acct.ID, st.MaterialRevision); lerr != nil {
 			return lerr
 		}
 		return nil
@@ -248,20 +280,29 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 	}
 }
 
-// link binds the alias's state row to the resolved account (status → 'linked'). A
-// 0-row result means the alias vanished (or is not this user's) between the reads
-// above and this write — an owner-scoped race the caller surfaces.
-func (r *CodexReconciler) link(ctx context.Context, userID, userSecretID, accountID uuid.UUID) error {
+// link binds the alias's state row to the resolved account (status → 'linked'),
+// CAS-guarded on the material_revision the reconcile OBSERVED at its top read (audit #4).
+// observedMaterialRevision is that revision, threaded from ReconcileCodexAuthIdentity.
+//
+// A 0-row result is NOT "the alias vanished": the CAS now also matches material_revision,
+// so 0 rows means the alias was REPLACED under us (BumpCodexMaterialRevision advanced the
+// revision and dropped the old link) between the state read and this write. Surfacing
+// ErrCodexRelinkRaceLost — not ErrCodexStateMissing, not markFailed — keeps that transient:
+// the replacement's own bump re-triggers reconcile on the NEW material, which relinks it
+// correctly. (On the new-account path a lost CAS may leave an orphan account row with no
+// alias pointing at it; that is acceptable — it is unreferenced and harmless.)
+func (r *CodexReconciler) link(ctx context.Context, userID, userSecretID, accountID uuid.UUID, observedMaterialRevision int64) error {
 	n, err := r.q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
 		ProviderAccountID: pgconv.UUID(accountID),
 		UserSecretID:      userSecretID,
 		UserID:            userID,
+		MaterialRevision:  observedMaterialRevision,
 	})
 	if err != nil {
 		return fmt.Errorf("codex reconcile: link state: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("%w: alias %s", ErrCodexStateMissing, userSecretID)
+		return fmt.Errorf("%w: alias %s", ErrCodexRelinkRaceLost, userSecretID)
 	}
 	return nil
 }

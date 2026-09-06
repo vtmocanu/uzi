@@ -109,11 +109,15 @@ var (
 // depends on (PRD #1147 M2). *codexauth.Client satisfies it; tests supply an in-process
 // fake with a refresh counter and single-use rotating tokens.
 //
-// It is DELIBERATELY narrow (only Refresh), mirroring codexcred.go's CodexIdentityClient:
-// the coordinated refresher's ONE provider interaction is a token exchange, so the seam
-// exposes exactly that and nothing else. The interface lives here in workersvc rather
-// than reaching into codexauth so the codexauth package needs no edit.
+// It EMBEDS CodexIdentityClient (codexcred.go) so the coordinated refresher can do BOTH
+// halves of a hardened rotation: exchange the refresh token AND re-verify, with a
+// nonrotating DiscoverIdentity, that the freshly-exchanged access token still resolves to
+// the SAME account tuple it is rotating (PRD #1147 audit #2). *codexauth.Client already
+// satisfies both methods, so this needs no codexauth edit and no new Service field. The
+// interface lives here in workersvc rather than reaching into codexauth so the codexauth
+// package needs no edit.
 type CodexRefreshClient interface {
+	CodexIdentityClient
 	Refresh(ctx context.Context, refreshToken string) (codexauth.RefreshResult, error)
 }
 
@@ -141,6 +145,14 @@ type codexRefreshStore interface {
 	ResetCodexCoordIdle(ctx context.Context, arg store.ResetCodexCoordIdleParams) (int64, error)
 	SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error)
 	QuarantineExpiredCodexLease(ctx context.Context, arg store.QuarantineExpiredCodexLeaseParams) (int64, error)
+	// QuarantineCodexAccount parks an in-progress account that this op still owns WITHOUT
+	// writing recovery material — the identity-mismatch path (audit #2), where the exchanged
+	// material belongs to a DIFFERENT account and there is nothing trustworthy to protect.
+	QuarantineCodexAccount(ctx context.Context, arg store.QuarantineCodexAccountParams) (int64, error)
+	// PromoteCodexRecovery installs the protected recovery material as the live login,
+	// CAS-guarded on from_generation — the reconcile roll-forward for a quarantined account
+	// whose recovery slot re-verifies to the account's frozen identity (audit #5).
+	PromoteCodexRecovery(ctx context.Context, arg store.PromoteCodexRecoveryParams) (int64, error)
 }
 
 // codexRefreshQueries adapts the Service's Store to the narrow refresh surface, the same
@@ -178,11 +190,13 @@ func mergeCodexLogin(prev codexLoginBlob, result codexauth.RefreshResult) codexL
 	return merged
 }
 
-// openCodexAccountLogin opens and decodes the account's sealed_login on the shared vault
-// path (AAD user_id||codex_auth). A locked vault surfaces as errVaultLocked (transient,
-// retry); undecryptable/malformed material surfaces as errCredentialUnavailable.
-func (s *Service) openCodexAccountLogin(userID uuid.UUID, acct store.CodexProviderAccount) (codexLoginBlob, error) {
-	plain, err := secretopen.OpenSealed(s.vlt, s.box, userID, store.KindCodexAuth, acct.SealedWith, acct.SealedLogin)
+// openCodexSealed opens and decodes ANY codex login blob sealed on the shared vault path
+// (AAD user_id||codex_auth) — the account's sealed_login OR its recovery_sealed, which are
+// always produced by the same per-user seal. A locked vault surfaces as errVaultLocked
+// (transient, retry); undecryptable/malformed material surfaces as errCredentialUnavailable
+// / ErrCodexLoginBlob.
+func (s *Service) openCodexSealed(userID uuid.UUID, sealed []byte, sealedWith string) (codexLoginBlob, error) {
+	plain, err := secretopen.OpenSealed(s.vlt, s.box, userID, store.KindCodexAuth, sealedWith, sealed)
 	if err != nil {
 		if errors.Is(err, secretopen.ErrVaultLocked) {
 			return codexLoginBlob{}, errVaultLocked
@@ -197,6 +211,11 @@ func (s *Service) openCodexAccountLogin(userID uuid.UUID, acct store.CodexProvid
 		return codexLoginBlob{}, fmt.Errorf("%w: missing access token", ErrCodexLoginBlob)
 	}
 	return blob, nil
+}
+
+// openCodexAccountLogin opens and decodes the account's CURRENT committed sealed_login.
+func (s *Service) openCodexAccountLogin(userID uuid.UUID, acct store.CodexProviderAccount) (codexLoginBlob, error) {
+	return s.openCodexSealed(userID, acct.SealedLogin, acct.SealedWith)
 }
 
 // sealCodexLogin seals a merged login blob for storage on the provider account, mirroring
@@ -233,7 +252,22 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 	if err != nil {
 		return CodexRefreshResult{}, err
 	}
-	return s.coordinatedRefresh(ctx, authCtx.UserID, authCtx.AccountID, operationID, observedGeneration)
+	res, err := s.coordinatedRefresh(ctx, authCtx.UserID, authCtx.AccountID, operationID, observedGeneration)
+
+	// (7) Post-exchange release recheck (audit #3b), the recheck-before-release idiom
+	// ReleaseCodexAccessToken uses. CoordinatedCodexRefresh authorized ScopeStartRefresh
+	// ONLY before the network; ownership/authority can be lost mid-IO (a requeue, a revoke,
+	// an alias replace) while the exchange is in flight. The durable commit still STANDS —
+	// it is good for the account, and the next authorized run reconciles to it — but a token
+	// is released to THIS run only if it STILL holds authority. On a lost recheck, DISCARD
+	// the token and refuse this run as contended; no token that a no-longer-owning run could
+	// use ever leaves this call.
+	if err == nil && res.AccessToken != "" {
+		if _, rerr := s.AuthorizeCodexCredentialOp(ctx, wkr, runID, capability, ScopeStartRefresh); rerr != nil {
+			return CodexRefreshResult{Outcome: CodexRefreshContended}, rerr
+		}
+	}
+	return res, err
 }
 
 // coordinatedRefresh is the post-authorization core, keyed on the resolved (user,
@@ -372,7 +406,7 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		return CodexRefreshResult{Outcome: CodexRefreshContended}, fmt.Errorf("codex refresh: provider exchange: %w", rerr)
 	}
 
-	// (6) Merged reseal + durable commit.
+	// (6) Merged reseal.
 	merged := mergeCodexLogin(prev, result)
 	raw, err := json.Marshal(merged) //nolint:gosec // G117: the merged codex login blob is resealed under the vault DEK before it leaves this function
 	if err != nil {
@@ -383,6 +417,34 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		return CodexRefreshResult{}, fmt.Errorf("codex refresh: seal merged login: %w", err)
 	}
 
+	// (6b) Post-refresh identity RE-VERIFICATION (audit #2), BEFORE the commit. A refresh
+	// token exchange can — through provider error, credential mix-up, or a hostile token —
+	// return an access token that belongs to a DIFFERENT account than the one we are
+	// rotating. Committing it would bind account A's row to account B's login and hand
+	// account B's token to account A's run. So re-read identity with a NONROTATING
+	// DiscoverIdentity and branch on the account's FROZEN tuple:
+	//
+	//   - MATCH (both fields equal) → proceed to commit exactly as before.
+	//   - VERIFIED MISMATCH (discovery succeeded, tuple differs) OR incomplete identity
+	//     (ErrIdentityIncomplete) → the material is NOT account A's: do NOT commit and do
+	//     NOT write it to the recovery slot (it would poison a later promotion). Mark the
+	//     intent unrecoverable, quarantine (owner+op guarded), return NO token.
+	//   - ABSENCE (DiscoverIdentity itself errored transiently — network/5xx) → we ALREADY
+	//     spent account A's single-use refresh token, so the NEW material must be RETAINED,
+	//     not discarded: protect it in the recovery slot at from_generation and leave the
+	//     intent 'rotating' so a later promotion re-verifies it. Return NO token, but do NOT
+	//     claim recovery is impossible.
+	id, derr := s.codexRefresh.DiscoverIdentity(ctx, result.AccessToken)
+	switch {
+	case derr == nil && id.ProviderUserID == acct.ProviderUserID && id.WorkspaceAccountID == acct.WorkspaceAccountID:
+		// MATCH → fall through to the commit below.
+	case derr == nil || errors.Is(derr, codexauth.ErrIdentityIncomplete):
+		return s.codexQuarantineIdentityMismatch(ctx, q, userID, accountID, operationID)
+	default:
+		return s.codexRetainUnverifiedMaterial(ctx, q, userID, accountID, operationID, acct.Generation, sealed, derr)
+	}
+
+	// (6c) Durable commit.
 	row, cerr := q.CommitCodexRefresh(ctx, store.CommitCodexRefreshParams{
 		Sealed:         sealed,
 		SealedWith:     sealedWith,
@@ -439,6 +501,41 @@ func (s *Service) handleCodexCommitFailure(ctx context.Context, q codexRefreshSt
 		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshQuarantined, rerr)
 	}
 	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: commit failed: %v", ErrCodexRefreshQuarantined, commitErr)
+}
+
+// codexQuarantineIdentityMismatch resolves a post-refresh re-verification that returned a
+// VERIFIED answer the material FAILS (audit #2): DiscoverIdentity either resolved the
+// freshly-exchanged access token to a DIFFERENT account tuple, or reported an incomplete
+// identity. The material is not account A's, so it is NEITHER committed NOR written to the
+// recovery slot (a poisoned recovery blob would later mis-promote). The intent is marked
+// unrecoverable (re-login required) and the account is quarantined (guarded on
+// in_progress + this op, so only the lease holder may park it). NO token is returned.
+func (s *Service) codexQuarantineIdentityMismatch(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID) (CodexRefreshResult, error) {
+	_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
+	_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
+	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, ErrCodexRefreshUnrecoverable
+}
+
+// codexRetainUnverifiedMaterial resolves a post-refresh re-verification whose OUTCOME is
+// unknown (audit #2, absence): DiscoverIdentity itself errored transiently, so we cannot
+// yet tell whether the exchanged material is account A's. Because the single-use refresh
+// token was ALREADY spent, discarding the new material would brick the account; instead it
+// is RETAINED in the recovery slot at from_generation (which also quarantines) and the
+// intent is LEFT 'rotating' so a later promotion re-verifies and installs it. Returns a
+// quarantined outcome with NO token — but recovery is possible, not lost. Should even the
+// recovery write fail, the outcome is truly unknown with no protected copy, so the intent
+// is marked unrecoverable.
+func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, discoverErr error) (CodexRefreshResult, error) {
+	if _, rerr := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+		Sealed: sealedMerged,
+		Gen:    fromGeneration,
+		ID:     accountID,
+		UserID: userID,
+	}); rerr != nil {
+		_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
+		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshQuarantined, rerr)
+	}
+	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: identity re-verification unavailable: %v", ErrCodexRefreshQuarantined, discoverErr)
 }
 
 // codexReplayAfterDuplicate resolves a 23505 on the pre-rotation intent insert: a prior
@@ -607,7 +704,75 @@ func (s *Service) ReconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 		}
 		resolved++
 	}
+
+	// Recovery/re-login promotion (audit #5). A quarantined account whose recovery slot
+	// holds protected material AT THE CURRENT generation is a candidate for roll-forward: a
+	// commit-failure or an absence-branch retention left a known-good login there. Attempt
+	// to make it live again — but ONLY after re-verifying its identity against the account's
+	// frozen tuple, so a poisoned/mismatched recovery blob can never be promoted. The intents
+	// resolved above are passed so a verified mismatch can correct their 'reconciled'
+	// (recoverable) verdict to 'unrecoverable' (the recovery copy turned out to be bad).
+	if acct.CoordState == codexCoordQuarantined && len(acct.RecoverySealed) > 0 &&
+		acct.RecoveryGeneration.Valid && acct.RecoveryGeneration.Int64 == acct.Generation {
+		if perr := s.promoteCodexRecovery(ctx, q, userID, acct, intents); perr != nil {
+			return resolved, perr
+		}
+	}
 	return resolved, nil
+}
+
+// promoteCodexRecovery attempts to make a quarantined account whose recovery slot holds
+// protected material live again (audit #5). It opens the recovery blob, re-verifies its
+// identity against the account's FROZEN tuple with a nonrotating DiscoverIdentity, and only
+// on a MATCH promotes it (PromoteCodexRecovery, CAS on from_generation) — installing the
+// recovery material as the live login, advancing the generation, clearing the quarantine.
+// A VERIFIED MISMATCH (or incomplete identity) means the recovery copy is not this
+// account's material after all, so every still-recoverable intent is corrected to
+// 'unrecoverable' and the account is left quarantined. A TRANSIENT DiscoverIdentity error
+// (or a locked vault) leaves the slot untouched for the next reconcile pass — the material
+// is retained, not lost. A nil identity seam (a Service wired without one) likewise defers.
+func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore, userID uuid.UUID, acct store.CodexProviderAccount, intents []store.CodexRefreshIntent) error {
+	if s.codexRefresh == nil {
+		return nil // no identity seam wired: cannot re-verify, leave for a later pass
+	}
+	blob, err := s.openCodexSealed(userID, acct.RecoverySealed, acct.SealedWith)
+	if err != nil {
+		if errors.Is(err, errVaultLocked) {
+			return nil // transient: the recovery material stays protected for the next pass
+		}
+		return fmt.Errorf("codex reconcile: open recovery: %w", err)
+	}
+
+	id, derr := s.codexRefresh.DiscoverIdentity(ctx, blob.AccessToken)
+	switch {
+	case derr == nil && id.ProviderUserID == acct.ProviderUserID && id.WorkspaceAccountID == acct.WorkspaceAccountID:
+		// MATCH → install the recovery material. ErrNoRows means the slot moved under us
+		// (already promoted, or the from_generation no longer matches) — an idempotent no-op.
+		if _, perr := q.PromoteCodexRecovery(ctx, store.PromoteCodexRecoveryParams{
+			ID:             acct.ID,
+			UserID:         userID,
+			FromGeneration: acct.Generation,
+		}); perr != nil && !errors.Is(perr, pgx.ErrNoRows) {
+			return fmt.Errorf("codex reconcile: promote recovery: %w", perr)
+		}
+		return nil
+	case derr == nil || errors.Is(derr, codexauth.ErrIdentityIncomplete):
+		// VERIFIED MISMATCH / incomplete: the recovery copy is not this account's. Correct
+		// every intent that was resolved 'reconciled' off this (now-untrusted) copy to
+		// 'unrecoverable', and leave the account quarantined — do NOT promote.
+		for _, it := range intents {
+			if _, serr := q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{
+				State:       codexIntentUnrecoverable,
+				OperationID: it.OperationID,
+				UserID:      userID,
+			}); serr != nil {
+				return fmt.Errorf("codex reconcile: mark recovery-mismatch intent %s: %w", it.OperationID, serr)
+			}
+		}
+		return nil
+	default:
+		return nil // transient discovery error: leave the slot for the next pass
+	}
 }
 
 // codexRefreshResolution decides the terminal state for a stranded 'rotating' intent given
