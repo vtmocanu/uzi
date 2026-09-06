@@ -548,7 +548,23 @@ func TestCodexDarkNoCodexOnNormalClaimPathLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, workerID, repoID := env.seedCodexInfra(t)
 	runID := env.seedCodexRun(t, userID, workerID, repoID) // the ordinary create path, no codex binding
-	svc := &Service{q: env.q, box: env.box}
+	// seedCodexInfra stores a placeholder forge token that box.Open cannot decrypt; the real
+	// claim assembly opens the bot PAT, so reseal it with a genuine master-box blob.
+	botPATSealed, err := env.box.Seal([]byte(codexToken("bot-pat")))
+	if err != nil {
+		t.Fatalf("seal bot PAT: %v", err)
+	}
+	env.exec(`UPDATE forge_connections SET token_ciphertext = $1 WHERE user_id = $2`, botPATSealed, userID)
+	// A default Anthropic token so the real claim assembly (openAnthropic) resolves a
+	// credential — an ordinary run always spends one.
+	anthropicSealed, err := env.box.Seal([]byte(codexToken("anthropic")))
+	if err != nil {
+		t.Fatalf("seal anthropic token: %v", err)
+	}
+	env.exec(`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+	          VALUES ($1, $2, 'anthropic_token', $3, true, $4, 'master')`,
+		uuid.New(), userID, "anthropic-"+uuid.NewString(), anthropicSealed)
+	svc := New(env.q, env.box, testParams())
 	wkr := store.Worker{ID: workerID, UserID: userID}
 
 	// The normal run has NO codex binding frozen.
@@ -566,15 +582,18 @@ func TestCodexDarkNoCodexOnNormalClaimPathLiveDB(t *testing.T) {
 		t.Fatalf("codexClaimSecrets on an unbound run: err = %v, want ErrCodexRunNotBound", err)
 	}
 
-	// The assembly branch is `if run.CodexSecretID.Valid`, so an ordinary run leaves
-	// ClaimSecrets.Codex nil, and omitempty drops the key: no `codex` on the wire.
-	secrets := ClaimSecrets{
-		ForgeUsername:       "bot",
-		ForgePAT:            "pat",
-		AnthropicOAuthToken: "oauth",
-		Codex:               nil,
+	// Build the REAL claim payload via the production assembly path, exercising the
+	// `run.CodexSecretID.Valid == false` branch (not a hand-built ClaimSecrets), then marshal
+	// its Secrets: an ordinary run leaves ClaimSecrets.Codex nil and omitempty drops the key,
+	// so no `codex` rides the wire.
+	payload, err := svc.assembleClaim(env.ctx, wkr, run)
+	if err != nil {
+		t.Fatalf("assembleClaim: %v", err)
 	}
-	raw, err := json.Marshal(secrets)
+	if payload.Secrets.Codex != nil {
+		t.Fatalf("ordinary run's assembled claim carried a codex block: %+v", payload.Secrets.Codex)
+	}
+	raw, err := json.Marshal(payload.Secrets)
 	if err != nil {
 		t.Fatalf("marshal claim secrets: %v", err)
 	}

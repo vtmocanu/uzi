@@ -358,17 +358,19 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 	// A worker-owned, claimed run.
 	runID := insertCodexRun(ctx, t, pool, user, repo, worker, 103, "claimed", "marker")
 
-	// A non-owning worker cannot mint.
-	if n, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
+	// A non-owning worker cannot mint. The query is now :one RETURNING codex_claim_epoch,
+	// so a non-matching WHERE (foreign worker) returns pgx.ErrNoRows rather than 0 rows.
+	if epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
 		Hash: []byte("cap"), ID: runID, WorkerID: pgUUID(uuid.New()),
-	}); err != nil || n != 0 {
-		t.Fatalf("SetRunCodexClaimCapability(non-owner) = (%d,%v), want (0,nil)", n, err)
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("SetRunCodexClaimCapability(non-owner) = (%d,%v), want (_, pgx.ErrNoRows)", epoch, err)
 	}
-	// The owning worker mints: hash set, epoch 0 -> 1.
-	if n, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
+	// The owning worker mints: hash set, epoch 0 -> 1. The RETURNING value is the
+	// PERSISTED post-bump epoch, so it must come back as 1.
+	if epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
 		Hash: []byte("cap"), ID: runID, WorkerID: pgUUID(worker),
-	}); err != nil || n != 1 {
-		t.Fatalf("SetRunCodexClaimCapability(owner) = (%d,%v), want (1,nil)", n, err)
+	}); err != nil || epoch != 1 {
+		t.Fatalf("SetRunCodexClaimCapability(owner) = (%d,%v), want (1,nil)", epoch, err)
 	}
 	minted, err := q.GetRunByID(ctx, runID)
 	if err != nil {
@@ -749,6 +751,7 @@ func TestCommitCodexRefreshLeaseGuardLiveDB(t *testing.T) {
 	}
 	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
 		Sealed: []byte("recovery-login"), Gen: 0, ID: qAcc.ID, UserID: user,
+		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
 	}); err != nil || n != 1 {
 		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
 	}
@@ -795,9 +798,10 @@ func TestCommitCodexRefreshLeaseGuardLiveDB(t *testing.T) {
 		t.Fatalf("AcquireCodexRefreshLease(genuine case) = (%d,%v), want (1,nil)", n, err)
 	}
 	// Park a recovery slot directly WITHOUT flipping coord_state (SetCodexRecoverySlot
-	// would quarantine), so we can prove a successful commit clears it.
+	// would quarantine), so we can prove a successful commit clears it. recovery_sealed_with
+	// is set alongside recovery_sealed to satisfy 00198's CHECK pairing.
 	mustExec(ctx, t, pool,
-		`UPDATE codex_provider_account SET recovery_sealed = $1, recovery_generation = 0 WHERE id = $2 AND user_id = $3`,
+		`UPDATE codex_provider_account SET recovery_sealed = $1, recovery_generation = 0, recovery_sealed_with = 'master' WHERE id = $2 AND user_id = $3`,
 		[]byte("stale-recovery"), gAcc.ID, user)
 	committed, err := q.CommitCodexRefresh(ctx, store.CommitCodexRefreshParams{
 		Sealed: []byte("fresh-login"), SealedWith: store.SealedWithMaster, Op: opG,
@@ -831,14 +835,18 @@ func TestSetCodexRecoverySlotLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert account: %v", err)
 	}
+	op := uuid.New()
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
+		Op: op, Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
 	}
 
+	// SetCodexRecoverySlot now requires the live-lease owner's op and the key that sealed
+	// the recovery blob (non-empty 'master'|'dek', per 00198's CHECK pairing).
 	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
 		Sealed: []byte("prior-good-login"), Gen: 3, ID: acc.ID, UserID: user,
+		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
 	}); err != nil || n != 1 {
 		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
 	}
@@ -847,14 +855,17 @@ func TestSetCodexRecoverySlotLiveDB(t *testing.T) {
 		t.Fatalf("GetCodexProviderAccountByID: %v", err)
 	}
 	if string(got.RecoverySealed) != "prior-good-login" || !got.RecoveryGeneration.Valid ||
-		got.RecoveryGeneration.Int64 != 3 || got.CoordState != "quarantined" {
-		t.Fatalf("after SetCodexRecoverySlot = (sealed=%q gen=%+v state=%q), want (prior-good-login, 3, quarantined)",
-			got.RecoverySealed, got.RecoveryGeneration, got.CoordState)
+		got.RecoveryGeneration.Int64 != 3 || got.CoordState != "quarantined" ||
+		!got.RecoverySealedWith.Valid || got.RecoverySealedWith.String != store.SealedWithMaster {
+		t.Fatalf("after SetCodexRecoverySlot = (sealed=%q gen=%+v state=%q sealed_with=%+v), want (prior-good-login, 3, quarantined, master)",
+			got.RecoverySealed, got.RecoveryGeneration, got.CoordState, got.RecoverySealedWith)
 	}
 
-	// Owner-scoping: a foreign user_id sets nothing.
+	// Owner-scoping: a foreign user_id sets nothing (the op/sealed_with are valid, so this
+	// isolates the user_id predicate).
 	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
 		Sealed: []byte("x"), Gen: 9, ID: acc.ID, UserID: uuid.New(),
+		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
 	}); err != nil || n != 0 {
 		t.Fatalf("SetCodexRecoverySlot(foreign user) = (%d,%v), want (0,nil)", n, err)
 	}
@@ -989,6 +1000,47 @@ func TestFreezeRunCodexBindingWriteOnceLiveDB(t *testing.T) {
 	if frozen.CodexAccountKey.String != keyA {
 		t.Fatalf("after conflicting identity freeze key = %q, want it unchanged at %q", frozen.CodexAccountKey.String, keyA)
 	}
+
+	// --- F5: FreezeRunCodexBinding's COALESCE keeps an already-frozen account identity
+	// through a replay that carries NULL account fields (a stale binding re-delivery must
+	// not clobber the identity that a later freeze/link pinned). Freeze a SEPARATE run WITH
+	// a non-null account_key/revision, then replay the freeze for the same run+secret with
+	// NULL account fields and assert the account identity is UNCHANGED.
+	idRun := insertCodexRun(ctx, t, pool, user, repo, uuid.Nil, 402, "queued", "marker")
+	acctKey := `["provider-id","workspace-id"]`
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretA, AuthMode: "subscription", SecretLabel: "a", MaterialRevision: 1,
+		AccountKey:      pgtype.Text{String: acctKey, Valid: true},
+		AccountRevision: pgtype.Int8{Int64: 4, Valid: true},
+		ID:              idRun, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("FreezeRunCodexBinding(with identity) = (%d,%v), want (1,nil)", n, err)
+	}
+	// Replay for the SAME run+secret with NULL account fields (nargs unset): the row is
+	// still affected (write-once secret guard is satisfied by the equal secret) but the
+	// COALESCE keeps the prior non-null account identity rather than nulling it.
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretA, AuthMode: "subscription", SecretLabel: "a", MaterialRevision: 1,
+		ID: idRun, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("FreezeRunCodexBinding(replay NULL account) = (%d,%v), want (1,nil)", n, err)
+	}
+	afterReplay, err := q.GetRunByID(ctx, idRun)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if afterReplay.CodexAccountKey.String != acctKey ||
+		!afterReplay.CodexAccountRevision.Valid || afterReplay.CodexAccountRevision.Int64 != 4 {
+		t.Fatalf("after NULL-account replay identity = (key=%q rev=%+v), want it preserved at (%q, 4) via COALESCE",
+			afterReplay.CodexAccountKey.String, afterReplay.CodexAccountRevision, acctKey)
+	}
+	// A replay with a DIFFERENT secret is rejected by the write-once secret guard (0 rows).
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretB, AuthMode: "subscription", SecretLabel: "b", MaterialRevision: 2,
+		ID: idRun, UserID: user,
+	}); err != nil || n != 0 {
+		t.Fatalf("FreezeRunCodexBinding(different secret) = (%d,%v), want (0,nil) — write-once", n, err)
+	}
 }
 
 // mkCodexAccount inserts a fresh provider account for `user` (gen 0, idle) and returns it.
@@ -1022,6 +1074,7 @@ func TestPromoteCodexRecoveryLiveDB(t *testing.T) {
 	}
 	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
 		Sealed: []byte("recovery-bytes"), Gen: 0, ID: acc.ID, UserID: user,
+		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
 	}); err != nil || n != 1 {
 		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
 	}
@@ -1063,13 +1116,15 @@ func TestPromoteCodexRecoveryLiveDB(t *testing.T) {
 	// Wrong from_generation: a quarantined account whose recovery_generation is 0 refuses
 	// a promote presenting a different from_generation.
 	wrongAcc := mkCodexAccount(ctx, t, q, user)
+	wrongOp := uuid.New()
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: uuid.New(), Deadline: future, ID: wrongAcc.ID, UserID: user, FromGeneration: 0,
+		Op: wrongOp, Deadline: future, ID: wrongAcc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("AcquireCodexRefreshLease(wrong-gen) = (%d,%v), want (1,nil)", n, err)
 	}
 	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
 		Sealed: []byte("recovery-bytes"), Gen: 0, ID: wrongAcc.ID, UserID: user,
+		Op: wrongOp, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
 	}); err != nil || n != 1 {
 		t.Fatalf("SetCodexRecoverySlot(wrong-gen) = (%d,%v), want (1,nil)", n, err)
 	}
@@ -1089,13 +1144,15 @@ func TestRefreshCodexAccountLoginLiveDB(t *testing.T) {
 
 	// Start from a quarantined account carrying a recovery slot, to prove Refresh clears it.
 	acc := mkCodexAccount(ctx, t, q, user)
+	op := uuid.New()
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
+		Op: op, Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
 	}
 	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
 		Sealed: []byte("stale-recovery"), Gen: 0, ID: acc.ID, UserID: user,
+		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
 	}); err != nil || n != 1 {
 		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
 	}
@@ -1117,10 +1174,13 @@ func TestRefreshCodexAccountLoginLiveDB(t *testing.T) {
 		t.Fatalf("after refresh = (gen=%d state=%q committed_gen=%+v), want (1, idle, 1)",
 			got.Generation, got.CoordState, got.CommittedGeneration)
 	}
-	if got.RecoverySealed != nil || got.RecoveryGeneration.Valid ||
+	// recovery_sealed_with MUST be cleared alongside recovery_sealed: a populated recovery
+	// slot (here sealed under 'master') would otherwise violate 00198's CHECK pairing
+	// ((recovery_sealed IS NULL) = (recovery_sealed_with IS NULL)) on this install (23514).
+	if got.RecoverySealed != nil || got.RecoveryGeneration.Valid || got.RecoverySealedWith.Valid ||
 		got.CoordOperationID.Valid || got.LeaseDeadline.Valid {
-		t.Fatalf("after refresh recovery/coord slots not cleared: recovery=%q recovery_gen=%+v op_valid=%v deadline_valid=%v",
-			got.RecoverySealed, got.RecoveryGeneration, got.CoordOperationID.Valid, got.LeaseDeadline.Valid)
+		t.Fatalf("after refresh recovery/coord slots not cleared: recovery=%q recovery_gen=%+v recovery_with=%+v op_valid=%v deadline_valid=%v",
+			got.RecoverySealed, got.RecoveryGeneration, got.RecoverySealedWith, got.CoordOperationID.Valid, got.LeaseDeadline.Valid)
 	}
 
 	// Owner-scoping: a foreign user refreshes nothing.

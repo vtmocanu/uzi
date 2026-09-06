@@ -6,9 +6,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
@@ -921,12 +923,23 @@ func TestReconcileUnresolvedCodexRefreshPromotesRecoveryLiveDB(t *testing.T) {
 		if serr != nil {
 			t.Fatalf("seal recovery blob: %v", serr)
 		}
+		// SetCodexRecoverySlot now requires the live-lease owner's op (and the key that
+		// sealed the blob), so acquire the lease under a known op first — this leaves the
+		// account 'quarantined' with the recovery blob at generation 0, which is exactly the
+		// unresolved state ReconcileUnresolvedCodexRefresh scans.
+		op := uuid.New()
+		future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+		if n, err := env.q.AcquireCodexRefreshLease(env.ctx, store.AcquireCodexRefreshLeaseParams{
+			Op: op, Deadline: future, ID: f.accountID, UserID: f.userID, FromGeneration: 0,
+		}); err != nil || n != 1 {
+			t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
+		}
 		if _, err := env.q.SetCodexRecoverySlot(env.ctx, store.SetCodexRecoverySlotParams{
 			Sealed: sealed, Gen: 0, ID: f.accountID, UserID: f.userID,
+			Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
 		}); err != nil {
 			t.Fatalf("seed recovery slot: %v", err)
 		}
-		op := uuid.New()
 		if _, err := env.q.InsertCodexRefreshIntent(env.ctx, store.InsertCodexRefreshIntentParams{
 			OperationID: op, UserID: f.userID, ProviderAccountID: f.accountID, FromGeneration: 0,
 		}); err != nil {
@@ -1062,11 +1075,13 @@ func TestReleaseCodexAccessTokenMisboundKindNonDisclosureLiveDB(t *testing.T) {
 	if !errors.Is(err, ErrCodexKindModeMismatch) {
 		t.Fatalf("mis-bound release: want ErrCodexKindModeMismatch, got %v", err)
 	}
+	// Any non-empty token is a failure; report a LEAKED value specifically (folded into the
+	// non-empty branch so the leak check is live, not dead code on an already-empty tok).
 	if tok != "" {
+		if strings.Contains(tok, "refresh") || tok == refresh {
+			t.Fatalf("the codex_auth login blob leaked through the api_key release path: %q", tok)
+		}
 		t.Fatalf("mis-bound release must disclose no token, got %q", tok)
-	}
-	if strings.Contains(tok, "refresh") || tok == refresh {
-		t.Fatalf("the codex_auth login blob leaked through the api_key release path: %q", tok)
 	}
 }
 

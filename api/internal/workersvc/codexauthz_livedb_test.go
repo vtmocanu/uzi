@@ -22,13 +22,19 @@ import (
 // fresh UUIDs so a single-process `-run 'LiveDB$'` sweep never collides.
 
 // codexRunFixture bundles a fully-seeded Codex-bound run and the pieces a test breaks.
+// accessToken/refreshToken are the EXACT random tokens the subscription login blob was
+// sealed with (codexToken embeds a uuid, so they are not re-derivable) — a test that
+// asserts the claim releases the access token, never the refresh token, compares against
+// these captured values.
 type codexRunFixture struct {
-	userID   uuid.UUID
-	workerID uuid.UUID
-	runID    uuid.UUID
-	aliasID  uuid.UUID
-	svc      *Service
-	wkr      store.Worker
+	userID       uuid.UUID
+	workerID     uuid.UUID
+	runID        uuid.UUID
+	aliasID      uuid.UUID
+	accessToken  string
+	refreshToken string
+	svc          *Service
+	wkr          store.Worker
 }
 
 // seedCodexInfra seeds a user, forge connection, repo and worker, returning the ids.
@@ -57,9 +63,9 @@ func (e codexTestEnv) seedCodexRun(t *testing.T, userID, workerID, repoID uuid.U
 
 // seedLinkedSubscription seeds a staging codex_auth alias and reconciles it to a linked
 // provider account via the in-process fake identity client, returning the alias id.
-func (e codexTestEnv) seedLinkedSubscription(t *testing.T, userID uuid.UUID, label, accessToken string) uuid.UUID {
+func (e codexTestEnv) seedLinkedSubscription(t *testing.T, userID uuid.UUID, label, accessToken, refreshToken string) uuid.UUID {
 	t.Helper()
-	blob := codexLoginBlob{AccessToken: accessToken, RefreshToken: codexToken("refresh")}
+	blob := codexLoginBlob{AccessToken: accessToken, RefreshToken: refreshToken}
 	aliasID := e.seedStagingAlias(t, userID, label, blob)
 	fake := newFakeCodexIdentity()
 	fake.idByToken[accessToken] = codexauth.Identity{
@@ -99,19 +105,23 @@ func (e codexTestEnv) seedStaticAPIKey(t *testing.T, userID uuid.UUID, label, ke
 func newSubscriptionFixture(t *testing.T, env codexTestEnv) codexRunFixture {
 	t.Helper()
 	userID, workerID, repoID := env.seedCodexInfra(t)
-	aliasID := env.seedLinkedSubscription(t, userID, "codex-sub-"+uuid.NewString(), codexToken("access"))
+	access := codexToken("access")
+	refresh := codexToken("refresh")
+	aliasID := env.seedLinkedSubscription(t, userID, "codex-sub-"+uuid.NewString(), access, refresh)
 	runID := env.seedCodexRun(t, userID, workerID, repoID)
 	svc := &Service{q: env.q, box: env.box}
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatalf("FreezeCodexBinding: %v", err)
 	}
 	return codexRunFixture{
-		userID:   userID,
-		workerID: workerID,
-		runID:    runID,
-		aliasID:  aliasID,
-		svc:      svc,
-		wkr:      store.Worker{ID: workerID, UserID: userID},
+		userID:       userID,
+		workerID:     workerID,
+		runID:        runID,
+		aliasID:      aliasID,
+		accessToken:  access,
+		refreshToken: refresh,
+		svc:          svc,
+		wkr:          store.Worker{ID: workerID, UserID: userID},
 	}
 }
 
@@ -119,12 +129,11 @@ func newSubscriptionFixture(t *testing.T, env codexTestEnv) codexRunFixture {
 // the worker would present. Used by reject tests that do not run the full claim path.
 func (e codexTestEnv) mintCap(t *testing.T, runID, workerID uuid.UUID) string {
 	t.Helper()
-	var epochBefore int64
-	if err := e.pool.QueryRow(e.ctx, `SELECT codex_claim_epoch FROM runs WHERE id = $1`, runID).Scan(&epochBefore); err != nil {
-		t.Fatalf("read epoch: %v", err)
-	}
 	plaintext, hash := mintCodexCapability()
-	n, err := e.q.SetRunCodexClaimCapability(e.ctx, store.SetRunCodexClaimCapabilityParams{
+	// The mint is now :one RETURNING codex_claim_epoch: it returns the PERSISTED post-bump
+	// epoch (pgx.ErrNoRows when no row matched), so wire the capability off that rather than
+	// a separately-read epochBefore+1.
+	epoch, err := e.q.SetRunCodexClaimCapability(e.ctx, store.SetRunCodexClaimCapabilityParams{
 		Hash:     hash,
 		ID:       runID,
 		WorkerID: pgconv.UUID(workerID),
@@ -132,10 +141,7 @@ func (e codexTestEnv) mintCap(t *testing.T, runID, workerID uuid.UUID) string {
 	if err != nil {
 		t.Fatalf("SetRunCodexClaimCapability: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("SetRunCodexClaimCapability affected %d rows, want 1", n)
-	}
-	return formatCodexCapability(epochBefore+1, plaintext)
+	return formatCodexCapability(epoch, plaintext)
 }
 
 func (e codexTestEnv) runEpoch(t *testing.T, runID uuid.UUID) int64 {
@@ -160,8 +166,13 @@ func TestAuthorizeCodexCredentialOpAcceptsValidLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("codexClaimSecrets: %v", err)
 	}
-	if codex.AccessToken == "" {
-		t.Fatal("claim must carry a subscription access token")
+	// The claim must carry EXACTLY the seeded subscription access token — the login blob's
+	// AccessToken, never its RefreshToken.
+	if codex.AccessToken != f.accessToken {
+		t.Fatalf("claim access token = %q, want the seeded access token %q", codex.AccessToken, f.accessToken)
+	}
+	if codex.AccessToken == f.refreshToken {
+		t.Fatal("claim leaked the refresh token as the access token")
 	}
 	if codex.Capability == "" {
 		t.Fatal("claim must carry a capability")
@@ -192,6 +203,38 @@ func TestAuthorizeCodexCredentialOpAcceptsValidLiveDB(t *testing.T) {
 		if ac.Scope != sc {
 			t.Fatalf("authCtx.Scope = %v, want %v", ac.Scope, sc)
 		}
+	}
+}
+
+// TestCodexClaimMintUsesPersistedEpochLiveDB pins the F10 mint-side epoch race: the claim
+// path must wire the capability off the PERSISTED post-bump epoch the mint RETURNed, not a
+// re-derived run.CodexClaimEpoch+1. It reads the run, then advances codex_claim_epoch in
+// the DB behind that in-memory row (a concurrent requeue/mint), so run.CodexClaimEpoch is
+// now stale by one; the claim path mints (advancing the epoch once more) and the resulting
+// capability must still authorize — which is only true if the wire epoch came from the
+// RETURNING value.
+//
+// FAIL-OLD / PASS-FIXED: deriving the wire epoch from the stale run.CodexClaimEpoch+1 would
+// carry the wrong epoch and authorize would fail with ErrCodexCapabilityEpoch.
+func TestCodexClaimMintUsesPersistedEpochLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	f := newSubscriptionFixture(t, env)
+
+	// Read the run at epoch N, then bump codex_claim_epoch to N+1 behind the in-memory row.
+	run := mustRun(t, env, f.runID)
+	env.exec(`UPDATE runs SET codex_claim_epoch = codex_claim_epoch + 1 WHERE id = $1`, f.runID)
+
+	// The claim path mints off the (now epoch-stale) run row; the RETURNING value advances
+	// the persisted epoch to N+2 and the wire capability must carry N+2, not N+1.
+	codex, err := f.svc.codexClaimSecrets(env.ctx, f.wkr, run)
+	if err != nil {
+		t.Fatalf("codexClaimSecrets: %v", err)
+	}
+	if got := env.runEpoch(t, f.runID); got != run.CodexClaimEpoch+2 {
+		t.Fatalf("persisted epoch = %d, want %d (read N → bump → mint)", got, run.CodexClaimEpoch+2)
+	}
+	if _, err := f.svc.AuthorizeCodexCredentialOp(env.ctx, f.wkr, f.runID, codex.Capability, ScopeReleaseAccessToken); err != nil {
+		t.Fatalf("authorize with minted capability: want success (persisted epoch used), got %v", err)
 	}
 }
 
@@ -303,7 +346,8 @@ func TestAuthorizeCodexCredentialOpRejectsLiveDB(t *testing.T) {
 func TestAuthorizeCodexScopeNotApplicableAPIKeyLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, workerID, repoID := env.seedCodexInfra(t)
-	aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), codexToken("sk"))
+	staticKey := codexToken("sk")
+	aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), staticKey)
 	runID := env.seedCodexRun(t, userID, workerID, repoID)
 	svc := &Service{q: env.q, box: env.box}
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); err != nil {
@@ -312,13 +356,13 @@ func TestAuthorizeCodexScopeNotApplicableAPIKeyLiveDB(t *testing.T) {
 	wkr := store.Worker{ID: workerID, UserID: userID}
 	run := mustRun(t, env, runID)
 
-	// The claim path opens the static key.
+	// The claim path opens EXACTLY the seeded static key.
 	codex, err := svc.codexClaimSecrets(env.ctx, wkr, run)
 	if err != nil {
 		t.Fatalf("codexClaimSecrets (api_key): %v", err)
 	}
-	if codex.AccessToken == "" {
-		t.Fatal("api_key claim must carry the static key")
+	if codex.AccessToken != staticKey {
+		t.Fatalf("api_key claim access token = %q, want the seeded static key %q", codex.AccessToken, staticKey)
 	}
 
 	// Release is authorized.

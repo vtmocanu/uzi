@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -161,11 +162,12 @@ func TestCodexProviderAccountTupleLiveDB(t *testing.T) {
 	if byID.ID != byTuple.ID {
 		t.Fatalf("by-id resolved %s, want %s", byID.ID, byTuple.ID)
 	}
-	// Owner-scoping: `other` cannot read `user`'s account by its id.
+	// Owner-scoping: `other` cannot read `user`'s account by its id — the owner-scoped
+	// predicate returns no row (pgx.ErrNoRows), not that user's account.
 	if _, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{
 		UserID: other, ID: byTuple.ID,
-	}); err == nil {
-		t.Fatal("by-id read of another user's account returned a row — the predicate is not owner-scoped")
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("by-id read of another user's account returned %v, want pgx.ErrNoRows — the predicate is not owner-scoped", err)
 	}
 	// Fresh-minted defaults are what a later refresher (m2) advances from.
 	if byTuple.Generation != 0 || byTuple.CredentialRevision != 0 || byTuple.CoordState != "idle" {
@@ -378,5 +380,124 @@ func TestLinkCodexCredentialStateRevisionCASLiveDB(t *testing.T) {
 	if linked.Status != "linked" || !linked.ProviderAccountID.Valid || uuid.UUID(linked.ProviderAccountID.Bytes) != accountB.ID {
 		t.Fatalf("relinked state = (status=%q account_valid=%v), want linked pointing at accountB",
 			linked.Status, linked.ProviderAccountID.Valid)
+	}
+}
+
+// TestLinkCodexCredentialStateCrossUserFKLiveDB pins the (user_id, provider_account_id)
+// composite FK on codex_credential_state (T-A): linking `user`'s alias to an account
+// owned by a DIFFERENT user has no matching (user_id, id) pair in codex_provider_account,
+// so the FK refuses the relink with a foreign_key_violation (23503) rather than binding an
+// alias across an ownership boundary.
+func TestLinkCodexCredentialStateCrossUserFKLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+
+	// `user`'s alias with a staging state row.
+	secret, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "xu-"+uuid.NewString(), false)
+	if err != nil {
+		t.Fatalf("insert secret: %v", err)
+	}
+	if _, err := q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{
+		UserSecretID: secret, UserID: user, Status: "staging",
+	}); err != nil {
+		t.Fatalf("insert staging state: %v", err)
+	}
+
+	// A DIFFERENT user owns the provider account we try to (illegally) link to.
+	other := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		other, fmt.Sprintf("codex-xu-%s@e2e", other))
+	otherAccount, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+		UserID: other, ProviderUserID: "p-" + uuid.NewString(), WorkspaceAccountID: "w-" + uuid.NewString(),
+		SealedLogin: []byte("sealed"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("insert other's account: %v", err)
+	}
+
+	// Link as `user` to `other`'s account: (user, otherAccount) is not a valid pair in
+	// codex_provider_account, so the composite FK rejects it (23503).
+	if _, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
+		UserSecretID: secret, UserID: user,
+		ProviderAccountID: pgtype.UUID{Bytes: otherAccount.ID, Valid: true}, MaterialRevision: 0,
+	}); pgCode(err) != "23503" {
+		t.Fatalf("cross-user link returned %v (code %q), want a foreign_key_violation (23503) — "+
+			"the (user_id, provider_account_id) composite FK is not owner-scoped", err, pgCode(err))
+	}
+}
+
+// TestCodexCredentialStateOrphanTriggerLiveDB pins BOTH sides of the refined F4 orphan
+// trigger (00199). (1) The FK cascade path: deleting a linked account nulls the alias's
+// provider_account_id and — because the cascade leaves status untouched (NEW.status =
+// OLD.status) — the trigger fires, demoting the row to 'failed' with an explanatory
+// last_error. (2) The regression guard: a legitimate app UPDATE that nulls
+// provider_account_id AND changes status in the same statement (BumpCodexMaterialRevision
+// to 'staging') is SKIPPED by the NEW.status = OLD.status guard, so its intended status is
+// preserved rather than clobbered to 'failed'.
+func TestCodexCredentialStateOrphanTriggerLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+
+	linkAlias := func() (uuid.UUID, uuid.UUID) {
+		secret, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "orph-"+uuid.NewString(), false)
+		if err != nil {
+			t.Fatalf("insert secret: %v", err)
+		}
+		if _, err := q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{
+			UserSecretID: secret, UserID: user, Status: "staging",
+		}); err != nil {
+			t.Fatalf("insert staging state: %v", err)
+		}
+		acc, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+			UserID: user, ProviderUserID: "p-" + uuid.NewString(), WorkspaceAccountID: "w-" + uuid.NewString(),
+			SealedLogin: []byte("sealed"), SealedWith: store.SealedWithMaster,
+		})
+		if err != nil {
+			t.Fatalf("insert account: %v", err)
+		}
+		if n, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
+			UserSecretID: secret, UserID: user,
+			ProviderAccountID: pgtype.UUID{Bytes: acc.ID, Valid: true}, MaterialRevision: 0,
+		}); err != nil || n != 1 {
+			t.Fatalf("link = (%d,%v), want (1,nil)", n, err)
+		}
+		return secret, acc.ID
+	}
+
+	// --- (1) FK cascade demotes the orphaned row to 'failed'. ---
+	cascadeSecret, cascadeAccount := linkAlias()
+	mustExec(ctx, t, pool, `DELETE FROM codex_provider_account WHERE id = $1 AND user_id = $2`, cascadeAccount, user)
+	orphaned, err := q.GetCodexCredentialState(ctx, store.GetCodexCredentialStateParams{
+		UserSecretID: cascadeSecret, UserID: user,
+	})
+	if err != nil {
+		t.Fatalf("read orphaned state: %v", err)
+	}
+	if orphaned.ProviderAccountID.Valid {
+		t.Fatal("provider_account_id survived the account delete — the ON DELETE SET NULL cascade did not fire")
+	}
+	if orphaned.Status != "failed" || !orphaned.LastError.Valid || orphaned.LastError.String == "" {
+		t.Fatalf("orphaned state = (status=%q last_error=%+v), want (\"failed\", non-empty) — the trigger must demote a cascade-orphaned row",
+			orphaned.Status, orphaned.LastError)
+	}
+
+	// --- (2) Regression: BumpCodexMaterialRevision(status='staging') nulls the link AND
+	//     changes status in one statement, so the trigger is skipped and 'staging' survives. ---
+	bumpSecret, _ := linkAlias()
+	if n, err := q.BumpCodexMaterialRevision(ctx, store.BumpCodexMaterialRevisionParams{
+		UserSecretID: bumpSecret, UserID: user, Status: "staging",
+	}); err != nil || n != 1 {
+		t.Fatalf("BumpCodexMaterialRevision = (%d,%v), want (1,nil)", n, err)
+	}
+	restaged, err := q.GetCodexCredentialState(ctx, store.GetCodexCredentialStateParams{
+		UserSecretID: bumpSecret, UserID: user,
+	})
+	if err != nil {
+		t.Fatalf("read restaged state: %v", err)
+	}
+	if restaged.ProviderAccountID.Valid {
+		t.Fatal("BumpCodexMaterialRevision did not un-link the account")
+	}
+	if restaged.Status != "staging" {
+		t.Fatalf("restaged status = %q, want \"staging\" — the trigger wrongly fired on an app-driven re-stage (NEW.status = OLD.status guard is missing)",
+			restaged.Status)
 	}
 }
