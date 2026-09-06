@@ -349,7 +349,80 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile must NOT put /opt/uzi-codex on PATH (resolve Codex by absolute path only)`,
       );
     });
+
+    it(`${name}: builds + installs the static Go supervisor root-owned 0555 in lockstep (PRD #1156 M3a)`, () => {
+      // M3a bakes the immutable trusted process-supervision helper: a STATICALLY LINKED Go
+      // binary (CGO_ENABLED=0, no /nix dependency) the untrusted same-uid runner cannot
+      // rewrite. jvm is NOT `FROM base`, so this is per-Dockerfile — pin the wiring as an
+      // invariant in lockstep. Each assertion is discriminating: it fails if the stanza is
+      // stripped or weakened.
+
+      // (a) COPY the supervisor module source into a throwaway /build dir.
+      assert.match(
+        text,
+        /COPY\s+agent\/codex\/supervisor\s+\/build\/uzi-codex-supervisor\b/,
+        `${name}/Dockerfile must COPY agent/codex/supervisor into a build dir`,
+      );
+
+      // (b) RUN a STATIC (CGO_ENABLED=0) go build producing /usr/local/bin/uzi-codex-supervisor.
+      assert.match(
+        text,
+        /RUN\s+cd\s+\/build\/uzi-codex-supervisor\b/,
+        `${name}/Dockerfile must build the supervisor from its copied source dir`,
+      );
+      assert.match(
+        text,
+        /CGO_ENABLED=0[^\n]*\bgo build\b[^\n]*-o\s+\/usr\/local\/bin\/uzi-codex-supervisor\b/,
+        `${name}/Dockerfile must go build the supervisor with CGO_ENABLED=0 (static) to /usr/local/bin/uzi-codex-supervisor`,
+      );
+      // Offline, reproducible: built from the committed vendor/ tree, not a network fetch.
+      assert.match(
+        text,
+        /GOFLAGS="[^"]*-mod=vendor[^"]*"[^\n]*\bgo build\b/,
+        `${name}/Dockerfile must build the supervisor offline from the vendored module (-mod=vendor)`,
+      );
+
+      // (c) chmod 0555 the installed binary — root-owned (build runs as root), immutable to
+      // the runner it supervises.
+      assert.match(
+        text,
+        /chmod\s+0555\s+\/usr\/local\/bin\/uzi-codex-supervisor\b/,
+        `${name}/Dockerfile must chmod 0555 the installed supervisor (immutable to the runner)`,
+      );
+
+      // (d) NO ENV PATH line may add the supervisor to PATH — the launcher resolves it by
+      // absolute path only (a trusted, caller-supplied argv0, never model-controlled).
+      assert.doesNotMatch(
+        text,
+        /^\s*ENV\s+PATH=[^\n]*uzi-codex-supervisor/m,
+        `${name}/Dockerfile must NOT put the supervisor on PATH (resolve it by absolute path only)`,
+      );
+    });
   }
+
+  // The supervisor build/install line is security-load-bearing (static, root-owned 0555)
+  // and MUST be byte-identical across templates — jvm is NOT `FROM base`, so a drift would
+  // ship two different trust anchors. Pin the COPY + RUN executable lines equal, mirroring
+  // the DEVBOX_VERSION / DinD-pin lockstep checks elsewhere in this file.
+  it("the static Go supervisor build/install lines are byte-identical across templates", () => {
+    const supervisorLines = (text: string): string[] =>
+      text
+        .split("\n")
+        .filter((l) => /^COPY\s+agent\/codex\/supervisor\b/.test(l) || /^RUN\s+cd\s+\/build\/uzi-codex-supervisor\b/.test(l));
+    const perTemplate = dockerfiles.map(({ name, text }) => {
+      const lines = supervisorLines(text);
+      assert.equal(lines.length, 2, `${name}/Dockerfile must carry exactly the supervisor COPY + RUN lines`);
+      return { name, lines: lines.join("\n") };
+    });
+    const first = perTemplate[0]!;
+    for (const t of perTemplate.slice(1)) {
+      assert.strictEqual(
+        t.lines,
+        first.lines,
+        `${t.name} and ${first.name} supervisor build/install lines have drifted — keep them byte-identical (one trust anchor, every template)`,
+      );
+    }
+  });
 });
 
 // The shared root-entry drop wrapper (PRD #51 A1) is the single mechanism both

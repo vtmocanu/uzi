@@ -2051,6 +2051,38 @@ tasks:
     cmds:
       - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
 
+  test:codex-supervisor:
+    desc: Opt-in gofmt vet and unit tests for the static Codex process supervisor module
+    # A SEPARATE Go module (uzi.local/codex-supervisor), deliberately NOT part of gate:api
+    # and NOT under gate. GOTOOLCHAIN=local pins the host toolchain (the module go.mod floors
+    # go 1.25); -mod=vendor builds offline from the committed vendor tree; -buildvcs=false
+    # skips VCS stamping, which otherwise fails inside a linked worktree.
+    dir: agent/codex/supervisor
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=vendor -buildvcs=false
+    cmds:
+      # gofmt -l EXITS 0 even when it lists drift, so branch on its OUTPUT, not its status,
+      # or the format check can never fail. A block scalar keeps the shell out of YAML quoting.
+      - |
+        drift="$(gofmt -l .)"
+        if [ -n "$drift" ]; then printf 'gofmt drift:\n%s\n' "$drift"; exit 1; fi
+      - go vet ./...
+      - go test ./...
+
+  test:codex-m3a:profile:
+    desc: Opt-in build the real worker image and run the M3a launcher isolation controls
+    # Builds the base worker image (jvm mirrors it in lockstep) with the M2 launcher and
+    # static supervisor, then runs the five container controls through the REAL root
+    # entrypoint under compose's hardened cap set (writable root, no read-only, no user
+    # override) so the ownership and uid-split they prove are the true production posture:
+    # channel nondumpability, profile fail-before-fork, ownership immutability,
+    # ECHILD+__WALL disposal, and fresh-tree ownership. Requires a working docker daemon,
+    # plus egress for the pinned Codex and toolchain artifacts on a cold build. NOT wired
+    # into gate. Set UZI_M3A_SKIP_BUILD=1 to reuse an already-built image.
+    cmds:
+      - ./e2e/codex-m3a/run.sh all
+
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)
     # Runs from the agent module so tsx + tsc + the SDK/zod deps resolve out of

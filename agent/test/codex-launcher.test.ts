@@ -1,0 +1,364 @@
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { createInterface } from "node:readline";
+import { PassThrough, Writable } from "node:stream";
+
+import { setprivRunnerArgs } from "../src/runner-uid.js";
+import {
+  CodexUnsupportedProfileError,
+  launchCodexRoot,
+  type CodexLaunchSpec,
+  type LauncherDeps,
+  type RunnerTreeRequest,
+  type SupervisorProcess,
+} from "../src/codex/launcher.js";
+import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
+
+// PRD #1156 (M3a) — the isolated per-root launcher. NO real Go binary, NO network,
+// NO setpriv/root: the supervisor is a FAKE process, every privileged/uid-resolving
+// step is injected.
+
+const CODEX_BIN = "/opt/uzi-codex/0.153.2/bin/codex";
+const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
+const RUNNER_UID = 10002;
+const DATA_ROOT = "/data/run/root-1";
+
+function baseSpec(overrides: Partial<CodexLaunchSpec> = {}): CodexLaunchSpec {
+  return {
+    ownedDataRoot: DATA_ROOT,
+    provider: { name: "uzi-codex", baseUrl: "http://127.0.0.1:9/v1", envKey: "CODEX_PROVIDER_KEY", credentialValue: "dummy-key" },
+    model: "gpt-5-codex",
+    codexBin: CODEX_BIN,
+    supervisorBin: SUPERVISOR_BIN,
+    kind: "provider",
+    childArgv: ["app-server"],
+    cwd: "/work/repo",
+    ...overrides,
+  };
+}
+
+interface FakeOpts {
+  uid?: number;
+  autoStarted?: boolean;
+  disposeState?: "drained" | "unconfirmed";
+  exitCode?: number;
+}
+
+/** A fake supervisor: 5 PassThrough fds, reads control on fd3, emits the pinned
+ *  evidence frames on fd4, and emits "exit" like a ChildProcess. */
+class FakeSupervisor extends EventEmitter {
+  readonly pid = 4242;
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly control = new PassThrough();
+  readonly evidence = new PassThrough();
+  readonly stdio: PassThrough[];
+  private readonly disposeState: "drained" | "unconfirmed";
+  private readonly exitCode: number;
+
+  constructor(opts: FakeOpts = {}) {
+    super();
+    this.stdio = [this.stdin, this.stdout, this.stderr, this.control, this.evidence];
+    this.disposeState = opts.disposeState ?? "drained";
+    this.exitCode = opts.exitCode ?? 0;
+    createInterface({ input: this.control }).on("line", (line) => this.onControl(line));
+    if (opts.autoStarted ?? true) {
+      this.writeEvidence({
+        event: "started", supervisorPid: this.pid, childPid: this.pid + 1,
+        subreaper: true, dumpable: true, uid: opts.uid ?? RUNNER_UID, capsZero: true, noNewPrivs: true,
+      });
+    }
+  }
+
+  writeEvidence(value: unknown): void { this.evidence.write(`${JSON.stringify(value)}\n`); }
+  writeRawEvidence(text: string): void { this.evidence.write(`${text}\n`); }
+  emitAbnormal(reason: string): void { this.writeEvidence({ event: "abnormal", reason, cleanup: { state: "unconfirmed" } }); }
+  exitWith(code: number, signal: NodeJS.Signals | null = null): void { this.emit("exit", code, signal); }
+
+  private onControl(line: string): void {
+    const cmd = JSON.parse(line) as { op: string; id: number };
+    if (cmd.op === "snapshot") {
+      this.writeEvidence({ event: "snapshot", id: cmd.id, processes: [{ pid: this.pid + 1, ppid: this.pid, pgid: this.pid, comm: "codex" }] });
+    } else if (cmd.op === "dispose") {
+      if (this.disposeState === "drained") {
+        this.writeEvidence({ event: "dispose", id: cmd.id, state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [this.pid + 1] });
+        queueMicrotask(() => this.exitWith(this.exitCode));
+      } else {
+        this.writeEvidence({ event: "dispose", id: cmd.id, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [this.pid + 1] });
+      }
+    }
+  }
+
+  destroyAll(): void {
+    for (const s of this.stdio) s.destroy();
+  }
+}
+
+const fakes: FakeSupervisor[] = [];
+const spawnCalls: { command: string; args: readonly string[]; options: { cwd: string; env: NodeJS.ProcessEnv } }[] = [];
+const treeCalls: RunnerTreeRequest[] = [];
+
+function baseDeps(fake: FakeSupervisor, overrides: Partial<LauncherDeps> = {}): LauncherDeps {
+  return {
+    env: { UZI_UID_SPLIT: "1" },
+    resolveRunnerUid: () => RUNNER_UID,
+    assertNoUnexpectedSystemConfig: () => { /* no /etc/codex in unit tests */ },
+    makeRunnerTrees: (req) => { treeCalls.push(req); },
+    spawnSupervisor: (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return fake as unknown as SupervisorProcess;
+    },
+    deadlines: { started: 1000, snapshot: 1000, dispose: 1000, exit: 1000 },
+    ...overrides,
+  };
+}
+
+function newFake(opts: FakeOpts = {}): FakeSupervisor {
+  const fake = new FakeSupervisor(opts);
+  fakes.push(fake);
+  return fake;
+}
+
+let savedSplit: string | undefined;
+let savedCanary: string | undefined;
+beforeEach(() => {
+  savedSplit = process.env.UZI_UID_SPLIT;
+  savedCanary = process.env.CODEX_CANARY_LEAK;
+  process.env.UZI_UID_SPLIT = "1"; // so the composed runnerCommand wraps in setpriv
+  process.env.CODEX_CANARY_LEAK = "SHOULD-NOT-LEAK";
+  spawnCalls.length = 0;
+  treeCalls.length = 0;
+});
+afterEach(() => {
+  for (const f of fakes) f.destroyAll();
+  fakes.length = 0;
+  if (savedSplit === undefined) delete process.env.UZI_UID_SPLIT; else process.env.UZI_UID_SPLIT = savedSplit;
+  if (savedCanary === undefined) delete process.env.CODEX_CANARY_LEAK; else process.env.CODEX_CANARY_LEAK = savedCanary;
+});
+
+describe("launchCodexRoot: fail-closed supported-profile gate", () => {
+  it("(a) REFUSES to launch when the uid-split is not active", async () => {
+    const fake = newFake();
+    await assert.rejects(
+      launchCodexRoot(baseSpec(), baseDeps(fake, { env: { PATH: "/usr/bin" } })),
+      (err: unknown) => {
+        assert.ok(err instanceof CodexUnsupportedProfileError);
+        assert.match((err as Error).message, /shared-uid \/ single-uid/);
+        assert.match((err as Error).message, /prerequisite/);
+        return true;
+      },
+    );
+    assert.equal(spawnCalls.length, 0, "no supervisor spawn under an unsupported profile");
+    assert.equal(treeCalls.length, 0, "no runner trees created under an unsupported profile");
+  });
+});
+
+describe("launchCodexRoot: env allowlist, trees, argv", () => {
+  it("(b) builds a REPLACED env of EXACTLY the allowed keys; a canary is excluded", async () => {
+    const fake = newFake();
+    await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const env = spawnCalls[0]?.options.env ?? {};
+    assert.deepEqual(
+      Object.keys(env).sort(),
+      [
+        "CODEX_HOME", "CODEX_PROVIDER_KEY", "HOME", "LANG", "PATH", "SHELL", "TERM", "TMPDIR",
+        "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+      ].sort(),
+    );
+    assert.equal(env.CODEX_PROVIDER_KEY, "dummy-key");
+    assert.equal(env.HOME, `${DATA_ROOT}/home`);
+    assert.equal(env.CODEX_HOME, `${DATA_ROOT}/codex`);
+    assert.equal(env.TMPDIR, `${DATA_ROOT}/tmp`);
+    assert.equal(env.SHELL, "/bin/sh");
+    assert.equal(env.LANG, "C");
+    assert.equal(env.TERM, "dumb");
+    // Fixed PATH: system dirs + toolchain, NOT the codex bundle.
+    assert.match(String(env.PATH), /\/opt\/uzi-toolchain\/bin/);
+    assert.doesNotMatch(String(env.PATH), /uzi-codex/);
+    // No leak of the worker/host env.
+    assert.equal(env.CODEX_CANARY_LEAK, undefined);
+    assert.equal(env.UZI_UID_SPLIT, undefined);
+  });
+
+  it("(b') is credential-FREE for kind:command", async () => {
+    const fake = newFake();
+    await launchCodexRoot(baseSpec({ kind: "command", childArgv: ["exec", "--", "echo"] }), baseDeps(fake));
+    const env = spawnCalls[0]?.options.env ?? {};
+    assert.equal(env.CODEX_PROVIDER_KEY, undefined, "no provider credential for a command root");
+    assert.equal(Object.keys(env).includes("CODEX_PROVIDER_KEY"), false);
+  });
+
+  it("(c) creates the fresh trees 0700 as the runner uid via the injected step", async () => {
+    const fake = newFake();
+    await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const req = treeCalls[0];
+    assert.ok(req, "makeRunnerTrees was called");
+    assert.equal(req.uid, RUNNER_UID);
+    assert.deepEqual([...req.dirs], [
+      `${DATA_ROOT}/home`, `${DATA_ROOT}/codex`, `${DATA_ROOT}/xdg-config`,
+      `${DATA_ROOT}/xdg-cache`, `${DATA_ROOT}/xdg-data`, `${DATA_ROOT}/xdg-state`, `${DATA_ROOT}/tmp`,
+    ]);
+    assert.equal(req.files.length, 1);
+    const configFile = req.files[0];
+    assert.ok(configFile);
+    assert.equal(configFile.path, `${DATA_ROOT}/codex/config.toml`);
+    assert.equal(configFile.mode, 0o600);
+    assert.match(configFile.content, /project_doc_max_bytes = 0/);
+    assert.match(configFile.content, /trust_level = "untrusted"/);
+    assert.doesNotMatch(configFile.content, /bypass_hook_trust/);
+  });
+
+  it("(d) constructs the launcher-fixed supervisor argv, composing runnerCommand (setpriv) unchanged", async () => {
+    const fake = newFake();
+    await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const call = spawnCalls[0];
+    assert.ok(call);
+    // Under the split, runnerCommand wraps in setpriv-to-runner, verbatim.
+    assert.equal(call.command, "/bin/setpriv");
+    assert.deepEqual([...call.args], [
+      ...setprivRunnerArgs(), SUPERVISOR_BIN, "--expect-uid", String(RUNNER_UID), "--", CODEX_BIN, "app-server",
+    ]);
+    // The supervisor portion is EXACTLY --expect-uid <N> -- <codexBin> <childArgv>.
+    const full = [call.command, ...call.args];
+    const at = full.indexOf(SUPERVISOR_BIN);
+    assert.ok(at >= 0);
+    assert.deepEqual(full.slice(at + 1), ["--expect-uid", String(RUNNER_UID), "--", CODEX_BIN, "app-server"]);
+  });
+
+  it("rejects a started posture that does not match the expected runner uid", async () => {
+    const fake = newFake({ uid: 12345 });
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture/);
+  });
+});
+
+describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () => {
+  it("(e) surfaces started, snapshot, and a drained dispose", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+
+    assert.equal(handle.started.event, "started");
+    assert.equal(handle.started.uid, RUNNER_UID);
+    assert.equal(handle.started.childPid, fake.pid + 1);
+    assert.equal(handle.supervisorPid, fake.pid);
+    assert.ok(handle.transport.stdin, "app-server transport stdin exposed");
+    assert.ok(handle.transport.stdout, "app-server transport stdout exposed");
+
+    const snap = await handle.snapshot();
+    assert.equal(snap.event, "snapshot");
+    assert.equal(snap.processes[0]?.comm, "codex");
+
+    const outcome = await handle.dispose(1500);
+    assert.equal(outcome.clean, true);
+    assert.ok(outcome.clean && outcome.event.state === "drained");
+    assert.equal(handle.failed, undefined);
+  });
+});
+
+describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
+  it("(f1) an `abnormal` evidence frame fails the root", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.emitAbnormal("controller loss");
+    await handle.whenFailed;
+    assert.ok(handle.failed);
+    const outcome = await handle.dispose();
+    assert.equal(outcome.clean, false);
+    assert.match(outcome.clean ? "" : outcome.reason, /abnormal/);
+  });
+
+  it("(f2) a spontaneous non-zero exit fails the root (no clean disposal)", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.exitWith(2);
+    await handle.whenFailed;
+    const outcome = await handle.dispose();
+    assert.equal(outcome.clean, false);
+  });
+
+  it("(f3) a dispose `unconfirmed` is NOT clean", async () => {
+    const fake = newFake({ disposeState: "unconfirmed" });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(200);
+    assert.equal(outcome.clean, false);
+    assert.ok(!outcome.clean && outcome.event?.state === "unconfirmed");
+    assert.match(outcome.clean ? "" : outcome.reason, /unconfirmed/);
+  });
+
+  it("(f4) a drained report contradicted by a non-zero exit is NOT clean", async () => {
+    const fake = newFake({ disposeState: "drained", exitCode: 3 });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.match(outcome.clean ? "" : outcome.reason, /non-zero/);
+  });
+
+  it("(f5) an oversized evidence line is a bounded rejection", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.writeRawEvidence(JSON.stringify({ event: "snapshot", id: 999, pad: "x".repeat(70000) }));
+    await handle.whenFailed;
+    assert.match(String(handle.failed?.message), /oversized evidence line/);
+    await assert.rejects(handle.snapshot(200), /oversized evidence line/);
+  });
+
+  it("(f6) a malformed evidence line is a bounded rejection", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.writeRawEvidence("{not json");
+    await handle.whenFailed;
+    assert.match(String(handle.failed?.message), /malformed evidence line/);
+  });
+
+  it("times out (bounded) when `started` never arrives", async () => {
+    const fake = newFake({ autoStarted: false });
+    await assert.rejects(
+      launchCodexRoot(baseSpec(), baseDeps(fake, { deadlines: { started: 40, snapshot: 40, dispose: 40, exit: 40 } })),
+      /started deadline exceeded/,
+    );
+  });
+});
+
+describe("runLaunchCli: packaged entrypoint (knip-visible import)", () => {
+  it("awaits started, disposes on the shutdown trigger, and returns 0 on a clean dispose", async () => {
+    // A minimal fake handle — this test exercises the CLI flow, not the launcher.
+    const disposed: number[] = [];
+    const fakeHandle = {
+      started: { event: "started" as const, supervisorPid: 1, childPid: 2, subreaper: true, dumpable: true, uid: RUNNER_UID, capsZero: true, noNewPrivs: true },
+      supervisorPid: 1,
+      transport: { stdin: null, stdout: null, stderr: null },
+      snapshot: () => Promise.reject(new Error("unused")),
+      dispose: () => { disposed.push(1); return Promise.resolve({ clean: true as const, event: { event: "dispose" as const, id: 1, state: "drained" as const } }); },
+      failed: undefined,
+      whenFailed: new Promise<Error>(() => { /* never fails in this test */ }),
+    };
+    const lines: string[] = [];
+    const stderr = new Writable({ write(chunk, _enc, cb) { lines.push(String(chunk)); cb(); } });
+    const deps: LaunchCliDeps = {
+      launch: () => Promise.resolve(fakeHandle),
+      loadSpec: () => baseSpec(),
+      proxyStdio: false,
+      until: Promise.resolve("eof"),
+      stderr,
+    };
+    const code = await runLaunchCli(["node", "launch-cli", "/spec.json"], deps);
+    assert.equal(code, 0);
+    assert.equal(disposed.length, 1, "the CLI disposed the root");
+    const joined = lines.join("");
+    assert.match(joined, /"event":"ready"/);
+    assert.match(joined, /"event":"final"/);
+    assert.match(joined, /"clean":true/);
+  });
+
+  it("returns 2 and reports a spec-error on an unloadable spec", async () => {
+    const lines: string[] = [];
+    const stderr = new Writable({ write(chunk, _enc, cb) { lines.push(String(chunk)); cb(); } });
+    const code = await runLaunchCli(["node", "launch-cli"], {
+      loadSpec: () => { throw new Error("usage: launch-cli <spec.json>"); },
+      stderr,
+    });
+    assert.equal(code, 2);
+    assert.match(lines.join(""), /"event":"spec-error"/);
+  });
+});

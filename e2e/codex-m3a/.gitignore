@@ -1,0 +1,6 @@
+# Build artifacts produced by run.sh — the stub is compiled from stub/main.go at run time
+# and must never be committed as a binary (PRD #1156 M3a: no committed downloaded/built
+# binaries). Container run logs land here too.
+.bin/
+*.log
+gate-log.*
