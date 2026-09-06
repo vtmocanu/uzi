@@ -525,7 +525,11 @@ func (s *Service) ReleaseCodexAccessToken(ctx context.Context, wkr store.Worker,
 		}
 		token = blob.AccessToken
 	case codexAuthModeAPIKey:
-		tok, oerr := secretopen.OpenByID(ctx, s.q, s.vlt, s.box, authCtx.UserID, authCtx.SecretID)
+		// Kind-guarded open (audit #6): the release predicate already rejects a kind↔mode
+		// mismatch, but the api_key release path opens by id defensively through
+		// OpenByIDOfKind so a mis-bound codex_auth alias can never disclose its login blob
+		// (refresh_token and all) here — a non-openai_api_key row is the not-found sentinel.
+		tok, oerr := secretopen.OpenByIDOfKind(ctx, s.q, s.vlt, s.box, authCtx.UserID, authCtx.SecretID, store.KindOpenAIAPIKey)
 		switch {
 		case oerr == nil:
 			token = string(tok)

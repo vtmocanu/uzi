@@ -161,6 +161,24 @@ var (
 	// ErrCodexAccountRevisionStale: the account's credential_revision has advanced since
 	// the run froze it — a genuine account-level revoke.
 	ErrCodexAccountRevisionStale = errors.New("codex account credential revision is stale")
+	// ErrCodexAccountQuarantined: the run's subscription account is parked in the
+	// 'quarantined' coord_state (a refresh commit failed into the recovery slot). No
+	// access token may be released or refresh started until it is reconciled or
+	// re-logged-in — handing back its stale sealed_login would return an expired token as
+	// a success. Deliberately DISTINCT from a revoke (ErrCodexAccountRevisionStale): the
+	// account identity is unchanged, it is merely paused.
+	ErrCodexAccountQuarantined = errors.New("codex account is quarantined; reconcile or re-login required")
+	// ErrCodexKindModeMismatch: the alias's user_secrets.kind contradicts the run's frozen
+	// auth mode (a 'subscription' run must be bound to a codex_auth alias, an 'api_key' run
+	// to an openai_api_key alias). Rejected so an api_key release path can never be pointed
+	// at a codex_auth login blob (which carries a refresh_token), and vice versa.
+	ErrCodexKindModeMismatch = errors.New("codex alias kind contradicts the run's auth mode")
+	// ErrCodexBindingConflict: a write-once freeze was refused because the run already
+	// carries a DIFFERENT frozen binding/identity (the store guard affected 0 rows for a
+	// run that DOES exist and is owned). Distinct from errRunVanished (a genuinely
+	// gone/foreign run): an identical retry (same secret/tuple) is idempotent success, only
+	// a conflicting re-point is refused.
+	ErrCodexBindingConflict = errors.New("codex run binding is already frozen to a different credential")
 	// errCodexStoreUnavailable: the service's store does not expose the Codex query
 	// surface (a test store, or a misconfiguration). Never happens with *store.Queries.
 	errCodexStoreUnavailable = errors.New("codex query surface unavailable")
@@ -251,6 +269,201 @@ func codexAccountKey(providerUserID, workspaceAccountID string) (string, error) 
 	return string(b), nil
 }
 
+// codexReleaseInputs is the pure, database-free snapshot the release predicate decides
+// over: the run's FROZEN binding facts alongside the CURRENT alias/account facts, so the
+// predicate compares the two without touching a store. Every nullable column carries an
+// explicit *Valid bool (rather than a pgtype) so the predicate stays a plain,
+// exhaustively-unit-testable value function. The subscription-only fields are ignored for
+// an api_key run (which has no account behind the LEFT join).
+type codexReleaseInputs struct {
+	authMode  string // runs.codex_auth_mode
+	boundKind string // the alias's user_secrets.kind (owner-scoped join)
+	status    string // runs.status
+
+	frozenMaterialRev       int64 // runs.codex_material_revision
+	frozenMaterialRevValid  bool
+	currentMaterialRev      int64 // codex_credential_state.material_revision
+	currentMaterialRevValid bool
+
+	// subscription only.
+	frozenAccountKey      string // runs.codex_account_key (the frozen identity tuple)
+	frozenAccountKeyValid bool
+
+	currentProviderUserID          string // codex_provider_account.provider_user_id
+	currentProviderUserIDValid     bool
+	currentWorkspaceAccountID      string // codex_provider_account.workspace_account_id
+	currentWorkspaceAccountIDValid bool
+
+	frozenAccountRev          int64 // runs.codex_account_revision
+	frozenAccountRevValid     bool
+	currentCredentialRev      int64 // codex_provider_account.credential_revision
+	currentCredentialRevValid bool
+
+	coordState      string // codex_provider_account.coord_state
+	coordStateValid bool
+}
+
+// codexReleaseInputsFromAuthRow projects a GetRunCodexAuthContext row into the pure
+// predicate inputs. It is the ONE place the row shape is mapped, so the release predicate
+// and every caller decide over the identical snapshot. current_material_revision is a
+// NOT-NULL column on the state row (the INNER join guarantees the row), so it is always
+// valid.
+func codexReleaseInputsFromAuthRow(row store.GetRunCodexAuthContextRow) codexReleaseInputs {
+	return codexReleaseInputs{
+		authMode:  row.CodexAuthMode.String,
+		boundKind: row.BoundKind,
+		status:    row.Status,
+
+		frozenMaterialRev:       row.CodexMaterialRevision.Int64,
+		frozenMaterialRevValid:  row.CodexMaterialRevision.Valid,
+		currentMaterialRev:      row.CurrentMaterialRevision,
+		currentMaterialRevValid: true,
+
+		frozenAccountKey:      row.CodexAccountKey.String,
+		frozenAccountKeyValid: row.CodexAccountKey.Valid,
+
+		currentProviderUserID:          row.ProviderUserID.String,
+		currentProviderUserIDValid:     row.ProviderUserID.Valid,
+		currentWorkspaceAccountID:      row.WorkspaceAccountID.String,
+		currentWorkspaceAccountIDValid: row.WorkspaceAccountID.Valid,
+
+		frozenAccountRev:          row.CodexAccountRevision.Int64,
+		frozenAccountRevValid:     row.CodexAccountRevision.Valid,
+		currentCredentialRev:      row.CurrentCredentialRevision.Int64,
+		currentCredentialRevValid: row.CurrentCredentialRevision.Valid,
+
+		coordState:      row.CurrentCoordState.String,
+		coordStateValid: row.CurrentCoordState.Valid,
+	}
+}
+
+// codexCheckKindMode enforces the kind↔auth-mode consistency invariant: a 'subscription'
+// run must be bound to a codex_auth alias, an 'api_key' run to an openai_api_key alias.
+// Any other pairing (including an unknown mode) is ErrCodexKindModeMismatch.
+func codexCheckKindMode(authMode, boundKind string) error {
+	switch authMode {
+	case codexAuthModeSubscription:
+		if boundKind != store.KindCodexAuth {
+			return ErrCodexKindModeMismatch
+		}
+	case codexAuthModeAPIKey:
+		if boundKind != store.KindOpenAIAPIKey {
+			return ErrCodexKindModeMismatch
+		}
+	default:
+		return ErrCodexKindModeMismatch
+	}
+	return nil
+}
+
+// codexCheckActivelyClaimed rejects a run that is not in the actively-claimed set.
+func codexCheckActivelyClaimed(status string) error {
+	if !codexActivelyClaimedStatuses[status] {
+		return ErrCodexRunNotActivelyClaimed
+	}
+	return nil
+}
+
+// codexCheckMaterialRev rejects a run whose frozen alias material_revision no longer
+// equals the alias's current material_revision (a manual alias replace bumps it).
+func codexCheckMaterialRev(in codexReleaseInputs) error {
+	if !in.frozenMaterialRevValid || !in.currentMaterialRevValid ||
+		in.frozenMaterialRev != in.currentMaterialRev {
+		return ErrCodexMaterialRevisionStale
+	}
+	return nil
+}
+
+// codexCheckAccountTuple enforces that a subscription run's frozen identity tuple is
+// present and still equals the account's current (provider_user_id, workspace_account_id).
+// A NULL frozen tuple is ErrCodexAccountKeyUnfrozen (not-yet-runnable); a NULL current
+// tuple or a differing tuple is ErrCodexAccountTupleMismatch (a replacement resolved
+// elsewhere). Both sides encode through the single codexAccountKey encoder so the two can
+// never serialize the same tuple differently.
+func codexCheckAccountTuple(in codexReleaseInputs) error {
+	if !in.frozenAccountKeyValid {
+		return ErrCodexAccountKeyUnfrozen
+	}
+	if !in.currentProviderUserIDValid || !in.currentWorkspaceAccountIDValid {
+		return ErrCodexAccountTupleMismatch
+	}
+	currentKey, err := codexAccountKey(in.currentProviderUserID, in.currentWorkspaceAccountID)
+	if err != nil {
+		return fmt.Errorf("codex predicate: encode account key: %w", err)
+	}
+	if in.frozenAccountKey != currentKey {
+		return ErrCodexAccountTupleMismatch
+	}
+	return nil
+}
+
+// evalCodexReleasePredicate is the SINGLE SOURCE OF TRUTH for "may this run be handed /
+// act on its credential right now" — the full authority set the release-family scopes
+// (release-access-token, start-refresh) and the claim-payload open both require (PRD #1147
+// audit #3/#3a/#6). It is a pure function so the whole matrix is unit-testable without a
+// database. The checks run in order, each returning its distinct sentinel:
+//
+//  1. kind↔mode consistency (subscription↔codex_auth, api_key↔openai_api_key);
+//  2. actively-claimed status;
+//  3. per-alias material_revision (frozen == current);
+//  4. subscription only: frozen identity tuple present + equal, account credential
+//     revision (frozen == current), and coord_state != 'quarantined'.
+//
+// api_key rows skip the account tuple/revision/quarantine checks — a static key has no
+// account behind it.
+func evalCodexReleasePredicate(in codexReleaseInputs) error {
+	if err := codexCheckKindMode(in.authMode, in.boundKind); err != nil {
+		return err
+	}
+	if err := codexCheckActivelyClaimed(in.status); err != nil {
+		return err
+	}
+	if err := codexCheckMaterialRev(in); err != nil {
+		return err
+	}
+	if in.authMode == codexAuthModeSubscription {
+		if err := codexCheckAccountTuple(in); err != nil {
+			return err
+		}
+		if !in.frozenAccountRevValid || !in.currentCredentialRevValid ||
+			in.frozenAccountRev != in.currentCredentialRev {
+			return ErrCodexAccountRevisionStale
+		}
+		if in.coordStateValid && in.coordState == codexCoordQuarantined {
+			return ErrCodexAccountQuarantined
+		}
+	}
+	return nil
+}
+
+// evalCodexPersistRecoveryPredicate is the DELIBERATELY REDUCED authority set for
+// ScopePersistRecovery (PRD #1147 audit #3, directive). It keeps ownership-adjacent
+// authority — actively-claimed status, per-alias material_revision, and (subscription) the
+// identity tuple match — but DELIBERATELY SKIPS credential_revision, quarantine, and the
+// kind↔mode check that the full release predicate enforces.
+//
+// The asymmetry is the whole point: a run must still be able to persist recoverable
+// material into the account's recovery slot BEFORE it parks (D4 persist-before-park), even
+// after the account was revoked (credential_revision bumped) or while it is quarantined.
+// Losing release/refresh permission must NOT also strip the authority to PROTECT material
+// the run already holds — that would turn a revoke or a quarantine into data loss. The
+// tuple match is kept because persist-recovery still acts on a SPECIFIC account and must
+// not be redirected to a different one; only the "may I still USE it" gates are dropped.
+func evalCodexPersistRecoveryPredicate(in codexReleaseInputs) error {
+	if err := codexCheckActivelyClaimed(in.status); err != nil {
+		return err
+	}
+	if err := codexCheckMaterialRev(in); err != nil {
+		return err
+	}
+	if in.authMode == codexAuthModeSubscription {
+		if err := codexCheckAccountTuple(in); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // CodexAuthContext is the resolved authority a successful AuthorizeCodexCredentialOp
 // grants: which scope it was authorized for, the run's auth mode, and enough to open
 // the credential in the caller (the resolved provider account id for a subscription
@@ -281,14 +494,19 @@ type CodexAuthContext struct {
 //     the run's codex_claim_epoch (a prior-epoch capability is rejected even if its
 //     secret hash-matches), and its secret's sha256 constant-time-equals the run's
 //     stored codex_cap_hash;
-//  4. the run is in an actively-claimed status (NOT queued, NOT terminal);
-//  5. per-alias: the run's frozen material_revision still equals the alias's current
-//     material_revision (a manual alias replace bumps it and invalidates the run);
-//  6. subscription only, account-wide: the run's frozen account_revision equals the
-//     account's current credential_revision AND the run's frozen identity tuple equals
-//     the account's current (provider_user_id, workspace_account_id). A NULL frozen
-//     tuple is not-yet-runnable and is rejected (so a replacement that resolves to a
-//     different account cannot retarget the run).
+//  4. the scope-family predicate holds (evalCodexReleasePredicate for the release family,
+//     evalCodexPersistRecoveryPredicate for persist-recovery), covering: kind↔mode
+//     consistency (release family only), actively-claimed status, per-alias
+//     material_revision, and — subscription only — the frozen identity tuple match,
+//     account credential_revision (release family only) and NOT-quarantined (release
+//     family only). The persist-recovery family DELIBERATELY skips credential_revision,
+//     quarantine and kind so a run can still protect material before parking after a
+//     revoke or while quarantined (audit #3).
+//
+// The distinct sentinels 4-6 of the former inline form (ErrCodexRunNotActivelyClaimed,
+// ErrCodexMaterialRevisionStale, ErrCodexAccountKeyUnfrozen/TupleMismatch/RevisionStale)
+// are preserved, plus the audit-added ErrCodexKindModeMismatch and
+// ErrCodexAccountQuarantined, so callers/tests still branch on WHY authority was refused.
 func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Worker, runID uuid.UUID, presentedCapability string, scope CodexOpScope) (CodexAuthContext, error) {
 	q, ok := s.codexStore()
 	if !ok {
@@ -344,15 +562,32 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 		return CodexAuthContext{}, ErrCodexCapabilityMismatch
 	}
 
-	// (4) actively-claimed status (NOT queued, NOT terminal).
-	if !codexActivelyClaimedStatuses[row.Status] {
-		return CodexAuthContext{}, ErrCodexRunNotActivelyClaimed
-	}
-
-	// (5) per-alias material revision (protects staging aliases and static api keys,
-	// which have no account row).
-	if !row.CodexMaterialRevision.Valid || row.CodexMaterialRevision.Int64 != row.CurrentMaterialRevision {
-		return CodexAuthContext{}, ErrCodexMaterialRevisionStale
+	// (4-6) The scope-family predicate. This is the SINGLE SOURCE OF TRUTH for the
+	// frozen-vs-current authority set, replacing the former inline checks 4-6 AND adding
+	// the audit-flagged quarantine + kind↔mode checks. Two families, deliberately
+	// asymmetric (PRD #1147 audit #3):
+	//
+	//   - the RELEASE family (release-access-token, start-refresh) runs the FULL predicate
+	//     — actively-claimed, material_revision, and (subscription) tuple + credential_
+	//     revision + NOT quarantined + kind↔mode consistent.
+	//   - ScopePersistRecovery runs a REDUCED predicate that DELIBERATELY SKIPS
+	//     credential_revision, quarantine and kind↔mode: a run must still be able to
+	//     persist recoverable material before parking even after a revoke or while
+	//     quarantined (D4 persist-before-park). Losing release permission must not lose the
+	//     authority to protect material. See evalCodexPersistRecoveryPredicate.
+	inputs := codexReleaseInputsFromAuthRow(row)
+	switch scope {
+	case ScopePersistRecovery:
+		if perr := evalCodexPersistRecoveryPredicate(inputs); perr != nil {
+			return CodexAuthContext{}, perr
+		}
+	case ScopeReleaseAccessToken, ScopeStartRefresh:
+		if perr := evalCodexReleasePredicate(inputs); perr != nil {
+			return CodexAuthContext{}, perr
+		}
+	default:
+		// Unreachable: scope.valid() and appliesTo() above already constrained the scope.
+		return CodexAuthContext{}, ErrCodexScopeNotApplicable
 	}
 
 	authCtx := CodexAuthContext{
@@ -363,31 +598,10 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 		SecretID: uuid.UUID(row.CodexSecretID.Bytes),
 	}
 
-	// (6) account-wide checks, subscription only. An api_key alias has no account row
-	// (the LEFT join is NULL), so there is nothing account-level to compare.
+	// Resolve the account id for a subscription run (owner-scoped via the state row). The
+	// predicate above already verified the tuple, so the account link is expected present;
+	// an unlinked link between the auth read and here is treated as not-runnable.
 	if authMode == codexAuthModeSubscription {
-		if !row.CodexAccountKey.Valid {
-			// NULL-frozen tuple: not-yet-runnable. Rejecting here is what stops a later
-			// replacement from silently retargeting the run onto a different account.
-			return CodexAuthContext{}, ErrCodexAccountKeyUnfrozen
-		}
-		if !row.ProviderUserID.Valid || !row.WorkspaceAccountID.Valid {
-			// The account behind the alias vanished or the alias no longer resolves to
-			// one — a replacement resolved elsewhere.
-			return CodexAuthContext{}, ErrCodexAccountTupleMismatch
-		}
-		currentKey, kerr := codexAccountKey(row.ProviderUserID.String, row.WorkspaceAccountID.String)
-		if kerr != nil {
-			return CodexAuthContext{}, fmt.Errorf("codex authorize: encode account key: %w", kerr)
-		}
-		if row.CodexAccountKey.String != currentKey {
-			return CodexAuthContext{}, ErrCodexAccountTupleMismatch
-		}
-		if !row.CodexAccountRevision.Valid || !row.CurrentCredentialRevision.Valid ||
-			row.CodexAccountRevision.Int64 != row.CurrentCredentialRevision.Int64 {
-			return CodexAuthContext{}, ErrCodexAccountRevisionStale
-		}
-		// Resolve the account id for the caller (owner-scoped via the state row).
 		st, serr := q.GetCodexCredentialState(ctx, store.GetCodexCredentialStateParams{
 			UserSecretID: authCtx.SecretID,
 			UserID:       wkr.UserID,
@@ -396,7 +610,6 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 			return CodexAuthContext{}, fmt.Errorf("codex authorize: resolve account: %w", serr)
 		}
 		if !st.ProviderAccountID.Valid {
-			// Linked-then-unlinked between the auth read and here: treat as not-runnable.
 			return CodexAuthContext{}, ErrCodexAccountKeyUnfrozen
 		}
 		authCtx.AccountID = uuid.UUID(st.ProviderAccountID.Bytes)
@@ -449,6 +662,15 @@ func (s *Service) FreezeCodexBinding(ctx context.Context, userID, runID, secretI
 		return fmt.Errorf("codex freeze: read alias meta: %w", err)
 	}
 
+	// Kind↔auth-mode consistency, enforced BEFORE any store write (audit #6): a
+	// 'subscription' binding must name a codex_auth alias, an 'api_key' binding an
+	// openai_api_key alias. Freezing an openai_api_key alias as 'subscription' (or a
+	// codex_auth alias as 'api_key') is refused here so the mismatch can never be persisted
+	// onto the run in the first place.
+	if kerr := codexCheckKindMode(authMode, meta.Kind); kerr != nil {
+		return kerr
+	}
+
 	n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
 		SecretID:         secretID,
 		AuthMode:         authMode,
@@ -466,7 +688,12 @@ func (s *Service) FreezeCodexBinding(ctx context.Context, userID, runID, secretI
 		return fmt.Errorf("codex freeze: freeze binding: %w", err)
 	}
 	if n == 0 {
-		return errRunVanished
+		// The write-once guard affected 0 rows. Distinguish a genuine conflict (the run
+		// exists and is owned but already carries a DIFFERENT frozen secret) from a
+		// vanished/foreign run: only the former is a binding conflict. An identical retry
+		// (same secret) would have matched the guard and affected ≥1 row, so it never
+		// reaches here.
+		return s.codexFreezeZeroRows(ctx, runID, userID)
 	}
 
 	// For a linked subscription alias, freeze the identity tuple + account revision now
@@ -495,10 +722,30 @@ func (s *Service) FreezeCodexBinding(ctx context.Context, userID, runID, secretI
 			return fmt.Errorf("codex freeze: freeze identity: %w", ierr)
 		}
 		if m == 0 {
-			return errRunVanished
+			// Same distinction as the binding freeze: 0 rows on the write-once identity
+			// guard is a conflict when the run exists and is owned (its identity is already
+			// frozen to a different tuple), else a vanished run.
+			return s.codexFreezeZeroRows(ctx, runID, userID)
 		}
 	}
 	return nil
+}
+
+// codexFreezeZeroRows maps a 0-row write-once freeze result to the right sentinel: a
+// conflict (ErrCodexBindingConflict) when the run still exists and is owned by the user
+// (so the 0 rows came from the immutability guard, not a missing run), else errRunVanished
+// (a genuinely gone/foreign run). Kept as one helper so the binding freeze and the
+// identity freeze classify a 0-row result identically.
+func (s *Service) codexFreezeZeroRows(ctx context.Context, runID, userID uuid.UUID) error {
+	_, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: userID})
+	switch {
+	case err == nil:
+		return ErrCodexBindingConflict
+	case errors.Is(err, pgx.ErrNoRows):
+		return errRunVanished
+	default:
+		return fmt.Errorf("codex freeze: classify zero-row freeze: %w", err)
+	}
 }
 
 // codexClaimSecrets builds the Codex block of a claim payload for a Codex-bound run
@@ -520,6 +767,26 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 	}
 	authMode := run.CodexAuthMode.String
 	secretID := uuid.UUID(run.CodexSecretID.Bytes)
+
+	// Enforce the FULL release predicate BEFORE minting a capability or opening anything
+	// (PRD #1147 audit #3a): a run whose binding is stale, quarantined or kind-mismatched
+	// must open NOTHING and mint NOTHING. This mirrors what a later
+	// AuthorizeCodexCredentialOp(release) would decide, so the claim can never hand out a
+	// credential the authority check would refuse. Ownership is asserted directly against
+	// the auth-context row (the presenting worker must currently own the run).
+	authRow, aerr := q.GetRunCodexAuthContext(ctx, run.ID)
+	if aerr != nil {
+		if errors.Is(aerr, pgx.ErrNoRows) {
+			return nil, ErrCodexRunNotBound
+		}
+		return nil, fmt.Errorf("codex claim: read auth context: %w", aerr)
+	}
+	if !authRow.WorkerID.Valid || uuid.UUID(authRow.WorkerID.Bytes) != wkr.ID {
+		return nil, ErrCodexWorkerMismatch
+	}
+	if perr := evalCodexReleasePredicate(codexReleaseInputsFromAuthRow(authRow)); perr != nil {
+		return nil, perr
+	}
 
 	// Mint the per-claim capability and store its hash worker-scoped, bumping the epoch.
 	// 0 rows means this worker no longer owns the run (a requeue reclaimed it between the
@@ -576,7 +843,12 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		}
 		accessToken = blob.AccessToken
 	case codexAuthModeAPIKey:
-		tok, oerr := secretopen.OpenByID(ctx, s.q, s.vlt, s.box, run.UserID, secretID)
+		// Kind-guarded open (audit #6): a mis-bound codex_auth alias must NEVER disclose
+		// its login blob (which carries a refresh_token) through the api_key path. The
+		// release predicate above already rejects a kind mismatch; this is the deeper,
+		// non-disclosing layer that holds even if that gate were ever bypassed — a
+		// non-openai_api_key row returns the not-found sentinel and NO bytes.
+		tok, oerr := secretopen.OpenByIDOfKind(ctx, s.q, s.vlt, s.box, run.UserID, secretID, store.KindOpenAIAPIKey)
 		switch {
 		case oerr == nil:
 			accessToken = string(tok)

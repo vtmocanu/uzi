@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -691,6 +692,48 @@ func TestReleaseCodexAccessTokenSubscriptionLiveDB(t *testing.T) {
 			t.Fatalf("token = %q, want empty when authority stales mid-call", tok)
 		}
 	})
+}
+
+// TestReleaseCodexAccessTokenMisboundKindNonDisclosureLiveDB pins the kind non-disclosure
+// defense (PRD #1147 audit #6): a run FORCED into a mis-bound state — codex_auth_mode
+// 'api_key' while its codex_secret_id points at a codex_auth alias (whose login blob
+// carries a refresh_token) — must NEVER release that blob. Release refuses it with
+// ErrCodexKindModeMismatch (the predicate's kind↔mode check is the first guard) and, even
+// were that bypassed, the api_key branch now opens through OpenByIDOfKind, which returns
+// the not-found sentinel for a non-openai_api_key row.
+//
+// FAIL-OLD / PASS-FIXED: the old release path had no kind↔mode predicate check and opened
+// the api_key branch with OpenByID, which decrypts a row of ANY kind — so this run would
+// have released the codex_auth login blob (refresh_token and all) as the "access token".
+// The fix refuses it and discloses no bytes.
+func TestReleaseCodexAccessTokenMisboundKindNonDisclosureLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := env.seedCodexInfra(t)
+
+	// A codex_auth staging alias whose sealed blob carries a refresh token.
+	refresh := codexToken("refresh")
+	aliasID := env.seedStagingAlias(t, userID, "codex-"+uuid.NewString(), codexLoginBlob{AccessToken: codexToken("access"), RefreshToken: refresh})
+	runID := env.seedCodexRun(t, userID, workerID, repoID)
+
+	// FORCE the mis-bind directly (FreezeCodexBinding would now refuse it): api_key mode
+	// bound to a codex_auth alias, material_revision matching the staging state so the old
+	// per-alias check would have passed straight through to the open.
+	env.exec(`UPDATE runs SET codex_secret_id=$1, codex_auth_mode='api_key', codex_secret_label='forced', codex_material_revision=0 WHERE id=$2`, aliasID, runID)
+
+	svc := &Service{q: env.q, box: env.box}
+	wkr := store.Worker{ID: workerID, UserID: userID}
+	capw := env.mintCap(t, runID, workerID)
+
+	tok, err := svc.ReleaseCodexAccessToken(env.ctx, wkr, runID, capw)
+	if !errors.Is(err, ErrCodexKindModeMismatch) {
+		t.Fatalf("mis-bound release: want ErrCodexKindModeMismatch, got %v", err)
+	}
+	if tok != "" {
+		t.Fatalf("mis-bound release must disclose no token, got %q", tok)
+	}
+	if strings.Contains(tok, "refresh") || tok == refresh {
+		t.Fatalf("the codex_auth login blob leaked through the api_key release path: %q", tok)
+	}
 }
 
 // TestReleaseCodexAccessTokenAPIKeyLiveDB proves release on an api_key run returns the

@@ -332,6 +332,206 @@ func TestAuthorizeCodexScopeNotApplicableAPIKeyLiveDB(t *testing.T) {
 	}
 }
 
+// quarantineAccount parks the subscription account behind the alias in 'quarantined'.
+func (e codexTestEnv) quarantineAccount(t *testing.T, aliasID uuid.UUID) {
+	t.Helper()
+	e.exec(`UPDATE codex_provider_account SET coord_state='quarantined'
+	        WHERE id = (SELECT provider_account_id FROM codex_credential_state WHERE user_secret_id = $1)`, aliasID)
+}
+
+// TestCodexClaimSecretsEnforcesReleasePredicateLiveDB proves codexClaimSecrets runs the
+// FULL release predicate BEFORE minting a capability or opening anything (PRD #1147 audit
+// #3a): a stale/retargeted/quarantined subscription run is refused with its specific
+// sentinel and opens NOTHING (no capability minted → the claim epoch is unchanged).
+//
+// FAIL-OLD / PASS-FIXED: the old codexClaimSecrets minted the capability FIRST and opened
+// the subscription login with NO frozen-vs-current or quarantine check at all, so each of
+// these runs would have minted a cap and returned a (stale/ambiguous) access token. The
+// predicate makes every case refuse before touching the credential.
+func TestCodexClaimSecretsEnforcesReleasePredicateLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+
+	// assertClaimRejected calls the claim path, asserts the sentinel, and asserts the run's
+	// claim epoch is unchanged (nothing was minted → nothing was opened).
+	assertClaimRejected := func(t *testing.T, f codexRunFixture, want error) {
+		t.Helper()
+		epochBefore := env.runEpoch(t, f.runID)
+		run := mustRun(t, env, f.runID)
+		codex, err := f.svc.codexClaimSecrets(env.ctx, f.wkr, run)
+		if !errors.Is(err, want) {
+			t.Fatalf("codexClaimSecrets err = %v, want %v", err, want)
+		}
+		if codex != nil {
+			t.Fatalf("a rejected claim must open nothing, got %+v", codex)
+		}
+		if after := env.runEpoch(t, f.runID); after != epochBefore {
+			t.Fatalf("claim epoch moved %d→%d on a rejected claim — a capability was minted before the predicate", epochBefore, after)
+		}
+	}
+
+	t.Run("stale material revision opens nothing", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		if _, err := env.q.BumpCodexMaterialRevision(env.ctx, store.BumpCodexMaterialRevisionParams{
+			Status:       "staging",
+			UserSecretID: f.aliasID,
+			UserID:       f.userID,
+		}); err != nil {
+			t.Fatalf("bump material: %v", err)
+		}
+		assertClaimRejected(t, f, ErrCodexMaterialRevisionStale)
+	})
+
+	t.Run("account tuple changed opens nothing", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		env.exec(`UPDATE codex_provider_account SET provider_user_id = 'retargeted-' || provider_user_id
+		          WHERE id = (SELECT provider_account_id FROM codex_credential_state WHERE user_secret_id = $1)`, f.aliasID)
+		assertClaimRejected(t, f, ErrCodexAccountTupleMismatch)
+	})
+
+	t.Run("quarantined account opens nothing", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		env.quarantineAccount(t, f.aliasID)
+		assertClaimRejected(t, f, ErrCodexAccountQuarantined)
+	})
+}
+
+// TestAuthorizeCodexReleaseVsPersistAsymmetryLiveDB proves the DELIBERATE asymmetry (PRD
+// #1147 audit #3): the release family refuses a quarantined or revoked account, while
+// ScopePersistRecovery STILL succeeds on that same account as long as ownership, the
+// identity tuple and material_revision hold — a run must keep the authority to protect
+// material before parking even after it lost the authority to use the credential.
+//
+// FAIL-OLD / PASS-FIXED: two directions. (a) The old Authorize had no quarantine check, so
+// release on a quarantined account SUCCEEDED — now it returns ErrCodexAccountQuarantined.
+// (b) The old Authorize applied the credential_revision check to EVERY scope, so persist
+// on a revoked account FAILED with ErrCodexAccountRevisionStale — now persist skips it and
+// succeeds.
+func TestAuthorizeCodexReleaseVsPersistAsymmetryLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+
+	t.Run("quarantine: release refused, persist allowed", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		env.quarantineAccount(t, f.aliasID)
+
+		capRel := env.mintCap(t, f.runID, f.workerID)
+		if _, err := f.svc.AuthorizeCodexCredentialOp(env.ctx, f.wkr, f.runID, capRel, ScopeReleaseAccessToken); !errors.Is(err, ErrCodexAccountQuarantined) {
+			t.Fatalf("release on quarantined account: want ErrCodexAccountQuarantined, got %v", err)
+		}
+
+		capPersist := env.mintCap(t, f.runID, f.workerID)
+		ac, err := f.svc.AuthorizeCodexCredentialOp(env.ctx, f.wkr, f.runID, capPersist, ScopePersistRecovery)
+		if err != nil {
+			t.Fatalf("persist-recovery on quarantined account must still authorize, got %v", err)
+		}
+		if ac.AccountID == uuid.Nil {
+			t.Fatal("persist-recovery authCtx must still resolve the account id")
+		}
+	})
+
+	t.Run("revoke: release refused, persist allowed", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		// A genuine account-level revoke bumps credential_revision.
+		env.exec(`UPDATE codex_provider_account SET credential_revision = credential_revision + 1
+		          WHERE id = (SELECT provider_account_id FROM codex_credential_state WHERE user_secret_id = $1)`, f.aliasID)
+
+		capRel := env.mintCap(t, f.runID, f.workerID)
+		if _, err := f.svc.AuthorizeCodexCredentialOp(env.ctx, f.wkr, f.runID, capRel, ScopeReleaseAccessToken); !errors.Is(err, ErrCodexAccountRevisionStale) {
+			t.Fatalf("release on revoked account: want ErrCodexAccountRevisionStale, got %v", err)
+		}
+
+		capPersist := env.mintCap(t, f.runID, f.workerID)
+		if _, err := f.svc.AuthorizeCodexCredentialOp(env.ctx, f.wkr, f.runID, capPersist, ScopePersistRecovery); err != nil {
+			t.Fatalf("persist-recovery on revoked account must still authorize, got %v", err)
+		}
+	})
+}
+
+// TestFreezeCodexBindingKindModeMismatchLiveDB proves the bind-time kind↔auth-mode check
+// (PRD #1147 audit #6): freezing a codex_auth alias as 'api_key' (or an openai_api_key
+// alias as 'subscription') is refused with ErrCodexKindModeMismatch and writes NOTHING —
+// the run's codex_secret_id stays NULL.
+//
+// FAIL-OLD / PASS-FIXED: the old FreezeCodexBinding had no kind check, so it would freeze
+// the contradictory binding onto the run (codex_secret_id set). The check refuses it
+// before any store write.
+func TestFreezeCodexBindingKindModeMismatchLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+
+	assertNoBinding := func(t *testing.T, runID uuid.UUID) {
+		t.Helper()
+		var bound bool
+		if err := env.pool.QueryRow(env.ctx, `SELECT codex_secret_id IS NOT NULL FROM runs WHERE id = $1`, runID).Scan(&bound); err != nil {
+			t.Fatalf("read binding: %v", err)
+		}
+		if bound {
+			t.Fatal("a kind-mismatched freeze must write nothing, but codex_secret_id is set")
+		}
+	}
+
+	t.Run("codex_auth alias as api_key", func(t *testing.T) {
+		userID, workerID, repoID := env.seedCodexInfra(t)
+		blob := codexLoginBlob{AccessToken: codexToken("access"), RefreshToken: codexToken("refresh")}
+		aliasID := env.seedStagingAlias(t, userID, "codex-"+uuid.NewString(), blob)
+		runID := env.seedCodexRun(t, userID, workerID, repoID)
+		svc := &Service{q: env.q, box: env.box}
+		if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); !errors.Is(err, ErrCodexKindModeMismatch) {
+			t.Fatalf("freeze codex_auth-as-api_key: want ErrCodexKindModeMismatch, got %v", err)
+		}
+		assertNoBinding(t, runID)
+	})
+
+	t.Run("openai_api_key alias as subscription", func(t *testing.T) {
+		userID, workerID, repoID := env.seedCodexInfra(t)
+		aliasID := env.seedStaticAPIKey(t, userID, "key-"+uuid.NewString(), codexToken("sk"))
+		runID := env.seedCodexRun(t, userID, workerID, repoID)
+		svc := &Service{q: env.q, box: env.box}
+		if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeSubscription); !errors.Is(err, ErrCodexKindModeMismatch) {
+			t.Fatalf("freeze openai_api_key-as-subscription: want ErrCodexKindModeMismatch, got %v", err)
+		}
+		assertNoBinding(t, runID)
+	})
+}
+
+// TestFreezeCodexBindingWriteOnceConflictLiveDB proves the service maps a 0-row write-once
+// freeze on an existing run to ErrCodexBindingConflict (not the generic vanished error),
+// leaves the original binding intact, and treats an identical retry as idempotent success
+// (PRD #1147 audit #6).
+//
+// FAIL-OLD / PASS-FIXED: the store's write-once guard already refuses a conflicting freeze
+// (Phase 1), but the old service mapped that 0-row result to errRunVanished. This test
+// asserts the distinct ErrCodexBindingConflict, so it fails against the old mapping and
+// passes with the new one.
+func TestFreezeCodexBindingWriteOnceConflictLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	aliasA := env.seedStaticAPIKey(t, userID, "key-a-"+uuid.NewString(), codexToken("sk"))
+	aliasB := env.seedStaticAPIKey(t, userID, "key-b-"+uuid.NewString(), codexToken("sk"))
+	runID := env.seedCodexRun(t, userID, workerID, repoID)
+	svc := &Service{q: env.q, box: env.box}
+
+	// First freeze: succeeds, binding = aliasA.
+	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasA, codexAuthModeAPIKey); err != nil {
+		t.Fatalf("first freeze: %v", err)
+	}
+
+	// Conflicting second freeze (a DIFFERENT secret) → ErrCodexBindingConflict, original intact.
+	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasB, codexAuthModeAPIKey); !errors.Is(err, ErrCodexBindingConflict) {
+		t.Fatalf("conflicting freeze: want ErrCodexBindingConflict, got %v", err)
+	}
+	var boundSecret uuid.UUID
+	if err := env.pool.QueryRow(env.ctx, `SELECT codex_secret_id FROM runs WHERE id = $1`, runID).Scan(&boundSecret); err != nil {
+		t.Fatalf("read binding: %v", err)
+	}
+	if boundSecret != aliasA {
+		t.Fatalf("binding = %v after a refused conflict, want the original %v", boundSecret, aliasA)
+	}
+
+	// Identical retry (same secret) → idempotent success.
+	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasA, codexAuthModeAPIKey); err != nil {
+		t.Fatalf("identical retry must be idempotent success, got %v", err)
+	}
+}
+
 // assertAuthErr mints nothing itself; it authorizes with the given capability/scope and
 // asserts the specific sentinel.
 func assertAuthErr(t *testing.T, f codexRunFixture, env codexTestEnv, capability string, scope CodexOpScope, want error) {
