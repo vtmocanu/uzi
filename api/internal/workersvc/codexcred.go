@@ -53,6 +53,21 @@ var (
 	ErrCodexRelinkRaceLost = errors.New("codex relink lost a material-revision race")
 )
 
+// CodexTxBeginner is the transaction seam the reconciler needs to make the
+// {resolve tuple → restore-or-insert canonical material → link} section ATOMIC
+// (PRD #1147 M3, defect 3). *pgxpool.Pool satisfies it. It is DELIBERATELY narrow —
+// just Begin — because the reconciler only ever opens one transaction and threads a
+// tx-bound *store.Queries through the section; it never needs the pool's other surface.
+//
+// The canonical write (RefreshCodexAccountLogin restore, or InsertCodexProviderAccount)
+// and the alias-revision link CAS MUST commit together: if the link loses its CAS
+// (0 rows, the alias's material_revision moved under a concurrent replace) the canonical
+// write has to roll back, or a stale reconcile would leave an orphan account (new-account
+// path) or a mutated account (quarantine restore) that a later import adopts.
+type CodexTxBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
 // CodexIdentityClient is the injectable identity seam the reconciler depends on
 // (PRD #1147 M1). *codexauth.Client satisfies it; tests supply an in-process fake.
 //
@@ -108,21 +123,28 @@ type codexLoginBlob struct {
 //
 // The deps are injected so tests supply a fake identity client and (for the seal
 // path) a real secretbox with a nil vault:
-//   - q     the Codex + ciphertext queries;
+//   - q     the Codex + ciphertext queries (pre-transaction reads run through this);
 //   - vlt   the per-user vault (nil ⇒ seal under the master box, the pre-vault path);
 //   - box   the master box (the nil-vault seal/open fallback);
-//   - ident the identity client (fake in tests).
+//   - ident the identity client (fake in tests);
+//   - beginner the transaction seam (a *pgxpool.Pool), REQUIRED: it makes the canonical
+//     install + link CAS atomic (PRD #1147 M3) so a lost link CAS rolls the canonical
+//     write back. There is no non-transactional fallback — a nil beginner is a
+//     programming error and reconcile fails closed rather than writing non-atomically.
 type CodexReconciler struct {
-	q     codexCredStore
-	vlt   *vault.Vault
-	box   *secretbox.Box
-	ident CodexIdentityClient
+	q        codexCredStore
+	beginner CodexTxBeginner
+	vlt      *vault.Vault
+	box      *secretbox.Box
+	ident    CodexIdentityClient
 }
 
 // NewCodexReconciler builds a reconciler over the store, the vault (may be nil), the
-// master box and the identity client.
-func NewCodexReconciler(q codexCredStore, vlt *vault.Vault, box *secretbox.Box, ident CodexIdentityClient) *CodexReconciler {
-	return &CodexReconciler{q: q, vlt: vlt, box: box, ident: ident}
+// master box, the identity client and the transaction beginner (a *pgxpool.Pool). The
+// beginner is REQUIRED: the reconciler always runs its canonical install + link CAS in
+// one transaction (PRD #1147 M3), so there is no non-atomic path to select.
+func NewCodexReconciler(q codexCredStore, vlt *vault.Vault, box *secretbox.Box, ident CodexIdentityClient, beginner CodexTxBeginner) *CodexReconciler {
+	return &CodexReconciler{q: q, vlt: vlt, box: box, ident: ident, beginner: beginner}
 }
 
 // ReconcileCodexAuthIdentity establishes the identity of one staged codex_auth alias
@@ -173,31 +195,78 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 			return err
 		default:
 			// Undecryptable material is terminal for this import.
-			r.markFailed(ctx, userID, userSecretID, "stored codex login could not be decrypted")
+			r.markFailed(ctx, userID, userSecretID, "stored codex login could not be decrypted", st.MaterialRevision)
 			return fmt.Errorf("codex reconcile: open login: %w", err)
 		}
 	}
 
 	var blob codexLoginBlob
 	if err := json.Unmarshal(plain, &blob); err != nil {
-		r.markFailed(ctx, userID, userSecretID, "stored codex login is not valid JSON")
+		r.markFailed(ctx, userID, userSecretID, "stored codex login is not valid JSON", st.MaterialRevision)
 		return fmt.Errorf("%w: %v", ErrCodexLoginBlob, err)
 	}
 	if blob.AccessToken == "" {
-		r.markFailed(ctx, userID, userSecretID, "stored codex login has no access token")
+		r.markFailed(ctx, userID, userSecretID, "stored codex login has no access token", st.MaterialRevision)
 		return fmt.Errorf("%w: missing access token", ErrCodexLoginBlob)
 	}
 
 	// NONROTATING identity read. On ANY failure: mark failed with the reason and
 	// return, having made zero oauth/refresh calls. Refresh is never invoked here.
+	// This is a NETWORK call and MUST stay OUTSIDE the transaction opened below.
 	id, err := r.ident.DiscoverIdentity(ctx, blob.AccessToken)
 	if err != nil {
-		r.markFailed(ctx, userID, userSecretID, discoveryFailureReason(err))
+		r.markFailed(ctx, userID, userSecretID, discoveryFailureReason(err), st.MaterialRevision)
 		return fmt.Errorf("codex reconcile: discover identity: %w", err)
 	}
 
-	// Reconcile by the full identity tuple, owner-scoped.
-	acct, err := r.q.GetCodexProviderAccountByTuple(ctx, store.GetCodexProviderAccountByTupleParams{
+	// Reconcile by the full identity tuple, owner-scoped. The canonical write and the
+	// link CAS run together in one transaction so a lost link (the alias's material
+	// moved under us) rolls the canonical write back (PRD #1147 M3).
+	return r.installAndLink(ctx, userID, userSecretID, plain, id, st.MaterialRevision)
+}
+
+// installAndLink runs the {resolve tuple → restore-or-insert canonical material → link}
+// section (PRD #1147 M3). When a transaction beginner is configured it wraps the WHOLE
+// section in ONE transaction: a lost link CAS (0 rows, the alias's material_revision
+// moved under a concurrent replace) returns ErrCodexRelinkRaceLost, which fires the
+// deferred rollback and UNDOES the canonical write — so a stale reconcile can no longer
+// leave an orphan account (new-account path) or a mutated account (quarantine restore)
+// for a later import to adopt.
+//
+// The beginner is required (NewCodexReconciler enforces it); a nil beginner fails closed
+// rather than falling back to a non-atomic write.
+func (r *CodexReconciler) installAndLink(ctx context.Context, userID, userSecretID uuid.UUID, plain []byte, id codexauth.Identity, observedMaterialRevision int64) error {
+	if r.beginner == nil {
+		return fmt.Errorf("codex reconcile: no transaction beginner configured")
+	}
+	tx, err := r.beginner.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("codex reconcile: begin tx: %w", err)
+	}
+	// Rollback is a no-op after a successful Commit; on any early return (notably a lost
+	// link CAS) it undoes the canonical install/restore written earlier in the tx.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := r.reconcileTuple(ctx, store.New(tx), tx, userID, userSecretID, plain, id, observedMaterialRevision); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("codex reconcile: commit: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// reconcileTuple resolves the identity tuple and installs+links inside q (a tx-bound
+// *store.Queries). tx is the enclosing transaction (always non-nil); it is used to open a
+// SAVEPOINT around the account insert so a same-tuple unique violation can be recovered
+// WITHOUT aborting the outer transaction.
+func (r *CodexReconciler) reconcileTuple(ctx context.Context, q codexCredStore, tx pgx.Tx, userID, userSecretID uuid.UUID, plain []byte, id codexauth.Identity, observedMaterialRevision int64) error {
+	acct, err := q.GetCodexProviderAccountByTuple(ctx, store.GetCodexProviderAccountByTupleParams{
 		UserID:             userID,
 		ProviderUserID:     id.ProviderUserID,
 		WorkspaceAccountID: id.WorkspaceAccountID,
@@ -212,13 +281,18 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 		//     generation, and clears the quarantine, so the account is usable again;
 		//   - if the account is HEALTHY (idle/committed), keep the no-overwrite converge — it
 		//     is authoritative and another alias may already hold the canonical material.
-		// Order: verify identity → (if quarantined) restore login → CAS-link.
+		// Order: verify identity → (if quarantined) restore login → CAS-link. The restore
+		// and the link are in the same transaction, so a lost link CAS rolls the restore back
+		// (the account keeps its dead login + old generation), and an ordinary duplicate
+		// import that merely OBSERVED the quarantine cannot install a re-login it did not win:
+		// it is still gated by (i) the account-generation CAS here and (ii) the alias
+		// material-revision link CAS below.
 		if acct.CoordState == codexCoordQuarantined {
 			sealed, sealedWith, serr := r.sealLogin(userID, plain)
 			if serr != nil {
 				return fmt.Errorf("codex reconcile: seal re-login: %w", serr)
 			}
-			n, rerr := r.q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
+			n, rerr := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
 				Sealed:         sealed,
 				SealedWith:     sealedWith,
 				ID:             acct.ID,
@@ -235,10 +309,7 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 				return fmt.Errorf("codex reconcile: quarantine moved under restore CAS")
 			}
 		}
-		if lerr := r.link(ctx, userID, userSecretID, acct.ID, st.MaterialRevision); lerr != nil {
-			return lerr
-		}
-		return nil
+		return r.link(ctx, q, userID, userSecretID, acct.ID, observedMaterialRevision)
 	case errors.Is(err, pgx.ErrNoRows):
 		// No account for this tuple yet: seal the login blob under the DEK (AAD
 		// user_id||codex_auth, the same vault Seal path the handler uses) and insert
@@ -247,7 +318,7 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 		if serr != nil {
 			return fmt.Errorf("codex reconcile: seal login: %w", serr)
 		}
-		acct, ierr := r.q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+		acct, ierr := r.insertAccount(ctx, tx, store.InsertCodexProviderAccountParams{
 			UserID:             userID,
 			ProviderUserID:     id.ProviderUserID,
 			WorkspaceAccountID: id.WorkspaceAccountID,
@@ -260,8 +331,10 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 			// codex_provider_account_tuple_key (23505). That is the convergence
 			// case, not a failure — re-resolve the now-existing account and link
 			// to it rather than creating a second copy. Any other error is real.
+			// Inside a tx the violation was contained by a savepoint (see insertAccount),
+			// so the outer tx is still live for the re-fetch + link.
 			if uniqueViolationOn(ierr, "codex_provider_account_tuple_key") {
-				existing, gerr := r.q.GetCodexProviderAccountByTuple(ctx, store.GetCodexProviderAccountByTupleParams{
+				existing, gerr := q.GetCodexProviderAccountByTuple(ctx, store.GetCodexProviderAccountByTupleParams{
 					UserID:             userID,
 					ProviderUserID:     id.ProviderUserID,
 					WorkspaceAccountID: id.WorkspaceAccountID,
@@ -269,17 +342,41 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 				if gerr != nil {
 					return fmt.Errorf("codex reconcile: resolve after insert race: %w", gerr)
 				}
-				return r.link(ctx, userID, userSecretID, existing.ID, st.MaterialRevision)
+				return r.link(ctx, q, userID, userSecretID, existing.ID, observedMaterialRevision)
 			}
 			return fmt.Errorf("codex reconcile: insert account: %w", ierr)
 		}
-		if lerr := r.link(ctx, userID, userSecretID, acct.ID, st.MaterialRevision); lerr != nil {
-			return lerr
-		}
-		return nil
+		return r.link(ctx, q, userID, userSecretID, acct.ID, observedMaterialRevision)
 	default:
 		return fmt.Errorf("codex reconcile: resolve tuple: %w", err)
 	}
+}
+
+// insertAccount inserts the authoritative account inside a SAVEPOINT (pgx v5 exposes
+// savepoints as nested tx.Begin) so a same-tuple unique violation (23505) rolls back JUST
+// the savepoint — recovering the outer transaction from its aborted state — and the caller
+// can re-fetch + link within the same outer tx. tx is always non-nil (installAndLink runs
+// this only within an open transaction); a nil tx fails closed rather than inserting
+// non-atomically, matching the reconciler's no-non-atomic-path invariant.
+func (r *CodexReconciler) insertAccount(ctx context.Context, tx pgx.Tx, arg store.InsertCodexProviderAccountParams) (store.CodexProviderAccount, error) {
+	if tx == nil {
+		return store.CodexProviderAccount{}, fmt.Errorf("codex reconcile: insertAccount requires an open transaction")
+	}
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return store.CodexProviderAccount{}, fmt.Errorf("codex reconcile: begin insert savepoint: %w", err)
+	}
+	acct, ierr := store.New(sp).InsertCodexProviderAccount(ctx, arg)
+	if ierr != nil {
+		// Roll the savepoint back so the outer tx is usable again, and surface the
+		// original insert error (unique-violation classification happens in the caller).
+		_ = sp.Rollback(ctx)
+		return store.CodexProviderAccount{}, ierr
+	}
+	if cerr := sp.Commit(ctx); cerr != nil {
+		return store.CodexProviderAccount{}, fmt.Errorf("codex reconcile: release insert savepoint: %w", cerr)
+	}
+	return acct, nil
 }
 
 // link binds the alias's state row to the resolved account (status → 'linked'),
@@ -291,10 +388,14 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 // revision and dropped the old link) between the state read and this write. Surfacing
 // ErrCodexRelinkRaceLost — not ErrCodexStateMissing, not markFailed — keeps that transient:
 // the replacement's own bump re-triggers reconcile on the NEW material, which relinks it
-// correctly. (On the new-account path a lost CAS may leave an orphan account row with no
-// alias pointing at it; that is acceptable — it is unreferenced and harmless.)
-func (r *CodexReconciler) link(ctx context.Context, userID, userSecretID, accountID uuid.UUID, observedMaterialRevision int64) error {
-	n, err := r.q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
+// correctly. When the reconcile runs inside a transaction (PRD #1147 M3), returning this
+// error ROLLS BACK the canonical write done earlier in the same tx — so a lost CAS leaves
+// NEITHER an orphan account (new-account path) NOR a mutated account (quarantine restore)
+// behind. That is the fix for defect 3: the pre-M3 comment here called the orphan
+// "harmless", but a later import that resolves the same tuple would ADOPT that stale
+// account's material, so the write must not persist unless its link wins.
+func (r *CodexReconciler) link(ctx context.Context, q codexCredStore, userID, userSecretID, accountID uuid.UUID, observedMaterialRevision int64) error {
+	n, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
 		ProviderAccountID: pgconv.UUID(accountID),
 		UserSecretID:      userSecretID,
 		UserID:            userID,
@@ -312,12 +413,20 @@ func (r *CodexReconciler) link(ctx context.Context, userID, userSecretID, accoun
 // markFailed records status='failed' with a human reason. Best-effort: the caller
 // is already returning the underlying error, and a failed status write that itself
 // fails must not mask it.
-func (r *CodexReconciler) markFailed(ctx context.Context, userID, userSecretID uuid.UUID, reason string) {
+//
+// observedMaterialRevision is the revision the reconcile read at its top (audit #4 / PRD
+// #1147 M3): SetCodexCredentialStateStatus now fences on it AND on a reconcilable status,
+// so a STALE caller whose alias was bumped (its revision moved), or a caller targeting an
+// alias that has since been linked/replaced, matches 0 rows and cannot clobber a live
+// binding to 'failed'. Best-effort still holds — the row count is ignored — but the fence
+// makes the failure write safe to fire even when a replacement has already won.
+func (r *CodexReconciler) markFailed(ctx context.Context, userID, userSecretID uuid.UUID, reason string, observedMaterialRevision int64) {
 	_, _ = r.q.SetCodexCredentialStateStatus(ctx, store.SetCodexCredentialStateStatusParams{
-		Status:       codexStatusFailed,
-		LastError:    pgconv.TextOrNull(reason),
-		UserSecretID: userSecretID,
-		UserID:       userID,
+		Status:           codexStatusFailed,
+		LastError:        pgconv.TextOrNull(reason),
+		UserSecretID:     userSecretID,
+		UserID:           userID,
+		MaterialRevision: observedMaterialRevision,
 	})
 }
 

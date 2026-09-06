@@ -266,11 +266,18 @@ func TestCodexCredentialStateLiveDB(t *testing.T) {
 	}
 
 	// SetCodexCredentialStateStatus records a failure reason without touching the link.
-	if _, err := q.SetCodexCredentialStateStatus(ctx, store.SetCodexCredentialStateStatusParams{
+	// PRD #1147 M3: the write is now fenced on the OBSERVED material_revision and a
+	// reconcilable status (staging/failed), so pass the current (post-bump) revision.
+	sn, err := q.SetCodexCredentialStateStatus(ctx, store.SetCodexCredentialStateStatusParams{
 		UserSecretID: authSecret, UserID: user, Status: "failed",
-		LastError: pgtype.Text{String: "provider refused the login", Valid: true},
-	}); err != nil {
+		MaterialRevision: bumped.MaterialRevision,
+		LastError:        pgtype.Text{String: "provider refused the login", Valid: true},
+	})
+	if err != nil {
 		t.Fatalf("set status: %v", err)
+	}
+	if sn != 1 {
+		t.Fatalf("set status affected %d rows, want 1", sn)
 	}
 	failed, err := q.GetCodexCredentialState(ctx, store.GetCodexCredentialStateParams{
 		UserSecretID: authSecret, UserID: user,

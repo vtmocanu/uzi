@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
@@ -181,7 +182,7 @@ func TestReconcileCodexIncompleteIdentityStaysFailedLiveDB(t *testing.T) {
 	fake := newFakeCodexIdentity()
 	fake.errByToken[incompleteTok] = codexauth.ErrIdentityIncomplete
 	fake.errByToken[expiredTok] = &codexauth.AuthError{Op: "discover_identity", StatusCode: 401}
-	r := NewCodexReconciler(env.q, nil, env.box, fake)
+	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
 
 	for _, alias := range []uuid.UUID{aliasIncomplete, aliasExpired} {
 		err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias)
@@ -231,7 +232,7 @@ func TestReconcileCodexSameTupleConvergesLiveDB(t *testing.T) {
 	sameID := codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace}
 	fake.idByToken[tok1] = sameID
 	fake.idByToken[tok2] = sameID
-	r := NewCodexReconciler(env.q, nil, env.box, fake)
+	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
 
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
@@ -293,7 +294,7 @@ func TestReconcileCodexDifferentUserSameWorkspaceLiveDB(t *testing.T) {
 	fake := newFakeCodexIdentity()
 	fake.idByToken[tokA] = codexauth.Identity{ProviderUserID: providerUserA, WorkspaceAccountID: workspace}
 	fake.idByToken[tokB] = codexauth.Identity{ProviderUserID: providerUserB, WorkspaceAccountID: workspace}
-	r := NewCodexReconciler(env.q, nil, env.box, fake)
+	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
 
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, aliasA); err != nil {
 		t.Fatalf("reconcile aliasA: %v", err)
@@ -345,7 +346,7 @@ func TestReconcileCodexRelinkRaceLostLiveDB(t *testing.T) {
 	alias1 := env.seedStagingAlias(t, userID, "codex-race-a", codexLoginBlob{AccessToken: tok1, RefreshToken: codexToken("r")})
 	fakeA := newFakeCodexIdentity()
 	fakeA.idByToken[tok1] = sameID
-	if err := NewCodexReconciler(env.q, nil, env.box, fakeA).ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
+	if err := NewCodexReconciler(env.q, nil, env.box, fakeA, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
 	}
 
@@ -363,7 +364,7 @@ func TestReconcileCodexRelinkRaceLostLiveDB(t *testing.T) {
 		}
 	}
 
-	err := NewCodexReconciler(env.q, nil, env.box, fakeB).ReconcileCodexAuthIdentity(env.ctx, userID, alias2)
+	err := NewCodexReconciler(env.q, nil, env.box, fakeB, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias2)
 	if !errors.Is(err, ErrCodexRelinkRaceLost) {
 		t.Fatalf("err = %v, want ErrCodexRelinkRaceLost", err)
 	}
@@ -397,7 +398,7 @@ func TestReconcileCodexReLoginRestoresQuarantinedLiveDB(t *testing.T) {
 	alias1 := env.seedStagingAlias(t, userID, "codex-relogin-a", codexLoginBlob{AccessToken: tok1, RefreshToken: codexToken("r")})
 	fake := newFakeCodexIdentity()
 	fake.idByToken[tok1] = sameID
-	r := NewCodexReconciler(env.q, nil, env.box, fake)
+	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
 	}
@@ -443,7 +444,7 @@ func TestReconcileCodexRefusesLinkedStatusLiveDB(t *testing.T) {
 
 	fake := newFakeCodexIdentity()
 	fake.idByToken[tok] = codexauth.Identity{ProviderUserID: "u-" + uuid.NewString(), WorkspaceAccountID: "a-" + uuid.NewString()}
-	r := NewCodexReconciler(env.q, nil, env.box, fake)
+	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
 
 	// First reconcile links it.
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias); err != nil {
@@ -457,5 +458,187 @@ func TestReconcileCodexRefusesLinkedStatusLiveDB(t *testing.T) {
 	}
 	if fake.discoverCalls != discoverAfterFirst {
 		t.Fatalf("refused reconcile must not call discovery (calls %d → %d)", discoverAfterFirst, fake.discoverCalls)
+	}
+}
+
+// TestReconcileCodexStaleFirstEnrollmentRollsBackLiveDB (PRD #1147 M3, defect 3 fix 3a,
+// new-account path) proves the atomic install+link: a FIRST enrollment (no existing
+// account for the tuple) whose alias is REPLACED mid-discovery loses the link CAS, and the
+// enclosing transaction ROLLS BACK the account insert — so NO orphan account is left for a
+// later import to adopt.
+//
+// FAILS OLD: without the transaction the InsertCodexProviderAccount autocommits before the
+// link CAS is checked, so the account row survives even though the link matched 0 rows.
+func TestReconcileCodexStaleFirstEnrollmentRollsBackLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID := env.seedUser(t)
+
+	providerUser := "user-" + uuid.NewString()
+	workspace := "acct-" + uuid.NewString()
+
+	tok := codexToken("access")
+	alias := env.seedStagingAlias(t, userID, "codex-stale-enroll", codexLoginBlob{AccessToken: tok, RefreshToken: codexToken("r")})
+
+	fake := newFakeCodexIdentity()
+	fake.idByToken[tok] = codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace}
+	// Concurrent replace lands in the window between the state read and the link: bump the
+	// alias's material_revision (BumpCodexMaterialRevision) inside DiscoverIdentity, exactly
+	// as the relink-race hook does, so the link below observes a moved revision.
+	fake.onDiscover = func() {
+		if _, err := env.q.BumpCodexMaterialRevision(env.ctx, store.BumpCodexMaterialRevisionParams{
+			Status: "staging", UserSecretID: alias, UserID: userID,
+		}); err != nil {
+			t.Errorf("bump alias material: %v", err)
+		}
+	}
+
+	err := NewCodexReconciler(env.q, nil, env.box, fake, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias)
+	if !errors.Is(err, ErrCodexRelinkRaceLost) {
+		t.Fatalf("err = %v, want ErrCodexRelinkRaceLost", err)
+	}
+	// The account insert MUST have rolled back: the tuple resolves to no account.
+	if _, gerr := env.q.GetCodexProviderAccountByTuple(env.ctx, store.GetCodexProviderAccountByTupleParams{
+		UserID: userID, ProviderUserID: providerUser, WorkspaceAccountID: workspace,
+	}); !errors.Is(gerr, pgx.ErrNoRows) {
+		t.Fatalf("tuple lookup err = %v, want pgx.ErrNoRows (the insert must have rolled back, leaving no orphan)", gerr)
+	}
+	if n := env.countProviderAccounts(t, userID); n != 0 {
+		t.Fatalf("provider accounts = %d, want 0 (the orphan insert must have rolled back)", n)
+	}
+}
+
+// TestReconcileCodexStaleQuarantineRestoreRollsBackLiveDB (PRD #1147 M3, defect 3 fix 3a,
+// quarantine-restore path) proves the same atomicity for the restore branch: a re-login
+// import that resolves to a QUARANTINED account, then loses the link CAS because the alias
+// was replaced mid-discovery, has its RefreshCodexAccountLogin restore ROLLED BACK — the
+// account keeps its dead login and its old generation.
+//
+// FAILS OLD: without the transaction RefreshCodexAccountLogin autocommits (generation
+// bumped, sealed_login overwritten with the re-login blob) even though the link then lost.
+func TestReconcileCodexStaleQuarantineRestoreRollsBackLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID := env.seedUser(t)
+
+	providerUser := "user-" + uuid.NewString()
+	workspace := "acct-" + uuid.NewString()
+	sameID := codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace}
+
+	// alias1 creates the account; its blob (tok1) becomes the canonical login.
+	tok1 := codexToken("access-1")
+	alias1 := env.seedStagingAlias(t, userID, "codex-stale-q-a", codexLoginBlob{AccessToken: tok1, RefreshToken: codexToken("r")})
+	fake := newFakeCodexIdentity()
+	fake.idByToken[tok1] = sameID
+	if err := NewCodexReconciler(env.q, nil, env.box, fake, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
+		t.Fatalf("reconcile alias1: %v", err)
+	}
+	st1 := mustState(t, env, userID, alias1)
+	accountID := uuid.UUID(st1.ProviderAccountID.Bytes)
+
+	// Quarantine the account (a dead login) and record its pre-restore login + generation.
+	env.exec(`UPDATE codex_provider_account SET coord_state='quarantined' WHERE id=$1`, accountID)
+	preGen := env.mustAccount(t, userID, accountID).Generation
+	if blob := env.accountBlob(t, userID, accountID); blob.AccessToken != tok1 {
+		t.Fatalf("precondition: account login access token = %q, want %q", blob.AccessToken, tok1)
+	}
+
+	// A fresh re-login import (alias2, tok2) resolves to the SAME quarantined account, but its
+	// alias is replaced mid-discovery so the link CAS below loses.
+	tok2 := codexToken("access-2")
+	alias2 := env.seedStagingAlias(t, userID, "codex-stale-q-b", codexLoginBlob{AccessToken: tok2, RefreshToken: codexToken("r2")})
+	fakeB := newFakeCodexIdentity()
+	fakeB.idByToken[tok2] = sameID
+	fakeB.onDiscover = func() {
+		if _, err := env.q.BumpCodexMaterialRevision(env.ctx, store.BumpCodexMaterialRevisionParams{
+			Status: "staging", UserSecretID: alias2, UserID: userID,
+		}); err != nil {
+			t.Errorf("bump alias2 material: %v", err)
+		}
+	}
+
+	err := NewCodexReconciler(env.q, nil, env.box, fakeB, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias2)
+	if !errors.Is(err, ErrCodexRelinkRaceLost) {
+		t.Fatalf("err = %v, want ErrCodexRelinkRaceLost", err)
+	}
+	// The restore MUST have rolled back: generation unchanged and the login is still tok1.
+	acct := env.mustAccount(t, userID, accountID)
+	if acct.Generation != preGen {
+		t.Fatalf("generation = %d, want %d (the restore must have rolled back)", acct.Generation, preGen)
+	}
+	if acct.CoordState != codexCoordQuarantined {
+		t.Fatalf("coord_state = %q, want %q (the restore must have rolled back)", acct.CoordState, codexCoordQuarantined)
+	}
+	if blob := env.accountBlob(t, userID, accountID); blob.AccessToken != tok1 {
+		t.Fatalf("account login access token = %q, want the ORIGINAL %q (the restore must have rolled back)", blob.AccessToken, tok1)
+	}
+}
+
+// TestReconcileCodexStaleFailureWriteFencedLiveDB (PRD #1147 M3, defect 3 fix 3b) proves the
+// SetCodexCredentialStateStatus fence: a STALE markFailed (observing a since-superseded
+// material_revision) can no longer clobber a since-linked alias to 'failed'.
+//
+// FAILS OLD: without the material_revision + reconcilable-status fence the failure write
+// matches the row on owner scope alone and overwrites 'linked' with 'failed'.
+func TestReconcileCodexStaleFailureWriteFencedLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID := env.seedUser(t)
+
+	tok := codexToken("access")
+	alias := env.seedStagingAlias(t, userID, "codex-stale-fail", codexLoginBlob{AccessToken: tok, RefreshToken: codexToken("r")})
+
+	fake := newFakeCodexIdentity()
+	fake.idByToken[tok] = codexauth.Identity{ProviderUserID: "u-" + uuid.NewString(), WorkspaceAccountID: "a-" + uuid.NewString()}
+	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+
+	// Healthy reconcile → linked at material_revision 0; grab the bound account.
+	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	linked := mustState(t, env, userID, alias)
+	if linked.Status != "linked" || linked.MaterialRevision != 0 {
+		t.Fatalf("after reconcile = (status %q, rev %d), want (linked, 0)", linked.Status, linked.MaterialRevision)
+	}
+	staleRev := linked.MaterialRevision // 0, the value a stale caller still holds
+	accountPA := linked.ProviderAccountID
+
+	// A concurrent replace bumps the alias to revision 1 (unlinking it), and the replacement
+	// reconcile relinks it at revision 1 — so the alias is 'linked' again, but at a revision
+	// the stale caller never observed.
+	if _, err := env.q.BumpCodexMaterialRevision(env.ctx, store.BumpCodexMaterialRevisionParams{
+		Status: "staging", UserSecretID: alias, UserID: userID,
+	}); err != nil {
+		t.Fatalf("bump: %v", err)
+	}
+	n, err := env.q.LinkCodexCredentialState(env.ctx, store.LinkCodexCredentialStateParams{
+		ProviderAccountID: accountPA, UserSecretID: alias, UserID: userID, MaterialRevision: 1,
+	})
+	if err != nil {
+		t.Fatalf("relink at rev 1: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("relink at rev 1 affected %d rows, want 1", n)
+	}
+
+	// The stale failure write markFailed would issue (status failed at the STALE revision) is
+	// fenced out: it matches 0 rows.
+	rows, err := env.q.SetCodexCredentialStateStatus(env.ctx, store.SetCodexCredentialStateStatusParams{
+		Status: codexStatusFailed, UserSecretID: alias, UserID: userID, MaterialRevision: staleRev,
+	})
+	if err != nil {
+		t.Fatalf("stale status write: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("stale failure write affected %d rows, want 0 (fenced by material_revision + status)", rows)
+	}
+
+	// markFailed itself (the production caller, best-effort) is likewise harmless.
+	r.markFailed(env.ctx, userID, alias, "stale failure via markFailed", staleRev)
+
+	// The alias survives as the live 'linked' binding.
+	final := mustState(t, env, userID, alias)
+	if final.Status != "linked" {
+		t.Fatalf("alias status = %q, want linked (a stale failure write must not clobber it)", final.Status)
+	}
+	if !final.ProviderAccountID.Valid {
+		t.Fatal("alias lost its provider account under a stale failure write")
 	}
 }

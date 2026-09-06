@@ -158,7 +158,7 @@ func newRefreshFixture(t *testing.T, env codexTestEnv, fake CodexRefreshClient) 
 		ProviderUserID:     "user-" + uuid.NewString(),
 		WorkspaceAccountID: "acct-" + uuid.NewString(),
 	}
-	r := NewCodexReconciler(env.q, nil, env.box, fid)
+	r := NewCodexReconciler(env.q, nil, env.box, fid, env.pool)
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, aliasID); err != nil {
 		t.Fatalf("reconcile subscription alias: %v", err)
 	}

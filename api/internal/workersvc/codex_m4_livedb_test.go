@@ -136,7 +136,7 @@ func seedTwoRunsSameAccount(t *testing.T, env codexTestEnv, refresh CodexRefresh
 	sameID := codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace}
 	fid.idByToken[access1] = sameID
 	fid.idByToken[access2] = sameID
-	r := NewCodexReconciler(env.q, nil, env.box, fid)
+	r := NewCodexReconciler(env.q, nil, env.box, fid, env.pool)
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
 	}

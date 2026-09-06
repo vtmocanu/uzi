@@ -68,13 +68,25 @@ WHERE user_secret_id = @user_secret_id AND user_id = @user_id
     AND material_revision = @material_revision::bigint;
 
 -- name: SetCodexCredentialStateStatus :execrows
--- Move an alias to an arbitrary status and record last_error alongside it (PRD #1147
--- M1) — the failure path writes 'failed' with the reason, and clearing a prior error
--- writes the new status with a NULL last_error. Owner-scoped. Deliberately does NOT
--- touch provider_account_id: a status change is not a re-link.
+-- Move an alias to a new status and record last_error alongside it (PRD #1147 M1) — the
+-- failure path writes 'failed' with the reason. Owner-scoped. Deliberately does NOT touch
+-- provider_account_id: a status change is not a re-link.
+--
+-- SECURITY HARDENING (PRD #1147 M3, defect 3 P2): the write is FENCED on the observed
+-- material_revision AND a reconcilable status. markFailed is a best-effort, autocommit
+-- round-trip that can fire LATE — after a concurrent replace bumped the alias's
+-- material_revision, or after a replacement reconcile already linked the alias. Without
+-- the fence a STALE caller (whose alias moved) or one targeting a since-linked alias would
+-- clobber a live 'linked' binding to 'failed'. Requiring material_revision = the revision
+-- the caller OBSERVED makes a bumped alias match 0 rows, and status IN ('staging','failed')
+-- makes a since-linked (or 'static') alias match 0 rows — so the failure write only lands
+-- on the exact reconcile attempt that is still current and still awaiting reconciliation.
+-- :execrows stays: 0 = the alias was bumped or already left the reconcilable window.
 UPDATE codex_credential_state
 SET status = @status, last_error = @last_error, updated_at = now()
-WHERE user_secret_id = @user_secret_id AND user_id = @user_id;
+WHERE user_secret_id = @user_secret_id AND user_id = @user_id
+    AND material_revision = @material_revision::bigint
+    AND status IN ('staging', 'failed');
 
 -- name: BumpCodexMaterialRevision :execrows
 -- The underlying material changed (PRD #1147 M1): advance material_revision, set the

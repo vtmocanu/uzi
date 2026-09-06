@@ -447,25 +447,39 @@ const setCodexCredentialStateStatus = `-- name: SetCodexCredentialStateStatus :e
 UPDATE codex_credential_state
 SET status = $1, last_error = $2, updated_at = now()
 WHERE user_secret_id = $3 AND user_id = $4
+    AND material_revision = $5::bigint
+    AND status IN ('staging', 'failed')
 `
 
 type SetCodexCredentialStateStatusParams struct {
-	Status       string      `json:"status"`
-	LastError    pgtype.Text `json:"last_error"`
-	UserSecretID uuid.UUID   `json:"user_secret_id"`
-	UserID       uuid.UUID   `json:"user_id"`
+	Status           string      `json:"status"`
+	LastError        pgtype.Text `json:"last_error"`
+	UserSecretID     uuid.UUID   `json:"user_secret_id"`
+	UserID           uuid.UUID   `json:"user_id"`
+	MaterialRevision int64       `json:"material_revision"`
 }
 
-// Move an alias to an arbitrary status and record last_error alongside it (PRD #1147
-// M1) — the failure path writes 'failed' with the reason, and clearing a prior error
-// writes the new status with a NULL last_error. Owner-scoped. Deliberately does NOT
-// touch provider_account_id: a status change is not a re-link.
+// Move an alias to a new status and record last_error alongside it (PRD #1147 M1) — the
+// failure path writes 'failed' with the reason. Owner-scoped. Deliberately does NOT touch
+// provider_account_id: a status change is not a re-link.
+//
+// SECURITY HARDENING (PRD #1147 M3, defect 3 P2): the write is FENCED on the observed
+// material_revision AND a reconcilable status. markFailed is a best-effort, autocommit
+// round-trip that can fire LATE — after a concurrent replace bumped the alias's
+// material_revision, or after a replacement reconcile already linked the alias. Without
+// the fence a STALE caller (whose alias moved) or one targeting a since-linked alias would
+// clobber a live 'linked' binding to 'failed'. Requiring material_revision = the revision
+// the caller OBSERVED makes a bumped alias match 0 rows, and status IN ('staging','failed')
+// makes a since-linked (or 'static') alias match 0 rows — so the failure write only lands
+// on the exact reconcile attempt that is still current and still awaiting reconciliation.
+// :execrows stays: 0 = the alias was bumped or already left the reconcilable window.
 func (q *Queries) SetCodexCredentialStateStatus(ctx context.Context, arg SetCodexCredentialStateStatusParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setCodexCredentialStateStatus,
 		arg.Status,
 		arg.LastError,
 		arg.UserSecretID,
 		arg.UserID,
+		arg.MaterialRevision,
 	)
 	if err != nil {
 		return 0, err

@@ -73,7 +73,7 @@ func (e codexTestEnv) seedLinkedSubscription(t *testing.T, userID uuid.UUID, lab
 		ProviderUserID:     "user-" + uuid.NewString(),
 		WorkspaceAccountID: "acct-" + uuid.NewString(),
 	}
-	r := NewCodexReconciler(e.q, nil, e.box, fake)
+	r := NewCodexReconciler(e.q, nil, e.box, fake, e.pool)
 	if err := r.ReconcileCodexAuthIdentity(e.ctx, userID, aliasID); err != nil {
 		t.Fatalf("reconcile subscription alias: %v", err)
 	}
