@@ -62,19 +62,36 @@ function apiForKind(kind: string) {
       };
 }
 
-// statusBadge maps a row's stateless codex_status to a badge tone + label, read
-// STRAIGHT off secret.codex_status (never a second fetch). Absent → no badge (an
-// anthropic_token would omit the field; a codex row always carries one).
-function statusBadge(status?: string): { tone: BadgeTone; label: string } | null {
+// statusBadge maps a row's stateless codex_status to a badge tone + label + hint,
+// read STRAIGHT off secret.codex_status (never a second fetch). Absent → no badge (an
+// anthropic_token would omit the field; a codex row always carries one). The hint is
+// rendered both as a title tooltip AND as an sr-only description (mirroring the
+// Anthropic chip): it conveys what the status means and that, while the card is dark,
+// nothing here is actionable yet — Codex is not used for runs.
+function statusBadge(
+  status?: string,
+): { tone: BadgeTone; label: string; hint: string } | null {
   switch (status) {
     case "staging":
-      return { tone: "info", label: "staging" };
+      return {
+        tone: "info",
+        label: "staging",
+        hint: "Saved; identity not yet verified. Codex is not used for runs yet.",
+      };
     case "linked":
-      return { tone: "ok", label: "linked" };
+      return { tone: "ok", label: "linked", hint: "Provider identity verified." };
     case "failed":
-      return { tone: "danger", label: "failed" };
+      return {
+        tone: "danger",
+        label: "failed",
+        hint: "Could not verify; re-add the credential.",
+      };
     case "static":
-      return { tone: "neutral", label: "static" };
+      return {
+        tone: "neutral",
+        label: "static",
+        hint: "Stored API key. Codex is not used for runs yet.",
+      };
     default:
       return null;
   }
@@ -190,7 +207,24 @@ function CredentialRow({
               {sanitizeLabel(secret.label)}
             </span>
             <Badge tone="neutral">{kindLabel(secret.kind)}</Badge>
-            {badge && <Badge tone={badge.tone}>{badge.label}</Badge>}
+            {badge && (
+              <>
+                {/* The status word alone states a DIAGNOSIS but not its meaning or
+                    that nothing is actionable yet while dark; the hint carries both,
+                    as a title AND an sr-only description that the badge points at —
+                    the same idiom AnthropicTokens uses for its auto chip. */}
+                <Badge
+                  tone={badge.tone}
+                  title={badge.hint}
+                  aria-describedby={`codex-status-${secret.id}`}
+                >
+                  {badge.label}
+                </Badge>
+                <span id={`codex-status-${secret.id}`} className="sr-only">
+                  {badge.hint}
+                </span>
+              </>
+            )}
             {secret.is_default && <Badge tone="ok">default</Badge>}
           </div>
         )}
@@ -310,7 +344,7 @@ function AddCredentialForm({
       setToken("");
       setLabel("");
       onNotice(
-        "Credential saved. It is sealed with your login password and validated on the first agent run.",
+        "Credential saved and sealed with your login password. Codex is not yet used for runs.",
       );
       await reload();
     } catch (err) {
@@ -325,7 +359,7 @@ function AddCredentialForm({
 
   return (
     <form onSubmit={add} className="space-y-3 border-t border-edge pt-5">
-      <Field label={first ? noun : `Add a ${noun}`}>
+      <Field label={first ? noun : `Add ${noun}`}>
         <Input
           type="password"
           autoComplete="off"
@@ -394,7 +428,7 @@ export function CodexCredentials({
       await apiForKind(row.kind).patch(rotateFor, { token: rotateValue });
       setRotateValue("");
       setRotateFor("");
-      onNotice("Credential value replaced. The new value is used on the next agent run.");
+      onNotice("Credential value replaced and re-sealed.");
       await reload();
     } catch (err) {
       onError(errText(err, "Failed to replace the credential value"));
@@ -408,11 +442,10 @@ export function CodexCredentials({
       <div>
         <SectionTitle>OpenAI / Codex credentials</SectionTitle>
         <p className="mt-2 text-sm text-muted">
-          Run your agents on OpenAI Codex instead of, or alongside, Anthropic. Paste a
-          Codex login token or an OpenAI API key, and give each one a name. A single{" "}
-          <strong className="text-fg">default</strong> is shared across both kinds. A
-          Codex credential on its own does not make a run startable — an Anthropic token
-          is still required to start a run.
+          Store your OpenAI Codex logins and API keys. Codex is not yet used to run
+          agents — an Anthropic token is still what starts a run. Paste a Codex login
+          token or an OpenAI API key, and give each one a name. A single{" "}
+          <strong className="text-fg">default</strong> is shared across both kinds.
         </p>
       </div>
 
