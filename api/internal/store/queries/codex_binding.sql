@@ -29,15 +29,21 @@ SET codex_secret_id         = @secret_id::uuid,
     -- identity back to NULL: COALESCE keeps the prior non-null value when this call
     -- passes NULL (e.g. a subscription run whose account was frozen by a later
     -- SetRunCodexFrozenIdentity and then a stale binding freeze is re-delivered).
-    codex_account_key       = COALESCE(codex_account_key, sqlc.narg('account_key')),
-    codex_account_revision  = COALESCE(codex_account_revision, sqlc.narg('account_revision')),
+    -- Explicit ::text/::bigint casts on every narg: under pgx's extended protocol the
+    -- parameter type of a bare sqlc.narg is undeterminable (it appears only inside
+    -- COALESCE / an OR guard, never against a typed column alone), which fails at prepare
+    -- with 42P08 ("could not determine data type of parameter"). The casts pin the types
+    -- (codex_account_key is TEXT, codex_account_revision is BIGINT) without altering the
+    -- write-once semantics.
+    codex_account_key       = COALESCE(codex_account_key, sqlc.narg('account_key')::text),
+    codex_account_revision  = COALESCE(codex_account_revision, sqlc.narg('account_revision')::bigint),
     updated_at              = now()
 WHERE id = @id AND user_id = @user_id
     AND (codex_secret_id IS NULL OR codex_secret_id = @secret_id::uuid)
     -- Write-once identity guard: a replay carrying a DIFFERENT account_key than the
     -- one already frozen affects 0 rows (a NULL incoming key, or an equal one, is
     -- allowed), so a frozen identity can never be silently re-pointed.
-    AND (codex_account_key IS NULL OR sqlc.narg('account_key') IS NULL OR codex_account_key = sqlc.narg('account_key'));
+    AND (codex_account_key IS NULL OR sqlc.narg('account_key')::text IS NULL OR codex_account_key = sqlc.narg('account_key')::text);
 
 -- name: SetRunCodexFrozenIdentity :execrows
 -- Freeze the run's canonical identity + account revision at FIRST link (PRD #1147 M2):
@@ -194,6 +200,10 @@ SET generation           = generation + 1,
     coord_operation_id   = @op::uuid,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
+    -- 00198's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
+    -- so clearing the recovery blob MUST also clear its key discriminator or an account
+    -- with a populated recovery slot would violate the CHECK (23514) on commit.
+    recovery_sealed_with = NULL,
     updated_at           = now()
 WHERE id = @id AND user_id = @user_id AND generation = @from_generation::bigint
     AND coord_state = 'in_progress' AND coord_operation_id = @op::uuid
@@ -204,14 +214,19 @@ RETURNING generation, coord_state, committed_generation;
 -- #1147 M2): the commit-or-persistence-failure path preserves the material needed to roll
 -- back and parks the account for reconciliation. Owner-scoped.
 --
--- SECURITY HARDENING (PRD #1147 audit): live-lease guard (coord_state='in_progress' AND
--- coord_operation_id=@op), mirroring sibling QuarantineCodexAccount. Only the operation
--- that STILL holds the in-progress lease may protect material and quarantine — a
--- presumed-dead or wrong operation matches 0 rows and cannot flip a settled account into
--- quarantine or overwrite its recovery slot out from under a live refresher.
--- recovery_sealed_with records which key sealed the protected blob (PRD #1147 F14), so a
--- later promotion can open it with the correct key even if the live sealed_login has since
--- migrated master→dek. (Callers in workersvc gain the @op param in a later unit.)
+-- SECURITY HARDENING (PRD #1147 audit): operation-identity guard (coord_operation_id=@op)
+-- across the in_progress/quarantined states. The identity guard is what prevents a
+-- stale/foreign op from writing: a different op that committed sets coord_operation_id to
+-- itself, and RefreshCodexAccountLogin nulls it, so a dead op matches 0 rows either way.
+-- Allowing coord_state IN ('in_progress','quarantined') lets the operation that owns the
+-- lease protect its own material even after its lease expired and was reaped to
+-- 'quarantined' (QuarantineExpiredCodexLease keeps coord_operation_id) — precisely the
+-- commit-failure recovery path (handleCodexCommitFailure/codexRetainUnverifiedMaterial).
+-- This does NOT weaken the identity guard: without the quarantined state the protect write
+-- matched 0 rows after a mid-flight quarantine and silently dropped freshly-rotated
+-- material. recovery_sealed_with records which key sealed the protected blob (PRD #1147
+-- F14), so a later promotion can open it with the correct key even if the live sealed_login
+-- has since migrated master→dek. (Callers in workersvc gain the @op param in a later unit.)
 UPDATE codex_provider_account
 SET recovery_sealed      = @sealed,
     recovery_generation  = @gen::bigint,
@@ -219,7 +234,8 @@ SET recovery_sealed      = @sealed,
     coord_state          = 'quarantined',
     updated_at           = now()
 WHERE id = @id AND user_id = @user_id
-    AND coord_state = 'in_progress' AND coord_operation_id = @op::uuid;
+    AND coord_operation_id = @op::uuid
+    AND coord_state IN ('in_progress', 'quarantined');
 
 -- name: ResetCodexCoordIdle :execrows
 -- Return a 'committed' account to 'idle' (PRD #1147 M2) once the committed token has been
@@ -294,6 +310,11 @@ SET sealed_login         = @sealed,
     lease_deadline       = NULL,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
+    -- 00198's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
+    -- so clearing the recovery blob MUST also clear its key discriminator or an account
+    -- with a populated recovery slot (e.g. a quarantine re-login) would violate the
+    -- CHECK (23514) on this install.
+    recovery_sealed_with = NULL,
     updated_at           = now()
 WHERE id = @id AND user_id = @user_id;
 

@@ -56,6 +56,12 @@ CREATE TABLE codex_credential_state (
 -- re-fire OF provider_account_id needlessly). Guarded by the WHEN clause so it fires ONLY
 -- on the not-null→null transition, never on a static alias (already NULL) or an ordinary
 -- re-link (null→not-null / not-null→not-null).
+-- The `NEW.status = OLD.status` guard distinguishes the FK cascade from an app-driven
+-- unlink: the ON DELETE SET NULL touches ONLY provider_account_id and leaves status
+-- untouched, so the cascade still fires this trigger; but a legitimate app UPDATE that
+-- nulls provider_account_id AND changes status in the SAME statement (e.g.
+-- BumpCodexMaterialRevision re-staging to 'staging'/'static') is skipped, so its intended
+-- status is not clobbered to 'failed'.
 -- +goose StatementBegin
 CREATE FUNCTION codex_credential_state_orphan_fail() RETURNS trigger AS $$
 BEGIN
@@ -70,7 +76,7 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER codex_credential_state_orphan_fail_trg
     BEFORE UPDATE OF provider_account_id ON codex_credential_state
     FOR EACH ROW
-    WHEN (OLD.provider_account_id IS NOT NULL AND NEW.provider_account_id IS NULL)
+    WHEN (OLD.provider_account_id IS NOT NULL AND NEW.provider_account_id IS NULL AND NEW.status = OLD.status)
     EXECUTE FUNCTION codex_credential_state_orphan_fail();
 
 -- +goose Down
