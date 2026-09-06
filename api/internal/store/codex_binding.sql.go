@@ -532,13 +532,16 @@ SET sealed_login         = $1,
     recovery_sealed_with = NULL,
     updated_at           = now()
 WHERE id = $3 AND user_id = $4
+    AND coord_state = 'quarantined'
+    AND generation = $5::bigint
 `
 
 type RefreshCodexAccountLoginParams struct {
-	Sealed     []byte    `json:"sealed"`
-	SealedWith string    `json:"sealed_with"`
-	ID         uuid.UUID `json:"id"`
-	UserID     uuid.UUID `json:"user_id"`
+	Sealed         []byte    `json:"sealed"`
+	SealedWith     string    `json:"sealed_with"`
+	ID             uuid.UUID `json:"id"`
+	UserID         uuid.UUID `json:"user_id"`
+	FromGeneration int64     `json:"from_generation"`
 }
 
 // Install a freshly-sealed login on an account after a VERIFIED re-login (SECURITY
@@ -548,12 +551,21 @@ type RefreshCodexAccountLoginParams struct {
 // so stale CAS writers lose, returns the account to 'idle', and clears the coordination +
 // recovery slots. Owner-scoped; 0 rows for a foreign account. Unlike PromoteCodexRecovery
 // this is a fresh install (new sealed_with may differ), so sealed_with IS written.
+//
+// Guarded on coord_state='quarantined' AND generation = @from_generation so ONLY a
+// quarantined account still at the caller's expected generation is restored: the restore
+// now LOSES to a concurrent PromoteCodexRecovery that already advanced the generation (and
+// returned the account to 'idle'). 0 rows means the quarantine moved under the caller (the
+// generation advanced or the account is no longer quarantined) → the caller must reject
+// before linking. This mirrors PromoteCodexRecovery's CAS: a stale writer loses rather than
+// clobbering a freshly-promoted login.
 func (q *Queries) RefreshCodexAccountLogin(ctx context.Context, arg RefreshCodexAccountLoginParams) (int64, error) {
 	result, err := q.db.Exec(ctx, refreshCodexAccountLogin,
 		arg.Sealed,
 		arg.SealedWith,
 		arg.ID,
 		arg.UserID,
+		arg.FromGeneration,
 	)
 	if err != nil {
 		return 0, err
@@ -669,6 +681,10 @@ SET codex_cap_hash    = $1,
     codex_claim_epoch = codex_claim_epoch + 1,
     updated_at        = now()
 WHERE id = $2 AND worker_id = $3
+  AND status IN (
+      'claimed', 'running', 'awaiting_approval',
+      'awaiting_input', 'awaiting_followup', 'limit_wait'
+  )
 RETURNING codex_claim_epoch
 `
 
@@ -692,6 +708,16 @@ type SetRunCodexClaimCapabilityParams struct {
 // SetRunLimitWait is INTENTIONALLY EXCLUDED: limit_wait is an actively-claimed status that
 // keeps its live capability by design (persist-before-park), so revoking there would strip
 // a run that still legitimately holds its claim.
+//
+// STATUS GUARD (PRD #1147): the mint is additionally gated on the run being in one of the
+// actively-claimed statuses ('claimed','running','awaiting_approval','awaiting_input',
+// 'awaiting_followup','limit_wait'), the exact set of codexActivelyClaimedStatuses in
+// codexauthz.go. It EXCLUDES the non-executing states (queued/pool_wait and the terminals):
+// a run requeued out from under the worker (RequeueClaimedRunToQueued / SweepClaimedNeverStarted
+// in runtime.sql clear the cap + bump the epoch but RETAIN worker_id) would otherwise still
+// match on worker_id and let the departed worker re-mint a fresh capability. Closing this
+// requeue TOCTOU: a 0-row match now surfaces as pgx.ErrNoRows → errRunVanished in the caller,
+// which is the desired outcome.
 func (q *Queries) SetRunCodexClaimCapability(ctx context.Context, arg SetRunCodexClaimCapabilityParams) (int64, error) {
 	row := q.db.QueryRow(ctx, setRunCodexClaimCapability, arg.Hash, arg.ID, arg.WorkerID)
 	var codex_claim_epoch int64

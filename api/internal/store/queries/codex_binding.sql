@@ -135,11 +135,25 @@ WHERE r.id = @id;
 -- SetRunLimitWait is INTENTIONALLY EXCLUDED: limit_wait is an actively-claimed status that
 -- keeps its live capability by design (persist-before-park), so revoking there would strip
 -- a run that still legitimately holds its claim.
+--
+-- STATUS GUARD (PRD #1147): the mint is additionally gated on the run being in one of the
+-- actively-claimed statuses ('claimed','running','awaiting_approval','awaiting_input',
+-- 'awaiting_followup','limit_wait'), the exact set of codexActivelyClaimedStatuses in
+-- codexauthz.go. It EXCLUDES the non-executing states (queued/pool_wait and the terminals):
+-- a run requeued out from under the worker (RequeueClaimedRunToQueued / SweepClaimedNeverStarted
+-- in runtime.sql clear the cap + bump the epoch but RETAIN worker_id) would otherwise still
+-- match on worker_id and let the departed worker re-mint a fresh capability. Closing this
+-- requeue TOCTOU: a 0-row match now surfaces as pgx.ErrNoRows → errRunVanished in the caller,
+-- which is the desired outcome.
 UPDATE runs
 SET codex_cap_hash    = @hash,
     codex_claim_epoch = codex_claim_epoch + 1,
     updated_at        = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND status IN (
+      'claimed', 'running', 'awaiting_approval',
+      'awaiting_input', 'awaiting_followup', 'limit_wait'
+  )
 RETURNING codex_claim_epoch;
 
 -- name: AcquireCodexRefreshLease :execrows
@@ -300,6 +314,14 @@ RETURNING generation;
 -- so stale CAS writers lose, returns the account to 'idle', and clears the coordination +
 -- recovery slots. Owner-scoped; 0 rows for a foreign account. Unlike PromoteCodexRecovery
 -- this is a fresh install (new sealed_with may differ), so sealed_with IS written.
+--
+-- Guarded on coord_state='quarantined' AND generation = @from_generation so ONLY a
+-- quarantined account still at the caller's expected generation is restored: the restore
+-- now LOSES to a concurrent PromoteCodexRecovery that already advanced the generation (and
+-- returned the account to 'idle'). 0 rows means the quarantine moved under the caller (the
+-- generation advanced or the account is no longer quarantined) → the caller must reject
+-- before linking. This mirrors PromoteCodexRecovery's CAS: a stale writer loses rather than
+-- clobbering a freshly-promoted login.
 UPDATE codex_provider_account
 SET sealed_login         = @sealed,
     sealed_with          = @sealed_with::text,
@@ -316,7 +338,9 @@ SET sealed_login         = @sealed,
     -- CHECK (23514) on this install.
     recovery_sealed_with = NULL,
     updated_at           = now()
-WHERE id = @id AND user_id = @user_id;
+WHERE id = @id AND user_id = @user_id
+    AND coord_state = 'quarantined'
+    AND generation = @from_generation::bigint;
 
 -- name: QuarantineCodexAccount :execrows
 -- Quarantine an in-progress account WITHOUT writing recovery material (SECURITY

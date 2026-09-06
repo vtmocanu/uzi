@@ -218,13 +218,21 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 			if serr != nil {
 				return fmt.Errorf("codex reconcile: seal re-login: %w", serr)
 			}
-			if _, rerr := r.q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
-				Sealed:     sealed,
-				SealedWith: sealedWith,
-				ID:         acct.ID,
-				UserID:     userID,
-			}); rerr != nil {
+			n, rerr := r.q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
+				Sealed:         sealed,
+				SealedWith:     sealedWith,
+				ID:             acct.ID,
+				UserID:         userID,
+				FromGeneration: acct.Generation,
+			})
+			if rerr != nil {
 				return fmt.Errorf("codex reconcile: restore re-login: %w", rerr)
+			}
+			if n == 0 {
+				// CAS lost: a concurrent PromoteCodexRecovery advanced the generation (or the
+				// account is no longer quarantined) under this restore. Reject BEFORE linking —
+				// linking against a moved quarantine would bind the run to stale material.
+				return fmt.Errorf("codex reconcile: quarantine moved under restore CAS")
 			}
 		}
 		if lerr := r.link(ctx, userID, userSecretID, acct.ID, st.MaterialRevision); lerr != nil {

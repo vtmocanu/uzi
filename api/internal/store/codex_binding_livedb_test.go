@@ -395,6 +395,17 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 		t.Fatalf("RequeueClaimedRunToQueued left epoch=%d, want 2", revoked.CodexClaimEpoch)
 	}
 
+	// --- Status guard: minting on a requeued ('queued') run is refused even by the
+	// still-recorded owner. RequeueClaimedRunToQueued left worker_id intact (resume
+	// affinity), so the worker_id predicate alone would still match; the status IN (...)
+	// guard is what now rejects the re-mint, surfacing as pgx.ErrNoRows. This closes the
+	// requeue TOCTOU where a departed worker could re-mint a fresh capability. ---
+	if epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
+		Hash: []byte("cap-after-requeue"), ID: runID, WorkerID: pgUUID(worker),
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("SetRunCodexClaimCapability(queued run) = (%d,%v), want (_, pgx.ErrNoRows)", epoch, err)
+	}
+
 	// --- RequeueWorkerRuns revokes a codex run AND leaves a non-codex run intact. ---
 	// Re-mint on a running codex run, and add a non-codex control run with a marker.
 	mustExec(ctx, t, pool, `UPDATE runs SET status='running' WHERE id=$1`, runID)
@@ -1157,8 +1168,11 @@ func TestRefreshCodexAccountLoginLiveDB(t *testing.T) {
 		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
 	}
 
+	// Fixture is quarantined at generation 0 (SetCodexRecoverySlot sets coord_state without
+	// bumping generation), so the CAS restore must present FromGeneration: 0 to match.
 	if n, err := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
 		Sealed: []byte("fresh-login"), SealedWith: store.SealedWithDEK, ID: acc.ID, UserID: user,
+		FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("RefreshCodexAccountLogin = (%d,%v), want (1,nil)", n, err)
 	}
@@ -1183,9 +1197,36 @@ func TestRefreshCodexAccountLoginLiveDB(t *testing.T) {
 			got.RecoverySealed, got.RecoveryGeneration, got.RecoverySealedWith, got.CoordOperationID.Valid, got.LeaseDeadline.Valid)
 	}
 
-	// Owner-scoping: a foreign user refreshes nothing.
+	// Stale-generation CAS: a fresh quarantined account at generation 0 refuses a restore
+	// presenting the WRONG expected generation (the quarantine moved under the caller). This
+	// isolates the generation half of the CAS: the account IS still quarantined, so a 0-row
+	// result can only be the generation mismatch.
+	stale := mkCodexAccount(ctx, t, q, user)
+	staleOp := uuid.New()
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: staleOp, Deadline: future, ID: stale.ID, UserID: user, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease(stale) = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+		Sealed: []byte("stale-recovery"), Gen: 0, ID: stale.ID, UserID: user,
+		Op: staleOp, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
+	}); err != nil || n != 1 {
+		t.Fatalf("SetCodexRecoverySlot(stale) = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
+		Sealed: []byte("y"), SealedWith: store.SealedWithDEK, ID: stale.ID, UserID: user,
+		FromGeneration: 99,
+	}); err != nil || n != 0 {
+		t.Fatalf("RefreshCodexAccountLogin(stale generation) = (%d,%v), want (0,nil)", n, err)
+	}
+
+	// Owner-scoping: a foreign user refreshes nothing. Note the guard now yields 0 for TWO
+	// reasons here (foreign user AND the account is no longer quarantined after the refresh
+	// above); either alone suffices to reject.
 	if n, err := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
 		Sealed: []byte("x"), SealedWith: store.SealedWithMaster, ID: acc.ID, UserID: uuid.New(),
+		FromGeneration: 1,
 	}); err != nil || n != 0 {
 		t.Fatalf("RefreshCodexAccountLogin(foreign user) = (%d,%v), want (0,nil)", n, err)
 	}
