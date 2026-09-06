@@ -25,11 +25,19 @@ SET codex_secret_id         = @secret_id::uuid,
     codex_auth_mode         = @auth_mode::text,
     codex_secret_label      = @secret_label::text,
     codex_material_revision = @material_revision::bigint,
-    codex_account_key       = sqlc.narg('account_key'),
-    codex_account_revision  = sqlc.narg('account_revision'),
+    -- A late/duplicate freeze replay must NOT clobber an already-frozen account
+    -- identity back to NULL: COALESCE keeps the prior non-null value when this call
+    -- passes NULL (e.g. a subscription run whose account was frozen by a later
+    -- SetRunCodexFrozenIdentity and then a stale binding freeze is re-delivered).
+    codex_account_key       = COALESCE(codex_account_key, sqlc.narg('account_key')),
+    codex_account_revision  = COALESCE(codex_account_revision, sqlc.narg('account_revision')),
     updated_at              = now()
 WHERE id = @id AND user_id = @user_id
-    AND (codex_secret_id IS NULL OR codex_secret_id = @secret_id::uuid);
+    AND (codex_secret_id IS NULL OR codex_secret_id = @secret_id::uuid)
+    -- Write-once identity guard: a replay carrying a DIFFERENT account_key than the
+    -- one already frozen affects 0 rows (a NULL incoming key, or an equal one, is
+    -- allowed), so a frozen identity can never be silently re-pointed.
+    AND (codex_account_key IS NULL OR sqlc.narg('account_key') IS NULL OR codex_account_key = sqlc.narg('account_key'));
 
 -- name: SetRunCodexFrozenIdentity :execrows
 -- Freeze the run's canonical identity + account revision at FIRST link (PRD #1147 M2):
@@ -113,6 +121,12 @@ WHERE r.id = @id;
 -- fresh capability. 0 rows when the caller is not the owning worker. The revocation half
 -- lives in every claimed→queued path in runtime.sql (the three Requeue* queries plus
 -- SweepClaimedNeverStarted), which clear the hash + bump the epoch on ownership loss.
+-- PRD #1147 F7 (defense-in-depth) extends the same revoke to the park/promote paths that
+-- likewise leave a run without a live owner: SetRunPoolWait (claimed→pool_wait hold),
+-- PromotePoolWaitRun (pool_wait→queued), and PromoteLimitWaitRuns (limit_wait→queued).
+-- SetRunLimitWait is INTENTIONALLY EXCLUDED: limit_wait is an actively-claimed status that
+-- keeps its live capability by design (persist-before-park), so revoking there would strip
+-- a run that still legitimately holds its claim.
 UPDATE runs
 SET codex_cap_hash    = @hash,
     codex_claim_epoch = codex_claim_epoch + 1,
@@ -186,12 +200,23 @@ RETURNING generation, coord_state, committed_generation;
 -- Protect a previously-good login into the recovery slot and quarantine the account (PRD
 -- #1147 M2): the commit-or-persistence-failure path preserves the material needed to roll
 -- back and parks the account for reconciliation. Owner-scoped.
+--
+-- SECURITY HARDENING (PRD #1147 audit): live-lease guard (coord_state='in_progress' AND
+-- coord_operation_id=@op), mirroring sibling QuarantineCodexAccount. Only the operation
+-- that STILL holds the in-progress lease may protect material and quarantine — a
+-- presumed-dead or wrong operation matches 0 rows and cannot flip a settled account into
+-- quarantine or overwrite its recovery slot out from under a live refresher.
+-- recovery_sealed_with records which key sealed the protected blob (PRD #1147 F14), so a
+-- later promotion can open it with the correct key even if the live sealed_login has since
+-- migrated master→dek. (Callers in workersvc gain the @op param in a later unit.)
 UPDATE codex_provider_account
-SET recovery_sealed     = @sealed,
-    recovery_generation = @gen::bigint,
-    coord_state         = 'quarantined',
-    updated_at          = now()
-WHERE id = @id AND user_id = @user_id;
+SET recovery_sealed      = @sealed,
+    recovery_generation  = @gen::bigint,
+    recovery_sealed_with = @recovery_sealed_with,
+    coord_state          = 'quarantined',
+    updated_at           = now()
+WHERE id = @id AND user_id = @user_id
+    AND coord_state = 'in_progress' AND coord_operation_id = @op::uuid;
 
 -- name: ResetCodexCoordIdle :execrows
 -- Return a 'committed' account to 'idle' (PRD #1147 M2) once the committed token has been
@@ -221,12 +246,18 @@ WHERE id = @id AND user_id = @user_id AND coord_state = 'committed';
 -- rows. The audit flagged that without a dedicated roll-forward primitive the reconcile
 -- path had no CAS-safe way to make the recovery material live.
 --
--- sealed_with is intentionally left unchanged: recovery_sealed and sealed_login are
--- ALWAYS produced by the same per-user seal (the account's own key), so the sealed_with
--- discriminator is invariant across the promotion — rewriting it would be a no-op at
--- best and a discriminator/material mismatch at worst.
+-- sealed_with ADOPTS recovery_sealed_with on promotion (PRD #1147 F14): the recovery
+-- blob may have been sealed under a DIFFERENT key than the current sealed_login — a
+-- master→dek migration can advance sealed_login's key while the protected recovery blob
+-- still carries the older discriminator (or vice versa). Promoting recovery_sealed into
+-- the live login therefore MUST also install its recovery_sealed_with, or a later open of
+-- the promoted login would try the wrong key and fail to decrypt. The prior assertion
+-- that the discriminator is invariant across promotion was wrong for exactly the
+-- cross-key-migration window; recovery_sealed_with is cleared alongside the rest of the
+-- recovery slot since the material has been consumed.
 UPDATE codex_provider_account
 SET sealed_login         = recovery_sealed,
+    sealed_with          = recovery_sealed_with,
     generation           = generation + 1,
     committed_generation = generation + 1,
     coord_state          = 'idle',
@@ -234,6 +265,7 @@ SET sealed_login         = recovery_sealed,
     lease_deadline       = NULL,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
+    recovery_sealed_with = NULL,
     updated_at           = now()
 WHERE id = @id AND user_id = @user_id
     AND coord_state = 'quarantined'

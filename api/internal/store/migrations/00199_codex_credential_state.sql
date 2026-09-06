@@ -46,5 +46,34 @@ CREATE TABLE codex_credential_state (
         ON DELETE SET NULL (provider_account_id)
 );
 
+-- Orphan invariant (PRD #1147 F4): the ON DELETE SET NULL above can leave an alias row
+-- reading status='linked' with a NULL provider_account_id — a link that points at nothing.
+-- A BEFORE UPDATE trigger closes that: when the FK cascade (or any update) nulls
+-- provider_account_id on a row that HAD an account, the row is demoted to 'failed' with an
+-- explanatory last_error. It is a BEFORE trigger, not AFTER, because an AFTER trigger
+-- cannot modify the row in place — a BEFORE trigger sets NEW.* directly and RETURNs NEW,
+-- so the demotion is part of the same write rather than a second UPDATE (which would
+-- re-fire OF provider_account_id needlessly). Guarded by the WHEN clause so it fires ONLY
+-- on the not-null→null transition, never on a static alias (already NULL) or an ordinary
+-- re-link (null→not-null / not-null→not-null).
+-- +goose StatementBegin
+CREATE FUNCTION codex_credential_state_orphan_fail() RETURNS trigger AS $$
+BEGIN
+    NEW.status := 'failed';
+    NEW.last_error := 'provider account deleted';
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+
+CREATE TRIGGER codex_credential_state_orphan_fail_trg
+    BEFORE UPDATE OF provider_account_id ON codex_credential_state
+    FOR EACH ROW
+    WHEN (OLD.provider_account_id IS NOT NULL AND NEW.provider_account_id IS NULL)
+    EXECUTE FUNCTION codex_credential_state_orphan_fail();
+
 -- +goose Down
+DROP TRIGGER codex_credential_state_orphan_fail_trg ON codex_credential_state;
+DROP FUNCTION codex_credential_state_orphan_fail();
 DROP TABLE codex_credential_state;

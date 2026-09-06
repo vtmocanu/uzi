@@ -173,6 +173,7 @@ type CodexProviderAccount struct {
 	CredentialRevision  int64              `json:"credential_revision"`
 	RecoverySealed      []byte             `json:"recovery_sealed"`
 	RecoveryGeneration  pgtype.Int8        `json:"recovery_generation"`
+	RecoverySealedWith  pgtype.Text        `json:"recovery_sealed_with"`
 	CoordState          string             `json:"coord_state"`
 	CoordOperationID    pgtype.UUID        `json:"coord_operation_id"`
 	LeaseDeadline       pgtype.Timestamptz `json:"lease_deadline"`

@@ -30,5 +30,11 @@ CREATE UNIQUE INDEX user_secrets_codex_one_default_key
 -- +goose Down
 DROP INDEX user_secrets_codex_one_default_key;
 ALTER TABLE user_secrets DROP CONSTRAINT user_secrets_kind_check;
+-- A downgrade removes the Codex feature, so it must remove its credentials too:
+-- re-adding an anthropic_token-only CHECK while any openai_api_key/codex_auth row still
+-- exists would fail the whole transaction. Their codex_credential_state rows cascade away
+-- via 00199's ON DELETE CASCADE FK to user_secrets, and any provider account left with no
+-- linked alias is dropped when 00198's Down drops its table.
+DELETE FROM user_secrets WHERE kind IN ('openai_api_key', 'codex_auth');
 ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_kind_check
     CHECK (kind IN ('anthropic_token'));

@@ -39,6 +39,12 @@ CREATE TABLE codex_provider_account (
     -- run (m2).
     recovery_sealed      BYTEA,
     recovery_generation  BIGINT,
+    -- Which key sealed the recovery blob, mirroring sealed_with above ('master' legacy
+    -- box | 'dek' per-user vault DEK). Nullable — NULL when the recovery slot is empty,
+    -- populated whenever recovery_sealed is written so a promotion can open the protected
+    -- login with the correct key even if the live sealed_login has since migrated
+    -- master→dek (PRD #1147 F14).
+    recovery_sealed_with TEXT CHECK (recovery_sealed_with IN ('master', 'dek')),
 
     -- Refresh coordination (driven by m2, inert here). coord_state is the lease
     -- state machine; coord_operation_id names the in-flight operation holding the

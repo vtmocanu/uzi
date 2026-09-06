@@ -1463,6 +1463,11 @@ UPDATE runs SET
     -- Issue #783: the fresh wall discards started_at, so the pause banked against the
     -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
     budget_paused_seconds = 0,
+    -- PRD #1147 F7 (defense-in-depth): revoke the per-claim Codex capability on park→queued.
+    -- A promoted run has no live owner until it is re-claimed, so any capability minted for
+    -- the prior claim must not survive the requeue; clearing the hash and bumping the epoch
+    -- supersedes it, mirroring the claimed→queued revocation sites.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE status = 'limit_wait' AND retry_not_before <= @now
@@ -2009,6 +2014,11 @@ UPDATE runs SET
     -- Issue #783: the fresh wall discards started_at, so the pause banked against the
     -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
     budget_paused_seconds = 0,
+    -- PRD #1147 F7 (defense-in-depth): revoke the per-claim Codex capability on the
+    -- claimed→pool_wait hold. A held run no longer has a live owner executing it, so any
+    -- capability minted for the claim must not survive the park; clearing the hash and
+    -- bumping the epoch supersedes it, mirroring the claimed→queued revocation sites.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at   = now()
 WHERE id = @id AND worker_id = @worker_id
@@ -2059,6 +2069,11 @@ UPDATE runs SET
     -- Issue #783: the fresh wall discards started_at, so the pause banked against the
     -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
     budget_paused_seconds = 0,
+    -- PRD #1147 F7 (defense-in-depth): revoke the per-claim Codex capability on
+    -- pool_wait→queued. A promoted run has no live owner until it is re-claimed, so any
+    -- capability minted for the prior claim must not survive the requeue; clearing the hash
+    -- and bumping the epoch supersedes it, mirroring the claimed→queued revocation sites.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at   = now()
 WHERE id = @id AND user_id = @user_id
