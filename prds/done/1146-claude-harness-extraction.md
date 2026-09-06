@@ -29,21 +29,21 @@ The shared advice ceiling permits isolated pure in-memory calculation for both C
 
 ## Implementation milestones
 
-- [ ] **1. Extract neutral records, decoding and reduction.**
+- [x] **1. Extract neutral records, decoding and reduction.**
 
 Create the neutral contract module and reducer (the companion proposes `agent/src/harness.ts` and `agent/src/harness-reducer.ts`). Move Claude decoding behind the adapter boundary; keep `sdk-messages.ts` callable for existing chat/tests without a second independent mapper. Move existing signal parsers rather than changing their rules. Provider SDK imports and raw events must not enter the neutral reducer. Preserve the accepted uzi wire capsule; normalized fields do not replace it.
 
-- [ ] **2. Route the existing Claude run implementation through the seam.**
+- [x] **2. Route the existing Claude run implementation through the seam.**
 
 Create the Claude adapter (the companion proposes `agent/src/claude-harness.ts`) and retain `sdk-executor.ts` as the workflow/constructor compatibility owner. Move query options, process ownership and session inspection; keep planning, approval, watchdog policy, checkpoints, git and run-state transitions with their existing uzi owners.
 
 Split run tool handlers from Claude `createSdkMcpServer` registration in the signal, memory, forge and findings modules. Keep registration in-process with identical names, schemas, descriptions, response objects, error text, role reach and call timing. Reuse the existing memory/findings handler seams. Preserve the forge server's single per-run shared call budget and run-bound closures; do not reset that budget per tool or turn. Signal handlers still return guidance and the stream reducer still owns workflow capture. Chat-only `uzi-tools.ts` behavior stays intact.
 
-- [ ] **3. Extract the Claude advice adapter with existing caller policies.**
+- [x] **3. Extract the Claude advice adapter with existing caller policies.**
 
 Keep `model-pass.ts` as the timeout/callback compatibility owner around the advice adapter. Judge/review/summary retain their outer parsing, fallback, usage and reporting policies. Preserve sparse environment, no run cwd, ephemeral HOME permissions, detached runner-uid spawn, deny-all hook, literal `settingSources: []`, model omission rules and exact label/error strings. All existing advice requests remain text output; prompts requesting JSON do not gain native output-schema enforcement.
 
-- [ ] **4. Validate the extraction and stop at M2.**
+- [x] **4. Validate the extraction and stop at M2.**
 
 Run `task gate:agent` and `task sast:semgrep` against the final tree. Record the command exit status and actual executed test results; a zero failure tally alone is insufficient. Confirm dead-code analysis actually ran, and preserve literal `settingSources: []` at each Claude options construction site. Demonstrate that the Semgrep rule still detects a temporary explicit widening in each moved options site, then restore and inspect the diff; also inspect options coverage for omission, which that rule cannot detect.
 
@@ -62,3 +62,5 @@ The parent's credential-kind/row identity, per-seat identity, CAS/recovery, rout
 ## Decision and progress log
 
 - 2026-09-06: User authorized M2-only Auto mode with MR rework enabled. Scope inherits accepted M0 contracts; wider provider enablement remains blocked.
+- 2026-09-06: M2 delivered on branch `agent/issue-1146` (base `c4eb47e6` → final harness commit). New neutral seam `agent/src/harness.ts` + `harness-reducer.ts` + `harness-messages.ts` + `claude-harness.ts`; `sdk-executor.ts` drives `HarnessTurn`+reducer while owning trip>throw>terminal precedence, `Date.now()` limit classification and `materialize`; forge/signal tool handlers split from `createSdkMcpServer` registration (forge single per-run budget preserved); advice lane routed through a module-local `ClaudeAdviceHarness` in `model-pass.ts`. Neutral `RunTurnReducer` is SDK-free; raw `scanSignals`/`isSubagentFrame` stay adapter-side per the accepted plan revision. `agent/test/` byte-identical and `.github/workflows/` unchanged (verified by empty range diff); `task gate:agent`, `task gate:repo` (incl. `sast:semgrep`) and `task test:harness-m2` all exit 0; the Semgrep `settingSources` rule was demonstrated to fire on a temporary widening at both moved options sites (`sdk-executor.ts` run lane, `model-pass.ts` advice lane) and restored. Differential coverage added under `e2e/harness-m2/`.
+- 2026-09-06: Deliberate residual (non-blocking, reviewed): the run-lane `SdkOptions` object assembly (env/`settingSources: []`/hooks/`mcpServers`/roster) remains in `sdk-executor.ts`; the adapter owns query execution, decode, session inspection, process ownership and the terminal, but not the options-object construction. Reason: the neutral `RunTurnRequest` cannot carry live in-process MCP server instances and the contract defers per-provider agent→definition conversion "upstream once", so a full lift would risk the D0 zero-behaviour-change mandate for no behavioural gain. The `settingSources: []` isolation literal and every guardrail stay intact and gate-verified. Completing that lift belongs with the M3 Codex adapter, when a Codex-specific option builder and server-instance channel land.
