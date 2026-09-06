@@ -604,6 +604,29 @@ func (d *midMintStore) SetRunCodexClaimCapability(ctx context.Context, arg store
 	return epoch, nil
 }
 
+// midOpenStore decorates the Codex claim store: its GetCodexProviderAccountByID runs the
+// REAL read and then, before returning, fires an injected callback that mutates DB state.
+// It reproduces the window BETWEEN Barrier A and Barrier B — a state change that lands
+// AFTER the post-mint re-check (Barrier A) but during the subscription decrypt, so only
+// Barrier B's FRESH release-predicate + ownership re-check (not its epoch/hash guard, which
+// this mutation leaves untouched) can catch it. It embeds *store.Queries so it satisfies
+// both store.Store and codexAuthzStore, exactly like midMintStore.
+type midOpenStore struct {
+	*store.Queries
+	afterRead func()
+}
+
+func (d *midOpenStore) GetCodexProviderAccountByID(ctx context.Context, arg store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error) {
+	acct, err := d.Queries.GetCodexProviderAccountByID(ctx, arg)
+	if err != nil {
+		return acct, err
+	}
+	if d.afterRead != nil {
+		d.afterRead()
+	}
+	return acct, nil
+}
+
 // newAPIKeyFixture seeds a fully-valid, claimed, api_key Codex run bound to a static
 // openai_api_key alias. accessToken holds the seeded static key.
 func newAPIKeyFixture(t *testing.T, env codexTestEnv) codexRunFixture {
@@ -646,14 +669,14 @@ func TestCodexClaimSecretsReauthorizesAfterMintLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 
 	// runClaimWithMidMutation installs the mid-mint mutation on the fixture's service, runs
-	// the claim, and asserts it errored with no access token released.
-	runClaimWithMidMutation := func(t *testing.T, f codexRunFixture, mutate func()) {
+	// the claim, and asserts it errored with the expected sentinel and no access token released.
+	runClaimWithMidMutation := func(t *testing.T, f codexRunFixture, want error, mutate func()) {
 		t.Helper()
 		f.svc.q = &midMintStore{Queries: env.q, afterMint: mutate}
 		run := mustRun(t, env, f.runID)
 		codex, err := f.svc.codexClaimSecrets(env.ctx, f.wkr, run)
-		if err == nil {
-			t.Fatal("codexClaimSecrets released a claim despite a mid-call state change; want a non-nil error")
+		if !errors.Is(err, want) {
+			t.Fatalf("codexClaimSecrets err = %v, want %v", err, want)
 		}
 		if codex != nil && codex.AccessToken != "" {
 			t.Fatalf("a re-authorization failure must release no access token, got %q", codex.AccessToken)
@@ -662,12 +685,12 @@ func TestCodexClaimSecretsReauthorizesAfterMintLiveDB(t *testing.T) {
 
 	t.Run("(a) account quarantined mid-mint (Barrier A)", func(t *testing.T) {
 		f := newSubscriptionFixture(t, env)
-		runClaimWithMidMutation(t, f, func() { env.quarantineAccount(t, f.aliasID) })
+		runClaimWithMidMutation(t, f, ErrCodexAccountQuarantined, func() { env.quarantineAccount(t, f.aliasID) })
 	})
 
 	t.Run("(b) account credential_revision bumped mid-mint (Barrier A)", func(t *testing.T) {
 		f := newSubscriptionFixture(t, env)
-		runClaimWithMidMutation(t, f, func() {
+		runClaimWithMidMutation(t, f, ErrCodexAccountRevisionStale, func() {
 			env.exec(`UPDATE codex_provider_account SET credential_revision = credential_revision + 1
 			          WHERE id = (SELECT provider_account_id FROM codex_credential_state WHERE user_secret_id = $1)`, f.aliasID)
 		})
@@ -675,14 +698,14 @@ func TestCodexClaimSecretsReauthorizesAfterMintLiveDB(t *testing.T) {
 
 	t.Run("(c) alias material_revision bumped mid-mint (Barrier A)", func(t *testing.T) {
 		f := newSubscriptionFixture(t, env)
-		runClaimWithMidMutation(t, f, func() {
+		runClaimWithMidMutation(t, f, ErrCodexMaterialRevisionStale, func() {
 			env.exec(`UPDATE codex_credential_state SET material_revision = material_revision + 1 WHERE user_secret_id = $1`, f.aliasID)
 		})
 	})
 
 	t.Run("(d) same-worker re-mint mid-mint: cap_hash cleared, epoch bumped, status stays claimed (Barrier B)", func(t *testing.T) {
 		f := newSubscriptionFixture(t, env)
-		runClaimWithMidMutation(t, f, func() {
+		runClaimWithMidMutation(t, f, errRunVanished, func() {
 			// A same-worker concurrent re-mint clears the just-installed cap_hash and bumps the
 			// epoch while KEEPING worker_id and the 'claimed' status — so ownership and the
 			// release predicate both still pass; only the epoch/hash barrier (Barrier B) rejects
@@ -694,11 +717,63 @@ func TestCodexClaimSecretsReauthorizesAfterMintLiveDB(t *testing.T) {
 
 	t.Run("(e) api_key: static-key alias material replaced mid-mint (Barrier A)", func(t *testing.T) {
 		f := newAPIKeyFixture(t, env)
-		runClaimWithMidMutation(t, f, func() {
+		runClaimWithMidMutation(t, f, ErrCodexMaterialRevisionStale, func() {
 			// Replacing the static key bumps the alias material_revision; the api_key release
 			// path opens strictly by secret id with no revision compare of its own, so without
 			// the re-authorization barrier the stale key would be released.
 			env.exec(`UPDATE codex_credential_state SET material_revision = material_revision + 1 WHERE user_secret_id = $1`, f.aliasID)
+		})
+	})
+}
+
+// TestCodexClaimSecretsReauthorizesAfterOpenLiveDB proves codexClaimSecrets's Barrier B
+// re-check catches a state change that lands in the window BETWEEN Barrier A and Barrier B —
+// specifically DURING the subscription account read/decrypt, after the post-mint re-check
+// (Barrier A) has already passed on a clean snapshot. A midOpenStore fires each mutation from
+// inside the real GetCodexProviderAccountByID, so it lands after Barrier A but before Barrier
+// B's fresh read; each case asserts the claim returns its specific sentinel and releases NO
+// access token. The mutations here leave codex_claim_epoch and codex_cap_hash untouched, so
+// Barrier B's epoch/hash guard is NOT what rejects them — its FRESH release-predicate and
+// worker-ownership re-check is.
+//
+// FAIL-OLD / PASS-FIXED: this test passes against the current code (Barrier B re-runs the
+// release predicate + ownership check on a fresh post-decrypt snapshot). If Barrier B's fresh
+// predicate/ownership re-check were removed, leaving only its epoch/hash guard, both cases
+// would FAIL — the mutations leave the minted epoch/hash intact, so the epoch/hash guard alone
+// passes them through and the claim would release the now-wrong credential. The existing
+// midMintStore tests cannot cover this: their mutation fires at the mint (before Barrier A),
+// so Barrier A already catches the predicate/ownership cases and Barrier B's fresh branch is
+// never the deciding rejecter.
+func TestCodexClaimSecretsReauthorizesAfterOpenLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+
+	// runClaimWithMidOpen installs the mid-open mutation on the fixture's service, runs the
+	// claim, and asserts it errored with the expected sentinel and no access token released.
+	runClaimWithMidOpen := func(t *testing.T, f codexRunFixture, want error, mutate func()) {
+		t.Helper()
+		f.svc.q = &midOpenStore{Queries: env.q, afterRead: mutate}
+		run := mustRun(t, env, f.runID)
+		codex, err := f.svc.codexClaimSecrets(env.ctx, f.wkr, run)
+		if !errors.Is(err, want) {
+			t.Fatalf("codexClaimSecrets err = %v, want %v", err, want)
+		}
+		if codex != nil && codex.AccessToken != "" {
+			t.Fatalf("a re-authorization failure must release no access token, got %q", codex.AccessToken)
+		}
+	}
+
+	t.Run("(i) account quarantined after the account read (Barrier B predicate)", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		runClaimWithMidOpen(t, f, ErrCodexAccountQuarantined, func() { env.quarantineAccount(t, f.aliasID) })
+	})
+
+	t.Run("(ii) worker ownership lost after the account read (Barrier B ownership)", func(t *testing.T) {
+		f := newSubscriptionFixture(t, env)
+		runClaimWithMidOpen(t, f, ErrCodexWorkerMismatch, func() {
+			// worker_id is nullable on runs; NULLing it while status stays 'claimed' lets the
+			// release predicate pass and trips reauthorizeCodexRelease's !row.WorkerID.Valid
+			// ownership branch — the FRESH check only Barrier B performs after the decrypt.
+			env.exec(`UPDATE runs SET worker_id = NULL WHERE id = $1`, f.runID)
 		})
 	})
 }

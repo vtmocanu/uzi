@@ -30,13 +30,26 @@ CREATE UNIQUE INDEX user_secrets_codex_one_default_key
 -- +goose Down
 DROP INDEX user_secrets_codex_one_default_key;
 ALTER TABLE user_secrets DROP CONSTRAINT user_secrets_kind_check;
--- A downgrade removes the Codex feature, so it must remove its credentials too:
--- re-adding an anthropic_token-only CHECK while any openai_api_key/codex_auth row still
--- exists would fail the whole transaction. Under goose's strict reverse-order down, 00200's
--- Down has ALREADY dropped codex_credential_state (and 00199's Down dropped
--- codex_provider_account) before this DELETE runs, so there are no state or account rows
--- left to worry about — this DELETE only removes the now-orphaned user_secrets rows so the
--- narrowed CHECK below can be re-added.
-DELETE FROM user_secrets WHERE kind IN ('openai_api_key', 'codex_auth');
+-- A downgrade re-adds an anthropic_token-only CHECK, which cannot coexist with any
+-- openai_api_key/codex_auth row. Rather than silently DELETE that sealed credential
+-- material (irreversible destruction of user secrets on a routine `goose down`), this
+-- block REFUSES the downgrade whenever such rows still exist, forcing a conscious operator
+-- deletion first. Under goose's strict reverse-order down, 00200's Down has ALREADY dropped
+-- codex_credential_state (and 00199's Down dropped codex_provider_account) before this runs,
+-- so only the user_secrets rows themselves remain — and they are the material we refuse to
+-- destroy implicitly. With no such rows present the block is a no-op and the narrowed CHECK
+-- below re-adds cleanly.
+-- +goose StatementBegin
+DO $$
+DECLARE
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM user_secrets WHERE kind IN ('openai_api_key', 'codex_auth');
+    IF n > 0 THEN
+        RAISE EXCEPTION 'refusing to roll back 00198: % Codex credential row(s) (openai_api_key/codex_auth) still exist; delete them explicitly before downgrading so credential material is never silently destroyed', n;
+    END IF;
+END
+$$;
+-- +goose StatementEnd
 ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_kind_check
     CHECK (kind IN ('anthropic_token'));
