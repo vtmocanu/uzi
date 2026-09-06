@@ -1,23 +1,10 @@
 // The read-only model pass (PRD #920 M2): the ONE place uzi's advice lane (judge,
-// review, summary) constructs its tool-less, repo-isolated SDK query, races it against
+// review, summary) runs its tool-less, repo-isolated SDK query, races it against
 // a wall-clock timeout, and accumulates the model's text.
 //
-// 🔴 THIS FILE IS THE ISOLATION SINGLE POINT OF TRUTH FOR THE ADVICE LANE. Before M2
-// the judge/review/summary runners each built the same isolation-shaped SdkOptions
-// (`settingSources: []`, a deny-all PreToolUse hook, bypassPermissions, the runner-uid
-// detached spawn) at their own `query` site. They are now ONE call to
-// runReadOnlyModelPass below, so the advice-lane literal `settingSources: []` lives at
-// exactly one query site (this file), alongside sdk-executor.ts and chat-executor.ts.
-//
-// 🔴 SEMGREP OMITTED-KEY BLINDNESS. The semgrep rule
-// semgrep/settings-sources-isolation.yml fires on a WIDENED value only
-// (`settingSources: ["project"]`, `settingSources: someVar`) and is BLIND to an
-// OMITTED key — the SDK default is fail-open (an absent `settingSources` loads the
-// checked-out repo's `.claude/` as configuration, the exact repo-borne
-// prompt-injection vector this isolation blocks). So a future edit that DROPPED the
-// key from the options below would pass semgrep silently and re-open the vector. Keep
-// `settingSources: []` a literal at the query site (see runReadOnlyModelPass), do not
-// extract it, do not spread it in.
+// ClaudeAdviceHarness in claude-advice-harness.ts owns SDK options, the literal
+// settingSources: [] and the deny-all hook. This file owns timeout/HOME lifecycle
+// and the text-returning compatibility boundary for judge/review/summary.
 //
 // FAILURE HANDLING. review/summary get the helper's DEFAULT: an error result frame
 // throws a generic `${label} model call returned an error result`, a success frame
@@ -30,43 +17,18 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import type {
-  HookInput,
-  HookJSONOutput,
-  Options as SdkOptions,
-  SpawnedProcess,
-} from "@anthropic-ai/claude-agent-sdk";
-
-import { spawnDetached } from "./sdk-spawn.js";
+import { ClaudeAdviceHarness } from "./claude-advice-harness.js";
 import { uidSplitActive } from "./runner-uid.js";
-import { buildSdkEnv } from "./sdk-env.js";
 import { rmTreeForce } from "./rmtree.js";
-import { promptStream, mapSdkMessage, isResult, isErrorResult } from "./sdk-messages.js";
-import { RateLimitObserver, LimitReachedError, type RateLimitObservation } from "./limit.js";
+import { LimitReachedError, type RateLimitObservation } from "./limit.js";
 import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
 import type { WorkerClient } from "./client.js"; // type-only — erased at runtime; client.ts imports no runner/model-pass, so no cycle
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
 import type {
-  AdviceHarness,
   AdviceRequest,
-  AdviceResult,
   AdviceResultPolicy,
 } from "./harness.js"; // type-only — erased at runtime; harness.ts has no SDK import, so no cycle
-
-/** A PreToolUse deny for EVERY tool: the advice runners (judge/review/summary) are
- *  read-only. A deny is authoritative even under bypassPermissions (the same property
- *  guardrails.ts relies on). Internal to this file since M2 — the only caller is
- *  runReadOnlyModelPass below (the advice lane no longer builds the hook itself). */
-function buildDenyAllHook(reason: string) {
-  return async (_input: HookInput): Promise<HookJSONOutput> => ({
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: reason,
-    },
-  });
-}
 
 /** Options for runReadOnlyModelPass — one tool-less, repo-isolated model turn. */
 export interface ReadOnlyModelPassOpts {
@@ -206,105 +168,6 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     await rmTreeForce(homeDir).catch((e) =>
       opts.log.warn(`${opts.label} HOME cleanup failed`, { home_dir: homeDir, error: errMessage(e) }),
     );
-  }
-}
-
-/** Construction inputs for ClaudeAdviceHarness — the Claude-specific isolation and
- *  compatibility surface the advice adapter absorbs from the old `consume` body. Module-
- *  local (not in harness.ts, which stays SDK-free): only runReadOnlyModelPass builds one. */
-interface ClaudeAdviceInputs {
-  token: string;
-  homeDir: string;
-  abort: AbortController;
-  queryFn: SdkQueryFn;
-  denyReason: string;
-  log: Logger;
-  /** Claude-only raw-msg compat shim (the judge's onResult). When present it REPLACES the
-   *  policy's default onTerminal, mirroring today's `if (opts.onResult) … else …`. */
-  rawResultShim?: ReadOnlyModelPassOpts["onResult"];
-}
-
-/** The neutral advice seam's Claude adapter: builds the isolation-shaped SdkOptions and
- *  streams one tool-less turn, absorbing the old `consume` body verbatim. Module-local and
- *  UN-EXPORTED — its only caller is runReadOnlyModelPass in this file, so knip stays clean
- *  without an export. */
-class ClaudeAdviceHarness implements AdviceHarness {
-  readonly kind = "claude";
-
-  constructor(private readonly inputs: ClaudeAdviceInputs) {}
-
-  async run(request: AdviceRequest, policy: AdviceResultPolicy): Promise<AdviceResult> {
-    const env = buildSdkEnv(this.inputs.token, this.inputs.homeDir);
-    const options: SdkOptions = {
-      env: env as unknown as Record<string, string | undefined>,
-      abortController: this.inputs.abort,
-      // 🔴 ISOLATION SINGLE POINT OF TRUTH. `settingSources: []` MUST stay a LITERAL at
-      // this one query site. The semgrep rule semgrep/settings-sources-isolation.yml
-      // fires on a WIDENED value only and is BLIND to an OMITTED key — so this is now the
-      // ONLY place the advice-lane literal lives, and a future edit that dropped this key
-      // would pass semgrep silently and re-open the repo-borne prompt-injection vector.
-      // Do NOT extract it to a variable, do NOT spread it in, do NOT delete it.
-      settingSources: [],
-      systemPrompt: request.systemPrompt,
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      includePartialMessages: false,
-      hooks: { PreToolUse: [{ hooks: [buildDenyAllHook(this.inputs.denyReason)] }] },
-      // Route the model-reasoning SDK CLI through the runner-uid detached spawn like every
-      // other SDK spawn (uniform boundary); the deny-all hook already blocks code-exec, so
-      // this is defense-in-depth. (PRD #51 M4 — keep this rationale.)
-      spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
-    };
-    if (request.model) options.model = request.model;
-
-    let text = "";
-    let terminalMsg: unknown;
-    let terminalIsError = false;
-    const rateLimits = new RateLimitObserver();
-    for await (const msg of this.inputs.queryFn({ prompt: promptStream(request.prompt), options })) {
-      rateLimits.observe(msg);
-      for (const em of mapSdkMessage(msg)) {
-        if (em.kind === "text") {
-          const t = (em.payload as { text?: string }).text;
-          if (t) text += t;
-        }
-      }
-      if (isResult(msg)) {
-        const isError = isErrorResult(msg);
-        terminalMsg = msg;
-        terminalIsError = isError;
-        if (this.inputs.rawResultShim) {
-          // Judge: hand it the RAW SDK msg, unchanged from today's onResult path.
-          this.inputs.rawResultShim(msg, { isError, latest: rateLimits.latest });
-        } else {
-          // review/summary default: the neutral policy. Byte-identical throw/success to
-          // today's `else if (isError) throw …`.
-          policy.onTerminal(this.neutralTerminal(msg, isError), { isError, latest: undefined });
-        }
-        break;
-      }
-    }
-    return {
-      text,
-      end: { kind: "terminal", terminal: this.neutralTerminal(terminalMsg, terminalIsError) },
-      usage: undefined,
-    };
-  }
-
-  /** A private MINIMAL neutral terminal builder that reads ONLY the raw `subtype` field.
-   *  It is unread by every M2 caller (the run-lane decoder lives elsewhere) and MUST NOT
-   *  be able to throw — no failure closure, no usage, no limit evidence. Do not grow a
-   *  real terminal decoder here. */
-  private neutralTerminal(msg: unknown, isError: boolean) {
-    return {
-      outcome: isError ? ("failed" as const) : ("success" as const),
-      subtype: (() => {
-        const s = (msg as Record<string, unknown> | undefined)?.["subtype"];
-        return typeof s === "string" ? s : "unknown";
-      })(),
-      errors: [] as readonly string[],
-      metrics: { cost: { kind: "unreported" as const } },
-    };
   }
 }
 

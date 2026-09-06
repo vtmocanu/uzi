@@ -4,7 +4,8 @@ PRD #1146 (#1106 M2) milestone **m4** validation. These are **credential-free,
 pure in-process unit tests** that characterize the NEW provider-neutral harness
 seam that milestones m1–m3 introduced. They import the frozen seam symbols from
 `agent/src` via NodeNext `.js` specifiers and exercise them over hand-built
-neutral literals — no SDK query, no real tokens/secrets, no network. Any
+neutral literals or injected fake query streams — no real SDK query, tokens/secrets
+or network. Any
 token-shaped value in a fixture is DUMMY data constructed at runtime.
 
 Run them with:
@@ -42,13 +43,16 @@ the type level, not only at runtime) and (2) runs them under
   `errors` on the FAILED path only, so a SUCCESS frame with a malformed `errors`
   element no longer throws before terminal accounting is emitted — while a FAILED
   frame with a malformed element still throws (base behavior preserved). And that the
-  advice lane's `neutralTerminal` (`model-pass.ts`) projects a non-string `subtype` to
+  advice lane's `neutralTerminal` (`claude-advice-harness.ts`) projects a non-string `subtype` to
   `"unknown"` without a raw `String()` coercion, so the review lane surfaces its
-  intended default policy error instead of a `TypeError`.
+  intended default policy error instead of a `TypeError`. EOF controls invoke the
+  actual Claude advice adapter and assert `end: {kind:"exhausted"}` with text or
+  an empty stream, unchanged compatibility text, and no terminal callback. Real
+  success/failure frames remain terminal; callbacks still precede iterator close.
 
 ## Scope note
 
-The advice adapter `ClaudeAdviceHarness` is module-local (not an exported seam
-symbol) and stays covered by the frozen `agent/test/model-pass.test.ts`; it is
-intentionally out of scope here. These suites add NO production code and do not
-touch `agent/src` or `agent/test`.
+`ClaudeAdviceHarness` lives in its own Claude module, consumed by the production
+`model-pass.ts` compatibility owner and the neutral EOF controls above. The existing
+`agent/test/` corpus stays byte-identical; these suites add conformance coverage
+without changing its assertions.

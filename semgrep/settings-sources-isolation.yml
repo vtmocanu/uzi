@@ -8,10 +8,11 @@
 # agent's own permissions from inside its own tree. See ARCHITECTURE.md's
 # guardrails section and agent/src/claude-harness.ts (the lead run lane, the widest
 # blast radius of the sites). There are exactly three real assignments today
-# -- claude-harness.ts, chat-executor.ts, and model-pass.ts (the consolidated
+# -- claude-harness.ts, chat-executor.ts, and claude-advice-harness.ts (the consolidated
 # advice-lane site: PRD #920 M2 folded the former judge-runner.ts /
 # summary-runner.ts / review-runner.ts literals into one query site in
-# runReadOnlyModelPass) -- and ALL are `settingSources: []`. The run-lane literal
+# ClaudeAdviceHarness.run, called by runReadOnlyModelPass) -- and ALL are
+# `settingSources: []`. The run-lane literal
 # lives in claude-harness.ts `buildSdkOptions` as of PRD #1146 M2, which moved the
 # SdkOptions assembly out of sdk-executor.ts into the Claude adapter. This rule
 # forbids any other value.

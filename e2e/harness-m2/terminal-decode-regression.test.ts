@@ -13,13 +13,17 @@
 //      to gate `.map(String)` on the failed-outcome path only — errors are only
 //      meaningful on failure. The failed path still String-maps (and still throws on
 //      a malformed failed-result element), matching base.
-//   2. neutralTerminal (model-pass.ts): `String(subtype)` used to throw on a non-string
+//   2. neutralTerminal (claude-advice-harness.ts): `String(subtype)` used to throw on a non-string
 //      subtype, pre-empting the intended default policy error. Fixed to a string-or-
 //      "unknown" projection that never throws.
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
+import { mkdtemp, rm } from "node:fs/promises";
+import path from "node:path";
+
+import { ClaudeAdviceHarness } from "../../agent/src/claude-advice-harness.js";
 
 import { decodeResult } from "../../agent/src/sdk-messages.js";
 import { runReadOnlyModelPass, type ReadOnlyModelPassOpts } from "../../agent/src/model-pass.js";
@@ -140,3 +144,71 @@ test("runReadOnlyModelPass: a non-string subtype terminal frame surfaces the def
     return true;
   });
 });
+
+// Natural EOF reports exhaustion on the neutral seam without changing the legacy
+// text result or invoking a terminal callback. Real terminal controls distinguish
+// exhaustion from both successful and failed provider results.
+for (const scenario of [
+  { name: "text EOF", text: "kept text", subtype: undefined },
+  { name: "empty EOF", text: "", subtype: undefined },
+  { name: "real success terminal", text: "kept text", subtype: "success" },
+  { name: "real failed terminal", text: "kept text", subtype: "error_max_turns" },
+]) {
+  test(`Claude advice end: ${scenario.name} preserves neutral metadata and legacy behavior`, async () => {
+    const homeRoot = await mkdtemp(path.join(os.tmpdir(), "cdr-advice-end-"));
+    try {
+      const terminal = scenario.subtype === undefined ? undefined : {
+        type: "result", subtype: scenario.subtype, is_error: scenario.subtype !== "success",
+      };
+      const frames: unknown[] = scenario.text ? [{
+        type: "assistant", message: { content: [{ type: "text", text: scenario.text }] },
+      }] : [];
+      if (terminal) frames.push(terminal);
+      const fakeQuery = (events: string[]): SdkQueryFn => (() => (async function* () {
+        try { yield* frames; } finally { events.push("close"); }
+      })()) as unknown as SdkQueryFn;
+      const events: string[] = [];
+      const abort = new AbortController();
+      const result = await new ClaudeAdviceHarness({
+        token: "dummy", homeDir: homeRoot, abort, queryFn: fakeQuery(events),
+        denyReason: "no tools", log: nullLogger(),
+      }).run({
+        label: "review", systemPrompt: "system", prompt: "prompt",
+        output: { kind: "text" }, signal: abort.signal, timeoutMs: 5000,
+      }, {
+        onTerminal(value, ctx) {
+          events.push("policy");
+          assert.equal(value.subtype, scenario.subtype);
+          assert.equal(ctx.isError, scenario.subtype !== "success");
+        },
+      });
+      // These compatibility assertions run before the metadata assertion, so the
+      // old producer's EOF red isolates the invented terminal, not text/callbacks.
+      assert.equal(result.text, scenario.text);
+      assert.deepStrictEqual(events, terminal ? ["policy", "close"] : ["close"]);
+      const legacyEvents: string[] = [];
+      const legacyText = await runReadOnlyModelPass({
+        token: "dummy", systemPrompt: "system", prompt: "prompt", homeRoot,
+        homePrefix: "pass-", label: "review", timeoutMs: 5000,
+        queryFn: fakeQuery(legacyEvents), denyReason: "no tools", log: nullLogger(),
+        onResult(msg, ctx) {
+          legacyEvents.push("callback");
+          assert.strictEqual(msg, terminal);
+          assert.equal(ctx.isError, scenario.subtype !== "success");
+        },
+      });
+      assert.equal(legacyText, scenario.text);
+      assert.deepStrictEqual(legacyEvents, terminal ? ["callback", "close"] : ["close"]);
+      if (terminal) {
+        assert.equal(result.end.kind, "terminal");
+        if (result.end.kind !== "terminal") assert.fail("actual result must remain terminal");
+        assert.equal(result.end.terminal.subtype, scenario.subtype);
+        assert.equal(result.end.terminal.outcome, scenario.subtype === "success" ? "success" : "failed");
+      } else {
+        assert.deepStrictEqual(result.end, { kind: "exhausted" });
+      }
+    } finally {
+      await rm(homeRoot, { recursive: true, force: true });
+    }
+  });
+}
