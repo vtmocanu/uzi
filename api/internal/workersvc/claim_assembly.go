@@ -181,10 +181,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		defaultModel = run.Model
 	}
 
-	// The run owner's per-user default reasoning effort (PRD #617). NULL ⇒ nil ⇒
-	// omitted from the payload, so the worker never sets the SDK effort key and the
-	// SDK default (`high`) applies. Unlike DefaultModel there is no per-schedule
-	// freeze — the owner's per-user value is the only source.
+	// The run owner's per-user default reasoning effort (PRD #617). NULL now
+	// resolves to the uzi default `xhigh` at this sink (via resolveEffortPtr /
+	// agenttmpl.ResolveDefaultEffort, issue #1157); an explicit choice is carried
+	// verbatim. Unlike DefaultModel there is no per-schedule freeze — the owner's
+	// per-user value is the only source.
 	defaultEffort, err := s.q.GetUserDefaultEffort(ctx, run.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("default effort lookup: %w", err)
@@ -435,7 +436,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			QuestionMax:            s.p.QuestionMax,
 			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
 			DefaultModel:           textPtr(defaultModel),
-			DefaultEffort:          textPtr(defaultEffort),
+			DefaultEffort:          resolveEffortPtr(defaultEffort),
 			AttributionEnabled:     attributionEnabled,
 			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read
 			// straight off the run row — not re-derived from the schedule. false for every

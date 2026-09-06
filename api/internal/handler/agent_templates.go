@@ -786,9 +786,9 @@ func validateModel(raw *string) (pgtype.Text, error) {
 // validateEffort is the thin HTTP-facing wrapper over agenttmpl.ValidateEffort
 // (the single source of the closed-enum effort rules, PRD #617), used by the
 // per-user default-effort endpoint. A nil pointer or a blank value becomes NULL
-// (inherit — we then omit the SDK effort key, so the SDK default `high` applies);
-// a valid level becomes a set pgtype.Text; anything else is an error (mapped to
-// 400 by the caller).
+// (inherit — stored as NULL; resolved to the uzi default `xhigh` at claim
+// assembly, issue #1157); a valid level becomes a set pgtype.Text; anything else
+// is an error (mapped to 400 by the caller).
 func validateEffort(raw *string) (pgtype.Text, error) {
 	if raw == nil {
 		return pgtype.Text{}, nil

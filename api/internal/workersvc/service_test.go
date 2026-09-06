@@ -1911,10 +1911,11 @@ func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
 	}
 }
 
-// TestClaimOmitsDefaultEffortWhenOwnerHasNone mirrors the default_model omit test
-// (PRD #617): with the owner's per-user default effort left NULL the field is nil
-// and omitted from the wire, so the worker never sets the SDK effort key.
-func TestClaimOmitsDefaultEffortWhenOwnerHasNone(t *testing.T) {
+// TestClaimDefaultsEffortToXhighWhenOwnerHasNone: with the owner's per-user default
+// effort left NULL (inherit), the claim resolves it to the uzi default `xhigh`
+// (issue #1157) rather than omitting the field, so the worker applies xhigh instead
+// of the SDK's own `high` fallback.
+func TestClaimDefaultsEffortToXhighWhenOwnerHasNone(t *testing.T) {
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte("bot-pat-EFFOMIT-abcdef1234567890"))
 	sealedTok, _ := box.Seal([]byte("anthropic-EFFOMIT-abcdef1234567890"))
@@ -1934,16 +1935,16 @@ func TestClaimOmitsDefaultEffortWhenOwnerHasNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if payload.Config.DefaultEffort != nil {
-		t.Fatalf("expected nil default effort, got %q", *payload.Config.DefaultEffort)
+	if payload.Config.DefaultEffort == nil || *payload.Config.DefaultEffort != "xhigh" {
+		t.Fatalf("expected default effort xhigh for an inheriting owner, got %+v", payload.Config.DefaultEffort)
 	}
-	// omitempty: an unset default must not appear on the wire at all.
+	// The uzi default now rides the wire for a NULL owner.
 	b, err := json.Marshal(payload.Config)
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}
-	if strings.Contains(string(b), "default_effort") {
-		t.Fatalf("unset default_effort should be omitted from the payload; got %s", b)
+	if !strings.Contains(string(b), `"default_effort":"xhigh"`) {
+		t.Fatalf("inheriting owner should carry default_effort xhigh on the wire; got %s", b)
 	}
 }
 
