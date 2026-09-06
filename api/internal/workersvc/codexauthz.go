@@ -28,14 +28,14 @@ import (
 // creation. The coordinated-refresh state machine (lease/intent/generation) is a
 // SEPARATE later unit — the store primitives for it exist but are NOT driven here.
 
-// Codex auth modes (the runs.codex_auth_mode CHECK values, migration 00201). Named
+// Codex auth modes (the runs.codex_auth_mode CHECK values, migration 00202). Named
 // here so this file never spells a bare literal that could drift from the schema.
 const (
 	codexAuthModeSubscription = "subscription"
 	codexAuthModeAPIKey       = "api_key"
 )
 
-// codexCoordQuarantined is the codex_provider_account.coord_state value (migration 00198)
+// codexCoordQuarantined is the codex_provider_account.coord_state value (migration 00199)
 // meaning a refresh left the account parked for reconciliation: no token may be handed out
 // until it is reconciled or re-logged-in.
 const codexCoordQuarantined = "quarantined"
@@ -256,7 +256,7 @@ func parseCodexCapability(presented string) (epoch int64, secret string, ok bool
 	return ep, rest, true
 }
 
-// codexAccountKey serializes an identity tuple exactly as migration 00201 documents:
+// codexAccountKey serializes an identity tuple exactly as migration 00202 documents:
 // a two-element JSON array TEXT, json.Marshal([]string{provider_user_id,
 // workspace_account_id}). Both the frozen run column and the authority check's
 // current-tuple comparison go through this one encoder, so the two sides can never
@@ -649,7 +649,7 @@ func (s *Service) FreezeCodexBinding(ctx context.Context, userID, runID, secretI
 		return fmt.Errorf("codex freeze: read state: %w", err)
 	}
 
-	// Snapshot the alias label at bind time (the same reason 00086/00201 snapshot it:
+	// Snapshot the alias label at bind time (the same reason 00086/00202 snapshot it:
 	// the FK nulls the id on delete and a rename rewrites the label in place).
 	meta, err := s.q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{
 		ID:     secretID,

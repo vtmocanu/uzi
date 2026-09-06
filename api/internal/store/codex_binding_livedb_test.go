@@ -55,7 +55,7 @@ func insertCodexRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, user,
 	return runID
 }
 
-// TestRunCodexBindingSchemaLiveDB pins 00201: the codex_* columns exist with
+// TestRunCodexBindingSchemaLiveDB pins 00202: the codex_* columns exist with
 // codex_claim_epoch defaulting to 0, and the composite-FK SET NULL (codex_secret_id)
 // nulls only the binding when a bound secret is deleted — never runs.user_id.
 func TestRunCodexBindingSchemaLiveDB(t *testing.T) {
@@ -324,7 +324,7 @@ func TestFreezeRunCodexBindingLiveDB(t *testing.T) {
 	}
 
 	// SetRunCodexFrozenIdentity freezes the identity tuple + account revision at link.
-	// The account key is the JSON-array serialization documented in 00201 (Postgres
+	// The account key is the JSON-array serialization documented in 00202 (Postgres
 	// TEXT cannot hold a NUL byte, so a NUL-separated join is not storable).
 	key := `["provider-x","workspace-y"]`
 	if n, err := q.SetRunCodexFrozenIdentity(ctx, store.SetRunCodexFrozenIdentityParams{
@@ -579,7 +579,7 @@ func TestCodexRefreshCoordinationLiveDB(t *testing.T) {
 	}
 }
 
-// TestCodexRefreshIntentLiveDB pins 00200 + the intent primitives: insert (born
+// TestCodexRefreshIntentLiveDB pins 00201 + the intent primitives: insert (born
 // rotating), get, set-state, a duplicate operation_id insert fails (23505), and the
 // unresolved scan returns only 'rotating' intents.
 func TestCodexRefreshIntentLiveDB(t *testing.T) {
@@ -810,7 +810,7 @@ func TestCommitCodexRefreshLeaseGuardLiveDB(t *testing.T) {
 	}
 	// Park a recovery slot directly WITHOUT flipping coord_state (SetCodexRecoverySlot
 	// would quarantine), so we can prove a successful commit clears it. recovery_sealed_with
-	// is set alongside recovery_sealed to satisfy 00198's CHECK pairing.
+	// is set alongside recovery_sealed to satisfy 00199's CHECK pairing.
 	mustExec(ctx, t, pool,
 		`UPDATE codex_provider_account SET recovery_sealed = $1, recovery_generation = 0, recovery_sealed_with = 'master' WHERE id = $2 AND user_id = $3`,
 		[]byte("stale-recovery"), gAcc.ID, user)
@@ -854,7 +854,7 @@ func TestSetCodexRecoverySlotLiveDB(t *testing.T) {
 	}
 
 	// SetCodexRecoverySlot now requires the live-lease owner's op and the key that sealed
-	// the recovery blob (non-empty 'master'|'dek', per 00198's CHECK pairing).
+	// the recovery blob (non-empty 'master'|'dek', per 00199's CHECK pairing).
 	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
 		Sealed: []byte("prior-good-login"), Gen: 3, ID: acc.ID, UserID: user,
 		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
@@ -1054,6 +1054,149 @@ func TestFreezeRunCodexBindingWriteOnceLiveDB(t *testing.T) {
 	}
 }
 
+// TestFreezeRunCodexBindingSnapshotImmutabilityLiveDB pins defect-1 hardening: the
+// freeze is write-once keyed on codex_material_revision IS NULL (a deletion-proof
+// "initialized" sentinel), so a same-secret retry that presents a CHANGED snapshot
+// affects 0 rows and leaves the original frozen material_revision intact. Under the
+// pre-fix WHERE (guarded only on codex_secret_id) this retry re-wrote the row, so this
+// test fails-old / passes-fixed.
+func TestFreezeRunCodexBindingSnapshotImmutabilityLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	repo, _ := codexRunFixture(ctx, t, pool, user)
+
+	secretA, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "a-"+uuid.NewString(), false)
+	if err != nil {
+		t.Fatalf("insert secretA: %v", err)
+	}
+	runID := insertCodexRun(ctx, t, pool, user, repo, uuid.Nil, 411, "queued", "marker")
+
+	// First freeze pins material_revision = 1.
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretA, AuthMode: "subscription", SecretLabel: "a", MaterialRevision: 1,
+		ID: runID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("FreezeRunCodexBinding(first) = (%d,%v), want (1,nil)", n, err)
+	}
+	// Retry with the SAME secret but a BUMPED material_revision (2): the snapshot changed,
+	// so the write-once guard rejects it (0 rows) rather than re-writing the frozen row.
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretA, AuthMode: "subscription", SecretLabel: "a", MaterialRevision: 2,
+		ID: runID, UserID: user,
+	}); err != nil || n != 0 {
+		t.Fatalf("FreezeRunCodexBinding(same secret, changed material_revision) = (%d,%v), want (0,nil) — the snapshot is immutable", n, err)
+	}
+	got, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if !got.CodexMaterialRevision.Valid || got.CodexMaterialRevision.Int64 != 1 {
+		t.Fatalf("after a changed-snapshot retry codex_material_revision = %+v, want it unchanged at 1", got.CodexMaterialRevision)
+	}
+}
+
+// TestSetRunCodexFrozenIdentityRevisionGuardLiveDB pins defect-1 hardening on the
+// identity freeze: account_revision is now part of the immutability guard, so a
+// same-tuple replay carrying a BUMPED account_revision (a replaced/revoked account
+// re-minted under the same identity tuple) affects 0 rows and leaves the frozen
+// revision intact. Fails-old (the pre-fix guard ignored account_revision and re-wrote
+// the row) / passes-fixed.
+func TestSetRunCodexFrozenIdentityRevisionGuardLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	repo, _ := codexRunFixture(ctx, t, pool, user)
+	runID := insertCodexRun(ctx, t, pool, user, repo, uuid.Nil, 412, "queued", "marker")
+
+	key := `["provider-k","workspace-k"]`
+	// First identity freeze pins account_revision = 1.
+	if n, err := q.SetRunCodexFrozenIdentity(ctx, store.SetRunCodexFrozenIdentityParams{
+		Key: key, Rev: 1, ID: runID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("SetRunCodexFrozenIdentity(first) = (%d,%v), want (1,nil)", n, err)
+	}
+	// Replay the SAME tuple with a BUMPED account_revision (2): rejected (0 rows).
+	if n, err := q.SetRunCodexFrozenIdentity(ctx, store.SetRunCodexFrozenIdentityParams{
+		Key: key, Rev: 2, ID: runID, UserID: user,
+	}); err != nil || n != 0 {
+		t.Fatalf("SetRunCodexFrozenIdentity(same tuple, bumped revision) = (%d,%v), want (0,nil) — the account_revision is part of the guard", n, err)
+	}
+	got, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if !got.CodexAccountRevision.Valid || got.CodexAccountRevision.Int64 != 1 {
+		t.Fatalf("after a bumped-revision replay codex_account_revision = %+v, want it unchanged at 1", got.CodexAccountRevision)
+	}
+}
+
+// TestFreezeRunCodexBindingDeletionProofLiveDB pins the defect-1 core: after the bound
+// alias is deleted (the runs_codex_secret_fk nulls codex_secret_id but NOT
+// codex_material_revision), a fresh freeze with a NEW secret must NOT re-point the run.
+// The write-once sentinel is codex_material_revision IS NULL, which survives the FK
+// cascade, so the re-point affects 0 rows. Under the pre-fix WHERE the null
+// codex_secret_id satisfied `codex_secret_id IS NULL` and the run was silently
+// re-pointed — so this fails-old / passes-fixed.
+func TestFreezeRunCodexBindingDeletionProofLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	repo, _ := codexRunFixture(ctx, t, pool, user)
+
+	secretA, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "a-"+uuid.NewString(), false)
+	if err != nil {
+		t.Fatalf("insert secretA: %v", err)
+	}
+	secretB, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "b-"+uuid.NewString(), false)
+	if err != nil {
+		t.Fatalf("insert secretB: %v", err)
+	}
+	runID := insertCodexRun(ctx, t, pool, user, repo, uuid.Nil, 413, "queued", "marker")
+
+	// Freeze the binding AND its account identity against secretA.
+	acctKey := `["provider-d","workspace-d"]`
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretA, AuthMode: "subscription", SecretLabel: "a", MaterialRevision: 5,
+		AccountKey:      pgtype.Text{String: acctKey, Valid: true},
+		AccountRevision: pgtype.Int8{Int64: 7, Valid: true},
+		ID:              runID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("FreezeRunCodexBinding(first) = (%d,%v), want (1,nil)", n, err)
+	}
+	// Delete the bound alias: the composite SET NULL (codex_secret_id) nulls only the
+	// secret id, leaving codex_material_revision (the write-once sentinel) intact.
+	mustExec(ctx, t, pool, `DELETE FROM user_secrets WHERE id = $1`, secretA)
+	afterDelete, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunByID after delete: %v", err)
+	}
+	if afterDelete.CodexSecretID.Valid {
+		t.Fatal("codex_secret_id is still set after the bound secret was deleted — SET NULL did not fire")
+	}
+	if !afterDelete.CodexMaterialRevision.Valid || afterDelete.CodexMaterialRevision.Int64 != 5 {
+		t.Fatalf("codex_material_revision = %+v after alias delete, want it preserved at 5 (the sentinel must survive the FK cascade)", afterDelete.CodexMaterialRevision)
+	}
+
+	// Attempt to re-point the run at a NEW secret post-deletion: rejected (0 rows).
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretB, AuthMode: "subscription", SecretLabel: "b", MaterialRevision: 9,
+		ID: runID, UserID: user,
+	}); err != nil || n != 0 {
+		t.Fatalf("FreezeRunCodexBinding(re-point after delete) = (%d,%v), want (0,nil) — a deleted alias must not open a re-point", n, err)
+	}
+	got, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if got.CodexSecretID.Valid {
+		t.Fatalf("after the post-deletion re-point attempt codex_secret_id = %s, want it still NULL (not re-pointed)", uuid.UUID(got.CodexSecretID.Bytes))
+	}
+	if !got.CodexMaterialRevision.Valid || got.CodexMaterialRevision.Int64 != 5 {
+		t.Fatalf("codex_material_revision = %+v after re-point attempt, want it unchanged at 5", got.CodexMaterialRevision)
+	}
+	if got.CodexAccountKey.String != acctKey {
+		t.Fatalf("codex_account_key = %q after re-point attempt, want it unchanged at %q", got.CodexAccountKey.String, acctKey)
+	}
+	if !got.CodexAccountRevision.Valid || got.CodexAccountRevision.Int64 != 7 {
+		t.Fatalf("codex_account_revision = %+v after re-point attempt, want it unchanged at 7", got.CodexAccountRevision)
+	}
+}
+
 // mkCodexAccount inserts a fresh provider account for `user` (gen 0, idle) and returns it.
 func mkCodexAccount(ctx context.Context, t *testing.T, q *store.Queries, user uuid.UUID) store.CodexProviderAccount {
 	t.Helper()
@@ -1189,7 +1332,7 @@ func TestRefreshCodexAccountLoginLiveDB(t *testing.T) {
 			got.Generation, got.CoordState, got.CommittedGeneration)
 	}
 	// recovery_sealed_with MUST be cleared alongside recovery_sealed: a populated recovery
-	// slot (here sealed under 'master') would otherwise violate 00198's CHECK pairing
+	// slot (here sealed under 'master') would otherwise violate 00199's CHECK pairing
 	// ((recovery_sealed IS NULL) = (recovery_sealed_with IS NULL)) on this install (23514).
 	if got.RecoverySealed != nil || got.RecoveryGeneration.Valid || got.RecoverySealedWith.Valid ||
 		got.CoordOperationID.Valid || got.LeaseDeadline.Valid {

@@ -6,8 +6,8 @@
 --   'openai_api_key' — a static OpenAI API key the user pastes, no subscription
 --                      lifecycle behind it.
 --   'codex_auth'     — a Codex subscription login whose authoritative state lives
---                      in codex_provider_account (00198) and whose per-alias link
---                      status lives in codex_credential_state (00199).
+--                      in codex_provider_account (00199) and whose per-alias link
+--                      status lives in codex_credential_state (00200).
 -- 00010 auto-named the column-level CHECK `user_secrets_kind_check`, so the ALTER
 -- pair drops and re-adds under that exact name. 00087's
 -- user_secrets_auto_eligible_kind_check is left untouched: auto-eligibility stays
@@ -32,8 +32,8 @@ DROP INDEX user_secrets_codex_one_default_key;
 ALTER TABLE user_secrets DROP CONSTRAINT user_secrets_kind_check;
 -- A downgrade removes the Codex feature, so it must remove its credentials too:
 -- re-adding an anthropic_token-only CHECK while any openai_api_key/codex_auth row still
--- exists would fail the whole transaction. Under goose's strict reverse-order down, 00199's
--- Down has ALREADY dropped codex_credential_state (and 00198's Down dropped
+-- exists would fail the whole transaction. Under goose's strict reverse-order down, 00200's
+-- Down has ALREADY dropped codex_credential_state (and 00199's Down dropped
 -- codex_provider_account) before this DELETE runs, so there are no state or account rows
 -- left to worry about — this DELETE only removes the now-orphaned user_secrets rows so the
 -- narrowed CHECK below can be re-added.

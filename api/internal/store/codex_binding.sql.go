@@ -70,7 +70,7 @@ SET generation           = generation + 1,
     coord_operation_id   = $3::uuid,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
-    -- 00198's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
+    -- 00199's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
     -- so clearing the recovery blob MUST also clear its key discriminator or an account
     -- with a populated recovery slot would violate the CHECK (23514) on commit.
     recovery_sealed_with = NULL,
@@ -143,7 +143,15 @@ SET codex_secret_id         = $1::uuid,
     codex_account_revision  = COALESCE(codex_account_revision, $6::bigint),
     updated_at              = now()
 WHERE id = $7 AND user_id = $8
-    AND (codex_secret_id IS NULL OR codex_secret_id = $1::uuid)
+    AND (
+        codex_material_revision IS NULL
+        OR (
+            codex_secret_id = $1::uuid
+            AND codex_material_revision = $4::bigint
+            AND codex_auth_mode = $2::text
+            AND codex_secret_label = $3::text
+        )
+    )
     -- Write-once identity guard: a replay carrying a DIFFERENT account_key than the
     -- one already frozen affects 0 rows (a NULL incoming key, or an equal one, is
     -- allowed), so a frozen identity can never be silently re-pointed.
@@ -164,8 +172,8 @@ type FreezeRunCodexBindingParams struct {
 // Codex per-run claim binding + coordinated-refresh primitives (PRD #1147 M2),
 // STORE/SCHEMA only — ships DARK. The service layer drives the refresh state machine
 // and the authority check; this file only provides the owner-scoped SQL primitives.
-// Companion schema: 00201 (runs.codex_* columns), 00200 (codex_refresh_intent),
-// 00198/00199 (codex_provider_account / codex_credential_state).
+// Companion schema: 00202 (runs.codex_* columns), 00201 (codex_refresh_intent),
+// 00199/00200 (codex_provider_account / codex_credential_state).
 // Freeze a run's Codex binding at creation (PRD #1147 M2), via an internal create path
 // rather than the public CreateRun — the binding is decided once, atomically, when the
 // claim is assembled. Records the alias id, auth mode, snapshotted label and the alias
@@ -174,13 +182,23 @@ type FreezeRunCodexBindingParams struct {
 // SetRunCodexFrozenIdentity freezes those at first link. Owner-scoped; 0 rows for a
 // run this user does not own.
 //
-// SECURITY HARDENING (PRD #1147 audit): write-once freeze. The guard
-// `codex_secret_id IS NULL OR codex_secret_id = @secret_id` makes the binding
-// immutable once set — the FIRST freeze (NULL) and an identical retry (equal
-// secret) affect the row, but a CONFLICTING second freeze with a DIFFERENT secret
-// affects 0 rows and cannot silently re-point a run at another credential. The audit
-// flagged the unguarded UPDATE: it let a late/duplicate freeze overwrite a run's
-// already-frozen binding, defeating the "decided once, atomically" guarantee.
+// SECURITY HARDENING (PRD #1147 audit): write-once-OR-exact-unchanged-retry freeze.
+// Immutability is keyed on `codex_material_revision IS NULL` as the "not yet frozen"
+// sentinel — NOT on codex_secret_id, which the runs_codex_secret_fk nulls on ON DELETE
+// SET NULL (codex_secret_id) when the bound alias is deleted. codex_material_revision is
+// written non-null at the first freeze and is NEVER nulled by that FK cascade, so it is a
+// deletion-proof "initialized" marker. Semantics:
+//   - FIRST-EVER freeze (codex_material_revision IS NULL) affects the row and pins the
+//     whole snapshot.
+//   - A same-secret retry must present the EXACT unchanged snapshot (same secret_id,
+//     material_revision, auth_mode and label) to affect the row — an idempotent replay.
+//   - A changed material_revision/auth_mode/label, OR a post-deletion re-point with a NEW
+//     secret_id (the alias was deleted so codex_secret_id is now NULL but
+//     codex_material_revision is still the frozen value), affects 0 rows, so the original
+//     binding survives and a run can never be silently re-pointed at another credential.
+//
+// The audit flagged the unguarded UPDATE: it let a late/duplicate freeze overwrite a
+// run's already-frozen binding, defeating the "decided once, atomically" guarantee.
 func (q *Queries) FreezeRunCodexBinding(ctx context.Context, arg FreezeRunCodexBindingParams) (int64, error) {
 	result, err := q.db.Exec(ctx, freezeRunCodexBinding,
 		arg.SecretID,
@@ -374,7 +392,7 @@ type ListUnresolvedCodexRefreshIntentsParams struct {
 
 // The recovery scan (PRD #1147 M2): every still-'rotating' intent for an account, which a
 // survivor reconciles against the account's actual generation. Owner-scoped; backed by
-// the partial index idx_codex_refresh_intent_unresolved (00200).
+// the partial index idx_codex_refresh_intent_unresolved (00201).
 func (q *Queries) ListUnresolvedCodexRefreshIntents(ctx context.Context, arg ListUnresolvedCodexRefreshIntentsParams) ([]CodexRefreshIntent, error) {
 	rows, err := q.db.Query(ctx, listUnresolvedCodexRefreshIntents, arg.UserID, arg.ProviderAccountID)
 	if err != nil {
@@ -525,7 +543,7 @@ SET sealed_login         = $1,
     lease_deadline       = NULL,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
-    -- 00198's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
+    -- 00199's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
     -- so clearing the recovery blob MUST also clear its key discriminator or an account
     -- with a populated recovery slot (e.g. a quarantine re-login) would violate the
     -- CHECK (23514) on this install.
@@ -731,7 +749,7 @@ SET codex_account_key      = $1::text,
     codex_account_revision = $2::bigint,
     updated_at             = now()
 WHERE id = $3 AND user_id = $4
-    AND (codex_account_key IS NULL OR codex_account_key = $1::text)
+    AND (codex_account_key IS NULL OR (codex_account_key = $1::text AND codex_account_revision = $2::bigint))
 `
 
 type SetRunCodexFrozenIdentityParams struct {
@@ -747,12 +765,15 @@ type SetRunCodexFrozenIdentityParams struct {
 // can later compare run-frozen vs current. Owner-scoped; 0 rows for a foreign run.
 //
 // SECURITY HARDENING (PRD #1147 audit): write-once identity freeze. The guard
-// `codex_account_key IS NULL OR codex_account_key = @key` pins the frozen identity
-// tuple immutably at first link — the FIRST freeze (NULL) and an identical retry
-// (equal tuple) succeed, but a conflicting freeze presenting a DIFFERENT identity
-// affects 0 rows, so the run's canonical identity can never be silently repointed to
-// another account after it was frozen. The audit flagged the unguarded UPDATE as the
-// symmetric hole to FreezeRunCodexBinding's.
+// `codex_account_key IS NULL OR (codex_account_key = @key AND codex_account_revision =
+// @rev)` pins the frozen identity tuple AND its account_revision immutably at first link
+// — the FIRST freeze (NULL) and an identical retry (equal tuple AND equal revision)
+// succeed, but a conflicting freeze presenting a DIFFERENT identity affects 0 rows, so
+// the run's canonical identity can never be silently repointed to another account after
+// it was frozen. account_revision is now part of the immutability guard: a same-tuple
+// replay carrying a BUMPED account_revision (a replaced/revoked account re-minted under
+// the same identity tuple) affects 0 rows, so it cannot be silently re-adopted. The audit
+// flagged the unguarded UPDATE as the symmetric hole to FreezeRunCodexBinding's.
 func (q *Queries) SetRunCodexFrozenIdentity(ctx context.Context, arg SetRunCodexFrozenIdentityParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunCodexFrozenIdentity,
 		arg.Key,

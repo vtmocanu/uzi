@@ -675,7 +675,7 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 }
 
 // Codex credential link statuses (PRD #1147 M1), mirroring codex_credential_state's
-// CHECK (00199). Only the two a WRITE sets appear here: a fresh codex_auth is born
+// CHECK (00200). Only the two a WRITE sets appear here: a fresh codex_auth is born
 // 'staging' (awaiting an account link a later milestone resolves); an openai_api_key
 // is 'static' (a standalone key with no subscription lifecycle). 'linked'/'failed' are
 // reached only by the resolver, not by these handlers.
@@ -1025,7 +1025,7 @@ func (h *Handler) DeleteOpenAIAPIKeyByID(w http.ResponseWriter, r *http.Request)
 // deleteCodexSecretByID is the shared delete path for both codex kinds (PRD #1147 M1),
 // mirroring DeleteAnthropicTokenByID. Owner-scoped; the id must name a secret of the
 // route's kind, so a foreign or mismatched id is a 404. The codex_credential_state row
-// is dropped by its ON DELETE CASCADE FK (00199) — no app-level cleanup.
+// is dropped by its ON DELETE CASCADE FK (00200) — no app-level cleanup.
 //
 // Unlike anthropic, deleting the codex default is ALLOWED even with other codex
 // credentials present: user_secrets_codex_one_default_key forbids TWO defaults, it does

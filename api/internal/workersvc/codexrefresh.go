@@ -38,7 +38,7 @@ import (
 const codexRefreshLeaseTTL = 8 * time.Second
 
 // Codex refresh-intent states (the codex_refresh_intent.state CHECK values, migration
-// 00200). Named here so the state machine never spells a bare literal that could drift
+// 00201). Named here so the state machine never spells a bare literal that could drift
 // from the schema.
 const (
 	codexIntentRotating      = "rotating"

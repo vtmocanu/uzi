@@ -4,7 +4,7 @@
 -- M1), STORE/SCHEMA only — ships DARK. One row is one Codex provider account as uzi
 -- knows it: the sealed login material, the coordination/lease state a later
 -- refresher (m2) drives, and the recovery slot. Per-alias link status is a separate
--- concern and lives in codex_credential_state (00199), which points HERE.
+-- concern and lives in codex_credential_state (00200), which points HERE.
 --
 -- WHY ACCOUNT-KEYED, NOT ALIAS-KEYED. Several codex_auth aliases (user_secrets rows)
 -- may resolve to the same provider account; the subscription's generation, revision
@@ -66,7 +66,7 @@ CREATE TABLE codex_provider_account (
     CONSTRAINT codex_provider_account_tuple_key
         UNIQUE (user_id, provider_user_id, workspace_account_id),
 
-    -- Composite-FK target for the alias link (00199): redundant as a uniqueness
+    -- Composite-FK target for the alias link (00200): redundant as a uniqueness
     -- statement (id is already the PK) and load-bearing as the (user_id, id) target
     -- that lets codex_credential_state reference an account owner-scoped, so an alias
     -- can never link to another user's account in the schema.

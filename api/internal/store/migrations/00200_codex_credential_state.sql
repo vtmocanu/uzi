@@ -4,11 +4,11 @@
 -- ships DARK. One row per user_secrets alias of kind 'openai_api_key' or
 -- 'codex_auth' (PK is the alias id), recording how that alias resolves:
 --   'staging' — created, not yet linked to a provider account.
---   'linked'  — bound to a codex_provider_account (00198) row.
+--   'linked'  — bound to a codex_provider_account (00199) row.
 --   'failed'  — a link/refresh attempt failed; last_error carries why.
 --   'static'  — a standalone openai_api_key with no subscription account behind it.
--- Ordering: 00198 (codex_provider_account) MUST precede this migration because
--- provider_account_id references it; the Down in 00198 drops that table, so this
+-- Ordering: 00199 (codex_provider_account) MUST precede this migration because
+-- provider_account_id references it; the Down in 00199 drops that table, so this
 -- table (and its FK) must already be gone, which the migration order guarantees.
 CREATE TABLE codex_credential_state (
     -- PK is the alias id: exactly one state row per user_secrets credential.
@@ -35,7 +35,7 @@ CREATE TABLE codex_credential_state (
     FOREIGN KEY (user_id, user_secret_id)
         REFERENCES user_secrets (user_id, id) ON DELETE CASCADE,
 
-    -- Owner-scoped composite FK to the account (00198's
+    -- Owner-scoped composite FK to the account (00199's
     -- codex_provider_account_user_id_id_key). The column-list SET NULL is
     -- load-bearing exactly as 00086 documents: a bare ON DELETE SET NULL on a
     -- COMPOSITE FK would null user_id too (which is NOT NULL, so the delete would

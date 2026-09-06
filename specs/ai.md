@@ -23978,7 +23978,7 @@ Presentation-only polish of the TUI in-progress milestone marker [user, #1136]; 
 
 Rationale for the two-surface colour split (D5): the micro-bar is a progress *bar* where in-progress is part of the tungsten fill; the checklist is a *todo list* where an in-progress item is a grey circle animating toward its green `✓`. All changes are in `api/cmd/uzi/`; no API, DB, web, or CLI-command change. `specs/human.md` untouched (presentation, not a new user-stated requirement).
 
-## 621. Codex credential-operation authority — release vs persist-recovery asymmetry, and verified re-login (PRD #1147)
+## 623. Codex credential-operation authority — release vs persist-recovery asymmetry, and verified re-login (PRD #1147)
 
 Serves PRD #1147's Codex-credential security hardening [user, #1147]; richer rationale is PRD #1147's Decision Log (D4 persist-before-park, M1 converge-not-overwrite) and the code comments in `api/internal/workersvc/codexauthz.go`. Records the AI authority model behind two related decisions: an intentional release-vs-protect asymmetry, and re-login/recovery that restores real usability, not just labels.
 

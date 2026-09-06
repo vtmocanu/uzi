@@ -12,7 +12,7 @@ ORDER BY kind, is_default DESC, lower(label) ASC;
 -- name: InsertCodexProviderAccount :one
 -- Create the authoritative account row for a Codex login (PRD #1147 M1). The
 -- generation/revision counters, coordination state and recovery slot take their
--- schema defaults (00198); a later refresher (m2) advances them. Returns the whole
+-- schema defaults (00199); a later refresher (m2) advances them. Returns the whole
 -- row so the caller has the minted id and defaults without a re-read.
 INSERT INTO codex_provider_account (user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with)
 VALUES (@user_id, @provider_user_id, @workspace_account_id, @sealed_login, @sealed_with)
@@ -35,7 +35,7 @@ WHERE user_id = @user_id AND id = @id;
 
 -- name: InsertCodexCredentialState :one
 -- Create the per-alias state row for a codex-kind secret (PRD #1147 M1). Owner-scoped
--- by the composite FK (00199) to a secret the same user owns. status is 'staging'
+-- by the composite FK (00200) to a secret the same user owns. status is 'staging'
 -- for a codex_auth awaiting link or 'static' for a standalone openai_api_key;
 -- material_revision and the account link take their schema defaults.
 INSERT INTO codex_credential_state (user_secret_id, user_id, status)

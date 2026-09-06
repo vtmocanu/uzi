@@ -68,7 +68,7 @@ func insertSecret(ctx context.Context, pool *pgxpool.Pool, user uuid.UUID, kind,
 	return id, err
 }
 
-// TestCodexSecretKindsLiveDB pins 00197: the kind CHECK now admits both codex kinds
+// TestCodexSecretKindsLiveDB pins 00198: the kind CHECK now admits both codex kinds
 // and still rejects an unknown one, and the shared codex default index collapses the
 // two codex kinds into one default slot while leaving the anthropic default alone.
 func TestCodexSecretKindsLiveDB(t *testing.T) {
@@ -102,13 +102,13 @@ func TestCodexSecretKindsLiveDB(t *testing.T) {
 			"the shared codex default index is not enforcing", err, pgCode(err))
 	}
 	// An anthropic default coexists with the codex default: they live in separate
-	// default slots (00077's index vs 00197's).
+	// default slots (00077's index vs 00198's).
 	if _, err := insertSecret(ctx, pool, def, store.KindAnthropicToken, "anthropic-"+uuid.NewString(), true); err != nil {
 		t.Fatalf("an anthropic default must coexist with a codex default, got: %v", err)
 	}
 }
 
-// TestCodexProviderAccountTupleLiveDB pins 00198's identity tuple: identical tuples
+// TestCodexProviderAccountTupleLiveDB pins 00199's identity tuple: identical tuples
 // for one user collide, a same-workspace/different-principal tuple is a distinct
 // account, and two uzi users may independently hold the same tuple.
 func TestCodexProviderAccountTupleLiveDB(t *testing.T) {
@@ -176,7 +176,7 @@ func TestCodexProviderAccountTupleLiveDB(t *testing.T) {
 	}
 }
 
-// TestCodexCredentialStateLiveDB pins 00199: per-alias insert, link to an account,
+// TestCodexCredentialStateLiveDB pins 00200: per-alias insert, link to an account,
 // the material-revision bump that increments and un-links, and the owner-scoped
 // composite FK that refuses a state row over a secret the user does not own.
 func TestCodexCredentialStateLiveDB(t *testing.T) {
@@ -286,7 +286,7 @@ func TestCodexCredentialStateLiveDB(t *testing.T) {
 	// --- Composite-FK ownership: a state row must reference an OWNED secret ---
 	//
 	// A different user's id over `user`'s secret has no (user_id, id) match in
-	// user_secrets, so the composite FK (00199, using 00077's user_secrets_user_id_id_key)
+	// user_secrets, so the composite FK (00200, using 00077's user_secrets_user_id_id_key)
 	// refuses it in the schema rather than leaving ownership to a Go check. The probe
 	// secret is fresh and state-less so the composite FK — not the user_secret_id PK —
 	// is what rejects the insert.
@@ -426,7 +426,7 @@ func TestLinkCodexCredentialStateCrossUserFKLiveDB(t *testing.T) {
 }
 
 // TestCodexCredentialStateOrphanTriggerLiveDB pins BOTH sides of the refined F4 orphan
-// trigger (00199). (1) The FK cascade path: deleting a linked account nulls the alias's
+// trigger (00200). (1) The FK cascade path: deleting a linked account nulls the alias's
 // provider_account_id and — because the cascade leaves status untouched (NEW.status =
 // OLD.status) — the trigger fires, demoting the row to 'failed' with an explanatory
 // last_error. (2) The regression guard: a legitimate app UPDATE that nulls
