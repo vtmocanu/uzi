@@ -459,8 +459,8 @@ type SetRunCodexClaimCapabilityParams struct {
 // bump the epoch so a prior capability is superseded. Guarded on worker_id — only the
 // CURRENTLY-OWNING worker may mint, so a worker that already lost the claim cannot mint a
 // fresh capability. 0 rows when the caller is not the owning worker. The revocation half
-// lives in the three requeue queries in runtime.sql (clear hash + bump epoch on ownership
-// loss).
+// lives in every claimed→queued path in runtime.sql (the three Requeue* queries plus
+// SweepClaimedNeverStarted), which clear the hash + bump the epoch on ownership loss.
 func (q *Queries) SetRunCodexClaimCapability(ctx context.Context, arg SetRunCodexClaimCapabilityParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunCodexClaimCapability, arg.Hash, arg.ID, arg.WorkerID)
 	if err != nil {
