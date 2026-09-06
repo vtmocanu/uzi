@@ -27,6 +27,10 @@ function templateDockerfiles(): { name: string; text: string }[] {
 
 describe("worker template Dockerfiles keep guardrail layers", () => {
   const dockerfiles = templateDockerfiles();
+  // The pinned-Codex install helper + runner-uid guard (PRD #1156 M3a) are SHARED by
+  // every template (the ONE packaging path), so read the guard script once and assert
+  // its substance below — the Dockerfiles only wire it in.
+  const codexGuardScript = fs.readFileSync(path.resolve(templatesDir, "../codex/assert-codex.sh"), "utf8");
 
   it("finds at least the base template", () => {
     assert.ok(
@@ -291,6 +295,58 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       assert.ok(
         text.indexOf("chmod -R a+rX /nix") > text.search(/timeout \d+ "\$AGENT_BROWSER_EXECUTABLE_PATH"/),
         `${name}/Dockerfile must run the /nix store-perm chmod AFTER the build-guard chromium launch (the guard, running as root, is what creates the root:root 0700 dir — normalizing before it is a no-op)`,
+      );
+    });
+
+    it(`${name}: packages the pinned Codex native bundle + runner-uid guard in lockstep (PRD #1156 M3a)`, () => {
+      // M3a bakes the COMBINED Codex native package (CLI + code-mode host) into a stable,
+      // immutable, root-owned /opt/uzi-codex/<version> root, verified fail-closed at build
+      // and executed under the real cap-less `runner` uid before the image ships. jvm is NOT
+      // `FROM base`, so this is per-Dockerfile — pin the wiring as an invariant in lockstep.
+
+      // (a) COPY the pinned lock + install/guard helpers from agent/codex/.
+      assert.match(text, /COPY\s+agent\/codex\/codex-package\.lock\b/, `${name}/Dockerfile must COPY the pinned Codex lock`);
+      assert.match(text, /COPY\s+agent\/codex\/install-codex\.sh\b/, `${name}/Dockerfile must COPY the Codex install helper`);
+      assert.match(text, /COPY\s+agent\/codex\/assert-codex\.sh\b/, `${name}/Dockerfile must COPY the Codex runner-uid guard`);
+
+      // (b) RUN the install (per-TARGETARCH, fail-closed) into the stable /opt/uzi-codex root.
+      assert.match(
+        text,
+        /RUN\s+bash\s+\/tmp\/codex\/install-codex\.sh\b/,
+        `${name}/Dockerfile must RUN the Codex install helper`,
+      );
+      assert.match(text, /\/opt\/uzi-codex\b/, `${name}/Dockerfile must install Codex into the stable /opt/uzi-codex root`);
+
+      // (c) RUN the runner-uid guard; the Dockerfile documents its contract (setpriv --reuid
+      // runner, the exact pinned version, the fake-GNU-ldd PATH case) so the two templates stay
+      // honest and in lockstep.
+      assert.match(
+        text,
+        /RUN\s+bash\s+\/tmp\/codex\/assert-codex\.sh\b/,
+        `${name}/Dockerfile must RUN the Codex runner-uid build guard`,
+      );
+      assert.match(text, /setpriv --reuid runner\b/, `${name}/Dockerfile must document the runner-uid setpriv guard`);
+      assert.match(text, /codex-cli 0\.153\.2\b/, `${name}/Dockerfile must document the exact pinned Codex version`);
+      assert.match(text, /fake-GNU-ldd\b/, `${name}/Dockerfile must document the fake-GNU-ldd PATH case`);
+      // ...and the SHARED guard script must carry that substance, not merely the comment: the
+      // setpriv --reuid to the runner uid, the `codex --version` exec, the expected `codex-cli`
+      // stdout assertion, and the fake glibc `ldd` first on PATH.
+      assert.match(codexGuardScript, /--reuid\s+"\$RUNNER_USER"/, "assert-codex.sh must setpriv --reuid to the runner uid");
+      assert.match(
+        codexGuardScript,
+        /RUNNER_USER="\$\{UZI_CODEX_RUNNER_USER:-runner\}"/,
+        "assert-codex.sh must default the runner uid to `runner`",
+      );
+      assert.match(codexGuardScript, /"\$CODEX" --version/, "assert-codex.sh must exec `codex --version`");
+      assert.match(codexGuardScript, /codex-cli/, "assert-codex.sh must assert the codex-cli version string");
+      assert.match(codexGuardScript, /ldd \(GNU libc\)/, "assert-codex.sh must include the fake glibc ldd PATH case");
+
+      // (d) NO ENV PATH line may add the Codex bundle to PATH — the launcher resolves it by
+      // absolute path only (a bundled codex-path/rg or resource shell must never shadow Claude's).
+      assert.doesNotMatch(
+        text,
+        /^\s*ENV\s+PATH=[^\n]*\/opt\/uzi-codex/m,
+        `${name}/Dockerfile must NOT put /opt/uzi-codex on PATH (resolve Codex by absolute path only)`,
       );
     });
   }

@@ -251,6 +251,31 @@ RUN command -v agent-browser \
 # un-chmodable-root abort the non-root seed would.
 RUN chmod -R a+rX /nix
 
+# --- PRD #1156 M3a: package pinned Codex 0.153.2 (CLI + code-mode host) ------------------
+# MIRRORED from templates/base (jvm is NOT `FROM base`; keep the two in lockstep). Install
+# the COMBINED native package (not the bare CLI) into a stable, immutable, root-owned root
+# at /opt/uzi-codex/<version>/ — OUTSIDE writable /app, /data and the per-run homes, and on
+# NO PATH: the launcher resolves Codex by absolute path only, so a bundled codex-path/rg or
+# resource shell can never shadow Claude's existing toolchain. The pin, per-arch artifact +
+# SHA256, expected members and expected codex-package.json fields all live in
+# agent/codex/codex-package.lock, consumed IDENTICALLY here and by templates/base — the ONE
+# packaging + integrity path, so the two images cannot drift.
+#
+# install-codex.sh downloads the pinned artifact for ${TARGETARCH} (the ARG declared above),
+# verifies its SHA256 fail-closed and rejects a missing member, a mismatched manifest field
+# or an unsupported arch BEFORE installing. assert-codex.sh is the build-time runner-uid
+# guard: it execs `codex --version` as the cap-less `runner` uid (setpriv --reuid runner,
+# fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY `codex-cli 0.153.2` + exit 0 AND
+# the fake-GNU-ldd PATH case AND the code-mode host sibling — so a broken binary/loader or a
+# missing host fails the BUILD, not a run. The helpers + lock are removed after (no
+# residue); NO auth/config/session state is baked.
+COPY agent/codex/codex-package.lock /tmp/codex/codex-package.lock
+COPY agent/codex/install-codex.sh /tmp/codex/install-codex.sh
+COPY agent/codex/assert-codex.sh /tmp/codex/assert-codex.sh
+RUN bash /tmp/codex/install-codex.sh "${TARGETARCH}"
+RUN bash /tmp/codex/assert-codex.sh \
+    && rm -rf /tmp/codex
+
 COPY agent/tsconfig.json ./
 COPY agent/src ./src
 
