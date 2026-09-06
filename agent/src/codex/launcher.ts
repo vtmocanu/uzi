@@ -387,11 +387,14 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
     switch (record.event) {
       case "started": {
         const ev = record as unknown as StartedEvidence;
-        if (ev.subreaper !== true || ev.capsZero !== true || ev.noNewPrivs !== true || ev.uid !== expectedUid) {
+        if (ev.subreaper !== true || ev.dumpable !== true || ev.capsZero !== true || ev.noNewPrivs !== true || ev.uid !== expectedUid) {
           // Do NOT set startedEvent: a bad posture must REJECT the launch, not resolve it.
+          // Re-validate EVERY posture boolean the supervisor reports, including `dumpable`
+          // (PR_SET_DUMPABLE(0), the channel-boundary anchor) — the controller's independent
+          // check must be symmetric with the fields it receives, not a subset of them.
           fail(new Error(
-            `supervisor reported an unsafe start posture (subreaper=${String(ev.subreaper)}, capsZero=${String(ev.capsZero)}, `
-            + `noNewPrivs=${String(ev.noNewPrivs)}, uid=${String(ev.uid)} expected ${expectedUid})`,
+            `supervisor reported an unsafe start posture (subreaper=${String(ev.subreaper)}, dumpable=${String(ev.dumpable)}, `
+            + `capsZero=${String(ev.capsZero)}, noNewPrivs=${String(ev.noNewPrivs)}, uid=${String(ev.uid)} expected ${expectedUid})`,
           ));
           return;
         }

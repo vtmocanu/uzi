@@ -40,6 +40,7 @@ function baseSpec(overrides: Partial<CodexLaunchSpec> = {}): CodexLaunchSpec {
 
 interface FakeOpts {
   uid?: number;
+  dumpable?: boolean;
   autoStarted?: boolean;
   disposeState?: "drained" | "unconfirmed";
   exitCode?: number;
@@ -67,7 +68,7 @@ class FakeSupervisor extends EventEmitter {
     if (opts.autoStarted ?? true) {
       this.writeEvidence({
         event: "started", supervisorPid: this.pid, childPid: this.pid + 1,
-        subreaper: true, dumpable: true, uid: opts.uid ?? RUNNER_UID, capsZero: true, noNewPrivs: true,
+        subreaper: true, dumpable: opts.dumpable ?? true, uid: opts.uid ?? RUNNER_UID, capsZero: true, noNewPrivs: true,
       });
     }
   }
@@ -230,6 +231,11 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
   it("rejects a started posture that does not match the expected runner uid", async () => {
     const fake = newFake({ uid: 12345 });
     await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture/);
+  });
+
+  it("rejects a started posture with dumpable=false (the channel-boundary anchor)", async () => {
+    const fake = newFake({ dumpable: false });
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture.*dumpable=false/s);
   });
 });
 
