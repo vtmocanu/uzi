@@ -269,11 +269,13 @@ type CodexAuthContext struct {
 //
 // It returns a distinct sentinel unless ALL of the following hold (checked in order):
 //  1. the run is Codex-bound with a valid auth mode, and the scope applies to that mode;
-//  2. the presented capability is tied to the CURRENT claim: its in-band epoch equals
+//  2. the run is currently owned by this worker (checked BEFORE the capability so a
+//     non-owner cannot use the capability/epoch sentinels as an oracle for another
+//     user's claim epoch);
+//  3. the presented capability is tied to the CURRENT claim: its in-band epoch equals
 //     the run's codex_claim_epoch (a prior-epoch capability is rejected even if its
 //     secret hash-matches), and its secret's sha256 constant-time-equals the run's
 //     stored codex_cap_hash;
-//  3. the run is currently owned by this worker;
 //  4. the run is in an actively-claimed status (NOT queued, NOT terminal);
 //  5. per-alias: the run's frozen material_revision still equals the alias's current
 //     material_revision (a manual alias replace bumps it and invalidates the run);
