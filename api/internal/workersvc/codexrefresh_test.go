@@ -1,8 +1,10 @@
 package workersvc
 
 import (
+	"errors"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
@@ -86,4 +88,25 @@ func TestCodexRefreshResolution(t *testing.T) {
 			t.Fatalf("resolution = %q, want unrecoverable (recovery copy is for another generation)", got)
 		}
 	})
+}
+
+// TestCodexReturnCommittedRefusesQuarantined pins the B6 §9 guard: the shared
+// replay/reconcile tail must NEVER hand back the account's committed token when the
+// account is quarantined (a failed rotation left the sealed_login as the pre-rotation,
+// expiry-triggering blob), so a quarantined account surfaces CodexRefreshQuarantined
+// instead of a stale/expired token. Deleting the guard makes this test fail (it would
+// then fall through to openCodexAccountLogin on a nil vault/store).
+func TestCodexReturnCommittedRefusesQuarantined(t *testing.T) {
+	s := &Service{}
+	acct := store.CodexProviderAccount{CoordState: codexCoordQuarantined, Generation: 2}
+	res, err := s.codexReturnCommitted(uuid.New(), acct, CodexRefreshReplayed)
+	if !errors.Is(err, ErrCodexRefreshQuarantined) {
+		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined", err)
+	}
+	if res.Outcome != CodexRefreshQuarantined {
+		t.Fatalf("outcome = %v, want CodexRefreshQuarantined", res.Outcome)
+	}
+	if res.AccessToken != "" {
+		t.Fatalf("token = %q, want NO token from a quarantined account", res.AccessToken)
+	}
 }

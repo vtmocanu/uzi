@@ -470,7 +470,19 @@ func (s *Service) codexReplayAfterDuplicate(ctx context.Context, q codexRefreshS
 // codexReturnCommitted opens the account's CURRENT committed login and returns its access
 // token with the account's current generation — the shared tail of every replay/reconcile
 // path (no provider exchange).
+//
+// It REFUSES a quarantined account (B6 §9): when a rotation's commit failed into the
+// recovery slot the account is quarantined and its sealed_login is the pre-rotation blob
+// (the very token whose expiry triggered the refresh), so handing it back would return a
+// stale/expired token as a nil-error success. A quarantined account must be reconciled or
+// re-logged-in first, so we surface CodexRefreshQuarantined instead of a token — this
+// closes both the winner's own post-failure retry and any bystander op (one that inserted
+// a rotating intent then lost the lease race) whose intent was reconciled off the winner's
+// recovery material.
 func (s *Service) codexReturnCommitted(userID uuid.UUID, acct store.CodexProviderAccount, outcome CodexRefreshOutcome) (CodexRefreshResult, error) {
+	if acct.CoordState == codexCoordQuarantined {
+		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, ErrCodexRefreshQuarantined
+	}
 	blob, err := s.openCodexAccountLogin(userID, acct)
 	if err != nil {
 		return CodexRefreshResult{}, err

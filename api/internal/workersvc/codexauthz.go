@@ -35,6 +35,11 @@ const (
 	codexAuthModeAPIKey       = "api_key"
 )
 
+// codexCoordQuarantined is the codex_provider_account.coord_state value (migration 00198)
+// meaning a refresh left the account parked for reconciliation: no token may be handed out
+// until it is reconciled or re-logged-in.
+const codexCoordQuarantined = "quarantined"
+
 // codexActivelyClaimedStatuses is the CLOSED set of run statuses under which a Codex
 // credential operation may be authorized (PRD #1147 M2, B5 check 4). It is the
 // "actively claimed by a live worker" set: the worker holds the run and is (or is
