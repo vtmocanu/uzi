@@ -152,14 +152,6 @@ function deleteCodexCredential(kind: CodexKind, id: string) {
   // The real route is kind-scoped (DELETE /me/secrets/{kind}/{id}), so an id of the
   // wrong kind (e.g. an anthropic_token or the sibling codex kind) is a 404, not a hit.
   if (!row || row.kind !== kind) throw new ApiError(404, "credential not found");
-  const codexRows = secrets.filter((s) => isCodexKind(s.kind));
-  // D6, across BOTH codex kinds: the default may not be deleted while others exist.
-  if (row.is_default && codexRows.length > 1) {
-    throw new ApiError(
-      409,
-      "cannot delete the default credential while others exist; set another credential as default first",
-    );
-  }
   secrets = secrets.filter((s) => s.id !== id);
   return delay(null);
 }
