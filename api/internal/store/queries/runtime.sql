@@ -1951,6 +1951,11 @@ UPDATE runs SET status = 'queued', status_since = now(),
     -- 'claimed' run never carries a flag, so this is defensive, but it keeps every
     -- claimed→queued path uniform.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- Codex claim-capability revocation (PRD #1147 M2): losing the claim revokes the
+    -- per-claim capability immediately — clear the hash and bump the epoch so a stale
+    -- capability minted under this claim can never be replayed. A harmless no-op for a
+    -- non-codex run, whose codex_cap_hash is already NULL.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE id = @id AND status = 'claimed';
 
@@ -2145,6 +2150,10 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
         + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
+    -- Codex claim-capability revocation (PRD #1147 M2): a stale worker losing its runs
+    -- revokes their per-claim capabilities immediately — clear the hash and bump the
+    -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count < @max_requeues
@@ -2191,6 +2200,10 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
         + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
+    -- Codex claim-capability revocation (PRD #1147 M2): re-queuing a worker's runs
+    -- revokes their per-claim capabilities immediately — clear the hash and bump the
+    -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')

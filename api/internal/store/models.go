@@ -181,6 +181,16 @@ type CodexProviderAccount struct {
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CodexRefreshIntent struct {
+	OperationID       uuid.UUID          `json:"operation_id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	ProviderAccountID uuid.UUID          `json:"provider_account_id"`
+	FromGeneration    int64              `json:"from_generation"`
+	State             string             `json:"state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
 type FindingDisposition struct {
 	ID            uuid.UUID          `json:"id"`
 	UserID        uuid.UUID          `json:"user_id"`
@@ -493,6 +503,14 @@ type Run struct {
 	TriggerSource         string             `json:"trigger_source"`
 	CheckpointTip         pgtype.Text        `json:"checkpoint_tip"`
 	UsageRefolded         bool               `json:"usage_refolded"`
+	CodexSecretID         pgtype.UUID        `json:"codex_secret_id"`
+	CodexAuthMode         pgtype.Text        `json:"codex_auth_mode"`
+	CodexSecretLabel      pgtype.Text        `json:"codex_secret_label"`
+	CodexAccountKey       pgtype.Text        `json:"codex_account_key"`
+	CodexMaterialRevision pgtype.Int8        `json:"codex_material_revision"`
+	CodexAccountRevision  pgtype.Int8        `json:"codex_account_revision"`
+	CodexClaimEpoch       int64              `json:"codex_claim_epoch"`
+	CodexCapHash          []byte             `json:"codex_cap_hash"`
 }
 
 type RunMessage struct {
