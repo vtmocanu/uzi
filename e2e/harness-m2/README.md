@@ -37,6 +37,14 @@ the type level, not only at runtime) and (2) runs them under
   assistant-text, tool_use, tool_result, success-result and failed-result frame, the
   chat mapper's output is `deepStrictEqual` to the projection over the equivalent
   hand-built neutral input (same key set, order and undefined-key presence).
+- **`terminal-decode-regression.test.ts`** — the two D0 terminal-decode regression
+  controls a maintainer flagged. That `decodeResult` (`sdk-messages.ts`) String-maps
+  `errors` on the FAILED path only, so a SUCCESS frame with a malformed `errors`
+  element no longer throws before terminal accounting is emitted — while a FAILED
+  frame with a malformed element still throws (base behavior preserved). And that the
+  advice lane's `neutralTerminal` (`model-pass.ts`) projects a non-string `subtype` to
+  `"unknown"` without a raw `String()` coercion, so the review lane surfaces its
+  intended default policy error instead of a `TypeError`.
 
 ## Scope note
 

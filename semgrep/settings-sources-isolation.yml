@@ -53,7 +53,7 @@ rules:
       checked-out repo's .claude/ as configuration. A non-empty settingSources
       (an array with elements, or a variable) lets a hostile repo widen the
       agent's own permissions from inside its tree. See ARCHITECTURE.md's
-      guardrails section and agent/src/sdk-executor.ts; keep it `[]`.
+      guardrails section and agent/src/claude-harness.ts; keep it `[]`.
     paths:
       # Root-anchored (leading `/`) to silence semgrep's Semgrepignore-v2
       # deprecation warning about bare relative includes, mirroring canary.yml.

@@ -185,8 +185,11 @@ export function decodeUserItems(msg: Record<string, unknown>): HarnessItem[] {
 
 /**
  * The input to harness-messages.projectResult — the terminal `result` frame's
- * outcome, display subtype, String-mapped error array and the opaque uzi wire
- * capsule. The accounting fields are forwarded UNGUARDED (duration_ms/
+ * outcome, display subtype, error array and the opaque uzi wire capsule. The
+ * errors field is String-mapped ONLY on the failed path — a successful result
+ * ignores the field (it is only meaningful on failure), so a malformed `errors`
+ * element on a success frame never throws before terminal accounting is emitted.
+ * The accounting fields are forwarded UNGUARDED (duration_ms/
  * total_cost_usd feed the finish line's duration and cost, PRD #11; usage/
  * modelUsage carry the token accounting the API folds into run_usage, PRD #40 M1)
  * — when the SDK frame omits one it lands as `undefined` and projectResult still
@@ -212,9 +215,10 @@ export function decodeResult(msg: Record<string, unknown>): {
   const subtype = asString(msg["subtype"]) ?? "unknown";
   const outcome: "success" | "failed" =
     subtype === "success" && msg["is_error"] !== true ? "success" : "failed";
-  const errors = Array.isArray(msg["errors"])
-    ? (msg["errors"] as unknown[]).map(String)
-    : [];
+  const errors =
+    outcome === "failed" && Array.isArray(msg["errors"])
+      ? (msg["errors"] as unknown[]).map(String)
+      : [];
   return {
     outcome,
     subtype,

@@ -298,7 +298,10 @@ class ClaudeAdviceHarness implements AdviceHarness {
   private neutralTerminal(msg: unknown, isError: boolean) {
     return {
       outcome: isError ? ("failed" as const) : ("success" as const),
-      subtype: String((msg as Record<string, unknown> | undefined)?.["subtype"] ?? "unknown"),
+      subtype: (() => {
+        const s = (msg as Record<string, unknown> | undefined)?.["subtype"];
+        return typeof s === "string" ? s : "unknown";
+      })(),
       errors: [] as readonly string[],
       metrics: { cost: { kind: "unreported" as const } },
     };
