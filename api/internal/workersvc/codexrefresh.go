@@ -334,18 +334,24 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	}
 
 	// (4) Acquire the lease, bounded to the provider callback deadline. It serializes the
-	// single rotation, now AFTER the durable intent exists. 0 rows means a live lease or a
-	// quarantine already holds the account, so this op must NOT exchange in parallel: if a
+	// single rotation, now AFTER the durable intent exists. The acquire is guarded on
+	// generation = acct.Generation (PRD #1147 M4): a loser op that snapshotted this
+	// generation but was scheduled out while a winner ran a full exchange→commit→reset cycle
+	// can no longer win the freshly-idle lease, because the account's generation has moved
+	// past the from_generation it presents. 0 rows means a live lease or a quarantine holds
+	// the account, OR the generation already advanced — so this op must NOT exchange: if a
 	// rival op has already advanced the account past our generation, reconcile to the
-	// now-committed token; otherwise the outcome is contended and this op's own 'rotating'
-	// intent (from_generation=acct.Generation) is resolved by ReconcileUnresolvedCodexRefresh
-	// once the account advances past it. Either way no lease is stranded.
+	// now-committed token with NO provider call; otherwise the outcome is contended and this
+	// op's own 'rotating' intent (from_generation=acct.Generation) is resolved by
+	// ReconcileUnresolvedCodexRefresh once the account advances past it. Either way no lease
+	// is stranded and the stale refresh token is never re-spent.
 	deadline := s.codexNow().Add(codexRefreshLeaseTTL)
 	n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op:       operationID,
-		Deadline: pgconv.Time(deadline),
-		ID:       accountID,
-		UserID:   userID,
+		Op:             operationID,
+		Deadline:       pgconv.Time(deadline),
+		ID:             accountID,
+		UserID:         userID,
+		FromGeneration: acct.Generation,
 	})
 	if err != nil {
 		return CodexRefreshResult{}, fmt.Errorf("codex refresh: acquire lease: %w", err)

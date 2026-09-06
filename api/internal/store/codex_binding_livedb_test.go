@@ -393,14 +393,29 @@ func TestCodexRefreshCoordinationLiveDB(t *testing.T) {
 	acc := mkAccount()
 	op := uuid.New()
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: op, Deadline: future, ID: acc.ID, UserID: user,
+		Op: op, Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("AcquireCodexRefreshLease(idle) = (%d,%v), want (1,nil)", n, err)
 	}
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user,
+		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 0 {
 		t.Fatalf("AcquireCodexRefreshLease(in_progress) = (%d,%v), want (0,nil) — a live lease must block", n, err)
+	}
+
+	// --- Generation guard (PRD #1147 M4): an acquire whose presented from_generation does
+	//     NOT match the account's current generation fails, even from an acquirable state.
+	//     A fresh idle account is at gen 0, so presenting gen 1 wins 0 rows; gen 0 wins. ---
+	genAcc := mkAccount()
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: uuid.New(), Deadline: future, ID: genAcc.ID, UserID: user, FromGeneration: 1,
+	}); err != nil || n != 0 {
+		t.Fatalf("AcquireCodexRefreshLease(stale from_generation) = (%d,%v), want (0,nil) — a moved generation must block the acquire", n, err)
+	}
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: uuid.New(), Deadline: future, ID: genAcc.ID, UserID: user, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease(matching from_generation) = (%d,%v), want (1,nil)", n, err)
 	}
 
 	// --- QuarantineExpiredCodexLease: not-expired is a no-op; expired flips it. ---
@@ -411,7 +426,7 @@ func TestCodexRefreshCoordinationLiveDB(t *testing.T) {
 	}
 	expAcc := mkAccount()
 	if _, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: uuid.New(), Deadline: past, ID: expAcc.ID, UserID: user,
+		Op: uuid.New(), Deadline: past, ID: expAcc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil {
 		t.Fatalf("acquire expired-lease account: %v", err)
 	}
@@ -636,7 +651,7 @@ func TestCommitCodexRefreshLeaseGuardLiveDB(t *testing.T) {
 	qAcc := mkAccount()
 	op := uuid.New()
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: op, Deadline: future, ID: qAcc.ID, UserID: user,
+		Op: op, Deadline: future, ID: qAcc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("AcquireCodexRefreshLease(quarantine case) = (%d,%v), want (1,nil)", n, err)
 	}
@@ -662,7 +677,7 @@ func TestCommitCodexRefreshLeaseGuardLiveDB(t *testing.T) {
 	wAcc := mkAccount()
 	opA := uuid.New()
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: opA, Deadline: future, ID: wAcc.ID, UserID: user,
+		Op: opA, Deadline: future, ID: wAcc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("AcquireCodexRefreshLease(wrong-op case) = (%d,%v), want (1,nil)", n, err)
 	}
@@ -683,7 +698,7 @@ func TestCommitCodexRefreshLeaseGuardLiveDB(t *testing.T) {
 	gAcc := mkAccount()
 	opG := uuid.New()
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: opG, Deadline: future, ID: gAcc.ID, UserID: user,
+		Op: opG, Deadline: future, ID: gAcc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("AcquireCodexRefreshLease(genuine case) = (%d,%v), want (1,nil)", n, err)
 	}
@@ -725,7 +740,7 @@ func TestSetCodexRecoverySlotLiveDB(t *testing.T) {
 		t.Fatalf("insert account: %v", err)
 	}
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user,
+		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
 	}
@@ -771,7 +786,7 @@ func TestAcquireCodexRefreshLeaseFromCommittedLiveDB(t *testing.T) {
 	// Drive it to 'committed' via a genuine acquire+commit cycle.
 	op := uuid.New()
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: op, Deadline: future, ID: acc.ID, UserID: user,
+		Op: op, Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
 	}); err != nil || n != 1 {
 		t.Fatalf("AcquireCodexRefreshLease(idle) = (%d,%v), want (1,nil)", n, err)
 	}
@@ -787,11 +802,20 @@ func TestAcquireCodexRefreshLeaseFromCommittedLiveDB(t *testing.T) {
 		t.Fatalf("coord_state = %q before re-acquire, want \"committed\"", got.CoordState)
 	}
 
-	// Re-acquire from 'committed' for the next cycle.
+	// The commit advanced the account to generation 1. The generation guard (PRD #1147 M4)
+	// means a re-acquire that still presents the pre-commit from_generation (0) is refused
+	// even from the acquirable 'committed' state — the stale loser cannot win.
 	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user,
+		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
+	}); err != nil || n != 0 {
+		t.Fatalf("AcquireCodexRefreshLease(committed, stale from_generation 0) = (%d,%v), want (0,nil) — the moved generation must block", n, err)
+	}
+
+	// Re-acquire from 'committed' for the next cycle, presenting the CURRENT generation (1).
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 1,
 	}); err != nil || n != 1 {
-		t.Fatalf("AcquireCodexRefreshLease(committed) = (%d,%v), want (1,nil) — a committed account is re-acquirable", n, err)
+		t.Fatalf("AcquireCodexRefreshLease(committed) = (%d,%v), want (1,nil) — a committed account is re-acquirable at its current generation", n, err)
 	}
 	if got, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: user, ID: acc.ID}); err != nil {
 		t.Fatalf("read re-acquired: %v", err)

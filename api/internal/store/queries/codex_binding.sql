@@ -82,15 +82,27 @@ WHERE id = @id AND worker_id = @worker_id;
 -- name: AcquireCodexRefreshLease :execrows
 -- CAS-acquire the refresh lease on a provider account (PRD #1147 M2): move it to
 -- 'in_progress' under this operation with a lease deadline, but only from a state where
--- no live lease or quarantine blocks it ('idle' or a prior 'committed'). 0 rows means a
--- live lease or a quarantine already holds the account — the caller must not proceed.
--- Owner-scoped.
+-- no live lease or quarantine blocks it ('idle' or a prior 'committed') AND the account is
+-- STILL at the generation the caller intends to advance from (@from_generation). 0 rows
+-- means a live lease or a quarantine already holds the account, OR the generation has
+-- already moved — the caller must not proceed.
+--
+-- The generation guard (PRD #1147 M4) closes the stale-generation redundant-exchange
+-- window: without it, a loser op that snapshotted an old generation could acquire the
+-- freshly-idle lease AFTER a winner completed a full exchange→commit→reset cycle and then
+-- perform a SECOND provider exchange with its now-stale refresh token (its commit would be
+-- CAS-rejected, but the provider was already called twice — violating the "exactly ONE
+-- rotation per stale-generation burst" invariant D5 and wasting a single-use rotating
+-- refresh token). Requiring generation = @from_generation makes that loser's acquire fail
+-- (0 rows), so the service re-reads, sees the account already advanced, and reconciles to
+-- the committed token with NO provider call. Owner-scoped.
 UPDATE codex_provider_account
 SET coord_state        = 'in_progress',
     coord_operation_id = @op::uuid,
     lease_deadline     = @deadline::timestamptz,
     updated_at         = now()
-WHERE id = @id AND user_id = @user_id AND coord_state IN ('idle', 'committed');
+WHERE id = @id AND user_id = @user_id AND coord_state IN ('idle', 'committed')
+    AND generation = @from_generation::bigint;
 
 -- name: QuarantineExpiredCodexLease :execrows
 -- Reap an expired lease (PRD #1147 M2): an 'in_progress' account whose lease_deadline has

@@ -390,6 +390,74 @@ func TestCoordinatedCodexRefreshSameOpConcurrentRetryDoesNotStrandLeaseLiveDB(t 
 	}
 }
 
+// TestCoordinatedCodexRefreshStaleLoserCannotExchangeLiveDB proves the M4 generation-guard
+// fix on AcquireCodexRefreshLease closes the stale-generation redundant-exchange window
+// (invariant D5: exactly ONE provider rotation per stale-generation burst). It forces the
+// adversarial interleaving deterministically: op B (a DISTINCT operation from A) reads the
+// account at generation 0, then in the window right after B's step-2 intent read — before B
+// takes the lease — a rival op A runs a FULL cycle (exchange → commit gen 1 → reset to
+// idle). B then proceeds into the advance path with its snapshotted from_generation=0 and
+// tries to acquire the now-freshly-idle lease. WITHOUT the guard, B would win the idle lease
+// at gen 1 and perform a SECOND provider exchange with its stale gen-0 refresh token (its
+// commit would then be CAS-rejected, but the provider was already spent twice). WITH the
+// guard, B's acquire matches generation=0 against the account's current generation 1, wins 0
+// rows, re-reads, sees the account advanced, and reconciles to A's committed token with NO
+// provider call. The assertion that pins the fix: the provider is called EXACTLY ONCE (by A)
+// — reverting the WHERE-clause generation guard makes B exchange a second time (fake.calls==2)
+// and this test fail.
+func TestCoordinatedCodexRefreshStaleLoserCannotExchangeLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	rotatedRefresh := codexToken("refresh-rotated")
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess, RefreshToken: &rotatedRefresh}}
+	f := newRefreshFixture(t, env, fake)
+	capw := env.mintCap(t, f.runID, f.workerID)
+
+	// The winner op A shares the fixture but runs on the un-hooked store, so its own step-2
+	// read does not recurse into the hook below. It uses a DISTINCT operation id from B.
+	attemptA := &Service{q: env.q, box: env.box, codexRefresh: fake}
+	opA := uuid.New()
+	opB := uuid.New()
+
+	var raced bool
+	f.svc.q = intentReadHookStore{
+		Queries: env.q,
+		onIntentRead: func(_ store.CodexRefreshIntent, err error) {
+			// Fire only on B's own first (NoRows) intent read, after B has already read the
+			// account at generation 0 (step 1) but before B acquires the lease (step 4).
+			if raced || !errors.Is(err, pgx.ErrNoRows) {
+				return
+			}
+			raced = true
+			if _, aerr := attemptA.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, opA, 0); aerr != nil {
+				t.Errorf("attempt A advance: %v", aerr)
+			}
+		},
+	}
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, opB, 0)
+	if err != nil {
+		t.Fatalf("attempt B: %v", err)
+	}
+	// B did not exchange: the generation-guarded acquire failed, so B reconciled to A's
+	// committed rotation rather than re-spending the stale gen-0 refresh token.
+	if res.Outcome != CodexRefreshReconciled {
+		t.Fatalf("outcome = %v, want reconciled (the stale loser must not exchange)", res.Outcome)
+	}
+	if res.AccessToken != newAccess || res.Generation != 1 {
+		t.Fatalf("B returned (%q,%d), want A's committed (%q,1)", res.AccessToken, res.Generation, newAccess)
+	}
+	// The invariant the fix protects: exactly ONE provider rotation for this stale-generation
+	// burst. Reverting the WHERE-clause guard lets B exchange a second time → fake.calls==2.
+	if fake.calls != 1 {
+		t.Fatalf("provider calls = %d, want exactly 1 (only the winner A exchanged; the stale loser must not)", fake.calls)
+	}
+	// The account settled to A's committed generation and back to idle; B stranded nothing.
+	if acct := env.mustAccount(t, f.userID, f.accountID); acct.CoordState != "idle" || acct.Generation != 1 {
+		t.Fatalf("account = (state=%q gen=%d), want (idle, 1)", acct.CoordState, acct.Generation)
+	}
+}
+
 // TestCoordinatedCodexRefreshQuarantinedHolderCannotCommitLiveDB proves the store's
 // quarantine guard end to end: a presumed-dead holder whose lease was quarantined mid-
 // flight CANNOT commit — the CAS fails, the freshly-rotated material is protected into the
