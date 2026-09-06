@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
@@ -59,6 +60,40 @@ func (h refreshHookStore) CommitCodexRefresh(ctx context.Context, arg store.Comm
 		return store.CommitCodexRefreshRow{}, h.commitErr
 	}
 	return h.Queries.CommitCodexRefresh(ctx, arg)
+}
+
+// intentReadHookStore wraps *store.Queries to fire a side effect right after the step-2
+// GetCodexRefreshIntent read observes its result. It reproduces the same-operationID
+// concurrent-retry race: the hook drives a rival attempt of the SAME op to full commit in
+// the exact window after this attempt has read NoRows but before it advances.
+type intentReadHookStore struct {
+	*store.Queries
+	onIntentRead func(store.CodexRefreshIntent, error)
+}
+
+func (h intentReadHookStore) GetCodexRefreshIntent(ctx context.Context, arg store.GetCodexRefreshIntentParams) (store.CodexRefreshIntent, error) {
+	it, err := h.Queries.GetCodexRefreshIntent(ctx, arg)
+	if h.onIntentRead != nil {
+		h.onIntentRead(it, err)
+	}
+	return it, err
+}
+
+// releaseHookStore wraps *store.Queries to fire a side effect during the subscription
+// token-read step of ReleaseCodexAccessToken — after the FIRST authorize has passed and
+// before the recheck-before-release — so a test can stale authority mid-call and pin the
+// recheck (deleting the recheck makes such a test leak the token and fail).
+type releaseHookStore struct {
+	*store.Queries
+	onAccountRead func()
+}
+
+func (h releaseHookStore) GetCodexProviderAccountByID(ctx context.Context, arg store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error) {
+	acct, err := h.Queries.GetCodexProviderAccountByID(ctx, arg)
+	if h.onAccountRead != nil {
+		h.onAccountRead()
+	}
+	return acct, err
 }
 
 // refreshFixture is a fully-seeded, linked subscription Codex run ready to refresh, with
@@ -297,6 +332,64 @@ func TestCoordinatedCodexRefreshContendedLiveDB(t *testing.T) {
 	}
 }
 
+// TestCoordinatedCodexRefreshSameOpConcurrentRetryDoesNotStrandLeaseLiveDB proves the
+// finding-1 fix: with the durable intent recorded BEFORE the lease is acquired, a
+// same-operationID concurrent retry can no longer strand the lease and quarantine the
+// account. It reproduces the adversarial interleaving in-process: attempt B reads its
+// intent as NoRows (step 2), then in that exact window a rival attempt A of the SAME op
+// fully advances (commit + reset to idle); B continues into the advance path, hits the
+// pre-lease duplicate insert (23505), and replays WITHOUT ever acquiring a lease. The
+// account must end 'idle' (never stranded 'in_progress'/'quarantined'), B must get the
+// committed token, and the provider must have been called exactly once (by A).
+func TestCoordinatedCodexRefreshSameOpConcurrentRetryDoesNotStrandLeaseLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+
+	// Attempt A shares the fixture but runs on the un-hooked store, so its own step-2 read
+	// does not recurse into the hook below.
+	attemptA := &Service{q: env.q, box: env.box, codexRefresh: fake}
+
+	var raced bool
+	f.svc.q = intentReadHookStore{
+		Queries: env.q,
+		onIntentRead: func(_ store.CodexRefreshIntent, err error) {
+			if raced || !errors.Is(err, pgx.ErrNoRows) {
+				return
+			}
+			raced = true
+			// The rival attempt A of the SAME op fully advances (commit + reset to idle) in
+			// the window after B read NoRows and before B advances.
+			if _, aerr := attemptA.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0); aerr != nil {
+				t.Errorf("attempt A advance: %v", aerr)
+			}
+		},
+	}
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+	if err != nil {
+		t.Fatalf("attempt B: %v", err)
+	}
+	// B did not exchange: it replayed A's committed rotation (a reconcile is equally valid).
+	if res.Outcome != CodexRefreshReplayed && res.Outcome != CodexRefreshReconciled {
+		t.Fatalf("outcome = %v, want replayed/reconciled (no second exchange)", res.Outcome)
+	}
+	if res.AccessToken != newAccess || res.Generation != 1 {
+		t.Fatalf("B returned (%q,%d), want the committed (%q,1)", res.AccessToken, res.Generation, newAccess)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("provider calls = %d, want exactly 1 (only attempt A exchanged)", fake.calls)
+	}
+	// The lease was NEVER stranded: the account settled to idle, not 'in_progress' (which
+	// the reconcile pass would then quarantine, bricking future refreshes).
+	if acct := env.mustAccount(t, f.userID, f.accountID); acct.CoordState != "idle" {
+		t.Fatalf("coord_state = %q, want idle (a stranded lease would leave in_progress/quarantined)", acct.CoordState)
+	}
+}
+
 // TestCoordinatedCodexRefreshQuarantinedHolderCannotCommitLiveDB proves the store's
 // quarantine guard end to end: a presumed-dead holder whose lease was quarantined mid-
 // flight CANNOT commit — the CAS fails, the freshly-rotated material is protected into the
@@ -503,6 +596,31 @@ func TestReleaseCodexAccessTokenSubscriptionLiveDB(t *testing.T) {
 		}
 		if tok != "" {
 			t.Fatalf("token = %q, want empty on stale authority", tok)
+		}
+	})
+
+	// Pins the recheck-before-release: authority is staled BETWEEN the initial authorize and
+	// the recheck (the token-read step bumps credential_revision), so the FIRST authorize
+	// passes and only the SECOND (recheck) rejects. Deleting the recheck would leak the
+	// token here and fail this test — the existing "rejects stale authority" case cannot,
+	// because its staleness is present before the first authorize.
+	t.Run("rejects authority staled mid-call (pins recheck)", func(t *testing.T) {
+		f := newRefreshFixture(t, env, &fakeRefreshClient{})
+		capw := env.mintCap(t, f.runID, f.workerID)
+		f.svc.q = releaseHookStore{
+			Queries: env.q,
+			onAccountRead: func() {
+				// The token read has completed (first authorize already passed); bump the
+				// account's credential_revision so only the recheck sees stale authority.
+				env.exec(`UPDATE codex_provider_account SET credential_revision = credential_revision + 1 WHERE id=$1`, f.accountID)
+			},
+		}
+		tok, err := f.svc.ReleaseCodexAccessToken(env.ctx, f.wkr, f.runID, capw)
+		if !errors.Is(err, ErrCodexAccountRevisionStale) {
+			t.Fatalf("err = %v, want ErrCodexAccountRevisionStale from the recheck", err)
+		}
+		if tok != "" {
+			t.Fatalf("token = %q, want empty when authority stales mid-call", tok)
 		}
 	})
 }

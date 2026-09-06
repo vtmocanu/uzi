@@ -221,7 +221,7 @@ func (s *Service) sealCodexLogin(userID uuid.UUID, plaintext []byte) (sealed []b
 //   - an operation whose observedGeneration is behind the account's current generation →
 //     RECONCILE to the current committed access token (no new exchange);
 //   - otherwise (observedGeneration == account.generation, the current access token
-//     expired) → ADVANCE: lease, durable intent, one provider exchange, merged reseal and
+//     expired) → ADVANCE: durable intent, lease, one provider exchange, merged reseal and
 //     a CAS commit to generation+1.
 //
 // It NEVER returns an access token that was not durably committed, NEVER rotates two
@@ -292,15 +292,17 @@ func (s *Service) coordinatedRefresh(ctx context.Context, userID, accountID, ope
 	return s.advanceCodexRefresh(ctx, q, userID, accountID, operationID, acct)
 }
 
-// advanceCodexRefresh performs the rotation itself (PRD #1147 M2, B6 §3-6): lease, durable
-// intent, one provider exchange, merged reseal, CAS commit. `acct` is the account read at
-// generation == observedGeneration (the generation this rotation advances FROM).
+// advanceCodexRefresh performs the rotation itself (PRD #1147 M2, B6 §3-6): durable intent,
+// lease, one provider exchange, merged reseal, CAS commit. The durable intent is recorded
+// BEFORE the lease so a same-operationID concurrent retry is caught (23505) before any lease
+// is held and can never strand it. `acct` is the account read at generation ==
+// observedGeneration (the generation this rotation advances FROM).
 func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, acct store.CodexProviderAccount) (CodexRefreshResult, error) {
 	// Extract the refresh token FIRST (a local read that mutates nothing). Hoisting it
-	// ahead of the lease/intent means a locked vault or a login with no refresh token
-	// fails cleanly — no lease taken, no durable intent left behind that a survivor would
-	// have to (conservatively) resolve as unrecoverable. The provider is still called
-	// exactly once, after the durable intent, preserving the crash-window guarantee.
+	// ahead of the intent/lease means a locked vault or a login with no refresh token
+	// fails cleanly — no durable intent left behind that a survivor would have to
+	// (conservatively) resolve as unrecoverable, and no lease taken. The provider is still
+	// called exactly once, after the durable intent, preserving the crash-window guarantee.
 	prev, err := s.openCodexAccountLogin(userID, acct)
 	if err != nil {
 		return CodexRefreshResult{}, err
@@ -312,8 +314,32 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		return CodexRefreshResult{}, ErrCodexRefreshNoClient
 	}
 
-	// (3) Acquire the lease, bounded to the provider callback deadline. 0 rows means a
-	// live lease or a quarantine already holds the account → do NOT rotate in parallel.
+	// (3) Durable pre-rotation intent, recorded BEFORE the lease is acquired. Ordering the
+	// intent ahead of the lease is what makes a same-operationID concurrent retry safe: a
+	// duplicate op (23505) is detected on THIS insert, before any lease is held, so the
+	// replay path (codexReplayAfterDuplicate) can never strand a freshly-acquired lease and
+	// quarantine the account. Any non-duplicate insert failure (e.g. DB unavailable) means
+	// the intent is not durable, so neither the lease nor the provider is touched — the
+	// current refresh token stays valid and nothing is lost.
+	if _, err := q.InsertCodexRefreshIntent(ctx, store.InsertCodexRefreshIntentParams{
+		OperationID:       operationID,
+		UserID:            userID,
+		ProviderAccountID: accountID,
+		FromGeneration:    acct.Generation,
+	}); err != nil {
+		if isUniqueViolation(err) {
+			return s.codexReplayAfterDuplicate(ctx, q, userID, accountID, operationID)
+		}
+		return CodexRefreshResult{}, fmt.Errorf("codex refresh: record intent: %w", err)
+	}
+
+	// (4) Acquire the lease, bounded to the provider callback deadline. It serializes the
+	// single rotation, now AFTER the durable intent exists. 0 rows means a live lease or a
+	// quarantine already holds the account, so this op must NOT exchange in parallel: if a
+	// rival op has already advanced the account past our generation, reconcile to the
+	// now-committed token; otherwise the outcome is contended and this op's own 'rotating'
+	// intent (from_generation=acct.Generation) is resolved by ReconcileUnresolvedCodexRefresh
+	// once the account advances past it. Either way no lease is stranded.
 	deadline := s.codexNow().Add(codexRefreshLeaseTTL)
 	n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
 		Op:       operationID,
@@ -325,24 +351,10 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		return CodexRefreshResult{}, fmt.Errorf("codex refresh: acquire lease: %w", err)
 	}
 	if n == 0 {
-		return CodexRefreshResult{Outcome: CodexRefreshContended}, ErrCodexRefreshContended
-	}
-
-	// (4) Durable pre-rotation intent, gated before the provider call. A duplicate op
-	// (23505) means a prior attempt of THIS op already recorded its intent → fall back to
-	// the replay/reconcile read rather than a second exchange. Any other insert failure
-	// (e.g. DB unavailable) means the intent is not durable, so the provider is NOT called
-	// — the current refresh token stays valid and nothing is lost.
-	if _, err := q.InsertCodexRefreshIntent(ctx, store.InsertCodexRefreshIntentParams{
-		OperationID:       operationID,
-		UserID:            userID,
-		ProviderAccountID: accountID,
-		FromGeneration:    acct.Generation,
-	}); err != nil {
-		if isUniqueViolation(err) {
-			return s.codexReplayAfterDuplicate(ctx, q, userID, accountID, operationID)
+		if fresh, gerr := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID}); gerr == nil && fresh.Generation > acct.Generation {
+			return s.codexReturnCommitted(userID, fresh, CodexRefreshReconciled)
 		}
-		return CodexRefreshResult{}, fmt.Errorf("codex refresh: record intent: %w", err)
+		return CodexRefreshResult{Outcome: CodexRefreshContended}, ErrCodexRefreshContended
 	}
 
 	// (5) Exactly one provider exchange. On error the outcome is AMBIGUOUS (the provider
@@ -424,8 +436,13 @@ func (s *Service) handleCodexCommitFailure(ctx context.Context, q codexRefreshSt
 }
 
 // codexReplayAfterDuplicate resolves a 23505 on the pre-rotation intent insert: a prior
-// attempt of THIS operation already recorded an intent. It re-reads the account + intent
-// and applies the same replay/reconcile decision rather than exchanging a second time.
+// attempt of THIS operation already recorded an intent. Because the intent insert now
+// precedes the lease acquire (advanceCodexRefresh step 3), this path holds NO lease — so a
+// same-operationID concurrent retry can never strand a lease here. It re-reads the account
+// + intent and applies the same replay/reconcile decision rather than exchanging a second
+// time, handling BOTH terminal states (committed/reconciled → replay/reconciled token) and
+// a still-'rotating' prior attempt that holds the lease (→ contended, no token, no second
+// exchange).
 func (s *Service) codexReplayAfterDuplicate(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID) (CodexRefreshResult, error) {
 	acct, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID})
 	if err != nil {
