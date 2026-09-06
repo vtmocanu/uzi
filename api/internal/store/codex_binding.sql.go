@@ -129,6 +129,7 @@ SET codex_secret_id         = $1::uuid,
     codex_account_revision  = $6,
     updated_at              = now()
 WHERE id = $7 AND user_id = $8
+    AND (codex_secret_id IS NULL OR codex_secret_id = $1::uuid)
 `
 
 type FreezeRunCodexBindingParams struct {
@@ -154,6 +155,14 @@ type FreezeRunCodexBindingParams struct {
 // (nullable args) because a subscription run may not have resolved its account yet —
 // SetRunCodexFrozenIdentity freezes those at first link. Owner-scoped; 0 rows for a
 // run this user does not own.
+//
+// SECURITY HARDENING (PRD #1147 audit): write-once freeze. The guard
+// `codex_secret_id IS NULL OR codex_secret_id = @secret_id` makes the binding
+// immutable once set — the FIRST freeze (NULL) and an identical retry (equal
+// secret) affect the row, but a CONFLICTING second freeze with a DIFFERENT secret
+// affects 0 rows and cannot silently re-point a run at another credential. The audit
+// flagged the unguarded UPDATE: it let a late/duplicate freeze overwrite a run's
+// already-frozen binding, defeating the "decided once, atomically" guarantee.
 func (q *Queries) FreezeRunCodexBinding(ctx context.Context, arg FreezeRunCodexBindingParams) (int64, error) {
 	result, err := q.db.Exec(ctx, freezeRunCodexBinding,
 		arg.SecretID,
@@ -215,10 +224,17 @@ SELECT
     cpa.generation          AS current_generation,
     cpa.credential_revision AS current_credential_revision,
     cpa.provider_user_id,
-    cpa.workspace_account_id
+    cpa.workspace_account_id,
+    -- CURRENT account coordination state (NULL for an api_key alias): the release
+    -- predicate refuses a run authority over a quarantined/in-progress account.
+    cpa.coord_state AS current_coord_state,
+    -- The bound alias's own kind, for the bind-time kind↔auth-mode check.
+    us.kind AS bound_kind
 FROM runs r
 JOIN codex_credential_state ccs
     ON ccs.user_secret_id = r.codex_secret_id AND ccs.user_id = r.user_id
+JOIN user_secrets us
+    ON us.id = r.codex_secret_id AND us.user_id = r.user_id
 LEFT JOIN codex_provider_account cpa
     ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
 WHERE r.id = $1
@@ -239,6 +255,8 @@ type GetRunCodexAuthContextRow struct {
 	CurrentCredentialRevision pgtype.Int8 `json:"current_credential_revision"`
 	ProviderUserID            pgtype.Text `json:"provider_user_id"`
 	WorkspaceAccountID        pgtype.Text `json:"workspace_account_id"`
+	CurrentCoordState         pgtype.Text `json:"current_coord_state"`
+	BoundKind                 string      `json:"bound_kind"`
 }
 
 // The authority-check read (PRD #1147 M2): the run's FROZEN Codex binding alongside the
@@ -249,6 +267,22 @@ type GetRunCodexAuthContextRow struct {
 // join is LEFT because an 'api_key' (static openai_api_key) alias has a state row but no
 // account behind it, so its current generation/revision/tuple come back NULL. Filtered
 // by run id only, per the M2 read contract.
+//
+// SECURITY HARDENING (PRD #1147 audit): two additive columns feed bind-time checks the
+// source audit found missing.
+//
+//	current_coord_state — the account's live coordination state (NULL for an api_key
+//	alias, which has no account behind the LEFT JOIN). The release predicate must NOT
+//	hand a run authority over an account parked in 'quarantined'/'in_progress'; without
+//	this column the release decision could not see the quarantine and could release a
+//	possibly-ambiguous account.
+//	bound_kind — the alias's own user_secrets.kind, joined owner-scoped (us.user_id =
+//	r.user_id) so it can never read a foreign secret's kind. The bind-time kind↔auth-mode
+//	check needs the actual kind to reject a binding whose auth_mode contradicts the
+//	credential kind (an openai_api_key alias frozen 'subscription', or vice versa). The
+//	join is INNER, not LEFT: a run carrying a codex binding always has its alias row (the
+//	codex_secret_id FK targets user_secrets) and the existing INNER join to
+//	codex_credential_state already requires a state row, so this adds no new NULL case.
 func (q *Queries) GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (GetRunCodexAuthContextRow, error) {
 	row := q.db.QueryRow(ctx, getRunCodexAuthContext, id)
 	var i GetRunCodexAuthContextRow
@@ -267,6 +301,8 @@ func (q *Queries) GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (Get
 		&i.CurrentCredentialRevision,
 		&i.ProviderUserID,
 		&i.WorkspaceAccountID,
+		&i.CurrentCoordState,
+		&i.BoundKind,
 	)
 	return i, err
 }
@@ -349,6 +385,85 @@ func (q *Queries) ListUnresolvedCodexRefreshIntents(ctx context.Context, arg Lis
 	return items, nil
 }
 
+const promoteCodexRecovery = `-- name: PromoteCodexRecovery :one
+UPDATE codex_provider_account
+SET sealed_login         = recovery_sealed,
+    generation           = generation + 1,
+    committed_generation = generation + 1,
+    coord_state          = 'idle',
+    coord_operation_id   = NULL,
+    lease_deadline       = NULL,
+    recovery_sealed      = NULL,
+    recovery_generation  = NULL,
+    updated_at           = now()
+WHERE id = $1 AND user_id = $2
+    AND coord_state = 'quarantined'
+    AND recovery_sealed IS NOT NULL
+    AND recovery_generation = $3::bigint
+RETURNING generation
+`
+
+type PromoteCodexRecoveryParams struct {
+	ID             uuid.UUID `json:"id"`
+	UserID         uuid.UUID `json:"user_id"`
+	FromGeneration int64     `json:"from_generation"`
+}
+
+// Install the protected recovery material as the live login (SECURITY HARDENING, PRD
+// #1147 audit): the reconcile path's roll-forward for a quarantined account whose
+// recovery slot holds a known-good login. It promotes recovery_sealed into sealed_login,
+// advances the generation (and committed_generation) so any stale CAS-guarded writer
+// loses, returns the account to 'idle', and clears the coordination + recovery slots.
+//
+// Guarded on coord_state='quarantined' AND recovery_sealed IS NOT NULL AND
+// recovery_generation = @from_generation so ONLY a quarantined account carrying the
+// expected recovery generation is promoted, and the promotion is IDEMPOTENT: a second
+// call finds coord_state != 'quarantined' (already promoted to 'idle') and matches 0
+// rows → pgx.ErrNoRows, so a retried reconcile cannot double-advance the generation. A
+// wrong @from_generation (the recovery slot moved under the caller) likewise matches 0
+// rows. The audit flagged that without a dedicated roll-forward primitive the reconcile
+// path had no CAS-safe way to make the recovery material live.
+//
+// sealed_with is intentionally left unchanged: recovery_sealed and sealed_login are
+// ALWAYS produced by the same per-user seal (the account's own key), so the sealed_with
+// discriminator is invariant across the promotion — rewriting it would be a no-op at
+// best and a discriminator/material mismatch at worst.
+func (q *Queries) PromoteCodexRecovery(ctx context.Context, arg PromoteCodexRecoveryParams) (int64, error) {
+	row := q.db.QueryRow(ctx, promoteCodexRecovery, arg.ID, arg.UserID, arg.FromGeneration)
+	var generation int64
+	err := row.Scan(&generation)
+	return generation, err
+}
+
+const quarantineCodexAccount = `-- name: QuarantineCodexAccount :execrows
+UPDATE codex_provider_account
+SET coord_state = 'quarantined', updated_at = now()
+WHERE id = $1 AND user_id = $2
+    AND coord_state = 'in_progress' AND coord_operation_id = $3::uuid
+`
+
+type QuarantineCodexAccountParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Op     uuid.UUID `json:"op"`
+}
+
+// Quarantine an in-progress account WITHOUT writing recovery material (SECURITY
+// HARDENING, PRD #1147 audit): the identity-mismatch path parks the account when the
+// provider returned a login for a DIFFERENT identity tuple than expected, so there is no
+// trustworthy prior-good login to protect into the recovery slot (that is
+// SetCodexRecoverySlot's job on the ordinary failure path). Guarded on
+// coord_state='in_progress' AND coord_operation_id=@op so only the operation that still
+// holds the live lease may quarantine it — a presumed-dead or wrong operation matches 0
+// rows and cannot flip a settled account into quarantine. Owner-scoped.
+func (q *Queries) QuarantineCodexAccount(ctx context.Context, arg QuarantineCodexAccountParams) (int64, error) {
+	result, err := q.db.Exec(ctx, quarantineCodexAccount, arg.ID, arg.UserID, arg.Op)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const quarantineExpiredCodexLease = `-- name: QuarantineExpiredCodexLease :execrows
 UPDATE codex_provider_account
 SET coord_state = 'quarantined', updated_at = now()
@@ -368,6 +483,48 @@ type QuarantineExpiredCodexLeaseParams struct {
 // in_progress). Owner-scoped.
 func (q *Queries) QuarantineExpiredCodexLease(ctx context.Context, arg QuarantineExpiredCodexLeaseParams) (int64, error) {
 	result, err := q.db.Exec(ctx, quarantineExpiredCodexLease, arg.ID, arg.UserID, arg.Now)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const refreshCodexAccountLogin = `-- name: RefreshCodexAccountLogin :execrows
+UPDATE codex_provider_account
+SET sealed_login         = $1,
+    sealed_with          = $2::text,
+    generation           = generation + 1,
+    committed_generation = generation + 1,
+    coord_state          = 'idle',
+    coord_operation_id   = NULL,
+    lease_deadline       = NULL,
+    recovery_sealed      = NULL,
+    recovery_generation  = NULL,
+    updated_at           = now()
+WHERE id = $3 AND user_id = $4
+`
+
+type RefreshCodexAccountLoginParams struct {
+	Sealed     []byte    `json:"sealed"`
+	SealedWith string    `json:"sealed_with"`
+	ID         uuid.UUID `json:"id"`
+	UserID     uuid.UUID `json:"user_id"`
+}
+
+// Install a freshly-sealed login on an account after a VERIFIED re-login (SECURITY
+// HARDENING, PRD #1147 audit): the recovery path when the recovery slot is empty or
+// untrusted and the service has re-authenticated the subscription out of band. It writes
+// the new sealed_login + sealed_with, advances the generation (and committed_generation)
+// so stale CAS writers lose, returns the account to 'idle', and clears the coordination +
+// recovery slots. Owner-scoped; 0 rows for a foreign account. Unlike PromoteCodexRecovery
+// this is a fresh install (new sealed_with may differ), so sealed_with IS written.
+func (q *Queries) RefreshCodexAccountLogin(ctx context.Context, arg RefreshCodexAccountLoginParams) (int64, error) {
+	result, err := q.db.Exec(ctx, refreshCodexAccountLogin,
+		arg.Sealed,
+		arg.SealedWith,
+		arg.ID,
+		arg.UserID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -489,6 +646,7 @@ SET codex_account_key      = $1::text,
     codex_account_revision = $2::bigint,
     updated_at             = now()
 WHERE id = $3 AND user_id = $4
+    AND (codex_account_key IS NULL OR codex_account_key = $1::text)
 `
 
 type SetRunCodexFrozenIdentityParams struct {
@@ -502,6 +660,14 @@ type SetRunCodexFrozenIdentityParams struct {
 // once a subscription run resolves its provider account, the account_key (the frozen
 // identity tuple) and account_revision are pinned onto the run so the authority check
 // can later compare run-frozen vs current. Owner-scoped; 0 rows for a foreign run.
+//
+// SECURITY HARDENING (PRD #1147 audit): write-once identity freeze. The guard
+// `codex_account_key IS NULL OR codex_account_key = @key` pins the frozen identity
+// tuple immutably at first link — the FIRST freeze (NULL) and an identical retry
+// (equal tuple) succeed, but a conflicting freeze presenting a DIFFERENT identity
+// affects 0 rows, so the run's canonical identity can never be silently repointed to
+// another account after it was frozen. The audit flagged the unguarded UPDATE as the
+// symmetric hole to FreezeRunCodexBinding's.
 func (q *Queries) SetRunCodexFrozenIdentity(ctx context.Context, arg SetRunCodexFrozenIdentityParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunCodexFrozenIdentity,
 		arg.Key,

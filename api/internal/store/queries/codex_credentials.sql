@@ -52,9 +52,20 @@ WHERE user_secret_id = @user_secret_id AND user_id = @user_id;
 -- Bind an alias to a resolved provider account (PRD #1147 M1): move it to 'linked'
 -- and record the account id. Owner-scoped; affects the single alias row, or 0 when
 -- the alias is not this user's.
+--
+-- SECURITY HARDENING (PRD #1147 audit): material-revision CAS. The added
+-- `AND material_revision = @material_revision` fences the reconcile relink against a
+-- manual replace that races a slow discovery. A user replacing the alias's underlying
+-- material calls BumpCodexMaterialRevision, which advances material_revision and drops
+-- the account link precisely because the old binding is now invalid. If a discovery
+-- that started BEFORE the replace then relinks blindly, it would re-point the freshly
+-- replaced alias at the STALE account it resolved. Requiring the revision the discovery
+-- observed makes that stale relink match 0 rows; the service treats 0 rows as a lost
+-- race and re-resolves. :execrows stays: 0 = the alias was replaced under us.
 UPDATE codex_credential_state
 SET status = 'linked', provider_account_id = @provider_account_id, updated_at = now()
-WHERE user_secret_id = @user_secret_id AND user_id = @user_id;
+WHERE user_secret_id = @user_secret_id AND user_id = @user_id
+    AND material_revision = @material_revision::bigint;
 
 -- name: SetCodexCredentialStateStatus :execrows
 -- Move an alias to an arbitrary status and record last_error alongside it (PRD #1147

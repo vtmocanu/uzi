@@ -320,19 +320,36 @@ const linkCodexCredentialState = `-- name: LinkCodexCredentialState :execrows
 UPDATE codex_credential_state
 SET status = 'linked', provider_account_id = $1, updated_at = now()
 WHERE user_secret_id = $2 AND user_id = $3
+    AND material_revision = $4::bigint
 `
 
 type LinkCodexCredentialStateParams struct {
 	ProviderAccountID pgtype.UUID `json:"provider_account_id"`
 	UserSecretID      uuid.UUID   `json:"user_secret_id"`
 	UserID            uuid.UUID   `json:"user_id"`
+	MaterialRevision  int64       `json:"material_revision"`
 }
 
 // Bind an alias to a resolved provider account (PRD #1147 M1): move it to 'linked'
 // and record the account id. Owner-scoped; affects the single alias row, or 0 when
 // the alias is not this user's.
+//
+// SECURITY HARDENING (PRD #1147 audit): material-revision CAS. The added
+// `AND material_revision = @material_revision` fences the reconcile relink against a
+// manual replace that races a slow discovery. A user replacing the alias's underlying
+// material calls BumpCodexMaterialRevision, which advances material_revision and drops
+// the account link precisely because the old binding is now invalid. If a discovery
+// that started BEFORE the replace then relinks blindly, it would re-point the freshly
+// replaced alias at the STALE account it resolved. Requiring the revision the discovery
+// observed makes that stale relink match 0 rows; the service treats 0 rows as a lost
+// race and re-resolves. :execrows stays: 0 = the alias was replaced under us.
 func (q *Queries) LinkCodexCredentialState(ctx context.Context, arg LinkCodexCredentialStateParams) (int64, error) {
-	result, err := q.db.Exec(ctx, linkCodexCredentialState, arg.ProviderAccountID, arg.UserSecretID, arg.UserID)
+	result, err := q.db.Exec(ctx, linkCodexCredentialState,
+		arg.ProviderAccountID,
+		arg.UserSecretID,
+		arg.UserID,
+		arg.MaterialRevision,
+	)
 	if err != nil {
 		return 0, err
 	}

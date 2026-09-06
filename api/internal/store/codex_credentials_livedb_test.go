@@ -302,3 +302,81 @@ func TestCodexCredentialStateLiveDB(t *testing.T) {
 			"foreign_key_violation (23503) — the composite FK is not owner-scoped", err, pgCode(err))
 	}
 }
+
+// TestLinkCodexCredentialStateRevisionCASLiveDB pins the material-revision CAS the
+// security audit added to LinkCodexCredentialState (PRD #1147): a relink succeeds only
+// when it presents the material_revision the alias currently carries. A relink that
+// observed an OLD revision (a manual replace bumped it under a slow discovery) matches 0
+// rows and cannot re-point the freshly replaced alias at the stale account it resolved.
+func TestLinkCodexCredentialStateRevisionCASLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+
+	secret, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "cas-"+uuid.NewString(), false)
+	if err != nil {
+		t.Fatalf("insert secret: %v", err)
+	}
+	if _, err := q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{
+		UserSecretID: secret, UserID: user, Status: "staging",
+	}); err != nil {
+		t.Fatalf("insert staging state: %v", err)
+	}
+	accountA, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+		UserID: user, ProviderUserID: "p-" + uuid.NewString(), WorkspaceAccountID: "w-" + uuid.NewString(),
+		SealedLogin: []byte("sealed"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("insert accountA: %v", err)
+	}
+	accountB, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+		UserID: user, ProviderUserID: "p-" + uuid.NewString(), WorkspaceAccountID: "w-" + uuid.NewString(),
+		SealedLogin: []byte("sealed"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("insert accountB: %v", err)
+	}
+
+	// Link at the current revision (0): succeeds.
+	if n, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
+		UserSecretID: secret, UserID: user,
+		ProviderAccountID: pgtype.UUID{Bytes: accountA.ID, Valid: true}, MaterialRevision: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("LinkCodexCredentialState(rev 0 matches) = (%d,%v), want (1,nil)", n, err)
+	}
+
+	// A manual replace bumps material_revision to 1 and drops the link.
+	if n, err := q.BumpCodexMaterialRevision(ctx, store.BumpCodexMaterialRevisionParams{
+		UserSecretID: secret, UserID: user, Status: "staging",
+	}); err != nil || n != 1 {
+		t.Fatalf("BumpCodexMaterialRevision = (%d,%v), want (1,nil)", n, err)
+	}
+
+	// A slow discovery that observed revision 0 relinks blindly: the CAS refuses it.
+	if n, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
+		UserSecretID: secret, UserID: user,
+		ProviderAccountID: pgtype.UUID{Bytes: accountA.ID, Valid: true}, MaterialRevision: 0,
+	}); err != nil || n != 0 {
+		t.Fatalf("LinkCodexCredentialState(stale rev 0) = (%d,%v), want (0,nil) — the CAS fence must reject a bumped revision", n, err)
+	}
+	// The alias is still un-linked after the refused stale relink.
+	if st, err := q.GetCodexCredentialState(ctx, store.GetCodexCredentialStateParams{UserSecretID: secret, UserID: user}); err != nil {
+		t.Fatalf("read state: %v", err)
+	} else if st.ProviderAccountID.Valid {
+		t.Fatal("a stale relink linked the alias — the material-revision CAS did not fence it")
+	}
+
+	// A relink presenting the CURRENT revision (1) succeeds and binds accountB.
+	if n, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
+		UserSecretID: secret, UserID: user,
+		ProviderAccountID: pgtype.UUID{Bytes: accountB.ID, Valid: true}, MaterialRevision: 1,
+	}); err != nil || n != 1 {
+		t.Fatalf("LinkCodexCredentialState(rev 1 matches) = (%d,%v), want (1,nil)", n, err)
+	}
+	linked, err := q.GetCodexCredentialState(ctx, store.GetCodexCredentialStateParams{UserSecretID: secret, UserID: user})
+	if err != nil {
+		t.Fatalf("read relinked state: %v", err)
+	}
+	if linked.Status != "linked" || !linked.ProviderAccountID.Valid || uuid.UUID(linked.ProviderAccountID.Bytes) != accountB.ID {
+		t.Fatalf("relinked state = (status=%q account_valid=%v), want linked pointing at accountB",
+			linked.Status, linked.ProviderAccountID.Valid)
+	}
+}

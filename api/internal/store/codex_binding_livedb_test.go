@@ -188,6 +188,98 @@ func TestGetRunCodexAuthContextLiveDB(t *testing.T) {
 	}
 }
 
+// TestGetRunCodexAuthContextHardeningLiveDB pins the two additive columns the security
+// audit added (PRD #1147): current_coord_state and bound_kind. An api_key alias has no
+// account, so current_coord_state comes back NULL and bound_kind is 'openai_api_key'; a
+// subscription alias linked to an account reports the account's live coord_state
+// ('idle', then 'quarantined' after the account is parked) and bound_kind 'codex_auth'.
+func TestGetRunCodexAuthContextHardeningLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	repo, _ := codexRunFixture(ctx, t, pool, user)
+
+	// --- api_key: no provider account, so current_coord_state is NULL. ---
+	apiSecret, err := insertSecret(ctx, pool, user, store.KindOpenAIAPIKey, "api-"+uuid.NewString(), false)
+	if err != nil {
+		t.Fatalf("insert api secret: %v", err)
+	}
+	if _, err := q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{
+		UserSecretID: apiSecret, UserID: user, Status: "static",
+	}); err != nil {
+		t.Fatalf("insert static state: %v", err)
+	}
+	apiRun := insertCodexRun(ctx, t, pool, user, repo, uuid.Nil, 211, "queued", "marker")
+	if _, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: apiSecret, AuthMode: "api_key", SecretLabel: "api", MaterialRevision: 0,
+		ID: apiRun, UserID: user,
+	}); err != nil {
+		t.Fatalf("freeze api binding: %v", err)
+	}
+	apiCtx, err := q.GetRunCodexAuthContext(ctx, apiRun)
+	if err != nil {
+		t.Fatalf("GetRunCodexAuthContext(api): %v", err)
+	}
+	if apiCtx.BoundKind != store.KindOpenAIAPIKey {
+		t.Fatalf("api bound_kind = %q, want %q", apiCtx.BoundKind, store.KindOpenAIAPIKey)
+	}
+	if apiCtx.CurrentCoordState.Valid {
+		t.Fatalf("api current_coord_state = %+v, want NULL — an api_key alias has no account", apiCtx.CurrentCoordState)
+	}
+
+	// --- subscription: linked to an account, so current_coord_state tracks it. ---
+	subSecret, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "codex-"+uuid.NewString(), false)
+	if err != nil {
+		t.Fatalf("insert codex secret: %v", err)
+	}
+	if _, err := q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{
+		UserSecretID: subSecret, UserID: user, Status: "staging",
+	}); err != nil {
+		t.Fatalf("insert staging state: %v", err)
+	}
+	account, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+		UserID: user, ProviderUserID: "p-" + uuid.NewString(), WorkspaceAccountID: "w-" + uuid.NewString(),
+		SealedLogin: []byte("sealed"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	if _, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
+		UserSecretID: subSecret, UserID: user,
+		ProviderAccountID: pgtype.UUID{Bytes: account.ID, Valid: true}, MaterialRevision: 0,
+	}); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	subRun := insertCodexRun(ctx, t, pool, user, repo, uuid.Nil, 212, "queued", "marker")
+	if _, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: subSecret, AuthMode: "subscription", SecretLabel: "codex", MaterialRevision: 0,
+		ID: subRun, UserID: user,
+	}); err != nil {
+		t.Fatalf("freeze sub binding: %v", err)
+	}
+	subCtx, err := q.GetRunCodexAuthContext(ctx, subRun)
+	if err != nil {
+		t.Fatalf("GetRunCodexAuthContext(sub): %v", err)
+	}
+	if subCtx.BoundKind != store.KindCodexAuth {
+		t.Fatalf("sub bound_kind = %q, want %q", subCtx.BoundKind, store.KindCodexAuth)
+	}
+	if !subCtx.CurrentCoordState.Valid || subCtx.CurrentCoordState.String != "idle" {
+		t.Fatalf("sub current_coord_state = %+v, want a valid \"idle\"", subCtx.CurrentCoordState)
+	}
+
+	// Park the account: the read now reports 'quarantined', which the release predicate
+	// keys off to refuse a run authority over an ambiguous account.
+	mustExec(ctx, t, pool,
+		`UPDATE codex_provider_account SET coord_state = 'quarantined' WHERE id = $1 AND user_id = $2`,
+		account.ID, user)
+	quarCtx, err := q.GetRunCodexAuthContext(ctx, subRun)
+	if err != nil {
+		t.Fatalf("GetRunCodexAuthContext(sub, quarantined): %v", err)
+	}
+	if !quarCtx.CurrentCoordState.Valid || quarCtx.CurrentCoordState.String != "quarantined" {
+		t.Fatalf("sub current_coord_state = %+v after quarantine, want \"quarantined\"", quarCtx.CurrentCoordState)
+	}
+}
+
 // TestFreezeRunCodexBindingLiveDB pins the two freeze primitives: they write the
 // binding/identity fields and are owner-scoped, so a foreign user_id moves 0 rows.
 func TestFreezeRunCodexBindingLiveDB(t *testing.T) {
@@ -821,5 +913,274 @@ func TestAcquireCodexRefreshLeaseFromCommittedLiveDB(t *testing.T) {
 		t.Fatalf("read re-acquired: %v", err)
 	} else if got.CoordState != "in_progress" {
 		t.Fatalf("coord_state = %q after re-acquire, want \"in_progress\"", got.CoordState)
+	}
+}
+
+// TestFreezeRunCodexBindingWriteOnceLiveDB pins the write-once freeze guards the security
+// audit added (PRD #1147): once a run's binding/identity is frozen, an identical retry is
+// idempotent (1 row) but a CONFLICTING re-freeze with a different secret/identity affects
+// 0 rows and cannot silently re-point the run.
+func TestFreezeRunCodexBindingWriteOnceLiveDB(t *testing.T) {
+	ctx, pool, q, user := codexLiveDB(t)
+	repo, _ := codexRunFixture(ctx, t, pool, user)
+
+	secretA, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "a-"+uuid.NewString(), false)
+	if err != nil {
+		t.Fatalf("insert secretA: %v", err)
+	}
+	secretB, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "b-"+uuid.NewString(), false)
+	if err != nil {
+		t.Fatalf("insert secretB: %v", err)
+	}
+	runID := insertCodexRun(ctx, t, pool, user, repo, uuid.Nil, 401, "queued", "marker")
+
+	// First freeze (from NULL) binds secretA.
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretA, AuthMode: "subscription", SecretLabel: "a", MaterialRevision: 1,
+		ID: runID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("FreezeRunCodexBinding(first) = (%d,%v), want (1,nil)", n, err)
+	}
+	// Identical retry (same secret) is idempotent — still affects the row.
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretA, AuthMode: "subscription", SecretLabel: "a", MaterialRevision: 1,
+		ID: runID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("FreezeRunCodexBinding(identical retry) = (%d,%v), want (1,nil) — must be idempotent", n, err)
+	}
+	// Conflicting re-freeze with a DIFFERENT secret affects 0 rows and leaves secretA bound.
+	if n, err := q.FreezeRunCodexBinding(ctx, store.FreezeRunCodexBindingParams{
+		SecretID: secretB, AuthMode: "subscription", SecretLabel: "b", MaterialRevision: 9,
+		ID: runID, UserID: user,
+	}); err != nil || n != 0 {
+		t.Fatalf("FreezeRunCodexBinding(conflicting secret) = (%d,%v), want (0,nil) — the binding is write-once", n, err)
+	}
+	bound, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if uuid.UUID(bound.CodexSecretID.Bytes) != secretA || bound.CodexSecretLabel.String != "a" {
+		t.Fatalf("after conflicting freeze the binding = (secret=%s label=%q), want it unchanged at secretA/a",
+			uuid.UUID(bound.CodexSecretID.Bytes), bound.CodexSecretLabel.String)
+	}
+
+	// SetRunCodexFrozenIdentity: same write-once pattern on the identity tuple.
+	keyA := `["provider-a","workspace-a"]`
+	keyB := `["provider-b","workspace-b"]`
+	if n, err := q.SetRunCodexFrozenIdentity(ctx, store.SetRunCodexFrozenIdentityParams{
+		Key: keyA, Rev: 1, ID: runID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("SetRunCodexFrozenIdentity(first) = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := q.SetRunCodexFrozenIdentity(ctx, store.SetRunCodexFrozenIdentityParams{
+		Key: keyA, Rev: 1, ID: runID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("SetRunCodexFrozenIdentity(identical retry) = (%d,%v), want (1,nil) — must be idempotent", n, err)
+	}
+	if n, err := q.SetRunCodexFrozenIdentity(ctx, store.SetRunCodexFrozenIdentityParams{
+		Key: keyB, Rev: 9, ID: runID, UserID: user,
+	}); err != nil || n != 0 {
+		t.Fatalf("SetRunCodexFrozenIdentity(conflicting tuple) = (%d,%v), want (0,nil) — the identity is write-once", n, err)
+	}
+	frozen, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if frozen.CodexAccountKey.String != keyA {
+		t.Fatalf("after conflicting identity freeze key = %q, want it unchanged at %q", frozen.CodexAccountKey.String, keyA)
+	}
+}
+
+// mkCodexAccount inserts a fresh provider account for `user` (gen 0, idle) and returns it.
+func mkCodexAccount(ctx context.Context, t *testing.T, q *store.Queries, user uuid.UUID) store.CodexProviderAccount {
+	t.Helper()
+	acc, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+		UserID: user, ProviderUserID: "p-" + uuid.NewString(), WorkspaceAccountID: "w-" + uuid.NewString(),
+		SealedLogin: []byte("sealed"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	return acc
+}
+
+// TestPromoteCodexRecoveryLiveDB pins PromoteCodexRecovery (PRD #1147 audit): it installs
+// the protected recovery material as the live login on a quarantined account whose
+// recovery_generation matches, advancing the generation and returning to idle; a second
+// call is a no-op (ErrNoRows, already promoted) and a wrong from_generation is refused.
+func TestPromoteCodexRecoveryLiveDB(t *testing.T) {
+	ctx, _, q, user := codexLiveDB(t)
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+
+	// Quarantine an account with a recovery slot at generation 0.
+	acc := mkCodexAccount(ctx, t, q, user)
+	op := uuid.New()
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: op, Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+		Sealed: []byte("recovery-bytes"), Gen: 0, ID: acc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
+	}
+
+	gen, err := q.PromoteCodexRecovery(ctx, store.PromoteCodexRecoveryParams{
+		ID: acc.ID, UserID: user, FromGeneration: 0,
+	})
+	if err != nil {
+		t.Fatalf("PromoteCodexRecovery: %v", err)
+	}
+	if gen != 1 {
+		t.Fatalf("PromoteCodexRecovery returned generation %d, want 1", gen)
+	}
+	promoted, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: user, ID: acc.ID})
+	if err != nil {
+		t.Fatalf("read promoted: %v", err)
+	}
+	if string(promoted.SealedLogin) != "recovery-bytes" {
+		t.Fatalf("sealed_login = %q after promote, want the recovery bytes", promoted.SealedLogin)
+	}
+	if promoted.Generation != 1 || promoted.CoordState != "idle" ||
+		!promoted.CommittedGeneration.Valid || promoted.CommittedGeneration.Int64 != 1 {
+		t.Fatalf("after promote = (gen=%d state=%q committed_gen=%+v), want (1, idle, 1)",
+			promoted.Generation, promoted.CoordState, promoted.CommittedGeneration)
+	}
+	if promoted.RecoverySealed != nil || promoted.RecoveryGeneration.Valid ||
+		promoted.CoordOperationID.Valid || promoted.LeaseDeadline.Valid {
+		t.Fatalf("after promote the recovery/coord slots = (recovery=%q recovery_gen=%+v op_valid=%v deadline_valid=%v), want all cleared",
+			promoted.RecoverySealed, promoted.RecoveryGeneration, promoted.CoordOperationID.Valid, promoted.LeaseDeadline.Valid)
+	}
+
+	// Idempotent: a second promote finds coord_state='idle' (not quarantined) → ErrNoRows.
+	if _, err := q.PromoteCodexRecovery(ctx, store.PromoteCodexRecoveryParams{
+		ID: acc.ID, UserID: user, FromGeneration: 1,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second PromoteCodexRecovery returned %v, want pgx.ErrNoRows — the promotion is idempotent", err)
+	}
+
+	// Wrong from_generation: a quarantined account whose recovery_generation is 0 refuses
+	// a promote presenting a different from_generation.
+	wrongAcc := mkCodexAccount(ctx, t, q, user)
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: uuid.New(), Deadline: future, ID: wrongAcc.ID, UserID: user, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease(wrong-gen) = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+		Sealed: []byte("recovery-bytes"), Gen: 0, ID: wrongAcc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("SetCodexRecoverySlot(wrong-gen) = (%d,%v), want (1,nil)", n, err)
+	}
+	if _, err := q.PromoteCodexRecovery(ctx, store.PromoteCodexRecoveryParams{
+		ID: wrongAcc.ID, UserID: user, FromGeneration: 5,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("PromoteCodexRecovery(wrong from_generation) returned %v, want pgx.ErrNoRows", err)
+	}
+}
+
+// TestRefreshCodexAccountLoginLiveDB pins RefreshCodexAccountLogin (PRD #1147 audit): a
+// verified re-login installs a fresh sealed login, advances the generation, returns the
+// account to idle, and clears the recovery/quarantine slots.
+func TestRefreshCodexAccountLoginLiveDB(t *testing.T) {
+	ctx, _, q, user := codexLiveDB(t)
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+
+	// Start from a quarantined account carrying a recovery slot, to prove Refresh clears it.
+	acc := mkCodexAccount(ctx, t, q, user)
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: uuid.New(), Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+		Sealed: []byte("stale-recovery"), Gen: 0, ID: acc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
+	}
+
+	if n, err := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
+		Sealed: []byte("fresh-login"), SealedWith: store.SealedWithDEK, ID: acc.ID, UserID: user,
+	}); err != nil || n != 1 {
+		t.Fatalf("RefreshCodexAccountLogin = (%d,%v), want (1,nil)", n, err)
+	}
+	got, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: user, ID: acc.ID})
+	if err != nil {
+		t.Fatalf("read refreshed: %v", err)
+	}
+	if string(got.SealedLogin) != "fresh-login" || got.SealedWith != store.SealedWithDEK {
+		t.Fatalf("after refresh login = (sealed=%q with=%q), want (fresh-login, %q)", got.SealedLogin, got.SealedWith, store.SealedWithDEK)
+	}
+	if got.Generation != 1 || got.CoordState != "idle" ||
+		!got.CommittedGeneration.Valid || got.CommittedGeneration.Int64 != 1 {
+		t.Fatalf("after refresh = (gen=%d state=%q committed_gen=%+v), want (1, idle, 1)",
+			got.Generation, got.CoordState, got.CommittedGeneration)
+	}
+	if got.RecoverySealed != nil || got.RecoveryGeneration.Valid ||
+		got.CoordOperationID.Valid || got.LeaseDeadline.Valid {
+		t.Fatalf("after refresh recovery/coord slots not cleared: recovery=%q recovery_gen=%+v op_valid=%v deadline_valid=%v",
+			got.RecoverySealed, got.RecoveryGeneration, got.CoordOperationID.Valid, got.LeaseDeadline.Valid)
+	}
+
+	// Owner-scoping: a foreign user refreshes nothing.
+	if n, err := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
+		Sealed: []byte("x"), SealedWith: store.SealedWithMaster, ID: acc.ID, UserID: uuid.New(),
+	}); err != nil || n != 0 {
+		t.Fatalf("RefreshCodexAccountLogin(foreign user) = (%d,%v), want (0,nil)", n, err)
+	}
+}
+
+// TestQuarantineCodexAccountLiveDB pins QuarantineCodexAccount (PRD #1147 audit): the
+// identity-mismatch path quarantines an in_progress account owned by the presenting op
+// WITHOUT touching the recovery slot; a wrong op or a non-in_progress account is refused.
+func TestQuarantineCodexAccountLiveDB(t *testing.T) {
+	ctx, _, q, user := codexLiveDB(t)
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+
+	// In-progress owned by op: quarantine succeeds, recovery slot stays empty.
+	acc := mkCodexAccount(ctx, t, q, user)
+	op := uuid.New()
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: op, Deadline: future, ID: acc.ID, UserID: user, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{
+		ID: acc.ID, UserID: user, Op: op,
+	}); err != nil || n != 1 {
+		t.Fatalf("QuarantineCodexAccount(owner) = (%d,%v), want (1,nil)", n, err)
+	}
+	got, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: user, ID: acc.ID})
+	if err != nil {
+		t.Fatalf("read quarantined: %v", err)
+	}
+	if got.CoordState != "quarantined" {
+		t.Fatalf("coord_state = %q after quarantine, want \"quarantined\"", got.CoordState)
+	}
+	if got.RecoverySealed != nil || got.RecoveryGeneration.Valid {
+		t.Fatalf("QuarantineCodexAccount wrote recovery material (sealed=%q gen=%+v), want it untouched",
+			got.RecoverySealed, got.RecoveryGeneration)
+	}
+
+	// Wrong op: an in_progress account is not quarantined by a non-owning operation.
+	wrongAcc := mkCodexAccount(ctx, t, q, user)
+	if n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: uuid.New(), Deadline: future, ID: wrongAcc.ID, UserID: user, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease(wrong-op) = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{
+		ID: wrongAcc.ID, UserID: user, Op: uuid.New(),
+	}); err != nil || n != 0 {
+		t.Fatalf("QuarantineCodexAccount(wrong op) = (%d,%v), want (0,nil) — only the lease owner may quarantine", n, err)
+	}
+
+	// Non-in_progress: a fresh idle account is not quarantined even by a matching-looking op.
+	idleAcc := mkCodexAccount(ctx, t, q, user)
+	if n, err := q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{
+		ID: idleAcc.ID, UserID: user, Op: uuid.New(),
+	}); err != nil || n != 0 {
+		t.Fatalf("QuarantineCodexAccount(idle) = (%d,%v), want (0,nil) — only an in_progress account is quarantinable", n, err)
 	}
 }
