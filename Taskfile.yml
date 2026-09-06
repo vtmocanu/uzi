@@ -2051,6 +2051,19 @@ tasks:
     cmds:
       - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
 
+  test:harness-m2:
+    desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)
+    # Runs from the agent module so tsx + tsc + the SDK/zod deps resolve out of
+    # agent/node_modules; the tests themselves import the frozen seam from
+    # ../../agent/src via NodeNext .js specifiers. Pure in-process unit tests over
+    # the neutral types + pure functions — no SDK query, no credentials, no network.
+    dir: agent
+    cmds:
+      # Typecheck the new TS suites explicitly against their own NodeNext tsconfig,
+      # so a drift in the frozen seam's shapes fails here, not only at runtime.
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/harness-m2/tsconfig.json
+      - node --import tsx --test --test-timeout=120000 ../e2e/harness-m2/harness-reducer.test.ts ../e2e/harness-m2/limit-evidence.test.ts ../e2e/harness-m2/projection-parity.test.ts
+
   # --------------------------------------------------------------------- docs --
   # docs:sync mirrors the root docs/*.md corpus into the api module tree so
   # api/internal/uzidocs can reach it with //go:embed (which cannot reference `..`,
