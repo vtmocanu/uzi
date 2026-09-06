@@ -9,14 +9,19 @@
 // during decode; a terminal provider failure is neutral data (`HarnessTerminal`),
 // materialized only at the owner's classification point.
 //
-// The workflow owner (`sdk-executor.ts`) still assembles the per-turn SdkOptions
-// (agents via agents.ts, hooks, in-process MCP servers, sparse env, the literal
-// `settingSources: []`, skills plugin, effort/attribution) EXACTLY as before and
-// hands them to `prepareTurn`; this adapter finalizes each turn (resume, the shared
-// abort controller, the pid-recording spawn) and runs the query. Keeping that
-// assembly with its byte-identical SdkOptions — and agents.ts's live in-process MCP
-// server INSTANCE references, which no neutral `readonly string[]` could carry —
-// is why the assembly was not lifted into a HarnessAgent round-trip for m1.
+// This adapter ASSEMBLES the per-turn SdkOptions from the owner-computed ingredients
+// (`ClaudeTurnConfig`): the workflow owner (`sdk-executor.ts`) still computes every
+// ingredient — agents via agents.ts, hooks, in-process MCP server INSTANCES, sparse
+// env, skills plugin, model/effort/attribution — but the actual `SdkOptions` object
+// (including the literal `settingSources: []` isolation) is built here in
+// `buildSdkOptions`, keeping the SDK-shape construction inside the Claude adapter.
+// Those live Claude bindings ride the private `ClaudeTurnConfig` construction input,
+// NOT the neutral `RunTurnRequest`: agents.ts's live in-process MCP server INSTANCE
+// references and the concrete SDK AgentDefinitions cannot be round-tripped through a
+// neutral `readonly string[]` surface, which is why they travel on the private config
+// rather than the neutral request. `prepareTurn` takes that config; this adapter then
+// finalizes each turn (resume, the shared abort controller, the pid-recording spawn)
+// and runs the query.
 
 import type {
   Options as SdkOptions,
@@ -45,6 +50,7 @@ import {
   type RateLimitObservation,
 } from "./limit.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
+import { ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import type {
   HarnessContext,
   HarnessContextHook,
@@ -123,6 +129,64 @@ type SdkQueryInstance = AsyncIterable<SDKMessage> & {
   getContextUsage?(): Promise<ContextUsageReading>;
 };
 
+/**
+ * The private Claude-specific construction input for a turn (PRD #1146 M2). The
+ * workflow owner computes every ingredient — roster, prompts, hooks, LIVE in-process
+ * MCP server instances, env, model, effort, attribution — and hands them here; the
+ * adapter turns them into the actual `SdkOptions` via {@link buildSdkOptions}. This is
+ * deliberately distinct from the neutral `RunTurnRequest`: the live SDK bindings
+ * (concrete AgentDefinitions, in-process MCP server INSTANCE references) ride this
+ * config because no neutral surface could carry them. It is a TYPE, so knip's
+ * `ignoreExportsUsedInFile: {interface,type}` spares the cross-file export.
+ */
+export interface ClaudeTurnConfig {
+  cwd: string;
+  env: Record<string, string | undefined>;
+  skillsPluginPath: string;
+  /** Already plugin-qualified by the owner. */
+  skills: readonly string[];
+  systemPrompt: SdkOptions["systemPrompt"];
+  agents: SdkOptions["agents"];
+  mcpServers: SdkOptions["mcpServers"];
+  preToolUse: NonNullable<SdkOptions["hooks"]>["PreToolUse"];
+  model?: string;
+  effort?: SdkOptions["effort"];
+  attributionSettings?: SdkOptions["settings"];
+}
+
+/**
+ * Assemble the per-turn `SdkOptions` from the owner-computed ingredients. Keys are in
+ * EXACTLY the insertion order the owner's literal used before the M2 extraction, so a
+ * snapshot/stringify comparison in the frozen tests still matches byte-for-byte.
+ */
+function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
+  const options: SdkOptions = {
+    cwd: config.cwd,
+    env: config.env,
+    // 🔴 GUARDRAIL INVARIANT #6 — keep this a LITERAL here (Semgrep
+    // semgrep/settings-sources-isolation.yml enforces it in agent/src): repo-borne
+    // prompt-injection defense, nothing from the cloned repo's .claude can grant the
+    // agent permissions.
+    settingSources: [],
+    plugins: [
+      { type: "local", path: config.skillsPluginPath, skipMcpDiscovery: true },
+    ],
+    skills: [...config.skills],
+    systemPrompt: config.systemPrompt,
+    agents: config.agents,
+    mcpServers: config.mcpServers,
+    permissionMode: "bypassPermissions",
+    allowDangerouslySkipPermissions: true,
+    disallowedTools: [...ASYNC_DEFERRAL_TOOLS],
+    hooks: { PreToolUse: config.preToolUse },
+    includePartialMessages: false,
+  };
+  if (config.model) options.model = config.model;
+  if (config.effort) options.effort = config.effort;
+  if (config.attributionSettings) options.settings = config.attributionSettings;
+  return options;
+}
+
 export interface ClaudeHarnessDeps {
   queryFn: SdkQueryFn;
   spawn: (opts: SpawnOptions) => { pid?: number };
@@ -139,10 +203,17 @@ export interface ClaudeHarnessDeps {
 export class ClaudeHarness implements RunHarness {
   readonly kind = "claude" as const;
 
-  /** The base SdkOptions and current-child sink the owner sets before each turn
-   *  (see prepareTurn). Assembly stays in the owner (agents.ts, hooks, MCP). */
+  /** The base SdkOptions and current-child sink set before each turn (see
+   *  prepareTurn). The options are ASSEMBLED here from the owner's ClaudeTurnConfig. */
   private nextOptions: SdkOptions | undefined;
   private nextChild: { pid?: number } | undefined;
+
+  /** Object-reuse cache: the assembled SdkOptions for the last distinct config, so a
+   *  config reused across turns (the plan config across the first plan + re-plan) is
+   *  built ONCE and the same SdkOptions instance is reused — matching today's
+   *  "baseOptions is the ONE instance". */
+  private lastConfig: ClaudeTurnConfig | undefined;
+  private lastOptions: SdkOptions | undefined;
 
   /** Per-turn lead context read state, re-pointed at each turn's query. The hook is
    *  a stable per-run object the reducer holds; turns run strictly sequentially so
@@ -171,12 +242,20 @@ export class ClaudeHarness implements RunHarness {
   }
 
   /**
-   * The owner supplies the fully-assembled per-turn SdkOptions (plan or implement)
-   * and the current-child sink trip() kills, immediately before startTurn. The
-   * options are used as-is; this adapter only clones and finalizes them per turn.
+   * The owner supplies the per-turn ingredients (plan or implement) as a
+   * ClaudeTurnConfig plus the current-child sink trip() kills, immediately before
+   * startTurn. This adapter assembles the SdkOptions from the config and finalizes
+   * them per turn (resume/abort/spawn) in startTurn.
    */
-  prepareTurn(options: SdkOptions, currentChild: { pid?: number }): void {
-    this.nextOptions = options;
+  prepareTurn(config: ClaudeTurnConfig, currentChild: { pid?: number }): void {
+    // Object reuse: the plan config is reused across both plan turns (first plan +
+    // re-plan), so assemble ONCE per distinct config object and reuse the same
+    // SdkOptions instance — matching today's "baseOptions is the ONE instance".
+    if (config !== this.lastConfig) {
+      this.lastConfig = config;
+      this.lastOptions = buildSdkOptions(config);
+    }
+    this.nextOptions = this.lastOptions;
     this.nextChild = currentChild;
   }
 

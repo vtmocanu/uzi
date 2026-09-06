@@ -76,7 +76,6 @@ import {
   buildSendMessageAliasHook,
   NESTED_AGENT_TOOL,
   SEND_MESSAGE_TOOL,
-  ASYNC_DEFERRAL_TOOLS,
 } from "./guardrails.js";
 import {
   buildSignalMcpServer,
@@ -92,7 +91,7 @@ import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import { defaultQueryFn } from "./sdk-messages.js";
-import { ClaudeHarness } from "./claude-harness.js";
+import { ClaudeHarness, type ClaudeTurnConfig } from "./claude-harness.js";
 import { RunTurnReducerImpl } from "./harness-reducer.js";
 import type {
   HarnessTerminal,
@@ -370,10 +369,11 @@ interface RunDrive {
  *
  * `onSignal` is stored as the SAME function reference the abort listener was
  * registered with, so run()'s finally removes the exact listener rather than
- * leaking a rebuilt closure. `baseOptions` is the ONE SdkOptions instance the
+ * leaking a rebuilt closure. `baseConfig` is the ONE ClaudeTurnConfig instance the
  * plan turn, the revise loop and the implement turn all read — it is never
- * reconstructed, so the guardrail-bearing `settingSources: []` and PreToolUse
- * hooks thread through every phase unchanged.
+ * reconstructed, so the ingredients that feed the guardrail-bearing `settingSources: []`
+ * and PreToolUse hooks (assembled into SdkOptions by the Claude adapter) thread through
+ * every phase unchanged. The implement turn spreads it, overriding the plan-scoped keys.
  */
 interface DriveState {
   oauthToken: string;
@@ -398,7 +398,7 @@ interface DriveState {
     allowedSubagents: string[],
   ) => NonNullable<SdkOptions["hooks"]>["PreToolUse"];
   isIssueRun: boolean;
-  baseOptions: SdkOptions;
+  baseConfig: ClaudeTurnConfig;
   initialWallMs: number;
   wallScaled: boolean;
   state: RunDrive;
@@ -634,7 +634,7 @@ export class SdkExecutor implements Executor {
 
   /**
    * Phases P1-P4 (PRD #949 M3): OAuth/HOME/provisioning + JS-deps kickoff, skills +
-   * agent roster, hooks/MCP/`baseOptions`, and the wall-clock/watchdog/cancel wiring.
+   * agent roster, hooks/MCP/`baseConfig`, and the wall-clock/watchdog/cancel wiring.
    * Runs BEFORE run()'s try (verbatim to its pre-try prologue), so a throw here — a
    * missing token, a provisioning failure — never reaches the finally, exactly as
    * before the split. Returns the populated carrier; the cancel listener it registers
@@ -912,98 +912,74 @@ export class SdkExecutor implements Executor {
       }).server;
     }
 
-    const baseOptions: SdkOptions = {
+    // PRD #1146 M2: the owner computes every INGREDIENT; the Claude adapter
+    // (claude-harness.ts buildSdkOptions) assembles them into the actual SdkOptions,
+    // including the literal `settingSources: []` isolation. The ingredients — and the
+    // reasons each is plan-turn-scoped vs shared — are unchanged from the old literal:
+    //
+    // - env: full replacement — only these keys reach the agent subprocess.
+    // - skillsPluginPath (Skills, PRD #16 M4): a local plugin dir OUTSIDE the clone,
+    //   loaded independently of settingSources so the isolation never loosens;
+    //   skipMcpDiscovery is set by the adapter (this plugin ships ONLY skills).
+    // - skills: ALWAYS an explicit plugin-qualified list — the full run union. Omitting
+    //   it is NOT "skills off" (sdk.d.ts:1872: CLI defaults would apply); `[]` disables
+    //   all. Per-subagent scoping is each AgentDefinition.skills; the lead is the main
+    //   thread, covered by this union.
+    // - agents (PLAN-TURN roster): every subagent minus the file-write tools (#203).
+    //   `baseConfig` drives both planning turns (first plan in Phase 1, re-plan in the
+    //   revise loop) while `implementConfig` spreads `baseConfig` and OVERRIDES this
+    //   from `selectSubagents(...)`, which reads `assembled.subagents` directly and is
+    //   therefore untouched. `agents` is one of THREE keys `implementConfig` overrides,
+    //   all plan-turn-scoped by that same spread mechanism: `agents`, `systemPrompt`
+    //   and `preToolUse`. Worth knowing which, because `preToolUse` is where the
+    //   recorded upgrade path goes — a plan-turn-only `PreToolUse` deny on the
+    //   write-tool family, the one mechanism that would also reach the LEAD's own
+    //   writes. DO NOT move that denial down to the adapter's top-level
+    //   `disallowedTools`: that key is NOT overridden, so the spread would carry it into
+    //   the implement turn and strip write tools for the whole run, breaking `coder`.
+    //   The scoping is the point of doing it via preToolUse here.
+    // - mcpServers: in-process tools the lead calls — the signal server (gate the plan /
+    //   mark done, signals.ts) plus, when a client is threaded, the memory server
+    //   (save_memory, PRD #90). Only the lead (full toolset) reaches the signal + memory
+    //   servers (lead-only by design). The forge and findings servers are ADDITIONALLY
+    //   exposed to allowlisted subagents per-agent via each AgentDefinition.mcpServers
+    //   (agents.ts toDefinition, issue #581). These are LIVE in-process INSTANCES, which
+    //   is why the ingredients ride the private ClaudeTurnConfig, not the neutral request.
+    // - preToolUse (the load-bearing deny layer): a PreToolUse deny blocks a tool even
+    //   under bypassPermissions. Bash screening, the file-tool path jail, AND the M4
+    //   hard-fail-on-unexpected-subagent guard (item 7) all live here. The plan turn
+    //   allows the own subagents THAT SURVIVED the #203 transform — the allowSet is
+    //   frozen at construction, so it must be the same list the `agents` map holds, or
+    //   the guard admits an Agent call the SDK cannot resolve. The implement turns
+    //   rebuild this with the selected roster (PRD #37). The adapter also injects the
+    //   run-wide disallowedTools (ASYNC_DEFERRAL_TOOLS): block the deferral tools so the
+    //   lead can't background work to a future turn the per-turn reap would only wake to
+    //   a killed subagent (#34); delegation is forced synchronous by the Agent guard hook.
+    //
+    // `leadModel` is computed above (before the plan-turn copy) so the PRD #305 own-roster
+    // override can use it; here it only drives the top-level lead model. PRD #617 effort
+    // and issue #916 attribution are set ONLY when present (never an explicit undefined),
+    // so an unset owner is byte-identical to today: the adapter omits the key and the SDK
+    // default applies. Both reach the implement turn too, via the `baseConfig` spread.
+    const effort = ctx.config?.default_effort;
+    const baseConfig: ClaudeTurnConfig = {
       cwd: ctx.worktreePath,
-      // Full replacement — only these keys reach the agent subprocess.
       env: env as unknown as Record<string, string | undefined>,
-      // Repo-borne prompt-injection defense: nothing from the cloned repo's
-      // .claude/{settings.json,agents,hooks} can grant the agent permissions.
-      settingSources: [],
-      // Skills (PRD #16 M4): a local plugin dir OUTSIDE the clone, loaded
-      // independently of settingSources (SdkPluginConfig is a separate option),
-      // so the isolation above never loosens. skipMcpDiscovery: this plugin ships
-      // ONLY skills — the SDK host owns MCP, so never read a manifest/.mcp.json.
-      plugins: [
-        { type: "local", path: skillsPluginPath, skipMcpDiscovery: true },
-      ],
-      // ALWAYS an explicit list — the full plugin-qualified run union. Omitting it
-      // is NOT "skills off" (sdk.d.ts:1872: CLI defaults would apply); `[]` when the
-      // run has no skills disables all. Per-subagent scoping is each
-      // AgentDefinition.skills; the lead is the main thread, covered by this union.
+      skillsPluginPath,
       skills: runSkills.map((s) => qualifiedSkillName(s.name)),
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
         kind: ctx.kind,
         repoInstructions: repoInstructionsBlock,
       }),
-      // PLAN-TURN roster: every subagent minus the file-write tools (#203).
-      // `baseOptions` drives both planning turns (first plan at the
-      // `drivePlanningTurn` call in Phase 1, re-plan in the revise loop) while
-      // `implementOptions` spreads `baseOptions` and OVERRIDES this key from
-      // `selectSubagents(...)`, which reads `assembled.subagents` directly and is
-      // therefore untouched.
-      //
-      // `agents` is one of THREE keys `implementOptions` overrides, and all three
-      // are plan-turn-scoped by that same mechanism: `agents`, `systemPrompt` and
-      // `hooks`. Worth knowing which, because `hooks` is where the recorded
-      // upgrade path goes — a plan-turn-only `PreToolUse` deny on the write-tool
-      // family, the one mechanism that would also reach the LEAD's own writes.
-      //
-      // DO NOT move this denial down to the `disallowedTools` key below. That one
-      // is top-level and is NOT overridden, so the spread carries it into the
-      // implement turn and it would strip write tools for the whole run, breaking
-      // `coder`. The scoping is the point of doing it here.
       agents: planTurn.subagents,
-      // In-process tools the lead calls: the signal server (gate the plan / mark
-      // done, see signals.ts) plus, when a client is threaded, the memory server
-      // (save_memory, PRD #90). Only the lead (full toolset) reaches the signal +
-      // memory servers (lead-only by design). The forge and findings servers are
-      // ADDITIONALLY exposed to allowlisted subagents per-agent via each
-      // AgentDefinition.mcpServers (see agents.ts toDefinition, issue #581).
       mcpServers,
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      // Block the deferral tools so the lead can't background work to a future
-      // turn that the per-turn reap would only wake to a killed subagent (#34).
-      // Delegation is forced synchronous by the Agent guard hook below.
-      disallowedTools: [...ASYNC_DEFERRAL_TOOLS],
-      // The load-bearing deny layer: a PreToolUse deny blocks a tool even under
-      // bypassPermissions. Bash screening, the file-tool path jail, AND the M4
-      // hard-fail-on-unexpected-subagent guard (item 7) all live here. The plan
-      // turn allows the own subagents THAT SURVIVED the #203 transform — the
-      // allowSet is frozen at construction, so it must be the same list the
-      // `agents` map above holds, or the guard admits an Agent call the SDK
-      // cannot resolve. The implement turns rebuild this with the selected
-      // roster (PRD #37).
-      hooks: {
-        PreToolUse: preToolUse(planSubagentNames),
-      },
-      // Persist discrete blocks only; partial token deltas would flood the seq
-      // stream (the live-partial channel is M5, not M3).
-      includePartialMessages: false,
+      preToolUse: preToolUse(planSubagentNames),
+      ...(leadModel ? { model: leadModel } : {}),
+      ...(effort ? { effort } : {}),
+      ...(ctx.config?.attribution_enabled === false
+        ? { attributionSettings: { attribution: { commit: "", pr: "" } } }
+        : {}),
     };
-    // `leadModel` is computed above (before the plan-turn copy) so the PRD #305
-    // own-roster override can use it; here it only drives the top-level lead model.
-    if (leadModel) baseOptions.model = leadModel;
-
-    // PRD #617: the owner's per-user reasoning effort. Set the SDK's top-level
-    // effort ONLY when present (never `effort: undefined`), so an unset owner is
-    // byte-identical to today and the SDK default (`high`) applies. This one
-    // assignment reaches both the plan turn and the implement turn, because the
-    // implement options are built by spreading baseOptions (see implementOptions);
-    // top-level effort cascades to the subagents (Decision 8, test-verified).
-    const effort = ctx.config?.default_effort;
-    if (effort) baseOptions.effort = effort;
-
-    // issue #916: the owner's AI-attribution opt-out, carried on the claim (resolved live
-    // per claim server-side). When explicitly false, suppress the Agent SDK's default
-    // Co-Authored-By: Claude commit trailer via Settings.attribution — empty string hides
-    // attribution (sdk.d.ts). Touch only commit+pr; leave sessionUrl at its default. When
-    // true or absent, set nothing so the SDK default is preserved (Decision 4) and an older
-    // server that omits the field keeps today's behavior. Reaches both the plan turn and the
-    // implement turn via the baseOptions spread (like effort above).
-    if (ctx.config?.attribution_enabled === false) {
-      baseOptions.settings = { attribution: { commit: "", pr: "" } };
-    }
 
     // PRD #122 M2: the wall budget the run STARTED with, kept so the loop can scale the
     // worker's own soft wall reference by the server-served delta exactly once (below).
@@ -1061,7 +1037,7 @@ export class SdkExecutor implements Executor {
       subagentCanWrite,
       preToolUse,
       isIssueRun,
-      baseOptions,
+      baseConfig,
       initialWallMs,
       wallScaled,
       state,
@@ -1085,7 +1061,7 @@ export class SdkExecutor implements Executor {
     drive: DriveState,
   ): Promise<ExecutorResult | undefined> {
     const {
-      baseOptions,
+      baseConfig,
       state,
       idleMs,
       oauthToken,
@@ -1369,7 +1345,7 @@ export class SdkExecutor implements Executor {
 
         const plan = await this.drivePlanningTurn(
           ctx,
-          baseOptions,
+          baseConfig,
           resumeId,
           planPrompt,
           state,
@@ -1440,11 +1416,11 @@ export class SdkExecutor implements Executor {
             payload: { round: revisions },
           });
           // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
-          // subagents (baseOptions), exactly like the first plan turn — the roster
+          // subagents (baseConfig), exactly like the first plan turn — the roster
           // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
           const turn = await this.drivePlanningTurn(
             ctx,
-            baseOptions,
+            baseConfig,
             resumeId,
             buildRevisePlanPrompt(feedback),
             state,
@@ -1520,7 +1496,7 @@ export class SdkExecutor implements Executor {
       assembled,
       survivorNames,
       prepared,
-      baseOptions,
+      baseConfig,
       repoInstructionsBlock,
       preToolUse,
       isIssueRun,
@@ -1615,15 +1591,15 @@ export class SdkExecutor implements Executor {
       // `selectedSubagents` is pre-strip on both sources (own: assembled defs unchanged;
       // repo: freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
       const selectedCanWrite = subagentWriteCapabilities(selectedSubagents);
-      const implementOptions: SdkOptions = {
-        ...baseOptions,
+      const implementConfig: ClaudeTurnConfig = {
+        ...baseConfig,
         agents: selectedSubagents,
         systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
           repoSourced: selection.source === "repo",
           kind: ctx.kind,
           repoInstructions: repoInstructionsBlock,
         }),
-        hooks: { PreToolUse: preToolUse(selectedNames) },
+        preToolUse: preToolUse(selectedNames),
       };
       ctx.emit({
         kind: "status",
@@ -1785,7 +1761,7 @@ export class SdkExecutor implements Executor {
         );
         const turn = await this.driveTurn(
           ctx,
-          implementOptions,
+          implementConfig,
           "implement",
           resumeId,
           buildImplementPrompt({
@@ -2307,7 +2283,7 @@ export class SdkExecutor implements Executor {
    */
   private async drivePlanningTurn(
     ctx: RunContext,
-    options: SdkOptions,
+    config: ClaudeTurnConfig,
     resumeId: string | undefined,
     prompt: string,
     state: RunDrive,
@@ -2324,7 +2300,7 @@ export class SdkExecutor implements Executor {
     for (let round = 0; ; round++) {
       const turn = await this.driveTurn(
         ctx,
-        options,
+        config,
         "plan",
         resumeId,
         turnPrompt,
@@ -2473,7 +2449,7 @@ export class SdkExecutor implements Executor {
 
   private async driveTurn(
     ctx: RunContext,
-    baseOptions: SdkOptions,
+    turnConfig: ClaudeTurnConfig,
     phase: "plan" | "implement",
     resumeId: string | undefined,
     prompt: string,
@@ -2523,17 +2499,18 @@ export class SdkExecutor implements Executor {
     if (state.tripReason) throw new Error(state.tripReason);
     try {
       armIdle();
-      // The owner hands the adapter the fully-assembled per-turn SdkOptions (plan
-      // or implement, built by phaseSetup/phaseRunLoop, agents.ts used as-is) plus
-      // the current-child sink; the adapter finalizes resume/abort/spawn per turn.
-      this.harness.prepareTurn(baseOptions, state.currentChild);
+      // The owner hands the adapter the per-turn ClaudeTurnConfig ingredients (plan
+      // or implement, computed by phaseSetup/phaseRunLoop, agents.ts used as-is) plus
+      // the current-child sink; the adapter assembles the SdkOptions and finalizes
+      // resume/abort/spawn per turn.
+      this.harness.prepareTurn(turnConfig, state.currentChild);
       const request: RunTurnRequest = {
         prompt,
-        // The neutral fields the adapter derives from the pre-built options are
-        // carried as-is; the placeholders below (systemPrompt/agents/leadSkills)
-        // are NOT read by the Claude adapter, which uses baseOptions directly (the
-        // agents.ts AgentDefinitions and live in-process MCP server references
-        // cannot be round-tripped through the neutral HarnessAgent surface in m1).
+        // The neutral fields below are carried as-is; the placeholders
+        // (systemPrompt/agents/leadSkills) are NOT read by the Claude adapter, which
+        // assembles its SdkOptions from turnConfig directly (the agents.ts
+        // AgentDefinitions and live in-process MCP server references cannot be
+        // round-tripped through the neutral HarnessAgent surface in m1).
         systemPrompt: "",
         resumeSessionId: resumeId,
         signal: abortController.signal,
