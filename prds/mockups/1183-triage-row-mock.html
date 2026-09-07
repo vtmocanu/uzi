@@ -848,7 +848,7 @@ The lead's first researcher subagent started with a malformed worktree path
               <ul class="occs">
                 <li class="occ"><div class="line"><span class="faint" style="font-size:.82rem">A run, judged 2h ago</span><span class="badge b-warn">⚖ issues</span><span class="badge b-neutral">To triage</span></div></li>
                 <li class="occ"><div class="line"><span class="faint" style="font-size:.82rem">A run, judged yesterday</span><span class="badge b-warn">⚖ issues</span><span class="badge b-neutral">To triage</span></div></li>
-                <li class="occ"><div class="line"><span class="faint" style="font-size:.82rem">A run, judged 3 days ago</span><span class="badge b-warn">⚖ issues</span><span class="link">Filed #1182 ↗</span></div></li>
+                <li class="occ"><div class="line"><span class="faint" style="font-size:.82rem">A run, judged 3 days ago</span><span class="badge b-warn">⚖ issues</span><span class="badge b-info">Filed</span></div></li>
               </ul>
             </li>
             <li class="row">
@@ -891,7 +891,7 @@ The lead's first researcher subagent started with a malformed worktree path
 
     <ol class="notes">
       <li><span class="mark">10</span><span><b>Mine / All users, admins only, remembered per browser.</b> The switch Notifications already has. Default is Mine; the last choice is saved through the existing per-browser preference wrapper (<code>web/src/lib/prefs.ts</code>, the one theme and board order use), so an admin who switches to All users lands there next time, in that browser only, and a non-admin never sees the switch. Today the backlog is owner-scoped and never consults IsAdmin; the run page is owner-or-admin, so an admin already sees every recommendation, one run at a time, with the owner's name on it. This adds the roll-up and takes the name off.</span></li>
-      <li><span class="mark">11</span><span><b>Attribution hidden, honestly.</b> No owner, no run title, no run link; occurrences are "a run, judged 2h ago"; "6 users" says how widespread it is. Rationale text can still name a repo or a file, so the docs say "aggregated across users", never "anonymous", and users who opt into the judge are told an admin sees the aggregate.</span></li>
+      <li><span class="mark">11</span><span><b>Attribution hidden, honestly.</b> No owner, no run title, no run link, and no filed-issue link either (a forge URL carries the owner's namespace); occurrences are "a run, judged 2h ago" with a bare state chip; "6 users" says how widespread it is. Rationale text can still name a repo or a file, so the docs say "aggregated across users", never "anonymous", and users who opt into the judge are told an admin sees the aggregate.</span></li>
       <li><span class="mark">12</span><span><b>Instance-level categories by default.</b> Improve uzi, Install a worker tool and the three template categories are things only an admin can act on. Enable a tool and Cost efficiency are one user's config and spend: off by default, one click to widen.</span></li>
       <li><span class="mark">13</span><span><b>File and Mark done, no Dismiss.</b> Filing across users already exists (PRD #68). Mark done fans out to every user's open occurrence with a new provenance value <code>admin</code>, so their row reads "Done by an admin via #N" and keeps its Undo, next to the existing "Done via issue close". Dismissing someone else's recommendation is their judgment, so the button is not there.</span></li>
     </ol>
