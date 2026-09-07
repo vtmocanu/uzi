@@ -68,6 +68,15 @@ export type LaunchReservationResult =
   | { kind: "reserved"; reservation: LaunchReservation }
   | { kind: "denied"; reason: "admission_closed" };
 
+/** The result of {@link ExecutionRegistry.registerRoot}. A failed registration
+ *  (unknown/already-settled reservation or a root-kind mismatch) poisons the epoch
+ *  AND returns `{ ok: false, error }`, so a caller can never keep using an
+ *  unadmitted (now-poisoned) root — it must tear the just-spawned root down instead
+ *  of reaping it. */
+export type RegisterRootResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly error: HarnessError };
+
 // --- Callback reservations (idempotency table; effects are m2's job) ----------
 
 /** The full tuple a worker callback is keyed by. Reservation is per (registry
@@ -172,6 +181,11 @@ export class ExecutionRegistry {
   private readonly callbacks = new Map<string, CallbackRecord>();
   private launchSeq = 0;
 
+  // A single in-flight quiesce waiter, installed by `quiesceChildren` while it waits
+  // bounded for accepted work to settle. Overlapping boundaries are serialized by the
+  // safety facade, so at most ONE quiesce is ever in flight, hence a single waiter.
+  private quiesceWaiter?: () => void;
+
   constructor(epoch: LocalExecutionEpoch) {
     this.epochValue = epoch;
   }
@@ -242,6 +256,12 @@ export class ExecutionRegistry {
       this.poisonList.push(e);
     }
     this.poisoned = true; // sticky; never cleared, survives disposal
+    // A mid-wait poison (e.g. a changed-fingerprint reuse) is a real protocol fault:
+    // short-circuit any bounded quiesce wait so it returns incomplete promptly. This
+    // fires BEFORE the state flip below because `maybeSignalQuiesce` only releases the
+    // waiter while the state is still "closing"; once we set "poisoned" the guard
+    // would suppress it.
+    this.maybeSignalQuiesce();
     if (this.currentState !== "disposed") this.currentState = "poisoned";
   }
 
@@ -263,24 +283,40 @@ export class ExecutionRegistry {
   }
 
   /** Settle a launch reservation with the root it produced. The root's declared
-   *  kind must match the reservation's. */
-  registerRoot(reservation: LaunchReservation, root: RegisteredRoot): void {
+   *  kind must match the reservation's. Returns a checked result: on an unknown/
+   *  already-settled reservation or a kind mismatch it poisons AND returns
+   *  `{ ok: false, error }`, so the caller tears the just-spawned root down instead
+   *  of continuing to reap an unadmitted (now-poisoned) root. */
+  registerRoot(reservation: LaunchReservation, root: RegisteredRoot): RegisterRootResult {
     const held = this.launches.get(reservation.id);
     if (!held) {
-      this.poison({ category: "protocol", message: "registerRoot: unknown or already-settled reservation" });
-      return;
+      const error: HarnessError = {
+        category: "protocol",
+        message: "registerRoot: unknown or already-settled reservation",
+      };
+      this.poison(error);
+      return { ok: false, error };
     }
     if (root.kind !== reservation.kind) {
-      this.poison({ category: "protocol", message: "registerRoot: root kind does not match reservation" });
-      return;
+      const error: HarnessError = {
+        category: "protocol",
+        message: "registerRoot: root kind does not match reservation",
+      };
+      this.poison(error);
+      return { ok: false, error };
     }
     this.launches.delete(reservation.id);
     this.roots.push({ root, reaped: false, disposed: false });
+    // A launch reservation just settled; a bounded quiesce wait may now be complete.
+    this.maybeSignalQuiesce();
+    return { ok: true };
   }
 
   /** Settle a launch reservation as aborted (nothing spawned). */
   cancelReservation(reservation: LaunchReservation): void {
     this.launches.delete(reservation.id);
+    // A launch reservation just settled; a bounded quiesce wait may now be complete.
+    this.maybeSignalQuiesce();
   }
 
   // --- callback reservations (idempotency bookkeeping only) -------------------
@@ -338,17 +374,30 @@ export class ExecutionRegistry {
       return;
     }
     rec.marker = { settled: true, outcome };
+    // An admitted callback just settled; a bounded quiesce wait may now be complete.
+    this.maybeSignalQuiesce();
   }
 
   // --- boundary transitions ---------------------------------------------------
 
   /**
-   * `open -> closing -> closed`. Refuses new admissions, then requires every launch
-   * reservation settled and every admitted callback settled. Any unresolved
-   * reservation returns `{ kind: "incomplete", errors }` and POISONS the epoch.
-   * A clean pass returns `{ kind: "quiescent", epoch }` with the frozen epoch.
+   * `open -> closing -> closed`. Refuses new admissions, then BOUNDEDLY WAITS up to
+   * `deadlineMs` for accepted work to settle — every launch reservation settled (via
+   * {@link registerRoot}/{@link cancelReservation}) AND every admitted callback
+   * settled (via {@link settleCallback}). It poisons ONLY at the deadline (work that
+   * genuinely never settled) or on a real protocol fault (the epoch becoming poisoned
+   * during the wait, e.g. a changed-fingerprint reuse). This honours the
+   * settle-before-boundary contract: a cancel racing a normal in-flight callback that
+   * would settle in time now completes quiescent instead of being poisoned on sight.
+   *
+   * Overlapping boundaries are serialized by the safety facade, so only ONE quiesce is
+   * ever in flight at a time and a single {@link quiesceWaiter} suffices.
+   *
+   * Any still-unsettled reservation at the deadline returns `{ kind: "incomplete",
+   * errors }` and POISONS the epoch. A clean pass returns `{ kind: "quiescent", epoch }`
+   * with the frozen epoch.
    */
-  async quiesceChildren(_deadlineMs: number): Promise<ChildQuiescence> {
+  async quiesceChildren(deadlineMs: number): Promise<ChildQuiescence> {
     if (this.currentState === "disposed") {
       return { kind: "incomplete", errors: [{ category: "protocol", message: "quiesceChildren: registry disposed" }] };
     }
@@ -381,7 +430,21 @@ export class ExecutionRegistry {
       }
       return { kind: "quiescent", epoch: this.epochValue };
     }
+    // Close admission, then wait bounded for accepted work to settle.
     this.currentState = "closing";
+    const settled = (): boolean => this.launches.size === 0 && this.inFlightCallbackCount() === 0;
+    if (!settled() && !this.poisoned && deadlineMs > 0) {
+      await this.waitForSettlement(deadlineMs);
+    }
+    // The wait is over (settled, poisoned mid-wait, or the deadline elapsed): drop the
+    // waiter so a late settle/poison signal after this point is a no-op.
+    this.quiesceWaiter = undefined;
+    // A real protocol fault during the wait poisons: report it, do not report clean.
+    if (this.poisoned) {
+      return { kind: "incomplete", errors: this.snapshotPoison() };
+    }
+    // Build errors for anything still unsettled at the deadline, using the SAME message
+    // text as before so callers/tests keying on it are unaffected.
     const errors: HarnessError[] = [];
     if (this.launches.size > 0) {
       errors.push({
@@ -402,6 +465,38 @@ export class ExecutionRegistry {
     }
     this.currentState = "closed";
     return { kind: "quiescent", epoch: this.epochValue };
+  }
+
+  /** Release the in-flight quiesce waiter once settlement (or poison) is reached while
+   *  closing. Called at the end of the settle/cancel/register paths and (before the
+   *  state flip) inside {@link poison}. A no-op unless a quiesce is actively waiting. */
+  private maybeSignalQuiesce(): void {
+    if (this.currentState !== "closing" || this.quiesceWaiter === undefined) return;
+    if (this.poisoned || (this.launches.size === 0 && this.inFlightCallbackCount() === 0)) {
+      const w = this.quiesceWaiter;
+      this.quiesceWaiter = undefined;
+      w();
+    }
+  }
+
+  /** Bounded wait resolved either by {@link maybeSignalQuiesce} (all accepted work
+   *  settled, or the epoch poisoned) or by the `deadlineMs` timer. The timer is
+   *  `unref`'d so a pending quiesce never keeps the process alive. */
+  private waitForSettlement(deadlineMs: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      this.quiesceWaiter = () => {
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
+      if (deadlineMs > 0) {
+        timer = setTimeout(() => {
+          this.quiesceWaiter = undefined;
+          resolve();
+        }, deadlineMs);
+        timer.unref?.();
+      }
+    });
   }
 
   /**

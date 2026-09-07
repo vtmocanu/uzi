@@ -242,6 +242,40 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
     assert.equal(reg.state(), "poisoned"); // ...but the boundary is poisoned, not clean
   });
 
+  it("disposes the spawned root and returns poisoned when registration fails (finding 6)", async () => {
+    // The injected spawn seam returns a root whose kind is NOT "boundary_action", so
+    // the registry's registerRoot rejects it (kind mismatch) and poisons. The facade
+    // must NOT go on to reap an unadmitted root: it must tear the just-spawned root
+    // down and surface the poison.
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(7));
+    let disposeCalls = 0;
+    let reapCalls = 0;
+    const seam: SpawnRootSeam = async () => ({
+      kind: "command", // mismatch: the reservation is boundary_action
+      reap: async () => {
+        reapCalls += 1;
+        return { ok: true };
+      },
+      dispose: async () => {
+        disposeCalls += 1;
+      },
+    });
+    const safety = createCodexExecutionSafety(reg, seam);
+    let outcome: BoundaryActionOutcome | undefined;
+    await assert.rejects(
+      safety.withBoundary(req("finalize"), async (permit) => {
+        outcome = await safety.spawnBoundaryAction(permit, ["x"], "command");
+        return "body";
+      }),
+      (e: unknown) => e instanceof CodexBoundaryError && e.stage === "action",
+    );
+    assert.equal(outcome?.kind, "poisoned");
+    if (outcome?.kind === "poisoned") assert.equal(outcome.error.category, "protocol");
+    assert.equal(disposeCalls, 1); // the unadmitted root was torn down...
+    assert.equal(reapCalls, 0); // ...and never reaped
+    assert.equal(reg.state(), "poisoned");
+  });
+
   it("refuses a stale permit once its boundary has ended", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(9));
     const { state: spawnState, seam } = spawnCounter();

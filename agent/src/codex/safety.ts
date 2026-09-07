@@ -271,7 +271,15 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.poison(error);
       return { kind: "poisoned", error };
     }
-    this.registry.registerRoot(reserved.reservation, root);
+    const registered = this.registry.registerRoot(reserved.reservation, root);
+    if (!registered.ok) {
+      // The reservation was unknown/already-settled or the root's kind did not match:
+      // the registry has poisoned itself and never admitted this root. Do NOT reap an
+      // unadmitted root; best-effort tear the just-spawned process down and surface the
+      // poison so the boundary is never treated as clean.
+      await root.dispose(this.currentDeadlineMs).catch(() => {});
+      return { kind: "poisoned", error: registered.error };
+    }
     // Hold the permit until this root reaps its whole descendant set.
     const reap = await root.reap(this.currentDeadlineMs);
     if (!reap.ok) {

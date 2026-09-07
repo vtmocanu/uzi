@@ -113,6 +113,115 @@ describe("ExecutionRegistry: launch reservations vs close races", () => {
   });
 });
 
+describe("ExecutionRegistry: quiesceChildren bounded settlement (finding 5)", () => {
+  it("waits for an in-flight launch reservation to settle before the deadline and quiesces clean", async () => {
+    // The settle-before-boundary contract: a launch reservation still in flight when
+    // quiesce begins must be given until the deadline to settle, not poisoned on sight.
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const reserved = reg.reserveLaunch("provider");
+    assert.equal(reserved.kind, "reserved");
+    if (reserved.kind !== "reserved") return;
+    // Start quiescing while the reservation is still unsettled; do NOT await yet.
+    const p = reg.quiesceChildren(1000);
+    // Settle it well before the deadline.
+    const registered = reg.registerRoot(reserved.reservation, new FakeRoot("provider"));
+    assert.equal(registered.ok, true);
+    const r = await p;
+    assert.equal(r.kind, "quiescent");
+    if (r.kind === "quiescent") assert.equal(r.epoch, 1);
+    assert.equal(reg.isPoisoned(), false);
+    assert.equal(reg.state(), "closed");
+  });
+
+  it("waits for an in-flight callback to settle before the deadline and quiesces clean", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const res = reg.reserveCallback({ threadId: "t1", turnId: "u1", callId: "c1", fingerprint: "fp" });
+    assert.equal(res.kind, "admitted");
+    if (res.kind !== "admitted") return;
+    const p = reg.quiesceChildren(1000); // start the bounded wait, do NOT await
+    reg.settleCallback(res.token, "ok"); // settle before the deadline
+    const r = await p;
+    assert.equal(r.kind, "quiescent");
+    assert.equal(reg.isPoisoned(), false);
+    assert.equal(reg.state(), "closed");
+  });
+
+  it("quiesces clean when an in-flight reservation is CANCELLED before the deadline", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const reserved = reg.reserveLaunch("command");
+    assert.equal(reserved.kind, "reserved");
+    if (reserved.kind !== "reserved") return;
+    const p = reg.quiesceChildren(1000);
+    reg.cancelReservation(reserved.reservation); // launch aborted before it spawned
+    const r = await p;
+    assert.equal(r.kind, "quiescent");
+    assert.equal(reg.isPoisoned(), false);
+  });
+
+  it("poisons at the deadline when accepted work never settles within the bound", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    reg.reserveLaunch("provider"); // never settled
+    const r = await reg.quiesceChildren(30); // small deadline: let it elapse
+    assert.equal(r.kind, "incomplete");
+    if (r.kind === "incomplete") assert.ok(r.errors.length >= 1);
+    assert.equal(reg.isPoisoned(), true);
+    assert.equal(reg.state(), "poisoned");
+  });
+
+  it("short-circuits to incomplete when the epoch is poisoned mid-wait", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const reserved = reg.reserveLaunch("provider");
+    assert.equal(reserved.kind, "reserved");
+    // Start the bounded wait, then hit a real protocol fault during it.
+    const p = reg.quiesceChildren(1000);
+    reg.poison({ category: "protocol", message: "mid-wait fault" });
+    const r = await p;
+    assert.equal(r.kind, "incomplete");
+    if (r.kind === "incomplete") assert.ok(r.errors.some((e) => e.message === "mid-wait fault"));
+    assert.equal(reg.isPoisoned(), true);
+  });
+});
+
+describe("ExecutionRegistry: registerRoot returns a checked result (finding 6)", () => {
+  it("returns ok:false AND poisons on a root-kind mismatch", () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const reserved = reg.reserveLaunch("provider");
+    assert.equal(reserved.kind, "reserved");
+    if (reserved.kind !== "reserved") return;
+    // The launch reserved a provider, but the root produced is a command: a protocol
+    // fault. The caller must be told (ok:false) so it does not keep using the root.
+    const result = reg.registerRoot(reserved.reservation, new FakeRoot("command"));
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.category, "protocol");
+    assert.equal(reg.isPoisoned(), true);
+    assert.equal(reg.rootCount(), 0); // the mismatched root was never admitted
+  });
+
+  it("returns ok:false AND poisons on an unknown/already-settled reservation", () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const reserved = reg.reserveLaunch("provider");
+    assert.equal(reserved.kind, "reserved");
+    if (reserved.kind !== "reserved") return;
+    assert.equal(reg.registerRoot(reserved.reservation, new FakeRoot("provider")).ok, true);
+    // Re-registering the SAME (now-settled) reservation is a protocol fault.
+    const again = reg.registerRoot(reserved.reservation, new FakeRoot("provider"));
+    assert.equal(again.ok, false);
+    if (!again.ok) assert.equal(again.error.category, "protocol");
+    assert.equal(reg.isPoisoned(), true);
+  });
+
+  it("returns ok:true on a matching-kind registration without poisoning", () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const reserved = reg.reserveLaunch("provider");
+    assert.equal(reserved.kind, "reserved");
+    if (reserved.kind !== "reserved") return;
+    const result = reg.registerRoot(reserved.reservation, new FakeRoot("provider"));
+    assert.equal(result.ok, true);
+    assert.equal(reg.isPoisoned(), false);
+    assert.equal(reg.rootCount(), 1);
+  });
+});
+
 describe("ExecutionRegistry: reapProcesses aggregation", () => {
   it("returns observed_empty only when the epoch matches and EVERY root reaped", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(5));
