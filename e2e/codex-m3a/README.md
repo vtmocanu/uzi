@@ -7,6 +7,17 @@ slimmed stand-in. They exercise the ACTUAL packaged launcher (`launch-cli` /
 `launchCodexRoot`) and the ACTUAL root-owned supervisor binary; they never edit those and
 bake no test-only escape hatch into them.
 
+There are **two suites, run under two different container postures**:
+
+- The **shell profile controls** (`run.sh` -> `controls.sh`, `task test:codex-m3a:profile`)
+  run under the **writable-root immutability posture** and prove channel nondumpability,
+  profile fail-before-fork, ownership immutability, `ECHILD+__WALL` disposal and fresh-tree
+  ownership (the five controls below).
+- The **credential-free lifecycle + isolation suites** (TypeScript;
+  `run-lifecycle.sh`, `task test:codex-m3a:lifecycle`) run under the **PRD confinement
+  posture** and prove the real code-mode-host lifecycle and the m3 isolation controls
+  (controls A/B/C below). This is the milestone-3 deliverable.
+
 ## Supported profile (do not deviate)
 
 The primitive is supported ONLY under the PRD #51 **A1 uid split**: a trusted worker uid
@@ -74,22 +85,94 @@ untrusted uid.
    `NODE_OPTIONS`, and an exported test canary are all absent). This is the regression guard
    for the supervisor's `launchChild` env forwarding.
 
+## The credential-free lifecycle + isolation suites (m3)
+
+These TypeScript suites run **inside the real image** through its root-start entrypoint,
+under the **PRD confinement posture** (distinct from the shell controls' writable-root
+posture): **read-only root filesystem**, read-only mounted fixtures, **only** writable
+tmpfs `/nix`, `/data`, `/tmp` (the entrypoint's root window needs those three writable
+while the image root fs stays `--read-only`), and **`--network none`** (loopback only, for
+the localhost fake provider). They run as the worker uid (10001) and drive the runner uid
+(10002) via the production `setpriv` wrapper. Node's own `--test-timeout` is backed by an
+**outer `timeout --kill-after` watchdog** (a leaked codex / code-mode-host handle can
+outlive Node's timeout; `--rm` tears the container and any leaked descendant down on kill).
+
+**The spike result (the make-or-break, proven empirically in the real image):** the real
+`codex-code-mode-host` launches and runs a code-mode cell **WITHOUT any hook-trust bypass**
+(no `--dangerously-bypass-hook-trust`, no per-thread `config:{bypass_hook_trust:true}`) and
+**WITHOUT live credentials** (a runtime-assembled dummy bearer against a localhost fake
+provider). M0 used `bypass_hook_trust` only to arm its PreToolUse HOOKS; the host launch and
+the item/tool/call dynamic-callback path need none of it. The isolated config it needs:
+`code_mode = code_mode_only = code_mode_host = true`, `unified_exec = false`, `hooks =
+false`, native authority off (`[agents] enabled = false`, `multi_agent(_v2) = false`,
+`environments: []` on thread/start), the canonical project `untrusted` with
+`project_doc_max_bytes = 0`, and the localhost provider block. No `/etc/codex` fixture is
+required for a dynamic-tool-only cell.
+
+- **A. Real code-mode-host lifecycle** (`lifecycle.test.ts`). Both models `gpt-6-astra`
+  and `gpt-5.6-sol`, **active AND yielded** (four launches, two tests each). Drives the
+  PRODUCTION Go supervisor + real Codex DIRECTLY with a TEST-ONLY `code_mode_host=true`
+  config (never `config.ts`), reproducing the frozen `supervisor.test.mjs` `running()`
+  BEHAVIOUR with the production supervisor (it does not import `Probe`/`SupervisorProbe`).
+  It asserts the real host launches below the supervisor in a DIFFERENT process group, the
+  uninterrupted cell writes its delayed marker (positive control), and
+  revoke+settle+interrupt+dispose reaps BOTH the app-server and the differently-grouped
+  host via `ECHILD+__WALL` with the late marker absent. NO hook-trust bypass, NO creds.
+- **B. Production-config app-server lifecycle** (`production-launcher.test.ts`). Launches
+  the real app-server through the ACTUAL `launchCodexRoot` + `config.ts` hardened stock
+  config (host DISABLED), runs a trivial credential-free turn against the fake provider,
+  disposes clean, and asserts via `handle.snapshot()` that NO code-mode host process
+  appears — the shipped stock config correctly does not launch one.
+- **C. Isolation controls** (`isolation.test.ts`). The m3-specific additions on top of the
+  shell controls: C1 reads the REAL Codex child's `/proc/<pid>/environ` and asserts exactly
+  the replacement-env allowlist + credential with no host/worker leak; C2 asserts no
+  auth/session/credential material is baked into the shipped image; C3 is a MUTATION control
+  proving the C1 assertion rejects a leaked/mutated env (non-vacuous, fails after
+  typecheck); C4 proves malicious repo config cannot enter the production launch
+  construction (untrusted project, no folded repo config, injection-shaped identifiers
+  rejected); C5 asserts the fresh HOME/CODEX_HOME/XDG/TMPDIR land on the owned writable
+  `/data` mount, uid 10002, owner-only mode 0700.
+
+## Integration seam (later M3)
+
+M3a ships ONLY the reusable per-root primitive. The launch/control/result contract is:
+`launchCodexRoot(spec)` launches ONE supervisor root and returns a handle whose
+`snapshot()` / `dispose()` speak the fd3 control / fd4 evidence wire protocol
+(`agent/codex/supervisor/doc.go`); the app-server transport is fds 0/1/2. A dispose is
+`clean` ONLY when the supervisor reports `state:"drained"` with authority `ECHILD+__WALL`
+AND exits 0 — never inferred from an app-server exit or a process-group kill.
+
+**The per-root evidence limit is deliberate and load-bearing.** A drained/clean result is a
+fact about EXACTLY ONE owned root, never a run-level `observed_empty` or a minted permit.
+The later worker-adapter integration (M3/M4, NOT this child) still owns: the per-run
+registry of ALL roots, immutable run/epoch launch reservations, callback admission /
+settlement, child-thread quiescence, and the outer `Executor.safety.withBoundary` permit
+that aggregates same-epoch evidence across every root before a run is called safe. A command
+requested through a callback is its OWN root, not an app-server descendant, and must be
+registered before admission. Complete production thread/tool conformance is M4.
+
 ## How to run
 
 Prerequisites: a working docker daemon and, on a cold build, egress for the pinned Codex
 and toolchain artifacts.
 
 ```
-# Build the real image and run all controls (opt-in; NOT part of `task gate`):
+# Build the real image and run the shell profile controls (opt-in; NOT part of `task gate`):
 task test:codex-m3a:profile
 
-# Or drive the orchestrator directly:
-./e2e/codex-m3a/run.sh all          # both containers (main + nnp)
-./e2e/codex-m3a/run.sh main         # controls 1, 2a, 3, 4, 5 (no-new-privileges ON)
-./e2e/codex-m3a/run.sh nnp          # control 2b (no-new-privileges OFF)
+# Build the real image and run the credential-free lifecycle + isolation suites under the
+# confinement posture (opt-in; NOT part of `task gate`):
+task test:codex-m3a:lifecycle
+
+# Or drive the orchestrators directly:
+./e2e/codex-m3a/run.sh all          # profile: both containers (main + nnp)
+./e2e/codex-m3a/run.sh main         # profile controls 1, 2a, 3, 4, 5 (no-new-privileges ON)
+./e2e/codex-m3a/run.sh nnp          # profile control 2b (no-new-privileges OFF)
+./e2e/codex-m3a/run-lifecycle.sh    # lifecycle + isolation suites (confinement posture)
 
 # Reuse an already-built image (skip the docker build):
 UZI_M3A_SKIP_BUILD=1 UZI_M3A_IMAGE=uzi-agent-m3a:base ./e2e/codex-m3a/run.sh all
+UZI_M3A_SKIP_BUILD=1 UZI_M3A_IMAGE=uzi-agent-m3a:base ./e2e/codex-m3a/run-lifecycle.sh
 ```
 
 The supervisor module's own unit tests (gofmt / vet / `go test`) run separately and
@@ -101,10 +184,10 @@ task test:codex-supervisor
 
 ## Files
 
-- `run.sh` — host orchestrator: builds the static stub, builds the image, runs the
-  hardened container(s).
-- `controls.sh` — in-container harness (runs as the worker uid; drops to runner via
-  `setpriv`). `main` runs controls 1/2a/3/4/5; `nnp` runs control 2b.
+- `run.sh` — profile-controls host orchestrator: builds the static stub, builds the image,
+  runs the hardened container(s).
+- `controls.sh` — profile-controls in-container harness (runs as the worker uid; drops to
+  runner via `setpriv`). `main` runs controls 1/2a/3/4/5; `nnp` runs control 2b.
 - `stub/main.go` — the tiny STATIC stub child the supervisor launches in place of the real
   app-server. Compiled at run time by `run.sh` into `.bin/stub-child` (never committed as a
   binary). It is a static Go binary rather than a shell script so it depends on no external
@@ -112,6 +195,21 @@ task test:codex-supervisor
   env-delivery assertion (see note).
 - `evq.mjs` — a tiny NDJSON event-query helper for the launcher's stderr events (avoids
   parsing JSON in shell and avoids running a `/nix` `jq` as the worker uid).
+- `run-lifecycle.sh` — lifecycle + isolation host orchestrator: builds the image and runs
+  the three TypeScript suites inside it under the confinement posture, with the outer
+  watchdog.
+- `lifecycle.test.ts` / `production-launcher.test.ts` / `isolation.test.ts` — controls A /
+  B / C (above).
+- `fake-provider.ts` — the localhost `/v1/responses` SSE fake provider with runtime dummy
+  bearer auth (the m3 analogue of the frozen M0 fixture's server; reuses only the frozen
+  pure protocol helpers).
+- `supervisor-driver.ts` — drives the PRODUCTION Go supervisor + real Codex app-server RPC
+  for control A, plus the TEST-ONLY `code_mode_host=true` config builder (never `config.ts`).
+- `harness-m0.d.ts` — ambient types for the FROZEN `../codex-m0/harness.mjs` pure protocol
+  helpers (the frozen `.mjs` is not edited; the wildcard `declare module` types it for the
+  strict `allowJs:false` tsconfig).
+- `tsconfig.json` — NodeNext/strict typecheck config for the suites (cloned from
+  `e2e/harness-m2/tsconfig.json`).
 
 ## Note: child environment delivery
 

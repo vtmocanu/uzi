@@ -2083,6 +2083,29 @@ tasks:
     cmds:
       - ./e2e/codex-m3a/run.sh all
 
+  test:codex-m3a:lifecycle:
+    desc: Opt-in real code-mode-host lifecycle plus isolation suites under the confinement posture
+    # Builds the real worker image, then runs the three credential-free TypeScript suites
+    # (lifecycle.test.ts / production-launcher.test.ts / isolation.test.ts) INSIDE that image
+    # through the REAL root-start entrypoint under the PRD confinement posture -- read-only
+    # root filesystem, read-only fixtures, only writable tmpfs /nix /data /tmp, network none
+    # (loopback only for the localhost fake provider). Control A drives the PRODUCTION Go
+    # supervisor plus real Codex to launch the real code-mode host on both model fixtures,
+    # active and yielded, with NO hook-trust bypass and NO live credentials; control B drives
+    # the actual launcher plus config builder with the host disabled; control C proves the
+    # replacement-env, no-baked-auth, mutation and no-repo-config isolation controls. Requires
+    # a working docker daemon, plus egress for the pinned Codex and toolchain artifacts on a
+    # cold build. NOT wired into gate. Set UZI_M3A_SKIP_BUILD=1 to reuse an already-built image.
+    dir: agent
+    cmds:
+      # Typecheck the suites explicitly against their own NodeNext tsconfig on the host, so a
+      # drift in the launcher/config shapes or the M0 protocol helpers fails here, not only at
+      # container runtime. The suites themselves run inside the image via run-lifecycle.sh,
+      # which wraps the container node --test in an OUTER timeout watchdog (a leaked codex or
+      # code-mode-host handle can outlive Node's own --test-timeout).
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m3a/tsconfig.json
+      - ../e2e/codex-m3a/run-lifecycle.sh
+
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)
     # Runs from the agent module so tsx + tsc + the SDK/zod deps resolve out of
