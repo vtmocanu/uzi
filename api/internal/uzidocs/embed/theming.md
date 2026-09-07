@@ -92,7 +92,7 @@ sign the underlying feature belongs in tokens, not in the theme.
 
 ## Adding a theme
 
-Adding a theme that stays within the existing token slots is exactly **four**
+Adding a theme that stays within the existing token slots is exactly **five**
 edits, no handler/component/migration changes:
 
 1. **Go registry** — add the id to `registry` in `api/internal/theme/theme.go`.
@@ -109,6 +109,10 @@ edits, no handler/component/migration changes:
    the web registry and hardcodes the same list instead; a theme added
    without this edit still renders correctly once `me()` resolves, it just
    flashes `ember` for one frame on a cold load.
+5. **Registry test** — add the id to the literal list `TestValid` iterates in
+   `api/internal/theme/theme_test.go` (it does not read `registry`, so a new id
+   is otherwise untested there). Verified 2026-09-07: the previous "four" omitted
+   this site.
 
 **A theme that needs a slot that doesn't exist yet is a different, two-step
 change**: add the slot theme-agnostically first (every existing theme gets a
