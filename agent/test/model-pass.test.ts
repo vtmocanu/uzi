@@ -90,6 +90,16 @@ describe("runReadOnlyModelPass — isolation-shape characterization pin", () => 
     await runReadOnlyModelPass(baseOpts({ queryFn: noModel.queryFn, model: "" }));
     assert.ok(!("model" in noModel.seen.options!), "an empty model is not set on the options");
   });
+
+  it("sets options.effort only when an effort is passed", async () => {
+    const withEffort = capturingQueryFn([successResult()]);
+    await runReadOnlyModelPass(baseOpts({ queryFn: withEffort.queryFn, effort: "xhigh" }));
+    assert.equal(withEffort.seen.options!.effort, "xhigh");
+
+    const noEffort = capturingQueryFn([successResult()]);
+    await runReadOnlyModelPass(baseOpts({ queryFn: noEffort.queryFn }));
+    assert.ok(!("effort" in noEffort.seen.options!), "no effort is set on the options when none is passed");
+  });
 });
 
 describe("runReadOnlyModelPass — onResult contract (differential pin)", () => {
