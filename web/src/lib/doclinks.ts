@@ -8,6 +8,7 @@
 
 export const DOC_WORKER_SETUP = "worker-setup";
 export const DOC_ANTHROPIC_TOKEN = "anthropic-token";
+export const DOC_CODEX_CREDENTIALS = "codex-credentials";
 export const DOC_SLACK = "slack";
 export const DOC_REPO_AGENTS = "repo-agents";
 export const DOC_AGENT_TEMPLATES = "agent-templates";
@@ -24,6 +25,7 @@ export const DOC_GITHUB_PROJECT_SYNC = "github-project-sync";
 export const ALL_DOC_SLUGS = [
   DOC_WORKER_SETUP,
   DOC_ANTHROPIC_TOKEN,
+  DOC_CODEX_CREDENTIALS,
   DOC_SLACK,
   DOC_REPO_AGENTS,
   DOC_AGENT_TEMPLATES,

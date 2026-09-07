@@ -63,4 +63,51 @@ export const mockSecrets: SecretMeta[] = [
     created_at: daysAgo(6),
     updated_at: minsAgo(14),
   },
+  // Codex credentials (PRD #1147 / issue #1174 item 10). Seeded so ALL FOUR status
+  // badges — and the legend that explains them — are browsable in the mock: the
+  // create path only ever births `staging`/`static`, so `linked` and `failed` are
+  // unreachable without fixture rows. This set is independent of the anthropic
+  // rows above: it carries its OWN single default (the linked login), no codex row
+  // is `auto_eligible` (there is no Codex auto-selection pool), and none of these
+  // touch the anthropic-only data.test.ts invariants.
+  {
+    id: "sec-codex-linked",
+    kind: "codex_auth",
+    label: "chatgpt-plus",
+    is_default: true,
+    auto_eligible: false,
+    codex_status: "linked",
+    created_at: daysAgo(20),
+    updated_at: daysAgo(2),
+  },
+  {
+    id: "sec-codex-staging",
+    kind: "codex_auth",
+    label: "pending-login",
+    is_default: false,
+    auto_eligible: false,
+    codex_status: "staging",
+    created_at: daysAgo(1),
+    updated_at: minsAgo(35),
+  },
+  {
+    id: "sec-codex-failed",
+    kind: "codex_auth",
+    label: "revoked-login",
+    is_default: false,
+    auto_eligible: false,
+    codex_status: "failed",
+    created_at: daysAgo(11),
+    updated_at: daysAgo(1),
+  },
+  {
+    id: "sec-openai-static",
+    kind: "openai_api_key",
+    label: "openai-key",
+    is_default: false,
+    auto_eligible: false,
+    codex_status: "static",
+    created_at: daysAgo(15),
+    updated_at: daysAgo(15),
+  },
 ];
