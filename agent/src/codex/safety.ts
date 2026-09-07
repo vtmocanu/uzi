@@ -63,20 +63,36 @@ export type BoundaryActionOutcome =
  *  never run, or ran but its cleanup was incomplete; either way the caller must
  *  NOT treat the boundary as clean. */
 export class CodexBoundaryError extends Error {
+  /** The action body's OWN thrown error, preserved when the action threw AND the
+   *  epoch was also left poisoned. Primary-failure evidence must not be discarded
+   *  behind the cleanup/poison evidence in {@link errors} (harness-contract.md:632
+   *  "preserve primary failure and cleanup evidence separately"). It is also set as
+   *  the standard `cause`. Undefined when the action itself did not throw. */
+  readonly actionError?: unknown;
   constructor(
     readonly stage: "quiesce" | "reap" | "action",
     readonly errors: readonly HarnessError[],
+    actionError?: unknown,
   ) {
-    super(`codex boundary failed at ${stage}`);
+    super(
+      `codex boundary failed at ${stage}`,
+      actionError !== undefined ? { cause: actionError } : undefined,
+    );
     this.name = "CodexBoundaryError";
+    this.actionError = actionError;
   }
 }
 
-// The permit is minted ONLY here, via a cast, because its brand
-// (`boundaryPermitBrand`) is a module-private unique symbol in harness.ts that no
-// other module can reference. That is the point: a sink action that merely receives
-// a permit cannot manufacture a fresh one from observations to reach a sink out of
-// band. This trusted minter is the sole authority.
+// The permit is minted ONLY here, via a cast. Its brand (`boundaryPermitBrand`, a
+// module-private `unique symbol` in harness.ts) is COMPILE-TIME discipline only: it
+// stops honest code from shaping a permit-typed literal, but it enforces nothing at
+// runtime and is defeatable by `as unknown as BoundaryPermit`. The RUNTIME authority
+// is the safety owner's HELD state: `spawnBoundaryAction` admits an action only while
+// `heldEpoch` is set AND `permit.epoch === heldEpoch` (see runBoundaryAction's
+// stale_permit guard), so a forged or stale permit cannot reach a sink out of band.
+// This matches harness-contract.md:637 ("the epoch number is descriptive; the
+// module-private brand and safety owner's held state enforce authority"). This
+// trusted minter is the sole legitimate construction point.
 function mintPermit(epoch: number, boundary: BoundaryRequest["boundary"]): BoundaryPermit {
   return { epoch, boundary } as unknown as BoundaryPermit;
 }
@@ -174,7 +190,16 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     this.pendingActions = [];
 
     if (this.registry.state() === "poisoned") {
-      throw new CodexBoundaryError("action", this.registry.poisonErrors());
+      // Preserve BOTH the cleanup/poison evidence AND the action's own thrown error
+      // (when it threw). The poison evidence explains why the boundary is not clean;
+      // the action error is the primary failure and must not be swallowed
+      // (harness-contract.md:632 "preserve primary failure and cleanup evidence
+      // separately").
+      throw new CodexBoundaryError(
+        "action",
+        this.registry.poisonErrors(),
+        outcome.ok ? undefined : outcome.error,
+      );
     }
     if (!outcome.ok) throw outcome.error;
     return outcome.value;

@@ -105,7 +105,7 @@ export type CallbackReservationResult =
   | { kind: "replay"; marker: CallbackTerminalMarker }
   | {
       kind: "denied";
-      reason: "admission_closed" | "in_flight_duplicate" | "changed_reuse";
+      reason: "admission_closed" | "in_flight_duplicate" | "changed_reuse" | "reservation_ceiling";
     };
 
 interface CallbackRecord {
@@ -125,6 +125,17 @@ function keyOf(k: CallbackKey): string {
   return JSON.stringify([k.threadId, k.turnId, k.callId]);
 }
 
+/** Per-run ceiling on DISTINCT callback reservations retained until disposal.
+ *  Call-ids are model/worker-influenced, so the idempotency table is an untrusted-
+ *  input-sized structure; without a bound a run could be steered into unbounded
+ *  memory growth. A single Codex run legitimately reserves far fewer than this, so
+ *  10000 is generous headroom while still finite. Crossing it is treated as an
+ *  attack/protocol fault: we FAIL CLOSED (poison + deny) rather than grow. Only
+ *  distinct NEW keys count toward the ceiling; replays/duplicates of an already-
+ *  tracked key are idempotent reads and never enlarge the table. Exported so the
+ *  test asserts the exact ceiling rather than hard-coding a copy of it. */
+export const MAX_CALLBACK_RESERVATIONS = 10000;
+
 /**
  * The per-run immutable local-execution-epoch registry.
  *
@@ -136,6 +147,11 @@ export class ExecutionRegistry {
   private readonly epochValue: LocalExecutionEpoch;
   private currentState: RegistryState = "open";
   private readonly poisonList: HarnessError[] = [];
+  // STICKY poison witness. `state()` reports "poisoned" only until disposal masks
+  // it as "disposed" (poison then survives ONLY in poisonList); this flag is set on
+  // ANY poison and NEVER cleared, so callers can ask "was this epoch ever poisoned?"
+  // independent of the disposal-masked state enum.
+  private poisoned = false;
 
   private readonly launches = new Map<string, LaunchReservation>();
   private readonly roots: RootRecord[] = [];
@@ -160,6 +176,13 @@ export class ExecutionRegistry {
 
   poisonErrors(): readonly HarnessError[] {
     return this.poisonList;
+  }
+
+  /** STICKY: true if this epoch was EVER poisoned, even after disposal has moved
+   *  `state()` to "disposed" and masked the "poisoned" enum. Fail-closed callers
+   *  consult this so a poisoned-then-disposed epoch can never read as clean. */
+  isPoisoned(): boolean {
+    return this.poisoned;
   }
 
   pendingLaunchCount(): number {
@@ -195,6 +218,7 @@ export class ExecutionRegistry {
   poison(errors: HarnessError | readonly HarnessError[]): void {
     const list = Array.isArray(errors) ? errors : [errors];
     for (const e of list) this.poisonList.push(e);
+    this.poisoned = true; // sticky; never cleared, survives disposal
     if (this.currentState !== "disposed") this.currentState = "poisoned";
   }
 
@@ -239,9 +263,12 @@ export class ExecutionRegistry {
   // --- callback reservations (idempotency bookkeeping only) -------------------
 
   reserveCallback(request: CallbackReservationRequest): CallbackReservationResult {
-    if (!this.admissionOpen()) return { kind: "denied", reason: "admission_closed" };
     const key = keyOf(request);
     const existing = this.callbacks.get(key);
+    // An already-tracked key is handled BEFORE the admission/ceiling gates: it
+    // enlarges nothing (so it cannot breach the ceiling) and a cached terminal
+    // marker is an idempotent read that stays safe to return even once admission
+    // has closed or the epoch was poisoned.
     if (existing) {
       if (existing.fingerprint !== request.fingerprint) {
         // Same tuple, changed payload/origin: replay/forgery. Deny AND poison.
@@ -255,6 +282,17 @@ export class ExecutionRegistry {
       // Same tuple, same fingerprint, still in flight: a concurrent duplicate. We
       // cannot hand back a terminal yet and MUST NOT run a second effect, so deny.
       return { kind: "denied", reason: "in_flight_duplicate" };
+    }
+    // A NEW distinct key: gated by admission, then by the per-run reservation
+    // ceiling. Crossing the ceiling is a fail-closed fault — poison + deny — since
+    // call-ids are model/worker-influenced and must not drive unbounded growth.
+    if (!this.admissionOpen()) return { kind: "denied", reason: "admission_closed" };
+    if (this.callbacks.size >= MAX_CALLBACK_RESERVATIONS) {
+      this.poison({
+        category: "protocol",
+        message: `reserveCallback: reservation ceiling (${MAX_CALLBACK_RESERVATIONS}) exceeded`,
+      });
+      return { kind: "denied", reason: "reservation_ceiling" };
     }
     this.callbacks.set(key, { fingerprint: request.fingerprint });
     return { kind: "admitted", token: { key } };
@@ -286,8 +324,30 @@ export class ExecutionRegistry {
     if (this.currentState === "poisoned") {
       return { kind: "incomplete", errors: this.snapshotPoison() };
     }
-    // Already quiesced: idempotently report the frozen epoch.
+    // Already quiesced: idempotently report the frozen epoch, but DEFENSE-IN-DEPTH
+    // re-assert emptiness first. A boundary_action root reserved through the trusted
+    // post-close lane (or any callback still in flight) that never settled means we
+    // are no longer quiescent; report incomplete + poison rather than blindly
+    // reporting quiescent on a re-quiesce.
     if (this.currentState === "closed") {
+      const reErrors: HarnessError[] = [];
+      if (this.launches.size > 0) {
+        reErrors.push({
+          category: "protocol",
+          message: `quiesceChildren: ${this.launches.size} launch reservation(s) unsettled at re-quiesce`,
+        });
+      }
+      const reUnsettled = this.inFlightCallbackCount();
+      if (reUnsettled > 0) {
+        reErrors.push({
+          category: "protocol",
+          message: `quiesceChildren: ${reUnsettled} callback/child-turn reservation(s) unsettled at re-quiesce`,
+        });
+      }
+      if (reErrors.length > 0) {
+        this.poison(reErrors);
+        return { kind: "incomplete", errors: reErrors };
+      }
       return { kind: "quiescent", epoch: this.epochValue };
     }
     this.currentState = "closing";

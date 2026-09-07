@@ -300,3 +300,49 @@ describe("CodexExecutionSafety [R3-2]: PAT-bearing ordering guard", () => {
     assert.equal(reg.hasLiveCommandRoot(), false);
   });
 });
+
+describe("CodexExecutionSafety.withBoundary: primary-failure evidence preservation", () => {
+  it("preserves the action's OWN thrown error alongside the poison evidence", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
+    const actionError = new Error("action body blew up");
+    await assert.rejects(
+      // The action poisons the epoch (a cleanup fault) AND then throws its own error;
+      // both the primary failure and the cleanup evidence must survive, not just poison.
+      safety.withBoundary(req("checkpoint"), async () => {
+        reg.poison({ category: "unknown", message: "cleanup evidence" });
+        throw actionError;
+      }),
+      (e: unknown) => {
+        assert.ok(e instanceof CodexBoundaryError);
+        assert.equal(e.stage, "action");
+        // The action's own error is retrievable, not swallowed by the poison evidence.
+        assert.equal(e.actionError, actionError);
+        assert.equal(e.cause, actionError);
+        // ...and the cleanup/poison evidence is still carried alongside it.
+        assert.ok(e.errors.some((x) => x.message === "cleanup evidence"));
+        return true;
+      },
+    );
+    assert.equal(reg.state(), "poisoned");
+  });
+
+  it("carries no actionError when the action did not itself throw (poison-only)", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const { seam } = spawnCounter(failReap); // the boundary child reap times out -> poison
+    const safety = createCodexExecutionSafety(reg, seam);
+    await assert.rejects(
+      safety.withBoundary(req("credentialed_git"), async (permit) => {
+        await safety.spawnBoundaryAction(permit, ["git", "push"], "command");
+        return "body-ok"; // the body returns normally; only cleanup failed
+      }),
+      (e: unknown) => {
+        assert.ok(e instanceof CodexBoundaryError);
+        assert.equal(e.stage, "action");
+        assert.equal(e.actionError, undefined);
+        assert.equal(e.cause, undefined);
+        return true;
+      },
+    );
+  });
+});

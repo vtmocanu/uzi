@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   ExecutionRegistry,
+  MAX_CALLBACK_RESERVATIONS,
   newLocalExecutionEpoch,
   type ReapOutcome,
   type RegisteredRoot,
@@ -221,6 +222,66 @@ describe("ExecutionRegistry: callback reservation idempotency", () => {
   });
 });
 
+describe("ExecutionRegistry: callback reservation ceiling (fail-closed bound)", () => {
+  it("poisons+denies a NEW distinct key at the ceiling, yet a replay of an existing key past the ceiling still returns its cached marker without poisoning again", () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    // Fill the table to EXACTLY the ceiling with distinct keys, settling the first so
+    // a replay of it can be exercised past the ceiling.
+    for (let i = 0; i < MAX_CALLBACK_RESERVATIONS; i++) {
+      const res = reg.reserveCallback({ threadId: "t", turnId: "u", callId: `c${i}`, fingerprint: "fp" });
+      assert.equal(res.kind, "admitted");
+      if (i === 0 && res.kind === "admitted") reg.settleCallback(res.token, "ok");
+    }
+    assert.equal(reg.inFlightCallbackCount(), MAX_CALLBACK_RESERVATIONS - 1); // one settled
+    assert.equal(reg.state(), "open");
+
+    // A NEW distinct key beyond the ceiling fails closed: poison + deny.
+    const overflow = reg.reserveCallback({ threadId: "t", turnId: "u", callId: "overflow", fingerprint: "fp" });
+    assert.equal(overflow.kind, "denied");
+    if (overflow.kind === "denied") assert.equal(overflow.reason, "reservation_ceiling");
+    assert.equal(reg.state(), "poisoned");
+    const poisonCountAfterOverflow = reg.poisonErrors().length;
+    assert.ok(poisonCountAfterOverflow >= 1);
+
+    // A replay of the already-settled key #0 — now past the ceiling AND with the
+    // epoch already poisoned — still returns its cached terminal marker (replays are
+    // idempotent reads that never count against the ceiling) and does NOT poison a
+    // second time.
+    const replay = reg.reserveCallback({ threadId: "t", turnId: "u", callId: "c0", fingerprint: "fp" });
+    assert.equal(replay.kind, "replay");
+    if (replay.kind === "replay") assert.equal(replay.marker.outcome, "ok");
+    assert.equal(reg.poisonErrors().length, poisonCountAfterOverflow); // no second poison
+  });
+});
+
+describe("ExecutionRegistry: idempotent re-quiesce re-asserts emptiness", () => {
+  it("a re-quiesce on a still-clean closed registry stays quiescent", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(2));
+    registerRoot(reg, new FakeRoot("provider"));
+    assert.equal((await reg.quiesceChildren(DEADLINE)).kind, "quiescent");
+    const again = await reg.quiesceChildren(DEADLINE);
+    assert.equal(again.kind, "quiescent");
+    if (again.kind === "quiescent") assert.equal(again.epoch, 2);
+  });
+
+  it("re-quiesce reports incomplete+poison when a post-close boundary_action reservation is left unsettled", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(2));
+    assert.equal((await reg.quiesceChildren(DEADLINE)).kind, "quiescent");
+    assert.equal(reg.state(), "closed");
+    // The trusted post-close lane admits a boundary_action reservation; leave it
+    // unsettled (a checkpoint/git action that reserved but never registered/cancelled).
+    const lane = reg.reserveLaunch("boundary_action");
+    assert.equal(lane.kind, "reserved");
+    assert.equal(reg.pendingLaunchCount(), 1);
+    // The second quiesce MUST re-assert emptiness, not blindly report quiescent.
+    const again = await reg.quiesceChildren(DEADLINE);
+    assert.equal(again.kind, "incomplete");
+    if (again.kind === "incomplete") assert.ok(again.errors.length >= 1);
+    assert.equal(reg.state(), "poisoned");
+    assert.equal(reg.isPoisoned(), true);
+  });
+});
+
 describe("ExecutionRegistry: disposal and poison stickiness", () => {
   it("disposes every root once and is idempotent on a second call", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
@@ -248,6 +309,21 @@ describe("ExecutionRegistry: disposal and poison stickiness", () => {
     const res = await reg.disposeTools(DEADLINE);
     assert.equal(res.kind, "incomplete");
     assert.equal(reg.state(), "poisoned");
+  });
+
+  it("isPoisoned() is sticky and survives disposal masking state() as 'disposed'", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    assert.equal(reg.isPoisoned(), false);
+    reg.poison({ category: "unknown", message: "poison before disposal" });
+    assert.equal(reg.isPoisoned(), true);
+    assert.equal(reg.state(), "poisoned");
+    const res = await reg.disposeTools(DEADLINE);
+    assert.equal(res.kind, "disposed");
+    // Disposal masks the enum: state() no longer reports "poisoned"...
+    assert.equal(reg.state(), "disposed");
+    // ...but the sticky witness stays true so a poisoned-then-disposed epoch can
+    // never be mistaken for clean.
+    assert.equal(reg.isPoisoned(), true);
   });
 
   it("poison is sticky and forces incomplete from quiesce and reap", async () => {
