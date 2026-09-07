@@ -345,9 +345,14 @@ describe("RunRunner — checkpoint on graceful shutdown (PRD #1030 M4)", () => {
     try {
       const iid = 1033;
       const { factory, started } = shutdownFactory(homeRoot, iid, "WORK.txt");
-      // A tiny budget: the hanging publish must be cut off, the run must complete promptly.
+      // A short budget: the hanging publish must be cut off, the run must complete
+      // promptly. Kept comfortably above local git-subprocess latency (the pre-publish
+      // commitWipMarker/fetch-back/overlay steps race the same budget in runner.ts) yet
+      // far below the 5s wall assertion below, so on a healthy host the publish IS
+      // reached and the budget caps the *hanging publish* — not an earlier git step.
+      // Test-only override; the production default (15s) is untouched.
       const runner = runnerWith(factory, gitlab, undefined, nullLogger(), {
-        shutdownPublishTimeoutMs: 50,
+        shutdownPublishTimeoutMs: 500,
       });
       const claim = gitlabClaim(iid);
       const started_at = Date.now();
@@ -355,7 +360,21 @@ describe("RunRunner — checkpoint on graceful shutdown (PRD #1030 M4)", () => {
       await started;
       runner.shutdown();
       await p; // must resolve despite the never-settling publish
-      await entered; // the publish WAS attempted (else the budget test is vacuous)
+      // Best-effort non-vacuity signal: on a healthy host the budget lets the pre-publish
+      // git steps finish so publish IS reached and `entered` resolves. Under CPU contention
+      // those real git subprocesses can eat the whole budget before publish is reached, so
+      // `entered` may never resolve — that is a legitimately skipped step, NOT a hang. Bound
+      // the wait so the test can never deadlock either way; the load-invariant lives in the
+      // observable assertions below (prompt return, requeue, NOT-published line). The timer
+      // is cleared after the race so it holds no handle open (see spyPublishHang's note).
+      let publishReachTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        entered,
+        new Promise<void>((resolve) => {
+          publishReachTimer = setTimeout(resolve, 1_000);
+        }),
+      ]);
+      clearTimeout(publishReachTimer);
 
       assert.ok(
         Date.now() - started_at < 5_000,

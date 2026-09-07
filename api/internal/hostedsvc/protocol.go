@@ -77,6 +77,22 @@ type DesiredWorker struct {
 	// draining (M5) — and to avoid re-cordoning one already draining (M4). It replaces
 	// M3's `draining` bool, which could say only y/n and not for-how-long.
 	DrainingSince *time.Time `json:"draining_since"`
+	// DiskPressure is true when the worker has self-reported a volume at/above the
+	// disk-pressure threshold on at least the last two consecutive fresh heartbeats
+	// (PRD #837 M4): the api derives it from a debounced streak counter
+	// (stats_disk_pressure_streak >= 2) gated on a fresh last_heartbeat_at, so a
+	// single spike or a stale gauge never fires it. It is a DISPLAY/LIFECYCLE-only
+	// signal — the controller reads it to decide whether to roll a worker whose /nix
+	// PVC is filling, and it NEVER feeds claim or scheduling. Always present on the
+	// wire (no omitempty) so a drop is a visible contract change, not a silent false,
+	// exactly like Busy. Purely "under pressure": it does NOT bake in Ephemeral.
+	DiskPressure bool `json:"disk_pressure"`
+	// Ephemeral is true for a run-bound throwaway worker (PRD #529): the controller
+	// reads it alongside DiskPressure to choose teardown-vs-reprovision for a
+	// disk-pressured worker (an ephemeral one is torn down, a persistent one rolled).
+	// Always present on the wire (no omitempty) so a drop is a visible contract change,
+	// not a silent false.
+	Ephemeral bool `json:"ephemeral"`
 	// Generation is bumped whenever the desired spec changes; the controller
 	// compares it against what it observes to decide whether to roll (Decision 9).
 	Generation int64 `json:"generation"`

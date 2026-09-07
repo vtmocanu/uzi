@@ -47,8 +47,9 @@ func selfImproveClaimFixture(t *testing.T, selfRunID uuid.UUID, repoID uuid.UUID
 			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
-		anthropic:   sealedDefault,
-		judgeSecret: pgtype.UUID{Bytes: judgeID, Valid: true},
+		anthropic:     sealedDefault,
+		judgeSecret:   pgtype.UUID{Bytes: judgeID, Valid: true},
+		judgeBindMode: BindModePinned,
 		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
 			judgeID:  {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedJudge, SealedWith: store.SealedWithMaster},
 			workerID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedDefault, SealedWith: store.SealedWithMaster},

@@ -131,6 +131,7 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 		MaxIssues:             cur.MaxIssues,
 		Guidance:              guidance,
 		Model:                 cur.Model,
+		OutputMode:            cur.OutputMode,
 		OverrideSubagentModel: cur.OverrideSubagentModel,
 	})
 	if err != nil {
@@ -250,6 +251,7 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 		MaxIssues:             cur.MaxIssues,
 		Guidance:              cur.Guidance,
 		Model:                 cur.Model,
+		OutputMode:            cur.OutputMode,
 		OverrideSubagentModel: cur.OverrideSubagentModel,
 		SiblingGroupID:        group,
 	})

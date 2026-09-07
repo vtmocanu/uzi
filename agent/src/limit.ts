@@ -32,6 +32,8 @@
 // TERMINATED. A run whose limit cleared inside the SDK's own retry budget simply
 // completes, exactly as today.
 
+import type { HarnessLimitEvidence, HarnessLimitFailure } from "./harness.js";
+
 /** How the SDK reported the limit window, verbatim. */
 export interface RateLimitObservation {
   /** 'allowed' | 'allowed_warning' | 'rejected' in the typings; kept as a string
@@ -139,6 +141,18 @@ export class RateLimitObserver {
 const LIMIT_TERMINAL_REASONS = new Set(["blocking_limit", "rapid_refill_breaker"]);
 
 /**
+ * Whether a result frame's `terminal_reason` names a usage-limit death outright
+ * (blocking_limit / rapid_refill_breaker). Exported so the Claude adapter builds
+ * `HarnessLimitEvidence.explicitExhaustion` without duplicating the canonical set
+ * here — same knowledge, one owner.
+ */
+export function isExplicitLimitReason(terminalReason: unknown): boolean {
+  return (
+    typeof terminalReason === "string" && LIMIT_TERMINAL_REASONS.has(terminalReason)
+  );
+}
+
+/**
  * Classify a TERMINATED turn's result frame as a usage-limit death, or not.
  *
  * Returns the normalized limit facts when it is one, and undefined otherwise.
@@ -181,44 +195,77 @@ export function classifyLimitFailure(
   // A clean success is not a failure, whatever terminal_reason it carries.
   if (frame["subtype"] === "success" && frame["is_error"] !== true) return undefined;
 
-  const futureReset = latest?.resetsAtMs !== undefined && latest.resetsAtMs > nowMs ? latest.resetsAtMs : undefined;
+  // PRD #1146 M2: the raw-frame parse (success guard, terminal_reason extraction,
+  // observation → neutral evidence) stays HERE, on the SDK-shaped side; the
+  // classification decision moves to the neutral `classifyLimitEvidence` so the run
+  // adapter and this compatibility entry share one policy. This is a pure rename of
+  // `rateLimitType` to the neutral `window`, mapped back on the way out, so this
+  // function's signature AND output are byte-identical (limit.test.ts pins both).
+  const evidence: HarnessLimitEvidence = {
+    explicitExhaustion: isExplicitLimitReason(frame["terminal_reason"]),
+    latest:
+      latest !== undefined
+        ? {
+            status: latest.status,
+            resetsAtMs: latest.resetsAtMs,
+            window: latest.rateLimitType,
+          }
+        : undefined,
+  };
+  const failure = classifyLimitEvidence(evidence, nowMs);
+  return failure
+    ? { resetsAtMs: failure.resetsAtMs, rateLimitType: failure.window }
+    : undefined;
+}
 
-  const terminalReason = frame["terminal_reason"];
-  if (typeof terminalReason === "string" && LIMIT_TERMINAL_REASONS.has(terminalReason)) {
-    // Take the reset only when it is still ahead of us. A past reset is worse than
-    // no reset: the server would compute a retry_not_before already in the past and
-    // promote the run straight back into the same exhausted window.
-    return { resetsAtMs: futureReset, rateLimitType: latest?.rateLimitType };
+/**
+ * Neutral limit classification (PRD #1146 M2). Given the already-parsed evidence
+ * — did the terminal name a usage-limit death outright (`explicitExhaustion`), and
+ * the latest rate-limit observation — decide whether this is a limit failure and
+ * with what future reset. This is the exact policy `classifyLimitFailure` used,
+ * lifted off the SDK-shaped frame so the run adapter classifies at the caller's
+ * completion point with `Date.now()`, not earlier in the stream. The caller owns
+ * the "a success terminal never becomes a limit failure" gate (it only invokes
+ * this on a FAILED terminal), matching where the frame-level success guard sat.
+ *
+ * Precedence, per Decision 1:
+ *   (a) explicit exhaustion (blocking_limit / rapid_refill_breaker) — PRIMARY. No
+ *       corroboration required; a missing/stale reset only costs a fallback park.
+ *   (b) otherwise, the latest observation with `status: 'rejected'`, and ONLY when
+ *       corroborated by a reset in the FUTURE.
+ *
+ * ⚠ SPECIFIED BEHAVIOUR WITH A KNOWN RESIDUAL — NOT AN OVERSIGHT, DO NOT "FIX".
+ * The corroboration in (b) is a FUTURE RESET AND NOTHING ELSE; the death's subtype
+ * is not consulted. So:
+ *     rejected + PAST reset   + error_max_turns  ->  does NOT park
+ *     rejected + FUTURE reset + error_max_turns  ->  PARKS
+ * What prevents classification in the first line is the ELAPSED RESET, not the fact
+ * that the death was unrelated. The residual is not a corner case: a five_hour
+ * window's reset is in the future for most of five hours, so ANY unrelated death
+ * observed after a `rejected` inside that window parks the run. Decision 1
+ * specifies staleness as the discriminator and this implements exactly that.
+ * Narrowing it into a subtype allowlist is policy the spec does not state; it was
+ * raised with the lead and the ruling was to keep it as written. A change of
+ * reading must be a FAILING TEST, never a silent tidy into an allowlist. In both
+ * branches only a FUTURE reset is kept in the failure facts; a past reset is worse
+ * than none (the server would compute a retry_not_before already elapsed and
+ * promote the run straight back into the same exhausted window).
+ */
+export function classifyLimitEvidence(
+  ev: HarnessLimitEvidence,
+  nowMs: number,
+): HarnessLimitFailure | undefined {
+  const futureReset =
+    ev.latest?.resetsAtMs !== undefined && ev.latest.resetsAtMs > nowMs
+      ? ev.latest.resetsAtMs
+      : undefined;
+
+  if (ev.explicitExhaustion) {
+    return { resetsAtMs: futureReset, window: ev.latest?.window };
   }
-
-  // ⚠ SPECIFIED BEHAVIOUR WITH A KNOWN RESIDUAL — NOT AN OVERSIGHT, DO NOT "FIX".
-  //
-  // The corroboration is a FUTURE RESET AND NOTHING ELSE. The death's subtype is not
-  // consulted at all. So:
-  //
-  //     rejected + PAST reset   + error_max_turns  ->  does NOT park
-  //     rejected + FUTURE reset + error_max_turns  ->  PARKS
-  //
-  // What prevents classification in the first line is the ELAPSED RESET, not the fact
-  // that the death was unrelated. It is worth being precise about which, because the
-  // residual is not a corner case: a five_hour window's reset is in the future for
-  // most of five hours, so ANY unrelated death observed after a `rejected` inside
-  // that window parks the run. Decision 1 specifies staleness as the discriminator
-  // and this implements exactly that; the PRD's own "an unrelated death must not
-  // park" phrasing is true only of the elapsed-reset subset.
-  //
-  // Narrowing it — excluding subtypes we believe unrelated — is policy the spec does
-  // not state, and it was deliberately not added on the implementer's own judgement.
-  // It was raised with the lead and the ruling was to keep it as written.
-  //
-  // Recorded this explicitly because the whole design principle of this module is
-  // that a change of reading is a FAILING TEST rather than a silent behaviour change.
-  // A future reader who "tidies" this into a subtype allowlist would be making
-  // precisely the silent change the principle exists to prevent.
-  if (latest?.status === "rejected" && futureReset !== undefined) {
-    return { resetsAtMs: futureReset, rateLimitType: latest.rateLimitType };
+  if (ev.latest?.status === "rejected" && futureReset !== undefined) {
+    return { resetsAtMs: futureReset, window: ev.latest.window };
   }
-
   return undefined;
 }
 

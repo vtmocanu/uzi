@@ -121,6 +121,14 @@ spec:
             # concrete pinned value after M1, so this is always non-empty in a normal deploy.
             - name: HOSTED_WORKER_VERSION
               value: {{ .Values.workers.image.tag | quote }}
+            # PRD #837 M4 disk-pressure threshold. The api derives a hosted worker's
+            # `disk_pressure` boolean by comparing each reported volume's used/total
+            # against this fraction in (0,1] (default 0.90); the controller then
+            # drains-then-recycles a pressured worker's PVCs. A soft-parsed tuning knob:
+            # config.go keeps the 0.90 default on a bad/empty value, so `| default` keeps
+            # this rendering even when an existing values file omits the key.
+            - name: UZI_DISK_PRESSURE_THRESHOLD
+              value: {{ .Values.api.diskPressureThreshold | default 0.90 | quote }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
           {{- with .Values.api.startupProbe }}

@@ -1,10 +1,12 @@
 # PRD #914: CI autofix on by default (mirror mr_rework — admin global + per-user tri-state)
 
 > Anchors re-verified against main at fcfd8aa on 2026-09-03, after the epic #915 file splits.
-> **Precondition status 2026-09-03: #908 is NOT on main** (`forgesvc/scheduled_mr_watch.go` absent; `ListCIAutofixCandidateRefs` still filters `r.kind IN ('issue','ci_fix')`). This PRD was pulled from the nightly sweep (`uzi` label removed) until #908 merges.
+> **Precondition status 2026-09-05: #908 is on main** (`forgesvc/scheduled_mr_watch.go` present; `ListCIAutofixCandidateRefs` filters `r.kind IN ('issue','ci_fix','prompt','self_improve')`). The precondition gate passed and this PRD was implemented.
+>
+> **As-built deltas (2026-09-05):** the migration landed as **00190** (the live head was 00189, not the drafted 00185/00186). The DTO/type became a nullable `*bool` / `boolean|null` **end-to-end** (M2's `toDTO` maps `pgtype.Bool`→`*bool` null-preserving via the existing `boolPtrValue`, and M3 carried the write-path pointer for clear-to-inherit) rather than the drafted interim "resolve inherit→true, DTO stays bool" — the tri-state renders on the web via `checked={x !== false}`, mirroring mr_rework. The admin global read reuses `Cache.CiAutofixEnabled` mirroring `MrReworkEnabled` (fail-closed in the detector).
 
 **Issue**: #914
-**Status**: Draft — ready for implementation
+**Status**: Done — implemented 2026-09-05 (all milestones landed; gate:api + gate:web green; 5-package `*LiveDB` sweep green)
 **Priority**: Medium
 **Split from**: #908 (this was #908's former Part B; #908 keeps Part A — autofix for scheduled runs).
 **Scope**: `api/` (one migration) + `web/`. No `agent/` change. No `.github/workflows/**` changes.
@@ -115,7 +117,7 @@ mr_rework is the template, but ci_autofix differs in ways that make this more th
 **Offline** = unit-testable with fakes. **LiveDB** = needs `./e2e/run-store-it.sh`. **web** = touches
 `web/`.
 
-- [ ] **M1 — Admin global `ci_autofix_enabled` setting + detector fail-closed read.** *(Offline)*
+- [x] **M1 — Admin global `ci_autofix_enabled` setting + detector fail-closed read.** *(Offline)*
   In `api/internal/settings/keys.go` add (all NEW): `KeyCiAutofixEnabled = "ci_autofix_enabled"`,
   `DefaultCiAutofixEnabled = "true"`, and the `Defaults` map entry (mirroring `KeyMrReworkEnabled`
   `:224`, `DefaultMrReworkEnabled` `:339`, `Defaults` entry `:449`). In a new
@@ -128,8 +130,8 @@ mr_rework is the template, but ci_autofix differs in ways that make this more th
   **Also fix the now-stale comment at `cmd/server/main.go:538-539`** ("per-user ci_autofix_enabled
   (default-OFF)" and "kill-switch is simply NOT wiring it") — both become false once the global exists.
 
-- [ ] **M2 — User column → nullable tri-state + candidate gate + Go-type ripple.** *(Offline + LiveDB)*
-  New migration (number at merge time; live head 00185, so this lands at 00186):
+- [x] **M2 — User column → nullable tri-state + candidate gate + Go-type ripple.** *(Offline + LiveDB)*
+  New migration (number at merge time; live head 00185, so this lands at 00186): (Superseded — see As-built deltas above: landed as 00190.)
   - Up: `ALTER TABLE users ALTER COLUMN ci_autofix_enabled DROP NOT NULL, DROP DEFAULT;` then
     `UPDATE users SET ci_autofix_enabled = NULL WHERE ci_autofix_enabled = false;` (existing `true`
     preserved).
@@ -142,9 +144,9 @@ mr_rework is the template, but ci_autofix differs in ways that make this more th
 
   Change `ci_autofix.sql:76` `AND u.ci_autofix_enabled` → `AND u.ci_autofix_enabled IS NOT FALSE`.
   Regenerate sqlc; `store.User.CiAutofixEnabled` flips `bool` → `pgtype.Bool` — fix `handler/handler.go:477`
-  (`toDTO`, resolve inherit→true) and the `SetUserCIAutofixEnabled` param.
+  (`toDTO`, resolve inherit→true) and the `SetUserCIAutofixEnabled` param. (Superseded — see As-built deltas above: the DTO is nullable `*bool` / `boolean|null` end-to-end, preserving the null clear-to-inherit path.)
 
-- [ ] **M3 — Tri-state over the API + web toggles.** *(Offline; web)*
+- [x] **M3 — Tri-state over the API + web toggles.** *(Offline; web)*
   Retrofit the dedicated endpoints to carry inherit/clear: `handler/ci_autofix_toggle.go`
   (`setCIAutofixRequest`, both handler methods → the single `SetUserCIAutofixEnabled` param as
   `pgtype.Bool`), the DTO `apitypes/user.go:36` + web `apiTypes.ts:23` `User.ci_autofix_enabled` →
@@ -160,7 +162,7 @@ mr_rework is the template, but ci_autofix differs in ways that make this more th
   (`web/src/mocks/data/users.ts` ×6, lines 16/37/59/77/97/115, + ~10 web test files) — update the
   ones M4's positive-control tests assert on so they don't assert "off" for a default-on user.
 
-- [ ] **M4 — Tests + docs.** *(Offline + LiveDB)*
+- [x] **M4 — Tests + docs.** *(Offline + LiveDB)*
   Migration test: an existing `false` row becomes NULL, a `true` row is preserved, a fresh row is NULL.
   Candidate query (**extend `api/internal/store/ci_autofix_integration_test.go:55-59`, which seeds only
   `{true,false,true}` — add a NULL case**): a NULL-user run is a candidate (default-on), an explicit

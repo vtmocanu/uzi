@@ -53,6 +53,13 @@ type ScheduleRequest struct {
 	MaxIssues       *int    `json:"max_issues"`
 	Guidance        *string `json:"guidance"`
 	Model           *string `json:"model"`
+	// OutputMode is the per-schedule output mode (PRD #929 M1, prompt target ONLY): "mr"
+	// (write an idea file, open an MR — today's behavior) or "issues" (file the proposal as
+	// a forge issue server-side). Tri-state: a nil/absent value means inherit the catalog/job
+	// default (NULL in the DB, resolved to "mr" at fire time), a value is an explicit override.
+	// Sweep/issue targets reject it (their output is a run on an existing issue, not a
+	// proposal). It carries the same "present, even to clear" replace-semantics as Model.
+	OutputMode *string `json:"output_mode"`
 	// OverrideSubagentModel is the per-schedule "apply model also to agents" opt-in (PRD
 	// #305, all targets): when true, a fired run's resolved model overrides every
 	// subagent's own model pin too, not just the lead. Boolean, not tri-state (Decision 5):
@@ -115,6 +122,12 @@ type ScheduleDTO struct {
 	// schedule fires its runs on. Validated via agenttmpl.ValidateModel; replace-semantics
 	// on PATCH (see mergeSchedule).
 	Model *string `json:"model"`
+	// OutputMode is the per-schedule output mode (PRD #929 M1, prompt target only): nil
+	// means inherit the catalog/job default (NULL in the DB, resolves to "mr" at fire time),
+	// a value ("mr" or "issues") is an explicit override. For a default prompt row it carries
+	// the stored resolved value (seeded from the catalog "mr"/"issues"); it is nil for a
+	// sweep/issue/self_improve row, which reject the setting.
+	OutputMode *string `json:"output_mode"`
 	// OverrideSubagentModel is the per-schedule "apply model also to agents" opt-in (PRD
 	// #305, all targets): true means a fired run's resolved model overrides every subagent's
 	// own model pin too, not just the lead. Boolean, not tri-state (Decision 5): nil ≡ false
@@ -202,7 +215,12 @@ type CatalogEntryDTO struct {
 	Cron        string `json:"cron"`
 	Timezone    string `json:"timezone"`
 	Model       string `json:"model"`
-	Prompt      string `json:"prompt"`
+	// OutputMode is a prompt entry's resolved output mode (PRD #929 M1): "mr" (the
+	// default) or "issues", resolved from the catalog `output:` frontmatter via
+	// DefaultJob.OutputMode so a prompt entry is never "". Empty for a non-prompt entry
+	// (sweep/self_improve carry no output mode).
+	OutputMode string `json:"output_mode"`
+	Prompt     string `json:"prompt"`
 	// SelectorKind is a sweep entry's selector kind (PRD #767 M4): "label" (the
 	// default) selects by Labels, "assigned" selects issues assigned to the
 	// uzi-bot account (and carries no Labels). Empty/"label" for every non-assigned

@@ -264,6 +264,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Int("max-issues", 10, "for --sweep: cap on issues started per fire, oldest-first (default 10; ignored for non-sweep targets)")
 	create.Flags().String("guidance", "", "optional owner guidance injected into the run instruction (--issue/--sweep only)")
 	create.Flags().String("model", "", "model alias (opus/sonnet/haiku/fable) or a custom model ID for runs this schedule fires; empty inherits your Worker-model default (valid on all targets)")
+	create.Flags().String("output", "", "output mode for a prompt schedule: mr (default) | issues; empty inherits the job/catalog default")
 	create.Flags().Bool("apply-model-to-agents", false, "also apply the schedule's model to every subagent (overrides each agent's own model pin); default off keeps per-agent pins")
 	create.Flags().String("at", "", "fire once at this RFC3339 time (one of --at/--cron)")
 	create.Flags().String("cron", "", "recurring 5-field cron expression (one of --at/--cron)")
@@ -423,6 +424,7 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().Bool("clear-mr-rework", false, "clear the stored MR-rework override back to inherit (the account default)")
 	edit.Flags().Bool("apply-model-to-agents", false, "set whether the schedule's model also overrides every subagent's model pin")
 	edit.Flags().String("model", "", "change the model alias (opus/sonnet/haiku/fable) or custom model ID for runs this schedule fires; empty string clears it back to your Worker-model default (valid on every target)")
+	edit.Flags().String("output", "", "change the output mode for a prompt schedule: mr | issues; empty string clears it back to the job/catalog default (prompt-target schedules only)")
 	edit.Flags().String("repo", "", "repoint the schedule to another repo by id (sweep/prompt targets; an issue-target schedule cannot be repointed)")
 	edit.Flags().Bool("create-missing-labels", false, "for a sweep target: create any newly-set --label missing on the schedule's repo before saving the edit (default: warn only)")
 	return edit

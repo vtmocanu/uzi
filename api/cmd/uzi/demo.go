@@ -54,7 +54,7 @@ func (d demoModel) Init() tea.Cmd {
 func (d demoModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if _, ok := msg.(demoTickMsg); ok {
 		var cmd tea.Cmd
-		if d.view == viewDetail && d.detail.loaded && isLiveRunStatus(d.detail.run.Status) {
+		if d.view == viewDetail && d.detail.runLoaded && isLiveRunStatus(d.detail.run.Status) {
 			nm, c := d.tuiModel.Update(streamEventsMsg{runID: d.detail.runID, events: []apitypes.RunEventDTO{d.nextLiveFrame()}})
 			d.tuiModel = nm.(tuiModel)
 			cmd = c

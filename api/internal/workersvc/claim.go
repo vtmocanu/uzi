@@ -335,6 +335,31 @@ type ClaimSecrets struct {
 	ForgeUsername       string `json:"forge_username"`
 	ForgePAT            string `json:"forge_pat"`
 	AnthropicOAuthToken string `json:"anthropic_oauth_token"`
+	// Codex is the Codex credential this claim spends, present ONLY for a Codex-bound
+	// run (runs.codex_secret_id non-null; PRD #1147 M2, ships DARK). omitempty is
+	// load-bearing: an ordinary Claude run leaves it nil so the emitted JSON is
+	// BYTE-IDENTICAL to today's wire (no `codex` key), and an old worker that never
+	// learns the key keeps working. Never logged — it carries a usable access token.
+	Codex *ClaimCodexSecrets `json:"codex,omitempty"`
+}
+
+// ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run
+// (PRD #1147 M2, B7). It carries ONLY what the worker needs to act as the credential
+// and to call the (dark) per-run credential-operation endpoints:
+//
+//   - AccessToken is the directly-usable token for the run's auth mode: for a
+//     subscription run it is the access_token extracted from the account's sealed
+//     merged login (the refresh/login blob is NEVER included); for an api_key run it
+//     is the static OpenAI API key.
+//   - Capability is the per-claim, high-entropy credential-operation capability
+//     (epoch-tagged plaintext), minted server-side at claim assembly. The worker
+//     presents it back to authorize a credential operation (persist-recovery /
+//     release-access-token / start-refresh); the server stores only its sha256.
+//
+// Never logged; the whole struct is secret-bearing like its parent ClaimSecrets.
+type ClaimCodexSecrets struct {
+	AccessToken string `json:"access_token"`
+	Capability  string `json:"capability"`
 }
 
 // ClaimAgent is a PRD #3 agent template as structured fields, ready to map onto
@@ -386,13 +411,16 @@ type ClaimConfig struct {
 	QuestionMax            int     `json:"question_max"`
 	QuestionTimeoutSeconds int     `json:"question_timeout_seconds"`
 	DefaultModel           *string `json:"default_model,omitempty"`
-	// DefaultEffort is the owner's per-user default reasoning effort (PRD #617):
-	// the SDK effort level the worker applies to the lead/main thread. omitempty:
-	// omitted when the owner has no default (NULL), so the worker never sets the
-	// SDK effort key and the SDK default (`high`) applies — byte-identical to
-	// today's wire for every run without an effort set. Unlike DefaultModel there
-	// is no per-run/per-schedule freeze; the owner's per-user value is the only
-	// source.
+	// DefaultEffort is the SDK effort level the worker applies to the lead/main
+	// thread: the owner's explicit per-user reasoning effort (PRD #617), or the uzi
+	// default `xhigh` (issue #1157) when the owner has not chosen (NULL). It is
+	// populated for every issue-lane claim assembled through resolveEffortPtr; the
+	// judge lane (issue #1157) now ALSO populates it best-effort through the same
+	// resolveEffortPtr, inheriting the owner's per-user default_effort (uzi default
+	// `xhigh` when NULL) just like the run/chat lanes, so judge runs carry the owner's
+	// effort rather than riding the SDK's own fallback. omitempty is retained. Unlike
+	// DefaultModel there is no per-run/per-schedule freeze; the owner's per-user value
+	// is the only source.
 	DefaultEffort *string `json:"default_effort,omitempty"`
 	// AttributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// LIVE from the owner's users row on every claim. When false, the worker suppresses
