@@ -18,12 +18,24 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.79.0] - 2026-09-07
+
 ### Added
 
 - **The bundled `uzi-cli` skill now installs to Codex CLI as well as Claude Code ([#1143](https://github.com/vtmocanu/uzi/issues/1143)).**
   `uzi skill install|install-hook|status|uninstall-hook` take `--target claude|codex|all`; Codex gets the skill at `~/.agents/skills/uzi-cli/SKILL.md` and a `SessionStart` hook in `$CODEX_HOME/hooks.json` (review it once with `/hooks`). Automatic install adds Codex only when its config home already exists.
 - **Slack DM when a usage-limit-paused run resumes ([#1116](https://github.com/vtmocanu/uzi/issues/1116)).**
   A run parked on an Anthropic usage limit already posts a ⏸️ Paused reply into its Slack DM thread; now the first time it is back to running it posts a single ▶️ Resumed reply into the same thread, carrying how long it waited and (from the second pause) the pause count (a resume straight into the plan gate, a question, or a terminal state is carried by that reply instead), deduped through the per-run Slack anchor so a redelivered running report never re-posts.
+- **CI-autofix is now on by default ([#1109](https://github.com/vtmocanu/uzi/issues/1109)).**
+  A failed pipeline on an `agent/issue-N` branch now auto-opens a `ci_fix` run with no opt-in, mirroring `mr_rework`: an admin instance-wide kill-switch (`ci_autofix_enabled`, default on) plus a per-user tri-state (inherit / on / off), with the detector reading the setting fail-closed so a settings-read blip never fails open.
+- **Scheduled jobs support output modes ([#929](https://github.com/vtmocanu/uzi/issues/929)).**
+  A scheduled sweep can now be configured for how a fire delivers its result.
+- **The early rate-limit reset alert now fires on any early clear ([#1114](https://github.com/vtmocanu/uzi/issues/1114)).**
+  The Slack heads-up for an Anthropic 7-day limit resetting early previously fired only while a token was actively constrained; it now fires on any early clear through two independent arms, so a reset that lands before you hit the wall still notifies.
+- **Worker disk-space observability and nix-store pressure handling ([#1113](https://github.com/vtmocanu/uzi/issues/1113)).**
+  Workers now report disk-space stats and react to nix-store pressure, so a filling worker surfaces before it strands a run.
+- **Foundational work toward a Codex-based worker lane ([#1106](https://github.com/vtmocanu/uzi/issues/1106)).**
+  Behind the scenes and not user-visible yet: concurrent-run Codex credential binding ([#1154](https://github.com/vtmocanu/uzi/issues/1154)), extraction of the Claude harness boundary with no behavior change ([#1153](https://github.com/vtmocanu/uzi/issues/1153)), and Codex image packaging with an isolated launcher ([#1160](https://github.com/vtmocanu/uzi/issues/1160)).
 
 ### Changed
 
@@ -35,6 +47,60 @@ through `[0.52.0]`.)
 
 - **The Findings surface in the web UI now uses a bug glyph instead of the warning triangle ([#1139](https://github.com/vtmocanu/uzi/issues/1139)).**
   The sidebar nav item, page header, empty state, and run-view finding card for Findings ("off-task bugs your workers flagged mid-run") switch from the AlertIcon warning triangle to a new BugIcon, keeping the sky/info tint; AlertIcon stays the genuine-warning glyph everywhere else (e.g. the missing-sweep-labels notice).
+
+- **Anthropic bind mode defaults to `auto` for every new worker and the judge lane ([#1140](https://github.com/vtmocanu/uzi/issues/1140)).**
+  A newly created worker, and the judge lane, now bind their Anthropic credential in `auto` mode by default instead of needing an explicit choice.
+
+- **The TUI run-detail view loads progressively ([#1137](https://github.com/vtmocanu/uzi/issues/1137)).**
+  `uzi tui` now renders the run first, then backfills history tail-first (`?tail`/`?before`), caps payloads (`?payload_max`), memoizes the transcript, and refetches incrementally, so a long run's detail opens fast on a slow link.
+
+- **A clearer in-progress milestone marker in the TUI ([#1136](https://github.com/vtmocanu/uzi/issues/1136)).**
+  The in-progress milestone now shows a tungsten micro-bar cell and faint blinking half-circle rail rows.
+
+- **TUI board polling is hardened on slow or flaky connections ([#1130](https://github.com/vtmocanu/uzi/issues/1130)).**
+  The board poll gains an in-flight guard, a per-poll timeout, and error backoff, ending the "context deadline exceeded" flood on slow links.
+
+- **Internal: the dead `runs.lineage_epoch` column was dropped ([#1079](https://github.com/vtmocanu/uzi/issues/1079)).**
+  The deferred contract step from the per-leg usage fold; no user-visible effect.
+
+### Fixed
+
+- **`mr_rework` no longer fires on a review bot's summary-only comment ([#1142](https://github.com/vtmocanu/uzi/issues/1142)).**
+  The rework trigger now counts only actionable review comments, so a CodeRabbit walkthrough/summary note (or a "no actionable comments" post) no longer queues a rework run or advances the high-water; a human top-level note and any inline finding still count.
+
+- **In-flight `mr_rework` runs are cancelled when an issue's MR is locked or closed ([#1125](https://github.com/vtmocanu/uzi/issues/1125)).**
+  Closing or locking the issue's MR now stops a rework run still working it, instead of leaving it running against a settled MR.
+
+- **The board no longer stale-overwrites a just-applied move, close, or reopen ([#1119](https://github.com/vtmocanu/uzi/issues/1119)).**
+  A mutation-generation guard keeps a slow board poll from clobbering a change you just made.
+
+- **Forgejo issue state and description edits use a field-only PATCH ([#1058](https://github.com/vtmocanu/uzi/issues/1058)).**
+  Changing a Forgejo issue's state or description no longer round-trips the title.
+
+- **A worker preserves `push_secret_blocked` as the failure origin when the terminal report throws ([#1077](https://github.com/vtmocanu/uzi/issues/1077)).**
+  A push blocked by secret-scanning is still attributed correctly even if the final report step then fails.
+
+- **Worker overlay checkpointing reconciles a lost publish ACK before chaining the next overlay ([#1036](https://github.com/vtmocanu/uzi/issues/1036)).**
+  A checkpoint whose publish ACK was lost is reconciled first, so the next overlay does not chain onto an unconfirmed state.
+
+- **The controller detects a stranded Pending PVC after a disk recycle within a bounded timeout ([#837](https://github.com/vtmocanu/uzi/issues/837)).**
+  A worker PVC left Pending after a disk recycle is detected within a bounded timeout instead of hanging.
+
+- **`report_md` is scrubbed before it is capped ([#1127](https://github.com/vtmocanu/uzi/issues/1127)).**
+  `clampWireReportMd` now redacts before truncating, so a secret near the length cap cannot survive into the wire report.
+
+- **Mock mode: three `mockApi` paths were realigned with the real backend ([#1111](https://github.com/vtmocanu/uzi/issues/1111)).**
+  The mock/demo build's schedule paths now match the real API shape.
+
+- **`model-pass` HOME cleanup no longer races the aborted SDK CLI on the timeout path ([#1110](https://github.com/vtmocanu/uzi/issues/1110)).**
+  On a timeout abort, HOME cleanup waits for the SDK CLI to exit instead of racing it.
+
+- **`Schedule.next_fires` handles the `null` the wire sends for once-schedules ([#982](https://github.com/vtmocanu/uzi/issues/982)).**
+  Two index sites are guarded and the type widened, fixing a crash on once-schedules.
+
+- **`judge-runner` JSON extraction scans later balanced candidates when the first object fails to parse ([#911](https://github.com/vtmocanu/uzi/issues/911)).**
+  A judge response whose first `{…}` block is not the verdict now falls through to later balanced candidates instead of failing.
+
 
 ## [0.78.0] - 2026-09-03
 
@@ -3807,7 +3873,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.78.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.79.0...HEAD
+[0.79.0]: https://github.com/vtmocanu/uzi/compare/v0.78.0...v0.79.0
 [0.78.0]: https://github.com/vtmocanu/uzi/compare/v0.77.0...v0.78.0
 [0.77.0]: https://github.com/vtmocanu/uzi/compare/v0.76.0...v0.77.0
 [0.76.0]: https://github.com/vtmocanu/uzi/compare/v0.75.1...v0.76.0
