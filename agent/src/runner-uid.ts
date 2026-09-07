@@ -35,26 +35,32 @@ const RUNNER_USER = "runner";
 const SETPRIV = "/bin/setpriv";
 
 // PRD #1171 (M3) — the Codex production adapter needs THREE OS identities where the
-// #51 split previously needed one. The numbers are the image-baked uids; see
-// agent/templates/base/Dockerfile:37-46 (`addgroup -g 10001 worker … -u 10001 …`,
-// `addgroup -g 10002 runner … -u 10002 …`). These consts are additive; the existing
-// `runner` (provider) identity and its argv are preserved byte-for-byte below.
+// #51 split previously needed one. The numbers are the image-baked uids; see the
+// worker/runner/runner-cmd accounts in agent/templates/base/Dockerfile (`addgroup`/
+// `adduser` for worker 10001, runner 10002, runner-cmd 10003). These consts are
+// additive; the existing `runner` (provider) identity and its argv are preserved
+// byte-for-byte below.
 
 /** uid 10002 — `runner`, the EXISTING cap-less identity. Provider roots (the app-server
  *  processes that hold the selected Codex credential) and every pre-#1171 untrusted
- *  surface run as this uid. Image account: agent/templates/base/Dockerfile:45. */
+ *  surface run as this uid. Image account: the `runner` account in
+ *  agent/templates/base/Dockerfile. */
 export const RUNNER_UID = 10002;
 /** uid 10003 — `runner-cmd`, a NEW distinct cap-less identity for command roots (the
  *  model-authorized shell + fileop effect surface). Credential-free, primary group
- *  `runner` so its worktree writes are group-`runner` and group-writable under the
- *  setgid+umask discipline landing in a later #1171 unit. Distinct from RUNNER_UID so
- *  a command root cannot read a provider root's auth/session state at the OS level
- *  (plan §2.8). The `runner-cmd` account itself is added to the image in a later unit;
- *  it is numbered above the existing pair at agent/templates/base/Dockerfile:37-46. */
+ *  `runner-cmd` (gid 10003) and a supplementary member of group `runner`, so its
+ *  worktree writes are group-`runner` and group-writable under the setgid+umask
+ *  discipline landing in a later #1171 unit. Distinct from RUNNER_UID so a command root
+ *  cannot read a provider root's auth/session state at the OS level (plan §2.8). The
+ *  `runner-cmd` account now EXISTS in the images — group gid 10003 plus a `runner-cmd`
+ *  passwd entry that is a supplementary member of group `runner` — numbered above the
+ *  existing pair; see the worker/runner/runner-cmd accounts in
+ *  agent/templates/base/Dockerfile. */
 export const COMMAND_UID = 10003;
 /** uid 10001 — `worker`, the PAT-holding worker process itself. Credentialed
  *  boundary-action roots ARE this process, so becoming `worker` needs no setpriv (see
- *  {@link workerBoundaryCommand}). Image account: agent/templates/base/Dockerfile:44. */
+ *  {@link workerBoundaryCommand}). Image account: the `worker` account in
+ *  agent/templates/base/Dockerfile. */
 export const WORKER_UID = 10001;
 
 /** True when the entrypoint established the worker/runner uid split (A1 root start). */
@@ -100,9 +106,10 @@ export function runnerTmpdir(env: NodeJS.ProcessEnv = process.env): string | und
  * otherwise. setpriv treats a name and its numeric uid identically, but emitting the
  * `runner` name for RUNNER_UID keeps the argv the established #51 Claude/launcher paths
  * produce BYTE-FOR-BYTE identical to the pre-#1171 literal (a drift guard pins it).
- * A uid with no image account name yet — COMMAND_UID, whose `runner-cmd` account is
- * created in a later #1171 unit — is emitted numerically, which setpriv resolves for
- * reuid/regid without a passwd entry.
+ * COMMAND_UID is emitted numerically (setpriv resolves a name or its numeric uid the
+ * same way). Its `runner-cmd` account now EXISTS in the images — group gid 10003 plus a
+ * `runner-cmd` passwd entry that is a supplementary member of group `runner` — so
+ * `--regid 10003 --init-groups` resolves the account and grants the `runner` group.
  */
 export function setprivArgsForUid(uid: number): string[] {
   const identity = uid === RUNNER_UID ? RUNNER_USER : String(uid);
