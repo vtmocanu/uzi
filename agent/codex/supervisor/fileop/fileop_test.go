@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -279,15 +281,139 @@ func TestSymlinkSwapTOCTOU(t *testing.T) {
 
 func TestGitDenied(t *testing.T) {
 	s, _ := newTestServer(t)
-	// A .git top-level component is denied as defense-in-depth (openat2 is primary).
+	// A .git component is denied as defense-in-depth (openat2 is primary), at ANY depth.
 	wantErr(t, s.handle(request{ID: 1, Op: opWrite, Path: ".git/config", Data: b64("x")}), codeDenied)
 	wantErr(t, s.handle(request{ID: 2, Op: opStat, Path: ".git"}), codeDenied)
 	wantErr(t, s.handle(request{ID: 3, Op: opMkdir, Path: ".git"}), codeDenied)
 	wantErr(t, s.handle(request{ID: 4, Op: opRename, Path: "x", NewPath: ".git/y"}), codeDenied)
-	// A look-alike top-level name and a nested .git are NOT top-level denials.
-	wantOK(t, s.handle(request{ID: 5, Op: opWrite, Path: ".gitignore", Data: b64("*")}))
-	wantOK(t, s.handle(request{ID: 6, Op: opMkdir, Path: "sub"}))
-	wantOK(t, s.handle(request{ID: 7, Op: opMkdir, Path: "sub/.git"}))
+	// A nested/submodule .git component is denied too (defect 1 defense-in-depth), not
+	// just the first component as the old first-component-only screen allowed.
+	wantOK(t, s.handle(request{ID: 5, Op: opMkdir, Path: "sub"}))
+	wantErr(t, s.handle(request{ID: 6, Op: opMkdir, Path: "sub/.git"}), codeDenied)
+	wantErr(t, s.handle(request{ID: 7, Op: opWrite, Path: "sub/.git/x", Data: b64("x")}), codeDenied)
+	// A look-alike name is NOT a .git component and is allowed.
+	wantOK(t, s.handle(request{ID: 8, Op: opWrite, Path: ".gitignore", Data: b64("*")}))
+	wantOK(t, s.handle(request{ID: 9, Op: opWrite, Path: "sub/.gitkeep", Data: b64("")}))
+}
+
+// TestGitBypassViaDotDotDenied is the regression for defect 1: openat2 uses
+// RESOLVE_BENEATH, which PERMITS "..", so "sub/../.git/config" resolves to the real
+// .git/config beneath root even though its FIRST component is the innocent "sub". The
+// old first-component-only screen passed it; the per-component policy denies it before
+// any syscall. Fails against the pre-fix code (the write would overwrite the planted
+// .git/config and the read would return its bytes).
+func TestGitBypassViaDotDotDenied(t *testing.T) {
+	s, root := newTestServer(t)
+	// Plant a real git dir with sentinel content, plus a real intermediate dir so the
+	// ".."-bypass paths actually have a target the kernel would resolve to.
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "config"), []byte("SECRET-GIT"), 0o600); err != nil {
+		t.Fatalf("write .git/config: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+
+	for _, p := range []string{"sub/../.git/config", "a/b/../../.git/config"} {
+		wantErrOneOf(t, s.handle(request{ID: 1, Op: opWrite, Path: p, Data: b64("PWNED")}), codeDenied, codeEscape)
+		wantErrOneOf(t, s.handle(request{ID: 2, Op: opRead, Path: p}), codeDenied, codeEscape)
+		wantErrOneOf(t, s.handle(request{ID: 3, Op: opStat, Path: p}), codeDenied, codeEscape)
+	}
+	// A nested .git component reached without ".." is denied outright.
+	wantErr(t, s.handle(request{ID: 4, Op: opStat, Path: "sub/.git/x"}), codeDenied)
+
+	// Nothing above created or modified the real .git/config.
+	got, err := os.ReadFile(filepath.Join(root, ".git", "config"))
+	if err != nil {
+		t.Fatalf("read back .git/config: %v", err)
+	}
+	if string(got) != "SECRET-GIT" {
+		t.Fatalf(".git/config was altered through a bypass: %q", got)
+	}
+}
+
+// TestPathComponentPolicy pins the per-component pathname policy: ".." anywhere and an
+// absolute path are E_ESCAPE (screened before any syscall), empty/"." interior
+// components are E_MALFORMED, and a bare "." (the anchor) is permitted. Fails against
+// the pre-fix code, which left these to openat2 (yielding E_NOT_FOUND/E_ESCAPE from
+// the kernel rather than the deterministic policy code).
+func TestPathComponentPolicy(t *testing.T) {
+	s, _ := newTestServer(t)
+	for _, p := range []string{"..", "../x", "a/../../x", "sub/../other"} {
+		wantErr(t, s.handle(request{ID: 1, Op: opStat, Path: p}), codeEscape)
+	}
+	wantErr(t, s.handle(request{ID: 2, Op: opStat, Path: "/etc/passwd"}), codeEscape)
+	wantErr(t, s.handle(request{ID: 3, Op: opRead, Path: "/etc/passwd"}), codeEscape)
+	for _, p := range []string{"a//b", "a/./b", "./a", "a/.", "a/b/"} {
+		wantErr(t, s.handle(request{ID: 4, Op: opStat, Path: p}), codeMalformed)
+	}
+	// A bare "." is the anchor and stays permitted (root listing works).
+	wantOK(t, s.handle(request{ID: 5, Op: opList, Path: "."}))
+}
+
+// TestSpecialFilesNoHang is the regression for defect 2: opening a FIFO/socket with a
+// blocking open (the pre-fix code) hangs this single-threaded helper forever. Each op
+// is run under a 2s timeout that FAILS if it hangs; all must return E_NOT_FILE
+// promptly, and a regular file must still round-trip.
+func TestSpecialFilesNoHang(t *testing.T) {
+	s, root := newTestServer(t)
+	if err := unix.Mkfifo(filepath.Join(root, "pipe"), 0o644); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	runWithTimeout := func(name string, fn func() map[string]any) map[string]any {
+		t.Helper()
+		ch := make(chan map[string]any, 1)
+		go func() { ch <- fn() }()
+		select {
+		case resp := <-ch:
+			return resp
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s on a special file hung (blocking open not fixed)", name)
+			return nil
+		}
+	}
+
+	rd := runWithTimeout("read", func() map[string]any {
+		return s.handle(request{ID: 1, Op: opRead, Path: "pipe"})
+	})
+	wantErr(t, rd, codeNotFile)
+
+	wr := runWithTimeout("write", func() map[string]any {
+		return s.handle(request{ID: 2, Op: opWrite, Path: "pipe", Data: b64("data")})
+	})
+	wantErr(t, wr, codeNotFile)
+
+	// list on a FIFO is ENOTDIR: O_DIRECTORY is rejected before any fifo blocking.
+	ls := runWithTimeout("list", func() map[string]any {
+		return s.handle(request{ID: 3, Op: opList, Path: "pipe"})
+	})
+	wantErr(t, ls, codeNotDir)
+
+	// A regular file still reads and writes fine.
+	wantOK(t, s.handle(request{ID: 4, Op: opWrite, Path: "reg", Data: b64("regular")}))
+	rr := s.handle(request{ID: 5, Op: opRead, Path: "reg"})
+	wantOK(t, rr)
+	if got := string(respData(t, rr)); got != "regular" {
+		t.Fatalf("regular read = %q, want %q", got, "regular")
+	}
+
+	// A unix socket file is also E_NOT_FILE (open returns ENXIO). Guarded because the
+	// socket path can exceed the sun_path limit on a long temp-dir path.
+	sockPath := filepath.Join(root, "sock")
+	if ln, lerr := net.Listen("unix", sockPath); lerr == nil {
+		defer ln.Close()
+		sr := runWithTimeout("read-socket", func() map[string]any {
+			return s.handle(request{ID: 6, Op: opRead, Path: "sock"})
+		})
+		wantErr(t, sr, codeNotFile)
+		sw := runWithTimeout("write-socket", func() map[string]any {
+			return s.handle(request{ID: 7, Op: opWrite, Path: "sock", Data: b64("x")})
+		})
+		wantErr(t, sw, codeNotFile)
+	}
 }
 
 func TestOversizeReadRejected(t *testing.T) {

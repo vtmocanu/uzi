@@ -53,13 +53,14 @@ const (
 	codeOversize  = "E_OVERSIZE"   // request line, path, or read/write body over a cap
 	codeMalformed = "E_MALFORMED"  // unparseable JSON, bad base64, or an invalid component
 	codeUnknownOp = "E_UNKNOWN_OP" // op not in the closed set
-	codeDenied    = "E_DENIED"     // policy denial (a .git top-level component)
-	codeEscape    = "E_ESCAPE"     // openat2 refused an absolute/".." escape (EXDEV)
+	codeDenied    = "E_DENIED"     // policy denial (any .git path component)
+	codeEscape    = "E_ESCAPE"     // absolute path / ".." component (policy or openat2 EXDEV)
 	codeSymlink   = "E_SYMLINK"    // openat2 refused a symlink/magic-link component (ELOOP)
 	codeNotFound  = "E_NOT_FOUND"  // ENOENT
 	codeExists    = "E_EXISTS"     // EEXIST
 	codeNotDir    = "E_NOT_DIR"    // ENOTDIR
 	codeIsDir     = "E_IS_DIR"     // EISDIR
+	codeNotFile   = "E_NOT_FILE"   // read/write target is a FIFO/socket/device, not a regular file
 	codeNotEmpty  = "E_NOT_EMPTY"  // ENOTEMPTY (rmdir of a non-empty dir)
 	codePerm      = "E_PERM"       // EACCES/EPERM
 	codeInternal  = "E_INTERNAL"   // a response could not be encoded
@@ -251,14 +252,35 @@ func (s *server) doStat(req request) map[string]any {
 }
 
 // doRead returns a regular file's bytes, base64-encoded, bounded by maxRead. The
-// LimitReader guard bounds memory even if the file grows after the stat.
+// LimitReader guard bounds memory even if the file grows after the stat. O_NONBLOCK
+// is set on the open so a FIFO/device (whose blocking open would hang this
+// single-threaded helper) returns immediately; the fstat then classifies it as
+// codeIsDir (directory) or codeNotFile (FIFO/socket/device) before any read. For a
+// confirmed regular file O_NONBLOCK is a no-op, but it is cleared anyway so the read
+// path is a plain blocking read.
 func (s *server) doRead(req request) map[string]any {
 	if err := validatePath(req.Path); err != nil {
 		return errResp(req.ID, classify(err))
 	}
-	fd, err := s.openBeneath(req.Path, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+	fd, err := s.openBeneath(req.Path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return errResp(req.ID, classify(err))
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return errResp(req.ID, classify(err))
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			return errResp(req.ID, codeIsDir)
+		}
+		return errResp(req.ID, codeNotFile)
+	}
+	if err := unix.SetNonblock(fd, false); err != nil {
+		unix.Close(fd)
+		return errResp(req.ID, codeIO)
 	}
 	f := os.NewFile(uintptr(fd), "read")
 	if f == nil {
@@ -266,16 +288,6 @@ func (s *server) doRead(req request) map[string]any {
 		return errResp(req.ID, codeIO)
 	}
 	defer f.Close()
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return errResp(req.ID, classify(err))
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
-			return errResp(req.ID, codeIsDir)
-		}
-		return errResp(req.ID, codeIO)
-	}
 	if st.Size > int64(s.maxRead) {
 		return errResp(req.ID, codeOversize)
 	}
@@ -293,8 +305,13 @@ func (s *server) doRead(req request) map[string]any {
 }
 
 // doWrite creates-or-truncates a regular file and writes the decoded bytes. An
-// oversize payload is rejected BEFORE the file is opened, so it neither creates
-// nor truncates. O_NOFOLLOW plus RESOLVE_NO_SYMLINKS refuse a symlink final.
+// oversize payload is rejected BEFORE the file is opened, so it neither creates nor
+// truncates. O_NOFOLLOW plus RESOLVE_NO_SYMLINKS refuse a symlink final. O_TRUNC is
+// deliberately NOT set on the open: truncation must not act on a special file, so the
+// open uses O_NONBLOCK (a readerless FIFO/socket then fails fast at open with ENXIO
+// instead of blocking this single-threaded helper), the fstat confirms a regular file
+// (else codeNotFile, with nothing written or truncated), and only then does an
+// explicit Ftruncate(fd, 0) reset the length before the write.
 func (s *server) doWrite(req request) map[string]any {
 	if err := validatePath(req.Path); err != nil {
 		return errResp(req.ID, classify(err))
@@ -306,9 +323,26 @@ func (s *server) doWrite(req request) map[string]any {
 	if len(data) > s.maxWrite {
 		return errResp(req.ID, codeOversize)
 	}
-	fd, err := s.openBeneath(req.Path, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW, 0o644)
+	fd, err := s.openBeneath(req.Path, unix.O_WRONLY|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o644)
 	if err != nil {
 		return errResp(req.ID, classify(err))
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return errResp(req.ID, classify(err))
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		return errResp(req.ID, codeNotFile)
+	}
+	if err := unix.SetNonblock(fd, false); err != nil {
+		unix.Close(fd)
+		return errResp(req.ID, codeIO)
+	}
+	if err := unix.Ftruncate(fd, 0); err != nil {
+		unix.Close(fd)
+		return errResp(req.ID, codeIO)
 	}
 	f := os.NewFile(uintptr(fd), "write")
 	if f == nil {
@@ -445,10 +479,20 @@ func (s *server) doList(req request) map[string]any {
 	})
 }
 
-// validatePath applies the pathname policy that does not need a syscall: reject an
-// empty path, an over-length path, and a .git top-level component. The primary
-// containment (beneath-root + no-symlink) is the KERNEL via openBeneath; the .git
-// denial is defense-in-depth mirroring the TS broker's screen.
+// validatePath applies the pathname policy that does not need a syscall, screening
+// EVERY slash-delimited component rather than only the first. It rejects: an empty
+// path (E_MALFORMED) or an over-length one (E_OVERSIZE); a leading-slash absolute
+// path (E_ESCAPE); any ".." component (E_ESCAPE); any empty or "." interior
+// component such as "a//b" or "a/./b" (E_MALFORMED); and any ".git" component,
+// nested or not (E_DENIED). A bare "." is allowed as the anchor itself.
+//
+// The per-component ".." and ".git" screens are load-bearing, not cosmetic: the
+// KERNEL containment via openBeneath uses RESOLVE_BENEATH, which PERMITS ".." as long
+// as resolution stays beneath the root. So the kernel alone would let "sub/../.git"
+// resolve to the real ".git" beneath root; a first-component-only check saw "sub" and
+// passed it. Screening ".." (unnecessary given RESOLVE_BENEATH anyway) and every
+// ".git" component here closes that bypass and mirrors the TS broker's screen for the
+// repo git dir and any nested/submodule ".git".
 func validatePath(p string) error {
 	if p == "" {
 		return errMalformed
@@ -456,21 +500,23 @@ func validatePath(p string) error {
 	if len(p) > maxPathLen {
 		return errTooLong
 	}
-	if gitTop(p) {
-		return errDenied
+	if p[0] == '/' {
+		return errEscape
+	}
+	if p == "." {
+		return nil
+	}
+	for _, comp := range strings.Split(p, "/") {
+		switch comp {
+		case "", ".":
+			return errMalformed
+		case "..":
+			return errEscape
+		case ".git":
+			return errDenied
+		}
 	}
 	return nil
-}
-
-// gitTop reports whether the first path component is exactly ".git". A leading
-// slash (absolute) yields an empty first component here and is left to openat2 to
-// reject as an escape; ".gitignore" and a nested "sub/.git" are not top-level.
-func gitTop(p string) bool {
-	first := p
-	if i := strings.IndexByte(p, '/'); i >= 0 {
-		first = p[:i]
-	}
-	return first == ".git"
 }
 
 // classify maps any failure to a stable, bounded code. Internal sentinels are
@@ -499,6 +545,10 @@ func classify(err error) string {
 		return codeNotDir
 	case errors.Is(err, unix.EISDIR):
 		return codeIsDir
+	case errors.Is(err, unix.ENXIO):
+		// A readerless FIFO or a socket file rejected at open with O_NONBLOCK: it is
+		// not a regular file, so it maps to the same code the fstat type check yields.
+		return codeNotFile
 	case errors.Is(err, unix.ENAMETOOLONG):
 		return codeOversize
 	case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
