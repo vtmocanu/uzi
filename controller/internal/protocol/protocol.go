@@ -66,6 +66,18 @@ type DesiredWorker struct {
 	// hostedsvc.DesiredWorker.DrainingSince, and the shared golden pins the two in lockstep.
 	DrainingSince *time.Time `json:"draining_since"`
 	Generation    int64      `json:"generation"`
+	// DiskPressure is true when the worker's own disk-space metric crossed the api's
+	// pressure threshold (PRD #837 M4). This side reacts by recycling the worker's /nix
+	// and /data volumes (teardown + reprovision), unless the worker is Ephemeral or a
+	// just-recycled worker is still within the recycle cooldown. Mirrors the api's
+	// hostedsvc.DesiredWorker.DiskPressure; the shared golden pins the two in lockstep.
+	DiskPressure bool `json:"disk_pressure"`
+	// Ephemeral is true for a run-bound worker whose lifetime is a single run (PRD #837
+	// M4). Such a worker is EXCLUDED from every disk recycle arm: recycling volumes out
+	// from under a run-bound worker would be pointless churn — the worker is torn down
+	// when its run ends anyway. Mirrors the api's hostedsvc.DesiredWorker.Ephemeral; the
+	// shared golden pins the two in lockstep.
+	Ephemeral bool `json:"ephemeral"`
 	// JoinToken is the plaintext, present only until a pod proves it holds it (by
 	// registering) or the api's buffer expires unread.
 	//

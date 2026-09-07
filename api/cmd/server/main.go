@@ -265,6 +265,7 @@ func run() error {
 		QuestionTimeoutSeconds:      cfg.QuestionTimeoutSeconds,
 		RunMaxRequeues:              cfg.RunMaxRequeues,
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
+		DiskPressureThreshold:       cfg.DiskPressureThreshold,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerAffinityCeiling:       cfg.WorkerAffinityCeiling,
 		WorkerSpreadGrace:           cfg.WorkerSpreadGrace,
@@ -536,10 +537,11 @@ func run() error {
 	// CI-autofix (PRD #71 M6): the poller's post-pipeline-sync detector turns an
 	// eligible failing agent-MR branch into an automatic ci_fix run (or one halt
 	// comment), through the same workersvc create path the manual "Fix CI" button uses
-	// and the M4 loop-guard ledger. Wired unconditionally — the instance kill-switch is
-	// simply NOT wiring it; per-user ci_autofix_enabled (default-OFF) and the
-	// pipelineMaxRefs>0 gate control activation. notifier lands the inbox rows.
-	engine.SetCIAutoFix(poller.NewCIAutoFix(q, wsvc, notifier, cfg.CIFixMaxJobs, cfg.CIFixLogTailBytes, cfg.CIAutofixMaxAttempts, cfg.CIAutofixConfigPaths))
+	// and the M4 loop-guard ledger. Activation is gated by an admin global kill-switch
+	// (settings ci_autofix_enabled, default ON), read fail-closed inside the detector
+	// (PRD #914), plus the per-user opt-in (users.ci_autofix_enabled) and the
+	// pipelineMaxRefs>0 gate. notifier lands the inbox rows.
+	engine.SetCIAutoFix(poller.NewCIAutoFix(q, wsvc, notifier, settingsCache, cfg.CIFixMaxJobs, cfg.CIFixLogTailBytes, cfg.CIAutofixMaxAttempts, cfg.CIAutofixConfigPaths))
 	// MR review watcher (PRD #700 M3): the poller's post-SyncMRStates detector turns an
 	// opted-in completed run's MR that gained new review comments on a green head
 	// pipeline into an automatic mr_rework run, through the workersvc create path and
@@ -1011,7 +1013,7 @@ func run() error {
 	// no caller. Shares the same secret cipher (sole key holder) as the forge/worker
 	// services — it seals pending join tokens with it.
 	if cfg.WorkerHostingEnabled {
-		h.SetHostedSvc(hostedsvc.New(q, box))
+		h.SetHostedSvc(hostedsvc.New(q, box, time.Now, cfg.WorkerHeartbeatStale))
 		slog.Info("hosted k8s workers enabled; serving the controller protocol on /api/controller")
 	}
 	// Wire the rate-limit poller so saving/replacing an Anthropic token pokes it for

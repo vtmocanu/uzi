@@ -70,6 +70,7 @@ function sched(over: Partial<Schedule>): Schedule {
     guidance: null,
     baked_guidance: null,
     model: null,
+    output_mode: null,
     override_subagent_model: false,
     enabled: true,
     status: "active",
@@ -126,6 +127,24 @@ describe("Schedules list", () => {
     expect(screen.getByText("paused")).toBeTruthy();
   });
 
+  it("renders a sibling sub-row whose next_fires is null without crashing (issue #1003)", async () => {
+    // A once/invalid-cron schedule ships `next_fires: null` on the wire. The per-repo
+    // sibling sub-row (MyScheduleSubRow, Schedules.tsx:1014) reads `s.next_fires?.[0]` and
+    // must tolerate it. Two siblings sharing a group id form the expandable group whose
+    // expansion mounts that sub-row.
+    mockApi.listSchedules.mockResolvedValue([
+      sched({ id: "g1", sibling_group_id: "grp-1003", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", target: "prompt", prompt: "grouped null next_fires", next_fires: null }),
+      sched({ id: "g2", sibling_group_id: "grp-1003", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas", target: "prompt", prompt: "grouped null next_fires", next_fires: null }),
+    ]);
+    renderPage();
+    // The group summary paints; expanding it mounts the MyScheduleSubRow per sibling.
+    await waitFor(() => expect(screen.getByText("Prompt: grouped null next_fires")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Show repos for Prompt: grouped null next_fires" }));
+    // The sub-rows rendered (their repo labels appear), so the Schedules.tsx:1014 nextFire
+    // read ran on a null next_fires without throwing.
+    expect(screen.getByText("vtmocanu/uzi")).toBeTruthy();
+  });
+
   it("suppresses the auto-approve chip for a self_improve row (PRD #590 follow-up 2)", async () => {
     // A self_improve run is always server-forced to auto_approve, so the chip is not a
     // user option: with wait_on_limit off, the row falls back to "defaults", not a chip.
@@ -169,6 +188,7 @@ describe("Schedules — two tabs (PRD #589 M6)", () => {
         cron: "0 2 * * *",
         timezone: "UTC",
         model: "",
+        output_mode: "",
         prompt: "",
         labels: ["bug"],
         guidance: "Triage the bug.",
@@ -226,6 +246,7 @@ describe("Schedules — enable-default sends the browser timezone (issue #660)",
         cron: "0 2 * * *",
         timezone: "UTC",
         model: "",
+        output_mode: "",
         prompt: "",
         labels: ["bug"],
         guidance: "Triage the bug.",

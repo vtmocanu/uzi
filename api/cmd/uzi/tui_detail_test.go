@@ -24,16 +24,13 @@ func TestTUIDetailSeparatorColumnIsConstant(t *testing.T) {
 	// No string carries a ▏ rune, so the only ▏ in the frame is the column separator.
 	long1 := "Sweep terraform occurrences + seed mapping"
 	long2 := "Reconcile the judge-model drift across every sibling branch"
-	next, _ := m.Update(detailLoadedMsg{
-		run: apitypes.RunDTO{ID: runID, Status: "running", Health: "ok"},
-		msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", Health: "ok"},
+		[]apitypes.MessageDTO{
 			msgDTO(1, "text", "lead", "toolu_a", long1, "planning", now.Add(-4*time.Minute)),
 			msgDTO(2, "text", "coder", "toolu_b", long2, "writing", now.Add(-3*time.Minute)),
 			msgDTO(3, "text", "tester", "toolu_c", "short", "testing", now.Add(-2*time.Minute)),
 			msgDTO(4, "text", "judge", "toolu_d", "", "reviewing", now.Add(-time.Minute)),
-		},
-	})
-	m = next.(tuiModel)
+		})
 
 	out := m.View().Content
 

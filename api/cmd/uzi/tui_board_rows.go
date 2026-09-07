@@ -448,8 +448,8 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 		fillC = m.pal.faintC
 	}
 	// The in-progress cell (first frozen id in progress, D4) takes the cell right after the
-	// done fill and blinks ▰/▱ in the wait colour. Not on a DONE (terminal) row — its
-	// in-progress snapshot is stale and the row is faint end to end.
+	// done fill and blinks ▰/▱ in the tungsten colour (PRD #1136 D2, via milestoneCell). Not on
+	// a DONE (terminal) row — its in-progress snapshot is stale and the row is faint end to end.
 	ipID, _ := milestoneInProgress(r.RunDTO)
 	blink := ipID != "" && done < total && !dim
 	out := paintSeg(fillC, bg, false, strings.Repeat("▰", done))

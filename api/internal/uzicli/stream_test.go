@@ -517,6 +517,59 @@ func TestStreamRunReReadsStateOnReconnect(t *testing.T) {
 	}
 }
 
+// NoteSeen (PRD #1137) raises the replay floor from a consumer goroutine (the TUI,
+// which fetches tail/catch-up pages out of band). A reconnect must then replay from
+// that floor, not from the zero lastSeq the stream started with — otherwise the
+// consumer re-downloads history it already has. On unfixed code (lastSeq never told
+// about the out-of-band fetch) the replay would ask for after=0.
+//
+// It also exercises the race the atomic guards: NoteSeen writes lastSeq from the test
+// goroutine while the pump reads/raises it from its own. Run under -race.
+func TestStreamRunReplaysFromNoteSeenFloorOnReconnect(t *testing.T) {
+	srv := newStreamServer(t)
+	c := srv.client("uzc_test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stream, err := c.StreamRun(ctx, testRunID)
+	if err != nil {
+		t.Fatalf("StreamRun: %v", err)
+	}
+	defer stream.Close()
+	conn := srv.nextConn(t)
+
+	// The consumer fetched up to seq 200 by other means (tail page) and tells the
+	// stream, WITHOUT the stream having emitted any of those frames itself.
+	stream.NoteSeen(200)
+
+	// The run has a message at seq 201 the socket never delivered; a reconnect must
+	// replay it, asking from after=200 (the floor NoteSeen set), not after=0.
+	srv.setMessages([]apitypes.MessageDTO{{Seq: 201, Kind: "text"}})
+	_ = conn.CloseNow()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case ev, ok := <-stream.Events():
+			if !ok {
+				t.Fatalf("stream closed during reconnect (Err: %v)", stream.Err())
+			}
+			if ev.Type == RunEventTypeMessage && ev.Seq == 201 {
+				_, _, _, _, logs := srv.snapshot()
+				if len(logs) == 0 {
+					t.Fatal("no RunLogs call on reconnect; the replay half of the recovery contract is missing")
+				}
+				if logs[0] != 200 {
+					t.Errorf("reconnect replayed from after=%d, want after=200 (the NoteSeen floor) — replaying from 0 re-downloads what the consumer already fetched", logs[0])
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("the seq-201 message was never replayed after the socket died")
+		}
+	}
+}
+
 // -------------------------------------------------------------------------
 // Shutdown: cancelling the context closes Events and leaves no goroutine behind.
 // -------------------------------------------------------------------------
@@ -848,7 +901,7 @@ func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
 	// migrations and only the most recent one describes the live constraint.
 	var chosen, upHalf string
 	for _, p := range paths {
-		raw, err := os.ReadFile(p)
+		raw, err := os.ReadFile(p) //nolint:gosec // G304: p comes from a fixed repo-relative migrations dir glob, never external input
 		if err != nil {
 			t.Fatalf("read %s: %v", p, err)
 		}

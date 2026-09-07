@@ -20,6 +20,7 @@ import type {
   AskUserQuestion,
   Milestone,
   MilestoneProgress,
+  Proposal,
 } from "./protocol.js";
 
 /** The in-process MCP server name; tools surface as `mcp__uzi__<tool>`. */
@@ -71,6 +72,13 @@ export interface ScannedSignals {
    *  run that completes with NO push/MR. Present only when signal_done carried `report_only:
    *  true`; absent otherwise so a plain signal_done still scans to exactly `{ done: true }`. */
   reportOnly?: boolean;
+  /** PRD #929 M2: the structured proposal (title + body) a signal_done call carried, for a
+   *  scheduled `prompt` run to convey a filing-ready issue to the server. MAIN-THREAD-ONLY,
+   *  behind the same isSubagentFrame guard as `summary`. Set ONLY when signal_done carried a
+   *  `proposal` object with two non-empty string members (defensively parsed — a malformed or
+   *  absent value leaves it undefined and never throws), so a plain signal_done still scans to
+   *  exactly `{ done: true }`. */
+  proposal?: Proposal;
   /** PRD #88: the questions an ask_user call carried, if the message made one.
    *  Present and non-empty ⇒ the executor parks the run. */
   questions?: AskUserQuestion[];
@@ -124,6 +132,84 @@ export interface SignalServerOptions {
   reportOnly?: boolean;
 }
 
+/** The terse ack object each signalling tool returns to the model. The AUTHORITATIVE
+ *  capture is the worker observing the tool_use in scanSignals; these handler returns
+ *  are only guidance. `type: "text"` is a literal so the shape stays assignable to the
+ *  SDK tool() callback's result type when the handler is wrapped separately. */
+type SignalAck = { content: Array<{ type: "text"; text: string }> };
+
+/** The raw signalling tool handlers (mirrors makeMemoryToolHandlers /
+ *  makeFindingsToolHandlers). Each handler takes no arguments and returns a fixed ack —
+ *  the workflow is driven by scanSignals observing the tool_use, not by these returns.
+ *  ALL five are always built; buildSignalMcpServer decides which to REGISTER based on
+ *  the conditional gating in opts, so the ack text/timing stays identical whether or not
+ *  a tool is exposed.
+ *
+ *  Module-private (not exported): the test suite reaches these handlers through the
+ *  built server's `_registeredTools`, and no other module imports the factory, so
+ *  exporting it would trip the knip `exports` gate (its `ignoreExportsUsedInFile` covers
+ *  only interfaces/types, not functions). The split is achieved either way. */
+function makeSignalToolHandlers(): {
+  submitPlan(): Promise<SignalAck>;
+  askUser(): Promise<SignalAck>;
+  signalDone(): Promise<SignalAck>;
+  reportProgress(): Promise<SignalAck>;
+  checkpoint(): Promise<SignalAck>;
+} {
+  return {
+    async submitPlan() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Plan submitted for human approval. Stop now and end your turn — do not implement until you are re-prompted with the approval.",
+          },
+        ],
+      };
+    },
+    async askUser() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Question sent to the human. Stop now and end your turn — their answer will arrive as a new message.",
+          },
+        ],
+      };
+    },
+    async signalDone() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Completion recorded. The worker will finalize the run — pushing the branch and opening the merge request, unless you set report_only, in which case it records your summary and transcript and opens no merge request. End your turn.",
+          },
+        ],
+      };
+    },
+    async reportProgress() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Progress recorded. Keep working — this did not end your turn.",
+          },
+        ],
+      };
+    },
+    async checkpoint() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Checkpoint saved. Stop now and end your turn.",
+          },
+        ],
+      };
+    },
+  };
+}
+
 /**
  * Build the in-process MCP server exposing the two signalling tools. Passed to
  * the SDK via `options.mcpServers`. The handlers return terse guidance; the
@@ -141,6 +227,25 @@ export function buildSignalMcpServer(
       .string()
       .optional()
       .describe("One-line summary of what was implemented."),
+    // PRD #929 M2: how an ISSUES-MODE scheduled prompt run delivers its proposal for
+    // server-side filing as a forge issue. UNGATED on run kind on purpose (unlike
+    // prd_done_path/report_only): the fire-time delivery instruction (a later milestone)
+    // is what tells the agent to fill it, so the field is always present-and-optional and
+    // the agent leaves it unset on every other run. Non-empty title + body are required
+    // WHEN the object is present; the whole object stays optional.
+    proposal: z
+      .object({
+        title: z.string().min(1).describe("The proposed issue's title."),
+        body: z
+          .string()
+          .min(1)
+          .describe("The proposed issue's body, as Markdown."),
+      })
+      .optional()
+      .describe(
+        "ONLY on an issues-mode scheduled prompt run instructed to deliver a proposal: the " +
+          "title + body of the issue to file on the server's behalf. Omit it entirely otherwise.",
+      ),
   };
   if (opts.prdDonePath) {
     doneShape["prd_done_path"] = z
@@ -207,6 +312,7 @@ export function buildSignalMcpServer(
           "Omit it entirely for small single-unit work.",
       );
   }
+  const h = makeSignalToolHandlers();
   return createSdkMcpServer({
     name: SIGNAL_SERVER_NAME,
     version: "1.0.0",
@@ -215,14 +321,7 @@ export function buildSignalMcpServer(
         SUBMIT_PLAN_TOOL,
         "Submit your implementation plan for human approval. Call this EXACTLY ONCE when the plan is ready, then STOP and end your turn — do not begin implementing. A human approves or rejects the plan out of band; you will be re-prompted to implement only after approval. Pass the plan as the 'plan_md' argument (Markdown).",
         planShape,
-        async () => ({
-          content: [
-            {
-              type: "text",
-              text: "Plan submitted for human approval. Stop now and end your turn — do not implement until you are re-prompted with the approval.",
-            },
-          ],
-        }),
+        () => h.submitPlan(),
       ),
       tool(
         ASK_USER_TOOL,
@@ -269,27 +368,13 @@ export function buildSignalMcpServer(
               "The questions to ask. Keep the list short and each question self-contained.",
             ),
         },
-        async () => ({
-          content: [
-            {
-              type: "text",
-              text: "Question sent to the human. Stop now and end your turn — their answer will arrive as a new message.",
-            },
-          ],
-        }),
+        () => h.askUser(),
       ),
       tool(
         SIGNAL_DONE_TOOL,
         "Signal that the implementation is complete and has passed review. Call this once — and only once — the work is committed locally and the reviewer is satisfied. The worker then finalizes the run — pushing the branch and opening the merge request, UNLESS you set report_only, in which case it records your summary and transcript and opens no merge request; you never push.",
         doneShape,
-        async () => ({
-          content: [
-            {
-              type: "text",
-              text: "Completion recorded. The worker will finalize the run — pushing the branch and opening the merge request, unless you set report_only, in which case it records your summary and transcript and opens no merge request. End your turn.",
-            },
-          ],
-        }),
+        () => h.signalDone(),
       ),
       // PRD #122 M2. Issue runs only (opts.progress, gated on kind==="issue"). Unlike
       // submit_plan/signal_done, this does NOT end the turn — it is a pure progress
@@ -316,14 +401,7 @@ export function buildSignalMcpServer(
                   .default([])
                   .describe("Milestone ids currently being worked on (a snapshot, replaced each call)."),
               },
-              async () => ({
-                content: [
-                  {
-                    type: "text",
-                    text: "Progress recorded. Keep working — this did not end your turn.",
-                  },
-                ],
-              }),
+              () => h.reportProgress(),
             ),
           ]
         : []),
@@ -343,14 +421,7 @@ export function buildSignalMcpServer(
                 "re-prompted to continue with the next milestone. This is a durability checkpoint, NOT a quality gate: " +
                 "it does not run tests or verify that review passed.",
               {},
-              async () => ({
-                content: [
-                  {
-                    type: "text",
-                    text: "Checkpoint saved. Stop now and end your turn.",
-                  },
-                ],
-              }),
+              () => h.checkpoint(),
             ),
           ]
         : []),
@@ -509,6 +580,23 @@ function parseProgressIds(raw: unknown): string[] {
   return out;
 }
 
+/**
+ * Parse the `proposal` argument of a signal_done call (PRD #929 M2). Defensive in the
+ * same register as the other extractions: a non-object, or one missing a non-empty
+ * string `title` or `body`, yields undefined and never throws — so a malformed proposal
+ * is dropped rather than half-forwarded, and the api never files a titleless/bodyless
+ * issue. Length is left to the api (the authoritative control validates/scrubs); no
+ * worker-side clamp is applied here, matching how the api owns the grammar for the other
+ * model-authored declarations. */
+function parseProposal(raw: unknown): Proposal | undefined {
+  const p = asRecord(raw);
+  if (!p) return undefined;
+  const title = typeof p["title"] === "string" ? p["title"].trim() : "";
+  const body = typeof p["body"] === "string" ? p["body"].trim() : "";
+  if (title === "" || body === "") return undefined;
+  return { title, body };
+}
+
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === "object"
     ? (v as Record<string, unknown>)
@@ -524,7 +612,7 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
  * main thread. Narrow probes only, so an SDK reshape degrades to "treat as main
  * thread" (fail toward the existing behavior) rather than throwing.
  */
-function isSubagentFrame(msg: Record<string, unknown>): boolean {
+export function isSubagentFrame(msg: Record<string, unknown>): boolean {
   const subagentType = msg["subagent_type"];
   if (typeof subagentType === "string" && subagentType.length > 0) return true;
   const parentToolUseId = msg["parent_tool_use_id"];
@@ -611,6 +699,14 @@ export function scanSignals(message: unknown): ScannedSignals {
       if (typeof summary === "string")
         out.summary = summary.slice(0, REPORT_MD_MAX_LEN);
       if (input?.["report_only"] === true) out.reportOnly = true;
+      // PRD #929 M2. Extracted HERE, in the same signal_done branch and therefore behind the
+      // same main-thread guard as summary above: a scheduled prompt run's proposal is filed
+      // as a forge issue server-side, so a subagent frame must never be able to declare it.
+      // Set ONLY when a well-formed {title, body} parsed (parseProposal drops anything else),
+      // so a plain signal_done still scans to exactly `{ done: true }` and never affects
+      // `done` — a malformed declaration still means the run finished.
+      const proposal = parseProposal(input?.["proposal"]);
+      if (proposal !== undefined) out.proposal = proposal;
     } else if (name === ASK_USER_QUALIFIED) {
       // PRD #88. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards, for the same reason prd_done_path is nested inside signal_done's

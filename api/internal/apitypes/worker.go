@@ -111,6 +111,15 @@ type WorkerDTO struct {
 	StatsMemBytes      *int64   `json:"stats_mem_bytes"`
 	StatsMemLimitBytes *int64   `json:"stats_mem_limit_bytes"`
 	StatsSource        *string  `json:"stats_source"`
+	// Latest per-volume disk sample (PRD #837 M1), all null until the worker reports one
+	// (and re-nulled if it stops). Used + total bytes for the /nix and data volumes; a
+	// volume's pair is null when its statfs failed or the mount is absent (dev/compose
+	// has no /nix). Same display-only, last-known-dimmed-by-freshness contract as the mem
+	// fields above.
+	StatsDiskNixBytes       *int64 `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes  *int64 `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes      *int64 `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes *int64 `json:"stats_disk_data_total_bytes"`
 	// Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
 	// Both null means "unbound": the worker spends its owner's default token, which
 	// is every worker's state until someone binds one. The label rides alongside the

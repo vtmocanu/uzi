@@ -102,10 +102,14 @@ type fakeStore struct {
 	// Sweep). A user absent from the map returns an empty candidate slice; nil map falls
 	// back to the blanket autoCandidates so every existing fixture is unchanged.
 	autoCandidatesByUser map[uuid.UUID][]store.ListAutoSelectCandidatesRow
-	// judgeSecret is the user's judge-lane binding (PRD #104 M4); the zero value is
-	// "unbound", which is every user's state until they choose otherwise, so existing
-	// judge fixtures keep resolving the default with no change.
+	// judgeSecret is the user's judge-lane pointer (PRD #104 M4); the zero value is a
+	// NULL pointer. judgeBindMode is the three-valued mode (PRD #1140 M2); the zero
+	// value "" falls into judgeChoice's default arm (resolves the owner's default), so
+	// an unbound judge fixture keeps resolving the default with no change. A fixture
+	// staging a Valid judgeSecret must set judgeBindMode: BindModePinned to spend it —
+	// the same coupling the migration's backfill produces on real rows.
 	judgeSecret    pgtype.UUID
+	judgeBindMode  string
 	judgeSecretErr error
 	// anthropicSealedWith is the row's sealed_with (defaults to 'master' when
 	// empty, so existing fixtures are unchanged); set to 'dek' for vault tests.
@@ -415,6 +419,11 @@ type fakeStore struct {
 	// Create worker.
 	createWorkerResult store.Worker
 	createWorkerParams *store.CreateWorkerParams
+	// hasAutoPool is the auto-select pool answer CreateWorker reads when no label
+	// resolved (PRD #1140 M1). Defaults false → the unbound mint derives `default`,
+	// which is the state these token/template tests assert; a test that cares about
+	// the `auto` derivation sets it true.
+	hasAutoPool bool
 
 	// Tool provisioning (PRD #18 M4). Defaults (zero profile, nil error, empty
 	// allowlist) resolve to no provisioning, so claim tests that don't opt in are
@@ -455,6 +464,15 @@ type fakeStore struct {
 	pendingProposalCount int64
 	createdProposal      *store.CreateIssueProposalParams
 	sweptStuckProposals  []uuid.UUID
+	// PRD #929 M2: server-side proposal filing. runSchedule/runScheduleErr back
+	// GetRunSchedule; stampedProposal records the StampFiledProposalParams the filing
+	// path settled with (nil = never stamped); stampProposalRows/Err control its result.
+	runSchedule       store.RunSchedule
+	runScheduleErr    error
+	stampedProposal   *store.StampFiledProposalParams
+	stampProposalRows int64
+	stampProposalErr  error
+	createProposalErr error
 	// PRD #191 M1: the lifted ConfirmProposalForUser reverts a claimed proposal on a
 	// post-claim failure. revertedProposals records every RevertProposalToPending id,
 	// in order, so a test can assert the revert fired (and how many times).
@@ -549,7 +567,19 @@ func (f *fakeStore) CountPendingProposalsForRun(context.Context, uuid.UUID) (int
 }
 func (f *fakeStore) CreateIssueProposal(_ context.Context, arg store.CreateIssueProposalParams) (store.IssueProposal, error) {
 	f.createdProposal = &arg
+	if f.createProposalErr != nil {
+		return store.IssueProposal{}, f.createProposalErr
+	}
 	return store.IssueProposal{ID: uuid.New(), RunID: arg.RunID, RepoID: arg.RepoID, Title: arg.Title, Status: "pending"}, nil
+}
+
+func (f *fakeStore) GetRunSchedule(_ context.Context, _ uuid.UUID) (store.RunSchedule, error) {
+	return f.runSchedule, f.runScheduleErr
+}
+
+func (f *fakeStore) StampFiledProposal(_ context.Context, arg store.StampFiledProposalParams) (int64, error) {
+	f.stampedProposal = &arg
+	return f.stampProposalRows, f.stampProposalErr
 }
 
 func (f *fakeStore) ClaimChatRun(_ context.Context, arg store.ClaimChatRunParams) (store.Run, error) {
@@ -600,8 +630,11 @@ func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecret
 	}
 	return store.GetUserSecretCiphertextRow{Ciphertext: f.anthropic, SealedWith: sealedWith}, f.anthropicErr
 }
-func (f *fakeStore) GetUserJudgeAnthropicSecret(context.Context, uuid.UUID) (pgtype.UUID, error) {
-	return f.judgeSecret, f.judgeSecretErr
+func (f *fakeStore) GetUserJudgeAnthropicBinding(context.Context, uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error) {
+	return store.GetUserJudgeAnthropicBindingRow{
+		JudgeAnthropicBindMode: f.judgeBindMode,
+		JudgeAnthropicSecretID: f.judgeSecret,
+	}, f.judgeSecretErr
 }
 func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
 	f.byIDLookups = append(f.byIDLookups, arg)
@@ -1176,6 +1209,13 @@ func (f *fakeStore) CountActiveCIFixForRef(context.Context, store.CountActiveCIF
 func (f *fakeStore) CreateWorker(_ context.Context, arg store.CreateWorkerParams) (store.Worker, error) {
 	f.createWorkerParams = &arg
 	return f.createWorkerResult, nil
+}
+
+// UserHasAutoEligibleAnthropicToken is the pool read CreateWorker performs on the
+// no-label path (PRD #1140 M1). fakeStore embeds Store so an unimplemented method
+// panics; this one is reached by every unbound mint, so it must be a real stub.
+func (f *fakeStore) UserHasAutoEligibleAnthropicToken(_ context.Context, _ uuid.UUID) (bool, error) {
+	return f.hasAutoPool, nil
 }
 func (f *fakeStore) CountWorkerNonTerminalRuns(_ context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error) {
 	f.countActiveParams = &arg
@@ -1871,10 +1911,11 @@ func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
 	}
 }
 
-// TestClaimOmitsDefaultEffortWhenOwnerHasNone mirrors the default_model omit test
-// (PRD #617): with the owner's per-user default effort left NULL the field is nil
-// and omitted from the wire, so the worker never sets the SDK effort key.
-func TestClaimOmitsDefaultEffortWhenOwnerHasNone(t *testing.T) {
+// TestClaimDefaultsEffortToXhighWhenOwnerHasNone: with the owner's per-user default
+// effort left NULL (inherit), the claim resolves it to the uzi default `xhigh`
+// (issue #1157) rather than omitting the field, so the worker applies xhigh instead
+// of the SDK's own `high` fallback.
+func TestClaimDefaultsEffortToXhighWhenOwnerHasNone(t *testing.T) {
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte("bot-pat-EFFOMIT-abcdef1234567890"))
 	sealedTok, _ := box.Seal([]byte("anthropic-EFFOMIT-abcdef1234567890"))
@@ -1894,16 +1935,16 @@ func TestClaimOmitsDefaultEffortWhenOwnerHasNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if payload.Config.DefaultEffort != nil {
-		t.Fatalf("expected nil default effort, got %q", *payload.Config.DefaultEffort)
+	if payload.Config.DefaultEffort == nil || *payload.Config.DefaultEffort != "xhigh" {
+		t.Fatalf("expected default effort xhigh for an inheriting owner, got %+v", payload.Config.DefaultEffort)
 	}
-	// omitempty: an unset default must not appear on the wire at all.
+	// The uzi default now rides the wire for a NULL owner.
 	b, err := json.Marshal(payload.Config)
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}
-	if strings.Contains(string(b), "default_effort") {
-		t.Fatalf("unset default_effort should be omitted from the payload; got %s", b)
+	if !strings.Contains(string(b), `"default_effort":"xhigh"`) {
+		t.Fatalf("inheriting owner should carry default_effort xhigh on the wire; got %s", b)
 	}
 }
 
@@ -4612,8 +4653,9 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 			ID: uuid.New(), Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
-		anthropic:   sealedDefault,
-		judgeSecret: pgtype.UUID{Bytes: judgeID, Valid: true},
+		anthropic:     sealedDefault,
+		judgeSecret:   pgtype.UUID{Bytes: judgeID, Valid: true},
+		judgeBindMode: BindModePinned,
 		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
 			judgeID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedJudge, SealedWith: store.SealedWithMaster},
 		},
@@ -4714,7 +4756,7 @@ func TestJudgeBindingLookupErrorFailsClaim(t *testing.T) {
 	if err == nil {
 		t.Fatal("a failed judge-binding lookup must fail the claim, never silently fall back to the default")
 	}
-	if !strings.Contains(err.Error(), "judge token binding lookup") {
+	if !strings.Contains(err.Error(), "judge binding lookup") {
 		t.Fatalf("error should name the binding lookup, got: %v", err)
 	}
 }
@@ -4730,9 +4772,10 @@ func TestJudgeBoundToVanishedSecretFailsClosed(t *testing.T) {
 			ID: uuid.New(), Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
-		anthropic:   sealedDefault,
-		judgeSecret: pgtype.UUID{Bytes: uuid.New(), Valid: true},
-		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{}, // resolves to nothing
+		anthropic:     sealedDefault,
+		judgeSecret:   pgtype.UUID{Bytes: uuid.New(), Valid: true},
+		judgeBindMode: BindModePinned,
+		byIDSecrets:   map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{}, // resolves to nothing
 	}
 	svc := New(fs, box, testParams())
 
@@ -4772,8 +4815,9 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
-		anthropic:   sealedDefault,
-		judgeSecret: pgtype.UUID{Bytes: judgeID, Valid: true},
+		anthropic:     sealedDefault,
+		judgeSecret:   pgtype.UUID{Bytes: judgeID, Valid: true},
+		judgeBindMode: BindModePinned,
 		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
 			judgeID:  {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedJudge, SealedWith: store.SealedWithMaster},
 			workerID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedDefault, SealedWith: store.SealedWithMaster},

@@ -15,6 +15,7 @@
   "max_issues": null,
   "guidance": null,
   "model": null,
+  "output_mode": null,
   "override_subagent_model": null,
   "sibling_group_id": null
 }

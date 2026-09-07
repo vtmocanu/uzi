@@ -77,7 +77,7 @@ func TestBoardRendersAwaitingFollowupGlyphTwin(t *testing.T) {
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "task", Status: "awaiting_followup", IssueTitle: "interactive one"}},
 	}}
 	m := tuiTestModel(t, fake, "")
-	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
 	m = next.(tuiModel)
 	// Strip every SGR escape: what remains is exactly what a NO_COLOR/Ascii terminal shows.
 	plain := stripANSI(m.View().Content)

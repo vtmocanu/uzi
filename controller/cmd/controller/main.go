@@ -102,8 +102,14 @@ func main() {
 	// satisfies kube.Cordoner, so a busy drifted worker is cordoned and drained rather
 	// than hard-killed. The DrainPolicy carries M5's two overrides: the bounded deadline
 	// after which a cordoned busy worker rolls anyway, and the emergency force-roll.
+	// The RecyclePolicy carries M4's disk self-heal toggle + cooldown (PRD #837): a
+	// worker reporting disk pressure has its /nix and /data volumes recycled (teardown +
+	// reprovision), unless self-heal is disabled or the worker was just recycled within
+	// the cooldown.
 	materializer := kube.New(kubeClient, materializerCfg, resolver, client,
-		kube.DrainPolicy{Deadline: cfg.DrainDeadline, ForceRoll: cfg.ForceRoll}, log)
+		kube.DrainPolicy{Deadline: cfg.DrainDeadline, ForceRoll: cfg.ForceRoll},
+		kube.RecyclePolicy{Enabled: cfg.WorkerDiskRecycleEnabled, Cooldown: cfg.WorkerDiskRecycleCooldown},
+		log)
 
 	// REFUSE TO BOOT on a PVC that its namespace's LimitRange will reject (issue #224).
 	//

@@ -77,7 +77,7 @@ context keeps growing underneath it.
 ### 2. Every SDK session starts lean
 
 Every SDK session uzi spawns — lead and subagent alike — runs with
-`settingSources: []` (`agent/src/sdk-executor.ts`), so it never loads the
+`settingSources: []` (run options in `agent/src/claude-harness.ts`), so it never loads the
 cloned repo's own `CLAUDE.md`, `.claude/rules/*`, `.claude/agents/*`, or
 skills; the comment beside the option calls this out explicitly as
 prompt-injection defense, not a cost optimization, but it has the cost effect

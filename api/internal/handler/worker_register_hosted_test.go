@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -70,7 +71,7 @@ func newRegisterHandler(t *testing.T, kind string, ns hostedsvc.Store, rotatedHa
 	t.Helper()
 	h := &Handler{wsvc: workersvc.New(&registerStore{kind: kind, rotatedHash: rotatedHash}, newHandlerTestBox(t), workersvc.Params{})}
 	if ns != nil {
-		h.SetHostedSvc(hostedsvc.New(ns, newHandlerTestBox(t)))
+		h.SetHostedSvc(hostedsvc.New(ns, newHandlerTestBox(t), time.Now, time.Hour))
 	}
 	return h
 }

@@ -1,12 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { makeClaim, nullLogger } from "./helpers.js";
-import { StubExecutor } from "../src/executor.js";
+import { StubExecutor, type Executor } from "../src/executor.js";
 import type { ClaimResponse, RunKind } from "../src/protocol.js";
 import {
   api,
   fx,
   fakeGitlab,
+  git,
   installHarness,
   runner,
 } from "./runner-harness.js";
@@ -82,5 +83,83 @@ describe("RunRunner — ad-hoc prompt kind (PRD #241 M8)", () => {
     const body = JSON.parse(calls[0]!.body ?? "{}");
     assert.equal(body.title, "Scheduled prompt run");
     assert.ok(!String(body.title).includes("#null"));
+  });
+});
+
+// PRD #929 M2 (agent/worker SEND half): a scheduled prompt run whose deliverable is a
+// structured proposal (no code to land) completes report-only and carries the proposal on
+// the terminal `completed` report, so the server can file it as a forge issue. The zero-diff
+// (report-only) prompt terminal is the send site (runner.ts ~1152). StubExecutor makes a real
+// commit so the agent branch fetches back; overriding changedFiles to [] drives the
+// confirmed-empty (report-only) leg deterministically.
+describe("RunRunner — prompt run proposal delivery (PRD #929 M2)", () => {
+  /** Wrap StubExecutor so the branch is really created (fetchAgentBranch succeeds) while the
+   *  ExecutorResult also carries a proposal, exactly as the SDK executor forwards one. */
+  function proposalExecutor(
+    proposal: { title: string; body: string } | undefined,
+  ): Executor {
+    const stub = new StubExecutor(nullLogger());
+    return {
+      run: async (ctx) => {
+        const result = await stub.run(ctx);
+        return proposal === undefined ? result : { ...result, proposal };
+      },
+    };
+  }
+
+  it("INCLUDES the proposal on the report-only completion when the agent set one", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    // Confirmed-empty diff ⇒ the zero-diff report-only terminal (no branch push, no MR).
+    git.changedFiles = (async () => []) as typeof git.changedFiles;
+    const proposal = {
+      title: "Flaky poller tests",
+      body: "`poller_test.go` is timing-sensitive; propose a deterministic clock.",
+    };
+    const claim = promptClaim();
+    await runner(proposalExecutor(proposal), gitlab).execute(claim);
+
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
+    assert.strictEqual(completed.report_only, true);
+    assert.deepStrictEqual(completed.proposal, proposal);
+    // A proposal delivery is report-only: no branch pushed, no MR opened.
+    assert.strictEqual(calls.length, 0, "no MR opened on a proposal (report-only) run");
+    assert.ok(
+      !("mr_iid" in completed) || completed.mr_iid === undefined,
+      "no MR iid on a report-only completion",
+    );
+  });
+
+  it("OMITS the proposal key entirely on an ordinary zero-diff prompt completion", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    git.changedFiles = (async () => []) as typeof git.changedFiles;
+    const claim = promptClaim();
+    // No proposal from the executor ⇒ the completion payload must be byte-identical to today.
+    await runner(proposalExecutor(undefined), gitlab).execute(claim);
+
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
+    assert.strictEqual(completed.report_only, true);
+    assert.ok(
+      !("proposal" in completed),
+      "proposal absent (not null/undefined) when the agent produced none",
+    );
+    assert.strictEqual(calls.length, 0);
+  });
+
+  it("OMITS the proposal key on a normal push+MR prompt completion", async () => {
+    // The committing prompt run falls through to push/MR; a proposal has no place there and
+    // the completed report stays byte-identical to today's mr-mode shape.
+    const { gitlab } = fakeGitlab();
+    const claim = promptClaim();
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
+    assert.strictEqual(completed.mr_iid, 42);
+    assert.ok(!("proposal" in completed), "no proposal key on a normal mr-mode completion");
   });
 });

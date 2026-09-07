@@ -53,10 +53,11 @@ func TestClaimChatSucceedsWithoutForgeConnection(t *testing.T) {
 	}
 }
 
-// TestClaimChatOmitsDefaultEffortWhenOwnerHasNone: with the owner's per-user default
-// effort left NULL the chat claim's Config.DefaultEffort is nil and omitted from the
-// wire (PRD #617), so the worker never sets the SDK effort key.
-func TestClaimChatOmitsDefaultEffortWhenOwnerHasNone(t *testing.T) {
+// TestClaimChatDefaultsEffortToXhighWhenOwnerHasNone: with the owner's per-user
+// default effort left NULL (inherit), the chat claim resolves it to the uzi default
+// `xhigh` (issue #1157) rather than omitting the field, so the worker applies xhigh
+// instead of the SDK's own `high` fallback.
+func TestClaimChatDefaultsEffortToXhighWhenOwnerHasNone(t *testing.T) {
 	box := newBox(t)
 	sealedTok, _ := box.Seal([]byte("anthropic-chat-effomit-abcdef1234567890"))
 	uid := uuid.New()
@@ -70,15 +71,15 @@ func TestClaimChatOmitsDefaultEffortWhenOwnerHasNone(t *testing.T) {
 	if err != nil || payload == nil {
 		t.Fatalf("ClaimChat: payload=%v err=%v", payload, err)
 	}
-	if payload.Config.DefaultEffort != nil {
-		t.Fatalf("expected nil default effort, got %q", *payload.Config.DefaultEffort)
+	if payload.Config.DefaultEffort == nil || *payload.Config.DefaultEffort != "xhigh" {
+		t.Fatalf("expected default effort xhigh for an inheriting owner, got %+v", payload.Config.DefaultEffort)
 	}
 	raw, err := json.Marshal(payload.Config)
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}
-	if strings.Contains(string(raw), "default_effort") {
-		t.Fatalf("unset default_effort should be omitted from the chat payload; got %s", raw)
+	if !strings.Contains(string(raw), `"default_effort":"xhigh"`) {
+		t.Fatalf("inheriting owner should carry default_effort xhigh on the chat payload; got %s", raw)
 	}
 }
 

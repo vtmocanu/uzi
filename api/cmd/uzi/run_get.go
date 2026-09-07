@@ -92,8 +92,41 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			follow, _ := cmd.Flags().GetBool("follow")
 			after, _ := cmd.Flags().GetInt32("after")
+			tail, _ := cmd.Flags().GetInt32("tail")
+			// --tail selects a window (the newest N) and --after selects a starting
+			// point; combining them is ambiguous, so it is a usage error caught before
+			// any request (mirroring the server's mutual-exclusion 400).
+			if tail != 0 && after != 0 {
+				return uzicli.Exitf(uzicli.ExitUsage, "--tail cannot be combined with --after")
+			}
+			// A non-positive --tail is a usage error, not a silent fall-through to the
+			// full history: the `tail > 0` guard below would otherwise skip the page
+			// path and print everything, the opposite of what the flag asks.
+			if tail < 0 {
+				return uzicli.Exitf(uzicli.ExitUsage, "--tail must be a positive integer")
+			}
 			p := env.printer(gf)
 			seq := after
+			// --tail N: fetch the newest N via one single-request page, render them,
+			// and advance seq to the highest rendered. Without --follow this is the
+			// whole command; with --follow the drain loop below continues from there.
+			if tail > 0 {
+				msgs, err := c.RunLogsPage(cmd.Context(), args[0], uzicli.LogsPageQuery{Tail: tail})
+				if err != nil {
+					return err
+				}
+				for _, m := range msgs {
+					if err := renderMessage(p, m); err != nil {
+						return err
+					}
+					if m.Seq > seq {
+						seq = m.Seq
+					}
+				}
+				if !follow {
+					return nil
+				}
+			}
 			drain := func() error {
 				msgs, err := c.RunLogs(cmd.Context(), args[0], seq)
 				if err != nil {
@@ -182,6 +215,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	logs.Flags().Bool("follow", false, "keep polling for new messages")
 	logs.Flags().Int32("after", 0, "only show messages after this sequence number")
+	logs.Flags().Int32("tail", 0, "print only the newest N messages")
 	return logs
 }
 

@@ -1,0 +1,5 @@
+# Container-only fixture: mount read-only at /etc/codex/requirements.toml.
+# An ordinary user config cannot keep unified_exec disabled in this version.
+[features]
+unified_exec = false
+shell_tool = true

@@ -310,6 +310,19 @@ export interface WorkerStats {
   /** Which mechanism produced the sample: "cgroup" (container-wide, covers children)
    *  or "process" (this worker process only, children-blind — the UI labels it). */
   source: "cgroup" | "process";
+  /** Used bytes on the `/nix` volume (`(blocks − bfree) × bsize` from statfs).
+   *  Omitted when the statfs call fails or the mount is absent (dev/compose has no
+   *  `/nix`) — never emitted as 0, so an absent field is distinct from an empty
+   *  volume, and a statfs failure never fails the heartbeat (PRD #837 M1). */
+  disk_nix_bytes?: number;
+  /** Total bytes on the `/nix` volume (`blocks × bsize`). Paired with disk_nix_bytes:
+   *  both present or both absent. */
+  disk_nix_total_bytes?: number;
+  /** Used bytes on the data volume (`config.dataDir`, default `/data`). Same
+   *  absent-on-failure convention as the `/nix` fields, guarded independently. */
+  disk_data_bytes?: number;
+  /** Total bytes on the data volume. Paired with disk_data_bytes. */
+  disk_data_total_bytes?: number;
 }
 
 export interface HeartbeatRequest {
@@ -435,11 +448,14 @@ export interface ClaimConfig {
   default_model?: string;
   /** The run owner's per-user default reasoning effort (PRD #617). When present it
    *  is applied to the SDK's top-level `Options.effort` for the main thread and
-   *  inherited by the implement-turn/subagent options via the baseOptions spread;
-   *  absent when the owner set no default, so the worker omits the key entirely and
-   *  the SDK default (`high`) applies. Typed as the SDK's own EffortLevel so the
-   *  worker tracks the SDK's closed set (mirror of the Go `agenttmpl.EffortLevels`
-   *  and the web EffortSelect list — no shared source, keep in lockstep). */
+   *  inherited by the implement-turn/subagent options via the baseOptions spread. The
+   *  API now populates this for every issue/chat claim — the owner's explicit choice,
+   *  or the uzi default `xhigh` for an owner who never chose (issue #1157); it is
+   *  absent only from an un-upgraded API, in which case the worker omits the key and
+   *  the SDK applies its own fallback (the worker adds no default of its own). Typed as
+   *  the SDK's own EffortLevel so the worker tracks the SDK's closed set (mirror of the
+   *  Go `agenttmpl.EffortLevels` and the web EffortSelect list — no shared source, keep
+   *  in lockstep). */
   default_effort?: EffortLevel;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
@@ -488,6 +504,19 @@ export interface ClaimConfig {
 export interface Milestone {
   id: string;
   title: string;
+}
+
+/**
+ * PRD #929 M2: a structured proposal a scheduled `prompt` run's agent conveys on
+ * `signal_done` so the server can file it as a forge issue. `title` is the issue
+ * title and `body` its Markdown body. Both are model-authored, UNTRUSTED text; the
+ * worker forwards them verbatim on the completion report and the api is the
+ * authoritative control (it validates/scrubs before filing). Omitted entirely when
+ * the run produced no proposal — a normal/mr-mode run's wire shape is unchanged.
+ */
+export interface Proposal {
+  title: string;
+  body: string;
 }
 
 /**
@@ -941,7 +970,9 @@ export interface ChatClaimConfig {
   max_turns: number;
   /** The owner's per-user default model (PRD #17); omitted when unset. */
   default_model?: string;
-  /** The owner's per-user default reasoning effort (PRD #617); omitted when unset. */
+  /** The owner's per-user default reasoning effort (PRD #617); the API populates it
+   *  with the owner's choice or the uzi default `xhigh` (issue #1157), and it is
+   *  optional only for an un-upgraded API. */
   default_effort?: EffortLevel;
 }
 
@@ -1433,6 +1464,14 @@ export interface StateRequest {
    *  the authoritative control and validates/scrubs/clamps it. Additive + optional and
    *  OMITTED ENTIRELY when the lead declared no summary. */
   report_md?: string;
+  /** PRD #929 M2: a scheduled `prompt` run's structured proposal (title + body) from
+   *  signal_done, carried on the terminal `completed` report so the server can file it as a
+   *  forge issue. Additive + optional and OMITTED ENTIRELY when the run produced no proposal
+   *  — never `null` and never a partial `{title}` — so an old worker's payload and a new
+   *  worker's ordinary (normal/mr-mode) completion stay byte-identical on the wire. The two
+   *  fields are model-authored UNTRUSTED text forwarded verbatim; the api validates/scrubs
+   *  before filing. */
+  proposal?: Proposal;
   /** PRD #634 M3: worker→api on the `completed` report of a scope-truncated run, so the
    *  server stamps stop_kind='scope_capped'. Additive + optional, OMITTED (never `false`) on
    *  a normal completion so an old worker's payload and a normal completion stay identical on

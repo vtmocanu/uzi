@@ -125,17 +125,25 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		}
 		s.recordMRState(ctx, c.ID, observed)
 	default:
-		// A KNOWN non-edge transition (merged / locked): record, never move.
-		// Unknown states never reach here — they are ignored before the bootstrap
-		// check above. A merge closes the issue via `Closes #N`, which the existing
-		// issue-close sync owns; locked is transient during merge processing.
+		// A KNOWN non-edge transition: record, never move (this arm makes no board
+		// move). Unknown states never reach here — they are ignored before the
+		// bootstrap check above. A merge closes the issue via `Closes #N`, which the
+		// existing issue-close sync owns.
 		//
-		// A merge additionally means the branch is gone and any in-flight rework can
-		// never land — abort it (#853). Locked is transient during merge processing
-		// and must NOT trigger a cancel.
-		if observed == forge.MRStateMerged {
+		// A confirmed TERMINAL state (merged OR closed) means the branch is gone / the
+		// MR can never land, so any in-flight rework must be aborted (#853). This must
+		// fire for `locked`->`closed` (and `locked`->`merged`) too: `locked` is the
+		// transient mid-merge state, so an `opened`->`locked`->`closed` sequence reaches
+		// this arm on the `locked`->`closed` tick — the `opened`->`closed` close arm
+		// above never sees it, so without cancelling here the run self-evicts at the
+		// terminal `closed` state with the rework still spending (issue #1072, the
+		// issue-lane analogue of the scheduled-lane fix in recordScheduledMRState). The
+		// cancel is keyed on the MR, not the card; no board move happens here because
+		// `locked` was mid-merge. A `locked`->`opened` settle is a non-terminal
+		// transition and must NOT cancel — the rework gate stays open.
+		if observed == forge.MRStateMerged || observed == forge.MRStateClosed {
 			if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
-				slog.Warn("forgesvc: cancel rework on MR merge failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", err)
+				slog.Warn("forgesvc: cancel rework on MR terminal state failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "state", observed, "error", err)
 				return // leave mr_state unadvanced so the next tick retries
 			}
 		}

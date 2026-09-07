@@ -193,7 +193,7 @@ func TestTokenListShowsPoolColumn(t *testing.T) {
 	// POSITIONAL, not "the word true appears somewhere". Each row's POOL cell is
 	// asserted against that row's own AutoEligible, which is what a
 	// Contains-anywhere check cannot do and what lets the wrong column render
-	// undetected. Rows are ID / LABEL / DEFAULT / POOL / CREATED.
+	// undetected. Rows are ID / KIND / LABEL / DEFAULT / POOL / ELIGIBLE / STATUS / CREATED.
 	for _, tc := range []struct {
 		label       string
 		wantPool    string
@@ -215,15 +215,15 @@ func TestTokenListShowsPoolColumn(t *testing.T) {
 			continue
 		}
 		cells := strings.Fields(row)
-		if len(cells) < 6 {
-			t.Errorf("row for %q has %d cells, want 6: %q", tc.label, len(cells), row)
+		if len(cells) < 8 {
+			t.Errorf("row for %q has %d cells, want 8: %q", tc.label, len(cells), row)
 			continue
 		}
-		if cells[2] != tc.wantDefault || cells[3] != tc.wantPool {
+		if cells[3] != tc.wantDefault || cells[4] != tc.wantPool {
 			t.Errorf("row for %q rendered DEFAULT=%q POOL=%q, want DEFAULT=%q POOL=%q — "+
 				"the two columns are separate facts and rendering one in the other's place "+
 				"tells a user the wrong credential is pooled: %q",
-				tc.label, cells[2], cells[3], tc.wantDefault, tc.wantPool, row)
+				tc.label, cells[3], cells[4], tc.wantDefault, tc.wantPool, row)
 		}
 	}
 }
@@ -311,19 +311,19 @@ func TestTokenListShowsLiveEligibility(t *testing.T) {
 	// The pooled token carries the server's status verbatim — this is the whole
 	// point of the column, and of D21: the string is autoselect.Classify's answer,
 	// not something the CLI re-derived from percentages it does not have.
-	if got := rowOf("console-key")[4]; got != "no_reading" {
+	if got := rowOf("console-key")[5]; got != "no_reading" {
 		t.Errorf("pooled token's ELIGIBLE = %q, want the server's no_reading — a pooled "+
 			"token that can never be picked must SAY so", got)
 	}
 	// An un-pooled token reads "-": the POOL column beside it already says it is out,
 	// and repeating "not in pool" would be noise on every row.
-	if got := rowOf("default")[4]; got != "-" {
+	if got := rowOf("default")[5]; got != "-" {
 		t.Errorf("un-pooled token's ELIGIBLE = %q, want -", got)
 	}
 	// A pooled token the meters did not mention reads "?" — NOT "-" and not blank.
 	// "Unknown" and "fine" must not look the same, which is the failure the column
 	// exists to remove.
-	if got := rowOf("spare-key")[4]; got != "-" {
+	if got := rowOf("spare-key")[5]; got != "-" {
 		t.Errorf("un-pooled spare-key's ELIGIBLE = %q, want -", got)
 	}
 }
@@ -339,7 +339,7 @@ func TestTokenListSurvivesAMetersFailure(t *testing.T) {
 	}
 	for _, line := range strings.Split(out, "\n") {
 		if strings.Contains(line, "console-key") {
-			if got := strings.Fields(line)[4]; got != "?" {
+			if got := strings.Fields(line)[5]; got != "?" {
 				t.Errorf("pooled token with no meter reads %q, want ? — unknown must not "+
 					"look the same as eligible", got)
 			}
@@ -411,5 +411,154 @@ func TestTokenListJSONCarriesLiveEligibility(t *testing.T) {
 	if raw != nil {
 		t.Errorf("unmentioned token's auto_status = %#v, want null — \"\" would read as a status the "+
 			"server never sent", raw)
+	}
+}
+
+// --- PRD #1147 M3: kind + status distinction, and the pool kind guard ---------
+
+// codexFake stages one anthropic row and two non-anthropic rows: a codex_auth with a
+// link status and a standalone openai_api_key. ListSecrets returns all kinds together
+// (M1), so `uzi token list` must render the kind and status distinction M3 adds.
+func codexFake() *uzicli.FakeClient {
+	return &uzicli.FakeClient{
+		Secrets: []apitypes.SecretDTO{
+			{ID: "s1", Kind: "anthropic_token", Label: "default", IsDefault: true, AutoEligible: true, CreatedAt: time.Unix(1784000000, 0)},
+			{ID: "c1", Kind: "codex_auth", Label: "my-codex", CodexStatus: "linked", CreatedAt: time.Unix(1784000000, 0)},
+			{ID: "o1", Kind: "openai_api_key", Label: "my-openai", CodexStatus: "static", CreatedAt: time.Unix(1784000000, 0)},
+		},
+	}
+}
+
+// TestTokenListShowsKindAndStatus pins the M3 human-table shape: a KIND column, a
+// STATUS column, and — critically — that POOL and ELIGIBLE read "-" (not applicable)
+// on a codex row rather than a misleading "false". There is no Codex auto-selection
+// pool server-side, so "false" would imply an opt-in a user could flip.
+func TestTokenListShowsKindAndStatus(t *testing.T) {
+	out, _, code := runCLI(t, fakeEnv(codexFake()), "token", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, col := range []string{"KIND", "STATUS"} {
+		if !strings.Contains(out, col) {
+			t.Errorf("token list is missing the %s column: %q", col, out)
+		}
+	}
+	rowOf := func(label string) []string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, label) {
+				return strings.Fields(line)
+			}
+		}
+		t.Fatalf("no row for %q in:\n%s", label, out)
+		return nil
+	}
+	// Rows are ID / KIND / LABEL / DEFAULT / POOL / ELIGIBLE / STATUS / CREATED.
+	for _, tc := range []struct {
+		label                                        string
+		wantKind, wantPool, wantEligible, wantStatus string
+	}{
+		// The anthropic row keeps its POOL/ELIGIBLE facts and carries no status ("-").
+		{"default", "anthropic", "true", "?", "-"},
+		// The codex row shows its kind and link status; POOL and ELIGIBLE are N/A ("-").
+		{"my-codex", "codex", "-", "-", "linked"},
+		// The openai_api_key row is a codex-family credential too: kind alias + status.
+		{"my-openai", "openai-key", "-", "-", "static"},
+	} {
+		cells := rowOf(tc.label)
+		if len(cells) < 8 {
+			t.Errorf("row for %q has %d cells, want 8: %v", tc.label, len(cells), cells)
+			continue
+		}
+		if cells[1] != tc.wantKind {
+			t.Errorf("row for %q KIND = %q, want %q", tc.label, cells[1], tc.wantKind)
+		}
+		// The anthropic row's ELIGIBLE depends on the meters read (unstaged here -> "?"),
+		// so only assert POOL and STATUS positionally there; the codex rows assert all.
+		if cells[4] != tc.wantPool {
+			t.Errorf("row for %q POOL = %q, want %q — a codex row's POOL must be N/A, not a misleading boolean", tc.label, cells[4], tc.wantPool)
+		}
+		if cells[6] != tc.wantStatus {
+			t.Errorf("row for %q STATUS = %q, want %q", tc.label, cells[6], tc.wantStatus)
+		}
+		if tc.label != "default" && cells[5] != tc.wantEligible {
+			t.Errorf("row for %q ELIGIBLE = %q, want %q — no Codex pool exists, so ELIGIBLE is N/A", tc.label, cells[5], tc.wantEligible)
+		}
+	}
+}
+
+// TestTokenListJSONCarriesKindAndStatus confirms the embedded SecretDTO already emits
+// `kind` and `codex_status` for a codex row (added in M1), so the JSON surface needs
+// no new field — M3's job is only to confirm they are legible per row.
+func TestTokenListJSONCarriesKindAndStatus(t *testing.T) {
+	out, _, code := runCLI(t, fakeEnv(codexFake()), "token", "list", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(out), &items); err != nil {
+		t.Fatalf("token list --json is not a JSON array: %v\n%s", err, out)
+	}
+	byLabel := map[string]map[string]any{}
+	for _, it := range items {
+		byLabel[it["label"].(string)] = it
+	}
+	if got := byLabel["my-codex"]["kind"]; got != "codex_auth" {
+		t.Errorf("codex row kind = %v, want codex_auth", got)
+	}
+	if got := byLabel["my-codex"]["codex_status"]; got != "linked" {
+		t.Errorf("codex row codex_status = %v, want linked", got)
+	}
+	// codex_status is `omitempty`, so an anthropic row (empty status) omits the key
+	// entirely — presence of the key IS the "this is a Codex credential" signal.
+	if _, present := byLabel["default"]["codex_status"]; present {
+		t.Errorf("anthropic row should omit codex_status (omitempty), got %v", byLabel["default"]["codex_status"])
+	}
+	if got := byLabel["default"]["kind"]; got != "anthropic_token" {
+		t.Errorf("anthropic row kind = %v, want anthropic_token", got)
+	}
+}
+
+// TestTokenPoolRejectsCodexLabel is the M3 kind guard: `uzi token pool <label>` must
+// refuse a codex-kind label and send NO write, because there is no Codex auto-selection
+// pool server-side. The error names the kind so the refusal is legible.
+func TestTokenPoolRejectsCodexLabel(t *testing.T) {
+	for _, tc := range []struct{ label, wantKind string }{
+		{"my-codex", "codex"},
+		{"my-openai", "openai-key"},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			fc := codexFake()
+			_, errOut, code := runCLI(t, fakeEnv(fc), "token", "pool", tc.label, "--on")
+			if code != uzicli.ExitUsage {
+				t.Fatalf("exit = %d, want %d (usage) — pool is Anthropic-only", code, uzicli.ExitUsage)
+			}
+			if !strings.Contains(errOut, "Anthropic") || !strings.Contains(errOut, tc.wantKind) {
+				t.Errorf("error should say pool is Anthropic-only and name the %s kind, got: %q", tc.wantKind, errOut)
+			}
+			if fc.LastPoolSecretID != "" {
+				t.Errorf("a codex label still sent a write for %q", fc.LastPoolSecretID)
+			}
+		})
+	}
+}
+
+// TestTokenPoolPrefersAnthropicOnLabelCollision pins that when a codex and an anthropic
+// secret share a label, pool resolves the ANTHROPIC one (the kind filter), rather than
+// cross-matching the codex row that happens to appear first.
+func TestTokenPoolPrefersAnthropicOnLabelCollision(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Secrets: []apitypes.SecretDTO{
+			// The codex row is listed FIRST, so an unfiltered match would pick it.
+			{ID: "c1", Kind: "codex_auth", Label: "shared", CodexStatus: "linked", CreatedAt: time.Unix(1784000000, 0)},
+			{ID: "s1", Kind: "anthropic_token", Label: "shared", AutoEligible: false, CreatedAt: time.Unix(1784000000, 0)},
+		},
+		PoolSecret: apitypes.SecretDTO{ID: "s1", Kind: "anthropic_token", Label: "shared", AutoEligible: true},
+	}
+	if _, _, code := runCLI(t, fakeEnv(fc), "token", "pool", "shared", "--on"); code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastPoolSecretID != "s1" {
+		t.Errorf("sent secret id %q, want s1 — the kind filter must resolve the anthropic row, not the codex one sharing the label", fc.LastPoolSecretID)
 	}
 }

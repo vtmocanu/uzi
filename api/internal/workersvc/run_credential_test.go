@@ -298,8 +298,9 @@ func TestJudgeClaimRecordsItsBinding(t *testing.T) {
 			ID: runID, Kind: runkind.Judge, Status: "claimed",
 			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
 		},
-		anthropic:   sealedDefault,
-		judgeSecret: pgtype.UUID{Bytes: judgeID, Valid: true},
+		anthropic:     sealedDefault,
+		judgeSecret:   pgtype.UUID{Bytes: judgeID, Valid: true},
+		judgeBindMode: BindModePinned,
 		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
 			judgeID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedJudge, SealedWith: store.SealedWithMaster},
 		},

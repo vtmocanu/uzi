@@ -237,6 +237,11 @@ export function ScheduleModal({
   // below (modelWarning) mirroring the server's ValidateModel reject.
   const [model, setModel] = useState<string>(editing?.model ?? "");
   const modelWarning = modelFieldWarning(model);
+  // PRD #929 M1: per-schedule output mode for prompt-target schedules. "" = inherit the
+  // catalog/job default; "mr" opens a merge request from an idea file, "issues" files issues.
+  const [outputMode, setOutputMode] = useState<string>(
+    editing?.output_mode ?? "",
+  );
   // PRD #305: apply the run model to every subagent (overriding pins). Default off.
   const [overrideSubagentModel, setOverrideSubagentModel] = useState<boolean>(
     editing?.override_subagent_model ?? false,
@@ -448,6 +453,10 @@ export function ScheduleModal({
     mr_rework_enabled: mrRework,
     max_issues: target === "sweep" ? maxIssues : undefined,
     model: model.trim() === "" ? null : model,
+    // PRD #929 M1: output mode on the prompt target only; explicit null clears to the
+    // catalog default. Omitted (undefined) on non-prompt so the server never sees a stray field.
+    output_mode:
+      target === "prompt" ? (outputMode.trim() === "" ? null : outputMode) : undefined,
     // PRD #305: apply the run model to every subagent. Editable on a default too
     // (issue #691) — always sent with replace-semantics.
     override_subagent_model: overrideSubagentModel,
@@ -489,6 +498,10 @@ export function ScheduleModal({
     // Model override on EVERY target (all-targets field, unlike guidance); an empty
     // control sends explicit null to clear-to-inherit (replace-semantics).
     model: model.trim() === "" ? null : model,
+    // PRD #929 M1: output mode on the prompt target only; explicit null clears to the
+    // catalog default. Omitted (undefined) on non-prompt so the server never sees a stray field.
+    output_mode:
+      target === "prompt" ? (outputMode.trim() === "" ? null : outputMode) : undefined,
     // PRD #305: apply the run model to every subagent. Always sent (replace-semantics).
     override_subagent_model: overrideSubagentModel,
     // Sent only on create; on edit, enable/disable is pause/resume, so leave it absent
@@ -858,6 +871,22 @@ export function ScheduleModal({
                     No forge issue — runs against the repo and opens an MR. Bypasses the PRD-issue gate by design;
                     <code className="mx-1 rounded bg-raised px-1">main</code> stays protected by the unchanged guardrails.
                   </p>
+                  {/* PRD #929 M1: per-schedule output mode (prompt target only). Empty
+                      value = inherit the job/catalog default. */}
+                  <Field label="Output mode (optional)" htmlFor="sched-output-mode">
+                    <Select
+                      id="sched-output-mode"
+                      value={outputMode}
+                      onChange={(e) => setOutputMode(e.target.value)}
+                    >
+                      <option value="">Job default</option>
+                      <option value="mr">MR (idea file)</option>
+                      <option value="issues">Issues</option>
+                    </Select>
+                    <p className="mt-1 text-[11px] text-faint">
+                      How a prompt run delivers: MR opens a merge request from an idea file; Issues files a labeled <code className="rounded bg-raised px-1">proposal::&lt;slug&gt;</code> issue (not sweep-eligible until promoted). Leave as job default to inherit.
+                    </p>
+                  </Field>
                 </>
               )}
             </>
@@ -879,6 +908,28 @@ export function ScheduleModal({
                 placeholder="unlimited"
               />
               <p className="mt-1 text-[11px] text-faint">Oldest issues first. Leave blank for unlimited.</p>
+            </Field>
+          )}
+
+          {/* A default prompt job's output mode IS editable (like max_issues for a default
+              sweep). buildDefaultInput() sends output_mode for a prompt default, so without
+              this control it could only ever re-send its initial value. outputMode seeds from
+              the RAW override (editing?.output_mode, null → ""), never the resolved catalog
+              mode, so "Job default" reflects an actually-cleared override. */}
+          {isDefault && target === "prompt" && (
+            <Field label="Output mode (optional)" htmlFor="sched-output-mode">
+              <Select
+                id="sched-output-mode"
+                value={outputMode}
+                onChange={(e) => setOutputMode(e.target.value)}
+              >
+                <option value="">Job default</option>
+                <option value="mr">MR (idea file)</option>
+                <option value="issues">Issues</option>
+              </Select>
+              <p className="mt-1 text-[11px] text-faint">
+                How a prompt run delivers: MR opens a merge request from an idea file; Issues files a labeled <code className="rounded bg-raised px-1">proposal::&lt;slug&gt;</code> issue (not sweep-eligible until promoted). Leave as job default to inherit.
+              </p>
             </Field>
           )}
 

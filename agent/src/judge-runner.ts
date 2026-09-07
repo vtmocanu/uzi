@@ -10,6 +10,8 @@
 
 import os from "node:os";
 
+import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+
 import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
@@ -244,7 +246,7 @@ export class JudgeRunner {
         claim.known_improve_uzi_targets ?? [],
         claim.failure_class ?? null,
       );
-      const { text, result } = await this.runModel(token, model, prompt);
+      const { text, result } = await this.runModel(token, model, prompt, claim.config?.default_effort);
       return { review: calibrateReview(parseReview(text, model), claim.failure_class ?? null), usageMessage: result };
     } catch (err) {
       this.log.warn("judge model call failed; using deterministic fallback", {
@@ -259,7 +261,7 @@ export class JudgeRunner {
     }
   }
 
-  private async runModel(token: string, model: string, prompt: string): Promise<{ text: string; result?: EmittedMessage }> {
+  private async runModel(token: string, model: string, prompt: string, effort?: EffortLevel): Promise<{ text: string; result?: EmittedMessage }> {
     // The terminal success frame mapped to a run message (PRD #69 M6): mapSdkMessage
     // routes a result frame through mapResult, which carries event:"result" + modelUsage
     // — the only fields the API's foldRunUsage reads. Surfaced to execute() to post so a
@@ -269,6 +271,7 @@ export class JudgeRunner {
     const text = await runReadOnlyModelPass({
       token,
       model,
+      effort,
       systemPrompt: JUDGE_SYSTEM_PROMPT,
       prompt,
       homeRoot: this.homeRoot,
@@ -547,19 +550,41 @@ export function calibrateReview(review: ReviewRequest, failureClass: string | nu
   return { ...review, recommendations };
 }
 
-// extractJsonObject pulls the first balanced {...} object out of the model text
-// (tolerating a ```json fence or surrounding prose). Exported for reuse by the inline
-// summary runner (PRD #362 M3a), which parses the same fenced/prose-wrapped JSON shape.
+// extractJsonObject pulls a balanced {...} object out of the model text (tolerating a
+// ```json fence or surrounding prose). Exported for reuse by the inline summary runner
+// (PRD #362 M3a) and the task review runner, which parse the same fenced/prose-wrapped
+// JSON shape. The FIRST balanced candidate is not always the JSON: a brace example in
+// prose before it (e.g. `Use {verdict, summary} here`, possibly inside the fence) slices
+// first but does not parse. So on a JSON.parse failure we advance past that WHOLE candidate
+// (not just its opening brace, which would re-enter a valid object nested inside the bad one)
+// and try the next one, keeping the throw (→ caller's deterministic fallback) only when no
+// balanced candidate parses.
 export function extractJsonObject(text: string): unknown {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const inner = fence ? fence[1]! : text;
-  const candidate = sliceFirstObject(inner);
-  if (!candidate) throw new Error("no JSON object found in the model output");
-  return JSON.parse(candidate);
+  let from = 0;
+  let sawCandidate = false;
+  let lastErr: unknown;
+  for (;;) {
+    const candidate = sliceFirstObject(inner, from);
+    if (!candidate) break;
+    sawCandidate = true;
+    try {
+      return JSON.parse(candidate.slice);
+    } catch (err) {
+      lastErr = err;
+      // Skip the ENTIRE rejected candidate, not just its opening '{': candidate.start +
+      // candidate.slice.length is the offset one past its closing brace, so a valid object
+      // NESTED inside the rejected one is not mistaken for the real later JSON.
+      from = candidate.start + candidate.slice.length;
+    }
+  }
+  if (!sawCandidate) throw new Error("no JSON object found in the model output");
+  throw new Error(`no parseable JSON object found in the model output: ${errMessage(lastErr)}`);
 }
 
-function sliceFirstObject(text: string): string | null {
-  const start = text.indexOf("{");
+function sliceFirstObject(text: string, from = 0): { start: number; slice: string } | null {
+  const start = text.indexOf("{", from);
   if (start < 0) return null;
   let depth = 0;
   let inStr = false;
@@ -576,7 +601,7 @@ function sliceFirstObject(text: string): string | null {
     else if (c === "{") depth++;
     else if (c === "}") {
       depth--;
-      if (depth === 0) return text.slice(start, i + 1);
+      if (depth === 0) return { start, slice: text.slice(start, i + 1) };
     }
   }
   return null;

@@ -112,7 +112,9 @@ export class Worker {
     // One collector for the loop's lifetime so the CPU% delta carries across ticks
     // (PRD #49). Its first tick omits cpu_pct (no prior sample); a worker restart
     // just re-runs that omission.
-    const stats = new StatsCollector();
+    // Pass the data volume so the disk sample targets the worker's real data dir
+    // (PRD #837 M1); /nix stays the fixed default inside the collector.
+    const stats = new StatsCollector({ dataDir: this.config.dataDir });
     while (!signal.aborted) {
       try {
         await this.client.heartbeat(this.collectStats(stats));
