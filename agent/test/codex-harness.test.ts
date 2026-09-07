@@ -77,6 +77,7 @@ class FakeTransport implements CodexTransport {
   private ended = false;
   private waiter: ((r: IteratorResult<CodexNotification>) => void) | undefined;
   private consumed = false;
+  private closedFlag = false;
 
   constructor(private readonly responder: (method: string, params: unknown) => unknown = defaultResponder) {}
 
@@ -114,6 +115,9 @@ class FakeTransport implements CodexTransport {
     requestId: number | string,
     response: { readonly result: unknown } | { readonly error: { readonly code: number; readonly message: string } },
   ): void {
+    // Mirror the real transport's closed-guard: a respond after close throws, so a broker
+    // reply that settles after the turn is torn down exercises routeToolCall's guard.
+    if (this.closedFlag) throw new Error("codex transport is closed");
     this.responses.push({ requestId, response });
   }
 
@@ -144,6 +148,7 @@ class FakeTransport implements CodexTransport {
 
   close(): Promise<void> {
     this.closes += 1;
+    this.closedFlag = true;
     return Promise.resolve();
   }
 }
@@ -183,6 +188,16 @@ function toolCall(
   callId = "c1",
 ): CodexNotification {
   return { kind: "activity", method: "item/tool/call", requestId, params: { threadId, turnId, callId, tool, arguments: args, namespace: null } };
+}
+
+/** An item/tool/call whose params OMIT threadId entirely (an absent/non-string id must
+ *  fail closed to origin="unknown", never fold to the root). */
+function toolCallNoThread(requestId: number, tool: string, args: unknown, turnId = "tn-1", callId = "c1"): CodexNotification {
+  return { kind: "activity", method: "item/tool/call", requestId, params: { turnId, callId, tool, arguments: args, namespace: null } };
+}
+
+function completedItem(item: Record<string, unknown>, threadId = "th-1"): CodexNotification {
+  return { kind: "activity", method: "item/completed", params: { threadId, item } };
 }
 
 // --- request + harness builders -----------------------------------------------------
@@ -247,6 +262,46 @@ async function collect(events: AsyncIterable<HarnessEvent>): Promise<HarnessEven
   const out: HarnessEvent[] = [];
   for await (const ev of events) out.push(ev);
   return out;
+}
+
+function tick(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/** Reject if `p` has not settled within `ms`, so a wedged (never-ending) stream fails the
+ *  test with a bounded timeout instead of hanging the run. Clears its timer on settle. */
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** A broker whose handleToolCall NEVER settles on its own: `entered` resolves the moment a
+ *  callback is dispatched to it, and `release` settles the pending callback on demand. This
+ *  models a model-selected long-running seam (a shell that never returns) so a test can prove
+ *  the turn stream still ends on the owner abort / requestStop rather than wedging. */
+function wedgeBroker(): { broker: CodexCallbackBroker; entered: Promise<void>; release: (r: CallbackResult) => void } {
+  let resolveEntered!: () => void;
+  const entered = new Promise<void>((r) => {
+    resolveEntered = r;
+  });
+  let release!: (r: CallbackResult) => void;
+  const result = new Promise<CallbackResult>((r) => {
+    release = r;
+  });
+  const broker = stubBroker(() => {
+    resolveEntered();
+    return result;
+  });
+  return { broker, entered, release };
 }
 
 // --- tests --------------------------------------------------------------------------
@@ -482,6 +537,161 @@ describe("CodexHarness: server→client tool-call routing", () => {
     assert.equal(seen.length, 1);
     assert.equal(seen[0]!.rt.threadId, "spoofed-thread");
     assert.equal(seen[0]!.origin, "unknown");
+  });
+});
+
+describe("CodexHarness: tool-call origin is fail-closed on the thread id", () => {
+  it("an ABSENT threadId yields origin=unknown and an empty rt.threadId (never folds to root)", async () => {
+    const seen: { rt: CallbackRuntimeId; origin: CallbackOrigin }[] = [];
+    const broker = stubBroker(async (rt, _name, _args, origin) => {
+      seen.push({ rt, origin });
+      return { ok: true, output: {} };
+    });
+    const { harness, transport } = makeHarness({ broker });
+    transport
+      .push(threadStarted())
+      .push(toolCallNoThread(1, "Bash", { command: "echo" }))
+      .push(turnCompleted("completed"))
+      .end();
+
+    await collect(harness.startTurn(makeRequest()).events);
+    assert.equal(seen.length, 1);
+    // Fail-closed: an absent id is NEVER "root".
+    assert.equal(seen[0]!.origin, "unknown");
+    // The RAW value ("" for an absent id) is handed to the broker's rt — NOT this.threadId —
+    // so the broker's own ingestion denies the absent/empty id.
+    assert.equal(seen[0]!.rt.threadId, "");
+  });
+
+  it("a present-but-DIFFERENT threadId yields origin=unknown", async () => {
+    const seen: CallbackOrigin[] = [];
+    const broker = stubBroker(async (_rt, _name, _args, origin) => {
+      seen.push(origin);
+      return { ok: true, output: {} };
+    });
+    const { harness, transport } = makeHarness({ broker });
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "Bash", { command: "echo" }, "different-thread"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    await collect(harness.startTurn(makeRequest()).events);
+    assert.deepEqual(seen, ["unknown"]);
+  });
+
+  it("the real ROOT threadId yields origin=root", async () => {
+    const seen: { rt: CallbackRuntimeId; origin: CallbackOrigin }[] = [];
+    const broker = stubBroker(async (rt, _name, _args, origin) => {
+      seen.push({ rt, origin });
+      return { ok: true, output: {} };
+    });
+    const { harness, transport } = makeHarness({ broker });
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "Bash", { command: "echo" }, "th-1"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    await collect(harness.startTurn(makeRequest()).events);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]!.origin, "root");
+    assert.equal(seen[0]!.rt.threadId, "th-1");
+  });
+});
+
+describe("CodexHarness: item content decode", () => {
+  it("decodes a reasoning item to a thinking frame", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(completedItem({ type: "reasoning", text: "let me think" }))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const frame = events.find((e) => e.kind === "frame");
+    assert.ok(frame && frame.kind === "frame", "the reasoning item decoded to a frame");
+    assert.deepEqual(frame.items, [{ kind: "thinking", text: "let me think" }]);
+  });
+
+  it("decodes an unknown completed-item type to activity, never a frame (documents current behavior)", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(completedItem({ type: "mysteryItem", text: "???" }))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    assert.equal(events.filter((e) => e.kind === "frame").length, 0);
+    assert.deepEqual(
+      events.map((e) => e.kind),
+      ["initialized", "activity", "turn_finished"],
+    );
+  });
+});
+
+describe("CodexHarness: owner abort cancels a turn wedged in a broker callback", () => {
+  it("an owner abort ENDS a turn wedged in a never-settling broker callback (no hang)", async () => {
+    const ac = new AbortController();
+    const { broker, entered } = wedgeBroker();
+    const { harness, transport } = makeHarness({ broker });
+    transport.push(threadStarted()).push(toolCall(1, "Bash", { command: "sleep 999" }));
+    const iter = harness.startTurn(makeRequest({ signal: ac.signal })).events[Symbol.asyncIterator]();
+
+    const first = await iter.next(); // setup → initialized
+    assert.equal(first.done, false);
+    assert.equal((first.value as HarnessEvent).kind, "initialized");
+
+    const pending = iter.next(); // drives the tool-call → wedges in the broker callback
+    await withTimeout(entered, 1000, "the broker callback to be entered");
+
+    ac.abort(); // owner abort WHILE the callback is pending
+    const ended = await withTimeout(pending, 1000, "the stream to end on abort");
+    assert.equal(ended.done, true, "the stream ends promptly instead of wedging");
+  });
+
+  it("requestStop ENDS a turn wedged in a never-settling broker callback (no hang)", async () => {
+    const { broker, entered } = wedgeBroker();
+    const { harness, transport } = makeHarness({ broker });
+    transport.push(threadStarted()).push(toolCall(1, "Bash", { command: "sleep 999" }));
+    const turn = harness.startTurn(makeRequest());
+    const iter = turn.events[Symbol.asyncIterator]();
+
+    await iter.next(); // initialized
+    const pending = iter.next(); // wedges in the broker callback
+    await withTimeout(entered, 1000, "the broker callback to be entered");
+
+    turn.requestStop("cancel");
+    const ended = await withTimeout(pending, 1000, "the stream to end on requestStop");
+    assert.equal(ended.done, true);
+    // A best-effort interrupt (a cancellation REQUEST, not a kill) was still issued.
+    assert.ok(transport.requests.some((r) => r.method === "turn/interrupt"), "an interrupt was requested");
+  });
+
+  it("a broker reply that settles AFTER abort+close is dropped, never thrown into the closed transport", async () => {
+    const ac = new AbortController();
+    const { broker, entered, release } = wedgeBroker();
+    const { harness, transport } = makeHarness({ broker });
+    transport.push(threadStarted()).push(toolCall(5, "Bash", { command: "echo" }));
+    const turn = harness.startTurn(makeRequest({ signal: ac.signal }));
+    const iter = turn.events[Symbol.asyncIterator]();
+
+    await iter.next(); // initialized
+    const pending = iter.next(); // wedges
+    await withTimeout(entered, 1000, "the broker callback to be entered");
+
+    ac.abort();
+    await withTimeout(pending, 1000, "the stream to end on abort");
+    await turn.close(); // tears the transport down under the still-pending callback
+
+    // The broker finally settles AFTER close: routeToolCall's guard must swallow the
+    // closed-transport throw so no reply is delivered and nothing throws.
+    release({ ok: true, output: {} });
+    await tick();
+    await tick();
+    assert.equal(transport.responses.length, 0, "the undeliverable reply was dropped");
   });
 });
 

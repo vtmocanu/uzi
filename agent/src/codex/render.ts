@@ -426,8 +426,11 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
     isRoot: true,
   };
 
-  // Sort roles so the maps and any serialized form are deterministic.
-  const roleEntries = Object.entries(request.agents).sort((a, b) => a[0].localeCompare(b[0]));
+  // Sort roles so the maps and any serialized form are deterministic. Uses the same
+  // code-unit comparator as sortDiagnostics/sortedSet (NOT localeCompare, whose ICU/locale
+  // dependence would make per-role Map insertion order vary across environments for a
+  // non-ASCII role name).
+  const roleEntries = Object.entries(request.agents).sort((a, b) => byCodeUnit(a[0], b[0]));
 
   const perRoleModels = new Map<string, ResolvedCodexModel>();
   const perRoleGrants = new Map<string, RunGrants>();

@@ -198,6 +198,11 @@ export class CodexHarness implements RunHarness {
   private activeTurnId?: string;
   private turnClosed = false;
   private terminalEmitted = false;
+  // Resolves the current turn's abort race (see runTurn). The owner-aborted signal
+  // resolves it via the listener; requestStop()/close() resolve it directly so a turn
+  // WEDGED in a pending broker callback (a never-settling model-selected effect) still
+  // ends promptly instead of hanging on that bare await. Undefined until the stream starts.
+  private stopTurn?: () => void;
 
   constructor(opts: CodexHarnessOptions) {
     this.registry = opts.registry;
@@ -259,12 +264,17 @@ export class CodexHarness implements RunHarness {
     const transport = this.transport;
     const threadId = this.threadId;
     const turnId = this.activeTurnId;
-    if (!transport || threadId === undefined || turnId === undefined) return;
-    void transport
-      .request("turn/interrupt", { threadId, turnId })
-      .catch(() => {
-        /* interrupt is best-effort; the terminal/EOF path settles the turn */
-      });
+    if (transport && threadId !== undefined && turnId !== undefined) {
+      void transport
+        .request("turn/interrupt", { threadId, turnId })
+        .catch(() => {
+          /* interrupt is best-effort; the terminal/EOF path settles the turn */
+        });
+    }
+    // End the stream even when it is wedged in a pending broker callback: the run loop
+    // otherwise only races notes.next(), so resolve the turn's stop promise to settle the
+    // abort race and return the generator promptly. A no-op before the stream starts.
+    this.stopTurn?.();
   }
 
   /** Bounded lead-context read. Codex exposes no characterized context-window RPC yet,
@@ -280,7 +290,19 @@ export class CodexHarness implements RunHarness {
    *  reap — that is quiesce/reap/dispose. */
   private async close(): Promise<void> {
     this.turnClosed = true;
+    // Wake a run loop wedged in a pending broker callback so the generator returns rather
+    // than hang on that await while the transport is torn down underneath it.
+    this.stopTurn?.();
     await this.transport?.close();
+  }
+
+  /** Shared stop path for an owner abort / watchdog / requestStop / close: interrupt the
+   *  turn (a cancellation REQUEST, not a process kill) and mark the stream closed. The
+   *  pending effect's process cleanup is the registry's reap job at the safety boundary
+   *  (quiesce/reap), not the harness's — here we only guarantee the STREAM ends. */
+  private endTurnOnStop(): void {
+    this.requestStop("cancel");
+    this.turnClosed = true;
   }
 
   // --- setup + stream -----------------------------------------------------------
@@ -289,8 +311,11 @@ export class CodexHarness implements RunHarness {
     this.currentModel = rendered.lead.model ?? this.provider.model;
 
     // A local watchdog/cancel (owner-aborted signal) ends the stream FIRST (rule 9).
+    // requestStop()/close() also settle it via `stopTurn`, so a turn wedged in a pending
+    // broker callback ends promptly and does not depend on a new notification arriving.
     let onAbort: (() => void) | undefined;
     const abortPromise = new Promise<"aborted">((resolve) => {
+      this.stopTurn = (): void => resolve("aborted");
       if (request.signal.aborted) {
         resolve("aborted");
         return;
@@ -326,8 +351,7 @@ export class CodexHarness implements RunHarness {
         const step = await Promise.race([notes.next(), abortPromise]);
         if (step === "aborted") {
           // Owner cancel/watchdog wins: interrupt the turn and end the stream cleanly.
-          this.requestStop("cancel");
-          this.turnClosed = true;
+          this.endTurnOnStop();
           return;
         }
         if (step.done) {
@@ -340,9 +364,21 @@ export class CodexHarness implements RunHarness {
             message: "codex app-server stream ended before turn completion",
           });
         }
-        const event = await this.mapNote(transport, step.value);
-        yield event;
-        if (event.kind === "turn_finished") return; // close the iterator after the terminal
+        // The broker-callback await (mapNote → routeToolCall → broker.handleToolCall) is
+        // itself raced against the owner abort — WITHOUT this, a never-settling broker seam
+        // (a model-selected long-running shell) leaves the turn un-cancellable, falsifying
+        // rule 9. On abort while a callback is pending we STOP awaiting it and end the
+        // stream promptly; the pending effect's process cleanup is the registry's reap job
+        // at the safety boundary, and a late broker reply is guarded in routeToolCall so it
+        // never throws into a closed transport. The happy path is unchanged: a callback
+        // that settles normally still replies via transport.respond after the broker settles.
+        const mapped = await Promise.race([this.mapNote(transport, step.value), abortPromise]);
+        if (mapped === "aborted") {
+          this.endTurnOnStop();
+          return;
+        }
+        yield mapped;
+        if (mapped.kind === "turn_finished") return; // close the iterator after the terminal
       }
     } finally {
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
@@ -499,20 +535,30 @@ export class CodexHarness implements RunHarness {
    *  policy-broker). Authority is the broker's; the harness binds nothing itself. */
   private async routeToolCall(transport: CodexTransport, requestId: number | string, params: unknown): Promise<void> {
     const p = asObject(params) ?? {};
-    const threadId = asString(p.threadId) ?? this.threadId ?? "";
+    // Origin is computed from the RAW parsed thread id ONLY — never folded to
+    // this.threadId. An absent/non-string threadId can therefore NEVER become "root":
+    // it fails CLOSED to "unknown" (matching e2e/codex-m0/policy-broker.mjs), so a
+    // missing id can neither latch a signal nor delegate. The raw value (or "" when
+    // absent) is what we hand the broker's `rt`, so the broker's OWN ingestion denies an
+    // absent/empty id — we do not substitute this.threadId into that identity.
+    const rawThreadId = asString(p.threadId);
+    const threadId = rawThreadId ?? "";
     const turnId = asString(p.turnId) ?? "";
     const callId = asString(p.callId) ?? "";
-    // Origin is the RUNTIME thread identity, never a model-supplied argument: only the
-    // known root thread is "root"; anything else is fail-closed "unknown" (it can never
-    // latch a signal or delegate through the broker).
-    const origin: CallbackOrigin = threadId === this.threadId ? "root" : "unknown";
+    const origin: CallbackOrigin = rawThreadId !== undefined && rawThreadId === this.threadId ? "root" : "unknown";
     let result: CallbackResult;
     try {
       result = await this.broker.handleToolCall({ threadId, turnId, callId }, p.tool, p.arguments, origin);
     } catch {
       result = { ok: false, code: "broker_error", message: "the callback failed" };
     }
-    transport.respond(requestId, this.replyOf(result));
+    try {
+      transport.respond(requestId, this.replyOf(result));
+    } catch {
+      // The transport may already be closed (an owner abort/close raced this pending
+      // broker callback): a reply that can no longer be delivered is dropped, NEVER thrown
+      // into a closed transport.
+    }
   }
 
   /** Map a broker {@link CallbackResult} to the app-server tool reply shape
@@ -557,6 +603,12 @@ export class CodexHarness implements RunHarness {
     };
   }
 
+  // PROVISIONAL item-type strings. The exact app-server `item.type` values below
+  // ("agentMessage"/"assistantMessage"/"agent_message"/"reasoning") are NOT yet confirmed
+  // against a real app-server — they are the current best guess. They MUST be verified in
+  // the packaged integration (m3b:packaged) before they are trusted; do NOT add or rename
+  // a type here on a guess. An unrecognized type intentionally falls through to `[]`, which
+  // the caller surfaces as `activity` (never a frame) — the safe default.
   private decodeItemContent(item: Record<string, unknown>): HarnessItem[] {
     const type = asString(item.type);
     if (type === "agentMessage" || type === "assistantMessage" || type === "agent_message") {

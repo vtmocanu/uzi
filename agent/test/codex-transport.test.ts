@@ -167,6 +167,53 @@ describe("codex transport: notification decoding", () => {
   });
 });
 
+describe("codex transport: respond (server→client reply lane)", () => {
+  it("frames a success reply as {id, result} on the outbound stream", async () => {
+    const { outbound, transport } = makePair();
+    const frames = collectFrames(outbound);
+    // A success reply for a server→client request (e.g. item/tool/call) mirrors the M0
+    // client reply `{ id, result }` (harness.mjs:291).
+    const result = { success: true, contentItems: [{ type: "inputText", text: "ok" }] };
+    transport.respond(42, { result });
+    const sent = await waitFor(() => (frames().length >= 1 ? frames() : undefined), "one reply frame");
+    assert.equal(sent[0]!.id, 42);
+    assert.deepEqual(sent[0]!.result, result);
+    // A reply is correlated by id; it must NOT carry a method (else a peer treats it as a
+    // fresh notification), and a success reply carries no error.
+    assert.equal("method" in sent[0]!, false);
+    assert.equal("error" in sent[0]!, false);
+    await transport.close();
+  });
+
+  it("frames an error reply as {id, error} on the outbound stream, preserving a string id", async () => {
+    const { outbound, transport } = makePair();
+    const frames = collectFrames(outbound);
+    // An error reply mirrors the M0 client error reply `{ id, error }` (harness.mjs:285).
+    const error = { code: -32601, message: "unsupported request" };
+    transport.respond("call-1", { error });
+    const sent = await waitFor(() => (frames().length >= 1 ? frames() : undefined), "one reply frame");
+    assert.equal(sent[0]!.id, "call-1");
+    assert.deepEqual(sent[0]!.error, error);
+    assert.equal("method" in sent[0]!, false);
+    assert.equal("result" in sent[0]!, false);
+    await transport.close();
+  });
+
+  it("throws a typed transport failure when responding after close (the closed-guard)", async () => {
+    const { transport } = makePair();
+    await transport.close();
+    assert.throws(
+      () => transport.respond(7, { result: { success: true, contentItems: [] } }),
+      (err: unknown) => {
+        assert.ok(err instanceof CodexTransportError);
+        // A caller-initiated close is not a framing/EOF violation.
+        assert.equal(err.failure.category, "transport");
+        return true;
+      },
+    );
+  });
+});
+
 describe("codex transport: bounded framing", () => {
   it("turns an over-cap frame into a protocol failure and rejects the in-flight request", async () => {
     const { inbound, transport } = makePair({ maxFrameBytes: 64 });

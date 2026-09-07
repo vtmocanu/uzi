@@ -395,6 +395,29 @@ describe("renderCodexRun — determinism", () => {
     assert.deepEqual([...a.perRolePrompts.keys()], ["alpha", "zeta"]);
   });
 
+  it("orders per-role maps by UTF-16 code unit, not by a locale collator", () => {
+    // Role names chosen so a code-unit comparator and a locale collator DISAGREE (see the
+    // diagnostics test below): 0x42 < 0x5A < 0x61 < 0xE4. Fed out of order to prove the
+    // renderer sorts, and with a non-ASCII role so localeCompare's ICU dependence would
+    // otherwise make the per-role Map insertion order vary across environments.
+    const run = renderCodexRun(
+      runRequest({
+        agents: {
+          apple: agent(),
+          Zebra: agent(),
+          "ä-zone": agent(),
+          Banana: agent(),
+        },
+      }),
+    );
+    const expected = ["Banana", "Zebra", "apple", "ä-zone"];
+    assert.deepEqual([...run.perRoleGrants.keys()], expected);
+    assert.deepEqual([...run.perRoleModels.keys()], expected);
+    assert.deepEqual([...run.perRolePrompts.keys()], expected);
+    // Matches a plain code-unit .sort() exactly (what sortedSet applies).
+    assert.deepEqual(expected, [...expected].sort());
+  });
+
   it("orders diagnostics by UTF-16 code unit, not by a locale collator", () => {
     // Names chosen so a code-unit comparator and a locale collator DISAGREE: code
     // units put uppercase (0x41-) before lowercase (0x61-) before a non-ASCII letter
