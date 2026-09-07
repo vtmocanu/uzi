@@ -8,6 +8,7 @@ import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { WorkerClient } from "../src/client.js";
 import type {
+  ClaimConfig,
   ClaimResponse,
   JudgeTraceResponse,
   OutgoingMessage,
@@ -893,5 +894,29 @@ describe("judge tool confinement (PRD #89 M-allow / auditor Medium)", () => {
     for (const t of DAEMON_REACHING) {
       assert.equal(await preToolUseDecision(options!, t), "deny", `${t} must be denied for the judge`);
     }
+  });
+
+  it("threads the claim's default_effort onto the judge SDK options", async () => {
+    const { client } = fakeClient(emptyTrace);
+    const { queryFn, captured } = capturingQueryFn(
+      JSON.stringify({ verdict: "ok", summary: "", recommendations: [] }),
+    );
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    await runner.execute(judgeClaim({ config: { default_effort: "high" } as ClaimConfig }));
+
+    assert.ok(captured.options, "the judge must have called the model (so options were captured)");
+    assert.equal(captured.options!.effort, "high", "the owner's default_effort is applied to the judge query");
+  });
+
+  it("sets no effort on the judge SDK options when the claim carries no config", async () => {
+    const { client } = fakeClient(emptyTrace);
+    const { queryFn, captured } = capturingQueryFn(
+      JSON.stringify({ verdict: "ok", summary: "", recommendations: [] }),
+    );
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    await runner.execute(judgeClaim());
+
+    assert.ok(captured.options, "the judge must have called the model (so options were captured)");
+    assert.ok(!("effort" in captured.options!), "no effort is set when the claim carries no default_effort");
   });
 });

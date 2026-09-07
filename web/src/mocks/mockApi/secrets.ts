@@ -73,6 +73,89 @@ function unbindAnthropicSecret(id: string): void {
   });
 }
 
+// Codex credentials (PRD #1147) share ONE default across BOTH kinds, so the
+// helpers below scope set-default / first-credential over the union rather than a
+// single kind. Kept module-local (not exported) so knip does not flag them.
+const CODEX_KINDS = ["codex_auth", "openai_api_key"] as const;
+type CodexKind = (typeof CODEX_KINDS)[number];
+const isCodexKind = (kind: string): boolean =>
+  (CODEX_KINDS as readonly string[]).includes(kind);
+
+function createCodexCredential(kind: CodexKind, label: string, isDefault: boolean) {
+  requireUnlockedVault();
+  const trimmed = label.trim();
+  if (trimmed === "") throw new ApiError(400, "label must not be empty");
+  rejectInvisibleLabel(trimmed);
+  // Label uniqueness is per-kind, like the Anthropic path.
+  if (secrets.some((s) => s.kind === kind && s.label.toLowerCase() === trimmed.toLowerCase())) {
+    throw new ApiError(409, "a credential with that label already exists");
+  }
+  const codex = () => secrets.filter((s) => isCodexKind(s.kind));
+  // FIRST codex credential across BOTH kinds is force-defaulted server-side.
+  const first = codex().length === 0;
+  const wantDefault = isDefault || first;
+  if (wantDefault) codex().forEach((s) => (s.is_default = false));
+  const now = new Date().toISOString();
+  const created: SecretMeta = {
+    id: `sec-${Math.random().toString(36).slice(2, 8)}`,
+    kind,
+    label: trimmed,
+    is_default: wantDefault,
+    // No Codex auto-selection pool.
+    auto_eligible: false,
+    // The resolver-observed lifecycle state at birth: a login stages, a key is static.
+    codex_status: kind === "codex_auth" ? "staging" : "static",
+    created_at: now,
+    updated_at: now,
+  };
+  secrets.push(created);
+  return delay({ secret: { ...created } });
+}
+
+function patchCodexCredential(
+  kind: CodexKind,
+  id: string,
+  body: { label?: string; default?: boolean; token?: string },
+) {
+  const row = secrets.find((s) => s.id === id);
+  // The real route is kind-scoped (PATCH /me/secrets/{kind}/{id}), so an id of the
+  // wrong kind (e.g. an anthropic_token or the sibling codex kind) is a 404, not a hit.
+  if (!row || row.kind !== kind) throw new ApiError(404, "credential not found");
+  if (body.token !== undefined) requireUnlockedVault();
+  if (body.default === false) {
+    throw new ApiError(400, "cannot clear the default; set another credential as default instead");
+  }
+  if (body.label !== undefined) {
+    const trimmed = body.label.trim();
+    if (trimmed === "") throw new ApiError(400, "label must not be empty");
+    rejectInvisibleLabel(trimmed);
+    if (
+      secrets.some(
+        (s) => s.id !== id && s.kind === row.kind && s.label.toLowerCase() === trimmed.toLowerCase(),
+      )
+    ) {
+      throw new ApiError(409, "a credential with that label already exists");
+    }
+    row.label = trimmed;
+  }
+  if (body.default === true) {
+    // Single default across BOTH codex kinds.
+    secrets.filter((s) => isCodexKind(s.kind)).forEach((s) => (s.is_default = false));
+    row.is_default = true;
+  }
+  row.updated_at = new Date().toISOString();
+  return delay({ secret: { ...row } });
+}
+
+function deleteCodexCredential(kind: CodexKind, id: string) {
+  const row = secrets.find((s) => s.id === id);
+  // The real route is kind-scoped (DELETE /me/secrets/{kind}/{id}), so an id of the
+  // wrong kind (e.g. an anthropic_token or the sibling codex kind) is a 404, not a hit.
+  if (!row || row.kind !== kind) throw new ApiError(404, "credential not found");
+  secrets = secrets.filter((s) => s.id !== id);
+  return delay(null);
+}
+
 export const secretsApi = {
   // ── Secrets ─────────────────────────────────────────────────────────────────
   listSecrets: async () =>
@@ -222,6 +305,27 @@ export const secretsApi = {
     unbindAnthropicSecret(id);
     return delay(null);
   },
+
+  // ── Codex / OpenAI credentials (PRD #1147 M3) ──────────────────────────────
+  // Two kinds share ONE default and ONE card: `codex_auth` (a Codex login, born
+  // "staging" — a resolver later moves it to "linked"/"failed") and `openai_api_key`
+  // (a static Console key, born "static"). The user's FIRST codex credential across
+  // BOTH kinds is force-defaulted server-side, and set-default is single across both
+  // kinds. No auto-selection pool — an `auto` worker never spends a Codex credential.
+  createCodexAuth: async (_token: string, label: string, isDefault: boolean) =>
+    createCodexCredential("codex_auth", label, isDefault),
+  patchCodexAuth: async (
+    id: string,
+    body: { label?: string; default?: boolean; token?: string },
+  ) => patchCodexCredential("codex_auth", id, body),
+  deleteCodexAuthById: async (id: string) => deleteCodexCredential("codex_auth", id),
+  createOpenAIApiKey: async (_token: string, label: string, isDefault: boolean) =>
+    createCodexCredential("openai_api_key", label, isDefault),
+  patchOpenAIApiKey: async (
+    id: string,
+    body: { label?: string; default?: boolean; token?: string },
+  ) => patchCodexCredential("openai_api_key", id, body),
+  deleteOpenAIApiKeyById: async (id: string) => deleteCodexCredential("openai_api_key", id),
 
   // ── Vault (PRD #32) ───────────────────────────────────────────────────────────
   // Any non-empty password unlocks in the demo (there is no real crypto); an empty

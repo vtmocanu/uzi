@@ -2051,6 +2051,82 @@ tasks:
     cmds:
       - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
 
+  test:codex-supervisor:
+    desc: Opt-in gofmt vet and unit tests for the static Codex process supervisor module
+    # A SEPARATE Go module (uzi.local/codex-supervisor), deliberately NOT part of gate:api
+    # and NOT under gate. GOTOOLCHAIN=local pins the host toolchain (the module go.mod floors
+    # go 1.25); -mod=vendor builds offline from the committed vendor tree; -buildvcs=false
+    # skips VCS stamping, which otherwise fails inside a linked worktree.
+    dir: agent/codex/supervisor
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=vendor -buildvcs=false
+    cmds:
+      # gofmt -l EXITS 0 even when it lists drift, so branch on its OUTPUT, not its status,
+      # or the format check can never fail. A block scalar keeps the shell out of YAML quoting.
+      - |
+        drift="$(gofmt -l .)"
+        if [ -n "$drift" ]; then printf 'gofmt drift:\n%s\n' "$drift"; exit 1; fi
+      - go vet ./...
+      - go test ./...
+
+  test:codex-m3a:matrix:
+    desc: Opt-in real base and jvm package matrix for amd64 and arm64 with negative controls
+    # Builds every actual template/architecture cell. Each Dockerfile executes the positive
+    # runner-uid guard; the harness then proves corrupt checksum, missing code-mode host and
+    # broken executable all fail in every cell. Requires buildx support for both platforms.
+    cmds:
+      - ./e2e/codex-m3a/run-matrix.sh
+
+  test:codex-m3a:profile:
+    desc: Opt-in build the real worker image and run the M3a launcher isolation controls
+    # Builds both base and jvm with the M2 launcher and static supervisor, then runs the
+    # five container controls through each template's REAL root
+    # entrypoint under compose's hardened cap set (writable root, no read-only, no user
+    # override) so the ownership and uid-split they prove are the true production posture:
+    # channel nondumpability, profile fail-before-fork, ownership immutability,
+    # ECHILD+__WALL disposal, and fresh-tree ownership. Requires a working docker daemon,
+    # plus egress for the pinned Codex and toolchain artifacts on a cold build. NOT wired
+    # into gate. Set UZI_M3A_SKIP_BUILD=1 to reuse an already-built image.
+    cmds:
+      - |
+        set -e
+        for template in base jvm; do
+          UZI_M3A_IMAGE="codex-m3a-profile-${template}:local" \
+          UZI_M3A_DOCKERFILE="agent/templates/${template}/Dockerfile" \
+            ./e2e/codex-m3a/run.sh all
+        done
+
+  test:codex-m3a:lifecycle:
+    desc: Opt-in real code-mode-host lifecycle plus isolation suites under the confinement posture
+    # Builds both real worker images, then runs the three credential-free TypeScript suites
+    # (lifecycle.test.ts / production-launcher.test.ts / isolation.test.ts) INSIDE each image
+    # through the REAL root-start entrypoint under the PRD confinement posture -- read-only
+    # root filesystem, read-only fixtures, exactly three writable runtime tmpfs mounts
+    # (/nix, /data, /tmp), network none
+    # (loopback only for the localhost fake provider). Control A drives the PRODUCTION Go
+    # supervisor plus real Codex to launch the real code-mode host on both model fixtures,
+    # active and yielded, with NO hook-trust bypass and NO live credentials; control B drives
+    # the actual launcher plus config builder with the host disabled; control C proves the
+    # replacement-env, no-baked-auth, mutation and no-repo-config isolation controls. Requires
+    # a working docker daemon, plus egress for the pinned Codex and toolchain artifacts on a
+    # cold build. NOT wired into gate. Set UZI_M3A_SKIP_BUILD=1 to reuse an already-built image.
+    dir: agent
+    cmds:
+      # Typecheck the suites explicitly against their own NodeNext tsconfig on the host, so a
+      # drift in the launcher/config shapes or the M0 protocol helpers fails here, not only at
+      # container runtime. The suites themselves run inside the image via run-lifecycle.sh,
+      # which wraps the container node --test in an OUTER timeout watchdog (a leaked codex or
+      # code-mode-host handle can outlive Node's own --test-timeout).
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m3a/tsconfig.json
+      - |
+        set -e
+        for template in base jvm; do
+          UZI_M3A_IMAGE="codex-m3a-lifecycle-${template}:local" \
+          UZI_M3A_DOCKERFILE="agent/templates/${template}/Dockerfile" \
+            ../e2e/codex-m3a/run-lifecycle.sh
+        done
+
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)
     # Runs from the agent module so tsx + tsc + the SDK/zod deps resolve out of

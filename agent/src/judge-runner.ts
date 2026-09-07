@@ -10,6 +10,8 @@
 
 import os from "node:os";
 
+import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+
 import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
@@ -244,7 +246,7 @@ export class JudgeRunner {
         claim.known_improve_uzi_targets ?? [],
         claim.failure_class ?? null,
       );
-      const { text, result } = await this.runModel(token, model, prompt);
+      const { text, result } = await this.runModel(token, model, prompt, claim.config?.default_effort);
       return { review: calibrateReview(parseReview(text, model), claim.failure_class ?? null), usageMessage: result };
     } catch (err) {
       this.log.warn("judge model call failed; using deterministic fallback", {
@@ -259,7 +261,7 @@ export class JudgeRunner {
     }
   }
 
-  private async runModel(token: string, model: string, prompt: string): Promise<{ text: string; result?: EmittedMessage }> {
+  private async runModel(token: string, model: string, prompt: string, effort?: EffortLevel): Promise<{ text: string; result?: EmittedMessage }> {
     // The terminal success frame mapped to a run message (PRD #69 M6): mapSdkMessage
     // routes a result frame through mapResult, which carries event:"result" + modelUsage
     // — the only fields the API's foldRunUsage reads. Surfaced to execute() to post so a
@@ -269,6 +271,7 @@ export class JudgeRunner {
     const text = await runReadOnlyModelPass({
       token,
       model,
+      effort,
       systemPrompt: JUDGE_SYSTEM_PROMPT,
       prompt,
       homeRoot: this.homeRoot,
