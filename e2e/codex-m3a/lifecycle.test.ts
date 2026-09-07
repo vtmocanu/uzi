@@ -197,8 +197,13 @@ for (const model of ["gpt-6-astra", "gpt-5.6-sol"]) {
       assert.ok(disp.reaped?.includes(r.app.pid), "app-server reaped by own supervisor");
       assert.ok(disp.reaped?.includes(r.host.pid), "escaped host adopted and reaped by own supervisor");
       await sleep(delayMs + 200);
+      // Reaping itself is proven by the reaped-set + ECHILD+__WALL assertions above. The
+      // two checks below are CORROBORATING no-late-effect: since admission is also revoked
+      // here, markCalls()===0 does not by itself discriminate a reaped host from a live one
+      // whose callback admission was rejected — it only confirms no late marker/callback
+      // effect survived disposal, consistent with the proven reap.
       assert.equal(await markerContent(r.markerPath), null, "late marker absent beyond the positive-control delay");
-      assert.equal(r.markCalls(), 0, "late dynamic callback itself absent, not merely rejected by revoked admission");
+      assert.equal(r.markCalls(), 0, "no late dynamic-callback effect survived disposal");
       t.diagnostic(JSON.stringify({ markerAbsentAfterMs: delayMs + 200, lateCalls: 0, disposal: disp }));
     });
   }
