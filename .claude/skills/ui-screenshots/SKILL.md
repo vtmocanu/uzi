@@ -17,8 +17,11 @@ a script, or a commit. Ask for the URL if it was not given, or read `UZI_URL` /
 
 ## Prerequisites
 
-- **macOS with Orca computer-use** available (`orca` on PATH, or `$ORCA_CLI_COMMAND`).
-  Load the `computer-use` skill for selector discovery and window commands.
+- **macOS.** Capture uses `screencapture` (needs Screen Recording permission for the
+  terminal) and `osascript` (needs Automation permission for System Events).
+- **Orca computer-use** (`orca` on PATH, or `$ORCA_CLI_COMMAND`) is needed **only for
+  `--url` navigation** and for clicking between views. Load the `computer-use` skill for
+  selector discovery. The capture itself does not use Orca.
 - **A desktop browser logged in to the uzi instance.** The scripts screenshot an
   existing window; they do not log in.
 - **Demo mode ON in that browser** (see below). Non-negotiable for anything public.
@@ -57,24 +60,25 @@ One call can navigate, resize, capture, and crop:
   --url <url> --size 1728x1080 --crop --width 1800
 ```
 
-- `--url <url>` opens the uzi URL in a **new tab** (leaves your other tabs alone), so
-  the script does not depend on what the window happened to be showing. Pass the
+`capture.sh` grabs the window's on-screen rectangle with macOS `screencapture -R`,
+which returns full native Retina pixels every time (a Retina display gives 2x). This
+deliberately avoids Orca's own screenshot, whose scale drops to a soft ~1280px
+"desktop-region" fallback whenever the target window is not the frontmost app, a
+non-deterministic trap. Orca is still used, but only to navigate.
+
+- `--url <url>` opens the uzi URL in a **new tab** (leaves your other tabs alone) via
+  Orca, so the shot does not depend on what the window happened to be showing. Pass the
   instance URL here; it is never hardcoded.
 - `--size WxH` resizes the window (via osascript) to fixed points for reproducible
-  framing. **It also tends to restore Retina**: a stale window often captures soft
-  (scale < 1), and the resize rebuilds the window surface so the next capture comes
-  back at scale 2. If a shot is soft, re-run with `--size`.
+  framing.
 - `--crop` chains `crop-ui.sh` (below) so one call gives a finished image; `--width
   1800` downscales for the blog.
 
-`capture.sh` fronts the window and retries until Orca returns a real window capture
-(scale >= 1.5) rather than the soft low-resolution desktop-region fallback.
-
-**When a capture stays soft (scale < 1):** re-run with `--size` first. Failing that,
-the window is in **native fullscreen** (use a normal window), on a **non-Retina
-display** (move it to the built-in), or **occluded / screensaver active** (keep it
-visible, dismiss the screensaver). On exit 1 the script saved the best (soft) shot and
-printed which condition to fix. During a batch, keep the window stable and unoccluded.
+The window is force-activated before the grab. Because `screencapture -R` captures the
+screen region (not the window's private surface), the **only** requirement is that the
+window is visible and **unoccluded**: nothing overlapping the rectangle, not minimized.
+A non-Retina display yields 1x (expected). During a batch, keep the window on top and
+do not drag another window over it.
 
 ## Step 4 — crop the browser chrome
 
