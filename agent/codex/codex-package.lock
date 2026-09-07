@@ -1,0 +1,49 @@
+# Pinned Codex native package lock (PRD #1156 M3a).
+#
+# The single source of truth consumed by agent/codex/install-codex.sh to download,
+# verify and install the combined Codex native package (CLI + code-mode host +
+# bundled resources) into BOTH worker image templates. NOT the bare CLI archive:
+# the real code-mode path needs the matching bin/codex-code-mode-host sibling.
+#
+# Nothing here is fetched at run time and no binary is committed to git — the
+# Dockerfiles download the pinned artifact at BUILD time and verify it fail-closed
+# against the SHA256 below. A version bump is deliberate and immutable: raising
+# CODEX_VERSION installs a NEW /opt/uzi-codex/<version>/ root (the old root is never
+# mutated in place), so the install path is content-addressed by version.
+#
+# Format: plain KEY=VALUE lines (greppable, shell-parseable, no tabs). Per-TARGETARCH
+# facts use an arch-suffixed key (CODEX_TARGET_amd64, CODEX_SHA256_arm64, ...) so an
+# unknown/missing TARGETARCH resolves to no key and the install script fails loudly.
+
+# --- Package identity (upstream release coordinates) -------------------------------
+CODEX_VERSION=0.153.2
+CODEX_TAG=rust-v0.153.2
+CODEX_SOURCE_COMMIT=657a993cbee87acf52d14b758ce49dbd46d1b8eb
+# Artifacts live at ${CODEX_BASE_URL}/${CODEX_TAG}/${artifact}.
+CODEX_BASE_URL=https://github.com/openai/codex/releases/download
+
+# --- Expected codex-package.json field values (asserted after extraction) ----------
+# The extracted manifest MUST match these before the package is installed; `target`
+# is asserted per-arch against CODEX_TARGET_<arch> below (musl target, no libc sniff).
+CODEX_MANIFEST_LAYOUT_VERSION=1
+CODEX_MANIFEST_VERSION=0.153.2
+CODEX_MANIFEST_VARIANT=codex
+CODEX_MANIFEST_ENTRYPOINT=bin/codex
+CODEX_MANIFEST_RESOURCES_DIR=codex-resources
+CODEX_MANIFEST_PATH_DIR=codex-path
+
+# --- Expected archive members (all must exist at the archive root after extract) ---
+# The tarball extracts members AT THE ARCHIVE ROOT (no top-level prefix dir). Every
+# member below is required; a missing one rejects the package before installation.
+CODEX_MEMBERS=bin/codex bin/codex-code-mode-host codex-package.json codex-path/rg codex-resources/bwrap codex-resources/zsh/bin/zsh
+
+# --- Per-TARGETARCH artifact + integrity -------------------------------------------
+# amd64 -> x86_64 musl
+CODEX_TARGET_amd64=x86_64-unknown-linux-musl
+CODEX_ARTIFACT_amd64=codex-package-x86_64-unknown-linux-musl.tar.gz
+CODEX_SHA256_amd64=e10fa0cee78e9f0bd395880f03fd4fd227d903ca7af649bbc08d1649101e9225
+
+# arm64 -> aarch64 musl
+CODEX_TARGET_arm64=aarch64-unknown-linux-musl
+CODEX_ARTIFACT_arm64=codex-package-aarch64-unknown-linux-musl.tar.gz
+CODEX_SHA256_arm64=a3bfaf4b62fcb17e0a0338dfe0502413ddce0ab1b39028679390539c45d2c6e3

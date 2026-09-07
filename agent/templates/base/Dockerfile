@@ -322,6 +322,54 @@ RUN command -v agent-browser \
 # does not hit the un-chmodable-root abort the non-root seed would.
 RUN chmod -R a+rX /nix
 
+# --- PRD #1156 M3a: package pinned Codex 0.153.2 (CLI + code-mode host) ------------------
+# Install the COMBINED native package (not the bare CLI) into a stable, immutable,
+# root-owned root at /opt/uzi-codex/<version>/ — OUTSIDE writable /app, /data and the
+# per-run homes, and on NO PATH: the launcher resolves Codex by absolute path only, so a
+# bundled codex-path/rg or resource shell can never shadow Claude's existing toolchain.
+# The pin, per-arch artifact + SHA256, expected members and expected codex-package.json
+# fields all live in agent/codex/codex-package.lock, consumed IDENTICALLY here and by
+# templates/jvm — the ONE packaging + integrity path, so the two images cannot drift.
+#
+# install-codex.sh downloads the pinned artifact for ${TARGETARCH} (the ARG declared
+# above), verifies its SHA256 fail-closed and rejects a missing member, a mismatched
+# manifest field or an unsupported arch BEFORE installing. assert-codex.sh is the
+# build-time runner-uid guard: it execs `codex --version` as the cap-less `runner` uid
+# (setpriv --reuid runner, fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY
+# `codex-cli 0.153.2` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
+# sibling — so a broken binary/loader or a missing host fails the BUILD, not a run. The
+# helpers + lock are removed after (no residue); NO auth/config/session state is baked.
+# MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep the two in lockstep.
+COPY agent/codex/codex-package.lock /tmp/codex/codex-package.lock
+COPY agent/codex/install-codex.sh /tmp/codex/install-codex.sh
+COPY agent/codex/assert-codex.sh /tmp/codex/assert-codex.sh
+RUN bash /tmp/codex/install-codex.sh "${TARGETARCH}"
+RUN bash /tmp/codex/assert-codex.sh \
+    && rm -rf /tmp/codex
+
+# --- PRD #1156 M3a: the static Go supervisor (immutable trusted supervision helper) ------
+# The isolated Codex launcher runs its untrusted per-root process tree under a trusted
+# process-supervision helper (establish + verify Linux child-subreaping before fork, then
+# reap the whole tree with pidfds + Wait4(__WALL) until an observed ECHILD). That helper
+# is the TRUST ANCHOR, so it cannot be a script an interpreter reads: under the PRD #51 A1
+# uid split /nix is runner-WRITABLE, so the toolchain Python (which lives in /nix) is NOT a
+# trust anchor. The supervisor is therefore a STATICALLY LINKED Go binary — CGO_ENABLED=0,
+# no dynamic loader/libs, no /nix dependency — baked here root-owned 0555 on the read-only
+# image layer, immutable to the same-uid runner it supervises.
+#
+# Built OFFLINE from the module's committed vendor/ tree (GOFLAGS -mod=vendor), so no
+# network module fetch happens in the image build; -buildvcs=false skips VCS stamping (the
+# copied /build dir carries no .git, and stamping otherwise fails in a linked worktree).
+# `go` resolves via the image PATH /opt/uzi-toolchain/bin set earlier. The build runs as
+# root, so the output is root-owned by default; chmod 0555 makes it read+exec for all and
+# writable by none, and the /build source tree is removed after (no residue, no source
+# baked). It is intentionally on NO PATH: the launcher resolves it by absolute path
+# (/usr/local/bin/uzi-codex-supervisor) as a trusted, caller-supplied argv0 — never model-
+# controlled. NOTE the executable COPY/RUN lines are byte-identical to templates/jvm; keep
+# them in lockstep (jvm is NOT `FROM base`).
+COPY agent/codex/supervisor /build/uzi-codex-supervisor
+RUN cd /build/uzi-codex-supervisor && GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && rm -rf /build/uzi-codex-supervisor
+
 COPY agent/tsconfig.json ./
 COPY agent/src ./src
 

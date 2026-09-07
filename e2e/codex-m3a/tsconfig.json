@@ -1,0 +1,27 @@
+{
+  "//": "PRD #1156 M3a: typecheck the credential-free lifecycle/isolation suites.",
+  "//1": "Cloned from e2e/harness-m2/tsconfig.json (NodeNext, strict, skipLibCheck, types",
+  "//2": "node) so the '../../agent/src/codex/*.js' NodeNext specifiers resolve exactly as",
+  "//3": "the agent module compiles them. typeRoots points at the agent module's @types",
+  "//4": "because this directory has no node_modules of its own; the imported agent src",
+  "//5": "files resolve their own sibling imports by walking up. harness-m0.d.ts supplies",
+  "//6": "the ambient types for the frozen '../codex-m0/harness.mjs' protocol helpers so the",
+  "//7": "strict, allowJs:false compile resolves them without editing the frozen .mjs.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2024"],
+    "typeRoots": ["../../agent/node_modules/@types"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["*.test.ts", "fake-provider.ts", "supervisor-driver.ts", "harness-m0.d.ts"],
+  "exclude": ["node_modules", ".bin"]
+}
