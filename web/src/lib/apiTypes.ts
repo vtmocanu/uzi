@@ -77,6 +77,13 @@ export interface SecretMeta {
    *  pick the token right now also depends on its rate-limit reading, which arrives
    *  as `auto_status` on TokenRateLimits and is computed server-side. */
   auto_eligible: boolean;
+  /** PRD #1147: the Codex/OpenAI credential's resolver-observed lifecycle state,
+   *  present ONLY on the Codex kinds (`codex_auth`/`openai_api_key`) — it is the Go
+   *  DTO's `omitempty` field, so an anthropic_token row omits it entirely. On create
+   *  it is "staging" (codex_auth) or "static" (openai_api_key); the resolver later
+   *  moves a codex_auth row to "linked" or "failed". Optional, matching the omitempty,
+   *  and stateless UI (a badge read straight off this — never a second fetch). */
+  codex_status?: string;
   created_at: string;
   updated_at: string;
 }

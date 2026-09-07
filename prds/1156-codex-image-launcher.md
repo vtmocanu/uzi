@@ -4,7 +4,7 @@
 **Status:** Implementation complete; post-review validation recorded below.
 **Execution:** Auto mode, MR rework enabled, implementation effort high.
 
-Package pinned Codex and its code-mode host in both worker images, and deliver a reusable isolated launcher with bounded, observed **per-root** process cleanup. This prepares later adapter integration without changing which harness any uzi run executes. [M2 #1146](done/1146-claude-harness-extraction.md) is complete; [M1 #1147](1147-codex-credentials-foundation.md) continues independently and is not a dependency of this credential-free child.
+Package pinned Codex and its code-mode host in both worker images, and deliver a reusable isolated launcher with bounded, observed **per-root** process cleanup. This prepares later adapter integration without changing which harness any uzi run executes. [M2 #1146](done/1146-claude-harness-extraction.md) and [M1 #1147](done/1147-codex-credentials-foundation.md) are complete; M1 was independent and is not a dependency of this credential-free child. *(AI-synced 2026-09-07)*
 
 Use current `main` and a new working branch, never write to `main`. The accepted [ADR-1106 execution policy](../adr/1106-codex-harness.md#execution-policy) and [neutral lifecycle contract](../e2e/codex-m0/harness-contract.md#lifecycle-operation-order-and-evidence) remain authoritative. Complete only this child and hand off its PR. Auto orchestration may review, rework and merge it; do not close the parent or start another milestone.
 
