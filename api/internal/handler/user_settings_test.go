@@ -25,11 +25,12 @@ import (
 // -> respond) without a real database. The
 // SetUserDefaultModel/SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme
 // UPDATEs QueryRow a single Text RETURNING column (discarded by the handler) and
-// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows six (default_model,
-// default_effort, judge_model, summary_model, theme, sidebar_token_ids) —
-// summary_model rides that one-row read, so the settings handler makes no separate
-// GetUserSummaryModel call. The UPDATE paths record the written value so the
-// round-trip is observable.
+// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows eleven (default_model,
+// default_effort, judge_model, summary_model, theme, sidebar_token_ids,
+// mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
+// appearance columns joined the read in PRD #1167 M1) — summary_model rides that
+// one-row read, so the settings handler makes no separate GetUserSummaryModel call.
+// The UPDATE paths record the written value so the round-trip is observable.
 type fakeSettingsDB struct {
 	model      pgtype.Text
 	effort     pgtype.Text
@@ -38,6 +39,10 @@ type fakeSettingsDB struct {
 	theme      pgtype.Text
 	mrRework   pgtype.Bool
 	sidebarIDs []uuid.UUID
+	apprMode   pgtype.Text
+	lightTheme pgtype.Text
+	darkTheme  pgtype.Text
+	typeface   pgtype.Text
 }
 
 func (f *fakeSettingsDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -87,6 +92,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		theme:      f.theme,
 		mrRework:   f.mrRework,
 		sidebarIDs: f.sidebarIDs,
+		apprMode:   f.apprMode,
+		lightTheme: f.lightTheme,
+		darkTheme:  f.darkTheme,
+		typeface:   f.typeface,
 	}
 }
 
@@ -98,6 +107,10 @@ type fakeSettingsRow struct {
 	theme      pgtype.Text
 	mrRework   pgtype.Bool
 	sidebarIDs []uuid.UUID
+	apprMode   pgtype.Text
+	lightTheme pgtype.Text
+	darkTheme  pgtype.Text
+	typeface   pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -111,9 +124,11 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[0].(*pgtype.Bool); ok {
 			*p = r.mrRework
 		}
-	case 7:
+	case 11:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
-		// summary_model, theme, sidebar_token_ids, mr_rework_enabled.
+		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
+		// appearance_mode, light_theme, dark_theme, typeface (the last four are
+		// PRD #1167 M1's appearance columns riding the same one-row read).
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
@@ -134,6 +149,18 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[6].(*pgtype.Bool); ok {
 			*p = r.mrRework
+		}
+		if p, ok := dest[7].(*pgtype.Text); ok {
+			*p = r.apprMode
+		}
+		if p, ok := dest[8].(*pgtype.Text); ok {
+			*p = r.lightTheme
+		}
+		if p, ok := dest[9].(*pgtype.Text); ok {
+			*p = r.darkTheme
+		}
+		if p, ok := dest[10].(*pgtype.Text); ok {
+			*p = r.typeface
 		}
 	}
 	return nil

@@ -20,6 +20,21 @@ const (
 	// this same table rather than a parallel settings store; its value is a theme
 	// id validated against the canonical theme registry, not a label.
 	KeyDefaultTheme = "default_theme"
+	// Instance-default APPEARANCE keys (PRD #1167 "Lights on" M1) layer the appearance
+	// model over the legacy default_theme: the appearance MODE (system|light|dark), the
+	// LIGHT-slot and DARK-slot theme ids, and the TYPEFACE (system|plex). Each value is
+	// validated against the canonical theme registry (api/internal/theme). The web
+	// mirror is web/src/lib/theme.ts.
+	//
+	// default_dark_theme carries a LEGACY FALLBACK CHAIN in its accessor
+	// (DefaultDarkTheme): an unset/invalid dark key falls back to default_theme (PRD
+	// #21) before the compiled "ember", so an instance that only ever set the old
+	// single theme keeps rendering it as its dark theme on upgrade. That is why its
+	// Defaults entry is "" (meaning "inherit") rather than a compiled value.
+	KeyDefaultAppearanceMode = "default_appearance_mode"
+	KeyDefaultLightTheme     = "default_light_theme"
+	KeyDefaultDarkTheme      = "default_dark_theme"
+	KeyDefaultTypeface       = "default_typeface"
 	// Slack integration keys (PRD #25). slack_enabled/public_base_url are plaintext
 	// non-secret settings (in Defaults). slack_bot_token/slack_app_token are SECRET
 	// keys (in SecretKeys, NOT Defaults): sealed with secretbox+base64 at rest and
@@ -369,6 +384,17 @@ var Defaults = map[string]string{
 	// migration seed is needed — this fallback plus the stable GET shape follow
 	// automatically from the entry here.
 	KeyDefaultTheme: theme.Default,
+	// PRD #1167 M1 instance-default appearance keys. Same no-seeded-row pattern as
+	// default_theme: an absent row synthesizes to the compiled fallback, sourced from
+	// the theme package so the Go and web mirrors share one origin (mode "dark", light
+	// "hall", typeface "system"). default_dark_theme is deliberately "" — its accessor
+	// (DefaultDarkTheme) runs the legacy fallback chain (default_dark_theme →
+	// default_theme → "ember"), so an empty entry means "inherit", not "ember". All
+	// four are Known()/admin-writable with no migration.
+	KeyDefaultAppearanceMode: theme.FallbackMode,
+	KeyDefaultLightTheme:     theme.FallbackLight,
+	KeyDefaultDarkTheme:      "",
+	KeyDefaultTypeface:       theme.FallbackTypeface,
 	// PRD #25 Slack non-secret keys. They have NO seeded row: an absent row
 	// synthesizes to these defaults, and no migration adds them.
 	KeySlackEnabled:  DefaultSlackEnabled,

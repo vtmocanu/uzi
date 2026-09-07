@@ -188,6 +188,45 @@ func (c *Cache) DefaultTheme(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyDefaultTheme)
 }
 
+// DefaultAppearanceMode returns the instance-default appearance MODE (PRD #1167):
+// system|light|dark. Falls back to the compiled-in "dark" (theme.FallbackMode).
+func (c *Cache) DefaultAppearanceMode(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyDefaultAppearanceMode)
+}
+
+// DefaultLightTheme returns the instance-default LIGHT-slot theme (PRD #1167).
+// Falls back to the compiled-in "hall" (theme.FallbackLight).
+func (c *Cache) DefaultLightTheme(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyDefaultLightTheme)
+}
+
+// DefaultTypeface returns the instance-default TYPEFACE (PRD #1167): system|plex.
+// Falls back to the compiled-in "system" (theme.FallbackTypeface).
+func (c *Cache) DefaultTypeface(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyDefaultTypeface)
+}
+
+// DefaultDarkTheme returns the instance-default DARK-slot theme (PRD #1167) with the
+// LEGACY FALLBACK CHAIN: an explicit (valid) default_dark_theme wins; else the legacy
+// default_theme (PRD #21) feeds the dark slot; else the compiled-in "ember". This is
+// what keeps an instance that only ever set the old single theme rendering it as its
+// dark theme on upgrade. A cold read error is propagated so a strict caller can
+// surface it, while the returned value stays a usable theme id.
+func (c *Cache) DefaultDarkTheme(ctx context.Context) (string, error) {
+	dark, err := c.get(ctx, KeyDefaultDarkTheme)
+	if err == nil && theme.ValidateFor(theme.PolarityDark, dark) == nil {
+		return dark, nil
+	}
+	// No explicit (valid) dark theme, or a read error: fall back to the legacy
+	// single-theme setting, resolved with the PRD #21 chain (the instance default
+	// when valid, else "ember").
+	legacy, lerr := c.get(ctx, KeyDefaultTheme)
+	if err == nil {
+		err = lerr
+	}
+	return theme.Resolve("", legacy), err
+}
+
 // GithubProjectSyncEnabled reports whether the GitHub Projects v2 Status sync is
 // enabled instance-wide (PRD #364): the global kill-switch. Stored as the text
 // "true"/"false"; any other value falls back to the compiled-in default (false) —
@@ -372,6 +411,14 @@ func Validate(key, value string) error {
 	switch key {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
+	case KeyDefaultAppearanceMode:
+		return validateAppearanceMode(value)
+	case KeyDefaultLightTheme:
+		return theme.ValidateFor(theme.PolarityLight, value)
+	case KeyDefaultDarkTheme:
+		return theme.ValidateFor(theme.PolarityDark, value)
+	case KeyDefaultTypeface:
+		return validateTypeface(value)
 	case KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
 		KeyCapabilityAwareScheduling, KeyGithubProjectSyncEnabled,
 		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled,
@@ -462,4 +509,25 @@ func validateEnum(value string, allowed ...string) error {
 		}
 	}
 	return fmt.Errorf("must be one of: %s", strings.Join(allowed, ", "))
+}
+
+// validateAppearanceMode / validateTypeface are the write gates for the PRD #1167
+// appearance-mode and typeface keys. They dispatch to the theme package's closed
+// sets (the single source of truth the web mirror shares) rather than duplicating the
+// allowed values in a validateEnum call, so adding a mode/typeface there needs no edit
+// here. Like the other enum validators, an explicit Validate case is load-bearing: the
+// default branch (ValidateLabel) would accept junk that then reads as the compiled
+// fallback.
+func validateAppearanceMode(value string) error {
+	if !theme.ValidMode(value) {
+		return fmt.Errorf("must be one of: %s, %s, %s", theme.ModeSystem, theme.ModeLight, theme.ModeDark)
+	}
+	return nil
+}
+
+func validateTypeface(value string) error {
+	if !theme.ValidTypeface(value) {
+		return fmt.Errorf("must be one of: %s, %s", theme.TypefaceSystem, theme.TypefacePlex)
+	}
+	return nil
 }

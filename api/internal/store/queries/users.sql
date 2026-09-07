@@ -203,7 +203,9 @@ RETURNING summary_model;
 -- surface (GetUserSummaryModel stays the narrow read for issue-run claim
 -- assembly), so the settings response needs no second query. mr_rework_enabled
 -- (PRD #700 M5) rides it too; NULL there means the default-ON per-user opt-in.
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled FROM users WHERE id = $1;
+-- The four appearance columns (PRD #1167 M1) ride this read as well; each NULL means
+-- "inherit the instance default", resolved by theme.ResolveAppearance at read time.
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch
@@ -226,6 +228,21 @@ RETURNING schedules_paused, schedules_paused_until;
 -- NULL falls the user back to the instance default. Own-user only.
 UPDATE users SET theme = @theme WHERE id = @id
 RETURNING theme;
+
+-- name: SetUserAppearance :one
+-- Sets the current user's whole appearance (PRD #1167 M1) in ONE statement: the mode,
+-- the light-slot and dark-slot themes, and the typeface. A NULL in any param CLEARS
+-- that field back to the instance default (the resolver treats a NULL column as
+-- inherit). Per-field granularity is the handler's job — it reads the current values
+-- and writes all four — so a single 4-column UPDATE is enough here. Own-user only;
+-- the caller passes the session user's id.
+UPDATE users
+SET appearance_mode = @appearance_mode,
+    light_theme = @light_theme,
+    dark_theme = @dark_theme,
+    typeface = @typeface
+WHERE id = @id
+RETURNING appearance_mode, light_theme, dark_theme, typeface;
 
 -- name: SetUserSidebarTokens :one
 -- Replaces the user's whole sidebar token-meter set (00123): the non-default
