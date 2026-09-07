@@ -223,13 +223,17 @@ they are deployment-specific, do not hard-code them** (and this is a public file
    run was re-claimed on a fresh worker and cold-started from the default branch while its
    full reviewed tip sat on the previous worker's PVC; `jq .worker_id` pointed at the cold
    worker.) Its pod is `uzi-hw-WORKER_ID-*` in the worker namespace.
-2. **Bundle the branch out**, base excluded so it stays small. **Prefer the working-clone
-   HEAD while its pod exists**: it is the live tip and also holds uncommitted/untracked work;
-   the bare tracking ref only advances at park/shutdown/finalize (`fetchBackBestEffort`), so
-   it lags after a hard mid-milestone kill. Easiest: `scripts/backup-runs.sh RUN`. By hand:
-   `git --git-dir=/data/runner/<slug>/issue-N/.git bundle create /tmp/r.bundle <branch>
-   --not origin/main`. Only when the current worker has no clone (cold-reassignment, step 1)
-   or the clone is gone, use the bare ref: `git --git-dir=BARE bundle create /tmp/r.bundle
+2. **Bundle the branch out**, base excluded so it stays small. The bare tracking ref
+   advances only at checkpoint boundaries (milestone/iteration checkpoints, park, shutdown via
+   `fetchBackBestEffort`; finalize via `fetchAgentBranch`), not on every commit, so after a
+   hard mid-milestone kill the **working-clone branch HEAD** is the fresher committed tip. For
+   a run still claimed on the worker holding the clone, `scripts/backup-runs.sh RUN` is easiest
+   and also saves the uncommitted patch + untracked files separately. By hand (committed
+   history only; add `git -C <clone> diff HEAD` and an untracked tar for WIP):
+   `git --git-dir=/data/runner/<slug>/issue-N/.git bundle create /tmp/r.bundle <branch> --not
+   origin/main`. Use the bare ref when the current worker has no clone (cold-reassignment,
+   step 1 — `backup-runs.sh` searches only the current `worker_id` and skips terminal runs) or
+   the clone is gone: `git --git-dir=BARE bundle create /tmp/r.bundle
    refs/uzi-runner/agent/issue-N ^MERGEBASE` (`MERGEBASE` = `git --git-dir=BARE merge-base
    refs/uzi-runner/agent/issue-N refs/remotes/origin/main`). Then `kubectl cp` it out.
 3. **Fetch into a branch + an ISOLATED worktree** (never the `main` worktree): `git fetch
