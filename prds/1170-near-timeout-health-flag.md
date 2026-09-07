@@ -1,0 +1,151 @@
+# PRD #1170: Replace the wall-clock `slow` run-health flag with a budget-relative "near timeout" warning
+
+**Issue:** [#1170](https://github.com/vtmocanu/uzi/issues/1170)
+**Status:** Ready for planning; no implementation yet.
+**Execution:** Queued for the nightly `Planned` sweep (auto-approve on, MR rework inherited). api (detector, settings, Slack, TUI) + web + docs. No migration. Do not touch `.github/workflows/**`.
+
+Use current `main` and a new working branch, never write to `main`.
+
+## Problem
+
+The run-health detector (PRD #47) has five flags. Four name a concrete cause: `stalled` (no updates, nothing in flight), `looping` (the same tool call repeated, or updates that cannot be saved), `waiting_worker` (queued with a named reason), `approval_idle` (a gate nobody answered). The fifth, `slow`, is a bare wall-clock timer: a `running` run is flagged once `now - started_at` passes `health_slow_seconds` (default 45 min), scaled by `budget_wall_seconds / RUN_TIMEOUT` for milestone-scaled runs (issue #323). Nothing about activity, progress, or the run's own deadline feeds it.
+
+It renders everywhere a run does: the board card and run-view header via `runBadge()`, the dashboard and runs list via `RunHealthBadge`, the TUI (where it replaces the status token with `▲ slow` and turns the active crew lane amber), the Slack root context block, and a threaded Slack DM ("🐢 This run is taking longer than usual.") on every ok→slow transition, once per 30 min cooldown.
+
+**Measured on the dev cluster on 2026-09-07** (live `runs` table, the 45 days to that date, every non-chat run that reached a terminal status, replayed against the detector's exact rule with the cluster's live parameters):
+
+| | count |
+|---|---|
+| terminal non-chat runs in the window | 1112 |
+| runs the current rule flags `slow` at some point | 179 |
+| of those, finished `completed` normally | 166 |
+| of those, actually failed on `run exceeded RUN_TIMEOUT` | 1 |
+| Slack "taking longer than usual" DMs since 2026-07-17 | ~95, about 4 per day in early September |
+
+Precision is under 1%. The one true positive got its DM five hours before the timeout, which is not an actionable warning either. Five runs got 2 or 3 slow DMs each, because every gate or park round trip resets `health` to `ok` and the flag re-raises on return, re-nudging once the 30 min cooldown has passed.
+
+**Why it fires so early.** The #323 scaling divides by `RUN_TIMEOUT`. The dev cluster sets `RUN_TIMEOUT=6h` (`uzi-api-config` ConfigMap), and every multi-milestone run freezes the 8h ceiling (`budgetWallCeilingSeconds`, `api/internal/workersvc/budget.go:17`), so the scale factor is 8/6 and the threshold is `2700 × 8/6 = 3600s`: every scaled run is flagged at exactly 60 minutes, 12.5% into an 8-hour budget. Confirmed on two 2026-09-05 runs with frozen 8h budgets whose DMs landed 60m08s and 60m12s after `started_at`, and on the api log line `sweeper pass … health_changed:2` at that second. Raising the operator's timeout from 2h to 6h silently lowered the slow threshold from 3h to 1h.
+
+Two smaller defects on the same arm: the clock uses raw `started_at` and ignores `budget_paused_seconds` (migration 00173 says so explicitly: "health baselines are unchanged"), while `SweepRunningTimeout` (`api/internal/store/queries/runtime.sql:2130-2135`) subtracts it, so the flag and the actual deadline disagree by the gate wait; and `docs/run-health.md:20` describes the flag as "Usually fine for a big task", an alert whose own documentation says to ignore it.
+
+## Solution
+
+Keep the `slow` enum value (DB CHECK, wire, web union, TUI map, Slack const) and change what it means: a `running` run is flagged when its **active** running time (wall clock since `started_at` minus `budget_paused_seconds`) has consumed at least `health_near_timeout_pct` percent (default 85) of its **effective** wall-clock timeout (`budget_wall_seconds` when frozen, else the global `RUN_TIMEOUT`), which is exactly the clock `SweepRunningTimeout` kills on. Every surface relabels it "near timeout" and the reason and DM say the run will be stopped when it reaches its timeout. The `health_slow_seconds` setting, its RUN_TIMEOUT clamp, the once-per-value clamp warning and the #323 scaling are removed; `health_near_timeout_pct` replaces the setting.
+
+On the measured window this rule fires on 2 runs in 45 days: the 08-28 run that timed out at 480/480 min (flagged at 408 min, 72 min before the kill) and an 08-23 run at 457/480 min (95%, which then failed for an unrelated push reason). Nothing else in the window reached 85% of its budget.
+
+## Resolved facts (no internet needed; every anchor read on 2026-09-07 at `main` c8f7d94b)
+
+**Detector.** `api/internal/workersvc/health.go`: `Settings` interface `:30-40` (`HealthSlowSeconds` at `:34`); enum consts `:44-51` (`healthSlow = "slow"` at `:49`); reason consts `:57-` (`reasonSlow` at `:62`, the "FIXED, server-controlled strings … never a live duration" contract in the comment above them; the comment at `:80` quotes the old sentence "this run is taking longer than usual" as a past-incident note and must be paraphrased so the retire-a-string sweep in M5 comes back clean); `healthThresholds` struct `:156-163` (`slow time.Duration`); `runningTarget` `:285-361`, its priority comment `:281-284`, the slow arm `:335-357` (`effTimeout` derivation `:340-343`, the #323 scaling `:353-356`, the `clampSlow` call `:357`); `healthThresholds()` `:669-676`; `slowThreshold()` `:692-720` with the once-per-value warn; `clampSlow()` `:723-737`. Priority inside `runningTarget` is persist-looping > tool-looping > stalled > slow. `Service.lastSlowClampWarn` is declared at `api/internal/workersvc/service.go:1029-1033` and named in a concurrency comment at `api/internal/workersvc/persistfail.go:199`. Test harness: `fakeHealthSettings` has a `slow` field (`health_test.go:145`, set by `defaultHealthSettings()` at `:176`, by `TestHealthThresholdDisablePerSignal` at `:343`, and by `health_persistfail_test.go:177`); `reasonSlow` is seeded by `TestHealthNoNudgeOnFlagChange` (`health_test.go:870-880`) and `TestHealthEnumChangeResetsSince` (`:937-950`); `health_loop_test.go:146-161` `TestHealthLoopingBeatsStalledAndSlow` seeds `StartedAt = ago(50*time.Minute)` as "slow", which under the test `RunTimeout` of 2h (`service_test.go:1242`) is only 42% of budget and would make the "beats slow" half vacuous. Stale prose that names the old rule: `tui_render.go:152` and `:211`, `settings_health.go:31-35` and `:55`, `web/src/lib/apiTypes.ts:1732`, `e2e/phases/46-run-health.sh:28` (a comment only; phase 46 sets `health_stall_seconds` and never asserts `slow`, so no e2e change is needed).
+
+**Sweeper clock to mirror.** `SweepRunningTimeout` (declared `runtime.sql:2082`, `UPDATE` body `:2117-2136`, driver `api/internal/workersvc/sweep.go:45-57`) fails a `running` run when `started_at < now - (COALESCE(budget_wall_seconds, RUN_TIMEOUT) + budget_paused_seconds)`, and skips `kind IN ('chat','judge')` and `interactive = true`. So a judge run and an interactive task **never time out**; the new arm must skip them too or it would promise a stop that never comes. `budget_wall_seconds` is immutable once frozen (`SetRunRunning`, `runtime.sql:996-998`, capped at the 8h ceiling by every writer). `budget_paused_seconds` is `NOT NULL DEFAULT 0` (migration 00173), written only on park→running and worker-death requeue transitions (`runtime.sql:1032`, `:2170`, `:2220`) and zeroed together with `started_at = NULL` on requeue (`:1465`, `:2016`, `:2071`), so while a run is `running` both are settled numbers and `started_at` is never NULL (stamped once by `SetRunRunning`; the `Valid` guard stays as belt and braces). The generated row will carry `Interactive bool` and `BudgetPausedSeconds int32` (`store/models.go:496,502` shapes); every `[]store.ListActiveRunsForHealthRow{...}` literal in the tests is keyed, so the two new fields break nothing.
+
+**Health read query.** `ListActiveRunsForHealth` (`runtime.sql:2932-2956`) selects `id, user_id, status, auto_approve, started_at, last_activity_at, updated_at, status_since, health, health_reason, health_since, health_notified_at, budget_wall_seconds, repo_id, kind, required_capabilities` for `status IN ('queued','running','awaiting_approval') AND kind <> 'chat'`. It does **not** select `budget_paused_seconds` or `interactive`; both must be added, then `cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate` (CI asserts the regenerate is a no-op). `SetRunHealth` is unchanged.
+
+**Settings.** `api/internal/settings/keys.go:84` `KeyHealthSlowSeconds = "health_slow_seconds"`, `:288` `DefaultHealthSlowSeconds = "2700"`, `:402` the `Defaults` map entry. `api/internal/settings/settings.go:404-406` routes the five health keys to `validateHealthSeconds`. `api/internal/settings/settings_health.go` holds the accessors (`HealthSlowSeconds` `:39-41`), the bounds consts `healthSecondsMin/Max` `:17-20`, and `validateHealthSeconds` `:53-68` ({0} ∪ [60, 86400]). The cache's `snapshot()` (`settings.go:92-120`) loads every `app_settings` row unfiltered, but every reader iterates `Defaults` (`get` `:142`, `All` `:307`, `AdminView` `:335`; the PUT-side `Effective` merge at `:355-359` likewise keeps only known keys), so an `app_settings` row for a retired key is inert: never served, never validated. **No migration is needed** to drop `health_slow_seconds`. `Known()` (`keys.go:493`) makes a `PUT` of the retired key from a stale SPA tab a 400 "unknown setting", which is the right answer. The dev cluster's `app_settings` holds no `health_*` row today (all defaults). The new key appears in `GET /api/admin/settings` with no handler change; there is no Go DTO or `fixtures/api-contract` file naming `health_slow_seconds` (checked with `git grep`); `settings_test.go:527,734` compare against `len(Defaults)`, not a literal count. Tests: `api/internal/settings/settings_health_test.go:52,67,77,92`.
+
+**Slack.** `api/internal/slacksvc/health.go`: `healthSlow` const `:34`, `healthRootLabel` `:93-109` (`"slow"` at `:100-101`), `healthNudgeHead` `:132-165` (`"🐢 This run is taking longer than usual."` at `:145-146`). Test `api/internal/slacksvc/health_nudge_head_test.go:68-74` pins that sentence and glyph; `:111` lists `healthSlow` in a table of enums that must ignore the reason argument.
+
+**TUI.** `api/cmd/uzi/tui_lanes.go:50-52` `stalledHealth = {stalled, slow, looping}` is used for **two different things**: the status-token override in `stateGlyphWord` (`api/cmd/uzi/tui_render.go:214-217`, returns `"▲", health` so the raw enum word "slow" is displayed; also `:260`) and the board strip (`tui_board.go:693`), **and** the active-lane amber in `tui_lanes.go:349`. The web deliberately excludes `slow` from the lane rule (`web/src/components/ActivityFeed.tsx:227-238`, `STALLED_HEALTH = {stalled, looping}`), so TUI and web disagree today, and `docs/run-activity.md:169` documents the TUI's behaviour as if it were the web's. Tests: `api/cmd/uzi/tui_lanes_test.go:160` (`"active + slow health" … crewStalled`), `:220`, `:271`. The longest existing status word is `rate-limited` (12 cells, `tui_render.go:~240`); "near timeout" is also 12 cells, so no column widens.
+
+**Web.** `web/src/lib/runBadge.ts:247-253` `HEALTH_FLAG_LABELS` (`slow: "slow"`), `:264` comment ("three signals (stalled / looping / slow) all describe a *running* agent"), `healthBadge()` `:310-326` (label `⚠ <label> · <elapsed since health_since>`, tooltip = owner-only `health_reason`). `web/src/lib/apiTypes.ts:755-762` `AppSettings` health keys (`health_slow_seconds` at `:759`); `:1740` `RunHealth` union (keeps `"slow"`). `web/src/pages/adminSettings/HealthSettingsCard.tsx:12-26` `HEALTH_FIELDS` (`health_slow_seconds` at `:18-22`), `:32-39` `validateHealthSeconds` applied to every field (`:65`), and the card blurb "looks slow, stuck, or looping" at `:110`. `web/src/components/ActivityFeed.tsx:230-238` comment. Mock mode: `web/src/mocks/mockApi/settings.ts:72` default, `:149` shape guard, `:606-614` the write validator, which applies the seconds rule to a key list and needs its own percent branch, not just a rename. Test fixtures naming the key or label: `web/src/mocks/mockApi.test.ts:58`, `web/src/pages/AdminBranding.test.tsx:46`, `web/src/pages/AdminSettings.test.tsx:53` and `:382`, `web/src/pages/AdminSettingsUpdates.test.tsx:56`, `web/src/components/ActivityFeed.test.tsx:197-204`, `web/src/lib/runBadge.test.ts:449` (`expect(healthFlagLabel("slow")).toBe("slow")`).
+
+**Docs** (every one is `audience: user` or operator and is mirrored into `api/internal/uzidocs/embed/` by `task docs:sync`; `TestEmbeddedDocsMatchSource` in `test:api` reddens `gate:api` if the mirror is stale): `docs/run-health.md:9` (the "slow, stuck, or looping" blurb), `:9-21` (flag table, `slow` row at `:20`) and `:62-68`; `docs/admin-settings.md:188` (same blurb), `:186-199` (settings table, `Slow after` row at `:196`) and `:256-266` (the validation bullet: "Each field accepts `0` or a whole number of seconds from 60 to 86400" and "the four detection thresholds (stalled, slow, …)" are both falsified by a percent field, plus the clamp sentence); `docs/slack.md:139` (glyph table `🐢 Slow`) and `:243-248` (nudge list, the `🐢 slow` glyph is on `:248`); `docs/run-activity.md:169`; `docs/configuration.md:224` (`RUN_TIMEOUT` row, the clamp sentence). `CHANGELOG.md` `[Unreleased]` follows the bold-title-line-then-one-line-description rule at its head. `specs/ai.md`'s last section is `## 623.` (`specs/ai.md:24056`); the next free number must be re-checked across sibling worktrees at landing (root `CLAUDE.md`, Conventions). `specs/human.md` lines are one terse sentence with a `[user, #N]` tag (e.g. `:717`).
+
+**CLI.** `uzi run get` / `run list` pass `health` and `health_reason` through verbatim (`api/cmd/uzi/run.go` sanitises the reason for the TTY); no CLI verb branches on the value. Only the TUI (above) renders it. No `uzi` CLI change beyond the TUI.
+
+**Live parameters, for calibration only** (the worker cannot reach the cluster and must not try): `RUN_TIMEOUT=6h`; frozen budgets are 8h for every ≥2-milestone issue run, 4h for a non-interactive handoff task, NULL (global) for `mr_rework`, `ci_fix`, `prompt`, `self_improve`; completed issue runs' median wall time is 35 min, p90 116 min.
+
+## Design
+
+### The arm
+
+Replace `runningTarget`'s slow block with, after the stalled check and keeping the existing priority:
+
+```
+effTimeout := s.p.RunTimeout
+if r.BudgetWallSeconds.Valid && r.BudgetWallSeconds.Int32 > 0 {
+    effTimeout = time.Duration(r.BudgetWallSeconds.Int32) * time.Second
+}
+if th.nearTimeoutPct > 0 && effTimeout > 0 && r.StartedAt.Valid && r.Kind != "judge" && !r.Interactive {
+    active := now.Sub(r.StartedAt.Time) - time.Duration(r.BudgetPausedSeconds)*time.Second
+    if active >= effTimeout/100*time.Duration(th.nearTimeoutPct) { // divide first: no overflow to reason about, sub-100ns loss
+        return healthSlow, reasonNearTimeout
+    }
+}
+```
+
+- `healthThresholds.slow time.Duration` becomes `nearTimeoutPct int` (0 = disabled), read straight from the new accessor with no clamp: a percentage is below the deadline by construction.
+- `reasonNearTimeout = "this run is close to its wall-clock timeout and will be stopped when it reaches it"`. Static, per the reason contract: no live duration, the UI keeps counting from `health_since`.
+- Delete `slowThreshold`, `clampSlow`, `Service.lastSlowClampWarn` and the comment at `persistfail.go:199` that names it. Delete the #323 scaling. Nothing else in `runningTarget` moves.
+- The exclusion set (`judge`, `interactive`) mirrors `SweepRunningTimeout` and is the reason `interactive` joins the health SELECT. A `chat` run never reaches the arm (excluded by the query).
+- The re-nudge-after-a-gate behaviour (health reset on every gate/park, nudge on the next ok→flagged) is unchanged and acceptable: a run that returns from a gate at ≥85% of budget is still near its timeout.
+
+### The setting
+
+- `KeyHealthNearTimeoutPct = "health_near_timeout_pct"`, `DefaultHealthNearTimeoutPct = "85"`, in `Defaults`; `KeyHealthSlowSeconds` and its default removed. Accessor `HealthNearTimeoutPct(ctx) (int, error)` on `*settings.Cache`, and the `workersvc.Settings` interface method renamed to match.
+- `Validate`: `KeyHealthNearTimeoutPct` → new `validateHealthPercent`: a base-10 integer that is `0` (disable) or in `[50, 99]`. The floor keeps an operator from recreating this PRD's noise with `10`; `100` would fire at the same instant the sweeper kills the run, so it is excluded. Error text: `must be 0 (disabled) or between 50 and 99 percent`. The four remaining seconds keys keep `validateHealthSeconds`.
+- Admin card field: key `health_near_timeout_pct`, label `Near timeout at (% of wall-clock budget)`, hint `Active running time, excluding time parked at a human gate, as a share of RUN_TIMEOUT or the run's frozen budget. 0 disables.`; a per-field validator so the percent field gets the `[50, 99]` rule client-side while the seconds fields keep theirs.
+
+### Surfaces and wording
+
+| surface | today | after |
+|---|---|---|
+| web label (`HEALTH_FLAG_LABELS.slow`) | `slow` | `near timeout` |
+| web tooltip (`health_reason`, owner only) | `this run is taking longer than usual` | the new reason |
+| TUI status token | `▲ slow` | `▲ near timeout` via a display map (`stalled`→`stalled`, `looping`→`looping`, `slow`→`near timeout`); `stateGlyphWord` must stop returning the raw enum word |
+| TUI active lane | amber for `slow` | **not** amber: split `stalledHealth` into the token/strip WARN set (all three) and a lane set (`stalled`, `looping`), matching the web's `STALLED_HEALTH` |
+| Slack root context word | `slow` | `near timeout` |
+| Slack nudge head | `🐢 This run is taking longer than usual.` | `⏰ This run is close to its timeout and will be stopped when it reaches it.` |
+| `docs/run-health.md` row | "Running much longer than typical … Usually fine" | "Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will be stopped at the timeout. Let it finish if it is on its last milestone, or `uzi run scope --through N` / `run stop` to finalize what is committed, or raise `RUN_TIMEOUT`." |
+| the generic blurb "flag a run that looks slow, stuck, or looping" (`HealthSettingsCard.tsx:110`, `docs/run-health.md:9`, `docs/admin-settings.md:188`) | as quoted | "flag a run that looks stuck, looping, or close to its timeout" |
+
+## Milestones
+
+- [ ] **M1: api detector and setting.** `health.go` arm as designed; `Settings` interface, `healthThresholds`, reason const; paraphrase the `:80` comment; delete the clamp/scale machinery and `lastSlowClampWarn` (and the `persistfail.go:199` mention); `ListActiveRunsForHealth` gains `budget_paused_seconds` and `interactive`, sqlc regenerated; settings key/default/accessor/validator swapped and the stale clamp prose in `settings_health.go` rewritten. Tests in `health_test.go`: delete `TestHealthSlowClampWarnsOncePerValue`, the `clampSlow` table test, `TestHealthSlowClampsPerRunBudget`, `TestHealthSlowScalesWithBudget`; rename `fakeHealthSettings.slow` to `nearTimeoutPct` at every site listed under *Resolved facts* (`defaultHealthSettings()` sets `85`); rename `reasonSlow` seeds in `TestHealthNoNudgeOnFlagChange` and `TestHealthEnumChangeResetsSince`; move `TestHealthLoopingBeatsStalledAndSlow`'s `StartedAt` to `ago(110*time.Minute)` (92% of the 2h test timeout) so the priority half is not vacuous; keep `TestHealthThresholdDisablePerSignal` as the "0 disables" test, seeding a run at 100% of budget; rewrite `TestHealthSlowFlagsWithRecentActivity` and `TestHealthStalledBeatsSlow` as near-timeout tests; add: flags at ≥85% of a frozen 8h budget (7h active) and not at 75% (6h); a 2h gate pause on a 7h-old run leaves it at 62% and unflagged; a NULL budget uses `RunTimeout`; `judge` and `interactive` rows are never flagged at 99%. Mutation check (`.claude/rules/go.md`): fold `- budget_paused_seconds` out of `active` and watch the pause test redden; fold the percent to `0` and watch the 75% test redden. Settings tests updated for the new key and the `[50, 99]` bounds (`49`, `100`, `-1`, `abc` rejected; `0`, `50`, `99` accepted). Gate: `task gate:api`.
+- [ ] **M2: Slack and TUI wording.** `slacksvc/health.go` root label and nudge head with `health_nudge_head_test.go` updated (`:68-74` becomes the ⏰ pin, `:111` keeps `healthSlow` in the reason-ignoring table); TUI display map, the `stalledHealth` split, and the stale comments at `tui_render.go:152` and `:211`; `tui_lanes_test.go:160` flips to `crewWorking` (`:220` and `:271` loop over parked runs and stay as they are); **add** a render test asserting the status token reads `▲ near timeout` under both a colour profile and `NO_COLOR`/Ascii, since none exists today (`specs/human.md` "keep the health words visible on the board"). Gate: `task gate:api` (the TUI lives in the api module).
+- [ ] **M3: web.** `runBadge.ts` label and comment; `apiTypes.ts` key and the `:1732` comment; `HealthSettingsCard.tsx` field, hint, blurb and per-field validator; `ActivityFeed.tsx` comment (the exclusion stays, the reason changes); mock-mode default, shape guard and a percent branch in the write validator; every test fixture naming `health_slow_seconds` renamed, including the negative assertion at `AdminSettings.test.tsx:382` (see Risks); `runBadge.test.ts:449` updated to `near timeout`; a card test asserting `100` is rejected and `50` accepted (the values that discriminate the percent rule from the old seconds rule: `10` and `85` fail and pass under both). Gate: `task gate:web`.
+- [ ] **M4: docs, specs, changelog.** The doc passages above; `task docs:sync` and commit the embed mirror; one terse `specs/human.md` line (`The "slow" health flag is a near-timeout warning at a share of the run's wall-clock budget, not a bare timer. [user, #1170]`); a `specs/ai.md` section (next free number, re-checked at landing) recording the rule, the exclusion set, the percent bounds and why the enum value survives; a `CHANGELOG.md` `[Unreleased]` → `### Changed` bullet in the file's one-line format. Gate: `task gate:repo` plus the `gate:api` rerun that checks the embed mirror.
+- [ ] **M5: whole-tree validation.** Retire-a-string sweep (`git grep -n -F`, per `.claude/rules/web.md`, run here and not earlier because M4 rewrites the doc hits) for `health_slow_seconds`, `taking longer than usual`, `Slow after`, `🐢` and `HealthSlowSeconds`: zero hits outside `CHANGELOG.md`, `prds/done/`, `specs/` history and this PRD. Then `task gate` green once, to a log, read from the log (root `CLAUDE.md`, Run economy). `git diff --name-only <base>..HEAD` shows nothing under `.github/workflows/` and no file under `api/internal/store/migrations/`.
+- [ ] **M6 (maintainer, post-merge, not for the worker):** after the next release reaches the dev cluster, confirm `health_near_timeout_pct` shows in Admin → Instance settings → Run health at `85`, that an ordinary 8h-budget issue run passes 60 min with no badge and no DM, and that `uzi run get --field health_reason` on a flagged run prints the new sentence.
+
+### Execution plan
+
+| phase | milestones | files | notes |
+|---|---|---|---|
+| 1 (parallel) | M1, M2, M3 | M1: `workersvc/health.go`, `service.go`, `persistfail.go`, `store/queries/runtime.sql` + generated, `settings/*`; M2: `slacksvc/health.go`, `cmd/uzi/tui_*.go`; M3: `web/src/**` | disjoint files; M2 and M3 need only the wording table above, not M1's code |
+| 2 | M4 | `docs/*.md`, `api/internal/uzidocs/embed/`, `specs/*.md`, `CHANGELOG.md` | after wording is final |
+| 3 | M5 | none | one full gate |
+
+## Decision log
+
+- **D1: keep the `slow` enum value.** Renaming to `near_timeout` costs a CHECK-constraint rewrite on `runs` (a worker-facing table under `scripts/check-migration-additive.sh`), the web `RunHealth` union, the TUI map, the Slack const, and every older CLI/TUI binary that would render an unknown word until upgraded. The value is an internal discriminator; every human-facing word changes. Rejected alternative: a new enum plus a migration deleting `slow`.
+- **D2: percent of budget, not a lead time in seconds.** A fixed "30 min before" lead is 11% of a 4h task budget but 25% of a 2h default; a percentage means the same thing on every budget, needs no clamp against small budgets, and the sweeper's own deadline is what it is a share of. Bounds `[50, 99]` (D2a): the floor exists because this PRD's whole point is that low thresholds are noise; `100` is excluded because the sweeper fires there.
+- **D3: mirror `SweepRunningTimeout` exactly** (paused seconds subtracted, `judge` and `interactive` skipped, `budget_wall_seconds` else `RUN_TIMEOUT`). A warning about a deadline must use the deadline's clock; the old arm's disagreement by the gate wait is one of the defects being fixed.
+- **D4: static reason text, no remaining-time number.** The reason contract in `health.go` bans live durations because the stored string would go stale; the badge keeps its `health_since` elapsed. A remaining-time countdown would need a new DTO field (`budget_paused_seconds` is not served today) and is out of scope; the doc row tells the owner how to act.
+- **D5: priority unchanged** (looping > stalled > near-timeout). A run that is both stalled and near its timeout shows the more specific cause; the sweeper stops it either way.
+- **D6: TUI lane aligned with web.** The lane colour is the *speaker's* health; a budget fact about the run is not evidence the speaker is unhealthy. The web already made this call for `slow`; the TUI diverged. The status-token override stays WARN on all three flags, which is what "keep the health words visible" asks for.
+- **D7: no migration and no cleanup of stale `app_settings` rows.** The loader ignores unknown keys, so a retired key's row is inert; a `DELETE` migration would be a schema-tree change for a row that cannot be read.
+- **D8: re-nudge after a gate round trip is left as is.** It is the generic PRD #47 episode rule; at ≥85% of budget a second DM after 30 min is defensible, and changing episode semantics touches every flag.
+
+## Success criteria
+
+- On the measured window the rule flags 2 of 1112 runs, both above 85% of their budget; the unit tests pin the 75%/87.5% boundary, the pause subtraction, the NULL-budget fallback and the `judge`/`interactive` exclusion.
+- No surface (web, TUI, Slack, docs, CLI reason) shows the word "slow" or the sentence "taking longer than usual" for this flag.
+- `GET /api/admin/settings` serves `health_near_timeout_pct` and no `health_slow_seconds`; a `PUT` of `10` is rejected with the percent message; the admin card mirrors the rule.
+- `task gate` green; no migration file; no workflow file in the diff.
+
+## Risks
+
+- **Old CLI/TUI binaries against a new server** keep printing `▲ slow` for a run that is near its timeout until upgraded. Cosmetic, self-healing on `uzi skill install` / the next CLI release, and the same skew every wording change has.
+- **A sibling PRD adds a health key** in the same window: `Defaults`, the admin card list and the mock shape guard are the three places both would touch; a rebase conflict there is textual, not semantic.
+- **The web `AdminSettings.test.tsx:382` negative assertion** (`not.toHaveProperty("health_slow_seconds")`) would pass vacuously after the rename (`.claude/rules/web.md`, vacuous negatives): rename it to the new key so it still guards "untouched fields are not sent".
+- **`sqlc generate` fetches the module on first use** (`go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1`; nothing in the worker image, `agent/src/repo-tools.ts` or `devbox.json` pre-warms it). On a worker whose egress cannot reach the Go module proxy, hand-edit `api/internal/store/runtime.sql.go` in sqlc's emitted shape instead (the `ListActiveRunsForHealth` SELECT const, the `ListActiveRunsForHealthRow` struct near `:3266`, and its `rows.Scan` list, adding `BudgetPausedSeconds int32` and `Interactive bool` in column order); CI's pinned v1.31.1 drift step (`validate:api`) verifies the hand edit byte for byte. `scripts/golangci-lint.sh v2.12.2` in `gate:api` has the same dependency; if it cannot download, run the rest of the gate and say so in the run report rather than skipping silently.
+- **A stale SPA tab** that still sends `health_slow_seconds` gets a 400 "unknown setting" from `Known()`; a reload fixes it. Not worth a compatibility shim.
+
+## Out of scope
+
+- The other four flags and the nudge/cooldown machinery.
+- A live remaining-time countdown on the badge (needs `budget_paused_seconds` on the run DTO).
+- Renaming the enum (D1).
+- Any change to `RUN_TIMEOUT`, the budget freeze or the 8h ceiling.
