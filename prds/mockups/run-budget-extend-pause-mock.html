@@ -82,6 +82,11 @@
   @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
   .elapsed { font-size: .78rem; color: rgb(var(--muted)); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .elapsed .dim { color: rgb(var(--faint)); }
+  .elapsed.focusable { text-decoration: underline dotted rgb(var(--edge-strong)); text-underline-offset: 3px; cursor: help; border-radius: 3px; }
+  .elapsed.focusable:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; }
+  details.more { font-size: .78rem; color: rgb(var(--muted)); }
+  details.more summary { cursor: default; color: rgb(var(--faint)); font-size: .74rem; }
+  details.more p { margin: 6px 0 0; }
   .btn { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px; border-radius: 6px; font-size: .75rem; font-weight: 500; border: 1px solid transparent; white-space: nowrap; cursor: default; }
   .btn-secondary { border-color: rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--fg)); }
   .btn-primary { background: rgb(var(--brand)); color: rgb(var(--on-brand)); font-weight: 600; }
@@ -211,7 +216,8 @@
     <p class="eyebrow">Mock · run page · TUI · CLI</p>
     <h1>See the clock, extend it, pause the run</h1>
     <p>One run (issue #1183, six milestones, 8h frozen budget) at three moments: healthy, near its timeout, and paused by its owner. The clock is the <b>active</b> time the timeout sweep kills on: wall time minus every park. The server computes the deadline once; web, TUI and CLI read it.</p>
-    <p><b>A healthy run changes almost nothing.</b> The web folds the budget into the elapsed text it already shows; the TUI is byte-identical. The header grows a control only when the state calls for one, the way Expedite appears only on a queued run: Extend when near timeout, Resume when paused. Pause lives with Stop run in the owner actions.</p>
+    <p><b>A healthy run changes almost nothing.</b> The web folds the budget into the elapsed text it already shows; the TUI is byte-identical. The header grows a control only when the state calls for one, the way Expedite appears only on a queued run: Extend when near timeout, Resume when paused. Pause lives with Stop run in the owner actions. A pending pause is a flag on the run, like <i>stop</i>, never a status of its own.</p>
+    <p>Revised 2026-09-07 after a UX review: no <i>pausing</i> state, a retractable pause request, Extend always opens a chooser, plainer paused copy.</p>
   </header>
 
   <!-- ───────────────────────── web header, three moments ───────────────────────── -->
@@ -231,7 +237,7 @@
             <span class="badge b-neutral">PRD</span>
             <span class="badge b-info"><span class="spin"></span> implement…</span>
             <span class="badge b-ok">● live</span>
-            <span class="elapsed" title="8h budget frozen from 6 milestones. Paused time (32m at the plan gate) does not count. Times out 15:20.">3h 48m <span class="dim">/ 8h</span></span><span class="mark">1</span>
+            <span class="elapsed focusable" tabindex="0" title="8h budget frozen from 6 milestones. Paused time (32m at the plan gate) does not count. Times out 15:20.">3h 48m <span class="dim">/ 8h</span></span><span class="mark">1</span>
           </div>
           <div class="nowline"><span class="k">now</span><span class="mile">▰▰▰◐<i>▱▱</i></span><span>M4 · wire the shared row into the run page · 6m</span></div>
           <div class="omitted">activity feed, crew lanes, milestone list, cost … unchanged</div>
@@ -246,40 +252,40 @@
 
       <!-- B: near timeout -->
       <div class="frame">
-        <div class="frame-bar warn"><span>B · 14:15 · running, 6h 55m active (86% of budget)</span><code>health: slow → "near timeout" (PRD #1170) · Extend appears</code></div>
+        <div class="frame-bar warn"><span>B · 14:15 · running, 6h 55m active (86% of budget)</span><code>health: slow → "near timeout" (PRD #1170) · Extend appears · only the ⚠ pill pulses</code></div>
         <div class="app">
           <div class="crumbs"><span>vtmocanu/uzi</span><span>/</span><span>#1183</span><span>/</span><span class="cur">Run</span></div>
           <h3>One triage row for Judge, run page and Findings</h3>
           <div class="metarow">
-            <span class="badge b-ok pill pulse">running</span>
+            <span class="badge b-ok pill">running</span>
             <span class="badge b-brand">autopilot</span>
             <span class="badge b-neutral">PRD</span>
             <span class="badge b-info"><span class="spin"></span> implement…</span>
             <span class="badge b-warn pulse" title="this run is close to its wall-clock timeout and will be stopped when it reaches it">⚠ near timeout · 1h 05m left</span><span class="mark">3</span>
             <span class="elapsed">6h 55m <span class="dim">/ 8h</span></span>
             <span class="popwrap">
-              <span class="btn btn-primary">Extend…</span><span class="mark">4</span>
+              <span class="btn btn-primary">Extend time…</span><span class="mark">4</span>
               <div class="pop">
                 <div class="ph">Give this run more time</div>
                 <div class="quick"><span>+1h</span><span class="on">+2h</span><span>+4h</span><span>+8h</span></div>
                 <div class="input"><span>custom</span><span>2h</span></div>
                 <ul class="facts">
-                  <li>Budget <b>8h</b> (frozen, 6 milestones) · used <b>6h 55m</b></li>
-                  <li>Extensions so far <b>none</b> · cap <b>+16h</b> per run (admin setting)</li>
-                  <li>After this: <b>3h 05m left</b>, times out <b>17:20</b></li>
+                  <li>Used <b>6h 55m</b> of <b>8h</b> (frozen, 6 milestones)</li>
+                  <li>Allowance left <b>16h</b> of 16h (admin setting)</li>
+                  <li>After +2h: <b>3h 05m left</b>, stops at <b>17:20</b></li>
                 </ul>
                 <div class="foot"><small>Owner only. Logged in the run's steering history.</small><span class="btn btn-primary">Extend by 2h</span></div>
               </div>
             </span>
           </div>
           <div class="popspace"></div>
-          <div class="nowline"><span class="k">now</span><span class="mile">▰▰▰▰▰◐</span><span>M6 · Findings page uses the shared row · 41m</span></div>
+          <div class="nowline"><span class="k">now</span><span class="mile">▰▰▰▰◐<i>▱</i></span><span>M5 · wire the Findings page · 41m</span></div>
           <div class="panel warn">
             <div class="ph">⚠ This run is close to its time limit</div>
             <p>It has used <b>6h 55m</b> of its <b>8h</b> budget and will be <b>stopped at 15:20</b> unless you extend it. Work already committed is safe: the last checkpoint was pushed 9 minutes ago (<span class="mono">agent/issue-1183 @ 7d21c0a</span>).</p>
             <div class="acts">
-              <span class="btn btn-primary">Extend by 2h</span>
-              <span class="btn btn-secondary">‖ Pause after M6</span>
+              <span class="btn btn-primary">Extend time…</span>
+              <span class="btn btn-secondary">‖ Pause after M5</span>
               <span class="btn btn-danger">Stop run</span>
               <span class="who">Only the run's owner can extend, pause or stop it.</span>
             </div>
@@ -297,19 +303,19 @@
             <span class="badge b-info pill">‖ paused</span><span class="mark">6</span>
             <span class="badge b-brand">autopilot</span>
             <span class="badge b-neutral">PRD</span>
-            <span class="elapsed">3h 42m <span class="dim">/ 8h · clock stopped</span></span>
+            <span class="elapsed">3h 42m <span class="dim">/ 8h · 4h 18m left when resumed · clock stopped</span></span>
             <span class="btn btn-primary">▶ Resume</span>
           </div>
           <div class="nowline"><span class="k">paused at</span><span class="mile">▰▰▰<i>▱▱▱</i></span><span>3 of 6 milestones done · 2h 40m ago</span></div>
           <div class="panel wait">
             <div class="ph">‖ Paused by you at 11:02</div>
-            <p>The run finished milestone 3, pushed a checkpoint (<span class="mono">agent/issue-1183 @ 3f9c2e1</span>) and parked. Its worker keeps the session while it stays alive; if the worker is replaced, the resume recovers the branch from the checkpoint and re-plans the remaining milestones from the approved plan.</p>
-            <p><b>Paused time does not count</b> toward the 8h budget. Nothing runs and nothing is spent while it waits.</p>
+            <p>Milestone 3 is finished and its checkpoint is pushed (<span class="mono">agent/issue-1183 @ 3f9c2e1</span>). <b>4h 18m</b> of the 8h budget remains when you resume. Nothing runs and nothing is spent while it waits.</p>
+            <details class="more"><summary>What happens on resume</summary><p>If the same worker is still alive, the session continues where it stopped. If the worker was replaced, the branch is recovered from the checkpoint and the remaining milestones are re-planned from the approved plan.</p></details>
             <div class="acts">
               <span class="btn btn-primary">▶ Resume</span>
-              <span class="btn btn-secondary">Extend…</span>
+              <span class="btn btn-secondary">Extend time…</span>
               <span class="btn btn-danger">Stop run</span>
-              <span class="who">Only the run's owner can resume it.</span>
+              <span class="who">Only the run's owner can resume, extend or stop it.</span>
             </div>
           </div><span class="mark" style="align-self:flex-start;margin-top:-6px">7</span>
         </div>
@@ -317,13 +323,13 @@
     </div>
 
     <ul class="notes">
-      <li><span class="mark">1</span><div><b>Elapsed text gains "/ 8h"</b> and a tooltip with the deadline. No chip, no button: the run page today shows the elapsed time, this is the same text with the budget beside it. Absent on chat, judge and interactive tasks, which never time out.</div></li>
-      <li><span class="mark">2</span><div><b>Pause ▾</b> sits with Stop run in the owner actions, wherever those render for a running run. A deliberate, rare action, so it does not earn a place in the header row.</div></li>
-      <li><span class="mark">3</span><div><b>Near-timeout pill</b> is PRD #1170's health chip with one change: the suffix is <i>time left</i>, not time since flagged. The other flags keep "since flagged" because "stalled · 12m" is unambiguous; on a flag named near timeout any bare duration reads as time left, so make it so.</div></li>
-      <li><span class="mark">4</span><div><b>Extend</b> appears in the header only while the flag is up, the way Expedite appears only on a queued run. Quick picks, a custom value, and the facts you need to pick: used, extensions so far, the cap, what the deadline becomes.</div></li>
-      <li><span class="mark">5</span><div><b>Near-timeout panel</b>, modelled on the limit-wait panel: what will happen, when, what is already safe, and the three actions in one row. The same text goes to #1170's Slack DM with the CLI command, since an autopilot run at 03:00 has nobody on this page.</div></li>
-      <li><span class="mark">6</span><div><b>paused</b> is a new status in the wait family (same blue as rate-limited). The elapsed text says <i>clock stopped</i>; the deadline is dropped because it moves with the pause. <b>Resume</b> is the conditional header action.</div></li>
-      <li><span class="mark">7</span><div><b>Paused panel</b> states the checkpoint, the session guarantee, the budget rule, and offers Resume first. Extend stays available while paused.</div></li>
+      <li><span class="mark">1</span><div><b>Elapsed text gains "/ 8h"</b>. It is focusable, so the deadline detail opens on focus or tap as well as hover, not only through a <code>title</code>. No chip, no button. Absent on chat, judge and interactive tasks, which never time out.</div></li>
+      <li><span class="mark">2</span><div><b>Pause ▾</b> sits with Stop run in the owner actions, wherever those render for a running run. A deliberate, rare action, so it does not earn a place in the header row. Two items: <i>After current milestone</i> (recommended) and <i>Pause now</i> (destructive, says what is discarded). On the final milestone the first item is hidden, since the run completes anyway.</div></li>
+      <li><span class="mark">3</span><div><b>Near-timeout pill</b> is PRD #1170's health chip with one change: the suffix is <i>time left</i>, not time since flagged (folded into #1170 on 2026-09-07). The other flags keep "since flagged". Only this pill pulses; the status pill goes still so one indicator carries the urgency.</div></li>
+      <li><span class="mark">4</span><div><b>Extend time…</b> appears in the header only while the flag is up, the way Expedite appears only on a queued run. It always opens the chooser with +2h preselected, never adds time on the first click. The chooser leads with what you need to pick: used, allowance left, and the deadline after the pick.</div></li>
+      <li><span class="mark">5</span><div><b>Near-timeout panel</b>, modelled on the limit-wait panel: what will happen, when, what is already safe, and the three actions in one row. The extend PRD gives #1170's Slack DM the same facts (localized deadline, time left, checkpoint age, the exact CLI command, omitted when the cap is exhausted), since an autopilot run at 03:00 has nobody on this page.</div></li>
+      <li><span class="mark">6</span><div><b>paused</b> is a new status in the wait family (same blue as rate-limited). The elapsed text reads <i>4h 18m left when resumed · clock stopped</i>; no deadline, because it moves with the pause. <b>Resume</b> is the conditional header action.</div></li>
+      <li><span class="mark">7</span><div><b>Paused panel</b> says four things: the checkpoint is safe, what remains when you resume, nothing is spent while waiting, Resume. Worker and re-planning mechanics live behind a disclosure. Extend stays available while paused.</div></li>
     </ul>
   </section>
 
@@ -392,24 +398,29 @@
 
 <span class="fa">── near timeout · row 2 appears while the flag is up ───────────────</span>
 <span class="fa">‹ floor  run</span> <span class="tg">9c672af9</span> <span class="fa">· issue ·</span> <span class="tg">#1183</span>   <b>One triage row for Judge, run page and Fi…</b>   <span class="st">▲ near timeout</span> <span class="fa">· 6h55m · $63</span>   <span class="sg">● live</span>
-<span class="st">▲ near timeout · 1h05m left of 8h · stops at 15:20 · extend: web or uzi run extend</span>
+<span class="st">▲ near timeout · 1h05m left · of 8h · stops at 15:20</span>
+<span class="fa">┌ transcript ─────────────────────────────────────────┐ ┌ crew ────┐</span>
+
+<span class="fa">── pause requested · status stays running, row 2 says so ───────────</span>
+<span class="fa">‹ floor  run</span> <span class="tg">9c672af9</span> <span class="fa">· issue ·</span> <span class="tg">#1183</span>   <b>One triage row for Judge, run page and Fi…</b>   <span class="sg">● running</span> <span class="fa">· 3h48m · $41</span>   <span class="sg">● live</span>
+<span class="wt">pause requested · after M4 · cancel or pause now from the web or CLI</span>
 <span class="fa">┌ transcript ─────────────────────────────────────────┐ ┌ crew ────┐</span>
 
 <span class="fa">── paused · same row 2 slot ────────────────────────────────────────</span>
 <span class="fa">‹ floor  run</span> <span class="tg">9c672af9</span> <span class="fa">· issue ·</span> <span class="tg">#1183</span>   <b>One triage row for Judge, run page and Fi…</b>   <span class="wt">‖ paused</span> <span class="fa">· 3h42m · $28</span>
-<span class="wt">‖ paused by you · since 11:02 (2h40m) · 3/6 milestones · checkpoint 3f9c2e1 · resume: web or uzi run resume</span>
+<span class="wt">‖ paused by you · since 11:02 (2h40m) · 3/6 done · 4h18m left when resumed · checkpoint 3f9c2e1</span>
 <span class="fa">┌ transcript ─────────────────────────────────────────┐ ┌ crew ────┐</span>
 
 <span class="fa">── today's rate-limit park line, for comparison (run_render.go:limitWaitLine) ──</span>
-<span class="wt">paused: Anthropic usage limit (five_hour) · resumes in 4h12m · attempt 1</span>
-<span class="fa">reword to "parked:" once a user pause exists, or the two read as one thing</span>
+<span class="wt">waiting: Anthropic usage limit (five_hour) · resumes in 4h12m · attempt 1</span>
+<span class="fa">today it starts with "paused:"; reword to "waiting:" so it cannot be read as a user pause</span>
 </div>
       </div>
     </div>
     <ul class="notes">
       <li><span class="mark">a</span><div><b>Nothing for a healthy run.</b> No LEFT column, no "left of 8h". The near-timeout flag reached 85% on 2 runs in 45 days; a permanent column for that would trim titles for everyone.</div></li>
-      <li><span class="mark">b</span><div><b>‖ paused</b> is the only vocabulary addition: one entry, wait colour next to <b>~ rate-limited</b> (both non-terminal holds, the word tells them apart). Without it the default arm draws a faint <b>· paused</b>, the same as queued, so a parked run reads as idle. Band placement needs nothing: unknown statuses already land on the floor.</div></li>
-      <li><span class="mark">c</span><div><b>Row 2 of the run detail</b> is the existing park-line slot (drawn today only for a rate-limit park). It gains two conditional lines: the near-timeout clock, in stall colour, and the paused line, in wait colour. Row 1 keeps its shape, so a healthy run is byte-identical. The rate-limit line's leading word <i>paused:</i> must become <i>parked:</i> so it cannot be mistaken for a user pause.</div></li>
+      <li><span class="mark">b</span><div><b>‖ paused</b> is the only vocabulary addition: one entry, wait colour next to <b>~ rate-limited</b> (both non-terminal holds, the word tells them apart). Without it the default arm draws a faint <b>· paused</b>, the same as queued, so a parked run reads as idle. A <i>pending</i> pause is not a state: the row stays <b>● running</b> and only the detail's row 2 mentions the request. Band placement needs nothing: unknown statuses already land on the floor.</div></li>
+      <li><span class="mark">c</span><div><b>Row 2 of the run detail</b> is the existing park-line slot (drawn today only for a rate-limit park). It gains three conditional lines: the near-timeout clock in stall colour, the pause-requested note and the paused line in wait colour. Row 1 keeps its shape, so a healthy run is byte-identical. Each line is one physical row: on a narrow terminal it sheds clauses from the right (<i>of 8h</i> first, then <i>stops at</i>; <i>left</i> never), instead of clamping mid-word. The rate-limit line's leading word <i>paused:</i> becomes <i>waiting:</i>.</div></li>
     </ul>
   </section>
 
@@ -422,10 +433,10 @@
         <div class="term"><span class="prompt">$</span> <span class="cmd">uzi run get 9c672af9</span>
 <span class="out">ID          9c672af9-3b1e-4c7a-9f02-6e1d5a8b2c40
 Issue       #1183 One triage row for Judge, run page and Findings
-Status      running          health <span class="st">slow (near timeout)</span>
+Status      running          health <span class="st">near timeout</span>
 Started     2026-09-07 06:48  active 6h55m · parked 32m
-Budget      8h frozen (6 milestones) · extension 0 · <span class="hi">1h05m left</span> · times out 15:20
-Milestones  5/6 · now M6 Findings page uses the shared row (41m)
+Deadline    15:20 · <span class="hi">1h05m left</span> · 8h frozen (6 milestones) · extension 0
+Milestones  4/6 · now M5 wire the Findings page (41m)
 Cost        $63.10</span>
 
 <span class="prompt">$</span> <span class="cmd">uzi run get 9c672af9 --json | jq '{deadline_at, time_left_seconds, budget_extension_seconds}'</span>
@@ -454,12 +465,15 @@ Extensions on this run: 2h of 16h allowed.</span>
 <span class="al">error: 20h exceeds the remaining extension cap (14h left of 16h). Try --by 14h or less.</span>
 
 <span class="prompt">$</span> <span class="cmd">uzi run pause 9c672af9</span>
-<span class="out">Pause requested. The run finishes milestone 6, pushes a checkpoint, then parks.
-Watch it: uzi run get 9c672af9 · park at once instead: --now</span>
+<span class="out">Pause requested. The run finishes milestone 5, pushes a checkpoint, then parks. Status stays running until then.
+Withdraw: uzi run pause 9c672af9 --cancel · park at once: --now</span>
+
+<span class="prompt">$</span> <span class="cmd">uzi run pause 9c672af9 --cancel</span>
+<span class="out">Pause request withdrawn. The run continues.</span>
 
 <span class="prompt">$</span> <span class="cmd">uzi run pause 9c672af9 --now</span>
-<span class="out">Paused 9c672af9. Checkpoint 3f9c2e1 pushed to agent/issue-1183; the in-flight turn was dropped.
-Clock stopped at 6h55m active. Resume: uzi run resume 9c672af9</span>
+<span class="out">Paused 9c672af9. Checkpoint 3f9c2e1 pushed to agent/issue-1183; the turn in flight was dropped
+(work since that checkpoint, 9m ago, is discarded). Clock stopped at 6h55m active. Resume: uzi run resume 9c672af9</span>
 
 <span class="prompt">$</span> <span class="cmd">uzi run resume 9c672af9</span>
 <span class="out">Resumed 9c672af9: queued, pinned to worker hw-7f3a (session kept).</span>
@@ -481,21 +495,23 @@ Clock stopped at 6h55m active. Resume: uzi run resume 9c672af9</span>
         <p>The owner picks how. The default finishes the milestone in flight, because that is where work is committed and a checkpoint already publishes.</p>
         <div class="ui">
           <div class="menu">
-            <div class="mi hover"><b>After this milestone <span class="tag">recommended</span></b><small>Finishes M4, pushes a checkpoint, then parks. Nothing in flight is lost.</small></div>
-            <div class="mi"><b>Now</b><small>Drops the current turn and parks on the last checkpoint (9m ago).</small></div>
-            <div class="mi sep"><small>Paused time does not count toward the 8h budget.</small></div>
+            <div class="mi hover"><b>After current milestone <span class="tag">recommended</span></b><small>Finishes M4, pushes a checkpoint, then parks. Nothing in flight is lost.</small></div>
+            <div class="mi danger"><b>Pause now</b><small>Drops the turn in flight. Work since the last checkpoint (9m ago) is discarded.</small></div>
+            <div class="mi sep"><small>Paused time does not count toward the 8h budget. On the final milestone only Pause now is offered.</small></div>
           </div>
         </div>
       </div>
       <div class="step">
         <div class="n">2 · winding down</div>
-        <h4>pausing</h4>
-        <p>A sticky flag on the agent, like <i>stop</i>. The lead is told to start no further milestone; the harness waits for the milestone boundary.</p>
+        <h4>Pause requested</h4>
+        <p>Not a status. A sticky flag on the run, like <i>stop</i>: the lead starts no further milestone and the harness parks at the boundary. Until then you can withdraw it or escalate.</p>
         <div class="ui">
           <div class="k">web</div>
-          <div><span class="badge b-ok pill pulse">running</span> <span class="badge b-info"><span class="spin"></span> pausing after M4…</span></div>
+          <div><span class="badge b-ok pill pulse">running</span> <span class="badge b-info">Pause requested · after M4</span></div>
+          <div><span class="btn btn-ghost">Cancel pause</span> <span class="btn btn-secondary">Pause now</span></div>
           <div class="k">tui</div>
-          <div class="tui"><span style="color:var(--t-wait)">‖  pausing      </span> <span style="color:var(--t-faint)">#1183</span> One triage row for Judge…   <span style="color:var(--t-sage)">▰▰▰◐</span><span style="color:var(--t-faint)">▱▱</span>   <span style="color:var(--t-faint)">$41</span></div>
+          <div class="tui"><span style="color:var(--t-sage)">●  running      </span> <span style="color:var(--t-faint)">#1183</span> One triage row for Judge…   <span style="color:var(--t-sage)">▰▰▰◐</span><span style="color:var(--t-faint)">▱▱</span>   <span style="color:var(--t-faint)">$41</span></div>
+          <div class="tui" style="color:var(--t-wait)">pause requested · after M4</div>
         </div>
       </div>
       <div class="step">
@@ -504,7 +520,7 @@ Clock stopped at 6h55m active. Resume: uzi run resume 9c672af9</span>
         <p>Checkpoint pushed, state reported, clock stopped. The worker keeps the session and its affinity; the HOME sweep must treat <i>paused</i> as non-terminal or it deletes the transcript.</p>
         <div class="ui">
           <div class="k">web</div>
-          <div><span class="badge b-info pill">‖ paused</span> <span class="elapsed">3h 42m <span class="dim">/ 8h · clock stopped</span></span></div>
+          <div><span class="badge b-info pill">‖ paused</span> <span class="elapsed">3h 42m <span class="dim">/ 8h · 4h 18m left when resumed · clock stopped</span></span></div>
           <div class="k">durable</div>
           <div class="mono" style="color:rgb(var(--muted))">git: agent/issue-1183 @ 3f9c2e1<br>db: plan_md · milestones_completed 3/6 · checkpoint_tip · session_id</div>
         </div>
@@ -532,13 +548,14 @@ Clock stopped at 6h55m active. Resume: uzi run resume 9c672af9</span>
         <tbody>
           <tr><td>Run DTO</td><td><code>budget_wall_seconds</code>, <code>started_at</code> present; no deadline</td><td>adds server-computed <code>deadline_at</code> (null for kinds that never time out, null while parked), <code>time_left_seconds</code>, <code>budget_extension_seconds</code></td></tr>
           <tr><td>Sweep clock</td><td>started + budget + paused</td><td>+ <b>extension</b>, a new additive column; <code>budget_wall_seconds</code> stays immutable and capped at 8h</td></tr>
-          <tr><td>Health flag</td><td>PRD #1170: <i>near timeout</i> at 85% of the effective budget, pill suffix = time since flagged</td><td>effective budget includes the extension, so extending clears the flag; this flag's pill suffix becomes <b>time left</b>; the Slack DM carries the extend hint and CLI command</td></tr>
+          <tr><td>Health flag</td><td>PRD #1170 (amended 2026-09-07): <i>near timeout</i> at 85% of the effective budget, pill suffix = <b>time left</b> from <code>deadline_at</code></td><td>effective budget includes the extension, so extending clears the flag; the Slack DM gains localized deadline, time left, checkpoint age and the exact CLI command (omitted when the cap is exhausted); a DM when a deferred pause lands or fails</td></tr>
           <tr><td>Admin settings</td><td>health thresholds</td><td>+ <b>extension cap per run</b> beside them (default 16h)</td></tr>
-          <tr><td>Web run page</td><td>elapsed time; Stop in the owner actions</td><td>elapsed text gains <b>/ 8h</b>; conditional header action (Extend when flagged, Resume when paused); <b>Pause ▾</b> beside Stop run; near-timeout and paused panels</td></tr>
-          <tr><td>TUI</td><td>state token + micro-bar + cost; row 2 only for a rate-limit park</td><td><b>‖ paused</b> / <b>‖ pausing</b> in the state vocabulary; row 2 for near timeout and paused; rate-limit line reworded <i>parked:</i>. No column, no controls</td></tr>
-          <tr><td>CLI</td><td><code>run get</code>, <code>run list</code></td><td>clock fields in both; <code>run extend --by</code>, <code>run pause [--now]</code>, <code>run resume</code></td></tr>
-          <tr><td>Statuses</td><td>queued · claimed · running · awaiting_* · limit_wait · pool_wait · terminal</td><td>+ <b>paused</b>: In Progress on the board, exempt from the timeout sweep, non-terminal for the HOME sweep, holds worker affinity</td></tr>
-          <tr><td>Inputs</td><td>follow_up · approve · reject · cancel · revise · answer · stop · scope</td><td>+ <b>extend</b>, <b>pause</b>, <b>resume</b>, owner-only, each a <code>run_user_inputs</code> row</td></tr>
+          <tr><td>Web run page</td><td>elapsed time; Stop in the owner actions</td><td>elapsed text gains <b>/ 8h</b> (focusable); conditional header action (<b>Extend time…</b> when flagged, opens the chooser; <b>Resume</b> when paused); <b>Pause ▾</b> beside Stop run; <i>Pause requested</i> chip with Cancel pause / Pause now; near-timeout and paused panels</td></tr>
+          <tr><td>TUI</td><td>state token + micro-bar + cost; row 2 only for a rate-limit park</td><td><b>‖ paused</b> in the state vocabulary (the only new word); row 2 for near timeout, pause requested and paused, each shedding clauses from the right on a narrow terminal; rate-limit line reworded <i>waiting:</i>. No column, no controls</td></tr>
+          <tr><td>CLI</td><td><code>run get</code>, <code>run list</code></td><td>clock fields in both, health word rendered as <i>near timeout</i> in the human table; <code>run extend --by</code>, <code>run pause [--now | --cancel]</code>, <code>run resume</code></td></tr>
+          <tr><td>Statuses</td><td>queued · claimed · running · awaiting_* · limit_wait · pool_wait · terminal</td><td>+ <b>paused</b> only: In Progress on the board, exempt from the timeout sweep, non-terminal for the HOME sweep, holds worker affinity. A pending pause is a flag, not a status</td></tr>
+          <tr><td>Inputs</td><td>follow_up · approve · reject · cancel · revise · answer · stop · scope</td><td>+ <b>extend</b>, <b>pause</b> (retractable until it lands), <b>resume</b>, owner-only, each a <code>run_user_inputs</code> row</td></tr>
+          <tr><td>Edge states (for the PRDs)</td><td>–</td><td>cap exhausted (Extend disabled with the reason); extend racing the sweep kill (409, run already stopped); pause on an already-waiting run (accepted, lands on resume); checkpoint push failing during a pause (run stays running, owner told, retry offered)</td></tr>
           <tr><td>Kinds</td><td>timeout applies to all but chat, judge, interactive task</td><td>pause targets issue, task, prompt, self_improve; extend targets anything the sweep can time out</td></tr>
         </tbody>
       </table>
