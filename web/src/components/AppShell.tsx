@@ -26,11 +26,11 @@ import { BuildInfoPopover } from "./BuildInfoPopover";
 import { ChangelogDrawer } from "./ChangelogDrawer";
 import {
   ActivityIcon,
-  AlertIcon,
   BellIcon,
   BoardIcon,
   BookIcon,
   BotIcon,
+  BugIcon,
   ChatIcon,
   ClockIcon,
   ChevronRightIcon,
@@ -771,7 +771,7 @@ function SidebarContent({
               meta; brand "count" tone, the noun is "open". */}
           <NavItem
             to="/findings"
-            icon={<AlertIcon />}
+            icon={<BugIcon />}
             label="Findings"
             badge={findingsOpen}
             badgeTone="count"

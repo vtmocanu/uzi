@@ -136,6 +136,15 @@ api:
   #
   # Paired with strategy: Recreate below (RollingUpdate's surge would briefly run two).
   replicaCount: 1
+  # PRD #837 M4 disk-pressure threshold. The used/total fraction in (0,1] at or above
+  # which the api flags a hosted worker's volume as under disk pressure (default 0.90),
+  # which the controller then drains-then-recycles (workers.diskRecycleEnabled above).
+  # A soft-parsed tuning knob: config.go keeps 0.90 on a bad/empty value.
+  #
+  # DELIBERATELY DIFFERENT from the web UI's 85% `danger` tone (PRD #837 M2): we act
+  # LATER than we warn, so DO NOT "align" the two — the gap is intentional (reviewer
+  # note, PRD Decision context).
+  diskPressureThreshold: 0.90
   resources:
     requests:
       cpu: 50m
@@ -443,6 +452,23 @@ workers:
   #   It only accelerates a PENDING roll (a drifted worker); it never invents one. Leave
   #   false in normal operation and flip it true only for the duration of the emergency.
   forceRoll: false
+
+  # PRD #837 M4 disk-pressure recycle (self-healing worker disk). When a hosted worker
+  # reports disk pressure (a volume at used/total >= the api's diskPressureThreshold
+  # across >=2 fresh heartbeats), the controller drains it and recycles its PVCs.
+  #
+  # diskRecycleEnabled: the master toggle over BOTH the M3 size-drift arm and this M4
+  #   pressure arm. Defaults true (Decision D9 — self-heal on by default over recorded
+  #   reviewer dissent; the drain-first + cooldown + ephemeral-exclusion guards make it
+  #   safe). Set false to observe pressure without any automated teardown. Always sent
+  #   explicitly (it is not `with`-gated), so an explicit false is honoured.
+  diskRecycleEnabled: true
+  # diskRecycleCooldown: the PVC-age thrash guard (Decision D6). A worker back at pressure
+  #   within this window is a CAPACITY problem (working set exceeds nixSize) — it is
+  #   capacity-warned and skipped, not recycled in a loop. An ordinary Go duration
+  #   ("1h", "30m"). Read statelessly from the PVC's creationTimestamp. Empty leaves the
+  #   controller's built-in 1h default.
+  diskRecycleCooldown: "1h"
 
   # --- the per-template agent images the controller renders (M6) ------------------
   #

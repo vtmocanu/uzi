@@ -22,7 +22,7 @@ import (
 // stderr is BOTH streamed (so the prompt is visible) and captured (so the error
 // message is clean) via an io.MultiWriter.
 func realGit(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", args...) //nolint:gosec // G204: the CLI's own git shell-out seam — `git <args>` where args are internal command literals (`git remote get-url origin`, `push … uzi/task/<id>`), never remote/untrusted input; running the operator's git with the operator's creds is the intended behaviour (PRD #400 M3).
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -74,11 +74,21 @@ type Env struct {
 	// case only env/flags supply settings.
 	Store *uzicli.Store
 
-	// SkillHome is the base dir the bundled skill installs under
-	// (SkillHome/.claude/skills/uzi-cli/). Empty means os.UserHomeDir(). This is a
-	// TEST/INJECTION SEAM only — DefaultEnv leaves it empty (real home) and it is
-	// never populated from a flag/env/config, so the "no user-supplied path
-	// component" property (PRD #64) holds. Tests point it at a temp dir.
+	// Getenv is the environment-lookup seam used for skill target resolution
+	// ($CODEX_HOME). DefaultEnv wires os.Getenv; tests inject a deterministic lookup
+	// so a developer's exported $CODEX_HOME can never leak into a temp-home test. A
+	// nil Getenv reads as the empty string (see getenv) — deliberately NOT a fallback
+	// to os.Getenv, which would break that isolation (PRD #1143 M1/D8).
+	Getenv func(string) string
+
+	// SkillHome is the base dir the bundled skill installs under (the fixed Claude
+	// tail .claude/skills/uzi-cli/ and the fixed Codex tail .agents/skills/uzi-cli/).
+	// Empty means os.UserHomeDir(). This is a TEST/INJECTION SEAM only — DefaultEnv
+	// leaves it empty (real home) and it is never populated from a flag/env/config.
+	// The only environment-derived path component is the Codex hook/config home, taken
+	// from $CODEX_HOME via the Getenv seam, validated absolute and cleaned — so the "no
+	// untrusted input reaches a path component" property (PRD #64/#1143) holds. Tests
+	// point it at a temp dir.
 	SkillHome string
 
 	// AutoUpgradeSkill enables the best-effort skill self-upgrade run before every
@@ -109,9 +119,20 @@ func DefaultEnv() Env {
 		NewClient:          func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
 		Git:                realGit,
 		Store:              store,
+		Getenv:             os.Getenv,
 		AutoUpgradeSkill:   true,
 		CheckServerVersion: true,
 	}
+}
+
+// getenv is the nil-safe accessor for the Env.Getenv seam. A nil Getenv reads as
+// "" — NEVER os.Getenv — so a test that leaves it unset gets a deterministic empty
+// environment and cannot pick up a developer's exported $CODEX_HOME.
+func (e Env) getenv(k string) string {
+	if e.Getenv == nil {
+		return ""
+	}
+	return e.Getenv(k)
 }
 
 // globalFlags are the persistent flags shared by every command.

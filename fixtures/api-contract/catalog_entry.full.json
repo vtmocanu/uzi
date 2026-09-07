@@ -6,6 +6,7 @@
   "cron": "x",
   "timezone": "x",
   "model": "x",
+  "output_mode": "x",
   "prompt": "x",
   "selector_kind": "x",
   "labels": [

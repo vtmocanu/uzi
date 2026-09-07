@@ -19,6 +19,7 @@ import type {
   MessageKind,
   Milestone,
   MilestoneProgress,
+  Proposal,
   ReviewCommentsSnapshot,
   RunKind,
 } from "./protocol.js";
@@ -427,6 +428,12 @@ export interface ExecutorResult {
   /** issue #279: the one-line/short findings summary from signal_done, persisted as
    *  report_md on a report-only completion. Issue runs only. */
   summary?: string;
+  /** PRD #929 M2: a scheduled `prompt` run's structured proposal (title + body) from
+   *  signal_done, forwarded verbatim on the prompt-run completion report so the server can
+   *  file it as a forge issue. NOT gated on run kind — the runner reads it only on the
+   *  prompt completion path. Absent when the run produced no proposal, which is the common
+   *  case (a normal/mr-mode run). StubExecutor never sets it. */
+  proposal?: Proposal;
   /** PRD #634 M3: set when the operator's scope ceiling truncated the run at the loop top.
    *  `completedCount` frozen milestones were completed and are the committed slice; `total`
    *  is the frozen count (may be absent on a pre-approved resume where the local frozen list

@@ -397,7 +397,7 @@ function SubRow({
 }) {
   const demo = useDemoMode();
   const repoPath = maskRepoPath(s.repo_path, demo);
-  const nextFire = s.next_fires[0] ?? s.next_fire_at;
+  const nextFire = s.next_fires?.[0] ?? s.next_fire_at;
   const [expanded, setExpanded] = useState(false);
   const panelId = `last-fire-${s.id}`;
   return (

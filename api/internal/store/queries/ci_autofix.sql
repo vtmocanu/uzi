@@ -29,8 +29,11 @@
 --      branches always carry an mr_iid and are never protected by construction, so
 --      default-branch exclusion + mr_iid IS NOT NULL is a sound stand-in for a
 --      protected-branch check.
---   3. THE OWNER OPT-IN + TOKEN GATE. The run's owner must have opted into ci
---      autofix (u.ci_autofix_enabled) AND have an Anthropic token on file. The token
+--   3. THE OWNER OPT-IN + TOKEN GATE. The run's owner must not have opted OUT of ci
+--      autofix AND have an Anthropic token on file. ci_autofix_enabled is a tri-state
+--      (PRD #914): NULL (inherit the admin global default, which is ON) and explicit
+--      true both pass; only an explicit false is excluded — hence `IS NOT FALSE`. The
+--      token
 --      check mirrors GetAutopilotConnectionContext's has_anthropic_token: an EXISTS
 --      over user_secrets (kind = 'anthropic_token'), NOT a column on users — there is
 --      no anthropic_token_ciphertext column.
@@ -76,7 +79,7 @@ JOIN pipeline_statuses ps
 JOIN repos rp ON rp.id = @repo_id::uuid
 JOIN users u ON u.id = per_branch.user_id
 WHERE per_branch.branch <> rp.default_branch
-  AND u.ci_autofix_enabled
+  AND u.ci_autofix_enabled IS NOT FALSE
   AND EXISTS (
       SELECT 1 FROM user_secrets s
       WHERE s.user_id = per_branch.user_id AND s.kind = 'anthropic_token'

@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 176 as of this commit (PRD #1093 M2 added GET, PUT and DELETE /api/schedules/pause —
+// 182 as of this commit (PRD #1147 M1 added the six id-keyed codex credential writes —
+// POST/PATCH/DELETE for /api/me/secrets/codex_auth and /api/me/secrets/openai_api_key,
+// all cookie-only and all noLimiter, like the anthropic writes they sit beside.)
+// It was 176 until then (PRD #1093 M2 added GET, PUT and DELETE /api/schedules/pause —
 // the user-level pause-all-schedules singleton: read the normalized state, pause with an
 // optional auto-resume until, and resume. All three carry noLimiter.)
 // It was 173 until then (PRD #836 M6 added POST /api/admin/release-check/snooze — the
@@ -198,6 +201,10 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/me/memory/{id}", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token/{id}", noLimiter},
+	// PRD #1147 M1 codex credential deletes: owner-scoped DB delete, no forge call, no
+	// spendable mint → noLimiter, exactly like the anthropic id-keyed delete above.
+	{"DELETE", "/api/me/secrets/codex_auth/{id}", noLimiter},
+	{"DELETE", "/api/me/secrets/openai_api_key/{id}", noLimiter},
 	// Explicit per-repo remove (PRD #357): owner-scoped DB delete, no forge call →
 	// noLimiter, like the schedule/connection deletes it sits beside.
 	{"DELETE", "/api/repos/{id}", noLimiter},
@@ -349,6 +356,10 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/ws", noLimiter},
 	{"PATCH", "/api/admin/users/{id}", noLimiter},
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}", noLimiter},
+	// PRD #1147 M1 codex credential patches (rename / set-default / replace): owner-scoped
+	// DB writes, no forge call, no spendable mint → noLimiter, like the anthropic PATCH above.
+	{"PATCH", "/api/me/secrets/codex_auth/{id}", noLimiter},
+	{"PATCH", "/api/me/secrets/openai_api_key/{id}", noLimiter},
 	// The auto-selection pool toggle (PRD #111 M2, D13). noLimiter, and the choice
 	// is deliberate rather than inherited: the credential-surface limiter (limAuth)
 	// exists for routes that MINT, REVEAL or ENUMERATE standing credentials, and
@@ -439,6 +450,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/me/cli-tokens/", noLimiter},
 	{"POST", "/api/me/cli-tokens/revoke-all", noLimiter},
 	{"POST", "/api/me/secrets/anthropic_token", noLimiter},
+	// PRD #1147 M1 codex credential creates: owner-scoped DB write, no forge call, no
+	// spendable mint (M1 ships dark) → noLimiter, exactly like the anthropic create above.
+	{"POST", "/api/me/secrets/codex_auth", noLimiter},
+	{"POST", "/api/me/secrets/openai_api_key", noLimiter},
 	{"POST", "/api/me/slack/test-dm", limSlackDM},
 	{"POST", "/api/notifications/{id}/read", noLimiter},
 	{"POST", "/api/repos/{id}/ci-fix-runs", limForge},

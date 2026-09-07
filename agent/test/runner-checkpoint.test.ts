@@ -1146,3 +1146,284 @@ describe("RunRunner — reap precedes the #1036 overlay's credentialed fetch (RE
     );
   });
 });
+
+// issue #1086 (F2 from #1036): the two-tip checkpoint reconciliation. The CONFIRMED tip
+// (flight.lastCheckpointRefTip) advances only on a real ACK; an AMBIGUOUS publish (a non-2xx,
+// or a throw after the pack tip is known) records the ATTEMPTED tip
+// (flight.lastAttemptedCheckpointRefTip) so the NEXT overlay chains from it (`attempted ??
+// confirmed`) and still descends the broker's actual ref if the prior push landed but its ACK
+// was lost. These pin each reconciliation arm by driving publishCheckpointBestEffort /
+// buildCheckpointOverlay directly (both private) through the same `as unknown as {...}` cast the
+// spies in this file use, with git.checkpointPack and client.publishCheckpoint stubbed so the
+// arm is exercised hermetically with no real pack/broker.
+describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
+  interface TestFlight {
+    runId: string;
+    lastCheckpointRefTip: string | undefined;
+    lastAttemptedCheckpointRefTip: string | undefined;
+    reportedPublishOutcomes: Set<string>;
+    runLog: Logger;
+    batcher: { emit: (m: unknown) => void };
+  }
+
+  /** A minimal RunFlight carrying only the fields publishCheckpointBestEffort /
+   *  buildCheckpointOverlay touch. Cast to `unknown` at the private-method seam. */
+  function makeFlight(over: Partial<TestFlight> = {}): TestFlight {
+    const log: Logger = {
+      debug() {},
+      info() {},
+      warn() {},
+      error() {},
+      addSecret() {},
+      removeSecret() {},
+      child: () => log,
+    };
+    return {
+      runId: "run-1086",
+      lastCheckpointRefTip: undefined,
+      lastAttemptedCheckpointRefTip: undefined,
+      reportedPublishOutcomes: new Set<string>(),
+      runLog: log,
+      batcher: { emit() {} },
+      ...over,
+    };
+  }
+
+  const noopExec: Executor = {
+    run: async (ctx) => ({ branch: ctx.branch }),
+    killAgentTree: () => {},
+  };
+
+  type PrivateRunner = {
+    publishCheckpointBestEffort: (
+      flight: unknown,
+      barePath: string,
+      branch: string,
+      overlay?: unknown,
+    ) => Promise<boolean>;
+    buildCheckpointOverlay: (
+      claim: unknown,
+      flight: unknown,
+      barePath: string,
+    ) => Promise<{ prevCheckpointTip?: string } | undefined>;
+  };
+
+  /** Stub git.checkpointPack: return a fixed tip (pack is inert — the client is stubbed too),
+   *  or throw to model a failure DURING the pack. Returns a restore fn. */
+  function spyCheckpointPack(opts: { tipOid?: string; throws?: boolean }): () => void {
+    const orig = git.checkpointPack.bind(git);
+    (git as unknown as { checkpointPack: unknown }).checkpointPack = async () => {
+      if (opts.throws) throw new Error("boom checkpointPack");
+      return { tipOid: opts.tipOid ?? "PACKTIP", pack: { resume() {} } };
+    };
+    return () => {
+      (git as unknown as { checkpointPack: unknown }).checkpointPack = orig;
+    };
+  }
+
+  /** Stub client.publishCheckpoint to a fixed result, or throw. Returns a restore fn. */
+  function spyPublishFixed(opts: { result?: unknown; throws?: boolean }): () => void {
+    const orig = client.publishCheckpoint.bind(client);
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async () => {
+      if (opts.throws) throw new Error("boom publish");
+      return opts.result;
+    };
+    return () => {
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
+    };
+  }
+
+  it("(a) a CONFIRMED publish advances the confirmed tip AND clears the attempted tip", async () => {
+    const { gitlab } = fakeGitlab();
+    // A pending attempted tip (sentinel) must be reconciled away by the confirmed publish.
+    const flight = makeFlight({
+      lastCheckpointRefTip: "OLD_CONFIRMED",
+      lastAttemptedCheckpointRefTip: "PENDING_ATTEMPT",
+    });
+    const restorePack = spyCheckpointPack({ tipOid: "NEW_TIP" });
+    const restorePub = spyPublishFixed({
+      result: { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" } },
+    });
+    let ok: boolean;
+    try {
+      ok = await (runner(noopExec, gitlab) as unknown as PrivateRunner).publishCheckpointBestEffort(
+        flight,
+        "bare",
+        "branch",
+        undefined,
+      );
+    } finally {
+      restorePub();
+      restorePack();
+    }
+    assert.equal(ok, true, "a confirmed publish returns true");
+    assert.equal(flight.lastCheckpointRefTip, "NEW_TIP", "the confirmed tip advanced to the packed tip");
+    assert.equal(
+      flight.lastAttemptedCheckpointRefTip,
+      undefined,
+      "the confirmed publish reconciled/cleared the attempted tip",
+    );
+  });
+
+  it("(b) a 2xx explicit skip advances neither tip", async () => {
+    const { gitlab } = fakeGitlab();
+    const flight = makeFlight({
+      lastCheckpointRefTip: "OLD_CONFIRMED",
+      lastAttemptedCheckpointRefTip: "PRIOR_ATTEMPT",
+    });
+    const restorePack = spyCheckpointPack({ tipOid: "SKIPPED_TIP" });
+    const restorePub = spyPublishFixed({
+      result: { ok: true, body: { published: false, ref: "", skipped: "workflow_scope" } },
+    });
+    let ok: boolean;
+    try {
+      ok = await (runner(noopExec, gitlab) as unknown as PrivateRunner).publishCheckpointBestEffort(
+        flight,
+        "bare",
+        "branch",
+        undefined,
+      );
+    } finally {
+      restorePub();
+      restorePack();
+    }
+    assert.equal(ok, false, "a skip returns false");
+    assert.equal(flight.lastCheckpointRefTip, "OLD_CONFIRMED", "a definitive skip does not advance the confirmed tip");
+    assert.equal(
+      flight.lastAttemptedCheckpointRefTip,
+      "PRIOR_ATTEMPT",
+      "a definitive skip records nothing as attempted (the server did not advance its ref)",
+    );
+  });
+
+  it("(c) an ambiguous result records the attempted tip; a throw during the pack records nothing", async () => {
+    const { gitlab } = fakeGitlab();
+
+    // non-2xx: the broker may have accepted before the ACK was lost → record the attempted tip.
+    {
+      const flight = makeFlight({ lastCheckpointRefTip: "OLD_CONFIRMED" });
+      const restorePack = spyCheckpointPack({ tipOid: "ATTEMPT_500" });
+      const restorePub = spyPublishFixed({ result: { ok: false, httpStatus: 500 } });
+      try {
+        await (runner(noopExec, gitlab) as unknown as PrivateRunner).publishCheckpointBestEffort(
+          flight,
+          "bare",
+          "branch",
+          undefined,
+        );
+      } finally {
+        restorePub();
+        restorePack();
+      }
+      assert.equal(flight.lastAttemptedCheckpointRefTip, "ATTEMPT_500", "a non-2xx records the attempted tip");
+      assert.equal(flight.lastCheckpointRefTip, "OLD_CONFIRMED", "a non-2xx does not advance the confirmed tip");
+    }
+
+    // thrown AFTER the pack tip is known: still ambiguous → record the attempted tip.
+    {
+      const flight = makeFlight({ lastCheckpointRefTip: "OLD_CONFIRMED" });
+      const restorePack = spyCheckpointPack({ tipOid: "ATTEMPT_THROW" });
+      const restorePub = spyPublishFixed({ throws: true });
+      try {
+        await (runner(noopExec, gitlab) as unknown as PrivateRunner).publishCheckpointBestEffort(
+          flight,
+          "bare",
+          "branch",
+          undefined,
+        );
+      } finally {
+        restorePub();
+        restorePack();
+      }
+      assert.equal(
+        flight.lastAttemptedCheckpointRefTip,
+        "ATTEMPT_THROW",
+        "a throw after the pack tip is known records the attempted tip",
+      );
+      assert.equal(flight.lastCheckpointRefTip, "OLD_CONFIRMED", "a post-pack throw does not advance the confirmed tip");
+    }
+
+    // thrown DURING checkpointPack: packedTip never obtained → neither field moves.
+    {
+      const flight = makeFlight({
+        lastCheckpointRefTip: "OLD_CONFIRMED",
+        lastAttemptedCheckpointRefTip: "PRIOR_ATTEMPT",
+      });
+      const restorePack = spyCheckpointPack({ throws: true });
+      const restorePub = spyPublishFixed({ throws: true });
+      try {
+        await (runner(noopExec, gitlab) as unknown as PrivateRunner).publishCheckpointBestEffort(
+          flight,
+          "bare",
+          "branch",
+          undefined,
+        );
+      } finally {
+        restorePub();
+        restorePack();
+      }
+      assert.equal(
+        flight.lastAttemptedCheckpointRefTip,
+        "PRIOR_ATTEMPT",
+        "a throw during checkpointPack records nothing as attempted",
+      );
+      assert.equal(flight.lastCheckpointRefTip, "OLD_CONFIRMED", "a throw during checkpointPack does not advance the confirmed tip");
+    }
+  });
+
+  it("(d) accepted-publish + lost-response + new-milestone: the next overlay chains from the ATTEMPTED tip, not the stale confirmed tip", async () => {
+    const { gitlab } = fakeGitlab();
+    // A GitHub claim so buildCheckpointOverlay yields a real overlay context; default_branch is
+    // set so it never reaches the credentialed git.defaultBranchName probe.
+    const claim = gitlabClaim(1086, {
+      repo: {
+        id: "r1",
+        url: "https://github.com/org/repo",
+        clone_url: fx.originPath,
+        forge_type: "github",
+        default_branch: "main",
+      },
+    });
+    const flight = makeFlight({ lastCheckpointRefTip: "CONFIRMED_0" });
+
+    // 1) An ambiguous first publish (accepted by the broker, ACK lost → non-2xx) records the
+    //    attempted tip.
+    const restorePack = spyCheckpointPack({ tipOid: "ATTEMPTED_1" });
+    const restorePub = spyPublishFixed({ result: { ok: false, httpStatus: 502 } });
+    try {
+      await (runner(noopExec, gitlab) as unknown as PrivateRunner).publishCheckpointBestEffort(
+        flight,
+        "bare",
+        "branch",
+        undefined,
+      );
+    } finally {
+      restorePub();
+      restorePack();
+    }
+    assert.equal(flight.lastAttemptedCheckpointRefTip, "ATTEMPTED_1", "the ambiguous publish recorded the attempted tip");
+
+    // 2) The NEXT overlay must chain from the attempted tip (precedence attempted ?? confirmed),
+    //    NOT the stale confirmed tip — this is the whole bug the fix closes.
+    const overlay = await (
+      runner(noopExec, gitlab) as unknown as PrivateRunner
+    ).buildCheckpointOverlay(claim, flight, "bare");
+    assert.ok(overlay, "a GitHub claim yields an overlay context");
+    assert.equal(
+      overlay!.prevCheckpointTip,
+      "ATTEMPTED_1",
+      "the next overlay chains from the ATTEMPTED tip, not the stale confirmed tip",
+    );
+
+    // Control: with no attempted tip pending, the overlay falls back to the confirmed tip.
+    const cleared = makeFlight({ lastCheckpointRefTip: "CONFIRMED_0" });
+    const overlay2 = await (
+      runner(noopExec, gitlab) as unknown as PrivateRunner
+    ).buildCheckpointOverlay(claim, cleared, "bare");
+    assert.equal(
+      overlay2!.prevCheckpointTip,
+      "CONFIRMED_0",
+      "with no attempted tip pending, the overlay uses the confirmed tip",
+    );
+  });
+});

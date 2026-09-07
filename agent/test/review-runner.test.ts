@@ -232,6 +232,16 @@ describe("parseTaskReview", () => {
     assert.equal(review.summary, "s");
   });
 
+  it("skips a brace example in prose before the real JSON (scans later candidates)", () => {
+    const text =
+      "Use {file, severity} here.\n" +
+      JSON.stringify({ summary: "s", findings: [{ file: "a.ts", severity: "warning", summary: "x", rationale: "y" }] });
+    const review = parseTaskReview(text);
+    assert.equal(review.summary, "s");
+    assert.equal(review.findings.length, 1);
+    assert.equal(review.findings[0]?.file, "a.ts");
+  });
+
   it("throws on output with no JSON object", () => {
     assert.throws(() => parseTaskReview("nothing here"));
   });

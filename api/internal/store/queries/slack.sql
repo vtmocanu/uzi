@@ -148,10 +148,15 @@ RETURNING *;
 -- the "narrowed by operator scope directive" partial. It carries the same CHECK-backed
 -- enum as everywhere else and is NULL for a run that was never stopped; the Go side
 -- only reads it in the completed arm, so a NULL renders exactly as today.
+--
+-- status_since (PRD #1116) is selected as the park-start source for the `▶️ Resumed`
+-- resume line: on a limit_wait park the notifier copies it onto slack_run_messages
+-- .limit_paused_at, and the waited duration is now − that instant. It is NOT NULL on runs
+-- (migration 00163), stamped now() on every status transition including the park.
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.stop_kind, r.kind,
        r.health, r.plan_md,
-       r.rate_limit_type, r.retry_not_before, r.limit_wait_count,
+       r.rate_limit_type, r.retry_not_before, r.limit_wait_count, r.status_since,
        r.milestones_frozen, r.milestones_completed, r.milestones_in_progress,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
@@ -238,6 +243,32 @@ RETURNING *;
 UPDATE slack_run_messages
 SET gate_ts = @gate_ts, gate_state = @gate_state, updated_at = now()
 WHERE run_id = @run_id AND gate_ts = @expected_gate_ts AND gate_state = @expected_gate_state
+RETURNING *;
+
+-- name: SetSlackRunLimitPause :one
+-- Stamp the pending usage-limit park's start on the run's anchor (PRD #1116): @at is the
+-- run's own status_since captured at the park. It is its OWN column, not a reuse of the
+-- gate/question anchors, for the same reason gate_generation and milestones_notified_completed
+-- are their own columns — a distinct dedupe fact (a park awaiting its resume line), so a park
+-- can never clear a gate and a gate can never clear a park. Overwrite is correct: a re-park
+-- always follows a consumed resume (the park SQL guards on status='running', and the resumed
+-- worker reports running first), so a set never clobbers a live pending park.
+UPDATE slack_run_messages
+SET limit_paused_at = @at, updated_at = now()
+WHERE run_id = @run_id
+RETURNING *;
+
+-- name: ClearSlackRunLimitPause :one
+-- Consume the park marker on the run's next transition (PRD #1116). The `AND limit_paused_at
+-- = @at` guard is the compare-and-swap: no row returned (pgx.ErrNoRows) means the clear was
+-- REFUSED because a newer park (a different @at, stamped by a later SetSlackRunLimitPause) or
+-- an already-cleared marker (NULL) does not match, so a stale clear can never wipe a newer
+-- park's marker. Post-then-clear gives at-least-once delivery: a crash between posting the
+-- `▶️ Resumed` line and this clear duplicates one line on the next event rather than losing
+-- the resume. Its own column for the same reason SetSlackRunLimitPause states.
+UPDATE slack_run_messages
+SET limit_paused_at = NULL, updated_at = now()
+WHERE run_id = @run_id AND limit_paused_at = @at
 RETURNING *;
 
 -- name: CountRunPlanMessages :one

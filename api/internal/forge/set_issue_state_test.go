@@ -116,15 +116,13 @@ func TestForgejoSetIssueStateSendsState(t *testing.T) {
 			m := newMockForgejo(t, map[string]http.HandlerFunc{
 				"/repos/acme/widgets/issues/5": func(w http.ResponseWriter, r *http.Request) {
 					switch r.Method {
-					case http.MethodGet:
-						_ = json.NewEncoder(w).Encode(map[string]any{
-							"number": 5, "title": "Fix the login flow", "body": "b", "state": "open",
-						})
 					case http.MethodPatch:
 						raw, _ := io.ReadAll(r.Body)
 						_ = json.Unmarshal(raw, &patched)
 						_ = json.NewEncoder(w).Encode(map[string]any{"number": 5, "title": "Fix the login flow"})
 					default:
+						// Only a PATCH is expected: the state-only PATCH does not read the
+						// issue first, so a GET here would be the reintroduced round-trip.
 						t.Errorf("unexpected method %s", r.Method)
 					}
 				},
@@ -140,34 +138,49 @@ func TestForgejoSetIssueStateSendsState(t *testing.T) {
 			if got := patched["state"]; got != tc.want {
 				t.Errorf("state = %v, want %q", got, tc.want)
 			}
+			if len(patched) != 1 {
+				t.Errorf("SetIssueState must PATCH ONLY state — a stray field clobbers an unrelated attribute: %v", patched)
+			}
+			// Parity with the GitLab and GitHub tests: a state-only PATCH must not
+			// carry a title, so a concurrent title edit cannot be clobbered.
+			if _, sent := patched["title"]; sent {
+				t.Errorf("SetIssueState must not send a title: %v", patched)
+			}
 		})
 	}
 }
 
-// TestForgejoSetIssueStatePreservesTheTitle pins the same no-omitempty hazard the
-// Forgejo UpdateIssueDescription driver works around: EditIssueOption.Title is a
-// plain `string` with no `omitempty`, so a naive edit PATCHes `"title": ""` and
-// can wipe the issue's title. SetIssueState reads the issue first and sends the
-// current title back — this asserts the PATCH body carries that title, not "".
+// TestForgejoSetIssueStatePreservesAConcurrentTitleEdit pins the lost-update bug
+// the state-only PATCH exists to prevent. The gitea SDK's EditIssueOption.Title is
+// a plain `string` with no `omitempty`, so a driver built on it must read the
+// issue and round-trip the current title — and that read-then-write silently
+// clobbers a title edited concurrently by someone else (TOCTOU).
 //
-// If someone later "simplifies" the driver by dropping the internal read, this is
-// the test that reddens, and the empty string in the failure message is the bug.
-func TestForgejoSetIssueStatePreservesTheTitle(t *testing.T) {
-	const existingTitle = "Fix the login flow"
+// The concurrent edit is modelled deterministically, no timing: the issue already
+// holds a "renamed concurrently" title, tracked in a mutable var the PATCH handler
+// rewrites ONLY when the body carries a "title" key (Forgejo field-only PATCH
+// semantics). A correct state-only PATCH omits "title", so the tracked title
+// survives; a driver that reads-then-writes the stale title reddens here.
+//
+// If someone later reintroduces the internal read, the non-PATCH arm's t.Errorf
+// fires too — the driver must not GET the issue first.
+func TestForgejoSetIssueStatePreservesAConcurrentTitleEdit(t *testing.T) {
+	const concurrentTitle = "Renamed concurrently by someone else"
+	title := concurrentTitle // mutable: only a PATCH that sends "title" changes it
 	var patched map[string]any
 	m := newMockForgejo(t, map[string]http.HandlerFunc{
 		"/repos/acme/widgets/issues/5": func(w http.ResponseWriter, r *http.Request) {
 			switch r.Method {
-			case http.MethodGet:
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"number": 5, "title": existingTitle, "body": "old body", "state": "open",
-				})
 			case http.MethodPatch:
 				raw, _ := io.ReadAll(r.Body)
 				_ = json.Unmarshal(raw, &patched)
-				_ = json.NewEncoder(w).Encode(map[string]any{"number": 5, "title": existingTitle, "state": "closed"})
+				// Forgejo field-only semantics: a title only changes if "title" is sent.
+				if t2, sent := patched["title"].(string); sent {
+					title = t2
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"number": 5, "title": title, "state": "closed"})
 			default:
-				t.Errorf("unexpected method %s", r.Method)
+				t.Errorf("state-only PATCH must not read the issue first; unexpected method %s", r.Method)
 			}
 		},
 	})
@@ -179,23 +192,27 @@ func TestForgejoSetIssueStatePreservesTheTitle(t *testing.T) {
 	if patched == nil {
 		t.Fatal("no PATCH was sent")
 	}
-	title, _ := patched["title"].(string)
-	if title == "" {
-		t.Fatalf("the PATCH carried an EMPTY title, which can wipe the issue's title — "+
-			"EditIssueOption.Title has no omitempty, so the driver must read the current title first; body = %v", patched)
+	if _, sent := patched["title"]; sent {
+		t.Errorf("the PATCH carried a title, which clobbers a concurrent rename (lost update) — "+
+			"a state-only PATCH must omit \"title\"; body = %v", patched)
 	}
-	if title != existingTitle {
-		t.Errorf("title = %q, want the issue's existing %q", title, existingTitle)
+	if got := patched["state"]; got != "closed" {
+		t.Errorf("state = %v, want %q", got, "closed")
+	}
+	if title != concurrentTitle {
+		t.Errorf("the concurrent rename was lost: title = %q, want %q", title, concurrentTitle)
 	}
 }
 
-// SetIssueState's error returns redact the PAT, including the Forgejo driver's
-// INTERNAL read — same per-method redaction contract as UpdateIssueDescription.
-func TestForgejoSetIssueStateRedactsTokenOnInternalRead(t *testing.T) {
+// SetIssueState's error returns redact the PAT. The state-only PATCH is the only
+// request the driver makes, so a forge that 403s the PATCH and echoes the token in
+// the error body must not leak it — same per-method redaction contract as the
+// GitLab and GitHub drivers.
+func TestForgejoSetIssueStateRedactsTokenOnPatchError(t *testing.T) {
 	const token = "forgejo-set-state-redaction-probe-0123456789" //nolint:gosec // G101: fake PAT fixture, the value this test asserts is redacted out of the error, never a real secret; gitleaks:allow
 	m := newMockForgejo(t, map[string]http.HandlerFunc{
 		"/repos/acme/widgets/issues/5": func(w http.ResponseWriter, _ *http.Request) {
-			// Fail the GET, which is the driver's own read.
+			// Fail the PATCH and echo the PAT back in the error body.
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"message":"denied for token ` + token + `"}`))
 		},
@@ -207,8 +224,5 @@ func TestForgejoSetIssueStateRedactsTokenOnInternalRead(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), token) {
 		t.Errorf("the PAT leaked into the error: %v", err)
-	}
-	if !strings.Contains(err.Error(), "read current issue") {
-		t.Errorf("the internal read's error should say which call failed; got %v", err)
 	}
 }

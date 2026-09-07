@@ -76,7 +76,7 @@ func TestExpirePendingTokensPropagatesErrors(t *testing.T) {
 func TestPollDoesNotDeliverAnExpiredToken(t *testing.T) {
 	st := newFakeStore()
 	box := newTestBox(t)
-	svc := New(st, box)
+	svc := New(st, box, time.Now, time.Hour)
 	id := newTestWorker(st, "base", "s", 1)
 	seal(t, st, box, id, "uzw_will-expire")
 	// The sweep cleared the ciphertext without ever stamping delivered_at.
@@ -99,7 +99,7 @@ func TestPollDoesNotDeliverAnExpiredToken(t *testing.T) {
 func TestSealJoinTokenRotatesAStrandedWorker(t *testing.T) {
 	st := newFakeStore()
 	box := newTestBox(t)
-	svc := New(st, box)
+	svc := New(st, box, time.Now, time.Hour)
 	id := newTestWorker(st, "base", "s", 1)
 
 	seal(t, st, box, id, "uzw_original")

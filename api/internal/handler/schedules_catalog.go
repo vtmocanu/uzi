@@ -122,6 +122,7 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 		WaitOnLimit: schedtmpl.WaitOnLimit,
 		MaxIssues:   catalogMaxIssues(job),
 		Model:       catalogModel(job),
+		OutputMode:  catalogOutputMode(job),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -184,6 +185,7 @@ func (h *Handler) ResetSchedule(w http.ResponseWriter, r *http.Request) {
 		AutoApprove: schedtmpl.AutoApprove,
 		WaitOnLimit: schedtmpl.WaitOnLimit,
 		MaxIssues:   catalogMaxIssues(job),
+		OutputMode:  catalogOutputMode(job),
 		NextFireAt:  pgtype.Timestamptz{Time: next, Valid: true},
 		ID:          id,
 		UserID:      user.ID,
@@ -268,6 +270,28 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	// output_mode (PRD #929 M1) is an owner-editable run option on a PROMPT default (it is
+	// prompt-only), NOT catalog-owned — so it is absent from the reject block above. It uses
+	// keep-on-nil like model: an omitted value keeps the stored mode. A set value is enum-checked
+	// (mr/issues) and, for a non-prompt default, rejected (422 — output is a proposal channel a
+	// sweep/self_improve default does not have). A blank clears it back to NULL = inherit.
+	outputMode := cur.OutputMode
+	if req.OutputMode != nil {
+		if cur.Target != "prompt" {
+			httpx.Error(w, http.StatusUnprocessableEntity, "output_mode is only valid for a prompt schedule")
+			return store.RunSchedule{}, false
+		}
+		switch strings.TrimSpace(*req.OutputMode) {
+		case "":
+			outputMode = pgtype.Text{}
+		case schedtmpl.OutputModeMR, schedtmpl.OutputModeIssues:
+			outputMode = pgtype.Text{String: strings.TrimSpace(*req.OutputMode), Valid: true}
+		default:
+			httpx.Error(w, http.StatusBadRequest, "output_mode must be one of: mr, issues")
+			return store.RunSchedule{}, false
+		}
+	}
+
 	autoApprove := cur.AutoApprove
 	if req.AutoApprove != nil {
 		autoApprove = *req.AutoApprove
@@ -342,7 +366,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// OR-ed with a stale true — Reset and an exact-restore patch both un-customize).
 	customized := false
 	if job, ok := schedtmpl.BySlug(cur.CatalogSlug.String); ok {
-		customized = defaultEditableDiverges(job, cron, tz, model, autoApprove, waitOnLimit, mrRework, maxIssues)
+		customized = defaultEditableDiverges(job, cron, tz, model, autoApprove, waitOnLimit, mrRework, maxIssues, outputMode)
 	} else {
 		// Catalog entry gone: cannot compare, so preserve the stored flag rather than guess.
 		customized = cur.Customized
@@ -378,6 +402,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		MaxIssues:             maxIssues,
 		Guidance:              guidance,
 		Model:                 model,
+		OutputMode:            outputMode,
 		OverrideSubagentModel: ov,
 		Customized:            customized,
 		ID:                    id,
@@ -402,6 +427,7 @@ func catalogEntryDTO(j schedtmpl.DefaultJob) apitypes.CatalogEntryDTO {
 		Cron:         j.Cron,
 		Timezone:     catalogTimezone(j),
 		Model:        j.Model,
+		OutputMode:   catalogEntryOutputMode(j),
 		Prompt:       j.Prompt,
 		SelectorKind: j.SelectorKind,
 		Labels:       j.Labels,
@@ -442,12 +468,32 @@ func catalogModel(j schedtmpl.DefaultJob) pgtype.Text {
 	return pgtype.Text{}
 }
 
+// catalogOutputMode maps a job's output mode to the nullable store column for SEEDING a
+// default row (PRD #929 M1): the RESOLVED value ("mr"/"issues") for a prompt job — stored
+// explicitly like catalogModel seeds model, so Reset and the customized recompute compare
+// against a concrete stored value — and NULL for a non-prompt job (output mode is prompt-only).
+func catalogOutputMode(j schedtmpl.DefaultJob) pgtype.Text {
+	if j.Target == "prompt" {
+		return pgtype.Text{String: j.OutputMode(), Valid: true}
+	}
+	return pgtype.Text{}
+}
+
+// catalogEntryOutputMode is the DTO view of a job's output mode (PRD #929 M1): the resolved
+// "mr"/"issues" for a prompt entry, "" for a non-prompt entry (which carries no output mode).
+func catalogEntryOutputMode(j schedtmpl.DefaultJob) string {
+	if j.Target == "prompt" {
+		return j.OutputMode()
+	}
+	return ""
+}
+
 // defaultEditableDiverges reports whether a default row's editable fields differ from the
 // catalog defaults (PRD #589 M2). It compares the editable run fields; the catalog-owned
 // prompt/labels/guidance are excluded (they are never stored on the row). A blank catalog
 // model and a NULL row model both mean "inherit", so they compare equal; a 0 catalog
 // max_issues and a NULL row max_issues both mean "unlimited".
-func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pgtype.Text, autoApprove, waitOnLimit bool, mrRework pgtype.Bool, maxIssues pgtype.Int4) bool {
+func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pgtype.Text, autoApprove, waitOnLimit bool, mrRework pgtype.Bool, maxIssues pgtype.Int4, outputMode pgtype.Text) bool {
 	if cron != job.Cron {
 		return true
 	}
@@ -484,5 +530,22 @@ func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pg
 	if maxIssues.Valid {
 		rMax = maxIssues.Int32
 	}
-	return rMax != jMax
+	if rMax != jMax {
+		return true
+	}
+	// output_mode (PRD #929 M1): prompt-only. The catalog baseline is job.OutputMode()
+	// ("mr"/"issues"); a NULL row column means "inherit the catalog default" and so equals
+	// the baseline, while an explicit value diverges only when it differs from it. A
+	// non-prompt default carries a NULL output_mode and job.OutputMode() would resolve a
+	// blank Output to "mr", so guard on the prompt target to avoid a false divergence there.
+	if job.Target == "prompt" {
+		rOut := job.OutputMode()
+		if outputMode.Valid && strings.TrimSpace(outputMode.String) != "" {
+			rOut = outputMode.String
+		}
+		if rOut != job.OutputMode() {
+			return true
+		}
+	}
+	return false
 }

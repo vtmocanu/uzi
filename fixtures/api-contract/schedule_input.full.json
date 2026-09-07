@@ -17,6 +17,7 @@
   "max_issues": 1,
   "guidance": "x",
   "model": "x",
+  "output_mode": "x",
   "override_subagent_model": true,
   "sibling_group_id": "x"
 }

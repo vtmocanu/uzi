@@ -38,30 +38,37 @@ func milestoneRunItem(id, status string, done int, inProg string) apitypes.RunLi
 // with a non-empty MilestonesInProgress, is NEVER double-armed across a 2s board refresh
 // (blinkArmed), and disarms — dropping to the static frame — when nothing is in progress.
 func TestTUIBlinkArmOnlyWithInProgress(t *testing.T) {
+	// The board reply now ALWAYS re-arms the board tick (PRD #1130: rescheduling moved to the
+	// reply), so `cmd != nil` no longer distinguishes "blink armed" — detect the blinkTickMsg
+	// itself. Shrink both cadences so draining the reply's ticks does not block on the real 2s/500ms.
+	origBoard, origBlink := boardPollInterval, blinkInterval
+	boardPollInterval, blinkInterval = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { boardPollInterval, blinkInterval = origBoard, origBlink })
+
 	fake := &uzicli.FakeClient{}
 	m := tuiTestModel(t, fake, "")
 
 	// A board with no in-progress run arms nothing.
 	plain := []apitypes.RunListItemDTO{milestoneRunItem("aaaaaaaa-1", "running", 2, "")}
-	next, cmd := m.Update(boardRunsMsg{runs: plain})
+	next, cmd := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: plain})
 	m = next.(tuiModel)
-	if m.blinkArmed || cmd != nil {
-		t.Fatalf("a board with no in-progress run must not arm the blink (armed=%v cmd=%v)", m.blinkArmed, cmd != nil)
+	if m.blinkArmed || hasMsg[blinkTickMsg](drainCmd(cmd)) {
+		t.Fatalf("a board with no in-progress run must not arm the blink (armed=%v)", m.blinkArmed)
 	}
 
 	// A refresh that reveals an in-progress run arms exactly one tick.
 	inprog := []apitypes.RunListItemDTO{milestoneRunItem("aaaaaaaa-1", "running", 1, "m2")}
-	next, cmd = m.Update(boardRunsMsg{runs: inprog})
+	next, cmd = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: inprog})
 	m = next.(tuiModel)
-	if !m.blinkArmed || cmd == nil {
-		t.Fatalf("revealing an in-progress run must arm the blink (armed=%v cmd=%v)", m.blinkArmed, cmd != nil)
+	if !m.blinkArmed || !hasMsg[blinkTickMsg](drainCmd(cmd)) {
+		t.Fatalf("revealing an in-progress run must arm the blink (armed=%v)", m.blinkArmed)
 	}
 
-	// A SECOND refresh while already armed must NOT stack another tick (double renders).
-	next, cmd = m.Update(boardRunsMsg{runs: inprog})
+	// A SECOND refresh while already armed must NOT stack another blink tick (double renders).
+	next, cmd = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: inprog})
 	m = next.(tuiModel)
-	if !m.blinkArmed || cmd != nil {
-		t.Fatalf("a refresh while already armed must not re-arm (armed=%v cmd=%v)", m.blinkArmed, cmd != nil)
+	if !m.blinkArmed || hasMsg[blinkTickMsg](drainCmd(cmd)) {
+		t.Fatalf("a refresh while already armed must not re-arm the blink (armed=%v)", m.blinkArmed)
 	}
 
 	// The tick toggles the phase and re-arms itself while a run is still in progress.
@@ -73,7 +80,7 @@ func TestTUIBlinkArmOnlyWithInProgress(t *testing.T) {
 
 	// When nothing is in progress any more, the run row still exists but the tick lapses and the
 	// phase resets to the static frame.
-	next, _ = m.Update(boardRunsMsg{runs: plain})
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: plain})
 	m = next.(tuiModel)
 	next, cmd = m.Update(blinkTickMsg{})
 	m = next.(tuiModel)
@@ -85,13 +92,19 @@ func TestTUIBlinkArmOnlyWithInProgress(t *testing.T) {
 // UZI_TUI_NO_BLINK=1 (noBlink) pins the static frame: the tick is never armed and blinkOn stays
 // false, even on a board with an in-progress run.
 func TestTUIBlinkNoBlinkPinsStaticFrame(t *testing.T) {
+	// The board reply always re-arms the board tick now (PRD #1130), so detect the blinkTickMsg
+	// itself rather than a non-nil cmd; shrink the cadences so draining does not block.
+	origBoard, origBlink := boardPollInterval, blinkInterval
+	boardPollInterval, blinkInterval = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { boardPollInterval, blinkInterval = origBoard, origBlink })
+
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	m.noBlink = true
 	inprog := []apitypes.RunListItemDTO{milestoneRunItem("aaaaaaaa-1", "running", 1, "m2")}
-	next, cmd := m.Update(boardRunsMsg{runs: inprog})
+	next, cmd := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: inprog})
 	m = next.(tuiModel)
-	if m.blinkArmed || cmd != nil {
-		t.Fatalf("UZI_TUI_NO_BLINK must never arm the blink (armed=%v cmd=%v)", m.blinkArmed, cmd != nil)
+	if m.blinkArmed || hasMsg[blinkTickMsg](drainCmd(cmd)) {
+		t.Fatalf("UZI_TUI_NO_BLINK must never arm the blink (armed=%v)", m.blinkArmed)
 	}
 	// A stray tick cannot flip the phase on.
 	next, _ = m.Update(blinkTickMsg{})
@@ -102,7 +115,7 @@ func TestTUIBlinkNoBlinkPinsStaticFrame(t *testing.T) {
 }
 
 // The board micro-bar's in-progress cell alternates by SHAPE (▰ vs ▱), so it survives an Ascii
-// (NO_COLOR) profile that strips the wait tint. The done fill stays ▰ and the in-progress cell
+// (NO_COLOR) profile that strips the tungsten tint. The done fill stays ▰ and the in-progress cell
 // is the one that flips between the two phases.
 func TestTUIBlinkAsciiShapeAlternates(t *testing.T) {
 	inprog := []apitypes.RunListItemDTO{milestoneRunItem("aaaaaaaa-1", "running", 1, "m2")}
@@ -111,7 +124,7 @@ func TestTUIBlinkAsciiShapeAlternates(t *testing.T) {
 		m.width = 120
 		next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 		m = next.(tuiModel)
-		next, _ = m.Update(boardRunsMsg{runs: inprog})
+		next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: inprog})
 		m = next.(tuiModel)
 		m.blinkOn = on
 		return stripANSI(m.View().Content)
@@ -131,6 +144,93 @@ func TestTUIBlinkAsciiShapeAlternates(t *testing.T) {
 	}
 }
 
+// milestoneDetailRun builds a milestone-structured RunDTO for the crew-rail detail rail: `done`
+// completed, one in progress, the rest not started.
+func milestoneDetailRun(id string, done int, inProg string) apitypes.RunDTO {
+	ms := []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}, {ID: "m3", Title: "Gamma"}}
+	var completed []string
+	for i := 0; i < done && i < len(ms); i++ {
+		completed = append(completed, ms[i].ID)
+	}
+	return apitypes.RunDTO{ID: id, Kind: "issue", Status: "running", IssueTitle: "structured run",
+		Milestones: ms, MilestonesCompleted: completed, MilestonesInProgress: []string{inProg}}
+}
+
+// PRD #1136 SC1: the crew-rail in-progress milestone ROW is a ◐ ⇄ ○ blink in the faint colour,
+// in ANTI-PHASE to the micro-bar. blinkOn==false → ◐ (the presence/static frame); blinkOn==true →
+// ○. This pins the alternation AND the inverted polarity — every OTHER rail test renders at the
+// default blinkOn==false (the static frame), so without this the toggle is unproven and green.
+// ◐ is the in-progress row's ONLY occurrence in the rail (the micro-bar uses ▰/▱, never ◐), so a
+// ◐-count of 1↔0 across the phases is a clean channel for the flip.
+func TestTUIDetailMilestoneRowBlinkAlternates(t *testing.T) {
+	now := time.Now()
+	run := milestoneDetailRun("77777777-2222", 1, "m2") // m1 done, m2 in progress, m3 not started
+	render := func(on bool) string {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+		m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
+		m.blinkOn = on
+		return m.View().Content
+	}
+	pal := newPalette(true)
+	off := render(false)
+	on := render(true)
+	// blinkOn==false (also the static / non-tty / NO_BLINK frame): the in-progress row is ◐ in faint.
+	if !strings.Contains(off, paintSeg(pal.faintC, nil, false, "◐")) {
+		t.Errorf("blinkOn=false: in-progress row is not ◐ in faint\n%s", stripANSI(off))
+	}
+	// blinkOn==true: the row flips to ○; no ◐ remains anywhere in the rail.
+	if strings.Contains(on, "◐") {
+		t.Errorf("blinkOn=true: in-progress row did not flip away from ◐\n%s", stripANSI(on))
+	}
+	if !strings.Contains(on, paintSeg(pal.faintC, nil, false, "○")) {
+		t.Errorf("blinkOn=true: in-progress row is not ○ in faint\n%s", stripANSI(on))
+	}
+}
+
+// PRD #1136 SC4: under an Ascii/NO_COLOR profile (tint stripped) the crew-rail in-progress row
+// stays legible by SHAPE — a static ◐, distinct from a not-started ○ and a done ✓. The board
+// micro-bar's Ascii test above covers only the micro-bar; this covers the rail rows (the case D4
+// exists for, doubly so now the row's ◐ shares faintC with a not-started ○).
+func TestTUIDetailMilestoneRowAsciiShape(t *testing.T) {
+	now := time.Now()
+	run := milestoneDetailRun("77777777-3333", 1, "m2") // m1 done (✓), m2 in progress (◐), m3 not started (○)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	m = next.(tuiModel)
+	m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
+	// blinkOn defaults false → the static/presence frame; Ascii strips colour, so only shape carries state.
+	out := stripANSI(m.View().Content)
+	if !strings.Contains(out, "◐") {
+		t.Errorf("Ascii in-progress row is not the ◐ shape\n%s", out)
+	}
+	if !strings.Contains(out, "○") {
+		t.Errorf("Ascii not-started row is not the ○ shape\n%s", out)
+	}
+	if !strings.Contains(out, "✓") {
+		t.Errorf("Ascii done row is not the ✓ shape\n%s", out)
+	}
+}
+
+// PRD #1136 D4/SC3: a TERMINAL run carrying a stale MilestonesInProgress must NOT pulse its
+// in-progress row — blinkOn is a GLOBAL phase driven by any live board run, so an ungated row
+// would flip to a bare ○ (indistinguishable from a not-started sibling) on half the frames on
+// finished/stale data. milestoneRowCell gates its animation on `blink` (the same !terminal
+// condition the eyebrow micro-bar uses), so a terminal run's row is the STATIC ◐ regardless of
+// blinkOn. Rendered at blinkOn==true — the frame that WOULD show ○ if the guard were missing.
+func TestTUIDetailMilestoneRowTerminalStaysStatic(t *testing.T) {
+	now := time.Now()
+	run := milestoneDetailRun("77777777-4444", 1, "m2")
+	run.Status = "completed" // terminal — the in-progress snapshot is stale (run.go terminalRunStatuses)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
+	m.blinkOn = true // the phase that would expose a bare ○ if the row weren't gated on !terminal
+	out := m.View().Content
+	pal := newPalette(true)
+	if !strings.Contains(out, paintSeg(pal.faintC, nil, false, "◐")) {
+		t.Errorf("terminal run: in-progress row must stay a static ◐ (not pulse to ○) at blinkOn=true\n%s", stripANSI(out))
+	}
+}
+
 // PRD #1064 D5: a run with NO frozen milestones AND no current_activity renders byte-for-byte
 // the same regardless of the blink phase or the noBlink pin — the blink machinery is inert on a
 // null-milestone run. Asserted on both the board and the run-detail rail.
@@ -142,7 +242,7 @@ func TestTUIBlinkNullMilestoneByteIdentical(t *testing.T) {
 	boardFrame := func(on, noBlink bool) string {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 		m.noBlink = noBlink
-		next, _ := m.Update(boardRunsMsg{runs: []apitypes.RunListItemDTO{{RunDTO: plainRun}}})
+		next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{{RunDTO: plainRun}}})
 		m = next.(tuiModel)
 		m.blinkOn = on
 		return m.View().Content
@@ -159,9 +259,8 @@ func TestTUIBlinkNullMilestoneByteIdentical(t *testing.T) {
 	// Detail rail: a plain run with a live frame, phase off vs on.
 	detailFrame := func(on bool) string {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, plainRun.ID)
-		next, _ := m.Update(detailLoadedMsg{run: plainRun,
-			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
-		m = next.(tuiModel)
+		m = applyDetail(m, plainRun,
+			[]apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
 		m.blinkOn = on
 		return m.View().Content
 	}
@@ -185,10 +284,9 @@ func TestTUIRailNowLineFromFrames(t *testing.T) {
 	// is the dispatch task label.
 	editPayload := json.RawMessage(`{"name":"Edit","input":{"file_path":"api/internal/poller/ci_autofix.go"}}`)
 	agent, label, at := "coder", "Decouple ci_fix detector from branch naming", now
-	next, _ := m.Update(detailLoadedMsg{run: run, msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, run, []apitypes.MessageDTO{
 		{Seq: 1, Kind: "tool_use", Agent: &agent, AgentLabel: &label, CreatedAt: at, Payload: editPayload},
-	}})
-	m = next.(tuiModel)
+	})
 	out := stripANSI(m.View().Content)
 	// The `↳ <role> · <age>` line and the italic task label sit under the in-progress milestone.
 	if !strings.Contains(out, "↳ coder") {
@@ -214,11 +312,10 @@ func TestTUIRailUnattachedNowLine(t *testing.T) {
 		MilestonesCompleted: []string{"m1"}} // nothing in progress
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 	agent, at := "lead", now
-	next, _ := m.Update(detailLoadedMsg{run: run, msgs: []apitypes.MessageDTO{
+	m = applyDetail(m, run, []apitypes.MessageDTO{
 		{Seq: 1, Kind: "tool_use", Agent: &agent, CreatedAt: at,
 			Payload: json.RawMessage(`{"name":"Read","input":{"file_path":"api/internal/poller/mr_rework.go"}}`)},
-	}})
-	m = next.(tuiModel)
+	})
 	out := stripANSI(m.View().Content)
 	if !strings.Contains(out, "↳ lead") {
 		t.Errorf("an unattached now line should show under the eyebrow when activity exists but nothing is declared\n%s", out)
@@ -250,7 +347,7 @@ func TestTUIBoardSecondLineTopAndBottom(t *testing.T) {
 	}
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	m.width, m.height = 120, 16
-	next, _ := m.Update(boardRunsMsg{runs: runs})
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	m = next.(tuiModel)
 
 	fits := func(label string) {
@@ -311,7 +408,7 @@ func TestTUIBoardSecondLineWindowReservesLine(t *testing.T) {
 	}
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	m.width, m.height = 120, 16
-	next, _ := m.Update(boardRunsMsg{runs: runs})
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	m = next.(tuiModel)
 
 	// Select the BOTTOM row, whose second line rides the very bottom of the window — exactly the
@@ -352,7 +449,7 @@ func TestTUIBoardSecondLineGainsAndLosesActivity(t *testing.T) {
 	withAct[1].CurrentActivity = activityFor("coder", "task-coder", now)
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	m.width, m.height = 120, 20
-	next, _ := m.Update(boardRunsMsg{runs: withAct})
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: withAct})
 	m = next.(tuiModel)
 	m = press(t, m, "j") // select the run WITH activity
 
@@ -366,7 +463,7 @@ func TestTUIBoardSecondLineGainsAndLosesActivity(t *testing.T) {
 		milestoneRunItem("aaaaaaaa-0", "running", 1, "m2"),
 		milestoneRunItem("aaaaaaaa-1", "running", 1, "m2"),
 	}
-	next, _ = m.Update(boardRunsMsg{runs: lost})
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: lost})
 	m = next.(tuiModel)
 	if strings.Contains(m.View().Content, "task-coder") {
 		t.Errorf("the selected run lost its activity but the second line is still drawn\n%s", m.View().Content)
@@ -376,7 +473,7 @@ func TestTUIBoardSecondLineGainsAndLosesActivity(t *testing.T) {
 	}
 
 	// Next poll: it gains activity again. The second line returns.
-	next, _ = m.Update(boardRunsMsg{runs: withAct})
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: withAct})
 	m = next.(tuiModel)
 	if !strings.Contains(m.View().Content, "task-coder") {
 		t.Errorf("the selected run regained activity but the second line did not return\n%s", m.View().Content)

@@ -52,6 +52,15 @@ type NotifierStore interface {
 	// `running` report cannot re-post a line the thread already carries. Distinct from
 	// gate_generation (the plan gate's own counter).
 	SetSlackRunMilestoneNotified(ctx context.Context, arg store.SetSlackRunMilestoneNotifiedParams) (store.SlackRunMessage, error)
+	// SetSlackRunLimitPause stamps the pending usage-limit park's start (the run's
+	// status_since) on the anchor (PRD #1116). It is its own column, so a park can
+	// never clear a gate/question and vice versa; overwrite is correct because a
+	// re-park always follows a consumed resume.
+	SetSlackRunLimitPause(ctx context.Context, arg store.SetSlackRunLimitPauseParams) (store.SlackRunMessage, error)
+	// ClearSlackRunLimitPause consumes the park marker on the next transition via a
+	// compare-and-swap on @at (PRD #1116): no row = a newer park or an already-cleared
+	// marker did not match, so a stale clear can never wipe a newer park's marker.
+	ClearSlackRunLimitPause(ctx context.Context, arg store.ClearSlackRunLimitPauseParams) (store.SlackRunMessage, error)
 }
 
 // Poster is the outbound Slack surface the notifier drives: open a DM channel and

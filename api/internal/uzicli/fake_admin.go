@@ -17,6 +17,7 @@ func (f *FakeClient) AdminListUsers(context.Context) ([]apitypes.UserDTO, error)
 }
 
 func (f *FakeClient) AdminListRuns(context.Context) ([]apitypes.RunListItemDTO, error) {
+	f.AdminListRunsCalls++
 	if f.Err != nil {
 		return nil, f.Err
 	}

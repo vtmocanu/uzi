@@ -96,18 +96,16 @@ func (f *forgejo) GetIssue(ctx context.Context, projectID, issueIID int64) (Issu
 
 // UpdateIssueDescription replaces an issue's body (PRD #72 M5).
 //
-// THE INTERNAL READ IS NOT OPTIONAL, and this is the hazard the whole method
-// exists to work around. In code.gitea.io/sdk/gitea, EditIssueOption.Title is a
-// plain `string` with the json tag "title" and NO `omitempty`, so a naive call
-// PATCHes `"title": ""` and can wipe the issue's title. Whether Forgejo happens to
-// ignore an empty title is not verifiable from this tree, and "probably ignores
-// it" is not a basis for a write against a user's issue. So: read the issue first
-// and send its current title back unchanged.
+// This sends a BODY-ONLY PATCH and does NOT read the issue first. The gitea SDK's
+// gitea.EditIssueOption cannot express that: its Title field is a plain `string`
+// tagged `json:"title"` with NO `omitempty`, so marshalling it always emits a
+// "title" key, and any driver built on it must round-trip the current title to
+// avoid PATCHing `"title": ""` (which wipes it). That read-then-write is a TOCTOU:
+// a title edited concurrently between the read and the write is silently clobbered
+// by the stale value. Bypassing the SDK struct via patchIssue lets us omit "title"
+// entirely, so a concurrent title edit survives and no read is needed.
 //
-// A driver absorbing its own forge's quirk is the established shape here —
-// UpdateIssueLabels above does a read-then-full-PUT for the same kind of reason
-// (Forgejo has no add/remove delta). The interface stays neutral, which is the
-// point; the GitLab driver sends the description alone.
+// The interface stays neutral; the GitLab driver sends the description alone.
 func (f *forgejo) UpdateIssueDescription(ctx context.Context, projectID, issueIID int64, description string) error {
 	c, err := f.newClient(ctx)
 	if err != nil {
@@ -117,32 +115,26 @@ func (f *forgejo) UpdateIssueDescription(ctx context.Context, projectID, issueII
 	if err != nil {
 		return err
 	}
-	cur, _, err := c.GetIssue(slug.owner, slug.repo, issueIID)
-	if err != nil {
-		// Redaction is per-method and not automatic, so the INTERNAL read's error
-		// needs wrapping too — it carries the same client and the same PAT.
-		return f.wrapErr("update issue description: read current issue", err)
-	}
-	if _, _, err := c.EditIssue(slug.owner, slug.repo, issueIID, gitea.EditIssueOption{
-		Title: cur.Title,
-		Body:  &description,
-	}); err != nil {
-		return f.wrapErr("update issue description", err)
-	}
-	return nil
+	return f.patchIssue(ctx, slug, issueIID, "update issue description",
+		struct {
+			Body string `json:"body"`
+		}{Body: description})
 }
 
 // SetIssueState closes or reopens an issue.
 //
-// THE INTERNAL READ IS NOT OPTIONAL, for the same reason UpdateIssueDescription
-// above reads first: EditIssueOption.Title is a plain `string` with no
-// `omitempty`, so a naive edit PATCHes `"title": ""` and can wipe the issue's
-// title. So read the issue first and send its current title back unchanged
-// alongside the state. EditIssueOption.State is a *gitea.StateType, mapped from
-// the neutral state by forgejoIssueStateMutation (the MUTATE mapper, NOT the
+// This sends a STATE-ONLY PATCH and does NOT read the issue first, for the same
+// reason UpdateIssueDescription above does not: the gitea SDK's
+// gitea.EditIssueOption.Title is a plain `string` with no `omitempty`, so a driver
+// built on it must round-trip the current title to avoid wiping it — a
+// read-then-write that clobbers a concurrent title edit (TOCTOU). patchIssue omits
+// "title" entirely, so there is no title round-trip and therefore no read.
+//
+// The state is mapped by forgejoIssueStateMutation (the MUTATE mapper, NOT the
 // list-filter forgejoIssueStateParam whose default is StateAll): StateClosed
-// closes, anything else reopens — reopening being the safe direction for a
-// caller bug, matching the GitLab and GitHub drivers.
+// closes, anything else reopens — reopening being the safe direction for a caller
+// bug, matching the GitLab and GitHub drivers. gitea.StateType JSON-marshals to
+// "closed"/"open".
 func (f *forgejo) SetIssueState(ctx context.Context, projectID, issueIID int64, state IssueState) error {
 	c, err := f.newClient(ctx)
 	if err != nil {
@@ -152,20 +144,11 @@ func (f *forgejo) SetIssueState(ctx context.Context, projectID, issueIID int64, 
 	if err != nil {
 		return err
 	}
-	cur, _, err := c.GetIssue(slug.owner, slug.repo, issueIID)
-	if err != nil {
-		// Redaction is per-method and not automatic, so the INTERNAL read's error
-		// needs wrapping too — it carries the same client and the same PAT.
-		return f.wrapErr("set issue state: read current issue", err)
-	}
 	st := forgejoIssueStateMutation(state)
-	if _, _, err := c.EditIssue(slug.owner, slug.repo, issueIID, gitea.EditIssueOption{
-		Title: cur.Title,
-		State: &st,
-	}); err != nil {
-		return f.wrapErr("set issue state", err)
-	}
-	return nil
+	return f.patchIssue(ctx, slug, issueIID, "set issue state",
+		struct {
+			State gitea.StateType `json:"state"`
+		}{State: st})
 }
 
 func (f *forgejo) CreateIssue(ctx context.Context, projectID int64, title, description string, labels []string) (Issue, error) {

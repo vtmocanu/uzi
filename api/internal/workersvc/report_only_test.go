@@ -116,6 +116,35 @@ func TestClampWireReportMdBoundsToCap(t *testing.T) {
 	}
 }
 
+// TestClampWireReportMdScrubsSecretStraddlingCap pins the scrub-BEFORE-cap ordering: a
+// credential positioned so it straddles ReviewSummaryMaxBytes must be scrubbed WHOLE,
+// never truncated first into a sub-match-length prefix that Scrub misses and that then
+// leaks into the stored report_md. This is the report-only sibling of
+// TestClampWireProposalScrubsSecretStraddlingCap (F4 from PR #1122). It FAILS on a
+// truncate-then-scrub order (the tail is cut, "glpat-<few>" survives) and PASSES on
+// scrub-then-cap.
+func TestClampWireReportMdScrubsSecretStraddlingCap(t *testing.T) {
+	// Assembled from parts (.claude/rules/prds.md): a contiguous glpat-<20> literal in
+	// tracked source is rejected by GitHub Push Protection. glpat- + 20 chars = 26 bytes.
+	secret := "glpat-" + "straddlethecap000000"
+	// Place the secret so it STARTS before the cap and ENDS past it: 10 bytes of the token
+	// sit beyond ReviewSummaryMaxBytes, so a truncate-first order would cut it mid-token.
+	pad := strings.Repeat("A", ReviewSummaryMaxBytes-(len(secret)-10))
+	got := clampWireReportMd(issueRun(), strp(pad+secret), true)
+	if !got.Valid {
+		t.Fatal("expected stored text, got NULL")
+	}
+	if strings.Contains(got.String, "glpat-") {
+		t.Errorf("a credential prefix leaked past the cap (truncate-before-scrub): report_md=%q", got.String)
+	}
+	if strings.Contains(got.String, secret) {
+		t.Errorf("full secret survived: report_md=%q", got.String)
+	}
+	if len(got.String) > ReviewSummaryMaxBytes {
+		t.Errorf("stored %d bytes, want <= %d", len(got.String), ReviewSummaryMaxBytes)
+	}
+}
+
 // A completed report from a run that produced a normal MR carries neither field: the
 // worker sends no key rather than "" or false, so both decode nil and clamp to the
 // no-report-only shape (report_only=false, report_md NULL), byte-identical to before.
