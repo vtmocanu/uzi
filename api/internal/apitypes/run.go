@@ -535,6 +535,11 @@ type MessageDTO struct {
 	AgentLabel    *string         `json:"agent_label"`
 	Payload       json.RawMessage `json:"payload"`
 	CreatedAt     time.Time       `json:"created_at"`
+	// PayloadTruncated is true only when a ?payload_max= trim actually removed
+	// bytes from this message's payload (PRD #1137). Absent (omitempty) on every
+	// untrimmed message, so the web SPA — which never sends payload_max — sees no
+	// change to the wire shape.
+	PayloadTruncated bool `json:"payload_truncated,omitempty"`
 }
 
 // RunInputRequest is the POST /api/runs/{id}/inputs body: a steering input

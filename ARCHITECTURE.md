@@ -448,11 +448,18 @@ Anthropic credential is resolved is a **per-claim** decision across four lanes,
 of which `workersvc.claimSecretID` decides two: a `self_improve` run follows
 the owner's judge-lane binding, and any other run-lane claim follows the
 claiming worker's **bind mode**. The other two never reach it — a judge run
-forks to `assembleJudgeClaim` *before* `claimSecretID` and follows the owner's
-judge binding, and the chat lane calls the opener directly with no override, so
-it always resolves the owner's default. Because the token rides the claim
-rather than the worker, re-pointing a worker is complete server-side — no
-restart, no re-minted join token.
+forks to `assembleJudgeClaim` *before* `claimSecretID`, and the chat lane calls
+the opener directly with no override, so it always resolves the owner's
+default. Since PRD #1140 the judge lane and `self_improve` both follow the
+owner's judge **bind mode** — `default` / `pinned` / `auto`, three-valued like
+a worker's — and an `auto` judge run resolves through the very same
+`autoChoice` ranker the run lane uses (`judgeChoice`, `judge.go`). The one
+deliberate asymmetry: on a genuinely empty pool the judge lane spends the
+owner's default token (recorded `pool_empty`) rather than holding in
+`pool_wait` as the run lane does, because a held retrospective carries no
+issue, no branch and nobody's attention, and would silently pile up. Because
+the token rides the claim rather than the worker, re-pointing a worker is
+complete server-side — no restart, no re-minted join token.
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens by rate-limit headroom
@@ -1428,6 +1435,22 @@ rolled — past the drain deadline, on force-roll, or by an uncontrolled pod los
 is unchanged by this PRD. Full rationale, the Decision Log, and what remains
 open (a CLI drain verb, live-cluster validation) are in
 [adr/0422-decouple-worker-version.md](adr/0422-decouple-worker-version.md).
+
+### Worker disk: observed on the heartbeat, self-healed by the controller (PRD #837)
+
+A worker now samples `/nix` and `/data` filesystem usage on the existing
+heartbeat and reports it display-only, alongside CPU/memory (PRD #49); no
+scheduling query reads it. The controller gained two new drift arms that both
+resolve to the same delete-and-remint mechanism (a pod roll re-attaches the
+same PVC, so it cannot reclaim disk): one reconciles a worker whose `/nix` PVC
+is smaller than the current `preset.nixSize` constant, the other recycles
+`{nix, data}` when the api derives sustained disk pressure (>=90% used,
+debounced, fresh) and flags it on the controller poll wire. Both drain a busy
+worker first and exclude ephemeral (run-bound, PRD #529) workers. Full
+rationale — the await-gone gate that keeps a re-mint from racing a
+still-Terminating PVC, the default-ON decision over reviewer dissent, and the
+thrash-cooldown-as-capacity-signal — is in
+[adr/0837-worker-disk-lifecycle.md](adr/0837-worker-disk-lifecycle.md).
 
 ## Not yet in scope
 

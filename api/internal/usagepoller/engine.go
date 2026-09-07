@@ -332,10 +332,23 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, igno
 // ahead of its advertised reset, so poll jitter never trips it (PRD #1020 D2).
 const earlyResetThreshold = 8 * time.Hour
 
-// exhaustionPct: the prior window counts as "was limiting" at/above this. Set
-// below 100 because a routine sync floors a limit_report 100 to 99
-// (fractionToPct, anthropic/client.go) while still exhausted (PRD #1020 D8).
-const exhaustionPct = 95
+// resetEpochMoveMargin: Arm A requires the fresh 7-day reset epoch to move at
+// least this far past the advertised T. A genuine reset moves it by ~days,
+// while a usage_endpoint->header_probe source flip re-derives the same instant
+// from a different wire field (ISO body string vs Unix-epoch header) and can
+// differ by seconds; +1h absorbs that jitter so a bare .After never fires on it
+// (PRD #1114 D8).
+const resetEpochMoveMargin = 1 * time.Hour
+
+// pctResetFloor / pctResetCeil: Arm B treats a 7-day utilization drop from
+// >= pctResetFloor to <= pctResetCeil as a reset (the fixed-grid manifestation,
+// where used% zeroes but the boundary does not move). The 7-day used% is
+// monotonic non-decreasing between resets, so a genuine drop only happens at a
+// reset; the small buffer stops a cross-source rounding delta from reading as a
+// reset. Set low deliberately (owner accepts a noisy floor; real weekly resets
+// are rare and a missed early clear costs more than a spurious alert) (PRD #1114 D5/D8).
+const pctResetFloor = 5
+const pctResetCeil = 1
 
 // observe writes the fresh reading and, when the owner opted in, fires the early
 // 7-day reset alert (PRD #1020 M2). It wraps EVERY upsert path — tick and poke —
@@ -389,15 +402,19 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, notify
 }
 
 // earlyResetFires is the D8 predicate. With T = prev.SevenDayResetsAt, it fires iff
-// the prior window was genuinely constrained (a pending, limiting 7-day window), the
-// fresh reading reports a moved-later reset epoch (the ONLY accepted "reset observed"
-// signal — a lone pct drop with an unchanged resets_at must NOT fire), and now is
-// strictly more than earlyResetThreshold before T. It returns T as the expected reset.
+// a prior pending 7-day reset exists (T set AND in the future relative to
+// prev.SyncedAt), now is strictly more than earlyResetThreshold before T, and the
+// reset is observed by EITHER Arm A (the fresh reset epoch moved strictly more than
+// resetEpochMoveMargin past T — the rolling-boundary model) OR Arm B (the 7-day
+// used% dropped from >= pctResetFloor to <= pctResetCeil with an unmoved boundary —
+// the fixed-grid model). The prior "was limiting" gate is gone (PRD #1114): the two
+// arms' jitter margins replace the false-positive protection it provided. It returns
+// T as the expected reset.
 func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic.Reading, now time.Time) (bool, time.Time) {
 	if !hasPrev {
 		return false, time.Time{}
 	}
-	// was constrained: prev.SevenDayResetsAt set AND a genuine pending reset (in the
+	// pending reset: prev.SevenDayResetsAt set AND a genuine pending reset (in the
 	// future relative to prev.SyncedAt).
 	if !prev.SevenDayResetsAt.Valid || !prev.SyncedAt.Valid {
 		return false, time.Time{}
@@ -406,16 +423,20 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 	if !t.After(prev.SyncedAt.Time) {
 		return false, time.Time{}
 	}
-	// window was limiting: a limit_report source, or a pct at/above exhaustionPct.
-	limiting := prev.Source.Valid && prev.Source.String == anthropic.SourceLimitReport
-	if !limiting && prev.SevenDayPct.Valid && int(prev.SevenDayPct.Int16) >= exhaustionPct {
-		limiting = true
-	}
-	if !limiting {
-		return false, time.Time{}
-	}
-	// reset observed (moved epoch): next.SevenDay.ResetsAt set AND strictly after T.
-	if next.SevenDay.ResetsAt == nil || !next.SevenDay.ResetsAt.After(t) {
+	// Arm A — boundary moved forward (rolling model): the fresh reset epoch is set
+	// AND strictly more than resetEpochMoveMargin past T.
+	armA := next.SevenDay.ResetsAt != nil && next.SevenDay.ResetsAt.After(t.Add(resetEpochMoveMargin))
+	// Arm B — utilization zeroed ahead of schedule (fixed-grid model): the fresh 7-day
+	// reset epoch is PRESENT and unmoved (== T, i.e. the fixed grid did not shift — a
+	// forward move past the margin is Arm A's domain, and a nil, sub-margin, or backward
+	// boundary is jitter-ambiguous and must not fire here), AND prior 7-day used% >=
+	// pctResetFloor while the fresh used% <= pctResetCeil.
+	armB := next.SevenDay.ResetsAt != nil &&
+		next.SevenDay.ResetsAt.Equal(t) &&
+		prev.SevenDayPct.Valid &&
+		int(prev.SevenDayPct.Int16) >= pctResetFloor &&
+		next.SevenDay.Pct <= pctResetCeil
+	if !armA && !armB {
 		return false, time.Time{}
 	}
 	// early: now strictly before T - threshold (exactly -threshold is NOT early).

@@ -60,9 +60,8 @@ func TestSteerBarIsSuppressedAndInertForANonOwner(t *testing.T) {
 	runID := "r-observed"
 	fake := &uzicli.FakeClient{}
 	m := tuiTestModel(t, fake, runID)
-	next, _ := m.Update(detailLoadedMsg{run: ownedRun(runID)})
-	m = next.(tuiModel)
-	next, _ = m.Update(runInputsMsg{runID: runID, err: notOwnerErr()})
+	m = applyDetail(m, ownedRun(runID), nil)
+	next, _ := m.Update(runInputsMsg{runID: runID, err: notOwnerErr()})
 	m = next.(tuiModel)
 
 	if m.detail.steer.access != steerNotOwner {
@@ -92,10 +91,9 @@ func TestSteerBarIsSuppressedAndInertForANonOwner(t *testing.T) {
 func TestSteerBarSuppressedForChatRuns(t *testing.T) {
 	runID := "r-chat"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "chat", Status: "running"}})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: runID, Kind: "chat", Status: "running"}, nil)
 	// Owner: the inputs call SUCCEEDS, so only the chat-kind rule can suppress it.
-	next, _ = m.Update(runInputsMsg{runID: runID})
+	next, _ := m.Update(runInputsMsg{runID: runID})
 	m = next.(tuiModel)
 
 	if m.detail.steer.access != steerChatRun {
@@ -178,9 +176,8 @@ func TestSteerFollowUpSubmits(t *testing.T) {
 func ownerModel(t *testing.T, c uzicli.Client, runID string, run apitypes.RunDTO) tuiModel {
 	t.Helper()
 	m := tuiTestModel(t, c, runID)
-	next, _ := m.Update(detailLoadedMsg{run: run})
-	m = next.(tuiModel)
-	next, _ = m.Update(runInputsMsg{runID: runID})
+	m = applyDetail(m, run, nil)
+	next, _ := m.Update(runInputsMsg{runID: runID})
 	m = next.(tuiModel)
 	if m.detail.steer.access != steerAllowed {
 		t.Fatalf("fixture is wrong: access = %v, want steerAllowed", m.detail.steer.access)
@@ -416,11 +413,10 @@ func TestSteerBarSuppressedOnATerminalRun(t *testing.T) {
 
 			fake := &uzicli.FakeClient{}
 			m := tuiTestModel(t, fake, runID)
-			next, _ := m.Update(detailLoadedMsg{run: run})
-			m = next.(tuiModel)
+			m = applyDetail(m, run, nil)
 			// The ownership probe SUCCEEDS — the caller does own it — so only the
 			// terminal-status rule can suppress the bar.
-			next, _ = m.Update(runInputsMsg{runID: runID})
+			next, _ := m.Update(runInputsMsg{runID: runID})
 			m = next.(tuiModel)
 
 			if m.detail.steer.access != steerTerminal {
@@ -462,11 +458,10 @@ func TestSteerBarSuppressedOnATerminalRun(t *testing.T) {
 func TestSteerUnknownIsRetriedOnAStateFrame(t *testing.T) {
 	runID := "r-blip"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	next, _ := m.Update(detailLoadedMsg{run: ownedRun(runID)})
-	m = next.(tuiModel)
+	m = applyDetail(m, ownedRun(runID), nil)
 
 	// A transport failure: not evidence about ownership, so the bar fails closed.
-	next, _ = m.Update(runInputsMsg{runID: runID, err: uzicli.Exitf(uzicli.ExitUnreachable, "connection refused")})
+	next, _ := m.Update(runInputsMsg{runID: runID, err: uzicli.Exitf(uzicli.ExitUnreachable, "connection refused")})
 	m = next.(tuiModel)
 	if m.detail.steer.access != steerUnknown {
 		t.Fatalf("access after a transport failure = %v, want steerUnknown (fail closed)", m.detail.steer.access)

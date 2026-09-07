@@ -46,9 +46,10 @@ func TestCIAutofixLiveDB(t *testing.T) {
 	defer pool.Close()
 	q := store.New(pool)
 
-	// Three owners: u1 opted in WITH a token (eligible), u2 opted OUT (with a token),
-	// u3 opted in but with NO token. Only u1's branches can be candidates.
-	u1, u2, u3 := uuid.New(), uuid.New(), uuid.New()
+	// Four owners: u1 opted in WITH a token (eligible), u2 opted OUT (with a token),
+	// u3 opted in but with NO token, u4 whose ci_autofix_enabled is NULL (inherit)
+	// WITH a token. u1's and u4's branches can be candidates.
+	u1, u2, u3, u4 := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	connID, repoID := uuid.New(), uuid.New()
 	for _, u := range []struct {
 		id      uuid.UUID
@@ -57,9 +58,16 @@ func TestCIAutofixLiveDB(t *testing.T) {
 		mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash, ci_autofix_enabled) VALUES ($1, $2, 'x', $3)`,
 			u.id, fmt.Sprintf("autofix-%s@e2e", u.id), u.enabled)
 	}
-	// u1 and u2 have an anthropic token; u3 does not.
+	// PRD #914: u4 OMITS ci_autofix_enabled entirely, so post-00190 (DROP DEFAULT,
+	// nullable) it is NULL = inherit the admin global default (ON). u4 proves the
+	// candidate gate is `IS NOT FALSE`: a NULL owner is INCLUDED, unlike u2's explicit
+	// false. Do NOT add u4 to the enabled-bool loop above.
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		u4, fmt.Sprintf("autofix-%s@e2e", u4))
+	// u1, u2, and u4 have an anthropic token; u3 does not.
 	mustExec(ctx, t, pool, `INSERT INTO user_secrets (user_id, kind, ciphertext, label) VALUES ($1, 'anthropic_token', $2, 'default')`, u1, []byte{0x1})
 	mustExec(ctx, t, pool, `INSERT INTO user_secrets (user_id, kind, ciphertext, label) VALUES ($1, 'anthropic_token', $2, 'default')`, u2, []byte{0x1})
+	mustExec(ctx, t, pool, `INSERT INTO user_secrets (user_id, kind, ciphertext, label) VALUES ($1, 'anthropic_token', $2, 'default')`, u4, []byte{0x1})
 
 	mustExec(ctx, t, pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
@@ -149,11 +157,18 @@ func TestCIAutofixLiveDB(t *testing.T) {
 	insertRun(u3, "self_improve", u3SelfImproveBranch, 7, iid(107), "1 hour")
 	insertPipeline(u3SelfImproveBranch, 9007, "failed")
 
+	// PRD #914: u4 (ci_autofix_enabled NULL = inherit → ON) proves the candidate gate is
+	// `IS NOT FALSE`: an inherit-default owner is INCLUDED, exactly as u2's explicit false
+	// is EXCLUDED. An eligible issue run on an agent-MR branch with a FAILED pipeline.
+	insertRun(u4, "issue", "agent/issue-9", 9, iid(109), "1 hour")
+	insertPipeline("agent/issue-9", 9009, "failed")
+
 	// ── ListCIAutofixCandidateRefs: the exact eligible SET ──
-	// Eligible now = agent/issue-1 (issue lane) + u1's two scheduled-lane branches. Every
-	// other seed is excluded by a specific gate (default-branch, mr_iid, green pipeline,
-	// owner opt-out, missing token). Assert the exact set by branch name — precise, not a
-	// bare count — so a stray candidate or a missing one both fail.
+	// Eligible now = agent/issue-1 (issue lane) + u1's two scheduled-lane branches +
+	// agent/issue-9 (u4, ci_autofix_enabled NULL = inherit → ON under the IS NOT FALSE
+	// gate). Every other seed is excluded by a specific gate (default-branch, mr_iid,
+	// green pipeline, owner opt-out, missing token). Assert the exact set by branch name —
+	// precise, not a bare count — so a stray candidate or a missing one both fail.
 	cands, err := q.ListCIAutofixCandidateRefs(ctx, repoID)
 	if err != nil {
 		t.Fatalf("ListCIAutofixCandidateRefs: %v", err)
@@ -162,7 +177,9 @@ func TestCIAutofixLiveDB(t *testing.T) {
 	for _, cand := range cands {
 		gotRefs[cand.Ref.String] = true
 	}
-	wantRefs := []string{"agent/issue-1", selfImproveBranch, promptBranch}
+	// agent/issue-9 (u4, NULL) proves inherit→included under IS NOT FALSE; u2's
+	// explicit-false branch proves false→excluded.
+	wantRefs := []string{"agent/issue-1", selfImproveBranch, promptBranch, "agent/issue-9"}
 	if len(cands) != len(wantRefs) {
 		t.Fatalf("want exactly %d candidates %v, got %d: %+v", len(wantRefs), wantRefs, len(cands), cands)
 	}

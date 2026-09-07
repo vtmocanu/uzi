@@ -304,7 +304,7 @@ func TestProvisionHostedWorkerCoWriteLiveDB(t *testing.T) {
 		t.Fatalf("docker_enabled = %+v on the provisioned row, want an explicit true", wkr.DockerEnabled)
 	}
 
-	resp, err := hostedsvc.New(q, box).Poll(ctx)
+	resp, err := hostedsvc.New(q, box, time.Now, time.Hour).Poll(ctx)
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
@@ -413,7 +413,7 @@ func TestDeleteHostedWorkerCascadesPendingTokenLiveDB(t *testing.T) {
 	// SET, so a vanished row IS the teardown cue (Decision 9/11) — there is no delete
 	// signal on the wire, which is exactly why this has to be asserted rather than
 	// assumed.
-	resp, err := hostedsvc.New(q, box).Poll(ctx)
+	resp, err := hostedsvc.New(q, box, time.Now, time.Hour).Poll(ctx)
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
@@ -428,6 +428,89 @@ func TestDeleteHostedWorkerCascadesPendingTokenLiveDB(t *testing.T) {
 	if _, err := h.provisionHostedWorker(ctx, userID, "replacement", "base", "m", false, 2); err != nil {
 		t.Fatalf("reprovision after delete: %v", err)
 	}
+}
+
+// TestProvisionHostedWorkerBindModeLiveDB pins PRD #1140 M1 for the HOSTED provision
+// path against real Postgres: a freshly provisioned hosted worker defaults to
+// anthropic_bind_mode 'auto' ONLY when its owner has a non-empty auto-select pool
+// (≥1 auto_eligible anthropic_token), and 'default' otherwise. There is no label input
+// on this route, so the derivation is two-way (auto or default) — no pinned case.
+//
+// It mirrors TestEphemeralProvisionBindModeLiveDB (ephemeral_provisioner_livedb_test.go)
+// for the hosted-provision lane: the handler reads UserHasAutoEligibleAnthropicToken
+// under the same qtx it inserts with and writes the derived mode into
+// CreateHostedWorker's INSERT (D3), so an empty pool never ships an auto worker whose
+// run would then park in pool_wait. The assertion reads wkr.AnthropicBindMode, the
+// effective mode the provision response carries.
+func TestProvisionHostedWorkerBindModeLiveDB(t *testing.T) {
+	insertToken := func(q *store.Queries, ctx context.Context, userID uuid.UUID, label string, first bool) uuid.UUID {
+		t.Helper()
+		row, err := q.InsertUserSecret(ctx, store.InsertUserSecretParams{
+			UserID: userID, Kind: store.KindAnthropicToken, Label: label, WantDefault: first,
+			Ciphertext: []byte("ct-" + label), SealedWith: store.SealedWithMaster,
+		})
+		if err != nil {
+			t.Fatalf("insert token %s: %v", label, err)
+		}
+		return row.ID
+	}
+
+	// An owner with ≥1 auto_eligible token (a born-eligible first token) → non-empty
+	// pool → auto.
+	t.Run("pooled_token_auto", func(t *testing.T) {
+		h, _, q, _, userID := hostedLiveDB(t, "5")
+		ctx := context.Background()
+		insertToken(q, ctx, userID, "default", true)      // first token, born auto_eligible (#804)
+		insertToken(q, ctx, userID, "console-key", false) // a second, non-eligible token; pool still non-empty
+		// Mirrors the ephemeral test's eligible_token_owner_auto: ≥1 auto_eligible token
+		// among several keeps the pool non-empty, so this is a distinct case from the
+		// single-token one below rather than a duplicate of it.
+
+		wkr, err := h.provisionHostedWorker(ctx, userID, "pooled", "base", "m", false, 5)
+		if err != nil {
+			t.Fatalf("provision: %v", err)
+		}
+		if wkr.AnthropicBindMode != workersvc.BindModeAuto {
+			t.Errorf("anthropic_bind_mode = %q, want %q (owner has ≥1 auto_eligible token)", wkr.AnthropicBindMode, workersvc.BindModeAuto)
+		}
+	})
+
+	// An owner whose SOLE token was opted out of the pool → empty pool → default, so the
+	// provisioned worker's run is never parked in pool_wait.
+	t.Run("empty_pool_default", func(t *testing.T) {
+		h, _, q, _, userID := hostedLiveDB(t, "5")
+		ctx := context.Background()
+		tok := insertToken(q, ctx, userID, "default", true) // born eligible, then opted out below
+		if _, err := q.SetUserSecretAutoEligible(ctx, store.SetUserSecretAutoEligibleParams{
+			ID: tok, UserID: userID, Kind: store.KindAnthropicToken, AutoEligible: false,
+		}); err != nil {
+			t.Fatalf("opt token out: %v", err)
+		}
+
+		wkr, err := h.provisionHostedWorker(ctx, userID, "empty", "base", "m", false, 5)
+		if err != nil {
+			t.Fatalf("provision: %v", err)
+		}
+		if wkr.AnthropicBindMode != workersvc.BindModeDefault {
+			t.Errorf("anthropic_bind_mode = %q, want %q (empty auto-select pool must not select auto)", wkr.AnthropicBindMode, workersvc.BindModeDefault)
+		}
+	})
+
+	// A single-token owner, eligible purely via the born-eligible first-token insert (no
+	// toggle) → auto. The headline #804 case: single-token users get auto for free.
+	t.Run("single_born_eligible_auto", func(t *testing.T) {
+		h, _, q, _, userID := hostedLiveDB(t, "5")
+		ctx := context.Background()
+		insertToken(q, ctx, userID, "default", true) // sole token, born auto_eligible via insert
+
+		wkr, err := h.provisionHostedWorker(ctx, userID, "single", "base", "m", false, 5)
+		if err != nil {
+			t.Fatalf("provision: %v", err)
+		}
+		if wkr.AnthropicBindMode != workersvc.BindModeAuto {
+			t.Errorf("anthropic_bind_mode = %q, want %q (single born-eligible token)", wkr.AnthropicBindMode, workersvc.BindModeAuto)
+		}
+	})
 }
 
 // Decision 11's refusal covers hosted workers too, and a refused delete must not

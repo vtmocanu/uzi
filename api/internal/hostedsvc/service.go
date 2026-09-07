@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -18,7 +19,7 @@ import (
 // transaction via WithTx — which is what the provision path (M2) needs in order
 // to insert a worker row and park its sealed token atomically.
 type Store interface {
-	ListHostedWorkersForController(ctx context.Context) ([]store.ListHostedWorkersForControllerRow, error)
+	ListHostedWorkersForController(ctx context.Context, arg store.ListHostedWorkersForControllerParams) ([]store.ListHostedWorkersForControllerRow, error)
 	UpsertHostedWorkerToken(ctx context.Context, arg store.UpsertHostedWorkerTokenParams) error
 	MarkHostedWorkerTokenDelivered(ctx context.Context, arg store.MarkHostedWorkerTokenDeliveredParams) (int64, error)
 	CordonHostedWorker(ctx context.Context, id uuid.UUID) (int64, error)
@@ -35,6 +36,12 @@ type ExpiryStore interface {
 	ExpirePendingHostedWorkerTokens(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 }
 
+// diskPressureMinStreak is the debounce: the poll declares disk_pressure only when a
+// worker has reported an over-threshold volume on at least this many CONSECUTIVE fresh
+// heartbeats (PRD #837 M4). 2 is the smallest value that rejects a single spike; the SQL
+// takes it as @disk_pressure_min_streak so the constant lives here beside its meaning.
+const diskPressureMinStreak = 2
+
 // Service is the api's half of the controller protocol.
 type Service struct {
 	q Store
@@ -42,10 +49,20 @@ type Service struct {
 	// as every other secret at rest; rotating it invalidates pending tokens, which
 	// for a buffer that lives minutes is a non-event.
 	box *secretbox.Box
+	// now + heartbeatStale build the poll's freshness cutoff (PRD #837 M4): a worker's
+	// derived disk_pressure is gated on last_heartbeat_at >= now()-heartbeatStale, the
+	// SAME staleness bound the claim path uses, so a silent worker cannot keep asserting
+	// pressure off a frozen streak. now is a seam for tests.
+	now            func() time.Time
+	heartbeatStale time.Duration
 }
 
-// New constructs a Service.
-func New(q Store, box *secretbox.Box) *Service { return &Service{q: q, box: box} }
+// New constructs a Service. now is the clock seam (production passes time.Now) and
+// heartbeatStale is the worker-staleness bound the poll's disk_pressure freshness gate
+// reuses (WORKER_HEARTBEAT_STALE).
+func New(q Store, box *secretbox.Box, now func() time.Time, heartbeatStale time.Duration) *Service {
+	return &Service{q: q, box: box, now: now, heartbeatStale: heartbeatStale}
+}
 
 // tokenAAD is the additional authenticated data every pending join token is
 // sealed under (secretbox.SealWithAAD, whose doc names exactly this use: "so a
@@ -163,7 +180,13 @@ func ExpirePendingTokens(ctx context.Context, q ExpiryStore, ttl time.Duration) 
 // proved it holds the token, or whose buffer expired unread, gets a nil JoinToken
 // and is reconciled without one.
 func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
-	rows, err := s.q.ListHostedWorkersForController(ctx)
+	rows, err := s.q.ListHostedWorkersForController(ctx, store.ListHostedWorkersForControllerParams{
+		DiskPressureMinStreak: diskPressureMinStreak,
+		// The freshness cutoff for the disk_pressure derivation: now()-heartbeatStale, the
+		// SAME staleness bound the claim path builds its @heartbeat_cutoff from
+		// (workersvc: s.now().Add(-s.p.WorkerHeartbeatStale)).
+		HeartbeatCutoff: pgconv.Time(s.now().Add(-s.heartbeatStale)),
+	})
 	if err != nil {
 		return PollResponse{}, fmt.Errorf("hostedsvc: list hosted workers: %w", err)
 	}
@@ -183,6 +206,12 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			// cordon timestamp, mapped from pgtype.Timestamptz to *time.Time below (nil == not
 			// draining) so the stateless controller can compute how long it has been draining.
 			Busy: row.Busy,
+			// disk_pressure/ephemeral feed the controller's M4 roll-vs-teardown decision for a
+			// disk-pressured worker (PRD #837). DiskPressure is the debounced, freshness-gated
+			// SQL derivation (streak>=2 AND fresh); Ephemeral is the raw column. Both are plain
+			// SQL booleans, mapped straight through.
+			DiskPressure: row.DiskPressure,
+			Ephemeral:    row.Ephemeral,
 		}
 		if row.DrainingSince.Valid {
 			t := row.DrainingSince.Time

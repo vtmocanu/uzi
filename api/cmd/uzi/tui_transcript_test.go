@@ -109,7 +109,8 @@ func TestRebuildPreservesSelectionByKey(t *testing.T) {
 	now := time.Now()
 	d := newDetailState("dddd1111-2222")
 	d.run = apitypes.RunDTO{Status: "running"}
-	d.loaded = true
+	d.runLoaded = true
+	d.tailLoaded = true
 	d.addFrame(laneFrame{Seq: 1, Kind: "text", Agent: "lead", CreatedAt: now})
 	d.rebuild()
 	if len(d.lanes) != 1 || d.lanes[d.laneIdx].Key != laneLead {

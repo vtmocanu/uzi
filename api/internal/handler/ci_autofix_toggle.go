@@ -6,14 +6,19 @@ import (
 	"net/http"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// setCIAutofixRequest carries the tri-state CI-autofix opt-in (PRD #914 M3).
+// Enabled is a pointer so the three wire shapes stay distinct: `true` = explicit
+// on, `false` = explicit off, and omitted/`null` (a nil pointer) = clear to
+// inherit — i.e. SET NULL, falling back to the admin global default (on).
 type setCIAutofixRequest struct {
-	Enabled bool `json:"enabled"`
+	Enabled *bool `json:"enabled"`
 }
 
 // SetCIAutofixEnabled flips the CURRENT user's automatic CI-fix opt-in (PRD #71).
@@ -34,7 +39,7 @@ func (h *Handler) SetCIAutofixEnabled(w http.ResponseWriter, r *http.Request) {
 	}
 	updated, err := h.q.SetUserCIAutofixEnabled(r.Context(), store.SetUserCIAutofixEnabledParams{
 		ID:               user.ID,
-		CiAutofixEnabled: req.Enabled,
+		CiAutofixEnabled: pgtype.Bool{Valid: req.Enabled != nil, Bool: req.Enabled != nil && *req.Enabled},
 	})
 	if err != nil {
 		slog.Error("set ci autofix enabled", "error", err)
@@ -62,7 +67,7 @@ func (h *Handler) SetUserCIAutofixEnabled(w http.ResponseWriter, r *http.Request
 	}
 	updated, err := h.q.SetUserCIAutofixEnabled(r.Context(), store.SetUserCIAutofixEnabledParams{
 		ID:               id,
-		CiAutofixEnabled: req.Enabled,
+		CiAutofixEnabled: pgtype.Bool{Valid: req.Enabled != nil, Bool: req.Enabled != nil && *req.Enabled},
 	})
 	if err != nil {
 		// A no-op UPDATE (unknown id) returns no row → 404; anything else is a real

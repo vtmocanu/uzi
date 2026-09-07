@@ -574,6 +574,7 @@ type Store interface {
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
 	ListRunMessagesAfterPage(ctx context.Context, arg store.ListRunMessagesAfterPageParams) ([]store.RunMessage, error)
+	ListRunMessagesBeforePage(ctx context.Context, arg store.ListRunMessagesBeforePageParams) ([]store.RunMessage, error)
 	// UpsertRunUsage folds a delivered result frame's per-model usage into
 	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
 	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
@@ -648,6 +649,12 @@ type Store interface {
 	// user_id-scoped chat read surface.
 	CreateIssueProposal(ctx context.Context, arg store.CreateIssueProposalParams) (store.IssueProposal, error)
 	CountPendingProposalsForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	// PRD #929 M2: the server-side proposal-filing path (scheduled issues-mode prompt
+	// runs). GetRunSchedule resolves the firing schedule's target/slug/output_mode;
+	// StampFiledProposal settles the audit row (pending → confirmed + iid) with no
+	// status guard, since the api both inserts the row and files the issue.
+	GetRunSchedule(ctx context.Context, id uuid.UUID) (store.RunSchedule, error)
+	StampFiledProposal(ctx context.Context, arg store.StampFiledProposalParams) (int64, error)
 	ClaimProposalForConfirm(ctx context.Context, arg store.ClaimProposalForConfirmParams) (store.ClaimProposalForConfirmRow, error)
 	RevertProposalToPending(ctx context.Context, id uuid.UUID) (int64, error)
 	SweepStuckConfirmingProposals(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error)
@@ -686,15 +693,19 @@ type Store interface {
 	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
+	// UserHasAutoEligibleAnthropicToken reports whether the owner has ≥1 auto_eligible
+	// anthropic_token (a non-empty auto-select pool). CreateWorker reads it to derive a
+	// new worker's bind mode the #804 way (PRD #1140 M1): no label + non-empty pool → auto.
+	UserHasAutoEligibleAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
-	// Judge-lane → token binding (PRD #104 M4): read at judge-claim time, written by
-	// PUT /api/me/judge.
-	GetUserJudgeAnthropicSecret(ctx context.Context, id uuid.UUID) (pgtype.UUID, error)
-	SetUserJudgeAnthropicSecret(ctx context.Context, arg store.SetUserJudgeAnthropicSecretParams) (store.User, error)
+	// Judge-lane bind mode + pointer (PRD #104 M4, three-valued per PRD #1140 M2): read
+	// at judge-claim time, written by PUT /api/me/judge in one statement (D6).
+	GetUserJudgeAnthropicBinding(ctx context.Context, id uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error)
+	SetUserJudgeAnthropicBinding(ctx context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// Per-user default reasoning effort (PRD #617): read at issue- and chat-run
-	// claim assembly, keyed on the run owner. NULL ⇒ inherit (worker omits the SDK
-	// effort key, so the SDK default `high` applies).
+	// claim assembly, keyed on the run owner. NULL ⇒ inherit, resolved to the uzi
+	// default `xhigh` at claim assembly (issue #1157).
 	GetUserDefaultEffort(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// Per-user AI-attribution opt-out (issue #916): read LIVE at standard run-claim
 	// assembly, keyed on the run owner, so flipping the toggle takes effect on the
@@ -747,7 +758,13 @@ type Params struct {
 	QuestionTimeoutSeconds int
 	RunMaxRequeues         int
 	WorkerHeartbeatStale   time.Duration
-	WorkerAffinityGrace    time.Duration
+	// DiskPressureThreshold (PRD #837 M4, UZI_DISK_PRESSURE_THRESHOLD) is the used/total
+	// fraction in (0,1] at/above which a self-reported disk volume counts as "over
+	// threshold" for one heartbeat. Heartbeat feeds it to diskOverThreshold, which drives
+	// the debounced stats_disk_pressure_streak the poll derives disk_pressure from. Purely
+	// a display/lifecycle tuning knob — it never gates claim or scheduling.
+	DiskPressureThreshold float64
+	WorkerAffinityGrace   time.Duration
 	// WorkerAffinityCeiling (PRD #628 D3a): the run-lane affinity ceiling. ClaimRun pins
 	// a promoted run to its prior worker only while that worker is a live, non-draining
 	// claim target (the liveness leg); this ceiling bounds the live-but-wedged case. It is
@@ -1245,6 +1262,13 @@ type WorkerStats struct {
 	MemLimit *int64
 	// Source is the validated enum: "cgroup" or "process".
 	Source string
+	// Disk usage per volume (PRD #837 M1), each nil when the worker's statfs failed or
+	// the mount was absent. Used and total bytes for the /nix and data volumes; a nil
+	// pointer writes NULL, exactly like the mem fields. Display-only, same as the rest.
+	DiskNixBytes       *int64
+	DiskNixTotalBytes  *int64
+	DiskDataBytes      *int64
+	DiskDataTotalBytes *int64
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
@@ -1257,8 +1281,29 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		arg.StatsMemBytes = pgtype.Int8{Int64: stats.MemBytes, Valid: true}
 		arg.StatsMemLimitBytes = pgconv.Int8Ptr(stats.MemLimit)
 		arg.StatsSource = pgconv.TextOrNull(stats.Source)
+		arg.StatsDiskNixBytes = pgconv.Int8Ptr(stats.DiskNixBytes)
+		arg.StatsDiskNixTotalBytes = pgconv.Int8Ptr(stats.DiskNixTotalBytes)
+		arg.StatsDiskDataBytes = pgconv.Int8Ptr(stats.DiskDataBytes)
+		arg.StatsDiskDataTotalBytes = pgconv.Int8Ptr(stats.DiskDataTotalBytes)
+		// Disk-pressure debounce input (PRD #837 M4): whether THIS sample crossed the
+		// threshold. HeartbeatWorker increments the streak when true and resets it to 0
+		// when false; a nil stats leaves this false, which correctly resets the streak
+		// (the tick carried no evidence of pressure).
+		arg.DiskOverThreshold = diskOverThreshold(stats, s.p.DiskPressureThreshold)
 	}
 	return s.q.HeartbeatWorker(ctx, arg)
+}
+
+// diskOverThreshold: any reported volume at/above threshold. >= pins the comparator
+// (0.90 fires, 0.899 does not). nil pair or non-positive total => not over (no div-by-zero).
+func diskOverThreshold(stats *WorkerStats, threshold float64) bool {
+	over := func(used, total *int64) bool {
+		if used == nil || total == nil || *total <= 0 {
+			return false
+		}
+		return float64(*used)/float64(*total) >= threshold
+	}
+	return over(stats.DiskNixBytes, stats.DiskNixTotalBytes) || over(stats.DiskDataBytes, stats.DiskDataTotalBytes)
 }
 
 // Claim atomically claims the oldest claimable run for the worker's user and
@@ -1735,6 +1780,17 @@ type StateRequest struct {
 	// clampWireReportMd / clampWireReportOnly. Absent on a normal MR completion.
 	ReportOnly *bool   `json:"report_only"`
 	ReportMd   *string `json:"report_md"`
+	// Proposal (PRD #929 M2) carries a scheduled issues-mode prompt run's structured
+	// idea — a title + body — that the SERVER files as a forge issue on run completion
+	// (Design C: the agent gains no forge-write tool; the api does the writing). It is a
+	// DECLARATION by an untrusted worker on the terminal `completed` report, kind-gated
+	// (prompt/scheduled runs only) and clamped server-side (control-char stripped,
+	// secret-scrubbed, length-bounded — see clampWireProposal) before it is filed.
+	// Absent (nil) on every normal completion and on a no-proposal no-op run, so an old
+	// worker's payload and a new worker's plain completion stay byte-identical on the
+	// wire. httpx.DecodeJSON rejects unknown fields, so this field MUST exist here or a
+	// new worker's report 400s.
+	Proposal *ProposalPayload `json:"proposal"`
 	// ScopeCapped (PRD #634 M3) is the worker's DECLARATION on the terminal `completed`
 	// report that an operator scope directive truncated the run at the loop top — the run
 	// finalized the already-committed slice and started no further milestone. The server
@@ -1865,6 +1921,15 @@ type StateRequest struct {
 	RequiredCapabilities *[]string `json:"required_capabilities"`
 	RequiredTools        *[]string `json:"required_tools"`
 	SizeClass            *string   `json:"size_class"`
+}
+
+// ProposalPayload is the structured idea a scheduled issues-mode prompt run emits on
+// its terminal `completed` report (PRD #929 M2). The server files it as a forge issue
+// via clampWireProposal → maybeFileProposal. Both fields are untrusted worker output
+// and are control-char-stripped, secret-scrubbed and length-bounded before filing.
+type ProposalPayload struct {
+	Title string `json:"title"`
+	Body  string `json:"body"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -2181,6 +2246,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// PRD #46 Decision 2: enqueue a judge on the COMMITTED terminal transition
 		// (rows>0), not the lossy notify seam. Best-effort — never fails the report.
 		s.maybeEnqueueJudge(ctx, run)
+		// PRD #929 M2: file a scheduled issues-mode prompt run's proposal as a forge
+		// issue on this same committed completion. The worker's proposal is untrusted, so
+		// it is clamped (kind-gated + control-char-stripped + secret-scrubbed + bounded)
+		// at the call site with the re-read run before filing. Best-effort — like the
+		// judge it must NEVER fail the worker's terminal report (maybeFileProposal
+		// log-and-returns on every failure).
+		s.maybeFileProposal(ctx, run, clampWireProposal(run, req.Proposal))
 		// PRD #400 M4a: auto-create a diff-review run for a just-completed --review task,
 		// on the SAME committed transition. Best-effort — never fails the report.
 		s.maybeEnqueueTaskReview(ctx, run)
@@ -3007,9 +3079,26 @@ func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, temp
 	// silently dead. Deriving it here rather than defaulting it in SQL is the same
 	// rule PatchWorker applies and the same one 00088's backfill applied to existing
 	// rows: a resolved label is `pinned`, its absence is `default`.
+	//
+	// The pool read (PRD #1140 M1) is the SECOND input to that same derivation, making
+	// every worker create path agree with the #804 ephemeral path (ephemeral.go:263):
+	// a resolved label is `pinned` regardless of the pool; its absence is `auto` when
+	// the owner has ≥1 auto_eligible anthropic_token (a non-empty auto-select pool),
+	// else `default`. So a pooled-up owner's new worker spends the pool by default
+	// instead of the owner's single default token, and it never parks a run in
+	// pool_wait because `auto` is only chosen when the pool is non-empty.
 	bindMode := BindModeDefault
-	if secretID.Valid {
+	switch {
+	case secretID.Valid:
 		bindMode = BindModePinned
+	default:
+		hasPool, err := s.q.UserHasAutoEligibleAnthropicToken(ctx, userID)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		if hasPool {
+			bindMode = BindModeAuto
+		}
 	}
 	// templateDeclared is the UI-chosen worker template (PRD #18), validated
 	// against the registry by the caller; empty → NULL (no choice made).
@@ -3101,15 +3190,27 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 	return wkr, nil
 }
 
-// SetUserJudgeToken points the user's JUDGE lane at one of their own Anthropic
-// credentials, or clears it back to their default when secretID is nil (PRD #104
-// M4). Per-user, not per-worker: which credential reviews your work is a property
-// of you, not of whichever worker claims the retrospective.
+// SetUserJudgeBinding sets the user's JUDGE-lane bind MODE and pointer in one write
+// (PRD #104 M4, three-valued per PRD #1140 M2, D6), mirroring SetWorkerAnthropicToken's
+// rules: 'pinned' requires an owned secret; 'default' and 'auto' carry no id and write
+// NULL. Per-user, not per-worker: which credential reviews your work is a property of
+// you, not of whichever worker claims the retrospective. A 'default' user spends their
+// default token; an 'auto' user has the judge lane run the same pool ranker the run
+// lane uses, falling to the default only when the pool is genuinely empty (D4).
 //
 // Ownership is checked here so the caller gets a 404 rather than a constraint
 // violation; 00079's composite FK refuses the same binding independently, and is
 // the layer that holds if this check is ever bypassed (D11).
-func (s *Service) SetUserJudgeToken(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) (store.User, error) {
+func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mode string, secretID *uuid.UUID) (store.User, error) {
+	if !ValidBindMode(mode) {
+		return store.User{}, ErrInvalidBindMode
+	}
+	// A non-pinned mode never carries an id (the same rule SetWorkerAnthropicToken
+	// enforces): 'default' and 'auto' resolve without a pointer, so a stale id left
+	// beside them cannot leak into a claim.
+	if mode != BindModePinned {
+		secretID = nil
+	}
 	var bind pgtype.UUID
 	if secretID != nil {
 		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
@@ -3123,8 +3224,9 @@ func (s *Service) SetUserJudgeToken(ctx context.Context, userID uuid.UUID, secre
 		}
 		bind = pgconv.UUID(*secretID)
 	}
-	return s.q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
+	return s.q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
 		ID:                     userID,
+		JudgeAnthropicBindMode: mode,
 		JudgeAnthropicSecretID: bind,
 	})
 }
@@ -3685,6 +3787,25 @@ func (s *Service) ListRunMessagesForViewerPage(ctx context.Context, userID uuid.
 		return nil, err
 	}
 	return s.q.ListRunMessagesAfterPage(ctx, store.ListRunMessagesAfterPageParams{RunID: runID, AfterSeq: afterSeq, Lim: limit})
+}
+
+// ListRunMessagesForViewerBefore returns the newest <= limit messages with
+// seq < beforeSeq, in ASCENDING seq order (the store query returns DESC; the
+// reverse happens here, not in SQL — keeps the row store.RunMessage). Same
+// owner-or-admin gate as the sibling. Caller clamps limit.
+func (s *Service) ListRunMessagesForViewerBefore(ctx context.Context, userID uuid.UUID, isAdmin bool, runID uuid.UUID, beforeSeq int32, limit int32) ([]store.RunMessage, error) {
+	if _, err := s.GetRunForViewer(ctx, userID, isAdmin, runID); err != nil {
+		return nil, err
+	}
+	rows, err := s.q.ListRunMessagesBeforePage(ctx, store.ListRunMessagesBeforePageParams{RunID: runID, BeforeSeq: beforeSeq, Lim: limit})
+	if err != nil {
+		return nil, err
+	}
+	// reverse DESC -> ASC in place
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	return rows, nil
 }
 
 // ListRunsForUser returns the user's runs (newest first) with repo path and

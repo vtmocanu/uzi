@@ -34,6 +34,11 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 2254857830, // 2.1 GiB
     stats_mem_limit_bytes: 4294967296, // 4 GiB → ~52%
     stats_source: "cgroup",
+    // Both volumes reported at a normal level → two "Disk /nix" + "Disk /data" bars.
+    stats_disk_nix_bytes: 7623566950, // 7.1 GiB
+    stats_disk_nix_total_bytes: 21474836480, // 20 GiB → ~35%
+    stats_disk_data_bytes: 3221225472, // 3 GiB
+    stats_disk_data_total_bytes: 10737418240, // 10 GiB → 30%
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -66,6 +71,11 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 1610612736, // 1.5 GiB
     stats_mem_limit_bytes: 2147483648, // 2 GiB → 75%
     stats_source: "cgroup",
+    // /nix nearly full (danger tone, ≥85%), /data mid — both dimmed (offline).
+    stats_disk_nix_bytes: 19327352832, // 18 GiB
+    stats_disk_nix_total_bytes: 21474836480, // 20 GiB → 90% (danger)
+    stats_disk_data_bytes: 4294967296, // 4 GiB
+    stats_disk_data_total_bytes: 10737418240, // 10 GiB → 40% (warn)
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -114,6 +124,11 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: null,
     stats_mem_limit_bytes: null,
     stats_source: null,
+    // No sample at all → no disk either (all four null → no disk section renders).
+    stats_disk_nix_bytes: null,
+    stats_disk_nix_total_bytes: null,
+    stats_disk_data_bytes: null,
+    stats_disk_data_total_bytes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -146,6 +161,12 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 503316480, // 480 MiB
     stats_mem_limit_bytes: null, // unlimited/unknown → no bar
     stats_source: "process",
+    // Process-source host reports only its writable /data volume (single-volume layout:
+    // one "Disk /data" bar, no "Disk /nix"). /nix left null → not rendered.
+    stats_disk_nix_bytes: null,
+    stats_disk_nix_total_bytes: null,
+    stats_disk_data_bytes: 6442450944, // 6 GiB
+    stats_disk_data_total_bytes: 17179869184, // 16 GiB → ~37%
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -186,6 +207,11 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 1181116006, // 1.1 GiB
     stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
     stats_source: "cgroup",
+    // Both volumes reported at a comfortable level.
+    stats_disk_nix_bytes: 12884901888, // 12 GiB
+    stats_disk_nix_total_bytes: 21474836480, // 20 GiB → 60%
+    stats_disk_data_bytes: 2147483648, // 2 GiB
+    stats_disk_data_total_bytes: 10737418240, // 10 GiB → 20%
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -222,6 +248,11 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 1181116006, // 1.1 GiB
     stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
     stats_source: "cgroup",
+    // Both volumes reported, /nix warm.
+    stats_disk_nix_bytes: 9663676416, // 9 GiB
+    stats_disk_nix_total_bytes: 21474836480, // 20 GiB → 45%
+    stats_disk_data_bytes: 5368709120, // 5 GiB
+    stats_disk_data_total_bytes: 10737418240, // 10 GiB → 50%
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -254,6 +285,11 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 1181116006, // 1.1 GiB
     stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
     stats_source: "cgroup",
+    // Both volumes reported at a low level.
+    stats_disk_nix_bytes: 5368709120, // 5 GiB
+    stats_disk_nix_total_bytes: 17179869184, // 16 GiB → ~31%
+    stats_disk_data_bytes: 3221225472, // 3 GiB
+    stats_disk_data_total_bytes: 10737418240, // 10 GiB → 30%
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
@@ -293,6 +329,11 @@ export const mockAdminWorkers: AdminWorker[] = [
     stats_mem_bytes: 8160437862, // 7.6 GiB
     stats_mem_limit_bytes: 8589934592, // 8 GiB → 95%
     stats_source: "cgroup",
+    // Near-full /nix (danger tone, ≥85%) alongside a busy /data → matches the tight box.
+    stats_disk_nix_bytes: 19864223744, // 18.5 GiB
+    stats_disk_nix_total_bytes: 21474836480, // 20 GiB → ~93% (danger)
+    stats_disk_data_bytes: 8589934592, // 8 GiB
+    stats_disk_data_total_bytes: 10737418240, // 10 GiB → 80% (warn)
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",

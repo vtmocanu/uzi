@@ -429,6 +429,7 @@ Tracked as GitLab issue vtmocanu/uzi#53; PRD at `prds/done/53-rate-limits.md`.
 - Server polls with the user's own token; the token never leaves the api container — SPA sees only percentages.
 - The header-probe fallback spends ~1 token/interval of the user's own quota; operators can disable the probe (`UZI_USAGE_PROBE=false`) or the whole poller (`UZI_USAGE_POLL_INTERVAL=0`).
 - No Anthropic token ever appears in a log line, API response, or the SPA.
+- Alert the user (opt-in, default on; Slack DM + inbox) whenever their Anthropic 7-day window clears early — on ANY early clear, not only after their runs were blocked on that window. [user, #1114]
 
 ## Feature #55 — OIDC group → role/access mapping (Keycloak / Pocket ID)
 
@@ -473,7 +474,7 @@ Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/done/64-uzi-cli.md`.
 
 Tracked as GitLab issue vtmocanu/uzi#71; PRD at `prds/done/71-ci-autofix.md`.
 
-- Opt-in per-user automatic CI-fix, default OFF (mirrors judge/autopilot); admin can force-toggle. [user 2026-07-17]
+- Automatic CI-fix is ON by default for every user (per-user tri-state opt-out, NULL=inherit=on), behind an admin instance-wide kill-switch (default on); admin can force-toggle any user. [user, PRD #914 — supersedes the earlier default-off from #71]
 - Fires only on agent-owned MR-branch pipelines (`agent/issue-N`); `main`/protected branches are never auto-touched — a fix still lands on the MR branch and a human still merges (primary directive). [user 2026-07-17]
 - Loop-guarded: max 2 automatic attempts per branch + an early stop when the failure hasn't changed; on giving up, uzi comments + notifies and stops (the manual Fix CI button remains). [user 2026-07-17]
 - "Usually we fix the code, not CI itself, but if CI is really at fault we can add a CI fix in the MR" — code fixes push automatically; a fix that edits the CI config passes the approval gate (human-approved before it pushes). [user 2026-07-17]
@@ -604,6 +605,7 @@ ADR at `adr/0035-run-limit-retry.md`.
   runs, which have no start affordance at all]
 - `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
+- When a run parked on a usage limit resumes, the owner gets a Slack message in the run's thread. [user 2026-09-05, PRD #1116]
 
 ## Feature #218 — A park or shutdown must not lose the agent's committed work
 
@@ -712,6 +714,7 @@ Redesigns the shipped `uzi tui` (PRD #112). TUI/CLI-only.
 - One-line keybinding footer. [user]
 - Keep the health words visible on the board (not colour-only). [user]
 - The interactive demo is rebuilt on the shipped views (not retired, not a separate prototype). [user, D1]
+- The run detail opens on the run and its newest messages first and fills older history in the background, so a slow link never sits on an empty pane; refetches continue from what is already held. [user, #1137]
 
 ## Feature #1093 — Pause all schedules
 
@@ -724,6 +727,14 @@ Tracked as GitHub issue vtmocanu/uzi#1093; PRD at `prds/done/1093-pause-all-sche
 - `Run now` still works while paused; runs already in flight are not stopped. [user]
 - Per-schedule toggles are left untouched, so resuming restores the exact prior set. [user]
 - Reachable from the Schedules page, the CLI (`uzi schedule pause-all --until <when>` / `resume-all` / `pause-status`), and shown in the schedule's last-fire record. [user]
+
+## Feature #1140 — Anthropic bind mode defaults to auto for every new worker and for the judge lane
+
+Tracked as GitHub issue vtmocanu/uzi#1140; PRD at `prds/done/1140-bind-mode-auto-defaults.md`.
+Extends Feature #111 (auto-select) and issue #804 (ephemeral default).
+
+- Every new worker — external (join-token mint) or hosted (provisioned) — defaults its Anthropic bind mode to auto-select when the owner has a pooled token, else the default token: the SAME rule ephemeral/throwaway workers already use (#804). A worker pinned to a named token stays pinned; existing workers are not retroactively changed. [user 2026-09-05]
+- The judge lane (run retrospectives and self-improvement runs) gets that same auto mode as its DEFAULT, spreading retrospectives across the owner's pooled tokens instead of always billing one fixed account. On an empty pool the judge spends the default token (it does not hold). [user 2026-09-05]
 
 ## Startup admin seed
 

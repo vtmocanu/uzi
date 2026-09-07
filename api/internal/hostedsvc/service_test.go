@@ -60,7 +60,11 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{rows: map[uuid.UUID]*tokenRow{}, tokenHashes: map[uuid.UUID][]byte{}}
 }
 
-func (f *fakeStore) ListHostedWorkersForController(context.Context) ([]store.ListHostedWorkersForControllerRow, error) {
+// The params (disk-pressure min streak + heartbeat cutoff) drive the real SQL's
+// disk_pressure derivation, but this fake models the DERIVED result directly on each Row
+// (DiskPressure/Ephemeral set by the test), so it ignores them — the SQL derivation itself
+// is exercised by the live-DB tests, not here.
+func (f *fakeStore) ListHostedWorkersForController(context.Context, store.ListHostedWorkersForControllerParams) ([]store.ListHostedWorkersForControllerRow, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -192,7 +196,7 @@ func newTestBox(t *testing.T) *secretbox.Box {
 
 func newTestService(t *testing.T, st Store) *Service {
 	t.Helper()
-	return New(st, newTestBox(t))
+	return New(st, newTestBox(t), time.Now, time.Hour)
 }
 
 // hashOf is the test-side stand-in for jointoken.Hash.
@@ -219,7 +223,7 @@ func seal(t *testing.T, st *fakeStore, box *secretbox.Box, id uuid.UUID, token s
 func TestPollDeliversTokenUntilTheWorkerRegisters(t *testing.T) {
 	st := newFakeStore()
 	box := newTestBox(t)
-	svc := New(st, box)
+	svc := New(st, box, time.Now, time.Hour)
 	id := newTestWorker(st, "base", "s", 1)
 	seal(t, st, box, id, "uzw_the-plaintext")
 
@@ -301,7 +305,7 @@ func TestPollDeliversTokenUntilTheWorkerRegisters(t *testing.T) {
 func TestInFlightRegisterCannotDestroyARotatedToken(t *testing.T) {
 	st := newFakeStore()
 	box := newTestBox(t)
-	svc := New(st, box)
+	svc := New(st, box, time.Now, time.Hour)
 	id := newTestWorker(st, "base", "s", 1)
 
 	// T1 delivered and in use by a healthy pod.
@@ -351,7 +355,7 @@ func TestInFlightRegisterCannotDestroyARotatedToken(t *testing.T) {
 func TestNoteRegisteredIsIdempotentOnReRegistration(t *testing.T) {
 	st := newFakeStore()
 	box := newTestBox(t)
-	svc := New(st, box)
+	svc := New(st, box, time.Now, time.Hour)
 	id := newTestWorker(st, "base", "m", 3)
 	seal(t, st, box, id, "uzw_x")
 
@@ -377,7 +381,7 @@ func TestNoteRegisteredIsIdempotentOnReRegistration(t *testing.T) {
 func TestLateRegistrationSelfHealsAnExpiredRow(t *testing.T) {
 	st := newFakeStore()
 	box := newTestBox(t)
-	svc := New(st, box)
+	svc := New(st, box, time.Now, time.Hour)
 	id := newTestWorker(st, "base", "s", 1)
 	seal(t, st, box, id, "uzw_slow-pull")
 
@@ -449,6 +453,53 @@ func TestPollCarriesBusyAndDraining(t *testing.T) {
 	}
 }
 
+// The disk_pressure/ephemeral poll fields (PRD #837 M4) must round-trip from the store
+// row into the DesiredWorker DTO the controller reads. The two workers carry
+// discriminating values (pressured-not-ephemeral vs ephemeral-not-pressured) so a swapped
+// or dropped field is caught here, not just by the wire golden. The SQL DERIVATION of
+// disk_pressure (streak>=2 AND fresh) is a live-DB concern; this test pins only the Go
+// mapping, so the fake sets the already-derived bool on the row.
+func TestPollCarriesDiskPressureAndEphemeral(t *testing.T) {
+	st := newFakeStore()
+	svc := newTestService(t, st)
+
+	pressuredID := uuid.New()
+	ephemeralID := uuid.New()
+	st.workers = append(st.workers,
+		store.ListHostedWorkersForControllerRow{
+			ID:               pressuredID,
+			TemplateDeclared: pgtype.Text{String: "base", Valid: true},
+			HostedSize:       pgtype.Text{String: "s", Valid: true},
+			HostedGeneration: 1,
+			DiskPressure:     true,
+			Ephemeral:        false,
+		},
+		store.ListHostedWorkersForControllerRow{
+			ID:               ephemeralID,
+			TemplateDeclared: pgtype.Text{String: "jvm", Valid: true},
+			HostedSize:       pgtype.Text{String: "l", Valid: true},
+			HostedGeneration: 2,
+			DiskPressure:     false,
+			Ephemeral:        true,
+		},
+	)
+
+	resp, err := svc.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	byID := map[string]DesiredWorker{}
+	for _, w := range resp.Workers {
+		byID[w.ID] = w
+	}
+	if got := byID[pressuredID.String()]; !got.DiskPressure || got.Ephemeral {
+		t.Fatalf("pressured worker = %+v, want DiskPressure=true Ephemeral=false", got)
+	}
+	if got := byID[ephemeralID.String()]; got.DiskPressure || !got.Ephemeral {
+		t.Fatalf("ephemeral worker = %+v, want DiskPressure=false Ephemeral=true", got)
+	}
+}
+
 // A registration for a worker with no token row at all deletes nothing and must not
 // error — the worker still registered successfully.
 func TestNoteRegisteredForWorkerWithNoRowIsNotAnError(t *testing.T) {
@@ -463,7 +514,7 @@ func TestNoteRegisteredForWorkerWithNoRowIsNotAnError(t *testing.T) {
 func TestSealedTokenIsBoundToItsWorker(t *testing.T) {
 	st := newFakeStore()
 	box := newTestBox(t)
-	svc := New(st, box)
+	svc := New(st, box, time.Now, time.Hour)
 	victim, attacker := uuid.New(), uuid.New()
 	st.addWorker(attacker, "base", "s", 1)
 	seal(t, st, box, victim, "uzw_victims-token")
@@ -485,7 +536,7 @@ func TestSealedTokenIsBoundToItsWorker(t *testing.T) {
 func TestPollSurvivesAnUnopenableToken(t *testing.T) {
 	st := newFakeStore()
 	box := newTestBox(t)
-	svc := New(st, box)
+	svc := New(st, box, time.Now, time.Hour)
 	broken := newTestWorker(st, "base", "s", 1)
 	fine := newTestWorker(st, "jvm", "l", 2)
 	st.rows[broken] = &tokenRow{ciphertext: []byte("not a valid ciphertext at all")}

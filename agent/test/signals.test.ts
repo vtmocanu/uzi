@@ -267,6 +267,76 @@ describe("scanSignals report_only + summary on signal_done (issue #279)", () => 
   });
 });
 
+describe("scanSignals proposal on signal_done (PRD #929 M2)", () => {
+  const DONE = "mcp__uzi__signal_done";
+
+  it("extracts a {title, body} proposal alongside done", () => {
+    assert.deepStrictEqual(
+      scanSignals(toolUse(DONE, { proposal: { title: "Add retry", body: "We should retry on 429." } })),
+      { done: true, proposal: { title: "Add retry", body: "We should retry on 429." } },
+    );
+  });
+
+  it("captures a proposal together with summary/report_only", () => {
+    assert.deepStrictEqual(
+      scanSignals(
+        toolUse(DONE, {
+          report_only: true,
+          summary: "surveyed the tree",
+          proposal: { title: "Flaky test hunt", body: "poller_test.go is timing-sensitive." },
+        }),
+      ),
+      {
+        done: true,
+        reportOnly: true,
+        summary: "surveyed the tree",
+        proposal: { title: "Flaky test hunt", body: "poller_test.go is timing-sensitive." },
+      },
+    );
+  });
+
+  it("still scans a plain signal_done (no proposal) to exactly { done: true }", () => {
+    const r = scanSignals(toolUse(DONE, {})) as Record<string, unknown>;
+    assert.deepStrictEqual(r, { done: true });
+    assert.ok(!("proposal" in r), "proposal absent, not undefined-valued");
+  });
+
+  it("trims title/body and drops a proposal missing either non-empty member", () => {
+    // trims whitespace on both members.
+    assert.deepStrictEqual(
+      scanSignals(toolUse(DONE, { proposal: { title: "  T  ", body: "\n B \n" } })),
+      { done: true, proposal: { title: "T", body: "B" } },
+    );
+    // a proposal missing a non-empty title or body (or malformed) is dropped, and done survives.
+    const bad = [
+      { title: "", body: "b" },
+      { title: "t", body: "" },
+      { title: "   ", body: "b" },
+      { title: "t" },
+      { body: "b" },
+      { title: 5, body: "b" },
+      "not-an-object",
+      42,
+      null,
+      ["t", "b"],
+    ];
+    for (const p of bad) {
+      const r = scanSignals(toolUse(DONE, { proposal: p })) as Record<string, unknown>;
+      assert.strictEqual(r["done"], true, `done must survive proposal ${JSON.stringify(p)}`);
+      assert.ok(!("proposal" in r), `malformed proposal ${JSON.stringify(p)} must not be captured`);
+    }
+  });
+
+  it("IGNORES a subagent-borne proposal entirely (main-thread guard covers the new field)", () => {
+    // A proposal is filed as a forge issue server-side, so a prompt-injected subagent must
+    // never reach it — the same guarantee that keeps a subagent from latching done/summary.
+    const p = { proposal: { title: "T", body: "B" } };
+    assert.deepStrictEqual(scanSignals(subagentToolUse(DONE, p)), {});
+    assert.deepStrictEqual(scanSignals(subagentToolUse(DONE, p, { subagent_type: "coder" })), {});
+    assert.deepStrictEqual(scanSignals(subagentToolUse(DONE, p, { parent_tool_use_id: "toolu_x" })), {});
+  });
+});
+
 describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
   // Gating the SCHEMA is the strongest layer available: on a non-issue run the
   // model never sees the parameter, rather than seeing it and having the value
@@ -317,6 +387,34 @@ describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
     const enabled = doneToolShape(buildSignalMcpServer({ reportOnly: true }));
     assert.ok("report_only" in enabled, `expected report_only; got ${Object.keys(enabled).join(", ")}`);
     assert.ok("summary" in enabled);
+  });
+
+  it("exposes signal_done proposal UNGATED on run kind, and it is optional (PRD #929 M2)", () => {
+    // Unlike prd_done_path/report_only, proposal is NOT gated: the fire-time delivery
+    // instruction (a later milestone) is what fills it, so the schema field is always present.
+    for (const server of [
+      buildSignalMcpServer(),
+      buildSignalMcpServer({}),
+      buildSignalMcpServer({ prdDonePath: true, milestones: true, reportOnly: true }),
+    ]) {
+      const shape = doneToolShape(server);
+      assert.ok("proposal" in shape, `proposal must always be present; got ${Object.keys(shape).join(", ")}`);
+      // Optional: a signal_done with no proposal must parse (the whole object is optional).
+      const proposalSchema = shape["proposal"] as { safeParse(v: unknown): { success: boolean } };
+      assert.ok(proposalSchema.safeParse(undefined).success, "proposal must be optional");
+      assert.ok(
+        proposalSchema.safeParse({ title: "t", body: "b" }).success,
+        "a well-formed {title, body} proposal must parse",
+      );
+      assert.ok(
+        !proposalSchema.safeParse({ title: "", body: "b" }).success,
+        "an empty title must fail (min(1))",
+      );
+      assert.ok(
+        !proposalSchema.safeParse({ title: "t" }).success,
+        "a body-less proposal must fail (body required)",
+      );
+    }
   });
 });
 

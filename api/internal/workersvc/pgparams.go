@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
@@ -86,6 +87,16 @@ func textPtr(t pgtype.Text) *string {
 	}
 	s := t.String
 	return &s
+}
+
+// resolveEffortPtr resolves the owner's per-user default reasoning effort to the
+// level the worker applies (PRD #617 + issue #1157): the owner's explicit choice,
+// or the uzi default (xhigh) when the column is NULL/blank. The wire field stays
+// *string+omitempty but is now ALWAYS populated — a NULL owner rides xhigh, not an
+// omitted effort key.
+func resolveEffortPtr(t pgtype.Text) *string {
+	e := agenttmpl.ResolveDefaultEffort(textPtr(t))
+	return &e
 }
 
 // coalesceInt returns the persisted int4 when present and def otherwise (PRD #122

@@ -17,10 +17,11 @@ export interface User {
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
-  // ci_autofix_enabled is the per-user opt-in to automatic CI fixes (PRD #71).
-  // Default false; the user toggles their own from Settings, an admin can force any
-  // user's.
-  ci_autofix_enabled: boolean;
+  // ci_autofix_enabled is the per-user opt-in to automatic CI fixes (PRD #71, made
+  // a tri-state in #914 M3): true = explicit on, false = explicit off, null =
+  // inherit the admin global default (on). The user toggles their own from
+  // Settings, an admin can force any user's.
+  ci_autofix_enabled: boolean | null;
   // attribution_enabled is the per-user opt-out for AI attribution in worker commits
   // (issue #916). Default TRUE (today's behavior): when true the worker's commits keep
   // the Co-Authored-By: Claude trailer; when false it is suppressed on the user's next
@@ -50,6 +51,10 @@ export interface User {
   // unbound ⇒ their default token. The label, never the value.
   judge_anthropic_secret_id: string | null;
   judge_anthropic_secret_label: string | null;
+  // Which bind mode this user's RETROSPECTIVES use (PRD #1140): default / pinned /
+  // auto. The EFFECTIVE mode (a pinned binding whose token was deleted reports
+  // default). auto spreads retrospectives across the user's pooled tokens.
+  judge_anthropic_bind_mode: BindMode;
   created_at: string;
   last_login: string | null;
 }
@@ -82,9 +87,9 @@ export interface SecretMeta {
 // #21).
 export interface UserSettings {
   default_model: string | null;
-  /** Per-user default reasoning effort (PRD #617); null means inherit — the worker
-   *  omits the SDK effort key, so the SDK default (`high`) applies. One of
-   *  low|medium|high|xhigh|max when set. */
+  /** Per-user default reasoning effort (PRD #617); null means the user has not chosen
+   *  (inherit), which resolves to the uzi default (`xhigh`) at claim assembly (issue
+   *  #1157). One of low|medium|high|xhigh|max when set. */
   default_effort: string | null;
   /** Per-user judge model override (PRD #69 M2); null means inherit the instance
    *  judge_model (which itself falls back to opus). Written through PUT /me/settings
@@ -716,6 +721,10 @@ export interface AppSettings {
   judge_enforce_all: string;
   judge_cooldown_seconds: string;
   judge_daily_budget: string;
+  // Instance-wide CI-autofix kill-switch (PRD #914). The text "true"/"false" (default
+  // "true"). When OFF, no user's failed pipeline is auto-fixed regardless of their
+  // per-user opt-in — the admin per-user CI-autofix toggle is inert while it is off.
+  ci_autofix_enabled: string;
   // Ephemeral worker auto-provisioning instance kill-switch (PRD #529 / #649 M1).
   // The text "true"/"false" (default "false"). When OFF, no run ever auto-provisions
   // a throwaway hosted worker regardless of a user's per-account opt-in; when ON,
@@ -1332,6 +1341,10 @@ export interface Schedule {
   // Per-schedule model override; null = inherit the owner's per-user Worker model.
   // Applies to ALL targets (prompt/issue/sweep), unlike guidance which is issue/sweep-only.
   model: string | null;
+  // PRD #929 M1: per-schedule output mode for prompt-target schedules; 'mr' opens a
+  // merge request from an idea file, 'issues' files issues. null = inherit the
+  // catalog/job default. Only meaningful for target === 'prompt'.
+  output_mode: string | null;
   // PRD #305: "apply model also to agents" — when true, the run's model overrides
   // every subagent's pin (lead + all subagents on one model). Default false.
   override_subagent_model: boolean;
@@ -1359,7 +1372,7 @@ export interface Schedule {
   updated_at: string;
   // The live "next N fires" preview (up to 3), computed server-side from the same
   // cron logic the modal preview uses so the list and the modal agree.
-  next_fires: string[];
+  next_fires: string[] | null;
 }
 
 // A schedule's provenance (PRD #589): owner-authored vs enabled from the catalog.
@@ -1390,6 +1403,9 @@ export interface CatalogEntry {
   timezone: string;
   // Per-entry model override; "" = inherit the owner's Worker default.
   model: string;
+  // PRD #929 M1: per-entry output mode for prompt entries; 'mr'/'issues', "" = the
+  // job default. Empty for non-prompt entries.
+  output_mode: string;
   // Baked prompt for a prompt entry; "" for a sweep entry.
   prompt: string;
   // Sweep selector labels; null for an assigned sweep (selects by assignee), [] for a prompt entry.
@@ -1458,6 +1474,10 @@ export interface ScheduleInput {
   // Model override for runs this schedule fires (all targets); explicit null/"" clears
   // to inherit. Unlike guidance it is sent on every target.
   model?: string | null;
+  // PRD #929 M1: per-schedule output mode for the prompt target; 'mr'/'issues', explicit
+  // null clears to the catalog default. Omitted on non-prompt targets so the server never
+  // sees a stray field.
+  output_mode?: string | null;
   // PRD #305 opt-in; omitted ≡ false (server replace-semantics). The modal always sends it.
   override_subagent_model?: boolean;
   enabled?: boolean;
@@ -1594,6 +1614,15 @@ export interface Worker {
   stats_mem_bytes: number | null;
   stats_mem_limit_bytes: number | null;
   stats_source: string | null;
+  // Latest worker disk-space sample (PRD #837), all null until the worker reports it.
+  // Two volumes are tracked as used/total byte pairs: /nix (the shared read-only store)
+  // and /data (the writable work area). Each pair is reported together (used implies
+  // total); a volume the worker does not report leaves both its fields null. The UI
+  // renders a percentage bar per reported volume (used/total), danger tone at ≥85%.
+  stats_disk_nix_bytes: number | null;
+  stats_disk_nix_total_bytes: number | null;
+  stats_disk_data_bytes: number | null;
+  stats_disk_data_total_bytes: number | null;
   // Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
   // Both null means unbound: the worker spends its owner's default token, which is
   // every worker's state until someone binds one. The label rides alongside the id
@@ -2716,6 +2745,10 @@ export interface RunMessage {
   agent_label: string | null;
   payload: unknown;
   created_at: string;
+  // payload_truncated is true only when a ?payload_max= trim actually removed bytes
+  // from this message's payload (PRD #1137). Absent on every untrimmed message; the
+  // web SPA never sends payload_max, so it never sees this key.
+  payload_truncated?: boolean;
 }
 
 /** PRD #88 adds "answer": the reply to an ask_user question. Unlike every other kind

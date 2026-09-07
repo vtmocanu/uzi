@@ -8,6 +8,13 @@ import (
 	"testing"
 )
 
+// claudeCanonicalCommand is the command the Claude manager writes as of M2 (PRD
+// #1143); claudeLegacyCommand is the M1 bare form it still RECOGNIZES and migrates.
+const (
+	claudeCanonicalCommand = "uzi skill install --target claude"
+	claudeLegacyCommand    = "uzi skill install"
+)
+
 func settingsPathIn(home string) string {
 	return filepath.Join(home, ".claude", "settings.json")
 }
@@ -21,10 +28,10 @@ func backupPathIn(home string) string {
 func writeSettings(t *testing.T, home, raw string) {
 	t.Helper()
 	dir := filepath.Join(home, ".claude")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(settingsPathIn(home), []byte(raw), 0o644); err != nil {
+	if err := os.WriteFile(settingsPathIn(home), []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -72,7 +79,7 @@ func sessionStartCommands(t *testing.T, m map[string]any) []string {
 func countOurCommands(cmds []string) int {
 	n := 0
 	for _, c := range cmds {
-		if c == hookCommand {
+		if c == claudeCanonicalCommand {
 			n++
 		}
 	}
@@ -155,7 +162,7 @@ func TestInstallHookPreservesForeignHookAndSiblings(t *testing.T) {
 		if c == "dot-ai refresh" {
 			sawForeign = true
 		}
-		if c == hookCommand {
+		if c == claudeCanonicalCommand {
 			sawOurs = true
 		}
 	}
@@ -309,8 +316,8 @@ func TestHookStatus(t *testing.T) {
 		if st.Installed || st.Current || st.Malformed {
 			t.Fatalf("missing file: %+v, want all false", st)
 		}
-		if st.Command != hookCommand {
-			t.Errorf("Command = %q, want canonical %q", st.Command, hookCommand)
+		if st.Command != claudeCanonicalCommand {
+			t.Errorf("Command = %q, want canonical %q", st.Command, claudeCanonicalCommand)
 		}
 	})
 
@@ -328,15 +335,15 @@ func TestHookStatus(t *testing.T) {
 	t.Run("duplicates", func(t *testing.T) {
 		home := t.TempDir()
 		writeSettings(t, home, `{"hooks":{"SessionStart":[
-		  {"matcher":"startup","hooks":[{"type":"command","command":"uzi skill install"}]},
+		  {"matcher":"startup","hooks":[{"type":"command","command":"uzi skill install --target claude"}]},
 		  {"matcher":"startup","hooks":[{"type":"command","command":"uzi skill install --force"}]}
 		]}}`)
 		st := NewHookManagerAt(home).HookStatus()
 		if !st.Installed || st.Duplicates < 1 {
 			t.Fatalf("duplicates: %+v, want Installed and Duplicates>=1", st)
 		}
-		if !st.Current { // the exact canonical one is present
-			t.Errorf("want Current=true when the exact command is one of the dups")
+		if !st.Current { // the exact canonical one is present (plus a legacy sibling)
+			t.Errorf("want Current=true when the exact canonical command is one of the dups")
 		}
 	})
 

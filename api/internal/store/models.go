@@ -459,7 +459,6 @@ type Run struct {
 	StatusSince           pgtype.Timestamptz `json:"status_since"`
 	ReviewComments        []byte             `json:"review_comments"`
 	BudgetPausedSeconds   int32              `json:"budget_paused_seconds"`
-	LineageEpoch          int32              `json:"lineage_epoch"`
 	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
 	TriggerSource         string             `json:"trigger_source"`
 	CheckpointTip         pgtype.Text        `json:"checkpoint_tip"`
@@ -521,6 +520,7 @@ type RunSchedule struct {
 	Customized            bool               `json:"customized"`
 	SiblingGroupID        pgtype.UUID        `json:"sibling_group_id"`
 	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
+	OutputMode            pgtype.Text        `json:"output_mode"`
 }
 
 type RunUsage struct {
@@ -580,6 +580,7 @@ type SlackRunMessage struct {
 	QuestionTs                  pgtype.Text        `json:"question_ts"`
 	MilestonesNotifiedCompleted pgtype.Int4        `json:"milestones_notified_completed"`
 	StatusTs                    pgtype.Text        `json:"status_ts"`
+	LimitPausedAt               pgtype.Timestamptz `json:"limit_paused_at"`
 }
 
 type TaskReview struct {
@@ -637,7 +638,7 @@ type User struct {
 	JudgeEnabled            bool               `json:"judge_enabled"`
 	JudgeAnthropicSecretID  pgtype.UUID        `json:"judge_anthropic_secret_id"`
 	WaitOnLimit             bool               `json:"wait_on_limit"`
-	CiAutofixEnabled        bool               `json:"ci_autofix_enabled"`
+	CiAutofixEnabled        pgtype.Bool        `json:"ci_autofix_enabled"`
 	SidebarTokenIds         []uuid.UUID        `json:"sidebar_token_ids"`
 	JudgeModel              pgtype.Text        `json:"judge_model"`
 	SummaryModel            pgtype.Text        `json:"summary_model"`
@@ -648,6 +649,7 @@ type User struct {
 	NotifyEarlyLimitReset   bool               `json:"notify_early_limit_reset"`
 	SchedulesPaused         bool               `json:"schedules_paused"`
 	SchedulesPausedUntil    pgtype.Timestamptz `json:"schedules_paused_until"`
+	JudgeAnthropicBindMode  string             `json:"judge_anthropic_bind_mode"`
 }
 
 type UserSecret struct {
@@ -673,33 +675,38 @@ type UserVault struct {
 }
 
 type Worker struct {
-	ID                 uuid.UUID          `json:"id"`
-	UserID             uuid.UUID          `json:"user_id"`
-	Name               string             `json:"name"`
-	TokenHash          []byte             `json:"token_hash"`
-	Status             string             `json:"status"`
-	LastHeartbeatAt    pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version            pgtype.Text        `json:"version"`
-	CreatedAt          pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared   pgtype.Text        `json:"template_declared"`
-	TemplateReported   pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns  pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct        pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes      pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource        pgtype.Text        `json:"stats_source"`
-	Kind               string             `json:"kind"`
-	HostedSize         pgtype.Text        `json:"hosted_size"`
-	HostedGeneration   int64              `json:"hosted_generation"`
-	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode  string             `json:"anthropic_bind_mode"`
-	OnlineSince        pgtype.Timestamptz `json:"online_since"`
-	DrainingSince      pgtype.Timestamptz `json:"draining_since"`
-	Capabilities       []string           `json:"capabilities"`
-	Ephemeral          bool               `json:"ephemeral"`
-	EphemeralRunID     pgtype.UUID        `json:"ephemeral_run_id"`
+	ID                      uuid.UUID          `json:"id"`
+	UserID                  uuid.UUID          `json:"user_id"`
+	Name                    string             `json:"name"`
+	TokenHash               []byte             `json:"token_hash"`
+	Status                  string             `json:"status"`
+	LastHeartbeatAt         pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                 pgtype.Text        `json:"version"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared        pgtype.Text        `json:"template_declared"`
+	TemplateReported        pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns       pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct             pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes           pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes      pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource             pgtype.Text        `json:"stats_source"`
+	Kind                    string             `json:"kind"`
+	HostedSize              pgtype.Text        `json:"hosted_size"`
+	HostedGeneration        int64              `json:"hosted_generation"`
+	DockerEnabled           pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID       pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode       string             `json:"anthropic_bind_mode"`
+	OnlineSince             pgtype.Timestamptz `json:"online_since"`
+	DrainingSince           pgtype.Timestamptz `json:"draining_since"`
+	Capabilities            []string           `json:"capabilities"`
+	Ephemeral               bool               `json:"ephemeral"`
+	EphemeralRunID          pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes       pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes  pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes      pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak int32              `json:"stats_disk_pressure_streak"`
 }
 
 type WorkerUpgradeMute struct {

@@ -6,9 +6,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/runkind"
-	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // clampWireReportOnly gates the worker's report_only declaration to issue runs
@@ -47,10 +45,12 @@ func clampWireReportMd(run store.Run, p *string, reportOnly bool) pgtype.Text {
 		slog.Warn("dropping report_md: report_only not set", "run_id", run.ID, "kind", run.Kind)
 		return pgtype.Text{}
 	}
-	// Order matters: sanitize (strip + cap) THEN scrub — mirroring judge_worker.go:
-	// ScrubSecrets(termsafe.SanitizeBounded(...)), so the scrubber sees whole runes and the
-	// cap is applied to structural text before redaction rewrites it.
-	s := secretscrub.Scrub(termsafe.SanitizeBounded(*p, ReviewSummaryMaxBytes))
+	// Order matters: sanitize the WHOLE field, secret-scrub it, and ONLY THEN apply the
+	// byte cap (see scrubThenBound). secretscrub.Scrub matches a credential only when it
+	// sees the whole token, so capping first can leave a sub-match-length prefix that Scrub
+	// misses — a near-cap credential would leak into the filed report_md. This is the
+	// report-only sibling of clampWireProposal's F4 fix (#1122).
+	s := scrubThenBound(*p, ReviewSummaryMaxBytes)
 	if s == "" {
 		return pgtype.Text{}
 	}

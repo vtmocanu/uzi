@@ -49,6 +49,30 @@ const pooledFixtureStatus: Record<string, AutoStatus> = {
   "sec-low": "below_threshold",
 };
 
+// unbindAnthropicSecret mirrors the schema cascade (migrations 00078/00079 hang composite
+// FKs off user_secrets (user_id, id) with ON DELETE SET NULL): deleting a bound anthropic
+// token unbinds its workers and the judge rather than orphaning them. Every delete path
+// (both the by-id path and the D14 kind-path alias) must run this or the mock leaves a
+// worker reading a token that no longer exists. Kept module-local (not exported) so knip
+// does not flag it as an unused export.
+function unbindAnthropicSecret(id: string): void {
+  workers.forEach((w) => {
+    if (w.anthropic_secret_id === id) {
+      w.anthropic_secret_id = null;
+      w.anthropic_secret_label = null;
+    }
+  });
+  // `state.session` is a COPY, not a reference into `users`, so both have to be
+  // swept or the cascade would be invisible to /me — which is the read every
+  // judge surface actually uses.
+  [...users, state.session].forEach((u) => {
+    if (u && u.judge_anthropic_secret_id === id) {
+      u.judge_anthropic_secret_id = null;
+      u.judge_anthropic_secret_label = null;
+    }
+  });
+}
+
 export const secretsApi = {
   // ── Secrets ─────────────────────────────────────────────────────────────────
   listSecrets: async () =>
@@ -188,29 +212,14 @@ export const secretsApi = {
       );
     }
     secrets = secrets.filter((s) => s.id !== id);
-    // The real schema CASCADES: migrations 00078/00079 hang composite FKs off
-    // user_secrets (user_id, id) with ON DELETE SET NULL, so deleting a bound token
-    // unbinds its workers and the judge rather than orphaning them. Without this the
-    // mock left workers reading "spends console-key" forever — and with one token
-    // left the picker is hidden, so there was no way to correct it. Two reasons that
-    // matters beyond tidiness: the shipped Dockerfile.mock demo was showing D5's own
-    // promise being broken, and D5's cascade otherwise has schema-level evidence
-    // only. Mirrored here so a browser can prove the behaviour end to end.
-    workers.forEach((w) => {
-      if (w.anthropic_secret_id === id) {
-        w.anthropic_secret_id = null;
-        w.anthropic_secret_label = null;
-      }
-    });
-    // `state.session` is a COPY, not a reference into `users`, so both have to be
-    // swept or the cascade would be invisible to /me — which is the read every
-    // judge surface actually uses.
-    [...users, state.session].forEach((u) => {
-      if (u && u.judge_anthropic_secret_id === id) {
-        u.judge_anthropic_secret_id = null;
-        u.judge_anthropic_secret_label = null;
-      }
-    });
+    // The real schema CASCADES: deleting a bound token unbinds its workers and the judge
+    // rather than orphaning them. Without this the mock left workers reading "spends
+    // console-key" forever — and with one token left the picker is hidden, so there was
+    // no way to correct it. Two reasons that matters beyond tidiness: the shipped
+    // Dockerfile.mock demo was showing D5's own promise being broken, and D5's cascade
+    // otherwise has schema-level evidence only. Mirrored here so a browser can prove the
+    // behaviour end to end.
+    unbindAnthropicSecret(id);
     return delay(null);
   },
 
@@ -243,7 +252,12 @@ export const secretsApi = {
         "you have multiple tokens; delete a specific one by id (DELETE /api/me/secrets/anthropic_token/{id})",
       );
     }
+    // Capture the sole token's id BEFORE filtering it out (at most one survives the 409
+    // guard above), then run the same unbind cascade the by-id path does. No token row is
+    // a no-op.
+    const tokenId = anthropic[0]?.id;
     secrets = secrets.filter((s) => s.kind !== "anthropic_token");
+    if (tokenId) unbindAnthropicSecret(tokenId);
     return delay(null);
   },
 };

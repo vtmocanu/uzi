@@ -41,6 +41,7 @@ const user = {
   notify_early_limit_reset: false,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,
+  judge_anthropic_bind_mode: "default" as const,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -323,6 +324,10 @@ describe("IssueView Start gate (PRD #764)", () => {
     stats_mem_bytes: null,
     stats_mem_limit_bytes: null,
     stats_source: null,
+    stats_disk_nix_bytes: null,
+    stats_disk_nix_total_bytes: null,
+    stats_disk_data_bytes: null,
+    stats_disk_data_total_bytes: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",

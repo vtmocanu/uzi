@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
@@ -74,6 +76,37 @@ type ObservedWorker struct {
 	HasDataPVC     bool
 	HasNixPVC      bool
 	HasDinDDataPVC bool
+	// NixPVCSize is the observed /nix PVC's requested storage (spec.resources.requests[storage]),
+	// recorded ONLY from a LIVE (deletionTimestamp == nil) nix PVC. nil means "no live nix PVC
+	// observed" — the PVC is absent OR Terminating. M3's size-drift arm compares it against the
+	// resolved Spec.NixSize; a nil here never triggers a recycle.
+	NixPVCSize *resource.Quantity
+	// DataPVCLive is true only when a LIVE (deletionTimestamp == nil) /data PVC was
+	// observed. It is the /data analogue of "NixPVCSize != nil": /data carries no size,
+	// so its liveness is the proxy the M4 disk-pressure recycle gates its delete on (a
+	// Terminating /data PVC is already being reaped, so it is not re-deleted) and the
+	// Deployment-recreate guard suppresses on (never place a Deployment over a doomed
+	// /data volume). HasDataPVC stays exists-in-ANY-state (it gates the create); this is
+	// the stricter live-only flag.
+	DataPVCLive bool
+	// NixPVCCreatedAt / DataPVCCreatedAt are the CreationTimestamps of the LIVE nix/data
+	// PVCs (nil when absent or Terminating), used by the M4 recycle cooldown: a worker
+	// back at disk pressure whose youngest volume was minted within the cooldown was
+	// just recycled, so it is surfaced as a capacity signal rather than recycled again
+	// into a thrash loop. The loop is stateless, so these apiserver-supplied timestamps
+	// are the only elapsed-time signal it has.
+	NixPVCCreatedAt  *time.Time
+	DataPVCCreatedAt *time.Time
+	// NixPVCPhase / DataPVCPhase carry the RAW observed .status.phase of the LIVE nix/data
+	// PVC (e.g. "Pending", "Bound"), for the stranded-PVC bind-timeout detector (#1115).
+	// PRD #837's recycle deletes the old PVC before the create-gate re-mints it, so a
+	// re-mint that never binds (storageclass unavailable, quota exhausted, no schedulable
+	// node) sits Pending with the worker stranded and no signal; the detector reads this
+	// phase and, past a bound-timeout, surfaces the worker. "" when the PVC is absent OR
+	// Terminating — recorded only for a non-terminating PVC, the same liveness gate as
+	// NixPVCSize / DataPVCLive.
+	NixPVCPhase  string
+	DataPVCPhase string
 	// Namespace is the namespace the object(s) for this worker were OBSERVED in
 	// (PRD #83 M3). With two worker namespaces — the restricted default and the
 	// privileged docker tier — teardown of a worker the api no longer wants must

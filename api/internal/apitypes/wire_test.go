@@ -61,6 +61,8 @@ func TestUserDTOTags(t *testing.T) {
 		// PRD #104 M4: which credential this user's retrospectives spend. Both null
 		// ⇒ their default. The label, never the token value.
 		"judge_anthropic_secret_id", "judge_anthropic_secret_label",
+		// PRD #1140 M2: the EFFECTIVE three-valued judge bind mode (default/pinned/auto).
+		"judge_anthropic_bind_mode",
 		"created_at", "last_login")
 }
 
@@ -575,6 +577,10 @@ var workerDTOKeys = []string{
 	"draining_since",
 	"created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",
+	// PRD #837 M1: per-volume disk usage (/nix + data), used + total bytes each. Null
+	// until the worker reports a statfs sample (and re-nulled if it stops). Display-only.
+	"stats_disk_nix_bytes", "stats_disk_nix_total_bytes",
+	"stats_disk_data_bytes", "stats_disk_data_total_bytes",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
 	// this DTO is the shape the web UI and the CLI both read.

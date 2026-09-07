@@ -8,11 +8,12 @@
   "wait_on_limit": false,
   "notify_early_limit_reset": false,
   "judge_enabled": false,
-  "ci_autofix_enabled": false,
+  "ci_autofix_enabled": null,
   "attribution_enabled": false,
   "ephemeral_workers_enabled": false,
   "judge_anthropic_secret_id": null,
   "judge_anthropic_secret_label": null,
+  "judge_anthropic_bind_mode": "",
   "created_at": "0001-01-01T00:00:00Z",
   "last_login": null
 }
