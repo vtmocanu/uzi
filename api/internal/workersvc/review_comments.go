@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -35,6 +36,41 @@ type ReviewCommentSnapshot struct {
 type ReviewCommentsSnapshot struct {
 	Comments  []ReviewCommentSnapshot `json:"comments"`
 	Truncated bool                    `json:"truncated"`
+}
+
+// CodeRabbit tags its non-actionable top-level notes with these HTML markers. They
+// are forge-agnostic: on GitLab/Forgejo CodeRabbit posts as an ordinary user (no
+// "[bot]" login suffix), so the marker is the only signal there. Carried verbatim.
+const (
+	coderabbitSummaryMarker     = "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->"
+	coderabbitWalkthroughMarker = "<!-- walkthrough_start -->"
+)
+
+// IsActionableReviewComment reports whether a kept review comment counts toward the
+// mr_rework trigger (issue #1142). An INLINE finding always counts — that is what
+// mr_rework exists for, including third-party review bots like CodeRabbit, which put
+// their findings inline. A summary / top-level note does NOT count when it is a bot
+// walkthrough/status/tips note: authored by a GitHub App bot (login ends in "[bot]"),
+// or carrying one of CodeRabbit's summary/walkthrough markers. A human top-level note
+// ("please also rename X") stays actionable. Anything whose review state is not the
+// summary sentinel defaults to actionable, so the trigger set can only ever shrink
+// relative to the pre-#1142 behavior, never grow.
+//
+// It reads only the fields BuildReviewCommentsSnapshot already carries; the poller
+// detector (poller/mr_review_watch.go) calls it to compute the trigger high-water,
+// while the full snapshot — including the non-actionable notes — still rides a run
+// that fires (they are useful context; the change is to what COUNTS, not what is read).
+func IsActionableReviewComment(c ReviewCommentSnapshot) bool {
+	if c.ReviewState != forge.ReviewCommentSummary {
+		return true
+	}
+	if strings.HasSuffix(c.AuthorUsername, "[bot]") {
+		return false
+	}
+	if strings.Contains(c.Body, coderabbitSummaryMarker) || strings.Contains(c.Body, coderabbitWalkthroughMarker) {
+		return false
+	}
+	return true
 }
 
 // BuildReviewCommentsSnapshot filters, caps, and orders an MR's review comments

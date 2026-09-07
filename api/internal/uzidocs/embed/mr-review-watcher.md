@@ -26,7 +26,10 @@ it queues a new `mr_rework` run, auto-approved so it starts working right away:
 - the MR's head pipeline is **green**,
 - the review has **settled** (the newest comment is a few minutes old and
   was written against the current head commit, not a superseded one),
-- there's at least one review comment uzi hasn't already acted on, and
+- there's at least one **actionable** review comment uzi hasn't already acted
+  on — a review bot's walkthrough or summary note (the "here's what changed" or
+  "no actionable comments" write-ups CodeRabbit and friends post at the top of a
+  PR) does not count; a human's top-level note and any inline finding do, and
 - the MR hasn't hit its [rework-cycle cap](#the-per-mr-cap).
 
 The rework run reads the MR's review comments (human reviewers and

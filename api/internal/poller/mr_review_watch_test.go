@@ -585,3 +585,119 @@ func TestMRReworkBotOnlyCommentsNoFire(t *testing.T) {
 		t.Fatalf("a bot-only comment set must not fire, got %d runs", len(runs.calls))
 	}
 }
+
+// mrwSummaryComment builds a TOP-LEVEL / summary review note (ReviewState summary,
+// no diff anchor, no head SHA — the shape github_mr.go's Source A produces). It uses a
+// THIRD-PARTY author id (77, != mrwBotID 999) so the D1 self-filter keeps it: a
+// non-actionable fixture must reach detectOne, not be dropped upstream, or the #1142
+// regression would pass vacuously.
+func mrwSummaryComment(id int64, created time.Time, login, body string) forge.MRComment {
+	return forge.MRComment{
+		ID:                id,
+		AuthorForgeUserID: 77,
+		AuthorUsername:    login,
+		Body:              body,
+		CreatedAt:         created,
+		ReviewState:       forge.ReviewCommentSummary,
+	}
+}
+
+const coderabbitSummaryMarker = "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->"
+
+func TestMRReworkBotWalkthroughSummaryNoFire(t *testing.T) {
+	// Issue #1142: the ONLY comment is a third-party bot's walkthrough/summary note
+	// (CodeRabbit "No actionable comments were generated"). It is KEPT by the snapshot
+	// (third-party, not uzi's own bot) but is NON-actionable, so it must neither fire
+	// nor advance the ledger. Fails on unfixed code (which counts it as a new comment).
+	st := &mrwStore{candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")}}
+	runs := &mrwRuns{}
+	body := coderabbitSummaryMarker + "\n\nNo actionable comments were generated in the recent review."
+	f := landedForge(mrwSummaryComment(400, landed(), "coderabbitai[bot]", body))
+
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+
+	if len(runs.calls) != 0 || len(st.upserts) != 0 {
+		t.Fatalf("a bot walkthrough/summary-only set must not fire or advance the ledger: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
+	}
+}
+
+func TestMRReworkInlineBotFindingFires(t *testing.T) {
+	// A third-party review bot's INLINE finding is exactly what mr_rework exists for —
+	// the "[bot]" login must NOT suppress it (only top-level/summary bot notes filter).
+	st := &mrwStore{candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")}}
+	runs := &mrwRuns{}
+	inline := mrwComment(120, landed(), mrwHeadSHA) // mrwComment is ReviewCommentInline
+	inline.AuthorForgeUserID = 77                   // a third party
+	inline.AuthorUsername = "coderabbitai[bot]"
+	f := landedForge(inline)
+
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("a bot INLINE finding must fire, got %d runs", len(runs.calls))
+	}
+	if len(st.upserts) != 1 || st.upserts[0].HighWater != 120 {
+		t.Fatalf("expected one ledger upsert advancing high_water to 120, got %+v", st.upserts)
+	}
+}
+
+func TestMRReworkHumanTopLevelNoteFires(t *testing.T) {
+	// A human top-level note ("please also rename X") is a real request and stays
+	// actionable even though it is a summary-state comment (non-bot login, no marker).
+	st := &mrwStore{candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")}}
+	runs := &mrwRuns{}
+	f := landedForge(mrwSummaryComment(130, landed(), "maintainer", "please also rename X before we merge"))
+
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("a human top-level note must fire, got %d runs", len(runs.calls))
+	}
+	if len(st.upserts) != 1 || st.upserts[0].HighWater != 130 {
+		t.Fatalf("expected one ledger upsert advancing high_water to 130, got %+v", st.upserts)
+	}
+}
+
+func TestMRReworkGitLabMarkerNonBotSummaryNoFire(t *testing.T) {
+	// Forge-agnostic marker rule: on GitLab/Forgejo CodeRabbit posts as an ordinary
+	// user (login has no "[bot]" suffix), so the summary marker in the body is the only
+	// signal that classifies the walkthrough as non-actionable.
+	st := &mrwStore{candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")}}
+	runs := &mrwRuns{}
+	body := coderabbitSummaryMarker + "\n\nNo actionable comments were generated."
+	f := landedForge(mrwSummaryComment(410, landed(), "coderabbit", body))
+
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+
+	if len(runs.calls) != 0 || len(st.upserts) != 0 {
+		t.Fatalf("a marker-carrying summary from a non-bot login must not fire: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
+	}
+}
+
+func TestMRReworkSummaryThenLowerIdInlineFires(t *testing.T) {
+	// Option B (issue #1142): a summary-only tick does NOT advance the high-water, so a
+	// later inline finding with a LOWER forge id than the summary still fires — the exact
+	// case the naive "advance to the max kept id" would have hidden.
+	st := &mrwStore{candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")}}
+	runs := &mrwRuns{}
+	walkthrough := "<!-- walkthrough_start -->\n\nWalkthrough of the change."
+	d := newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5})
+
+	// Tick 1: only a bot walkthrough with a HIGH id (300). No fire, no ledger advance.
+	f1 := landedForge(mrwSummaryComment(300, landed(), "coderabbitai[bot]", walkthrough))
+	d.detect(context.Background(), mrwRepoRow(), f1)
+	if len(runs.calls) != 0 || len(st.upserts) != 0 {
+		t.Fatalf("a summary-only tick must not fire or advance the ledger: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
+	}
+
+	// Tick 2: the same walkthrough (300) plus a real inline finding with a LOWER id
+	// (200). Because tick 1 left high_water at 0, the id-200 inline still clears GATE 3.
+	f2 := landedForge(mrwSummaryComment(300, landed(), "coderabbitai[bot]", walkthrough), mrwComment(200, landed(), mrwHeadSHA))
+	d.detect(context.Background(), mrwRepoRow(), f2)
+	if len(runs.calls) != 1 {
+		t.Fatalf("a later inline finding with a lower id than the summary must still fire, got %d runs", len(runs.calls))
+	}
+	if len(st.upserts) != 1 || st.upserts[0].HighWater != 200 {
+		t.Fatalf("expected the fire to advance high_water to the actionable id 200 (not the summary 300), got %+v", st.upserts)
+	}
+}

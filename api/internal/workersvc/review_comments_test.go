@@ -108,6 +108,35 @@ func TestBuildReviewCommentsSnapshotZeroBotID(t *testing.T) {
 	}
 }
 
+// TestIsActionableReviewComment covers the #1142 trigger classifier: inline findings
+// (including a third-party review bot's) always count; a bot walkthrough/summary note
+// and a marker-carrying summary from a non-bot login (the GitLab/Forgejo CodeRabbit
+// shape) do not; a human top-level note and an unknown review state stay actionable.
+func TestIsActionableReviewComment(t *testing.T) {
+	summaryMarker := "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n\nNo actionable comments were generated."
+	walkthroughMarker := "<!-- walkthrough_start -->\n\nWalkthrough."
+	cases := []struct {
+		name string
+		c    ReviewCommentSnapshot
+		want bool
+	}{
+		{"inline human finding", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentInline, AuthorUsername: "carol", Body: "guard nil"}, true},
+		{"inline bot finding is actionable", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentInline, AuthorUsername: "coderabbitai[bot]", Body: "guard nil"}, true},
+		{"summary bot walkthrough by [bot] login", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "coderabbitai[bot]", Body: "here is what changed"}, false},
+		{"summary with coderabbit summarize marker, non-bot login", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "coderabbit", Body: summaryMarker}, false},
+		{"summary with walkthrough_start marker, non-bot login", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "coderabbit", Body: walkthroughMarker}, false},
+		{"human top-level note", ReviewCommentSnapshot{ReviewState: forge.ReviewCommentSummary, AuthorUsername: "maintainer", Body: "please also rename X"}, true},
+		{"unknown review state defaults to actionable", ReviewCommentSnapshot{ReviewState: "", AuthorUsername: "coderabbitai[bot]", Body: summaryMarker}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsActionableReviewComment(tc.c); got != tc.want {
+				t.Fatalf("IsActionableReviewComment(%+v) = %v, want %v", tc.c, got, tc.want)
+			}
+		})
+	}
+}
+
 // errMRForge overrides only ListMergeRequestComments (embedding forge.Forge for the
 // rest of the interface), returning a scripted error to exercise the degrade path.
 type errMRForge struct {
