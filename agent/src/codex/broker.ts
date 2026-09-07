@@ -54,12 +54,14 @@ import type { ExecutionRegistry } from "./registry.js";
 export const MAX_ID_BYTES = 512;
 export const MAX_TOOL_NAME_BYTES = 256;
 
-// Output caps. A shell effect's stdout/stderr and a file read's returned body are
-// bounded before they reach the model so a large effect cannot balloon a callback
-// result. HYGIENE bounds, not a redaction guarantee — the screener already denies a
-// secret READ, so an ALLOWED effect's output is the model's own legitimate result.
+// Output cap. A shell effect's stdout/stderr is bounded (as plain TEXT) before it
+// reaches the model so a large effect cannot balloon a callback result. HYGIENE bound,
+// not a redaction guarantee — the screener already denies a secret READ, so an ALLOWED
+// effect's output is the model's own legitimate result. A file READ has NO broker-level
+// cap: the fileop helper already bounds it to its own maxRead (1 MB) and returns valid
+// base64, which dispatchFileRead forwards verbatim (re-capping encoded base64 in the
+// broker would corrupt it — see dispatchFileRead).
 const MAX_SHELL_OUTPUT_BYTES = 64 * 1024;
-const MAX_FILE_READ_BYTES = 64 * 1024;
 // A tool/role/skill name echoed into a diagnostic is bounded so a long name cannot
 // bloat a denial message; the name already passed the byte cap, this is belt-and-braces.
 const MAX_DIAGNOSTIC_CHARS = 120;
@@ -267,13 +269,50 @@ function firstStrField(args: unknown, keys: readonly string[]): string | undefin
 }
 
 function boundedString(s: string, maxBytes: number): string {
-  if (Buffer.byteLength(s, "utf8") <= maxBytes) return s;
-  // Truncate by runes until under the byte cap, then mark it.
-  let out = s;
-  while (Buffer.byteLength(out, "utf8") > maxBytes && out.length > 0) {
-    out = out.slice(0, Math.max(0, out.length - 1));
-  }
+  // Enforce the byte cap in ONE shot (O(n)): encode once, and only if the encoding
+  // exceeds the cap slice the RAW bytes to the cap and decode. A trailing partial
+  // multi-byte sequence dropped by the slice is fine (toString renders it as the
+  // replacement char). The per-char shrink loop this replaced was O(n^2) — it
+  // recomputed Buffer.byteLength over the whole shrinking string every iteration,
+  // and on model-controlled shell/read output that is an event-loop DoS. This helper
+  // is for plain-TEXT (shell stdout/stderr) callers only; NEVER run it on base64 (a
+  // byte-boundary cut there yields non-decodable text — see dispatchFileRead).
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
+  const out = buf.subarray(0, maxBytes).toString("utf8");
   return `${out}…[truncated]`;
+}
+
+/** True for a code point that must not reach a human `message`: a C0 control
+ *  (0x00-0x1F, incl. TAB/LF/CR/ESC), DEL (0x7F), a C1 control (0x80-0x9F), or a
+ *  Unicode bidi/format control (zero-width, line/paragraph separators, bidi
+ *  embeddings/overrides/isolates, word joiner, BOM). */
+function isUnsafeIdentifierChar(cp: number): boolean {
+  if (cp <= 0x1f) return true; // C0 controls incl. TAB/LF/CR/ESC
+  if (cp === 0x7f) return true; // DEL
+  if (cp >= 0x80 && cp <= 0x9f) return true; // C1 controls
+  if (cp >= 0x200b && cp <= 0x200f) return true; // ZWSP..RLM
+  if (cp === 0x2028 || cp === 0x2029) return true; // line / paragraph separators
+  if (cp >= 0x202a && cp <= 0x202e) return true; // bidi embeddings / overrides
+  if (cp >= 0x2060 && cp <= 0x2064) return true; // word joiner..invisible separator
+  if (cp >= 0x2066 && cp <= 0x206f) return true; // bidi isolates + deprecated format
+  return cp === 0xfeff; // BOM / ZWNBSP
+}
+
+/** Sanitize an untrusted identifier (a model/app-server-controlled tool/role/skill
+ *  name) BEFORE it is embedded in a returned human `message`: replace every control
+ *  and bidi/format code point (see {@link isUnsafeIdentifierChar}) with the visible
+ *  replacement char so a name carrying ESC, CR/LF, or a bidi override cannot forge or
+ *  terminal-rewrite a downstream log/report line, then length-bound via `diag`. Pure
+ *  and allocation-bounded (one code-point pass + one slice). The stable machine `code`
+ *  is NEVER routed through this — only the human message. */
+function safeId(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    out += isUnsafeIdentifierChar(cp) ? "�" : ch;
+  }
+  return diag(out);
 }
 
 function diag(s: string): string {
@@ -463,12 +502,12 @@ export class CodexCallbackBroker {
 
     // An unrecognized tool never executes: deny with a diagnostic naming it.
     if (cap === "unknown") {
-      return deny("unknown_tool", `unrecognized tool "${diag(name)}" was stripped`);
+      return deny("unknown_tool", `unrecognized tool "${safeId(name)}" was stripped`);
     }
     // Authority is the grant, not the args: a known tool absent from the allow-list
     // is denied even with perfectly plausible arguments.
     if (!this.grants.allowedTools.has(canonical)) {
-      return deny("denied_tool", `tool "${diag(canonical)}" is not granted to role "${diag(this.grants.role)}"`);
+      return deny("denied_tool", `tool "${safeId(canonical)}" is not granted to role "${safeId(this.grants.role)}"`);
     }
 
     switch (cap) {
@@ -575,12 +614,21 @@ export class CodexCallbackBroker {
 
     const res = await this.fileop.op({ op: "read", path: screened.rel });
     if (!res.ok) return this.mapFileopError(res);
-    // The body is base64 from the helper; bound it and keep it lossless.
+    // FORWARD the helper's base64 body VERBATIM and PROPAGATE its `truncated` flag.
+    // Decision (forward-verbatim, no broker-level re-cap): the fileop helper already
+    // bounds a read to its own maxRead (1 MB) and returns VALID base64, so a second
+    // broker cap buys nothing. Running boundedString on the ENCODED text would cut it
+    // at a raw-byte boundary that is not a 4-char base64 quantum, producing
+    // non-decodable garbage and silently dropping the helper's truncation signal — the
+    // exact corruption this replaces. A smaller broker cap, were one ever needed, would
+    // have to DECODE -> slice the raw bytes -> RE-ENCODE (never truncate the text); it
+    // is not needed here, so the helper's bound stands.
     return {
       ok: true,
       output: {
         size: res.size,
-        contentBase64: typeof res.data === "string" ? boundedString(res.data, MAX_FILE_READ_BYTES) : undefined,
+        contentBase64: typeof res.data === "string" ? res.data : undefined,
+        truncated: res.truncated === true,
       },
     };
   }
@@ -597,7 +645,7 @@ export class CodexCallbackBroker {
     // Mirror isSubagentFrame/scanSignals authority: only the root/main origin may
     // latch a signal. A child or unknown origin can NEVER move the run's workflow.
     if (origin !== "root" || !this.grants.isRoot) {
-      return deny("signal_root_only", `signal "${diag(canonical)}" may be latched only by the root origin`);
+      return deny("signal_root_only", `signal "${safeId(canonical)}" may be latched only by the root origin`);
     }
     // Reuse the AUTHORITATIVE main-thread parser rather than a second copy of the
     // clamping logic: synthesize the same assistant/tool_use frame scanSignals reads.
@@ -632,7 +680,7 @@ export class CodexCallbackBroker {
     const role = firstStrField(args, ["subagent_type", "role", "agent_type"]);
     if (role === undefined) return deny("bad_args", "delegation requires a target role");
     if (!this.allowedRoles.has(role)) {
-      return deny("unknown_role", `role "${diag(role)}" is not a known delegation target`);
+      return deny("unknown_role", `role "${safeId(role)}" is not a known delegation target`);
     }
     // Await the child SYNCHRONOUSLY: the parent callback resolves only after it settles.
     const child = await this.delegateSeam({ tool: canonical, role, args, parent: rt });
@@ -651,18 +699,18 @@ export class CodexCallbackBroker {
       const skill = firstStrField(args, ["skill", "name"]);
       if (skill === undefined) return deny("bad_args", "a skill invocation requires a skill name");
       if (!this.grants.allowedSkills.has(skill)) {
-        return deny("denied_skill", `skill "${diag(skill)}" is not granted to role "${diag(this.grants.role)}"`);
+        return deny("denied_skill", `skill "${safeId(skill)}" is not granted to role "${safeId(this.grants.role)}"`);
       }
     }
     const handler = this.toolHandlers?.get(name);
     if (handler === undefined) {
-      return deny("denied_tool", `no handler is wired for "${diag(name)}"`);
+      return deny("denied_tool", `no handler is wired for "${safeId(name)}"`);
     }
     try {
       const output = await handler(args);
       return { ok: true, output };
     } catch {
-      return deny("handler_error", `the "${diag(name)}" handler failed`);
+      return deny("handler_error", `the "${safeId(name)}" handler failed`);
     }
   }
 }

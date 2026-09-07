@@ -203,7 +203,13 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     const h = makeBroker({ fileop });
     const r = await h.broker.handleToolCall(rt(), "Read", { path: "src/x.ts" }, "root");
     assert.equal(r.ok, true);
-    if (r.ok) assert.deepEqual(r.output, { size: 5, contentBase64: Buffer.from("hello").toString("base64") });
+    if (r.ok) {
+      assert.deepEqual(r.output, {
+        size: 5,
+        contentBase64: Buffer.from("hello").toString("base64"),
+        truncated: false,
+      });
+    }
     assert.equal(fileop.calls.length, 1);
     assert.equal(fileop.calls[0]!.op, "read");
   });
@@ -392,5 +398,170 @@ describe("CodexCallbackBroker: admission (registry idempotency + poison)", () =>
     const r = await h.broker.handleToolCall(rt(), "Bash", { command: "echo x" }, "root");
     assertDenied(r, "admission_closed");
     assert.equal(h.spawn.calls.length, 0);
+  });
+});
+
+const SHELL_OUTPUT_CAP_BYTES = 64 * 1024;
+const TRUNCATED_MARKER = "…[truncated]";
+
+describe("CodexCallbackBroker: large shell output is bounded in O(n) (no O(n^2) hang)", () => {
+  it("bounds 512 KiB of stdout FAST and marks it truncated", async () => {
+    // 512 KiB of single-byte ASCII. On the OLD per-char shrink loop this took ~71s
+    // (recomputing Buffer.byteLength over the whole shrinking string every iteration),
+    // which blows past both the time bound below and, on 1 MiB, the 120s test timeout.
+    const bigStdout = "x".repeat(512 * 1024);
+    const h = makeBroker({
+      spawnCommand: async (): Promise<SpawnCommandResult> => ({ code: 0, stdout: bigStdout, stderr: "" }),
+    });
+
+    const start = Date.now();
+    const r = await h.broker.handleToolCall(rt(), "Bash", { command: "echo big" }, "root");
+    const elapsedMs = Date.now() - start;
+
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      const out = r.output as { code: number; stdout: string; stderr: string };
+      // The truncation marker is present...
+      assert.ok(out.stdout.endsWith(TRUNCATED_MARKER), "expected the truncated marker");
+      // ...and the pre-marker body is byte-bounded to the cap (single-byte chars, so
+      // exactly the cap here). This alone fails the old code, which never returns.
+      const body = out.stdout.slice(0, out.stdout.length - TRUNCATED_MARKER.length);
+      assert.ok(
+        Buffer.byteLength(body, "utf8") <= SHELL_OUTPUT_CAP_BYTES,
+        `body ${Buffer.byteLength(body, "utf8")} exceeds cap ${SHELL_OUTPUT_CAP_BYTES}`,
+      );
+    }
+    // O(n) completes in milliseconds; the old O(n^2) path takes tens of seconds. A
+    // 5s ceiling cleanly separates the two without flaking under CI contention.
+    assert.ok(elapsedMs < 5000, `boundedString was slow (${elapsedMs}ms) — O(n^2) regression?`);
+  });
+
+  it("leaves at-cap output unmarked and byte-exact", async () => {
+    // Exactly the cap: no truncation, returned verbatim, no marker.
+    const exact = "y".repeat(SHELL_OUTPUT_CAP_BYTES);
+    const h = makeBroker({
+      spawnCommand: async (): Promise<SpawnCommandResult> => ({ code: 0, stdout: exact, stderr: "" }),
+    });
+    const r = await h.broker.handleToolCall(rt(), "Bash", { command: "echo exact" }, "root");
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      const out = r.output as { stdout: string };
+      assert.equal(out.stdout, exact);
+      assert.ok(!out.stdout.includes(TRUNCATED_MARKER));
+    }
+  });
+});
+
+describe("CodexCallbackBroker: file read forwards the helper's base64 verbatim + propagates truncated", () => {
+  it("forwards a large body (> any broker cap) that round-trips, truncated=false", async () => {
+    // 200 KiB of raw bytes -> ~266 KiB of base64, larger than the old 64 KiB broker
+    // cap. The old code ran boundedString on the ENCODED text, cutting it at a raw-byte
+    // boundary and appending a marker -> non-decodable garbage. Forwarding verbatim
+    // must round-trip exactly.
+    const raw = Buffer.alloc(200 * 1024, 0x41);
+    const b64 = raw.toString("base64");
+    const fileop = new FileopSpy({ ok: true, size: raw.length, data: b64, truncated: false });
+    const h = makeBroker({ fileop });
+
+    const r = await h.broker.handleToolCall(rt(), "Read", { path: "big.bin" }, "root");
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      const out = r.output as { size?: number; contentBase64?: string; truncated?: boolean };
+      assert.equal(out.contentBase64, b64, "base64 must be forwarded verbatim");
+      assert.ok(out.contentBase64 !== undefined);
+      // Round-trips cleanly and equals the original bytes (fails on the old truncation).
+      assert.ok(Buffer.from(out.contentBase64!, "base64").equals(raw), "base64 must round-trip");
+      assert.equal(out.truncated, false);
+    }
+  });
+
+  it("propagates truncated=true from the helper while still round-tripping", async () => {
+    const raw = Buffer.alloc(200 * 1024, 0x42);
+    const b64 = raw.toString("base64");
+    const fileop = new FileopSpy({ ok: true, size: raw.length, data: b64, truncated: true });
+    const h = makeBroker({ fileop });
+
+    const r = await h.broker.handleToolCall(rt(), "Read", { path: "big.bin" }, "root");
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      const out = r.output as { contentBase64?: string; truncated?: boolean };
+      assert.ok(out.contentBase64 !== undefined);
+      assert.ok(Buffer.from(out.contentBase64!, "base64").equals(raw), "base64 must round-trip");
+      assert.equal(out.truncated, true);
+    }
+  });
+});
+
+/** True if any code point in `s` is a C0/C1 control or DEL — a raw byte that could
+ *  forge or terminal-rewrite a downstream log/report line. Scans by code point (no
+ *  regex, which would trip oxlint's no-control-regex on the test file itself). */
+function hasRawControlChars(s: string): boolean {
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp <= 0x1f || cp === 0x7f || (cp >= 0x80 && cp <= 0x9f)) return true;
+  }
+  return false;
+}
+
+describe("CodexCallbackBroker: untrusted identifiers are sanitized in denial messages", () => {
+  // ESC + a CSI "clear screen" + LF + CR: the classic terminal-injection payload.
+  const CONTROL_PROBE = "evil\u001b[2Jtool\nrole\r";
+
+  it("strips control chars from an unknown tool name while keeping the stable code", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(rt(), CONTROL_PROBE, {}, "root");
+    assertDenied(r, "unknown_tool"); // stable machine code unchanged
+    assert.ok(!hasRawControlChars(r.message), `message carried a control char: ${JSON.stringify(r.message)}`);
+    // The visible, safe portion of the name is preserved.
+    assert.match(r.message, /evil/);
+  });
+
+  it("strips control chars from an unknown delegation role while keeping the stable code", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: CONTROL_PROBE }, "root");
+    assertDenied(r, "unknown_role");
+    assert.ok(!hasRawControlChars(r.message), `message carried a control char: ${JSON.stringify(r.message)}`);
+  });
+
+  it("strips control chars from a denied skill name while keeping the stable code", async () => {
+    const handlers = new Map([["Skill", async () => ({ ran: true })]]);
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["Skill"]), allowedSkills: new Set(["prd-lifecycle"]) }),
+      toolHandlers: handlers,
+    });
+    const r = await h.broker.handleToolCall(rt(), "Skill", { skill: CONTROL_PROBE }, "root");
+    assertDenied(r, "denied_skill");
+    assert.ok(!hasRawControlChars(r.message), `message carried a control char: ${JSON.stringify(r.message)}`);
+  });
+});
+
+describe("CodexCallbackBroker: root authority requires BOTH origin=root and grants.isRoot", () => {
+  it("denies a signal when origin is root but grants.isRoot is false", async () => {
+    const h = makeBroker({ grants: grants({ isRoot: false }) });
+    const r = await h.broker.handleToolCall(rt(), "submit_plan", { plan_md: "p" }, "root");
+    assertDenied(r, "signal_root_only");
+  });
+
+  it("denies delegation when origin is root but grants.isRoot is false, never running a child", async () => {
+    const h = makeBroker({ grants: grants({ isRoot: false }) });
+    const r = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "reviewer" }, "root");
+    assertDenied(r, "delegate_root_only");
+    assert.equal(h.delegate.calls.length, 0);
+  });
+});
+
+describe("CodexCallbackBroker: a throwing seam denies as broker_error with the reservation settled", () => {
+  it("catches a throwing spawn seam, denies broker_error, and settles (no in-flight, no poison)", async () => {
+    const h = makeBroker({
+      spawnCommand: async (): Promise<SpawnCommandResult> => {
+        throw new Error("seam blew up");
+      },
+    });
+    const r = await h.broker.handleToolCall(rt(), "Bash", { command: "echo hi" }, "root");
+    assertDenied(r, "broker_error");
+    // The admitted reservation was settled, so nothing is left in flight and the
+    // epoch is not poisoned (a clean quiesce would follow).
+    assert.equal(h.registry.inFlightCallbackCount(), 0);
+    assert.equal(h.registry.isPoisoned(), false);
   });
 });
