@@ -445,8 +445,12 @@ describe("CodexSessionStore", () => {
     const outsideDir = join(root, "outside-tree");
     await writeFileAt(join(outsideDir, "rollout-outside.jsonl"), "SECRET_OUTSIDE_TREE");
     await writeFileAt(join(codexHome, "sessions", "rollout-real.jsonl"), '{"ok":true}');
-    // sessions/subdir is a SYMLINK to that outside dir. The fd-anchored walk opens it
-    // O_NOFOLLOW|O_DIRECTORY (ELOOP → skip) and never descends into the target.
+    // sessions/subdir is a SYMLINK to that outside dir. readdir(withFileTypes) reports it
+    // as a symlink dirent, so entry.isDirectory() is false; it then fails the
+    // !entry.isFile() check and the walk skips it by dirent TYPE — before any openAt is
+    // attempted. (The separate O_NOFOLLOW|O_DIRECTORY/ELOOP guard is the TOCTOU defense
+    // for a directory that is swapped INTO a symlink AFTER readdir listed it as a real
+    // dir; a statically-symlinked dirent never reaches it.) Either way, never descended.
     await fsp.symlink(outsideDir, join(codexHome, "sessions", "subdir"));
 
     const result = await CodexSessionStore.persist(codexHome, storeDir);
@@ -474,6 +478,56 @@ describe("CodexSessionStore", () => {
     const stored = await collectRelFiles(storeDir);
     assert.deepEqual(stored, ["sessions/rollout-real.jsonl"]);
     assert.ok(!stored.some((p) => p.includes("inner")), "the inner rollout never copies");
+  });
+
+  it("FIX 4: persist REFUSES a source tree deeper than maxDepth (fail-closed, no partial store)", async () => {
+    // The auditor's MEDIUM regression: the fd-anchored walk holds a source AND dest dir
+    // fd OPEN at every recursion level, closing them only on unwind. maxScanEntries bounds
+    // total entries but NOT depth, so a deep single-child chain in the UNTRUSTED source
+    // (one dirent per level) can recurse arbitrarily deep, holding ~2·depth dir fds at
+    // once and exhausting the process fd table (EMFILE ≈ depth 510 at ulimit -n 1024).
+    // A 5-deep chain past a small injected maxDepth=3 must be refused BEFORE descending.
+    const deep = join(codexHome, "sessions", "l1", "l2", "l3", "l4", "l5");
+    await writeFileAt(join(deep, "rollout-deep.jsonl"), '{"deep":true}\n');
+    const shallow: SessionStoreBounds = { ...DEFAULT_SESSION_STORE_BOUNDS, maxDepth: 3 };
+
+    await assert.rejects(
+      () => CodexSessionStore.persist(codexHome, storeDir, { bounds: shallow }),
+      (err: unknown) => {
+        assert.ok(
+          err instanceof CodexSessionStoreBoundError,
+          "a bound error, not an unbounded fd-holding recursion",
+        );
+        assert.equal(err.bound, "maxDepth", "the recursion-DEPTH cap tripped");
+        return true;
+      },
+    );
+
+    // Atomic persist: the depth-breached copy leaves nothing a later inspect/adopt would
+    // treat as a resumable store (the deep rollout must NOT have been copied).
+    assert.equal(
+      await CodexSessionStore.inspect(storeDir),
+      "absent",
+      "a depth-breached persist must leave no adoptable partial store",
+    );
+  });
+
+  it("FIX 4: adopt STOPS on a too-deep store without throwing (fail-safe, copies 0)", async () => {
+    // The fail-safe twin of the persist test above. adopt uses the default maxDepth, so
+    // build a store chain a few levels PAST it: the fail-safe walk must stop (return
+    // false) rather than throw, seeding nothing — never recursing the full chain.
+    const depthTarget = (DEFAULT_SESSION_STORE_BOUNDS.maxDepth ?? 64) + 5;
+    let deep = join(storeDir, "sessions");
+    for (let i = 0; i < depthTarget; i += 1) deep = join(deep, "d");
+    await writeFileAt(join(deep, "rollout-deep.jsonl"), '{"deep":true}\n');
+
+    const freshHome = join(root, "fresh-home");
+    const adopted = await CodexSessionStore.adopt(storeDir, freshHome);
+    assert.equal(
+      adopted.files,
+      0,
+      "a too-deep store is not adopted (fail-safe stop, no throw)",
+    );
   });
 
   it("the allowlist/denylist constants encode the credential-free contract", () => {

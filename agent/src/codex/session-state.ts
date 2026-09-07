@@ -48,11 +48,17 @@
 // Each source file is copied through the OPEN fd — its size taken from an `fstat` on
 // that pinned fd and AT MOST that many bytes read — so a file that grows after the stat
 // can never be read unboundedly. The copy is bounded on every axis — a per-file byte
-// cap, a total byte cap, a file-count cap AND a per-entry scan cap that charges EVERY
-// entry examined (not just copied) — so a hostile tree stuffed with non-allowlisted
-// entries cannot make the walk run unboundedly even when it copies nothing. A failed
-// `persist` removes any partial dest copy before re-throwing, so a breach mid-copy
-// leaves nothing a later `adopt`/`inspect` would treat as a resumable store.
+// cap, a total byte cap, a file-count cap, a per-entry scan cap that charges EVERY entry
+// examined (not just copied), AND a recursion-DEPTH cap — so a hostile tree cannot make
+// the walk run unboundedly even when it copies nothing. The depth cap is load-bearing
+// beyond total work: the fd-anchored walk holds an open source AND dest directory fd at
+// EVERY level simultaneously (~2·depth open fds), so a deep single-child source chain in
+// the untrusted codexHome would otherwise exhaust the process fd table (EMFILE, ≈ depth
+// 510 at the default 1024 fd limit) long before the per-entry scan cap — which bounds
+// total entries but NOT depth — is reached; the depth cap bounds the simultaneous-fd
+// count directly. A failed `persist` removes any partial dest copy before re-throwing,
+// so a breach mid-copy leaves nothing a later `adopt`/`inspect` would treat as a
+// resumable store.
 //
 // This module NEVER logs file contents or a token; diagnostics are static and
 // bounded (an error names only which cap was hit, never a path or a byte).
@@ -120,7 +126,22 @@ export interface SessionStoreBounds {
    *  non-allowlisted entries cannot make the walk run unboundedly. Must comfortably
    *  exceed `maxFiles` so a legitimate full-size copy is never starved by the scan. */
   readonly maxScanEntries: number;
+  /** Maximum directory-recursion DEPTH of the copy walk (top-level `sessions/` is depth
+   *  0; its immediate subdirs are depth 1, and so on). OPTIONAL: when undefined the walk
+   *  uses {@link DEFAULT_SESSION_STORE_MAX_DEPTH}, so existing bounds objects need no
+   *  change. Unlike `maxScanEntries` (which bounds total entries but NOT depth), this
+   *  bounds the number of directory fds held OPEN simultaneously (~2·depth, one source +
+   *  one dest per level) so a deep single-child chain in the untrusted source cannot
+   *  exhaust the process fd table (EMFILE). A real rollout tree is only a few levels. */
+  readonly maxDepth?: number;
 }
+
+/** Module-private default recursion-DEPTH cap, used by the copy walk when
+ *  `bounds.maxDepth` is undefined. A real rollout tree is only a few levels deep, so 64
+ *  is generous while still bounding the ~2·depth directory fds the fd-anchored walk holds
+ *  open simultaneously — a deep single-child chain in the untrusted source can no longer
+ *  recurse toward the process fd-table limit (EMFILE ≈ depth 510 at the default 1024). */
+const DEFAULT_SESSION_STORE_MAX_DEPTH = 64;
 
 /** Conservative production caps. A real rollout subtree is a handful of JSONL files;
  *  these exist so a hostile/runaway tree fails closed rather than copying forever. */
@@ -129,6 +150,7 @@ export const DEFAULT_SESSION_STORE_BOUNDS: SessionStoreBounds = {
   maxTotalBytes: 512 * 1024 * 1024, // 512 MiB
   maxFileBytes: 64 * 1024 * 1024, // 64 MiB
   maxScanEntries: 100_000, // 10× maxFiles: headroom for dirs on a legit full copy
+  maxDepth: DEFAULT_SESSION_STORE_MAX_DEPTH, // caps simultaneous dir fds (~2·depth)
 };
 
 /** Result of {@link CodexSessionStore.persist}. */
@@ -284,8 +306,12 @@ async function readBounded(fh: FileHandle, size: number): Promise<Buffer> {
  * fresh-root "nothing to persist" contract), while ELOOP (a symlink) or ENOTDIR (not a
  * dir) is a refusal — `persist` throws {@link CodexSessionStoreError}, `adopt` returns
  * empty. Every entry examined charges the per-entry `visited` counter against
- * `bounds.maxScanEntries`, so an adversarial tree of non-allowlisted entries cannot
- * make the walk run unboundedly even copying zero.
+ * `bounds.maxScanEntries`, and every descent charges the `depth` argument against
+ * `bounds.maxDepth` (default {@link DEFAULT_SESSION_STORE_MAX_DEPTH}) BEFORE the child
+ * directory fd is opened, so neither an adversarial wide tree of non-allowlisted entries
+ * nor a deep single-child chain (which would hold ~2·depth source+dest dir fds open
+ * across the recursion and exhaust the process fd table) can make the walk run
+ * unboundedly even copying zero — the walk is bounded on every axis, entries AND depth.
  */
 async function copyAllowlistedSessions(
   srcSessionsDir: string,
@@ -295,13 +321,19 @@ async function copyAllowlistedSessions(
 ): Promise<CopyTally> {
   const srcRoot = resolve(srcSessionsDir);
   const destRoot = resolve(destSessionsDir);
+  const maxDepth = bounds.maxDepth ?? DEFAULT_SESSION_STORE_MAX_DEPTH;
   const tally: CopyTally = { files: 0, bytes: 0 };
   let visited = 0;
 
-  // Walk one directory level holding BOTH the source and dest directory fds. Returns
-  // false to signal a fail-safe stop (a bound tripped with throwOnBound=false); throws
-  // on a fail-closed bound breach.
-  const walk = async (srcDirFh: FileHandle, destDirFh: FileHandle): Promise<boolean> => {
+  // Walk one directory level holding BOTH the source and dest directory fds. `depth` is
+  // the current recursion depth (top-level `sessions/` is 0). Returns false to signal a
+  // fail-safe stop (a bound tripped with throwOnBound=false); throws on a fail-closed
+  // bound breach.
+  const walk = async (
+    srcDirFh: FileHandle,
+    destDirFh: FileHandle,
+    depth: number,
+  ): Promise<boolean> => {
     let entries;
     try {
       // Listing the fd's own inode (via /proc/self/fd) keeps the read anchored: it
@@ -323,6 +355,15 @@ async function copyAllowlistedSessions(
 
       if (entry.isDirectory()) {
         if (nameHasDenySubstring(name)) continue; // never descend an auth-shaped dir
+        // Depth cap BEFORE opening the child dir fd, so we never open even one fd past the
+        // limit. The fd-anchored walk holds a source AND dest dir fd at every level
+        // simultaneously (~2·depth), so an unbounded-depth chain in the untrusted source
+        // would exhaust the process fd table (EMFILE); cap it on the same fail-closed /
+        // fail-safe split every other bound uses.
+        if (depth + 1 > maxDepth) {
+          if (throwOnBound) throw new CodexSessionStoreBoundError("maxDepth", maxDepth);
+          return false; // fail-safe: stop the walk
+        }
         let srcChild: FileHandle;
         try {
           srcChild = await openAt(srcDirFh, name, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_DIRECTORY);
@@ -345,7 +386,7 @@ async function copyAllowlistedSessions(
             FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_DIRECTORY,
           );
           try {
-            const proceed = await walk(srcChild, destChild);
+            const proceed = await walk(srcChild, destChild, depth + 1);
             if (!proceed) return false;
           } finally {
             await destChild.close();
@@ -430,7 +471,7 @@ async function copyAllowlistedSessions(
     await fsp.mkdir(destRoot, { recursive: true, mode: 0o700 });
     const destTop = await fsp.open(destRoot, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_DIRECTORY);
     try {
-      await walk(srcTop, destTop);
+      await walk(srcTop, destTop, 0);
     } finally {
       await destTop.close();
     }
