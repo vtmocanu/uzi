@@ -291,7 +291,7 @@ func (q *Queries) GetUserSecretIDByLabel(ctx context.Context, arg GetUserSecretI
 }
 
 const getUserSecretMetaByID = `-- name: GetUserSecretMetaByID :one
-SELECT id, label FROM user_secrets
+SELECT id, label, kind FROM user_secrets
 WHERE id = $1 AND user_id = $2
 `
 
@@ -303,6 +303,7 @@ type GetUserSecretMetaByIDParams struct {
 type GetUserSecretMetaByIDRow struct {
 	ID    uuid.UUID `json:"id"`
 	Label string    `json:"label"`
+	Kind  string    `json:"kind"`
 }
 
 // The by-id counterpart of GetDefaultUserSecretMeta (PRD #111 M1): the label of
@@ -322,10 +323,16 @@ type GetUserSecretMetaByIDRow struct {
 // would change what an (already impossible) mis-kinded binding fails WITH, for no
 // gain. pgx.ErrNoRows means "not this user's secret, or gone", which the claim path
 // maps to the same credential failure OpenByID's ErrNoSecret produces today.
+//
+// SECURITY HARDENING (PRD #1147 audit): kind rides along additively so the bind-time
+// kind↔auth-mode check can verify the credential's actual kind matches the auth mode
+// the binding was frozen with (a codex_auth alias bound as an api_key, or an
+// openai_api_key bound as a subscription, is a contradiction the audit found unchecked).
+// The predicate stays unfiltered on kind for the reason above; only the SELECT list grows.
 func (q *Queries) GetUserSecretMetaByID(ctx context.Context, arg GetUserSecretMetaByIDParams) (GetUserSecretMetaByIDRow, error) {
 	row := q.db.QueryRow(ctx, getUserSecretMetaByID, arg.ID, arg.UserID)
 	var i GetUserSecretMetaByIDRow
-	err := row.Scan(&i.ID, &i.Label)
+	err := row.Scan(&i.ID, &i.Label, &i.Kind)
 	return i, err
 }
 

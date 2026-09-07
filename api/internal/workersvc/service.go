@@ -995,6 +995,13 @@ type Service struct {
 	// deployment without the vault) disables the gate and falls back to opening the
 	// token under the master box — the pre-vault behavior.
 	vlt *vault.Vault
+	// codexRefresh is the injectable oauth-exchange seam the coordinated Codex
+	// refresher uses (PRD #1147 M2, B6, ships DARK). *codexauth.Client satisfies
+	// CodexRefreshClient in production; tests supply a call-counting fake. Optional
+	// (nil): a nil client makes CoordinatedCodexRefresh refuse before touching the
+	// provider, so a deployment (or test) without it never rotates. No production path
+	// wires it yet — m2 ships dark.
+	codexRefresh CodexRefreshClient
 	// Two narrow settings views over the same *settings.Cache: `settings` =
 	// judge/self-improve reads, `healthSettings` = run-health reads (interface
 	// segregation — each feature's tests fake only what they use).

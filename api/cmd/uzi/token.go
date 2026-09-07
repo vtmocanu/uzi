@@ -92,10 +92,23 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(secrets))
 			for _, s := range secrets {
+				// KIND distinguishes the credential kinds `ListSecrets` now returns
+				// together (PRD #1147 M1): anthropic_token, codex_auth, openai_api_key.
+				// STATUS renders the codex link state for a codex row, and "-" for an
+				// anthropic row that carries none.
+				//
 				// POOL is the OPT-IN; ELIGIBLE is the live answer, and they are different
 				// facts on purpose. A token can be opted in and still unpickable — its
 				// gauge may never have polled, or its reading may have aged out — which is
 				// exactly the state a user needs to see rather than infer.
+				//
+				// Both POOL and ELIGIBLE are Anthropic-only concepts: there is no Codex
+				// auto-selection pool server-side, so a codex row's POOL/ELIGIBLE must read
+				// "-" (not applicable), not "false"/"no" (which would imply an opt-in a user
+				// could flip). ELIGIBLE already reads "-" for a codex row because it is
+				// absent from the anthropic-only eligibility map and carries
+				// AutoEligible=false; POOL is forced to "-" here for the same reason rather
+				// than rendering a misleading boolean (PRD #1147 M3).
 				//
 				// The status string is RENDERED, never re-derived (D21): it is
 				// autoselect.Classify's answer, the same function the selector gates on,
@@ -110,13 +123,19 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// reasons are the durable part: cellText additionally caps length, it names
 				// this value as untrusted where the boundary cannot, and it keeps holding if
 				// this row ever stops being rendered through Printer.Table.
+				isAnthropic := s.Kind == kindAnthropicToken
+				poolCell := "-"
+				if isAnthropic {
+					poolCell = boolStr(s.AutoEligible)
+				}
 				rows = append(rows, []string{
-					s.ID, cellText(s.Label), boolStr(s.IsDefault), boolStr(s.AutoEligible),
-					eligibilityCell(s.AutoEligible, eligibility[s.ID]),
+					s.ID, tokenKindAlias(s.Kind), cellText(s.Label), boolStr(s.IsDefault),
+					poolCell, eligibilityCell(s.AutoEligible, eligibility[s.ID]),
+					codexStatusCell(s.CodexStatus),
 					s.CreatedAt.Format("2006-01-02"),
 				})
 			}
-			return p.Table([]string{"ID", "LABEL", "DEFAULT", "POOL", "ELIGIBLE", "CREATED"}, rows)
+			return p.Table([]string{"ID", "KIND", "LABEL", "DEFAULT", "POOL", "ELIGIBLE", "STATUS", "CREATED"}, rows)
 		},
 	}
 
@@ -136,9 +155,11 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 	//     string distinct to the index — so both labels can coexist as separate rows
 	//     while this command folds them together and pools whichever the list returns
 	//     first. Exotic, and self-evident in `uzi token list`, which shows both rows.
-	//   - findSecretByLabel has NO kind filter, while GetUserSecretIDByLabel does. It
-	//     is vacuous today (anthropic_token is the only kind) and would matter the
-	//     moment a second one lands.
+	//   - findSecretByLabel once had NO kind filter, while GetUserSecretIDByLabel
+	//     does. That was vacuous while anthropic_token was the only kind; PRD #1147
+	//     M1 landed codex_auth/openai_api_key, so this now passes kindAnthropicToken
+	//     to findSecretByLabel and rejects a non-anthropic match with a usage error
+	//     (M3). The client-side/server-side case-folding split above still stands.
 	//
 	// The reason it is client-side anyway: the toggle route is keyed on the secret id
 	// (D13's narrow route), and giving it a label-accepting variant would widen a
@@ -176,8 +197,23 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			target, ok := findSecretByLabel(secrets, args[0])
+			// KIND-FILTERED to anthropic_token (PRD #1147 M3). Before this milestone
+			// findSecretByLabel had no kind filter and anthropic_token was the only kind,
+			// so the resolution was vacuously anthropic-only; now that ListSecrets returns
+			// codex_auth/openai_api_key rows too, an unfiltered match could cross-resolve a
+			// codex secret sharing a label with an anthropic one, or land on a codex row
+			// and try to set auto-eligible on it — but there is no Codex auto-selection
+			// pool server-side, so pool stays Anthropic-only.
+			target, ok := findSecretByLabel(secrets, kindAnthropicToken, args[0])
 			if !ok {
+				// If a NON-anthropic secret carries this label, name its kind so the caller
+				// understands the refusal (the pool is Anthropic-only) rather than being told
+				// no such token exists when one plainly does under `uzi token list`.
+				if other, found := findSecretByLabel(secrets, "", args[0]); found {
+					return uzicli.Exitf(uzicli.ExitUsage,
+						"token pool applies only to Anthropic tokens; %q is a %s credential",
+						args[0], tokenKindAlias(other.Kind))
+				}
 				// A usage error, not a 404: the label never reached the server, so this
 				// reports what actually happened — the caller holds no token by that name.
 				return uzicli.Exitf(uzicli.ExitUsage, "no Anthropic token labelled %q; `uzi token list` shows yours", args[0])
@@ -256,13 +292,66 @@ func eligibilityCell(pooled bool, status string) string {
 	return status
 }
 
+// Secret kind values as stored server-side and carried in SecretDTO.Kind (PRD
+// #1147 M1). ListSecrets returns all three together, so the CLI names them rather
+// than assuming anthropic_token is the only kind.
+const (
+	kindAnthropicToken = "anthropic_token" //nolint:gosec // G101: this is a secret KIND discriminator (the server's enum value), not a credential value; SecretDTO carries no secret material at all.
+	kindCodexAuth      = "codex_auth"
+	kindOpenAIAPIKey   = "openai_api_key" //nolint:gosec // G101: a secret KIND discriminator, not a credential value; SecretDTO carries no secret material at all.
+)
+
+// tokenKindAlias maps a SecretDTO.Kind to the short label the KIND column shows
+// (PRD #1147 M3). The mapping is:
+//
+//	anthropic_token -> "anthropic"
+//	codex_auth      -> "codex"
+//	openai_api_key  -> "openai-key"
+//
+// An unrecognised kind prints as ITSELF rather than being dropped or mismapped —
+// the same discipline eligibilityCell applies to an unknown status, so a kind this
+// binary has never heard of is still legible instead of silently blank.
+func tokenKindAlias(kind string) string {
+	switch kind {
+	case kindAnthropicToken:
+		return "anthropic"
+	case kindCodexAuth:
+		return "codex"
+	case kindOpenAIAPIKey:
+		return "openai-key"
+	default:
+		return kind
+	}
+}
+
+// codexStatusCell renders the STATUS column for `uzi token list` (PRD #1147 M3):
+// the codex link state (staging/linked/failed/static) for a codex row, or "-" for
+// an anthropic row, which carries no such state and leaves CodexStatus empty. The
+// value is rendered verbatim, never re-derived, so a status this binary has not
+// heard of prints as itself.
+func codexStatusCell(status string) string {
+	if status == "" {
+		return "-"
+	}
+	return status
+}
+
 // findSecretByLabel resolves a user-facing label to the token it names,
 // case-insensitively — matching the unique index 00077 put on
 // (user_id, kind, lower(label)), so the CLI accepts the same spellings the server
 // treats as one token.
-func findSecretByLabel(secrets []apitypes.SecretDTO, label string) (apitypes.SecretDTO, bool) {
+//
+// kind filters the search to a single SecretDTO.Kind; an empty kind matches any.
+// The filter mirrors GetUserSecretIDByLabel's server-side kind scoping (PRD #1147
+// M3): now that ListSecrets returns multiple kinds, a label can collide across
+// kinds, so the pool command passes kindAnthropicToken to avoid cross-resolving a
+// codex secret.
+func findSecretByLabel(secrets []apitypes.SecretDTO, kind, label string) (apitypes.SecretDTO, bool) {
 	want := strings.ToLower(strings.TrimSpace(label))
 	for _, s := range secrets {
+		if kind != "" && s.Kind != kind {
+			continue
+		}
 		if strings.ToLower(s.Label) == want {
 			return s, true
 		}

@@ -513,6 +513,50 @@ const realApi = {
   deleteAnthropicToken: () =>
     request<null>("DELETE", "/me/secrets/anthropic_token"),
 
+  // PRD #1147 M3 Codex/OpenAI credential CRUD. Body shapes mirror Anthropic exactly
+  // (create {token,label,default} → {secret}; patch {label?,default?,token?} → {secret};
+  // delete → empty). All cookie-only (D8), like the Anthropic writes. There is NO codex
+  // pool/auto-eligible route — an `auto` worker never spends a Codex credential.
+  //
+  // Two kinds share one card and one default: `codex_auth` (a `claude`-style Codex
+  // login, status "staging" → resolver → "linked"/"failed") and `openai_api_key`
+  // (a static Console key, status "static"). The server force-defaults a user's FIRST
+  // codex credential across BOTH kinds.
+  createCodexAuth: (token: string, label: string, isDefault: boolean) =>
+    request<{ secret: SecretMeta }>("POST", "/me/secrets/codex_auth", {
+      token,
+      label,
+      default: isDefault,
+    }),
+  patchCodexAuth: (
+    id: string,
+    body: { label?: string; default?: boolean; token?: string },
+  ) =>
+    request<{ secret: SecretMeta }>(
+      "PATCH",
+      `/me/secrets/codex_auth/${id}`,
+      body,
+    ),
+  deleteCodexAuthById: (id: string) =>
+    request<null>("DELETE", `/me/secrets/codex_auth/${id}`),
+  createOpenAIApiKey: (token: string, label: string, isDefault: boolean) =>
+    request<{ secret: SecretMeta }>("POST", "/me/secrets/openai_api_key", {
+      token,
+      label,
+      default: isDefault,
+    }),
+  patchOpenAIApiKey: (
+    id: string,
+    body: { label?: string; default?: boolean; token?: string },
+  ) =>
+    request<{ secret: SecretMeta }>(
+      "PATCH",
+      `/me/secrets/openai_api_key/${id}`,
+      body,
+    ),
+  deleteOpenAIApiKeyById: (id: string) =>
+    request<null>("DELETE", `/me/secrets/openai_api_key/${id}`),
+
   // Vault (PRD #32): unlock re-derives the DEK from the login password (204, or
   // 403 on a wrong password); lock evicts it; status is a lightweight poll. Unlock
   // and lock return no body.
