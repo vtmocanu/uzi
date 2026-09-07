@@ -128,6 +128,21 @@ export interface CodexAdviceHarnessOptions {
  *  after abort (the success path settles first, so no grace is waited). */
 const DEFAULT_ADVICE_GRACE_MS = 500;
 
+/**
+ * Hard ceiling on the TOTAL accumulated advice text, enforced as a running byte sum in
+ * {@link CodexAdviceHarness.consume}. The transport's per-frame (4 MiB) and aggregate
+ * inbound-queue (64 MiB) ceilings bound only momentary BUFFERING: because `consume` drains
+ * notifications ONE at a time, the queue stays near-empty and never binds, so the running
+ * `text` string it accumulates would otherwise be UNBOUNDED — a hostile or looping
+ * app-server streaming near-cap frames within the timeout window could accrue arbitrary
+ * text (100+ MiB observed) and OOM the worker, and the wall-clock timeout is not a memory
+ * bound. 8 MiB is generous headroom for any judge/review/summary output (advice results are
+ * model text, realistically kilobytes) yet well below Node's default old-space (~2 GB,
+ * `--max-old-space-size`), so a genuine advice response never trips it while a runaway
+ * stream fails closed long before OOM.
+ */
+const MAX_ADVICE_TEXT_BYTES = 8 * 1024 * 1024;
+
 // --- small pure helpers -------------------------------------------------------
 
 function asObject(v: unknown): Record<string, unknown> | undefined {
@@ -287,6 +302,10 @@ export class CodexAdviceHarness implements AdviceHarness {
     // Single-consumer: obtain the notifications iterator exactly once.
     const notes = transport.notifications();
     let text = "";
+    // Running byte sum of the accumulated advice text, so the total is bounded against an
+    // unbounded/looping stream (see MAX_ADVICE_TEXT_BYTES). Kept O(n) total: each appended
+    // chunk is measured EXACTLY ONCE here, never a re-scan of the whole `text`.
+    let textBytes = 0;
 
     // Abort race: an aborted signal (timeout OR external) ends the stream promptly rather
     // than blocking forever on notes.next().
@@ -340,7 +359,26 @@ export class CodexAdviceHarness implements AdviceHarness {
 
         // Assistant text accumulation (item/completed agentMessage). Everything else
         // (thread/started, turn/started, item deltas, unknown methods) is liveness only.
-        if (note.kind === "activity") text += this.extractAdviceText(note);
+        if (note.kind === "activity") {
+          const chunk = this.extractAdviceText(note);
+          if (chunk.length > 0) {
+            const chunkBytes = Buffer.byteLength(chunk, "utf8");
+            // FAIL-CLOSED when appending WOULD exceed the ceiling: throw the bounded
+            // overflow error (mirroring the transport's own {category:"transport"} inbound
+            // overflow discipline) rather than return a silently-truncated verdict — a
+            // truncated judge/review result is worse than a thrown failure, which advice
+            // callers already handle. The throw propagates through run()'s settlement /
+            // grace / HOME-dispose finally like any other stream failure.
+            if (textBytes + chunkBytes > MAX_ADVICE_TEXT_BYTES) {
+              throw new CodexAdviceError({
+                category: "transport",
+                message: "advice response exceeded the maximum size",
+              });
+            }
+            textBytes += chunkBytes;
+            text += chunk;
+          }
+        }
       }
     } finally {
       if (onAbort) signal.removeEventListener("abort", onAbort);

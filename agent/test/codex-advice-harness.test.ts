@@ -474,6 +474,56 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
   });
 });
 
+describe("CodexAdviceHarness: accumulated advice text is bounded (fail-closed)", () => {
+  it("many large chunks with NO terminal REJECT with the bounded overflow error PROMPTLY, and the HOME is still disposed", async () => {
+    const bits = makeHarness();
+    // Feed near-cap assistant chunks with NO terminal and NO end(). The transport's
+    // per-frame (4 MiB) and inbound-queue (64 MiB) ceilings bound only momentary buffering:
+    // because consume() drains notes one at a time, the running `text` would otherwise grow
+    // UNBOUNDED (100+ MiB) and OOM the worker. The byte cap must FAIL CLOSED long before the
+    // wall-clock timeout. One 2 MiB string is shared across the notes (references, not
+    // copies), so the test's own footprint stays small.
+    const chunk = "x".repeat(2 * 1024 * 1024); // 2 MiB per frame
+    bits.transport.push(threadStarted()).push(turnStarted());
+    for (let i = 0; i < 6; i += 1) bits.transport.push(agentMessage(chunk)); // > 8 MiB total, no terminal
+
+    // A wall-clock timeout well above the (near-instant) in-loop cap trip: if the cap
+    // regressed, the harness would instead block on the drained queue until this timeout —
+    // which the type/message + promptness assertions below both catch.
+    const req = makeAdviceRequest({ label: "judge", timeoutMs: 5000, graceMs: 10 });
+    const start = Date.now();
+    await assert.rejects(bits.harness.run(req, noThrowPolicy), (err: unknown) => {
+      assert.ok(err instanceof CodexAdviceError);
+      // Mirrors the transport's own {category:"transport"} inbound overflow discipline.
+      assert.equal(err.failure.category, "transport");
+      assert.match(err.message, /exceeded the maximum size/);
+      return true;
+    });
+    // PROMPTLY: the cap fired IN-LOOP, not at the 5000ms wall-clock timeout — proof it does
+    // not accumulate toward OOM and does not wait out the timeout window.
+    assert.ok(Date.now() - start < 2000, "the overflow rejects promptly, not at the wall-clock timeout");
+    assert.equal(bits.disposeCalls(), 1, "the isolated HOME is disposed after the overflow");
+  });
+
+  it("accumulated text just UNDER the cap still returns normally (the cap does not fire on a genuine response)", async () => {
+    const bits = makeHarness();
+    // A single ~1 MiB assistant message is well under the 8 MiB ceiling: a normal advice
+    // response must accumulate and return, proving the bound is a ceiling, not a throttle.
+    const body = "y".repeat(1024 * 1024);
+    bits.transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(agentMessage(body))
+      .push(turnCompleted("completed", { total_tokens: 3 }))
+      .end();
+
+    const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+    assert.equal(result.text, body);
+    assert.equal(result.end.kind, "terminal");
+    assert.equal(bits.disposeCalls(), 1);
+  });
+});
+
 describe("CodexAdviceHarness: output schema is fail-closed", () => {
   it("a {kind:'json'} output is REFUSED fail-closed (no silent unenforced text, nothing launched)", async () => {
     let launched = 0;
