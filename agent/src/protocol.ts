@@ -448,11 +448,14 @@ export interface ClaimConfig {
   default_model?: string;
   /** The run owner's per-user default reasoning effort (PRD #617). When present it
    *  is applied to the SDK's top-level `Options.effort` for the main thread and
-   *  inherited by the implement-turn/subagent options via the baseOptions spread;
-   *  absent when the owner set no default, so the worker omits the key entirely and
-   *  the SDK default (`high`) applies. Typed as the SDK's own EffortLevel so the
-   *  worker tracks the SDK's closed set (mirror of the Go `agenttmpl.EffortLevels`
-   *  and the web EffortSelect list — no shared source, keep in lockstep). */
+   *  inherited by the implement-turn/subagent options via the baseOptions spread. The
+   *  API now populates this for every issue/chat claim — the owner's explicit choice,
+   *  or the uzi default `xhigh` for an owner who never chose (issue #1157); it is
+   *  absent only from an un-upgraded API, in which case the worker omits the key and
+   *  the SDK applies its own fallback (the worker adds no default of its own). Typed as
+   *  the SDK's own EffortLevel so the worker tracks the SDK's closed set (mirror of the
+   *  Go `agenttmpl.EffortLevels` and the web EffortSelect list — no shared source, keep
+   *  in lockstep). */
   default_effort?: EffortLevel;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
@@ -967,7 +970,9 @@ export interface ChatClaimConfig {
   max_turns: number;
   /** The owner's per-user default model (PRD #17); omitted when unset. */
   default_model?: string;
-  /** The owner's per-user default reasoning effort (PRD #617); omitted when unset. */
+  /** The owner's per-user default reasoning effort (PRD #617); the API populates it
+   *  with the owner's choice or the uzi default `xhigh` (issue #1157), and it is
+   *  optional only for an un-upgraded API. */
   default_effort?: EffortLevel;
 }
 

@@ -704,8 +704,8 @@ type Store interface {
 	SetUserJudgeAnthropicBinding(ctx context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// Per-user default reasoning effort (PRD #617): read at issue- and chat-run
-	// claim assembly, keyed on the run owner. NULL ⇒ inherit (worker omits the SDK
-	// effort key, so the SDK default `high` applies).
+	// claim assembly, keyed on the run owner. NULL ⇒ inherit, resolved to the uzi
+	// default `xhigh` at claim assembly (issue #1157).
 	GetUserDefaultEffort(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// Per-user AI-attribution opt-out (issue #916): read LIVE at standard run-claim
 	// assembly, keyed on the run owner, so flipping the toggle takes effect on the

@@ -147,8 +147,8 @@ UPDATE users SET default_model = @default_model WHERE id = @id
 RETURNING default_model;
 
 -- name: GetUserDefaultEffort :one
--- The current user's per-user default reasoning effort (PRD #617); NULL = inherit
--- (we omit the SDK effort key, so the SDK default `high` applies). Read at issue-
+-- The current user's per-user default reasoning effort (PRD #617); NULL = inherit,
+-- resolved to the uzi default `xhigh` at claim assembly (issue #1157). Read at issue-
 -- and chat-run claim assembly, keyed on the run owner. Selects only the column.
 SELECT default_effort FROM users WHERE id = $1;
 

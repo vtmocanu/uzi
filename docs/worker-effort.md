@@ -7,8 +7,9 @@ audience: user
 # Reasoning effort
 
 Pick how hard the Claude Agent SDK reasons on your own runs — the lead
-orchestrator and the subagents that inherit it. This overrides the SDK
-default just for you. Other users' runs are unaffected.
+orchestrator and the subagents that inherit it. This sets your own
+reasoning effort, overriding uzi's default just for you. Other users' runs
+are unaffected.
 
 ## Effort levels
 
@@ -17,11 +18,13 @@ default just for you. Other users' runs are unaffected.
 - `high`
 - `xhigh`
 - `max`
-- **Inherit** (the default)
+- **Inherit** (uzi default: `xhigh`)
 
-**Unset means the SDK default (`high`).** When you leave it on Inherit, uzi
-sends no effort setting at all, so the Claude Agent SDK's own default
-(`high`) applies — exactly as before this setting existed.
+**Unset means the uzi default (`xhigh`).** When you leave it on Inherit, uzi
+applies its own default reasoning effort — `xhigh` — to your runs. (This is
+deeper reasoning than the Claude Agent SDK's own built-in fallback of
+`high`; uzi now sets the level explicitly for you rather than leaving it
+unset.)
 
 ## Good to know
 
@@ -48,4 +51,4 @@ sends no effort setting at all, so the Claude Agent SDK's own default
    **Inherit**.
 3. Click **Save effort**. It applies starting with your next run.
 
-Leave it on **Inherit** to use the SDK default (`high`).
+Leave it on **Inherit** to use the uzi default (`xhigh`).

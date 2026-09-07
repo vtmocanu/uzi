@@ -958,9 +958,12 @@ export class SdkExecutor implements Executor {
     //
     // `leadModel` is computed above (before the plan-turn copy) so the PRD #305 own-roster
     // override can use it; here it only drives the top-level lead model. PRD #617 effort
-    // and issue #916 attribution are set ONLY when present (never an explicit undefined),
-    // so an unset owner is byte-identical to today: the adapter omits the key and the SDK
-    // default applies. Both reach the implement turn too, via the `baseConfig` spread.
+    // and issue #916 attribution are set ONLY when present in the config (never an explicit
+    // undefined); when a key is absent the adapter omits it and the SDK applies its own
+    // fallback. The runtime adds no default of its own — the API is the policy source and
+    // now populates effort with the owner's choice or the uzi default `xhigh` for an
+    // inheriting owner (issue #1157). Both reach the implement turn too, via the
+    // `baseConfig` spread.
     const effort = ctx.config?.default_effort;
     const baseConfig: ClaudeTurnConfig = {
       cwd: ctx.worktreePath,
