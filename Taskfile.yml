@@ -2127,6 +2127,23 @@ tasks:
             ../e2e/codex-m3a/run-lifecycle.sh
         done
 
+  test:codex-m3b:
+    desc: Opt-in serial aggregate of the credential-free Codex adapter unit and state controls (PRD 1171 M1)
+    # The SERIAL aggregate of the Codex adapter UNIT/state controls that exist today: the
+    # agent-side registry/safety/transport suites plus the runner-uid identity-boundary
+    # tests (including the runner-cmd command-root uid). Pure in-process unit tests over the
+    # adapter's pure functions and the setpriv argv builders -- no SDK query, no container,
+    # no credentials, no network. Runs from `dir: agent` so tsx + the SDK/zod deps resolve
+    # out of agent/node_modules, matching test:agent / test:harness-m2.
+    #
+    # A later PRD 1171 milestone (the Codex harness milestone) EXTENDS this aggregate to
+    # also run test:codex-m3b:packaged -- the both-image integration whose packaged test
+    # file does not exist yet -- so this target grows that entry then. Do NOT add
+    # test:codex-m3b:packaged until that milestone lands.
+    dir: agent
+    cmds:
+      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts
+
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)
     # Runs from the agent module so tsx + tsc + the SDK/zod deps resolve out of
