@@ -310,9 +310,13 @@ describe("CodexCredentials", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save Codex login" }));
     expect(screen.getByText(/not a raw token/i)).toBeTruthy();
     expect(mockApi.createCodexAuth).not.toHaveBeenCalled();
-    expect(
-      screen.getAllByRole("link", { name: /how to get this/i }).length,
-    ).toBeGreaterThan(0);
+    // The "How to get this" affordance is the disclosure <summary> (a single
+    // named control the message points at), not a link; the one docs link in the
+    // block is "Full guide".
+    expect(screen.getByText("How to get this", { selector: "summary" }).tagName).toBe(
+      "SUMMARY",
+    );
+    expect(screen.getByRole("link", { name: /full guide/i })).toBeTruthy();
   });
 
   it("blocks the whole ~/.codex/auth.json paste with the flat-object message and sends nothing", () => {

@@ -465,15 +465,13 @@ function AddCredentialForm({
             (and{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">refresh_token</code>{" "}
             for renewal). It is <strong className="text-fg">not</strong> an OpenAI
-            API key.{" "}
-            <DocLink slug={DOC_CODEX_CREDENTIALS}>How to get this</DocLink>.
+            API key.
           </p>
           {shapeError && (
-            // The pre-check verdict, inline and value-free, pointing at both the
-            // guide and the disclosure just below.
+            // The pre-check verdict, inline and value-free. Its text ends with
+            // See "How to get this" below. — pointing at the disclosure just below.
             <p role="alert" className="text-danger">
-              {shapeError}{" "}
-              <DocLink slug={DOC_CODEX_CREDENTIALS}>How to get this</DocLink>.
+              {shapeError}
             </p>
           )}
           {/* Native <details>/<summary>: keyboard, touch and screen-reader reachable
