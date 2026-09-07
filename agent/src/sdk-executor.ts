@@ -28,7 +28,6 @@ import type {
   Options as SdkOptions,
   SDKMessage,
   SpawnOptions,
-  SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
@@ -77,19 +76,12 @@ import {
   buildSendMessageAliasHook,
   NESTED_AGENT_TOOL,
   SEND_MESSAGE_TOOL,
-  ASYNC_DEFERRAL_TOOLS,
 } from "./guardrails.js";
 import {
   buildSignalMcpServer,
-  isSignalToolName,
-  scanSignals,
   SIGNAL_SERVER_NAME,
 } from "./signals.js";
-import {
-  classifyLimitFailure,
-  LimitReachedError,
-  RateLimitObserver,
-} from "./limit.js";
+import { classifyLimitEvidence } from "./limit.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -98,17 +90,15 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
-import {
-  assistantModelOf,
-  assistantUsageOf,
-  defaultQueryFn,
-  isErrorResult,
-  isResult,
-  mapSdkMessage,
-  orphanInstanceKind,
-  promptStream,
-  sessionIdOf,
-} from "./sdk-messages.js";
+import { defaultQueryFn } from "./sdk-messages.js";
+import { ClaudeHarness, type ClaudeTurnConfig } from "./claude-harness.js";
+import { RunTurnReducerImpl } from "./harness-reducer.js";
+import type {
+  HarnessTerminal,
+  RunTurnReducer,
+  RunTurnRequest,
+  TurnStreamEnd,
+} from "./harness.js";
 import { PlanRejectedError } from "./executor.js";
 import { clampToDirCharset, errMessage } from "./util.js";
 import { SummaryRunner } from "./summary-runner.js";
@@ -208,46 +198,10 @@ export type SdkQueryFn = (params: {
 /** PRD #516 R1: how long to wait on the `getContextUsage()` control call before
  *  giving up. A bare `await` on a call that never resolves (CLI mid-shutdown,
  *  control unsupported) would block the turn until the wall watchdog kills it, so
- *  the reading is raced against this timeout and any timeout/error is swallowed. */
+ *  the reading is raced against this timeout and any timeout/error is swallowed.
+ *  The read itself now lives in the Claude adapter (claude-harness.ts); this is
+ *  the default bound the executor still threads to it. */
 const CONTEXT_USAGE_TIMEOUT_MS = 2000;
-
-/**
- * PRD #516 M1: read the lead session's live context-window fill via the SDK
- * Query's `getContextUsage()` control method, mapped to the pinned payload
- * contract `{ used, window, pct }`. Returns `undefined` — never throws — when the
- * method is absent (existing fakes, older CLI), the call errors, or it hangs past
- * the timeout, so the caller simply attaches no `context` and the turn is
- * unaffected (Risk R1/R2, Success Criteria 5).
- */
-async function readLeadContext(
-  queryInstance: { getContextUsage?(): Promise<ContextUsageReading> },
-  timeoutMs: number,
-): Promise<{ used: number; window: number; pct: number } | undefined> {
-  const getContextUsage = queryInstance.getContextUsage;
-  if (typeof getContextUsage !== "function") return undefined;
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    const reading = await Promise.race([
-      getContextUsage.call(queryInstance),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("getContextUsage timed out")),
-          timeoutMs,
-        );
-        timer.unref?.();
-      }),
-    ]);
-    return {
-      used: reading.totalTokens,
-      window: reading.rawMaxTokens,
-      pct: reading.percentage,
-    };
-  } catch {
-    return undefined;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
 
 export interface SdkExecutorOptions {
   /** Override the SDK entrypoint (tests inject a fake transport here). */
@@ -394,7 +348,9 @@ function unansweredPrompt(questions: AskUserQuestion[]): string {
   return `Your question${questions.length > 1 ? "s" : ""} could not be put to a human on this run:\n\n${lines}\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.`;
 }
 
-/** Run-level watchdog/cancel state shared across the plan turn and every loop turn. */
+/** Run-level watchdog/cancel state shared across the plan turn and every loop turn.
+ *  The first-truthy-session-id latch moved into the per-run reducer (harness-
+ *  reducer.ts); the owner delivers ctx.onSessionId from its `firstSessionId`. */
 interface RunDrive {
   tripReason?: string;
   currentAbort?: AbortController;
@@ -402,7 +358,6 @@ interface RunDrive {
   wallRemainingMs: number;
   wallArmedAt?: number;
   wallTimer?: NodeJS.Timeout;
-  reportedSessionId: boolean;
 }
 
 /**
@@ -414,10 +369,11 @@ interface RunDrive {
  *
  * `onSignal` is stored as the SAME function reference the abort listener was
  * registered with, so run()'s finally removes the exact listener rather than
- * leaking a rebuilt closure. `baseOptions` is the ONE SdkOptions instance the
+ * leaking a rebuilt closure. `baseConfig` is the ONE ClaudeTurnConfig instance the
  * plan turn, the revise loop and the implement turn all read — it is never
- * reconstructed, so the guardrail-bearing `settingSources: []` and PreToolUse
- * hooks thread through every phase unchanged.
+ * reconstructed, so the ingredients that feed the guardrail-bearing `settingSources: []`
+ * and PreToolUse hooks (assembled into SdkOptions by the Claude adapter) thread through
+ * every phase unchanged. The implement turn spreads it, overriding the plan-scoped keys.
  */
 interface DriveState {
   oauthToken: string;
@@ -442,7 +398,7 @@ interface DriveState {
     allowedSubagents: string[],
   ) => NonNullable<SdkOptions["hooks"]>["PreToolUse"];
   isIssueRun: boolean;
-  baseOptions: SdkOptions;
+  baseConfig: ClaudeTurnConfig;
   initialWallMs: number;
   wallScaled: boolean;
   state: RunDrive;
@@ -480,8 +436,19 @@ export class SdkExecutor implements Executor {
   private readonly contextUsageTimeoutMs: number;
   /** Every pid spawned across the current run's turns, for the done-path reap.
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
-   *  4), so two concurrent runs can never wipe/kill each other's set. */
+   *  4), so two concurrent runs can never wipe/kill each other's set. Shared with
+   *  the Claude adapter, which records pids into it; killAgentTree (below, the
+   *  legacy path) reaps it. */
   private readonly spawnedPids = new Set<number>();
+  /** The Claude run-lane adapter (PRD #1146 M2). Owns query options finalization,
+   *  frame decode, the lead context read, process ownership and terminal building;
+   *  driveTurn drives it and the per-run reducer. */
+  private readonly harness: ClaudeHarness;
+  /** The per-run turn reducer, REUSED across every turn of the run (so its run-level
+   *  session latch persists). Recreated per run in run() (the latch must not survive
+   *  into a second run() on the same instance). Typed as the neutral RunTurnReducer
+   *  seam; `beginTurn()`/`accept()`/`finish()` are all on that interface. */
+  private reducer: RunTurnReducer;
 
   /**
    * @param homeDir per-run SDK HOME (`agent-home/<runId>` on $UZI_DATA_DIR, PRD #42
@@ -523,6 +490,18 @@ export class SdkExecutor implements Executor {
       opts.summaryRunner ?? new SummaryRunner(this.log, { homeRoot: this.provisionHomeDir });
     this.contextUsageTimeoutMs =
       opts.contextUsageTimeoutMs ?? CONTEXT_USAGE_TIMEOUT_MS;
+    // The Claude adapter carries the SDK-aware run-lane behavior (decode, process
+    // ownership, context read, terminal). All its deps are construction-available.
+    this.harness = new ClaudeHarness({
+      queryFn: this.queryFn,
+      spawn: this.spawn,
+      kill: this.kill,
+      log: this.log,
+      contextUsageTimeoutMs: this.contextUsageTimeoutMs,
+      spawnedPids: this.spawnedPids,
+      homeDir: this.homeDir,
+    });
+    this.reducer = new RunTurnReducerImpl(this.harness.contextHook);
   }
 
   /**
@@ -618,6 +597,10 @@ export class SdkExecutor implements Executor {
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
     this.spawnedPids.clear();
+    // Fresh per-run reducer: the first-truthy-session latch must not survive a
+    // second run() on this instance (one executor per run is the norm, but keep
+    // the latch honest regardless).
+    this.reducer = new RunTurnReducerImpl(this.harness.contextHook);
     const drive = await this.phaseSetup(ctx);
     try {
       const early = await this.phasePlanGate(ctx, drive);
@@ -651,7 +634,7 @@ export class SdkExecutor implements Executor {
 
   /**
    * Phases P1-P4 (PRD #949 M3): OAuth/HOME/provisioning + JS-deps kickoff, skills +
-   * agent roster, hooks/MCP/`baseOptions`, and the wall-clock/watchdog/cancel wiring.
+   * agent roster, hooks/MCP/`baseConfig`, and the wall-clock/watchdog/cancel wiring.
    * Runs BEFORE run()'s try (verbatim to its pre-try prologue), so a throw here — a
    * missing token, a provisioning failure — never reaches the finally, exactly as
    * before the split. Returns the populated carrier; the cancel listener it registers
@@ -929,98 +912,77 @@ export class SdkExecutor implements Executor {
       }).server;
     }
 
-    const baseOptions: SdkOptions = {
+    // PRD #1146 M2: the owner computes every INGREDIENT; the Claude adapter
+    // (claude-harness.ts buildSdkOptions) assembles them into the actual SdkOptions,
+    // including the literal `settingSources: []` isolation. The ingredients — and the
+    // reasons each is plan-turn-scoped vs shared — are unchanged from the old literal:
+    //
+    // - env: full replacement — only these keys reach the agent subprocess.
+    // - skillsPluginPath (Skills, PRD #16 M4): a local plugin dir OUTSIDE the clone,
+    //   loaded independently of settingSources so the isolation never loosens;
+    //   skipMcpDiscovery is set by the adapter (this plugin ships ONLY skills).
+    // - skills: ALWAYS an explicit plugin-qualified list — the full run union. Omitting
+    //   it is NOT "skills off" (sdk.d.ts:1872: CLI defaults would apply); `[]` disables
+    //   all. Per-subagent scoping is each AgentDefinition.skills; the lead is the main
+    //   thread, covered by this union.
+    // - agents (PLAN-TURN roster): every subagent minus the file-write tools (#203).
+    //   `baseConfig` drives both planning turns (first plan in Phase 1, re-plan in the
+    //   revise loop) while `implementConfig` spreads `baseConfig` and OVERRIDES this
+    //   from `selectSubagents(...)`, which reads `assembled.subagents` directly and is
+    //   therefore untouched. `agents` is one of THREE keys `implementConfig` overrides,
+    //   all plan-turn-scoped by that same spread mechanism: `agents`, `systemPrompt`
+    //   and `preToolUse`. Worth knowing which, because `preToolUse` is where the
+    //   recorded upgrade path goes — a plan-turn-only `PreToolUse` deny on the
+    //   write-tool family, the one mechanism that would also reach the LEAD's own
+    //   writes. DO NOT move that denial down to the adapter's top-level
+    //   `disallowedTools`: that key is NOT overridden, so the spread would carry it into
+    //   the implement turn and strip write tools for the whole run, breaking `coder`.
+    //   The scoping is the point of doing it via preToolUse here.
+    // - mcpServers: in-process tools the lead calls — the signal server (gate the plan /
+    //   mark done, signals.ts) plus, when a client is threaded, the memory server
+    //   (save_memory, PRD #90). Only the lead (full toolset) reaches the signal + memory
+    //   servers (lead-only by design). The forge and findings servers are ADDITIONALLY
+    //   exposed to allowlisted subagents per-agent via each AgentDefinition.mcpServers
+    //   (agents.ts toDefinition, issue #581). These are LIVE in-process INSTANCES, which
+    //   is why the ingredients ride the private ClaudeTurnConfig, not the neutral request.
+    // - preToolUse (the load-bearing deny layer): a PreToolUse deny blocks a tool even
+    //   under bypassPermissions. Bash screening, the file-tool path jail, AND the M4
+    //   hard-fail-on-unexpected-subagent guard (item 7) all live here. The plan turn
+    //   allows the own subagents THAT SURVIVED the #203 transform — the allowSet is
+    //   frozen at construction, so it must be the same list the `agents` map holds, or
+    //   the guard admits an Agent call the SDK cannot resolve. The implement turns
+    //   rebuild this with the selected roster (PRD #37). The adapter also injects the
+    //   run-wide disallowedTools (ASYNC_DEFERRAL_TOOLS): block the deferral tools so the
+    //   lead can't background work to a future turn the per-turn reap would only wake to
+    //   a killed subagent (#34); delegation is forced synchronous by the Agent guard hook.
+    //
+    // `leadModel` is computed above (before the plan-turn copy) so the PRD #305 own-roster
+    // override can use it; here it only drives the top-level lead model. PRD #617 effort
+    // and issue #916 attribution are set ONLY when present in the config (never an explicit
+    // undefined); when a key is absent the adapter omits it and the SDK applies its own
+    // fallback. The runtime adds no default of its own — the API is the policy source and
+    // now populates effort with the owner's choice or the uzi default `xhigh` for an
+    // inheriting owner (issue #1157). Both reach the implement turn too, via the
+    // `baseConfig` spread.
+    const effort = ctx.config?.default_effort;
+    const baseConfig: ClaudeTurnConfig = {
       cwd: ctx.worktreePath,
-      // Full replacement — only these keys reach the agent subprocess.
       env: env as unknown as Record<string, string | undefined>,
-      // Repo-borne prompt-injection defense: nothing from the cloned repo's
-      // .claude/{settings.json,agents,hooks} can grant the agent permissions.
-      settingSources: [],
-      // Skills (PRD #16 M4): a local plugin dir OUTSIDE the clone, loaded
-      // independently of settingSources (SdkPluginConfig is a separate option),
-      // so the isolation above never loosens. skipMcpDiscovery: this plugin ships
-      // ONLY skills — the SDK host owns MCP, so never read a manifest/.mcp.json.
-      plugins: [
-        { type: "local", path: skillsPluginPath, skipMcpDiscovery: true },
-      ],
-      // ALWAYS an explicit list — the full plugin-qualified run union. Omitting it
-      // is NOT "skills off" (sdk.d.ts:1872: CLI defaults would apply); `[]` when the
-      // run has no skills disables all. Per-subagent scoping is each
-      // AgentDefinition.skills; the lead is the main thread, covered by this union.
+      skillsPluginPath,
       skills: runSkills.map((s) => qualifiedSkillName(s.name)),
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
         kind: ctx.kind,
         repoInstructions: repoInstructionsBlock,
       }),
-      // PLAN-TURN roster: every subagent minus the file-write tools (#203).
-      // `baseOptions` drives both planning turns (first plan at the
-      // `drivePlanningTurn` call in Phase 1, re-plan in the revise loop) while
-      // `implementOptions` spreads `baseOptions` and OVERRIDES this key from
-      // `selectSubagents(...)`, which reads `assembled.subagents` directly and is
-      // therefore untouched.
-      //
-      // `agents` is one of THREE keys `implementOptions` overrides, and all three
-      // are plan-turn-scoped by that same mechanism: `agents`, `systemPrompt` and
-      // `hooks`. Worth knowing which, because `hooks` is where the recorded
-      // upgrade path goes — a plan-turn-only `PreToolUse` deny on the write-tool
-      // family, the one mechanism that would also reach the LEAD's own writes.
-      //
-      // DO NOT move this denial down to the `disallowedTools` key below. That one
-      // is top-level and is NOT overridden, so the spread carries it into the
-      // implement turn and it would strip write tools for the whole run, breaking
-      // `coder`. The scoping is the point of doing it here.
       agents: planTurn.subagents,
-      // In-process tools the lead calls: the signal server (gate the plan / mark
-      // done, see signals.ts) plus, when a client is threaded, the memory server
-      // (save_memory, PRD #90). Only the lead (full toolset) reaches the signal +
-      // memory servers (lead-only by design). The forge and findings servers are
-      // ADDITIONALLY exposed to allowlisted subagents per-agent via each
-      // AgentDefinition.mcpServers (see agents.ts toDefinition, issue #581).
       mcpServers,
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      // Block the deferral tools so the lead can't background work to a future
-      // turn that the per-turn reap would only wake to a killed subagent (#34).
-      // Delegation is forced synchronous by the Agent guard hook below.
-      disallowedTools: [...ASYNC_DEFERRAL_TOOLS],
-      // The load-bearing deny layer: a PreToolUse deny blocks a tool even under
-      // bypassPermissions. Bash screening, the file-tool path jail, AND the M4
-      // hard-fail-on-unexpected-subagent guard (item 7) all live here. The plan
-      // turn allows the own subagents THAT SURVIVED the #203 transform — the
-      // allowSet is frozen at construction, so it must be the same list the
-      // `agents` map above holds, or the guard admits an Agent call the SDK
-      // cannot resolve. The implement turns rebuild this with the selected
-      // roster (PRD #37).
-      hooks: {
-        PreToolUse: preToolUse(planSubagentNames),
-      },
-      // Persist discrete blocks only; partial token deltas would flood the seq
-      // stream (the live-partial channel is M5, not M3).
-      includePartialMessages: false,
+      preToolUse: preToolUse(planSubagentNames),
+      ...(leadModel ? { model: leadModel } : {}),
+      ...(effort ? { effort } : {}),
+      ...(ctx.config?.attribution_enabled === false
+        ? { attributionSettings: { attribution: { commit: "", pr: "" } } }
+        : {}),
     };
-    // `leadModel` is computed above (before the plan-turn copy) so the PRD #305
-    // own-roster override can use it; here it only drives the top-level lead model.
-    if (leadModel) baseOptions.model = leadModel;
-
-    // PRD #617: the owner's per-user reasoning effort. Set the SDK's top-level
-    // effort ONLY when present (never `effort: undefined`), so an unset owner is
-    // byte-identical to today and the SDK default (`high`) applies. This one
-    // assignment reaches both the plan turn and the implement turn, because the
-    // implement options are built by spreading baseOptions (see implementOptions);
-    // top-level effort cascades to the subagents (Decision 8, test-verified).
-    const effort = ctx.config?.default_effort;
-    if (effort) baseOptions.effort = effort;
-
-    // issue #916: the owner's AI-attribution opt-out, carried on the claim (resolved live
-    // per claim server-side). When explicitly false, suppress the Agent SDK's default
-    // Co-Authored-By: Claude commit trailer via Settings.attribution — empty string hides
-    // attribution (sdk.d.ts). Touch only commit+pr; leave sessionUrl at its default. When
-    // true or absent, set nothing so the SDK default is preserved (Decision 4) and an older
-    // server that omits the field keeps today's behavior. Reaches both the plan turn and the
-    // implement turn via the baseOptions spread (like effort above).
-    if (ctx.config?.attribution_enabled === false) {
-      baseOptions.settings = { attribution: { commit: "", pr: "" } };
-    }
 
     // PRD #122 M2: the wall budget the run STARTED with, kept so the loop can scale the
     // worker's own soft wall reference by the server-served delta exactly once (below).
@@ -1035,7 +997,6 @@ export class SdkExecutor implements Executor {
     const state: RunDrive = {
       currentChild: {},
       wallRemainingMs: initialWallMs,
-      reportedSessionId: false,
     };
     const idleMs = seconds(
       ctx.config?.idle_timeout_seconds,
@@ -1079,7 +1040,7 @@ export class SdkExecutor implements Executor {
       subagentCanWrite,
       preToolUse,
       isIssueRun,
-      baseOptions,
+      baseConfig,
       initialWallMs,
       wallScaled,
       state,
@@ -1103,7 +1064,7 @@ export class SdkExecutor implements Executor {
     drive: DriveState,
   ): Promise<ExecutorResult | undefined> {
     const {
-      baseOptions,
+      baseConfig,
       state,
       idleMs,
       oauthToken,
@@ -1387,7 +1348,7 @@ export class SdkExecutor implements Executor {
 
         const plan = await this.drivePlanningTurn(
           ctx,
-          baseOptions,
+          baseConfig,
           resumeId,
           planPrompt,
           state,
@@ -1458,11 +1419,11 @@ export class SdkExecutor implements Executor {
             payload: { round: revisions },
           });
           // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
-          // subagents (baseOptions), exactly like the first plan turn — the roster
+          // subagents (baseConfig), exactly like the first plan turn — the roster
           // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
           const turn = await this.drivePlanningTurn(
             ctx,
-            baseOptions,
+            baseConfig,
             resumeId,
             buildRevisePlanPrompt(feedback),
             state,
@@ -1538,7 +1499,7 @@ export class SdkExecutor implements Executor {
       assembled,
       survivorNames,
       prepared,
-      baseOptions,
+      baseConfig,
       repoInstructionsBlock,
       preToolUse,
       isIssueRun,
@@ -1633,15 +1594,15 @@ export class SdkExecutor implements Executor {
       // `selectedSubagents` is pre-strip on both sources (own: assembled defs unchanged;
       // repo: freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
       const selectedCanWrite = subagentWriteCapabilities(selectedSubagents);
-      const implementOptions: SdkOptions = {
-        ...baseOptions,
+      const implementConfig: ClaudeTurnConfig = {
+        ...baseConfig,
         agents: selectedSubagents,
         systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
           repoSourced: selection.source === "repo",
           kind: ctx.kind,
           repoInstructions: repoInstructionsBlock,
         }),
-        hooks: { PreToolUse: preToolUse(selectedNames) },
+        preToolUse: preToolUse(selectedNames),
       };
       ctx.emit({
         kind: "status",
@@ -1803,7 +1764,8 @@ export class SdkExecutor implements Executor {
         );
         const turn = await this.driveTurn(
           ctx,
-          implementOptions,
+          implementConfig,
+          "implement",
           resumeId,
           buildImplementPrompt({
             branch: ctx.branch,
@@ -2324,7 +2286,7 @@ export class SdkExecutor implements Executor {
    */
   private async drivePlanningTurn(
     ctx: RunContext,
-    options: SdkOptions,
+    config: ClaudeTurnConfig,
     resumeId: string | undefined,
     prompt: string,
     state: RunDrive,
@@ -2341,7 +2303,8 @@ export class SdkExecutor implements Executor {
     for (let round = 0; ; round++) {
       const turn = await this.driveTurn(
         ctx,
-        options,
+        config,
+        "plan",
         resumeId,
         turnPrompt,
         state,
@@ -2489,12 +2452,13 @@ export class SdkExecutor implements Executor {
 
   private async driveTurn(
     ctx: RunContext,
-    baseOptions: SdkOptions,
+    turnConfig: ClaudeTurnConfig,
+    phase: "plan" | "implement",
     resumeId: string | undefined,
     prompt: string,
     state: RunDrive,
     idleMs: number,
-    // PRD #1064 M1 (Decisions 1/2): called the moment the scan loop folds a `report_progress`
+    // PRD #1064 M1 (Decisions 1/2): called the moment the reducer folds a `report_progress`
     // signal (below), off the hot loop. The implement loop passes a per-turn closure that
     // diffs the observation for transition frames and enqueues the immediate push via
     // `ctx.reportProgress`; the plan gate passes nothing (no progress is reported while
@@ -2504,25 +2468,12 @@ export class SdkExecutor implements Executor {
     // A trip may already be pending (e.g. a cancel that landed during the gate).
     if (state.tripReason) throw new Error(state.tripReason);
 
+    // The owner still owns the neutral abort signal (trip/cancel drives it); the
+    // adapter links the SDK's own controller to it. state.currentChild is the sink
+    // the adapter's spawn records into, so trip() can group-kill the current child.
     const abortController = new AbortController();
     state.currentAbort = abortController;
     state.currentChild = {};
-
-    const options: SdkOptions = { ...baseOptions, abortController };
-    if (resumeId) options.resume = resumeId;
-    else delete options.resume;
-    // Spawn the CLI in its own process group so a watchdog trip can group-kill
-    // the whole tree (default SDK spawn is not detached).
-    options.spawnClaudeCodeProcess = (
-      spawnOpts: SpawnOptions,
-    ): SpawnedProcess => {
-      const proc = this.spawn(spawnOpts);
-      if (typeof proc.pid === "number") {
-        state.currentChild.pid = proc.pid;
-        this.spawnedPids.add(proc.pid); // reaped on the done path (B1)
-      }
-      return proc as unknown as SpawnedProcess;
-    };
 
     let idleTimer: NodeJS.Timeout | undefined;
     const armIdle = (): void => {
@@ -2531,228 +2482,109 @@ export class SdkExecutor implements Executor {
       idleTimer.unref?.();
     };
 
-    const result: TurnResult = { done: false };
-    let turnSessionId: string | undefined;
-    // Issue #281: the lead's own text this turn, in emit order, for the no-progress
-    // detector's verbatim-repeat check (joined into result.finalText below).
-    const leadText: string[] = [];
-    // PRD #516 M1 / issue #553 M2: the lead context reading is FIRED (not awaited)
-    // AT MOST ONCE per turn, on the first LEAD usage frame, and the resolved value
-    // is attached to the turn's TERMINAL result frame. Turn-scoped so a turn with
-    // several assistant frames issues exactly one `getContextUsage()` call; a
-    // non-undefined promise doubles as the "already fired" guard.
-    let contextPromise:
-      | Promise<{ used: number; window: number; pct: number } | undefined>
-      | undefined;
-    let sawErrorResult = false;
-    let errorSubtype = "unknown";
-    // PRD #35. The observer rides the SAME iteration mapSdkMessage already does —
-    // rate_limit_event is simply one of the frame types that mapper drops on its
-    // default arm, so nothing is buffered and no second pass over the turn exists.
-    // `resultFrame` is kept because classification needs the frame ITSELF
-    // (terminal_reason lives on it) and not just the subtype the collapse records.
-    const rateLimits = new RateLimitObserver();
-    let resultFrame: unknown;
+    // PRD #1146 M2: the per-run reducer folds the neutral event stream; the owner
+    // keeps trip/precedence/limit-classify and delivers ctx.emit / onProgress /
+    // ctx.onSessionId / orphan-warn from each reduction. The adapter decodes raw
+    // SDK frames into those neutral events and owns the lead context read.
+    const reducer = this.reducer;
+    // Per-run reducer, REUSED across turns: reset its per-turn accumulators at the TOP
+    // of every turn — unconditionally, before any event is accepted — so a prior turn
+    // that ended by throw (skipping the reducer's `finish`) cannot leak stale per-turn
+    // state (leadText / turnSessionId / result / signals) into this one. The run-level
+    // session latch is preserved (beginTurn does not touch it). Observable no-op on the
+    // clean path, where the state is already fresh from construction or the prior turn.
+    reducer.beginTurn();
+    let sawTerminal = false;
+    let terminal: HarnessTerminal | undefined;
 
     this.armWall(state);
     // Budget already spent by earlier turns → fail now rather than run unbounded.
     if (state.tripReason) throw new Error(state.tripReason);
     try {
       armIdle();
-      const queryInstance = this.queryFn({
-        prompt: promptStream(prompt),
-        options,
-      });
-      for await (const msg of queryInstance) {
-        armIdle(); // any message is liveness
-
-        const sid = sessionIdOf(msg);
-        if (sid) {
-          turnSessionId = sid;
-          if (!state.reportedSessionId) {
-            state.reportedSessionId = true;
-            try {
-              ctx.onSessionId?.(sid);
-            } catch (err) {
-              this.log.warn("onSessionId handler threw", {
-                run_id: ctx.runId,
-                error: errMessage(err),
-              });
-            }
+      // The owner hands the adapter the per-turn ClaudeTurnConfig ingredients (plan
+      // or implement, computed by phaseSetup/phaseRunLoop, agents.ts used as-is) plus
+      // the current-child sink; the adapter assembles the SdkOptions and finalizes
+      // resume/abort/spawn per turn.
+      this.harness.prepareTurn(turnConfig, state.currentChild);
+      const request: RunTurnRequest = {
+        prompt,
+        // The neutral fields below are carried as-is; the placeholders
+        // (systemPrompt/agents/leadSkills) are NOT read by the Claude adapter, which
+        // assembles its SdkOptions from turnConfig directly (the agents.ts
+        // AgentDefinitions and live in-process MCP server references cannot be
+        // round-tripped through the neutral HarnessAgent surface in m1).
+        systemPrompt: "",
+        resumeSessionId: resumeId,
+        signal: abortController.signal,
+        phase,
+        agents: {},
+        leadSkills: [],
+      };
+      const turn = this.harness.startTurn(request);
+      for await (const event of turn.events) {
+        armIdle(); // any event is liveness
+        const reduction = await reducer.accept(event);
+        // First-truthy session id once per run: the run callback, catch-and-warn
+        // exactly as before (a handler throw must not fail the turn).
+        if (reduction.firstSessionId !== undefined) {
+          try {
+            ctx.onSessionId?.(reduction.firstSessionId);
+          } catch (err) {
+            this.log.warn("onSessionId handler threw", {
+              run_id: ctx.runId,
+              error: errMessage(err),
+            });
           }
         }
-
-        // Emit everything EXCEPT the signal tool_use blocks — the plan is
-        // surfaced as a `plan` message by the runner, not duplicated as a raw
-        // tool_use payload, and signal_done is infra noise. An assistant frame's
-        // per-call usage (PRD #40 Decision 11) rides the FIRST message that
-        // survives that filter — attached HERE, not in mapAssistant, which cannot
-        // see this executor-side drop; every phase terminates on a signal frame, so
-        // attaching earlier would systematically lose the lead's terminating-frame
-        // usage. A frame whose messages are ALL filtered loses its usage (accepted).
-        // Result-frame usage travels inside mapResult's payload instead, so it is
-        // never re-attached here (assistantUsageOf is assistant-only, not results).
         // PRD #99: alarm on a frame that carries an invocation id but no role
-        // field. Logged HERE rather than in the mapper because sdk-messages.ts is
-        // a pure module with no logger, and this is the only executor that can
-        // produce subagent frames at all (chat-executor and judge-runner both
-        // prevent the Agent tool — chat via disallowedTools, judge via a deny-all
-        // PreToolUse hook). The `kind` is the ONLY thing logged — no id, no label —
-        // so nothing new reaches `docker logs`, keeping the deliberate omission at
-        // batcher.ts's debug line intact.
-        // PRD #35: feed the limit observer before anything can `continue` past it.
-        // Placed at the top of the per-frame body deliberately — a rate_limit_event
-        // maps to zero run messages, so any placement inside the mapSdkMessage loop
-        // below would never see one.
-        rateLimits.observe(msg);
-        const orphanKind = orphanInstanceKind(msg);
-        if (orphanKind !== undefined) {
+        // field. Logged HERE rather than in the pure reducer, which has no logger;
+        // the `kind` is the ONLY thing logged — no id, no label.
+        for (const d of reduction.diagnostics) {
           this.log.warn(
             "frame carried parent_tool_use_id without subagent_type",
-            {
-              run_id: ctx.runId,
-              kind: orphanKind,
-            },
+            { run_id: ctx.runId, kind: d.frameKind },
           );
         }
-        const frameUsage = assistantUsageOf(msg);
-        const frameModel = assistantModelOf(msg);
-        let usageAttached = false;
-        for (const em of mapSdkMessage(msg)) {
-          if (em.kind === "tool_use" && isSignalToolName(em.payload["name"]))
-            continue;
-          // Issue #281: accumulate the two no-progress signals off the emitted frames —
-          // the lead's own text (the repeated-refusal input), and whether any subagent
-          // produced a frame this turn (work in flight, which disqualifies a stall).
-          if (em.kind === "text" && em.agent === "lead") {
-            const t = em.payload["text"];
-            if (typeof t === "string" && t) leadText.push(t);
-          }
-          if (em.agent !== undefined && em.agent !== "lead")
-            result.subagentActivity = true;
-          if (frameUsage && !usageAttached) {
-            em.payload["usage"] = frameUsage;
-            // PRD #93 Decision 2: `model` is CO-GATED with usage — same surviving
-            // message, same latch. A model is recorded only where that agent's
-            // tokens are, so the web derive (which reads it inside its existing
-            // `"usage" in payload` branch) can never produce a zero-token agent row
-            // from a model-only frame. No usage ⇒ no model, deliberately.
-            if (frameModel !== undefined) em.payload["model"] = frameModel;
-            usageAttached = true;
-            // PRD #516 M1 / issue #553 M2 (finding 2 + 3): FIRE the lead's live
-            // context-window read here, once per turn, on the first LEAD usage frame —
-            // but do NOT await it and do NOT attach on this frame. Two reasons: (a) a
-            // subagent frame can latch usage before the lead's within a turn, so the
-            // `em.agent === "lead"` guard keeps the reading keyed to the lead lane and
-            // off any subagent frame (finding 2); (b) awaiting inline sat on the hot
-            // message loop, so a hanging control call delayed every remaining frame of
-            // the turn by up to the timeout — firing without awaiting lets the read run
-            // concurrently while the turn streams (finding 3). The resolved value is
-            // attached below to the turn's terminal result frame. A non-undefined
-            // `contextPromise` doubles as the "already fired" guard, so `getContextUsage()`
-            // is issued at most once per turn.
-            //
-            // This floating (unawaited) promise is safe ONLY because `readLeadContext`
-            // NEVER rejects — it swallows every error/timeout to `undefined` (see its
-            // definition). If that contract ever changes, this becomes an unhandled
-            // rejection and must be re-guarded (e.g. `.catch(() => undefined)`).
-            if (contextPromise === undefined && em.agent === "lead") {
-              contextPromise = readLeadContext(
-                queryInstance,
-                this.contextUsageTimeoutMs,
-              );
-            }
-          }
-          // PRD #516 M1 / issue #553 M2: attach the (concurrently-read) lead context
-          // reading to the turn's TERMINAL result frame. Both result variants — success
-          // (`kind:"status"`) and error (`kind:"error"`) — come from mapResult with
-          // `agent: LEAD` and `payload.event === "result"`, so this is always the lead
-          // lane and always the LAST frame of the turn. Awaiting here therefore delays
-          // no in-turn frame; only turn completion waits, and only up to the timeout
-          // already baked into the read on a genuine hang (normally the read has long
-          // since resolved, so the residual await is ~0).
-          if (
-            contextPromise !== undefined &&
-            em.payload["event"] === "result"
-          ) {
-            const context = await contextPromise;
-            if (context) em.payload["context"] = context;
-          }
-          ctx.emit(em);
-        }
-        const sig = scanSignals(msg);
-        if (sig.plan !== undefined) result.plan = sig.plan;
-        if (sig.milestones) result.milestones = sig.milestones; // last-wins, alongside plan (PRD #122 M1)
-        if (sig.progress) {
-          result.progress = sig.progress; // last-wins (PRD #122 M2)
-          // PRD #1064 M1: push + emit transition frames the MOMENT progress is observed,
-          // not at the next turn boundary. The observer diffs (for D2 frames) and enqueues
-          // the immediate running push off the loop; it must not be awaited here — the scan
-          // loop is hot and the push is fire-and-forget in the runner.
-          onProgress?.(sig.progress);
-        }
-        if (sig.done) result.done = true;
-        if (sig.checkpoint) result.checkpoint = true; // latch, like `done` (PRD #122 M6)
-        // Last-wins within the turn, mirroring `plan` rather than `done`'s latch:
-        // if the lead somehow signals twice, the LAST declaration is the one that
-        // describes the tree the worker is about to push (PRD #72 M4).
-        if (sig.prdDonePath !== undefined) result.prdDonePath = sig.prdDonePath;
-        // PRD #265 M1: last-wins within the turn, mirroring prdDonePath — if the lead
-        // signals twice, the LAST declaration describes the finished set the worker is
-        // about to reconcile at completion.
-        if (sig.milestonesCompleted !== undefined)
-          result.milestonesCompleted = sig.milestonesCompleted;
-        // issue #279: the summary is last-wins within the turn (like prdDonePath), and
-        // report_only latches true (like `done`) — once the lead declares the run
-        // report-only it stays report-only through the terminating turn's break.
-        if (sig.summary !== undefined) result.summary = sig.summary;
-        if (sig.reportOnly) result.reportOnly = true;
-        // PRD #929 M2: the proposal is last-wins within the turn (like summary) — if the
-        // lead signals twice, the LAST well-formed proposal is the one the worker forwards
-        // on the completion report.
-        if (sig.proposal !== undefined) result.proposal = sig.proposal;
-        // PRD #88: accumulate across the turn rather than last-wins. A lead told to
-        // batch its questions into one call normally makes exactly one, but if it
-        // makes two we must ask both — dropping the earlier one would park the run on
-        // a question the lead is no longer waiting on.
-        if (sig.questions?.length)
-          result.questions = [...(result.questions ?? []), ...sig.questions];
-
-        if (isResult(msg)) {
-          resultFrame = msg;
-          if (isErrorResult(msg)) {
-            sawErrorResult = true;
-            errorSubtype =
-              ((msg as { subtype?: unknown }).subtype as string) ?? "unknown";
-          }
-          // The turn is done. Abort so a lingering background bash the agent left
-          // running can't pin the iterator open (bottega's pattern).
-          abortController.abort();
+        for (const em of reduction.messages) ctx.emit(em);
+        // PRD #1064 M1: push + emit transition frames the MOMENT progress is
+        // observed, not at the next turn boundary. Fire-and-forget in the runner.
+        if (reduction.progress) onProgress?.(reduction.progress);
+        if (event.kind === "turn_finished") {
+          sawTerminal = true;
+          terminal = event.terminal;
+          // The turn is done. Request root stop so a lingering background bash the
+          // agent left running can't pin the iterator open (bottega's pattern).
+          turn.requestStop("terminal");
           break;
         }
       }
 
+      // Run-lane precedence, EXACTLY as before: the first-wins watchdog/cancel trip
+      // wins over every other failure; then a query/iteration/close throw (handled
+      // by the catch below); then a failed terminal is classified and materialized
+      // into today's typed exception; a clean EOF returns the accumulated result.
       if (state.tripReason) throw new Error(state.tripReason);
-      if (sawErrorResult) {
-        // PRD #35: a usage-limit death is thrown as a TYPED error carrying the
-        // normalized reset, so the runner branches on the type rather than on
-        // message text. Everything else keeps today's collapse verbatim.
-        //
-        // The trip check above still wins: a cancel or watchdog that fired during a
-        // limit-shaped turn is a deliberate stop, not something to park and resume.
-        const limit = classifyLimitFailure(
-          resultFrame,
-          rateLimits.latest,
+      if (sawTerminal && terminal && terminal.outcome === "failed") {
+        // PRD #35: classify at the completion point with Date.now() (not earlier in
+        // the stream). A usage-limit death materializes as the TYPED LimitReachedError
+        // carrying the normalized reset; everything else materializes as the generic
+        // `agent run failed: ${subtype}` collapse. The materializer retains the RAW
+        // subtype; malformed-value conversion throws HERE, at this call site.
+        const limitFacts = classifyLimitEvidence(
+          terminal.limitEvidence ?? { explicitExhaustion: false },
           Date.now(),
         );
-        if (limit)
-          throw new LimitReachedError({ ...limit, detail: errorSubtype });
-        throw new Error(`agent run failed: ${errorSubtype}`);
+        const thrown = terminal.failure
+          ? terminal.failure.materialize(limitFacts)
+          : { original: new Error("agent run failed: unknown") };
+        throw thrown.original;
       }
-      result.sessionId = turnSessionId;
-      // Issue #281: expose the lead's concatenated text for the no-progress detector.
-      if (leadText.length > 0) result.finalText = leadText.join("\n");
-      return result;
+      const end: TurnStreamEnd =
+        sawTerminal && terminal
+          ? { kind: "terminal", terminal }
+          : { kind: "exhausted" };
+      return reducer.finish(end).result;
     } catch (err) {
       // A watchdog/cancel trip surfaces as its static reason, not the raw
       // AbortError the aborted iterator throws.

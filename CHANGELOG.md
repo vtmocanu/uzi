@@ -20,10 +20,15 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **The bundled `uzi-cli` skill now installs to Codex CLI as well as Claude Code ([#1143](https://github.com/vtmocanu/uzi/issues/1143)).**
+  `uzi skill install|install-hook|status|uninstall-hook` take `--target claude|codex|all`; Codex gets the skill at `~/.agents/skills/uzi-cli/SKILL.md` and a `SessionStart` hook in `$CODEX_HOME/hooks.json` (review it once with `/hooks`). Automatic install adds Codex only when its config home already exists.
 - **Slack DM when a usage-limit-paused run resumes ([#1116](https://github.com/vtmocanu/uzi/issues/1116)).**
   A run parked on an Anthropic usage limit already posts a ⏸️ Paused reply into its Slack DM thread; now the first time it is back to running it posts a single ▶️ Resumed reply into the same thread, carrying how long it waited and (from the second pause) the pause count (a resume straight into the plan gate, a question, or a terminal state is carried by that reply instead), deduped through the per-run Slack anchor so a redelivered running report never re-posts.
 
 ### Changed
+
+- **Default reasoning effort is now `xhigh` for users who have not chosen a level ([#1157](https://github.com/vtmocanu/uzi/issues/1157)).**
+  Runs whose owner never picked a reasoning-effort level now dispatch at uzi's own default of `xhigh` instead of the Claude Agent SDK's built-in `high`; an explicit choice (including `high`) is honored unchanged, and the Settings picker now labels the inherit and `xhigh` options as the uzi default.
 
 - **The Findings surface in the web UI now uses a bug glyph instead of the warning triangle ([#1139](https://github.com/vtmocanu/uzi/issues/1139)).**
   The sidebar nav item, page header, empty state, and run-view finding card for Findings ("off-task bugs your workers flagged mid-run") switch from the AlertIcon warning triangle to a new BugIcon, keeping the sky/info tint; AlertIcon stays the genuine-warning glyph everywhere else (e.g. the missing-sweep-labels notice).

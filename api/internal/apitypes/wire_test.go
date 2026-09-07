@@ -61,6 +61,8 @@ func TestUserDTOTags(t *testing.T) {
 		// PRD #104 M4: which credential this user's retrospectives spend. Both null
 		// ⇒ their default. The label, never the token value.
 		"judge_anthropic_secret_id", "judge_anthropic_secret_label",
+		// PRD #1140 M2: the EFFECTIVE three-valued judge bind mode (default/pinned/auto).
+		"judge_anthropic_bind_mode",
 		"created_at", "last_login")
 }
 

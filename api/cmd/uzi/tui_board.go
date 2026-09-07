@@ -280,7 +280,11 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		}
 		m.view = viewDetail
 		m.detail = newDetailState(sel.ID)
-		return m, tea.Batch(m.loadDetailCmd(sel.ID), m.openStreamCmd(sel.ID))
+		// A fresh session generation per drill-in: a reply still in flight from a previous
+		// session on the SAME run (exit, reopen) passes the runID guard and is rejected on this.
+		m.detailGen++
+		m.detail.gen = m.detailGen
+		return m, tea.Batch(m.loadRunCmd(sel.ID), m.loadTailCmd(sel.ID), m.openStreamCmd(sel.ID))
 	}
 	return m, nil
 }

@@ -172,8 +172,7 @@ func TestTUIDetailMetaGuardClearsOnError(t *testing.T) {
 	m := tuiTestModel(t, fake, runID) // startRun → view == viewDetail
 
 	// Establish the loaded baseline so applyMeta runs and run.ID is set.
-	next, _ := m.Update(detailLoadedMsg{runID: runID, run: run})
-	m = next.(tuiModel)
+	m = applyDetail(m, run, nil)
 	if m.view != viewDetail || m.detail.run.ID == "" || m.detail.polling {
 		t.Fatalf("detail precondition not met: view=%v runID=%q polling=%v", m.view, m.detail.run.ID, m.detail.polling)
 	}
@@ -191,7 +190,7 @@ func TestTUIDetailMetaGuardClearsOnError(t *testing.T) {
 
 	// The flaky-connection path: a detailMetaMsg for THIS run carrying err != nil. The marker must
 	// clear despite the case's err early-return.
-	next, _ = m.Update(detailMetaMsg{runID: runID, reqID: metaWaitID, err: uzicli.Exitf(uzicli.ExitGeneric, "context deadline exceeded")})
+	next, _ := m.Update(detailMetaMsg{runID: runID, reqID: metaWaitID, err: uzicli.Exitf(uzicli.ExitGeneric, "context deadline exceeded")})
 	m = next.(tuiModel)
 	if m.detail.metaWaitID != 0 {
 		t.Fatal("a detailMetaMsg with err != nil did not clear metaWaitID; the detail-meta poll would wedge forever on a flaky link")
@@ -469,8 +468,7 @@ func TestTUIDetailMetaIgnoresReplyForNavigatedAwayRun(t *testing.T) {
 	m := tuiTestModel(t, fake, runA)
 
 	// Drill into A and load it, then get a meta poll for A outstanding.
-	next, _ := m.Update(detailLoadedMsg{runID: runA, run: apitypes.RunDTO{ID: runA, Kind: "issue", Status: "running"}})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: runA, Kind: "issue", Status: "running"}, nil)
 	m = idleBoard(t, m, nil)
 	m, _ = tick(t, m)
 	if m.detail.metaWaitID == 0 {
@@ -479,13 +477,12 @@ func TestTUIDetailMetaIgnoresReplyForNavigatedAwayRun(t *testing.T) {
 
 	// Navigate to run B: the detail state resets (metaSeq restarts at 0).
 	m.detail = newDetailState(runB)
-	next, _ = m.Update(detailLoadedMsg{runID: runB, run: apitypes.RunDTO{ID: runB, Kind: "issue", Status: "running"}})
-	m = next.(tuiModel)
+	m = applyDetail(m, apitypes.RunDTO{ID: runB, Kind: "issue", Status: "running"}, nil)
 
 	// Get a meta poll for B outstanding. Its metaWaitID is 1 (metaSeq restarted) — the SAME id
 	// run A's outstanding poll carried, which is exactly the cross-run collision the runID check
 	// defends against.
-	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: nil}) // idle the board again
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: nil}) // idle the board again
 	m = next.(tuiModel)
 	m, _ = tick(t, m)
 	if m.detail.metaWaitID != 1 {

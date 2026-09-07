@@ -574,6 +574,7 @@ type Store interface {
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
 	ListRunMessagesAfterPage(ctx context.Context, arg store.ListRunMessagesAfterPageParams) ([]store.RunMessage, error)
+	ListRunMessagesBeforePage(ctx context.Context, arg store.ListRunMessagesBeforePageParams) ([]store.RunMessage, error)
 	// UpsertRunUsage folds a delivered result frame's per-model usage into
 	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
 	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
@@ -692,15 +693,19 @@ type Store interface {
 	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
+	// UserHasAutoEligibleAnthropicToken reports whether the owner has ≥1 auto_eligible
+	// anthropic_token (a non-empty auto-select pool). CreateWorker reads it to derive a
+	// new worker's bind mode the #804 way (PRD #1140 M1): no label + non-empty pool → auto.
+	UserHasAutoEligibleAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
-	// Judge-lane → token binding (PRD #104 M4): read at judge-claim time, written by
-	// PUT /api/me/judge.
-	GetUserJudgeAnthropicSecret(ctx context.Context, id uuid.UUID) (pgtype.UUID, error)
-	SetUserJudgeAnthropicSecret(ctx context.Context, arg store.SetUserJudgeAnthropicSecretParams) (store.User, error)
+	// Judge-lane bind mode + pointer (PRD #104 M4, three-valued per PRD #1140 M2): read
+	// at judge-claim time, written by PUT /api/me/judge in one statement (D6).
+	GetUserJudgeAnthropicBinding(ctx context.Context, id uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error)
+	SetUserJudgeAnthropicBinding(ctx context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// Per-user default reasoning effort (PRD #617): read at issue- and chat-run
-	// claim assembly, keyed on the run owner. NULL ⇒ inherit (worker omits the SDK
-	// effort key, so the SDK default `high` applies).
+	// claim assembly, keyed on the run owner. NULL ⇒ inherit, resolved to the uzi
+	// default `xhigh` at claim assembly (issue #1157).
 	GetUserDefaultEffort(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// Per-user AI-attribution opt-out (issue #916): read LIVE at standard run-claim
 	// assembly, keyed on the run owner, so flipping the toggle takes effect on the
@@ -3081,9 +3086,26 @@ func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, temp
 	// silently dead. Deriving it here rather than defaulting it in SQL is the same
 	// rule PatchWorker applies and the same one 00088's backfill applied to existing
 	// rows: a resolved label is `pinned`, its absence is `default`.
+	//
+	// The pool read (PRD #1140 M1) is the SECOND input to that same derivation, making
+	// every worker create path agree with the #804 ephemeral path (ephemeral.go:263):
+	// a resolved label is `pinned` regardless of the pool; its absence is `auto` when
+	// the owner has ≥1 auto_eligible anthropic_token (a non-empty auto-select pool),
+	// else `default`. So a pooled-up owner's new worker spends the pool by default
+	// instead of the owner's single default token, and it never parks a run in
+	// pool_wait because `auto` is only chosen when the pool is non-empty.
 	bindMode := BindModeDefault
-	if secretID.Valid {
+	switch {
+	case secretID.Valid:
 		bindMode = BindModePinned
+	default:
+		hasPool, err := s.q.UserHasAutoEligibleAnthropicToken(ctx, userID)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		if hasPool {
+			bindMode = BindModeAuto
+		}
 	}
 	// templateDeclared is the UI-chosen worker template (PRD #18), validated
 	// against the registry by the caller; empty → NULL (no choice made).
@@ -3175,15 +3197,27 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 	return wkr, nil
 }
 
-// SetUserJudgeToken points the user's JUDGE lane at one of their own Anthropic
-// credentials, or clears it back to their default when secretID is nil (PRD #104
-// M4). Per-user, not per-worker: which credential reviews your work is a property
-// of you, not of whichever worker claims the retrospective.
+// SetUserJudgeBinding sets the user's JUDGE-lane bind MODE and pointer in one write
+// (PRD #104 M4, three-valued per PRD #1140 M2, D6), mirroring SetWorkerAnthropicToken's
+// rules: 'pinned' requires an owned secret; 'default' and 'auto' carry no id and write
+// NULL. Per-user, not per-worker: which credential reviews your work is a property of
+// you, not of whichever worker claims the retrospective. A 'default' user spends their
+// default token; an 'auto' user has the judge lane run the same pool ranker the run
+// lane uses, falling to the default only when the pool is genuinely empty (D4).
 //
 // Ownership is checked here so the caller gets a 404 rather than a constraint
 // violation; 00079's composite FK refuses the same binding independently, and is
 // the layer that holds if this check is ever bypassed (D11).
-func (s *Service) SetUserJudgeToken(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) (store.User, error) {
+func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mode string, secretID *uuid.UUID) (store.User, error) {
+	if !ValidBindMode(mode) {
+		return store.User{}, ErrInvalidBindMode
+	}
+	// A non-pinned mode never carries an id (the same rule SetWorkerAnthropicToken
+	// enforces): 'default' and 'auto' resolve without a pointer, so a stale id left
+	// beside them cannot leak into a claim.
+	if mode != BindModePinned {
+		secretID = nil
+	}
 	var bind pgtype.UUID
 	if secretID != nil {
 		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
@@ -3197,8 +3231,9 @@ func (s *Service) SetUserJudgeToken(ctx context.Context, userID uuid.UUID, secre
 		}
 		bind = pgconv.UUID(*secretID)
 	}
-	return s.q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
+	return s.q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
 		ID:                     userID,
+		JudgeAnthropicBindMode: mode,
 		JudgeAnthropicSecretID: bind,
 	})
 }
@@ -3759,6 +3794,25 @@ func (s *Service) ListRunMessagesForViewerPage(ctx context.Context, userID uuid.
 		return nil, err
 	}
 	return s.q.ListRunMessagesAfterPage(ctx, store.ListRunMessagesAfterPageParams{RunID: runID, AfterSeq: afterSeq, Lim: limit})
+}
+
+// ListRunMessagesForViewerBefore returns the newest <= limit messages with
+// seq < beforeSeq, in ASCENDING seq order (the store query returns DESC; the
+// reverse happens here, not in SQL — keeps the row store.RunMessage). Same
+// owner-or-admin gate as the sibling. Caller clamps limit.
+func (s *Service) ListRunMessagesForViewerBefore(ctx context.Context, userID uuid.UUID, isAdmin bool, runID uuid.UUID, beforeSeq int32, limit int32) ([]store.RunMessage, error) {
+	if _, err := s.GetRunForViewer(ctx, userID, isAdmin, runID); err != nil {
+		return nil, err
+	}
+	rows, err := s.q.ListRunMessagesBeforePage(ctx, store.ListRunMessagesBeforePageParams{RunID: runID, BeforeSeq: beforeSeq, Lim: limit})
+	if err != nil {
+		return nil, err
+	}
+	// reverse DESC -> ASC in place
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	return rows, nil
 }
 
 // ListRunsForUser returns the user's runs (newest first) with repo path and

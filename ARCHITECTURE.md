@@ -448,11 +448,18 @@ Anthropic credential is resolved is a **per-claim** decision across four lanes,
 of which `workersvc.claimSecretID` decides two: a `self_improve` run follows
 the owner's judge-lane binding, and any other run-lane claim follows the
 claiming worker's **bind mode**. The other two never reach it — a judge run
-forks to `assembleJudgeClaim` *before* `claimSecretID` and follows the owner's
-judge binding, and the chat lane calls the opener directly with no override, so
-it always resolves the owner's default. Because the token rides the claim
-rather than the worker, re-pointing a worker is complete server-side — no
-restart, no re-minted join token.
+forks to `assembleJudgeClaim` *before* `claimSecretID`, and the chat lane calls
+the opener directly with no override, so it always resolves the owner's
+default. Since PRD #1140 the judge lane and `self_improve` both follow the
+owner's judge **bind mode** — `default` / `pinned` / `auto`, three-valued like
+a worker's — and an `auto` judge run resolves through the very same
+`autoChoice` ranker the run lane uses (`judgeChoice`, `judge.go`). The one
+deliberate asymmetry: on a genuinely empty pool the judge lane spends the
+owner's default token (recorded `pool_empty`) rather than holding in
+`pool_wait` as the run lane does, because a held retrospective carries no
+issue, no branch and nobody's attention, and would silently pile up. Because
+the token rides the claim rather than the worker, re-pointing a worker is
+complete server-side — no restart, no re-minted join token.
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens by rate-limit headroom

@@ -1,5 +1,6 @@
 import {
   type AppSettings,
+  type BindMode,
   type ReleaseCheckStatus,
   type SettingSource,
   type SettingsResponse,
@@ -689,7 +690,11 @@ export const settingsApi = {
 
   // ── Run-judge opt-in (PRD #46) ───────────────────────────────────────────────
   // Own-user (session identity, never a body id, mirroring the server's audit H3).
-  setJudgeEnabled: async (enabled: boolean, anthropicToken?: string | null) => {
+  setJudgeEnabled: async (
+    enabled: boolean,
+    anthropicToken?: string | null,
+    judgeBindMode?: BindMode,
+  ) => {
     const u = requireSession();
     u.judge_enabled = enabled;
     // Three-way, like the server: undefined leaves the binding, null clears it, a
@@ -708,6 +713,11 @@ export const settingsApi = {
         u.judge_anthropic_secret_id = secret.id;
         u.judge_anthropic_secret_label = secret.label;
       }
+    }
+    // PRD #1140 M3: the three-valued bind mode rides along when provided, so the
+    // mock reflects the effective mode the picker drives (auto / default / pinned).
+    if (judgeBindMode !== undefined) {
+      u.judge_anthropic_bind_mode = judgeBindMode;
     }
     return delay({ user: { ...u } }, 200);
   },

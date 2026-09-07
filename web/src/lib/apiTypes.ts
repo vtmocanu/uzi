@@ -51,6 +51,10 @@ export interface User {
   // unbound ⇒ their default token. The label, never the value.
   judge_anthropic_secret_id: string | null;
   judge_anthropic_secret_label: string | null;
+  // Which bind mode this user's RETROSPECTIVES use (PRD #1140): default / pinned /
+  // auto. The EFFECTIVE mode (a pinned binding whose token was deleted reports
+  // default). auto spreads retrospectives across the user's pooled tokens.
+  judge_anthropic_bind_mode: BindMode;
   created_at: string;
   last_login: string | null;
 }
@@ -90,9 +94,9 @@ export interface SecretMeta {
 // #21).
 export interface UserSettings {
   default_model: string | null;
-  /** Per-user default reasoning effort (PRD #617); null means inherit — the worker
-   *  omits the SDK effort key, so the SDK default (`high`) applies. One of
-   *  low|medium|high|xhigh|max when set. */
+  /** Per-user default reasoning effort (PRD #617); null means the user has not chosen
+   *  (inherit), which resolves to the uzi default (`xhigh`) at claim assembly (issue
+   *  #1157). One of low|medium|high|xhigh|max when set. */
   default_effort: string | null;
   /** Per-user judge model override (PRD #69 M2); null means inherit the instance
    *  judge_model (which itself falls back to opus). Written through PUT /me/settings
@@ -2748,6 +2752,10 @@ export interface RunMessage {
   agent_label: string | null;
   payload: unknown;
   created_at: string;
+  // payload_truncated is true only when a ?payload_max= trim actually removed bytes
+  // from this message's payload (PRD #1137). Absent on every untrimmed message; the
+  // web SPA never sends payload_max, so it never sees this key.
+  payload_truncated?: boolean;
 }
 
 /** PRD #88 adds "answer": the reply to an ask_user question. Unlike every other kind

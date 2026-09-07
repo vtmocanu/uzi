@@ -119,16 +119,14 @@ func TestIssueIDRendersInBoardAndDetail(t *testing.T) {
 
 	// Detail header for the issue run shows #463.
 	detail := tuiTestModel(t, fake, withIssue.ID)
-	next, _ = detail.Update(detailLoadedMsg{run: withIssue})
-	detail = next.(tuiModel)
+	detail = applyDetail(detail, withIssue, nil)
 	if dout := detail.View().Content; !strings.Contains(dout, "#463") {
 		t.Errorf("detail header should render #463 for the issue run; frame:\n%s", dout)
 	}
 
 	// Detail header for the nil-issue run shows no #.
 	nd := tuiTestModel(t, fake, noIssue.ID)
-	next, _ = nd.Update(detailLoadedMsg{run: noIssue})
-	nd = next.(tuiModel)
+	nd = applyDetail(nd, noIssue, nil)
 	if dout := nd.View().Content; strings.Contains(dout, "#") {
 		t.Errorf("nil-issue detail header must not render a #; frame:\n%s", dout)
 	}

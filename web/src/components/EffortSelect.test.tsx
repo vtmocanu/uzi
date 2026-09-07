@@ -30,6 +30,23 @@ describe("EffortSelect", () => {
     expect(values).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
   });
 
+  // Copy guard (issue #1157): the visible option LABELS surface uzi's default effort
+  // (xhigh) — the Inherit option and the xhigh option carry the "uzi default" copy,
+  // the other four render their bare value. The option VALUES are unchanged (asserted
+  // above), so this is a pure label check via the rendered <option>s' text.
+  it("labels the Inherit and xhigh options with the uzi default copy", () => {
+    render(<Harness initial="" />);
+    const labels = Array.from(combo().options).map((o) => o.text);
+    expect(labels).toEqual([
+      "Inherit (uzi default: xhigh)",
+      "low",
+      "medium",
+      "high",
+      "xhigh (uzi default)",
+      "max",
+    ]);
+  });
+
   it("selecting a level fires onChange with that level", () => {
     render(<Harness initial="" />);
     fireEvent.change(combo(), { target: { value: "low" } });

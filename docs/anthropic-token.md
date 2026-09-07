@@ -113,13 +113,19 @@ token** on each one you are happy for uzi to spend; `uzi token pool <name>
 itself into the pool would spend a credential you reserved for something
 else, which is the whole reason it starts out.
 
-> **A throwaway worker defaults to auto-select too.** A [worker uzi
+> **Every new worker defaults to auto-select.** Pin a worker to a token
+> (above) and it stays **pinned**. Otherwise, a newly created worker — a
+> [worker uzi
 > auto-provisions for an unmet
-> capability](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability)
-> comes up set to **Auto-select from the pool** as long as you have at least
-> one pooled token, so a burst of throwaway workers spreads across your pool
-> instead of leaning on one credential. If your pool is empty, it quietly
-> spends your default token instead, the same as any other worker.
+> capability](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability),
+> a hosted worker you provision yourself, or one you join with a plain join
+> token — comes up set to **Auto-select from the pool** as long as you have
+> at least one pooled token, so a burst of new workers spreads across your
+> pool instead of leaning on one credential. If your pool is empty, it
+> quietly spends your default token instead, the same as any other worker.
+> This is the default for **newly created** workers only: it does not
+> retroactively re-point a worker you already set up, so an existing worker
+> keeps whatever mode it already has until you change it yourself.
 
 **Opting a token in does not guarantee it gets picked.** Beside the toggle,
 each pooled token shows whether auto-selection could pick it *right now*:
@@ -219,10 +225,12 @@ A single-token user's runs all billed the one token, so the list stays as it was
 ## Pointing the judge at a token
 
 **Settings → Run judge** has a **Token the judge spends** picker (shown once
-you hold more than one token). It covers the [run judge](./judge.md) and
-uzi's own self-improvement runs — retrospective work, which you may well want
-billed separately from the runs being reviewed. Leave it on **your default
-token** to keep everything on one account.
+you hold at least one token), offering your default token, a token you name
+for the judge lane specifically, or **Auto-select from the pool** — the
+default. It covers the [run judge](./judge.md) and uzi's own self-improvement
+runs — retrospective work, which you may well want billed separately from the
+runs being reviewed. Leave it on **your default token** to keep everything on
+one account.
 
 ## Rotating a value
 

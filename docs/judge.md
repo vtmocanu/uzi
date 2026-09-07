@@ -10,9 +10,9 @@ With the run judge on, every one of your **finished** runs gets a
 retrospective: an LLM reads the run's trace (agents, tools, plan, review
 cycles, delivery) and produces a verdict plus structured recommendations —
 never code changes, only advice. It runs on **your own Anthropic token** —
-your default one, or a token you name for the judge lane specifically — so
-it's opt-in and off by default; your instance admin also has to enable it
-globally first.
+your default one, a token you name for the judge lane specifically, or
+auto-selected from your token pool — so it's opt-in and off by default; your
+instance admin also has to enable it globally first.
 
 ## 1. Enable it
 
@@ -50,11 +50,13 @@ see the next section.
 
 ## Which token the judge spends
 
-By default the judge spends your default [Anthropic token](./anthropic-token.md)
-— the same credential your runs use. If you hold more than one, **Settings →
-Run judge** offers a **Token the judge spends** picker, so retrospectives can
-bill a different account from the work they review (a cheaper console key for
-the reviewing, a subscription for the runs).
+By default the judge auto-selects from your Anthropic [token
+pool](./anthropic-token.md#letting-uzi-pick-the-token-auto-selection). If you
+hold more than one token, **Settings → Run judge** offers a **Token the judge
+spends** picker — your default one, a token you name for the judge lane
+specifically, or **Auto-select from the pool** — so retrospectives can bill a
+different account from the work they review (a cheaper console key for the
+reviewing, a subscription for the runs).
 
 The picker also covers uzi's **self-improvement** runs, for the same reason:
 they are uzi reviewing and improving itself, not work you asked a particular
@@ -62,6 +64,13 @@ worker to do, so they follow the judge's credential rather than the claiming
 worker's. Everything else — issue runs, autopilot, CI-fix, chat — is unaffected
 by this setting. Leave it on **your default token** to keep everything on one
 account.
+
+**Auto-select from the pool** picks whichever pooled token has the most
+rate-limit headroom, same as an auto worker. It differs from a worker in one
+deliberate way: a worker with an empty pool *holds* the run, waiting for a
+token to be pooled, but the judge lane never holds a retrospective — with an
+empty pool it spends your default token instead, so finished runs never pile
+up waiting on a judge that can't run.
 
 ## Which model it runs on
 

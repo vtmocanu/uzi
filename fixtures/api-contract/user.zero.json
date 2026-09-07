@@ -13,6 +13,7 @@
   "ephemeral_workers_enabled": false,
   "judge_anthropic_secret_id": null,
   "judge_anthropic_secret_label": null,
+  "judge_anthropic_bind_mode": "",
   "created_at": "0001-01-01T00:00:00Z",
   "last_login": null
 }

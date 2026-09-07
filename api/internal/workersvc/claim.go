@@ -411,13 +411,13 @@ type ClaimConfig struct {
 	QuestionMax            int     `json:"question_max"`
 	QuestionTimeoutSeconds int     `json:"question_timeout_seconds"`
 	DefaultModel           *string `json:"default_model,omitempty"`
-	// DefaultEffort is the owner's per-user default reasoning effort (PRD #617):
-	// the SDK effort level the worker applies to the lead/main thread. omitempty:
-	// omitted when the owner has no default (NULL), so the worker never sets the
-	// SDK effort key and the SDK default (`high`) applies — byte-identical to
-	// today's wire for every run without an effort set. Unlike DefaultModel there
-	// is no per-run/per-schedule freeze; the owner's per-user value is the only
-	// source.
+	// DefaultEffort is the SDK effort level the worker applies to the lead/main
+	// thread: the owner's explicit per-user reasoning effort (PRD #617), or the uzi
+	// default `xhigh` (issue #1157) when the owner has not chosen (NULL). It is
+	// populated for every issue-lane claim assembled through resolveEffortPtr; the
+	// judge lane shares this struct but leaves it nil (omitted), so judge runs keep
+	// riding the SDK's own fallback. omitempty is retained. Unlike DefaultModel there
+	// is no per-run/per-schedule freeze; the owner's per-user value is the only source.
 	DefaultEffort *string `json:"default_effort,omitempty"`
 	// AttributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// LIVE from the owner's users row on every claim. When false, the worker suppresses
