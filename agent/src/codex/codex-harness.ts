@@ -45,6 +45,7 @@
 // {@link CodexHarnessError} throw (Claude's clean-EOF `exhausted` is unaffected).
 
 import { renderCodexRun } from "./render.js";
+import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
 
 import type { Logger } from "../log.js";
 import type {
@@ -57,14 +58,13 @@ import type {
   HarnessTerminal,
   HarnessThrownFailure,
   HarnessTurn,
-  HarnessUsage,
   ProcessReap,
   RunHarness,
   RunTurnRequest,
   SessionPresence,
   ToolDisposal,
 } from "../harness.js";
-import type { CallbackOrigin, CallbackResult, CodexCallbackBroker } from "./broker.js";
+import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexRun } from "./render.js";
@@ -169,6 +169,11 @@ function extractText(item: Record<string, unknown>): string[] {
   }
   return out;
 }
+
+/** A small best-effort deadline (ms) for tearing down a just-launched root that FAILED
+ *  registry admission. The launch is already being failed; this only bounds the cleanup
+ *  of the unadmitted root so it cannot hang the setup throw. */
+const REGISTRY_ADMISSION_TEARDOWN_DEADLINE_MS = 1000;
 
 // --- the harness --------------------------------------------------------------
 
@@ -407,7 +412,17 @@ export class CodexHarness implements RunHarness {
       this.registry.cancelReservation(reservation.reservation);
       throw error;
     }
-    this.registry.registerRoot(reservation.reservation, launched.root);
+    const admission = this.registry.registerRoot(reservation.reservation, launched.root);
+    if (!admission.ok) {
+      // The registry POISONED on a kind / unknown-reservation mismatch: this root was
+      // never admitted, so model work must NOT proceed on it. Do NOT assign transport/
+      // notes; best-effort tear the just-launched root down (a poisoned epoch will not
+      // reap it), then fail closed. A close/dispose throw is swallowed — we are already
+      // failing the launch and only bound the cleanup.
+      await launched.transport.close().catch(() => {});
+      await launched.root.dispose(REGISTRY_ADMISSION_TEARDOWN_DEADLINE_MS).catch(() => {});
+      throw new CodexHarnessError({ category: "protocol", message: "codex provider root failed registry admission" });
+    }
     this.transport = launched.transport;
     // Single-consumer: obtain the notifications iterator exactly once for the root.
     this.notes = launched.transport.notifications();
@@ -506,6 +521,14 @@ export class CodexHarness implements RunHarness {
       case "turn_started":
         return { kind: "activity", sessionId: note.threadId };
       case "turn_completed": {
+        // The harness serves ONLY the ACTIVE root turn. A terminal for a stale turn id or
+        // a child/foreign thread is liveness ONLY — it must never latch `terminalEmitted`
+        // or emit `turn_finished`, or a stale/child completion could end the root turn.
+        // Keeping the loop waiting also means a later clean EOF without the REAL terminal
+        // still protocol-throws (unexpected-EOF), never a fabricated success.
+        if (note.threadId !== this.threadId || note.turnId !== this.activeTurnId) {
+          return { kind: "activity", sessionId: note.threadId };
+        }
         const terminal = this.decodeTerminal(note);
         this.terminalEmitted = true;
         return { kind: "turn_finished", terminal, sessionId: note.threadId };
@@ -530,27 +553,41 @@ export class CodexHarness implements RunHarness {
   }
 
   /** Route one `item/tool/call` server→client request to the broker and reply with the
-   *  neutral result. The reply is sent ONLY AFTER the broker settles (a broker deny is a
-   *  FAILED tool RESULT — `success:false` — not a JSON-RPC error, mirroring the M0
-   *  policy-broker). Authority is the broker's; the harness binds nothing itself. */
+   *  neutral result. The harness FIRST binds the request fail-closed to the ACTIVE
+   *  (threadId, activeTurnId): only a callback for the active root turn reaches the broker
+   *  (origin `"root"`); any other identity is denied here with a bounded FAILED tool result
+   *  and the broker is never called. When the broker IS called, the reply is sent ONLY AFTER
+   *  it settles (a broker deny is a FAILED tool RESULT — `success:false` — not a JSON-RPC
+   *  error, mirroring the M0 policy-broker). Authority over WHAT a matched callback may do
+   *  stays the broker's; the harness only gates WHICH turn's callbacks reach it. */
   private async routeToolCall(transport: CodexTransport, requestId: number | string, params: unknown): Promise<void> {
     const p = asObject(params) ?? {};
-    // Origin is computed from the RAW parsed thread id ONLY — never folded to
-    // this.threadId. An absent/non-string threadId can therefore NEVER become "root":
-    // it fails CLOSED to "unknown" (matching e2e/codex-m0/policy-broker.mjs), so a
-    // missing id can neither latch a signal nor delegate. The raw value (or "" when
-    // absent) is what we hand the broker's `rt`, so the broker's OWN ingestion denies an
-    // absent/empty id — we do not substitute this.threadId into that identity.
+    // A callback is served ONLY for the ACTIVE root turn. We bind on BOTH the raw thread
+    // id AND the raw turn id (never folded to this.threadId/activeTurnId), so an absent/
+    // stale/foreign identity fails CLOSED. Binding on the turn as well as the thread closes
+    // TWO gaps at once: a stale-turn root-signal latch (right thread, wrong turn) and a
+    // child/foreign-thread effect running under the root's grants. On ANY mismatch we do
+    // NOT call the broker (no effect ever runs) and reply with a bounded FAILED tool result.
     const rawThreadId = asString(p.threadId);
+    const rawTurnId = asString(p.turnId);
     const threadId = rawThreadId ?? "";
-    const turnId = asString(p.turnId) ?? "";
+    const turnId = rawTurnId ?? "";
     const callId = asString(p.callId) ?? "";
-    const origin: CallbackOrigin = rawThreadId !== undefined && rawThreadId === this.threadId ? "root" : "unknown";
+    const matchesActive =
+      rawThreadId !== undefined &&
+      rawThreadId === this.threadId &&
+      rawTurnId !== undefined &&
+      rawTurnId === this.activeTurnId;
     let result: CallbackResult;
-    try {
-      result = await this.broker.handleToolCall({ threadId, turnId, callId }, p.tool, p.arguments, origin);
-    } catch {
-      result = { ok: false, code: "broker_error", message: "the callback failed" };
+    if (!matchesActive) {
+      result = { ok: false, code: "not_active_turn", message: "callback does not match the active turn" };
+    } else {
+      try {
+        // A matched callback is, by construction, the root turn's — origin is "root".
+        result = await this.broker.handleToolCall({ threadId, turnId, callId }, p.tool, p.arguments, "root");
+      } catch {
+        result = { ok: false, code: "broker_error", message: "the callback failed" };
+      }
     }
     try {
       transport.respond(requestId, this.replyOf(result));
@@ -580,18 +617,22 @@ export class CodexHarness implements RunHarness {
   }
 
   /** Decode an `item/completed` note carrying assistant content into a `frame`; return
-   *  undefined for a non-assistant item (the caller yields `activity`). Usage and model
-   *  ride the frame (call basis); token normalization is deferred, so only the raw usage
-   *  is retained in the wire capsule (unknown fields absent, never 0). */
+   *  undefined for a non-assistant item OR a non-active-thread item (the caller yields
+   *  `activity`). Usage and model ride the frame (call basis), bounded/redacted through
+   *  {@link normalizeCodexUsage} so no raw provider blob is retained. */
   private decodeItemFrame(note: Extract<CodexNotification, { kind: "activity" }>): HarnessEvent | undefined {
     if (note.method !== "item/completed") return undefined;
-    const item = asObject(asObject(note.params)?.item);
+    const params = asObject(note.params);
+    // Bind the frame to the ACTIVE root thread. `item/completed` carries NO turnId (only a
+    // threadId), so we bind on threadId ONLY: the item's own thread id must be PRESENT and
+    // EQUAL to this.threadId. A child/foreign/absent thread id yields undefined so the
+    // caller surfaces `activity`, never a {origin:{kind:"main"}} frame for a non-root thread.
+    if (params === undefined || params.threadId !== this.threadId) return undefined;
+    const item = asObject(params.item);
     if (!item) return undefined;
     const items = this.decodeItemContent(item);
     if (items.length === 0) return undefined;
-    const usageObj = asObject(item.usage);
-    const usage: HarnessUsage | undefined =
-      usageObj !== undefined ? { basis: "call", tokens: {}, wire: { usage: usageObj } } : undefined;
+    const usage = normalizeCodexUsage(item.usage, "call");
     return {
       kind: "frame",
       origin: { kind: "main" },
@@ -625,26 +666,27 @@ export class CodexHarness implements RunHarness {
    *  `failed`. A terminal PROVIDER failure is DATA here — it is never also thrown. */
   private decodeTerminal(note: Extract<CodexNotification, { kind: "turn_completed" }>): HarnessTerminal {
     const turn = asObject(asObject(note.params)?.turn);
-    const status = note.status ?? asString(turn?.status) ?? "unknown";
-    const outcome: "success" | "failed" = status === "completed" ? "success" : "failed";
-    const usageObj = asObject(turn?.usage);
-    const usage: HarnessUsage | undefined =
-      usageObj !== undefined ? { basis: "turn", tokens: {}, wire: { usage: usageObj } } : undefined;
-    const errors: string[] = [];
-    const err = turn?.error;
-    if (typeof err === "string" && err.length > 0) errors.push(err);
+    const rawStatus = note.status ?? asString(turn?.status);
+    // Normalize through the single-source-of-truth module so no raw provider field
+    // (arbitrary status, secret-bearing turn.error, or a multi-megabyte usage blob) is
+    // ever retained: subtype/outcome come from the CLOSED vocabulary, errors are provider-
+    // text-free, and usage is a bounded numeric-only subset.
+    const { subtype, outcome } = normalizeCodexStatus(rawStatus);
+    const errors = normalizeCodexTerminalErrors(subtype, outcome);
+    const usage = normalizeCodexUsage(turn?.usage, "turn");
     return {
       outcome,
-      subtype: status,
+      subtype,
       errors,
       usage,
       metrics: { cost: { kind: "unreported" } },
       failure: {
         // Deferred, invoked only at the owner's classification point. Codex M3 carries no
         // limit facts, so this constructs the generic terminal exception; it never invents
-        // an auth/model/effort category from a provider status.
+        // an auth/model/effort category from a provider status, and its message is based on
+        // the CLOSED subtype, never the raw provider status string.
         materialize: (_limit): HarnessThrownFailure => {
-          const original = new Error(`codex turn failed: ${status}`);
+          const original = new Error(`codex turn failed: ${subtype}`);
           return { failure: { category: "unknown", message: original.message }, original };
         },
       },

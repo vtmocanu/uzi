@@ -190,8 +190,8 @@ function toolCall(
   return { kind: "activity", method: "item/tool/call", requestId, params: { threadId, turnId, callId, tool, arguments: args, namespace: null } };
 }
 
-/** An item/tool/call whose params OMIT threadId entirely (an absent/non-string id must
- *  fail closed to origin="unknown", never fold to the root). */
+/** An item/tool/call whose params OMIT threadId entirely (an absent/non-string id can never
+ *  match the active root turn, so it must be denied fail-closed and never reach the broker). */
 function toolCallNoThread(requestId: number, tool: string, args: unknown, turnId = "tn-1", callId = "c1"): CodexNotification {
   return { kind: "activity", method: "item/tool/call", requestId, params: { turnId, callId, tool, arguments: args, namespace: null } };
 }
@@ -447,6 +447,67 @@ describe("CodexHarness: frame → neutral event decode", () => {
   });
 });
 
+describe("CodexHarness: notifications are bound to the active (thread, turn)", () => {
+  it("a turn_completed with a STALE turnId is liveness only; the REAL active terminal ends the turn", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      // A stale-turn terminal (right thread, wrong turn) must NOT end the root turn — it is
+      // surfaced as `activity`, so the loop keeps waiting for the real active-turn terminal.
+      .push(turnCompleted("completed", undefined, "th-1", "stale-turn"))
+      // The REAL active turn's terminal (th-1/tn-1) is the one that ends the turn.
+      .push(turnCompleted("completed", { total_tokens: 3 }))
+      .end();
+
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    // The stale terminal shows up as an activity, never as an early turn_finished.
+    assert.deepEqual(
+      events.map((e) => e.kind),
+      ["initialized", "activity", "turn_finished"],
+    );
+    assert.equal(events.filter((e) => e.kind === "turn_finished").length, 1);
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    // The surviving terminal is the REAL one (its usage), not the stale (usage-less) one.
+    if (last.kind === "turn_finished") {
+      assert.deepEqual(last.terminal.usage, { basis: "turn", tokens: {}, wire: { usage: { total_tokens: 3 } } });
+    }
+  });
+
+  it("a child/foreign-thread turn_completed is ignored; a clean EOF then protocol-throws (no fabricated terminal)", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      // A foreign thread's terminal must never end the root turn.
+      .push(turnCompleted("completed", undefined, "foreign-thread", "tn-1"))
+      .end(); // clean EOF WITHOUT the real active terminal
+
+    await assert.rejects(collect(harness.startTurn(makeRequest()).events), (err: unknown) => {
+      assert.ok(err instanceof CodexHarnessError);
+      assert.equal(err.failure.category, "protocol");
+      assert.match(err.message, /ended before turn completion/);
+      return true;
+    });
+  });
+
+  it("a child/foreign-thread item/completed yields activity, never a main frame", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      // An assistant item on a foreign thread must not become a {origin:{kind:"main"}} frame.
+      .push(completedItem({ type: "agentMessage", text: "from a child thread" }, "foreign-thread"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    assert.equal(events.filter((e) => e.kind === "frame").length, 0, "no main frame for a foreign thread");
+    assert.deepEqual(
+      events.map((e) => e.kind),
+      ["initialized", "activity", "turn_finished"],
+    );
+  });
+});
+
 describe("CodexHarness: server→client tool-call routing", () => {
   it("routes an item/tool/call to the broker, admits via the registry, and replies via respond", async () => {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
@@ -519,14 +580,15 @@ describe("CodexHarness: server→client tool-call routing", () => {
     assert.equal(result.success, false);
   });
 
-  it("routes with the RUNTIME thread identity, not a spoofed argument (origin=root only for the real root thread)", async () => {
-    const seen: { rt: CallbackRuntimeId; origin: CallbackOrigin }[] = [];
-    const broker = stubBroker(async (rt, _name, _args, origin) => {
-      seen.push({ rt, origin });
+  it("a tool-call SPOOFING a different threadId is denied fail-closed: the broker is never invoked", async () => {
+    const seen: CallbackRuntimeId[] = [];
+    const broker = stubBroker(async (rt) => {
+      seen.push(rt);
       return { ok: true, output: {} };
     });
     const { harness, transport } = makeHarness({ broker });
-    // A tool-call whose params SPOOF a different threadId is treated as non-root (fail-closed).
+    // A tool-call whose params SPOOF a different threadId is NOT the active root turn's, so
+    // the broker is never asked to run an effect for it (finding 1: bind to the active turn).
     transport
       .push(threadStarted())
       .push(toolCall(1, "Bash", { command: "echo" }, "spoofed-thread"))
@@ -534,69 +596,119 @@ describe("CodexHarness: server→client tool-call routing", () => {
       .end();
 
     await collect(harness.startTurn(makeRequest()).events);
-    assert.equal(seen.length, 1);
-    assert.equal(seen[0]!.rt.threadId, "spoofed-thread");
-    assert.equal(seen[0]!.origin, "unknown");
+    assert.equal(seen.length, 0, "no effect ran for a spoofed thread");
+    // The transport still receives a bounded FAILED tool result (never a JSON-RPC error).
+    assert.equal(transport.responses.length, 1);
+    assert.equal(rec(rec(transport.responses[0]!.response).result).success, false);
   });
 });
 
-describe("CodexHarness: tool-call origin is fail-closed on the thread id", () => {
-  it("an ABSENT threadId yields origin=unknown and an empty rt.threadId (never folds to root)", async () => {
-    const seen: { rt: CallbackRuntimeId; origin: CallbackOrigin }[] = [];
+describe("CodexHarness: tool-call is bound fail-closed to the active (thread, turn)", () => {
+  function spyBroker(): { broker: CodexCallbackBroker; calls: { rt: CallbackRuntimeId; origin: CallbackOrigin }[] } {
+    const calls: { rt: CallbackRuntimeId; origin: CallbackOrigin }[] = [];
     const broker = stubBroker(async (rt, _name, _args, origin) => {
-      seen.push({ rt, origin });
+      calls.push({ rt, origin });
       return { ok: true, output: {} };
     });
-    const { harness, transport } = makeHarness({ broker });
-    transport
-      .push(threadStarted())
-      .push(toolCallNoThread(1, "Bash", { command: "echo" }))
-      .push(turnCompleted("completed"))
-      .end();
+    return { broker, calls };
+  }
 
+  /** Drive a single tool-call note through a full turn and return what the broker saw and
+   *  what the transport was told to reply. */
+  async function driveToolCall(
+    note: CodexNotification,
+  ): Promise<{ calls: { rt: CallbackRuntimeId; origin: CallbackOrigin }[]; transport: FakeTransport }> {
+    const { broker, calls } = spyBroker();
+    const { harness, transport } = makeHarness({ broker });
+    transport.push(threadStarted()).push(note).push(turnCompleted("completed")).end();
     await collect(harness.startTurn(makeRequest()).events);
-    assert.equal(seen.length, 1);
-    // Fail-closed: an absent id is NEVER "root".
-    assert.equal(seen[0]!.origin, "unknown");
-    // The RAW value ("" for an absent id) is handed to the broker's rt — NOT this.threadId —
-    // so the broker's own ingestion denies the absent/empty id.
-    assert.equal(seen[0]!.rt.threadId, "");
+    return { calls, transport };
+  }
+
+  it("an ABSENT threadId is denied fail-closed: broker never invoked, success:false reply", async () => {
+    const { calls, transport } = await driveToolCall(toolCallNoThread(1, "Bash", { command: "echo" }));
+    assert.equal(calls.length, 0, "no effect ran for an absent thread id");
+    assert.equal(transport.responses.length, 1);
+    assert.equal(rec(rec(transport.responses[0]!.response).result).success, false);
   });
 
-  it("a present-but-DIFFERENT threadId yields origin=unknown", async () => {
-    const seen: CallbackOrigin[] = [];
-    const broker = stubBroker(async (_rt, _name, _args, origin) => {
-      seen.push(origin);
-      return { ok: true, output: {} };
-    });
-    const { harness, transport } = makeHarness({ broker });
-    transport
-      .push(threadStarted())
-      .push(toolCall(1, "Bash", { command: "echo" }, "different-thread"))
-      .push(turnCompleted("completed"))
-      .end();
-
-    await collect(harness.startTurn(makeRequest()).events);
-    assert.deepEqual(seen, ["unknown"]);
+  it("a present-but-DIFFERENT threadId is denied fail-closed: broker never invoked", async () => {
+    const { calls, transport } = await driveToolCall(toolCall(1, "Bash", { command: "echo" }, "different-thread"));
+    assert.equal(calls.length, 0);
+    assert.equal(rec(rec(transport.responses[0]!.response).result).success, false);
   });
 
-  it("the real ROOT threadId yields origin=root", async () => {
-    const seen: { rt: CallbackRuntimeId; origin: CallbackOrigin }[] = [];
-    const broker = stubBroker(async (rt, _name, _args, origin) => {
-      seen.push({ rt, origin });
-      return { ok: true, output: {} };
-    });
-    const { harness, transport } = makeHarness({ broker });
-    transport
-      .push(threadStarted())
-      .push(toolCall(1, "Bash", { command: "echo" }, "th-1"))
-      .push(turnCompleted("completed"))
-      .end();
+  it("a STALE turnId (right thread, wrong turn) is denied fail-closed: broker never invoked", async () => {
+    // The stale-turn root-signal latch: same root thread, but a turn that is no longer
+    // active. It must run NO effect and reply failed (finding 1).
+    const { calls, transport } = await driveToolCall(toolCall(1, "Bash", { command: "echo" }, "th-1", "stale-turn"));
+    assert.equal(calls.length, 0, "a stale-turn callback runs no effect");
+    assert.equal(rec(rec(transport.responses[0]!.response).result).success, false);
+  });
 
-    await collect(harness.startTurn(makeRequest()).events);
-    assert.equal(seen.length, 1);
-    assert.equal(seen[0]!.origin, "root");
-    assert.equal(seen[0]!.rt.threadId, "th-1");
+  it("the ACTIVE (root thread, active turn) is served with origin=root", async () => {
+    const { calls, transport } = await driveToolCall(toolCall(1, "Bash", { command: "echo" }, "th-1", "tn-1"));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.origin, "root");
+    assert.equal(calls[0]!.rt.threadId, "th-1");
+    assert.equal(calls[0]!.rt.turnId, "tn-1");
+    // A matched, successful callback replies success:true.
+    assert.equal(rec(rec(transport.responses[0]!.response).result).success, true);
+  });
+});
+
+describe("CodexHarness: terminal provider fields are bounded + redacted", () => {
+  it("a terminal never leaks a raw turn.error, a raw usage blob, and closes an unknown status", async () => {
+    const { harness, transport } = makeHarness();
+    // Assembled at runtime so no secret-shaped literal sits in the source (scanner-safe).
+    const secret = ["sk", "redact", "PRETENDSECRET0123456789"].join("-");
+    const hugeNested = { blob: "x".repeat(4096), inner: { deep: [1, 2, 3] } };
+    const rawUsage = {
+      input_tokens: 7, // finite, >= 0 → kept
+      note: secret, // string → dropped
+      breakdown: hugeNested, // nested object → dropped
+      negative: -5, // negative → dropped
+      naughty: Number.NaN, // NaN → dropped
+      infinite: Number.POSITIVE_INFINITY, // Infinity → dropped
+    };
+    // A raw status OUTSIDE the closed allowlist, plus a secret-bearing raw turn.error.
+    const note: CodexNotification = {
+      kind: "turn_completed",
+      method: "turn/completed",
+      threadId: "th-1",
+      turnId: "tn-1",
+      status: "mystery-provider-status",
+      params: {
+        threadId: "th-1",
+        turn: { id: "tn-1", status: "mystery-provider-status", error: secret, usage: rawUsage },
+      },
+    };
+    transport.push(threadStarted()).push(note).end();
+
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind !== "turn_finished") return;
+    const terminal = last.terminal;
+
+    // subtype collapses to the closed token; an unknown raw status is failed.
+    assert.equal(terminal.outcome, "failed");
+    assert.equal(terminal.subtype, "unknown");
+
+    // errors are provider-text-free: derived only from the closed subtype, no secret.
+    assert.deepEqual(terminal.errors, ["codex turn ended with status: unknown"]);
+    assert.ok(!terminal.errors.join(" ").includes(secret), "no secret leaked into errors");
+
+    // usage is a bounded numeric-only subset — never the raw object.
+    assert.deepEqual(terminal.usage, { basis: "turn", tokens: {}, wire: { usage: { input_tokens: 7 } } });
+    const usageJson = JSON.stringify(terminal.usage);
+    assert.ok(!usageJson.includes(secret), "no secret leaked into usage");
+    assert.ok(!usageJson.includes("blob"), "no raw nested blob retained in usage");
+
+    // The deferred failure message is based on the CLOSED subtype, not the raw status/secret.
+    const thrown = terminal.failure!.materialize();
+    assert.match(thrown.failure.message, /codex turn failed: unknown/);
+    assert.ok(!thrown.failure.message.includes("mystery-provider-status"), "no raw status in the failure message");
   });
 });
 
@@ -716,6 +828,50 @@ describe("CodexHarness: error precedence + lifecycle", () => {
     await assert.rejects(collect(harness.startTurn(makeRequest()).events), (err: unknown) => err === boom);
     assert.equal(registry.pendingLaunchCount(), 0, "the reservation was settled (cancelled)");
     assert.equal(registry.isPoisoned(), false, "a launch abort cancels, it does not poison");
+  });
+
+  it("aborts the launch and tears the root down when registry admission fails (finding 6)", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let disposed = 0;
+    // A root whose declared kind MISMATCHES the reserved "provider" kind: the REAL registry
+    // poisons and registerRoot returns { ok: false }, so ensureRoot must not proceed on it.
+    const mismatchedRoot: RegisteredRoot = {
+      kind: "command",
+      reap: async () => ({ ok: true }),
+      dispose: async () => {
+        disposed += 1;
+      },
+    };
+    const transport = new FakeTransport();
+    // Frames are pre-loaded so that CURRENT (pre-fix) code — which ignores the admission
+    // result and proceeds — would finish the turn WITHOUT throwing, making this a true
+    // regression test: it only rejects once ensureRoot honours the failed admission.
+    transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    const { harness } = makeHarness({
+      registry,
+      transport,
+      launchRoot: async () => ({ root: mismatchedRoot, transport, supervisorPid: 1 }),
+    });
+
+    await assert.rejects(collect(harness.startTurn(makeRequest()).events), (err: unknown) => {
+      assert.ok(err instanceof CodexHarnessError);
+      assert.equal(err.failure.category, "protocol");
+      assert.match(err.message, /failed registry admission/);
+      return true;
+    });
+    // The registry poisoned on the kind mismatch, and the just-launched root was torn down:
+    // its transport was closed and it was disposed rather than left to a (dead) reap.
+    assert.equal(registry.isPoisoned(), true, "the admission failure poisoned the epoch");
+    assert.equal(transport.closes, 1, "the just-launched transport was closed");
+    assert.equal(disposed, 1, "the just-launched root was disposed");
+
+    // this.transport was NEVER assigned: a second turn re-enters ensureRoot (rather than
+    // short-circuiting on a set transport) and is refused by the now-poisoned registry.
+    await assert.rejects(collect(harness.startTurn(makeRequest()).events), (err: unknown) => {
+      assert.ok(err instanceof CodexHarnessError);
+      assert.match(err.message, /launch admission is closed/);
+      return true;
+    });
   });
 
   it("requestStop interrupts the in-flight turn (a cancellation request, not a process kill)", async () => {
