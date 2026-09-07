@@ -130,6 +130,20 @@ export interface CodexTransport {
   /** Send a fire-and-forget notification (no id). Throws a typed transport failure if
    *  the bounded outbound queue is full. */
   notify(method: string, params?: unknown): void;
+  /**
+   * Answer a server→client request (a frame carrying BOTH a `method` and an `id`, e.g.
+   * `item/tool/call` — see {@link decodeNotification}) by its `requestId`. This is the
+   * worker-owned callback reply lane: the adapter above decodes the request off
+   * {@link notifications}, routes it to the broker, and replies here with the neutral
+   * result (`{ result }`) or a JSON-RPC error (`{ error }`). Mirrors the M0 client reply
+   * `{ id, result }` / `{ id, error }` (e2e/codex-m0/harness.mjs:291, :285). Additive to
+   * the M3 transport; existing behavior is unchanged. Throws a typed transport failure if
+   * the transport is closed or the bounded outbound queue is full.
+   */
+  respond(
+    requestId: number | string,
+    response: { readonly result: unknown } | { readonly error: { readonly code: number; readonly message: string } },
+  ): void;
   /** Single-consumer async iterator of decoded notifications. Ends (done) on a clean
    *  close; throws the terminal {@link CodexTransportError} on a framing/EOF failure. */
   notifications(): AsyncIterableIterator<CodexNotification>;
@@ -255,6 +269,18 @@ class CodexTransportImpl implements CodexTransport {
   notify(method: string, params?: unknown): void {
     if (this.closed) throw this.terminalError ?? fail("transport", "codex transport is closed");
     this.enqueueFrame(params === undefined ? { method } : { method, params });
+  }
+
+  respond(
+    requestId: number | string,
+    response: { readonly result: unknown } | { readonly error: { readonly code: number; readonly message: string } },
+  ): void {
+    if (this.closed) throw this.terminalError ?? fail("transport", "codex transport is closed");
+    // A reply is correlated by the server-supplied `id`, never one we mint. It is a
+    // `{ id, result }` or `{ id, error }` frame (never `method`), so a peer routes it to
+    // its pending request rather than treating it as a fresh notification.
+    const frame = "error" in response ? { id: requestId, error: response.error } : { id: requestId, result: response.result };
+    this.enqueueFrame(frame);
   }
 
   notifications(): AsyncIterableIterator<CodexNotification> {
