@@ -394,6 +394,26 @@ describe("renderCodexRun — determinism", () => {
     assert.deepEqual([...a.perRoleModels.keys()], ["alpha", "zeta"]);
     assert.deepEqual([...a.perRolePrompts.keys()], ["alpha", "zeta"]);
   });
+
+  it("orders diagnostics by UTF-16 code unit, not by a locale collator", () => {
+    // Names chosen so a code-unit comparator and a locale collator DISAGREE: code
+    // units put uppercase (0x41-) before lowercase (0x61-) before a non-ASCII letter
+    // (a-umlaut, U+00E4), where an en-US collator would interleave them (apple,
+    // a-umlaut-zone, Banana, Zebra). Fed in a third order to prove the renderer sorts.
+    // These are unknown tools, so each yields one unknown_tool diagnostic differing
+    // only by name.
+    const run = renderCodexRun(
+      runRequest({ agents: { r: agent({ tools: allow(["apple", "Zebra", "ä-zone", "Banana"]) }) } }),
+    );
+    const names = run.diagnostics
+      .filter((d) => d.kind === "unknown_tool" && d.role === "r")
+      .map((d) => d.name);
+    // Code-unit order: 0x42 < 0x5A < 0x61 < 0xE4. This is the SAME ordering sortedSet
+    // applies via default .sort(); under the old localeCompare it would differ.
+    assert.deepEqual(names, ["Banana", "Zebra", "apple", "ä-zone"]);
+    // The comparator matches sortedSet's default-.sort() code-unit order exactly.
+    assert.deepEqual(names, [...names].sort());
+  });
 });
 
 describe("renderCodexRun — Claude-path independence (guard)", () => {
@@ -423,5 +443,105 @@ describe("renderCodexRun — Claude-path independence (guard)", () => {
     // Mutating the OUTPUT does not reach back into the input.
     (run.leadGrants.allowedTools as Set<string>).add("INJECTED");
     assert.equal(JSON.stringify(req.agents), agentsBefore);
+  });
+});
+
+describe("renderCodexRun — diagnostic name sanitization", () => {
+  const REPLACEMENT = "�"; // U+FFFD, the visible replacement char sanitizeName emits.
+
+  /** A code-point scan asserting no control/DEL/C1/bidi/zero-width byte survives —
+   *  the reader-side mirror of render.ts's isUnsafeNameChar (NOT a control-char regex;
+   *  oxlint no-control-regex is denied). */
+  function assertNoUnsafeChars(s: string): void {
+    for (const ch of s) {
+      const cp = ch.codePointAt(0) ?? 0;
+      const unsafe =
+        cp <= 0x1f ||
+        cp === 0x7f ||
+        (cp >= 0x80 && cp <= 0x9f) ||
+        (cp >= 0x200b && cp <= 0x200f) ||
+        cp === 0x2028 ||
+        cp === 0x2029 ||
+        (cp >= 0x202a && cp <= 0x202e) ||
+        (cp >= 0x2060 && cp <= 0x2064) ||
+        (cp >= 0x2066 && cp <= 0x206f) ||
+        cp === 0xfeff;
+      assert.equal(unsafe, false, `unexpected unsafe code point U+${cp.toString(16)} in ${JSON.stringify(s)}`);
+    }
+  }
+
+  it("strips control/ANSI/CR bytes from a diagnostic name, leaving kind/role and canonicalization intact", () => {
+    // A hostile unknown-tool identifier: ESC[2J clear-screen + LF + CR, built from
+    // escapes so the SOURCE carries no raw control bytes (\u001b = ESC, \n = LF, \r = CR).
+    const hostile = "\u001b[2Jpwn\n\r";
+    const run = renderCodexRun(
+      runRequest({ agents: { r: agent({ tools: allow(["Read", "Write", hostile]) }) } }),
+    );
+
+    // The machine-facing canonicalization is UNCHANGED: Read stays, Write→apply_patch.
+    const tools = toolsOf(run, "r");
+    assert.equal(tools.has("Read"), true);
+    assert.equal(tools.has("apply_patch"), true);
+    assert.equal(tools.has("Write"), false);
+
+    // Exactly one unknown_tool diagnostic (the hostile name); kind/role are unchanged.
+    const diags = run.diagnostics.filter((d) => d.kind === "unknown_tool" && d.role === "r");
+    assert.equal(diags.length, 1);
+    const diag = diags[0];
+    assert.ok(diag, "expected the hostile diagnostic");
+    assert.equal(diag.kind, "unknown_tool");
+    assert.equal(diag.role, "r");
+
+    // No raw control chars survive in the sanitized name (code-point scan)…
+    assertNoUnsafeChars(diag.name);
+    // …the ESC/LF/CR became U+FFFD and the visible payload is preserved.
+    assert.equal(diag.name.includes("\u001b"), false);
+    assert.equal(diag.name.includes("\n"), false);
+    assert.equal(diag.name.includes("\r"), false);
+    assert.equal(diag.name.includes("pwn"), true);
+    assert.equal(diag.name.includes(REPLACEMENT), true);
+  });
+
+  it("sanitizes bidi/zero-width and every other diagnostic kind's name", () => {
+    // Bidi override (U+202E) + zero-width space (U+200B) in a model name, and a control
+    // byte (BEL, U+0007) in an effort name — both non-tool kinds must be sanitized too.
+    // Escapes only: these code points are invisible in source and must never be pasted raw.
+    const run = renderCodexRun(
+      runRequest({
+        model: "gpt\u202e-\u200bx",
+        effort: "turb\u0007o" as unknown as HarnessEffort,
+      }),
+    );
+    const model = run.diagnostics.find((d) => d.kind === "unknown_model");
+    const effort = run.diagnostics.find((d) => d.kind === "unknown_effort");
+    assert.ok(model, "expected an unknown_model diagnostic");
+    assert.ok(effort, "expected an unknown_effort diagnostic");
+    assertNoUnsafeChars(model.name);
+    assertNoUnsafeChars(effort.name);
+    assert.equal(model.name.includes(REPLACEMENT), true);
+    assert.equal(effort.name.includes(REPLACEMENT), true);
+    // The visible payload around the stripped bytes is preserved.
+    assert.equal(model.name.includes("gpt"), true);
+    assert.equal(effort.name.includes("turb"), true);
+  });
+
+  it("bounds an over-long diagnostic name to the cap", () => {
+    const long = "x".repeat(500);
+    const run = renderCodexRun(runRequest({ model: long }));
+    const diag = run.diagnostics.find((d) => d.kind === "unknown_model" && d.role === "lead");
+    assert.ok(diag, "expected an unknown_model diagnostic");
+    // Bounded to the 120-char cap plus a one-char ellipsis marker.
+    assert.ok(diag.name.length <= 121, `name length ${diag.name.length} exceeds cap`);
+    assert.equal(diag.name.startsWith("x"), true);
+    assert.equal(diag.name.endsWith("…"), true);
+  });
+
+  it("leaves an all-ASCII name untouched (no false positives)", () => {
+    const run = renderCodexRun(
+      runRequest({ agents: { r: agent({ tools: allow(["Read", "Grep", "Frobnicate-XYZ"]) }) } }),
+    );
+    // Ordinary identifiers pass through verbatim — the existing unknown_tool contract holds.
+    assert.equal(hasDiagnostic(run.diagnostics, "unknown_tool", "r", "Grep"), true);
+    assert.equal(hasDiagnostic(run.diagnostics, "unknown_tool", "r", "Frobnicate-XYZ"), true);
   });
 });

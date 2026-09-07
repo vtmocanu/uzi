@@ -58,9 +58,11 @@ const FINDINGS_TOOL_NAME = reportIncidentalIssueToolName();
 
 /** Codex source aliases → the canonical callback name. Mirrors broker.ts
  *  `TOOL_ALIASES`: `Write`/`Edit`/`MultiEdit` are the source aliases for
- *  `apply_patch`; `Agent` is the alias for `spawn_agent`. `NotebookEdit` is
- *  DELIBERATELY absent (the ADR maps only Write/Edit to apply_patch); it therefore
- *  falls through to the unknown-tool path — see the report's open item. */
+ *  `apply_patch`; `Agent` is the alias for `spawn_agent`. `MultiEdit` is INCLUDED
+ *  for broker parity — broker.ts's `TOOL_ALIASES` maps it too, so both sides collapse
+ *  it to `apply_patch`. `NotebookEdit` is DELIBERATELY absent because neither the ADR
+ *  nor broker.ts maps it; it therefore falls through to the unknown-tool path and
+ *  fails closed to unknown_tool. */
 const TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
   ["Write", APPLY_PATCH],
   ["Edit", APPLY_PATCH],
@@ -116,7 +118,9 @@ export type CodexRenderDiagnosticKind =
   | "unknown_model";
 
 /** One stripped Claude tool/skill/effort/model reported with the role it was
- *  attached to. `name` is the ORIGINAL (pre-canonicalization) input name. */
+ *  attached to. `name` is the ORIGINAL (pre-canonicalization) input name, passed
+ *  through {@link sanitizeName} so a control/newline/ANSI/bidi sequence in the raw
+ *  identifier cannot survive into whichever consumer renders the diagnostic. */
 export interface CodexRenderDiagnostic {
   readonly kind: CodexRenderDiagnosticKind;
   readonly role: string;
@@ -244,7 +248,7 @@ function buildAllowedTools(
     for (const raw of tools.names) {
       const canonical = canonicalizeToolName(raw);
       if (!isRecognizedCanonical(canonical)) {
-        diagnostics.push({ kind: "unknown_tool", role, name: raw });
+        diagnostics.push({ kind: "unknown_tool", role, name: sanitizeName(raw) });
         continue;
       }
       allowed.add(canonical);
@@ -284,7 +288,7 @@ function buildAllowedSkills(
       ? raw.slice(SKILL_QUALIFIER_PREFIX.length)
       : raw;
     if (!SKILL_NAME_RE.test(bare)) {
-      diagnostics.push({ kind: "unknown_skill", role, name: raw });
+      diagnostics.push({ kind: "unknown_skill", role, name: sanitizeName(raw) });
       continue;
     }
     allowed.add(bare);
@@ -301,7 +305,7 @@ function resolveModel(
 ): string | undefined {
   if (candidate === undefined) return undefined;
   if (CONTRACT_MODELS.has(candidate)) return candidate;
-  diagnostics.push({ kind: "unknown_model", role, name: candidate });
+  diagnostics.push({ kind: "unknown_model", role, name: sanitizeName(candidate) });
   return undefined;
 }
 
@@ -315,7 +319,7 @@ function resolveEffort(
 ): HarnessEffort | undefined {
   if (candidate === undefined) return undefined;
   if (CONTRACT_EFFORTS.has(candidate)) return candidate as HarnessEffort;
-  diagnostics.push({ kind: "unknown_effort", role, name: candidate });
+  diagnostics.push({ kind: "unknown_effort", role, name: sanitizeName(candidate) });
   return undefined;
 }
 
@@ -330,7 +334,7 @@ function resolveRoleModel(
 ): string | undefined {
   if (agentModel === undefined) return requestModel;
   if (CONTRACT_MODELS.has(agentModel)) return agentModel;
-  diagnostics.push({ kind: "unknown_model", role, name: agentModel });
+  diagnostics.push({ kind: "unknown_model", role, name: sanitizeName(agentModel) });
   return requestModel;
 }
 
@@ -341,11 +345,61 @@ function renderSubagentPrompt(agent: HarnessAgent): string {
   return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}`;
 }
 
+/** The character ceiling on a sanitized diagnostic `name`, mirroring broker.ts's
+ *  MAX_DIAGNOSTIC_CHARS. An over-long name is truncated with an ellipsis. */
+const MAX_DIAGNOSTIC_NAME_CHARS = 120;
+
+/** True for a code point that must not survive in a human-facing diagnostic `name`:
+ *  a C0 control (0x00-0x1F, incl. TAB/LF/CR/ESC), DEL (0x7F), a C1 control
+ *  (0x80-0x9F), or a Unicode bidi/format control (zero-width, line/paragraph
+ *  separators, bidi embeddings/overrides/isolates, word joiner, BOM). MIRRORS
+ *  broker.ts `isUnsafeIdentifierChar`. A code-point scan on purpose: oxlint's
+ *  `no-control-regex` is denied, so a control-char regex is not an option. */
+function isUnsafeNameChar(cp: number): boolean {
+  if (cp <= 0x1f) return true; // C0 controls incl. TAB/LF/CR/ESC
+  if (cp === 0x7f) return true; // DEL
+  if (cp >= 0x80 && cp <= 0x9f) return true; // C1 controls
+  if (cp >= 0x200b && cp <= 0x200f) return true; // ZWSP..RLM
+  if (cp === 0x2028 || cp === 0x2029) return true; // line / paragraph separators
+  if (cp >= 0x202a && cp <= 0x202e) return true; // bidi embeddings / overrides
+  if (cp >= 0x2060 && cp <= 0x2064) return true; // word joiner..invisible separator
+  if (cp >= 0x2066 && cp <= 0x206f) return true; // bidi isolates + deprecated format
+  return cp === 0xfeff; // BOM / ZWNBSP
+}
+
+/** Sanitize an untrusted, user-authored diagnostic `name` (an unknown tool/skill/
+ *  effort/model identifier) so a control/newline/ANSI/bidi sequence can never forge
+ *  or terminal-rewrite a downstream log/report line, whichever future consumer renders
+ *  the diagnostic. Replaces every control and bidi/format code point (see
+ *  {@link isUnsafeNameChar}) with the visible replacement char U+FFFD, then bounds the
+ *  length. MIRRORS broker.ts `safeId`; pure and allocation-bounded (one code-point pass
+ *  + one slice). Only the human `name` is routed through this — never the machine-facing
+ *  `kind`/`role` shape or the tool canonicalization. */
+function sanitizeName(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    out += isUnsafeNameChar(cp) ? "�" : ch;
+  }
+  return out.length > MAX_DIAGNOSTIC_NAME_CHARS
+    ? `${out.slice(0, MAX_DIAGNOSTIC_NAME_CHARS)}…`
+    : out;
+}
+
+/** Code-unit comparator (UTF-16), IDENTICAL to what `sortedSet`'s default `.sort()`
+ *  applies. Locale-independent, so the ordering is byte-identical across environments. */
+function byCodeUnit(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 /** Stable diagnostic ordering (kind, role, name), so any serialized form of the
- *  result is byte-identical across calls regardless of push order. */
+ *  result is byte-identical across calls regardless of push order. Sorts by UTF-16
+ *  code unit (the SAME comparator `sortedSet` uses) rather than `localeCompare`, whose
+ *  ICU/locale-dependence would make the order vary across environments for a non-ASCII
+ *  `name` (an arbitrary unknown-tool/model string). */
 function sortDiagnostics(diagnostics: MutableDiagnostics): readonly CodexRenderDiagnostic[] {
   return [...diagnostics].sort(
-    (a, b) => a.kind.localeCompare(b.kind) || a.role.localeCompare(b.role) || a.name.localeCompare(b.name),
+    (a, b) => byCodeUnit(a.kind, b.kind) || byCodeUnit(a.role, b.role) || byCodeUnit(a.name, b.name),
   );
 }
 
