@@ -31,7 +31,7 @@
 // mint a run-level permit or `observed_empty`.
 
 import { spawn, spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
@@ -50,6 +50,14 @@ const MAX_CONTROL_BYTES = 8192; // 8 KiB per control frame
  *  Codex bundle (`/opt/uzi-codex/.../bin` and `codex-path/rg` are resolved by
  *  absolute path INSIDE the launch, never via PATH — PRD #1156 build facts). */
 const CODEX_LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin";
+const CODEX_BIN = "/opt/uzi-codex/0.153.2/bin/codex";
+const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
+const PROVIDER_CHILD_ARGV = ["app-server"] as const;
+const RESERVED_PROVIDER_ENV_KEYS = new Set([
+  "HOME", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+  "TMPDIR", "PATH", "SHELL", "LANG", "TERM", "NODE_OPTIONS", "BASH_ENV", "ENV", "SHELLOPTS",
+  "LD_PRELOAD", "LD_LIBRARY_PATH",
+]);
 
 // ─── Public spec/handle types ─────────────────────────────────────────────────
 export type CodexRootKind = "provider" | "command";
@@ -68,9 +76,11 @@ export interface CodexLaunchSpec {
   readonly ownedDataRoot: string;
   readonly provider: CodexLaunchProvider;
   readonly model: string;
-  /** Absolute installed Codex executable (`/opt/uzi-codex/0.153.2/bin/codex`). */
+  /** Provider roots require the pinned Codex path. Command roots may select a trusted
+   *  absolute child executable, but never the supervisor trust anchor. */
   readonly codexBin: string;
-  /** Absolute supervisor executable (`/usr/local/bin/uzi-codex-supervisor`). */
+  /** Must equal the immutable image path; retained on the wire only for explicit
+   *  compatibility and rejected if it names anything else. */
   readonly supervisorBin: string;
   readonly kind: CodexRootKind;
   /** The Codex sub-argv (e.g. `["app-server"]`); launcher-fixed, never model-controlled. */
@@ -84,6 +94,7 @@ export interface CodexLaunchSpec {
  *  the runner uid (setpriv). Injectable so unit tests fake it (no setpriv/root). */
 export interface RunnerTreeRequest {
   readonly uid: number;
+  readonly root: string;
   readonly dirs: readonly string[];
   readonly files: readonly { readonly path: string; readonly content: string; readonly mode: number }[];
 }
@@ -133,9 +144,10 @@ export interface StartedEvidence {
   readonly supervisorPid: number;
   readonly childPid: number;
   readonly subreaper: boolean;
-  readonly dumpable: boolean;
+  readonly nondumpable: boolean;
   readonly uid: number;
-  readonly capsZero: boolean;
+  readonly liveCapsZero: boolean;
+  readonly capBoundingSet: "0x0" | "0xc0";
   readonly noNewPrivs: boolean;
 }
 export interface SnapshotEvidence {
@@ -199,14 +211,28 @@ function defaultResolveRunnerUid(): number {
  *  ALL as the runner uid via setpriv (`runnerCommand`), never chown. File content is
  *  fed on stdin so it is never embedded in an argv. Not exercised by unit tests. */
 function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
-  const mk = runnerCommand("/bin/sh", ["-c", 'umask 077; mkdir -p "$@"', "sh", ...request.dirs]);
-  const r = spawnSync(mk.command, mk.args, { stdio: ["ignore", "ignore", "pipe"] });
+  // The helper itself runs as the shared runner uid, so it must not inherit the worker
+  // process environment: another concurrent runner can read a normal helper process via
+  // /proc/<pid>/environ. Only inert locale/path values cross this short provisioning step.
+  const provisionEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
+  const mk = runnerCommand("/bin/sh", [
+    "-ceu",
+    `root="$1"; uid="$2"; shift 2; umask 077; mkdir -m 700 -- "$root"; trap 'rc=$?; [ "$rc" -eq 0 ] || rm -rf -- "$root"; exit "$rc"' EXIT; chmod 700 "$root"; for d in "$@"; do mkdir -m 700 -- "$d"; chmod 700 "$d"; done; for d in "$root" "$@"; do [ "$(stat -c %u "$d")" = "$uid" ] && [ "$(stat -c %a "$d")" = 700 ]; done; trap - EXIT`,
+    "sh", request.root, String(request.uid), ...request.dirs,
+  ]);
+  const r = spawnSync(mk.command, mk.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
   if (r.status !== 0) throw new Error(`runner-owned tree creation failed (exit ${String(r.status)}): ${String(r.stderr)}`);
-  for (const file of request.files) {
-    const octal = (file.mode & 0o777).toString(8).padStart(3, "0");
-    const w = runnerCommand("/bin/sh", ["-c", `umask 077; cat > "$1"; chmod ${octal} "$1"`, "sh", file.path]);
-    const wr = spawnSync(w.command, w.args, { input: file.content, stdio: ["pipe", "ignore", "pipe"] });
-    if (wr.status !== 0) throw new Error(`runner-owned file write failed for ${file.path} (exit ${String(wr.status)}): ${String(wr.stderr)}`);
+  try {
+    for (const file of request.files) {
+      const octal = (file.mode & 0o777).toString(8).padStart(3, "0");
+      const w = runnerCommand("/bin/sh", ["-ceu", `umask 077; cat > "$1"; chmod ${octal} "$1"; [ "$(stat -c %u "$1")" = "$2" ] && [ "$(stat -c %a "$1")" = ${octal} ]`, "sh", file.path, String(request.uid)]);
+      const wr = spawnSync(w.command, w.args, { env: provisionEnv, input: file.content, stdio: ["pipe", "ignore", "pipe"] });
+      if (wr.status !== 0) throw new Error(`runner-owned file write failed for ${file.path} (exit ${String(wr.status)}): ${String(wr.stderr)}`);
+    }
+  } catch (error) {
+    const rm = runnerCommand("/bin/rm", ["-rf", "--", request.root]);
+    spawnSync(rm.command, rm.args, { env: provisionEnv, stdio: "ignore" });
+    throw error;
   }
 }
 
@@ -236,6 +262,40 @@ function deriveOwnedTrees(root: string): OwnedTrees {
     home, codexHome, xdgConfig, xdgCache, xdgData, xdgState, tmpdir,
     all: [home, codexHome, xdgConfig, xdgCache, xdgData, xdgState, tmpdir],
   };
+}
+
+function pathsOverlap(a: string, b: string): boolean {
+  const ar = resolve(a);
+  const br = resolve(b);
+  const aToB = relative(ar, br);
+  const bToA = relative(br, ar);
+  return aToB === "" || (!aToB.startsWith(`..${sep}`) && aToB !== ".." && !isAbsolute(aToB))
+    || (!bToA.startsWith(`..${sep}`) && bToA !== ".." && !isAbsolute(bToA));
+}
+
+/** Validate the trusted construction contract for every caller, not only the JSON CLI. */
+function validateLaunchContract(spec: CodexLaunchSpec): void {
+  if (spec.kind !== "provider" && spec.kind !== "command") throw new Error("kind must be provider or command");
+  if (!isAbsolute(spec.ownedDataRoot) || resolve(spec.ownedDataRoot) === sep) {
+    throw new Error("ownedDataRoot must be an absolute non-root path");
+  }
+  if (!isAbsolute(spec.cwd)) throw new Error("cwd must be an absolute path");
+  if (pathsOverlap(spec.ownedDataRoot, spec.cwd)) {
+    throw new Error("ownedDataRoot and cwd must be disjoint");
+  }
+  if (spec.supervisorBin !== SUPERVISOR_BIN) {
+    throw new Error(`supervisorBin must equal the immutable image path ${SUPERVISOR_BIN}`);
+  }
+  if (!isAbsolute(spec.codexBin)) throw new Error("child executable must be absolute");
+  if (spec.kind === "provider") {
+    if (spec.codexBin !== CODEX_BIN || spec.childArgv.length !== PROVIDER_CHILD_ARGV.length
+      || spec.childArgv.some((arg, index) => arg !== PROVIDER_CHILD_ARGV[index])) {
+      throw new Error("provider roots must use the pinned Codex app-server target");
+    }
+  }
+  if (!/^[A-Z][A-Z0-9_]*$/.test(spec.provider.envKey) || RESERVED_PROVIDER_ENV_KEYS.has(spec.provider.envKey)) {
+    throw new Error("provider envKey is invalid or reserved by the launcher allowlist");
+  }
 }
 
 /** The fully-REPLACED env allowlist (never a merge of the worker's env): HOME,
@@ -297,6 +357,8 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
     );
   }
 
+  validateLaunchContract(spec);
+
   // Resolve the intended runner uid <N> for --expect-uid and the runner-owned trees.
   const uid = (deps.resolveRunnerUid ?? defaultResolveRunnerUid)();
   if (!Number.isInteger(uid) || uid <= 0) throw new Error(`resolved runner uid is invalid: ${String(uid)}`);
@@ -315,6 +377,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   });
   (deps.makeRunnerTrees ?? defaultMakeRunnerTrees)({
     uid,
+    root: spec.ownedDataRoot,
     dirs: trees.all,
     files: [{ path: configPath, content: configText, mode: 0o600 }],
   });
@@ -368,6 +431,10 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
     }
     for (const p of pending.values()) p.reject(failure);
     pending.clear();
+    // Closing the trusted control endpoint makes the real supervisor take its abnormal
+    // controller-loss path and perform a bounded best-effort drain. The evidence channel
+    // is already untrusted/unavailable on these paths, so no clean result is inferred.
+    try { if (!control.destroyed && !control.writableEnded) control.end(); } catch { /* primary failure already recorded */ }
   }
 
   const lines = createInterface({ input: evidence });
@@ -380,6 +447,11 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
     dispatch(value);
   });
   lines.on("error", (err: Error) => fail(new Error(`evidence stream error: ${err.message}`)));
+  lines.on("close", () => {
+    if (failure || cleanDisposed || exited) return;
+    if (pending.size > 0 || !disposeInFlight) fail(new Error("evidence stream closed before confirmed disposal"));
+  });
+  control.on("error", (err: Error) => fail(new Error(`control stream error: ${err.message}`)));
 
   function dispatch(value: unknown): void {
     if (typeof value !== "object" || value === null) { fail(new Error("evidence line is not a JSON object")); return; }
@@ -387,14 +459,19 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
     switch (record.event) {
       case "started": {
         const ev = record as unknown as StartedEvidence;
-        if (ev.subreaper !== true || ev.dumpable !== true || ev.capsZero !== true || ev.noNewPrivs !== true || ev.uid !== expectedUid) {
+        if (!Number.isInteger(ev.supervisorPid) || ev.supervisorPid !== child.pid
+          || !Number.isInteger(ev.childPid) || ev.childPid <= 0
+          || ev.subreaper !== true || ev.nondumpable !== true || ev.liveCapsZero !== true
+          || (ev.capBoundingSet !== "0x0" && ev.capBoundingSet !== "0xc0")
+          || ev.noNewPrivs !== true || ev.uid !== expectedUid) {
           // Do NOT set startedEvent: a bad posture must REJECT the launch, not resolve it.
-          // Re-validate EVERY posture boolean the supervisor reports, including `dumpable`
-          // (PR_SET_DUMPABLE(0), the channel-boundary anchor) — the controller's independent
+          // Re-validate every posture field, including nondumpability and the explicit
+          // bounding-set residue — the controller's independent
           // check must be symmetric with the fields it receives, not a subset of them.
           fail(new Error(
-            `supervisor reported an unsafe start posture (subreaper=${String(ev.subreaper)}, dumpable=${String(ev.dumpable)}, `
-            + `capsZero=${String(ev.capsZero)}, noNewPrivs=${String(ev.noNewPrivs)}, uid=${String(ev.uid)} expected ${expectedUid})`,
+            `supervisor reported an unsafe start posture (pid=${String(ev.supervisorPid)} expectedPid=${String(child.pid)}, `
+            + `subreaper=${String(ev.subreaper)}, nondumpable=${String(ev.nondumpable)}, liveCapsZero=${String(ev.liveCapsZero)}, `
+            + `capBoundingSet=${String(ev.capBoundingSet)}, noNewPrivs=${String(ev.noNewPrivs)}, uid=${String(ev.uid)} expected ${expectedUid})`,
           ));
           return;
         }
@@ -431,6 +508,9 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
     }
   });
   child.on("error", (err: Error) => fail(new Error(`supervisor process error: ${err.message}`)));
+  child.once("close", () => {
+    if (pending.size > 0) fail(new Error("supervisor channels closed with an unanswered control request"));
+  });
 
   function writeControl(frame: Record<string, unknown>): boolean {
     if (control.destroyed || exited) return false;
@@ -474,6 +554,9 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
       const disposeEv = ev;
       if (disposeEv.state !== "drained") {
         return { clean: false, reason: `dispose ${String(disposeEv.state)}${disposeEv.reason ? `: ${disposeEv.reason}` : ""}`, event: disposeEv };
+      }
+      if (disposeEv.authority !== "ECHILD+__WALL") {
+        return { clean: false, reason: `drained dispose missing required authority (got ${String(disposeEv.authority)})`, event: disposeEv };
       }
       // Drained reported — a clean supervisor exit (0) must confirm it.
       let exit: { code: number | null; signal: NodeJS.Signals | null };

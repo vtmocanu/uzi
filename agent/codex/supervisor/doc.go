@@ -38,7 +38,7 @@
 // EXIT CODE: 0 iff a dispose reached state "drained"; non-zero on abnormal,
 // unconfirmed or profile-fail.
 //
-// The mechanism is NON-DISABLEABLE: no flag switches off the subreaper/dumpable
+// The mechanism is NON-DISABLEABLE: no flag switches off the subreaper/nondumpable
 // establishment, the pre-fork profile verification, the descriptor closure, or
 // the ECHILD+__WALL drain authority.
 package main

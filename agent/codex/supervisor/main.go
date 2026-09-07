@@ -17,7 +17,7 @@ func main() {
 }
 
 // realMain is the whole flow: parse the trusted argv, establish + verify the
-// subreaper/dumpable posture, verify the container profile BEFORE fork, launch
+// subreaper/nondumpable posture, verify the container profile BEFORE fork, launch
 // the child with fd3/fd4 closed at its execve, then run the control loop. Every
 // pre-fork failure emits a sanitized abnormal event on fd 4 and exits non-zero
 // WITHOUT forking.
@@ -30,11 +30,11 @@ func realMain(args []string) int {
 		return 2
 	}
 
-	// (1) Establish + verify subreaper and dumpable BEFORE fork. PR_SET_DUMPABLE
+	// (1) Establish + verify subreaper and nondumpability BEFORE fork. PR_SET_DUMPABLE
 	// 0 makes the supervisor's /proc/<pid> root-owned, so a same-uid child cannot
 	// open /proc/<sup>/fd/3|4 and forge the trusted channels.
 	subreaper := establishSubreaper()
-	dumpable := establishDumpable()
+	nondumpable := establishNondumpable()
 
 	// (2) Profile verification, fail-before-fork.
 	statusText, rerr := os.ReadFile("/proc/self/status")
@@ -47,7 +47,7 @@ func realMain(args []string) int {
 		_ = ev.writeJSON(abnormalEvidence("profile:parse", nil))
 		return 2
 	}
-	if ok, field := evaluateProfile(st, expectUID, subreaper, dumpable); !ok {
+	if ok, field := evaluateProfile(st, expectUID, subreaper, nondumpable); !ok {
 		_ = ev.writeJSON(abnormalEvidence("profile:"+field, nil))
 		return 2
 	}
@@ -76,7 +76,7 @@ func realMain(args []string) int {
 			sleep:          func() { time.Sleep(2 * time.Millisecond) },
 		},
 	}
-	return sup.run(childPid, st.UID)
+	return sup.run(childPid, st)
 }
 
 var errBadArgs = errors.New("invalid arguments")
@@ -133,9 +133,9 @@ func establishSubreaper() bool {
 	return v == 1
 }
 
-// establishDumpable sets PR_SET_DUMPABLE 0 then CONFIRMS it via
+// establishNondumpable sets PR_SET_DUMPABLE 0 then CONFIRMS it via
 // PR_GET_DUMPABLE == 0 (that get returns the value as the syscall result).
-func establishDumpable() bool {
+func establishNondumpable() bool {
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 		return false
 	}

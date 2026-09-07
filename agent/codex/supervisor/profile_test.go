@@ -128,15 +128,15 @@ func TestEvaluateProfilePass(t *testing.T) {
 
 func TestEvaluateProfileFailures(t *testing.T) {
 	tests := []struct {
-		name      string
-		mutate    func(*procStatus)
-		subreaper bool
-		dumpable  bool
-		expectUID int
-		wantField string
+		name        string
+		mutate      func(*procStatus)
+		subreaper   bool
+		nondumpable bool
+		expectUID   int
+		wantField   string
 	}{
 		{"subreaper", func(*procStatus) {}, false, true, 10002, "subreaper"},
-		{"dumpable", func(*procStatus) {}, true, false, 10002, "dumpable"},
+		{"nondumpable", func(*procStatus) {}, true, false, 10002, "nondumpable"},
 		{"uid", func(*procStatus) {}, true, true, 999, "uid"},
 		{"capEff", func(s *procStatus) { s.CapEff = 1 }, true, true, 10002, "capEff"},
 		{"capPrm", func(s *procStatus) { s.CapPrm = 1 }, true, true, 10002, "capPrm"},
@@ -149,7 +149,7 @@ func TestEvaluateProfileFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			st := okStatus()
 			tc.mutate(&st)
-			ok, field := evaluateProfile(st, tc.expectUID, tc.subreaper, tc.dumpable)
+			ok, field := evaluateProfile(st, tc.expectUID, tc.subreaper, tc.nondumpable)
 			if ok {
 				t.Fatalf("expected failure on %q, got ok", tc.wantField)
 			}

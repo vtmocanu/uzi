@@ -28,7 +28,7 @@ log() { printf '\n### %s\n' "$*"; }
 # 1. Build the static stub child from committed source (never committed as a binary).
 log "building stub child (static, host toolchain)"
 mkdir -p "$HERE/.bin"
-( cd "$HERE/stub" && GOTOOLCHAIN=local CGO_ENABLED=0 GOPROXY=off go build -trimpath -o "$HERE/.bin/stub-child" . )
+( cd "$HERE/stub" && GOOS=linux GOTOOLCHAIN=local CGO_ENABLED=0 GOPROXY=off go build -trimpath -o "$HERE/.bin/stub-child" . )
 chmod 0755 "$HERE/.bin/stub-child"
 chmod 0755 "$HERE/controls.sh" "$HERE/run.sh" 2>/dev/null || true
 file "$HERE/.bin/stub-child" || true

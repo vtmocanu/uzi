@@ -73,11 +73,11 @@ untrusted uid.
    missed the grandchild.
 
 5. **Fresh-tree ownership + env delivery** (`control_5`). Drives `launch-cli` with a
-   `kind:"provider"` spec (a dummy provider credential) and a stub child in `env` mode.
+   `kind:"provider"` spec (a dummy provider credential) and the fixed real Codex app-server.
    Asserts each per-launch HOME/CODEX_HOME/XDG_*/TMPDIR tree is owned by uid 10002 with
-   owner-only 0700 access, and `config.toml` is uid 10002 mode 0600. (The trees also carry an
-   inherited setgid bit from the setgid `/data/runner` parent — benign; access stays
-   owner-only.) It then asserts, **fail-closed**, that the child's dumped environment is the
+   exact 0700 access, and `config.toml` is uid 10002 mode 0600. The launcher clears any
+   setgid bit inherited from `/data/runner`. It then asserts, **fail-closed**, that the
+   real app-server's `/proc` environment is the
    env-delivery allowlist and nothing else: non-empty; EXACTLY `HOME`, `CODEX_HOME`, the four
    `XDG_*_HOME`, `TMPDIR`, `PATH`, `SHELL`, `LANG`, `TERM`, and the provider credential var
    (== the dummy value); `HOME`/`CODEX_HOME` pointing into the fresh 0700 trees; and NO
@@ -89,10 +89,10 @@ untrusted uid.
 
 These TypeScript suites run **inside the real image** through its root-start entrypoint,
 under the **PRD confinement posture** (distinct from the shell controls' writable-root
-posture): **read-only root filesystem**, read-only mounted fixtures, **only** writable
-tmpfs `/nix`, `/data`, `/tmp` (the entrypoint's root window needs those three writable
-while the image root fs stays `--read-only`), and **`--network none`** (loopback only, for
-the localhost fake provider). They run as the worker uid (10001) and drive the runner uid
+posture): **read-only root filesystem**, read-only mounted fixtures, and exactly three
+explicit writable runtime mounts: runner-owned `/nix`, owned `/data`, and per-uid `/tmp`
+(the real entrypoint must migrate/create all three), plus **`--network none`** (loopback
+only, for the localhost fake provider). They run as the worker uid (10001) and drive the runner uid
 (10002) via the production `setpriv` wrapper. Node's own `--test-timeout` is backed by an
 **outer `timeout --kill-after` watchdog** (a leaked codex / code-mode-host handle can
 outlive Node's timeout; `--rm` tears the container and any leaked descendant down on kill).
@@ -118,6 +118,8 @@ required for a dynamic-tool-only cell.
   uninterrupted cell writes its delayed marker (positive control), and
   revoke+settle+interrupt+dispose reaps BOTH the app-server and the differently-grouped
   host via `ECHILD+__WALL` with the late marker absent. NO hook-trust bypass, NO creds.
+  This is intentionally an e2e-only characterization config: production `config.ts`
+  exposes no host-enabling toggle, so the test cannot become a production escape hatch.
 - **B. Production-config app-server lifecycle** (`production-launcher.test.ts`). Launches
   the real app-server through the ACTUAL `launchCodexRoot` + `config.ts` hardened stock
   config (host DISABLED), runs a trivial credential-free turn against the fake provider,
@@ -159,6 +161,9 @@ and toolchain artifacts.
 ```
 # Build the real image and run the shell profile controls (opt-in; NOT part of `task gate`):
 task test:codex-m3a:profile
+
+# Build both templates for amd64 and arm64; run three package negatives in every cell:
+task test:codex-m3a:matrix
 
 # Build the real image and run the credential-free lifecycle + isolation suites under the
 # confinement posture (opt-in; NOT part of `task gate`):

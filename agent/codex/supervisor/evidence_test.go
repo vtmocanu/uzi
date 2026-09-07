@@ -23,17 +23,18 @@ func decode(t *testing.T, v any) map[string]any {
 func TestStartedEvidence(t *testing.T) {
 	m := decode(t, startedEvidence{
 		Event: "started", SupervisorPid: 7, ChildPid: 8,
-		Subreaper: true, Dumpable: true, UID: 10002, CapsZero: true, NoNewPrivs: true,
+		Subreaper: true, Nondumpable: true, UID: 10002, LiveCapsZero: true,
+		CapBoundingSet: "0xc0", NoNewPrivs: true,
 	})
 	if m["event"] != "started" {
 		t.Errorf("event = %v", m["event"])
 	}
-	for _, k := range []string{"supervisorPid", "childPid", "subreaper", "dumpable", "uid", "capsZero", "noNewPrivs"} {
+	for _, k := range []string{"supervisorPid", "childPid", "subreaper", "nondumpable", "uid", "liveCapsZero", "capBoundingSet", "noNewPrivs"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("missing key %q", k)
 		}
 	}
-	if m["subreaper"] != true || m["dumpable"] != true || m["capsZero"] != true || m["noNewPrivs"] != true {
+	if m["subreaper"] != true || m["nondumpable"] != true || m["liveCapsZero"] != true || m["capBoundingSet"] != "0xc0" || m["noNewPrivs"] != true {
 		t.Errorf("posture flags not all true: %v", m)
 	}
 }

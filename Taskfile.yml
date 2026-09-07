@@ -2070,10 +2070,18 @@ tasks:
       - go vet ./...
       - go test ./...
 
+  test:codex-m3a:matrix:
+    desc: Opt-in real base and jvm package matrix for amd64 and arm64 with negative controls
+    # Builds every actual template/architecture cell. Each Dockerfile executes the positive
+    # runner-uid guard; the harness then proves corrupt checksum, missing code-mode host and
+    # broken executable all fail in every cell. Requires buildx support for both platforms.
+    cmds:
+      - ./e2e/codex-m3a/run-matrix.sh
+
   test:codex-m3a:profile:
     desc: Opt-in build the real worker image and run the M3a launcher isolation controls
-    # Builds the base worker image (jvm mirrors it in lockstep) with the M2 launcher and
-    # static supervisor, then runs the five container controls through the REAL root
+    # Builds both base and jvm with the M2 launcher and static supervisor, then runs the
+    # five container controls through each template's REAL root
     # entrypoint under compose's hardened cap set (writable root, no read-only, no user
     # override) so the ownership and uid-split they prove are the true production posture:
     # channel nondumpability, profile fail-before-fork, ownership immutability,
@@ -2081,14 +2089,21 @@ tasks:
     # plus egress for the pinned Codex and toolchain artifacts on a cold build. NOT wired
     # into gate. Set UZI_M3A_SKIP_BUILD=1 to reuse an already-built image.
     cmds:
-      - ./e2e/codex-m3a/run.sh all
+      - |
+        set -e
+        for template in base jvm; do
+          UZI_M3A_IMAGE="codex-m3a-profile-${template}:local" \
+          UZI_M3A_DOCKERFILE="agent/templates/${template}/Dockerfile" \
+            ./e2e/codex-m3a/run.sh all
+        done
 
   test:codex-m3a:lifecycle:
     desc: Opt-in real code-mode-host lifecycle plus isolation suites under the confinement posture
-    # Builds the real worker image, then runs the three credential-free TypeScript suites
-    # (lifecycle.test.ts / production-launcher.test.ts / isolation.test.ts) INSIDE that image
+    # Builds both real worker images, then runs the three credential-free TypeScript suites
+    # (lifecycle.test.ts / production-launcher.test.ts / isolation.test.ts) INSIDE each image
     # through the REAL root-start entrypoint under the PRD confinement posture -- read-only
-    # root filesystem, read-only fixtures, only writable tmpfs /nix /data /tmp, network none
+    # root filesystem, read-only fixtures, exactly three writable runtime tmpfs mounts
+    # (/nix, /data, /tmp), network none
     # (loopback only for the localhost fake provider). Control A drives the PRODUCTION Go
     # supervisor plus real Codex to launch the real code-mode host on both model fixtures,
     # active and yielded, with NO hook-trust bypass and NO live credentials; control B drives
@@ -2104,7 +2119,13 @@ tasks:
       # which wraps the container node --test in an OUTER timeout watchdog (a leaked codex or
       # code-mode-host handle can outlive Node's own --test-timeout).
       - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m3a/tsconfig.json
-      - ../e2e/codex-m3a/run-lifecycle.sh
+      - |
+        set -e
+        for template in base jvm; do
+          UZI_M3A_IMAGE="codex-m3a-lifecycle-${template}:local" \
+          UZI_M3A_DOCKERFILE="agent/templates/${template}/Dockerfile" \
+            ../e2e/codex-m3a/run-lifecycle.sh
+        done
 
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)

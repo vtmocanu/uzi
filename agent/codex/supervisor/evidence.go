@@ -50,14 +50,15 @@ func (d drainResult) fields() map[string]any {
 // startedEvidence is the fixed-shape "started" event proving the established,
 // verified posture at the moment the child was launched.
 type startedEvidence struct {
-	Event         string `json:"event"`
-	SupervisorPid int    `json:"supervisorPid"`
-	ChildPid      int    `json:"childPid"`
-	Subreaper     bool   `json:"subreaper"`
-	Dumpable      bool   `json:"dumpable"`
-	UID           int    `json:"uid"`
-	CapsZero      bool   `json:"capsZero"`
-	NoNewPrivs    bool   `json:"noNewPrivs"`
+	Event          string `json:"event"`
+	SupervisorPid  int    `json:"supervisorPid"`
+	ChildPid       int    `json:"childPid"`
+	Subreaper      bool   `json:"subreaper"`
+	Nondumpable    bool   `json:"nondumpable"`
+	UID            int    `json:"uid"`
+	LiveCapsZero   bool   `json:"liveCapsZero"`
+	CapBoundingSet string `json:"capBoundingSet"`
+	NoNewPrivs     bool   `json:"noNewPrivs"`
 }
 
 // procRow is one sanitized process record: pid/ppid/pgid and comm ONLY. comm is

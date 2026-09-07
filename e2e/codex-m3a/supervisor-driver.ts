@@ -46,9 +46,10 @@ export interface StartedEvidence {
   readonly supervisorPid: number;
   readonly childPid: number;
   readonly subreaper: boolean;
-  readonly dumpable: boolean;
+  readonly nondumpable: boolean;
   readonly uid: number;
-  readonly capsZero: boolean;
+  readonly liveCapsZero: boolean;
+  readonly capBoundingSet: "0x0" | "0xc0";
   readonly noNewPrivs: boolean;
 }
 export interface ProcRow { readonly pid: number; readonly ppid: number; readonly pgid: number; readonly comm: string }
@@ -159,7 +160,8 @@ export class SupervisorRoot {
       "supervisor started evidence", EVIDENCE_DEADLINE_MS,
     );
     // Re-validate EVERY posture boolean the launcher validates (symmetric independent check).
-    if (started.subreaper !== true || started.dumpable !== true || started.capsZero !== true
+    if (started.subreaper !== true || started.nondumpable !== true || started.liveCapsZero !== true
+      || (started.capBoundingSet !== "0x0" && started.capBoundingSet !== "0xc0")
       || started.noNewPrivs !== true || started.uid !== this.options.expectUid) {
       throw new Error(`unsafe start posture: ${JSON.stringify(started)}`);
     }
@@ -289,6 +291,9 @@ export class SupervisorRoot {
   async dispose(timeoutMs = 2000): Promise<DisposeEvidence> {
     const result = await this.supervisorCommand("dispose", { timeoutMs }) as DisposeEvidence;
     if (result.state === "drained") {
+      if (result.authority !== "ECHILD+__WALL") {
+        throw new Error(`drained without ECHILD+__WALL authority: ${String(result.authority)}`);
+      }
       const exit = await deadline(new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
         if (this.exited) { resolve({ code: this.child.exitCode, signal: this.child.signalCode }); return; }
         this.child.once("exit", (code, signal) => resolve({ code, signal }));

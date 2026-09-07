@@ -40,9 +40,11 @@ function baseSpec(overrides: Partial<CodexLaunchSpec> = {}): CodexLaunchSpec {
 
 interface FakeOpts {
   uid?: number;
-  dumpable?: boolean;
+  nondumpable?: boolean;
+  capBoundingSet?: "0x0" | "0xc0" | "0xff";
   autoStarted?: boolean;
   disposeState?: "drained" | "unconfirmed";
+  disposeAuthority?: string;
   exitCode?: number;
 }
 
@@ -57,18 +59,21 @@ class FakeSupervisor extends EventEmitter {
   readonly evidence = new PassThrough();
   readonly stdio: PassThrough[];
   private readonly disposeState: "drained" | "unconfirmed";
+  private readonly disposeAuthority: string;
   private readonly exitCode: number;
 
   constructor(opts: FakeOpts = {}) {
     super();
     this.stdio = [this.stdin, this.stdout, this.stderr, this.control, this.evidence];
     this.disposeState = opts.disposeState ?? "drained";
+    this.disposeAuthority = opts.disposeAuthority ?? "ECHILD+__WALL";
     this.exitCode = opts.exitCode ?? 0;
     createInterface({ input: this.control }).on("line", (line) => this.onControl(line));
     if (opts.autoStarted ?? true) {
       this.writeEvidence({
         event: "started", supervisorPid: this.pid, childPid: this.pid + 1,
-        subreaper: true, dumpable: opts.dumpable ?? true, uid: opts.uid ?? RUNNER_UID, capsZero: true, noNewPrivs: true,
+        subreaper: true, nondumpable: opts.nondumpable ?? true, uid: opts.uid ?? RUNNER_UID,
+        liveCapsZero: true, capBoundingSet: opts.capBoundingSet ?? "0xc0", noNewPrivs: true,
       });
     }
   }
@@ -84,7 +89,7 @@ class FakeSupervisor extends EventEmitter {
       this.writeEvidence({ event: "snapshot", id: cmd.id, processes: [{ pid: this.pid + 1, ppid: this.pid, pgid: this.pid, comm: "codex" }] });
     } else if (cmd.op === "dispose") {
       if (this.disposeState === "drained") {
-        this.writeEvidence({ event: "dispose", id: cmd.id, state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [this.pid + 1] });
+        this.writeEvidence({ event: "dispose", id: cmd.id, state: "drained", authority: this.disposeAuthority, killed: [], reaped: [this.pid + 1] });
         queueMicrotask(() => this.exitWith(this.exitCode));
       } else {
         this.writeEvidence({ event: "dispose", id: cmd.id, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [this.pid + 1] });
@@ -197,6 +202,7 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
     const req = treeCalls[0];
     assert.ok(req, "makeRunnerTrees was called");
     assert.equal(req.uid, RUNNER_UID);
+    assert.equal(req.root, DATA_ROOT);
     assert.deepEqual([...req.dirs], [
       `${DATA_ROOT}/home`, `${DATA_ROOT}/codex`, `${DATA_ROOT}/xdg-config`,
       `${DATA_ROOT}/xdg-cache`, `${DATA_ROOT}/xdg-data`, `${DATA_ROOT}/xdg-state`, `${DATA_ROOT}/tmp`,
@@ -233,9 +239,50 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
     await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture/);
   });
 
-  it("rejects a started posture with dumpable=false (the channel-boundary anchor)", async () => {
-    const fake = newFake({ dumpable: false });
-    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture.*dumpable=false/s);
+  it("rejects a started posture with nondumpable=false (the channel-boundary anchor)", async () => {
+    const fake = newFake({ nondumpable: false });
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture.*nondumpable=false/s);
+  });
+
+  it("rejects a started posture with an unexpected capability bounding set", async () => {
+    const fake = newFake({ capBoundingSet: "0xff" });
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture.*capBoundingSet=0xff/s);
+  });
+});
+
+describe("launchCodexRoot: trusted construction contract", () => {
+  it("rejects a caller-selected supervisor before provisioning any tree", async () => {
+    const fake = newFake();
+    await assert.rejects(
+      launchCodexRoot(baseSpec({ supervisorBin: "/data/runner/fake-supervisor" }), baseDeps(fake)),
+      /supervisorBin must equal the immutable image path/,
+    );
+    assert.equal(treeCalls.length, 0);
+    assert.equal(spawnCalls.length, 0);
+  });
+
+  it("rejects a provider root that does not use the pinned Codex app-server target", async () => {
+    const fake = newFake();
+    await assert.rejects(
+      launchCodexRoot(baseSpec({ codexBin: "/data/runner/fake-codex" }), baseDeps(fake)),
+      /provider roots must use the pinned Codex app-server target/,
+    );
+  });
+
+  it("rejects allowlist-reserved provider env keys", async () => {
+    const fake = newFake();
+    await assert.rejects(
+      launchCodexRoot(baseSpec({ provider: { ...baseSpec().provider, envKey: "PATH" } }), baseDeps(fake)),
+      /envKey is invalid or reserved/,
+    );
+  });
+
+  it("rejects an owned data root that overlaps the target repository", async () => {
+    const fake = newFake();
+    await assert.rejects(
+      launchCodexRoot(baseSpec({ ownedDataRoot: "/work/repo/.codex-state" }), baseDeps(fake)),
+      /ownedDataRoot and cwd must be disjoint/,
+    );
   });
 });
 
@@ -300,6 +347,14 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     assert.match(outcome.clean ? "" : outcome.reason, /non-zero/);
   });
 
+  it("(f4b) a drained report without ECHILD+__WALL authority is NOT clean", async () => {
+    const fake = newFake({ disposeAuthority: "process-group" });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.match(outcome.clean ? "" : outcome.reason, /missing required authority/);
+  });
+
   it("(f5) an oversized evidence line is a bounded rejection", async () => {
     const fake = newFake();
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
@@ -331,7 +386,7 @@ describe("runLaunchCli: packaged entrypoint (knip-visible import)", () => {
     // A minimal fake handle — this test exercises the CLI flow, not the launcher.
     const disposed: number[] = [];
     const fakeHandle = {
-      started: { event: "started" as const, supervisorPid: 1, childPid: 2, subreaper: true, dumpable: true, uid: RUNNER_UID, capsZero: true, noNewPrivs: true },
+      started: { event: "started" as const, supervisorPid: 1, childPid: 2, subreaper: true, nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0" as const, noNewPrivs: true },
       supervisorPid: 1,
       transport: { stdin: null, stdout: null, stderr: null },
       snapshot: () => Promise.reject(new Error("unused")),

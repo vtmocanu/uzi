@@ -9,9 +9,8 @@
 # posture that is DISTINCT from run.sh's:
 #
 #   * read-only root filesystem (`--read-only`), read-only mounted fixtures,
-#   * ONLY explicit owned writable data + tmp mounts: writable tmpfs /nix, /data, /tmp
-#     (the entrypoint's root window chowns /nix + /data and creates the per-uid /tmp trees;
-#     those three need to be writable while the image root fs stays read-only),
+#   * exactly three explicit writable runtime mounts: runner-owned /nix, owned /data and
+#     per-uid /tmp (the entrypoint chowns/creates all three while the image root stays ro),
 #   * `--network none` (loopback only, for the localhost fake provider),
 #   * `--cap-drop ALL` + only the startup caps the A1 entrypoint needs, no-new-privileges.
 #
@@ -48,11 +47,10 @@ else
     --build-arg "UZI_SRC_SHA=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" "$REPO"
 fi
 
-# 2. Run the three suites under the CONFINEMENT posture. The tests + the frozen M0
-#    protocol helpers are mounted read-only under /work/e2e; the ACTUAL packaged launcher
-#    source is mounted read-only under /work/agent/src (control B/C import it, control A
-#    drives the installed supervisor + codex directly). tsx resolves from /app/node_modules
-#    (cwd /app); the test files resolve ../../agent/src/... and ../codex-m0/... under /work.
+# 2. Run the three suites under the CONFINEMENT posture. The tests + frozen M0 protocol
+#    helpers are mounted read-only under /work/e2e. Controls B/C dynamically import the
+#    IMAGE-BAKED production code from /app/src; control A drives installed supervisor/Codex.
+#    Type-only source imports are erased and cannot substitute the host tree at runtime.
 log "running lifecycle + isolation suites in $IMAGE under the confinement posture"
 set +e
 timeout --kill-after=60s "$TIMEOUT" docker run --rm --network none \
@@ -63,7 +61,6 @@ timeout --kill-after=60s "$TIMEOUT" docker run --rm --network none \
   --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
   --entrypoint /usr/local/sbin/uzi-entrypoint \
   -v "$REPO/e2e":/work/e2e:ro \
-  -v "$REPO/agent/src":/work/agent/src:ro \
   --name "$NAME" \
   "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
     /work/e2e/codex-m3a/lifecycle.test.ts \

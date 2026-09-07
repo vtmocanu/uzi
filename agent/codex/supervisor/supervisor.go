@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"strconv"
 	"time"
 )
 
@@ -35,16 +36,17 @@ func (s *supervisor) drainWith(timeoutMs int) drainResult {
 // reaches drained (exit 0) or an abnormal condition ends the run (non-zero).
 // There is NO fixed lifetime: the loop lives on the control channel, bounded
 // only by per-op deadlines.
-func (s *supervisor) run(childPid, uid int) int {
+func (s *supervisor) run(childPid int, st procStatus) int {
 	_ = s.ev.writeJSON(startedEvidence{
-		Event:         "started",
-		SupervisorPid: s.seams.supervisorPid,
-		ChildPid:      childPid,
-		Subreaper:     true,
-		Dumpable:      true,
-		UID:           uid,
-		CapsZero:      true,
-		NoNewPrivs:    true,
+		Event:          "started",
+		SupervisorPid:  s.seams.supervisorPid,
+		ChildPid:       childPid,
+		Subreaper:      true,
+		Nondumpable:    true,
+		UID:            st.UID,
+		LiveCapsZero:   st.CapInh == 0 && st.CapPrm == 0 && st.CapEff == 0 && st.CapAmb == 0,
+		CapBoundingSet: "0x" + strconv.FormatUint(st.CapBnd, 16),
+		NoNewPrivs:     st.NoNewPrivs == 1,
 	})
 
 	for {

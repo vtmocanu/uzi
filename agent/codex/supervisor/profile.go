@@ -113,16 +113,16 @@ func parseCapHex(val string) (uint64, error) {
 const capBndSetuidSetgidResidue = 0xc0
 
 // evaluateProfile is the pure fail-before-fork decision. Given the parsed status,
-// the --expect-uid value, and whether subreaper+dumpable were established and
+// the --expect-uid value, and whether subreaper+nondumpability were established and
 // CONFIRMED, it returns ok, or the first field that failed (for the
 // "profile:<field>" abnormal reason). Every check is mandatory; no flag disables
 // any of them.
-func evaluateProfile(st procStatus, expectUID int, subreaper, dumpable bool) (ok bool, field string) {
+func evaluateProfile(st procStatus, expectUID int, subreaper, nondumpable bool) (ok bool, field string) {
 	if !subreaper {
 		return false, "subreaper"
 	}
-	if !dumpable {
-		return false, "dumpable"
+	if !nondumpable {
+		return false, "nondumpable"
 	}
 	if st.UID != expectUID {
 		return false, "uid"

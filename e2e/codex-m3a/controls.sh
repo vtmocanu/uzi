@@ -129,6 +129,24 @@ write_spec() {
 EOF
 }
 
+# Write the fixed production provider-root spec. Unlike command-root controls, this target
+# cannot select a child or supervisor: launchCodexRoot requires the pinned Codex app-server.
+write_provider_spec() {
+  _p="$1"; _root="$2"; _cwd="$3"; _cred="$4"
+  cat > "$_p" <<EOF
+{
+  "ownedDataRoot": "$_root",
+  "provider": { "name": "fakeprov", "baseUrl": "http://127.0.0.1:9/v1", "envKey": "FAKE_PROVIDER_API_KEY", "credentialValue": "$_cred" },
+  "model": "gpt-5-codex",
+  "codexBin": "/opt/uzi-codex/0.153.2/bin/codex",
+  "supervisorBin": "$SUP",
+  "kind": "provider",
+  "childArgv": ["app-server"],
+  "cwd": "$_cwd"
+}
+EOF
+}
+
 # ---- Control 1: channel nondumpability (fd3/fd4) + positive control ---------------------
 control_1() {
   hdr "Control 1: channel boundary (nondumpability of supervisor fd3/fd4) + positive control"
@@ -360,7 +378,7 @@ control_5() {
   _cred="sk-m3a-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   M3A_ENV_CANARY="leak-canary-must-not-reach-child"; export M3A_ENV_CANARY
   _spec="$WTMP/spec5.json"
-  write_spec "$_spec" provider "$_md" env "$_cwd" "$_cred"
+  write_provider_spec "$_spec" "$_md/run" "$_cwd" "$_cred"
   launch_cli "$_spec" c5
   if ! wait_ready; then
     bad "control 5: launch-cli did not reach ready"
@@ -368,25 +386,18 @@ control_5() {
     dispose_cli
     return
   fi
-  # The mandate is "owned by uid 10002 and mode 0700" = runner-owned, OWNER-ONLY access.
-  # The trees also carry an inherited setgid bit (raw mode 2700) because the chosen
-  # ownedDataRoot sits under the production setgid /data/runner (2775) — a benign
-  # inheritance that does NOT widen access (group/other still get nothing). Assert the
-  # owner-only 0700 access bits + uid and note the setgid separately.
+  # The mandate is exact uid 10002 and mode 0700. The launcher explicitly clears any
+  # setgid bit inherited from the production /data/runner parent before it verifies.
   _odr="$_md/run"
-  _setgid_seen=n
   for _d in home codex xdg-config xdg-cache xdg-data xdg-state tmp; do
     _u="$(as_runner stat -c '%u' "$_odr/$_d" 2>/dev/null || echo NA)"
     _perm="$(as_runner stat -c '%a' "$_odr/$_d" 2>/dev/null || echo NA)"
-    _low="${_perm#"${_perm%???}"}"
-    [ "${#_perm}" -eq 4 ] && _setgid_seen=y
-    if [ "$_u" = "10002" ] && [ "$_low" = "700" ]; then
-      ok "$_d -> uid 10002, owner-only 0700 (raw mode $_perm)"
+    if [ "$_u" = "10002" ] && [ "$_perm" = "700" ]; then
+      ok "$_d -> uid 10002 mode 0700"
     else
       bad "$_d uid='$_u' mode='$_perm' (want uid 10002, owner-only 700)"
     fi
   done
-  [ "$_setgid_seen" = y ] && note "trees carry an inherited setgid bit (raw 2700) from the setgid /data/runner parent (2775); access stays owner-only 0700"
   _cu="$(as_runner stat -c '%u' "$_odr/codex/config.toml" 2>/dev/null || echo NA)"
   _cp="$(as_runner stat -c '%a' "$_odr/codex/config.toml" 2>/dev/null || echo NA)"
   { [ "$_cu" = "10002" ] && [ "$_cp" = "600" ]; } && ok "config.toml -> uid 10002 mode 0600" || bad "config.toml uid='$_cu' mode='$_cp' (want uid 10002 mode 600)"
@@ -395,12 +406,13 @@ control_5() {
   # With the supervisor fix (launchChild sets Env: os.Environ(), and setpriv passed the
   # launcher's replaced-env allowlist through to the supervisor unchanged), the child must
   # observe EXACTLY the allowlist + the provider credential and NOTHING from the host/worker.
-  # This drove `launch-cli` above with kind:"provider" + a dummy credential and a stub child
-  # in `env` mode; assert the dumped child environment rather than merely noting its count.
+  # This drove `launch-cli` above with the fixed production Codex app-server target. Read the
+  # real app-server process environment as the same runner uid and assert its full key set.
   _expect_keys="HOME CODEX_HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME TMPDIR PATH SHELL LANG TERM FAKE_PROVIDER_API_KEY"
-  if wait_marker "$_md/env-done" 20; then
-    _cnt="$(as_runner cat "$_md/child-env-count" 2>/dev/null || echo 0)"
-    _envtxt="$(as_runner cat "$_md/child-env.txt" 2>/dev/null || true)"
+  _child="$($NODE "$EVQ" "$CLI_ERR" ready started.childPid 2>/dev/null)"
+  _envtxt="$(as_runner sh -c 'tr "\000" "\n" < "/proc/$1/environ"' sh "$_child" 2>/dev/null || true)"
+  _cnt="$(printf '%s\n' "$_envtxt" | grep -c '=' || true)"
+  if [ -n "$_child" ] && [ -n "$_envtxt" ]; then
     _keys="$(printf '%s\n' "$_envtxt" | grep -v '^[[:space:]]*$' | cut -d= -f1 | sort)"
 
     # (a) NON-EMPTY: the fix delivers env (pre-fix the child saw an empty env, count 0).
@@ -463,12 +475,27 @@ control_5() {
 
     note "child env observed: $(printf '%s' "$_keys" | tr '\n' ' ')"
   else
-    bad "control 5: stub child never dumped its env ('env-done' marker absent)"
+    bad "control 5: real Codex child environment was not readable (child='$_child')"
   fi
 
   dispose_cli
   _clean="$("$NODE" "$EVQ" "$CLI_ERR" final clean 2>/dev/null)"
   [ "$_clean" = "true" ] && ok "control 5 clean disposal (drained, supervisor exit 0)" || bad "control 5 not clean"
+
+  # Fresh means absent before launch, not merely mkdir -p. Pre-seed the root and prove the
+  # production launcher refuses before spawning a supervisor.
+  _pre="$DATA/c5-preseed"; as_runner rm -rf "$_pre" 2>/dev/null; as_runner mkdir -p "$_pre/run" "$_pre/cwd"
+  _pre_spec="$WTMP/spec5-preseed.json"
+  write_provider_spec "$_pre_spec" "$_pre/run" "$_pre/cwd" "$_cred"
+  launch_cli "$_pre_spec" c5-preseed
+  _i=0
+  while [ "$_i" -lt 20 ] && kill -0 "$CLI_PID" 2>/dev/null; do sleep 1; _i=$((_i + 1)); done
+  if grep -q '"event":"launch-failed"' "$CLI_ERR" 2>/dev/null && ! grep -q '"event":"ready"' "$CLI_ERR" 2>/dev/null; then
+    ok "pre-existing ownedDataRoot rejected before supervisor launch"
+  else
+    bad "pre-existing ownedDataRoot did not fail closed: $(as_runner cat "$CLI_ERR" 2>/dev/null)"
+  fi
+  dispose_cli
 }
 
 preflight() {

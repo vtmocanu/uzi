@@ -44,7 +44,6 @@ reviews:
     - "!**/package-lock.json"                 # lock files
     - "!**/dist/**"                           # build output
     - "!**/node_modules/**"
-    - "!**/vendor/**"                         # vendored third-party trees (e.g. Go supervisor's golang.org/x/sys)
     - "!api/internal/store/*.sql.go"          # sqlc-generated query code
     - "!api/internal/store/models.go"         # sqlc-generated
     - "!api/internal/store/querier.go"        # sqlc-generated

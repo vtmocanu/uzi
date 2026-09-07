@@ -16,12 +16,26 @@
 
 import assert from "node:assert/strict";
 import { lstatSync } from "node:fs";
-import test from "node:test";
+import { before, test } from "node:test";
 
-import { buildCodexConfigToml } from "../../agent/src/codex/config.js";
-import { launchCodexRoot, type CodexLaunchSpec, type CodexRootHandle } from "../../agent/src/codex/launcher.js";
+import type { CodexLaunchSpec, CodexRootHandle } from "../../agent/src/codex/launcher.js";
 import { FakeProvider, dummyCredential, trivialResponder } from "./fake-provider.js";
+import {
+  loadPackagedConfig,
+  loadPackagedLauncher,
+  type ConfigModule,
+  type LauncherModule,
+} from "./packaged-modules.js";
 import { asRunnerSync } from "./supervisor-driver.js";
+
+let buildCodexConfigToml: ConfigModule["buildCodexConfigToml"];
+let launchCodexRoot: LauncherModule["launchCodexRoot"];
+before(async () => {
+  [{ buildCodexConfigToml }, { launchCodexRoot }] = await Promise.all([
+    loadPackagedConfig(),
+    loadPackagedLauncher(),
+  ]);
+});
 
 const SUPERVISOR_BIN = process.env.M3A_SUPERVISOR_BIN ?? "/usr/local/bin/uzi-codex-supervisor";
 const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.153.2/bin/codex";
@@ -36,10 +50,10 @@ const BASE_ALLOWLIST = [
   "XDG_STATE_HOME", "TMPDIR", "PATH", "SHELL", "LANG", "TERM",
 ] as const;
 
-/** Parse a NUL-separated /proc/<pid>/environ dump into a key→value map. */
+/** Parse a NUL- or newline-separated /proc/<pid>/environ dump into a key→value map. */
 function parseEnviron(raw: string): Map<string, string> {
   const map = new Map<string, string>();
-  for (const entry of raw.split("\0")) {
+  for (const entry of raw.split(/[\0\n]/)) {
     if (entry.length === 0) continue;
     const eq = entry.indexOf("=");
     if (eq < 0) continue;
@@ -114,9 +128,20 @@ test("C1: real Codex child sees ONLY the replacement-env allowlist + credential,
   });
 
   const childPid = launched.handle.started.childPid;
+  const snapshot = await launched.handle.snapshot();
+  assert.ok(snapshot.processes.some((process) => process.pid === childPid), `started child ${childPid} must still be owned by the supervisor`);
   // Read the REAL codex child's environ as the runner uid (owner of the dumpable child).
-  const read = asRunnerSync("/bin/cat", [`/proc/${childPid}/environ`]);
+  // `started` follows ForkExec, so /proc can briefly expose an empty environ while exec is
+  // settling. Poll for positive non-empty evidence; a vanished child or persistent empty
+  // result fails rather than being interpreted as an empty allowlist.
+  let read = asRunnerSync("/bin/false", []);
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    read = asRunnerSync("/bin/sh", ["-c", 'tr "\\000" "\\n" < "$1"', "sh", `/proc/${childPid}/environ`]);
+    if (read.status === 0 && read.stdout.length > 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
   assert.equal(read.status, 0, `read /proc/${childPid}/environ as runner: ${read.stderr}`);
+  assert.notEqual(read.stdout.length, 0, `read /proc/${childPid}/environ returned no positive evidence`);
   const env = parseEnviron(read.stdout);
   // The intended assertion must PASS for the real child.
   assertReplacementEnv(env, { credentialKey: ENV_KEY, credentialValue: launched.credential, home: launched.home, codexHome: launched.codexHome });

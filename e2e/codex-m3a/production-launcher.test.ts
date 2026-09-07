@@ -11,13 +11,17 @@
 
 import assert from "node:assert/strict";
 import { createInterface } from "node:readline";
-import test from "node:test";
+import { before, test } from "node:test";
 import type { Readable, Writable } from "node:stream";
 
 import { message } from "../codex-m0/harness.mjs";
-import { launchCodexRoot, type CodexLaunchSpec, type CodexRootHandle } from "../../agent/src/codex/launcher.js";
+import type { CodexLaunchSpec, CodexRootHandle } from "../../agent/src/codex/launcher.js";
 import { FakeProvider, dummyCredential, type ResponseItem, type ResponsesBody } from "./fake-provider.js";
+import { loadPackagedLauncher, type LauncherModule } from "./packaged-modules.js";
 import { asRunnerSync } from "./supervisor-driver.js";
+
+let launchCodexRoot: LauncherModule["launchCodexRoot"];
+before(async () => { ({ launchCodexRoot } = await loadPackagedLauncher()); });
 
 const SUPERVISOR_BIN = process.env.M3A_SUPERVISOR_BIN ?? "/usr/local/bin/uzi-codex-supervisor";
 const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.153.2/bin/codex";
@@ -129,8 +133,9 @@ test("production launcher: real app-server runs a stock credential-free turn, no
 
   // The production supervisor posture must be the hardened one.
   assert.equal(handle.started.subreaper, true);
-  assert.equal(handle.started.dumpable, true);
-  assert.equal(handle.started.capsZero, true);
+  assert.equal(handle.started.nondumpable, true);
+  assert.equal(handle.started.liveCapsZero, true);
+  assert.ok(handle.started.capBoundingSet === "0x0" || handle.started.capBoundingSet === "0xc0");
   assert.equal(handle.started.noNewPrivs, true);
   assert.equal(handle.started.uid, Number(process.env.M3A_RUNNER_UID ?? "10002"));
 
