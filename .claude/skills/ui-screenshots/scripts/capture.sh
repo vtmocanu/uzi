@@ -68,11 +68,16 @@ activate_app() {
 navigate() {
   local ORCA="${ORCA_CLI_COMMAND:-orca}"
   command -v "$ORCA" >/dev/null 2>&1 || die 4 "--url needs the Orca CLI '$ORCA' (set ORCA_CLI_COMMAND or install Orca)"
+  # A failed nav step can leave the old tab in place, so warn loudly rather than
+  # swallow it; the caller still visually verifies the shot before publishing.
   "$ORCA" computer get-app-state --app "$APP" --restore-window --no-screenshot --json >/dev/null 2>&1 || true
-  "$ORCA" computer hotkey --app "$APP" --key "CmdOrCtrl+T" --restore-window --no-screenshot --json >/dev/null 2>&1 || true
+  "$ORCA" computer hotkey --app "$APP" --key "CmdOrCtrl+T" --restore-window --no-screenshot --json >/dev/null 2>&1 \
+    || echo "capture: new-tab step failed; the captured page may be the wrong one" >&2
   sleep 0.8
-  "$ORCA" computer type-text --app "$APP" --text "$URL" --restore-window --no-screenshot --json >/dev/null 2>&1 || true
-  "$ORCA" computer press-key --app "$APP" --key Return --restore-window --no-screenshot --json >/dev/null 2>&1 || true
+  "$ORCA" computer type-text --app "$APP" --text "$URL" --restore-window --no-screenshot --json >/dev/null 2>&1 \
+    || echo "capture: typing the URL failed; the captured page may be the wrong one" >&2
+  "$ORCA" computer press-key --app "$APP" --key Return --restore-window --no-screenshot --json >/dev/null 2>&1 \
+    || echo "capture: submitting the URL failed; the captured page may be the wrong one" >&2
   sleep 2.5
 }
 
@@ -90,8 +95,10 @@ crop_here() {
   "$SCRIPT_DIR/crop-ui.sh" "${args[@]}"
 }
 
-[ -n "$URL" ] && navigate
-[ -n "$SIZE" ] && resize_window
+# Use if-blocks, not `cond && func`: the `&&` form disables `set -e` inside the
+# called function for the rest of its body (a bash errexit footgun).
+if [ -n "$URL" ]; then navigate; fi
+if [ -n "$SIZE" ]; then resize_window; fi
 activate_app
 sleep 0.5
 
@@ -108,3 +115,6 @@ screencapture -x -R "${X},${Y},${W},${H}" "$OUT"
 crop_here
 read -r OW OH < <(magick identify -format '%w %h\n' "$OUT" 2>/dev/null || echo "? ?")
 echo "capture: ${PROC} window ${W}x${H}@${X},${Y} -> ${OUT##*/} ${OW}x${OH}"
+# Privacy fail-safe: the script cannot read the browser's demo-mode flag, so it
+# cannot prove masking is active. Require a human/agent to confirm before publishing.
+echo "capture: VERIFY demo-mode masking in ${OUT##*/} before publishing — no real email, repo owner, or forge host." >&2
