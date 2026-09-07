@@ -201,13 +201,18 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		return
 	}
 
-	// The newest kept comment (snapshot is oldest-first) drives the review-landed gate;
-	// the max kept comment id is the advance-only high-water anchor.
+	// The newest kept comment (snapshot is oldest-first) drives the review-landed gate.
 	newest := snap.Comments[len(snap.Comments)-1]
-	var maxID int64
+
+	// The trigger + advance-only high-water anchor key on ACTIONABLE comments only
+	// (issue #1142): a non-actionable note (a bot walkthrough/summary, or a top-level
+	// note carrying a CodeRabbit summary/walkthrough marker) is context for a run that
+	// fires, never a reason to fire. maxActionableID is 0 when nothing actionable is
+	// kept, so a summary-only tick can never clear GATE 3 and never advances the ledger.
+	var maxActionableID int64
 	for _, c := range snap.Comments {
-		if c.ID > maxID {
-			maxID = c.ID
+		if workersvc.IsActionableReviewComment(c) && c.ID > maxActionableID {
+			maxActionableID = c.ID
 		}
 	}
 
@@ -223,9 +228,13 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		return // comment written against a superseded head SHA
 	}
 
-	// GATE 3 — NEW COMMENT PAST THE HIGH-WATER (Decision 2 / SC3). Fire only when a
-	// kept comment has id STRICTLY ABOVE the consumed high-water. A comment at/below the
-	// mark is never re-acted.
+	// GATE 3 — NEW ACTIONABLE COMMENT PAST THE HIGH-WATER (Decision 2 / SC3, issue
+	// #1142). Fire only when an ACTIONABLE kept comment has id STRICTLY ABOVE the
+	// consumed high-water. A comment at/below the mark is never re-acted; a
+	// non-actionable note (a bot walkthrough/summary) never counts, and a summary-only
+	// tick does not advance the high-water — leaving the mark unmoved is what lets a
+	// later actionable comment with a lower forge id still fire (it also avoids widening
+	// the scalar-high-water skip below rather than narrowing it).
 	//
 	// 🔴 KNOWN LIMITATION (documented decision, mirrored from the 00168 migration
 	// comment, NOT an oversight): GitHub/Forgejo source comment ids from DISTINCT
@@ -234,7 +243,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	// skipped comment falls back to human review, never a wrong write) and bounded by
 	// the capLimit. A per-sequence high-water is the robust follow-up; the scalar mark is
 	// what Decision 2 + SC3 specify.
-	if maxID <= led.HighWater {
+	if maxActionableID <= led.HighWater {
 		return
 	}
 
@@ -263,8 +272,8 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	// a race surfaces as ErrBranchInUse / ErrActiveMRReworkExists, swallowed here.
 	//
 	// CREATE-THEN-RECORD: create the run first, then advance the ledger (high_water to
-	// the max kept id, attempt_count +1). A crash between the two re-evaluates next tick;
-	// the same-kind index keeps it from doubling.
+	// the max ACTIONABLE kept id, attempt_count +1). A crash between the two re-evaluates
+	// next tick; the same-kind index keeps it from doubling.
 	title := fmt.Sprintf("Rework MR review: %s (!%d)", ref, mrIID)
 	description := fmt.Sprintf("Address the new review comments on merge request !%d for `%s`, folding the fixes onto the existing branch.", mrIID, ref)
 
@@ -274,7 +283,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		if err := d.q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
 			RepoID:    r.ID,
 			Ref:       ref,
-			HighWater: maxID,
+			HighWater: maxActionableID,
 		}); err != nil {
 			// The run is active; the next tick's branch guard keeps it from doubling.
 			slog.Error("poller: mr-rework upsert ledger", "repo", r.PathWithNamespace, "ref", ref, "error", err)
