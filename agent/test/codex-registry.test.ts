@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   ExecutionRegistry,
   MAX_CALLBACK_RESERVATIONS,
+  MAX_POISON_ERRORS,
   newLocalExecutionEpoch,
   type ReapOutcome,
   type RegisteredRoot,
@@ -179,6 +180,29 @@ describe("ExecutionRegistry: callback reservation idempotency", () => {
     if (replay.kind === "replay") assert.equal(replay.marker.outcome, "ok");
   });
 
+  it("returns a settled key's cached marker on replay AFTER a clean close (poisoned is distinct from cleanly-closed)", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const first = reg.reserveCallback({ ...key, fingerprint: "fp" });
+    assert.equal(first.kind, "admitted");
+    if (first.kind !== "admitted") return;
+    reg.settleCallback(first.token, "ok");
+    // A CLEAN close: nothing unsettled, so the epoch quiesces to "closed" and is NOT
+    // poisoned. (poisoned and cleanly-closed are distinct terminal states.)
+    const q = await reg.quiesceChildren(DEADLINE);
+    assert.equal(q.kind, "quiescent");
+    assert.equal(reg.state(), "closed");
+    assert.equal(reg.isPoisoned(), false);
+    // The settled key is still replayable: the existing-key block runs BEFORE the
+    // admission gate, so a replay-after-clean-close returns its cached terminal
+    // marker rather than being denied admission_closed.
+    const replay = reg.reserveCallback({ ...key, fingerprint: "fp" });
+    assert.equal(replay.kind, "replay");
+    if (replay.kind === "replay") assert.equal(replay.marker.outcome, "ok");
+    // Reading a cached marker never re-opens admission or poisons.
+    assert.equal(reg.state(), "closed");
+    assert.equal(reg.isPoisoned(), false);
+  });
+
   it("denies a concurrent in-flight duplicate without running a second effect", () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
     assert.equal(reg.reserveCallback({ ...key, fingerprint: "fp" }).kind, "admitted");
@@ -251,6 +275,53 @@ describe("ExecutionRegistry: callback reservation ceiling (fail-closed bound)", 
     assert.equal(replay.kind, "replay");
     if (replay.kind === "replay") assert.equal(replay.marker.outcome, "ok");
     assert.equal(reg.poisonErrors().length, poisonCountAfterOverflow); // no second poison
+  });
+});
+
+describe("ExecutionRegistry: changed-fingerprint reuse flood stays bounded (availability)", () => {
+  it("denies every changed-fingerprint reuse of one tuple, poisons once, and keeps poisonErrors() bounded (not linear in call count)", () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const tuple = { threadId: "t1", turnId: "u1", callId: "c1" };
+    // Reserve the tuple ONCE with a baseline fingerprint.
+    assert.equal(reg.reserveCallback({ ...tuple, fingerprint: "fp-0" }).kind, "admitted");
+
+    // The audit's attack: flood the SAME (threadId,turnId,callId) tuple with ever-
+    // varying fingerprints. Each is a changed_reuse: the first poisons, and every
+    // subsequent one must deny WITHOUT re-entering poison(), so the poison list can
+    // never grow linearly in the number of calls.
+    const FLOOD = 5000;
+    for (let i = 1; i <= FLOOD; i++) {
+      const res = reg.reserveCallback({ ...tuple, fingerprint: `fp-${i}` });
+      // (a) every reuse is denied changed_reuse.
+      assert.equal(res.kind, "denied");
+      if (res.kind === "denied") assert.equal(res.reason, "changed_reuse");
+    }
+
+    // (b) the registry is (and stays) poisoned.
+    assert.equal(reg.isPoisoned(), true);
+    assert.equal(reg.state(), "poisoned");
+
+    // (c) the poison accumulator stayed BOUNDED — at most MAX_POISON_ERRORS, and in
+    // particular NOT linear in FLOOD (the pre-fix regression measured one entry per
+    // call). With the idempotent changed_reuse branch it is exactly one here.
+    assert.ok(reg.poisonErrors().length <= MAX_POISON_ERRORS);
+    assert.ok(reg.poisonErrors().length < FLOOD);
+    assert.equal(reg.poisonErrors().length, 1);
+  });
+
+  it("caps poisonErrors() at MAX_POISON_ERRORS even under many DISTINCT poison() calls", () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    // A backstop independent of any single caller: poison() called far more than the
+    // cap retains only the FIRST MAX_POISON_ERRORS reasons and never grows past it.
+    for (let i = 0; i < MAX_POISON_ERRORS * 10; i++) {
+      reg.poison({ category: "protocol", message: `poison-${i}` });
+    }
+    assert.equal(reg.isPoisoned(), true);
+    assert.equal(reg.poisonErrors().length, MAX_POISON_ERRORS);
+    // The retained reasons are the FIRST ones (most diagnostic), not the last.
+    const retained = reg.poisonErrors();
+    assert.equal(retained[0]?.message, "poison-0");
+    assert.equal(retained[MAX_POISON_ERRORS - 1]?.message, `poison-${MAX_POISON_ERRORS - 1}`);
   });
 });
 

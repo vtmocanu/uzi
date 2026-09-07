@@ -136,6 +136,20 @@ function keyOf(k: CallbackKey): string {
  *  test asserts the exact ceiling rather than hard-coding a copy of it. */
 export const MAX_CALLBACK_RESERVATIONS = 10000;
 
+/** Backstop bound on the number of poison reasons the registry RETAINS. `poison()`
+ *  can be driven by model/worker-influenced input (e.g. a flood of changed-
+ *  fingerprint callback reuse on one tuple), so an UNBOUNDED poison list is itself
+ *  an unbounded-model-influenced-memory-growth vector — the same class the callback
+ *  ceiling closes, on the poison accumulator instead of the callbacks map. We retain
+ *  only the FIRST MAX_POISON_ERRORS reasons (the earliest are the most diagnostic)
+ *  and drop the rest. This is a bound on retained EVIDENCE only: the sticky
+ *  `poisoned` flag, `isPoisoned()` and the "poisoned" state are unaffected, so
+ *  fail-closed behaviour never changes no matter how many times `poison()` is
+ *  called. 64 is generous headroom for a run's legitimate distinct fault reasons
+ *  while staying small and finite. Exported so the test asserts the exact bound
+ *  rather than hard-coding a copy of it. */
+export const MAX_POISON_ERRORS = 64;
+
 /**
  * The per-run immutable local-execution-epoch registry.
  *
@@ -217,7 +231,16 @@ export class ExecutionRegistry {
    *  disposed. May be called from any non-disposed state. */
   poison(errors: HarnessError | readonly HarnessError[]): void {
     const list = Array.isArray(errors) ? errors : [errors];
-    for (const e of list) this.poisonList.push(e);
+    // Append only while under MAX_POISON_ERRORS; once at the cap we stop retaining
+    // reasons (keeping the FIRST, most-diagnostic ones). This is the unconditional
+    // backstop for ALL poison sources — present and future — so that no number of
+    // poison() calls, however model/worker-driven, can grow the accumulator without
+    // bound. The sticky flag/state below are set REGARDLESS of the cap, so the
+    // registry still fails closed exactly as before.
+    for (const e of list) {
+      if (this.poisonList.length >= MAX_POISON_ERRORS) break;
+      this.poisonList.push(e);
+    }
     this.poisoned = true; // sticky; never cleared, survives disposal
     if (this.currentState !== "disposed") this.currentState = "poisoned";
   }
@@ -271,11 +294,19 @@ export class ExecutionRegistry {
     // has closed or the epoch was poisoned.
     if (existing) {
       if (existing.fingerprint !== request.fingerprint) {
-        // Same tuple, changed payload/origin: replay/forgery. Deny AND poison.
-        this.poison({
-          category: "protocol",
-          message: "reserveCallback: call-id reuse with changed payload/origin",
-        });
+        // Same tuple, changed payload/origin: replay/forgery. Deny AND poison — but
+        // poison ONLY on the FIRST detection. Once the epoch is already poisoned, a
+        // flood of changed-fingerprint reuse of the same tuple denies cheaply and
+        // must NOT re-enter poison() (which would grow the poison accumulator once
+        // per call — the availability regression this branch previously reopened).
+        // Fail-closed is preserved: the registry stays poisoned and every such call
+        // is still denied `changed_reuse`.
+        if (!this.poisoned) {
+          this.poison({
+            category: "protocol",
+            message: "reserveCallback: call-id reuse with changed payload/origin",
+          });
+        }
         return { kind: "denied", reason: "changed_reuse" };
       }
       if (existing.marker) return { kind: "replay", marker: existing.marker };
