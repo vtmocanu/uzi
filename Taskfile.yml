@@ -2144,7 +2144,7 @@ tasks:
     # entry then. Do NOT add test:codex-m3b:packaged until that milestone lands.
     dir: agent
     cmds:
-      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts
+      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts
 
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)
