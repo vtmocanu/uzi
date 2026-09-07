@@ -230,6 +230,60 @@ func milestoneInProgress(run apitypes.RunDTO) (id, title string) {
 	return "", ""
 }
 
+// milestoneInProgressIDs returns EVERY frozen milestone id (in frozen order) that is in the run's
+// in-progress set and not already completed — the set the two milestone micro-bars count as
+// blinking cells and the eyebrow suffix lists (#1176). Iterating the frozen Milestones slice (NOT
+// MilestonesInProgress) is load-bearing: it drops an id absent from the frozen list, dedups a
+// repeated in-progress id, and bounds the result to total-done (every entry is a not-completed
+// frozen milestone), so a stale or duplicated snapshot can never overflow the bar. milestoneInProgress
+// stays the FIRST-by-frozen-order selection the naming (boardSecondLine) and now-line-attach sites need.
+func milestoneInProgressIDs(run apitypes.RunDTO) []string {
+	if len(run.MilestonesInProgress) == 0 || len(run.Milestones) == 0 {
+		return nil
+	}
+	inProg := make(map[string]bool, len(run.MilestonesInProgress))
+	for _, mid := range run.MilestonesInProgress {
+		inProg[mid] = true
+	}
+	completed := make(map[string]bool, len(run.MilestonesCompleted))
+	for _, mid := range run.MilestonesCompleted {
+		completed[mid] = true
+	}
+	var ids []string
+	for _, mi := range run.Milestones {
+		if inProg[mi.ID] && !completed[mi.ID] {
+			ids = append(ids, mi.ID)
+		}
+	}
+	return ids
+}
+
+// milestoneIPSuffix builds the eyebrow's `<id>, <id> +N` in-progress suffix from the frozen-order
+// in-progress id list: up to two ids joined by ", ", then " +N" for the rest (`m1`, `m1, m2`,
+// `m1, m2 +1`). Each id is UNTRUSTED (a frozen key) and goes through renderer.Plain; the +N is a
+// plain integer. Empty for no ids. Both this and the bar's cell count derive from milestoneInProgressIDs
+// so they cannot disagree.
+func (m tuiModel) milestoneIPSuffix(ids []string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	shown := ids
+	extra := 0
+	if len(ids) > 2 {
+		shown = ids[:2]
+		extra = len(ids) - 2
+	}
+	parts := make([]string, 0, len(shown))
+	for _, id := range shown {
+		parts = append(parts, m.renderer.Plain(id, 12))
+	}
+	s := strings.Join(parts, ", ")
+	if extra > 0 {
+		s += " +" + itoa(extra)
+	}
+	return s
+}
+
 // milestoneCell renders the blinking in-progress milestone micro-bar cell (PRD #1136, recoloring
 // #1064 D4): ▰ when the model's blink phase is on, ▱ when off, in the tungsten colour (matching
 // the done fill; the blink and the empty ▱ off-frame, not the hue, set it apart — PRD #1136 D2).
@@ -335,11 +389,17 @@ func (m tuiModel) renderMilestones() string {
 	done, total, reported := milestoneProgress(m.detail.run)
 	terminal := terminalRunStatuses[m.detail.run.Status]
 
-	// The FIRST in-progress id (frozen order, D4) is the one that blinks, carries the `· <id>`
-	// eyebrow suffix and hosts the now line. A terminal run's in-progress snapshot is stale, so
-	// nothing blinks there.
+	// milestoneInProgress stays the FIRST-by-frozen-order id and now drives ONLY the now-line
+	// attach point (which milestone the crew's activity rides under). The micro-bar counts EVERY
+	// in-progress milestone and the eyebrow suffix lists them (#1176); a terminal run's in-progress
+	// snapshot is stale, so nothing blinks there.
 	ipID, _ := milestoneInProgress(m.detail.run)
-	blink := ipID != "" && done < total && !terminal
+	ipIDs := milestoneInProgressIDs(m.detail.run)
+	n := len(ipIDs)
+	if rem := total - done; n > rem {
+		n = rem
+	}
+	blink := n > 0 && done < total && !terminal
 	// The rail's "now" line comes from the crew rail's OWN frames via the same runactivity rule
 	// the server runs, so the DTO and the rail cannot disagree (D3). No now line on a terminal
 	// run — a finished run has no "now".
@@ -357,17 +417,17 @@ func (m tuiModel) renderMilestones() string {
 		empty := total - done
 		mid := ""
 		if blink {
-			mid = m.milestoneCell(nil)
-			empty--
+			mid = strings.Repeat(m.milestoneCell(nil), n)
+			empty -= n
 		}
 		bar = lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(strings.Repeat("▰", done)) +
 			mid + m.pal.faint.Render(strings.Repeat("▱", empty)) + " "
 	}
 	eyebrow := m.pal.faint.Render("MILESTONES") + " " + bar + m.pal.faint.Render(milestoneCount(done, total, reported))
-	if ipID != "" {
-		// `· <id>` names the milestone the crew is on, carrying the state without motion for a
-		// static/non-tty frame. The id is a validated frozen key, sanitized defensively.
-		eyebrow += m.pal.faint.Render(" · " + m.renderer.Plain(ipID, 12))
+	if suffix := m.milestoneIPSuffix(ipIDs); suffix != "" {
+		// `· <id>, <id> +N` lists every in-progress milestone (frozen order, capped) — the same set
+		// the bar counts — carrying the in-flight set without motion for a static/non-tty frame.
+		eyebrow += m.pal.faint.Render(" · " + suffix)
 	}
 	sb.WriteString(eyebrow + "\n")
 	// Nothing declared in progress but there IS activity: an unattached now line directly under
