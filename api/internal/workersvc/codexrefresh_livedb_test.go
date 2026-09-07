@@ -147,6 +147,19 @@ func (h *recoverySlotHookStore) SetCodexRecoverySlot(ctx context.Context, arg st
 	return h.Queries.SetCodexRecoverySlot(ctx, arg)
 }
 
+// recoverySlotZeroStore simulates a recovery CAS whose operation fence moved before
+// the write. The SQL call succeeds but affects zero rows, which must never be reported
+// as persisted recovery material.
+type recoverySlotZeroStore struct {
+	*store.Queries
+	calls int
+}
+
+func (h *recoverySlotZeroStore) SetCodexRecoverySlot(context.Context, store.SetCodexRecoverySlotParams) (int64, error) {
+	h.calls++
+	return 0, nil
+}
+
 // refreshFixture is a fully-seeded, linked subscription Codex run ready to refresh, with
 // the ORIGINAL access/refresh tokens known so a test can assert the merged reseal.
 type refreshFixture struct {
@@ -1182,6 +1195,42 @@ func TestCoordinatedCodexRefreshRecoverySlotRetryPersistsLiveDB(t *testing.T) {
 	}
 }
 
+// TestCoordinatedCodexRefreshRecoverySlotZeroRowsIsNotPersistedLiveDB proves that a
+// successful SQL round trip is not enough: a zero-row operation-fence miss stored no
+// recovery material and must be classified as unrecoverable rather than retained.
+//
+// FAILS OLD: writeCodexRecoverySlotOnce ignored the :execrows count, returned true on
+// (0,nil), and the caller reported a protected quarantined outcome with an empty slot.
+func TestCoordinatedCodexRefreshRecoverySlotZeroRowsIsNotPersistedLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	fake.errByToken = map[string]error{newAccess: errors.New("codexauth: identity request: network unreachable")}
+	hook := &recoverySlotZeroStore{Queries: env.q}
+	f.svc.q = hook
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+	if !errors.Is(err, ErrCodexRefreshUnrecoverable) {
+		t.Fatalf("err = %v, want ErrCodexRefreshUnrecoverable after a fenced-out recovery write", err)
+	}
+	if res.AccessToken != "" {
+		t.Fatalf("token = %q, want NO token", res.AccessToken)
+	}
+	if hook.calls != 1 {
+		t.Fatalf("SetCodexRecoverySlot calls = %d, want 1 (a fence miss is permanent, not retryable)", hook.calls)
+	}
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if len(acct.RecoverySealed) != 0 {
+		t.Fatalf("recovery slot contains %d bytes after a zero-row write, want empty", len(acct.RecoverySealed))
+	}
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentUnrecoverable {
+		t.Fatalf("intent state = %q, want unrecoverable after the recovery fence rejected the only copy", it.State)
+	}
+}
+
 // TestCoordinatedCodexRefreshRecoverySlotSurvivesCtxCancelLiveDB (defect 4, sub-fix 2) proves
 // a CANCELLED request ctx no longer drops the freshly-rotated material: the recovery write
 // runs on a DETACHED context (context.WithoutCancel), so it persists even though the request
@@ -1227,13 +1276,13 @@ func TestCoordinatedCodexRefreshRecoverySlotSurvivesCtxCancelLiveDB(t *testing.T
 	}
 }
 
-// TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB (defect 4, sub-fix 1) proves a
-// vault-locked seal AFTER a successful rotation is treated as TRANSIENT: the account is
-// quarantined for a survivor and the intent is LEFT 'rotating' (retried later), NOT marked
-// unrecoverable, and NO token is released.
+// TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB proves that a vault lock after
+// provider rotation does not discard the only new login. The operation protects the
+// material under the server master key, returns no token, then re-seals it under the user
+// DEK and promotes it after unlock.
 //
-// FAILS OLD: the old seal-failure branch marked ANY seal error unrecoverable + quarantine,
-// forcing a needless re-login on a transient vault lock.
+// FAILS OLD: the prior vault-locked branch quarantined an EMPTY recovery slot and later
+// reconciliation marked the operation unrecoverable, so its "retained" claim was false.
 func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	newAccess := codexToken("access-new")
@@ -1243,9 +1292,10 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	op := uuid.New()
 
 	// Wire a real vault that is LOCKED for this user. The account's sealed_login is
-	// master-sealed (opens without an unlock), but the post-rotation reseal takes the dek path
-	// and returns vault.ErrLocked — a transient seal failure that must RETAIN, not brick.
-	f.svc.SetVault(vault.New(env.box, env.q))
+	// master-sealed (opens without an unlock), but the post-rotation canonical seal takes the
+	// DEK path and returns vault.ErrLocked. The recovery path must still retain the new login.
+	vlt := vault.New(env.box, env.q)
+	f.svc.SetVault(vlt)
 
 	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
 	if !errors.Is(err, ErrCodexRefreshQuarantined) {
@@ -1267,9 +1317,38 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	if acct.CoordState != codexCoordQuarantined {
 		t.Fatalf("coord_state = %q, want quarantined (retained for a survivor)", acct.CoordState)
 	}
+	if len(acct.RecoverySealed) == 0 || !acct.RecoveryGeneration.Valid || acct.RecoveryGeneration.Int64 != 0 {
+		t.Fatalf("vault-locked refresh did not retain protected recovery: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
+	}
+	if !acct.RecoverySealedWith.Valid || acct.RecoverySealedWith.String != store.SealedWithMaster {
+		t.Fatalf("recovery sealed_with = %v, want temporary master protection", acct.RecoverySealedWith)
+	}
 	// The intent stays 'rotating' — retried by a later pass, NOT marked unrecoverable.
 	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
 		t.Fatalf("intent state = %q, want rotating (retained, not unrecoverable)", it.State)
+	}
+
+	// Once the user vault unlocks, reconciliation must re-seal the protected recovery under
+	// the DEK before making it live, then return the account to an idle usable generation.
+	if uerr := vlt.Unlock(env.ctx, f.userID, "vault-lock-recovery-password"); uerr != nil {
+		t.Fatalf("unlock vault: %v", uerr)
+	}
+	if _, rerr := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID); rerr != nil {
+		t.Fatalf("reconcile protected vault-lock recovery: %v", rerr)
+	}
+	acct = env.mustAccount(t, f.userID, f.accountID)
+	if acct.CoordState != "idle" || acct.Generation != 1 {
+		t.Fatalf("post-unlock account = (state=%q gen=%d), want (idle,1)", acct.CoordState, acct.Generation)
+	}
+	if acct.SealedWith != store.SealedWithDEK {
+		t.Fatalf("promoted sealed_with = %q, want %q", acct.SealedWith, store.SealedWithDEK)
+	}
+	blob, oerr := f.svc.openCodexAccountLogin(f.userID, acct)
+	if oerr != nil {
+		t.Fatalf("open promoted login: %v", oerr)
+	}
+	if blob.AccessToken != newAccess {
+		t.Fatalf("promoted access token = %q, want retained %q", blob.AccessToken, newAccess)
 	}
 }
 

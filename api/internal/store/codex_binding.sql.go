@@ -423,8 +423,8 @@ func (q *Queries) ListUnresolvedCodexRefreshIntents(ctx context.Context, arg Lis
 
 const promoteCodexRecovery = `-- name: PromoteCodexRecovery :one
 UPDATE codex_provider_account
-SET sealed_login         = recovery_sealed,
-    sealed_with          = recovery_sealed_with,
+SET sealed_login         = $1,
+    sealed_with          = $2::text,
     generation           = generation + 1,
     committed_generation = generation + 1,
     coord_state          = 'idle',
@@ -434,24 +434,28 @@ SET sealed_login         = recovery_sealed,
     recovery_generation  = NULL,
     recovery_sealed_with = NULL,
     updated_at           = now()
-WHERE id = $1 AND user_id = $2
+WHERE id = $3 AND user_id = $4
     AND coord_state = 'quarantined'
     AND recovery_sealed IS NOT NULL
-    AND recovery_generation = $3::bigint
+    AND recovery_generation = $5::bigint
 RETURNING generation
 `
 
 type PromoteCodexRecoveryParams struct {
+	Sealed         []byte    `json:"sealed"`
+	SealedWith     string    `json:"sealed_with"`
 	ID             uuid.UUID `json:"id"`
 	UserID         uuid.UUID `json:"user_id"`
 	FromGeneration int64     `json:"from_generation"`
 }
 
-// Install the protected recovery material as the live login (SECURITY HARDENING, PRD
+// Install re-verified recovery material as the live login (SECURITY HARDENING, PRD
 // #1147 audit): the reconcile path's roll-forward for a quarantined account whose
-// recovery slot holds a known-good login. It promotes recovery_sealed into sealed_login,
-// advances the generation (and committed_generation) so any stale CAS-guarded writer
-// loses, returns the account to 'idle', and clears the coordination + recovery slots.
+// recovery slot holds a known-good login. The caller opens and identity-verifies the
+// recovery blob, then re-seals it under the currently required key and passes that sealed
+// value here. This is what lets a vault-locked refresh use a temporary master-sealed
+// recovery envelope without promoting that envelope as a live credential: after unlock,
+// the live login is DEK-sealed before this CAS makes it authoritative.
 //
 // Guarded on coord_state='quarantined' AND recovery_sealed IS NOT NULL AND
 // recovery_generation = @from_generation so ONLY a quarantined account carrying the
@@ -462,17 +466,17 @@ type PromoteCodexRecoveryParams struct {
 // rows. The audit flagged that without a dedicated roll-forward primitive the reconcile
 // path had no CAS-safe way to make the recovery material live.
 //
-// sealed_with ADOPTS recovery_sealed_with on promotion (PRD #1147 F14): the recovery
-// blob may have been sealed under a DIFFERENT key than the current sealed_login — a
-// master→dek migration can advance sealed_login's key while the protected recovery blob
-// still carries the older discriminator (or vice versa). Promoting recovery_sealed into
-// the live login therefore MUST also install its recovery_sealed_with, or a later open of
-// the promoted login would try the wrong key and fail to decrypt. The prior assertion
-// that the discriminator is invariant across promotion was wrong for exactly the
-// cross-key-migration window; recovery_sealed_with is cleared alongside the rest of the
-// recovery slot since the material has been consumed.
+// @sealed/@sealed_with are one inseparable freshly-sealed pair. The recovery slot's own
+// discriminator remains the authority for opening the recovery input; it is cleared with
+// the slot after this replacement pair lands.
 func (q *Queries) PromoteCodexRecovery(ctx context.Context, arg PromoteCodexRecoveryParams) (int64, error) {
-	row := q.db.QueryRow(ctx, promoteCodexRecovery, arg.ID, arg.UserID, arg.FromGeneration)
+	row := q.db.QueryRow(ctx, promoteCodexRecovery,
+		arg.Sealed,
+		arg.SealedWith,
+		arg.ID,
+		arg.UserID,
+		arg.FromGeneration,
+	)
 	var generation int64
 	err := row.Scan(&generation)
 	return generation, err
@@ -627,6 +631,7 @@ SET recovery_sealed      = $1,
 WHERE id = $4 AND user_id = $5
     AND coord_operation_id = $6::uuid
     AND coord_state IN ('in_progress', 'quarantined')
+    AND generation = $2::bigint
 `
 
 type SetCodexRecoverySlotParams struct {
@@ -646,6 +651,9 @@ type SetCodexRecoverySlotParams struct {
 // across the in_progress/quarantined states. The identity guard is what prevents a
 // stale/foreign op from writing: a different op that committed sets coord_operation_id to
 // itself, and RefreshCodexAccountLogin nulls it, so a dead op matches 0 rows either way.
+// The generation guard is the second half of the fence: recovery material produced from
+// generation N must never be installed after the account moved to another generation,
+// even if a corrupt/intermediate state retained the old operation id.
 // Allowing coord_state IN ('in_progress','quarantined') lets the operation that owns the
 // lease protect its own material even after its lease expired and was reaped to
 // 'quarantined' (QuarantineExpiredCodexLease keeps coord_operation_id) — precisely the

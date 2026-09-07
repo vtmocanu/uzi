@@ -87,6 +87,11 @@ const (
 // write NEVER produces it — it is handed off to the background retrier instead.
 var errCodexRecoveryLost = errors.New("codex refresh: recovery material could not be persisted")
 
+// errCodexRecoveryFenceLost means SetCodexRecoverySlot executed successfully but affected
+// zero rows: the operation/generation fence moved, so no recovery copy was persisted and
+// retrying the same stale write cannot become valid.
+var errCodexRecoveryFenceLost = errors.New("codex refresh: recovery operation fence moved")
+
 // CodexRefreshOutcome names how a CoordinatedCodexRefresh resolved. It is observability
 // on top of the (result, error) contract: an ADVANCED/REPLAYED/RECONCILED outcome always
 // rides a nil error and a usable access token; a CONTENDED/QUARANTINED outcome always
@@ -189,9 +194,8 @@ type codexRefreshStore interface {
 	// writing recovery material — the identity-mismatch path (audit #2), where the exchanged
 	// material belongs to a DIFFERENT account and there is nothing trustworthy to protect.
 	QuarantineCodexAccount(ctx context.Context, arg store.QuarantineCodexAccountParams) (int64, error)
-	// PromoteCodexRecovery installs the protected recovery material as the live login,
-	// CAS-guarded on from_generation — the reconcile roll-forward for a quarantined account
-	// whose recovery slot re-verifies to the account's frozen identity (audit #5).
+	// PromoteCodexRecovery installs the identity-verified recovery material after it is
+	// freshly re-sealed under the current key, CAS-guarded on from_generation.
 	PromoteCodexRecovery(ctx context.Context, arg store.PromoteCodexRecoveryParams) (int64, error)
 }
 
@@ -467,23 +471,32 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		// recovery blob would need. The correct verdict turns on WHY the seal failed (PRD #1147
 		// M4, defect 4):
 		//
-		//   - TRANSIENT (a vault-locked seal, errVaultLocked): do NOT declare loss INLINE.
-		//     Quarantine the account (owner+op guarded) and LEAVE the intent 'rotating'. We do
-		//     NOT hold the unsealed plaintext to re-seal in the background — lingering raw login
-		//     material is a worse exposure than a re-login, and account A's single-use refresh
-		//     token was already spent by the exchange, so this specific material cannot be
-		//     recovered anyway. Leaving the intent rotating defers the verdict to the next
-		//     reconcile pass (account quarantined, generation unchanged, empty recovery slot →
-		//     unrecoverable → clean re-login) instead of racing an inline unrecoverable while the
-		//     vault is merely momentarily locked. Net effect vs the old code: same eventual
-		//     re-login, but a concurrent survivor is not told "unrecoverable" prematurely. NO
-		//     token is returned.
+		//   - TRANSIENT (a vault-locked seal, errVaultLocked): protect the merged login under
+		//     the server master key and persist it in the recovery slot. This leaves no raw login
+		//     material beyond this operation, survives process loss, and avoids spending the
+		//     single-use refresh token again. Reconciliation opens that temporary envelope and
+		//     re-seals it under the user DEK before promotion once the vault unlocks. NO token is
+		//     returned while the account is quarantined.
 		//   - PERMANENT (any other seal error): the material genuinely cannot be sealed, so route
 		//     it through the same unrecoverable resolution as an identity mismatch — mark the
 		//     intent unrecoverable and quarantine, forcing a clean re-login. NO token.
 		if errors.Is(err, errVaultLocked) {
-			_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
-			return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: seal of refreshed login temporarily unavailable: %v", ErrCodexRefreshQuarantined, err)
+			if s.box == nil {
+				s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
+				_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
+				return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: no master recovery sealer", ErrCodexRefreshUnrecoverable)
+			}
+			protected, perr := s.box.Seal(raw)
+			if perr != nil {
+				s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
+				_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
+				return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: protect vault-locked refresh: %v", ErrCodexRefreshUnrecoverable, perr)
+			}
+			if perr := s.persistCodexRecoverySlot(ctx, q, userID, accountID, operationID, acct.Generation, protected, store.SealedWithMaster); perr != nil {
+				s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
+				return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshUnrecoverable, perr)
+			}
+			return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: refreshed login retained pending vault unlock", ErrCodexRefreshQuarantined)
 		}
 		_, _ = q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{State: codexIntentUnrecoverable, OperationID: operationID, UserID: userID})
 		_, _ = q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: accountID, UserID: userID, Op: operationID})
@@ -572,7 +585,7 @@ func (s *Service) handleCodexCommitFailure(ctx context.Context, q codexRefreshSt
 	// marks the intent unrecoverable.
 	if perr := s.persistCodexRecoverySlot(ctx, q, userID, accountID, operationID, fromGeneration, sealedMerged, sealedWith); perr != nil {
 		s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
-		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshQuarantined, perr)
+		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshUnrecoverable, perr)
 	}
 	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: commit failed: %v", ErrCodexRefreshQuarantined, commitErr)
 }
@@ -605,7 +618,7 @@ func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefr
 	// the single-use material. Only an ESTABLISHED loss marks the intent unrecoverable.
 	if perr := s.persistCodexRecoverySlot(ctx, q, userID, accountID, operationID, fromGeneration, sealedMerged, sealedWith); perr != nil {
 		s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
-		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshQuarantined, perr)
+		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshUnrecoverable, perr)
 	}
 	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: identity re-verification unavailable: %v", ErrCodexRefreshQuarantined, discoverErr)
 }
@@ -632,8 +645,10 @@ func (s *Service) persistCodexRecoverySlot(ctx context.Context, q codexRefreshSt
 
 	// Bounded synchronous retry on a detached ctx.
 	for attempt := 0; attempt < codexRecoverySlotSyncAttempts; attempt++ {
-		if s.writeCodexRecoverySlotOnce(ctx, q, params) {
+		if werr := s.writeCodexRecoverySlotOnce(ctx, q, params); werr == nil {
 			return nil
+		} else if errors.Is(werr, errCodexRecoveryFenceLost) {
+			return werr
 		}
 		if attempt < codexRecoverySlotSyncAttempts-1 {
 			time.Sleep(codexRecoverySlotRetryBackoff)
@@ -648,8 +663,12 @@ func (s *Service) persistCodexRecoverySlot(ctx context.Context, q codexRefreshSt
 	}
 	s.background(func() {
 		for attempt := 0; attempt < codexRecoverySlotBgAttempts; attempt++ {
-			if s.writeCodexRecoverySlotOnce(ctx, q, params) {
+			werr := s.writeCodexRecoverySlotOnce(ctx, q, params)
+			if werr == nil {
 				return
+			}
+			if errors.Is(werr, errCodexRecoveryFenceLost) {
+				break
 			}
 			time.Sleep(codexRecoverySlotRetryBackoff)
 		}
@@ -665,13 +684,19 @@ func (s *Service) persistCodexRecoverySlot(ctx context.Context, q codexRefreshSt
 
 // writeCodexRecoverySlotOnce performs ONE SetCodexRecoverySlot write on a detached,
 // bounded-timeout context derived from ctx, so a cancelled request ctx does not abort it.
-// It returns true when the write succeeded (a store error is a transient failure the caller
-// retries; a 0-row result preserves the store's pre-existing fence semantics).
-func (s *Service) writeCodexRecoverySlotOnce(ctx context.Context, q codexRefreshStore, params store.SetCodexRecoverySlotParams) bool {
+// Store errors are retryable; exactly one affected row is success. Zero rows is a permanent
+// operation/generation fence miss and must never masquerade as persisted material.
+func (s *Service) writeCodexRecoverySlotOnce(ctx context.Context, q codexRefreshStore, params store.SetCodexRecoverySlotParams) error {
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRecoverySlotWriteTimeout)
 	defer cancel()
-	_, err := q.SetCodexRecoverySlot(wctx, params)
-	return err == nil
+	n, err := q.SetCodexRecoverySlot(wctx, params)
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return errCodexRecoveryFenceLost
+	}
+	return nil
 }
 
 // markCodexIntentUnrecoverable is the shared best-effort transition of an operation's intent
@@ -905,12 +930,29 @@ func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore,
 	id, derr := s.codexRefresh.DiscoverIdentity(ctx, blob.AccessToken)
 	switch {
 	case derr == nil && id.ProviderUserID == acct.ProviderUserID && id.WorkspaceAccountID == acct.WorkspaceAccountID:
-		// MATCH → install the recovery material. ErrNoRows means the slot moved under us
-		// (already promoted, or the from_generation no longer matches) — an idempotent no-op.
+		// MATCH → re-seal under the currently required key before installing. A recovery
+		// envelope may be master-sealed because the provider rotated while the user vault was
+		// locked; it must never become the live credential in that form. If the vault remains
+		// locked, leave the protected slot untouched for a later reconcile pass.
+		raw, merr := json.Marshal(blob) //nolint:gosec // G117: the merged login is immediately sealed before it leaves this branch
+		if merr != nil {
+			return fmt.Errorf("codex reconcile: encode recovery: %w", merr)
+		}
+		sealed, sealedWith, serr := s.sealCodexLogin(userID, raw)
+		if errors.Is(serr, errVaultLocked) {
+			return nil
+		}
+		if serr != nil {
+			return fmt.Errorf("codex reconcile: re-seal recovery: %w", serr)
+		}
+		// ErrNoRows means the slot moved under us (already promoted, or the
+		// from_generation no longer matches) — an idempotent no-op.
 		if _, perr := q.PromoteCodexRecovery(ctx, store.PromoteCodexRecoveryParams{
 			ID:             acct.ID,
 			UserID:         userID,
 			FromGeneration: acct.Generation,
+			Sealed:         sealed,
+			SealedWith:     sealedWith,
 		}); perr != nil && !errors.Is(perr, pgx.ErrNoRows) {
 			return fmt.Errorf("codex reconcile: promote recovery: %w", perr)
 		}

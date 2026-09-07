@@ -853,10 +853,18 @@ func TestSetCodexRecoverySlotLiveDB(t *testing.T) {
 		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
 	}
 
-	// SetCodexRecoverySlot now requires the live-lease owner's op and the key that sealed
-	// the recovery blob (non-empty 'master'|'dek', per 00199's CHECK pairing).
+	// A blob produced from the wrong generation is rejected even when the operation id
+	// still matches; this isolates the generation half of the recovery fence.
 	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
-		Sealed: []byte("prior-good-login"), Gen: 3, ID: acc.ID, UserID: user,
+		Sealed: []byte("wrong-generation"), Gen: 3, ID: acc.ID, UserID: user,
+		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
+	}); err != nil || n != 0 {
+		t.Fatalf("SetCodexRecoverySlot(wrong generation) = (%d,%v), want (0,nil)", n, err)
+	}
+
+	// The live-lease owner at the current generation can persist the recovery pair.
+	if n, err := q.SetCodexRecoverySlot(ctx, store.SetCodexRecoverySlotParams{
+		Sealed: []byte("prior-good-login"), Gen: 0, ID: acc.ID, UserID: user,
 		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
 	}); err != nil || n != 1 {
 		t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
@@ -866,9 +874,9 @@ func TestSetCodexRecoverySlotLiveDB(t *testing.T) {
 		t.Fatalf("GetCodexProviderAccountByID: %v", err)
 	}
 	if string(got.RecoverySealed) != "prior-good-login" || !got.RecoveryGeneration.Valid ||
-		got.RecoveryGeneration.Int64 != 3 || got.CoordState != "quarantined" ||
+		got.RecoveryGeneration.Int64 != 0 || got.CoordState != "quarantined" ||
 		!got.RecoverySealedWith.Valid || got.RecoverySealedWith.String != store.SealedWithMaster {
-		t.Fatalf("after SetCodexRecoverySlot = (sealed=%q gen=%+v state=%q sealed_with=%+v), want (prior-good-login, 3, quarantined, master)",
+		t.Fatalf("after SetCodexRecoverySlot = (sealed=%q gen=%+v state=%q sealed_with=%+v), want (prior-good-login, 0, quarantined, master)",
 			got.RecoverySealed, got.RecoveryGeneration, got.CoordState, got.RecoverySealedWith)
 	}
 
@@ -1211,9 +1219,9 @@ func mkCodexAccount(ctx context.Context, t *testing.T, q *store.Queries, user uu
 }
 
 // TestPromoteCodexRecoveryLiveDB pins PromoteCodexRecovery (PRD #1147 audit): it installs
-// the protected recovery material as the live login on a quarantined account whose
-// recovery_generation matches, advancing the generation and returning to idle; a second
-// call is a no-op (ErrNoRows, already promoted) and a wrong from_generation is refused.
+// the caller's identity-verified, freshly re-sealed material as the live login on a
+// quarantined account whose recovery_generation matches, advancing the generation and
+// returning to idle; a second call is a no-op and a wrong generation is refused.
 func TestPromoteCodexRecoveryLiveDB(t *testing.T) {
 	ctx, _, q, user := codexLiveDB(t)
 	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
@@ -1235,6 +1243,7 @@ func TestPromoteCodexRecoveryLiveDB(t *testing.T) {
 
 	gen, err := q.PromoteCodexRecovery(ctx, store.PromoteCodexRecoveryParams{
 		ID: acc.ID, UserID: user, FromGeneration: 0,
+		Sealed: []byte("verified-resealed"), SealedWith: store.SealedWithDEK,
 	})
 	if err != nil {
 		t.Fatalf("PromoteCodexRecovery: %v", err)
@@ -1246,8 +1255,8 @@ func TestPromoteCodexRecoveryLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read promoted: %v", err)
 	}
-	if string(promoted.SealedLogin) != "recovery-bytes" {
-		t.Fatalf("sealed_login = %q after promote, want the recovery bytes", promoted.SealedLogin)
+	if string(promoted.SealedLogin) != "verified-resealed" || promoted.SealedWith != store.SealedWithDEK {
+		t.Fatalf("promoted login = (%q,%q), want freshly re-sealed DEK material", promoted.SealedLogin, promoted.SealedWith)
 	}
 	if promoted.Generation != 1 || promoted.CoordState != "idle" ||
 		!promoted.CommittedGeneration.Valid || promoted.CommittedGeneration.Int64 != 1 {
@@ -1263,6 +1272,7 @@ func TestPromoteCodexRecoveryLiveDB(t *testing.T) {
 	// Idempotent: a second promote finds coord_state='idle' (not quarantined) → ErrNoRows.
 	if _, err := q.PromoteCodexRecovery(ctx, store.PromoteCodexRecoveryParams{
 		ID: acc.ID, UserID: user, FromGeneration: 1,
+		Sealed: []byte("second"), SealedWith: store.SealedWithDEK,
 	}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("second PromoteCodexRecovery returned %v, want pgx.ErrNoRows — the promotion is idempotent", err)
 	}
@@ -1284,6 +1294,7 @@ func TestPromoteCodexRecoveryLiveDB(t *testing.T) {
 	}
 	if _, err := q.PromoteCodexRecovery(ctx, store.PromoteCodexRecoveryParams{
 		ID: wrongAcc.ID, UserID: user, FromGeneration: 5,
+		Sealed: []byte("wrong-generation"), SealedWith: store.SealedWithDEK,
 	}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("PromoteCodexRecovery(wrong from_generation) returned %v, want pgx.ErrNoRows", err)
 	}
