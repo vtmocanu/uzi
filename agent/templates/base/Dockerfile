@@ -11,7 +11,7 @@
 # Agent SDK spawns a real Bash tool and the git flow needs git + coreutils. This
 # is a minimal Node 24 + git + bash base (digest shared with web/Dockerfile), run
 # as a non-root user (PRD §Worker runtime).
-FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf
 WORKDIR /app
 
 # git for clone/fetch/worktree; bash for the SDK Bash tool (M3); tini as PID 1 so

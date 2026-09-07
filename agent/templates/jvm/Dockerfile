@@ -8,7 +8,7 @@
 # of truth for the common layers; keep this in lockstep with it (a test pins the
 # devbox install + DEVBOX_VERSION match), and never drop a guardrail-relevant layer
 # to add a dependency.
-FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf
 WORKDIR /app
 
 # git for clone/fetch/worktree; bash for the SDK Bash tool; tini as PID 1; curl +
