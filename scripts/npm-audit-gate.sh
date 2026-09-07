@@ -209,10 +209,14 @@ registry_unreachable() {  # $1 = output file; rc 0 iff it looks like a registry 
 # classification below is identical on the last attempt as on the first.
 attempts="${UZI_NPM_AUDIT_ATTEMPTS:-3}"
 backoff="${UZI_NPM_AUDIT_BACKOFF_SECONDS:-2}"
-# Coerce a non-integer override back to the default so a bad env value cannot
-# error the gate under set -eu.
-case "$attempts" in ''|*[!0-9]*) attempts=3 ;; esac
-case "$backoff"  in ''|*[!0-9]*) backoff=2  ;; esac
+# Coerce a non-integer OR out-of-range override back to the default: these knobs
+# exist only to let a test shrink the sleeps, so a huge attempts count (retry for
+# an impractical duration) or a huge backoff (block the first retry for years) is a
+# fat-finger, not a real request. Empty/non-numeric AND above-max both fall back to
+# the default, applied independently to each (#1166 review, CodeRabbit). The trailing
+# `|| default` keeps these set -eu safe.
+case "$attempts" in ''|*[!0-9]*) attempts=3 ;; *) [ "$attempts" -ge 1 ] && [ "$attempts" -le 10 ] || attempts=3 ;; esac
+case "$backoff"  in ''|*[!0-9]*) backoff=2  ;; *) [ "$backoff" -le 60 ] || backoff=2 ;; esac
 attempt=1
 rc=0
 while : ; do
@@ -231,7 +235,9 @@ while : ; do
   echo "npm-audit-gate: $PKG_DIR -- registry unreachable on attempt $attempt of $attempts; retrying in ${backoff}s." >&2
   sleep "$backoff" || true
   attempt=$((attempt + 1))
-  backoff=$((backoff * 2))
+  # Capped exponential backoff: double, but never above the per-sleep ceiling, so a
+  # sustained outage cannot balloon into an arbitrarily long sleep even at the bound.
+  backoff=$((backoff * 2)); [ "$backoff" -le 60 ] || backoff=60
 done
 
 cat "$TMP/out"
