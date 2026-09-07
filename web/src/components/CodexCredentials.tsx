@@ -31,12 +31,12 @@ import { CODEX_DARK_COPY } from "./codexCredentialsCopy";
 // vaultLockedMessage is the shared copy for a 409 vault_locked: the global handler
 // has already refreshed the session, so the unlock banner is showing above.
 const VAULT_LOCKED =
-  "Your vault is locked — unlock it with the banner above, then save again.";
+  "Your vault is locked; unlock it with the banner above, then save again.";
 
 // D6's reason, in one place: rendered as a tooltip AND as the screen-reader
 // description the disabled-looking Delete points at, so the two cannot drift.
 const D6_HINT =
-  "Make another credential the default first — every account needs one default while any credential exists.";
+  "Make another credential the default first; every account needs one default while any credential exists.";
 
 function errText(err: unknown, fallback: string): string {
   if (isVaultLocked(err)) return VAULT_LOCKED;
@@ -136,7 +136,7 @@ export function codexShapeError(raw: string): string | null {
     typeof (nested as Record<string, unknown>).access_token === "string" &&
     ((nested as Record<string, unknown>).access_token as string).trim() !== ""
   ) {
-    return "This looks like the whole ~/.codex/auth.json file. Uzi needs a flat object with just access_token and refresh_token — use the copy command in “How to get this”.";
+    return "This looks like the whole ~/.codex/auth.json file. Uzi needs a flat object with just access_token and refresh_token; use the copy command in “How to get this”.";
   }
   return "This JSON has no access_token. See “How to get this” below.";
 }
@@ -496,7 +496,7 @@ function AddCredentialForm({
                 </code>
                 .
               </p>
-              <p>Then copy JUST the two fields uzi needs — never the whole file:</p>
+              <p>Then copy JUST the two fields uzi needs, never the whole file:</p>
               <p>
                 <code className="block overflow-x-auto rounded bg-raised px-2 py-1 text-fg">
                   {

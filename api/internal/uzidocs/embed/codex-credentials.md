@@ -8,7 +8,7 @@ audience: user
 
 **Settings → OpenAI / Codex credentials** lets you import an existing
 **Codex CLI / ChatGPT-subscription login** into uzi. It is not an OpenAI
-API key — that has its own field on the same card.
+API key; that has its own field on the same card.
 
 **Codex credentials do not yet start runs.** Saving one is dark: uzi stores
 and seals it, but no run, worker, or judge can spend it. You still need an
@@ -26,10 +26,10 @@ The **Codex login** field wants a flat JSON object, not a raw token:
 
 - **`access_token`** is the only thing required to save the credential.
 - **`refresh_token`** isn't checked at save time, but uzi needs it later to
-  renew the login once it expires — paste both together now rather than
+  renew the login once it expires, so paste both together now rather than
   going back for the refresh token afterwards.
 
-Do not paste a bare token string, and do not paste an OpenAI API key here —
+Do not paste a bare token string, and do not paste an OpenAI API key here;
 use the **OpenAI API key** field beside it for that.
 
 ## 1. Sign in with the Codex CLI
@@ -46,7 +46,7 @@ codex login status
 
 ## 2. Get the value safely
 
-The Codex CLI's own credential file, `~/.codex/auth.json`, is **nested** —
+The Codex CLI's own credential file, `~/.codex/auth.json`, is **nested**:
 your tokens live under a `tokens` object alongside other fields:
 
 ```json
@@ -62,7 +62,7 @@ your tokens live under a `tokens` object alongside other fields:
 }
 ```
 
-uzi wants the **flat** shape above, not the whole file — pasting the whole
+uzi wants the **flat** shape above, not the whole file; pasting the whole
 file fails with "codex login must contain a non-empty access_token",
 because the top level has no `access_token` of its own.
 
@@ -97,12 +97,12 @@ file-backed storage.
 
 ## Keep it secret
 
-The value you paste is a renewable credential, not a one-time code — treat
+The value you paste is a renewable credential, not a one-time code, so treat
 it like a password. Don't commit it, log it, paste it into an issue, or
 share it in chat.
 
 uzi seals it at rest the moment you save and never shows it again in the
-UI, an API response, or a log — not even to you. If you need to change it,
+UI, an API response, or a log, not even to you. If you need to change it,
 use **Replace value** to paste a new one; there is nothing to reveal or
 edit in place.
 
@@ -112,7 +112,7 @@ Each stored Codex credential shows one of four statuses:
 
 | Status | Meaning |
 |---|---|
-| `staging` | Saved and encrypted; the provider identity has not been verified yet. This build has no automatic verification — a `staging` credential can stay `staging` indefinitely. |
+| `staging` | Saved and encrypted; the provider identity has not been verified yet. This build has no automatic verification, so a `staging` credential can stay `staging` indefinitely. |
 | `linked` | The provider identity has been verified. |
 | `failed` | Verification failed. Replace the value, or re-add the login. |
-| `static` | An OpenAI API key, not a Codex login — provider-account linking doesn't apply to a key. |
+| `static` | An OpenAI API key, not a Codex login; provider-account linking doesn't apply to a key. |
