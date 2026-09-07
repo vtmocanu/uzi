@@ -2,11 +2,11 @@
 
 **Parent:** [#1106](https://github.com/vtmocanu/uzi/issues/1106), M3a only.
 **Status:** Implementation complete; post-review validation recorded below.
-**Execution:** Auto mode, MR rework enabled, implementation effort high.
+**Execution:** Auto mode, automatic MR rework disabled, implementation effort high. (AI-synced 2026-09-07)
 
 Package pinned Codex and its code-mode host in both worker images, and deliver a reusable isolated launcher with bounded, observed **per-root** process cleanup. This prepares later adapter integration without changing which harness any uzi run executes. [M2 #1146](done/1146-claude-harness-extraction.md) and [M1 #1147](done/1147-codex-credentials-foundation.md) are complete; M1 was independent and is not a dependency of this credential-free child. *(AI-synced 2026-09-07)*
 
-Use current `main` and a new working branch, never write to `main`. The accepted [ADR-1106 execution policy](../adr/1106-codex-harness.md#execution-policy) and [neutral lifecycle contract](../e2e/codex-m0/harness-contract.md#lifecycle-operation-order-and-evidence) remain authoritative. Complete only this child and hand off its PR. Auto orchestration may review, rework and merge it; do not close the parent or start another milestone.
+Use current `main` and a new working branch, never write to `main`. The accepted [ADR-1106 execution policy](../adr/1106-codex-harness.md#execution-policy) and [neutral lifecycle contract](../e2e/codex-m0/harness-contract.md#lifecycle-operation-order-and-evidence) remain authoritative. Complete only this child and hand off its PR. Maintainer review owns the final corrections and merge; do not close the parent or start another milestone. (AI-synced 2026-09-07)
 
 ## Boundary and preserved behavior
 
@@ -51,6 +51,8 @@ No credentials, refresh API, credential-default/identity design, full `CodexRunH
 Implementation owners: `agent/templates/{base,jvm}/`, a narrow worker-internal launcher/supervisor/install location, `e2e/codex-m3a/`, root `Taskfile.yml` and narrowly related documentation. Do not touch API/web/migrations, human specs or any real `.github/workflows/` file, even during validation. No real secrets/account identifiers/private hosts/raw runtime artifacts in code or public evidence; assemble secret-shaped test strings at runtime. Package/forge retrieval is allowed for the pinned artifacts; feature-semantics research is resolved here, not delegated to an offline worker.
 
 - 2026-09-06: User authorized this independent M3a child in Auto mode with MR rework enabled. M1 remains active and M2 complete. This child packages and tests an isolated per-root launch primitive; registry/epoch coordination, provider execution/credentials and the outer safety gate remain later M3 integration. Parent M3 stays unchecked.
+
+- 2026-09-07: Maintainer review took over the final corrections and disabled automatic MR rework. The reviewed tree fixes launcher substitution, runner-tree reuse, incomplete process evidence and sticky control/evidence-stream failures; the validation record below covers the corrected implementation. Parent M3 remains open. (AI-synced 2026-09-07)
 
 ## Validation evidence (this run)
 
