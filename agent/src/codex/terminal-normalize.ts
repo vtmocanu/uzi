@@ -30,9 +30,12 @@ const STATUS_ALLOWLIST: ReadonlySet<string> = new Set([
 /** The fixed token substituted for any status outside {@link STATUS_ALLOWLIST}. */
 const UNKNOWN_STATUS = "unknown";
 
-/** Cap on the number of numeric usage keys retained. Usage is provider-controlled and
- *  otherwise unbounded in key count; a single Codex turn legitimately reports far fewer
- *  than this, so 32 is generous headroom while staying finite. */
+/** Cap on the number of numeric usage keys RETAINED — NOT a loop-iteration bound. The loop
+ *  still walks every raw entry (a `break` fires only once 32 numeric keys are kept, which a
+ *  key-heavy non-numeric object never reaches), so what keeps the scan finite is the raw
+ *  input being size-bounded UPSTREAM by the transport's per-frame/queue ceilings, not this
+ *  cap. Usage is provider-controlled, and a single Codex turn legitimately reports far fewer
+ *  than this, so 32 is generous headroom for the retained subset while staying finite. */
 const MAX_USAGE_KEYS = 32;
 
 /**

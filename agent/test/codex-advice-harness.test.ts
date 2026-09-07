@@ -543,3 +543,120 @@ describe("CodexAdviceHarness: output schema is fail-closed", () => {
     assert.equal(launched, 0, "a refused json request launches nothing");
   });
 });
+
+describe("CodexAdviceHarness: terminal fields are normalized (no raw provider leakage)", () => {
+  it("routes decodeTerminal through the shared normalizers: no secret error/usage, bounded numeric usage, closed subtype", async () => {
+    // Assemble the secret at RUNTIME so no literal appears in source (the scanner sees none).
+    const secret = ["sk", "live", "DEADBEEF", "advice", "TOKEN"].join("_");
+    // A raw provider status OUTSIDE the closed allowlist → must collapse to the "unknown" token.
+    const rawStatus = ["provider", "weird", "status"].join("-");
+    // A big non-numeric nested blob to prove the WHOLE raw usage object is never retained.
+    const blob = "z".repeat(256 * 1024);
+    const usage = {
+      total_tokens: 42, // numeric ≥ 0 → kept
+      input_tokens: 7, // numeric ≥ 0 → kept
+      api_key: secret, // secret-shaped STRING field → dropped
+      nested: { blob }, // huge nested OBJECT → dropped
+    };
+    const terminalNote: CodexNotification = {
+      kind: "turn_completed",
+      method: "turn/completed",
+      threadId: "th-1",
+      turnId: "tn-1",
+      status: rawStatus,
+      params: { threadId: "th-1", turn: { id: "tn-1", status: rawStatus, error: secret, usage } },
+    };
+
+    const bits = makeHarness();
+    bits.transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(agentMessage("verdict"))
+      .push(terminalNote)
+      .end();
+
+    const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+
+    assert.equal(result.end.kind, "terminal");
+    if (result.end.kind === "terminal") {
+      const t = result.end.terminal;
+      // subtype is a CLOSED token for an unknown raw status (never the raw provider string).
+      assert.equal(t.subtype, "unknown");
+      assert.equal(t.outcome, "failed");
+      // errors are provider-text-free: the raw, secret-bearing turn.error is NEVER echoed.
+      assert.deepEqual(t.errors, ["codex turn ended with status: unknown"]);
+      // the materialized failure message is based on the CLOSED subtype, not the raw status.
+      const thrown = t.failure!.materialize();
+      assert.match(thrown.failure.message, /codex advice turn failed: unknown/);
+      assert.ok(!thrown.failure.message.includes(rawStatus), "the raw status never rides the failure message");
+    }
+    // usage.wire.usage is a bounded numeric-only subset — the string + nested blob are dropped.
+    assert.deepEqual(result.usage, {
+      basis: "turn",
+      tokens: {},
+      wire: { usage: { total_tokens: 42, input_tokens: 7 } },
+    });
+
+    // Nothing secret-bearing or oversize survives ANYWHERE in the returned result.
+    const serialized = JSON.stringify(result);
+    assert.ok(!serialized.includes(secret), "the secret-bearing provider error/field never leaks out");
+    assert.ok(!serialized.includes("zzzz"), "the huge nested usage blob is never retained");
+    assert.ok(!serialized.includes(rawStatus), "the raw provider status is never echoed");
+  });
+});
+
+describe("CodexAdviceHarness: launch is deadline-bound and disposed exactly once (finding 4)", () => {
+  it("the injected launchRoot receives a signal that becomes aborted on the wall-clock timeout", async () => {
+    const bits = makeHarness();
+    // thread/start answers, a partial message, then the stream blocks with NO terminal and NO
+    // end() → the wall-clock timeout fires and must abort the launch signal too.
+    bits.transport.push(threadStarted()).push(agentMessage("partial"));
+
+    const req = makeAdviceRequest({ label: "judge", timeoutMs: 25, graceMs: 10 });
+    await assert.rejects(bits.harness.run(req, noThrowPolicy), /judge model call exceeded 25ms/);
+
+    assert.equal(bits.launchSpecs.length, 1);
+    const spec = bits.launchSpecs[0]!;
+    assert.ok(spec.signal, "the launch spec carries an abort signal");
+    assert.equal(spec.signal!.aborted, true, "the wall-clock timeout aborts the launch signal");
+  });
+
+  it("late-dispose: a launch that finishes AFTER the settlement grace is still disposed EXACTLY once", async () => {
+    let disposeCalls = 0;
+    // A transport that NEVER completes (no terminal, no end): once the slow launch resolves
+    // past the timeout/grace, consume finds the signal already aborted and unwinds.
+    const transport = new FakeTransport();
+    const timeoutMs = 25;
+    const graceMs = 10;
+    const launchDelayMs = 120; // resolves well AFTER timeoutMs + graceMs
+
+    const launchRoot: LaunchAdviceRootSeam = (_spec) =>
+      new Promise<CodexAdviceLaunchResult>((resolve) => {
+        const t = setTimeout(() => {
+          resolve({
+            transport,
+            cwd: "/isolated/advice/late",
+            dispose: async () => {
+              disposeCalls += 1;
+            },
+          });
+        }, launchDelayMs);
+        t.unref?.();
+      });
+    const harness = new CodexAdviceHarness({ launchRoot, provider, log: noopLog });
+    const req = makeAdviceRequest({ label: "judge", timeoutMs, graceMs });
+
+    await assert.rejects(harness.run(req, noThrowPolicy), (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.equal((err as Error).message, `judge model call exceeded ${timeoutMs}ms`);
+      return true;
+    });
+    // The finally already ran while the launch was still pending (disposeSeam undefined), so
+    // nothing has been disposed yet — the old code would leak the root here forever.
+    assert.equal(disposeCalls, 0, "nothing is disposed while the slow launch is still pending");
+
+    // Wait past the launch delay for the late disposer (work.then → disposeOnce) to run.
+    await new Promise((r) => setTimeout(r, launchDelayMs + 80));
+    assert.equal(disposeCalls, 1, "the late-resolving launch root is disposed EXACTLY once");
+  });
+});

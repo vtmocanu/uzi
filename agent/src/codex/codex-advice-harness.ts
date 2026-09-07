@@ -39,6 +39,7 @@
 //     NEVER returned after a timeout.
 
 import { renderCodexAdvice } from "./render.js";
+import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
 import { errMessage } from "../util.js";
 
 import type { Logger } from "../log.js";
@@ -50,7 +51,6 @@ import type {
   HarnessError,
   HarnessTerminal,
   HarnessThrownFailure,
-  HarnessUsage,
 } from "../harness.js";
 import type { CodexProviderConfig } from "./codex-harness.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
@@ -90,6 +90,11 @@ export interface CodexAdviceLaunchSpec {
   /** The provider credential; PRIVATE — the seam forwards it to the isolated launcher
    *  env ONLY, never anywhere model-visible. */
   readonly credentialValue?: string;
+  /** OPTIONAL deadline/cancel signal for the launch itself. The harness passes its internal
+   *  abort signal (fired by the external request.signal OR the wall-clock timeout) so a slow
+   *  launcher can be cancelled instead of running uncancellable past the timeout. The
+   *  production launcher wiring is a deferred seam; honoring this is additive/best-effort. */
+  readonly signal?: AbortSignal;
 }
 
 /** What {@link LaunchAdviceRootSeam} returns: the app-server transport over the isolated
@@ -247,8 +252,19 @@ export class CodexAdviceHarness implements AdviceHarness {
     });
 
     // Launch + stream is ONE raced unit so the timeout bounds setup too. `disposeSeam` is
-    // captured for the finally regardless of how the race settles.
+    // captured once the launch resolves. Disposal is funneled through the idempotent
+    // `disposeOnce` so it runs EXACTLY ONCE regardless of race ordering.
     let disposeSeam: (() => Promise<void>) | undefined;
+    let disposed = false;
+    const disposeOnce = async (): Promise<void> => {
+      if (disposed) return;
+      const d = disposeSeam;
+      if (d === undefined) return; // nothing launched yet (a launch that itself rejected leaves nothing)
+      disposed = true;
+      await d().catch((e) =>
+        this.log.warn(`${request.label} codex advice HOME cleanup failed`, { error: errMessage(e) }),
+      );
+    };
     const work = (async (): Promise<AdviceResult> => {
       const launched = await this.launchRoot({
         kind: "advice",
@@ -257,10 +273,19 @@ export class CodexAdviceHarness implements AdviceHarness {
         model,
         // PRIVATE → the isolated launcher env ONLY; never a thread/turn param or frame.
         credentialValue: this.credentialValue,
+        // Bound the launch itself by the same deadline: a slow launcher can be aborted
+        // instead of resolving uncancellable past the timeout and leaking its root.
+        signal: internalAbort.signal,
       });
       disposeSeam = launched.dispose;
       return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal);
     })();
+
+    // Late-disposal owner: a launch that resolves AFTER the finally already ran (a slow
+    // launch that outlives the grace on the timeout path) still gets disposed here. Idempotent
+    // with the finally's `disposeOnce`, so the root is torn down EXACTLY ONCE whichever wins;
+    // `work`'s own rejection is swallowed (it was already surfaced by the race).
+    void work.then(() => disposeOnce(), () => disposeOnce());
 
     try {
       return await Promise.race([work, timeout]);
@@ -271,13 +296,10 @@ export class CodexAdviceHarness implements AdviceHarness {
       // isolated HOME is disposed, so cleanup does not race an aborted app-server that may
       // still touch its HOME. On the success path work already settled → returns at once.
       await awaitSettled(work, request.graceMs ?? DEFAULT_ADVICE_GRACE_MS);
-      // Best-effort HOME/root disposal. A cleanup warning NEVER replaces the primary
-      // failure (the try's throw/return already stands).
-      if (disposeSeam) {
-        await disposeSeam().catch((e) =>
-          this.log.warn(`${request.label} codex advice HOME cleanup failed`, { error: errMessage(e) }),
-        );
-      }
+      // Best-effort HOME/root disposal, EXACTLY ONCE. If the launch has not resolved within
+      // the grace this is a no-op and the late disposer above owns cleanup instead. A cleanup
+      // warning NEVER replaces the primary failure (the try's throw/return already stands).
+      await disposeOnce();
     }
   }
 
@@ -498,26 +520,28 @@ export class CodexAdviceHarness implements AdviceHarness {
    *  PROVIDER failure is DATA here — it is never also thrown. */
   private decodeTerminal(note: Extract<CodexNotification, { kind: "turn_completed" }>): HarnessTerminal {
     const turn = asObject(asObject(note.params)?.turn);
-    const status = note.status ?? asString(turn?.status) ?? "unknown";
-    const outcome: "success" | "failed" = status === "completed" ? "success" : "failed";
-    const usageObj = asObject(turn?.usage);
-    const usage: HarnessUsage | undefined =
-      usageObj !== undefined ? { basis: "turn", tokens: {}, wire: { usage: usageObj } } : undefined;
-    const errors: string[] = [];
-    const err = turn?.error;
-    if (typeof err === "string" && err.length > 0) errors.push(err);
+    const rawStatus = note.status ?? asString(turn?.status);
+    // Route through the single-source-of-truth normalizers so this advice decoder and the
+    // run-lane decoder (codex-harness.ts) cannot diverge and no raw provider field is ever
+    // retained: subtype/outcome come from the CLOSED vocabulary, errors are provider-text-
+    // free (the raw, possibly secret-bearing `turn.error` is never read), and usage is a
+    // bounded numeric-only subset (the raw, possibly multi-megabyte object is never kept).
+    const { subtype, outcome } = normalizeCodexStatus(rawStatus);
+    const errors = normalizeCodexTerminalErrors(subtype, outcome);
+    const usage = normalizeCodexUsage(turn?.usage, "turn");
     return {
       outcome,
-      subtype: status,
+      subtype,
       errors,
       usage,
       metrics: { cost: { kind: "unreported" } },
       failure: {
         // Deferred, invoked only at the owner's classification point. Codex M3 carries no
         // limit facts, so this constructs the generic terminal exception; it never invents
-        // an auth/model/effort category from a provider status.
+        // an auth/model/effort category from a provider status, and its message is based on
+        // the CLOSED subtype, never the raw provider status string.
         materialize: (_limit): HarnessThrownFailure => {
-          const original = new Error(`codex advice turn failed: ${status}`);
+          const original = new Error(`codex advice turn failed: ${subtype}`);
           return { failure: { category: "unknown", message: original.message }, original };
         },
       },
