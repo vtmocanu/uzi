@@ -84,6 +84,12 @@ instance is set to. Your admin can also pin a cheaper instance-wide default (`ha
 works, but your own override only changes your runs, while the admin's is
 the fallback for everyone who hasn't set one.
 
+The judge's reasoning effort follows your own [reasoning effort](./worker-effort.md)
+setting (uzi default `xhigh` when you haven't chosen a level) — previously the
+judge call fell through to the Claude Agent SDK's own built-in default of
+`high` instead. The `judge_model` picker above is unaffected; this only
+changes how hard the judge model reasons.
+
 Opus runs roughly **5–15× the cost of haiku** per retrospective. If your
 Anthropic token is a **subscription plan** rather than a metered console key,
 an opus judge spends **plan/rate-limit quota, not dollars** — under enforced

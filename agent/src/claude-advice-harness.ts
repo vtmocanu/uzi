@@ -69,6 +69,7 @@ export class ClaudeAdviceHarness implements AdviceHarness {
       spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
     };
     if (request.model) options.model = request.model;
+    if (request.effort) options.effort = request.effort;
 
     let text = "";
     let terminalMsg: unknown;

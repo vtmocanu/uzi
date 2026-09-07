@@ -30,6 +30,9 @@ through `[0.52.0]`.)
 - **Default reasoning effort is now `xhigh` for users who have not chosen a level ([#1157](https://github.com/vtmocanu/uzi/issues/1157)).**
   Runs whose owner never picked a reasoning-effort level now dispatch at uzi's own default of `xhigh` instead of the Claude Agent SDK's built-in `high`; an explicit choice (including `high`) is honored unchanged, and the Settings picker now labels the inherit and `xhigh` options as the uzi default.
 
+- **The retrospective judge lane now inherits the run owner's reasoning-effort setting ([#1162](https://github.com/vtmocanu/uzi/issues/1162)).**
+  A judge run over your finished runs now dispatches at your chosen reasoning-effort level (uzi default `xhigh` when you haven't chosen one), instead of falling through to the Claude Agent SDK's own built-in default of `high`; the `judge_model` setting is unchanged.
+
 - **The Findings surface in the web UI now uses a bug glyph instead of the warning triangle ([#1139](https://github.com/vtmocanu/uzi/issues/1139)).**
   The sidebar nav item, page header, empty state, and run-view finding card for Findings ("off-task bugs your workers flagged mid-run") switch from the AlertIcon warning triangle to a new BugIcon, keeping the sky/info tint; AlertIcon stays the genuine-warning glyph everywhere else (e.g. the missing-sweep-labels notice).
 
