@@ -30,29 +30,38 @@
 // is trusted in production. Widen the allowlist only with a proven credential-free
 // characterization; never widen it speculatively.
 //
-// ─── TRAVERSAL / SYMLINK SAFETY (openat2-style mindset) ─────────────────────────
-// All work is confined to the given source/dest roots: every copied path is resolved
-// and checked to stay within its root, directories are descended only after an
-// `lstat` proves they are not symlinks, and each file is copied through an
-// `O_NOFOLLOW` open on BOTH ends so a symlink (planted in the source `sessions/` or
-// at a dest path) is rejected atomically rather than followed out of the tree. The
-// TOP-LEVEL `sessions/` dir is itself `lstat`-guarded on BOTH ends before any
-// `readdir`/`mkdir`: if it is a symlink or not a directory the copy refuses (persist
-// throws a static module error; adopt no-ops) rather than letting `readdir` follow a
-// symlinked `sessions/` out to the untrusted codexHome root — the source there is the
-// UNTRUSTED codexHome, so the guard matters most on the copy path. The copy is
-// bounded on every axis — a per-file byte cap, a total byte cap, a file-count cap AND
-// a per-entry scan cap that charges EVERY entry examined (not just copied) — so a
-// hostile tree stuffed with non-allowlisted entries cannot make the walk run
-// unboundedly even when it copies nothing.
+// ─── TRAVERSAL / SYMLINK SAFETY (openat2-style, fd-anchored) ────────────────────
+// The copy walk is ANCHORED on held directory file descriptors on BOTH ends, never on
+// re-resolved pathnames. Each level holds an open source dir fd and dest dir fd, and
+// every child is opened relative to its parent fd via the Linux magic-symlink
+// `/proc/self/fd/<fd>/<name>` with `O_NOFOLLOW` (userland `openat`). Because a held fd
+// pins the directory INODE, a concurrent swap of an intermediate directory into a
+// symlink between listing a level and descending it cannot redirect resolution out of
+// either root — the guarantee the earlier lstat-then-readdir-by-pathname walk could not
+// give (it re-opened each level by name, so a raced intermediate symlink escaped BOTH
+// roots, and the source here is the UNTRUSTED codexHome). `O_NOFOLLOW` on every open
+// additionally rejects a symlinked final component atomically (ELOOP). The TOP-LEVEL
+// `sessions/` dir is opened by absolute path with `O_NOFOLLOW | O_DIRECTORY`: a
+// symlinked or non-directory `sessions/` is refused (persist throws a static module
+// error; adopt no-ops) rather than followed out to the untrusted codexHome root, while
+// an ABSENT source yields an empty tally (the fresh-root "nothing to persist" contract).
+// Each source file is copied through the OPEN fd — its size taken from an `fstat` on
+// that pinned fd and AT MOST that many bytes read — so a file that grows after the stat
+// can never be read unboundedly. The copy is bounded on every axis — a per-file byte
+// cap, a total byte cap, a file-count cap AND a per-entry scan cap that charges EVERY
+// entry examined (not just copied) — so a hostile tree stuffed with non-allowlisted
+// entries cannot make the walk run unboundedly even when it copies nothing. A failed
+// `persist` removes any partial dest copy before re-throwing, so a breach mid-copy
+// leaves nothing a later `adopt`/`inspect` would treat as a resumable store.
 //
 // This module NEVER logs file contents or a token; diagnostics are static and
 // bounded (an error names only which cap was hit, never a path or a byte).
 
 import fsp from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { constants as FS } from "node:fs";
 import type { Stats } from "node:fs";
-import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 
 import type { SessionPresence } from "../harness.js";
 
@@ -186,7 +195,7 @@ function isAllowedSessionArtifact(name: string): boolean {
   return true;
 }
 
-// ─── Confinement + symlink-safe file copy ───────────────────────────────────────
+// ─── Confinement helpers ─────────────────────────────────────────────────────────
 
 /** True iff `target` resolves to `root` itself or a descendant of it — the openat2
  *  "resolve within the given dir" confinement, applied to every path we touch. */
@@ -203,53 +212,80 @@ async function tryLstat(path: string): Promise<Stats | undefined> {
   }
 }
 
-/** Copy one file source→dest without following a symlink on EITHER end. `O_NOFOLLOW`
- *  makes the open fail (ELOOP) if the final component is a symlink, so a symlink
- *  planted in the source or a pre-existing symlink at the dest is rejected atomically
- *  rather than read/written through. Bounded by the caller's per-file cap. */
-async function copyFileNoFollow(src: string, dest: string): Promise<void> {
-  const input = await fsp.open(src, FS.O_RDONLY | FS.O_NOFOLLOW);
-  try {
-    const data = await input.readFile();
-    const output = await fsp.open(
-      dest,
-      FS.O_WRONLY | FS.O_CREAT | FS.O_TRUNC | FS.O_NOFOLLOW,
-      0o600,
-    );
-    try {
-      await output.writeFile(data);
-    } finally {
-      await output.close();
-    }
-  } finally {
-    await input.close();
-  }
-}
-
 interface CopyTally {
   files: number;
   bytes: number;
 }
 
+/** Open a single readdir CHILD `name` relative to an already-open parent directory
+ *  handle, using the Linux magic-symlink `/proc/self/fd/<fd>/<name>`. Because the
+ *  parent fd pins the directory INODE, a concurrent rename/swap of any ancestor path
+ *  cannot redirect where `name` resolves — this is `openat(parent, name, …)` emulated
+ *  in userland (the load-bearing anti-TOCTOU guard for the whole walk). `O_NOFOLLOW`
+ *  in `flags` additionally makes `name` itself un-followable if it is a symlink.
+ *
+ *  `name` is always a single component straight from `readdir`, which never yields a
+ *  separator or `.`/`..`; we still reject those defensively (fail closed) so a bug or a
+ *  hostile dirent can never turn this into a multi-component or parent traversal. */
+async function openAt(
+  parent: FileHandle,
+  name: string,
+  flags: number,
+  mode?: number,
+): Promise<FileHandle> {
+  if (
+    name === "" ||
+    name === "." ||
+    name === ".." ||
+    name.includes("/") ||
+    name.includes("\\") ||
+    name.includes("\0")
+  ) {
+    throw new Error("codex session store: refusing suspicious path component");
+  }
+  return fsp.open(`/proc/self/fd/${parent.fd}/${name}`, flags, mode);
+}
+
+/** Read AT MOST `size` bytes from an already-open file handle, against the PINNED fd
+ *  (never re-opening by path). `size` comes from an `fstat` on that same fd, so a file
+ *  that grows after the stat can never make this read past `size` — the read is bounded
+ *  by the size we already accounted, not by the file's current length. Returns only the
+ *  bytes actually read (a file that shrank yields fewer). */
+async function readBounded(fh: FileHandle, size: number): Promise<Buffer> {
+  const buf = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < size) {
+    const { bytesRead } = await fh.read(buf, offset, size - offset, offset);
+    if (bytesRead === 0) break; // EOF: the file is shorter than the fstat size
+    offset += bytesRead;
+  }
+  return offset === size ? buf : buf.subarray(0, offset);
+}
+
 /**
  * Recursively copy the allowlisted session artifacts from `srcSessionsDir` into
- * `destSessionsDir`, preserving relative structure. Rejects symlinks (files and
- * dirs), stays within both roots, skips non-regular files and non-allowlisted names,
- * and enforces the bounds.
+ * `destSessionsDir`, preserving relative structure. The walk is ANCHORED on held
+ * directory file descriptors on BOTH ends: every child is resolved relative to its
+ * parent fd via `/proc/self/fd/<fd>/<name>` (see {@link openAt}), and every open uses
+ * `O_NOFOLLOW`. Because each level pins its directory inode, a concurrent swap of an
+ * intermediate directory into a symlink between listing and descending it cannot
+ * redirect resolution out of either root — the openat2 "resolve within the given dir"
+ * guarantee the earlier pathname-based re-open (lstat-then-readdir-by-path) could not
+ * give. Symlinks (files or dirs) are never followed; non-regular files, non-allowlisted
+ * names, and auth-shaped (deny-substring) names/dirs are skipped; the copy is bounded
+ * on every axis.
  *
  * `throwOnBound` distinguishes the two contracts: `persist` passes `true` (fail
  * CLOSED — a breach throws and the partial store is not trusted); `adopt` passes
  * `false` (fail SAFE — it copies what fits and stops).
  *
- * FIX 1 (confinement): the top-level `srcRoot` is `lstat`-guarded BEFORE any
- * `readdir`. If it is a symlink or not a directory the copy refuses — `persist`
- * (fail-closed) throws a static {@link CodexSessionStoreError}, `adopt` (fail-safe)
- * returns an empty tally — so a symlinked `$CODEX_HOME/sessions` is never followed out
- * to the untrusted codexHome root. (An ABSENT source is NOT a refusal: it falls
- * through to `readdir`, which ENOENTs and yields 0 files, preserving the fresh-root
- * "nothing to persist" contract.) FIX 2 (DoS): every entry examined charges the
- * per-entry `visited` counter against `bounds.maxScanEntries`, so an adversarial tree
- * of non-allowlisted entries cannot make the walk run unboundedly even copying zero.
+ * The top-level SOURCE `sessions/` is opened directly by absolute path with
+ * `O_NOFOLLOW | O_DIRECTORY`: ENOENT is an ABSENT source (empty tally, preserving the
+ * fresh-root "nothing to persist" contract), while ELOOP (a symlink) or ENOTDIR (not a
+ * dir) is a refusal — `persist` throws {@link CodexSessionStoreError}, `adopt` returns
+ * empty. Every entry examined charges the per-entry `visited` counter against
+ * `bounds.maxScanEntries`, so an adversarial tree of non-allowlisted entries cannot
+ * make the walk run unboundedly even copying zero.
  */
 async function copyAllowlistedSessions(
   srcSessionsDir: string,
@@ -262,74 +298,146 @@ async function copyAllowlistedSessions(
   const tally: CopyTally = { files: 0, bytes: 0 };
   let visited = 0;
 
-  // FIX 1: guard the TOP-LEVEL source dir itself. `lstat` does not follow the final
-  // component, so a symlinked `sessions/` is caught here rather than being silently
-  // dereferenced by the `readdir` in `walk("")`. An absent source (no stat) is left to
-  // the fail-safe `readdir` path below (0 files), matching the fresh-root contract.
-  const srcStat = await tryLstat(srcRoot);
-  if (srcStat && (srcStat.isSymbolicLink() || !srcStat.isDirectory())) {
-    if (throwOnBound) throw new CodexSessionStoreError("source-not-directory");
-    return tally; // fail-safe: copy nothing
-  }
-
-  const walk = async (relDir: string): Promise<boolean> => {
-    const absDir = join(srcRoot, relDir);
+  // Walk one directory level holding BOTH the source and dest directory fds. Returns
+  // false to signal a fail-safe stop (a bound tripped with throwOnBound=false); throws
+  // on a fail-closed bound breach.
+  const walk = async (srcDirFh: FileHandle, destDirFh: FileHandle): Promise<boolean> => {
     let entries;
     try {
-      entries = await fsp.readdir(absDir, { withFileTypes: true });
+      // Listing the fd's own inode (via /proc/self/fd) keeps the read anchored: it
+      // enumerates exactly the directory the fd pins, not a re-resolved pathname.
+      entries = await fsp.readdir(`/proc/self/fd/${srcDirFh.fd}`, { withFileTypes: true });
     } catch {
-      return true; // an unreadable subdir is skipped (fail-safe), traversal continues
+      return true; // an unreadable subdir is skipped (fail-safe); the walk continues
     }
     for (const entry of entries) {
-      // FIX 2: charge EVERY entry examined, not just the ones copied, so a `sessions/`
-      // stuffed with non-allowlisted junk cannot make this walk run unboundedly.
+      // Charge EVERY entry examined, not just the ones copied, so a `sessions/` stuffed
+      // with non-allowlisted junk cannot make this walk run unboundedly.
       visited += 1;
       if (visited > bounds.maxScanEntries) {
         if (throwOnBound) throw new CodexSessionStoreBoundError("maxScanEntries", bounds.maxScanEntries);
         return false; // fail-safe: stop the walk
       }
 
-      const relPath = relDir === "" ? entry.name : `${relDir}/${entry.name}`;
-      const absSrc = join(srcRoot, relPath);
-      if (!isWithin(srcRoot, absSrc)) continue; // confinement
+      const name = entry.name;
 
-      const st = await tryLstat(absSrc);
-      if (!st) continue;
-      if (st.isSymbolicLink()) continue; // rejected: never follow out of the roots
-
-      if (st.isDirectory()) {
-        if (nameHasDenySubstring(entry.name)) continue; // never descend an auth-shaped dir
-        const proceed = await walk(relPath);
-        if (!proceed) return false;
+      if (entry.isDirectory()) {
+        if (nameHasDenySubstring(name)) continue; // never descend an auth-shaped dir
+        let srcChild: FileHandle;
+        try {
+          srcChild = await openAt(srcDirFh, name, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_DIRECTORY);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ELOOP" || code === "ENOTDIR") continue; // symlink / raced away: skip
+          throw error;
+        }
+        try {
+          // Create the dest child relative to the dest parent fd (openat-style), then
+          // open it O_NOFOLLOW so we descend into a real, in-tree directory.
+          try {
+            await fsp.mkdir(`/proc/self/fd/${destDirFh.fd}/${name}`, { mode: 0o700 });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          }
+          const destChild = await openAt(
+            destDirFh,
+            name,
+            FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_DIRECTORY,
+          );
+          try {
+            const proceed = await walk(srcChild, destChild);
+            if (!proceed) return false;
+          } finally {
+            await destChild.close();
+          }
+        } finally {
+          await srcChild.close();
+        }
         continue;
       }
-      if (!st.isFile()) continue; // sockets/fifos/devices excluded
-      if (!isAllowedSessionArtifact(entry.name)) continue;
 
-      if (st.size > bounds.maxFileBytes) {
-        if (throwOnBound) throw new CodexSessionStoreBoundError("maxFileBytes", bounds.maxFileBytes);
-        continue; // fail-safe: skip the oversized file
-      }
-      if (tally.files + 1 > bounds.maxFiles) {
-        if (throwOnBound) throw new CodexSessionStoreBoundError("maxFiles", bounds.maxFiles);
-        return false; // fail-safe: stop
-      }
-      if (tally.bytes + st.size > bounds.maxTotalBytes) {
-        if (throwOnBound) throw new CodexSessionStoreBoundError("maxTotalBytes", bounds.maxTotalBytes);
-        return false; // fail-safe: stop
-      }
+      if (!entry.isFile()) continue; // symlinks, sockets, fifos, devices excluded
+      if (!isAllowedSessionArtifact(name)) continue;
 
-      const absDest = join(destRoot, relPath);
-      if (!isWithin(destRoot, absDest)) continue; // confinement
-      await fsp.mkdir(dirname(absDest), { recursive: true, mode: 0o700 });
-      await copyFileNoFollow(absSrc, absDest);
-      tally.files += 1;
-      tally.bytes += st.size;
+      let srcFile: FileHandle;
+      try {
+        srcFile = await openAt(srcDirFh, name, FS.O_RDONLY | FS.O_NOFOLLOW);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ELOOP") continue; // raced into a symlink
+        throw error;
+      }
+      try {
+        // fstat on the PINNED fd: the size we bound and account is the size of the exact
+        // inode we hold open, immune to a post-listing grow/swap of the pathname.
+        const st = await srcFile.stat();
+        if (!st.isFile()) continue; // not a regular file after all → skip
+        if (st.size > bounds.maxFileBytes) {
+          if (throwOnBound) throw new CodexSessionStoreBoundError("maxFileBytes", bounds.maxFileBytes);
+          continue; // fail-safe: skip the oversized file
+        }
+        if (tally.files + 1 > bounds.maxFiles) {
+          if (throwOnBound) throw new CodexSessionStoreBoundError("maxFiles", bounds.maxFiles);
+          return false; // fail-safe: stop
+        }
+        if (tally.bytes + st.size > bounds.maxTotalBytes) {
+          if (throwOnBound) throw new CodexSessionStoreBoundError("maxTotalBytes", bounds.maxTotalBytes);
+          return false; // fail-safe: stop
+        }
+
+        // Bounded read of AT MOST st.size bytes from the fd (never readFile(), which
+        // would read past st.size if the file grew after the fstat).
+        const data = await readBounded(srcFile, st.size);
+
+        const destFile = await openAt(
+          destDirFh,
+          name,
+          FS.O_WRONLY | FS.O_CREAT | FS.O_TRUNC | FS.O_NOFOLLOW,
+          0o600,
+        );
+        try {
+          await destFile.writeFile(data);
+        } finally {
+          await destFile.close();
+        }
+
+        tally.files += 1;
+        tally.bytes += data.length; // account the ACTUAL bytes copied
+      } finally {
+        await srcFile.close();
+      }
     }
     return true;
   };
 
-  await walk("");
+  // Open the TOP-LEVEL source sessions dir directly by absolute path, O_NOFOLLOW so a
+  // symlinked `sessions/` is refused rather than followed out to the untrusted root.
+  let srcTop: FileHandle;
+  try {
+    srcTop = await fsp.open(srcRoot, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_DIRECTORY);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return tally; // absent source → nothing to persist (0 files)
+    if (code === "ELOOP" || code === "ENOTDIR") {
+      // Top-level sessions/ is a symlink or not a directory → refuse.
+      if (throwOnBound) throw new CodexSessionStoreError("source-not-directory");
+      return tally; // fail-safe: copy nothing
+    }
+    throw error; // unexpected (EACCES/…): let the caller wrap it
+  }
+  try {
+    // Create + open the top-level DEST sessions dir, O_NOFOLLOW so we never write
+    // THROUGH a symlinked dest either.
+    await fsp.mkdir(destRoot, { recursive: true, mode: 0o700 });
+    const destTop = await fsp.open(destRoot, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_DIRECTORY);
+    try {
+      await walk(srcTop, destTop);
+    } finally {
+      await destTop.close();
+    }
+  } finally {
+    await srcTop.close();
+  }
+
   return tally;
 }
 
@@ -387,6 +495,11 @@ export const CodexSessionStore = {
    * so a stale rollout never lingers. Only the allowlist is copied; symlinks are
    * rejected; the copy is bounded and throws {@link CodexSessionStoreBoundError} on
    * a breach. `opts.bounds` overrides the default caps (used by tests).
+   *
+   * Atomic-ish on failure: if the copy throws mid-way (a bound breach or an I/O
+   * error), the partial `destSessions` subtree is removed before the error propagates,
+   * so a failed persist leaves nothing a later `inspect`/`adopt` would treat as a
+   * resumable store.
    */
   async persist(
     codexHome: string,
@@ -394,21 +507,28 @@ export const CodexSessionStore = {
     opts: { bounds?: SessionStoreBounds } = {},
   ): Promise<PersistResult> {
     const bounds = opts.bounds ?? DEFAULT_SESSION_STORE_BOUNDS;
+    const srcSessions = join(codexHome, SESSION_ALLOWED_SUBDIR);
+    const destSessions = join(storeDir, SESSION_ALLOWED_SUBDIR);
     try {
       await fsp.mkdir(storeDir, { recursive: true, mode: 0o700 });
       await fsp.chmod(storeDir, 0o700);
 
-      const srcSessions = join(codexHome, SESSION_ALLOWED_SUBDIR);
-      const destSessions = join(storeDir, SESSION_ALLOWED_SUBDIR);
       // Refresh: clear any prior copy so the store never holds a stale rollout set.
       await fsp.rm(destSessions, { recursive: true, force: true });
 
       const tally = await copyAllowlistedSessions(srcSessions, destSessions, bounds, true);
       return { files: tally.files, bytes: tally.bytes };
     } catch (error) {
-      // Bound breaches keep their fail-closed contract, and the FIX 1 source refusal is
-      // already a static, path-free error — re-throw both as-is. Anything else is a raw
-      // `fs` error whose `.path` names a filesystem path; wrap it in a static module
+      // FIX 3 (atomic-ish persist): a bound breach or I/O error can throw AFTER some
+      // files were already copied, leaving a PARTIAL `destSessions` that a later
+      // `inspect()` would report "present" and `adopt()` would resume. Remove it before
+      // re-throwing so a failed persist leaves nothing adoptable. Swallow any cleanup
+      // error so it never masks the original failure.
+      await fsp.rm(destSessions, { recursive: true, force: true }).catch(() => {});
+
+      // Bound breaches keep their fail-closed contract, and the top-level source refusal
+      // is already a static, path-free error — re-throw both as-is. Anything else is a
+      // raw `fs` error whose `.path` names a filesystem path; wrap it in a static module
       // error so persist never propagates a path (see the module's safety rule).
       if (
         error instanceof CodexSessionStoreBoundError ||

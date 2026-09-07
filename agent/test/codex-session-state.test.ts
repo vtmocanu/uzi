@@ -353,6 +353,129 @@ describe("CodexSessionStore", () => {
     );
   });
 
+  it("FIX 3: a mid-copy file-count breach leaves NO adoptable partial store", async () => {
+    // Several allowlisted rollouts; a tiny maxFiles cap breaches AFTER the first is
+    // already copied. Pre-fix, persist threw but left that one file behind → inspect
+    // reported "present" and adopt would resume a truncated store. The fix removes the
+    // partial store in persist's catch, so nothing adoptable survives a failed persist.
+    for (let i = 0; i < 3; i += 1) {
+      await writeFileAt(join(codexHome, "sessions", `rollout-${i}.jsonl`), `{"i":${i}}\n`);
+    }
+    const tiny: SessionStoreBounds = { ...DEFAULT_SESSION_STORE_BOUNDS, maxFiles: 1 };
+
+    await assert.rejects(
+      () => CodexSessionStore.persist(codexHome, storeDir, { bounds: tiny }),
+      (err: unknown) => {
+        assert.ok(err instanceof CodexSessionStoreBoundError, "a bound error, not an unbounded copy");
+        assert.equal(err.bound, "maxFiles", "the file-count cap tripped mid-copy");
+        return true;
+      },
+    );
+
+    // The load-bearing FIX 3 assertion: no partial store is left behind.
+    assert.equal(
+      await CodexSessionStore.inspect(storeDir),
+      "absent",
+      "a failed persist must leave nothing a later inspect reports as present",
+    );
+    const freshHome = join(root, "fresh-home");
+    const adopted = await CodexSessionStore.adopt(storeDir, freshHome);
+    assert.equal(adopted.files, 0, "adopt finds nothing to resume after a failed persist");
+    assert.equal(existsSync(join(freshHome, "sessions")), false);
+  });
+
+  it("FIX 3: a mid-copy total-bytes breach leaves NO adoptable partial store", async () => {
+    // Same atomicity contract, tripped by the total-bytes cap instead: the first file
+    // fits, the second overflows maxTotalBytes and throws — pre-fix leaving the first.
+    for (let i = 0; i < 3; i += 1) {
+      await writeFileAt(join(codexHome, "sessions", `rollout-${i}.jsonl`), "x".repeat(64));
+    }
+    const tiny: SessionStoreBounds = { ...DEFAULT_SESSION_STORE_BOUNDS, maxTotalBytes: 100 };
+
+    await assert.rejects(
+      () => CodexSessionStore.persist(codexHome, storeDir, { bounds: tiny }),
+      (err: unknown) => {
+        assert.ok(err instanceof CodexSessionStoreBoundError);
+        assert.equal(err.bound, "maxTotalBytes", "the total-bytes cap tripped mid-copy");
+        return true;
+      },
+    );
+    assert.equal(await CodexSessionStore.inspect(storeDir), "absent", "no partial store survives");
+  });
+
+  it("FIX 2: a within-bounds nested tree copies with the correct files/bytes tally", async () => {
+    // Functional preservation of the fd-anchored walk: nested dirs copy, non-allowlisted
+    // files are skipped, and the byte tally is the sum of the ACTUAL rollout bytes read.
+    await writeFileAt(join(codexHome, "sessions", "rollout-a.jsonl"), "aaaa"); // 4 bytes
+    await writeFileAt(join(codexHome, "sessions", "2026", "rollout-b.jsonl"), "bbbbbb"); // 6 bytes
+    await writeFileAt(join(codexHome, "sessions", "notes.txt"), "ignored"); // not allowlisted
+
+    const result: PersistResult = await CodexSessionStore.persist(codexHome, storeDir);
+    assert.equal(result.files, 2, "both allowlisted rollouts copied; notes.txt skipped");
+    assert.equal(result.bytes, 10, "bytes tally is the sum of the actual rollout bytes");
+
+    const stored = await collectRelFiles(storeDir);
+    assert.deepEqual(stored, ["sessions/2026/rollout-b.jsonl", "sessions/rollout-a.jsonl"]);
+    assert.equal(
+      await fsp.readFile(join(storeDir, "sessions", "rollout-a.jsonl"), "utf8"),
+      "aaaa",
+    );
+    assert.equal(
+      await fsp.readFile(join(storeDir, "sessions", "2026", "rollout-b.jsonl"), "utf8"),
+      "bbbbbb",
+    );
+  });
+
+  it("FIX 2: a file over the per-file byte cap throws and leaves no store", async () => {
+    await writeFileAt(join(codexHome, "sessions", "rollout-big.jsonl"), "x".repeat(1024));
+    const tiny: SessionStoreBounds = { ...DEFAULT_SESSION_STORE_BOUNDS, maxFileBytes: 16 };
+    await assert.rejects(
+      () => CodexSessionStore.persist(codexHome, storeDir, { bounds: tiny }),
+      (err: unknown) => {
+        assert.ok(err instanceof CodexSessionStoreBoundError);
+        assert.equal(err.bound, "maxFileBytes");
+        return true;
+      },
+    );
+    assert.equal(await CodexSessionStore.inspect(storeDir), "absent");
+  });
+
+  it("FIX 1: a symlinked INTERMEDIATE directory under sessions/ is not followed", async () => {
+    // A dir OUTSIDE the roots holding a rollout a symlinked subdir would leak if followed.
+    const outsideDir = join(root, "outside-tree");
+    await writeFileAt(join(outsideDir, "rollout-outside.jsonl"), "SECRET_OUTSIDE_TREE");
+    await writeFileAt(join(codexHome, "sessions", "rollout-real.jsonl"), '{"ok":true}');
+    // sessions/subdir is a SYMLINK to that outside dir. The fd-anchored walk opens it
+    // O_NOFOLLOW|O_DIRECTORY (ELOOP → skip) and never descends into the target.
+    await fsp.symlink(outsideDir, join(codexHome, "sessions", "subdir"));
+
+    const result = await CodexSessionStore.persist(codexHome, storeDir);
+    assert.equal(result.files, 1, "only the in-tree rollout; the symlinked subtree is skipped");
+
+    const stored = await collectRelFiles(storeDir);
+    assert.deepEqual(stored, ["sessions/rollout-real.jsonl"]);
+    assert.ok(!stored.some((p) => p.includes("outside")), "no file from the symlinked subtree");
+    for (const rel of stored) {
+      assert.doesNotMatch(await fsp.readFile(join(storeDir, rel), "utf8"), /SECRET_OUTSIDE_TREE/);
+    }
+  });
+
+  it("FIX 1: a deny-substring directory under sessions/ is not descended", async () => {
+    await writeFileAt(join(codexHome, "sessions", "rollout-real.jsonl"), '{"ok":true}');
+    // A dir whose NAME carries an auth-shaped substring is never descended, even though
+    // it holds an otherwise-allowlisted .jsonl.
+    await writeFileAt(
+      join(codexHome, "sessions", "auth-cache", "rollout-inner.jsonl"),
+      "SECRET_INNER",
+    );
+
+    const result = await CodexSessionStore.persist(codexHome, storeDir);
+    assert.equal(result.files, 1, "the auth-cache/ dir is skipped entirely");
+    const stored = await collectRelFiles(storeDir);
+    assert.deepEqual(stored, ["sessions/rollout-real.jsonl"]);
+    assert.ok(!stored.some((p) => p.includes("inner")), "the inner rollout never copies");
+  });
+
   it("the allowlist/denylist constants encode the credential-free contract", () => {
     assert.equal(SESSION_ALLOWED_SUBDIR, "sessions");
     assert.ok(SESSION_ALLOWED_EXTENSIONS.includes(".jsonl"));
