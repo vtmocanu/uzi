@@ -433,7 +433,7 @@ check.
 It is offline by construction and never a bare `npx`, which would fetch from the
 network when the dep is missing.
 
-### `web` is pinned to vitest `4.1.10`, exactly
+### `web` is pinned to vitest `4.1.11`, exactly
 
 MR-C took `web` across the vitest 2 → 4 major. The pin is **exact, not a range**, and
 so is `@vitest/coverage-v8` — it is an exact-version optional peer of vitest, so the
