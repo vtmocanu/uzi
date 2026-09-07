@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import {
   CodexSessionStore,
   CodexSessionStoreBoundError,
+  CodexSessionStoreError,
   DEFAULT_SESSION_STORE_BOUNDS,
   SESSION_ALLOWED_EXTENSIONS,
   SESSION_ALLOWED_SUBDIR,
@@ -236,11 +237,127 @@ describe("CodexSessionStore", () => {
     );
   });
 
+  it("FIX 1: persist REFUSES a symlinked top-level sessions/ pointing at an outside dir", async () => {
+    // The HIGH-1 blind spot: `$CODEX_HOME/sessions` is ITSELF a symlink to a dir OUTSIDE
+    // codexHome. Pre-fix, `copyAllowlistedSessions` readdir'd the resolved path with no
+    // lstat on the top-level dir, so `readdir` followed the link and copied out-of-tree
+    // `.jsonl` into the runner-owned store. persist must now refuse before reading.
+    const outsideDir = join(root, "outside-sessions");
+    await writeFileAt(join(outsideDir, "rollout-outside.jsonl"), "SECRET_OUTSIDE_ROLLOUT");
+    await fsp.mkdir(codexHome, { recursive: true });
+    await fsp.symlink(outsideDir, join(codexHome, "sessions"));
+
+    await assert.rejects(
+      () => CodexSessionStore.persist(codexHome, storeDir),
+      CodexSessionStoreError,
+      "persist must refuse a symlinked top-level sessions/ rather than follow it",
+    );
+    const stored = await collectRelFiles(storeDir);
+    assert.deepEqual(stored, [], "no out-of-tree rollout was copied into the store");
+  });
+
+  it("FIX 1: persist REFUSES a symlinked top-level sessions/ pointing at the codexHome ROOT", async () => {
+    // sessions/ -> codexHome would expose the ROOT (where history.jsonl / auth.json live)
+    // to the .jsonl allowlist. `history.jsonl` passes name+ext, so absent the top-level
+    // guard it WOULD be copied out into the runner-owned store.
+    await fsp.mkdir(codexHome, { recursive: true });
+    await writeFileAt(join(codexHome, "history.jsonl"), "SECRET_ROOT_HISTORY");
+    await writeFileAt(join(codexHome, "auth.json"), "SECRET_ROOT_AUTH");
+    await fsp.symlink(codexHome, join(codexHome, "sessions"));
+
+    await assert.rejects(
+      () => CodexSessionStore.persist(codexHome, storeDir),
+      CodexSessionStoreError,
+    );
+    const stored = await collectRelFiles(storeDir);
+    // Empty store ⇒ neither the root history.jsonl nor auth.json (nor anything else) leaked.
+    assert.deepEqual(stored, [], "history.jsonl / auth.json at the codexHome root never leaked");
+  });
+
+  it("FIX 2: copy path is bounded by a per-entry scan cap, not just by files copied", async () => {
+    // Many NON-allowlisted entries: none are copyable, so the file/byte caps never trip —
+    // only the per-entry scan cap bounds the walk. Pre-fix this scanned unboundedly.
+    for (let i = 0; i < 40; i += 1) {
+      await writeFileAt(join(codexHome, "sessions", `junk-${i}.txt`), "x");
+    }
+    const tiny: SessionStoreBounds = {
+      ...DEFAULT_SESSION_STORE_BOUNDS,
+      maxFiles: 1,
+      maxScanEntries: 5,
+    };
+    await assert.rejects(
+      () => CodexSessionStore.persist(codexHome, storeDir, { bounds: tiny }),
+      (err: unknown) => {
+        assert.ok(err instanceof CodexSessionStoreBoundError, "a bound error, not an unbounded walk");
+        assert.equal(err.bound, "maxScanEntries", "the SCAN cap tripped, not maxFiles");
+        return true;
+      },
+    );
+  });
+
+  it("FIX 3: access.jsonl under sessions/ is excluded by the deny-substring list", async () => {
+    await writeFileAt(join(codexHome, "sessions", "rollout-real.jsonl"), '{"ok":true}');
+    await writeFileAt(join(codexHome, "sessions", "access.jsonl"), "SECRET_ACCESS");
+
+    const result = await CodexSessionStore.persist(codexHome, storeDir);
+    assert.equal(result.files, 1, "access.jsonl excluded; only the real rollout copies");
+
+    const stored = await collectRelFiles(storeDir);
+    assert.deepEqual(stored, ["sessions/rollout-real.jsonl"]);
+    assert.ok(!stored.some((p) => p.endsWith("access.jsonl")), "access.jsonl must not be stored");
+  });
+
+  it("FIX 3: adopt REFUSES to write through a symlinked dest sessions/", async () => {
+    // A store holding a rollout to adopt.
+    await writeFileAt(join(codexHome, "sessions", "rollout-real.jsonl"), '{"ok":true}');
+    await CodexSessionStore.persist(codexHome, storeDir);
+
+    // The fresh dest root has a PLANTED symlink at sessions/ -> an outside dir. mkdir
+    // (recursive) would FOLLOW it; adopt must not land the adopted file outside the root.
+    const freshHome = join(root, "fresh-home");
+    const outsideDir = join(root, "adopt-outside");
+    await fsp.mkdir(outsideDir, { recursive: true });
+    await fsp.mkdir(freshHome, { recursive: true });
+    await fsp.symlink(outsideDir, join(freshHome, "sessions"));
+
+    await CodexSessionStore.adopt(storeDir, freshHome);
+
+    assert.equal(
+      existsSync(join(outsideDir, "rollout-real.jsonl")),
+      false,
+      "adopt must not write the adopted file through the symlinked dest sessions/",
+    );
+    // The symlink was replaced by a real in-tree dir that received the rollout.
+    assert.equal(
+      existsSync(join(freshHome, "sessions", "rollout-real.jsonl")),
+      true,
+      "the rollout landed in a real, in-tree sessions dir",
+    );
+  });
+
+  it("FIX 3: persist wraps a raw fs error in a path-free module error", async () => {
+    await writeFileAt(join(codexHome, "sessions", "rollout-a.jsonl"), "x");
+    // storeDir pre-exists as a FILE, so persist's mkdir(storeDir, {recursive}) throws
+    // EEXIST — a raw fs error that would otherwise carry a `.path`.
+    await writeFileAt(storeDir, "i am a file, not a directory");
+
+    await assert.rejects(
+      () => CodexSessionStore.persist(codexHome, storeDir),
+      (err: unknown) => {
+        assert.ok(err instanceof CodexSessionStoreError, "raw fs error is wrapped");
+        assert.equal((err as { path?: unknown }).path, undefined, "wrapped error carries no .path");
+        assert.equal((err as CodexSessionStoreError).category, "io-error");
+        assert.doesNotMatch((err as Error).message, /\//, "message names no filesystem path");
+        return true;
+      },
+    );
+  });
+
   it("the allowlist/denylist constants encode the credential-free contract", () => {
     assert.equal(SESSION_ALLOWED_SUBDIR, "sessions");
     assert.ok(SESSION_ALLOWED_EXTENSIONS.includes(".jsonl"));
     assert.ok(SESSION_DENY_EXTENSIONS.includes(".pem"));
-    for (const deny of ["auth", "token", "credential", "login", "refresh", "cache"]) {
+    for (const deny of ["auth", "access", "token", "credential", "login", "refresh", "cache"]) {
       assert.ok(SESSION_DENY_NAME_SUBSTRINGS.includes(deny), `deny list must include ${deny}`);
     }
   });

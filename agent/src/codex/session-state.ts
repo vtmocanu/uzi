@@ -36,8 +36,15 @@
 // `lstat` proves they are not symlinks, and each file is copied through an
 // `O_NOFOLLOW` open on BOTH ends so a symlink (planted in the source `sessions/` or
 // at a dest path) is rejected atomically rather than followed out of the tree. The
-// copy is bounded — a per-file byte cap, a total byte cap, and a file-count cap — so
-// a hostile or runaway tree cannot copy unboundedly.
+// TOP-LEVEL `sessions/` dir is itself `lstat`-guarded on BOTH ends before any
+// `readdir`/`mkdir`: if it is a symlink or not a directory the copy refuses (persist
+// throws a static module error; adopt no-ops) rather than letting `readdir` follow a
+// symlinked `sessions/` out to the untrusted codexHome root — the source there is the
+// UNTRUSTED codexHome, so the guard matters most on the copy path. The copy is
+// bounded on every axis — a per-file byte cap, a total byte cap, a file-count cap AND
+// a per-entry scan cap that charges EVERY entry examined (not just copied) — so a
+// hostile tree stuffed with non-allowlisted entries cannot make the walk run
+// unboundedly even when it copies nothing.
 //
 // This module NEVER logs file contents or a token; diagnostics are static and
 // bounded (an error names only which cap was hit, never a path or a byte).
@@ -59,12 +66,23 @@ export const SESSION_ALLOWED_SUBDIR = "sessions";
  *  Provisional pending m3b:packaged confirmation (see file header). */
 export const SESSION_ALLOWED_EXTENSIONS: readonly string[] = [".jsonl"];
 
-/** Auth-shaped name substrings (case-insensitive). A file OR directory whose name
- *  contains any of these is excluded even when it otherwise looks like a rollout —
- *  the second allowlist gate, applied belt-and-braces on top of the subdir scope so
- *  an `auth-*.jsonl` accidentally written under `sessions/` is still never copied. */
+/** Auth-shaped name substrings. A file OR directory whose name contains any of these
+ *  is excluded even when it otherwise looks like a rollout.
+ *
+ *  This is a SECONDARY, belt-and-braces gate: the PRIMARY confinement is the
+ *  `sessions/` subdir scope (now symlink-guarded on the top-level dir, see FIX 1) plus
+ *  the `.jsonl` extension allowlist. The deny-list only adds depth so an `auth-*.jsonl`
+ *  (or `access.jsonl`) accidentally written under `sessions/` is still never copied.
+ *
+ *  It matches ASCII-case-insensitively ONLY (`.toLowerCase()`): homoglyph / Unicode
+ *  confusable names (e.g. a Cyrillic `а` in "аuth") are NOT normalized and would slip
+ *  past this substring test. That is a DOCUMENTED residual of the PROVISIONAL
+ *  content-trust model (see file header) — the primary allowlist, not this deny-list,
+ *  is the load-bearing gate, and the real rollout name set must be characterized
+ *  against the app-server in m3b:packaged before this is trusted in production. */
 export const SESSION_DENY_NAME_SUBSTRINGS: readonly string[] = [
   "auth",
+  "access",
   "token",
   "credential",
   "login",
@@ -87,6 +105,12 @@ export interface SessionStoreBounds {
   readonly maxTotalBytes: number;
   /** Maximum size of any single copied file. */
   readonly maxFileBytes: number;
+  /** Maximum number of directory ENTRIES the copy walk may examine in one operation,
+   *  counting EVERY entry lstat'd (files, dirs, non-allowlisted junk), not just the
+   *  ones copied. Bounds total work so an adversarial `sessions/` full of
+   *  non-allowlisted entries cannot make the walk run unboundedly. Must comfortably
+   *  exceed `maxFiles` so a legitimate full-size copy is never starved by the scan. */
+  readonly maxScanEntries: number;
 }
 
 /** Conservative production caps. A real rollout subtree is a handful of JSONL files;
@@ -95,6 +119,7 @@ export const DEFAULT_SESSION_STORE_BOUNDS: SessionStoreBounds = {
   maxFiles: 10_000,
   maxTotalBytes: 512 * 1024 * 1024, // 512 MiB
   maxFileBytes: 64 * 1024 * 1024, // 64 MiB
+  maxScanEntries: 100_000, // 10× maxFiles: headroom for dirs on a legit full copy
 };
 
 /** Result of {@link CodexSessionStore.persist}. */
@@ -119,6 +144,27 @@ export class CodexSessionStoreBoundError extends Error {
   ) {
     super(`codex session store bound exceeded: ${bound} (limit ${limit})`);
     this.name = "CodexSessionStoreBoundError";
+  }
+}
+
+/** The categories a {@link CodexSessionStoreError} can report. Each is a static token —
+ *  NEVER a path, byte, or filesystem detail — so a thrown error names only WHAT failed,
+ *  consistent with the "errors name only the cap, never a path" safety rule. */
+export type CodexSessionStoreErrorCategory =
+  /** The top-level `sessions/` source is a symlink or not a directory (FIX 1 refusal). */
+  | "source-not-directory"
+  /** A raw filesystem error escaped the copy; wrapped so its `.path` never propagates. */
+  | "io-error";
+
+/** Thrown by `persist` for a non-bound failure it must NOT leak details of. Raw `fs`
+ *  errors carry a `.path` (the source/dest path), which contradicts the module's
+ *  "errors name only the cap, never a path" rule — so `persist` wraps them in this
+ *  static, path-free error. Distinct from {@link CodexSessionStoreBoundError}, whose
+ *  fail-closed behavior is preserved (bound breaches are re-thrown as-is, not wrapped). */
+export class CodexSessionStoreError extends Error {
+  constructor(readonly category: CodexSessionStoreErrorCategory) {
+    super(`codex session store error: ${category}`);
+    this.name = "CodexSessionStoreError";
   }
 }
 
@@ -194,6 +240,16 @@ interface CopyTally {
  * `throwOnBound` distinguishes the two contracts: `persist` passes `true` (fail
  * CLOSED — a breach throws and the partial store is not trusted); `adopt` passes
  * `false` (fail SAFE — it copies what fits and stops).
+ *
+ * FIX 1 (confinement): the top-level `srcRoot` is `lstat`-guarded BEFORE any
+ * `readdir`. If it is a symlink or not a directory the copy refuses — `persist`
+ * (fail-closed) throws a static {@link CodexSessionStoreError}, `adopt` (fail-safe)
+ * returns an empty tally — so a symlinked `$CODEX_HOME/sessions` is never followed out
+ * to the untrusted codexHome root. (An ABSENT source is NOT a refusal: it falls
+ * through to `readdir`, which ENOENTs and yields 0 files, preserving the fresh-root
+ * "nothing to persist" contract.) FIX 2 (DoS): every entry examined charges the
+ * per-entry `visited` counter against `bounds.maxScanEntries`, so an adversarial tree
+ * of non-allowlisted entries cannot make the walk run unboundedly even copying zero.
  */
 async function copyAllowlistedSessions(
   srcSessionsDir: string,
@@ -204,6 +260,17 @@ async function copyAllowlistedSessions(
   const srcRoot = resolve(srcSessionsDir);
   const destRoot = resolve(destSessionsDir);
   const tally: CopyTally = { files: 0, bytes: 0 };
+  let visited = 0;
+
+  // FIX 1: guard the TOP-LEVEL source dir itself. `lstat` does not follow the final
+  // component, so a symlinked `sessions/` is caught here rather than being silently
+  // dereferenced by the `readdir` in `walk("")`. An absent source (no stat) is left to
+  // the fail-safe `readdir` path below (0 files), matching the fresh-root contract.
+  const srcStat = await tryLstat(srcRoot);
+  if (srcStat && (srcStat.isSymbolicLink() || !srcStat.isDirectory())) {
+    if (throwOnBound) throw new CodexSessionStoreError("source-not-directory");
+    return tally; // fail-safe: copy nothing
+  }
 
   const walk = async (relDir: string): Promise<boolean> => {
     const absDir = join(srcRoot, relDir);
@@ -214,6 +281,14 @@ async function copyAllowlistedSessions(
       return true; // an unreadable subdir is skipped (fail-safe), traversal continues
     }
     for (const entry of entries) {
+      // FIX 2: charge EVERY entry examined, not just the ones copied, so a `sessions/`
+      // stuffed with non-allowlisted junk cannot make this walk run unboundedly.
+      visited += 1;
+      if (visited > bounds.maxScanEntries) {
+        if (throwOnBound) throw new CodexSessionStoreBoundError("maxScanEntries", bounds.maxScanEntries);
+        return false; // fail-safe: stop the walk
+      }
+
       const relPath = relDir === "" ? entry.name : `${relDir}/${entry.name}`;
       const absSrc = join(srcRoot, relPath);
       if (!isWithin(srcRoot, absSrc)) continue; // confinement
@@ -319,16 +394,30 @@ export const CodexSessionStore = {
     opts: { bounds?: SessionStoreBounds } = {},
   ): Promise<PersistResult> {
     const bounds = opts.bounds ?? DEFAULT_SESSION_STORE_BOUNDS;
-    await fsp.mkdir(storeDir, { recursive: true, mode: 0o700 });
-    await fsp.chmod(storeDir, 0o700);
+    try {
+      await fsp.mkdir(storeDir, { recursive: true, mode: 0o700 });
+      await fsp.chmod(storeDir, 0o700);
 
-    const srcSessions = join(codexHome, SESSION_ALLOWED_SUBDIR);
-    const destSessions = join(storeDir, SESSION_ALLOWED_SUBDIR);
-    // Refresh: clear any prior copy so the store never holds a stale rollout set.
-    await fsp.rm(destSessions, { recursive: true, force: true });
+      const srcSessions = join(codexHome, SESSION_ALLOWED_SUBDIR);
+      const destSessions = join(storeDir, SESSION_ALLOWED_SUBDIR);
+      // Refresh: clear any prior copy so the store never holds a stale rollout set.
+      await fsp.rm(destSessions, { recursive: true, force: true });
 
-    const tally = await copyAllowlistedSessions(srcSessions, destSessions, bounds, true);
-    return { files: tally.files, bytes: tally.bytes };
+      const tally = await copyAllowlistedSessions(srcSessions, destSessions, bounds, true);
+      return { files: tally.files, bytes: tally.bytes };
+    } catch (error) {
+      // Bound breaches keep their fail-closed contract, and the FIX 1 source refusal is
+      // already a static, path-free error — re-throw both as-is. Anything else is a raw
+      // `fs` error whose `.path` names a filesystem path; wrap it in a static module
+      // error so persist never propagates a path (see the module's safety rule).
+      if (
+        error instanceof CodexSessionStoreBoundError ||
+        error instanceof CodexSessionStoreError
+      ) {
+        throw error;
+      }
+      throw new CodexSessionStoreError("io-error");
+    }
   },
 
   /**
@@ -344,6 +433,16 @@ export const CodexSessionStore = {
       if (!st || st.isSymbolicLink() || !st.isDirectory()) return { files: 0 };
 
       const destSessions = join(codexHome, SESSION_ALLOWED_SUBDIR);
+      // FIX 3 (dest-side twin of FIX 1): never write THROUGH a symlinked (or non-dir)
+      // dest `sessions/`. `mkdir(..., {recursive})` FOLLOWS a symlink, so a planted
+      // `codexHome/sessions -> /elsewhere` would land the copy out of the fresh root.
+      // If the dest exists as a symlink or a non-directory, remove that entry first
+      // (rm on a symlink unlinks only the link, never its target) so we then create a
+      // real, in-tree directory. A legit existing directory is left untouched.
+      const destStat = await tryLstat(destSessions);
+      if (destStat && (destStat.isSymbolicLink() || !destStat.isDirectory())) {
+        await fsp.rm(destSessions, { recursive: true, force: true });
+      }
       await fsp.mkdir(destSessions, { recursive: true, mode: 0o700 });
       const tally = await copyAllowlistedSessions(
         srcSessions,
