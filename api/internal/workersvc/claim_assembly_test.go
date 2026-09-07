@@ -144,10 +144,14 @@ func TestFormatInflightLineTruncation(t *testing.T) {
 		Status:     "running",
 	}
 	wantASCII := `issue #7 "` + strings.Repeat("a", 290)
-	if got := formatInflightLine(asciiRun); got != wantASCII {
-		t.Errorf("ASCII truncation: len=%d\n got=%q\nwant=%q", len(got), got, wantASCII)
-	} else if len(got) != maxInflightLineLen {
-		t.Errorf("ASCII truncation: len(got)=%d, want %d", len(got), maxInflightLineLen)
+	gotASCII := formatInflightLine(asciiRun)
+	if gotASCII != wantASCII {
+		t.Errorf("ASCII truncation: len=%d\n got=%q\nwant=%q", len(gotASCII), gotASCII, wantASCII)
+	}
+	// Independent length gate (kept unconditional, like the straddle cases below), so a
+	// regression that returns the right prefix at the wrong length is caught on its own.
+	if len(gotASCII) != maxInflightLineLen {
+		t.Errorf("ASCII truncation: len(gotASCII)=%d, want %d", len(gotASCII), maxInflightLineLen)
 	}
 
 	// (b) A 3-byte rune (世 = E4 B8 96) placed so its bytes occupy indices 298-300: byte
