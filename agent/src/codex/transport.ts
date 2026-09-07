@@ -38,6 +38,19 @@ const DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_OUTBOUND_FRAMES = 1024;
 /** Bound on decoded notifications buffered while no consumer is draining them. */
 const DEFAULT_MAX_INBOUND_NOTIFICATIONS = 4096;
+/**
+ * Aggregate-byte ceiling on the buffered notifications, independent of the count bound
+ * above. The count alone is not a memory bound: each queued note retains its raw frame
+ * `.params` up to the per-frame cap (DEFAULT_MAX_FRAME_BYTES = 4 MiB), so the count bound
+ * alone permits ~4096 × 4 MiB ≈ 16 GiB of retained frames — an OOM crash of the worker
+ * (default heap ~2 GB) long before 4096 items accrue, under an untrusted app-server
+ * emitting near-cap frames to a slow/non-draining `notifications()` consumer. 64 MiB is
+ * well below Node's default old-space (~2 GB, `--max-old-space-size`), leaving ample
+ * headroom for the rest of the worker while still absorbing a healthy notification burst;
+ * whichever of the two bounds trips first terminates the transport. The running sum is
+ * decremented as notes are consumed, so a draining consumer keeps the transport healthy.
+ */
+const DEFAULT_MAX_INBOUND_BYTES = 64 * 1024 * 1024;
 
 /**
  * A neutral, typed error carrying a reusable {@link HarnessError}. Every rejection and
@@ -100,6 +113,7 @@ export interface CodexTransportOptions {
   readonly maxFrameBytes?: number;
   readonly maxOutboundFrames?: number;
   readonly maxInboundNotifications?: number;
+  readonly maxInboundBytes?: number;
 }
 
 export interface CodexTransport {
@@ -143,6 +157,7 @@ class CodexTransportImpl implements CodexTransport {
   private readonly maxFrameBytes: number;
   private readonly maxOutbound: number;
   private readonly maxInbound: number;
+  private readonly maxInboundBytes: number;
 
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
@@ -154,7 +169,8 @@ class CodexTransportImpl implements CodexTransport {
   private readonly sendQueue: string[] = [];
   private draining = false;
 
-  private readonly notesQueue: CodexNotification[] = [];
+  private readonly notesQueue: Array<{ note: CodexNotification; bytes: number }> = [];
+  private notesBytes = 0;
   private notesWaiter: { resolve: (r: IteratorResult<CodexNotification>) => void; reject: (e: unknown) => void } | undefined;
   private notesIterated = false;
 
@@ -169,6 +185,7 @@ class CodexTransportImpl implements CodexTransport {
     this.maxFrameBytes = opts.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     this.maxOutbound = opts.maxOutboundFrames ?? DEFAULT_MAX_OUTBOUND_FRAMES;
     this.maxInbound = opts.maxInboundNotifications ?? DEFAULT_MAX_INBOUND_NOTIFICATIONS;
+    this.maxInboundBytes = opts.maxInboundBytes ?? DEFAULT_MAX_INBOUND_BYTES;
 
     this.inbound.setEncoding("utf8");
     this.inbound.on("data", this.onDataHandler);
@@ -185,7 +202,10 @@ class CodexTransportImpl implements CodexTransport {
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       if (this.closed) {
-        reject(this.terminalError ?? fail("protocol", "codex transport is closed"));
+        // A caller-initiated close (or a request after a clean EOF) is not a protocol
+        // violation; only a terminal framing/EOF failure (`terminalError`) carries
+        // `protocol`. Absent one, the transport is simply closed.
+        reject(this.terminalError ?? fail("transport", "codex transport is closed"));
         return;
       }
       const signal = opts?.signal;
@@ -233,7 +253,7 @@ class CodexTransportImpl implements CodexTransport {
   }
 
   notify(method: string, params?: unknown): void {
-    if (this.closed) throw this.terminalError ?? fail("protocol", "codex transport is closed");
+    if (this.closed) throw this.terminalError ?? fail("transport", "codex transport is closed");
     this.enqueueFrame(params === undefined ? { method } : { method, params });
   }
 
@@ -245,7 +265,8 @@ class CodexTransportImpl implements CodexTransport {
         new Promise<IteratorResult<CodexNotification>>((resolve, reject) => {
           const queued = this.notesQueue.shift();
           if (queued !== undefined) {
-            resolve({ value: queued, done: false });
+            this.notesBytes -= queued.bytes;
+            resolve({ value: queued.note, done: false });
             return;
           }
           if (this.closed) {
@@ -311,11 +332,12 @@ class CodexTransportImpl implements CodexTransport {
     while (nl !== -1) {
       const line = this.readBuf.slice(0, nl);
       this.readBuf = this.readBuf.slice(nl + 1);
-      if (Buffer.byteLength(line, "utf8") > this.maxFrameBytes) {
+      const byteLen = Buffer.byteLength(line, "utf8");
+      if (byteLen > this.maxFrameBytes) {
         this.terminate(fail("protocol", "codex transport inbound frame exceeds size cap"));
         return;
       }
-      this.handleLine(line);
+      this.handleLine(line, byteLen);
       if (this.closed) return;
       nl = this.readBuf.indexOf("\n");
     }
@@ -326,7 +348,7 @@ class CodexTransportImpl implements CodexTransport {
     }
   }
 
-  private handleLine(line: string): void {
+  private handleLine(line: string, byteLen: number): void {
     if (line.trim().length === 0) return;
     let value: unknown;
     try {
@@ -344,15 +366,15 @@ class CodexTransportImpl implements CodexTransport {
     const id = msg.id;
     if (typeof method === "string") {
       const requestId = typeof id === "number" || typeof id === "string" ? id : undefined;
-      this.pushNotification(this.decodeNotification(method, msg.params, requestId));
+      this.pushNotification(this.decodeNotification(method, msg.params, requestId), byteLen);
       return;
     }
     if (typeof id === "number" || typeof id === "string") {
-      this.dispatchResponse(id, msg);
+      this.dispatchResponse(id, msg, byteLen);
       return;
     }
     // Framing intact, but neither a method nor a correlatable id: liveness only.
-    this.pushNotification({ kind: "activity", method: null, params: msg });
+    this.pushNotification({ kind: "activity", method: null, params: msg }, byteLen);
   }
 
   private decodeNotification(method: string, params: unknown, requestId: number | string | undefined): CodexNotification {
@@ -381,12 +403,12 @@ class CodexTransportImpl implements CodexTransport {
       : { kind: "activity", method, requestId, params };
   }
 
-  private dispatchResponse(id: number | string, msg: Record<string, unknown>): void {
+  private dispatchResponse(id: number | string, msg: Record<string, unknown>, byteLen: number): void {
     const pending = typeof id === "number" ? this.pending.get(id) : undefined;
     if (!pending) {
       // Unmatched response id — not a request we track (or a string id we never mint).
       // Surface as liveness rather than drop it silently.
-      this.pushNotification({ kind: "activity", method: null, requestId: id, params: msg });
+      this.pushNotification({ kind: "activity", method: null, requestId: id, params: msg }, byteLen);
       return;
     }
     pending.onResponse(msg);
@@ -406,9 +428,10 @@ class CodexTransportImpl implements CodexTransport {
 
   // --- notification delivery (bounded, single-consumer) -----------------------
 
-  private pushNotification(note: CodexNotification): void {
+  private pushNotification(note: CodexNotification, bytes: number): void {
     if (this.closed) return;
     if (this.notesWaiter) {
+      // Delivered straight to a waiting consumer — never retained, so no byte accounting.
       const waiter = this.notesWaiter;
       this.notesWaiter = undefined;
       waiter.resolve({ value: note, done: false });
@@ -418,7 +441,15 @@ class CodexTransportImpl implements CodexTransport {
       this.terminate(fail("transport", "codex transport inbound notification buffer overflow"));
       return;
     }
-    this.notesQueue.push(note);
+    // Independent aggregate-byte ceiling: the count bound above does not cap retained
+    // memory (each note holds its raw frame `.params`), so enforce the byte sum too —
+    // whichever bound trips first wins.
+    if (this.notesBytes + bytes > this.maxInboundBytes) {
+      this.terminate(fail("transport", "codex transport inbound notification byte overflow"));
+      return;
+    }
+    this.notesQueue.push({ note, bytes });
+    this.notesBytes += bytes;
   }
 
   // --- terminal state ---------------------------------------------------------
@@ -443,7 +474,10 @@ class CodexTransportImpl implements CodexTransport {
     this.inbound.removeListener("error", this.onInboundError);
     this.outbound.removeListener("error", this.onOutboundError);
 
-    const reason = error ?? fail("protocol", "codex transport closed");
+    // A bare terminate() is a caller-initiated close (or a clean EOF with no request in
+    // flight) — a transport closure, not a `protocol` framing/EOF violation. Genuine
+    // protocol/EOF failures pass their own `error` and keep that category.
+    const reason = error ?? fail("transport", "codex transport closed");
     const entries = [...this.pending.values()];
     this.pending.clear();
     for (const entry of entries) entry.onError(reason);

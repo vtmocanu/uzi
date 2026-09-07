@@ -19,6 +19,11 @@ function tick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+/** Let queued stream `data` events drain into the transport before we inspect it. */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 3; i++) await tick();
+}
+
 /** Poll until `fn` yields a value, letting the event loop flush stream data events. */
 async function waitFor<T>(fn: () => T | undefined, label: string): Promise<T> {
   for (let i = 0; i < 2000; i++) {
@@ -47,7 +52,14 @@ function collectFrames(stream: Readable): () => Array<Record<string, unknown>> {
   return () => frames;
 }
 
-function makePair(opts: { maxFrameBytes?: number; maxOutboundFrames?: number } = {}): {
+function makePair(
+  opts: {
+    maxFrameBytes?: number;
+    maxOutboundFrames?: number;
+    maxInboundNotifications?: number;
+    maxInboundBytes?: number;
+  } = {},
+): {
   inbound: PassThrough;
   outbound: PassThrough;
   transport: CodexTransport;
@@ -184,6 +196,63 @@ describe("codex transport: bounded framing", () => {
   });
 });
 
+describe("codex transport: bounded inbound notification queue", () => {
+  it("terminates on the aggregate-byte ceiling before the count bound when nothing drains", async () => {
+    // A generous item-count bound, a tight byte ceiling: near-cap frames must trip BYTES
+    // first. A pending request observes the terminal failure without a note consumer.
+    const { inbound, transport } = makePair({ maxInboundNotifications: 1000, maxInboundBytes: 9000 });
+    const p = transport.request("thread/start", {});
+    const blob = "z".repeat(4000); // ~4 KB/frame: two fit under 9 KB, the third overflows.
+    for (let i = 0; i < 3; i++) writeFrame(inbound, { method: "flood", params: { i, blob } });
+
+    await assert.rejects(p, (err: unknown) => {
+      assert.ok(err instanceof CodexTransportError);
+      assert.equal(err.failure.category, "transport");
+      // BYTES tripped, not the (nowhere-near) item count.
+      assert.match(err.message, /byte overflow/);
+      return true;
+    });
+    await transport.close();
+  });
+
+  it("a draining consumer decrements the byte sum so a sustained burst never trips the ceiling", async () => {
+    const { inbound, transport } = makePair({ maxInboundNotifications: 1000, maxInboundBytes: 9000 });
+    const notes = transport.notifications();
+    const blob = "z".repeat(4000); // ~4 KB/frame; two fit under the 9 KB ceiling, three do not.
+
+    // Three rounds of {queue two, drain two}. Six ~4 KB frames total (~24 KB) dwarf the
+    // 9 KB ceiling, so absent the per-consume decrement the second round's first push
+    // would overflow and terminate the transport.
+    for (let round = 0; round < 3; round++) {
+      writeFrame(inbound, { method: "flood", params: { round, n: 0, blob } });
+      writeFrame(inbound, { method: "flood", params: { round, n: 1, blob } });
+      await flush(); // both queued (no waiter pending) before we drain them
+      for (let n = 0; n < 2; n++) {
+        const note = await notes.next();
+        assert.equal(note.done, false);
+        assert.equal((note.value as CodexNotification).kind, "activity");
+      }
+    }
+    await transport.close();
+  });
+
+  it("terminates on the item-count bound when frames are tiny", async () => {
+    // The audit noted the count bound was untested. Tiny frames stay far below the
+    // default 64 MiB byte ceiling, so only the count bound can trip.
+    const { inbound, transport } = makePair({ maxInboundNotifications: 3 });
+    const p = transport.request("thread/start", {});
+    for (let i = 0; i < 5; i++) writeFrame(inbound, { method: "tick", params: { i } });
+
+    await assert.rejects(p, (err: unknown) => {
+      assert.ok(err instanceof CodexTransportError);
+      assert.equal(err.failure.category, "transport");
+      assert.match(err.message, /buffer overflow/);
+      return true;
+    });
+    await transport.close();
+  });
+});
+
 describe("codex transport: unexpected EOF", () => {
   it("rejects a pending request with a protocol failure when the stream closes mid-request", async () => {
     const { inbound, transport } = makePair();
@@ -266,6 +335,57 @@ describe("codex transport: backpressure", () => {
     assert.equal((overflow as CodexTransportError).failure.category, "transport");
     assert.match((overflow as CodexTransportError).message, /outbound queue is full/);
 
+    await transport.close();
+  });
+});
+
+describe("codex transport: close vs protocol classification", () => {
+  it("rejects a request made after a caller-initiated close with a transport failure, not protocol", async () => {
+    const { transport } = makePair();
+    await transport.close();
+    await assert.rejects(transport.request("thread/start", {}), (err: unknown) => {
+      assert.ok(err instanceof CodexTransportError);
+      // A caller-initiated close is not a framing/EOF violation.
+      assert.equal(err.failure.category, "transport");
+      return true;
+    });
+  });
+
+  it("rejects pending requests with a transport failure when the caller closes explicitly", async () => {
+    const { transport } = makePair();
+    const p = transport.request("thread/start", {});
+    await tick();
+    await transport.close(); // caller-initiated closure of an in-flight call
+    await assert.rejects(p, (err: unknown) => {
+      assert.ok(err instanceof CodexTransportError);
+      assert.equal(err.failure.category, "transport");
+      return true;
+    });
+  });
+
+  it("rejects a request made after a clean EOF (no call in flight) with a transport failure", async () => {
+    const { inbound, transport } = makePair();
+    inbound.end(); // clean close with nothing pending — an ordinary close, not protocol
+    await flush();
+    await assert.rejects(transport.request("thread/start", {}), (err: unknown) => {
+      assert.ok(err instanceof CodexTransportError);
+      assert.equal(err.failure.category, "transport");
+      return true;
+    });
+    await transport.close();
+  });
+
+  it("still rejects an in-flight request with a protocol failure on a genuine EOF mid-request", async () => {
+    const { inbound, transport } = makePair();
+    const p = transport.request("thread/start", {});
+    await tick();
+    inbound.end(); // EOF WHILE a call is in flight — a genuine protocol failure
+    await assert.rejects(p, (err: unknown) => {
+      assert.ok(err instanceof CodexTransportError);
+      assert.equal(err.failure.category, "protocol");
+      assert.match(err.message, /closed mid-request/);
+      return true;
+    });
     await transport.close();
   });
 });
