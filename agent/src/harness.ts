@@ -318,6 +318,8 @@ export interface AdviceRequest {
   systemPrompt: string;
   prompt: string;
   model?: string;
+  /** Reasoning effort; applied to the SDK query only when set. */
+  effort?: HarnessEffort;
   output: { kind: "text" } | { kind: "json"; schema: JsonObject };
   signal: AbortSignal;
   timeoutMs: number;

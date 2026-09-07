@@ -43,6 +43,10 @@ unset.)
   model](./worker-model.md) — see that page. There is no per-schedule
   effort override and no CLI setter; the Settings control below is the
   only place to change it.
+- **Also governs the [judge](./judge.md) lane.** The retrospective judge run
+  over your finished runs now uses this same setting (uzi default `xhigh`
+  when you haven't chosen a level), instead of the Claude Agent SDK's own
+  built-in default of `high`.
 
 ## Set your reasoning effort
 
