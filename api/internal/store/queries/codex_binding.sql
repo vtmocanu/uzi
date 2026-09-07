@@ -1,0 +1,407 @@
+-- Codex per-run claim binding + coordinated-refresh primitives (PRD #1147 M2),
+-- STORE/SCHEMA only — ships DARK. The service layer drives the refresh state machine
+-- and the authority check; this file only provides the owner-scoped SQL primitives.
+-- Companion schema: 00202 (runs.codex_* columns), 00201 (codex_refresh_intent),
+-- 00199/00200 (codex_provider_account / codex_credential_state).
+
+-- name: FreezeRunCodexBinding :execrows
+-- Freeze a run's Codex binding at creation (PRD #1147 M2), via an internal create path
+-- rather than the public CreateRun — the binding is decided once, atomically, when the
+-- claim is assembled. Records the alias id, auth mode, snapshotted label and the alias
+-- material_revision frozen at creation; the account identity/revision are OPTIONAL here
+-- (nullable args) because a subscription run may not have resolved its account yet —
+-- SetRunCodexFrozenIdentity freezes those at first link. Owner-scoped; 0 rows for a
+-- run this user does not own.
+--
+-- SECURITY HARDENING (PRD #1147 audit): write-once-OR-exact-unchanged-retry freeze.
+-- Immutability is keyed on `codex_material_revision IS NULL` as the "not yet frozen"
+-- sentinel — NOT on codex_secret_id, which the runs_codex_secret_fk nulls on ON DELETE
+-- SET NULL (codex_secret_id) when the bound alias is deleted. codex_material_revision is
+-- written non-null at the first freeze and is NEVER nulled by that FK cascade, so it is a
+-- deletion-proof "initialized" marker. Semantics:
+--   * FIRST-EVER freeze (codex_material_revision IS NULL) affects the row and pins the
+--     whole snapshot.
+--   * A same-secret retry must present the EXACT unchanged snapshot (same secret_id,
+--     material_revision, auth_mode and label) to affect the row — an idempotent replay.
+--   * A changed material_revision/auth_mode/label, OR a post-deletion re-point with a NEW
+--     secret_id (the alias was deleted so codex_secret_id is now NULL but
+--     codex_material_revision is still the frozen value), affects 0 rows, so the original
+--     binding survives and a run can never be silently re-pointed at another credential.
+-- The audit flagged the unguarded UPDATE: it let a late/duplicate freeze overwrite a
+-- run's already-frozen binding, defeating the "decided once, atomically" guarantee.
+UPDATE runs
+SET codex_secret_id         = @secret_id::uuid,
+    codex_auth_mode         = @auth_mode::text,
+    codex_secret_label      = @secret_label::text,
+    codex_material_revision = @material_revision::bigint,
+    -- A late/duplicate freeze replay must NOT clobber an already-frozen account
+    -- identity back to NULL: COALESCE keeps the prior non-null value when this call
+    -- passes NULL (e.g. a subscription run whose account was frozen by a later
+    -- SetRunCodexFrozenIdentity and then a stale binding freeze is re-delivered).
+    -- Explicit ::text/::bigint casts on every narg: under pgx's extended protocol the
+    -- parameter type of a bare sqlc.narg is undeterminable (it appears only inside
+    -- COALESCE / an OR guard, never against a typed column alone), which fails at prepare
+    -- with 42P08 ("could not determine data type of parameter"). The casts pin the types
+    -- (codex_account_key is TEXT, codex_account_revision is BIGINT) without altering the
+    -- write-once semantics.
+    codex_account_key       = COALESCE(codex_account_key, sqlc.narg('account_key')::text),
+    codex_account_revision  = COALESCE(codex_account_revision, sqlc.narg('account_revision')::bigint),
+    updated_at              = now()
+WHERE id = @id AND user_id = @user_id
+    AND (
+        codex_material_revision IS NULL
+        OR (
+            codex_secret_id = @secret_id::uuid
+            AND codex_material_revision = @material_revision::bigint
+            AND codex_auth_mode = @auth_mode::text
+            AND codex_secret_label = @secret_label::text
+        )
+    )
+    -- Write-once identity guard: a replay carrying a DIFFERENT account_key than the
+    -- one already frozen affects 0 rows (a NULL incoming key, or an equal one, is
+    -- allowed), so a frozen identity can never be silently re-pointed.
+    AND (codex_account_key IS NULL OR sqlc.narg('account_key')::text IS NULL OR codex_account_key = sqlc.narg('account_key')::text);
+
+-- name: SetRunCodexFrozenIdentity :execrows
+-- Freeze the run's canonical identity + account revision at FIRST link (PRD #1147 M2):
+-- once a subscription run resolves its provider account, the account_key (the frozen
+-- identity tuple) and account_revision are pinned onto the run so the authority check
+-- can later compare run-frozen vs current. Owner-scoped; 0 rows for a foreign run.
+--
+-- SECURITY HARDENING (PRD #1147 audit): write-once identity freeze. The guard
+-- `codex_account_key IS NULL OR (codex_account_key = @key AND codex_account_revision =
+-- @rev)` pins the frozen identity tuple AND its account_revision immutably at first link
+-- — the FIRST freeze (NULL) and an identical retry (equal tuple AND equal revision)
+-- succeed, but a conflicting freeze presenting a DIFFERENT identity affects 0 rows, so
+-- the run's canonical identity can never be silently repointed to another account after
+-- it was frozen. account_revision is now part of the immutability guard: a same-tuple
+-- replay carrying a BUMPED account_revision (a replaced/revoked account re-minted under
+-- the same identity tuple) affects 0 rows, so it cannot be silently re-adopted. The audit
+-- flagged the unguarded UPDATE as the symmetric hole to FreezeRunCodexBinding's.
+UPDATE runs
+SET codex_account_key      = @key::text,
+    codex_account_revision = @rev::bigint,
+    updated_at             = now()
+WHERE id = @id AND user_id = @user_id
+    AND (codex_account_key IS NULL OR (codex_account_key = @key::text AND codex_account_revision = @rev::bigint));
+
+-- name: GetRunCodexAuthContext :one
+-- The authority-check read (PRD #1147 M2): the run's FROZEN Codex binding alongside the
+-- CURRENT alias/account state, so the service can compare the two and decide whether the
+-- run still holds authority over the account. A pure read — it mutates nothing. Joined
+-- rows are owner-consistent (state and account must belong to the run's own user), the
+-- same self-standing-scope idiom SetRunAnthropicSecret documents. The provider account
+-- join is LEFT because an 'api_key' (static openai_api_key) alias has a state row but no
+-- account behind it, so its current generation/revision/tuple come back NULL. Filtered
+-- by run id only, per the M2 read contract.
+--
+-- SECURITY HARDENING (PRD #1147 audit): two additive columns feed bind-time checks the
+-- source audit found missing.
+--   current_coord_state — the account's live coordination state (NULL for an api_key
+--   alias, which has no account behind the LEFT JOIN). The release predicate must NOT
+--   hand a run authority over an account parked in 'quarantined'/'in_progress'; without
+--   this column the release decision could not see the quarantine and could release a
+--   possibly-ambiguous account.
+--   bound_kind — the alias's own user_secrets.kind, joined owner-scoped (us.user_id =
+--   r.user_id) so it can never read a foreign secret's kind. The bind-time kind↔auth-mode
+--   check needs the actual kind to reject a binding whose auth_mode contradicts the
+--   credential kind (an openai_api_key alias frozen 'subscription', or vice versa). The
+--   join is INNER, not LEFT: a run carrying a codex binding always has its alias row (the
+--   codex_secret_id FK targets user_secrets) and the existing INNER join to
+--   codex_credential_state already requires a state row, so this adds no new NULL case.
+SELECT
+    r.codex_secret_id,
+    r.codex_auth_mode,
+    r.codex_account_key,
+    r.codex_material_revision,
+    r.codex_account_revision,
+    r.codex_claim_epoch,
+    r.codex_cap_hash,
+    r.worker_id,
+    r.status,
+    -- CURRENT alias material revision (the run-frozen one is r.codex_material_revision).
+    ccs.material_revision AS current_material_revision,
+    -- CURRENT account counters + immutable identity tuple (NULL for an api_key alias).
+    cpa.generation          AS current_generation,
+    cpa.credential_revision AS current_credential_revision,
+    cpa.provider_user_id,
+    cpa.workspace_account_id,
+    -- CURRENT account coordination state (NULL for an api_key alias): the release
+    -- predicate refuses a run authority over a quarantined/in-progress account.
+    cpa.coord_state AS current_coord_state,
+    -- The bound alias's own kind, for the bind-time kind↔auth-mode check.
+    us.kind AS bound_kind
+FROM runs r
+JOIN codex_credential_state ccs
+    ON ccs.user_secret_id = r.codex_secret_id AND ccs.user_id = r.user_id
+JOIN user_secrets us
+    ON us.id = r.codex_secret_id AND us.user_id = r.user_id
+LEFT JOIN codex_provider_account cpa
+    ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+WHERE r.id = @id;
+
+-- name: SetRunCodexClaimCapability :one
+-- Mint (or rotate) the per-claim Codex capability (PRD #1147 M2): store the new hash and
+-- bump the epoch so a prior capability is superseded. Guarded on worker_id — only the
+-- CURRENTLY-OWNING worker may mint, so a worker that already lost the claim cannot mint a
+-- fresh capability. RETURNING codex_claim_epoch hands back the PERSISTED post-bump epoch
+-- so the caller wires the capability off the value actually stored, not a re-derived one;
+-- a caller that no longer owns the run matches no row → pgx.ErrNoRows. The revocation half
+-- lives in every claimed→queued path in runtime.sql (the three Requeue* queries plus
+-- SweepClaimedNeverStarted), which clear the hash + bump the epoch on ownership loss.
+-- PRD #1147 F7 (defense-in-depth) extends the same revoke to the park/promote paths that
+-- likewise leave a run without a live owner: SetRunPoolWait (claimed→pool_wait hold),
+-- PromotePoolWaitRun (pool_wait→queued), and PromoteLimitWaitRuns (limit_wait→queued).
+-- SetRunLimitWait is INTENTIONALLY EXCLUDED: limit_wait is an actively-claimed status that
+-- keeps its live capability by design (persist-before-park), so revoking there would strip
+-- a run that still legitimately holds its claim.
+--
+-- STATUS GUARD (PRD #1147): the mint is additionally gated on the run being in one of the
+-- actively-claimed statuses ('claimed','running','awaiting_approval','awaiting_input',
+-- 'awaiting_followup','limit_wait'), the exact set of codexActivelyClaimedStatuses in
+-- codexauthz.go. It EXCLUDES the non-executing states (queued/pool_wait and the terminals):
+-- a run requeued out from under the worker (RequeueClaimedRunToQueued / SweepClaimedNeverStarted
+-- in runtime.sql clear the cap + bump the epoch but RETAIN worker_id) would otherwise still
+-- match on worker_id and let the departed worker re-mint a fresh capability. Closing this
+-- requeue TOCTOU: a 0-row match now surfaces as pgx.ErrNoRows → errRunVanished in the caller,
+-- which is the desired outcome.
+UPDATE runs
+SET codex_cap_hash    = @hash,
+    codex_claim_epoch = codex_claim_epoch + 1,
+    updated_at        = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status IN (
+      'claimed', 'running', 'awaiting_approval',
+      'awaiting_input', 'awaiting_followup', 'limit_wait'
+  )
+RETURNING codex_claim_epoch;
+
+-- name: AcquireCodexRefreshLease :execrows
+-- CAS-acquire the refresh lease on a provider account (PRD #1147 M2): move it to
+-- 'in_progress' under this operation with a lease deadline, but only from a state where
+-- no live lease or quarantine blocks it ('idle' or a prior 'committed') AND the account is
+-- STILL at the generation the caller intends to advance from (@from_generation). 0 rows
+-- means a live lease or a quarantine already holds the account, OR the generation has
+-- already moved — the caller must not proceed.
+--
+-- The generation guard (PRD #1147 M4) closes the stale-generation redundant-exchange
+-- window: without it, a loser op that snapshotted an old generation could acquire the
+-- freshly-idle lease AFTER a winner completed a full exchange→commit→reset cycle and then
+-- perform a SECOND provider exchange with its now-stale refresh token (its commit would be
+-- CAS-rejected, but the provider was already called twice — violating the "exactly ONE
+-- rotation per stale-generation burst" invariant D5 and wasting a single-use rotating
+-- refresh token). Requiring generation = @from_generation makes that loser's acquire fail
+-- (0 rows), so the service re-reads, sees the account already advanced, and reconciles to
+-- the committed token with NO provider call. Owner-scoped.
+UPDATE codex_provider_account
+SET coord_state        = 'in_progress',
+    coord_operation_id = @op::uuid,
+    lease_deadline     = @deadline::timestamptz,
+    updated_at         = now()
+WHERE id = @id AND user_id = @user_id AND coord_state IN ('idle', 'committed')
+    AND generation = @from_generation::bigint;
+
+-- name: QuarantineExpiredCodexLease :execrows
+-- Reap an expired lease (PRD #1147 M2): an 'in_progress' account whose lease_deadline has
+-- passed is moved to 'quarantined' so a survivor can reconcile it rather than steal a
+-- possibly-still-live lease. 0 rows when the lease is not expired (or the account is not
+-- in_progress). Owner-scoped.
+UPDATE codex_provider_account
+SET coord_state = 'quarantined', updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND coord_state = 'in_progress' AND lease_deadline < @now::timestamptz;
+
+-- name: CommitCodexRefresh :one
+-- CAS-commit a completed refresh (PRD #1147 M2): advance the generation and install the
+-- new sealed login ONLY IF the account is still at the generation the refresh started
+-- from (@from_generation), which is what makes a lost/duplicate refresher's stale commit
+-- a no-op. committed_generation records the generation this commit produced, and the
+-- recovery slot is cleared (the commit succeeded, so there is nothing to roll back to).
+-- The immutable identity tuple (provider_user_id/workspace_account_id) is deliberately
+-- NOT touched. pgx.ErrNoRows means the CAS was lost — EITHER the generation moved OR this
+-- operation no longer holds a live lease. The coord_state='in_progress' AND
+-- coord_operation_id=@op guard is load-bearing (PRD #1147 M2, B6 §9): a lease that expired
+-- and was moved to 'quarantined' must NOT be revivable into a commit by its presumed-dead
+-- refresher — that would silently bypass the quarantine (clearing the recovery slot and
+-- flipping quarantined→committed) exactly when the rotation outcome is ambiguous. Only the
+-- operation that still owns the in_progress lease may commit. Owner-scoped.
+UPDATE codex_provider_account
+SET generation           = generation + 1,
+    sealed_login         = @sealed,
+    sealed_with          = @sealed_with::text,
+    coord_state          = 'committed',
+    committed_generation = generation + 1,
+    coord_operation_id   = @op::uuid,
+    recovery_sealed      = NULL,
+    recovery_generation  = NULL,
+    -- 00199's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
+    -- so clearing the recovery blob MUST also clear its key discriminator or an account
+    -- with a populated recovery slot would violate the CHECK (23514) on commit.
+    recovery_sealed_with = NULL,
+    updated_at           = now()
+WHERE id = @id AND user_id = @user_id AND generation = @from_generation::bigint
+    AND coord_state = 'in_progress' AND coord_operation_id = @op::uuid
+RETURNING generation, coord_state, committed_generation;
+
+-- name: SetCodexRecoverySlot :execrows
+-- Protect a previously-good login into the recovery slot and quarantine the account (PRD
+-- #1147 M2): the commit-or-persistence-failure path preserves the material needed to roll
+-- back and parks the account for reconciliation. Owner-scoped.
+--
+-- SECURITY HARDENING (PRD #1147 audit): operation-identity guard (coord_operation_id=@op)
+-- across the in_progress/quarantined states. The identity guard is what prevents a
+-- stale/foreign op from writing: a different op that committed sets coord_operation_id to
+-- itself, and RefreshCodexAccountLogin nulls it, so a dead op matches 0 rows either way.
+-- The generation guard is the second half of the fence: recovery material produced from
+-- generation N must never be installed after the account moved to another generation,
+-- even if a corrupt/intermediate state retained the old operation id.
+-- Allowing coord_state IN ('in_progress','quarantined') lets the operation that owns the
+-- lease protect its own material even after its lease expired and was reaped to
+-- 'quarantined' (QuarantineExpiredCodexLease keeps coord_operation_id) — precisely the
+-- commit-failure recovery path (handleCodexCommitFailure/codexRetainUnverifiedMaterial).
+-- This does NOT weaken the identity guard: without the quarantined state the protect write
+-- matched 0 rows after a mid-flight quarantine and silently dropped freshly-rotated
+-- material. recovery_sealed_with records which key sealed the protected blob (PRD #1147
+-- F14), so a later promotion can open it with the correct key even if the live sealed_login
+-- has since migrated master→dek. (Callers in workersvc gain the @op param in a later unit.)
+UPDATE codex_provider_account
+SET recovery_sealed      = @sealed,
+    recovery_generation  = @gen::bigint,
+    recovery_sealed_with = @recovery_sealed_with,
+    coord_state          = 'quarantined',
+    updated_at           = now()
+WHERE id = @id AND user_id = @user_id
+    AND coord_operation_id = @op::uuid
+    AND coord_state IN ('in_progress', 'quarantined')
+    AND generation = @gen::bigint;
+
+-- name: ResetCodexCoordIdle :execrows
+-- Return a 'committed' account to 'idle' (PRD #1147 M2) once the committed token has been
+-- distributed, clearing the operation id and lease deadline so the account is ready for
+-- the next refresh cycle. Guarded on coord_state='committed' so it only ever advances a
+-- settled account. Owner-scoped.
+UPDATE codex_provider_account
+SET coord_state        = 'idle',
+    coord_operation_id = NULL,
+    lease_deadline     = NULL,
+    updated_at         = now()
+WHERE id = @id AND user_id = @user_id AND coord_state = 'committed';
+
+-- name: PromoteCodexRecovery :one
+-- Install re-verified recovery material as the live login (SECURITY HARDENING, PRD
+-- #1147 audit): the reconcile path's roll-forward for a quarantined account whose
+-- recovery slot holds a known-good login. The caller opens and identity-verifies the
+-- recovery blob, then re-seals it under the currently required key and passes that sealed
+-- value here. This is what lets a vault-locked refresh use a temporary master-sealed
+-- recovery envelope without promoting that envelope as a live credential: after unlock,
+-- the live login is DEK-sealed before this CAS makes it authoritative.
+--
+-- Guarded on coord_state='quarantined' AND recovery_sealed IS NOT NULL AND
+-- recovery_generation = @from_generation so ONLY a quarantined account carrying the
+-- expected recovery generation is promoted, and the promotion is IDEMPOTENT: a second
+-- call finds coord_state != 'quarantined' (already promoted to 'idle') and matches 0
+-- rows → pgx.ErrNoRows, so a retried reconcile cannot double-advance the generation. A
+-- wrong @from_generation (the recovery slot moved under the caller) likewise matches 0
+-- rows. The audit flagged that without a dedicated roll-forward primitive the reconcile
+-- path had no CAS-safe way to make the recovery material live.
+--
+-- @sealed/@sealed_with are one inseparable freshly-sealed pair. The recovery slot's own
+-- discriminator remains the authority for opening the recovery input; it is cleared with
+-- the slot after this replacement pair lands.
+UPDATE codex_provider_account
+SET sealed_login         = @sealed,
+    sealed_with          = @sealed_with::text,
+    generation           = generation + 1,
+    committed_generation = generation + 1,
+    coord_state          = 'idle',
+    coord_operation_id   = NULL,
+    lease_deadline       = NULL,
+    recovery_sealed      = NULL,
+    recovery_generation  = NULL,
+    recovery_sealed_with = NULL,
+    updated_at           = now()
+WHERE id = @id AND user_id = @user_id
+    AND coord_state = 'quarantined'
+    AND recovery_sealed IS NOT NULL
+    AND recovery_generation = @from_generation::bigint
+RETURNING generation;
+
+-- name: RefreshCodexAccountLogin :execrows
+-- Install a freshly-sealed login on an account after a VERIFIED re-login (SECURITY
+-- HARDENING, PRD #1147 audit): the recovery path when the recovery slot is empty or
+-- untrusted and the service has re-authenticated the subscription out of band. It writes
+-- the new sealed_login + sealed_with, advances the generation (and committed_generation)
+-- so stale CAS writers lose, returns the account to 'idle', and clears the coordination +
+-- recovery slots. Owner-scoped; 0 rows for a foreign account. Unlike PromoteCodexRecovery
+-- this is a fresh install (new sealed_with may differ), so sealed_with IS written.
+--
+-- Guarded on coord_state='quarantined' AND generation = @from_generation so ONLY a
+-- quarantined account still at the caller's expected generation is restored: the restore
+-- now LOSES to a concurrent PromoteCodexRecovery that already advanced the generation (and
+-- returned the account to 'idle'). 0 rows means the quarantine moved under the caller (the
+-- generation advanced or the account is no longer quarantined) → the caller must reject
+-- before linking. This mirrors PromoteCodexRecovery's CAS: a stale writer loses rather than
+-- clobbering a freshly-promoted login.
+UPDATE codex_provider_account
+SET sealed_login         = @sealed,
+    sealed_with          = @sealed_with::text,
+    generation           = generation + 1,
+    committed_generation = generation + 1,
+    coord_state          = 'idle',
+    coord_operation_id   = NULL,
+    lease_deadline       = NULL,
+    recovery_sealed      = NULL,
+    recovery_generation  = NULL,
+    -- 00199's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
+    -- so clearing the recovery blob MUST also clear its key discriminator or an account
+    -- with a populated recovery slot (e.g. a quarantine re-login) would violate the
+    -- CHECK (23514) on this install.
+    recovery_sealed_with = NULL,
+    updated_at           = now()
+WHERE id = @id AND user_id = @user_id
+    AND coord_state = 'quarantined'
+    AND generation = @from_generation::bigint;
+
+-- name: QuarantineCodexAccount :execrows
+-- Quarantine an in-progress account WITHOUT writing recovery material (SECURITY
+-- HARDENING, PRD #1147 audit): the identity-mismatch path parks the account when the
+-- provider returned a login for a DIFFERENT identity tuple than expected, so there is no
+-- trustworthy prior-good login to protect into the recovery slot (that is
+-- SetCodexRecoverySlot's job on the ordinary failure path). Guarded on
+-- coord_state='in_progress' AND coord_operation_id=@op so only the operation that still
+-- holds the live lease may quarantine it — a presumed-dead or wrong operation matches 0
+-- rows and cannot flip a settled account into quarantine. Owner-scoped.
+UPDATE codex_provider_account
+SET coord_state = 'quarantined', updated_at = now()
+WHERE id = @id AND user_id = @user_id
+    AND coord_state = 'in_progress' AND coord_operation_id = @op::uuid;
+
+-- name: InsertCodexRefreshIntent :one
+-- Record the durable pre-rotation intent (PRD #1147 M2) before touching the provider. The
+-- operation_id PK makes a duplicate insert of the same operation fail (23505), so
+-- idempotence is enforced by the service reading the existing intent first rather than by
+-- blind retry. Born 'rotating'. Owner-scoped via the composite FK to the account.
+INSERT INTO codex_refresh_intent (operation_id, user_id, provider_account_id, from_generation, state)
+VALUES (@operation_id, @user_id, @provider_account_id, @from_generation::bigint, 'rotating')
+RETURNING *;
+
+-- name: GetCodexRefreshIntent :one
+-- Fetch one intent by operation id (PRD #1147 M2), owner-scoped so a foreign operation id
+-- reads no row. pgx.ErrNoRows means no such intent for this user.
+SELECT * FROM codex_refresh_intent
+WHERE operation_id = @operation_id AND user_id = @user_id;
+
+-- name: SetCodexRefreshIntentState :execrows
+-- Advance an intent's state (PRD #1147 M2) as the service drives the rotation state
+-- machine ('rotating' → 'committed'/'unrecoverable'/'reconciled'). Owner-scoped; 0 rows
+-- for a foreign or missing operation.
+UPDATE codex_refresh_intent
+SET state = @state, updated_at = now()
+WHERE operation_id = @operation_id AND user_id = @user_id;
+
+-- name: ListUnresolvedCodexRefreshIntents :many
+-- The recovery scan (PRD #1147 M2): every still-'rotating' intent for an account, which a
+-- survivor reconciles against the account's actual generation. Owner-scoped; backed by
+-- the partial index idx_codex_refresh_intent_unresolved (00201).
+SELECT * FROM codex_refresh_intent
+WHERE user_id = @user_id AND provider_account_id = @provider_account_id AND state = 'rotating';

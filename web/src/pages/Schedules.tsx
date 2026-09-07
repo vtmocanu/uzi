@@ -690,6 +690,10 @@ function ScheduleRow({
               prompt
             </Badge>
           )}
+          {/* PRD #929 M1: resolved output mode for a prompt schedule (null = job default). */}
+          {s.target === "prompt" && s.output_mode && (
+            <Badge tone="neutral">{s.output_mode}</Badge>
+          )}
           {s.timing === "once" && (
             <Badge tone="brand" dot>
               once
@@ -1011,7 +1015,7 @@ function MyScheduleSubRow({
 }) {
   const demo = useDemoMode();
   const repoLabel = s.repo_path ? maskRepoPath(s.repo_path, demo) : "repo unavailable";
-  const nextFire = s.next_fires[0] ?? s.next_fire_at;
+  const nextFire = s.next_fires?.[0] ?? s.next_fire_at;
   const [expanded, setExpanded] = useState(false);
   const panelId = `last-fire-${s.id}`;
   return (
@@ -1054,6 +1058,10 @@ function MyScheduleSubRow({
             <Badge tone="ok" dot>
               prompt
             </Badge>
+          )}
+          {/* PRD #929 M1: resolved output mode for a prompt schedule (null = job default). */}
+          {s.target === "prompt" && s.output_mode && (
+            <Badge tone="neutral">{s.output_mode}</Badge>
           )}
           {s.target === "self_improve" && (
             <Badge tone="ok" dot>

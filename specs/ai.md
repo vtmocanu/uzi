@@ -7651,7 +7651,7 @@ worker-execution protocol, which stays `/api/worker/*`).
   uzi worker list|rm            # NO create — minting a join token is a webui action (§279)
   uzi repo list
   uzi admin users|runs|workers|usage|rate-limits   # READ-ONLY; needs a uza_ token
-  uzi skill status|install [--force]
+  uzi skill status|install [--force]|install-hook|uninstall-hook  [--target claude|codex|all]
   uzi version
   ```
   Global flags: `--json --url --quiet --no-color`. `admin` has **no write verbs by construction** — the
@@ -7950,18 +7950,65 @@ line, recorded per the phase-2 follow-ups.
     this (PRD #64 Risk 13 — a risk the `--json` swap *creates* by turning an escaped-text-for-a-human
     payload into an agent-read channel).
 
-## 284. Bundled skill — `go:embed`, content-hash self-upgrade, `.bak` rescue, never-fatal, drift-tested
+## 284. Bundled skill — `go:embed`, content-hash self-upgrade, `.bak` rescue, never-fatal, drift-tested; dual-target (Claude + Codex) install and session-start hooks
 
 Serves human: Feature #64 (agents always know how to drive the *installed* CLI); Success Criterion 5.
-PRD #64 skill section + Decision 14. Realized in `api/internal/uzicli/skill/` (`SKILL.md` embedded) +
-`api/internal/uzicli/skill.go`.
+PRD #64 skill section + Decision 14; **dual-target install + auto-refresh hook is PRD #1143 (M1-M3)**.
+Realized in `api/internal/uzicli/skill/` (`SKILL.md` embedded) + `api/internal/uzicli/skill.go`
+(`SkillInstaller`), `api/internal/uzicli/skilltarget.go` (`SkillTarget`, `ResolveSkillTargets`),
+`api/internal/uzicli/skillhook.go` (`HookManager`, `NewCodexHookManager`), and the cobra verbs in
+`api/cmd/uzi/skill.go` (`status|install|install-hook|uninstall-hook`, shared `--target` flag).
 
-- **Decision — the skill is `go:embed`ed into the binary and written to
-  `~/.claude/skills/uzi-cli/SKILL.md`**, in the measured plugin format
-  (`---\nname:…\ndescription:…\n---\n\n<body>`, plus `allowed-tools: Bash(uzi *)` and
-  `user-invocable: false`). Beats a fetch-from-GitHub-`main` approach: an embedded skill cannot
-  describe a version other than the one running, works offline, and works for a **private** repo
-  (a fetched-from-GitHub skill is unusable for us).
+- **Decision — the skill is `go:embed`ed into the binary and written per target** in the measured
+  plugin format (`---\nname:…\ndescription:…\n---\n\n<body>`, plus `allowed-tools: Bash(uzi *)` and
+  `user-invocable: false`). The same embedded `SKILL.md` serves every harness. Beats a
+  fetch-from-GitHub-`main` approach: an embedded skill cannot describe a version other than the one
+  running, works offline, and works for a **private** repo (a fetched-from-GitHub skill is unusable
+  for us).
+
+### Dual-target model (`--target claude|codex|all`, PRD #1143 M1)
+- **Two install targets, resolved by `ResolveSkillTargets(home, getenv)` into `[]ResolvedTarget`:**
+  - **Claude** — skill `~/.claude/skills/uzi-cli/SKILL.md`; hook file `~/.claude/settings.json`. Path
+    tail is a compile-time constant under `$HOME` with no user-supplied component.
+  - **Codex CLI** — skill `$HOME/.agents/skills/uzi-cli/SKILL.md` (the documented Codex user-skill
+    root, deliberately **independent of `$CODEX_HOME`** — no env-derived string reaches the skill path);
+    hook file `$CODEX_HOME/hooks.json`, defaulting to `~/.codex/hooks.json` when `$CODEX_HOME` is unset.
+- **Env access via an injected `getenv` seam, never package-global `os.Getenv`** — keeps a test's temp
+  home from being polluted by a developer's exported `$CODEX_HOME`.
+- **`--target` (persistent flag on the `skill` subtree; applies to every verb), default auto-detect:**
+  - omitted → **auto-detect**: Claude is **always** a target; Codex is added only when its config home
+    exists as a directory (`isDir`). A machine without Codex silently gets Claude-only.
+  - `claude` / `codex` / `all` → the explicit selection.
+- **A relative, non-empty `$CODEX_HOME` is a usage error only when Codex is selected explicitly**
+  (`ExitUsage`); on the automatic path it is skipped (Codex just stays undetected). Only the Codex
+  hook/config home is derived from `$CODEX_HOME`, and it is validated absolute and `filepath.Clean`ed
+  before becoming a path component (PRD #1143 D8).
+
+### Session-start hooks — target-specific `HookManager` (PRD #1143 M2)
+- **`install-hook` / `uninstall-hook` manage an opt-in SessionStart hook that re-runs `uzi skill
+  install` at every harness session start**, so the installed skill self-refreshes without the user
+  re-invoking anything. One `HookManager` type, two constructors carrying the per-harness differences:
+  - **Claude** (`NewHookManagerAt`): `settings.json`, matcher `startup`, canonical command
+    `uzi skill install --target claude`, file perm `0o600` (settings.json may hold secrets).
+  - **Codex** (`NewCodexHookManager`): `hooks.json`, matcher `startup|resume`, canonical command
+    `uzi skill install --target codex`, file perm `0o644`.
+- **Foreign entries and array order are preserved**; a legacy/differently-spelled uzi command is
+  migrated in place to the canonical one rather than duplicated (`migrateLegacyCommand`); install is
+  idempotent (exactly one entry).
+- **A byte-identical `.bak` of the prior hook file is written before the first mutation.** Malformed
+  JSON aborts rather than clobbering the file.
+- **Codex trust is the user's, never uzi's.** uzi writes only `hooks.json`; the user reviews and trusts
+  the hook once via Codex's `/hooks` flow. uzi **NEVER** writes Codex trust state or `config.toml`, and
+  **refuses (read-only) to create a `hooks.json` when an inline `[hooks]` table already exists in
+  `config.toml`** — that mixed representation is Codex-warned, so we surface it (`HookConfigConflict`)
+  and abort instead of producing it.
+
+### JSON envelope — backward-compatible `targets[]` (PRD #1143 M3)
+- **`--target` omitted → the response keeps today's Claude single-target top-level fields
+  (`skill`/`hook`, or the install/hook result) AND adds a `targets` array**, so existing `--json`
+  consumers/tests keyed on the top-level shape keep working while new consumers read every selected
+  target from `targets[]`.
+- **`--target` given → the response emits `{targets}` only** (no legacy top-level duplication).
 - **Staleness = content hash, not CLI version.** A sidecar `.uzi-cli-state.json` records
   `{cli_version, skill_sha256}`; rewrite iff `embedded_sha != recorded_sha`. Keying on the CLI version
   would rewrite on every unrelated release.
@@ -7973,8 +8020,10 @@ PRD #64 skill section + Decision 14. Realized in `api/internal/uzicli/skill/` (`
   `UZI_SKILL_AUTO_UPGRADE=0`, `uzi skill status`, `uzi skill install --force`.
 - **Atomic**: temp file in the same dir + `os.Rename`; handles racing `uzi` processes without a
   lockfile.
-- **Cannot clobber `~/.claude/commands/`**: the write path is a compile-time constant joined to
-  `os.UserHomeDir()` with no user-supplied component, so no traversal is expressible.
+- **Cannot clobber an adjacent dir (e.g. `~/.claude/commands/`)**: every skill write path is a
+  compile-time constant tail joined to the home dir with no user-supplied component (Claude and Codex
+  alike; the Codex skill tail is likewise `$HOME`-fixed, independent of `$CODEX_HOME`), so no traversal
+  is expressible.
 - **Drift control — a test asserts every command/flag the SKILL.md documents exists in the cobra
   tree** (`skill_drift_test.go`). This is the same discipline a manual source-map doc would enforce by
   hand, done **mechanically**, possible because our skill documents our own CLI. Its limit (recorded): it
@@ -18017,8 +18066,9 @@ about, so a stale binary answers confidently and wrongly, and nothing anywhere s
   precisely when they suspect something is wrong, so a failed live probe falls back to the last
   known-good reading instead of to nothing.
 - Also exempt: the `skill` subtree (already exempt for the auto-upgrade hook, and
-  `uzi skill install` is machine-invoked at every Claude Code session start, where an extra
-  stderr line is pure noise in an agent context); `completion`, whose script is `eval`'d from a
+  `uzi skill install` is machine-invoked at every Claude Code or Codex CLI session start — both
+  harnesses now install the refresh hook — where an extra stderr line is pure noise in an agent
+  context); `completion`, whose script is `eval`'d from a
   shell rc file, so the warning would print at every shell start; and cobra's
   `__complete`/`__completeNoDesc` RPC, invoked on every TAB, where a 2s stall is unacceptable
   and stderr corrupts the display in some shells. `--help`, `--version` and a bare non-runnable
@@ -20237,12 +20287,17 @@ also reach — those must never spawn runs).
 - **Sibling of the PRD #19 autopilot detector** (`api/internal/poller/ci_autofix.go`): runs
   each tick **after** the pipeline-status sync, on the freshly-refreshed `pipeline_statuses`
   cache — the same "detect only in the poller" placement as §98. Nil-optional-wired via
-  `engine.SetCIAutoFix(...)` in `api/cmd/server/main.go`; **not wiring it is the instance
-  kill-switch** (the autopilot nil pattern), and it can only run where the pipeline watch is
-  on (`CI_WATCH_MAX_REFS>0`), since it reads that cache.
-- **Global `app_settings.ci_autofix_enabled` (full judge parity) deliberately deferred** —
-  the optional-wiring is the instance switch, per-user opt-in is the consent gate; a global
-  KV kill-switch is a documented follow-up (Decision Log Q4), not shipped.
+  `engine.SetCIAutoFix(...)` in `api/cmd/server/main.go`; leaving it un-wired disables the
+  detector (the autopilot nil pattern), and it can only run where the pipeline watch is
+  on (`CI_WATCH_MAX_REFS>0`), since it reads that cache. The runtime kill-switch is the
+  admin global below, not the wiring.
+- **Global `settings.ci_autofix_enabled` admin kill-switch shipped in PRD #914** (was
+  deferred under PRD #71) — a text `"true"`/`"false"` KV, compiled default `"true"`, so the
+  feature ships ON. The accessor `settings.CiAutofixEnabled` (`settings/settings_ci_autofix.go`,
+  key `settings/keys.go#KeyCiAutofixEnabled`) is DELIBERATELY three-state and
+  error-propagating, mirroring `MrReworkEnabled`: absent/malformed → default ON, but a store
+  READ ERROR must not be misread as absent; the accessor propagates the error and the detector
+  (`poller/ci_autofix.go`) is the caller that maps a non-nil error to OFF (**fail closed**).
 
 ## 513. PRD #71 — durable `ci_autofix_attempts` ledger: the `autopilot_triggers` analogue, keyed `(repo_id, ref)`
 
@@ -20380,12 +20435,19 @@ Serves human: "on giving up, uzi comments + notifies"; the notification story PR
 
 ## 519. PRD #71 — scope, opt-in, and cross-forge posture
 
-Serves human: "opt-in per-user default OFF, admin can force-toggle; agent-owned MR branches
-only; never main/protected."
+Serves human: "on by default per user (tri-state opt-out, NULL=inherit=on), admin can
+force-toggle; agent-owned MR branches only; never main/protected." (Updated PRD #914; PRD
+#71 originally shipped this per-user default OFF.)
 
-- **Per-user `ci_autofix_enabled`, default OFF** (migration `00115_user_ci_autofix_enabled`,
-  mirrors the judge/autopilot boolean): self-service PUT + an **admin force-toggle** (judge
-  parity). Surfaced on the user DTO and web `Settings.tsx` / `AdminUsers.tsx`.
+- **Per-user `ci_autofix_enabled` is a NULLABLE tri-state, default ON** (PRD #914, migration
+  `00190_user_ci_autofix_tristate`): NULL = inherit = on, `true` = explicit opt-in, `false` =
+  explicit opt-out. The candidate gate is `AND u.ci_autofix_enabled IS NOT FALSE`
+  (`store/ci_autofix.sql.go`), so only an explicit `false` suppresses. PRD #71's original
+  `00115_user_ci_autofix_enabled` column was `NOT NULL DEFAULT false`; 00190 does a one-time
+  `false → NULL` fold (down-migration re-folds `NULL → false` and restores NOT NULL/default)
+  so the pre-914 default-off rows become inherit-on rather than staying silently opted out.
+  Self-service PUT + an **admin force-toggle** (judge parity). Surfaced on the user DTO and
+  web `Settings.tsx` / `AdminUsers.tsx`.
 - **MR-branch pipelines only** (`refs/merge-requests/*` of `agent/issue-N` branches); `main`,
   default, and protected branches are **never** auto-touched — a fix lands on the MR branch
   and a human still merges (the primary directive). The four `main`-untouched guardrail layers
@@ -23621,16 +23683,15 @@ the exemption table, what the contract cannot catch).
   retyped). A field-anchored grep over `web/src` found **zero** consumer hits for the 7 `Run` fields
   and `selector_kind`, so the reconciliation is purely additive; the two `docker` consumers already
   read `w.docker === true`, which is null-safe. Every `@ts-expect-error #982` directive this landed
-  is now gone except one.
-- **`Schedule.next_fires` is the one directive left, deliberately deferred, not reconciled.** The wire
-  sends `null` for a once/invalid-cron schedule (the mapper only sets `NextFires` for
-  recurring+valid-cron), so the TS type is drifted the same way `docker` was — but widening
-  `next_fires: string[]` to `string[] | null` surfaces two **unguarded** `next_fires[0]` index sites
-  (`DefaultJobs.tsx:383`, `Schedules.tsx:855`) as a red gate: a latent crash-on-once-schedule. That is
-  a **behaviour** fix needing its own regression test, out of scope for a type-only PRD, so it was
-  filed as its own bug and the directive stays, its reason rewritten to name the deferral rather than
-  "reconciled in M4". Do not read this PRD as having closed `next_fires` — it is the one documented
-  exception.
+  is now gone. (AI-synced 2026-09-05: the last one, `next_fires`, was reconciled by issue #1003; see below.)
+- **`Schedule.next_fires` was the one directive #982 deliberately deferred; issue #1003 reconciled it
+  (AI-synced 2026-09-05).** The wire sends `null` for a once/invalid-cron schedule (the mapper only
+  sets `NextFires` for recurring+valid-cron), so the TS type drifted the same way `docker` did. #982
+  left it because widening `next_fires: string[]` to `string[] | null` surfaced two **unguarded**
+  `next_fires[0]` index sites (a latent crash-on-once-schedule) — a **behaviour** fix out of scope for
+  a type-only PRD. #1003 widened the type to `string[] | null` and guarded both sites with `?.`
+  (`components/DefaultJobs.tsx:400`, `pages/Schedules.tsx:1014`), removed the `@ts-expect-error #982`
+  directive, and added failing-first render regression tests for the `next_fires: null` payload.
 
 Cross-refs: `fixtures/run-usage`/`fixtures/judge-fidelity` precedent for the differential-fixture shape
 and the "recorded, not authored, no `-update` flag" house rule (`.claude/rules/go.md`); PRD #700 MR
@@ -23903,3 +23964,102 @@ Serves human Feature #1093: one user-level switch to pause every schedule the us
 - **D11 — no notifications in v1.** The user flipped the switch; the Schedules-page banner and the skip records are the feedback. The `park()` notice shape in `scheduler.go` is the template if an auto-resume notice is wanted later.
 
 Cross-refs: PRD #396 (per-row resume re-arm, the no-replay property this pause preserves by a different mechanism); the vault-lock skip in `api/internal/schedsvc/self_improve.go` (the user-level condition consulted at fire time this copies); PRD #929 (schedule output modes — edits the same `scheduler.go` + `Schedules.tsx`, sequenced not concurrent); migration 00165 (`users.mr_rework_enabled` + `app_settings`, the admin-twin template D1 defers).
+
+## 616. PRD #837 — worker disk observability + nix-store pressure self-heal: display-only per-volume metering, api-derived `disk_pressure`, controller drain-then-recycle
+
+Serves human Feature #837: surface per-worker `/nix` and `/data` disk use in the web UI, and self-heal the nix-store-full incident by tearing down and reprovisioning an over-pressured (or undersized) worker's PVC rather than resizing it (specs/human.md:683-684 — "The PVC resize path is dropped; the one legacy worker gets delete-and-reprovision"). Richer rationale is PRD #837's Decision Log (D1-D9) and `adr/0837-worker-disk-lifecycle.md`; terse contract here.
+
+- **D1 — disk metric rides the existing heartbeat off `fs.statfs`, never pulled.** The worker samples `statfs` for `/nix` and `/data` on the same heartbeat that already carries the cgroup CPU/mem stats (§228-231), and `WorkerStats` gains per-volume `used`+`total` bytes. Each volume is **optional** and omitted when `statfs` fails or the mount is absent — dev/compose has no `/nix`, matching the §230 process-fallback discipline (a collector failure never fails the heartbeat). No new endpoint, no inbound surface. Persisted to `stats_disk_nix_bytes` / `stats_disk_nix_total_bytes` / `stats_disk_data_bytes` / `stats_disk_data_total_bytes` (migration **00190**), surfaced on `WorkerDTO` and `uzi worker list --json`. A worker with no disk stats renders no disk bar/segment (three-state clean).
+- **D2 — the disk columns are DISPLAY-ONLY, with exactly one allow-listed lifecycle reader.** No scheduling / claim / assignment / sweeper query may reference a `stats_disk_*` column; a guard test asserts this, mirroring the existing `stats_*` display-only guard. The **sole** exception is the controller poll query `ListHostedWorkersForController`, which reads them (and the derived `disk_pressure`) purely for lifecycle — allow-listed exactly as `ReapEphemeralWorkers` is allow-listed for `online_since` in `TestOnlineSinceIsWriteOnlyAndNeverScheduled` (the §494 contract).
+- **D3 — `disk_pressure` is derived in the api, debounced by a streak column, reset-on-action.** Migration **00191** adds `stats_disk_pressure_streak int NOT NULL DEFAULT 0`. `HeartbeatWorker` bounded-increments it (`LEAST(streak+1, 100)`) when a reported volume is `>= UZI_DISK_PRESSURE_THRESHOLD` (default **0.90**), and resets it to 0 on any sub-threshold sample. `RegisterWorker` also resets it to 0 — reset-on-action for a fresh pod incarnation, so a recycled/re-minted worker starts clean. The poll derives `disk_pressure = streak >= 2 AND last_heartbeat_at fresh (>= @heartbeat_cutoff)`, so a stale worker or a single spike never flags. `Ephemeral` is surfaced as its OWN wire field and is NOT baked into `disk_pressure` (the api reports "under pressure"; the controller ANDs the exclusion — D5).
+- **D4 — controller: two drift arms share one multi-phase idempotent recycle helper (drain-first).** `reconcileWorker` has two arms both calling `recycleWorkerVolumes(worker, obs, ns, vols)`: (1) **size-drift** — observed `/nix` PVC strictly `< preset.nixSize` → recycle `{nix}`; (2) **disk-pressure** — `DiskPressure && !Ephemeral` → recycle `{nix, data}`. Recycle = delete the Deployment + the target PVC(s), keeping the worker row/uuid and the join-token Secret (D2/D3 of the PRD — the cluster Secret is the only copy of the delivered token; nothing re-creates a dropped persistent-worker row); the create-gate re-mints the PVC at the current size. Phase 0 reuses PRD #422's busy-guard/cordon/`DrainDeadline`/`ForceRoll` drain machinery verbatim.
+- **D5 — Terminating-PVC handling preserves the create-gate's quota safety; liveness carried separately.** `HasNixPVC` stays **exists-in-any-state** (including Terminating) so the create-gate keeps its `AlreadyExists`/quota-overshoot protection (kubernetes#119593 — a Terminating PVC still counts against quota and a blind re-create races the finalizer). Actual liveness for the recycle/size-drift arms rides `NixPVCSize` (nil while absent OR Terminating) and `DataPVCLive`; the size-drift arm gates on `NixPVCSize != nil` and strict `<`. The Deployment-recreate guard (await-gone) keeps the re-minted pod off a doomed/Terminating PVC.
+- **D6 — guards, all retained precisely because actuation defaults ON.** Master toggle `UZI_WORKER_DISK_RECYCLE_ENABLED` (default **true**) suppresses both arms when false. Cooldown `UZI_WORKER_DISK_RECYCLE_COOLDOWN` (default **1h**) reads the youngest target PVC's `creationTimestamp` statelessly (no persisted "last recycled"); a worker back at pressure within the window is a capacity problem, skipped with the fixed, test-asserted log token `disk-recycle-skipped-cooldown worker=<id>` (a capacity signal, not a loop). The PRD #529 ephemeral (run-bound) exclusion applies in BOTH arms.
+- **D7 — reclaim-by-delete has an inherent no-rollback strand risk: detection, not prevention.** The machine deletes the old PVC before re-minting; if the new PVC cannot bind (storageclass/quota/no schedulable node), the old data is already gone with nothing to restore. This cannot be made atomic. The intended mitigation is to detect a re-mint stuck `Pending` past a bound-timeout and surface it loudly (stable log token + display-only report), never an auto-rollback (there is no prior state). **Detector (#1115, landed):** `observeNamespace` records each LIVE `/nix`/`/data` PVC's `.status.phase`; `flagStrandedPVCs` (in `Observe`, once per tick, after the pod pass) treats a target PVC still `Pending` past a **10m bound-timeout** (`pvcBindTimeout` constant, not a knob in v1; start event = the PVC's `.metadata.creationTimestamp`, Pending-age `now − created`, stateless like the D6 cooldown) as stranded — emitting the stable log token `pvc-bind-timeout worker=<id> pvc=<name> pending_for=<dur>` (one per stranded volume) and synthesizing a `stuck` roll-health `WorkerStatus` (`BlockingContainer=<PVC name>`, `BlockingReason="stranded Pending past 10m0s bind-timeout; no auto-rollback"` within the api's 64-byte cap → classified `upgrade_failed`, rendered on the Workers failed-worker strip; no new wire field). Covers `/nix`+`/data` (`dind-data` still unmetered), names `/nix` first when both strand, ungated by the recycle toggle (display-only, issues no create/delete/patch), no auto-rollback.
+- **D8 — the 90% actuation threshold and the 85% UI danger tone are intentionally different.** The web UI paints the disk bar in `danger` tone at `>= 85%` (warn), while `UZI_DISK_PRESSURE_THRESHOLD` actuates at `0.90` (act) — we warn earlier than we tear down, so an operator sees pressure before the controller recycles.
+- **D9 — recycle defaults ON over recorded reviewer dissent.** The risk/correctness and testability reviews unanimously recommended **default-OFF plus splitting observe (pressure on the wire) from actuate (the recycle arm)**, so pressure could be watched in production before any automated teardown. The user chose **default-ON with one master toggle and a single `DiskPressure` bool** (no observe/actuate split). The decision stands; the mitigation is that every guard in D3/D6 (freshness + ≥2-heartbeat debounce + reset-on-action + PVC-age cooldown + drain-before-recycle + ephemeral exclusion) is retained precisely because the default is ON.
+
+Known v1 gaps (documented, not regressions): docker-tier `dind-data` (build/image cache) is unmetered and unrecyclable, so `disk_pressure` can never fire on it — a metering fast-follow. Agent-side `nix-collect-garbage` self-GC is out of scope (the controller cannot exec into a worker, and the incident volume was undersized where GC cannot help). A `nixSize` raise must move the `maxPVCStorage` LimitRange ceiling + quota together (currently at parity, 20Gi).
+
+## 618. PRD #1116 — Slack DM when a usage-limit-paused run resumes
+
+Serves human Feature #35 (the resume-notification line: "when a run parked on a usage limit resumes, the owner gets a Slack message in the run's thread"); richer rationale is PRD #1116's Decision Log D1-D9. A run parking on `limit_wait` already posts `⏸️ Paused · usage limit` into its DM thread; this adds the matching `▶️ Resumed · usage limit cleared` reply.
+
+- **D1 — reverses the PRD #268 M3 ruling ("the resume posts nothing").** That ruling's reasoning (a Slack edit raises no notification, a park lasting hours must be told) is the argument FOR a resume line; only its conclusion ("ten posts read as a stream") is overturned, by the owner. The bound it cared about survives: ≤ `2 × RUN_LIMIT_MAX_WAITS` park/resume lines per run — one pause line + one resume line per episode, thread reading pause → resume → (maybe) pause → resume, never a stream.
+- **D2 — a thread reply, not a root edit** (a Slack edit raises no notification; the point is to be told). Root line still edits back to `▶️ Running` as before.
+- **D3 — trigger on the first `running` after the park, NOT the sweeper's `queued` promotion.** Promotion means "eligible to be re-claimed", not "working" (the worker may be busy/draining, the run may fall to `pool_wait`, or the re-claim may re-park). `running` is the honest moment, broadcast from `SetState` on the worker's first report. `claimed` is not a usable trigger (no site broadcasts it by name; where it arrives via a summary re-emit it says nothing about work restarting) — the table leaves the marker on it.
+- **D4 — a resume that lands straight in a gate / question / terminal state posts NO resume line** (that surface's own post — gate card, question card, ✅/❌/🚫 — already carries the news; a second line is noise) but still CLEARS the marker so the next park/resume cycle posts normally.
+- **D5 — dedupe through the anchor row `slack_run_messages.limit_paused_at` (migration 00193), post-then-clear with a compare-and-swap.** `ClearSlackRunLimitPause` is guarded `WHERE run_id = @run_id AND limit_paused_at = @at` (no row = refused), mirroring `gate_generation`/`SetSlackRunGateIf` and `milestones_notified_completed`. The anchor is the notifier's only durable memory (the event carries no previous status; a redelivered `running` is routine). Post-then-clear is at-least-once — a crash between post and clear duplicates one line, never loses the resume; the CAS keeps a stale clear from wiping a newer park's marker. With the marker NULL, `handleLimitResume` is a no-op.
+- **D6 — the pause start is the run's own `runs.status_since`, captured onto the anchor at the park.** `SetRunLimitWait` stamps `status_since = now()`, but promotion re-stamps it, so by the `running` event it is the resume time; copying it to the anchor at the park is what preserves it, and it makes marker and duration one value. Waited duration is `now − limit_paused_at`; an implausible value (negative, or `> RUN_LIMIT_MAX_PARK`, default 8d) omits the `waited` fragment rather than inventing it. (An earlier draft derived the duration from the pause post's Slack `ts`; rejected once `status_since` was found — a DB timestamp needs no parsing, no malformed branch, no Slack round-trip.)
+- **D7 — no threshold, no cross-run batching, no new toggle, no inbox row.** A park is bounded below by `retry_not_before`, so sub-minute flapping is impossible and a minimum-duration filter guards nothing. Rides the existing per-user `slack_notify` kill switch like every run-state DM. Run-state DMs never write inbox rows (that is `notifysvc`'s seam); the pause line does not, so neither does the resume line.
+- **D8 — chat runs never park; the judge/self_improve suppression is untouched.** `SetRunLimitWait`'s guard rules a chat run out of the run lane, and neither the chat runner nor `notifier_chat.go` knows `limit_wait`. Nothing to do on the chat path.
+- **D9 — no CLI or web change.** `uzi run get` already renders `LIMIT_WAITS N (resumed)`, and the run view + feed already surface the pause/resume; this PRD adds no route or DTO.
+
+Implementation seam: `handleLimitResume` in `api/internal/slacksvc/notifier_state.go` is anchor-driven (keyed on `limit_paused_at`), called from the existing-anchor branch before `handleMilestone` (thread reads resume-then-progress), NOT a `renderThreadBlocks` status arm — a status arm would fire on every `running` broadcast, and `running`/`queued` are re-emitted routinely (summary persist, progress reports). `renderThreadBlocks` still returns `ok=false` for `running`/`queued` on purpose. The park writes `limit_paused_at = rc.StatusSince` (fallback `now()` if NULL) after the park's post; `GetSlackRunContext` selects `runs.status_since` to carry it. The clear's `WHERE` is the only SQL guard in play; the slacksvc fake never runs SQL, so the live-DB CAS proof is `api/internal/store/slack_limit_pause_integration_test.go` (a stale `@at` returns `pgx.ErrNoRows` and leaves the column).
+
+Cross-refs: PRD #35 (the park machinery / `RUN_LIMIT_*` config this rides on); PRD #268 M3 (the "resume posts nothing" ruling this reverses); PRD #41/#122 (the `gate_generation`/`milestones_notified_completed` anchor-dedupe precedents `limit_paused_at` mirrors).
+
+Cross-refs: PRD #49 (§228-231, the heartbeat/cgroup stats collector this metering rides on and mirrors for optional-field decode); PRD #251 (§494, `online_since` — the write-only/never-scheduled allow-list pattern the poll query reuses); PRD #422 (the busy-guard/cordon/`DrainDeadline`/`ForceRoll` drain machinery phase 0 reuses); PRD #529 (ephemeral run-bound workers, excluded from both recycle arms); `adr/0837-worker-disk-lifecycle.md` (the parallel lifecycle ADR).
+
+## 617. PRD #1114 — early 7-day reset alert widened
+
+Serves human Feature #53's widened early-reset-alert bullet [user, #1114]. Richer rationale is PRD #1114's Decision Log; terse contract here.
+
+- **#1114 — early 7-day reset alert widened.** Dropped the "was limiting" gate (limit park with `source=limit_report`, or a poller reading with `seven_day_pct >= 95`) in usagepoller `earlyResetFires`; the alert now fires on any early 7-day clear detected by EITHER arm — boundary moved >`resetEpochMoveMargin` (1h) past the advertised reset T (rolling model) OR 7-day used% dropped from >=`pctResetFloor` (5) to <=`pctResetCeil` (1) with an unmoved boundary (fixed-grid model) — keeping the >=8h-early guard (`earlyResetThreshold`). The two jitter margins replace the gate as the false-positive backstop (PRD #1114 D5/D8). Known limitation: an early clear whose boundary did not move forward past `resetEpochMoveMargin` (Arm A silent) is caught only by Arm B, which requires a present, unmoved (== T) boundary and prev >= `pctResetFloor`; so a near-zero-usage clear (prev < `pctResetFloor`) or one with an absent/sub-margin/backward boundary is deliberately NOT detected — indistinguishable from cross-source jitter (PRD #1114 D5/D8). Same single opt-in toggle, 7-day window only.
+
+## 619. PRD #1130 — TUI board polling resilience: one bounded in-flight periodic poll per surface, per-poll deadline, reset-on-success backoff
+
+Serves human Feature #1130 (the board must stay usable on a slow/flaky link instead of self-congesting into a `context deadline exceeded` flood). Behavioral-only hardening of the TUI's two high-frequency polls (`api/cmd/uzi/tui.go` + `tui_board.go` + `tui_detail.go`); no wire type, CLI, route, or render-surface change (the visible "could not refresh" error line in `tui_board.go` is intentionally unchanged). Landed as commits 36f2ee19 (M1 in-flight guard), d2aa03e (M2 per-poll timeout), c29f9309 (M3 error backoff), then reworked in 79ebebe2 (review !1135: booleans → per-surface request-generation ids + reply-driven backoff reschedule, fixing an out-of-order reply that could clear a newer request's guard and a first-retry that used the stale pre-failure interval). The M1/M3 bullets below describe the reworked mechanism; PRD #1130's Decision Log (D1-D6 history, D7 rework) carries the richer rationale.
+
+- **M1 D1/D2 — one in-flight periodic poll per surface, guarded by a per-surface request id, reply honoured only on an id match.** The guard is now a monotonic request-generation id per surface: `boardState.waitID` (board) and `detailState.metaWaitID` (detail), each the id of the latest outstanding request, with `0 = idle`. A `boardTickMsg` starts a new board poll (and, on the detail view, a new meta poll) only when the id is `0`, so a link slower than 2s can no longer pile up overlapping concurrent request goroutines (bubbletea runs each `Cmd` in its own goroutine — the cascade mechanism). The correctness point that replaces the old "marker cleared on EVERY reply" framing: a reply is honoured only when its `reqID` matches the latest outstanding id, so an out-of-order older reply cannot clear a newer request's guard — bubbletea delivers `Cmd` results in completion order, not request order, so an older poll resolving after a newer request was minted must be dropped without clearing, applying, or rescheduling. The Init board fetch is counted in flight (`newTUIModel` seeds `reqSeq/waitID/tickGen = 1`, `initCmds` issues `fetchRunsCmd(admin, 1)`), so the first periodic tick cannot stack a second poll on the Init request. The `detailMetaMsg` case checks `runID` FIRST, then `reqID == metaWaitID` — because `metaSeq` restarts per run (`newDetailState`), the runID-first order prevents a cross-run id collision — then clears `metaWaitID`, then returns on `err`, so a matching-run FAILED poll still unlatches (the D2 anti-wedge property). User-initiated `r` (`keyRefresh`) / `a` (`keyAdmin`) and `exitToBoard` mint a fresh id via `startBoardReq` and are never gated (D1: a keypress is intent); the fresh id becomes the new `waitID`, so any periodic reply still in flight is superseded (its stale reqID dropped) rather than mistaken for theirs.
+- **M2 D3 — a per-poll deadline separate from the shared 30s client timeout.** `fetchRunsCmd` / `refreshRunMetaCmd` derive `context.WithTimeout(m.ctx, boardPollTimeout)` (a package var, default ~10s, `defer cancel()`) inside the command closure, so a stalled poll fails within ~10s and its in-flight marker self-heals within that bound rather than latching for 30s. The shared `http.Client.Timeout` (30s, `api/internal/uzicli/client.go`) is deliberately untouched — it is correct for one-shot CLI calls and the stream handshake, and shortening it there would harm unrelated commands. A var (not const) so a test shrinks it deterministically instead of sleeping, matching the `boardPollInterval` convention.
+- **M3 D4 — reset-on-success error backoff, rescheduled from the reply so the first retry is already backed off.** A consecutive-error streak (`boardState.errStreak`) is updated inside `apply`, gated by the same `msg.admin == b.admin` condition `apply` uses, so a stale admin-mismatch reply neither resets nor inflates the streak. The tick reschedule now lives in the `boardRunsMsg` reply, not in the `boardTickMsg` case: after `apply` has updated the streak, the reply bumps a tick-chain generation `tickGen` and arms `tickAfter(boardTickInterval(errStreak), tickGen)`. Because the reschedule runs on the post-apply streak, the FIRST retry after a failed poll already uses the backed-off interval (e.g. 4s) rather than the stale pre-failure 2s — the backoff-lag fix. `boardTickInterval(streak)` remains a pure streak→duration function (doubling from `boardPollInterval` 2s base up to `boardBackoffCap` ~30s), so the interval is still unit-assertable by value; the FIRST success resets the streak, snapping the cadence back to the 2s base instantly. A `boardTickMsg` whose `gen != tickGen` belongs to a superseded chain (a manual/admin refresh, `exitToBoard`, or the Init bootstrap tick can leave an extra timer pending) and is dropped, so exactly one tick chain stays live; while the CANCELLABLE ctrl+c confirm modal (`m.quitting`) is open the tick re-arms at the current generation but skips the poll (mirroring the strip/skew ticks), so dismissing the modal resumes polling — returning `m, nil` there would wedge the reply-driven chain, since the reply is now the only other re-arm site. Together: the request-id guard prevents pile-up and out-of-order clears, the per-poll timeout bounds each attempt and unlatches the guard, and reply-driven backoff spaces out attempts on a confirmed-bad link — converting the cascade into at most one bounded, backing-off request at a time per surface.
+
+Cross-refs: PRD #1130 Decision Log (D1-D6 history, D7 the 79ebebe2 rework — request-generation ids + reply-driven reschedule superseding D2's boolean-marker description); `charm.land/bubbletea/v2` per-`Cmd` goroutine model (the cascade + completion-order-delivery mechanism); `api/internal/uzicli/client.go` `NewHTTPClient` (the 30s shared timeout left intact).
+
+## 620. PRD #1136 — TUI milestone marker: tungsten in-progress micro-bar cell + faint half-circle rail rows
+
+Presentation-only polish of the TUI in-progress milestone marker [user, #1136]; supersedes the TUI half of PRD #1064 D4. Web (`RunView.tsx`, blue `◐`) and `uzi run get` (text states) unchanged by deliberate decision.
+
+- **#1136 D1 — TUI only.** Recoloring the web `◐` was considered and declined; web and TUI diverging on the in-progress colour is accepted. CLI `uzi run get` renders text words, not a glyph, so it is untouched.
+- **#1136 D2 — micro-bar in-progress cell recolored `wait` → `tungsten`, blink kept.** The shared `milestoneCell` (`api/cmd/uzi/tui_detail_rail.go`) that draws the blinking `▰`/`▱` cell for BOTH the crew-rail eyebrow micro-bar and the board per-run micro-bar now paints `m.pal.tungsten` instead of `m.pal.wait` (blue, elsewhere reserved for paused/rate-limited). On the lit `▰` frame it matches the done fill; the blink and the empty `▱` off-frame — not the hue — set it apart. The board second-line `· <id>` in-progress id text (`tui_board_rows.go`, still `m.pal.wait`) is explicitly OUT of scope.
+- **#1136 D4/D5 — crew-rail checklist rows return to a `◐`, blinking `◐`/`○` in the FAINT/grey colour (NOT tungsten).** A new `milestoneRowCell` renders every in-progress checklist row as a `◐ ⇄ ○` half-circle in `m.pal.faintC` — the same colour a not-started `○` uses — replacing #1064's `▰`/`▱` parallelogram cell for the row. This supersedes #1064 D4's TUI-only retirement of `◐`; the parallelogram survives only in the micro-bars. Polarity is INVERTED vs `milestoneCell`: `blinkOn==false → ◐` (the presence frame) is the static / non-tty / `UZI_TUI_NO_BLINK` frame, so the row stays legible by SHAPE when the tint is stripped and never collapses to a bare not-started `○`. The row is told apart from a not-started row by the `◐` shape, its motion, and its brighter (plain-fg) title — never by glyph colour. Consequence, expected not a bug: the micro-bar and the row blink in ANTI-PHASE.
+- **#1136 (review) — the row animation is gated on the same `!terminal` condition (`blink`) the eyebrow micro-bar uses.** `blinkOn` is a GLOBAL phase driven by any live board run, so an ungated row on a terminal run carrying a stale `MilestonesInProgress` would pulse to a bare `○`; gating on `blink` renders a static `◐` there, keeping row and micro-bar consistent about liveness.
+
+Rationale for the two-surface colour split (D5): the micro-bar is a progress *bar* where in-progress is part of the tungsten fill; the checklist is a *todo list* where an in-progress item is a grey circle animating toward its green `✓`. All changes are in `api/cmd/uzi/`; no API, DB, web, or CLI-command change. `specs/human.md` untouched (presentation, not a new user-stated requirement).
+
+## 621. PRD #1140 — Anthropic bind mode defaults to auto for every new worker and for the judge lane
+
+Serves human Feature #1140: generalize the #804 ephemeral default to EVERY worker create path, and give the judge lane the same three-valued bind mode resolved by the same ranker. Terse contract here; PRD #1140's Decision Log (D1-D9) carries the richer rationale. Cross-refs: §594 (#804 — ephemeral default flip + the born-eligible sole-token rule the derivation reuses), §581 (#754 — the auto lane never spends an un-pooled token; `pool_stale` floors, `pool_wait` holds).
+
+- **D1/D2/D3 — worker bind mode is create-time derived and stored, on ALL create paths, new rows only.** The mode is derived once at create (label → `pinned`; owner has ≥1 pooled `auto_eligible` token → `auto`; else `default`) and written with the row, so "what will this worker spend" stays answerable from the row (D1); a later pool change never re-modes an existing worker, and the Workers page already warns on an `auto` worker whose pool went empty. Applied to `CreateWorker` (external mint) AND the hosted provision handler; ephemeral already did this (#804, §594). No backfill of existing `default` workers — a `default` worker beside a non-empty pool may be a deliberately reserved account (PRD #111 D2); the flip is a default for rows that do not exist yet (D2). D3: the hosted INSERT names the `anthropic_bind_mode` column and takes it as a required query parameter — an INSERT that omitted it would let the SQL default silently ship `default` for every hosted worker, green at every gate (the PRD #111 M3 regression `runtime.sql` records).
+- **D4 — judge-lane `auto` on a genuinely empty pool spends the DEFAULT, recorded `pool_empty`; the run lane keeps holding in `pool_wait`.** The one deliberate asymmetry. A run-lane hold protects a token a user reserved from an auto *worker* and preserves issue/worker affinity for a resume someone waits on; a judge run holds no issue, branch, or attention, and parking retrospectives in `pool_wait` would silently pile up (every finished run enqueues one) with no backlog surface, against the judge's "spends your own token" contract — the default being the credential any token-holding user always has. `autoselect.ReasonPoolEmpty` (kept in the closed vocabulary for pre-#754 rows where the default genuinely was spent) is revived for this row, so migration 00089's CHECK and every renderer are unchanged. `self_improve` follows the judge resolution exactly, including this fallback (it is uzi reviewing itself, not a worker). Mechanically a one-branch decision: `assembleJudgeClaim` could instead reuse the run-lane hold, and flipping it rewrites only D4.
+- **D5 — judge mode column default `auto` reaches EXISTING users** (unlike worker rows), because the judge pointer is resolved at claim time, and it worsens nobody's spend: a pinned-judge-token user backfills to `pinned` (00197: `UPDATE … WHERE judge_anthropic_secret_id IS NOT NULL`, unchanged); a sole-token user's pool is their default (same credential, reason becomes `auto`); a pooled-set user gets the spread they opted into; an emptied-pool user spends the default (D4). Backfilling to `default` would reach nobody who did not find the picker.
+- **D6 — mode + pointer written in one statement; `pinned` with a NULL pointer resolves as `default`; no coupling CHECK.** Same two rules 00088 states for workers, for the same reason: 00079's FK is `ON DELETE SET NULL (judge_anthropic_secret_id)`, so a legal token delete nulls the pointer and leaves the mode — a coupling CHECK would reject that delete. The API reports the *effective* mode (`effectiveBindMode`, reused/mirrored) so no client re-derives the rule. Migration `00197_user_judge_anthropic_bind_mode.sql` adds `users.judge_anthropic_bind_mode` (`NOT NULL DEFAULT 'auto'`, CHECK in `default/pinned/auto`) with the D5 backfill in the same migration; draft number, renumbered above the live head on the landing rebase (root `CLAUDE.md` rule).
+- **D7 — reuse the single `autoChoice` ranker (now two callers), and extract the open-failed retry into `openWithAutoRetry`.** `judgeSecretID` becomes `judgeChoice(ctx, run)`: `pinned`+pointer → static bound; `pinned`+NULL or `default` → static nil (records `default` honestly); `auto` → `autoChoice` (same run, same `claimExclude` for a just-parked dead credential), and on `errAutoPoolEmpty` a choice built directly with `ReasonPoolEmpty` (NOT through `staticChoice`, which would rewrite the reason to `default`). Both `assembleJudgeClaim` and the `self_improve` arm of `claimSecretID` move to `judgeChoice`. The D14 open-failed floor-onto-another-pooled-token retry (`autoFloorRetry`) sat *after* the judge fork on the run lane, so a judge `auto` pick that would not decrypt failed the judge run terminally; it is extracted into `openWithAutoRetry(ctx, run, choice)` returning the post-retry choice, called by both `assembleClaim` and `assembleJudgeClaim`, so `recordRunCredential` logs the final reason (`open_failed` on fallback) on both lanes.
+- **D8 — no new CLI verb.** Setting the judge token stays web-only (PRD #104 D8 kept credential-choosing writes off the CLI). The judge mode rides `UserDTO` on `GET /api/auth/me` (`uzi whoami --json`); a `uzi judge set-token` verb is left to a follow-up. The judge picker gains an "Auto-select from the pool" option, at copy/a11y parity with the worker picker (M3).
+- **D9 — chat runs untouched.** The chat lane calls the opener with no override and always resolves the owner's default; out of scope, stated so nobody reads M1 as covering it.
+
+## 622. PRD #1137 — TUI run detail loads progressively: run-first, tail-first history, payload cap, memoized transcript, incremental refetch
+
+Serves human Feature #325 (the run detail must open on the run and its newest messages first and fill older history in the background, so a slow link never sits on an empty pane; refetches continue from what is already held). Additive server paging on `GET /api/runs/{id}/messages` plus a TUI-only rewrite of the detail load; no schema change, no migration, no wire change for the web (which sends none of the new params and sees no difference). Touched: `api/internal/handler/runs_lifecycle.go`, `api/internal/handler/runs_payload_trim.go`, `api/internal/store/runtime.sql(.go)` (`ListRunMessagesBeforePage`), `api/internal/uzicli/{client,client_runs,stream}.go`, `api/cmd/uzi/{tui.go,tui_detail.go,tui_detail_transcript.go,run_get.go}`. Richer rationale is PRD #1137's Decision Log D1-D11.
+
+- **Three additive `?…` query params (D2/D3).** `?tail=<n>` returns the newest n messages ascending; `?before=<seq>`+`?limit=<n>` returns the newest ≤n with `seq < before`, ascending; `?payload_max=<bytes>` opt-in trims payloads and combines with any form. Mutual exclusion is enforced with 400s (tail excludes after/before/limit; before excludes after/tail; before requires limit) and validated before any store call; malformed values are 400s. `tail`/`limit` are clamped to `maxRunMessagesPage` (1000) before the store call. Backed by one new store query `ListRunMessagesBeforePage` (DESC + `LIMIT`), reversed to ascending in the service (a ten-line Go reverse, not a SQL subquery, so the row stays `store.RunMessage` with no per-query Row type). `tail` is implemented as `before = MaxInt32, limit = tail`. Legacy `?after`/`?limit` and the unbounded path are unchanged.
+- **`payload_max` trim invariants (D4).** `trimPayload` cuts only `tool_result.content` and `tool_use.input` string values (the two kinds that are ~87% of the bytes and are drawn from ≤200 runes). It EXEMPTS the three identity keys `subagent_type`/`description`/`file_path` (read verbatim by `runactivity.FromFrame` for the now-line) and preserves every other key (`usage`/`context`/`is_error`/`tool_use_id`/`id`/`name`), so the lead-context meter and tool pairing survive. Cuts land on a rune boundary (a straddling multi-byte rune is dropped whole); a malformed payload is returned verbatim; output is always valid JSON. `MessageDTO.payload_truncated` (json `omitempty`) is set only when bytes were actually removed; the flag rides the DTO, never the model-authored payload.
+- **TUI progressive load — run-first then tail-first (D1).** The header/rail/milestones render from one `GetRun` via `detailRunMsg` before any transcript; then `detailPageMsg{pageTail}` delivers the newest page (`Tail: detailPageSize, PayloadMax: detailPayloadMax`). A live socket frame arriving before the tail renders instead of hiding. `detailLoadedMsg`/`loadDetailCmd`/`applyLoaded` are retired (D11's `applyDetail` helper migrated the ~54 test sites).
+- **Background backfill, separate from the socket (D1/D7).** `pageBackfill` walks older pages (`Before: lowSeq`) issued only by the previous page's reply, so the chain self-serialises and needs no request-id guard; it stops on an empty page, a page that did not advance below `before`, or reaching seq 1, then sets `historyComplete`. Frames are kept seq-sorted and deduped by `addFrames` (prepend / append / merge with a stable sort + `seen` set), so a paused viewport does not jump when older pages land.
+- **Incremental refetch, never from seq 0 (D5/D7).** The D8 poll fallback (`pollFallbackMsg`, 2s tick while the socket is down) and the `r` key refetch incrementally from the highest seq held via `catchupCmd` (`After: highSeq`), plus `Before: lowSeq` only while history is incomplete — never a `Tail` or `after=0` after the first load. Two guards, each the #1130 request-id pattern: one meta refresh at a time (`metaWaitID`, reusing #1135's `startDetailMetaReq`) and one catch-up chain at a time (`catchupWaitID`); a reply is honoured only on a matching run and id, and a failed poll clears its guard so the next tick retries. `applyMeta` adopts the DTO status only while polling; while streaming it preserves the stream's status. A reconnecting stream replays from the highest seq held: `RunStream.NoteSeen`/`LastSeen` raise the replay floor (atomic CAS) so a socket that drops before its first live frame no longer replays the whole history.
+- **Memoized transcript lines (D6).** `transcriptCache` (a pointer field on the value-receiver model, never shared across goroutines) is keyed on every render input (lane, width, theme, profile, identities signature, frame extent) and is never explicitly invalidated — a stale entry simply never matches, so a missed invalidation is impossible by construction. A tail-append fast path re-renders only from the previous last frame (the one block whose separator depends on its successor). `-race` in `gate:api` guards the shared pointer.
+- **CLI: `uzi run logs --tail N`** prints the newest N ascending and `--follow` continues from there; `--tail` cannot combine with `--after`, and a negative `--tail` is a usage error (not a silent full-history fall-through; `--tail 0` is the unset default). `RunLogs` stays all-or-nothing (issue #160); `RunLogsPage` is the separate single-request verb the TUI drives (D10).
+
+Cross-refs: PRD #1137 Decision Log (D1-D11); PRD #1130 / §619 (the request-id guard + `boardPollTimeout` shapes reused, not reworked); PRD #1064 (`current_activity`/milestones on `RunDTO`, why the header renders from `GetRun` alone); PRD #325 (the detail-view pane model this loads into).
+## 623. Codex credential-operation authority — release vs persist-recovery asymmetry, and verified re-login (PRD #1147)
+
+Serves PRD #1147's Codex-credential security hardening [user, #1147]; richer rationale is PRD #1147's Decision Log (D4 persist-before-park, M1 converge-not-overwrite) and the code comments in `api/internal/workersvc/codexauthz.go`. Records the AI authority model behind two related decisions: an intentional release-vs-protect asymmetry, and re-login/recovery that restores real usability, not just labels.
+
+- **Single release gate.** `evalCodexReleasePredicate` (`api/internal/workersvc/codexauthz.go`) is the one predicate for handing a run its Codex credential — claim assembly, coordinated-refresh token release, and `ReleaseCodexAccessToken`. It requires: kind↔auth-mode match, actively-claimed status, per-alias `material_revision` match, and — for subscription — the frozen account identity tuple, the account `credential_revision`, and a NON-quarantined account. Any mismatch refuses the release.
+- **Deliberate asymmetry (release vs persist-recovery).** `ScopePersistRecovery` runs a REDUCED predicate that keeps ownership + actively-claimed + `material_revision` + tuple but SKIPS `credential_revision`, quarantine, and kind. Rationale: a run must still be able to persist recoverable auth material before parking (D4 persist-before-park) even after its credential was revoked or the account quarantined. Losing permission to RELEASE a token must not also strip the authority to PROTECT material already in hand — release is refused in those states, persist-recovery is not.
+- **Verified re-login / recovery restores usability, not labels.** A persistence failure leaves new material in the account recovery slot and quarantines the account. If provider rotation succeeds while the user vault is locked, the server master key protects a temporary recovery envelope; after unlock, `ReconcileUnresolvedCodexRefresh` opens it, re-verifies provider identity against the frozen tuple, re-seals it under the user DEK, and only then promotes it into the live `sealed_login`. A fresh same-tuple re-login of a quarantined account similarly replaces the canonical login only after identity re-verification, narrowly relaxing M1's "converge, do not overwrite" rule for quarantined accounts.
+- **TOCTOU follow-ups both closed with SQL-local CAS results checked.** `RefreshCodexAccountLogin` requires `coord_state = 'quarantined' AND generation = @from_generation`; its caller rejects a 0-row result before linking. `SetCodexRecoverySlot` requires the owning operation, an in-progress/quarantined state and the exact source generation, and the service accepts only exactly one affected row as persisted recovery. A zero-row fence miss is unrecoverable rather than a false retained result.
+
+Cross-refs: PRD #1147 Decision Log (D4 persist-before-park, M1 converge-not-overwrite); `api/internal/workersvc/codexauthz.go` (`evalCodexReleasePredicate`, `ScopePersistRecovery`), `codexrefresh.go` (`ReconcileUnresolvedCodexRefresh`), `api/internal/store/codex_binding.sql.go` (`PromoteCodexRecovery`, `RefreshCodexAccountLogin`, `SetCodexRecoverySlot`).

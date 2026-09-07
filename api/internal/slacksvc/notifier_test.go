@@ -41,6 +41,16 @@ type fakeNotifStore struct {
 	// call is captured so a test can assert the advanced count was recorded (or that a
 	// deduped/no-milestone report recorded nothing).
 	milestoneSet []store.SetSlackRunMilestoneNotifiedParams
+	// PRD #1116: the usage-limit park anchor writes. Each set/clear is captured so a
+	// later milestone's test can assert the park marker was stamped/consumed. The fake
+	// is STATEFUL for this column (unlike the other static setters): SetSlackRunLimitPause
+	// writes msg.LimitPausedAt and ClearSlackRunLimitPause NULLs it only on a matching
+	// value, mirroring the live compare-and-swap — this is what lets a park→running
+	// sequence flow through handle across events (criteria 2 and 3 can't be driven by a
+	// static row). clearErr injects a non-ErrNoRows failure to exercise the log path.
+	limitPauseSet []store.SetSlackRunLimitPauseParams
+	limitPauseClr []store.ClearSlackRunLimitPauseParams
+	clearErr      error
 	// PRD #191 M2b: the repo-less chat context the notifier falls back to. chatCtxErr
 	// defaults to pgx.ErrNoRows via the method below when no row is staged, modelling a
 	// non-chat run.
@@ -98,6 +108,25 @@ func (f *fakeNotifStore) SetSlackRunQuestion(_ context.Context, arg store.SetSla
 func (f *fakeNotifStore) SetSlackRunMilestoneNotified(_ context.Context, arg store.SetSlackRunMilestoneNotifiedParams) (store.SlackRunMessage, error) {
 	f.milestoneSet = append(f.milestoneSet, arg)
 	return store.SlackRunMessage{RunID: arg.RunID, MilestonesNotifiedCompleted: arg.Count}, nil
+}
+func (f *fakeNotifStore) SetSlackRunLimitPause(_ context.Context, arg store.SetSlackRunLimitPauseParams) (store.SlackRunMessage, error) {
+	f.limitPauseSet = append(f.limitPauseSet, arg)
+	f.msg.LimitPausedAt = arg.At // stateful: the next GetSlackRunMessage sees the marker
+	return f.msg, nil
+}
+func (f *fakeNotifStore) ClearSlackRunLimitPause(_ context.Context, arg store.ClearSlackRunLimitPauseParams) (store.SlackRunMessage, error) {
+	f.limitPauseClr = append(f.limitPauseClr, arg)
+	if f.clearErr != nil { // allow injecting a non-ErrNoRows failure
+		return store.SlackRunMessage{}, f.clearErr
+	}
+	// Compare-and-swap: clear ONLY when the stored marker matches @at, else refuse with
+	// pgx.ErrNoRows — the same semantics the live ClearSlackRunLimitPause query enforces
+	// (proven in TestClearSlackRunLimitPauseLiveDB). Value-based match, not just Valid.
+	if f.msg.LimitPausedAt.Valid && arg.At.Valid && f.msg.LimitPausedAt.Time.Equal(arg.At.Time) {
+		f.msg.LimitPausedAt = pgtype.Timestamptz{} // NULL
+		return f.msg, nil
+	}
+	return store.SlackRunMessage{}, pgx.ErrNoRows
 }
 
 type postCall struct{ channel, thread, text string }
@@ -883,19 +912,26 @@ func TestParkedRunRendersAsPausedNotAsARawStatus(t *testing.T) {
 	}
 }
 
-// A park is the ONE non-terminal transition that threads an event, and the reason is
-// mechanical rather than editorial: the root line is EDITED, and a Slack edit raises
-// no notification, so without this a user is never told their run paused.
-func TestParkThreadsAnEventWhileResumeDoesNot(t *testing.T) {
+// A park threads an event; queued does NOT — and the reason queued does not is exactly
+// why the resume line lives elsewhere. The park threads because the root line is EDITED
+// and a Slack edit raises no notification, so without this a user is never told their run
+// paused. The resume, since PRD #1116, DOES post — but it is ANCHOR-DRIVEN
+// (handleLimitResume, keyed on the row's limit_paused_at marker), NOT a renderThreadBlocks
+// status arm. That is precisely WHY renderThreadBlocks still returns ok=false for
+// queued/running here: a status arm would fire on EVERY running broadcast (heartbeat,
+// milestone progress, summary re-emit), producing a stream. The resume is posted once per
+// park by the marker, not by this function; this test pins that renderThreadBlocks stays
+// out of the resume business.
+func TestRenderThreadBlocksThreadsParkNotQueued(t *testing.T) {
 	if _, _, ok := renderThreadBlocks(parkedCtx("seven_day", time.Hour, 1), "https://uzi.example"); !ok {
 		t.Fatal("a park threaded nothing; the edited root raises no Slack notification, so " +
 			"the user would never learn the run paused")
 	}
-	// The promotion back to queued must NOT post — resuming is a return to normal and
-	// the edited root already shows it. A run that parks five times would otherwise
-	// produce ten posts.
+	// The promotion back to queued must NOT thread here — the resume is anchor-driven, not
+	// a renderThreadBlocks status arm, so this function stays ok=false for queued.
 	if _, _, ok := renderThreadBlocks(baseRun("queued"), "https://uzi.example"); ok {
-		t.Fatal("the resume threaded an event; only the park is worth interrupting for")
+		t.Fatal("renderThreadBlocks threaded a queued event; the resume is anchor-driven, " +
+			"not a status arm here")
 	}
 }
 
@@ -938,6 +974,294 @@ func TestLimitWaitDetailEscapesTheWindowField(t *testing.T) {
 	got := limitWaitDetail(parkedCtx("five_hour<https://evil|click>", time.Hour, 1))
 	if strings.Contains(got, "<https://evil|click>") {
 		t.Fatalf("unescaped mrkdwn reached the DM: %q", got)
+	}
+}
+
+// --- PRD #1116: the ▶️ Resumed line, driven end-to-end through handle -------------
+
+// resumeBlocks returns the ▶️ Resumed thread posts recorded on the poster (matched by
+// the section text), so a case can assert exactly one landed and read its context.
+func resumeBlocks(blocks []blockCall) []blockCall {
+	var out []blockCall
+	for _, b := range blocks {
+		if strings.Contains(b.sectionText, "Resumed") {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// countSection counts recorded block posts whose section carries substr.
+func countSection(blocks []blockCall, substr string) int {
+	n := 0
+	for _, b := range blocks {
+		if strings.Contains(b.sectionText, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// Criterion 1: a park then a running report posts exactly ONE ▶️ Resumed reply, after
+// the ⏸️ Paused reply, carrying the waited duration (no pause count on the first park)
+// and the in-progress milestone title. The run ID is stable across the two events and
+// the parked rc carries a real status_since (the pause start), so the marker written on
+// the park is what the resume reads back through the stateful fake.
+// Reddening mutation: delete handleLimitResume's `running` arm → this case fails.
+func TestNotifierResumePostsOnceOnRunning(t *testing.T) {
+	rc := milestoneRun(t, 1, 3, "m2") // in-progress "Milestone 2" for the working suffix
+	rc.StatusSince = pgtype.Timestamptz{Time: time.Now().Add(-2*time.Hour - 13*time.Minute), Valid: true}
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	// Park: threads ⏸️ Paused and stamps the marker.
+	fs.rc.Status = "limit_wait"
+	fs.rc.LimitWaitCount = 1
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "limit_wait"})
+	if got := countSection(fp.blocks, "Paused · usage limit"); got != 1 {
+		t.Fatalf("the park must thread exactly one ⏸️ Paused block, got %d: %+v", got, fp.blocks)
+	}
+	if len(fs.limitPauseSet) != 1 {
+		t.Fatalf("the park must stamp the limit-pause marker: %+v", fs.limitPauseSet)
+	}
+	if len(resumeBlocks(fp.blocks)) != 0 {
+		t.Fatalf("a park must not post a resume line: %+v", fp.blocks)
+	}
+
+	// Resume: one ▶️ Resumed reply with the waited duration + working title, no pause count.
+	fs.rc.Status = "running"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+	rb := resumeBlocks(fp.blocks)
+	if len(rb) != 1 {
+		t.Fatalf("a resume must post exactly one ▶️ Resumed reply: %+v", fp.blocks)
+	}
+	if !strings.Contains(rb[0].contextText, "waited 2h 13m") {
+		t.Fatalf("resume context = %q, want it to carry `waited 2h 13m`", rb[0].contextText)
+	}
+	if strings.Contains(rb[0].contextText, "(pause") {
+		t.Fatalf("a FIRST-park resume must carry no pause count: %q", rb[0].contextText)
+	}
+	if !strings.Contains(rb[0].contextText, "working Milestone 2") {
+		t.Fatalf("resume context = %q, want the in-progress `working Milestone 2`", rb[0].contextText)
+	}
+}
+
+// Criterion 2: a redelivered `running` after the resume posts nothing more — the marker
+// was consumed by the compare-and-swap clear.
+// Reddening mutation: delete the CAS clear after the post → the second running re-posts.
+func TestNotifierRedeliveredRunningPostsNoResume(t *testing.T) {
+	rc := baseRun("limit_wait")
+	rc.StatusSince = pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	fs.rc.Status = "limit_wait"
+	fs.rc.LimitWaitCount = 1
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "limit_wait"})
+
+	fs.rc.Status = "running"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if got := len(resumeBlocks(fp.blocks)); got != 1 {
+		t.Fatalf("a redelivered running must not re-post the resume: got %d resume blocks in %+v", got, fp.blocks)
+	}
+	if len(fs.limitPauseClr) == 0 {
+		t.Fatalf("the resume must have cleared the marker via the CAS: %+v", fs.limitPauseClr)
+	}
+}
+
+// Criterion 4: `queued` after a park posts nothing (the resume waits for `running`) and
+// leaves the marker set — a later `running` still resumes.
+func TestNotifierQueuedAfterParkPostsNoResume(t *testing.T) {
+	rc := baseRun("limit_wait")
+	rc.StatusSince = pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	fs.rc.Status = "limit_wait"
+	fs.rc.LimitWaitCount = 1
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "limit_wait"})
+
+	fs.rc.Status = "queued"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "queued"})
+	if len(resumeBlocks(fp.blocks)) != 0 {
+		t.Fatalf("queued after a park must post no resume line: %+v", fp.blocks)
+	}
+	if !fs.msg.LimitPausedAt.Valid {
+		t.Fatalf("queued must LEAVE the marker set for the eventual running: %+v", fs.msg.LimitPausedAt)
+	}
+
+	fs.rc.Status = "running"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+	if len(resumeBlocks(fp.blocks)) != 1 {
+		t.Fatalf("the running after queued must finally resume: %+v", fp.blocks)
+	}
+}
+
+// Criterion 3: a resume that lands straight in a gate posts NO resume line (the gate's
+// own post carries the news) but clears the marker; a LATER park+resume on the same run
+// posts again, now with `(pause 2)`. planCount=0 keeps handleGate silent so the only
+// blocks in play are the pause/resume ones.
+// Reddening mutation: delete the silent-clear arm → the marker sticks and the later
+// running re-reads the FIRST park's marker, so the `(pause 2)` resume reads the wrong
+// waited/marker; more directly, the intermediate awaiting_approval never clears it.
+func TestNotifierResumeIntoGateClearsMarkerSilently(t *testing.T) {
+	rc := baseRun("limit_wait")
+	rc.StatusSince = pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
+	fs := &fakeNotifStore{
+		rc:        rc,
+		delivery:  txt("U1"),
+		msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+		planCount: 0, // no plan flushed → handleGate posts nothing
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	// Park 1.
+	fs.rc.Status = "limit_wait"
+	fs.rc.LimitWaitCount = 1
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "limit_wait"})
+
+	// Resume straight into a gate: no resume line, marker cleared silently.
+	fs.rc.Status = "awaiting_approval"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+	if len(resumeBlocks(fp.blocks)) != 0 {
+		t.Fatalf("a resume into a gate must post NO ▶️ Resumed line: %+v", fp.blocks)
+	}
+	if fs.msg.LimitPausedAt.Valid {
+		t.Fatalf("awaiting_approval must clear the marker silently: %+v", fs.msg.LimitPausedAt)
+	}
+
+	// Park 2, then running: the next cycle resumes normally with `(pause 2)`.
+	fs.rc.Status = "limit_wait"
+	fs.rc.LimitWaitCount = 2
+	fs.rc.StatusSince = pgtype.Timestamptz{Time: time.Now().Add(-30 * time.Minute), Valid: true}
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "limit_wait"})
+
+	fs.rc.Status = "running"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+	rb := resumeBlocks(fp.blocks)
+	if len(rb) != 1 {
+		t.Fatalf("the second cycle must post exactly one ▶️ Resumed line: %+v", fp.blocks)
+	}
+	if !strings.Contains(rb[0].contextText, "(pause 2)") {
+		t.Fatalf("the second resume must carry `(pause 2)`: %q", rb[0].contextText)
+	}
+}
+
+// Criterion 5: a run whose park is its FIRST-ever Slack event (root created on the park)
+// still resumes — recordLimitPause stamps the marker in the no-anchor branch, so it
+// survives to the running event once the anchor exists.
+func TestNotifierParkAsFirstEventStillResumes(t *testing.T) {
+	rc := baseRun("limit_wait")
+	rc.StatusSince = pgtype.Timestamptz{Time: time.Now().Add(-90 * time.Minute), Valid: true}
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msgErr:   pgx.ErrNoRows, // no anchor yet: the park IS the first Slack event
+	}
+	fp := &fakePoster{}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	// Park as the first event: posts the root, stamps the marker in the no-anchor branch.
+	fs.rc.Status = "limit_wait"
+	fs.rc.LimitWaitCount = 1
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "limit_wait"})
+	if len(fs.limitPauseSet) != 1 {
+		t.Fatalf("a first-event park must still stamp the marker: %+v", fs.limitPauseSet)
+	}
+
+	// The anchor now exists; recordLimitPause already wrote fs.msg.LimitPausedAt, leave it.
+	fs.msgErr = nil
+	fs.msg.RunID = rc.ID
+	fs.msg.ChannelID = "D1"
+	fs.msg.RootTs = "ts1"
+
+	fs.rc.Status = "running"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+	if len(resumeBlocks(fp.blocks)) != 1 {
+		t.Fatalf("a first-event park must still resume on the first running: %+v", fp.blocks)
+	}
+}
+
+// Criterion 6: an implausible waited value (park start > maxPlausibleWait ago) OMITS the
+// `waited` fragment but the resume line still posts.
+func TestNotifierImplausibleWaitOmitsFragment(t *testing.T) {
+	rc := baseRun("limit_wait")
+	rc.StatusSince = pgtype.Timestamptz{Time: time.Now().Add(-9 * 24 * time.Hour), Valid: true} // > 8d bound
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	fs.rc.Status = "limit_wait"
+	fs.rc.LimitWaitCount = 1
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "limit_wait"})
+
+	fs.rc.Status = "running"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+	rb := resumeBlocks(fp.blocks)
+	if len(rb) != 1 {
+		t.Fatalf("an implausible wait must still post the resume line: %+v", fp.blocks)
+	}
+	if strings.Contains(rb[0].contextText, "waited") {
+		t.Fatalf("an implausible wait must OMIT the waited fragment: %q", rb[0].contextText)
+	}
+}
+
+// humanWait renders a park duration compactly, with the day rollover and the sub-minute
+// floor. The boundaries (exactly 1m, exactly 1h) pin the arm transitions.
+func TestHumanWait(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{30 * time.Second, "<1m"},
+		{time.Minute, "1m"}, // boundary: exactly 1m is no longer "<1m"
+		{45 * time.Minute, "45m"},
+		{time.Hour, "1h 0m"}, // boundary: exactly 1h rolls to the h/m form
+		{2*time.Hour + 13*time.Minute, "2h 13m"},
+		{3*24*time.Hour + 2*time.Hour, "3d 2h"},
+	} {
+		if got := humanWait(tc.d); got != tc.want {
+			t.Errorf("humanWait(%s) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
+// resumeThreadBlocks with hasWait=false (a negative or implausible duration) omits the
+// waited fragment yet still renders the ▶️ Resumed section and the repo#iid fallback.
+func TestResumeThreadBlocksOmitsFragmentWhenNoWait(t *testing.T) {
+	rc := baseRun("running")
+	blocks, fallback := resumeThreadBlocks(rc, -5*time.Minute, false, "https://uzi.example")
+	_, section := blockSummary(blocks)
+	if !strings.Contains(section, "Resumed · usage limit cleared") {
+		t.Fatalf("resume section = %q, want the resume head", section)
+	}
+	if strings.Contains(contextText(blocks), "waited") {
+		t.Fatalf("hasWait=false must omit the waited fragment: %q", contextText(blocks))
+	}
+	if fallback != "Resumed · grp/repo#42" {
+		t.Fatalf("resume fallback = %q, want `Resumed · grp/repo#42`", fallback)
 	}
 }
 

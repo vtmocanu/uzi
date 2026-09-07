@@ -474,7 +474,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		WaitOnLimit:             u.WaitOnLimit,
 		NotifyEarlyLimitReset:   u.NotifyEarlyLimitReset,
 		JudgeEnabled:            u.JudgeEnabled,
-		CIAutofixEnabled:        u.CiAutofixEnabled,
+		CIAutofixEnabled:        boolPtrValue(u.CiAutofixEnabled),
 		AttributionEnabled:      u.AttributionEnabled,
 		EphemeralWorkersEnabled: u.EphemeralWorkersEnabled,
 		CreatedAt:               u.CreatedAt.Time,
@@ -482,6 +482,10 @@ func toDTO(u store.User) apitypes.UserDTO {
 		// resolved it (PUT /api/me/judge), since a bare users row carries no join to
 		// look it up. A bound user rendered without a label is honest, not a bug.
 		JudgeAnthropicSecretID: uuidPtrValue(u.JudgeAnthropicSecretID),
+		// The EFFECTIVE judge bind mode (PRD #1140 M2, D6): effectiveBindMode maps a
+		// "pinned" row whose pointer was nulled back to "default". Since SetUserJudgeBinding
+		// writes NULL for every non-"pinned" mode, the id always agrees with the mode.
+		JudgeAnthropicBindMode: effectiveBindMode(u.JudgeAnthropicBindMode, u.JudgeAnthropicSecretID),
 	}
 	if u.DisplayName.Valid {
 		dto.DisplayName = &u.DisplayName.String

@@ -94,6 +94,44 @@ func OpenByID(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box
 	return OpenSealed(vlt, box, userID, row.Kind, row.SealedWith, row.Ciphertext)
 }
 
+// OpenByIDOfKind is OpenByID with an additional KIND GUARD: it opens ONE specific
+// secret of the user's only when the row's own user_secrets.kind equals expectedKind,
+// and otherwise returns the SAME not-found sentinel (ErrNoSecret) a missing or foreign
+// secret returns — never the plaintext, and never a distinct error that would confirm
+// the row exists under a different kind.
+//
+// This is defense-in-depth for the bound credential paths (PRD #1147 audit #6): an
+// api_key open path must never decrypt and return a codex_auth login blob (which carries
+// a refresh_token), even if an upstream kind check were ever bypassed or a binding were
+// somehow mis-kinded. The caller states the kind it EXPECTS to open; a row of any other
+// kind is treated as if it did not exist. The kind check is non-disclosing on purpose —
+// it collapses to ErrNoSecret rather than a "wrong kind" error so it leaks nothing about
+// the row's real kind.
+//
+// The row's OWN kind still feeds the vault dispatch (the DEK AAD is user_id||kind); the
+// expectedKind argument only gates access, it never changes how the ciphertext is opened.
+func OpenByIDOfKind(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box, userID, secretID uuid.UUID, expectedKind string) ([]byte, error) {
+	row, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+		ID:     secretID,
+		UserID: userID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNoSecret
+		}
+		return nil, fmt.Errorf("secretopen: lookup by id: %w", err)
+	}
+	if row.UserID != userID {
+		return nil, ErrNoSecret
+	}
+	if row.Kind != expectedKind {
+		// Non-disclosing: a row of the wrong kind is the not-found sentinel, so this path
+		// can never decrypt+return a credential of a kind the caller did not ask for.
+		return nil, ErrNoSecret
+	}
+	return OpenSealed(vlt, box, userID, row.Kind, row.SealedWith, row.Ciphertext)
+}
+
 // OpenSealed decrypts an already-fetched sealed row, without a DB lookup — the
 // path the rate-limit poller takes when it lists every token in one query (D1).
 // It is the crypto half of Open and shares the exact vault dispatch: a 'dek' row

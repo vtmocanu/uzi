@@ -11,16 +11,44 @@ own agent merge-request branches by itself: no clicking **Fix CI**. Like the
 manual button, it spends your own Anthropic token, not the instance's. It's
 the unattended sibling of the manual **Fix CI** button described in
 [Configuration](./configuration.md#ci-status-integration-prd-6) — same
-`ci_fix` run type, same verification, just started for you. Off by default,
-and opt-in per user.
+`ci_fix` run type, same verification, just started for you. **On by
+default** for every user, capped by `CI_AUTOFIX_MAX_ATTEMPTS` and bounded to
+your own branches — see [Opting out](#1-opt-out) below, and [Upgrading from
+an older uzi](#upgrading-from-an-older-uzi) if this instance predates the
+change.
 
-## 1. Opt in
+## 1. Opt out
 
-Open **Settings → Automatic CI fixes** and check **Automatically fix my
-failed CI pipelines**. Off by default; it only ever spends your own
-Anthropic token, and only on branches that trace back to your own agent
-runs. Admins can also force-enable or force-disable it for any individual
-user from **Admin → Users**, the same pattern as the [run judge](./judge.md).
+Automatic CI fixes ship **on** for every user — there is nothing to turn on.
+Your per-user setting is really a tri-state opt-**out**: leaving it alone
+stores nothing (`NULL`, meaning "inherit the instance default", which is
+ON); unchecking it stores an explicit off. To opt out, open **Settings →
+Automatic CI fixes** and uncheck **Automatically fix my failed CI
+pipelines**. Either way — inherited on or explicitly on — it only ever
+spends your own Anthropic token, never the instance's, and only on branches
+that trace back to your own agent runs. Admins can also force-enable or
+force-disable it for any individual user from **Admin → Users**, the same
+pattern as the [run judge](./judge.md).
+
+On top of the per-user setting, an admin can flip a separate,
+instance-wide kill-switch (`ci_autofix_enabled`, default **on**) that turns
+automatic CI fixes off for every user at once regardless of their own
+setting — the same pattern as [MR review rework](./mr-review-watcher.md#enablement)'s
+kill-switch, and set the same way: through the settings API rather than a
+dedicated Admin Settings control today. A settings-read hiccup is treated as
+off (fail closed), never as silently on.
+
+### Upgrading from an older uzi
+
+Automatic CI fixes used to be off by default and opt-in per user. A
+one-time migration turns the feature **on for everyone**, including anyone
+who had previously opted out on purpose — folding their old "off" into the
+same "never chose" state, since the pre-migration column couldn't tell the
+two apart. That is an accepted, intentional trade so that going forward the
+tri-state can distinguish them. If you'd previously turned this off
+deliberately, check **Settings → Automatic CI fixes** after upgrading and
+opt out again if you still want it off: until you do, it resumes spending
+your Anthropic token on failed pipelines.
 
 ## What triggers it
 
@@ -29,15 +57,19 @@ every watched **agent-owned MR branch** — the branch one of your agent runs
 pushed to: an issue run's `agent/issue-N`, or a [scheduled
 run](./scheduling.md)'s `uzi/prompt-<id>` (an ad-hoc prompt job) or
 `uzi/self-improve/<id>` (self-improvement). When that branch's latest pipeline
-is failed and you have the toggle on and an Anthropic token configured, uzi
+is failed and you haven't opted out and an Anthropic token is configured, uzi
 queues the same `ci_fix` run the **Fix CI** button would — auto-approved, so it
 skips the plan-approval step and starts working right away. A scheduled run
-inherits your account-wide opt-in; there is no separate per-schedule switch.
+inherits your account-wide setting; there is no separate per-schedule switch.
 
 `main`, the repo's default branch, and any non-MR ref are never auto-touched
-— only a branch that is itself the product of one of your agent runs. And
-none of this fires at all unless the pipeline watch itself is on
-(`CI_WATCH_MAX_REFS` > 0 — see [Configuration](./configuration.md#ci-status-integration-prd-6)); with the watch off, there are no CI badges and no automatic fixes.
+— only a branch that is itself the product of one of your agent runs. None of
+this fires at all unless the pipeline watch itself is on (`CI_WATCH_MAX_REFS`
+> 0 — see [Configuration](./configuration.md#ci-status-integration-prd-6));
+with the watch off, there are no CI badges and no automatic fixes. It also
+doesn't fire while the [instance-wide kill-switch](#1-opt-out) is off,
+regardless of anyone's own setting — and, fail-closed, a settings-read
+hiccup on that admin gate is treated the same as off.
 
 ## The loop guard
 

@@ -30,10 +30,12 @@ type UserDTO struct {
 	// Decision 7). Default false; the user toggles their own from Settings, and an
 	// admin can force-toggle any user's from the admin users surface.
 	JudgeEnabled bool `json:"judge_enabled"`
-	// CIAutofixEnabled is the user's per-user opt-in to automatic CI fixes (PRD
-	// #71). Default false; the user toggles their own from Settings, and an admin
-	// can force-toggle any user's from the admin users surface.
-	CIAutofixEnabled bool `json:"ci_autofix_enabled"`
+	// CIAutofixEnabled is the user's per-user tri-state opt for automatic CI fixes
+	// (PRD #71, tri-state per #914): nil = inherit the admin global default (which is
+	// ON), true = explicit on, false = explicit off. Serializes as JSON null / true /
+	// false. The user toggles their own from Settings, and an admin can force-toggle
+	// any user's from the admin users surface.
+	CIAutofixEnabled *bool `json:"ci_autofix_enabled"`
 	// AttributionEnabled is the user's opt-out for AI attribution in worker commits
 	// (issue #916). Default true (current behavior); when false the worker suppresses
 	// the SDK's Co-Authored-By: Claude commit trailer.
@@ -48,8 +50,13 @@ type UserDTO struct {
 	// token, which is every user's state until they choose otherwise. The label
 	// rides so a client can render "judged by: console-key" without a second
 	// lookup — a name, never the credential.
-	JudgeAnthropicSecretID    *string    `json:"judge_anthropic_secret_id"`
-	JudgeAnthropicSecretLabel *string    `json:"judge_anthropic_secret_label"`
-	CreatedAt                 time.Time  `json:"created_at"`
-	LastLogin                 *time.Time `json:"last_login"`
+	JudgeAnthropicSecretID    *string `json:"judge_anthropic_secret_id"`
+	JudgeAnthropicSecretLabel *string `json:"judge_anthropic_secret_label"`
+	// JudgeAnthropicBindMode is the EFFECTIVE judge bind mode (PRD #1140 M2, D6):
+	// "default", "pinned", or "auto". Effective means a "pinned" row whose pointer was
+	// nulled (a deleted token) reports "default", so the mode always agrees with what
+	// the claim will actually resolve — the client never re-derives the rule.
+	JudgeAnthropicBindMode string     `json:"judge_anthropic_bind_mode"`
+	CreatedAt              time.Time  `json:"created_at"`
+	LastLogin              *time.Time `json:"last_login"`
 }

@@ -6,6 +6,7 @@
   "cron": "",
   "timezone": "",
   "model": "",
+  "output_mode": "",
   "prompt": "",
   "selector_kind": "",
   "labels": null,

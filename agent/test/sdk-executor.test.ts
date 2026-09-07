@@ -1787,9 +1787,10 @@ describe("SdkExecutor override_subagent_model (PRD #305 M4)", () => {
 
 describe("SdkExecutor reasoning effort on baseOptions (PRD #617)", () => {
   // The owner's per-user effort must land on options.effort on BOTH the plan turn
-  // and the implement turn (Decision 8 cascade via the baseOptions spread), and an
-  // unset owner must OMIT the key (never `effort: undefined`) so the SDK default
-  // (`high`) applies.
+  // and the implement turn (Decision 8 cascade via the baseOptions spread), and a
+  // config WITHOUT default_effort must OMIT the key (never `effort: undefined`) so the
+  // SDK applies its own fallback — the runtime adds no default; the API now supplies
+  // xhigh for an inheriting owner (issue #1157).
   /** Run a plan turn + one implement turn, returning the turns for inspection. */
   async function runTurns(overrides: Partial<RunContext>, verdict?: PlanVerdict) {
     const { queryFn, turns } = fakeTurns([

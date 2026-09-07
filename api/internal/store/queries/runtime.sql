@@ -198,6 +198,12 @@ WITH prev AS (
         -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
         -- until it actually rolls.
         draining_since      = NULL,
+        -- Reset the disk-pressure debounce streak (PRD #837 M4): a register is a FRESH
+        -- pod incarnation, so a prior incarnation's streak must never carry forward — a
+        -- rolled/restarted worker starts clean and must re-earn its >=2-heartbeat streak
+        -- before the poll re-derives disk_pressure. (Distinct from HeartbeatWorker's
+        -- increment/reset CASE: this is reset-on-action, unconditional.)
+        stats_disk_pressure_streak = 0,
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = @id
@@ -276,6 +282,23 @@ UPDATE workers SET
     stats_mem_bytes       = sqlc.narg('stats_mem_bytes'),
     stats_mem_limit_bytes = sqlc.narg('stats_mem_limit_bytes'),
     stats_source          = sqlc.narg('stats_source'),
+    -- Per-volume disk sample (PRD #837 M1), same write-every-tick-incl-NULL discipline
+    -- as the mem columns; display-only.
+    stats_disk_nix_bytes        = sqlc.narg('stats_disk_nix_bytes'),
+    stats_disk_nix_total_bytes  = sqlc.narg('stats_disk_nix_total_bytes'),
+    stats_disk_data_bytes       = sqlc.narg('stats_disk_data_bytes'),
+    stats_disk_data_total_bytes = sqlc.narg('stats_disk_data_total_bytes'),
+    -- Disk-pressure debounce streak (PRD #837 M4). Increment (bounded to 100 so a
+    -- perpetually-full worker can't overflow the counter) when THIS tick's sample is
+    -- over threshold, else reset to 0 — so a single under-threshold (or absent) sample
+    -- breaks the streak. @disk_over_threshold is a NON-narg bool computed in the Go
+    -- service (diskOverThreshold): a nil/absent stats sample lands here as false, which
+    -- correctly resets. The poll derives disk_pressure = streak>=2 AND fresh; this column
+    -- is display/lifecycle-only and never a scheduling input (Decision 5).
+    stats_disk_pressure_streak = CASE
+        WHEN @disk_over_threshold::boolean THEN LEAST(workers.stats_disk_pressure_streak + 1, 100)
+        ELSE 0
+    END,
     updated_at            = now()
 WHERE id = @id
 RETURNING *;
@@ -1440,6 +1463,11 @@ UPDATE runs SET
     -- Issue #783: the fresh wall discards started_at, so the pause banked against the
     -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
     budget_paused_seconds = 0,
+    -- PRD #1147 F7 (defense-in-depth): revoke the per-claim Codex capability on park→queued.
+    -- A promoted run has no live owner until it is re-claimed, so any capability minted for
+    -- the prior claim must not survive the requeue; clearing the hash and bumping the epoch
+    -- supersedes it, mirroring the claimed→queued revocation sites.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE status = 'limit_wait' AND retry_not_before <= @now
@@ -1908,6 +1936,12 @@ UPDATE runs SET status = 'queued', status_since = now(),
     -- Exit contract (PRD #47 Decision 3): reset on the way to a fresh 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- Codex claim-capability revocation (PRD #1147 M2): this is the sweeper's
+    -- claimed→queued path (RequeueClaimedRunToQueued mirrors it) — losing the claim
+    -- must revoke the per-claim capability here too, or a run swept back to queued
+    -- would keep a live cap_hash replayable on its next claim. Clear the hash and
+    -- bump the epoch; a harmless no-op for non-codex runs (cap_hash already NULL).
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE status = 'claimed' AND claimed_at < @cutoff
 RETURNING id, user_id, status;
@@ -1928,6 +1962,11 @@ UPDATE runs SET status = 'queued', status_since = now(),
     -- 'claimed' run never carries a flag, so this is defensive, but it keeps every
     -- claimed→queued path uniform.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- Codex claim-capability revocation (PRD #1147 M2): losing the claim revokes the
+    -- per-claim capability immediately — clear the hash and bump the epoch so a stale
+    -- capability minted under this claim can never be replayed. A harmless no-op for a
+    -- non-codex run, whose codex_cap_hash is already NULL.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE id = @id AND status = 'claimed';
 
@@ -1975,6 +2014,11 @@ UPDATE runs SET
     -- Issue #783: the fresh wall discards started_at, so the pause banked against the
     -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
     budget_paused_seconds = 0,
+    -- PRD #1147 F7 (defense-in-depth): revoke the per-claim Codex capability on the
+    -- claimed→pool_wait hold. A held run no longer has a live owner executing it, so any
+    -- capability minted for the claim must not survive the park; clearing the hash and
+    -- bumping the epoch supersedes it, mirroring the claimed→queued revocation sites.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at   = now()
 WHERE id = @id AND worker_id = @worker_id
@@ -2025,6 +2069,11 @@ UPDATE runs SET
     -- Issue #783: the fresh wall discards started_at, so the pause banked against the
     -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
     budget_paused_seconds = 0,
+    -- PRD #1147 F7 (defense-in-depth): revoke the per-claim Codex capability on
+    -- pool_wait→queued. A promoted run has no live owner until it is re-claimed, so any
+    -- capability minted for the prior claim must not survive the requeue; clearing the hash
+    -- and bumping the epoch supersedes it, mirroring the claimed→queued revocation sites.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at   = now()
 WHERE id = @id AND user_id = @user_id
@@ -2122,6 +2171,10 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
         + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
+    -- Codex claim-capability revocation (PRD #1147 M2): a stale worker losing its runs
+    -- revokes their per-claim capabilities immediately — clear the hash and bump the
+    -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count < @max_requeues
@@ -2168,6 +2221,10 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
         + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
+    -- Codex claim-capability revocation (PRD #1147 M2): re-queuing a worker's runs
+    -- revokes their per-claim capabilities immediately — clear the hash and bump the
+    -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
@@ -2209,6 +2266,21 @@ SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC
+LIMIT @lim;
+
+-- name: ListRunMessagesBeforePage :many
+-- Backward twin of ListRunMessagesAfterPage for the TUI's tail-first/backfill paging
+-- (PRD #1137): the newest @lim messages with seq < @before_seq, returned DESC. The
+-- service reverses to ascending in Go (D3) — NOT in a SQL subquery — so the row stays
+-- store.RunMessage. Authorization (owner-or-admin) is checked by the caller.
+-- Column order is IDENTICAL to ListRunMessagesAfter and ListRunMessagesAfterPage so
+-- the row stays store.RunMessage. New columns must be APPENDED to ALL THREE of these
+-- queries in the same order the ALTER TABLE adds them — see ListRunMessagesAfter's
+-- note. Diverge and sqlc mints a per-query Row type, breaking that []store.RunMessage.
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+FROM run_messages
+WHERE run_id = @run_id AND seq < @before_seq
+ORDER BY seq DESC
 LIMIT @lim;
 
 -- Usage accounting (PRD #40) ------------------------------------------------

@@ -14,6 +14,7 @@ import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "../components/ui";
 import { AnthropicTokens } from "../components/AnthropicTokens";
+import { CodexCredentials } from "../components/CodexCredentials";
 import { SettingsShell } from "../components/SettingsShell";
 import { RateLimitCard } from "../components/RateLimitMeters";
 import { VaultBadge, useVaultLock } from "../components/VaultControls";
@@ -60,12 +61,21 @@ export function Settings() {
         api.getMySettings(),
       ]);
       setSidebarTokenIds(settings.sidebar_token_ids ?? []);
-      return { secrets: rows.filter((s) => s.kind === "anthropic_token") };
+      // ONE listSecrets() call feeds both cards: the Anthropic slice is unchanged,
+      // and the Codex slice is the union of the two Codex kinds (they share one
+      // card and one default across both).
+      return {
+        secrets: rows.filter((s) => s.kind === "anthropic_token"),
+        codexSecrets: rows.filter(
+          (s) => s.kind === "codex_auth" || s.kind === "openai_api_key",
+        ),
+      };
     },
     [],
     { fallback: "Failed to load settings" },
   );
   const secrets = useMemo(() => data?.secrets ?? [], [data]);
+  const codexSecrets = useMemo(() => data?.codexSecrets ?? [], [data]);
 
   // Whole-set replace over PUT /me/settings, then tell the sidebar rail (a
   // separate mount) to refetch now rather than on its next poll.
@@ -112,7 +122,7 @@ export function Settings() {
   };
 
   return (
-    <SettingsShell description="Your Anthropic tokens, vault, appearance, and account.">
+    <SettingsShell description="Your Anthropic tokens, OpenAI / Codex credentials, vault, appearance, and account.">
       {(loadError || error) && <Alert message={loadError || error} />}
       {notice && <Alert tone="success" message={notice} />}
 
@@ -126,6 +136,17 @@ export function Settings() {
         judgeSecretId={user?.judge_anthropic_secret_id ?? null}
         sidebarTokenIds={sidebarTokenIds}
         onToggleSidebarToken={toggleSidebarToken}
+      />
+
+      {/* OpenAI / Codex credentials (PRD #1147 M3). Fed by the SAME listSecrets()
+          call above; shares this page's error/notice slots and reload. */}
+      <CodexCredentials
+        secrets={codexSecrets}
+        loading={loading}
+        busy={busy}
+        reload={reload}
+        onError={setError}
+        onNotice={setNotice}
       />
 
       {/* The rotate-your-legacy-token reminder (PRD #32): password protection

@@ -156,6 +156,26 @@ spec:
             {{- end }}
             - name: UZI_WORKER_FORCE_ROLL
               value: {{ .Values.workers.forceRoll | default false | quote }}
+            # PRD #837 M4 disk-pressure recycle knobs. When a hosted worker reports disk
+            # pressure (a volume at used/total >= the api's UZI_DISK_PRESSURE_THRESHOLD
+            # across >=2 fresh heartbeats), the controller drains-then-recycles its PVCs.
+            # The master toggle gates BOTH the M3 size-drift arm and this M4 pressure arm
+            # (default true, Decision D9 — self-heal on, over recorded reviewer dissent).
+            # NOT with-gated: it must always carry an explicit true/false (a `with` gate
+            # or `| default true` would drop or silently flip an operator's explicit
+            # false, since sprig treats a false as empty), so the chart default lives in
+            # values.yaml (workers.diskRecycleEnabled: true) and is always rendered.
+            - name: UZI_WORKER_DISK_RECYCLE_ENABLED
+              value: {{ .Values.workers.diskRecycleEnabled | quote }}
+            # The PVC-age thrash guard (Decision D6): a worker back at pressure within
+            # this cooldown is a CAPACITY signal (working set exceeds nixSize) — it is
+            # capacity-warned and skipped, not recycled again. An ordinary Go duration.
+            # with-gated like drainDeadline above: empty leaves the controller's built-in
+            # 1h default.
+            {{- with .Values.workers.diskRecycleCooldown }}
+            - name: UZI_WORKER_DISK_RECYCLE_COOLDOWN
+              value: {{ . | quote }}
+            {{- end }}
             # The worker container's requests.ephemeral-storage (issue #224). Without
             # it a worker pod declares nothing for the resource and is therefore the
             # first thing kubelet evicts under node disk pressure, which destroys the

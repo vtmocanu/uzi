@@ -367,6 +367,7 @@ type Config struct {
 	RunMaxRequeues          int           // worker-death re-queues allowed before a run is failed
 	WorkerHeartbeatInterval time.Duration // how often a worker heartbeats
 	WorkerHeartbeatStale    time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
+	DiskPressureThreshold   float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
 	SweepInterval           time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
 	WorkerPollInterval      time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
@@ -853,6 +854,20 @@ func Load() (Config, error) {
 	cfg.RunMaxRequeues = parseNonNegInt("RUN_MAX_REQUEUES", 1)
 	cfg.WorkerHeartbeatInterval = parseDuration("WORKER_HEARTBEAT_INTERVAL", 15*time.Second)
 	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)
+	// PRD #837 M4: the disk-pressure threshold. There is no shared float parser, so parse
+	// inline. Soft-parse: this is a display/lifecycle tuning knob, not a security lever, so
+	// a malformed or out-of-range override keeps the 0.90 default and warns rather than
+	// failing boot. Valid range is (0,1]: 0 would make every worker perpetually pressured
+	// and >1 is unsatisfiable.
+	cfg.DiskPressureThreshold = 0.90
+	if raw := strings.TrimSpace(os.Getenv("UZI_DISK_PRESSURE_THRESHOLD")); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v > 0 && v <= 1 {
+			cfg.DiskPressureThreshold = v
+		} else {
+			slog.Warn("UZI_DISK_PRESSURE_THRESHOLD is not a float in (0,1]; keeping the 0.90 default (this is a display/lifecycle tuning knob, so a bad value is non-fatal)",
+				"value", raw)
+		}
+	}
 	// 0 (or unset) delegates to the sweeper's own built-in 15s default, so current
 	// behaviour is preserved unless SWEEP_INTERVAL is explicitly set.
 	cfg.SweepInterval = parseNonNegDuration("SWEEP_INTERVAL", 0)

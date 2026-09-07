@@ -69,8 +69,9 @@ func versionCheckEnabled(env Env, gf *globalFlags) bool {
 //     visible self-contradiction inside one invocation. It warns inline instead
 //     (see version.go), from the probe it was already making.
 //   - the `skill` subtree already has this exemption for the auto-upgrade hook, and
-//     `uzi skill install` is machine-invoked at EVERY Claude Code session start by
-//     the opt-in hook, where an extra stderr line is pure noise in an agent context.
+//     `uzi skill install` is machine-invoked at EVERY Claude Code or Codex CLI session
+//     start by the opt-in hook, where an extra stderr line is pure noise in an agent
+//     context.
 //   - `__complete` / `__completeNoDesc` are cobra's shell-completion RPC, invoked on
 //     every TAB. A 2s stall there is unacceptable and stderr during completion
 //     corrupts the display in some shells.

@@ -294,6 +294,76 @@ func TestPatchDefaultScheduleCustomizedLiveDB(t *testing.T) {
 	}
 }
 
+// TestPatchDefaultScheduleOutputModeLiveDB (PRD #929 M1): output_mode is owner-editable on a
+// PROMPT default with replace-semantics. Patching it to a value differing from the catalog
+// baseline persists AND flips Customized; an exact-restore to the baseline un-customizes. It
+// is prompt-only: the same PATCH on a SWEEP default is a 422, and a bad enum value is a 400.
+func TestPatchDefaultScheduleOutputModeLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	job, _ := schedtmpl.BySlug("docs-hygiene")
+	// The docs-hygiene prompt catalog entry declares no `output:`, so its baseline resolves to
+	// "mr"; a freshly enabled prompt default surfaces that resolved seed and is not customized.
+	if dto.OutputMode == nil || *dto.OutputMode != job.OutputMode() {
+		t.Fatalf("fresh prompt default output_mode = %v, want the resolved baseline %q", dto.OutputMode, job.OutputMode())
+	}
+	if job.OutputMode() != schedtmpl.OutputModeMR {
+		t.Fatalf("baseline OutputMode() = %q, want %q (no frontmatter output)", job.OutputMode(), schedtmpl.OutputModeMR)
+	}
+	if dto.Customized {
+		t.Fatal("fresh prompt default is customized, want false")
+	}
+
+	// Patching to "issues" (differs from the "mr" baseline) persists and flips Customized.
+	patched := f.patchDefault(t, f.owner.ID, dto.ID, `{"output_mode":"issues"}`)
+	if patched.OutputMode == nil || *patched.OutputMode != schedtmpl.OutputModeIssues {
+		t.Fatalf("patched output_mode = %v, want %q persisted", patched.OutputMode, schedtmpl.OutputModeIssues)
+	}
+	if !patched.Customized {
+		t.Fatal("output_mode divergence: customized = false, want true")
+	}
+
+	// It really persisted: re-read via GET surfaces the stored override.
+	got, gcode := f.getSchedule(t, f.owner.ID, dto.ID)
+	if gcode != http.StatusOK {
+		t.Fatalf("re-read status = %d, want 200", gcode)
+	}
+	if got.OutputMode == nil || *got.OutputMode != schedtmpl.OutputModeIssues {
+		t.Fatalf("re-read output_mode = %v, want the persisted %q", got.OutputMode, schedtmpl.OutputModeIssues)
+	}
+
+	// Exact-restore to the catalog baseline ("mr") un-customizes.
+	restored := f.patchDefault(t, f.owner.ID, dto.ID, `{"output_mode":"`+job.OutputMode()+`"}`)
+	if restored.Customized {
+		t.Fatal("baseline-matching output_mode: customized = true, want false (exact-restore un-customizes)")
+	}
+
+	// output_mode is prompt-only: the same PATCH on a SWEEP default is a 422.
+	sweep, scode := f.enableCatalog(t, f.owner.ID, f.repoID, "bug-triage")
+	if scode != http.StatusCreated {
+		t.Fatalf("enable sweep status = %d, want 201", scode)
+	}
+	sweepReq := userReq(http.MethodPatch, "/api/schedules/"+sweep.ID, `{"output_mode":"mr"}`, f.owner.ID, map[string]string{"id": sweep.ID})
+	sweepRec := httptest.NewRecorder()
+	f.h.PatchSchedule(sweepRec, sweepReq)
+	if sweepRec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("output_mode on sweep default status = %d, want 422", sweepRec.Code)
+	}
+
+	// A bad enum value on the prompt default is a 400.
+	badReq := userReq(http.MethodPatch, "/api/schedules/"+dto.ID, `{"output_mode":"both"}`, f.owner.ID, map[string]string{"id": dto.ID})
+	badRec := httptest.NewRecorder()
+	f.h.PatchSchedule(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("bad output_mode enum status = %d, want 400", badRec.Code)
+	}
+}
+
 // TestPatchDefaultOverrideSubagentModelLiveDB (issue #691): override_subagent_model is a run
 // option owner-editable on a default. A config PATCH toggling it persists AND flips
 // customized (its catalog baseline is always false, so any toggled-on value diverges); an

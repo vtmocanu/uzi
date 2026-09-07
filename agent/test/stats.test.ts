@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { StatsCollector, type StatsCollectorOptions } from "../src/stats.js";
+import { StatsCollector, type StatfsSample, type StatsCollectorOptions } from "../src/stats.js";
 
 // Unit tests over fixture cgroup v2 trees (PRD #49 M1). Each test writes a throwaway
 // /sys/fs/cgroup-shaped dir plus a /proc/self/cgroup file, so the collector's real
@@ -190,5 +190,74 @@ describe("StatsCollector — fallback to process source", () => {
     nowNs = 1_000_000_000n;
     cpu = { user: 150_000, system: 50_000 };
     assert.strictEqual(c.collect()?.cpu_pct, 10);
+  });
+});
+
+describe("StatsCollector — disk sampling (PRD #837 M1)", () => {
+  // A minimal cgroup tree so the mem/cpu reading succeeds and collect() returns a
+  // stats object we can inspect the disk fields on. Distinct memCurrent so the base
+  // assertions never collide with the disk numbers.
+  function base(): { cgroupRoot: string; procCgroupPath: string } {
+    return limitedTree("0");
+  }
+
+  it("attaches exact used/total for both volumes from an injected statfs (used≠total, distinct per volume)", () => {
+    // bsize=4096. /nix: blocks=1000, bfree=250 → total=4_096_000, used=(750)*4096=3_072_000.
+    // /data: blocks=2000, bfree=1500 → total=8_192_000, used=(500)*4096=2_048_000.
+    // bfree≠bavail and bfree≠0, so a used↔total swap or a bfree↔bavail confusion changes
+    // the asserted bytes and fails.
+    const statfs = (path: string): StatfsSample => {
+      if (path === "/nix") return { bsize: 4096, blocks: 1000, bfree: 250, bavail: 200 };
+      if (path === "/data") return { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400 };
+      throw new Error(`unexpected statfs path ${path}`);
+    };
+    const c = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs, dataDir: "/data" });
+    const s = c.collect();
+    assert.ok(s);
+    assert.strictEqual(s.disk_nix_bytes, 3_072_000, "nix used = (blocks−bfree)×bsize");
+    assert.strictEqual(s.disk_nix_total_bytes, 4_096_000, "nix total = blocks×bsize");
+    assert.strictEqual(s.disk_data_bytes, 2_048_000, "data used = (blocks−bfree)×bsize");
+    assert.strictEqual(s.disk_data_total_bytes, 8_192_000, "data total = blocks×bsize");
+  });
+
+  it("targets the injected dataDir, not a hardcoded /data, and the fixed /nix constant", () => {
+    const seen: string[] = [];
+    const statfs = (path: string): StatfsSample => {
+      seen.push(path);
+      return { bsize: 1, blocks: 10, bfree: 3, bavail: 2 };
+    };
+    const c = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs, dataDir: "/custom/data" });
+    c.collect();
+    assert.deepStrictEqual(seen.sort(), ["/custom/data", "/nix"]);
+  });
+
+  it("omits ONLY the failing volume's fields when statfs throws for /nix but succeeds for the data dir", () => {
+    const statfs = (path: string): StatfsSample => {
+      if (path === "/nix") throw new Error("ENOENT: no /nix in dev/compose");
+      return { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400 };
+    };
+    const c = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs, dataDir: "/data" });
+    const s = c.collect();
+    assert.ok(s);
+    // The failing volume's keys are ABSENT (not 0 — a truthiness check would miss a 0 bug).
+    assert.ok(!("disk_nix_bytes" in s), "disk_nix_bytes absent when /nix statfs throws");
+    assert.ok(!("disk_nix_total_bytes" in s), "disk_nix_total_bytes absent when /nix statfs throws");
+    // The sibling volume is still present (a bug that drops both would fail here).
+    assert.strictEqual(s.disk_data_bytes, 2_048_000);
+    assert.strictEqual(s.disk_data_total_bytes, 8_192_000);
+  });
+
+  it("still returns the mem stats (heartbeat not failed) when statfs throws for BOTH volumes", () => {
+    const statfs = (): StatfsSample => {
+      throw new Error("statfs unavailable");
+    };
+    const c = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs, dataDir: "/data" });
+    const s = c.collect();
+    assert.ok(s, "collect() still returns a sample when all disk statfs calls throw");
+    assert.strictEqual(s.source, "cgroup");
+    assert.ok(!("disk_nix_bytes" in s));
+    assert.ok(!("disk_data_bytes" in s));
+    // The mem reading is untouched by the disk failure.
+    assert.strictEqual(s.mem_bytes, 104857600 - 4194304);
   });
 });

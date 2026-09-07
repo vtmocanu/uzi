@@ -367,7 +367,7 @@ const realApi = {
     request<{ user: User }>("PUT", `/admin/users/${id}/judge`, { enabled }),
   // Admin per-user CI-autofix toggle (PRD #71): force any user's opt-in. Actor is
   // admin (route-gated); target is the path id, never the body. Returns the user.
-  setUserCIAutofixEnabled: (id: string, enabled: boolean) =>
+  setUserCIAutofixEnabled: (id: string, enabled: boolean | null) =>
     request<{ user: User }>("PUT", `/admin/users/${id}/ci-autofix`, { enabled }),
   getSettings: () => request<SettingsResponse>("GET", "/admin/settings"),
   updateSettings: (settings: UpdateSettingsPayload) =>
@@ -425,7 +425,7 @@ const realApi = {
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
   // Flip the current user's CI-autofix opt-in (PRD #71). Session identity only —
   // the body carries no user id. Returns the updated user.
-  setCIAutofixEnabled: (enabled: boolean) =>
+  setCIAutofixEnabled: (enabled: boolean | null) =>
     request<{ user: User }>("PUT", "/me/ci-autofix", { enabled }),
   // Flip the current user's AI-attribution opt-out (issue #916). Session identity only —
   // the body carries no user id. Returns the updated user.
@@ -462,15 +462,15 @@ const realApi = {
   // enabled is required; anthropicToken is the three-way token field (PRD #104 M4):
   // omitted leaves the binding alone, null clears it back to the default, a label
   // binds it. Omitting it is what every pre-#104 caller did, and must stay a no-op
-  // on the binding.
-  setJudgeEnabled: (enabled: boolean, anthropicToken?: string | null) =>
-    request<{ user: User }>(
-      "PUT",
-      "/me/judge",
-      anthropicToken === undefined
-        ? { enabled }
-        : { enabled, anthropic_token: anthropicToken },
-    ),
+  // on the binding. judgeBindMode (PRD #1140 M3) is the three-valued bind mode
+  // (default / pinned / auto), sent as judge_bind_mode only when provided, so every
+  // existing caller's body shape is unchanged.
+  setJudgeEnabled: (enabled: boolean, anthropicToken?: string | null, judgeBindMode?: BindMode) => {
+    const body: Record<string, unknown> = { enabled };
+    if (anthropicToken !== undefined) body.anthropic_token = anthropicToken;
+    if (judgeBindMode !== undefined) body.judge_bind_mode = judgeBindMode;
+    return request<{ user: User }>("PUT", "/me/judge", body);
+  },
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
   // PRD #104 M2 token CRUD. create/rename/set-default/rotate/delete are all
   // cookie-only (D8) — the SPA is the only client that can reach them.
@@ -512,6 +512,50 @@ const realApi = {
     }),
   deleteAnthropicToken: () =>
     request<null>("DELETE", "/me/secrets/anthropic_token"),
+
+  // PRD #1147 M3 Codex/OpenAI credential CRUD. Body shapes mirror Anthropic exactly
+  // (create {token,label,default} → {secret}; patch {label?,default?,token?} → {secret};
+  // delete → empty). All cookie-only (D8), like the Anthropic writes. There is NO codex
+  // pool/auto-eligible route — an `auto` worker never spends a Codex credential.
+  //
+  // Two kinds share one card and one default: `codex_auth` (a `claude`-style Codex
+  // login, status "staging" → resolver → "linked"/"failed") and `openai_api_key`
+  // (a static Console key, status "static"). The server force-defaults a user's FIRST
+  // codex credential across BOTH kinds.
+  createCodexAuth: (token: string, label: string, isDefault: boolean) =>
+    request<{ secret: SecretMeta }>("POST", "/me/secrets/codex_auth", {
+      token,
+      label,
+      default: isDefault,
+    }),
+  patchCodexAuth: (
+    id: string,
+    body: { label?: string; default?: boolean; token?: string },
+  ) =>
+    request<{ secret: SecretMeta }>(
+      "PATCH",
+      `/me/secrets/codex_auth/${id}`,
+      body,
+    ),
+  deleteCodexAuthById: (id: string) =>
+    request<null>("DELETE", `/me/secrets/codex_auth/${id}`),
+  createOpenAIApiKey: (token: string, label: string, isDefault: boolean) =>
+    request<{ secret: SecretMeta }>("POST", "/me/secrets/openai_api_key", {
+      token,
+      label,
+      default: isDefault,
+    }),
+  patchOpenAIApiKey: (
+    id: string,
+    body: { label?: string; default?: boolean; token?: string },
+  ) =>
+    request<{ secret: SecretMeta }>(
+      "PATCH",
+      `/me/secrets/openai_api_key/${id}`,
+      body,
+    ),
+  deleteOpenAIApiKeyById: (id: string) =>
+    request<null>("DELETE", `/me/secrets/openai_api_key/${id}`),
 
   // Vault (PRD #32): unlock re-derives the DEK from the login password (204, or
   // 403 on a wrong password); lock evicts it; status is a lightweight poll. Unlock

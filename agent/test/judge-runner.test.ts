@@ -8,6 +8,7 @@ import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { WorkerClient } from "../src/client.js";
 import type {
+  ClaimConfig,
   ClaimResponse,
   JudgeTraceResponse,
   OutgoingMessage,
@@ -371,6 +372,31 @@ describe("parseReview", () => {
       '```json\nNote: focused on correctness.\n{"verdict":"ok","summary":"s","recommendations":[]}\n```';
     const r = parseReview(text, "haiku");
     assert.equal(r.verdict, "ok");
+  });
+
+  it("skips a brace example in prose before the real JSON (scans later candidates)", () => {
+    const text = 'Use {verdict, summary} here\n{"verdict":"ok","summary":"s","recommendations":[]}';
+    const r = parseReview(text, "haiku");
+    assert.equal(r.verdict, "ok");
+  });
+
+  it("skips a brace example inside the fence before the real JSON", () => {
+    const text =
+      '```json\nUse {verdict, summary} here\n{"verdict":"ok","summary":"s","recommendations":[]}\n```';
+    const r = parseReview(text, "haiku");
+    assert.equal(r.verdict, "ok");
+  });
+
+  it("skips a malformed candidate that CONTAINS a nested valid object, then parses the real JSON", () => {
+    // The first balanced candidate is malformed (unquoted `example:`) yet contains a nested
+    // valid object. Advancing past the whole rejected candidate (not just its '{') must skip
+    // that nested object and reach the real, later JSON — otherwise the wrong verdict wins.
+    const text =
+      'Use {example: {"verdict":"ok","summary":"wrong","recommendations":[]}} here\n' +
+      '{"verdict":"issues","summary":"right","recommendations":[]}';
+    const r = parseReview(text, "haiku");
+    assert.equal(r.verdict, "issues");
+    assert.equal(r.summary, "right");
   });
 
   it("parses JSON embedded in prose and drops unknown categories", () => {
@@ -868,5 +894,29 @@ describe("judge tool confinement (PRD #89 M-allow / auditor Medium)", () => {
     for (const t of DAEMON_REACHING) {
       assert.equal(await preToolUseDecision(options!, t), "deny", `${t} must be denied for the judge`);
     }
+  });
+
+  it("threads the claim's default_effort onto the judge SDK options", async () => {
+    const { client } = fakeClient(emptyTrace);
+    const { queryFn, captured } = capturingQueryFn(
+      JSON.stringify({ verdict: "ok", summary: "", recommendations: [] }),
+    );
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    await runner.execute(judgeClaim({ config: { default_effort: "high" } as ClaimConfig }));
+
+    assert.ok(captured.options, "the judge must have called the model (so options were captured)");
+    assert.equal(captured.options!.effort, "high", "the owner's default_effort is applied to the judge query");
+  });
+
+  it("sets no effort on the judge SDK options when the claim carries no config", async () => {
+    const { client } = fakeClient(emptyTrace);
+    const { queryFn, captured } = capturingQueryFn(
+      JSON.stringify({ verdict: "ok", summary: "", recommendations: [] }),
+    );
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    await runner.execute(judgeClaim());
+
+    assert.ok(captured.options, "the judge must have called the model (so options were captured)");
+    assert.ok(!("effort" in captured.options!), "no effort is set when the claim carries no default_effort");
   });
 });

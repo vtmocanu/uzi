@@ -373,19 +373,22 @@ var knownInstructions = []knownInstruction{
 		// the second said HELP, naming only the Short description in skill.go. Both were
 		// right about the site they looked at and wrong about the set: the scan reached one
 		// package, so the second site did not exist as far as this file was concerned.
-		note: "RUNTIME by the strictest-bar rule, from TWO sites lifting the identical text. " +
-			"(a) the Short description of `uzi skill install-hook` (cmd/uzi/skill.go) — " +
-			"documentation; (b) `hookCommand` (internal/uzicli/skillhook.go), the command " +
-			"written into ~/.claude/settings.json for Claude Code to EXECUTE at session start. " +
-			"(b) makes a stronger claim than any printed hint does — it does not tell a human to " +
-			"run something, it causes a machine to — and until the scope widened it carried no " +
-			"bar at all. No split is expressible (both sites lift the same string and " +
-			"attribute() keys on the text), so the execution bar governs. EXECUTED by " +
+		note: "RUNTIME by the strictest-bar rule, from sites lifting the text and its " +
+			"--target variants. (a) the Short description of `uzi skill install-hook` " +
+			"(cmd/uzi/skill.go) — documentation; (b) the HookManager `command`/`legacyCommands` " +
+			"struct fields (internal/uzicli/skillhook.go), the commands written into the " +
+			"harness hook file (Claude settings.json, Codex hooks.json) for that harness to " +
+			"EXECUTE at session start — the canonical `uzi skill install --target {claude,codex}` " +
+			"and the recognized legacy bare form. (b) makes a stronger claim than any printed " +
+			"hint does — it does not tell a human to run something, it causes a machine to. Since " +
+			"M2 those commands live in composite-literal struct fields, which classifyKind reads " +
+			"as a binding (strictest bar); the same-text legacy form and the Short share the " +
+			"`uzi skill install` candidate, and the execution bar governs. EXECUTED by " +
 			"TestSkillInstallCommand, which runs `uzi skill install` through runCLI and asserts " +
 			"the OUTCOME: the bundled SKILL.md is on disk byte-for-byte. Its honest limit: that " +
 			"is the command working, not the HOOK invoking it — the wiring is " +
-			"TestSkillInstallHookCommand's, and no test runs the settings.json entry the way " +
-			"Claude Code would.",
+			"TestSkillInstallHookCommand's, and no test runs the hook-file entry the way the " +
+			"harness would.",
 	},
 	{
 		command:  "uzi auth token",
@@ -669,6 +672,18 @@ func classifyKind(stack []ast.Node) instructionKind {
 			if id, ok := n.Key.(*ast.Ident); ok && helpFields[id.Name] {
 				return kindHelp
 			}
+		case *ast.CompositeLit:
+			// A command string bound as a FIELD VALUE or ELEMENT of a composite literal —
+			// e.g. HookManager{command: "uzi skill install --target claude"} and its
+			// legacyCommands []string{…} (skillhook.go) — is stored into a struct the CLI
+			// later WRITES into a harness hook file for that harness to EXECUTE at session
+			// start. That is a stronger claim than any printed hint makes, so the STRICTEST
+			// BAR applies for the same reason as the AssignStmt/ValueSpec binding arm below:
+			// a binding is where an instruction hides from a position-based classifier. A
+			// help field (checked above, innermost-wins) still classifies HELP, so only a
+			// non-help composite element reaches here, and it can only move kindUnknown →
+			// kindRuntime, never grant an exemption.
+			return kindRuntime
 		case *ast.AssignStmt, *ast.ValueSpec:
 			// A command string BOUND TO A NAME — a local variable, or a package-level
 			// const/var — rather than handed straight to an emitter or sitting in a help
@@ -685,10 +700,12 @@ func classifyKind(stack []ast.Node) instructionKind {
 			//	return Exitf(ExitAuth, "%s", msg)
 			//
 			// derived kindUnknown despite reaching the user through Exitf two lines later —
-			// no enclosing CallExpr, so nothing to recognise. Same for the package const
-			// `uzicli/skillhook.go`'s hookCommand, which is not printed at all: it is written
-			// into ~/.claude/settings.json for Claude Code to EXECUTE, which is a stronger
-			// claim than any printed hint makes and had no bar on it whatsoever.
+			// no enclosing CallExpr, so nothing to recognise. `uzicli/skillhook.go` once held
+			// the same shape as a package const (the hook command, never printed but written
+			// into ~/.claude/settings.json for Claude Code to EXECUTE); PRD #1143 M2 moved it
+			// into HookManager's `command`/`legacyCommands` composite-literal struct fields,
+			// which the *ast.CompositeLit arm above now classifies kindRuntime for the same
+			// strictest-bar reason.
 			//
 			// WHY THIS ARM CANNOT GRANT AN EXEMPTION, which is the only property that matters
 			// for a new classifier arm: it returns kindRuntime and nothing else. It can only

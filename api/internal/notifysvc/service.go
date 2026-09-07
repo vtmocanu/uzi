@@ -324,7 +324,7 @@ func (s *Service) NotifyEarlyReset(ctx context.Context, userID uuid.UUID, expect
 		Slack: &SlackRender{
 			Emoji: "🚨",
 			Title: "7-DAY RATE LIMIT RESET EARLY",
-			Body:  "Parked runs can resume now.",
+			Body:  "Anthropic reopened your weekly window ahead of schedule.",
 			Facts: []string{
 				fmt.Sprintf("reset ~%dh early", hoursEarlyInt),
 				fmt.Sprintf("observed <!date^%d^{time}|%s>", observed.Unix(), observed.UTC().Format("15:04 MST")),

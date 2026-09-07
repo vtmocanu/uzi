@@ -56,6 +56,11 @@ export const workersApi = {
       stats_mem_bytes: null,
       stats_mem_limit_bytes: null,
       stats_source: null,
+      // No disk sample yet either (PRD #837) → no disk bars until the first heartbeat.
+      stats_disk_nix_bytes: null,
+      stats_disk_nix_total_bytes: null,
+      stats_disk_data_bytes: null,
+      stats_disk_data_total_bytes: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
       anthropic_bind_mode: "default" as const,
@@ -154,6 +159,11 @@ export const workersApi = {
       stats_mem_bytes: null,
       stats_mem_limit_bytes: null,
       stats_source: null,
+      // No disk sample yet either (PRD #837) → no disk bars until the first heartbeat.
+      stats_disk_nix_bytes: null,
+      stats_disk_nix_total_bytes: null,
+      stats_disk_data_bytes: null,
+      stats_disk_data_total_bytes: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
       anthropic_bind_mode: "default" as const,
