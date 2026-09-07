@@ -11,7 +11,7 @@ import { CODEX_DARK_COPY } from "./codexCredentialsCopy";
 describe("CODEX_DARK_COPY (the one Codex-dark retirement flag)", () => {
   it("pins the not-used-for-runs sentence", () => {
     expect(CODEX_DARK_COPY.notUsedForRuns).toBe(
-      "Codex is not yet used to run agents — an Anthropic token is still what starts a run.",
+      "Codex is not yet used to run agents; an Anthropic token is still what starts a run.",
     );
   });
 

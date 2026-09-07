@@ -6,7 +6,7 @@
 // from here so retirement stays a one-line change.
 export const CODEX_DARK_COPY = {
   notUsedForRuns:
-    "Codex is not yet used to run agents — an Anthropic token is still what starts a run.",
+    "Codex is not yet used to run agents; an Anthropic token is still what starts a run.",
   stagingNotAutoVerified:
     "This build does not verify Codex logins automatically.",
 } as const;
