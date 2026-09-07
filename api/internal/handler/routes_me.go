@@ -52,6 +52,17 @@ func (h *Handler) mountMeRoutes(r chi.Router) {
 			// for a multi-token user (delete by id instead).
 			r.Put("/anthropic_token", h.PutAnthropicToken)
 			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
+			// PRD #1147 M1 codex credentials, id-keyed CRUD alongside the anthropic
+			// writes and cookie-only for the SAME reason (D8): a Bearer-reachable mint
+			// would let a stolen uzc_ replace a user's credentials. The list (GET,
+			// RequireUser, above) already covers these kinds. No PUT/DELETE-default
+			// compatibility aliases for codex. Ships dark — saving enables no execution.
+			r.Post("/codex_auth", h.CreateCodexAuth)
+			r.Patch("/codex_auth/{id}", h.PatchCodexAuth)
+			r.Delete("/codex_auth/{id}", h.DeleteCodexAuthByID)
+			r.Post("/openai_api_key", h.CreateOpenAIAPIKey)
+			r.Patch("/openai_api_key/{id}", h.PatchOpenAIAPIKey)
+			r.Delete("/openai_api_key/{id}", h.DeleteOpenAIAPIKeyByID)
 		})
 	})
 

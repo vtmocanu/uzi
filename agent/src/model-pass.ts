@@ -17,6 +17,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+
 import { ClaudeAdviceHarness } from "./claude-advice-harness.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { rmTreeForce } from "./rmtree.js";
@@ -35,6 +37,8 @@ export interface ReadOnlyModelPassOpts {
   token: string;
   /** The model id; applied to the query only when non-empty. */
   model?: string;
+  /** Reasoning effort; applied to the query only when set. */
+  effort?: EffortLevel;
   systemPrompt: string;
   prompt: string;
   /** Root under which the per-pass ephemeral SDK HOME is created. */
@@ -135,6 +139,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     systemPrompt: opts.systemPrompt,
     prompt: opts.prompt,
     model: opts.model,
+    effort: opts.effort,
     output: { kind: "text" },
     signal: abort.signal,
     timeoutMs: opts.timeoutMs,

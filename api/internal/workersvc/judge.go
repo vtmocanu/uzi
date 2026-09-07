@@ -1190,6 +1190,17 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 		knownTargets = kt
 	}
 
+	// The owner's per-user default reasoning effort (issue #1157): resolve it to the level
+	// the judge SDK call uses — the owner's explicit choice, or the uzi default xhigh when
+	// NULL/blank. Best-effort to preserve the judge's no-spurious-fail design (audit H2): on a
+	// read error, log and fall back to xhigh (resolveEffortPtr on the zero pgtype.Text yields it),
+	// exactly as the judge-model read above falls back rather than failing the claim.
+	defaultEffort, err := s.q.GetUserDefaultEffort(ctx, run.UserID)
+	if err != nil {
+		slog.Warn("judge claim: read user default effort", "user", run.UserID.String(), "error", err)
+		// defaultEffort is the zero pgtype.Text (invalid) here → resolveEffortPtr → xhigh
+	}
+
 	return &ClaimPayload{
 		RunID:                  run.ID.String(),
 		Kind:                   run.Kind,
@@ -1222,6 +1233,7 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 			PlanMaxRevisions:       s.p.PlanMaxRevisions,
 			QuestionMax:            s.p.QuestionMax,
 			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
+			DefaultEffort:          resolveEffortPtr(defaultEffort),
 			ToolPackages:           []string{},
 			DeniedToolPackages:     toolprofile.DenylistNames(),
 		},

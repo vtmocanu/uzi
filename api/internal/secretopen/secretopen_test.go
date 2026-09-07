@@ -223,6 +223,94 @@ func TestOpenByIDVaultLocked(t *testing.T) {
 	}
 }
 
+// TestOpenByIDOfKindMatchingKind: a row whose kind equals expectedKind opens exactly
+// like OpenByID — the kind guard is transparent on a match.
+func TestOpenByIDOfKindMatchingKind(t *testing.T) {
+	box, _ := secretbox.New(key)
+	sealed, err := box.Seal([]byte("sk-static-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, secretID := uuid.New(), uuid.New()
+	st := &fakeStore{byID: store.GetUserSecretCiphertextByIDRow{
+		UserID: userID, Kind: store.KindOpenAIAPIKey, Ciphertext: sealed, SealedWith: store.SealedWithMaster,
+	}}
+	plain, err := OpenByIDOfKind(context.Background(), st, nil, box, userID, secretID, store.KindOpenAIAPIKey)
+	if err != nil {
+		t.Fatalf("matching kind must open: %v", err)
+	}
+	if string(plain) != "sk-static-key" {
+		t.Fatalf("plaintext = %q, want sk-static-key", plain)
+	}
+	if st.byIDArg.ID != secretID || st.byIDArg.UserID != userID {
+		t.Fatalf("lookup was (%v,%v), want (%v,%v) — the query must be owner-scoped",
+			st.byIDArg.ID, st.byIDArg.UserID, secretID, userID)
+	}
+}
+
+// TestOpenByIDOfKindMismatchIsNotFound pins the non-disclosing kind guard (PRD #1147
+// audit #6): a codex_auth login blob (which carries a refresh_token) opened via the
+// api_key path — expectedKind=openai_api_key — returns the not-found sentinel and NO
+// bytes, never the codex_auth plaintext, and never a distinct "wrong kind" error that
+// would confirm the row exists.
+//
+// FAIL-OLD / PASS-FIXED: the pre-existing OpenByID decrypts and returns a row's plaintext
+// regardless of its kind, so an api_key path built on it WOULD have disclosed this
+// codex_auth blob. OpenByIDOfKind refuses it. This test fails against OpenByID and passes
+// against OpenByIDOfKind.
+func TestOpenByIDOfKindMismatchIsNotFound(t *testing.T) {
+	box, _ := secretbox.New(key)
+	loginBlob, err := box.Seal([]byte(`{"access_token":"a","refresh_token":"SECRET-REFRESH-TOKEN"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, secretID := uuid.New(), uuid.New()
+	st := &fakeStore{byID: store.GetUserSecretCiphertextByIDRow{
+		UserID: userID, Kind: store.KindCodexAuth, Ciphertext: loginBlob, SealedWith: store.SealedWithMaster,
+	}}
+
+	plain, err := OpenByIDOfKind(context.Background(), st, nil, box, userID, secretID, store.KindOpenAIAPIKey)
+	if !errors.Is(err, ErrNoSecret) {
+		t.Fatalf("kind mismatch: want ErrNoSecret, got %v", err)
+	}
+	if plain != nil {
+		t.Fatalf("kind mismatch must yield no plaintext, got %q", plain)
+	}
+	if err != nil && strings.Contains(err.Error(), "codex") {
+		t.Fatalf("the not-found error must not disclose the row's real kind: %q", err.Error())
+	}
+
+	// Sanity: the SAME row DOES open when the expected kind matches — proving the guard,
+	// not a broken fixture, is what refused above.
+	plain, err = OpenByIDOfKind(context.Background(), st, nil, box, userID, secretID, store.KindCodexAuth)
+	if err != nil {
+		t.Fatalf("matching kind must open the same row: %v", err)
+	}
+	if !strings.Contains(string(plain), "SECRET-REFRESH-TOKEN") {
+		t.Fatal("matching-kind open returned unexpected plaintext")
+	}
+}
+
+// TestOpenByIDOfKindForeignRowIsNotFound: the kind guard does not weaken the owner-scope
+// defense — a row belonging to another user is still ErrNoSecret, never that user's
+// credential, even when the kind matches.
+func TestOpenByIDOfKindForeignRowIsNotFound(t *testing.T) {
+	box, _ := secretbox.New(key)
+	sealed, _ := box.Seal([]byte("someone-elses-key"))
+	caller := uuid.New()
+	st := &fakeStore{byID: store.GetUserSecretCiphertextByIDRow{
+		UserID: uuid.New(), // a DIFFERENT owner than the caller
+		Kind:   store.KindOpenAIAPIKey, Ciphertext: sealed, SealedWith: store.SealedWithMaster,
+	}}
+	plain, err := OpenByIDOfKind(context.Background(), st, nil, box, caller, uuid.New(), store.KindOpenAIAPIKey)
+	if !errors.Is(err, ErrNoSecret) {
+		t.Fatalf("foreign row: want ErrNoSecret, got %v", err)
+	}
+	if plain != nil {
+		t.Fatalf("a foreign row must yield no plaintext, got %q", plain)
+	}
+}
+
 func TestOpenRoundTripNilVault(t *testing.T) {
 	box, _ := secretbox.New(key)
 	sealed, err := box.Seal([]byte("s3cr3t-token"))

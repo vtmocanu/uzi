@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -67,27 +68,49 @@ func secretMeta(id uuid.UUID, kind, label string, isDefault, autoEligible bool, 
 	}
 }
 
-// ListMySecrets returns metadata for the current user's Anthropic tokens (PRD #104
-// M2): one entry per token, default first, each with its id/label/default flag and
-// timestamps — never the ciphertext.
+// ListMySecrets returns metadata for ALL of the current user's stored secrets across
+// every kind (PRD #1147 M1): the Anthropic tokens (PRD #104 M2) plus the codex-kind
+// credentials (openai_api_key, codex_auth), each with its id/label/default flag and
+// timestamps — never the ciphertext. Ordered by ListUserSecretsAll (kind, then
+// default-first, then label), so each kind's group reads default-first.
+//
+// A codex-kind row additionally carries its codex_credential_state status
+// (staging/linked/failed/static) in CodexStatus, merged from
+// ListCodexCredentialStatesForUser; an anthropic_token row has no such state and
+// leaves CodexStatus empty. Metadata-only and RequireUser, exactly as the
+// Anthropic-only form was.
 func (h *Handler) ListMySecrets(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	rows, err := h.q.ListUserSecretsForKind(r.Context(), store.ListUserSecretsForKindParams{
-		UserID: user.ID,
-		Kind:   store.KindAnthropicToken,
-	})
+	rows, err := h.q.ListUserSecretsAll(r.Context(), user.ID)
 	if err != nil {
 		slog.Error("list user secrets", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// One owner-scoped read of every codex alias's status, turned into a by-id map so
+	// each codex row below is a lookup rather than a per-row query. Anthropic rows are
+	// absent from this map and keep an empty status.
+	states, err := h.q.ListCodexCredentialStatesForUser(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("list codex credential states", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	statusByID := make(map[uuid.UUID]string, len(states))
+	for _, s := range states {
+		statusByID[s.UserSecretID] = s.Status
+	}
 	out := make([]apitypes.SecretDTO, 0, len(rows))
 	for _, s := range rows {
-		out = append(out, secretMeta(s.ID, s.Kind, s.Label, s.IsDefault, s.AutoEligible, s.CreatedAt, s.UpdatedAt))
+		dto := secretMeta(s.ID, s.Kind, s.Label, s.IsDefault, s.AutoEligible, s.CreatedAt, s.UpdatedAt)
+		if isCodexKind(s.Kind) {
+			dto.CodexStatus = statusByID[s.ID]
+		}
+		out = append(out, dto)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"secrets": out})
 }
@@ -649,6 +672,451 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 		h.usagePoker.Poke(user.ID)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Codex credential link statuses (PRD #1147 M1), mirroring codex_credential_state's
+// CHECK (00200). Only the two a WRITE sets appear here: a fresh codex_auth is born
+// 'staging' (awaiting an account link a later milestone resolves); an openai_api_key
+// is 'static' (a standalone key with no subscription lifecycle). 'linked'/'failed' are
+// reached only by the resolver, not by these handlers.
+const (
+	codexStatusStaging = "staging"
+	codexStatusStatic  = "static"
+)
+
+// maxCodexBlobBytes bounds a pasted Codex login blob. Larger than maxTokenBytes
+// because the blob is a JSON object carrying several JWTs (access/refresh/id tokens),
+// which comfortably exceed a single token's 4 KiB; this is a DoS sanity bound, not a
+// format assumption.
+const maxCodexBlobBytes = 64 * 1024
+
+// isCodexKind reports whether a user_secrets.kind is one of the two codex kinds that
+// share a single default slot and carry a codex_credential_state row.
+func isCodexKind(kind string) bool {
+	return kind == store.KindCodexAuth || kind == store.KindOpenAIAPIKey
+}
+
+// codexInitialStatus is the codex_credential_state.status a NEW secret of the kind is
+// born with, and the status a manual replacement (rotate) resets it to: a codex_auth
+// awaits a link ('staging'); an openai_api_key is standalone ('static').
+func codexInitialStatus(kind string) string {
+	if kind == store.KindCodexAuth {
+		return codexStatusStaging
+	}
+	return codexStatusStatic
+}
+
+// validateCodexValue validates a pasted codex-kind credential value for the kind,
+// returning the sanitized value to seal. It NEVER contacts the provider (M1 ships
+// dark) and NEVER includes the value in an error string.
+func validateCodexValue(kind, raw string) (string, error) {
+	if kind == store.KindCodexAuth {
+		return validateCodexAuthBlob(raw)
+	}
+	return validateOpenAIAPIKey(raw)
+}
+
+// CreateCodexAuth stores a NEW named Codex subscription login for the current user
+// (PRD #1147 M1). Cookie-only. Ships dark: saving enables no provider execution.
+func (h *Handler) CreateCodexAuth(w http.ResponseWriter, r *http.Request) {
+	h.createCodexSecret(w, r, store.KindCodexAuth)
+}
+
+// CreateOpenAIAPIKey stores a NEW named static OpenAI API key for the current user
+// (PRD #1147 M1). Cookie-only. Ships dark.
+func (h *Handler) CreateOpenAIAPIKey(w http.ResponseWriter, r *http.Request) {
+	h.createCodexSecret(w, r, store.KindOpenAIAPIKey)
+}
+
+// createCodexSecret is the shared create path for both codex kinds (PRD #1147 M1). It
+// mirrors CreateAnthropicToken but with the codex-specific rules:
+//
+//   - The value is validated per-kind (validateCodexValue) and sealed under the user's
+//     vault DEK, exactly as an anthropic token is; a locked vault surfaces as 409.
+//   - Default is decided across BOTH codex kinds: the user's FIRST codex credential is
+//     forced default (CountCodexSecrets == 0), otherwise the caller's `default` stands.
+//     InsertCodexSecret sets is_default EXACTLY as asked — deliberately NOT the
+//     first-of-a-kind auto-force InsertUserSecret does, which would mint a SECOND codex
+//     default the moment a user adds their first openai_api_key while already holding a
+//     codex_auth default. So the handler computes wantDefault and clears the single
+//     shared codex default first when it wins.
+//   - A per-alias codex_credential_state row is created ('staging' for a codex_auth,
+//     'static' for an openai_api_key).
+//
+// It does NOT poke the usage poller: that is the Anthropic rate-limit surface only.
+func (h *Handler) createCodexSecret(w http.ResponseWriter, r *http.Request, kind string) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req struct {
+		Token   string `json:"token"`
+		Label   string `json:"label"`
+		Default bool   `json:"default"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	value, err := validateCodexValue(kind, req.Token)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	label, err := validateSecretLabel(req.Label)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sealed, sealedWith, err := h.sealUserSecret(user.ID, kind, []byte(value))
+	if err != nil {
+		if h.writeVaultLocked(w, err) {
+			return
+		}
+		slog.Error("seal codex secret", "error", err) // error carries no plaintext
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	status := codexInitialStatus(kind)
+
+	var row store.InsertCodexSecretRow
+	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+		// The user's FIRST codex credential (across both kinds) is forced default so it
+		// is never invisible; a later one is default only if the caller asks. Under the
+		// advisory lock this count is stable against a concurrent create.
+		n, cerr := q.CountCodexSecrets(r.Context(), user.ID)
+		if cerr != nil {
+			return cerr
+		}
+		wantDefault := req.Default || n == 0
+		if wantDefault {
+			// Clear the single shared codex default first — across BOTH kinds — so the
+			// insert leaves exactly one, never tripping user_secrets_codex_one_default_key.
+			if _, cerr := q.ClearCodexDefaults(r.Context(), user.ID); cerr != nil {
+				return cerr
+			}
+		}
+		var ierr error
+		row, ierr = q.InsertCodexSecret(r.Context(), store.InsertCodexSecretParams{
+			UserID:      user.ID,
+			Kind:        kind,
+			Label:       label,
+			WantDefault: wantDefault,
+			Ciphertext:  sealed,
+			SealedWith:  sealedWith,
+		})
+		if ierr != nil {
+			return ierr
+		}
+		_, serr := q.InsertCodexCredentialState(r.Context(), store.InsertCodexCredentialStateParams{
+			UserSecretID: row.ID,
+			UserID:       user.ID,
+			Status:       status,
+		})
+		return serr
+	})
+	if err != nil {
+		if isLabelCollision(err) {
+			httpx.Error(w, http.StatusConflict, "a credential with that label already exists")
+			return
+		}
+		slog.Error("create codex secret", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	dto := secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.AutoEligible, row.CreatedAt, row.UpdatedAt)
+	dto.CodexStatus = status
+	httpx.JSON(w, http.StatusCreated, map[string]any{"secret": dto})
+}
+
+// PatchCodexAuth renames, sets-default, and/or replaces the value of ONE of the user's
+// codex_auth credentials (PRD #1147 M1). Cookie-only; a foreign or wrong-kind id is a
+// 404.
+func (h *Handler) PatchCodexAuth(w http.ResponseWriter, r *http.Request) {
+	h.patchCodexSecret(w, r, store.KindCodexAuth)
+}
+
+// PatchOpenAIAPIKey renames, sets-default, and/or replaces the value of ONE of the
+// user's openai_api_key credentials (PRD #1147 M1). Cookie-only; a foreign or
+// wrong-kind id is a 404.
+func (h *Handler) PatchOpenAIAPIKey(w http.ResponseWriter, r *http.Request) {
+	h.patchCodexSecret(w, r, store.KindOpenAIAPIKey)
+}
+
+// patchCodexSecret is the shared patch path for both codex kinds (PRD #1147 M1),
+// mirroring PatchAnthropicToken. Every requested change applies in one transaction
+// under the advisory lock. Fields are optional:
+//
+//   - rename (RenameUserSecret);
+//   - set-default (`default:true`): ClearCodexDefaults then SetUserSecretDefault — the
+//     cross-kind single-default swap, atomic under the per-user lock. `default:false`
+//     is refused, as with anthropic: promote another credential instead;
+//   - replace/rotate (`token`): validate+seal, RotateUserSecret, then
+//     BumpCodexMaterialRevision, which advances material_revision, resets the status
+//     ('staging' for a codex_auth, 'static' for an openai_api_key) and drops any account
+//     link — a manual replacement invalidates the previous binding.
+//
+// The id must name a secret of THIS kind (the route's kind); a foreign or mismatched id
+// is a 404, never a 403. A locked vault is a 409; a label collision is a 409.
+func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind string) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	secretID, ok := httpx.PathUUID(w, r, "id", "secret")
+	if !ok {
+		return
+	}
+	var req struct {
+		Label   *string `json:"label"`
+		Default *bool   `json:"default"`
+		Token   *string `json:"token"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Validate + seal the new value (if any) BEFORE the transaction: a locked vault must
+	// surface as a 409 without ever opening a tx, exactly as PatchAnthropicToken does.
+	var err error
+	var newLabel string
+	if req.Label != nil {
+		newLabel, err = validateSecretLabel(*req.Label)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	var sealed []byte
+	var sealedWith string
+	if req.Token != nil {
+		val, verr := validateCodexValue(kind, *req.Token)
+		if verr != nil {
+			httpx.Error(w, http.StatusBadRequest, verr.Error())
+			return
+		}
+		sealed, sealedWith, err = h.sealUserSecret(user.ID, kind, []byte(val))
+		if err != nil {
+			if h.writeVaultLocked(w, err) {
+				return
+			}
+			slog.Error("seal codex secret", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	if req.Default != nil && !*req.Default {
+		httpx.Error(w, http.StatusBadRequest, "cannot clear the default; set another credential as default instead")
+		return
+	}
+
+	var out store.RenameUserSecretRow
+	var status string
+	var found bool
+	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
+			ID: secretID, UserID: user.ID,
+		})
+		if gerr != nil {
+			if errors.Is(gerr, pgx.ErrNoRows) {
+				return nil // found stays false → 404
+			}
+			return gerr
+		}
+		// The route names the kind; an id of some OTHER kind (an anthropic token, or the
+		// sibling codex kind) is not addressable here → 404, never a cross-kind edit.
+		if cur.Kind != kind {
+			return nil // found stays false → 404
+		}
+		found = true
+		out = store.RenameUserSecretRow{
+			ID: cur.ID, Kind: cur.Kind, Label: cur.Label,
+			IsDefault: cur.IsDefault, AutoEligible: cur.AutoEligible,
+		}
+
+		if req.Token != nil {
+			rotated, rerr := q.RotateUserSecret(r.Context(), store.RotateUserSecretParams{
+				ID: secretID, UserID: user.ID, Ciphertext: sealed, SealedWith: sealedWith,
+			})
+			if rerr != nil {
+				return rerr
+			}
+			// RotateUserSecretRow is field-identical to RenameUserSecretRow (both carry
+			// CreatedAt/UpdatedAt); capture it so a rotate-only patch reports live
+			// timestamps instead of the zero values a bare cur copy would leave.
+			out = store.RenameUserSecretRow(rotated)
+			// A manual replacement invalidates the previous account binding: bump the
+			// material revision, reset the status for the kind, and drop the link.
+			if _, berr := q.BumpCodexMaterialRevision(r.Context(), store.BumpCodexMaterialRevisionParams{
+				Status: codexInitialStatus(kind), UserSecretID: secretID, UserID: user.ID,
+			}); berr != nil {
+				return berr
+			}
+		}
+		if req.Label != nil {
+			renamed, rerr := q.RenameUserSecret(r.Context(), store.RenameUserSecretParams{
+				ID: secretID, UserID: user.ID, Label: newLabel,
+			})
+			if rerr != nil {
+				return rerr
+			}
+			out = renamed
+		}
+		if req.Default != nil && *req.Default && !cur.IsDefault {
+			if _, cerr := q.ClearCodexDefaults(r.Context(), user.ID); cerr != nil {
+				return cerr
+			}
+			promoted, perr := q.SetUserSecretDefault(r.Context(), store.SetUserSecretDefaultParams{
+				ID: secretID, UserID: user.ID,
+			})
+			if perr != nil {
+				return perr
+			}
+			out = store.RenameUserSecretRow(promoted)
+		}
+		// Report the alias's status AFTER the mutations, from the single source of truth
+		// (a rotate has just reset it; other patches leave it unchanged). A missing state
+		// row leaves status empty rather than failing the patch.
+		st, serr := q.GetCodexCredentialState(r.Context(), store.GetCodexCredentialStateParams{
+			UserSecretID: secretID, UserID: user.ID,
+		})
+		if serr != nil {
+			if errors.Is(serr, pgx.ErrNoRows) {
+				return nil
+			}
+			return serr
+		}
+		status = st.Status
+		return nil
+	})
+	if err != nil {
+		if isLabelCollision(err) {
+			httpx.Error(w, http.StatusConflict, "a credential with that label already exists")
+			return
+		}
+		slog.Error("patch codex secret", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !found {
+		httpx.Error(w, http.StatusNotFound, "credential not found")
+		return
+	}
+	dto := secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.AutoEligible, out.CreatedAt, out.UpdatedAt)
+	dto.CodexStatus = status
+	httpx.JSON(w, http.StatusOK, map[string]any{"secret": dto})
+}
+
+// DeleteCodexAuthByID deletes ONE of the user's codex_auth credentials by id (PRD
+// #1147 M1). Cookie-only; a foreign or wrong-kind id is a 404.
+func (h *Handler) DeleteCodexAuthByID(w http.ResponseWriter, r *http.Request) {
+	h.deleteCodexSecretByID(w, r, store.KindCodexAuth)
+}
+
+// DeleteOpenAIAPIKeyByID deletes ONE of the user's openai_api_key credentials by id
+// (PRD #1147 M1). Cookie-only; a foreign or wrong-kind id is a 404.
+func (h *Handler) DeleteOpenAIAPIKeyByID(w http.ResponseWriter, r *http.Request) {
+	h.deleteCodexSecretByID(w, r, store.KindOpenAIAPIKey)
+}
+
+// deleteCodexSecretByID is the shared delete path for both codex kinds (PRD #1147 M1),
+// mirroring DeleteAnthropicTokenByID. Owner-scoped; the id must name a secret of the
+// route's kind, so a foreign or mismatched id is a 404. The codex_credential_state row
+// is dropped by its ON DELETE CASCADE FK (00200) — no app-level cleanup.
+//
+// Unlike anthropic, deleting the codex default is ALLOWED even with other codex
+// credentials present: user_secrets_codex_one_default_key forbids TWO defaults, it does
+// not require one, so removing the default simply leaves the user with none until they
+// pick a new one. A single-row delete can never create a two-default state, so no
+// promotion and no default guard are needed in M1.
+func (h *Handler) deleteCodexSecretByID(w http.ResponseWriter, r *http.Request, kind string) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	secretID, ok := httpx.PathUUID(w, r, "id", "secret")
+	if !ok {
+		return
+	}
+
+	var found bool
+	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
+			ID: secretID, UserID: user.ID,
+		})
+		if gerr != nil {
+			if errors.Is(gerr, pgx.ErrNoRows) {
+				return nil // found stays false → 404
+			}
+			return gerr
+		}
+		if cur.Kind != kind {
+			return nil // wrong-kind id → 404
+		}
+		found = true
+		_, derr := q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{ID: secretID, UserID: user.ID})
+		return derr
+	})
+	if err != nil {
+		slog.Error("delete codex secret by id", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !found {
+		httpx.Error(w, http.StatusNotFound, "credential not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// validateCodexAuthBlob checks a pasted Codex login blob (PRD #1147 M1): non-empty,
+// within maxCodexBlobBytes, and parsing to a JSON OBJECT that carries a non-empty
+// `access_token`. Validation is deliberately light — the blob is untrusted user input
+// and M1 ships dark, so NOTHING here contacts the provider; a later milestone resolves
+// and links the account. The whole blob (trimmed) is returned to seal, not just the
+// access_token. Errors NEVER include the blob bytes.
+func validateCodexAuthBlob(raw string) (string, error) {
+	blob := strings.TrimSpace(raw)
+	if blob == "" {
+		return "", errors.New("codex login must not be empty")
+	}
+	if len(blob) > maxCodexBlobBytes {
+		return "", fmt.Errorf("codex login must be at most %d bytes", maxCodexBlobBytes)
+	}
+	var parsed struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal([]byte(blob), &parsed); err != nil {
+		return "", errors.New("codex login must be a JSON object with an access_token")
+	}
+	if strings.TrimSpace(parsed.AccessToken) == "" {
+		return "", errors.New("codex login must contain a non-empty access_token")
+	}
+	return blob, nil
+}
+
+// validateOpenAIAPIKey checks a pasted OpenAI API key (PRD #1147 M1): non-empty, within
+// maxTokenBytes, and free of interior whitespace and control characters. It makes no
+// assumption about the key's prefix or format and NEVER contacts the provider (M1 ships
+// dark). Errors NEVER include the key bytes. Mirrors validateAnthropicToken.
+func validateOpenAIAPIKey(raw string) (string, error) {
+	key := strings.TrimSpace(raw)
+	if key == "" {
+		return "", errors.New("api key must not be empty")
+	}
+	if len(key) > maxTokenBytes {
+		return "", fmt.Errorf("api key must be at most %d bytes", maxTokenBytes)
+	}
+	for _, r := range key {
+		if r == unicode.ReplacementChar || unicode.IsControl(r) || unicode.IsSpace(r) {
+			return "", errors.New("api key must not contain whitespace or control characters")
+		}
+	}
+	return key, nil
 }
 
 // validateSecretLabel trims and checks a token label (PRD #104 D7): non-empty, at

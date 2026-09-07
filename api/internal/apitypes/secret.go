@@ -24,4 +24,11 @@ type SecretDTO struct {
 	AutoEligible bool      `json:"auto_eligible"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+	// CodexStatus is the codex_credential_state link status for a codex-kind row
+	// (PRD #1147 M1): 'staging' (a codex_auth awaiting an account link), 'linked' (an
+	// account resolved and bound), 'failed' (link resolution errored), or 'static' (a
+	// standalone openai_api_key with no subscription lifecycle). Empty and omitted for
+	// anthropic_token rows, which carry no such state — so a client reads its presence
+	// as "this is a Codex credential" and its value as where that credential stands.
+	CodexStatus string `json:"codex_status,omitempty"`
 }
