@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run Clock, Extend & Pause</title>
+<style>
+  /* uzi's shipped "ember" tokens (web/src/index.css). Dark-only like the product; every
+     colour is painted explicitly. The TUI frames use the ANDON palette from
+     api/cmd/uzi/tui_render.go (dark values). */
+  :root {
+    color-scheme: dark;
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    /* TUI andon (dark) */
+    --t-bg: #0e1016; --t-fg: #d8dbe2; --t-tungsten: #c9a061; --t-amber: #ffb454; --t-stall: #fb923c;
+    --t-sage: #6fbf8f; --t-wait: #38bdf8; --t-faint: #8a8a8a; --t-sel: #33302a; --t-alarm: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: rgb(var(--bg)); color: rgb(var(--fg)); font-family: var(--font-sans); -webkit-font-smoothing: antialiased; line-height: 1.45; }
+  .page { max-width: 1400px; margin: 0 auto; padding: 36px 28px 72px; display: flex; flex-direction: column; gap: 46px; }
+
+  .lede .eyebrow { margin: 0 0 8px; font-size: .68rem; letter-spacing: .1em; text-transform: uppercase; font-weight: 650; color: rgb(var(--brand)); }
+  .lede h1 { margin: 0 0 10px; font-size: 1.6rem; font-weight: 650; letter-spacing: -.02em; text-wrap: balance; max-width: 32ch; }
+  .lede p { margin: 0; color: rgb(var(--muted)); max-width: 70ch; font-size: .95rem; }
+  .lede p + p { margin-top: 6px; }
+  .lede p b { color: rgb(var(--fg)); font-weight: 600; }
+  section h2 { margin: 0 0 12px; font-size: 1.05rem; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  section h2 .glyph { color: rgb(var(--brand)); }
+  section h2 code { font-family: var(--font-mono); font-size: .76rem; color: rgb(var(--faint)); font-weight: 400; }
+  section h2 .tag { font-size: .6rem; letter-spacing: .08em; text-transform: uppercase; font-weight: 650; border: 1px solid rgb(var(--info) / .4); background: rgb(var(--info) / .1); color: rgb(var(--info)); border-radius: 999px; padding: 1px 8px; line-height: 1.6; }
+  .stack { display: flex; flex-direction: column; gap: 14px; }
+  .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 1000px) { .cols2 { grid-template-columns: 1fr; } }
+
+  .notes { margin: 14px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 10px 26px; }
+  .notes li { display: flex; gap: 10px; font-size: .86rem; color: rgb(var(--muted)); line-height: 1.5; }
+  .notes li b { color: rgb(var(--fg)); font-weight: 600; }
+  .notes li .mark { margin-top: 3px; }
+  .mark { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 18px; height: 18px; border-radius: 50%; background: rgb(var(--brand)); color: rgb(var(--on-brand)); font-size: .68rem; font-weight: 700; margin-left: 4px; vertical-align: middle; line-height: 1; }
+
+  /* frames */
+  .frame { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; min-width: 0; }
+  .frame-bar { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 8px 14px; border-bottom: 1px solid rgb(var(--edge)); font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 650; color: rgb(var(--muted)); }
+  .frame-bar code { text-transform: none; letter-spacing: 0; font-weight: 400; font-family: var(--font-mono); font-size: .68rem; color: rgb(var(--faint)); }
+  .frame-bar.warn { color: rgb(var(--warn)); background: rgb(var(--warn) / .06); border-bottom-color: rgb(var(--warn) / .25); }
+  .frame-bar.wait { color: rgb(var(--info)); background: rgb(var(--info) / .06); border-bottom-color: rgb(var(--info) / .25); }
+  .app { padding: 18px 18px 20px; font-size: 13px; display: flex; flex-direction: column; gap: 12px; }
+  .crumbs { display: flex; gap: 6px; font-size: .75rem; color: rgb(var(--faint)); }
+  .crumbs span.cur { color: rgb(var(--muted)); }
+  .app h3 { margin: 0; font-size: 1.15rem; font-weight: 600; letter-spacing: -.01em; }
+  .metarow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .metarow .spacer { flex: 1 1 24px; }
+  .badge { display: inline-flex; align-items: center; gap: 5px; border: 1px solid; border-radius: 999px; padding: 1px 8px; font-size: .7rem; font-weight: 500; white-space: nowrap; line-height: 1.5; font-variant-numeric: tabular-nums; }
+  .b-ok { border-color: rgb(var(--ok) / .4); background: rgb(var(--ok) / .1); color: rgb(var(--ok)); }
+  .b-warn { border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .1); color: rgb(var(--warn)); }
+  .b-info { border-color: rgb(var(--info) / .4); background: rgb(var(--info) / .1); color: rgb(var(--info)); }
+  .b-brand { border-color: rgb(var(--brand) / .4); background: rgb(var(--brand) / .1); color: rgb(var(--brand)); }
+  .b-neutral { border-color: rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--muted)); }
+  .b-danger { border-color: rgb(var(--danger) / .4); background: rgb(var(--danger) / .1); color: rgb(var(--danger)); }
+  .pill { text-transform: none; font-weight: 600; }
+  .pulse::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+  @media (prefers-reduced-motion: reduce) { .pulse::before { animation: none; } }
+  .spin { display: inline-block; width: 9px; height: 9px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg) } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+  .elapsed { font-size: .78rem; color: rgb(var(--muted)); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .elapsed .dim { color: rgb(var(--faint)); }
+  .btn { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px; border-radius: 6px; font-size: .75rem; font-weight: 500; border: 1px solid transparent; white-space: nowrap; cursor: default; }
+  .btn-secondary { border-color: rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--fg)); }
+  .btn-primary { background: rgb(var(--brand)); color: rgb(var(--on-brand)); font-weight: 600; }
+  .btn-danger { border-color: rgb(var(--danger) / .4); background: rgb(var(--danger) / .1); color: rgb(var(--danger)); }
+  .btn-ghost { color: rgb(var(--muted)); }
+  .btn .car { color: rgb(var(--faint)); font-size: .7rem; margin-left: 2px; }
+  .nowline { display: flex; align-items: center; gap: 8px; font-size: .8rem; color: rgb(var(--muted)); font-variant-numeric: tabular-nums; }
+  .nowline .k { font-size: .66rem; letter-spacing: .08em; text-transform: uppercase; font-weight: 650; color: rgb(var(--faint)); }
+  .nowline .mile { font-family: var(--font-mono); letter-spacing: 1px; color: rgb(var(--ok)); }
+  .nowline .mile i { color: rgb(var(--faint)); font-style: normal; }
+  .omitted { border: 1px dashed rgb(var(--edge-strong)); border-radius: 8px; padding: 6px 12px; font-size: .72rem; color: rgb(var(--faint)); }
+  .owner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; border-top: 1px solid rgb(var(--edge)); padding-top: 12px; }
+  .owner .k { font-size: .66rem; letter-spacing: .08em; text-transform: uppercase; font-weight: 650; color: rgb(var(--faint)); margin-right: 4px; }
+  .owner .who { font-size: .72rem; color: rgb(var(--faint)); }
+
+  /* panels inside the run page */
+  .panel { border: 1px solid rgb(var(--edge)); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; background: rgb(var(--raised) / .35); }
+  .panel.warn { border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .07); }
+  .panel.wait { border-color: rgb(var(--info) / .35); background: rgb(var(--info) / .06); }
+  .panel .ph { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: .9rem; }
+  .panel.warn .ph { color: rgb(var(--warn)); }
+  .panel.wait .ph { color: rgb(var(--info)); }
+  .panel p { margin: 0; color: rgb(var(--muted)); font-size: .82rem; }
+  .panel p b { color: rgb(var(--fg)); font-weight: 600; }
+  .panel .acts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 2px; }
+  .panel .who { font-size: .72rem; color: rgb(var(--faint)); }
+  .mono { font-family: var(--font-mono); font-size: .74rem; }
+
+  /* extend popover */
+  .popwrap { position: relative; display: inline-flex; }
+  .pop { position: absolute; right: 0; top: calc(100% + 6px); width: 300px; background: rgb(var(--surface)); border: 1px solid rgb(var(--edge-strong)); border-radius: 8px; padding: 12px; box-shadow: 0 14px 34px rgb(0 0 0 / .6); z-index: 5; display: flex; flex-direction: column; gap: 10px; font-size: .8rem; }
+  .pop .ph { font-weight: 600; font-size: .86rem; }
+  .pop .quick { display: flex; gap: 6px; }
+  .pop .quick span { flex: 1; text-align: center; border: 1px solid rgb(var(--edge)); border-radius: 6px; padding: 5px 0; font-variant-numeric: tabular-nums; color: rgb(var(--fg)); }
+  .pop .quick span.on { border-color: rgb(var(--brand)); background: rgb(var(--brand) / .12); color: rgb(var(--brand)); font-weight: 600; }
+  .pop .input { border: 1px solid rgb(var(--edge)); background: rgb(var(--raised) / .5); border-radius: 6px; padding: 5px 8px; font-family: var(--font-mono); font-size: .74rem; color: rgb(var(--faint)); display: flex; justify-content: space-between; }
+  .pop .facts { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 3px; font-size: .74rem; color: rgb(var(--muted)); font-variant-numeric: tabular-nums; }
+  .pop .facts b { color: rgb(var(--fg)); font-weight: 600; }
+  .pop .foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .pop .foot small { color: rgb(var(--faint)); font-size: .68rem; }
+  .popspace { height: 210px; }
+
+  /* pause menu */
+  .menu { width: 320px; background: rgb(var(--surface)); border: 1px solid rgb(var(--edge-strong)); border-radius: 8px; padding: 4px; box-shadow: 0 12px 30px rgb(0 0 0 / .55); display: flex; flex-direction: column; gap: 2px; font-size: .8rem; }
+  .mi { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 6px; }
+  .mi.hover { background: rgb(var(--raised)); }
+  .mi b { font-weight: 600; display: flex; gap: 8px; align-items: center; }
+  .mi b .tag { font-size: .6rem; letter-spacing: .08em; text-transform: uppercase; font-weight: 650; border: 1px solid rgb(var(--ok) / .4); background: rgb(var(--ok) / .1); color: rgb(var(--ok)); border-radius: 999px; padding: 0 7px; line-height: 1.6; }
+  .mi small { color: rgb(var(--faint)); font-size: .72rem; }
+  .mi.sep { border-top: 1px solid rgb(var(--edge)); border-radius: 0; margin-top: 2px; padding-top: 8px; }
+  .mi.danger b { color: rgb(var(--danger)); }
+
+  /* budget strip */
+  .strip { border: 1px solid rgb(var(--edge)); border-radius: var(--radius); padding: 14px 16px 12px; display: flex; flex-direction: column; gap: 12px; background: rgb(var(--surface)); }
+  .strip .lab { display: flex; justify-content: space-between; gap: 10px; font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; font-weight: 650; color: rgb(var(--muted)); }
+  .strip .lab span:last-child { text-transform: none; letter-spacing: 0; font-weight: 400; color: rgb(var(--faint)); font-variant-numeric: tabular-nums; }
+  .track { position: relative; height: 34px; }
+  .track .seg { position: absolute; top: 10px; height: 12px; }
+  .seg.active { background: rgb(var(--ok) / .75); }
+  .seg.gate, .seg.pause { background: repeating-linear-gradient(135deg, rgb(var(--info) / .55) 0 4px, transparent 4px 8px); border: 1px solid rgb(var(--info) / .5); }
+  .seg.left { background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); }
+  .seg.ext { background: rgb(var(--brand) / .25); border: 1px dashed rgb(var(--brand) / .7); }
+  .seg.warnzone { background: rgb(var(--warn) / .18); top: 8px; height: 16px; border-left: 1px solid rgb(var(--warn) / .6); }
+  .tick { position: absolute; top: 0; height: 34px; border-left: 1px solid rgb(var(--edge-strong)); }
+  .tick span { position: absolute; top: -2px; left: 4px; font-size: .62rem; color: rgb(var(--faint)); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .tick.now { border-left: 2px solid rgb(var(--fg)); }
+  .tick.now span { color: rgb(var(--fg)); font-weight: 600; top: 24px; }
+  .tick.warn { border-left-color: rgb(var(--warn)); }
+  .tick.warn span { color: rgb(var(--warn)); top: 24px; }
+  .tick.dead { border-left-color: rgb(var(--danger)); }
+  .tick.dead span { color: rgb(var(--danger)); top: 24px; }
+  .tick.ext { border-left-color: rgb(var(--brand)); }
+  .tick.ext span { color: rgb(var(--brand)); top: 24px; }
+  .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; font-size: .7rem; letter-spacing: .04em; text-transform: uppercase; color: rgb(var(--faint)); }
+  .legend .sw { display: inline-block; width: 14px; height: 9px; margin-right: 6px; vertical-align: middle; border-radius: 1px; }
+  .legend b { color: rgb(var(--fg)); letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; margin-left: 2px; }
+  .strip .formula { margin: 0; font-family: var(--font-mono); font-size: .72rem; color: rgb(var(--muted)); border-top: 1px solid rgb(var(--edge)); padding-top: 10px; line-height: 1.6; }
+  .strip .formula b { color: rgb(var(--fg)); font-weight: 600; }
+
+  /* terminal frames */
+  .term { background: var(--t-bg); color: var(--t-fg); font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; padding: 12px 14px; overflow-x: auto; white-space: pre; }
+  .term .tg { color: var(--t-tungsten); font-weight: 700; }
+  .term .fa { color: var(--t-faint); }
+  .term .sg { color: var(--t-sage); }
+  .term .st { color: var(--t-stall); }
+  .term .wt { color: var(--t-wait); }
+  .term .am { color: var(--t-amber); }
+  .term .al { color: var(--t-alarm); }
+  .term .sel { background: var(--t-sel); display: inline-block; width: 100%; }
+  .term .prompt { color: var(--t-faint); }
+  .term .cmd { color: var(--t-fg); font-weight: 600; }
+  .term .out { color: #b8bcc6; }
+  .term .hi { color: var(--t-tungsten); }
+  .term .eyebrow { color: var(--t-faint); letter-spacing: .12em; font-size: 11px; }
+  .term .eyebrow.amb { color: var(--t-amber); }
+  .term .blink { animation: blink 1.2s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: .25 } }
+  @media (prefers-reduced-motion: reduce) { .term .blink { animation: none; } }
+
+  /* pause flow */
+  .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: stretch; }
+  @media (max-width: 1000px) { .flow { grid-template-columns: 1fr 1fr; } }
+  .step { border: 1px solid rgb(var(--edge)); border-radius: var(--radius); background: rgb(var(--surface)); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .step .n { font-size: .66rem; letter-spacing: .1em; text-transform: uppercase; font-weight: 650; color: rgb(var(--brand)); }
+  .step h4 { margin: 0; font-size: .92rem; font-weight: 600; }
+  .step p { margin: 0; color: rgb(var(--muted)); font-size: .8rem; }
+  .step .ui { display: flex; flex-direction: column; gap: 6px; border: 1px dashed rgb(var(--edge-strong)); border-radius: 8px; padding: 8px 10px; background: rgb(var(--raised) / .3); }
+  .step .ui .k { font-size: .62rem; letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--faint)); font-weight: 650; }
+  .step .tui { font-family: var(--font-mono); font-size: 12px; color: var(--t-fg); background: var(--t-bg); border-radius: 4px; padding: 3px 8px; white-space: pre; overflow-x: auto; }
+
+  /* summary table */
+  .tbl { width: 100%; border-collapse: collapse; font-size: .84rem; }
+  .tbl th, .tbl td { text-align: left; padding: 9px 12px; border-bottom: 1px solid rgb(var(--edge)); vertical-align: top; }
+  .tbl th { font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--muted)); font-weight: 650; }
+  .tbl td:first-child { font-weight: 600; white-space: nowrap; }
+  .tbl td { color: rgb(var(--muted)); }
+  .tbl td b { color: rgb(var(--fg)); font-weight: 600; }
+  .tbl code { font-family: var(--font-mono); font-size: .74rem; color: rgb(var(--faint)); }
+  .tblwrap { overflow-x: auto; border: 1px solid rgb(var(--edge)); border-radius: var(--radius); }
+  .tbl tr:last-child td { border-bottom: 0; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="lede">
+    <p class="eyebrow">Mock · run page · TUI · CLI</p>
+    <h1>See the clock, extend it, pause the run</h1>
+    <p>One run (issue #1183, six milestones, 8h frozen budget) at three moments: healthy, near its timeout, and paused by its owner. The clock is the <b>active</b> time the timeout sweep kills on: wall time minus every park. The server computes the deadline once; web, TUI and CLI read it.</p>
+    <p><b>A healthy run changes almost nothing.</b> The web folds the budget into the elapsed text it already shows; the TUI is byte-identical. The header grows a control only when the state calls for one, the way Expedite appears only on a queued run: Extend when near timeout, Resume when paused. Pause lives with Stop run in the owner actions.</p>
+  </header>
+
+  <!-- ───────────────────────── web header, three moments ───────────────────────── -->
+  <section>
+    <h2><span class="glyph">◔</span> Run page, three moments of one run <code>web/src/pages/RunView.tsx</code></h2>
+    <div class="stack">
+
+      <!-- A: healthy -->
+      <div class="frame">
+        <div class="frame-bar"><span>A · 11:08 · running, 3h 48m active</span><code>health: ok · header unchanged except the elapsed text</code></div>
+        <div class="app">
+          <div class="crumbs"><span>vtmocanu/uzi</span><span>/</span><span>#1183</span><span>/</span><span class="cur">Run</span></div>
+          <h3>One triage row for Judge, run page and Findings</h3>
+          <div class="metarow">
+            <span class="badge b-ok pill pulse">running</span>
+            <span class="badge b-brand">autopilot</span>
+            <span class="badge b-neutral">PRD</span>
+            <span class="badge b-info"><span class="spin"></span> implement…</span>
+            <span class="badge b-ok">● live</span>
+            <span class="elapsed" title="8h budget frozen from 6 milestones. Paused time (32m at the plan gate) does not count. Times out 15:20.">3h 48m <span class="dim">/ 8h</span></span><span class="mark">1</span>
+          </div>
+          <div class="nowline"><span class="k">now</span><span class="mile">▰▰▰◐<i>▱▱</i></span><span>M4 · wire the shared row into the run page · 6m</span></div>
+          <div class="omitted">activity feed, crew lanes, milestone list, cost … unchanged</div>
+          <div class="owner">
+            <span class="k">owner actions</span>
+            <span class="btn btn-secondary">‖ Pause <span class="car">▾</span></span><span class="mark">2</span>
+            <span class="btn btn-danger">Stop run</span>
+            <span class="who">Only the run's owner can pause or stop it.</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- B: near timeout -->
+      <div class="frame">
+        <div class="frame-bar warn"><span>B · 14:15 · running, 6h 55m active (86% of budget)</span><code>health: slow → "near timeout" (PRD #1170) · Extend appears</code></div>
+        <div class="app">
+          <div class="crumbs"><span>vtmocanu/uzi</span><span>/</span><span>#1183</span><span>/</span><span class="cur">Run</span></div>
+          <h3>One triage row for Judge, run page and Findings</h3>
+          <div class="metarow">
+            <span class="badge b-ok pill pulse">running</span>
+            <span class="badge b-brand">autopilot</span>
+            <span class="badge b-neutral">PRD</span>
+            <span class="badge b-info"><span class="spin"></span> implement…</span>
+            <span class="badge b-warn pulse" title="this run is close to its wall-clock timeout and will be stopped when it reaches it">⚠ near timeout · 1h 05m left</span><span class="mark">3</span>
+            <span class="elapsed">6h 55m <span class="dim">/ 8h</span></span>
+            <span class="popwrap">
+              <span class="btn btn-primary">Extend…</span><span class="mark">4</span>
+              <div class="pop">
+                <div class="ph">Give this run more time</div>
+                <div class="quick"><span>+1h</span><span class="on">+2h</span><span>+4h</span><span>+8h</span></div>
+                <div class="input"><span>custom</span><span>2h</span></div>
+                <ul class="facts">
+                  <li>Budget <b>8h</b> (frozen, 6 milestones) · used <b>6h 55m</b></li>
+                  <li>Extensions so far <b>none</b> · cap <b>+16h</b> per run (admin setting)</li>
+                  <li>After this: <b>3h 05m left</b>, times out <b>17:20</b></li>
+                </ul>
+                <div class="foot"><small>Owner only. Logged in the run's steering history.</small><span class="btn btn-primary">Extend by 2h</span></div>
+              </div>
+            </span>
+          </div>
+          <div class="popspace"></div>
+          <div class="nowline"><span class="k">now</span><span class="mile">▰▰▰▰▰◐</span><span>M6 · Findings page uses the shared row · 41m</span></div>
+          <div class="panel warn">
+            <div class="ph">⚠ This run is close to its time limit</div>
+            <p>It has used <b>6h 55m</b> of its <b>8h</b> budget and will be <b>stopped at 15:20</b> unless you extend it. Work already committed is safe: the last checkpoint was pushed 9 minutes ago (<span class="mono">agent/issue-1183 @ 7d21c0a</span>).</p>
+            <div class="acts">
+              <span class="btn btn-primary">Extend by 2h</span>
+              <span class="btn btn-secondary">‖ Pause after M6</span>
+              <span class="btn btn-danger">Stop run</span>
+              <span class="who">Only the run's owner can extend, pause or stop it.</span>
+            </div>
+          </div><span class="mark" style="align-self:flex-start;margin-top:-6px">5</span>
+        </div>
+      </div>
+
+      <!-- C: paused -->
+      <div class="frame">
+        <div class="frame-bar wait"><span>C · 13:42 · paused since 11:02 (after milestone 3)</span><code>status: paused (new) · Resume appears</code></div>
+        <div class="app">
+          <div class="crumbs"><span>vtmocanu/uzi</span><span>/</span><span>#1183</span><span>/</span><span class="cur">Run</span></div>
+          <h3>One triage row for Judge, run page and Findings</h3>
+          <div class="metarow">
+            <span class="badge b-info pill">‖ paused</span><span class="mark">6</span>
+            <span class="badge b-brand">autopilot</span>
+            <span class="badge b-neutral">PRD</span>
+            <span class="elapsed">3h 42m <span class="dim">/ 8h · clock stopped</span></span>
+            <span class="btn btn-primary">▶ Resume</span>
+          </div>
+          <div class="nowline"><span class="k">paused at</span><span class="mile">▰▰▰<i>▱▱▱</i></span><span>3 of 6 milestones done · 2h 40m ago</span></div>
+          <div class="panel wait">
+            <div class="ph">‖ Paused by you at 11:02</div>
+            <p>The run finished milestone 3, pushed a checkpoint (<span class="mono">agent/issue-1183 @ 3f9c2e1</span>) and parked. Its worker keeps the session while it stays alive; if the worker is replaced, the resume recovers the branch from the checkpoint and re-plans the remaining milestones from the approved plan.</p>
+            <p><b>Paused time does not count</b> toward the 8h budget. Nothing runs and nothing is spent while it waits.</p>
+            <div class="acts">
+              <span class="btn btn-primary">▶ Resume</span>
+              <span class="btn btn-secondary">Extend…</span>
+              <span class="btn btn-danger">Stop run</span>
+              <span class="who">Only the run's owner can resume it.</span>
+            </div>
+          </div><span class="mark" style="align-self:flex-start;margin-top:-6px">7</span>
+        </div>
+      </div>
+    </div>
+
+    <ul class="notes">
+      <li><span class="mark">1</span><div><b>Elapsed text gains "/ 8h"</b> and a tooltip with the deadline. No chip, no button: the run page today shows the elapsed time, this is the same text with the budget beside it. Absent on chat, judge and interactive tasks, which never time out.</div></li>
+      <li><span class="mark">2</span><div><b>Pause ▾</b> sits with Stop run in the owner actions, wherever those render for a running run. A deliberate, rare action, so it does not earn a place in the header row.</div></li>
+      <li><span class="mark">3</span><div><b>Near-timeout pill</b> is PRD #1170's health chip with one change: the suffix is <i>time left</i>, not time since flagged. The other flags keep "since flagged" because "stalled · 12m" is unambiguous; on a flag named near timeout any bare duration reads as time left, so make it so.</div></li>
+      <li><span class="mark">4</span><div><b>Extend</b> appears in the header only while the flag is up, the way Expedite appears only on a queued run. Quick picks, a custom value, and the facts you need to pick: used, extensions so far, the cap, what the deadline becomes.</div></li>
+      <li><span class="mark">5</span><div><b>Near-timeout panel</b>, modelled on the limit-wait panel: what will happen, when, what is already safe, and the three actions in one row. The same text goes to #1170's Slack DM with the CLI command, since an autopilot run at 03:00 has nobody on this page.</div></li>
+      <li><span class="mark">6</span><div><b>paused</b> is a new status in the wait family (same blue as rate-limited). The elapsed text says <i>clock stopped</i>; the deadline is dropped because it moves with the pause. <b>Resume</b> is the conditional header action.</div></li>
+      <li><span class="mark">7</span><div><b>Paused panel</b> states the checkpoint, the session guarantee, the budget rule, and offers Resume first. Extend stays available while paused.</div></li>
+    </ul>
+  </section>
+
+  <!-- ───────────────────────── budget strip ───────────────────────── -->
+  <section>
+    <h2><span class="glyph">▬</span> Where the hours went <span class="tag">PRD explainer, not a product surface</span></h2>
+    <div class="strip">
+      <div class="lab"><span>Wall clock 06:48 → 17:20 · same run, after a +2h extension</span><span>active 6h 55m · parks 3h 12m · budget 8h + 2h</span></div>
+      <div class="track">
+        <!-- 10h35m wall span mapped onto 100%. 06:48=0. Scale: 1h = 9.45% -->
+        <div class="seg active" style="left:0%;width:5.2%"></div>
+        <div class="seg gate" style="left:5.2%;width:5.0%" title="plan gate 32m"></div>
+        <div class="seg active" style="left:10.2%;width:29.8%"></div>
+        <div class="seg pause" style="left:40%;width:25.2%" title="paused 2h 40m"></div>
+        <div class="seg active" style="left:65.2%;width:5.6%"></div>
+        <div class="seg warnzone" style="left:70.8%;width:10.6%" title="85% zone"></div>
+        <div class="seg left" style="left:70.8%;width:10.6%"></div>
+        <div class="seg ext" style="left:81.4%;width:18.6%" title="+2h extension"></div>
+        <div class="tick" style="left:0%"><span>06:48 start</span></div>
+        <div class="tick" style="left:5.2%"><span>plan gate</span></div>
+        <div class="tick" style="left:40%"><span>‖ 11:02</span></div>
+        <div class="tick" style="left:65.2%"><span>▶ 13:42</span></div>
+        <div class="tick now" style="left:70.8%"><span>now 14:15</span></div>
+        <div class="tick warn" style="left:70.8%"><span style="left:-58px">85% ⚠</span></div>
+        <div class="tick dead" style="left:81.4%"><span>15:20 was the deadline</span></div>
+        <div class="tick ext" style="left:100%"><span style="left:auto;right:4px">17:20 new deadline</span></div>
+      </div>
+      <div class="legend">
+        <span><i class="sw" style="background:rgb(var(--ok) / .75)"></i>active <b>6h 55m</b></span>
+        <span><i class="sw" style="background:repeating-linear-gradient(135deg, rgb(var(--info) / .55) 0 3px, transparent 3px 6px);border:1px solid rgb(var(--info) / .5)"></i>parked, not counted <b>3h 12m</b></span>
+        <span><i class="sw" style="background:rgb(var(--raised));border:1px solid rgb(var(--edge))"></i>left of 8h <b>1h 05m</b></span>
+        <span><i class="sw" style="background:rgb(var(--brand) / .25);border:1px dashed rgb(var(--brand) / .7)"></i>extension <b>+2h</b></span>
+        <span><i class="sw" style="background:rgb(var(--warn) / .18);border-left:1px solid rgb(var(--warn))"></i>near-timeout zone <b>≥85%</b></span>
+      </div>
+      <p class="formula">server: <b>deadline_at</b> = started_at + budget_wall_seconds (8h) + budget_paused_seconds (3h 12m) + <b>budget_extension_seconds</b> (2h, new column)<br>clients: time left = deadline_at − now. <b>deadline_at</b> is null for kinds that never time out and null while parked, because it moves. The sweep, the ⚠ flag and every surface read the same value.</p>
+    </div>
+  </section>
+
+  <!-- ───────────────────────── TUI ───────────────────────── -->
+  <section>
+    <h2><span class="glyph">▤</span> TUI <code>uzi tui · one new word, one conditional row, nothing else</code></h2>
+    <div class="cols2">
+      <div class="frame">
+        <div class="frame-bar"><span>Board, columns unchanged</span><code>tui_board.go · no clock, no new column</code></div>
+        <div class="term"><span class="tg">uzi</span> <span class="fa">·</span> board  <span class="fa">vtmocanu/uzi</span>                                        <span class="fa">/ filter   ? keys</span>
+
+<span class="eyebrow amb">NEEDS YOU  1</span>
+  <span class="am">⚑</span>  <span class="am">plan gate    </span> <span class="fa">#1184</span> Admin All-users Judge scope                 <span class="fa">▱▱▱▱</span>     <span class="fa">$1</span>
+
+<span class="eyebrow">ON THE FLOOR  4</span>                                                        <span class="fa">MILE   COST</span>
+<span class="sel"><span class="tg">▸</span> <span class="sg">●</span>  <span class="sg">running      </span> <span class="tg">#1183</span> One triage row for Judge, run page and Fi…  <span class="sg">▰▰▰</span><span class="sg blink">◐</span><span class="fa">▱▱</span>   <span class="fa">$41</span></span>
+  <span class="st">▲</span>  <span class="st">near timeout </span> <span class="fa">#1170</span> Replace the wall-clock slow flag with a bu…  <span class="sg">▰▰▰▰▰</span><span class="sg blink">◐</span>   <span class="fa">$63</span>
+  <span class="wt">‖</span>  <span class="wt">paused       </span> <span class="fa">#1167</span> Three light themes and a Lights on/off mode  <span class="sg">▰▰▰</span><span class="fa">▱▱▱</span>   <span class="fa">$28</span>
+  <span class="wt">~</span>  <span class="wt">rate-limited </span> <span class="fa">#1176</span> TUI milestone glyph and micro-bar blink     <span class="sg">▰</span><span class="fa">▱▱▱</span>    <span class="fa">$4</span>
+
+<span class="eyebrow">DONE  2</span>
+  <span class="fa">✓  done          #1177 Codex credential UX                          ▰▰▰▰     $19</span>
+  <span class="fa">✗  failed        #1139 Findings bug icon                            ▰▱▱▱      $2</span>
+</div>
+      </div>
+      <div class="frame">
+        <div class="frame-bar"><span>Run detail, rows 1 and 2</span><code>tui_detail.go · renderDetail · row 2 is the existing park-line slot</code></div>
+        <div class="term"><span class="fa">── healthy · unchanged ─────────────────────────────────────────────</span>
+<span class="fa">‹ floor  run</span> <span class="tg">9c672af9</span> <span class="fa">· issue ·</span> <span class="tg">#1183</span>   <b>One triage row for Judge, run page and Fi…</b>   <span class="sg">● running</span> <span class="fa">· 3h48m · $41</span>   <span class="sg">● live</span>
+<span class="fa">┌ transcript ─────────────────────────────────────────┐ ┌ crew ────┐</span>
+
+<span class="fa">── near timeout · row 2 appears while the flag is up ───────────────</span>
+<span class="fa">‹ floor  run</span> <span class="tg">9c672af9</span> <span class="fa">· issue ·</span> <span class="tg">#1183</span>   <b>One triage row for Judge, run page and Fi…</b>   <span class="st">▲ near timeout</span> <span class="fa">· 6h55m · $63</span>   <span class="sg">● live</span>
+<span class="st">▲ near timeout · 1h05m left of 8h · stops at 15:20 · extend: web or uzi run extend</span>
+<span class="fa">┌ transcript ─────────────────────────────────────────┐ ┌ crew ────┐</span>
+
+<span class="fa">── paused · same row 2 slot ────────────────────────────────────────</span>
+<span class="fa">‹ floor  run</span> <span class="tg">9c672af9</span> <span class="fa">· issue ·</span> <span class="tg">#1183</span>   <b>One triage row for Judge, run page and Fi…</b>   <span class="wt">‖ paused</span> <span class="fa">· 3h42m · $28</span>
+<span class="wt">‖ paused by you · since 11:02 (2h40m) · 3/6 milestones · checkpoint 3f9c2e1 · resume: web or uzi run resume</span>
+<span class="fa">┌ transcript ─────────────────────────────────────────┐ ┌ crew ────┐</span>
+
+<span class="fa">── today's rate-limit park line, for comparison (run_render.go:limitWaitLine) ──</span>
+<span class="wt">paused: Anthropic usage limit (five_hour) · resumes in 4h12m · attempt 1</span>
+<span class="fa">reword to "parked:" once a user pause exists, or the two read as one thing</span>
+</div>
+      </div>
+    </div>
+    <ul class="notes">
+      <li><span class="mark">a</span><div><b>Nothing for a healthy run.</b> No LEFT column, no "left of 8h". The near-timeout flag reached 85% on 2 runs in 45 days; a permanent column for that would trim titles for everyone.</div></li>
+      <li><span class="mark">b</span><div><b>‖ paused</b> is the only vocabulary addition: one entry, wait colour next to <b>~ rate-limited</b> (both non-terminal holds, the word tells them apart). Without it the default arm draws a faint <b>· paused</b>, the same as queued, so a parked run reads as idle. Band placement needs nothing: unknown statuses already land on the floor.</div></li>
+      <li><span class="mark">c</span><div><b>Row 2 of the run detail</b> is the existing park-line slot (drawn today only for a rate-limit park). It gains two conditional lines: the near-timeout clock, in stall colour, and the paused line, in wait colour. Row 1 keeps its shape, so a healthy run is byte-identical. The rate-limit line's leading word <i>paused:</i> must become <i>parked:</i> so it cannot be mistaken for a user pause.</div></li>
+    </ul>
+  </section>
+
+  <!-- ───────────────────────── CLI ───────────────────────── -->
+  <section>
+    <h2><span class="glyph">❯</span> CLI <code>uzi run get · extend · pause · resume</code></h2>
+    <div class="cols2">
+      <div class="frame">
+        <div class="frame-bar"><span>Reading the clock</span><code>server-computed fields, existing verbs</code></div>
+        <div class="term"><span class="prompt">$</span> <span class="cmd">uzi run get 9c672af9</span>
+<span class="out">ID          9c672af9-3b1e-4c7a-9f02-6e1d5a8b2c40
+Issue       #1183 One triage row for Judge, run page and Findings
+Status      running          health <span class="st">slow (near timeout)</span>
+Started     2026-09-07 06:48  active 6h55m · parked 32m
+Budget      8h frozen (6 milestones) · extension 0 · <span class="hi">1h05m left</span> · times out 15:20
+Milestones  5/6 · now M6 Findings page uses the shared row (41m)
+Cost        $63.10</span>
+
+<span class="prompt">$</span> <span class="cmd">uzi run get 9c672af9 --json | jq '{deadline_at, time_left_seconds, budget_extension_seconds}'</span>
+<span class="out">{
+  "deadline_at": "2026-09-07T12:20:00Z",
+  "time_left_seconds": 3900,
+  "budget_extension_seconds": 0
+}</span>
+
+<span class="prompt">$</span> <span class="cmd">uzi run get 7a…  --json | jq '{status, deadline_at, time_left_seconds}'   <span class="fa"># paused</span></span>
+<span class="out">{ "status": "paused", "deadline_at": null, "time_left_seconds": 15480 }</span>
+
+<span class="prompt">$</span> <span class="cmd">uzi run list --status running --sort time-left</span>
+<span class="out">ID        ISSUE  STATUS   HEALTH         LEFT    COST
+9c672af9  #1183  running  <span class="st">near timeout</span>   1h05m   $63
+2f88c1d0  #1170  running  ok             4h12m   $41</span>
+</div>
+      </div>
+      <div class="frame">
+        <div class="frame-bar"><span>Acting on it</span><code>three new verbs, owner-scoped, audited as steering inputs</code></div>
+        <div class="term"><span class="prompt">$</span> <span class="cmd">uzi run extend 9c672af9 --by 2h</span>
+<span class="out">Extended 9c672af9 by 2h. 3h05m left, times out 17:20.
+Extensions on this run: 2h of 16h allowed.</span>
+
+<span class="prompt">$</span> <span class="cmd">uzi run extend 9c672af9 --by 20h</span>
+<span class="al">error: 20h exceeds the remaining extension cap (14h left of 16h). Try --by 14h or less.</span>
+
+<span class="prompt">$</span> <span class="cmd">uzi run pause 9c672af9</span>
+<span class="out">Pause requested. The run finishes milestone 6, pushes a checkpoint, then parks.
+Watch it: uzi run get 9c672af9 · park at once instead: --now</span>
+
+<span class="prompt">$</span> <span class="cmd">uzi run pause 9c672af9 --now</span>
+<span class="out">Paused 9c672af9. Checkpoint 3f9c2e1 pushed to agent/issue-1183; the in-flight turn was dropped.
+Clock stopped at 6h55m active. Resume: uzi run resume 9c672af9</span>
+
+<span class="prompt">$</span> <span class="cmd">uzi run resume 9c672af9</span>
+<span class="out">Resumed 9c672af9: queued, pinned to worker hw-7f3a (session kept).</span>
+
+<span class="prompt">$</span> <span class="cmd">uzi run pause 4a1e…  <span class="fa"># a chat run</span></span>
+<span class="al">error: chat runs already park between turns; pause applies to issue, task, prompt and self-improve runs.</span>
+</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ───────────────────────── pause flow ───────────────────────── -->
+  <section>
+    <h2><span class="glyph">‖</span> How a pause lands <code>reuses the scope-ceiling seam (PRD #634) and the limit-wait park (PRD #35, ADR-628)</code></h2>
+    <div class="flow">
+      <div class="step">
+        <div class="n">1 · ask</div>
+        <h4>Pause ▾, in the owner actions</h4>
+        <p>The owner picks how. The default finishes the milestone in flight, because that is where work is committed and a checkpoint already publishes.</p>
+        <div class="ui">
+          <div class="menu">
+            <div class="mi hover"><b>After this milestone <span class="tag">recommended</span></b><small>Finishes M4, pushes a checkpoint, then parks. Nothing in flight is lost.</small></div>
+            <div class="mi"><b>Now</b><small>Drops the current turn and parks on the last checkpoint (9m ago).</small></div>
+            <div class="mi sep"><small>Paused time does not count toward the 8h budget.</small></div>
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="n">2 · winding down</div>
+        <h4>pausing</h4>
+        <p>A sticky flag on the agent, like <i>stop</i>. The lead is told to start no further milestone; the harness waits for the milestone boundary.</p>
+        <div class="ui">
+          <div class="k">web</div>
+          <div><span class="badge b-ok pill pulse">running</span> <span class="badge b-info"><span class="spin"></span> pausing after M4…</span></div>
+          <div class="k">tui</div>
+          <div class="tui"><span style="color:var(--t-wait)">‖  pausing      </span> <span style="color:var(--t-faint)">#1183</span> One triage row for Judge…   <span style="color:var(--t-sage)">▰▰▰◐</span><span style="color:var(--t-faint)">▱▱</span>   <span style="color:var(--t-faint)">$41</span></div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="n">3 · parked</div>
+        <h4>paused</h4>
+        <p>Checkpoint pushed, state reported, clock stopped. The worker keeps the session and its affinity; the HOME sweep must treat <i>paused</i> as non-terminal or it deletes the transcript.</p>
+        <div class="ui">
+          <div class="k">web</div>
+          <div><span class="badge b-info pill">‖ paused</span> <span class="elapsed">3h 42m <span class="dim">/ 8h · clock stopped</span></span></div>
+          <div class="k">durable</div>
+          <div class="mono" style="color:rgb(var(--muted))">git: agent/issue-1183 @ 3f9c2e1<br>db: plan_md · milestones_completed 3/6 · checkpoint_tip · session_id</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="n">4 · back</div>
+        <h4>▶ Resume</h4>
+        <p>Moves <i>paused → queued</i> keeping the worker pin. Same worker alive: the SDK session continues. Worker gone: the tree is recovered from the checkpoint and the remaining milestones re-plan from the approved plan.</p>
+        <div class="ui">
+          <div class="k">web</div>
+          <div><span class="badge b-neutral pill">queued</span> <span style="color:rgb(var(--faint))">→</span> <span class="badge b-neutral pill">claimed</span> <span style="color:rgb(var(--faint))">→</span> <span class="badge b-ok pill pulse">running</span></div>
+          <div class="k">clock</div>
+          <div class="elapsed">3h 42m <span class="dim">/ 8h · times out 18:00</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ───────────────────────── summary ───────────────────────── -->
+  <section>
+    <h2><span class="glyph">≡</span> What changes where</h2>
+    <div class="tblwrap">
+      <table class="tbl">
+        <thead><tr><th>Surface</th><th>Today</th><th>This mock</th></tr></thead>
+        <tbody>
+          <tr><td>Run DTO</td><td><code>budget_wall_seconds</code>, <code>started_at</code> present; no deadline</td><td>adds server-computed <code>deadline_at</code> (null for kinds that never time out, null while parked), <code>time_left_seconds</code>, <code>budget_extension_seconds</code></td></tr>
+          <tr><td>Sweep clock</td><td>started + budget + paused</td><td>+ <b>extension</b>, a new additive column; <code>budget_wall_seconds</code> stays immutable and capped at 8h</td></tr>
+          <tr><td>Health flag</td><td>PRD #1170: <i>near timeout</i> at 85% of the effective budget, pill suffix = time since flagged</td><td>effective budget includes the extension, so extending clears the flag; this flag's pill suffix becomes <b>time left</b>; the Slack DM carries the extend hint and CLI command</td></tr>
+          <tr><td>Admin settings</td><td>health thresholds</td><td>+ <b>extension cap per run</b> beside them (default 16h)</td></tr>
+          <tr><td>Web run page</td><td>elapsed time; Stop in the owner actions</td><td>elapsed text gains <b>/ 8h</b>; conditional header action (Extend when flagged, Resume when paused); <b>Pause ▾</b> beside Stop run; near-timeout and paused panels</td></tr>
+          <tr><td>TUI</td><td>state token + micro-bar + cost; row 2 only for a rate-limit park</td><td><b>‖ paused</b> / <b>‖ pausing</b> in the state vocabulary; row 2 for near timeout and paused; rate-limit line reworded <i>parked:</i>. No column, no controls</td></tr>
+          <tr><td>CLI</td><td><code>run get</code>, <code>run list</code></td><td>clock fields in both; <code>run extend --by</code>, <code>run pause [--now]</code>, <code>run resume</code></td></tr>
+          <tr><td>Statuses</td><td>queued · claimed · running · awaiting_* · limit_wait · pool_wait · terminal</td><td>+ <b>paused</b>: In Progress on the board, exempt from the timeout sweep, non-terminal for the HOME sweep, holds worker affinity</td></tr>
+          <tr><td>Inputs</td><td>follow_up · approve · reject · cancel · revise · answer · stop · scope</td><td>+ <b>extend</b>, <b>pause</b>, <b>resume</b>, owner-only, each a <code>run_user_inputs</code> row</td></tr>
+          <tr><td>Kinds</td><td>timeout applies to all but chat, judge, interactive task</td><td>pause targets issue, task, prompt, self_improve; extend targets anything the sweep can time out</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>
