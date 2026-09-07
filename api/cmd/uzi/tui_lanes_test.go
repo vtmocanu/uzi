@@ -370,3 +370,11 @@ func TestBuildLanesGroupsByInvocationInFirstSeenOrder(t *testing.T) {
 		t.Errorf("lane label = %q, want %q", lanes[1].Label, wantLabel)
 	}
 }
+
+func TestLaneDotWaitingIsFilledCircle(t *testing.T) {
+	// The crew-rail waiting-lane dot shares the rail column with ○/● and must be an
+	// in-font, ○-sized glyph; the old dot U+25D0 falls back to a mismatched-size font (#1176).
+	if got := laneDot(crewWaiting); got != "◕" {
+		t.Errorf("laneDot(crewWaiting) = %q, want ◕", got)
+	}
+}

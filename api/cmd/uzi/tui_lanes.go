@@ -396,7 +396,7 @@ func laneDot(s crewState) string {
 	case crewStalled:
 		return "▲"
 	case crewWaiting:
-		return "◐"
+		return "◕"
 	case crewDone:
 		return "✓"
 	default:

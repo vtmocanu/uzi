@@ -156,12 +156,12 @@ func milestoneDetailRun(id string, done int, inProg string) apitypes.RunDTO {
 		Milestones: ms, MilestonesCompleted: completed, MilestonesInProgress: []string{inProg}}
 }
 
-// PRD #1136 SC1: the crew-rail in-progress milestone ROW is a ◐ ⇄ ○ blink in the faint colour,
-// in ANTI-PHASE to the micro-bar. blinkOn==false → ◐ (the presence/static frame); blinkOn==true →
+// PRD #1136 SC1: the crew-rail in-progress milestone ROW is a ◕ ⇄ ○ blink in the faint colour,
+// in ANTI-PHASE to the micro-bar. blinkOn==false → ◕ (the presence/static frame); blinkOn==true →
 // ○. This pins the alternation AND the inverted polarity — every OTHER rail test renders at the
 // default blinkOn==false (the static frame), so without this the toggle is unproven and green.
-// ◐ is the in-progress row's ONLY occurrence in the rail (the micro-bar uses ▰/▱, never ◐), so a
-// ◐-count of 1↔0 across the phases is a clean channel for the flip.
+// ◕ is the in-progress row's ONLY occurrence in the rail (the micro-bar uses ▰/▱, never ◕), so a
+// ◕-count of 1↔0 across the phases is a clean channel for the flip.
 func TestTUIDetailMilestoneRowBlinkAlternates(t *testing.T) {
 	now := time.Now()
 	run := milestoneDetailRun("77777777-2222", 1, "m2") // m1 done, m2 in progress, m3 not started
@@ -174,13 +174,13 @@ func TestTUIDetailMilestoneRowBlinkAlternates(t *testing.T) {
 	pal := newPalette(true)
 	off := render(false)
 	on := render(true)
-	// blinkOn==false (also the static / non-tty / NO_BLINK frame): the in-progress row is ◐ in faint.
-	if !strings.Contains(off, paintSeg(pal.faintC, nil, false, "◐")) {
-		t.Errorf("blinkOn=false: in-progress row is not ◐ in faint\n%s", stripANSI(off))
+	// blinkOn==false (also the static / non-tty / NO_BLINK frame): the in-progress row is ◕ in faint.
+	if !strings.Contains(off, paintSeg(pal.faintC, nil, false, "◕")) {
+		t.Errorf("blinkOn=false: in-progress row is not ◕ in faint\n%s", stripANSI(off))
 	}
-	// blinkOn==true: the row flips to ○; no ◐ remains anywhere in the rail.
-	if strings.Contains(on, "◐") {
-		t.Errorf("blinkOn=true: in-progress row did not flip away from ◐\n%s", stripANSI(on))
+	// blinkOn==true: the row flips to ○; no ◕ remains anywhere in the rail.
+	if strings.Contains(on, "◕") {
+		t.Errorf("blinkOn=true: in-progress row did not flip away from ◕\n%s", stripANSI(on))
 	}
 	if !strings.Contains(on, paintSeg(pal.faintC, nil, false, "○")) {
 		t.Errorf("blinkOn=true: in-progress row is not ○ in faint\n%s", stripANSI(on))
@@ -188,20 +188,20 @@ func TestTUIDetailMilestoneRowBlinkAlternates(t *testing.T) {
 }
 
 // PRD #1136 SC4: under an Ascii/NO_COLOR profile (tint stripped) the crew-rail in-progress row
-// stays legible by SHAPE — a static ◐, distinct from a not-started ○ and a done ✓. The board
+// stays legible by SHAPE — a static ◕, distinct from a not-started ○ and a done ✓. The board
 // micro-bar's Ascii test above covers only the micro-bar; this covers the rail rows (the case D4
-// exists for, doubly so now the row's ◐ shares faintC with a not-started ○).
+// exists for, doubly so now the row's ◕ shares faintC with a not-started ○).
 func TestTUIDetailMilestoneRowAsciiShape(t *testing.T) {
 	now := time.Now()
-	run := milestoneDetailRun("77777777-3333", 1, "m2") // m1 done (✓), m2 in progress (◐), m3 not started (○)
+	run := milestoneDetailRun("77777777-3333", 1, "m2") // m1 done (✓), m2 in progress (◕), m3 not started (○)
 	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
 	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	m = next.(tuiModel)
 	m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
 	// blinkOn defaults false → the static/presence frame; Ascii strips colour, so only shape carries state.
 	out := stripANSI(m.View().Content)
-	if !strings.Contains(out, "◐") {
-		t.Errorf("Ascii in-progress row is not the ◐ shape\n%s", out)
+	if !strings.Contains(out, "◕") {
+		t.Errorf("Ascii in-progress row is not the ◕ shape\n%s", out)
 	}
 	if !strings.Contains(out, "○") {
 		t.Errorf("Ascii not-started row is not the ○ shape\n%s", out)
@@ -215,7 +215,7 @@ func TestTUIDetailMilestoneRowAsciiShape(t *testing.T) {
 // in-progress row — blinkOn is a GLOBAL phase driven by any live board run, so an ungated row
 // would flip to a bare ○ (indistinguishable from a not-started sibling) on half the frames on
 // finished/stale data. milestoneRowCell gates its animation on `blink` (the same !terminal
-// condition the eyebrow micro-bar uses), so a terminal run's row is the STATIC ◐ regardless of
+// condition the eyebrow micro-bar uses), so a terminal run's row is the STATIC ◕ regardless of
 // blinkOn. Rendered at blinkOn==true — the frame that WOULD show ○ if the guard were missing.
 func TestTUIDetailMilestoneRowTerminalStaysStatic(t *testing.T) {
 	now := time.Now()
@@ -226,8 +226,8 @@ func TestTUIDetailMilestoneRowTerminalStaysStatic(t *testing.T) {
 	m.blinkOn = true // the phase that would expose a bare ○ if the row weren't gated on !terminal
 	out := m.View().Content
 	pal := newPalette(true)
-	if !strings.Contains(out, paintSeg(pal.faintC, nil, false, "◐")) {
-		t.Errorf("terminal run: in-progress row must stay a static ◐ (not pulse to ○) at blinkOn=true\n%s", stripANSI(out))
+	if !strings.Contains(out, paintSeg(pal.faintC, nil, false, "◕")) {
+		t.Errorf("terminal run: in-progress row must stay a static ◕ (not pulse to ○) at blinkOn=true\n%s", stripANSI(out))
 	}
 }
 

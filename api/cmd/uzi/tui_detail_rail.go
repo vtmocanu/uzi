@@ -245,10 +245,10 @@ func (m tuiModel) milestoneCell(bg color.Color) string {
 }
 
 // milestoneRowCell renders the crew-rail checklist's in-progress milestone ROW mark (PRD #1136
-// D4/D5): a ◐ ⇄ ○ half-circle blinking on the SAME tick as the micro-bar but in ANTI-PHASE, and
+// D4/D5): a ◕ ⇄ ○ half-circle blinking on the SAME tick as the micro-bar but in ANTI-PHASE, and
 // in the faint/grey colour (faintC) — the SAME colour a not-started ○ uses, so the ○ phase reads
 // as one of the row's not-yet-started siblings and the row reads as a single grey circle pulsing
-// toward done. The polarity is INVERTED relative to milestoneCell: blinkOn==false → ◐ (the
+// toward done. The polarity is INVERTED relative to milestoneCell: blinkOn==false → ◕ (the
 // presence frame), which is therefore ALSO the static / non-tty / UZI_TUI_NO_BLINK frame, keeping
 // the in-progress state legible by SHAPE when the tint is stripped and never collapsing to a bare
 // not-started ○. Not milestoneCell (opposite mapping, different glyphs and colour).
@@ -256,9 +256,9 @@ func (m tuiModel) milestoneCell(bg color.Color) string {
 // blink gates the animation to the SAME non-terminal condition the eyebrow micro-bar uses (D4):
 // blinkOn is a GLOBAL phase (any live board run drives the tick), so without this gate a terminal
 // run carrying a stale MilestonesInProgress would pulse its row to a bare ○ — the exact "never a
-// bare ○" case D4/SC3 exist to prevent. When !blink the row is the static ◐ presence frame.
+// bare ○" case D4/SC3 exist to prevent. When !blink the row is the static ◕ presence frame.
 func (m tuiModel) milestoneRowCell(blink bool) string {
-	g := "◐"
+	g := "◕"
 	if blink && m.blinkOn {
 		g = "○"
 	}
@@ -303,7 +303,7 @@ func activityLabel(act *apitypes.RunActivity) string {
 // renderMilestones is the crew rail's milestone progress block (the TUI twin of the web's
 // MilestoneChecklist and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
 // summary and one row per milestone in FROZEN order — done ✓, not started ○, and the
-// in-progress milestone as the blinking ▰/▱ wait-colour cell (PRD #1064 M4; no ◐ glyph).
+// in-progress milestone as a faint ◕ ⇄ ○ half-circle blink (milestoneRowCell; PRD #1136 D4/D5).
 //
 // Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run's
 // rail is byte-for-byte unchanged — the same back-compat contract the nil Milestones slice
@@ -386,9 +386,9 @@ func (m tuiModel) renderMilestones() string {
 			// strikethrough (which lipgloss emits per-rune, bloating the frame for no signal).
 			style = m.pal.faint
 		case inProgress[mi.ID]:
-			// Every in-progress row is a ◐ ⇄ ○ half-circle blink in the faint/grey colour (PRD
-			// #1136 D4/D5), static ◐ under non-tty / NO_BLINK or on a terminal run (blink==false,
-			// same gate as the eyebrow micro-bar). The brighter (plain-fg) title, the ◐ shape, and
+			// Every in-progress row is a ◕ ⇄ ○ half-circle blink in the faint/grey colour (PRD
+			// #1136 D4/D5), static ◕ under non-tty / NO_BLINK or on a terminal run (blink==false,
+			// same gate as the eyebrow micro-bar). The brighter (plain-fg) title, the ◕ shape, and
 			// the motion — never the glyph colour — separate it from a not-started ○.
 			glyph = m.milestoneRowCell(blink)
 			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
