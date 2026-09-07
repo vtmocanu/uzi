@@ -328,7 +328,10 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        -- strings.TrimSpace (Go's unicode.IsSpace set) so the board card and run read agree
        -- on is_planning for all whitespace, not just ASCII (issue #321, #342).
        r.kind, r.iteration_count, (r.plan_md IS NOT NULL AND btrim(r.plan_md, E' \t\n\r\f\v\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '') AS has_plan_md,
-       r.health, r.health_reason, r.health_since, r.created_at, r.updated_at,
+       r.health, r.health_reason, r.health_since,
+       -- PRD #1170: the near-timeout inputs the card's deadline_at needs (RunDeadline).
+       r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
+       r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
 FROM runs r
@@ -345,26 +348,30 @@ type GetLatestRunForIssueParams struct {
 }
 
 type GetLatestRunForIssueRow struct {
-	ID             uuid.UUID          `json:"id"`
-	UserID         uuid.UUID          `json:"user_id"`
-	Status         string             `json:"status"`
-	MrIid          pgtype.Int8        `json:"mr_iid"`
-	MrWebUrl       pgtype.Text        `json:"mr_web_url"`
-	MrState        pgtype.Text        `json:"mr_state"`
-	FailureReason  pgtype.Text        `json:"failure_reason"`
-	StopKind       pgtype.Text        `json:"stop_kind"`
-	StopReason     pgtype.Text        `json:"stop_reason"`
-	Kind           string             `json:"kind"`
-	IterationCount int32              `json:"iteration_count"`
-	HasPlanMd      pgtype.Bool        `json:"has_plan_md"`
-	Health         string             `json:"health"`
-	HealthReason   pgtype.Text        `json:"health_reason"`
-	HealthSince    pgtype.Timestamptz `json:"health_since"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	OwnerName      pgtype.Text        `json:"owner_name"`
-	WorkerName     pgtype.Text        `json:"worker_name"`
-	RunCount       int64              `json:"run_count"`
+	ID                  uuid.UUID          `json:"id"`
+	UserID              uuid.UUID          `json:"user_id"`
+	Status              string             `json:"status"`
+	MrIid               pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl            pgtype.Text        `json:"mr_web_url"`
+	MrState             pgtype.Text        `json:"mr_state"`
+	FailureReason       pgtype.Text        `json:"failure_reason"`
+	StopKind            pgtype.Text        `json:"stop_kind"`
+	StopReason          pgtype.Text        `json:"stop_reason"`
+	Kind                string             `json:"kind"`
+	IterationCount      int32              `json:"iteration_count"`
+	HasPlanMd           pgtype.Bool        `json:"has_plan_md"`
+	Health              string             `json:"health"`
+	HealthReason        pgtype.Text        `json:"health_reason"`
+	HealthSince         pgtype.Timestamptz `json:"health_since"`
+	StartedAt           pgtype.Timestamptz `json:"started_at"`
+	BudgetWallSeconds   pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds int32              `json:"budget_paused_seconds"`
+	Interactive         bool               `json:"interactive"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	OwnerName           pgtype.Text        `json:"owner_name"`
+	WorkerName          pgtype.Text        `json:"worker_name"`
+	RunCount            int64              `json:"run_count"`
 }
 
 // One issue's newest run with the same display fields as the board lateral join,
@@ -393,6 +400,10 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 		&i.Health,
 		&i.HealthReason,
 		&i.HealthSince,
+		&i.StartedAt,
+		&i.BudgetWallSeconds,
+		&i.BudgetPausedSeconds,
+		&i.Interactive,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.OwnerName,
@@ -863,6 +874,10 @@ SELECT DISTINCT ON (r.issue_iid)
        -- consistent. Server is UTF-8, so the E'\uXXXX' escapes below are valid.
        r.kind, r.iteration_count, (r.plan_md IS NOT NULL AND btrim(r.plan_md, E' \t\n\r\f\v\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '') AS has_plan_md,
        r.health, r.health_reason, r.health_since,
+       -- PRD #1170: the near-timeout inputs the card's deadline_at needs (RunDeadline):
+       -- started_at + COALESCE(budget_wall_seconds, RUN_TIMEOUT) + budget_paused_seconds,
+       -- null unless running & not chat/judge/interactive.
+       r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
@@ -874,27 +889,31 @@ ORDER BY r.issue_iid, r.created_at DESC
 `
 
 type ListLatestRunsForRepoRow struct {
-	IssueIid       pgtype.Int8        `json:"issue_iid"`
-	ID             uuid.UUID          `json:"id"`
-	UserID         uuid.UUID          `json:"user_id"`
-	Status         string             `json:"status"`
-	MrIid          pgtype.Int8        `json:"mr_iid"`
-	MrWebUrl       pgtype.Text        `json:"mr_web_url"`
-	MrState        pgtype.Text        `json:"mr_state"`
-	FailureReason  pgtype.Text        `json:"failure_reason"`
-	StopKind       pgtype.Text        `json:"stop_kind"`
-	StopReason     pgtype.Text        `json:"stop_reason"`
-	Kind           string             `json:"kind"`
-	IterationCount int32              `json:"iteration_count"`
-	HasPlanMd      pgtype.Bool        `json:"has_plan_md"`
-	Health         string             `json:"health"`
-	HealthReason   pgtype.Text        `json:"health_reason"`
-	HealthSince    pgtype.Timestamptz `json:"health_since"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	OwnerName      pgtype.Text        `json:"owner_name"`
-	WorkerName     pgtype.Text        `json:"worker_name"`
-	RunCount       int64              `json:"run_count"`
+	IssueIid            pgtype.Int8        `json:"issue_iid"`
+	ID                  uuid.UUID          `json:"id"`
+	UserID              uuid.UUID          `json:"user_id"`
+	Status              string             `json:"status"`
+	MrIid               pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl            pgtype.Text        `json:"mr_web_url"`
+	MrState             pgtype.Text        `json:"mr_state"`
+	FailureReason       pgtype.Text        `json:"failure_reason"`
+	StopKind            pgtype.Text        `json:"stop_kind"`
+	StopReason          pgtype.Text        `json:"stop_reason"`
+	Kind                string             `json:"kind"`
+	IterationCount      int32              `json:"iteration_count"`
+	HasPlanMd           pgtype.Bool        `json:"has_plan_md"`
+	Health              string             `json:"health"`
+	HealthReason        pgtype.Text        `json:"health_reason"`
+	HealthSince         pgtype.Timestamptz `json:"health_since"`
+	StartedAt           pgtype.Timestamptz `json:"started_at"`
+	BudgetWallSeconds   pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds int32              `json:"budget_paused_seconds"`
+	Interactive         bool               `json:"interactive"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	OwnerName           pgtype.Text        `json:"owner_name"`
+	WorkerName          pgtype.Text        `json:"worker_name"`
+	RunCount            int64              `json:"run_count"`
 }
 
 // The board payload's run half (PRD #12 M2): the newest run per issue for a repo,
@@ -940,6 +959,10 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 			&i.Health,
 			&i.HealthReason,
 			&i.HealthSince,
+			&i.StartedAt,
+			&i.BudgetWallSeconds,
+			&i.BudgetPausedSeconds,
+			&i.Interactive,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.OwnerName,

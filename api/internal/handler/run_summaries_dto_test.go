@@ -20,7 +20,7 @@ func TestRunToDTOSummaries(t *testing.T) {
 			SummaryIntent: pgtype.Text{String: "builds the thing", Valid: true},
 			SummaryPlan:   pgtype.Text{String: "the plan does X", Valid: true},
 			SummaryDeltas: []byte(`[{"kind":"added","text":"a test"},{"kind":"dropped","text":"the cache"}]`),
-		}, "normal")
+		}, "normal", 0)
 		if dto.SummaryIntent == nil || *dto.SummaryIntent != "builds the thing" {
 			t.Fatalf("SummaryIntent = %v, want the intent text", dto.SummaryIntent)
 		}
@@ -33,7 +33,7 @@ func TestRunToDTOSummaries(t *testing.T) {
 	})
 
 	t.Run("absent summaries are nil (null on the wire)", func(t *testing.T) {
-		dto := runToDTO(store.Run{ID: uuid.New()}, "normal")
+		dto := runToDTO(store.Run{ID: uuid.New()}, "normal", 0)
 		if dto.SummaryIntent != nil || dto.SummaryPlan != nil || dto.SummaryDeltas != nil {
 			t.Fatalf("a run with no summaries must expose nils, got intent=%v plan=%v deltas=%+v",
 				dto.SummaryIntent, dto.SummaryPlan, dto.SummaryDeltas)
@@ -41,7 +41,7 @@ func TestRunToDTOSummaries(t *testing.T) {
 	})
 
 	t.Run("malformed deltas degrade to nil, never panic", func(t *testing.T) {
-		dto := runToDTO(store.Run{ID: uuid.New(), SummaryDeltas: []byte(`{not an array`)}, "normal")
+		dto := runToDTO(store.Run{ID: uuid.New(), SummaryDeltas: []byte(`{not an array`)}, "normal", 0)
 		if dto.SummaryDeltas != nil {
 			t.Fatalf("a malformed summary_deltas column must degrade to nil, got %+v", dto.SummaryDeltas)
 		}

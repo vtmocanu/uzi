@@ -196,11 +196,10 @@ type persistFailStats struct {
 // streak reaches the threshold, so auto-stop stops firing rather than misfiring.
 // See deploy/chart/values.yaml's api.replicaCount comment.
 //
-// CONCURRENCY. Service's only other mutable field, lastSlowClampWarn, is
-// documented as lock-free because it is sweeper-only. THAT REASONING DOES NOT
-// TRANSFER AND MUST NOT BE COPIED HERE: this state is written by N parallel HTTP
+// CONCURRENCY. This state is NOT sweeper-only: it is written by N parallel HTTP
 // handler goroutines (chi serves each request on its own goroutine, and a fleet
-// of workers appends concurrently) and read by the sweeper goroutine. Every field
+// of workers appends concurrently) and read by the sweeper goroutine, so a
+// lock-free sweeper-only field's reasoning MUST NOT be copied here. Every field
 // access goes through mu. The shape follows usagepoller.Engine's
 // inBackoff/setBackoff/clearBackoff — one small method per operation, the lock
 // taken and released inside each.

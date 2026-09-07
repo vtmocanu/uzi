@@ -136,13 +136,15 @@ func (f *healthFakeStore) SetRunHealth(_ context.Context, arg store.SetRunHealth
 // fakeHealthSettings is a static health-settings source. All accessors are error-free;
 // the zero value has the detector disabled, so tests opt in explicitly.
 type fakeHealthSettings struct {
-	enabled                                 bool
-	stall, slow, queued, approval, cooldown int
+	enabled                                           bool
+	stall, nearTimeoutPct, queued, approval, cooldown int
 }
 
-func (s fakeHealthSettings) HealthEnabled(context.Context) (bool, error)      { return s.enabled, nil }
-func (s fakeHealthSettings) HealthStallSeconds(context.Context) (int, error)  { return s.stall, nil }
-func (s fakeHealthSettings) HealthSlowSeconds(context.Context) (int, error)   { return s.slow, nil }
+func (s fakeHealthSettings) HealthEnabled(context.Context) (bool, error)     { return s.enabled, nil }
+func (s fakeHealthSettings) HealthStallSeconds(context.Context) (int, error) { return s.stall, nil }
+func (s fakeHealthSettings) HealthNearTimeoutPct(context.Context) (int, error) {
+	return s.nearTimeoutPct, nil
+}
 func (s fakeHealthSettings) HealthQueuedSeconds(context.Context) (int, error) { return s.queued, nil }
 func (s fakeHealthSettings) HealthApprovalSeconds(context.Context) (int, error) {
 	return s.approval, nil
@@ -171,9 +173,10 @@ var (
 	errFakeEligible  = errors.New("fake eligible-count error")
 )
 
-// defaultHealthSettings mirrors the compiled-in defaults (5m / 45m / 10m / 1h / 30m).
+// defaultHealthSettings mirrors the compiled-in defaults (stall 5m / near-timeout 85% /
+// queued 10m / approval 1h / cooldown 30m).
 func defaultHealthSettings() fakeHealthSettings {
-	return fakeHealthSettings{enabled: true, stall: 300, slow: 2700, queued: 600, approval: 3600, cooldown: 1800}
+	return fakeHealthSettings{enabled: true, stall: 300, nearTimeoutPct: 85, queued: 600, approval: 3600, cooldown: 1800}
 }
 
 func healthSvc(fs Store, st Settings) *Service {
@@ -235,7 +238,7 @@ func TestHealthDisabledIsNoop(t *testing.T) {
 
 func TestHealthStalledFlagsThenClearsOnResume(t *testing.T) {
 	r := runRow("running")
-	r.StartedAt = ago(20 * time.Minute)      // under the 45m slow cap, so slow never masks the clear
+	r.StartedAt = ago(20 * time.Minute)      // well under the near-timeout threshold, so it never masks the clear
 	r.LastActivityAt = ago(10 * time.Minute) // silent 10m > 5m stall
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc := healthSvc(fs, defaultHealthSettings())
@@ -286,7 +289,7 @@ func TestHealthStalledSuppressedWhileToolInFlight(t *testing.T) {
 			r.ID: {useMsg(t, 10, "call_A", "Bash", map[string]any{"command": "go build ./..."})},
 		},
 	}
-	svc := healthSvc(fs, fakeHealthSettings{enabled: true, stall: 300}) // slow disabled
+	svc := healthSvc(fs, fakeHealthSettings{enabled: true, stall: 300}) // near-timeout disabled (pct 0)
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
 		t.Fatalf("changed = %d, want 0 (stalled suppressed while a tool is in flight)", n)
@@ -306,9 +309,20 @@ func TestHealthStalledSuppressedWhileToolInFlight(t *testing.T) {
 	}
 }
 
-func TestHealthSlowFlagsWithRecentActivity(t *testing.T) {
+// frozenBudget stamps a run's effective wall-clock budget in seconds (PRD #1170); a
+// zero/omitted value leaves the run on the global RUN_TIMEOUT (NULL budget).
+func frozenBudget(hours int) pgtype.Int4 {
+	return pgtype.Int4{Int32: int32(hours) * 60 * 60, Valid: true}
+}
+
+// TestHealthNearTimeoutFlagsWithRecentActivity: a run 7h into a frozen 8h budget (87.5%,
+// past the 85% default) is flagged near timeout even though it is actively emitting —
+// the arm is budget-relative, not activity-based (PRD #1170). Reason is the static
+// near-timeout string; the live countdown rides deadline_at on the DTO.
+func TestHealthNearTimeoutFlagsWithRecentActivity(t *testing.T) {
 	r := runRow("running")
-	r.StartedAt = ago(50 * time.Minute)     // > 45m slow
+	r.BudgetWallSeconds = frozenBudget(8)
+	r.StartedAt = ago(7 * time.Hour)        // 87.5% of the 8h budget
 	r.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc := healthSvc(fs, defaultHealthSettings())
@@ -316,31 +330,143 @@ func TestHealthSlowFlagsWithRecentActivity(t *testing.T) {
 	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
 		t.Fatalf("changed = %d, want 1", n)
 	}
-	if w := lastWrite(t, fs, r.ID); w.Health != healthSlow {
-		t.Fatalf("health = %q, want slow", w.Health)
+	w := lastWrite(t, fs, r.ID)
+	if w.Health != healthSlow {
+		t.Fatalf("health = %q, want the raw slow enum (kept on the wire, D1)", w.Health)
+	}
+	if !w.HealthReason.Valid || w.HealthReason.String != reasonNearTimeout {
+		t.Fatalf("reason = %+v, want %q", w.HealthReason, reasonNearTimeout)
 	}
 }
 
-func TestHealthStalledBeatsSlow(t *testing.T) {
+func TestHealthStalledBeatsNearTimeout(t *testing.T) {
 	r := runRow("running")
-	r.StartedAt = ago(50 * time.Minute)      // slow
+	r.BudgetWallSeconds = frozenBudget(8)
+	r.StartedAt = ago(7 * time.Hour)         // near timeout (87.5%)
 	r.LastActivityAt = ago(10 * time.Minute) // also stalled
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc := healthSvc(fs, defaultHealthSettings())
 
 	svc.detectRunHealth(context.Background(), t0)
 	if w := lastWrite(t, fs, r.ID); w.Health != healthStalled {
-		t.Fatalf("health = %q, want stalled (priority over slow)", w.Health)
+		t.Fatalf("health = %q, want stalled (priority over near-timeout)", w.Health)
+	}
+}
+
+// TestHealthNearTimeoutFrozenBudget pins the 85% boundary against a frozen 8h budget:
+// 7h active (87.5%) flags, 6h active (75%) does not.
+func TestHealthNearTimeoutFrozenBudget(t *testing.T) {
+	cases := []struct {
+		name      string
+		activeHrs int
+		wantFlag  bool
+	}{
+		{"7h of 8h (87.5%) flags", 7, true},
+		{"6h of 8h (75%) does not", 6, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("running")
+			r.BudgetWallSeconds = frozenBudget(8)
+			r.StartedAt = ago(time.Duration(tc.activeHrs) * time.Hour)
+			r.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc := healthSvc(fs, defaultHealthSettings())
+
+			n := svc.detectRunHealth(context.Background(), t0)
+			if tc.wantFlag {
+				if n != 1 {
+					t.Fatalf("changed = %d, want 1 (%s)", n, tc.name)
+				}
+				if w := lastWrite(t, fs, r.ID); w.Health != healthSlow {
+					t.Fatalf("health = %q, want slow", w.Health)
+				}
+			} else if n != 0 {
+				w := lastWrite(t, fs, r.ID)
+				t.Fatalf("changed = %d, want 0 (%s); wrote %q", n, tc.name, w.Health)
+			}
+		})
+	}
+}
+
+// TestHealthNearTimeoutSubtractsPausedSeconds: active running time excludes seconds
+// parked at a gate. A 7h-old run with a 2h gate pause has consumed 5h of its 8h budget
+// (62.5%), below the 85% threshold, so it is NOT flagged. Mutation check: folding the
+// `- budget_paused_seconds` term out of `active` makes this run read 87.5% and reddens.
+func TestHealthNearTimeoutSubtractsPausedSeconds(t *testing.T) {
+	r := runRow("running")
+	r.BudgetWallSeconds = frozenBudget(8)
+	r.StartedAt = ago(7 * time.Hour)           // 7h wall clock since start
+	r.BudgetPausedSeconds = int32(2 * 60 * 60) // 2h of it was parked at a gate
+	r.LastActivityAt = ago(1 * time.Minute)    // recent → not stalled
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	svc := healthSvc(fs, defaultHealthSettings())
+
+	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
+		w := lastWrite(t, fs, r.ID)
+		t.Fatalf("changed = %d, want 0 (5h of 8h = 62.5%% after the pause); wrote %q", n, w.Health)
+	}
+}
+
+// TestHealthNearTimeoutNullBudgetUsesRunTimeout: a NULL-budget run has no frozen budget,
+// so the arm measures against the global RUN_TIMEOUT (2h in testParams). 110m active is
+// 91.6% of 2h → flagged; the 85% threshold is 102m.
+func TestHealthNearTimeoutNullBudgetUsesRunTimeout(t *testing.T) {
+	r := runRow("running")
+	// BudgetWallSeconds left zero/invalid → global RUN_TIMEOUT (2h).
+	r.StartedAt = ago(110 * time.Minute)    // 91.6% of the 2h global timeout
+	r.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	svc := healthSvc(fs, defaultHealthSettings())
+
+	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1 (110m of the 2h global timeout is past 85%%)", n)
+	}
+	if w := lastWrite(t, fs, r.ID); w.Health != healthSlow {
+		t.Fatalf("health = %q, want slow", w.Health)
+	}
+}
+
+// TestHealthNearTimeoutExcludesJudgeAndInteractive mirrors SweepRunningTimeout's
+// exclusion set (D3): a judge run and an interactive task NEVER time out, so the arm
+// must never flag them — even at 99% of budget.
+func TestHealthNearTimeoutExcludesJudgeAndInteractive(t *testing.T) {
+	cases := []struct {
+		name        string
+		kind        string
+		interactive bool
+	}{
+		{"judge run", "judge", false},
+		{"interactive task", "task", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("running")
+			r.Kind = tc.kind
+			r.Interactive = tc.interactive
+			r.BudgetWallSeconds = frozenBudget(8)
+			r.StartedAt = ago(475 * time.Minute)    // ~99% of the 8h budget
+			r.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc := healthSvc(fs, defaultHealthSettings())
+
+			if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
+				w := lastWrite(t, fs, r.ID)
+				t.Fatalf("changed = %d, want 0 (%s never times out); wrote %q", n, tc.name, w.Health)
+			}
+		})
 	}
 }
 
 func TestHealthThresholdDisablePerSignal(t *testing.T) {
 	r := runRow("running")
-	r.StartedAt = ago(2 * time.Hour)
+	r.BudgetWallSeconds = frozenBudget(8)
+	r.StartedAt = ago(8 * time.Hour)  // 100% of budget — would flag if enabled
 	r.LastActivityAt = ago(time.Hour) // very silent
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
-	// stall disabled (0), slow disabled (0) → healthy despite the long silence.
-	svc := healthSvc(fs, fakeHealthSettings{enabled: true, stall: 0, slow: 0, queued: 600, approval: 3600})
+	// stall disabled (0), near-timeout disabled (pct 0) → healthy despite the long
+	// silence and a run at 100% of its budget.
+	svc := healthSvc(fs, fakeHealthSettings{enabled: true, stall: 0, nearTimeoutPct: 0, queued: 600, approval: 3600})
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
 		t.Fatalf("changed = %d, want 0 with both running signals disabled", n)
@@ -665,146 +791,8 @@ func TestHealthQueuedReasonChangeRewrites(t *testing.T) {
 	}
 }
 
-func TestHealthSlowClampWarnsOncePerValue(t *testing.T) {
-	fs := &healthFakeStore{}
-	// testParams RunTimeout is 2h; a 3h slow threshold at/above the GLOBAL timeout is the
-	// operator misconfiguration this warns on. PRD #122 M2 (Decision 5b): slowThreshold
-	// now returns the RAW value (the per-run clamp moved to clampSlow/runningTarget), but
-	// the once-per-value warn stays here.
-	svc := healthSvc(fs, fakeHealthSettings{enabled: true, slow: 3 * 60 * 60})
-	ctx := context.Background()
-
-	if d := svc.slowThreshold(ctx); d != 3*time.Hour {
-		t.Fatalf("raw = %v, want the unclamped 3h", d)
-	}
-	if svc.lastSlowClampWarn != 3*time.Hour {
-		t.Fatalf("lastSlowClampWarn = %v, want 3h recorded after the first clamp warn", svc.lastSlowClampWarn)
-	}
-	// A repeat pass at the same misconfigured value keeps the tracker stable — the
-	// warn is not re-armed, so it logs once per distinct value, not every tick.
-	svc.slowThreshold(ctx)
-	if svc.lastSlowClampWarn != 3*time.Hour {
-		t.Fatalf("lastSlowClampWarn = %v after a repeat pass, want a stable 3h", svc.lastSlowClampWarn)
-	}
-	// Reconfiguring below the timeout clears the tracker so a later re-break warns again.
-	svc.healthSettings = fakeHealthSettings{enabled: true, slow: 300}
-	if d := svc.slowThreshold(ctx); d != 5*time.Minute {
-		t.Fatalf("slow = %v, want 5m raw", d)
-	}
-	if svc.lastSlowClampWarn != 0 {
-		t.Fatalf("lastSlowClampWarn = %v, want reset to 0 once configured below the timeout", svc.lastSlowClampWarn)
-	}
-}
-
-// clampSlow is the per-run clamp (PRD #122 M2, Decision 5b): raw unchanged below the
-// effective timeout, pulled just under at/above it, 0 stays 0.
-func TestClampSlow(t *testing.T) {
-	cases := []struct {
-		name     string
-		raw, eff time.Duration
-		want     time.Duration
-	}{
-		{"raw below eff is unchanged", 45 * time.Minute, 2 * time.Hour, 45 * time.Minute},
-		{"raw at eff pulls under", 2 * time.Hour, 2 * time.Hour, 2*time.Hour - time.Minute},
-		{"raw above eff pulls under", 3 * time.Hour, 2 * time.Hour, 2*time.Hour - time.Minute},
-		{"zero raw stays zero", 0, 2 * time.Hour, 0},
-		{"tiny eff falls back to eff/2", 30 * time.Second, 30 * time.Second, 15 * time.Second},
-		{"scaled eff keeps a big raw", 3 * time.Hour, 8 * time.Hour, 3 * time.Hour},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := clampSlow(tc.raw, tc.eff); got != tc.want {
-				t.Fatalf("clampSlow(%v,%v) = %v, want %v", tc.raw, tc.eff, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestHealthSlowClampsPerRunBudget (Decision 5b): a scaled run (budget_wall = 8h) with
-// a raw slow threshold >= the GLOBAL RUN_TIMEOUT and started 3h ago is NOT slow — its
-// effective ceiling is 8h, so the clamp lands near 8h, not near 2h. The SAME run with a
-// NULL budget (global 2h) started the same 3h ago IS slow.
-func TestHealthSlowClampsPerRunBudget(t *testing.T) {
-	// Raw slow = 4h: above the global 2h RUN_TIMEOUT (misconfig path exercised) and above
-	// the 3h elapsed. For the scaled run (8h budget) issue #323 first scales the raw
-	// threshold by the budget ratio (4h × 8h/2h = 16h), which clampSlow then pulls to the
-	// 8h ceiling (~8h after scaling) — so it has not fired at 3h, while the unscaled run's
-	// (clamped to ~2h) has.
-	settings := fakeHealthSettings{enabled: true, slow: 4 * 60 * 60}
-
-	scaled := runRow("running")
-	scaled.StartedAt = ago(3 * time.Hour)
-	scaled.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
-	scaled.BudgetWallSeconds = pgtype.Int4{Int32: 8 * 60 * 60, Valid: true}
-	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{scaled}}
-	svc := healthSvc(fs, settings)
-	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
-		w := lastWrite(t, fs, scaled.ID)
-		t.Fatalf("a scaled run 3h into an 8h budget must not flag; wrote %q", w.Health)
-	}
-
-	unscaled := runRow("running")
-	unscaled.StartedAt = ago(3 * time.Hour)
-	unscaled.LastActivityAt = ago(1 * time.Minute)
-	// BudgetWallSeconds left zero/invalid → global 2h ceiling, clamp near 2h-1m.
-	fs2 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{unscaled}}
-	svc2 := healthSvc(fs2, settings)
-	if n := svc2.detectRunHealth(context.Background(), t0); n != 1 {
-		t.Fatalf("changed = %d, want 1 (an unscaled run 3h in is slow)", n)
-	}
-	if w := lastWrite(t, fs2, unscaled.ID); w.Health != healthSlow {
-		t.Fatalf("health = %q, want slow for the NULL-budget run", w.Health)
-	}
-}
-
-// TestHealthSlowScalesWithBudget (issue #323): the raw health_slow_seconds threshold is
-// scaled UP by a run's budget ratio (effTimeout / RUN_TIMEOUT) before the per-run clamp,
-// so a milestone-scaled run is not flagged "slow" at the flat default while it is still
-// working. testParams RunTimeout is 2h; an 8h budget → scaled slow = 2700 × 8h/2h = 3h.
-func TestHealthSlowScalesWithBudget(t *testing.T) {
-	// 1. A scaled run active 90m in — well past the flat 45m default, but under the 3h
-	//    scaled threshold — must NOT flag. Fails before the ratio scaling.
-	scaledOK := runRow("running")
-	scaledOK.BudgetWallSeconds = pgtype.Int4{Int32: 8 * 60 * 60, Valid: true}
-	scaledOK.StartedAt = ago(90 * time.Minute)
-	scaledOK.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
-	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{scaledOK}}
-	svc := healthSvc(fs, defaultHealthSettings())
-	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
-		w := lastWrite(t, fs, scaledOK.ID)
-		t.Fatalf("a scaled run 90m into an 8h budget must not flag; wrote %q", w.Health)
-	}
-
-	// 2. The same scaled run past the 3h scaled threshold IS slow.
-	scaledSlow := runRow("running")
-	scaledSlow.BudgetWallSeconds = pgtype.Int4{Int32: 8 * 60 * 60, Valid: true}
-	scaledSlow.StartedAt = ago(5 * time.Hour)        // past the 3h scaled threshold
-	scaledSlow.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
-	fs2 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{scaledSlow}}
-	svc2 := healthSvc(fs2, defaultHealthSettings())
-	if n := svc2.detectRunHealth(context.Background(), t0); n != 1 {
-		t.Fatalf("changed = %d, want 1 (a scaled run 5h in is slow)", n)
-	}
-	if w := lastWrite(t, fs2, scaledSlow.ID); w.Health != healthSlow {
-		t.Fatalf("health = %q, want slow for the scaled run past 3h", w.Health)
-	}
-
-	// 3. An unscaled (NULL budget) run is unchanged: flagged slow at the flat 45m.
-	unscaled := runRow("running")
-	unscaled.StartedAt = ago(50 * time.Minute) // > 45m flat default
-	unscaled.LastActivityAt = ago(1 * time.Minute)
-	fs3 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{unscaled}}
-	svc3 := healthSvc(fs3, defaultHealthSettings())
-	if n := svc3.detectRunHealth(context.Background(), t0); n != 1 {
-		t.Fatalf("changed = %d, want 1 (an unscaled run 50m in is slow)", n)
-	}
-	if w := lastWrite(t, fs3, unscaled.ID); w.Health != healthSlow {
-		t.Fatalf("health = %q, want slow for the NULL-budget run", w.Health)
-	}
-}
-
-// stalledRunRow is a running run that will flag stalled (silent 10m, under the 45m
-// slow cap so slow never masks it).
+// stalledRunRow is a running run that will flag stalled (silent 10m, well under the
+// near-timeout threshold so near-timeout never masks it).
 func stalledRunRow() store.ListActiveRunsForHealthRow {
 	r := runRow("running")
 	r.StartedAt = ago(20 * time.Minute)
@@ -868,11 +856,11 @@ func TestHealthNudgeAfterCooldown(t *testing.T) {
 }
 
 func TestHealthNoNudgeOnFlagChange(t *testing.T) {
-	// A run already flagged slow that becomes stalled: same episode continuing, not an
-	// ok→flagged transition, so no fresh nudge.
+	// A run already flagged near-timeout (raw enum slow) that becomes stalled: same
+	// episode continuing, not an ok→flagged transition, so no fresh nudge.
 	r := stalledRunRow()
 	r.Health = healthSlow
-	r.HealthReason = pgconv.TextOrNull(reasonSlow)
+	r.HealthReason = pgconv.TextOrNull(reasonNearTimeout)
 	_, svc, b := nudgeSvc(t, r, defaultHealthSettings())
 	svc.detectRunHealth(context.Background(), t0)
 
@@ -935,14 +923,14 @@ func TestHealthRestartNoDupeNudge(t *testing.T) {
 }
 
 func TestHealthEnumChangeResetsSince(t *testing.T) {
-	// A run flagged slow that becomes stalled is a NEW episode: health_since resets to
-	// now, not the old slow timestamp.
+	// A run flagged near-timeout (raw enum slow) that becomes stalled is a NEW episode:
+	// health_since resets to now, not the old timestamp.
 	oldSince := ago(30 * time.Minute)
 	r := runRow("running")
 	r.StartedAt = ago(20 * time.Minute)
-	r.LastActivityAt = ago(10 * time.Minute) // stalled; not slow (20m < 45m)
+	r.LastActivityAt = ago(10 * time.Minute) // stalled; not near-timeout (20m well under the threshold)
 	r.Health = healthSlow
-	r.HealthReason = pgconv.TextOrNull(reasonSlow)
+	r.HealthReason = pgconv.TextOrNull(reasonNearTimeout)
 	r.HealthSince = oldSince
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc := healthSvc(fs, defaultHealthSettings())
@@ -954,5 +942,57 @@ func TestHealthEnumChangeResetsSince(t *testing.T) {
 	}
 	if !w.HealthSince.Valid || !w.HealthSince.Time.Equal(t0) {
 		t.Fatalf("health_since = %v, want now (%v) on an enum change", w.HealthSince, t0)
+	}
+}
+
+// TestRunDeadline pins the one server-computed wall-clock deadline every surface shares
+// (PRD #1170 D9): started_at + COALESCE(budget_wall_seconds, globalTimeout) +
+// budget_paused_seconds, and nil when the run has no wall deadline (no started_at, a
+// chat/judge/interactive run, or any non-running status).
+func TestRunDeadline(t *testing.T) {
+	const globalTimeout = 2 * time.Hour
+	started := pgconv.Time(t0)
+	budget8h := pgtype.Int4{Int32: 8 * 60 * 60, Valid: true}
+	nullBudget := pgtype.Int4{}
+
+	cases := []struct {
+		name        string
+		started     pgtype.Timestamptz
+		budget      pgtype.Int4
+		paused      int32
+		kind        string
+		interactive bool
+		status      string
+		wantNil     bool
+		want        time.Time
+	}{
+		{"8h budget + 32m pause", started, budget8h, int32(32 * 60), "issue", false, "running", false, t0.Add(8*time.Hour + 32*time.Minute)},
+		{"null budget uses globalTimeout", started, nullBudget, 0, "issue", false, "running", false, t0.Add(globalTimeout)},
+		{"null started_at", pgtype.Timestamptz{}, budget8h, 0, "issue", false, "running", true, time.Time{}},
+		{"chat", started, budget8h, 0, "chat", false, "running", true, time.Time{}},
+		{"judge", started, budget8h, 0, "judge", false, "running", true, time.Time{}},
+		{"interactive", started, budget8h, 0, "task", true, "running", true, time.Time{}},
+		{"queued", started, budget8h, 0, "issue", false, "queued", true, time.Time{}},
+		{"awaiting_approval", started, budget8h, 0, "issue", false, "awaiting_approval", true, time.Time{}},
+		{"completed", started, budget8h, 0, "issue", false, "completed", true, time.Time{}},
+		{"failed", started, budget8h, 0, "issue", false, "failed", true, time.Time{}},
+		{"cancelled", started, budget8h, 0, "issue", false, "cancelled", true, time.Time{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RunDeadline(tc.started, tc.budget, tc.paused, tc.kind, tc.interactive, tc.status, globalTimeout)
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("RunDeadline = %v, want nil", *got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("RunDeadline = nil, want %v", tc.want)
+			}
+			if !got.Equal(tc.want) {
+				t.Fatalf("RunDeadline = %v, want %v", *got, tc.want)
+			}
+		})
 	}
 }
