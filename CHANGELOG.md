@@ -18,6 +18,15 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Three light themes: Dawn, Hall, and Shadow ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
+  Each keeps the dark factory somewhere on screen: Dawn stays dark only on machine surfaces (the run activity feed, code/log/CLI blocks); Hall adds a dark sidebar and mobile top bar; Shadow additionally keeps a board card, run row, or run header dark while that run is actively working, staying light with a rust accent while it waits on a human. All three share one WCAG 2.2 AA-verified light palette and reuse ember's own dark values for every dark surface, so a machine pane looks identical across every theme.
+- **A System / Lights on / Lights off appearance mode, with one theme held per polarity and matching admin instance defaults ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
+  Settings → Appearance now holds a mode alongside a "Lights on theme" and a "Lights off theme"; System follows the OS's `prefers-color-scheme` live, with no reload. An admin can set the same four fields (mode, light theme, dark theme, typeface) as instance-wide defaults from Admin → Instance settings; the legacy single "Default theme" keeps feeding the dark slot, so nobody's screen changes on upgrade.
+- **A bundled IBM Plex typeface option ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
+  Settings → Appearance gains a Typeface choice: System (the platform default) or IBM Plex, shipped with the app so switching to it makes no external font request and the System choice downloads nothing.
+
 ## [0.79.0] - 2026-09-07
 
 ### Added
