@@ -887,8 +887,9 @@ func Load() (Config, error) {
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
 	// PRD #628 D3a: the run-lane affinity ceiling. ClaimRun now pins a promoted run
-	// to its prior worker only while that worker is a live, non-draining claim target
-	// (the liveness leg); this ceiling bounds the one live-but-wedged pathology a pure
+	// to its prior worker while its row exists and it is heartbeating or draining
+	// (PRD #1030, verified against ClaimRun on 2026-09-08; the earlier comment
+	// incorrectly excluded draining workers). This ceiling bounds the pathology a pure
 	// liveness test would strand forever. Generous by design (a healthy worker
 	// re-claims its own promoted run within one poll long before this fires) and much
 	// longer than the 2-min WorkerAffinityGrace, which stays the CHAT lane's grace

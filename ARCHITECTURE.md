@@ -725,20 +725,24 @@ chain in the diagram above, with no intervening `running`.
   fast-forward and adoption peels it back to the real tip. GitHub-only. See
   [ADR-1036](adr/1036-checkpoint-workflow-overlay.md).
 
-- **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
-  oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),
-  or the caller's own re-queued run still inside its **affinity grace**
-  (`WORKER_AFFINITY_GRACE`, default 2m), giving a resume the best chance of
-  landing back on the worker whose disk holds the session and worktree. Past the
-  grace any of the user's workers may claim it, and the SDK session is **not**
-  portable: it is a local JSONL transcript at
-  `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, keyed by both HOME
-  and cwd, so it is lost to a different worker, a replaced volume, or a changed
-  clone path on the same machine. The worker preflights the transcript before
+- **queued → claimed**: `POST /api/worker/runs/claim` atomically claims an eligible
+  queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`). A re-queued
+  run stays pinned to its prior worker while that worker's row exists and it is
+  either draining or heartbeating, bounded by `WORKER_AFFINITY_CEILING` (default
+  2h of queue dwell after promotion). A deleted worker, a stale non-draining
+  worker, or an expired ceiling lets another eligible worker claim it.
+  `WORKER_AFFINITY_GRACE` (default 2m) remains the chat lane's grace.
+  uzi currently keeps SDK transcripts only on the owning worker, under its per-run
+  HOME at `.claude/projects/<encoded-cwd>/<session-id>.jsonl`; Git checkpoints
+  recover code but do not transfer the conversation. The worker preflights the
+  transcript before
   resuming (`agent/src/sdk-session.ts`, issue #105) and, when it is not
   resolvable, drops the resume and says so on the feed rather than passing an id
   the SDK can only fail on. The run continues without its earlier context; if the
   branch already carries pushed work, the planning prompt says so.
+  Verified 2026-09-08 against `ClaimRun` in `api/internal/store/queries/runtime.sql`
+  and `api/internal/config/config.go`: the earlier run-lane description incorrectly
+  used the chat lane's 2m grace instead of the liveness-aware 2h ceiling.
   Claim placement is also **fleet-aware** (PRD #216): past affinity, a worker
   already holding an active run defers a fresh queued run to a live, eligible peer
   that is strictly less loaded with a free slot, rather than taking a second run
@@ -1489,8 +1493,8 @@ display-only status report above) instead of rolling — the api stamps a `worke
 draining_since` timestamp, an orthogonal column, not a `workers.status` value,
 because `status` is rewritten to `'online'` on every heartbeat and would clobber a
 drain flag stored there. A draining worker keeps heartbeating and finishes its
-in-flight run, but the claim gate treats it as a third "stop claiming" lever
-(alongside the vault gate and the concurrency cap) so it takes on nothing new; the
+in-flight run. It can re-claim its own promoted runs, but the claim gate prevents
+it from taking on new runs (PRD #1030); the
 controller performs the `Recreate` roll once the api reports it idle, and
 `RegisterWorker` clears `draining_since` on the worker's next registration after
 that roll. The wait is bounded by `workers.drainDeadline` (default `24h`) — past

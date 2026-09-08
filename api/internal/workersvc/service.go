@@ -838,8 +838,9 @@ type Params struct {
 	DiskPressureThreshold float64
 	WorkerAffinityGrace   time.Duration
 	// WorkerAffinityCeiling (PRD #628 D3a): the run-lane affinity ceiling. ClaimRun pins
-	// a promoted run to its prior worker only while that worker is a live, non-draining
-	// claim target (the liveness leg); this ceiling bounds the live-but-wedged case. It is
+	// a promoted run to its prior worker while its row exists and it is heartbeating or
+	// draining (PRD #1030, verified against ClaimRun on 2026-09-08; the earlier comment
+	// incorrectly excluded draining workers). The ceiling bounds the live-but-wedged case. It is
 	// the run lane's @affinity_cutoff, distinct from WorkerAffinityGrace which stays the
 	// chat lane's grace (ClaimChatRun gets no liveness short-circuit in M1's scope).
 	WorkerAffinityCeiling time.Duration
