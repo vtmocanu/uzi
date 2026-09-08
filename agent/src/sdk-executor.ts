@@ -2674,6 +2674,8 @@ function describeSkillDrop(name: string, reason: string): string {
       return `skill "${name}" was dropped: its body exceeds the maximum allowed size`;
     case "repo_collision":
       return `repo skill "${name}" was skipped: a higher-precedence skill of the same name is already loaded`;
+    case "shadowed_by_claude":
+      return `repo skill "${name}" from .agents/skills was skipped: a real .claude/skills skill of the same name takes precedence`;
     case "repo_invalid":
       return `repo skill "${name}" was skipped: invalid name, description, or body`;
     default:

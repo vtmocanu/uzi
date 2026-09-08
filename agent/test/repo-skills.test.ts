@@ -4,7 +4,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { DROP_REPO_INVALID, enumerateRepoSkills, repoSkillsDir } from "../src/repo-skills.js";
+import {
+  collectRepoSkills,
+  DROP_REPO_INVALID,
+  DROP_SHADOWED_BY_CLAUDE,
+  enumerateRepoSkills,
+  repoAgentsSkillsDir,
+  repoSkillsDir,
+} from "../src/repo-skills.js";
 import { DROP_TOO_LARGE } from "../src/skills-plugin.js";
 
 let clone: string;
@@ -22,8 +29,19 @@ function writeSkill(dir: string, content: string): void {
   fs.writeFileSync(path.join(d, "SKILL.md"), content, "utf8");
 }
 
+/** Write <clone>/.agents/skills/<dir>/SKILL.md (the cross-agent root, #1205). */
+function writeAgentsSkill(dir: string, content: string): void {
+  const d = path.join(repoAgentsSkillsDir(clone), dir);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, "SKILL.md"), content, "utf8");
+}
+
 async function enumerate(maxBytes = 65536) {
   return enumerateRepoSkills(repoSkillsDir(clone), maxBytes);
+}
+
+async function collect(maxBytes = 65536) {
+  return collectRepoSkills(clone, maxBytes);
 }
 
 describe("enumerateRepoSkills", () => {
@@ -142,5 +160,91 @@ describe("enumerateRepoSkills", () => {
     writeSkill("alpha", "---\nname: alpha\ndescription: a.\n---\n\nb\n");
     const { skills } = await enumerate();
     assert.deepEqual(skills.map((s) => s.name), ["alpha", "zeta"]);
+  });
+});
+
+// Issue #1205: `.agents/skills` (the Codex root) is enumerated as a SECOND real
+// root under the identical rules, with `.claude/skills` winning a real-vs-real
+// name collision. The canonical cross-agent layout keeps real bodies under
+// `.agents/skills` and projects `.claude/skills` as a symlink.
+describe("collectRepoSkills (dual-root .claude/skills + .agents/skills)", () => {
+  it("enumerates a real .agents/skills skill when there is no .claude/skills", async () => {
+    writeAgentsSkill("codex-only", "---\nname: codex-only\ndescription: from agents.\n---\n\nbody\n");
+    const { skills, dropped } = await collect();
+    assert.deepEqual(skills.map((s) => s.name), ["codex-only"]);
+    assert.equal(skills[0]!.description, "from agents.");
+    assert.deepEqual(dropped, []);
+    // The old single-root path (.claude/skills only) misses it — this is the bug.
+    const legacy = await enumerate();
+    assert.deepEqual(legacy.skills, [], ".claude/skills-only enumeration cannot see .agents/skills");
+  });
+
+  it("returns nothing when .agents/skills itself is a symlink (containment guard)", async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-outside-agents-"));
+    fs.mkdirSync(path.join(outside, "x"));
+    fs.writeFileSync(path.join(outside, "x", "SKILL.md"), "---\nname: x\ndescription: y.\n---\n\nb\n");
+    try {
+      fs.mkdirSync(path.join(clone, ".agents"), { recursive: true });
+      fs.symlinkSync(outside, path.join(clone, ".agents", "skills"));
+      const { skills } = await collect();
+      assert.deepEqual(skills, [], "a symlinked .agents/skills dir is never enumerated");
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("skips a symlinked skill dir or SKILL.md under .agents/skills", async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-outside-agents2-"));
+    fs.writeFileSync(path.join(outside, "SKILL.md"), "---\nname: leaked\ndescription: secret.\n---\n\nbody\n");
+    try {
+      writeAgentsSkill("legit", "---\nname: legit\ndescription: ok.\n---\n\nbody\n");
+      fs.symlinkSync(outside, path.join(repoAgentsSkillsDir(clone), "linked-dir"));
+      fs.mkdirSync(path.join(repoAgentsSkillsDir(clone), "linked-file"));
+      fs.symlinkSync(
+        path.join(outside, "SKILL.md"),
+        path.join(repoAgentsSkillsDir(clone), "linked-file", "SKILL.md"),
+      );
+      const { skills } = await collect();
+      assert.deepEqual(skills.map((s) => s.name), ["legit"], "symlinked dir/file must not be read");
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("canonical layout: real .agents/skills + `.claude/skills -> ../.agents/skills` symlink yields the skills", async () => {
+    // The exact shape PR #1204 moved this repo to. The `.claude/skills` symlink is
+    // rejected by the guard; the real `.agents/skills` side supplies the skills.
+    writeAgentsSkill("deploy", "---\nname: deploy\ndescription: how we deploy.\n---\n\nbody\n");
+    writeAgentsSkill("review", "---\nname: review\ndescription: how we review.\n---\n\nbody\n");
+    fs.mkdirSync(path.join(clone, ".claude"), { recursive: true });
+    fs.symlinkSync("../.agents/skills", path.join(clone, ".claude", "skills"));
+
+    const { skills, dropped } = await collect();
+    assert.deepEqual(skills.map((s) => s.name), ["deploy", "review"]);
+    assert.deepEqual(dropped, []);
+    // Acceptance criterion: SAME result a real `.claude/skills/<name>` tree gives.
+    // The old single-root path over the symlinked `.claude/skills` sees nothing.
+    const legacy = await enumerate();
+    assert.deepEqual(legacy.skills, [], "the symlinked .claude/skills projection is (correctly) empty on its own");
+  });
+
+  it("real-vs-real collision: .claude/skills wins and the .agents/skills copy is dropped", async () => {
+    writeSkill("dup", "---\nname: dup\ndescription: claude wins.\n---\n\nclaude body\n");
+    writeAgentsSkill("dup", "---\nname: dup\ndescription: agents copy.\n---\n\nagents body\n");
+    // A non-colliding .agents skill still comes through, proving the drop is scoped.
+    writeAgentsSkill("solo", "---\nname: solo\ndescription: only in agents.\n---\n\nbody\n");
+
+    const { skills, dropped } = await collect();
+    assert.deepEqual(skills.map((s) => s.name), ["dup", "solo"]);
+    const dup = skills.find((s) => s.name === "dup")!;
+    assert.equal(dup.description, "claude wins.", ".claude/skills is the surviving copy");
+    assert.ok(dup.body.includes("claude body"));
+    assert.deepEqual(dropped, [{ name: "dup", reason: DROP_SHADOWED_BY_CLAUDE }]);
+  });
+
+  it("returns nothing when neither root exists", async () => {
+    const { skills, dropped } = await collect();
+    assert.deepEqual(skills, []);
+    assert.deepEqual(dropped, []);
   });
 });
