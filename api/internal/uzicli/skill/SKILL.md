@@ -353,7 +353,7 @@ uzi version
 
   **One wait process per run.** Start `run wait` once; reserve `--timeout` for a
   real deadline, not a short timer to regain tool control. A tool returning a
-  process/session/cell id has yielded, not killed the process: continue waiting
+  process/session/task id has yielded, not killed the process: continue waiting
   through that tool's wait/resume mechanism. Do not start another watcher while
   the first is alive. `run wait` already polls the server; do not add parallel
   `run get`, `run list`, or `run logs` checks while it is healthy. Inspect the
@@ -372,8 +372,7 @@ uzi version
   excluding the cleared approval gate during the post-approval wait. Read logs only
   for this freshness check or when action is needed. Use one monitoring mechanism,
   never both. A normal tool yield or an unchanged run state is not
-  evidence that a watcher was reaped. This distinction was verified after a
-  session repeatedly restarted short waits and fetched redundant logs (2026-09-08).
+  evidence that a watcher was reaped.
 
   **`--min-plan-seq <n>`** is for waiting on a REVISED plan after `uzi run
   revise`. It makes the wait stop at `awaiting_approval` only once a plan
