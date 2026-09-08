@@ -61,6 +61,12 @@ WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
 -- NULL reason) and a re-opened coordinate is cleanly fileable again. rows-affected (1 vs
 -- 0) tells the caller whether it re-opened. The `content_hash IS DISTINCT FROM
 -- @content_hash` guard is what makes an identical-hash re-report a no-op.
+--
+-- PRD #1183 M3: 'done' joins the resolved statuses this reopens, and set_via/close_synced_at
+-- are cleared alongside the rest of the resolved state. A bug that reappears (a materially
+-- different content_hash) after its filed issue was CLOSED — moving the coordinate to 'done'
+-- via the close sync — returns to `open` with no stale close-sync provenance, so it is cleanly
+-- re-notifiable and re-fileable and the close sync will re-fire honestly once a new issue closes.
 UPDATE finding_dispositions
 SET status = 'open',
     dismiss_reason = NULL,
@@ -69,9 +75,11 @@ SET status = 'open',
     resolved_at = NULL,
     filed_issue_iid = NULL,
     filed_issue_url = '',
-    filing_since = NULL
+    filing_since = NULL,
+    set_via = NULL,
+    close_synced_at = NULL
 WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
-  AND status IN ('filed', 'dismissed')
+  AND status IN ('filed', 'dismissed', 'done')
   AND content_hash IS DISTINCT FROM @content_hash;
 
 -- name: ClaimFindingForFiling :execrows
@@ -90,11 +98,19 @@ WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
 -- Close a won claim after the forge issue is created (M5), filing → filed. Guarded to
 -- status='filing' so only the claim-winner settles; stamps the forge iid, clears the
 -- transient marker and records resolved_at. rows-affected=1 confirms the settle landed.
+--
+-- It also RESETS the close-sync provenance (PRD #1183 M3): set_via=NULL, close_synced_at=NULL.
+-- A coordinate reopened after its issue closed (ReopenDispositionOnHashMismatch below) and then
+-- refiled writes a NEW filed_issue_iid, so its old close_synced_at edge must be cleared or the
+-- close sync would never re-fire for the new issue; and set_via must return to NULL so the
+-- refiled coordinate reads as a plain human-filed row until its new issue closes.
 UPDATE finding_dispositions
 SET status = 'filed',
     filed_issue_iid = @filed_issue_iid,
     filed_issue_url = @filed_issue_url,
     filing_since = NULL,
+    set_via = NULL,
+    close_synced_at = NULL,
     resolved_at = now()
 WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
   AND status = 'filing';
@@ -195,12 +211,15 @@ WHERE user_id = @user_id
 -- order because id is a unique PK — so exactly one (or, with no evidence, none) matches.
 -- latest.id is constant per d.id, so it joins the GROUP BY unchanged.
 SELECT
+    d.id                             AS disposition_id,
     d.user_id                        AS user_id,
     d.repo_id                        AS repo_id,
     r.path_with_namespace            AS repo_path,
     d.location                       AS location,
     d.status                         AS status,
     d.last_title                     AS last_title,
+    d.dismiss_reason                 AS dismiss_reason,
+    d.set_via                        AS set_via,
     d.filed_issue_iid                AS filed_issue_iid,
     d.filed_issue_url                AS filed_issue_url,
     d.resolved_at                    AS resolved_at,
@@ -232,3 +251,79 @@ WHERE d.user_id = @user_id
   )
 GROUP BY d.id, r.path_with_namespace, latest.id
 ORDER BY d.created_at DESC, d.id DESC;
+
+-- name: CountFindingsByStatusForUser :one
+-- The per-status Findings tally (PRD #1183 M3), the finding twin of the judge's TriageDTO
+-- aggregate. ONE row over finding_dispositions, owner-scoped, with an OPTIONAL ?repo= narrow
+-- (the ListFindingsBacklog repo pattern). It deliberately IGNORES any run filter: the run
+-- anchor narrows the LIST, never the counts (the judge page already accepts this divergence),
+-- so the nav badge, the tabs and the summary strip are one number per repo scope. total is a
+-- raw count(*) INCLUDING a transient `filing` row, so the All tab's count matches the All list
+-- during a filing window. todo = open, false_positives = the not_an_issue sub-count of
+-- dismissed. Columns/order map cleanly onto apitypes.TriageDTO.
+SELECT
+    count(*)                                               AS total,
+    count(*) FILTER (WHERE status = 'open')                AS todo,
+    count(*) FILTER (WHERE status = 'filed')               AS filed,
+    count(*) FILTER (WHERE status = 'done')                AS done,
+    count(*) FILTER (WHERE status = 'dismissed')           AS dismissed,
+    count(*) FILTER (WHERE dismiss_reason = 'not_an_issue') AS false_positives
+FROM finding_dispositions
+WHERE user_id = @user_id
+  AND (sqlc.narg('repo_id')::uuid IS NULL OR repo_id = sqlc.narg('repo_id')::uuid);
+
+-- name: ListFindingEvidenceForDispositions :many
+-- One batched read of the per-run evidence behind a PAGE of disposition coordinates (PRD #1183
+-- M3), so the backlog never N+1s: FindingsBacklog collects the page's disposition ids and calls
+-- this ONCE. Evidence lives in `findings` keyed by the coordinate (user_id, repo_id, location),
+-- so it joins finding_dispositions d (by id) back to findings f on the coordinate, then to runs
+-- for the run title. `runs.issue_title` is the run title, exactly what JudgeOccurrenceDTO carries;
+-- findings.run_id CASCADEs to runs, so the inner JOIN never drops a live evidence row. Ordered
+-- newest-first WITHIN each disposition (created_at DESC, id DESC breaks ties on the same instant),
+-- so Go takes the FIRST row per disposition as the evidence_preview and the rows in order as the
+-- occurrence list (capped at 20 in Go, not here, per the delegation). A resolved coordinate whose
+-- evidence was all cascaded away with a deleted run simply returns no rows — no preview, no
+-- occurrences — which is correct (last_title still keeps it legible in the backlog).
+SELECT
+    d.id             AS disposition_id,
+    f.run_id         AS run_id,
+    r.issue_title    AS run_title,
+    f.created_at     AS reported_at,
+    f.confidence     AS confidence,
+    f.description_md AS description_md
+FROM finding_dispositions d
+JOIN findings f
+    ON f.user_id = d.user_id AND f.repo_id = d.repo_id AND f.location = d.location
+JOIN runs r ON r.id = f.run_id
+WHERE d.id = ANY(@ids::uuid[])
+ORDER BY d.id, f.created_at DESC, f.id DESC;
+
+-- name: BulkDismissFindings :many
+-- Bulk triage (PRD #1183 M3): dismiss up to N owned OPEN coordinates in one statement, keyed by
+-- disposition id (the 100-id cap is enforced in the handler, not here). Owner-scoped by user_id
+-- and guarded to status='open', so a foreign id or a non-open coordinate is SKIPPED SILENTLY by
+-- the WHERE — the judge fan-out's "settle what you can" shape. RETURNING * re-reads each row so
+-- the handler can echo the updated coordinates back without a second query.
+UPDATE finding_dispositions
+SET status = 'dismissed',
+    dismiss_reason = @reason,
+    resolved_at = now()
+WHERE user_id = @user_id
+  AND id = ANY(@ids::uuid[])
+  AND status = 'open'
+RETURNING *;
+
+-- name: UndoDismissFinding :one
+-- Undo a dismissal (PRD #1183 M3), dismissed → open, keyed by disposition id (a dismissed
+-- coordinate may have no evidence row to key by). Owner-scoped and guarded to status='dismissed',
+-- so an undo of a non-dismissed (or foreign) coordinate matches zero rows → pgx.ErrNoRows → the
+-- handler returns 404. Clears dismiss_reason and resolved_at so the CHECK
+-- ((status='dismissed')=(reason IS NOT NULL)) holds for the reopened `open` row.
+UPDATE finding_dispositions
+SET status = 'open',
+    dismiss_reason = NULL,
+    resolved_at = NULL
+WHERE user_id = @user_id
+  AND id = @id
+  AND status = 'dismissed'
+RETURNING *;

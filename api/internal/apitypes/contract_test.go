@@ -90,6 +90,10 @@ func contractCases() []contractCase {
 		newContractCase[UserSettingsDTO]("user_settings"),
 		newContractCase[CatalogEntryDTO]("catalog_entry"),
 		newContractCase[AdminCLITokenDTO]("cli_token"),
+		// PRD #1183 M3: the first fixture pair for the Findings backlog row, so its Go/TS
+		// mirror is guarded from now on. IncidentalFindingDTO has a nullable field
+		// (finding_id), so its zero.json carries a null — assertion 2 is not vacuous.
+		newContractCase[IncidentalFindingDTO]("finding"),
 	}
 }
 

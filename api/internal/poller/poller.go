@@ -399,6 +399,15 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		slog.Error("poller: sync filed-issue closes", "repo", r.PathWithNamespace, "error", err)
 	}
 
+	// Filed→Done findings sync (PRD #1183 Child B, M3): the finding twin of the judge sync above,
+	// on the SAME fresh issue cache and with no forge call of its own. A filed incidental finding
+	// whose issue was just observed CLOSED moves to Done, once, on the open→closed edge, and reopens
+	// if the bug reappears. Placed immediately after the judge sync so both consume the same tick's
+	// cache; skipped by the same early returns when the forge is unreachable.
+	if err := e.svc.SyncFindingIssueCloses(ctx, r.ID); err != nil {
+		slog.Error("poller: sync finding-issue closes", "repo", r.PathWithNamespace, "error", err)
+	}
+
 	// Pipeline-status sync (PRD #6): refresh the CI-badge cache for the repo's
 	// default branch + its watched agent run branches. Rides this tick (no second
 	// loop, no new interval); disabled when SetPipelineWatch was not called or

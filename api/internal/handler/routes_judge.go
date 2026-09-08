@@ -50,10 +50,19 @@ func (h *Handler) mountJudgeRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 		r.Use(mw.RequireUser(h.q, h.cfg))
 		// Reads: owner-scoped by the query's user_id filter, no forge write, no spend.
 		r.Get("/", h.ListFindings)
+		// The per-status tally (PRD #1183 M3): the finding twin of /me/judge/stats, reusing
+		// apitypes.TriageDTO. Repo-scoped like the badge, ignores ?run=. A static segment, so it
+		// never collides with the {id} routes below.
+		r.Get("/stats", h.FindingsStats)
 		r.Get("/{id}/issue-draft", h.GetFindingIssueDraft)
-		// Writes: filing rides the per-user forge limiter (mirroring FileIssue); dismiss is
-		// a local write and carries no limiter.
+		// Writes: filing rides the per-user forge limiter (mirroring FileIssue); every dismiss
+		// path is a LOCAL write (no forge call, no spend) and carries no limiter.
 		r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issue", h.FileFinding)
 		r.Post("/{id}/dismiss", h.DismissFinding)
+		// Bulk dismiss (PRD #1183 M3): a static /dismiss segment, distinct from /{id}/dismiss.
+		// Cap of 100 ids enforced in the handler.
+		r.Post("/dismiss", h.BulkDismissFindings)
+		// Undo a dismissal (PRD #1183 M3): keyed on the disposition id, 404 when not dismissed.
+		r.Delete("/{id}/dismiss", h.UndoDismissFinding)
 	})
 }

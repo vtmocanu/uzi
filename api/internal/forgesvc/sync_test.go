@@ -382,6 +382,16 @@ func (s *fakeStore) ApplyFiledIssueCloseEdge(_ context.Context, arg store.ApplyF
 	return s.closeApplyRows, s.closeApplyErr
 }
 
+// The findings Filed→Done sync (PRD #1183 M3) is covered by a live-DB test against real Postgres
+// (finding_issue_close_livedb_test.go), the same way the judge sync's edge semantics live in a
+// live-DB test; these stubs exist only so *fakeStore keeps satisfying the widened IssueStore.
+func (s *fakeStore) ListFindingIssueCloseEdges(_ context.Context, _ uuid.UUID) ([]store.ListFindingIssueCloseEdgesRow, error) {
+	return nil, nil
+}
+func (s *fakeStore) ApplyFindingIssueCloseEdge(_ context.Context, _ uuid.UUID) (int64, error) {
+	return 0, nil
+}
+
 func (s *fakeStore) ListPRDLinkPatchCandidates(_ context.Context, arg store.ListPRDLinkPatchCandidatesParams) ([]store.ListPRDLinkPatchCandidatesRow, error) {
 	s.prdCandidateArgs = append(s.prdCandidateArgs, arg)
 	return s.prdCandidates, s.prdCandidatesErr

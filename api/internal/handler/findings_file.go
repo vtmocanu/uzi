@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
@@ -17,18 +19,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
-
-// fileFindingRequest is the (all-optional) body of POST /api/findings/{id}/issue. Every
-// field is a user EDIT of the server-rendered draft, so none is trusted: title/description
-// are re-run through the field-level sanitisers, and labels are sanitised + capped and
-// UNIONED with the server marker — a client can never supply a trigger label that bypasses
-// D5, and agent-authored text never rides through when a field is omitted (the default is
-// resolved from the stored, already-sanitised row).
-type fileFindingRequest struct {
-	Title       *string  `json:"title"`
-	Description *string  `json:"description"`
-	Labels      []string `json:"labels"`
-}
 
 // FileFinding files a forge issue from one incidental finding (PRD #333 M5, D4/D5). It is the
 // human-gated forge write: mounted on RequireUser (CLI-reachable via Bearer; CSRF preserved
@@ -66,7 +56,7 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req fileFindingRequest
+	var req apitypes.FileFindingRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -189,18 +179,12 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// NEVER revert (would orphan it) and NEVER retry (mirrors settleFiledIssue).
 	warning := h.settleFiledFinding(ctx, finding, created.IID, created.WebURL)
 
-	httpx.JSON(w, http.StatusCreated, fileFindingResponse{
-		Issue:   createdIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
+	// The response is the exported apitypes.IncidentalFindingFileResultDTO (PRD #1183 M3 folds the
+	// handler-local fileFindingResponse twin into it): wire-identical to what shipped before.
+	httpx.JSON(w, http.StatusCreated, apitypes.IncidentalFindingFileResultDTO{
+		Issue:   apitypes.IncidentalFindingFiledIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
 		Warning: warning,
 	})
-}
-
-// fileFindingResponse mirrors fileIssueResponse: the real forge issue the click created, plus a
-// non-empty warning when the issue was created but its local disposition could not settle
-// (created-with-warning) — a success, never a retry signal.
-type fileFindingResponse struct {
-	Issue   createdIssueDTO `json:"issue"`
-	Warning string          `json:"warning,omitempty"`
 }
 
 // buildFindingDraft builds the deterministic finding issue draft (D4) over the STORED row. It is
@@ -319,13 +303,6 @@ func containsComma(s string) bool {
 	return false
 }
 
-// dismissFindingRequest is the body of POST /api/findings/{id}/dismiss: a required reason from the
-// closed enum {wont_do, not_an_issue}. The DB CHECK ((status='dismissed')=(reason IS NOT NULL)) is
-// the backstop, but the handler rejects a missing/invalid reason as a 400 first.
-type dismissFindingRequest struct {
-	Reason string `json:"reason"`
-}
-
 // findingDismissReasons is the closed set of dismissal reasons (mirrors the judge's
 // recommendation_dispositions reasons and the finding_dispositions CHECK).
 var findingDismissReasons = map[string]struct{}{
@@ -351,7 +328,7 @@ func (h *Handler) DismissFinding(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req dismissFindingRequest
+	var req apitypes.DismissFindingRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -392,5 +369,133 @@ func (h *Handler) DismissFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpx.JSON(w, http.StatusOK, map[string]string{"status": "dismissed", "reason": req.Reason})
+	httpx.JSON(w, http.StatusOK, apitypes.DismissFindingResultDTO{Status: "dismissed", Reason: req.Reason})
+}
+
+// bulkDismissMaxIDs bounds one BulkDismissFindings request. Over it the handler 400s rather than
+// letting an unbounded id list drive one statement — the same "bound them where they are written"
+// rule the judge fan-out and the close-edge scan follow.
+const bulkDismissMaxIDs = 100
+
+// BulkDismissFindings triages up to bulkDismissMaxIDs owned OPEN coordinates to `dismissed` with one
+// shared reason in a SINGLE statement (PRD #1183 M3). It is a LOCAL write — no forge call, no token
+// spend — mounted on RequireUser WITHOUT the forge limiter beside DismissFinding. Owner-scoped by the
+// query's user_id filter and guarded to status='open', so a foreign id or a non-open coordinate is
+// SKIPPED SILENTLY (the judge fan-out's "settle what you can" shape): Updated reports how many rows
+// actually moved, which can be less than len(ids). The 100-id cap is a 400 above the limit; an
+// unparseable id is a 400. Returns {updated, findings} with the re-read rows.
+func (h *Handler) BulkDismissFindings(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req apitypes.BulkDismissFindingsRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if _, ok := findingDismissReasons[req.Reason]; !ok {
+		httpx.Error(w, http.StatusBadRequest, "reason must be wont_do or not_an_issue")
+		return
+	}
+	if len(req.IDs) > bulkDismissMaxIDs {
+		httpx.Error(w, http.StatusBadRequest, "too many ids (max 100)")
+		return
+	}
+	ids := make([]uuid.UUID, 0, len(req.IDs))
+	for _, raw := range req.IDs {
+		parsed, err := uuid.Parse(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid finding id")
+			return
+		}
+		ids = append(ids, parsed)
+	}
+
+	rows, err := h.q.BulkDismissFindings(r.Context(), store.BulkDismissFindingsParams{
+		Reason: pgtype.Text{String: req.Reason, Valid: true},
+		UserID: user.ID,
+		Ids:    ids,
+	})
+	if err != nil {
+		slog.Error("bulk dismiss findings", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	out := apitypes.BulkDismissFindingsResultDTO{
+		Updated:  len(rows),
+		Findings: make([]apitypes.IncidentalFindingDTO, 0, len(rows)),
+	}
+	for _, row := range rows {
+		out.Findings = append(out.Findings, findingDispositionDTO(row))
+	}
+	httpx.JSON(w, http.StatusOK, out)
+}
+
+// UndoDismissFinding reopens a dismissed coordinate (dismissed → open, PRD #1183 M3): DELETE
+// /api/findings/{id}/dismiss, keyed on the disposition id (a dismissed coordinate may carry no
+// evidence row to key by, which is why this and BulkDismissFindings key on the disposition id, not
+// the evidence id the file/single-dismiss POSTs use). Owner-scoped and guarded to status='dismissed'
+// by the query, so an undo of a non-dismissed or foreign coordinate matches zero rows → 404. On
+// success it returns the reopened coordinate so the client can reconcile the row in place. A LOCAL
+// write: RequireUser, no forge limiter.
+func (h *Handler) UndoDismissFinding(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	dispositionID, ok := httpx.PathUUID(w, r, "id", "finding")
+	if !ok {
+		return
+	}
+
+	row, err := h.q.UndoDismissFinding(r.Context(), store.UndoDismissFindingParams{
+		UserID: user.ID,
+		ID:     dispositionID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No owned dismissed coordinate at this id — an unknown/foreign id or a coordinate that
+			// is not currently dismissed. Both are a 404, leaking no existence oracle.
+			httpx.Error(w, http.StatusNotFound, "no dismissed finding to undo")
+			return
+		}
+		slog.Error("undo dismiss finding", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, findingDispositionDTO(row))
+}
+
+// findingDispositionDTO projects a re-read finding_dispositions row onto the wire DTO for the
+// bulk-dismiss and undo responses. Unlike the backlog mapper it has no repo_path, seen_in_runs,
+// evidence_preview or occurrences to carry (a raw disposition row holds none of them) — the client
+// reconciles by disposition_id + status. FindingID stays nil for the same reason.
+func findingDispositionDTO(d store.FindingDisposition) apitypes.IncidentalFindingDTO {
+	dto := apitypes.IncidentalFindingDTO{
+		DispositionID: d.ID.String(),
+		Location:      d.Location,
+		RepoID:        d.RepoID.String(),
+		Status:        d.Status,
+		LastTitle:     d.LastTitle,
+		FiledIssueURL: d.FiledIssueUrl,
+	}
+	if d.DismissReason.Valid {
+		dto.DismissReason = d.DismissReason.String
+	}
+	if d.SetVia.Valid {
+		dto.SetVia = d.SetVia.String
+	}
+	if d.FiledIssueIid.Valid {
+		iid := d.FiledIssueIid.Int64
+		dto.FiledIssueIID = &iid
+	}
+	if d.ResolvedAt.Valid {
+		ts := d.ResolvedAt.Time
+		dto.ResolvedAt = &ts
+	}
+	return dto
 }

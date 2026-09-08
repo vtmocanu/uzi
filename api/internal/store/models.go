@@ -206,6 +206,8 @@ type FindingDisposition struct {
 	LastTitle     string             `json:"last_title"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	ResolvedAt    pgtype.Timestamptz `json:"resolved_at"`
+	SetVia        pgtype.Text        `json:"set_via"`
+	CloseSyncedAt pgtype.Timestamptz `json:"close_synced_at"`
 }
 
 type ForgeConnection struct {

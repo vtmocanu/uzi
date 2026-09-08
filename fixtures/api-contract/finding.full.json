@@ -1,0 +1,24 @@
+{
+  "disposition_id": "x",
+  "finding_id": "x",
+  "location": "x",
+  "repo_id": "x",
+  "repo_path": "x",
+  "status": "x",
+  "last_title": "x",
+  "seen_in_runs": 1,
+  "dismiss_reason": "x",
+  "set_via": "x",
+  "filed_issue_iid": 1,
+  "filed_issue_url": "x",
+  "resolved_at": "2020-01-02T03:04:05Z",
+  "evidence_preview": "x",
+  "occurrences": [
+    {
+      "run_id": "x",
+      "run_title": "x",
+      "reported_at": "2020-01-02T03:04:05Z",
+      "confidence": "x"
+    }
+  ]
+}

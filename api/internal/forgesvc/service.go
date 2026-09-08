@@ -136,6 +136,11 @@ type IssueStore interface {
 	// cache, the DO-NOTHING disposition insert, and the edge stamp (judge_issue_close.go).
 	ListFiledIssueCloseEdges(ctx context.Context, arg store.ListFiledIssueCloseEdgesParams) ([]store.ListFiledIssueCloseEdgesRow, error)
 	ApplyFiledIssueCloseEdge(ctx context.Context, arg store.ApplyFiledIssueCloseEdgeParams) (store.ApplyFiledIssueCloseEdgeRow, error)
+	// Findings Filed→Done sync (PRD #1183 Child B, M3): the finding twin of the judge close
+	// sync — the open→closed edge over the freshly-synced issue cache and its guarded apply
+	// (finding_issue_close.go).
+	ListFindingIssueCloseEdges(ctx context.Context, repoID uuid.UUID) ([]store.ListFindingIssueCloseEdgesRow, error)
+	ApplyFindingIssueCloseEdge(ctx context.Context, id uuid.UUID) (int64, error)
 	// PRD-link patch (PRD #72 M5): the merged-MR edge over completed issue runs that
 	// declared a moved PRD path, and its settle (prd_link_patch.go).
 	ListPRDLinkPatchCandidates(ctx context.Context, arg store.ListPRDLinkPatchCandidatesParams) ([]store.ListPRDLinkPatchCandidatesRow, error)
