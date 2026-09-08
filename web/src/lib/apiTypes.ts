@@ -581,6 +581,10 @@ export interface LatestRun {
   health: RunHealth;
   health_reason: string | null;
   health_since: string | null;
+  // deadline_at (PRD #1170): the server-computed wall-clock deadline for a RUNNING run,
+  // null for a non-running/chat/judge/interactive run. Optional for the same api/web
+  // rollout skew as is_planning: a pre-feature api pod omits the key.
+  deadline_at?: string | null;
   owner_name: string;
   worker_name: string | null;
   is_mine: boolean;
@@ -1876,6 +1880,10 @@ export interface Run {
   health: RunHealth;
   health_reason: string | null;
   health_since: string | null;
+  // deadline_at (PRD #1170): the server-computed wall-clock deadline for a RUNNING run,
+  // null for a non-running/chat/judge/interactive run. Optional for the same api/web
+  // rollout skew as is_planning: a pre-feature api pod omits the key.
+  deadline_at?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH

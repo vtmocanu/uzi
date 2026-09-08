@@ -312,7 +312,7 @@ func TestHealthStalledSuppressedWhileToolInFlight(t *testing.T) {
 // frozenBudget stamps a run's effective wall-clock budget in seconds (PRD #1170); a
 // zero/omitted value leaves the run on the global RUN_TIMEOUT (NULL budget).
 func frozenBudget(hours int) pgtype.Int4 {
-	return pgtype.Int4{Int32: int32(hours) * 60 * 60, Valid: true}
+	return pgtype.Int4{Int32: int32(hours) * 60 * 60, Valid: true} //nolint:gosec // G115: hours is a small test-fixture value, always well within int32
 }
 
 // TestHealthNearTimeoutFlagsWithRecentActivity: a run 7h into a frozen 8h budget (87.5%,
