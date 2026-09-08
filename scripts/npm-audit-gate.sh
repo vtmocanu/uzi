@@ -167,6 +167,20 @@ TMP="$(mktemp -d)"
 # shellcheck disable=SC2064  # expand TMP now: the trap must survive its unset.
 trap "rm -rf '$TMP'" EXIT INT TERM
 
+# THE NETWORK BRANCH. npm's own wording for an unreachable registry is
+# "audit endpoint returned an error"; the ENOTFOUND/ECONNREFUSED/ETIMEDOUT codes
+# cover the DNS and connection cases that never reach the endpoint at all. Any of
+# them means the verdict is about the network, not about the tree.
+#
+# This is the SINGLE source of truth for that pattern, read in BOTH the retry loop
+# below and the final network classification. Keeping the prose and the literal
+# patterns together in one function means the two read sites can no longer drift.
+registry_unreachable() {  # $1 = output file; rc 0 iff it looks like a registry outage
+  grep -q -F -e 'audit endpoint returned an error' \
+             -e 'ENOTFOUND' -e 'ECONNREFUSED' -e 'ETIMEDOUT' -e 'ERR_SOCKET_TIMEOUT' \
+             "$1"
+}
+
 # 🔴 RC FIRST, AND INTO A FILE. Redirect and read `$?` on the very next line -- do
 # not pipe into grep and read the pipeline's status, and do not feed a shell
 # builtin's multi-line output into an early-exiting reader: `printf '%s' "$BIG" |
@@ -189,8 +203,42 @@ trap "rm -rf '$TMP'" EXIT INT TERM
 # a tree full of critical advisories. This script shipped with `--silent` for
 # exactly one calibration run, which reported a network failure as
 # "web has advisories at or above 'high'". Do not put it back.
+#
+# Attempts/backoff are overridable ONLY so a test can shrink the sleeps; neither
+# can turn a red into a green -- the audit always runs at least once and the
+# classification below is identical on the last attempt as on the first.
+attempts="${UZI_NPM_AUDIT_ATTEMPTS:-3}"
+backoff="${UZI_NPM_AUDIT_BACKOFF_SECONDS:-2}"
+# Coerce a non-integer OR out-of-range override back to the default: these knobs
+# exist only to let a test shrink the sleeps, so a huge attempts count (retry for
+# an impractical duration) or a huge backoff (block the first retry for years) is a
+# fat-finger, not a real request. Empty/non-numeric AND above-max both fall back to
+# the default, applied independently to each (#1166 review, CodeRabbit). The trailing
+# `|| default` keeps these set -eu safe.
+case "$attempts" in ''|*[!0-9]*) attempts=3 ;; *) [ "$attempts" -ge 1 ] && [ "$attempts" -le 10 ] || attempts=3 ;; esac
+case "$backoff"  in ''|*[!0-9]*) backoff=2  ;; *) [ "$backoff" -le 60 ] || backoff=2 ;; esac
+attempt=1
 rc=0
-(cd "$PKG_DIR" && npm run audit) >"$TMP/out" 2>&1 || rc=$?
+while : ; do
+  rc=0
+  (cd "$PKG_DIR" && npm run audit) >"$TMP/out" 2>&1 || rc=$?
+  # Proceed (break) the moment npm produced a non-network result, or attempts are
+  # spent. Retry ONLY when rc != 0 AND the shared network pattern matches AND
+  # attempts remain (#1166, npm-side sibling of #1144). Findings (rc=1 + report
+  # header) still fail CLOSED on the FIRST observation because registry_unreachable
+  # is false for them; the rc==0 clean path and the two catch-all exit-2 branches
+  # are non-transient and never retry. A SUSTAINED outage exhausts the attempts,
+  # breaks, and still exits 2 below (fail-closed, unchanged).
+  if [ "$rc" -eq 0 ] || ! registry_unreachable "$TMP/out" || [ "$attempt" -ge "$attempts" ]; then
+    break
+  fi
+  echo "npm-audit-gate: $PKG_DIR -- registry unreachable on attempt $attempt of $attempts; retrying in ${backoff}s." >&2
+  sleep "$backoff" || true
+  attempt=$((attempt + 1))
+  # Capped exponential backoff: double, but never above the per-sleep ceiling, so a
+  # sustained outage cannot balloon into an arbitrarily long sleep even at the bound.
+  backoff=$((backoff * 2)); [ "$backoff" -le 60 ] || backoff=60
+done
 
 cat "$TMP/out"
 
@@ -243,14 +291,10 @@ if [ "$rc" -eq 0 ]; then
   exit 0
 fi
 
-# THE NETWORK BRANCH. npm's own wording for an unreachable registry is
-# "audit endpoint returned an error"; the ENOTFOUND/ECONNREFUSED/ETIMEDOUT codes
-# cover the DNS and connection cases that never reach the endpoint at all. Any of
-# them means the verdict is about the network, not about the tree.
-if grep -q -F -e 'audit endpoint returned an error' \
-             -e 'ENOTFOUND' -e 'ECONNREFUSED' -e 'ETIMEDOUT' -e 'ERR_SOCKET_TIMEOUT' \
-             "$TMP/out"; then
-  echo "npm-audit-gate: $PKG_DIR -- npm audit could not reach the registry." >&2
+# THE NETWORK BRANCH (see registry_unreachable above for npm's wording and the
+# literal patterns). A sustained outage exhausts the retry loop and lands here.
+if registry_unreachable "$TMP/out"; then
+  echo "npm-audit-gate: $PKG_DIR -- npm audit could not reach the registry after $attempt attempt(s)." >&2
   echo "  INSTRUMENT FAILURE, NOT FINDINGS. npm audit returns 1 for both, so this" >&2
   echo "  distinction cannot live in its exit code and lives here instead." >&2
   exit 2

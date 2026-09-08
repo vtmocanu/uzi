@@ -22,16 +22,21 @@ import { isVaultLocked } from "../lib/api";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
 import type { BadgeTone } from "./ui";
+import { DocLink } from "./DocLink";
+import { DOC_CODEX_CREDENTIALS } from "../lib/doclinks";
+// Every "dark" sentence on this card comes from ONE flag, so the milestone that
+// enables Codex routing flips it in a single place (issue #1174 item 6).
+import { CODEX_DARK_COPY } from "./codexCredentialsCopy";
 
 // vaultLockedMessage is the shared copy for a 409 vault_locked: the global handler
 // has already refreshed the session, so the unlock banner is showing above.
 const VAULT_LOCKED =
-  "Your vault is locked — unlock it with the banner above, then save again.";
+  "Your vault is locked; unlock it with the banner above, then save again.";
 
 // D6's reason, in one place: rendered as a tooltip AND as the screen-reader
 // description the disabled-looking Delete points at, so the two cannot drift.
 const D6_HINT =
-  "Make another credential the default first — every account needs one default while any credential exists.";
+  "Make another credential the default first; every account needs one default while any credential exists.";
 
 function errText(err: unknown, fallback: string): string {
   if (isVaultLocked(err)) return VAULT_LOCKED;
@@ -73,28 +78,67 @@ function statusBadge(
 ): { tone: BadgeTone; label: string; hint: string } | null {
   switch (status) {
     case "staging":
+      // The one place a `staging` login says WHY it is not yet linked: this build
+      // does not auto-verify (routed through the flag so retirement is one edit).
       return {
         tone: "info",
         label: "staging",
-        hint: "Saved; identity not yet verified. Codex is not used for runs yet.",
+        hint:
+          "Saved and encrypted; identity not yet verified. " +
+          CODEX_DARK_COPY.stagingNotAutoVerified,
       };
     case "linked":
       return { tone: "ok", label: "linked", hint: "Provider identity verified." };
     case "failed":
+      // Deliberately GENERIC — no provider or secret detail leaks into a diagnosis
+      // string that is rendered as a tooltip and read aloud by a screen reader.
       return {
         tone: "danger",
         label: "failed",
-        hint: "Could not verify; re-add the credential.",
+        hint: "Verification failed. Replace the value or re-add the login.",
       };
     case "static":
       return {
         tone: "neutral",
         label: "static",
-        hint: "Stored API key. Codex is not used for runs yet.",
+        hint: "API key stored; provider-account linking does not apply.",
       };
     default:
       return null;
   }
+}
+
+// codexShapeError is a PURE, IN-MEMORY pre-check for a codex_auth paste (issue
+// #1174 item 2 / AC 2). It exists to catch the two shapes a user actually pastes
+// by mistake — a raw token, and the WHOLE ~/.codex/auth.json file — and answer with
+// a specific, secret-free hint BEFORE any request leaves the browser. It returns a
+// message string, NEVER the pasted value, and logs/persists nothing; the server
+// validator stays the real backstop. Exported because the card and its test both
+// import it. NB: only a codex_auth value is JSON — an OpenAI API key is a raw
+// string, so the caller must NOT run this check on the openai_api_key path.
+export function codexShapeError(raw: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "This field expects a JSON object with access_token and refresh_token, not a raw token. See “How to get this” below.";
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return "This field expects a JSON object with access_token and refresh_token. See “How to get this” below.";
+  }
+  const obj = parsed as Record<string, unknown>;
+  const top = obj.access_token;
+  if (typeof top === "string" && top.trim() !== "") return null;
+  const nested = obj.tokens;
+  if (
+    typeof nested === "object" &&
+    nested !== null &&
+    typeof (nested as Record<string, unknown>).access_token === "string" &&
+    ((nested as Record<string, unknown>).access_token as string).trim() !== ""
+  ) {
+    return "This looks like the whole ~/.codex/auth.json file. Uzi needs a flat object with just access_token and refresh_token; use the copy command in “How to get this”.";
+  }
+  return "This JSON has no access_token. See “How to get this” below.";
 }
 
 // codexDeleteWarning mirrors the Anthropic D5 delete confirmation, minus the
@@ -322,19 +366,41 @@ function AddCredentialForm({
   const [token, setToken] = useState("");
   const [label, setLabel] = useState("");
   const [addBusy, setAddBusy] = useState(false);
+  // The wrong-shape pre-check message (issue #1174 item 2 / AC 2) lives in LOCAL
+  // state and renders INLINE beneath this field, deliberately NOT on the shared
+  // onError banner: a paste-shape mistake is local to this field, and the shared
+  // banner is a surface where a value-adjacent message must never land. Cleared on
+  // every keystroke so a corrected paste is not shadowed by a stale message.
+  const [shapeError, setShapeError] = useState<string | null>(null);
+  // Only a Codex login is JSON; an OpenAI API key is a raw string. This gate decides
+  // both the inline help and whether the JSON shape check runs at all.
+  const isCodexLogin = kind === "codex_auth";
 
   // The Name field UNMOUNTS when the card collapses to first-credential mode, so a
   // label typed and never submitted would silently name the next credential through
-  // a field the user cannot see. Clearing both fields on the transition is the fix.
+  // a field the user cannot see. Clearing both fields on the transition is the fix;
+  // the shape message is cleared too so it cannot outlive the value that caused it.
   useEffect(() => {
     setToken("");
     setLabel("");
+    setShapeError(null);
   }, [first]);
 
   const add = async (e: FormEvent) => {
     e.preventDefault();
     onError("");
     onNotice("");
+    // Wrong-shape pre-check, for a codex_auth value ONLY. Runs in memory, echoes
+    // nothing, and on a bad shape shows the message inline and SENDS NOTHING — the
+    // server validator remains the backstop. An OpenAI API key skips this entirely.
+    if (isCodexLogin) {
+      const shape = codexShapeError(token);
+      if (shape !== null) {
+        setShapeError(shape);
+        return;
+      }
+    }
+    setShapeError(null);
     setAddBusy(true);
     try {
       // A user's FIRST codex credential is forced default server-side whatever we
@@ -343,8 +409,14 @@ function AddCredentialForm({
       await apiForKind(kind).create(token, first ? "default" : label.trim(), false);
       setToken("");
       setLabel("");
+      // Name the resulting lifecycle state (issue #1174 item 5): a login is born
+      // `staging` (not verified), a key is born `static`. The dark clause comes
+      // from the one flag so it retires everywhere at once.
       onNotice(
-        "Credential saved and sealed with your login password. Codex is not yet used for runs.",
+        isCodexLogin
+          ? "Saved and encrypted. Status: staging (not verified). " +
+              CODEX_DARK_COPY.notUsedForRuns
+          : "Saved and encrypted. Status: static. " + CODEX_DARK_COPY.notUsedForRuns,
       );
       await reload();
     } catch (err) {
@@ -366,12 +438,91 @@ function AddCredentialForm({
           placeholder={
             kind === "openai_api_key"
               ? "Paste your OpenAI API key"
-              : "Paste your Codex login token"
+              : "Paste your Codex login JSON"
           }
           value={token}
-          onChange={(e) => setToken(e.target.value)}
+          // A keystroke means the value changed, so a stale shape message (which
+          // described the OLD value) must go — never persisted, never re-checked.
+          onChange={(e) => {
+            setToken(e.target.value);
+            if (shapeError) setShapeError(null);
+          }}
         />
       </Field>
+      {isCodexLogin && (
+        // Codex-login help lives OUTSIDE the <Field> (which is a wrapping <label>)
+        // so the DocLink and the disclosure are not swallowed into the input's
+        // accessible name. The whole block is codex_auth-only: the OpenAI key field
+        // stays a bare raw-string paste.
+        <div className="space-y-2 text-xs">
+          {/* What this field IS, so a user does not paste an API key here: it
+              imports an EXISTING Codex CLI / ChatGPT-subscription login — a JSON
+              object with access_token (+ refresh_token for renewal). */}
+          <p className="text-muted">
+            This imports an existing Codex CLI / ChatGPT-subscription login — a JSON
+            object with{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">access_token</code>{" "}
+            (and{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">refresh_token</code>{" "}
+            for renewal). It is <strong className="text-fg">not</strong> an OpenAI
+            API key.
+          </p>
+          {shapeError && (
+            // The pre-check verdict, inline and value-free. Its text ends with
+            // See "How to get this" below. — pointing at the disclosure just below.
+            <p role="alert" className="text-danger">
+              {shapeError}
+            </p>
+          )}
+          {/* Native <details>/<summary>: keyboard, touch and screen-reader reachable
+              with no JS. Summarizes the copy recipe; the full guide is the DocLink. */}
+          <details className="group">
+            <summary className="cursor-pointer list-none text-muted marker:content-none">
+              <span aria-hidden="true" className="text-faint group-open:hidden">
+                ▸{" "}
+              </span>
+              <span aria-hidden="true" className="hidden text-faint group-open:inline">
+                ▾{" "}
+              </span>
+              How to get this
+            </summary>
+            <div className="mt-2 space-y-2 text-muted">
+              <p>
+                First sign in with{" "}
+                <code className="rounded bg-raised px-1 py-0.5 text-fg">codex login</code>
+                , then confirm it with{" "}
+                <code className="rounded bg-raised px-1 py-0.5 text-fg">
+                  codex login status
+                </code>
+                .
+              </p>
+              <p>Then copy JUST the two fields uzi needs, never the whole file:</p>
+              <p>
+                <code className="block overflow-x-auto rounded bg-raised px-2 py-1 text-fg">
+                  {
+                    "jq -c '{access_token: .tokens.access_token, refresh_token: .tokens.refresh_token}' ~/.codex/auth.json | pbcopy"
+                  }
+                </code>
+              </p>
+              <p>
+                On Linux swap{" "}
+                <code className="rounded bg-raised px-1 py-0.5 text-fg">pbcopy</code>{" "}
+                for{" "}
+                <code className="rounded bg-raised px-1 py-0.5 text-fg">
+                  xclip -selection clipboard
+                </code>{" "}
+                or <code className="rounded bg-raised px-1 py-0.5 text-fg">wl-copy</code>
+                .
+              </p>
+              <p className="text-faint">
+                This is a renewable credential — do not commit it, log it, paste it
+                into issues, or otherwise share it.{" "}
+                <DocLink slug={DOC_CODEX_CREDENTIALS}>Full guide</DocLink>.
+              </p>
+            </div>
+          </details>
+        </div>
+      )}
       {!first && (
         <Field label="Name">
           <Input
@@ -413,6 +564,9 @@ export function CodexCredentials({
   const [rotateFor, setRotateFor] = useState("");
   const [rotateValue, setRotateValue] = useState("");
   const [rotateBusy, setRotateBusy] = useState(false);
+  // Same in-memory, value-free wrong-shape guard as the add form, for a codex_auth
+  // rotation (issue #1174 item 2 / AC 2). Inline, never the shared banner.
+  const [rotateShapeError, setRotateShapeError] = useState<string | null>(null);
 
   const first = secrets.length === 0;
   const anyBusy = busy || rotateBusy;
@@ -423,6 +577,17 @@ export function CodexCredentials({
     onNotice("");
     const row = secrets.find((s) => s.id === rotateFor);
     if (!row) return;
+    // A codex_auth rotation is JSON and gets the same pre-check as the add form; an
+    // OpenAI key is a raw string and skips it. On a bad shape: show inline, send
+    // nothing. The check runs in memory and never carries the pasted value.
+    if (row.kind === "codex_auth") {
+      const shape = codexShapeError(rotateValue);
+      if (shape !== null) {
+        setRotateShapeError(shape);
+        return;
+      }
+    }
+    setRotateShapeError(null);
     setRotateBusy(true);
     try {
       await apiForKind(row.kind).patch(rotateFor, { token: rotateValue });
@@ -442,9 +607,8 @@ export function CodexCredentials({
       <div>
         <SectionTitle>OpenAI / Codex credentials</SectionTitle>
         <p className="mt-2 text-sm text-muted">
-          Store your OpenAI Codex logins and API keys. Codex is not yet used to run
-          agents — an Anthropic token is still what starts a run. Paste a Codex login
-          token or an OpenAI API key, and give each one a name. A single{" "}
+          Store your OpenAI Codex logins and API keys. {CODEX_DARK_COPY.notUsedForRuns}{" "}
+          Paste a Codex login or an OpenAI API key, and give each one a name. A single{" "}
           <strong className="text-fg">default</strong> is shared across both kinds.
         </p>
       </div>
@@ -471,6 +635,54 @@ export function CodexCredentials({
         </div>
       )}
 
+      {/* A visible, keyboard/touch/screen-reader-reachable legend for the four
+          status badges (issue #1174 item 3). The per-badge title + sr-only text
+          answers "what does THIS badge mean" in place; this answers "what can a
+          badge mean" in one surface a keyboard or touch user can actually open. It
+          rides the same native <details>/<summary> idiom as RunUsage's breakdown,
+          so <details> conveys expanded state and the ▸/▾ is decorative only. */}
+      {!loading && !first && (
+        <details className="group">
+          <summary className="cursor-pointer list-none text-xs text-muted marker:content-none">
+            <span aria-hidden="true" className="text-faint group-open:hidden">
+              ▸{" "}
+            </span>
+            <span aria-hidden="true" className="hidden text-faint group-open:inline">
+              ▾{" "}
+            </span>
+            What do these statuses mean?
+          </summary>
+          <dl className="mt-2 space-y-2 text-xs text-muted">
+            <div>
+              <dt className="font-medium text-fg">staging</dt>
+              <dd>
+                Saved and encrypted, but the provider identity has not been verified.{" "}
+                {CODEX_DARK_COPY.stagingNotAutoVerified}
+              </dd>
+            </div>
+            <div>
+              <dt className="font-medium text-fg">linked</dt>
+              <dd>The provider identity has been verified.</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-fg">failed</dt>
+              <dd>
+                Verification failed. Replace the value or re-add the login. No
+                provider or secret details are shown.
+              </dd>
+            </div>
+            <div>
+              <dt className="font-medium text-fg">static</dt>
+              <dd>
+                An API key is stored. Provider-account linking does not apply to API
+                keys.
+              </dd>
+            </div>
+          </dl>
+          <p className="mt-2 text-xs text-faint">{CODEX_DARK_COPY.notUsedForRuns}</p>
+        </details>
+      )}
+
       {/* Rotating a value is a separate form because the value is pasted, never
           edited: the API never returns it, so there is nothing to pre-fill. The
           route is chosen from the selected row's kind. */}
@@ -481,7 +693,12 @@ export function CodexCredentials({
               aria-label="Credential to replace"
               className="h-9 w-full rounded-md border border-edge bg-surface px-2 text-sm text-fg"
               value={rotateFor}
-              onChange={(e) => setRotateFor(e.target.value)}
+              // Switching the target row invalidates any shape message the previous
+              // row's paste produced.
+              onChange={(e) => {
+                setRotateFor(e.target.value);
+                setRotateShapeError(null);
+              }}
             >
               <option value="">Select a credential…</option>
               {secrets.map((s) => (
@@ -500,9 +717,20 @@ export function CodexCredentials({
                   autoComplete="off"
                   placeholder="Paste the replacement credential"
                   value={rotateValue}
-                  onChange={(e) => setRotateValue(e.target.value)}
+                  onChange={(e) => {
+                    setRotateValue(e.target.value);
+                    if (rotateShapeError) setRotateShapeError(null);
+                  }}
                 />
               </Field>
+              {rotateShapeError && (
+                // A codex_auth rotation with the wrong shape: inline, value-free,
+                // and pointing at the guide (only ever set for a codex_auth row).
+                <p role="alert" className="text-xs text-danger">
+                  {rotateShapeError}{" "}
+                  <DocLink slug={DOC_CODEX_CREDENTIALS}>How to get this</DocLink>.
+                </p>
+              )}
               <Button type="submit" disabled={anyBusy || rotateValue.trim() === ""}>
                 Replace value
               </Button>
