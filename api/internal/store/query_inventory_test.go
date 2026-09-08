@@ -906,6 +906,24 @@ var queryInventory = []queryPin{
 			"filters by ?repo= and by ?run= (a SEMI-JOIN that does NOT shrink seen_in_runs), excludes " +
 			"an evidence row with no disposition (disposition-driven, D7), and returns nothing for a " +
 			"foreign user"},
+	{"CountFindingsByStatusForUser", "findings.sql", "TestFindingsStatsLiveDB",
+		"direct call via the /findings/stats handler: the per-status FILTER aggregate is read back as " +
+			"the canonical TriageDTO (total incl. a filing row, todo=open / filed / done / dismissed, " +
+			"false_positives=not_an_issue), repo-scoped and ignoring ?run"},
+	{"ListFindingEvidenceForDispositions", "findings.sql", "TestFindingsE2EHappyPathLiveDB",
+		"driven through the real ListFindings handler (listBacklog -> FindingsBacklog -> " +
+			"attachFindingEvidence): the batched evidence/occurrence fetch runs once for the page's " +
+			"dispositions. The newest-preview-capped and occurrences-newest-first-cap-20 property " +
+			"assertions live in workersvc TestFindingsBacklogEvidenceLiveDB (workersvc is not in " +
+			"inventoryPackages)"},
+	{"BulkDismissFindings", "findings.sql", "TestBulkDismissFindingsLiveDB",
+		"direct call via the /findings/dismiss handler: the owner-scoped, status='open'-guarded bulk " +
+			"UPDATE dismisses only the caller's open coordinates (a foreign id and a non-open row are " +
+			"skipped silently) and returns the re-read rows"},
+	{"UndoDismissFinding", "findings.sql", "TestUndoDismissFindingLiveDB",
+		"direct call via DELETE /findings/{id}/dismiss: a dismissed coordinate returns to open with " +
+			"dismiss_reason/resolved_at cleared (n=1), and a non-dismissed or foreign row yields " +
+			"pgx.ErrNoRows -> 404"},
 	{"SweepStrandedFilingFindings", "findings.sql", "TestSweepStrandedFilingFindingsLiveDB",
 		"direct call, both directions and fixture-scoped: a `filing` coordinate whose filing_since " +
 			"is older than the cutoff is reset to `open` (n>=1, read back as open with filing_since " +

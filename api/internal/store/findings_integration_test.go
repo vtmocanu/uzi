@@ -535,7 +535,7 @@ func dispStatus(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID, r
 // migrationUpStatements in recommendation_canonicalize_integration_test.go).
 func migrationDownStatements(t *testing.T, name string) []string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("migrations", name))
+	b, err := os.ReadFile(filepath.Join("migrations", name)) //nolint:gosec // G304: test reads a repo-local migration file by fixed name under migrations/, not user input
 	if err != nil {
 		t.Fatalf("read migration %s: %v", name, err)
 	}
