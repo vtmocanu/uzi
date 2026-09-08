@@ -293,6 +293,49 @@ var knownInstructions = []knownInstruction{
 			"Never emitted at runtime.",
 	},
 	{
+		command:  "uzi run get",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #1190 M4. The span sits inside `uzi run pause`'s Long help
+		// (run_steer.go), which cross-links `uzi run get <id>` as where to watch the
+		// not-synchronous park land. classifyKind reads a cobra Long field as documentation,
+		// so the kind derives HELP; the runtime `run pause --now` copy that also names it
+		// ("watch: uzi run get <id>") sits mid-line and unbackticked, so instructionRE does
+		// not lift it — only this backticked help reference is a candidate. The complete bar
+		// for a help reference is that the path RESOLVES, and `uzi run get` is a real
+		// subcommand, pinned by TestCommandTree and exercised across the run_*_test.go suite.
+		note: "HELP: `uzi run pause`'s Long help cross-links `uzi run get` as where to watch " +
+			"the deferred park land (run_steer.go). Never emitted as a lifted runtime " +
+			"candidate; the path-resolution check is the complete bar.",
+	},
+	{
+		command:  "uzi run resume",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #1190 M4. Backticked cross-references in two Long/help fields:
+		// `uzi run pause`'s Long ("Resume it later with `uzi run resume <id>`", run_steer.go)
+		// and `uzi run wait`'s Long ("resumes on demand with `uzi run resume`", run_wait.go).
+		// classifyKind reads a cobra Long field as documentation, so the kind derives HELP.
+		// matchesCommand is word-boundary, so this entry does NOT absorb `uzi run resume-now`
+		// (the "-now" is not a space), which carries its own entry below. The complete bar for
+		// a help reference is that the path RESOLVES — `uzi run resume` is a real subcommand,
+		// pinned by TestCommandTree and exercised by run_resume_test.go.
+		note: "HELP: `uzi run pause` and `uzi run wait` cross-link `uzi run resume` as the way " +
+			"to resume a paused run (run_steer.go, run_wait.go). Never emitted at runtime; the " +
+			"path-resolution check is the complete bar.",
+	},
+	{
+		command:  "uzi run resume-now",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #1190 M4. The span sits inside `uzi run resume`'s Long help
+		// (run_limits.go), which cross-links `uzi run resume-now` — the sibling verb that
+		// posts to the same widened /resume-now endpoint (D14). classifyKind reads a cobra
+		// Long field as documentation, so the kind derives HELP; the complete bar for a help
+		// reference is that the path RESOLVES, and `uzi run resume-now` is a real subcommand,
+		// pinned by TestCommandTree.
+		note: "HELP: `uzi run resume`'s Long help cross-links the sibling `uzi run resume-now` " +
+			"verb that shares its endpoint (run_limits.go). Never emitted at runtime; the " +
+			"path-resolution check is the complete bar.",
+	},
+	{
 		command:  "uzi findings file",
 		evidence: evidenceHelpOnly,
 		// ARRIVED WITH PRD #333 M6. The span sits in `uzi findings list`'s Long field

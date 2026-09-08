@@ -695,6 +695,9 @@ func TestNormalizeRunEventTable(t *testing.T) {
 		// consumer AS "limit_wait". Dropping it from knownRunStatuses turns this into
 		// RunStatusUnknown here rather than anywhere visible in the CLI's own code.
 		{"limit_wait survives the decode boundary", apitypes.RunEventDTO{Type: "state", Status: "limit_wait"}, "state", "limit_wait"},
+		// PRD #1190: an owner pause is non-terminal and must reach the consumer AS "paused"
+		// (not RunStatusUnknown), so `run wait` and the TUI keep waiting on it and print it.
+		{"paused survives the decode boundary", apitypes.RunEventDTO{Type: "state", Status: "paused"}, "state", "paused"},
 		{"unknown status is made inert", apitypes.RunEventDTO{Type: "state", Status: "ascended"}, "state", RunStatusUnknown},
 		{"empty status on a state frame is inert too", apitypes.RunEventDTO{Type: "state"}, "state", RunStatusUnknown},
 		{"unknown type is made inert and loses its status", apitypes.RunEventDTO{Type: "teleport", Status: "running"}, RunEventTypeUnknown, ""},
@@ -731,7 +734,10 @@ func TestIsTerminalRunStatus(t *testing.T) {
 	// terminal would stop `uzi run logs --follow` (run.go's own terminalRunStatuses),
 	// stop this stream's reconcile ticker, and make the TUI draw every lane `done` —
 	// three surfaces going quiet on a run that is about to start talking again.
-	for _, s := range []string{"queued", "claimed", "running", "awaiting_approval", "limit_wait", RunStatusUnknown, ""} {
+	// paused (PRD #1190) joins this list for limit_wait's exact reason: an owner park
+	// resumes on demand, so calling it terminal would stop the follow loop, the reconcile
+	// ticker and the TUI on a run that is about to resume.
+	for _, s := range []string{"queued", "claimed", "running", "awaiting_approval", "limit_wait", "paused", RunStatusUnknown, ""} {
 		if IsTerminalRunStatus(s) {
 			t.Errorf("IsTerminalRunStatus(%q) = true, want false — treating a live run as terminal stops the reconcile that would have corrected it", s)
 		}

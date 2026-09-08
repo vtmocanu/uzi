@@ -26,6 +26,13 @@ const (
 	kindAnswer      = "answer"
 	kindStop        = "stop"
 	kindScope       = "scope"
+	// kindPause / kindPauseCancel are the owner's pause steering inputs (PRD #1190 M4):
+	// `pause` carries a mode body ("milestone"|"now"), `pause_cancel` withdraws a pending
+	// request. Both ride the same POST /inputs path the sibling steering verbs use. Resume
+	// is NOT a `POST /inputs` kind — it is the widened /resume-now endpoint (D14) — so no
+	// kindResume constant exists here.
+	kindPause       = "pause"
+	kindPauseCancel = "pause_cancel"
 )
 
 // agentSources are the two rosters a plan approval may draw its subagents from
@@ -57,6 +64,17 @@ const statusLimitWait = "limit_wait"
 // terminal would make `--follow` exit on a run that is about to produce more messages.
 const statusPoolWait = "pool_wait"
 
+// statusPaused is the status a run carries while parked by an OWNER pause (PRD #1190):
+// a voluntary hold in the wait family beside limit_wait and pool_wait. Named for the same
+// reason as its two siblings — the follow loop, the steer-queue delivery label and the
+// `uzi run get` / TUI detail blocks compare against one literal.
+//
+// NON-TERMINAL, and unlike the two involuntary parks it resumes ONLY on demand (`uzi run
+// resume`), never on a clock or a pooled token. It is still deliberately absent from
+// terminalRunStatuses: a paused run resumes into more messages, so `--follow` and
+// `run wait` keep waiting on it rather than exiting.
+const statusPaused = "paused"
+
 // logsPollInterval is how often `uzi run logs --follow` re-polls
 // /api/runs/{id}/messages?after=<seq>. REST polling ships instead of a WebSocket
 // (PRD #64 Out of scope). A var, not a const, only so tests can shrink the wait;
@@ -80,8 +98,8 @@ var terminalRunStatuses = map[string]bool{
 }
 
 // allRunStatusesOrder is the run status enum in wire/enum order (matching
-// runs_status_check — last rewritten by migration 00165, eleven values), the ONE source
-// of truth both allRunStatuses (membership)
+// runs_status_check — widened to add 'paused' by PRD #1190, TWELVE values), the ONE
+// source of truth both allRunStatuses (membership)
 // and the `--until` validation-error's "valid: …" list derive from — so a status added
 // here can never be silently omitted from the human-readable enumeration.
 var allRunStatusesOrder = []string{
@@ -93,6 +111,11 @@ var allRunStatusesOrder = []string{
 	"awaiting_followup",
 	statusLimitWait,
 	statusPoolWait,
+	// paused (PRD #1190): an owner park, non-terminal, resumed on demand. Kept in the
+	// wait family beside the two involuntary parks and before the terminals. It is a
+	// recognised status so `run wait` prints one clean `paused` transition line and keeps
+	// waiting, rather than firing the "unrecognized status" (older-than-server) warning.
+	statusPaused,
 	"completed",
 	"failed",
 	"cancelled",
@@ -205,7 +228,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		newRunReviewCmd(env, gf), newRunCreateCmd(env, gf), newRunApproveCmd(env, gf), newRunRejectCmd(env, gf),
 		newRunReviseCmd(env, gf), newRunCancelCmd(env, gf), newRunStopCmd(env, gf), newRunScopeCmd(env, gf),
 		newRunFollowUpCmd(env, gf), newRunAnswerCmd(env, gf), newRunInputsCmd(env, gf), newRunExpediteCmd(env, gf),
-		newRunResumeNowCmd(env, gf), newRunMrReworkCmd(env, gf),
+		newRunResumeNowCmd(env, gf), newRunMrReworkCmd(env, gf), newRunPauseCmd(env, gf), newRunResumeCmd(env, gf),
 	)
 	return cmd
 }

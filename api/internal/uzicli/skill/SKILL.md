@@ -156,11 +156,13 @@ uzi run revise <run-id> [--message <text>]
 uzi run cancel <run-id>
 uzi run stop <run-id> [--message <text>]
 uzi run scope <run-id> --through <n>
+uzi run pause <run-id> [--now] [--cancel]
 uzi run follow-up <run-id> [--message <text>]
 uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
 uzi run resume-now <run-id>
+uzi run resume <run-id>
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues]
 uzi schedule list

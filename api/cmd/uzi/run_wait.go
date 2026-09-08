@@ -195,8 +195,9 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
 			strings.Join(defaultWaitStates, ", ") + ". It does NOT stop " +
-			"on queued/claimed/running (still working), limit_wait (auto-resumes), or pool_wait " +
-			"(an auto run held on an empty token pool; resumes when a token is pooled), so a bare " +
+			"on queued/claimed/running (still working), limit_wait (auto-resumes), pool_wait " +
+			"(an auto run held on an empty token pool; resumes when a token is pooled), or paused " +
+			"(an owner park; resumes on demand with `uzi run resume`), so a bare " +
 			"`uzi run wait <id>` waits for the plan gate OR the end.\n\n" +
 			"Transitions print to stderr; `--json` prints the final run object (same shape as " +
 			"`run get --json`) to stdout. Exit codes: 0 a target state was reached (including if " +

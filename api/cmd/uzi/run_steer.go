@@ -52,6 +52,80 @@ func newRunScopeCmd(env Env, gf *globalFlags) *cobra.Command {
 	return scope
 }
 
+// newRunPauseCmd builds `uzi run pause` (PRD #1190 M4).
+//
+// It rides the SAME POST /inputs path the sibling steering verbs use (c.SubmitRunInput),
+// but prints its own copy instead of submitInput's generic one-liner because a pause has
+// three distinct outcomes to word. --now and --cancel are mutually exclusive (they express
+// opposite intents); the default posts kind=pause with body "milestone", --now posts body
+// "now", --cancel posts kind=pause_cancel.
+//
+// None of the three is synchronous: the park (default or --now) lands on the worker's next
+// report, so even --now prints "Pause requested (now) …" and points at `uzi run get` rather
+// than claiming the run is already parked. The kind-allowlist and the wrong-status 409s
+// (chat runs already park, the run is at a gate, …) are the server's and flow through as
+// exit-5 errors with the server's message.
+func newRunPauseCmd(env Env, gf *globalFlags) *cobra.Command {
+	pause := &cobra.Command{
+		Use:   "pause <run-id>",
+		Short: "Pause a running issue/task/prompt/self-improve run, parked on a pushed checkpoint (--now, or --cancel to withdraw)",
+		Long: "Ask a running run to park on a pushed checkpoint and spend nothing until you resume it " +
+			"(PRD #1190). Owner-only, and valid only on a running issue, non-interactive task, prompt or " +
+			"self-improve run (a 409 with the reason otherwise — chat runs already park between turns, " +
+			"interactive tasks park after each turn, and judge/mr-rework/ci-fix runs finish on their own).\n\n" +
+			"The default finishes the milestone (or turn) in flight, pushes a checkpoint, then parks; the " +
+			"run stays `running` until then. `--now` drops the turn in flight and parks on the last " +
+			"checkpoint. `--cancel` withdraws a pending request. None is synchronous: the park lands on the " +
+			"worker's next report, so watch `uzi run get <id>`.\n\n" +
+			"Resume it later with `uzi run resume <id>`; the remaining budget is preserved (the clock stops " +
+			"while paused).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			now, _ := cmd.Flags().GetBool("now")
+			cancel, _ := cmd.Flags().GetBool("cancel")
+			if now && cancel {
+				return uzicli.Exitf(uzicli.ExitUsage, "--now and --cancel are mutually exclusive")
+			}
+			runID := args[0]
+			kind, body := kindPause, "milestone"
+			switch {
+			case cancel:
+				kind, body = kindPauseCancel, ""
+			case now:
+				body = "now"
+			}
+			res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, nil)
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(res)
+			}
+			if gf.quiet {
+				return nil
+			}
+			switch {
+			case cancel:
+				p.Printf("Pause withdrawn for %s.\n", runID)
+			case now:
+				p.Printf("Pause requested (now) for %s. The turn in flight is dropped and it parks on the last checkpoint; watch: uzi run get %s\n", runID, runID)
+			default:
+				p.Printf("Pause requested. The run finishes the current milestone, pushes a checkpoint, then parks. Status stays running until then.\n")
+				p.Printf("Withdraw: uzi run pause %s --cancel · park at once: --now\n", runID)
+			}
+			return nil
+		},
+	}
+	pause.Flags().Bool("now", false, "drop the turn in flight and park on the last checkpoint (default: finish the current milestone first)")
+	pause.Flags().Bool("cancel", false, "withdraw a pending pause request (the run keeps running)")
+	return pause
+}
+
 // newRunFollowUpCmd builds `uzi run follow-up`.
 func newRunFollowUpCmd(env Env, gf *globalFlags) *cobra.Command {
 	followUp := &cobra.Command{
