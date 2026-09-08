@@ -1,7 +1,7 @@
 # PRD #1183: One triage row for Judge, the run page and Findings
 
 **Issue:** [#1183](https://github.com/vtmocanu/uzi/issues/1183)
-**Status:** Ready for planning; no implementation yet.
+**Status:** Complete (2026-09-08) — Child A (M1+M2, PR #1211) and Child B (M3-M7) both shipped; archived to `prds/done/`.
 **Execution:** Queued for the nightly `Planned` sweep (auto-approve on, MR rework on) from the night after 2026-09-07 (the `uzi` label is applied after that night's sweep, see the issue comment). Web + api + CLI + docs, one additive migration, no workflow files. PRD #1184 (admin All-users scope) waits for this one. **Sweep collision with PRD #1167** (light themes, running the night of 2026-09-07): its M3 edits an overlay wash at `web/src/pages/runView/JudgePanel.tsx:1043` and `web/src/pages/judge/LabelFilter.tsx:89`; this PRD rewrites JudgePanel's per-recommendation block and turns LabelFilter into an inline row. Start this run from a `main` that already contains #1167's merge; if #1167's MR is still open when this run starts, keep the `bg-raised` wash it introduces on both files when rebasing, so whichever merges second resolves by hand once.
 **Mock:** `prds/mockups/1183-triage-row-mock.html` (open locally). Sections 1 to 3 are the accepted before/after for the Judge page, the run-page judge panel and the Findings page; the "Other things worth fixing" cards are in scope here too. The mock predates folding the Findings close-sync in, so its Findings tabs show three; this PRD ships Judge's five.
 
