@@ -3493,6 +3493,46 @@ export class RunRunner {
     });
     await batcher.flush().catch(() => undefined);
 
+    // Make the clone's work durable in the BARE tracking ref BEFORE the publish. checkpointPack
+    // (inside publishCheckpointBestEffort) packs refs/uzi-runner/<branch> in the bare, NOT the
+    // runner clone's refs/heads/<branch>; before this fix handlePausePark published WITHOUT first
+    // fetching the clone's newer committed work back into that ref (unlike the sibling limit-wait
+    // park), so a `now` pause — or a milestone-boundary pause after commits since the last
+    // fetch-back — packed a STALE tip while still recording the NEWER cloneTip below as
+    // lastPublishedTip: the work between the two was lost on a cross-worker resume AND the
+    // bookkeeping named a tip that was never published. Mirror the limit-wait park: capture any
+    // uncommitted edits into a throwaway wip(park): marker, then fetch the clone tip back. NO reap
+    // — the run may CONTINUE (Decision 8), so the agent tree must stay alive; the marker (runner-uid
+    // local commit) and the fetch-back (file://) are credential-free, safe with the agent alive, the
+    // same class as the mid-run reap:false checkpoint.
+    //
+    // The fetch-back is GATED on the clone carrying NEW work this cycle (its tip moved beyond the
+    // reseed base, including a marker just made). When the clone is still AT its base — a `now` pause
+    // before any commit, or a resume with no new work — it is DELIBERATELY skipped: an unconditional
+    // fetch-back would create a spurious base tracking ref, and the broker would then publish a
+    // base-only checkpoint (published:true) and PARK an empty pause, violating Decision 8. Skipping
+    // it leaves the ref exactly as the reseed did (absent on a fresh run → checkpointPack null →
+    // pause_failed; the recovered tracking tip on a resume → re-published as before), i.e. today's
+    // behaviour. This is NOT the rejected base-tip SHORTCUT (which would SKIP the publish and CLAIM
+    // durability, unsafe on the seededFrom:"tracking" leg): the publish below always runs; only the
+    // redundant fetch-back is skipped when there is nothing new to move.
+    let markerCreated = false;
+    if (barePath && branch && runnerClone) {
+      markerCreated = await this.git.commitWipMarker(runnerClone.path).catch(() => false);
+      const preTip = await this.git
+        .branchTip(runnerClone.path, branch)
+        .catch(() => null);
+      if (preTip !== null && preTip !== runnerClone.baseCommit) {
+        await this.fetchBackBestEffort(
+          barePath,
+          runnerClone.path,
+          branch,
+          flight.runId,
+          runLog,
+        );
+      }
+    }
+
     // Checkpoint FIRST (Decision 8). An already-durable tip (a prior mid-run publish
     // confirmed-landed the committed work) is a successful pause with NO fresh pack — checkpointPack
     // would return null for an unmoved tip, which must NOT read as a publish failure. Otherwise
@@ -3524,6 +3564,13 @@ export class RunRunner {
     }
 
     if (!published) {
+      // The run CONTINUES (Decision 8), so a wip(park): marker we just made must not stay committed
+      // at the clone HEAD: it would ride into the eventual MR and the restarted turn would build on a
+      // throwaway commit. Restore its content to the uncommitted tree, the same shape the resume
+      // adopt gives a marker. Best-effort; only when we actually created one this call.
+      if (markerCreated && runnerClone) {
+        await this.git.undoWipMarker(runnerClone.path).catch(() => undefined);
+      }
       // Decision 8: no durable checkpoint ⇒ no park. Report pause_failed (the server clears the
       // pending request and keeps the run running), tell the owner the run is still running, and
       // return false so the loop CONTINUES — a `now` pause restarts the aborted turn on the next

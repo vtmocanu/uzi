@@ -168,6 +168,47 @@ function emptyPauseFactory(homeRoot: string): {
   return { factory, parkResults };
 }
 
+/** An executor that commits a milestone, fetch-backs it (as the mid-run checkpoint does), then
+ *  commits a SECOND milestone WITHOUT fetching it back, and finally requests a pause. This is the
+ *  bug shape: at pause time the runner clone's tip (`expected.tip`, the second commit) is AHEAD of
+ *  the bare tracking ref the checkpoint publish reads (still the first commit). A correct pause
+ *  fetches the clone tip back BEFORE publishing, so the published checkpoint carries the SECOND
+ *  commit; the unfixed path published the STALE first commit while recording the second as
+ *  lastPublishedTip, silently losing the second commit's work on a cross-worker resume. */
+function stalePauseFactory(homeRoot: string): {
+  factory: ExecutorFactory;
+  parkResults: (boolean | undefined)[];
+  expected: { tip: string | undefined };
+} {
+  const parkResults: (boolean | undefined)[] = [];
+  const expected: { tip: string | undefined } = { tip: undefined };
+  const factory: ExecutorFactory = (runId) => ({
+    homeDir: path.join(homeRoot, runId),
+    executor: {
+      run: async (ctx: RunContext): Promise<ExecutorResult> => {
+        fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+        // Milestone 1: commit, then fetch-back to the tracking ref (the mid-run checkpoint's job).
+        commitInTree(ctx.worktreePath, "WORK.txt", "milestone 1\n");
+        await ctx.checkpoint?.({ reap: false });
+        // Milestone 2: commit MORE work but do NOT checkpoint — the tracking ref is now STALE
+        // relative to the clone tip, exactly as a `now` pause mid-milestone leaves it.
+        commitInTree(ctx.worktreePath, "WORK2.txt", "milestone 2 — committed, not yet fetched back\n");
+        expected.tip = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], {
+          env: GIT_ENV,
+          stdio: "pipe",
+        })
+          .toString()
+          .trim();
+        const at = { completedCount: 2, total: 3 };
+        const parked = await ctx.parkForPause?.(at);
+        parkResults.push(parked);
+        return parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+      },
+    },
+  });
+  return { factory, parkResults, expected };
+}
+
 const stateStatuses = (runId: string): string[] =>
   api.states.filter((s) => s.runId === runId).map((s) => s.body.status);
 
@@ -295,6 +336,36 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
         String(pf!.payload.text),
         /still running/i,
         "the pause_failed message tells the owner the run is still running",
+      );
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes the CURRENT clone tip on pause, fetching committed work back before the checkpoint (not a stale tip)", async () => {
+    const { gitlab, calls: mrCalls } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1190-stale-"));
+    const { calls, restore } = spyPublish();
+    try {
+      const { factory, parkResults, expected } = stalePauseFactory(homeRoot);
+      const claim = gitlabClaim(1106);
+      await runnerWithGit(factory, gitlab).execute(claim);
+
+      assert.ok(expected.tip, "the executor recorded the clone's second-commit tip");
+      assert.deepEqual(parkResults, [true], "the run parked (the committed work was made durable)");
+      const statuses = stateStatuses(claim.run_id);
+      assert.ok(statuses.includes("paused"), `a paused report was sent, got ${JSON.stringify(statuses)}`);
+      assert.ok(!statuses.includes("completed") && !statuses.includes("failed"), "a parked run must NOT finalize");
+      assert.equal(mrCalls.length, 0, "a parked run opens no merge request");
+      // The load-bearing assertion: the checkpoint published the SECOND commit (the current clone
+      // tip), not the stale first commit the bare tracking ref still held. On the unfixed path this
+      // is the first commit's SHA, so this equality fails.
+      assert.ok(calls.length >= 1, `a checkpoint was published, got ${calls.length} publish calls`);
+      assert.equal(
+        calls[calls.length - 1]!.tipOid,
+        expected.tip,
+        "the pause checkpoint published the current clone tip (committed work fetched back first), not a stale earlier tip",
       );
     } finally {
       restore();
