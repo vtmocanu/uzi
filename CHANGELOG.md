@@ -18,6 +18,15 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Appearance and Demo mode moved to their own Settings › Appearance tab ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
+  The theme / mode / typeface controls and the per-device Demo mode toggle now live on a dedicated **Appearance** tab, second after Account & tokens, instead of as cards buried inside the Account & tokens tab. The controls behave exactly as before — only their home changed — and Account & tokens no longer lists appearance in its description.
+- **The board search and toolbar are left-anchored on their own row ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
+  On a wide viewport the board's search and controls no longer fling to the far-right edge with a dead gap after the title: they render as their own full-width row beneath the board title, left-aligned at every width, so search stays top-left and a wide window matches the normal-width layout. Sticky positioning, the `/`-to-focus shortcut, and `Esc`-to-clear are unchanged.
+- **Boards open with empty columns hidden by default ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
+  The **Hide empty** toggle now defaults on, so a board you have never configured opens without its empty label lanes. The choice is still remembered per board, so a board you explicitly set to show empty columns keeps showing them.
+
 ## [0.80.0] - 2026-09-08
 
 ### Added

@@ -119,9 +119,9 @@ export function Board() {
   // component (the lazy init only ran for the first repo). See boardColumns.ts —
   // the actual hide decision is derived at render, never stored per column.
   const hideEmptyKey = `uzi.board.${repoId}.hideEmpty`;
-  const [hideEmpty, setHideEmpty] = useState(() => prefs.get(hideEmptyKey, false));
+  const [hideEmpty, setHideEmpty] = useState(() => prefs.get(hideEmptyKey, true));
   useEffect(() => {
-    setHideEmpty(prefs.get(`uzi.board.${repoId}.hideEmpty`, false));
+    setHideEmpty(prefs.get(`uzi.board.${repoId}.hideEmpty`, true));
   }, [repoId]);
   const toggleHideEmpty = () => {
     setHideEmpty((v) => {
@@ -1114,123 +1114,134 @@ export function Board() {
           </div>
         }
         description={boardDescription}
-        actions={
-          <>
-            {/* M3: board search. First in the toolbar so it is the primary action; the
-                label is sr-only (the placeholder carries the visible affordance) and the
-                ref lets `/` focus it (M5). Escape clears the query and blurs. */}
-            <label htmlFor={SEARCH_INPUT_ID} className="sr-only">
-              Search issues
-            </label>
-            <Input
-              id={SEARCH_INPUT_ID}
-              type="search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") {
-                  setQuery("");
-                  e.currentTarget.blur();
-                }
-              }}
-              placeholder="Search issues…"
-              className="w-44 py-1 text-xs"
-            />
-            {/* A real <label> around the repo's Select, so the control is named for a
-                screen reader without any custom markup. */}
-            <label className="flex select-none items-center gap-1.5 py-1.5 text-xs text-muted">
-              Sort
-              <Select
-                value={sortMode}
-                onChange={(e) => setSortMode(e.target.value as SortMode)}
-                className="py-1 text-xs"
-              >
-                {SORT_MODES.map((m) => (
-                  <option key={m.value} value={m.value}>
-                    {m.label}
-                  </option>
-                ))}
-              </Select>
-            </label>
-            {/* Direction toggle (Decision 6). DISABLED (not hidden) in manual mode so the
-                toolbar layout stays stable and the control remains discoverable; manual
-                ignores direction. Carries an accessible name and aria-pressed for the
-                reversed state, plus a visible arrow and text label. When disabled in
-                manual mode aria-pressed is omitted, so the inert control does not advertise
-                a stale pressed state to a screen reader. */}
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              className="py-1 text-xs"
-              disabled={sortMode === "manual"}
-              aria-pressed={sortMode === "manual" ? undefined : sortDir === "desc"}
-              aria-label={`Sort direction: ${sortDir === "asc" ? "ascending" : "descending"}`}
-              onClick={() => setSortDir(sortDir === "asc" ? "desc" : "asc")}
-            >
-              {sortDir === "asc" ? "↑ Ascending" : "↓ Descending"}
-            </Button>
-            {/* Per-lane density (PRD #304 M4), mirroring the Sort control's markup.
-                Changing it re-baselines every lane's shownCount (the effect on
-                [searchActive, perLane, repoId]). */}
-            <label className="flex select-none items-center gap-1.5 py-1.5 text-xs text-muted">
-              Per lane
-              <Select
-                value={String(perLane)}
-                onChange={(e) => setPerLane(Number(e.target.value))}
-                className="py-1 text-xs"
-              >
-                {PER_LANE_OPTIONS.map((n) => (
-                  <option key={n} value={n}>
-                    {n}
-                  </option>
-                ))}
-              </Select>
-            </label>
-            {/* The "Issues" popover (PRD #764): a simple `uzi`-only / all toggle. The
-                board renders only `uzi`-labelled (runnable) issues until "Show all other
-                issues" is ticked. The button names the CONFIGURED `uzi` label (uzi_label
-                is renameable) and borders in the brand tint when all issues are shown. */}
-            <IssuesFilter
-              open={issuesOpen}
-              onToggleOpen={() => setIssuesOpen((o) => !o)}
-              popRef={issuesPopRef}
-              triggerRef={issuesTriggerRef}
-              uziLabel={uziLabel}
-              showAll={showAll}
-              showAllCount={showAllCount}
-              onToggleShowAll={toggleShowAll}
-            />
-            <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
-              <input
-                type="checkbox"
-                checked={hideEmpty}
-                onChange={toggleHideEmpty}
-                className="h-3.5 w-3.5 rounded border-edge accent-brand"
-              />
-              Hide empty
-              {hiddenCount > 0 && <span className="text-muted">({hiddenCount} hidden)</span>}
-            </label>
-            <Button size="sm" onClick={() => setCreatingIssue((v) => !v)}>
-              {creatingIssue ? (
-                <>
-                  <XIcon /> Close
-                </>
-              ) : (
-                <>
-                  <PlusIcon /> Create issue
-                </>
-              )}
-            </Button>
-            <Button variant="secondary" size="sm" onClick={() => setEditingColumns((v) => !v)}>
-              {editingColumns ? "Close settings" : "Columns"}
-            </Button>
-            <Button variant="secondary" size="sm" disabled={syncing} onClick={refresh}>
-              {syncing ? "Refreshing…" : "Refresh"}
-            </Button>
-          </>
-        }
       />
+      {/* M2: the search + controls are their OWN full-width, left-anchored row(s)
+          directly beneath the header, NOT routed through PageHeader.actions. PageHeader
+          wraps its title-block and actions-block in a `justify-between` flex row, which
+          on a wide viewport flings the whole actions block (search included) to the
+          right edge and leaves a dead gap; rendering the toolbar here — a sibling of the
+          header block, inside the same sticky container — keeps it left-anchored at every
+          width. mt-3 separates it from the header. */}
+      <div className="mt-3 space-y-2">
+        {/* M3: board search on its OWN full-width row so it stays the primary action; the
+            label is sr-only (the placeholder carries the visible affordance) and the id
+            lets `/` focus it (the effect at ~line 465). Escape clears the query and blurs.
+            w-full (already Input's base) resolves the old w-full/w-44 conflict — the row
+            is full-width now, so no fixed width. */}
+        <label htmlFor={SEARCH_INPUT_ID} className="sr-only">
+          Search issues
+        </label>
+        <Input
+          id={SEARCH_INPUT_ID}
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              setQuery("");
+              e.currentTarget.blur();
+            }
+          }}
+          placeholder="Search issues…"
+          className="w-full py-1 text-xs"
+        />
+        {/* The remaining controls on a left-aligned wrapping row, verbatim and in the
+            same order as before. */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* A real <label> around the repo's Select, so the control is named for a
+              screen reader without any custom markup. */}
+          <label className="flex select-none items-center gap-1.5 py-1.5 text-xs text-muted">
+            Sort
+            <Select
+              value={sortMode}
+              onChange={(e) => setSortMode(e.target.value as SortMode)}
+              className="py-1 text-xs"
+            >
+              {SORT_MODES.map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label}
+                </option>
+              ))}
+            </Select>
+          </label>
+          {/* Direction toggle (Decision 6). DISABLED (not hidden) in manual mode so the
+              toolbar layout stays stable and the control remains discoverable; manual
+              ignores direction. Carries an accessible name and aria-pressed for the
+              reversed state, plus a visible arrow and text label. When disabled in
+              manual mode aria-pressed is omitted, so the inert control does not advertise
+              a stale pressed state to a screen reader. */}
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            className="py-1 text-xs"
+            disabled={sortMode === "manual"}
+            aria-pressed={sortMode === "manual" ? undefined : sortDir === "desc"}
+            aria-label={`Sort direction: ${sortDir === "asc" ? "ascending" : "descending"}`}
+            onClick={() => setSortDir(sortDir === "asc" ? "desc" : "asc")}
+          >
+            {sortDir === "asc" ? "↑ Ascending" : "↓ Descending"}
+          </Button>
+          {/* Per-lane density (PRD #304 M4), mirroring the Sort control's markup.
+              Changing it re-baselines every lane's shownCount (the effect on
+              [searchActive, perLane, repoId]). */}
+          <label className="flex select-none items-center gap-1.5 py-1.5 text-xs text-muted">
+            Per lane
+            <Select
+              value={String(perLane)}
+              onChange={(e) => setPerLane(Number(e.target.value))}
+              className="py-1 text-xs"
+            >
+              {PER_LANE_OPTIONS.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </Select>
+          </label>
+          {/* The "Issues" popover (PRD #764): a simple `uzi`-only / all toggle. The
+              board renders only `uzi`-labelled (runnable) issues until "Show all other
+              issues" is ticked. The button names the CONFIGURED `uzi` label (uzi_label
+              is renameable) and borders in the brand tint when all issues are shown. */}
+          <IssuesFilter
+            open={issuesOpen}
+            onToggleOpen={() => setIssuesOpen((o) => !o)}
+            popRef={issuesPopRef}
+            triggerRef={issuesTriggerRef}
+            uziLabel={uziLabel}
+            showAll={showAll}
+            showAllCount={showAllCount}
+            onToggleShowAll={toggleShowAll}
+          />
+          <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
+            <input
+              type="checkbox"
+              checked={hideEmpty}
+              onChange={toggleHideEmpty}
+              className="h-3.5 w-3.5 rounded border-edge accent-brand"
+            />
+            Hide empty
+            {hiddenCount > 0 && <span className="text-muted">({hiddenCount} hidden)</span>}
+          </label>
+          <Button size="sm" onClick={() => setCreatingIssue((v) => !v)}>
+            {creatingIssue ? (
+              <>
+                <XIcon /> Close
+              </>
+            ) : (
+              <>
+                <PlusIcon /> Create issue
+              </>
+            )}
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => setEditingColumns((v) => !v)}>
+            {editingColumns ? "Close settings" : "Columns"}
+          </Button>
+          <Button variant="secondary" size="sm" disabled={syncing} onClick={refresh}>
+            {syncing ? "Refreshing…" : "Refresh"}
+          </Button>
+        </div>
+      </div>
       {/* Board-level result count (PRD #304 M2): only while a search is active, so a
           user knows the board is filtered and by how much. Pinned with the toolbar.
           Purely VISUAL — deliberately NOT a live region: the count is announced through
