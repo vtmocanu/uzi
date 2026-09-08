@@ -206,6 +206,9 @@ export type JudgeBacklogRow = {
   review_id: string;
   run_id: string;
   verdict: string;
+  // judged_at is rv.updated_at (PRD #1183 M2) — projected by the query and carried onto
+  // every occurrence, so it is a required key here to stay byte-identical to the Go struct.
+  judged_at: string;
   run_title: string;
   rec_id: string;
   category: RecommendationCategory;
@@ -251,6 +254,9 @@ export function groupJudgeRecommendations(rows: JudgeBacklogRow[]): JudgeRecomme
       verdict: row.verdict as ReviewVerdict,
       confidence: row.confidence,
       bucket: b,
+      // judged_at is rv.updated_at — carried through unchanged (PRD #1183 M2). Always
+      // present, matching Go's non-omitempty `json:"judged_at"`.
+      judged_at: row.judged_at,
       // Provenance rides alongside the bucket, because both a hand-marked and an
       // auto-done are bucket "done" (PRD #98 Decision 6 / review B3). Omitted rather than
       // nulled when absent, matching Go's `json:"set_via,omitempty"` on a "" string.
@@ -340,6 +346,9 @@ function backlogRowsFromReviews(): JudgeBacklogRow[] {
         review_id: review.id,
         run_id: review.target_run_id,
         verdict: review.verdict,
+        // judged_at is rv.updated_at (PRD #1183 M2): the same field the rows are ordered
+        // by above, so the newest-open-occurrence pick works in mock mode too.
+        judged_at: review.updated_at,
         run_title: getRun(review.target_run_id)?.issue_title ?? "",
         rec_id: rec.id,
         category: rec.category,

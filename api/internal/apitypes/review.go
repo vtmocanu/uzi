@@ -153,6 +153,12 @@ type JudgeOccurrenceDTO struct {
 	Verdict    string `json:"verdict"`
 	Confidence string `json:"confidence"`
 	Bucket     string `json:"bucket"`
+	// JudgedAt is rv.updated_at, the review's last-judging time; it is the backlog sort key
+	// and lets the Judge page pick the newest open occurrence (and compute the stale-link
+	// warning the per-occurrence filer previously could not). NOT omitempty — it is always
+	// present, matching FiledIssueDTO.FiledAt, so a consumer never has to special-case its
+	// absence.
+	JudgedAt time.Time `json:"judged_at"`
 	// SetVia is the disposition's PROVENANCE (PRD #98 Decision 6): "" (omitted) means a
 	// PERSON set it, "issue_close" means the M6 poller sync did when the filed issue closed.
 	// A client MUST render the two differently — an auto-done reads "done via #IID" — because

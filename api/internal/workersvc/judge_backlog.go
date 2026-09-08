@@ -230,6 +230,12 @@ func GroupJudgeRecommendations(rows []store.ListJudgeRecommendationRowsForUserRo
 			Verdict:    r.Verdict,
 			Confidence: r.Confidence,
 			Bucket:     b,
+			// judged_at is rv.updated_at — the query's leading ORDER BY key, so a group's
+			// first occurrence carries the greatest JudgedAt. It is NOT NULL in run_reviews,
+			// but this repo's sqlc config types every timestamptz as pgtype.Timestamptz, so
+			// the value is read off .Time (never .Valid-gated: the base-table column cannot
+			// be NULL, unlike the LEFT-JOINed FiledAt in filedIssueRef).
+			JudgedAt: r.JudgedAt.Time,
 			// Passed through, never interpreted here: this layer has no opinion on whether a
 			// done was hand-set or synced, it only refuses to drop the distinction. A NULL
 			// set_via (a hand-set or absent disposition) yields "" and the DTO omits it.

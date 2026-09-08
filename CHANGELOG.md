@@ -18,8 +18,15 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **The Judge page's group expander now shows the newest occurrence's full rationale, and gains a select-all checkbox ([#1183](https://github.com/vtmocanu/uzi/issues/1183)).**
+  Expanding a group fetches and renders the newest open occurrence's complete rationale above its occurrence list, in place of the clamped preview shown before you expand; a "Select all N shown" checkbox above the group list ticks every group currently on screen, for a bulk Mark done or Dismiss in one pass.
+
 ### Changed
 
+- **Judge and the run page's judge panel now share one triage row and one vocabulary ([#1183](https://github.com/vtmocanu/uzi/issues/1183)).**
+  Every open recommendation, on `/judge` and on the run page, now shows File issue · Mark done · Dismiss ▾ at equal weight in one row, replacing the run page's lone File issue button on its own line and `/judge`'s per-run File issue buried inside the occurrence expander; the open state reads "To triage" everywhere it appears, the tab, the chip, the strip, and the status line, and a filed recommendation reads "Filed #N" in the same slot. On `/judge`, File issue no longer needs the expander open, it drafts straight from the group's newest open occurrence, the most recently judged run still open, tracked by a new `judged_at` field on the judge backlog occurrence API, while the group's other open runs stay open until you mark the whole group done.
 - **Appearance and Demo mode moved to their own Settings › Appearance tab ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
   The theme / mode / typeface controls and the per-device Demo mode toggle now live on a dedicated **Appearance** tab, second after Account & tokens, instead of as cards buried inside the Account & tokens tab. The controls behave exactly as before — only their home changed — and Account & tokens no longer lists appearance in its description.
 - **The board search and toolbar are left-anchored on their own row ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**

@@ -29,6 +29,11 @@ vi.mock("../lib/api", () => ({
     bulkSetJudgeDisposition: vi.fn(),
     deleteDisposition: vi.fn(),
     listRepos: vi.fn().mockResolvedValue({ repos: [] }),
+    // Judge.tsx passes api.getRunReview to every GroupRow as the expander's rationale fetch
+    // (PRD #1183 M2). These tests render but never expand, so a bare stub is enough — but this
+    // module mock has no importOriginal, so the property must exist or the prop read is
+    // undefined at render.
+    getRunReview: vi.fn(),
     // PRD #270 chip-count matrix — the Judge page fetches this and re-fetches on mutations. It
     // must NOT be able to move the nav badge (a separate endpoint whose matrix has no `todo`
     // scalar), which the isolation test below asserts. Defaulted here so the page renders;
@@ -332,7 +337,12 @@ describe("nav badge vs To-triage tab vs the judge notification (PRD #98 M5)", ()
   }
 
   function notificationTodoText() {
-    return screen.getByText(/to triage/).textContent ?? "";
+    // ANCHORED on the leading digit. The run-page sibling's PRD #1183 vocabulary change makes
+    // the TriageSummary strip legend read "to triage" too (its own span, with the count in a
+    // separate <b>), so a bare /to triage/ now matches both the strip legend and this header.
+    // The notification header renders the count and the words in ONE span ("3 to triage"), so
+    // `\d+ to triage` addresses only it — the strip's label span carries no digit.
+    return screen.getByText(/\d+ to triage/).textContent ?? "";
   }
 
   it("all three agree on first load", async () => {

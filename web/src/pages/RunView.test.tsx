@@ -1925,8 +1925,8 @@ describe("JudgePanel (PRD #46 M4)", () => {
         },
       ],
       filed_issues: [],
-      // PRD #94: default to an untriaged review (every rec reads "To do"). The triage
-      // bar reads these server counts directly — the panel never re-derives them.
+      // PRD #94/#1183: default to an untriaged review (every rec reads "To triage"). The
+      // triage bar reads these server counts directly — the panel never re-derives them.
       dispositions: [],
       triage: {
         total: 1,
@@ -2877,8 +2877,26 @@ describe("JudgePanel (PRD #46 M4)", () => {
     ).toBe("INPUT");
   });
 
-  it("files the issue and shows the created link (state C)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+  it("files the issue, then the refetch flips the row to the Filed #N chip (state C)", async () => {
+    // The card no longer keeps a local just-filed state: onCreate posts the file-issue call
+    // then REFETCHES, so the filed link arrives on the next getRunReview and the shared
+    // "Filed #N ↗" chip replaces the "Issue created." box the old flow rendered.
+    mockApi.getRunReview
+      .mockResolvedValueOnce({ review: review(), pending_judge: null })
+      .mockResolvedValue({
+        pending_judge: null,
+        review: review({
+          filed_issues: [
+            {
+              category: "install_worker_tool",
+              target: "shellcheck",
+              issue_iid: 71,
+              issue_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+              filed_at: "2026-01-02T00:00:00Z", // newer than updated_at → not stale
+            },
+          ],
+        }),
+      });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -2899,10 +2917,57 @@ describe("JudgePanel (PRD #46 M4)", () => {
       title: "Improve the reviewer: reviewer",
       description: draftFixture().description,
     });
-    const link = await screen.findByRole("link", { name: /#71/ });
+    const link = await screen.findByRole("link", { name: /Filed #71/ });
     expect(link.getAttribute("href")).toBe(
       "https://gitlab.example/vtmocanu/uzi/-/issues/71",
     );
+    // "Issue created." is gone — the filed state is the chip now.
+    expect(screen.queryByText("Issue created.")).toBeNull();
+    // And File issue hides once filed.
+    expect(screen.queryByText("File issue")).toBeNull();
+  });
+
+  it("keeps the created issue + its warning up when the refetch does not settle the link (created-with-warning)", async () => {
+    // fileIssue's `warning` is a created-with-warning SUCCESS: the forge issue WAS created, only
+    // its local link/cache could not settle, so it is set EXACTLY when the review refetch will
+    // NOT carry the filed link. Every getRunReview here returns the UNFILED review (the link
+    // never settles). Without the local just-filed override the row would fall back to "To
+    // triage" and re-arm File issue over a live forge issue (a silent duplicate); the override
+    // keeps "Filed #N" + the warning on screen and withholds File issue.
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+    mockApi.listRepos.mockResolvedValue({
+      repos: [repoOpt("repo1", "vtmocanu/uzi")],
+    });
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    mockApi.fileIssue.mockResolvedValue({
+      issue: {
+        iid: 71,
+        web_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+        title: "t",
+      },
+      warning: "Issue created, but its local link could not be saved.",
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("File issue"));
+    fireEvent.click(await screen.findByText("Create issue"));
+    expect(mockApi.fileIssue).toHaveBeenCalledWith("r1", "rc1", {
+      repo_id: "repo1",
+      title: "Improve the reviewer: reviewer",
+      description: draftFixture().description,
+    });
+
+    // (a) the "Filed #N ↗" chip/link renders from the local override, not the refetch.
+    const link = await screen.findByRole("link", { name: /Filed #71/ });
+    expect(link.getAttribute("href")).toBe(
+      "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+    );
+    // (b) the created-with-warning line renders under the chip.
+    expect(
+      screen.getByText("Issue created, but its local link could not be saved."),
+    ).toBeTruthy();
+    // (c) File issue does NOT reappear — no duplicate invitation over a live issue.
+    expect(screen.queryByText("File issue")).toBeNull();
   });
 
   it("disables Create until a repo is picked when no default resolves (state D)", async () => {
@@ -3007,7 +3072,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     };
   }
 
-  it("renders a status chip per row by the disposition→filed→to-do ladder", async () => {
+  it("renders a status chip per row by the disposition→filed→to-triage ladder", async () => {
     mockApi.getRunReview.mockResolvedValue({
       pending_judge: null,
       review: review({
@@ -3069,8 +3134,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(await screen.findByText("Done")).toBeTruthy(); // done > filed
     expect(screen.getByText("Dismissed · Won't do")).toBeTruthy();
     expect(screen.getByText("Dismissed · Not an issue")).toBeTruthy();
-    expect(screen.getByText("To do")).toBeTruthy(); // no disposition, not filed
-    expect(screen.getByText("Filed")).toBeTruthy(); // settled link, no disposition
+    expect(screen.getByText("To triage")).toBeTruthy(); // no disposition, not filed
+    // A settled link with no disposition is the shared "Filed #N ↗" chip (a link when https).
+    expect(screen.getByRole("link", { name: /Filed #72/ })).toBeTruthy();
   });
 
   it("Mark done sets a done disposition (no reason) and refetches the review", async () => {
@@ -3333,6 +3399,51 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
     fireEvent.click(await screen.findByText("Mark done"));
     expect(await screen.findByText("Marked done")).toBeTruthy();
+  });
+
+  // PRD #1183 live-region fix (carried-forward review finding): in owned mode the row swaps
+  // TriageActions→TriageDisposedRow on a mutation. If the announce region lived INSIDE
+  // TriageActions it would unmount with the row exactly as the message is set, dropping the
+  // screen-reader announcement. The panel hosts a PERSISTENT region a level up; this guards
+  // that the "Marked done" message is still in a polite sr-only region AFTER the swap.
+  it("keeps the owned-mode disposition announcement in a live region that SURVIVES the row swap (#1183)", async () => {
+    mockApi.getRunReview
+      .mockResolvedValueOnce({ review: review(), pending_judge: null })
+      .mockResolvedValue({
+        pending_judge: null,
+        review: review({
+          dispositions: [
+            {
+              category: "install_worker_tool",
+              target: "shellcheck",
+              status: "done",
+              reason: "",
+              set_at: "2026-01-01T00:00:00Z",
+              stale: false,
+            },
+          ],
+          triage: {
+            total: 1,
+            todo: 0,
+            filed: 0,
+            done: 1,
+            dismissed: 0,
+            false_positives: 0,
+          },
+        }),
+      });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Mark done"));
+    // The row has swapped to the disposed state — the action row (and its would-be region) is
+    // gone, exactly where the m1 bug dropped the message.
+    await screen.findByText("Undo");
+    expect(screen.queryByText("Mark done")).toBeNull();
+    // …yet the announcement persists, in a polite sr-only status region.
+    const region = await screen.findByText("Marked done");
+    expect(region.getAttribute("role")).toBe("status");
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.className).toContain("sr-only");
   });
 });
 

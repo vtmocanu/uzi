@@ -375,6 +375,7 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   correctness, verification depth, or code quality. [user 2026-08-15]
 - `cost_efficiency` is triage-only: it does NOT feed the self-improvement job.
   [user 2026-08-15]
+- **Judge and Findings share one triage row and one vocabulary** (File issue · Mark done · Dismiss ▾ at equal weight; the open state is "To triage" everywhere; filed is "Filed #N"); Findings shows each coordinate's evidence and the runs it was seen in, counted tabs, multi-select with undo, and a filed finding becomes Done when its issue closes on the forge. [user 2026-09-07]
 
 ## Feature #45 — OIDC SSO login (Keycloak / Pocket ID)
 

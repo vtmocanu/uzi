@@ -38,6 +38,15 @@ SELECT
     rv.id                          AS review_id,
     rv.target_run_id               AS run_id,
     rv.verdict                     AS verdict,
+    -- judged_at is rv.updated_at, the review's last-judging time. It is ALREADY the
+    -- leading ORDER BY key below (a re-judge bumps it, so the first row of a group is its
+    -- most-recently-judged occurrence), but was never projected — so the client could not
+    -- pick the newest open occurrence or compute the stale-link warning. run_reviews.updated_at
+    -- is NOT NULL, but this repo's pgx/v5 sqlc config types EVERY timestamptz as
+    -- pgtype.Timestamptz (see RunReview.UpdatedAt in models.go), so the generated row field is
+    -- pgtype.Timestamptz and the grouper reads it off .Time — no .Valid gate is needed because
+    -- the base-table column cannot be NULL (unlike the LEFT-JOINed filed_at above).
+    rv.updated_at                  AS judged_at,
     r.issue_title                  AS run_title,
     rr.id                          AS rec_id,
     rr.category                    AS category,
