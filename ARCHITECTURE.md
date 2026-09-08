@@ -581,6 +581,7 @@ queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiti
                                                                                                                    → failed
    ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
    ↳ (Anthropic usage limit, opt-in) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
+   ↳ (owner pause) → paused → queued, resume on demand (no limit on count) → running
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
 
@@ -627,6 +628,25 @@ chain in the diagram above, with no intervening `running`.
   [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection property. See
   [adr/0759-protect-run-work-usage-limit-park.md](adr/0759-protect-run-work-usage-limit-park.md).
 
+- **running → paused** ([PRD #1190](prds/1190-run-pause-resume.md)) — the
+  owner-requested twin of `limit_wait`: `pause` (default: after the milestone
+  or turn in flight; `--now`: drop it) is a **flag** on the still-running run,
+  and the worker parks only after it publishes a checkpoint — a failed
+  publish clears the request and leaves the run running rather than parking
+  on an unrecoverable worker disk. `resume` moves `paused` back to `queued`
+  keeping the worker pin, exactly like the limit park's promotion, but its
+  budget accounting is the **gate-park** rule, not the limit park's: the
+  parked wall-clock is banked into `budget_paused_seconds` and `started_at`
+  is kept, so the clock stops rather than resetting and the remaining budget
+  is preserved. A pending request made before an involuntary park
+  (`limit_wait`/`pool_wait`/`awaiting_input`) survives it and re-arms at the
+  first boundary after the run resumes, since none of those parks clears the
+  pause columns. See [docs/run-pause.md](docs/run-pause.md) and
+  [adr/1190-run-pause-invariants.md](adr/1190-run-pause-invariants.md) for
+  the negative-space rules — the run-status lists `paused` must never enter,
+  and the guards that must not be relaxed — that a future edit could break
+  silently.
+
 - **Affinity holds through a worker roll** ([PRD #1030](prds/done/1030-worker-resume-durability.md)).
   The fix distinguishes a **roll** (sets `draining_since`, keeps the worker row)
   from a **teardown** (deletes the row API-side), so `teardown ⟺ row absent` and
@@ -637,6 +657,9 @@ chain in the diagram above, with no intervening `running`.
   publish outcomes now surface on the run feed, and every terminal transition
   deletes the run's `refs/uzi-checkpoints/<branch>`. See
   [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
+  This same affinity leg is what lets a **paused** run's `resume` fall open
+  to a different worker once the pinned one is stale or gone; see
+  [ADR-1190](adr/1190-run-pause-invariants.md).
 
 - **The checkpoint net survives a branch behind `main` on `.github/workflows`**
   ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), completing

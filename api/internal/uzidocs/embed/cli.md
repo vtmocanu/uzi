@@ -94,6 +94,9 @@ uzi run revise <id> [--message <text>]
 uzi run cancel <id>
 uzi run stop <id> [--message <text>]
 uzi run scope <id> --through <n>
+uzi run pause <id> [--now|--cancel]
+uzi run resume <id>
+uzi run resume-now <id>
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
@@ -222,6 +225,28 @@ A few worth knowing:
   below, not in `scope`'s own output, since a read-back there would race
   the worker settling it. Owner-only; valid only on a milestone-structured
   issue run (409 otherwise).
+- **`run pause <id> [--now|--cancel]`** (PRD #1190) parks a running run on a
+  pushed checkpoint until you resume it — see [Pausing and resuming a
+  run](./run-pause.md) for the full picture. The default finishes the
+  milestone (or turn) already in flight, pushes a checkpoint, then parks;
+  `--now` drops the turn in flight and parks on the last checkpoint instead,
+  discarding whatever changed since; `--cancel` withdraws a pending request
+  and leaves the run running. `--now` and `--cancel` are mutually exclusive.
+  None of the three is synchronous — the park lands on the worker's next
+  report, so watch `uzi run get <id>`. Owner-only, and valid only on a
+  running issue, non-interactive task, prompt or self-improve run: a chat
+  run already parks between turns, an interactive task parks after every
+  turn, judge/mr-rework/ci-fix runs finish on their own, and a run already
+  at a gate or an involuntary park is refused too — all as a 409 (exit 5)
+  naming the reason.
+- **`run resume <id>`** resumes a run the owner paused: it moves the run
+  from `paused` back to `queued`, keeps the worker pin, and preserves the
+  remaining budget (the clock stopped while paused, so resuming does not
+  reset it). The claim then continues the same SDK session if that worker
+  is still alive, or recovers the branch from the checkpoint and re-plans
+  the remaining milestones if it's gone. A run that isn't paused is a 409
+  (exit 5). It posts to the same endpoint as `run resume-now` below, which
+  now also resumes a paused run in addition to a pool-held one.
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open

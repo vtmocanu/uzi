@@ -608,6 +608,12 @@ ADR at `adr/0035-run-limit-retry.md`.
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
 - When a run parked on a usage limit resumes, the owner gets a Slack message in the run's thread. [user 2026-09-05, PRD #1116]
 
+## Feature #1190 — Pause and resume a run on demand
+
+Tracked as GitHub issue vtmocanu/uzi#1190; PRD at `prds/1190-run-pause-resume.md`.
+
+- A run's owner can pause it (after the current milestone, or at once) and resume it later; the run parks on a pushed checkpoint, spends nothing while paused, and its budget clock stops. [user, #1190]
+
 ## Feature #218 — A park or shutdown must not lose the agent's committed work
 
 Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work-loss.md`.

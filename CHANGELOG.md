@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Pause a running run and resume it later, right where it left off ([#1190](https://github.com/vtmocanu/uzi/issues/1190)).**
+  A run's owner can now park a running issue, task, prompt or self-improve run on demand — after the milestone in flight (the default) or immediately with `--now`, which drops the turn in flight and discards work since the last checkpoint — and resume it later with the remaining budget untouched, since the clock stops rather than resetting while it waits. The worker publishes a checkpoint before parking, so if that publish fails the run stays running and the owner is told in its activity feed instead of losing the park silently; resuming continues the same session on the original worker or recovers the branch and re-plans only the unfinished milestones on another. Reachable from the run page (a `‖ Pause ▾` menu, a pending-pause chip, a Resume button), the CLI (`uzi run pause <id> [--now|--cancel]`, `uzi run resume <id>`), and the TUI (a `‖ paused` word and detail line, read-only).
+
 ### Changed
 
 - **The `slow` run-health flag is now a budget-relative "near timeout" warning instead of a bare wall-clock timer ([#1170](https://github.com/vtmocanu/uzi/issues/1170)).**
