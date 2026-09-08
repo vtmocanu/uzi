@@ -1307,6 +1307,38 @@ WHERE id = @id AND worker_id = @worker_id
 UPDATE runs SET required_capabilities = '{}', updated_at = now()
 WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval';
 
+-- name: SetRunAutopilotPlan :execrows
+-- RC1 (issue #1197): durably persist an AUTOPILOT run's approved plan_md on its
+-- self-contained `running` report (the autopilot gate never enters awaiting_approval,
+-- so SetRunAwaitingApproval — the other plan_md writer — never runs for it). A guarded,
+-- idempotent write whose affected-row count PROVES the intended plan is stored: rows>0
+-- ⟺ @plan_md is now the durable plan; rows=0 ⟺ refusal (no mutation).
+--
+-- The four positive guards, all load-bearing (GetRunOwnedByWorker filters only
+-- id+worker_id and runOwnedByWorker adds no state check, so this query is the ONLY
+-- protection):
+--   * status IN ('claimed','running') — the legitimate running-report source only;
+--     refuses a terminal (completed/failed/cancelled) or parked (limit_wait/pool_wait/
+--     recovery_wait/awaiting_*) row atomically, e.g. a concurrent cancel/park that won
+--     the race. No plan_md/plan_source/updated_at mutation on a refused row.
+--   * auto_approve = true — true ⟹ no human ever gated this run (auto_approve is monotone
+--     true→false, cleared only at the human plan gate in SetRunAwaitingApproval). A
+--     human-approved / force-gated run carries auto_approve=false and is refused.
+--   * plan_source = 'agent' — positive provenance allowlist: never overwrite a
+--     user-authored seeded ('seeded') plan.
+--   * plan_md IS NULL OR plan_md = @plan_md — write-once, but a re-send of the SAME body
+--     matches idempotently (a retry succeeds; a DIFFERENT body on an already-set row is
+--     refused).
+UPDATE runs SET
+    plan_md     = @plan_md,
+    plan_source = 'agent',
+    updated_at  = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status IN ('claimed', 'running')
+  AND auto_approve = true
+  AND plan_source = 'agent'
+  AND (plan_md IS NULL OR plan_md = @plan_md);
+
 -- name: SetRunIntentSummary :execrows
 -- PRD #362 M1: persist a run's plain-English INTENT summary ("what this run will
 -- implement"), posted by the worker after the clone is provisioned and before it

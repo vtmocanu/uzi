@@ -205,7 +205,16 @@ type fakeStore struct {
 	clearMilestonesParams *store.ClearRunMilestonesCompletedParams
 	clearBeforeRunning    bool
 	clearMilestonesRows   int64
-	setAwaiting           *store.SetRunAwaitingApprovalParams
+	// RC1 (issue #1197): captures the SetRunAutopilotPlan arg (nil until the guarded
+	// autopilot plan write is reached, so a test can prove it was NOT called on an absent
+	// or blank plan_md) and records whether it ran BEFORE SetRunRunning (setRunningParams
+	// still nil at write time — the running arm persists the plan first so the ack proves
+	// storage). setAutopilotPlanRows/Err are what the fake returns (rows==0 ⟺ refusal).
+	setAutopilotPlanParams *store.SetRunAutopilotPlanParams
+	setAutopilotPlanBefore bool
+	setAutopilotPlanRows   int64
+	setAutopilotPlanErr    error
+	setAwaiting            *store.SetRunAwaitingApprovalParams
 	// PRD #517 M2: captures the SetRunAwaitingFollowup arg (nil until the park query
 	// is reached) so a test can assert the accept path was taken and prove the
 	// interactive/task guard rejects BEFORE the query on a mismatched run.
@@ -835,6 +844,16 @@ func (f *fakeStore) CountRunInitFramesBefore(_ context.Context, arg store.CountR
 func (f *fakeStore) SetRunRunning(_ context.Context, arg store.SetRunRunningParams) (int64, error) {
 	f.setRunningParams = &arg
 	return f.setRunningRows, nil
+}
+
+// SetRunAutopilotPlan (RC1, issue #1197) records the guarded plan write and, critically,
+// that it ran BEFORE SetRunRunning in the running arm (setRunningParams is still nil at
+// write time). Returns the configurable (rows, err): rows==0 models a refusal (guard
+// mismatch — a concurrent cancel/park, a human-gated/seeded row, or a different body).
+func (f *fakeStore) SetRunAutopilotPlan(_ context.Context, arg store.SetRunAutopilotPlanParams) (int64, error) {
+	f.setAutopilotPlanParams = &arg
+	f.setAutopilotPlanBefore = f.setRunningParams == nil
+	return f.setAutopilotPlanRows, f.setAutopilotPlanErr
 }
 
 // PRD #628 M4: records the clear and, critically, that it ran BEFORE SetRunRunning in the
@@ -2910,6 +2929,129 @@ func TestSetStateClearsMilestonesOnSeededFromDefault(t *testing.T) {
 		}
 		if fs.clearMilestonesParams != nil {
 			t.Fatal("ClearRunMilestonesCompleted must NOT be called when seeded_from_default=false")
+		}
+	})
+}
+
+// TestSetStatePersistsAutopilotPlanOnRunning pins RC1 (issue #1197): a `running` report
+// that CARRIES plan_md (the autopilot gate's self-contained approved-plan report) persists
+// it via the guarded SetRunAutopilotPlan BEFORE SetRunRunning acknowledges the report, so a
+// successful running ack proves the plan is durably stored. The four sub-cases exercise the
+// full contract: a present valid body writes and the report applies; a refusal (0 rows) or
+// a blank body fails the report so the worker does not proceed; and an absent plan_md is an
+// ordinary heartbeat, untouched.
+func TestSetStatePersistsAutopilotPlanOnRunning(t *testing.T) {
+	t.Run("present valid plan_md is stored before SetRunRunning, report applies", func(t *testing.T) {
+		w := worker()
+		fs := &fakeStore{
+			runOwned:             store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
+			setRunningRows:       1,
+			setAutopilotPlanRows: 1, // the guarded write matched (plan durably stored)
+		}
+		svc := New(fs, newBox(t), testParams())
+		plan := "## Plan\n1. do the thing\n2. verify it"
+		_, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+			State: "running", IterationCount: 1, PlanMd: &plan,
+		})
+		if err != nil {
+			t.Fatalf("SetState: %v", err)
+		}
+		if !applied {
+			t.Fatal("a running report on a live run with a stored plan must apply (handler answers 200)")
+		}
+		if fs.setAutopilotPlanParams == nil {
+			t.Fatal("SetRunAutopilotPlan was never called — the plan was not persisted")
+		}
+		if !fs.setAutopilotPlanParams.PlanMd.Valid || fs.setAutopilotPlanParams.PlanMd.String != plan {
+			t.Fatalf("SetRunAutopilotPlan got plan_md %+v, want the exact body %q", fs.setAutopilotPlanParams.PlanMd, plan)
+		}
+		if fs.setAutopilotPlanParams.ID != fs.runOwned.ID {
+			t.Fatalf("plan write ran against the wrong run: got %v, want %v", fs.setAutopilotPlanParams.ID, fs.runOwned.ID)
+		}
+		if fs.setAutopilotPlanParams.WorkerID != pgconv.UUID(w.ID) {
+			t.Fatalf("plan write ran with the wrong worker id: got %+v, want %+v", fs.setAutopilotPlanParams.WorkerID, pgconv.UUID(w.ID))
+		}
+		if !fs.setAutopilotPlanBefore {
+			t.Fatal("the plan write MUST run BEFORE SetRunRunning so the running ack proves storage")
+		}
+		if fs.setRunningParams == nil {
+			t.Fatal("SetRunRunning must still run after the plan is stored")
+		}
+	})
+
+	t.Run("refusal (0 rows) fails the report and does NOT run SetRunRunning", func(t *testing.T) {
+		w := worker()
+		fs := &fakeStore{
+			runOwned:             store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
+			setRunningRows:       1,
+			setAutopilotPlanRows: 0, // guarded write matched no row (concurrent cancel/park, seeded, etc.)
+		}
+		svc := New(fs, newBox(t), testParams())
+		plan := "## Plan\nimplement"
+		_, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+			State: "running", IterationCount: 1, PlanMd: &plan,
+		})
+		if !errors.Is(err, ErrInvalidState) {
+			t.Fatalf("err = %v, want ErrInvalidState — a refused plan write must fail the report", err)
+		}
+		if applied {
+			t.Fatal("a refused plan write must NOT report the transition as applied")
+		}
+		if fs.setAutopilotPlanParams == nil {
+			t.Fatal("SetRunAutopilotPlan must have been attempted")
+		}
+		if fs.setRunningParams != nil {
+			t.Fatal("SetRunRunning must NOT run once the plan write is refused — the worker must not proceed")
+		}
+	})
+
+	t.Run("blank/whitespace plan_md is rejected and SetRunAutopilotPlan is NOT called", func(t *testing.T) {
+		w := worker()
+		fs := &fakeStore{
+			runOwned:             store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
+			setRunningRows:       1,
+			setAutopilotPlanRows: 1,
+		}
+		svc := New(fs, newBox(t), testParams())
+		blank := "   \n\t  "
+		_, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+			State: "running", IterationCount: 1, PlanMd: &blank,
+		})
+		if !errors.Is(err, ErrInvalidState) {
+			t.Fatalf("err = %v, want ErrInvalidState — a present-but-blank plan_md must be rejected, not silently dropped", err)
+		}
+		if applied {
+			t.Fatal("a blank plan_md must NOT report the transition as applied")
+		}
+		if fs.setAutopilotPlanParams != nil {
+			t.Fatal("SetRunAutopilotPlan must NOT be called for a blank body — the rejection happens before the query")
+		}
+		if fs.setRunningParams != nil {
+			t.Fatal("SetRunRunning must NOT run once the report is rejected")
+		}
+	})
+
+	t.Run("absent plan_md is an ordinary heartbeat: no plan write, SetRunRunning applies", func(t *testing.T) {
+		w := worker()
+		fs := &fakeStore{
+			runOwned:       store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Status: "running"},
+			setRunningRows: 1,
+		}
+		svc := New(fs, newBox(t), testParams())
+		_, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+			State: "running", IterationCount: 2,
+		})
+		if err != nil {
+			t.Fatalf("SetState: %v", err)
+		}
+		if !applied {
+			t.Fatal("an ordinary heartbeat must apply exactly as before")
+		}
+		if fs.setAutopilotPlanParams != nil {
+			t.Fatal("SetRunAutopilotPlan must NOT be called when plan_md is absent (nil)")
+		}
+		if fs.setRunningParams == nil {
+			t.Fatal("SetRunRunning must run for an ordinary heartbeat")
 		}
 	})
 }

@@ -33,9 +33,11 @@ func siOpenMRHarness(t *testing.T) (*Service, *fakeStore, *fakeForge, store.Run,
 	return svc, fs, f, run, rc
 }
 
-// siRow builds a candidate self_improve run row with an mr_iid and an issue_description
-// (plan_md left NULL, the autopilot self_improve shape — issue_description is the
-// effective proposed-text source).
+// siRow builds a candidate self_improve run row with an mr_iid and an issue_description,
+// plan_md left NULL — so issue_description is the effective proposed-text source here.
+// (Since RC1, issue #1197, an autopilot run's approved plan IS persisted to plan_md, so
+// autopilot rows may carry one; the prefer-plan_md-else-issue_description order picks it
+// up. This fixture pins the plan_md-NULL branch specifically.)
 func siRow(id uuid.UUID, mrIID int64, issueDescription string) store.RecentSelfImproveMRRunsForRepoRow {
 	return store.RecentSelfImproveMRRunsForRepoRow{
 		ID:               id,
@@ -63,8 +65,10 @@ func TestSelfImproveOpenMRsNilForges(t *testing.T) {
 }
 
 // TestSelfImproveOpenMRsOpenCandidateRendered pins the core case: a candidate whose MR the
-// forge reports OPEN contributes the FIRST non-empty line of its issue_description (plan_md
-// NULL) to the returned slice, and the query is scoped to the run's repo.
+// forge reports OPEN contributes the FIRST non-empty line of its issue_description to the
+// returned slice (plan_md NULL here, the fall-through source; since RC1/#1197 a plan_md,
+// when present, wins — see the prefer order in selfImproveOpenMRs), and the query is scoped
+// to the run's repo.
 func TestSelfImproveOpenMRsOpenCandidateRendered(t *testing.T) {
 	svc, fs, f, run, rc := siOpenMRHarness(t)
 	fs.recentSIMRRuns = []store.RecentSelfImproveMRRunsForRepoRow{

@@ -587,9 +587,11 @@ func formatInflightLine(r store.Run) string {
 //
 // Open-state is resolved LIVE from the forge per candidate (D12): runs.mr_state is
 // unreliable for this multi-MR-per-tracking-issue lane. The proposed text comes from the
-// RUN ROW (plan_md if present, else issue_description — plan_md is NULL for autopilot
-// self_improve runs today, so issue_description is the effective source), never from the
-// MR title/body: GetMergeRequest is used ONLY for the open-state check.
+// RUN ROW (plan_md if present, else issue_description) — never from the MR title/body:
+// GetMergeRequest is used ONLY for the open-state check. Since RC1 (issue #1197) an
+// autopilot run's approved plan IS persisted to plan_md (via SetRunAutopilotPlan on the
+// running report), so autopilot self_improve rows can now carry a plan_md; the
+// prefer-plan_md-else-issue_description order is unchanged and handles both.
 func (s *Service) selfImproveOpenMRs(ctx context.Context, run store.Run, rc store.GetRunClaimContextRow) []string {
 	if s.forges == nil {
 		return nil

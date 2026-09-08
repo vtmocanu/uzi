@@ -446,6 +446,16 @@ type Store interface {
 	ReopenDispositionOnHashMismatch(ctx context.Context, arg store.ReopenDispositionOnHashMismatchParams) (int64, error)
 	UpdateDispositionLastTitle(ctx context.Context, arg store.UpdateDispositionLastTitleParams) (int64, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
+	// SetRunAutopilotPlan durably persists an AUTOPILOT run's approved plan_md on its
+	// self-contained `running` report (RC1, issue #1197). The autopilot gate never enters
+	// awaiting_approval, so SetRunAwaitingApproval — the other plan_md writer — never runs
+	// for it, and a resume would otherwise re-plan on a NULL plan_md. Guarded + idempotent:
+	// the affected-row count PROVES storage — rows>0 ⟺ @plan_md is durably stored (fresh or
+	// an identical body matched idempotently); rows==0 ⟺ refusal (terminal/parked row,
+	// human-gated auto_approve=false, seeded plan_source, a different body already stored,
+	// or not-owned) with no mutation. Runs BEFORE SetRunRunning in the running arm so a
+	// successful running ack proves the plan was stored.
+	SetRunAutopilotPlan(ctx context.Context, arg store.SetRunAutopilotPlanParams) (int64, error)
 	// ClearRunMilestonesCompleted (PRD #628 M4) is the only non-union writer of
 	// milestones_completed: it resets the column to empty on a cross-worker re-claim that
 	// reseeds from the DEFAULT branch (no committed work recovered), so pass-1's stale
@@ -1953,6 +1963,40 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	var settleScopeDisposition string
 	switch req.State {
 	case "running":
+		// RC1 (issue #1197): an AUTOPILOT run auto-approves its own plan and NEVER reports
+		// awaiting_approval, so its approved plan text rides THIS self-contained `running`
+		// report instead. Persist it via the guarded, idempotent SetRunAutopilotPlan whose
+		// affected-row count PROVES storage, BEFORE SetRunRunning acknowledges the report —
+		// so a successful running ack means the plan is durably stored and a resume enters
+		// implementation instead of re-planning. Present body only (req.PlanMd is *string;
+		// nil ⇒ an ordinary heartbeat, unchanged). A present-but-blank body is REJECTED (not
+		// silently dropped to "omitted"), mirroring the awaiting_input qid rejection: a
+		// running report that carries a plan_md key means the worker intends to store a plan.
+		if req.PlanMd != nil {
+			// Reuse the awaiting_approval NUL-strip conversion (stripNULParam), and
+			// separately trim to reject a blank/whitespace body.
+			planBody := stripNULParam(req.PlanMd)
+			clean, _ := stripNUL(*req.PlanMd)
+			if strings.TrimSpace(clean) == "" {
+				return store.Run{}, false, fmt.Errorf("%w: running report carries a blank plan_md", ErrInvalidState)
+			}
+			var planRows int64
+			planRows, err = s.q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
+				PlanMd:   planBody,
+				ID:       runID,
+				WorkerID: pgconv.UUID(wkr.ID),
+			})
+			if err != nil {
+				return store.Run{}, false, err
+			}
+			if planRows == 0 {
+				// Refusal: the guarded write matched no row (a concurrent cancel/park landed
+				// first, a human-gated/seeded/other-body row, or not-owned). The plan is NOT
+				// durably stored, so the report must not succeed — the worker learns it and
+				// does not proceed to implementation.
+				return store.Run{}, false, fmt.Errorf("%w: autopilot plan_md was not durably stored (run not in a writable autopilot-approved state)", ErrInvalidState)
+			}
+		}
 		// PRD #37: the roster and (for autopilot) the resolved selection ride the
 		// `running` report. Both are re-validated here — the worker capped them, but
 		// the API does not take a worker's word for the shape of what it persists and
