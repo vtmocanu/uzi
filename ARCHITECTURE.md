@@ -303,16 +303,24 @@ model); this section is the map. User-facing usage is
   there are no template rows, so every repo subagent receives the whole surviving
   set.
 - **Repo skills** (`agent/src/repo-skills.ts`), opt-in and default off. Only when
-  `ClaimRepo.skills_enabled`, the worker enumerates
-  `<clone>/.claude/skills/*/SKILL.md` after checkout, keeping only the `name` and
-  `description` frontmatter keys (every other key, e.g. `allowed-tools`, is
-  stripped, the security point) and re-synthesizing through the same escaped-YAML
-  materializer. Repo skills carry no allocation, so a surviving one attaches to
-  **every** template; they rank lowest (a name collision with any delivered skill
-  drops the repo skill) and are first evicted if the set exceeds
-  `skills_max_per_run`. This is the **only** clone-borne configuration the worker
-  reads (no hooks, settings, commands, or `CLAUDE.md`), which is why the toggle is
-  per repo: a repo's `.claude/` is exactly the config class `settingSources: []`
+  `ClaimRepo.skills_enabled`, the worker enumerates two real-directory roots after
+  checkout — `<clone>/.claude/skills/*/SKILL.md` (what Claude Code reads) and
+  `<clone>/.agents/skills/*/SKILL.md` (the cross-agent root Codex reads, issue
+  #1205) — keeping only the `name` and `description` frontmatter keys (every other
+  key, e.g. `allowed-tools`, is stripped, the security point) and re-synthesizing
+  through the same escaped-YAML materializer. Both roots run the identical
+  validation, symlink refusal included (each root, each skill dir, and each
+  `SKILL.md` must be a real directory/file, so a hostile repo cannot redirect
+  enumeration outside the clone); on a real-vs-real name collision `.claude/skills`
+  wins and the shadowed `.agents/skills` entry is recorded as a drop. The canonical cross-agent layout
+  keeps the real bodies under `.agents/skills` and projects `.claude/skills` as a
+  symlink, so the symlink-refusing guard reads the `.agents/skills` side. Repo
+  skills carry no allocation, so a surviving one attaches to **every** template;
+  they rank lowest (a name collision with any delivered skill drops the repo skill)
+  and are first evicted if the set exceeds `skills_max_per_run`. These two roots are
+  the **only** clone-borne configuration the worker reads (no hooks, settings,
+  commands, or `CLAUDE.md`), which is why the toggle is per repo: a repo's
+  `.claude/` (and `.agents/`) is exactly the config class `settingSources: []`
   keeps closed, so loading even this much requires the repo owner or an admin to
   vouch for that repo's review discipline.
 - **Trust boundary.** `settingSources: []` stays `[]` with or without repo skills

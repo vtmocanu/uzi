@@ -293,3 +293,47 @@ content has been made safe to blindly follow.
   `repo_devbox_opt_in`, never both kinds together" — any future opt-in added
   to this endpoint must decide which of the two disjoint paths it belongs to,
   or add a third.
+
+## Addendum — issue #1205: `.agents/skills` as a second real skills root
+
+**Date**: 2026-09-08
+
+The repo-skills channel this ADR's Context describes (PRD #16 M6,
+`agent/src/repo-skills.ts`) originally read one root, `<clone>/.claude/skills`.
+The cross-agent skill layout keeps a single set of real skill bodies under
+`<clone>/.agents/skills/<name>/` (the root Codex reads) and projects them under
+`.claude/skills` (the root Claude Code reads) with a symlink — either per-skill
+(`.claude/skills/<name> -> ../../.agents/skills/<name>`) or whole-directory
+(`.claude/skills -> ../.agents/skills`). PR #1204 moved this repo to the
+whole-directory form. Because the enumerator **refuses every symlink** by
+design (the containment guard: the skills dir, each skill dir, and each
+`SKILL.md` must be a real directory/file), a repo on that layout had a
+`.claude/skills` that is a symlink, so the worker found **zero** repo skills for
+it even with `repo_skills_enabled` on.
+
+**Decision.** Enumerate a **second real-directory root**, `<clone>/.agents/skills`,
+under the **identical** validation already applied to `.claude/skills`
+(`enumerateRepoSkills` is reused verbatim per root; the merge lives in
+`collectRepoSkills`). On a name that resolves to a real skill under **both**
+roots, `.claude/skills` **wins** — it is the Claude-specific projection and the
+worker runs a Claude Code SDK agent — and the shadowed `.agents/skills` entry is
+recorded in the `dropped` list with a new reason code,
+`DROP_SHADOWED_BY_CLAUDE`, rather than silently discarded. In the canonical
+symlink layout this collision cannot occur (the `.claude/skills` side is a
+symlink and is skipped), so the precedence rule fires only on a hand-rolled
+dual-real layout; it is nonetheless deterministic and tested.
+
+**Why this does not widen the security seam.** The symlink refusal is
+**unchanged** for both roots, and no realpath-follow or symlink-follow logic was
+added. The seam this ADR and PRD #16 protect is "a hostile repo cannot redirect
+enumeration outside its own clone" — that is enforced by the `lstat` +
+`isDirectory()` / `isFile()` guard, which still rejects any symlinked root, skill
+dir, or `SKILL.md`. Adding `.agents/skills` adds one more **real** directory
+**inside the clone** to scan under exactly those checks; a real directory inside
+the clone was never the escape vector the guard exists to block. The
+capability-key stripping (only `name` + `description` survive), the name regex
+(path-safety), the size cap, and the lowest-precedence ranking are all applied
+per root unchanged. `settingSources: []` is likewise untouched — neither root is
+read through the SDK's project loader. The net effect is that a repo on the
+cross-agent layout loads the same skills it always intended to, through the same
+controlled, symlink-refusing channel.
