@@ -78,8 +78,18 @@ moment.
   resumes on the schedule described above; this alert just lets you know
   sooner that the account itself has room again.
 
-## Not the same as waiting for a pooled token
+## Not the same as waiting for a pooled token or an empty model turn
 
-A **`limit_wait`** pause (this page) and a **`pool_wait`** hold are both non-terminal waits, but for different reasons with different resolutions. `limit_wait` means a token you were actually spending hit its Anthropic rate limit, and it clears when that window resets. `pool_wait` means an `auto`-lane worker's token pool was genuinely empty — there was nothing to spend at all — and it clears when you opt a token into the pool, or on demand with `uzi run resume-now`. See [Letting uzi pick the token (auto-selection)](anthropic-token.md#letting-uzi-pick-the-token-auto-selection) for the pooled-token wait.
+A **`limit_wait`** pause (this page), a **`pool_wait`** hold and a
+**`recovery_wait`** park are all non-terminal waits, but for different
+reasons with different resolutions. `limit_wait` means a token you were
+actually spending hit its Anthropic rate limit, and it clears when that
+window resets. `pool_wait` means an `auto`-lane worker's token pool was
+genuinely empty — there was nothing to spend at all — and it clears when you
+opt a token into the pool, or on demand with `uzi run resume-now`. See
+[Letting uzi pick the token (auto-selection)](anthropic-token.md#letting-uzi-pick-the-token-auto-selection)
+for the pooled-token wait. `recovery_wait` means a resumed turn came back
+empty (no model activity), not a limit or an empty pool at all — see
+[Recovering from an empty turn](run-recovery-wait.md).
 
-Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Configuration](configuration.md) · [Slack notifications](slack.md)
+Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Configuration](configuration.md) · [Slack notifications](slack.md) · [Recovering from an empty turn](run-recovery-wait.md)
