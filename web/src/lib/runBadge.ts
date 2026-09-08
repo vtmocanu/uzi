@@ -268,6 +268,10 @@ export function runStatusTone(
   // other "blocked on something outside the run" holds — never danger: it has not
   // failed and it resumes on its own when a token is pooled (or on demand).
   if (status === "pool_wait") return "warning";
+  // Issue #1197: a transient-recovery park. Warn, like the other self-resuming
+  // holds — never danger: it has not failed and it resumes on its own on a capped
+  // backoff until it recovers or the owner cancels it.
+  if (status === "recovery_wait") return "warning";
   // PRD #1190: a run its owner paused. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
@@ -549,6 +553,21 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         pulse: false,
         title:
           "Waiting for a pooled Anthropic token. It resumes automatically once one is added to the pool.",
+      };
+    // Issue #1197: a transient-recovery park. STATIC — no countdown and no elapsed,
+    // like the other self-resuming holds: the backoff instant is server-owned and
+    // carries no DTO field the card could count down to, so the only honest thing
+    // the pill says is THAT it is recovering. The label "recovery wait" reads fine
+    // de-underscored, so StatusPill needs no RUN_STATUS_LABELS override to match it.
+    // Warn-toned, never danger: it has not failed and it resumes on its own.
+    case "recovery_wait":
+      return {
+        kind: "badge",
+        label: "recovery wait",
+        tone: "warning",
+        pulse: false,
+        title:
+          "Paused to recover from a transient empty model result — it resumes automatically.",
       };
     // PRD #1190: a run its owner paused. Info-toned and STATIC (no elapsed on the badge —
     // the per-card duration token carries `paused <elapsed>` via runDurationLabel). The

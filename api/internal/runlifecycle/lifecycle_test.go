@@ -218,6 +218,7 @@ func TestReconcilerDecisionTotalMap(t *testing.T) {
 		// trips the 30m give-up warn; a park routinely outlasts 30 minutes by design,
 		// so that warn would be the normal case rather than an exception.
 		{"limit_wait", later, decision{act: true, target: board.ColumnInProgress}},
+		{"recovery_wait", later, decision{act: true, target: board.ColumnInProgress}},
 		{"completed", later, decision{act: true, target: board.ColumnHumanReview}},
 		{"failed", later, decision{act: true, target: "Later"}},
 		{"cancelled", later, decision{act: true, target: "Later"}},

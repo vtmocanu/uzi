@@ -172,6 +172,18 @@ function runnerTrackingOwnerKey(branch: string): string {
   return `uzi-trackowner.${branch}.owner`;
 }
 
+/** A same-run clone survived recovery; the runner must capture it before reseeding. */
+export class PendingRecoveryCaptureError extends Error {
+  constructor(readonly clonePath: string, readonly branch: string) {
+    super("retained recovery work must be captured before reseeding");
+    this.name = "PendingRecoveryCaptureError";
+  }
+}
+
+function recoveryCaptureKey(branch: string): string {
+  return `uzi-recovery.${branch}.clone`;
+}
+
 // issue #909 — the PRE-#887 flattened owner-key form. Kept ONLY so a resume can still READ a
 // stamp a persistent bare wrote under old code during the rollout window. flatten() is lossy
 // (`/`, `.` -> `-`), so this key is NOT branch-injective: never WRITE under it, and read it only
@@ -523,6 +535,19 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const repoDir = path.basename(barePath).replace(/\.git$/, "");
       const clonePath = path.join(this.runnerRoot, repoDir, key);
+      // #1197, verified 2026-09-08: the clone is the only remaining copy when a
+      // recovery capture failed. The journal is in WORKER-owned bare config, never
+      // in the runner-owned clone. An unreadable journal fails closed before rm.
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending && await fs.lstat(pending.clonePath).then(() => true, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return false;
+        throw err;
+      })) {
+        if (pending.runId !== runId || pending.clonePath !== clonePath) {
+          throw new Error("refusing to replace a retained clone owned by another run");
+        }
+        throw new PendingRecoveryCaptureError(clonePath, branch);
+      }
       await fs.rm(clonePath, { recursive: true, force: true });
       // The clone's parent dir. Under the M4 split it must be group-`runner`-writable so
       // the runner-uid `git clone` can create <key> inside it: /data/runner is
@@ -1260,6 +1285,82 @@ export class GitCache {
   async branchTip(clonePath: string, branch: string): Promise<string | null> {
     const sha = (await this.runGitAsRunner(clonePath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]).catch(() => "")).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
+  /**
+   * issue #1197 (D-RC2c): positively verify the LOCAL restore point after a recovery
+   * capture. Compares the WORKER bare's tracking ref (`refs/uzi-runner/<branch>`, what a
+   * reseed reads) against the runner clone's current HEAD, and returns true IFF both
+   * resolve to the SAME commit — i.e. `fetchAgentBranch` moved the tracking ref up to the
+   * run's current tip (including any WIP-marker commit `commitWipMarker` made), so a
+   * same-worker reclaim's reseed will recover exactly this tip. A clean tree whose already
+   * -committed tip already matches is a no-op success. This is the fetch-back success
+   * signal the `void`-returning `fetchBackBestEffort` cannot give.
+   *
+   * The bare ref read runs worker-uid (the bare is worker-owned, like trackingTip); the
+   * HEAD read runs RUNNER-uid (`runGitAsRunner`) because the clone is runner-owned and a
+   * worker-uid read there would hit the B2 dubious-ownership boundary (git.ts B2). Reading
+   * HEAD is a pure ref read (no checkout/diff), so no attacker-chosen filter driver fires.
+   * Swallows every error to `false`: an unresolvable ref, an unreadable clone, or a
+   * mismatch all mean "restore point NOT verified", which the caller treats as a capture
+   * failure (preserve, do not promote).
+   */
+  async verifyRunnerTrackingCovers(
+    barePath: string,
+    worktreePath: string,
+    branch: string,
+  ): Promise<boolean> {
+    try {
+      const trackingRef = runnerTrackingRef(branch);
+      const bareTip = (
+        await this.runGit(barePath, ["rev-parse", "--verify", `${trackingRef}^{commit}`])
+      ).trim();
+      const headTip = (
+        await this.runGitAsRunner(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"])
+      ).trim();
+      return /^[0-9a-f]{40}$/.test(bareTip) && bareTip === headTip;
+    } catch (err) {
+      this.log.warn("recovery restore-point verification failed (→ not verified)", {
+        bare: barePath,
+        cwd: worktreePath,
+        error: gitErrorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /** Record clone ownership BEFORE running the model, so disk pressure during a
+   * later capture cannot prevent the restart guard from knowing whose work it is.
+   * The runner clears this journal only after removing a safely disposable clone. */
+  async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string): Promise<void> {
+    await this.withLock(barePath, async () => {
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify({ runId, clonePath })]);
+    });
+  }
+
+  async clearRecoveryCapture(barePath: string, branch: string, runId: string): Promise<void> {
+    await this.withLock(barePath, async () => {
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending?.runId === runId) {
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      }
+    });
+  }
+
+  private async readRecoveryCapture(barePath: string, branch: string): Promise<{ runId: string; clonePath: string } | undefined> {
+    // Unlike tryGitStdout, --list succeeds when the key is absent and throws on
+    // an unreadable/corrupt config. Never interpret a failed read as no journal.
+    const entries = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+    const prefix = `${recoveryCaptureKey(branch)}\n`;
+    const entry = entries.filter((item) => item.startsWith(prefix)).at(-1);
+    const value = entry?.slice(prefix.length);
+    if (!value) return undefined;
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null || !("runId" in parsed) || !("clonePath" in parsed)
+        || typeof parsed.runId !== "string" || typeof parsed.clonePath !== "string") {
+      throw new Error("invalid retained recovery clone journal");
+    }
+    return { runId: parsed.runId, clonePath: parsed.clonePath };
   }
 
   /**

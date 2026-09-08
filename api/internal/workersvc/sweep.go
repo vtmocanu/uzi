@@ -159,6 +159,21 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		s.publishSwept(r.ID, r.Status)
 	}
 
+	// Transient-recovery promotion (issue #1197): recovery_wait → queued once
+	// recovery_retry_not_before has elapsed. Placed beside the limit-wait promote for the
+	// same "transitions first, enforcement second" reason, and it is a distinct clock-based
+	// hold — never folded into PromoteLimitWaitRuns. Unlike the limit park there is no
+	// lifetime cap, so this pass keeps auto-promoting a recovering run at the capped cadence
+	// until it succeeds or the owner cancels.
+	recoveryPromoted, err := s.q.PromoteRecoveryWaitRuns(ctx, pgconv.Time(now))
+	if err != nil {
+		return res, fmt.Errorf("promote recovery-wait runs: %w", err)
+	}
+	res.RecoveryPromoted = int64(len(recoveryPromoted))
+	for _, r := range recoveryPromoted {
+		s.publishSwept(r.ID, r.Status)
+	}
+
 	// Reactive pool resume (PRD #754 M5): a pool_wait hold is released the moment its
 	// owner's Anthropic token pool becomes non-empty again. Scoped to pool_wait ONLY —
 	// never folded into PromoteLimitWaitRuns, whose clock-based predicate is a different

@@ -149,6 +149,20 @@ describe("MilestoneChecklist now line (PRD #1064 M3)", () => {
     expect(screen.queryByText("40s ago")).toBeNull();
   });
 
+  // Issue #1197: a transient-recovery park is a self-resuming hold too, so the now-line
+  // must show the WAITING variant rather than pretending the lane is at work.
+  it("shows the WAITING variant on a recovery_wait run", () => {
+    render(
+      <MilestoneChecklist
+        run={run({ status: "recovery_wait", milestones, milestones_completed: ["m1"], milestones_in_progress: ["m2"] })}
+        activity={anActivity()}
+      />,
+    );
+    expect(screen.getByText("waiting to recover · 40s")).toBeTruthy();
+    expect(screen.queryByText(/waiting on rate limit/)).toBeNull();
+    expect(screen.queryByText("40s ago")).toBeNull();
+  });
+
   it("D4: with several ids in progress, only the FIRST by frozen order is named and carries the strip", () => {
     render(
       <MilestoneChecklist

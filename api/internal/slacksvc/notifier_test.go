@@ -936,6 +936,42 @@ func TestRenderThreadBlocksThreadsParkNotQueued(t *testing.T) {
 	}
 }
 
+// TestRecoveryWaitRendersAsRecoveringNotARawStatus is the recovery_wait sibling of the
+// limit_wait raw-enum gap (issue #1197): the notifier has NO status filter, so a
+// recovery-parked run must not reach statusGlyph's default arm and leak the literal
+// database string "recovery_wait" into a user's DM. The root line reads "🔄 Recovering".
+// Reddening mutation: remove the recovery_wait case from statusGlyph → the default arm
+// returns the raw status, so the leak assertion fires and "Recovering" is absent.
+func TestRecoveryWaitRendersAsRecoveringNotARawStatus(t *testing.T) {
+	blocks, fallback := rootBlocks(baseRun("recovery_wait"), "https://uzi.example")
+	_, section := blockSummary(blocks)
+	all := section + contextText(blocks) + fallback
+	if strings.Contains(all, "recovery_wait") {
+		t.Fatalf("root = %q — the raw status string leaked to a user's DM", all)
+	}
+	if !strings.Contains(section, "Recovering") {
+		t.Fatalf("root section = %q, want it to name the transient-recovery park", section)
+	}
+	if !strings.Contains(fallback, "Recovering") {
+		t.Fatalf("root fallback = %q, want it to name the transient-recovery park", fallback)
+	}
+}
+
+// A recovery_wait park must NOT thread a per-park event, unlike limit_wait. The widening
+// that let limit_wait thread is bounded by construction — RUN_LIMIT_MAX_WAITS caps parks
+// per run (renderThreadBlocks' doc comment, property 1). recovery_wait has NO lifetime cap
+// (it auto-resumes indefinitely on a capped backoff until it recovers or is cancelled), so
+// threading it would violate that bound and could spam the thread. It therefore falls to
+// the default (ok=false) exactly like pool_wait; the edited root line still carries
+// "Recovering". Reddening mutation: add a recovery_wait arm to renderThreadBlocks → ok
+// becomes true and this fails.
+func TestRenderThreadBlocksDoesNotThreadRecoveryWait(t *testing.T) {
+	if _, _, ok := renderThreadBlocks(baseRun("recovery_wait"), "https://uzi.example"); ok {
+		t.Fatal("renderThreadBlocks threaded a recovery_wait event; an unbounded auto-resuming " +
+			"park must not thread per-park (it would violate the bounded-by-construction property)")
+	}
+}
+
 // Every part is omitted rather than defaulted when unknown, matching the server's own
 // failure-reason composition: the detail must never claim a fact uzi does not have. The
 // park head is the section (⏸️ Paused · usage limit); the detail suffix is the context.

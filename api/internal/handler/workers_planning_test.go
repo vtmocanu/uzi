@@ -27,8 +27,11 @@ func TestIsPlanningPhase(t *testing.T) {
 		// Seeded startup: a plan is already persisted at iter 0, so a plan_md-empty-only
 		// rule would wrongly call this planning.
 		{"issue running iter0 with-plan (seeded) not planning", "issue", "running", 0, true, false},
-		// Autopilot implementing with no plan persisted: an iteration-only rule keyed on
-		// iter==0 handles this, but a plan_md-only rule would get it wrong.
+		// Autopilot implementing, plan_md not visible on THIS report: an iteration-only rule
+		// keyed on iter==0 handles this, but a plan_md-only rule would get it wrong. (Since
+		// RC1/#1197 an autopilot plan IS persisted to plan_md, but isPlanningPhase keys on
+		// the iteration count, not on plan_md presence, so a no-plan-flag implementing report
+		// is still classified by iter — this row exercises exactly that.)
 		{"issue running iter1 no-plan (autopilot impl) not planning", "issue", "running", 1, false, false},
 		// Revise re-plans at the gate — status is awaiting_approval, never running, so the
 		// status guard excludes it.

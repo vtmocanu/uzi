@@ -23,6 +23,7 @@ import {
   RunStopReason,
   HealthFlag,
   LimitWaitPanel,
+  RecoveryWaitPanel,
   MrReworkPanel,
   PausedPanel,
   RunView,
@@ -4227,6 +4228,65 @@ describe("RunView ↔ LimitWaitPanel wiring (PRD #35)", () => {
   });
 });
 
+// Issue #1197: the transient-recovery hold panel. COPY ONLY — it explains the automatic
+// resume and self-hides on every other status, exactly like PoolWaitPanel.
+describe("RecoveryWaitPanel (issue #1197)", () => {
+  it("renders the recovery copy for a recovery_wait run", () => {
+    const { container } = render(<RecoveryWaitPanel run={run({ status: "recovery_wait" })} />);
+    // The park is announced (role=status heading) and the copy explains the automatic
+    // resume and the owner's cancel option — distinct from a pooled-token / usage-limit park.
+    expect(container.querySelector('[role="status"]')).not.toBeNull();
+    expect(container.textContent).toContain("transient empty model result");
+    expect(container.textContent).toContain("resumes on");
+    expect(container.textContent).toContain("cancel");
+    // COPY ONLY: no "Resume now" control (no resume-now verb for this park) and no countdown.
+    expect(container.querySelector("button")).toBeNull();
+    expect(container.textContent).not.toContain("Resumes in");
+  });
+
+  it("renders NOTHING for any other status, including the sibling parks and terminal runs", () => {
+    for (const status of [
+      "running",
+      "limit_wait",
+      "pool_wait",
+      "completed",
+      "failed",
+      "cancelled",
+    ] as const) {
+      cleanup();
+      const { container } = render(<RecoveryWaitPanel run={run({ status })} />);
+      expect(container.textContent).toBe("");
+    }
+  });
+});
+
+// Issue #1197: the page wiring for recovery_wait — the panel is mounted, the stray "live"
+// chip is suppressed, and the now-line treats it as a waiting park. Same source-text
+// instrument (and the same acknowledged ceiling — presence, not render) as the wiring
+// blocks above: the page needs a router, the auth context and a live WS stream to mount.
+describe("RunView ↔ recovery_wait wiring (issue #1197)", () => {
+  const live = runViewSource
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+
+  it("mounts the panel on the run page", () => {
+    expect(live).toContain("<RecoveryWaitPanel");
+  });
+
+  it("suppresses the green 'live' chip on a recovery_wait run (no false all-clear)", () => {
+    // The self-resuming park must be excluded alongside limit_wait/pool_wait, or a green
+    // "live" chip sits beside the amber "recovery wait" pill telling two opposite things.
+    expect(live).toContain('run.status !== "recovery_wait"');
+  });
+
+  it("counts recovery_wait as a waiting park in the now-line strip", () => {
+    // MilestoneNowStrip's waiting flag must list recovery_wait so the strip does not
+    // pretend the lane is working while the run is backing off to retry.
+    expect(live).toContain('status === "recovery_wait"');
+  });
+});
+
 describe("RunView ↔ QuestionPanel wiring (PRD #88 M2)", () => {
   // Same instrument and the SAME acknowledged ceiling as the block above: this proves
   // the text is present and not commented out, never that it runs. `{false && …}` still
@@ -4357,6 +4417,48 @@ describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () 
     await screen.findByText("Add rate limiting");
     const region = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
     expect(region.textContent).toBe("");
+  });
+});
+
+// Issue #1197 (a11y): recovery_wait is a self-resuming park with NO ActivityFeed message
+// backup (unlike limit_wait, whose run message the feed's polite region narrates) and
+// RecoveryWaitPanel mounts in the same tick as its content — so, exactly like pool_wait,
+// the ALWAYS-MOUNTED page-level sr-only region is what reliably announces it. Same
+// instrument as the awaiting_followup block above.
+describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () => {
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("announces the recovery park through the always-mounted sr-only region", async () => {
+    renderPage({ status: "recovery_wait" });
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe(
+      "This run paused to recover from a transient empty result and will resume automatically.",
+    );
+    // Mutation guard: it is the recovery copy, NOT the pool_wait or awaiting_input copy.
+    expect(region.textContent).not.toContain("pooled Anthropic token");
+    expect(region.textContent).not.toContain("asking you a question");
   });
 });
 

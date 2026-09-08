@@ -823,22 +823,24 @@ func steerKindLabel(kind string) string {
 // label from its consumed_at and the run's live status, mirroring PRD #95 Decision 7
 // as closely as the CLI can:
 //   - not consumed, run terminal  → "not delivered (run finished)"
-//   - not consumed, run parked    → "queued (run paused on a usage limit)"
+//   - not consumed, run parked    → "queued" + the park's reason suffix (usage limit /
+//     empty token pool / transient-recovery)
 //   - not consumed, otherwise     → "queued"
 //   - consumed, run at plan gate  → "delivered (applies after approval)"
 //   - consumed, awaiting follow-up → "delivered (resumes the run)"
-//   - consumed, run parked        → "delivered (run paused on a usage limit)"
+//   - consumed, run parked        → "delivered" + the park's reason suffix
 //   - consumed, otherwise         → "delivered"
 //
 // runStatus may be "" when the run's status could not be fetched (Decision 10
 // floor): the gate/terminal nuance is then dropped and only queued/delivered
 // show — the acceptable CLI minimum.
 //
-// The two statusLimitWait arms are a SUFFIX on the existing answer, never a
-// replacement for it (PRD #35). A park changes nothing about whether a follow-up was
-// handed to the worker; it changes only whether anything is currently acting on it.
-// Rewriting "queued" to something else on a parked run would be the same lie as
-// dropping the park entirely, one level down: the queue state is still queued.
+// The park-status arms (limit_wait PRD #35, pool_wait PRD #754, recovery_wait issue
+// #1197) are a SUFFIX on the existing answer, never a replacement for it. A park changes
+// nothing about whether a follow-up was handed to the worker; it changes only whether
+// anything is currently acting on it. Rewriting "queued" to something else on a parked
+// run would be the same lie as dropping the park entirely, one level down: the queue
+// state is still queued.
 func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string) string {
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
@@ -865,6 +867,9 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	// PRD #754: a pool_wait run is HELD on an empty token pool, not a usage limit, so its
 	// suffix names the actual reason (distinct copy for a distinct hold).
 	const heldSuffix = " (run held on an empty token pool)"
+	// issue #1197: a recovery_wait run is parked recovering from a transient empty turn,
+	// neither a usage limit nor an empty pool, so its suffix names the actual reason.
+	const recoveringSuffix = " (run recovering from a transient empty turn)"
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
 			return "not delivered (run finished)"
@@ -874,6 +879,9 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 		}
 		if runStatus == statusPoolWait {
 			return "queued" + heldSuffix
+		}
+		if runStatus == statusRecoveryWait {
+			return "queued" + recoveringSuffix
 		}
 		return "queued"
 	}
@@ -898,6 +906,9 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	}
 	if runStatus == statusPoolWait {
 		return "delivered" + heldSuffix
+	}
+	if runStatus == statusRecoveryWait {
+		return "delivered" + recoveringSuffix
 	}
 	return "delivered"
 }

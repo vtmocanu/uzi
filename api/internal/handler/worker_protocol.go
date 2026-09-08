@@ -608,7 +608,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, paused, pause_failed, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -629,7 +629,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		//
 		// 🔴 A 409 IS NOT "THE RUN IS FINISHED", AND THE WORKER MUST NOT KEY CLEANUP ON
 		// IT. The worker's carve-out (skip the clone/plugin-dir/HOME removals) keys off
-		// the RETURNED STATUS being literally "limit_wait", never off applied — because
+		// the RETURNED STATUS matching the requested park, never off applied, because
 		// the three most common ways a park does not happen (budget spent, park too far,
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
