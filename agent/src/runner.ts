@@ -431,8 +431,10 @@ export interface RunnerOptions {
  *   claim → running → seed runner clone → PLAN turn → approval gate → implement⇄
  *   review loop → worker fetches the agent branch back + pushes + opens MR →
  *   completed | failed
- * and always tears the runner clone down (keeping the worker bare clone). Under
- * PRD #51 (b) the agent commits in the runner clone; the worker is bare-only.
+ * and normally tears the runner clone down (keeping the worker bare clone).
+ * Unverified recovery capture retains the clone and its ownership journal
+ * (verified against preserveRecoveryClone on 2026-09-08, issue #1197).
+ * Under PRD #51 (b) the agent commits in the runner clone; the worker is bare-only.
  *
  * The plan gate, follow-up injection, and cancel are steered through a single
  * /inputs poller (SteeringChannel); the executor drives the SDK turns and calls

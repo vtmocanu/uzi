@@ -186,6 +186,16 @@ type FakeClient struct {
 	MrReworkRun         apitypes.RunDTO
 	SetRunMrReworkErr   error
 
+	// RunRework capture (PRD #1202 M1): LastReworkRunID is the run id `uzi run rework`
+	// targeted; LastReworkGuidance is the guidance it sent (from -m or stdin, "" when
+	// none). ReworkRun is the canned success reply; RunReworkErr wins over the blanket Err
+	// so a test can model the 409/404/400 on the write while the capture still proves it
+	// was reached with the right args.
+	LastReworkRunID    string
+	LastReworkGuidance string
+	ReworkRun          apitypes.RunDTO
+	RunReworkErr       error
+
 	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
 	// meters, each carrying the server-computed auto-selection status.
 	SelfMeters []apitypes.TokenRateLimitDTO

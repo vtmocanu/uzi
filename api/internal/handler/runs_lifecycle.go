@@ -367,6 +367,35 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.IssueWebURL = &webURL
 		}
 	}
+	// PRD #1202 D11: the OWNER-ONLY automatic-rework loop-guard view (why the watcher
+	// stopped), enriched here because runToDTO stays pure. Populated ONLY when the viewer
+	// is the run's OWNER (GetRun reads through GetRunForViewer, so an admin sees any run —
+	// an owner-only field needs this explicit check), the run is a completed
+	// issue/prompt/self_improve run, and its MR is open; null otherwise, so the pair never
+	// leaks another user's MR state. Best-effort: a settings or ledger read error leaves
+	// both nil rather than failing the read of an otherwise-fine run.
+	if run.UserID == user.ID && h.settings != nil &&
+		(run.Kind == runkind.Issue || run.Kind == runkind.Prompt || run.Kind == runkind.SelfImprove) &&
+		run.Status == "completed" && run.MrState.String == "opened" && run.Branch.Valid {
+		capVal, capErr := h.settings.MrReworkCap(r.Context())
+		led, ledErr := h.q.GetMRReworkLedger(r.Context(), store.GetMRReworkLedgerParams{
+			RepoID: uuid.UUID(run.RepoID.Bytes),
+			Ref:    run.Branch.String,
+		})
+		switch {
+		case capErr != nil:
+			slog.Warn("mr-rework cap read for run dto", "run_id", run.ID, "error", capErr)
+		case ledErr != nil && !errors.Is(ledErr, pgx.ErrNoRows):
+			slog.Error("mr-rework ledger read for run dto", "run_id", run.ID, "error", ledErr)
+		default:
+			// No ledger row (pgx.ErrNoRows) means the MR was never reworked: the zero-value
+			// row reads attempt_count 0, which is the correct "0 of N used".
+			cycles := int(led.AttemptCount)
+			capUsed := capVal
+			dto.MrReworkAutoCycles = &cycles
+			dto.MrReworkAutoCap = &capUsed
+		}
+	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
 	// so the plan-gate picker sources its "My agent templates" chips from exactly the
 	// roster the approve validator + worker use (allocation-resolved, lead stripped).

@@ -358,6 +358,17 @@ type Store interface {
 	// MR review-watcher rework runs (PRD #700 M3): the create path + its create-time
 	// cross-kind branch guard.
 	CreateAutoMRReworkRun(ctx context.Context, arg store.CreateAutoMRReworkRunParams) (store.Run, error)
+	// On-demand mr_rework (PRD #1202): StartMRReworkForRun reads the loop-guard ledger
+	// (what is new since the last cycle) and advances the consumed high-water WITHOUT
+	// spending an automatic cycle; UserHasAnthropicToken is the door-check that the owner
+	// can pay for the run the endpoint would mint.
+	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
+	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
+	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
+	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that
+	// lets the automatic watcher re-fire on the same comments.
+	CreateManualMRReworkRunAndAdvance(ctx context.Context, arg store.CreateManualMRReworkRunAndAdvanceParams) (store.Run, error)
+	UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	// Self-improvement runs (PRD #46 Decision 10).
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
 	// Scheduled prompt runs (PRD #241).
@@ -827,8 +838,9 @@ type Params struct {
 	DiskPressureThreshold float64
 	WorkerAffinityGrace   time.Duration
 	// WorkerAffinityCeiling (PRD #628 D3a): the run-lane affinity ceiling. ClaimRun pins
-	// a promoted run to its prior worker only while that worker is a live, non-draining
-	// claim target (the liveness leg); this ceiling bounds the live-but-wedged case. It is
+	// a promoted run to its prior worker while its row exists and it is heartbeating or
+	// draining (PRD #1030, verified against ClaimRun on 2026-09-08; the earlier comment
+	// incorrectly excluded draining workers). The ceiling bounds the live-but-wedged case. It is
 	// the run lane's @affinity_cutoff, distinct from WorkerAffinityGrace which stays the
 	// chat lane's grace (ClaimChatRun gets no liveness short-circuit in M1's scope).
 	WorkerAffinityCeiling time.Duration

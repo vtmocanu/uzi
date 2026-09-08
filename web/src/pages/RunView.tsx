@@ -22,7 +22,7 @@ import {
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
-import { canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
+import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import {
@@ -681,6 +681,11 @@ export function LimitWaitPanel({
   );
 }
 
+// PRD #1202: the guidance textarea's byte cap, mirroring the server's 8 KiB limit. Counted
+// in BYTES (a multibyte char costs >1) so the client-side refusal matches the server's,
+// never letting a body the server will 400 through as "under the limit".
+const MAX_GUIDANCE_BYTES = 8192;
+
 // PRD #1190: the pending-pause chip's text. "· now" for an immediate pause; "· after M<N>"
 // on a milestone-structured run (N = pause_after_count + 1, the milestone the request waits
 // to see complete); "· after the current step" on a milestone mode request against a run
@@ -790,24 +795,34 @@ export function PausedPanel({
 }
 
 /**
- * PRD #841: the per-run "auto-rework this MR's review comments" toggle. Mirrors the
- * LimitWaitPanel checkbox block, with two deliberate divergences (D2/D3):
+ * PRD #841 + #1202: the per-run MR-review-rework panel. Two stacked affordances:
  *
- * - Visibility is gated by canToggleMrRework(run) — an `issue` run whose MR is null or
- *   `opened` — NOT by a non-terminal status. The watcher acts AFTER the run completes,
- *   so the toggle stays live on a completed run whose MR is still open and disappears
- *   only once the MR merges/closes.
- * - A non-owner (canSteer=false) sees NOTHING (returns null), not the inert
- *   current-state text LimitWaitPanel shows: this is a post-completion preference with
- *   no "when does it resume" fact a viewer needs, so there is nothing to render inert.
+ * 1. The "auto-rework this MR's review comments" toggle (PRD #841). Mirrors the
+ *    LimitWaitPanel checkbox block, with two deliberate divergences (D2/D3):
+ *    - Visibility is gated by canToggleMrRework(run) — a reworkable-KIND run (issue /
+ *      prompt / self_improve, widened by PRD #908) whose MR is null or `opened` — NOT by
+ *      a non-terminal status. The watcher acts AFTER the run completes, so the toggle
+ *      stays live on a completed run whose MR is still open and disappears only once the
+ *      MR merges/closes.
+ *    - A non-owner (canSteer=false) sees NOTHING (returns null), not the inert
+ *      current-state text LimitWaitPanel shows: this is a post-completion preference with
+ *      no "when does it resume" fact a viewer needs, so there is nothing to render inert.
+ *    The checkbox reflects the EFFECTIVE value (run override ?? owner default ?? on); a
+ *    click sends the explicit boolean. The setting is tri-state (inherit/on/off), so a run
+ *    carrying an EXPLICIT override (true/false, not null) also shows a "Reset to default"
+ *    button that sends null, returning the run to live inheritance of the owner default.
  *
- * The checkbox reflects the EFFECTIVE value (run override ?? owner default ?? on); a
- * click sends the explicit boolean. The setting is tri-state (inherit/on/off), so when the
- * run carries an EXPLICIT override (mr_rework_enabled is true or false, not null) a "Reset
- * to default" button is shown that sends null, returning the run to live inheritance of the
- * owner default (PRD #841) — so every state is reachable from the web, not only the CLI
- * --clear. Exported like LimitWaitPanel so the gate + copy are testable without mounting
- * the whole page.
+ * 2. PRD #1202: the OWNER-ONLY past-cap surface, below the toggle. A muted line reports
+ *    the automatic loop's guard readings ("Automatic rework: N of M cycles used", with
+ *    "· stopped" once N >= M) whenever the server populated them (owner-only fields). And
+ *    a "Rework now" affordance — shown when canReworkNow(run) — that discloses an optional
+ *    guidance textarea (counted against MAX_GUIDANCE_BYTES) and POSTs api.startRunRework to
+ *    start an on-demand rework past the automatic cap. Its busy/note are LOCAL (like
+ *    PoolWaitPanel), and every server response — a 409 "already running" / "nothing new",
+ *    a 404, a success link — renders INLINE here, never through the page-level error banner:
+ *    those are states, not failures.
+ *
+ * Exported like LimitWaitPanel so the gate + copy are testable without mounting the page.
  */
 export function MrReworkPanel({
   run,
@@ -825,34 +840,158 @@ export function MrReworkPanel({
   // null clears the run override back to inherit (the account default); true/false set it.
   onToggle: (enabled: boolean | null) => void;
 }) {
-  // Hidden for a non-owner and once the MR is merged/closed (or a non-issue run).
+  // On-demand rework (PRD #1202) local state — self-contained like PoolWaitPanel, so a
+  // 409 ("already running" / "nothing new") lands as an inline note, not the page banner.
+  // Declared BEFORE the early returns to satisfy the Rules of Hooks.
+  const [reworkOpen, setReworkOpen] = useState(false);
+  const [guidance, setGuidance] = useState("");
+  const [reworkBusy, setReworkBusy] = useState(false);
+  const [reworkNote, setReworkNote] = useState("");
+  const [startedRunId, setStartedRunId] = useState<string | null>(null);
+
+  // Hidden for a non-owner and once the MR is merged/closed (or a non-reworkable kind).
   if (!canSteer) return null;
   if (!canToggleMrRework(run)) return null;
   const effective = effectiveMrRework(run, userDefault);
   // An explicit per-run override (true/false) is distinct from inherit (null/undefined);
   // only then is there something to reset back to the account default.
   const overridden = run.mr_rework_enabled != null;
+
+  // Owner-only automatic-loop guard readings (the server nulls these for a non-owner). The
+  // denominator is read defensively (`?? 0`) so a populated cycles count with an absent cap
+  // still renders rather than "N of undefined".
+  const cycles = run.mr_rework_auto_cycles;
+  const cap = run.mr_rework_auto_cap ?? 0;
+  const stopped = cycles != null && cycles >= cap;
+
+  const showRework = canReworkNow(run);
+  const guidanceBytes = new TextEncoder().encode(guidance).length;
+  const overCap = guidanceBytes > MAX_GUIDANCE_BYTES;
+
+  const startRework = async () => {
+    setStartedRunId(null);
+    setReworkNote("");
+    setReworkBusy(true);
+    try {
+      const { run: newRun } = await api.startRunRework(run.id, guidance.trim());
+      setStartedRunId(newRun.id);
+      setReworkOpen(false);
+      setGuidance("");
+    } catch (e) {
+      // Every failure code here is a STATE (409 already running / nothing new, 404 foreign
+      // run, 400 bad guidance, 502 forge read) — surface the server's message inline, never
+      // through the page-level error banner.
+      setReworkNote(errorMessage(e, "Could not start the rework run."));
+    } finally {
+      setReworkBusy(false);
+    }
+  };
+
   return (
-    <div className="flex items-center gap-3 px-1">
-      <label className="flex items-center gap-2 text-xs">
-        <input
-          type="checkbox"
-          className="h-4 w-4 accent-brand"
-          checked={effective}
-          disabled={busy}
-          onChange={(e) => onToggle(e.target.checked)}
-        />
-        <span className="text-muted">Auto-rework this MR&apos;s review comments</span>
-      </label>
-      {overridden && (
-        <button
-          type="button"
-          className="text-xs font-medium text-muted transition-colors hover:text-fg disabled:opacity-50"
-          disabled={busy}
-          onClick={() => onToggle(null)}
-        >
-          Reset to default
-        </button>
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-3 px-1">
+        <label className="flex items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={effective}
+            disabled={busy}
+            onChange={(e) => onToggle(e.target.checked)}
+          />
+          <span className="text-muted">Auto-rework this MR&apos;s review comments</span>
+        </label>
+        {overridden && (
+          <button
+            type="button"
+            className="text-xs font-medium text-muted transition-colors hover:text-fg disabled:opacity-50"
+            disabled={busy}
+            onClick={() => onToggle(null)}
+          >
+            Reset to default
+          </button>
+        )}
+      </div>
+
+      {/* PRD #1202: the automatic-loop guard reading (owner-only fields). Rendered only
+          when the server populated the cycles count; "· stopped" once the cap is reached. */}
+      {cycles != null && (
+        <p className="px-1 text-xs text-muted">
+          Automatic rework: {cycles} of {cap} cycles used{stopped ? " · stopped" : ""}
+        </p>
+      )}
+
+      {/* PRD #1202: the on-demand "Rework now" affordance — start a rework past the
+          automatic cap. Owner-only (this whole panel is), and only for a completed run
+          whose MR is still open (canReworkNow). */}
+      {showRework && (
+        <div className="px-1">
+          {!reworkOpen ? (
+            <button
+              type="button"
+              className="text-xs font-medium text-brand transition-colors hover:text-brand-hover disabled:opacity-50"
+              onClick={() => {
+                setReworkNote("");
+                setReworkOpen(true);
+              }}
+            >
+              Rework now
+            </button>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <label className="flex flex-col gap-1 text-xs text-muted" htmlFor="mr-rework-guidance">
+                <span>Guidance (optional)</span>
+                <textarea
+                  id="mr-rework-guidance"
+                  className="min-h-[4.5rem] w-full rounded-lg border border-edge bg-raised px-2 py-1.5 text-xs text-fg focus:border-brand focus:outline-none"
+                  value={guidance}
+                  disabled={reworkBusy}
+                  onChange={(e) => setGuidance(e.target.value)}
+                  placeholder="Optional steering for this rework (e.g. focus on the review comments about error handling)."
+                />
+              </label>
+              <p className={cx("text-[11px]", overCap ? "font-medium text-danger" : "text-muted")}>
+                {guidanceBytes.toLocaleString()} / {MAX_GUIDANCE_BYTES.toLocaleString()} bytes
+                {overCap ? " · too long" : ""}
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="primary"
+                  size="sm"
+                  disabled={reworkBusy || overCap}
+                  onClick={startRework}
+                >
+                  Start rework
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={reworkBusy}
+                  onClick={() => {
+                    setReworkOpen(false);
+                    setGuidance("");
+                    setReworkNote("");
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
+          {/* Inline result/error note — success links to the new run; a failure shows the
+              server's message. Never the page-level banner (these are states). */}
+          {startedRunId ? (
+            <p role="status" className="mt-1.5 text-xs font-medium text-ok">
+              Rework run started.{" "}
+              <Link to={`/runs/${startedRunId}`} className="underline hover:text-fg">
+                Open the rework run
+              </Link>
+            </p>
+          ) : reworkNote ? (
+            <p role="status" aria-live="polite" className="mt-1.5 text-xs font-medium text-warn">
+              {reworkNote}
+            </p>
+          ) : null}
+        </div>
       )}
     </div>
   );

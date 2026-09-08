@@ -20,6 +20,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **On-demand MR rework past the automatic cap, with optional guidance ([#1202](https://github.com/vtmocanu/uzi/issues/1202)).**
+  An owner can start one rework cycle on a completed run whose MR is open even after the automatic cap, from the run page's Rework now control, `uzi run rework <run-id> [-m <guidance>]`, or `POST /api/runs/{id}/rework`. It bypasses the cap, debounce, staleness and green-pipeline gates while keeping the branch, one-active-rework, kill-switch, token and open-MR guards. The cycle never counts against the automatic cap and atomically advances the consumed high-water so the watcher does not repeat those comments. The cap halt comment and notification now point at this action.
+
 - **The Judge page's group expander now shows the newest occurrence's full rationale, and gains a select-all checkbox ([#1183](https://github.com/vtmocanu/uzi/issues/1183)).**
   Expanding a group fetches and renders the newest open occurrence's complete rationale above its occurrence list, in place of the clamped preview shown before you expand; a "Select all N shown" checkbox above the group list ticks every group currently on screen, for a bulk Mark done or Dismiss in one pass.
 

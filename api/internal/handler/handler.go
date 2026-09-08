@@ -789,6 +789,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Owner-scoped in SQL (foreign run → 404); no status guard (D2). Guarded
 				// against a cookie-only mis-mount by a router-level auth test.
 				r.Put("/{id}/mr-rework", h.SetRunMrReworkEnabled)
+				// On-demand MR rework past the automatic cap (PRD #1202). RequireUser (NOT the
+				// cookie-only RequireAuth group) so the `uzi run rework` CLI verb reaches it
+				// from a uzc_ Bearer, mirroring the mr-rework toggle above; behind the per-user
+				// forge limiter because the endpoint reads the MR's review comments off the
+				// forge on every call, exactly as the manual Fix CI button does. Owner-scoped
+				// in SQL (foreign run → 404).
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/rework", h.StartRunRework)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))

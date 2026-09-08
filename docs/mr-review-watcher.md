@@ -130,15 +130,44 @@ A merge request can't be reworked forever. uzi tracks, per MR, how many
 automatic rework cycles it has spent and stops after a cap — **5 by
 default**, admin-configurable (`mr_rework_cap`). Past the cap, uzi lands an
 in-app notification and, on an issue-run MR, also posts one comment on the
-issue naming the limit; a scheduled prompt MR has no backing issue, so it gets
-the in-app notification only. uzi then stops trying automatically; it doesn't
-retry on its own. Addressing
-the remaining comments yourself (or pushing more changes to the branch) is
-the escape hatch from there.
+issue naming the limit and pointing at the manual escape hatch below; a
+scheduled prompt MR has no backing issue, so it gets the in-app notification
+only. uzi then stops trying automatically. From there you can address the
+remaining comments yourself, push more changes to the branch, or — if you
+want uzi to take one more pass — trigger a [rework on demand](#rework-on-demand);
+on-demand cycles don't count against this cap.
 
 Only genuinely new comments count against a rework's trigger: a comment
 already consumed by a previous cycle is never re-acted on, so the watcher
 can't loop on the same finding.
+
+## Rework on demand
+
+You don't have to wait out the cap. On a completed run whose MR is still
+open, you can trigger one rework cycle on demand — from the run's page in
+uzi (a **Rework now** control) or with `uzi run rework <run-id>` — even
+after the automatic cap is reached.
+
+- **What it skips.** An on-demand rework skips the throttles the automatic
+  loop needs: the per-MR cap, the quiet-period wait for the review to
+  settle, the same-head-SHA check, and the green-pipeline requirement —
+  you already know the state of your MR, and a rework on a red pipeline
+  is a legitimate choice, since its push runs CI anyway.
+- **What it keeps.** Every safety guard stays: it won't run two reworks
+  on one MR at once, won't collide with an in-flight CI fix on the
+  branch, respects the instance's admin kill-switch, needs your own
+  Anthropic token, and needs the MR to still be open.
+- **Guidance.** You can attach optional guidance to steer the pass — for
+  example "focus on the migration thread; skip the naming nits." It
+  rides the run like any other steering text.
+- **The automatic cap.** An on-demand cycle doesn't count against it: the
+  cap bounds *unattended* spend, and a cycle you asked for and pay for
+  with your own token isn't what the cap guards against.
+- **Re-doing an earlier finding.** The rework sees the whole review
+  thread and, as in the automatic path, skips findings a prior cycle
+  already addressed. To make it revisit a finding an earlier cycle
+  skipped, post a fresh comment on the MR (a new human note is
+  actionable) or name that finding in the guidance, then rework.
 
 ## Forge support
 
@@ -176,6 +205,5 @@ that count.
   coexist on one MR without sharing a loop guard, because they fire on
   opposite pipeline states (CI-fix on red, rework on green) and never run
   on the branch at the same time.
-- There's no manual "rework now" button or CLI verb — the automatic path is
-  the whole feature today. `uzi run get`/`list` show an active rework as an
-  ordinary run with kind `mr_rework`.
+- `uzi run get`/`list` show a rework — automatic or [on demand](#rework-on-demand) —
+  as an ordinary run with kind `mr_rework`.
