@@ -156,6 +156,14 @@ type IssueStore interface {
 // sync to the default label rather than filtering on an empty one.
 type LabelConfig interface {
 	UziLabel(ctx context.Context) (string, error)
+	// FindingLabel resolves the incidental-finding marker label (PRD #333 D5) the
+	// sync's THIRD fetch keys on (PRD #1183 Child B). A filed finding issue carries
+	// ONLY this marker, never the uzi label (settings.ValidateMerged forbids the two
+	// being equal), so without a fetch keyed on it a CLOSED finding issue is observed
+	// by neither of the first two fetches and SyncFindingIssueCloses never sees the
+	// open→closed edge. Best-effort like UziLabel: a nil resolver or an empty/errored
+	// read falls back to settings.DefaultFindingLabel. *settings.Cache satisfies it.
+	FindingLabel(ctx context.Context) (string, error)
 }
 
 // Service bundles the dependencies for building forge clients and syncing.
@@ -219,6 +227,19 @@ func (s *Service) uziLabel(ctx context.Context) string {
 		}
 	}
 	return settings.DefaultUziLabel
+}
+
+// findingLabel resolves the configured incidental-finding marker label for the
+// sync's third fetch (PRD #1183 Child B), falling back to the compiled-in default
+// when unconfigured or on a settings read error — the same best-effort resolution
+// uziLabel uses, and against the same s.labels dependency the Service already holds.
+func (s *Service) findingLabel(ctx context.Context) string {
+	if s.labels != nil {
+		if l, _ := s.labels.FindingLabel(ctx); l != "" {
+			return l
+		}
+	}
+	return settings.DefaultFindingLabel
 }
 
 // EncryptToken seals a plaintext PAT for storage.
@@ -388,10 +409,14 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 	})
 }
 
-// Marks is the pair of high-water marks the two sync fetches carry — ONE PER
-// FETCH (issue #177), not one shared between them. PRD bounds the PRD-labelled
-// fetch (state=all); Open bounds the additive open, no-label fetch. Each mark
-// advances only on its OWN fetch's evidence: to the max forge updated_at over
+// Marks holds the high-water marks the sync fetches carry — ONE PER FETCH
+// (issue #177), not one shared between them. PRD bounds the uzi-labelled
+// fetch (state=all); Open bounds the additive open, no-label fetch; Finding bounds
+// the additive finding-labelled fetch (state=all, PRD #1183 Child B). The
+// per-fetch independence argument below is written about the PRD/Open pair — the
+// original race issue #177 dissolved — and the Finding mark sits on exactly the same
+// footing: its own bound, its own evidence, no constraint from or on the other two.
+// Each mark advances only on its OWN fetch's evidence: to the max forge updated_at over
 // that fetch's RAW result, and never backwards. An empty result carries no
 // evidence and leaves its mark exactly where it was.
 //
@@ -456,14 +481,21 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 // minutes at shipped defaults). Eviction is unaffected, since the keep-set is
 // built from what the fetches returned and never from a mark.
 type Marks struct {
-	PRD  time.Time // bounds the PRD-labelled fetch (state=all)
+	PRD  time.Time // bounds the uzi-labelled fetch (state=all)
 	Open time.Time // bounds the additive open, no-label fetch
+	// Finding bounds the finding-labelled fetch (state=all), PRD #1183 Child B. It is
+	// a THIRD independent per-fetch mark on exactly the same footing as PRD and Open —
+	// advanced only on its own fetch's raw-result evidence, never constrained by the
+	// other two, and left untouched by an empty result. In-memory only, like the whole
+	// struct (the poller's repoState holds it and nothing persists it), so no
+	// migration or persistence change rides along with the new field.
+	Finding time.Time
 }
 
-// Advance folds an observed pair into m FIELD-WISE, keeping the later of each.
-// Neither mark regresses, and neither is constrained by the other's value — the
-// zero time an empty fetch reports simply loses the comparison. Combining ACROSS
-// the fields is exactly what this type exists to stop; see Marks for why a shared
+// Advance folds an observed Marks into m FIELD-WISE, keeping the later of each.
+// No mark regresses, and none is constrained by another's value — the
+// zero time an empty (or unissued) fetch reports simply loses the comparison. Combining
+// ACROSS the fields is exactly what this type exists to stop; see Marks for why a shared
 // mark had to, and why a per-fetch one must not.
 func (m Marks) Advance(next Marks) Marks {
 	if next.PRD.After(m.PRD) {
@@ -472,25 +504,37 @@ func (m Marks) Advance(next Marks) Marks {
 	if next.Open.After(m.Open) {
 		m.Open = next.Open
 	}
+	if next.Finding.After(m.Finding) {
+		m.Finding = next.Finding
+	}
 	return m
 }
 
-// FullSync fetches the complete uzi-labeled set (state=all, no lower bound) and,
-// since PRD #102 M6, every OPEN issue regardless of label — an ADDITIVE second
-// fetch, not a widening of the first (Decision 9). It upserts both, then evicts
-// cache rows absent from the UNION of the two. This is the only path that
-// observes de-labeling and deletion, so it doubles as the reconcile pass and the
-// manual Refresh. (PRD #764 D7: the any-state fetch keys on the uzi label now that
-// the PRD label has lost its special meaning.)
+// FullSync fetches the complete uzi-labeled set (state=all, no lower bound); since
+// PRD #102 M6, every OPEN issue regardless of label — an ADDITIVE second fetch, not
+// a widening of the first (Decision 9); and, since PRD #1183 Child B, every
+// finding-labelled issue in ALL states — an ADDITIVE third fetch mirroring the first
+// so CLOSED finding issues are observed. It upserts all three, then evicts cache rows
+// absent from the UNION of them. This is the only path that observes de-labeling and
+// deletion, so it doubles as the reconcile pass and the manual Refresh. (PRD #764 D7:
+// the any-state fetch keys on the uzi label now that the PRD label has lost its
+// special meaning.)
 //
-// It takes NO marks (it is unbounded by design) and returns the pair it OBSERVED,
+// The third fetch closes a gap the first two structurally left open: a filed finding
+// issue carries only the finding marker label, never the uzi label, so once it CLOSES
+// the uzi fetch (uzi-labelled) never returns it and the open fetch (state=opened) no
+// longer does either — it would be evicted and SyncFindingIssueCloses would never see
+// the open→closed edge. Keyed on the finding label (state=all), the third fetch
+// observes exactly those closed finding issues and keeps them cached as closed.
+//
+// It takes NO marks (it is unbounded by design) and returns the TRIPLE it OBSERVED,
 // one mark per fetch, for the caller to fold into its own with Marks.Advance. On
-// any error it returns the ZERO pair, which folds in as a no-op, so a failed
+// any error it returns the ZERO Marks, which folds in as a no-op, so a failed
 // reconcile leaves the caller's marks exactly as they were.
 //
-// BOTH fetches must succeed before anything is deleted (Decision 11). A union
-// missing one half is not authoritative, and treating it as one wipes whatever
-// the failed half owns — the entire non-uzi backlog, every poll, on a transient
+// ALL THREE fetches must succeed before anything is deleted (Decision 11). A union
+// missing one part is not authoritative, and treating it as one wipes whatever
+// the failed part owns — the entire non-uzi backlog, every poll, on a transient
 // forge error. There is deliberately no "the extra fetch is best-effort, log and
 // continue" path: a soft-fail would also report a mark for a window nobody read
 // (Decision 11a).
@@ -500,7 +544,7 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 	if err != nil {
 		// Abort BEFORE any eviction: a failed/partial fetch must never be
 		// treated as an authoritative empty set, or a transient forge error
-		// would wipe the cache. Eviction only runs below, after BOTH fetches
+		// would wipe the cache. Eviction only runs below, after ALL THREE fetches
 		// have come back clean.
 		return Marks{}, err
 	}
@@ -510,45 +554,79 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 	}
 	extra := withoutLabel(openIssues, uziLabel)
 
+	// Third fetch: finding-labelled issues in ALL states (State zero = StateAll),
+	// mirroring the uzi fetch's shape. Additive from the first fetch, exactly like the
+	// open fetch — withoutLabel drops any issue that ALSO carries the uzi label so it
+	// stays owned by the uzi path (its state=all + eviction semantics). findingExtra
+	// overlapping the open fetch for OPEN finding issues is harmless: UpsertIssue is
+	// idempotent and DeleteIssuesNotIn dedupes the keep-set. Its error, like the first
+	// two, returns BEFORE any eviction — extending the "all fetches succeed first"
+	// invariant from two to three. When the finding label equals the uzi label (a
+	// misconfig ValidateMerged forbids), the third fetch is SKIPPED: those issues are
+	// already covered by the first fetch's state=all uzi query, so a third round trip
+	// would be pure duplicate work.
+	findingLabel := s.findingLabel(ctx)
+	var findingExtra []forge.Issue
+	var findingMark time.Time
+	if findingLabel != uziLabel {
+		findingIssues, ferr := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{findingLabel}})
+		if ferr != nil {
+			return Marks{}, ferr
+		}
+		findingExtra = withoutLabel(findingIssues, uziLabel)
+		findingMark = maxUpdatedAt(findingIssues)
+	}
+
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return Marks{}, err
 	}
 	if err := s.upsertIssues(ctx, repoID, extra); err != nil {
 		return Marks{}, err
 	}
-	// A clean PAIR of fetches that legitimately returns zero issues DOES evict
+	if err := s.upsertIssues(ctx, repoID, findingExtra); err != nil {
+		return Marks{}, err
+	}
+	// A clean SET of fetches that legitimately returns zero issues DOES evict
 	// everything — the forge is the source of truth (empty means empty).
-	keep := make([]int64, 0, len(issues)+len(extra))
+	keep := make([]int64, 0, len(issues)+len(extra)+len(findingExtra))
 	for _, is := range issues {
 		keep = append(keep, is.IID)
 	}
 	for _, is := range extra {
 		keep = append(keep, is.IID)
 	}
+	for _, is := range findingExtra {
+		keep = append(keep, is.IID)
+	}
 	if _, err := s.q.DeleteIssuesNotIn(ctx, store.DeleteIssuesNotInParams{RepoID: repoID, KeepIids: keep}); err != nil {
 		return Marks{}, err
 	}
-	return Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues)}, nil
+	return Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues), Finding: findingMark}, nil
 }
 
 // IncrementalSync fetches only the issues updated at/after each fetch's OWN mark
-// and upserts them — the uzi-labeled set (state=all) plus the additive open,
-// no-label set, the same pair FullSync takes. It cannot see de-labeling or
-// deletion (the filters structurally exclude them) — that is FullSync's job.
-// Returns m advanced field-wise, never lower than what it was given. The bound is
-// inclusive at second granularity, so the boundary row is re-fetched and deduped
-// by upsert.
+// and upserts them — the uzi-labeled set (state=all), the additive open, no-label
+// set, and (PRD #1183 Child B) the additive finding-labelled set (state=all), the
+// same three FullSync takes. It cannot see de-labeling or deletion (the filters
+// structurally exclude them) — that is FullSync's job. Returns m advanced field-wise,
+// never lower than what it was given. The bound is inclusive at second granularity,
+// so the boundary row is re-fetched and deduped by upsert.
 //
-// The two lower bounds are guarded INDEPENDENTLY: a zero mark sends no
-// updated_after on its own fetch and leaves the other's bound alone. A single
-// shared guard would drop both bounds the moment either mark was zero, which is
+// The three lower bounds are guarded INDEPENDENTLY: a zero mark sends no
+// updated_after on its own fetch and leaves the others' bounds alone. A single
+// shared guard would drop every bound the moment any mark was zero, which is
 // the unbounded re-read issue #177 is about.
 //
-// Either fetch failing returns the CALLER'S pair unchanged, along with the error
-// (Decision 11a) — BOTH marks held, not just the failed one's. Both fetches
-// complete before any upsert runs, so a half-failure means neither path's rows
-// were written; advancing the successful path's mark would skip a window whose
+// Any fetch failing returns the CALLER'S marks unchanged, along with the error
+// (Decision 11a) — ALL marks held, not just the failed one's. Every fetch
+// completes before any upsert runs, so a partial failure means no path's rows
+// were written; advancing a successful path's mark would skip a window whose
 // rows never reached the cache.
+//
+// The finding fetch is SKIPPED when the finding label equals the uzi label (a
+// misconfig ValidateMerged forbids): those issues are already covered by the uzi
+// fetch, so a third round trip would be pure duplicate work. Its mark then never
+// advances, which is correct — an unissued fetch is no evidence.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
 	uziLabel := s.uziLabel(ctx)
 	opts := forge.ListIssuesOptions{Labels: []string{uziLabel}}
@@ -567,13 +645,28 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 	if err != nil {
 		return m, err
 	}
+	findingLabel := s.findingLabel(ctx)
+	var findingIssues []forge.Issue
+	if findingLabel != uziLabel {
+		findingOpts := forge.ListIssuesOptions{Labels: []string{findingLabel}}
+		if !m.Finding.IsZero() {
+			findingOpts.UpdatedAfter = &m.Finding
+		}
+		findingIssues, err = f.ListIssues(ctx, forgeProjectID, findingOpts)
+		if err != nil {
+			return m, err
+		}
+	}
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return m, err
 	}
 	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel)); err != nil {
 		return m, err
 	}
-	return m.Advance(Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues)}), nil
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(findingIssues, uziLabel)); err != nil {
+		return m, err
+	}
+	return m.Advance(Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues), Finding: maxUpdatedAt(findingIssues)}), nil
 }
 
 // withoutLabel drops the issues carrying label from a fetch result. It is what

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -102,6 +103,107 @@ func readDisp(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID, rep
 	s.closeSynced = syncedAt.Valid
 	s.resolved = resolvedAt.Valid
 	return s
+}
+
+// seedFiledFindingNoCache seeds a user/connection/repo/run and one FILED finding
+// coordinate at iid, but DELIBERATELY inserts NO `issues` cache row — the contrast with
+// seedFindingCloseFixture, which pre-seeds the closed row. Here the only way a closed
+// issue row can appear is through the real sync path (FullSync/IncrementalSync), which is
+// exactly what TestFindingClosePollerCachePathLiveDB exercises. Returns (userID, repoID,
+// location).
+func seedFiledFindingNoCache(ctx context.Context, t *testing.T, q *store.Queries, pool *pgxpool.Pool, iid int64) (uuid.UUID, uuid.UUID, string) {
+	t.Helper()
+	userID, connID, repoID, runID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	location := fmt.Sprintf("internal/x_%s.go#f", uuid.NewString()[:6])
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("m3cp-%s@e2e", userID))
+	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	      VALUES ($1, $2, 1, 'g/cp', 'https://forge.e2e/g/cp', 'main', true)`, repoID, connID)
+	exec(`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+	      VALUES ($1, $2, $3, 1, 't', 'd', 'completed', 'issue')`, runID, userID, repoID)
+
+	// A FILED coordinate at iid — but no `issues` row, so the sync must be the one to cache it.
+	if _, err := q.UpsertOpenDisposition(ctx, store.UpsertOpenDispositionParams{
+		UserID: userID, RepoID: repoID, Location: location, ContentHash: "h-1", LastTitle: "leaky",
+	}); err != nil {
+		t.Fatalf("UpsertOpenDisposition: %v", err)
+	}
+	exec(`UPDATE finding_dispositions SET status='filed', filed_issue_iid=$4, filed_issue_url='u', resolved_at=now()
+	      WHERE user_id=$1 AND repo_id=$2 AND location=$3`, userID, repoID, location, iid)
+	return userID, repoID, location
+}
+
+// ── The poller CACHE PATH: a closed finding issue reaches the cache through the real
+// sync, and the close-sync then fires ────────────────────────────────────────────────
+//
+// TestSyncFindingIssueClosesLiveDB (below) INSERTs the closed `issues` row directly,
+// which proves the SQL edge but NOT that a closed finding issue can ever reach the cache
+// on its own. It cannot through the first two sync fetches: a filed finding issue carries
+// only the finding marker label (never uzi), so the uzi fetch (uzi-labelled, state=all)
+// and the additive open fetch (state=opened) BOTH structurally miss it once it closes —
+// it is evicted on close and this sync never fires. That was the confirmed bug. This test
+// drives the WHOLE path end to end: seed a filed disposition with NO cached issue row, run
+// the real FullSync against a fake forge that returns the issue as CLOSED and
+// finding-labelled (NOT uzi-labelled), assert the cache now holds it as closed, then run
+// SyncFindingIssueCloses and assert the finding moved to done via issue_close — i.e. the
+// third fetch is what carries a closed finding issue into the cache so the edge can fire.
+func TestFindingClosePollerCachePathLiveDB(t *testing.T) {
+	svc, pool, q := findingCloseSyncLiveDB(t)
+	ctx := context.Background()
+	const iid = 820
+	userID, repoID, location := seedFiledFindingNoCache(ctx, t, q, pool, iid)
+
+	// Precondition: the issue is NOT cached yet, so the close-sync has nothing to act on —
+	// which is exactly the state a just-closed finding issue was stuck in before this fix.
+	if _, err := q.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repoID, ForgeIssueIid: iid}); err == nil {
+		t.Fatalf("precondition: issue %d must not be cached before the sync", iid)
+	}
+	if err := svc.SyncFindingIssueCloses(ctx, repoID); err != nil {
+		t.Fatalf("pre-sync SyncFindingIssueCloses: %v", err)
+	}
+	if s := readDisp(ctx, t, pool, userID, repoID, location); s.status != "filed" {
+		t.Fatalf("with no cached issue the finding must stay filed, got %s", s.status)
+	}
+
+	// The forge reports the finding issue CLOSED and finding-labelled (never uzi) — the
+	// ONLY route a closed finding row reaches the cache. findingClosed carries the default
+	// finding label, which the nil-labels Service resolves the third fetch onto.
+	f := &fakeForge{findingIssues: []forge.Issue{findingClosed(iid, time.Unix(1000, 0))}}
+	if _, err := svc.FullSync(ctx, repoID, 1, f); err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+
+	// The cache now holds the issue as closed — the close-sync's precondition, reached
+	// through the real sync rather than a hand-inserted row.
+	cached, err := q.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repoID, ForgeIssueIid: iid})
+	if err != nil {
+		t.Fatalf("issue %d must be cached after FullSync (the third fetch carries closed finding issues): %v", iid, err)
+	}
+	if cached.State != "closed" {
+		t.Fatalf("cached issue state = %q, want closed", cached.State)
+	}
+
+	// And the close-sync fires off that freshly-synced snapshot, auto-resolving the finding.
+	if err := svc.SyncFindingIssueCloses(ctx, repoID); err != nil {
+		t.Fatalf("SyncFindingIssueCloses: %v", err)
+	}
+	s := readDisp(ctx, t, pool, userID, repoID, location)
+	if s.status != "done" {
+		t.Fatalf("status = %s, want done — a closed finding issue synced via the cache path must auto-resolve", s.status)
+	}
+	if s.setVia == nil || *s.setVia != "issue_close" {
+		t.Fatalf("set_via = %v, want issue_close", s.setVia)
+	}
+	if !s.closeSynced || !s.resolved {
+		t.Fatalf("close_synced_at/resolved_at must be stamped, got closeSynced=%v resolved=%v", s.closeSynced, s.resolved)
+	}
 }
 
 // ── The sync moves filed → done exactly once, stamping set_via and close_synced_at ──
