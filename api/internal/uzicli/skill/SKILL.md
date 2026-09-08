@@ -364,8 +364,14 @@ uzi version
   Claude Code has reaped detached watchers (`status: killed`) during long runs
   while the run itself continued. After observing that failure, replace the dead
   watcher with `uzi run get <id> --field status` on the harness's scheduler;
-  branch on status and read logs only when action is needed. Use one monitoring
-  mechanism, never both. A normal tool yield or an unchanged run state is not
+  retain its original `--until` stop set, any deadline and `--min-plan-seq` watermark.
+  If a watermark was set, accept `awaiting_approval` only after a successful
+  `uzi run logs <id> --json` fetch proves the highest **plan** message seq is greater
+  than that watermark. Stale, missing or unreadable plan messages mean keep waiting;
+  other requested stop states are not gated by plan sequence. In particular, keep
+  excluding the cleared approval gate during the post-approval wait. Read logs only
+  for this freshness check or when action is needed. Use one monitoring mechanism,
+  never both. A normal tool yield or an unchanged run state is not
   evidence that a watcher was reaped. This distinction was verified after a
   session repeatedly restarted short waits and fetched redundant logs (2026-09-08).
 
