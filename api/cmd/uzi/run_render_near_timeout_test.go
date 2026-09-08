@@ -30,10 +30,15 @@ func TestNearTimeoutLinePresentForFlaggedRun(t *testing.T) {
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 	got := nearTimeoutLine(slowRun(now, 65*time.Minute), now)
 
-	for _, want := range []string{"▲ near timeout", "left", "stops at", "of 8h"} {
+	for _, want := range []string{"▲ near timeout", "left", "stops at", "· of 8h ·"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("nearTimeoutLine = %q, want it to contain %q", got, want)
 		}
+	}
+	// The budget clause is the PRD's compact "of 8h" (shortDuration elides a whole-hour
+	// budget's "00m"), NOT the two-unit "of 8h00m".
+	if strings.Contains(got, "8h00m") {
+		t.Errorf("nearTimeoutLine = %q, want compact budget %q not %q", got, "of 8h", "of 8h00m")
 	}
 	// The countdown is off deadline_at, at two units (fmtUntil), so 65m reads "1h05m".
 	if !strings.Contains(got, "1h05m left") {
@@ -100,7 +105,7 @@ func TestFitNearTimeoutLineShedsClauses(t *testing.T) {
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 	r := slowRun(now, 65*time.Minute)
 
-	full := nearTimeoutLine(r, now) // floor + " · of 8h00m" + " · stops at HH:MM"
+	full := nearTimeoutLine(r, now) // floor + " · of 8h" + " · stops at HH:MM"
 	ofIdx := strings.Index(full, " · of ")
 	stopsIdx := strings.Index(full, " · stops at ")
 	if ofIdx < 0 || stopsIdx < 0 || stopsIdx < ofIdx {

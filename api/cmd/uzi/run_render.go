@@ -810,9 +810,9 @@ func nearTimeoutClauseParts(r apitypes.RunDTO, now time.Time) (floor, ofBudget, 
 	}
 	floor = "▲ near timeout · " + fmtUntil(r.DeadlineAt.Sub(now)) + " left"
 	if r.BudgetWallSeconds != nil {
-		// The same duration formatter the BUDGET_WALL row uses, so the budget reads the same
-		// on both surfaces (8h → "8h00m", of which "of 8h" is the PRD's shorthand prefix).
-		ofBudget = " · of " + fmtUntil(time.Duration(*r.BudgetWallSeconds)*time.Second)
+		// shortDuration elides a whole-hour budget's "00m" so an 8h budget reads "of 8h"
+		// (PRD #1170 Surfaces table), not "of 8h00m"; a mixed budget still reads "1h30m".
+		ofBudget = " · of " + shortDuration(time.Duration(*r.BudgetWallSeconds)*time.Second)
 	}
 	stopsAt = " · stops at " + r.DeadlineAt.Local().Format("15:04")
 	return floor, ofBudget, stopsAt, true
