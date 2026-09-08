@@ -3989,6 +3989,48 @@ describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () 
   });
 });
 
+// Issue #1197 (a11y): recovery_wait is a self-resuming park with NO ActivityFeed message
+// backup (unlike limit_wait, whose run message the feed's polite region narrates) and
+// RecoveryWaitPanel mounts in the same tick as its content — so, exactly like pool_wait,
+// the ALWAYS-MOUNTED page-level sr-only region is what reliably announces it. Same
+// instrument as the awaiting_followup block above.
+describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () => {
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("announces the recovery park through the always-mounted sr-only region", async () => {
+    renderPage({ status: "recovery_wait" });
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe(
+      "This run paused to recover from a transient empty result and will resume automatically.",
+    );
+    // Mutation guard: it is the recovery copy, NOT the pool_wait or awaiting_input copy.
+    expect(region.textContent).not.toContain("pooled Anthropic token");
+    expect(region.textContent).not.toContain("asking you a question");
+  });
+});
+
 // PRD #122: the milestone header badge, the checklist, and the plan-gate candidate list.
 describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
   const ms = (n: number) =>

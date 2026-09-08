@@ -882,10 +882,13 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
       <div className="min-w-0">
-        {/* role="status" announces the hold when this panel mounts, mirroring
-            PoolWaitPanel's heading — recovery_wait is a non-terminal park a screen-reader
-            user must be told about, and (like limit_wait) this panel is what announces it,
-            so it is deliberately NOT also in RunView's page-level parkAnnounce region. */}
+        {/* role="status" is the on-screen heading; it is NOT what a screen reader
+            relies on here — this panel mounts in the same tick as its content, and a
+            region created with its first content is typically silent to assistive tech
+            (see RunView's parkAnnounce note). Like pool_wait (and UNLIKE limit_wait,
+            which has an ActivityFeed run message to narrate it), recovery_wait has no
+            message backup, so RunView's always-mounted page-level parkAnnounce region is
+            what reliably announces the hold. */}
         <p role="status" className="text-sm font-semibold text-warn">
           <span aria-hidden="true">⏸ </span>
           Recovering and resuming automatically
@@ -1018,6 +1021,13 @@ export function RunView() {
   // screen-reader user must be told about, exactly like the follow-up park. One
   // stable key ("pool_wait"), since a pool hold has no per-instance identity to
   // re-announce on the way awaiting_input keys on the question.
+  // Issue #1197: recovery_wait announces here for the SAME reason as pool_wait — it
+  // is a non-terminal, self-resuming hold with no ActivityFeed message backup (unlike
+  // limit_wait, whose run message ActivityFeed's polite region narrates), so this
+  // always-mounted region is its only reliable announcement. RecoveryWaitPanel mounts
+  // in the same tick as its content, and a region created with its first content is
+  // typically silent to assistive tech, so the panel's own role="status" cannot be
+  // relied on. One stable key ("recovery_wait"), like pool_wait.
   const parkKey =
     questionId !== ""
       ? `question:${questionId}`
@@ -1025,7 +1035,9 @@ export function RunView() {
         ? "followup"
         : run?.status === "pool_wait"
           ? "pool_wait"
-          : "";
+          : run?.status === "recovery_wait"
+            ? "recovery_wait"
+            : "";
   useEffect(() => {
     if (parkKey === "") {
       setParkAnnounce("");
@@ -1036,7 +1048,9 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
-          : "The agent is asking you a question. The run is parked until you answer.",
+          : parkKey === "recovery_wait"
+            ? "This run paused to recover from a transient empty result and will resume automatically."
+            : "The agent is asking you a question. The run is parked until you answer.",
     );
   }, [parkKey]);
 
