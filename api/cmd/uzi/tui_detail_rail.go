@@ -260,29 +260,38 @@ func milestoneInProgressIDs(run apitypes.RunDTO) []string {
 }
 
 // milestoneIPSuffix builds the eyebrow's `<id>, <id> +N` in-progress suffix from the frozen-order
-// in-progress id list: up to two ids joined by ", ", then " +N" for the rest (`m1`, `m1, m2`,
-// `m1, m2 +1`). Each id is UNTRUSTED (a frozen key) and goes through renderer.Plain; the +N is a
-// plain integer. Empty for no ids. Both this and the bar's cell count derive from milestoneInProgressIDs
-// so they cannot disagree.
-func (m tuiModel) milestoneIPSuffix(ids []string) string {
-	if len(ids) == 0 {
+// in-progress id list, BUDGETED to fit maxWidth visual columns (the width the rail line can carry):
+// up to two ids joined by ", ", then " +N" for the rest (`m1`, `m1, m2`, `m1, m2 +1`), dropping to a
+// single id + a larger " +N" when two ids would overflow maxWidth — so a long-slug pair still fits
+// the fixed 26-col rail and the in-flight COUNT is folded into +N, never clamped away. Each id is
+// UNTRUSTED (a frozen key) and goes through renderer.Plain(id, 12); the +N is a plain integer.
+// Empty for no ids (or a maxWidth too small to hold one). Both this and the bar's cell count derive
+// from milestoneInProgressIDs, so the shown set never overstates what the bar counts.
+func (m tuiModel) milestoneIPSuffix(ids []string, maxWidth int) string {
+	if len(ids) == 0 || maxWidth < 1 {
 		return ""
 	}
-	shown := ids
-	extra := 0
-	if len(ids) > 2 {
-		shown = ids[:2]
-		extra = len(ids) - 2
+	// Prefer two ids; fall back to one when two would overflow the rail. The dropped ids always
+	// ride " +N", so the count is folded, never silently lost.
+	for _, show := range []int{2, 1} {
+		if show > len(ids) {
+			continue
+		}
+		parts := make([]string, 0, show)
+		for _, id := range ids[:show] {
+			parts = append(parts, m.renderer.Plain(id, 12))
+		}
+		s := strings.Join(parts, ", ")
+		if extra := len(ids) - show; extra > 0 {
+			s += " +" + itoa(extra)
+		}
+		if visualWidth(s) <= maxWidth {
+			return s
+		}
 	}
-	parts := make([]string, 0, len(shown))
-	for _, id := range shown {
-		parts = append(parts, m.renderer.Plain(id, 12))
-	}
-	s := strings.Join(parts, ", ")
-	if extra > 0 {
-		s += " +" + itoa(extra)
-	}
-	return s
+	// Unreachable at the rail's budget (a single Plain-capped id + " +N" is <= ~18 cols), but keep
+	// the line bounded if maxWidth is ever pathologically small.
+	return clampVisual(m.renderer.Plain(ids[0], 12), maxWidth)
 }
 
 // milestoneCell renders the blinking in-progress milestone micro-bar cell (PRD #1136, recoloring
@@ -425,13 +434,13 @@ func (m tuiModel) renderMilestones() string {
 			mid + m.pal.faint.Render(strings.Repeat("▱", empty)) + " "
 	}
 	eyebrow := m.pal.faint.Render("MILESTONES") + " " + bar + m.pal.faint.Render(milestoneCount(done, total, reported))
-	// `· <id>, <id> +N` lists every in-progress milestone (frozen order, capped) — the same set the
-	// bar counts — carrying the in-flight set without motion for a static/non-tty frame. joinColumns
-	// clamps EVERY rail line to laneRailWidth (26) in the composed View, so an inline suffix that
-	// would push the eyebrow past the rail is dropped to its own continuation line (`· <id>, <id>`,
-	// always <= the rail) where the full set survives the clamp; a suffix that still fits keeps the
-	// one-line `MILESTONES … · <id>` form (#1176).
-	switch suffix := m.milestoneIPSuffix(ipIDs); {
+	// `· <id>, <id> +N` lists the in-progress milestones (frozen order) the bar counts — the in-flight
+	// set carried without motion for a static/non-tty frame. joinColumns clamps EVERY rail line to
+	// laneRailWidth (26) in the composed View, so the suffix is budgeted to the rail's continuation
+	// width (milestoneIPSuffix folds a long-id overflow into " +N") and, when appending it inline
+	// would push the eyebrow past the rail, dropped to its own continuation line — so the line always
+	// fits the 26-col rail and the in-flight count never ellipsizes away in the composed view (#1176).
+	switch suffix := m.milestoneIPSuffix(ipIDs, laneRailWidth-visualWidth("· ")); {
 	case suffix == "":
 		sb.WriteString(eyebrow + "\n")
 	case visualWidth(eyebrow)+visualWidth(" · "+suffix) <= laneRailWidth:

@@ -607,6 +607,26 @@ func TestTUIRailEyebrowSuffixOmitsCompleted(t *testing.T) {
 	}
 }
 
+// FAILS-BEFORE (this rework): a long-slug in-progress trio must keep its in-flight COUNT in the
+// composed rail. `backend-setup`/`frontend-wire`/`deploy-stage` (each at/over the 12-col Plain cap)
+// make an unbudgeted `· <id>, <id> +1` exceed the fixed 26-col rail, so joinColumns clamps the line
+// and eats the trailing `+N`. The budgeted suffix folds the shown pair into one id + a larger `+N`,
+// so the composed continuation line fits and the count survives.
+func TestTUIRailEyebrowLongIDsKeepCount(t *testing.T) {
+	run := milestoneRailRun("eeeeeeee-4", "rail long ids",
+		[]apitypes.Milestone{
+			{ID: "backend-setup", Title: "Backend"}, {ID: "frontend-wire", Title: "Frontend"},
+			{ID: "deploy-stage", Title: "Deploy"}},
+		[]string{}, // non-nil empty ⇒ reported
+		[]string{"backend-setup", "frontend-wire", "deploy-stage"}) // three long ids in flight
+	view := railEyebrow(t, run, false)
+	// Three in flight, one id shown ⇒ `+2`. The count must survive the composed-view rail clamp
+	// (an unbudgeted `<id>, <id> +1` line would ellipsize the `+N` away).
+	if !strings.Contains(view, "+2") {
+		t.Errorf("long-id in-flight count must survive the composed rail clamp as `+2`\n%s", view)
+	}
+}
+
 // GUARD (#1176): a TERMINAL run carrying a stale MilestonesInProgress draws NO in-progress cells
 // and does not flip with the blink phase — the row is faint end to end. Holds before and after m2
 // (the `dim`/`!terminal` gate is unchanged). Rendered at blinkOn=true (the frame that would show
