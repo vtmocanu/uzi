@@ -109,8 +109,23 @@ export async function enumerateRepoSkills(
   skillsDir: string,
   maxBytes: number,
 ): Promise<{ skills: ClaimSkill[]; dropped: SkillDrop[] }> {
-  // The skills dir itself must be a real directory, never a symlink (guards
-  // `.claude/skills -> /` from redirecting enumeration outside the clone).
+  // The skills dir AND its immediate in-clone parent (`.claude` / `.agents`) must
+  // both be REAL directories, never symlinks. `lstat` refuses a symlink only at
+  // the FINAL path component: it silently FOLLOWS a symlinked parent, so a repo
+  // shipping `.agents -> <outside>` (or `.claude -> /`) would redirect enumeration
+  // out of the clone even though `<clone>/.agents/skills` still lstats as a real
+  // directory. The clone root and everything above it is created by the worker and
+  // trusted, so validating the one attacker-controlled parent closes that escape
+  // without introducing a realpath-follow (issue #1205 follow-up).
+  const parentDir = path.dirname(skillsDir);
+  let parentStat;
+  try {
+    parentStat = await fs.lstat(parentDir);
+  } catch {
+    return { skills: [], dropped: [] };
+  }
+  if (!parentStat.isDirectory()) return { skills: [], dropped: [] };
+
   let dirStat;
   try {
     dirStat = await fs.lstat(skillsDir);

@@ -314,15 +314,20 @@ model); this section is the map. User-facing usage is
   enumeration outside the clone); on a real-vs-real name collision `.claude/skills`
   wins and the shadowed `.agents/skills` entry is recorded as a drop. The canonical cross-agent layout
   keeps the real bodies under `.agents/skills` and projects `.claude/skills` as a
-  symlink, so the symlink-refusing guard reads the `.agents/skills` side. Repo
+  symlink, so the symlink-refusing guard reads the `.agents/skills` side. The
+  symlink refusal covers each root's immediate in-clone parent too (`.claude` /
+  `.agents`), since `lstat` follows a symlinked parent (issue #1205 follow-up). Repo
   skills carry no allocation, so a surviving one attaches to **every** template;
   they rank lowest (a name collision with any delivered skill drops the repo skill)
   and are first evicted if the set exceeds `skills_max_per_run`. These two roots are
   the **only** clone-borne configuration the worker reads (no hooks, settings,
-  commands, or `CLAUDE.md`), which is why the toggle is per repo: a repo's
-  `.claude/` (and `.agents/`) is exactly the config class `settingSources: []`
-  keeps closed, so loading even this much requires the repo owner or an admin to
-  vouch for that repo's review discipline.
+  commands, or `CLAUDE.md`), and it reads them through its OWN enumeration, not the
+  SDK: `settingSources: []` keeps the SDK from auto-loading the clone's `.claude/`
+  config class (settings, hooks, commands, subagents, `CLAUDE.md`), and `.agents/`
+  is not an SDK setting source at all. The opt-in deliberately re-opens one narrow,
+  skills-only slice of that otherwise-closed clone-config class, which is why the
+  toggle is per repo: it requires the repo owner or an admin to vouch for that
+  repo's review discipline.
 - **Trust boundary.** `settingSources: []` stays `[]` with or without repo skills
   enabled; the plugin channel (`plugins: [{type: 'local', ...}]`) is a separate SDK
   option, so this delivery never loosens that isolation. A hostile repo skill still

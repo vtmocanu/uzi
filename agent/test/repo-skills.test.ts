@@ -247,4 +247,42 @@ describe("collectRepoSkills (dual-root .claude/skills + .agents/skills)", () => 
     assert.deepEqual(skills, []);
     assert.deepEqual(dropped, []);
   });
+
+  // Parent-symlink containment: `lstat` refuses a symlink at the FINAL component
+  // but FOLLOWS a symlinked parent, so `.agents -> <outside>` (or `.claude -> …`)
+  // must be rejected too, or enumeration escapes the clone even though
+  // `<clone>/.agents/skills` lstats as a real directory (issue #1205 follow-up).
+  it("returns nothing when the .agents PARENT itself is a symlink (parent-follow escape)", async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-outside-agents-parent-"));
+    fs.mkdirSync(path.join(outside, "skills", "leaked"), { recursive: true });
+    fs.writeFileSync(
+      path.join(outside, "skills", "leaked", "SKILL.md"),
+      "---\nname: leaked\ndescription: escaped the clone.\n---\n\nsecret\n",
+    );
+    try {
+      // `<clone>/.agents` -> outside, whose real `skills/leaked/SKILL.md` would
+      // be read if only the final `skills` component were guarded.
+      fs.symlinkSync(outside, path.join(clone, ".agents"));
+      const { skills } = await collect();
+      assert.deepEqual(skills, [], "a symlinked .agents parent must not be followed");
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("returns nothing when the .claude PARENT itself is a symlink (parent-follow escape)", async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-outside-claude-parent-"));
+    fs.mkdirSync(path.join(outside, "skills", "leaked"), { recursive: true });
+    fs.writeFileSync(
+      path.join(outside, "skills", "leaked", "SKILL.md"),
+      "---\nname: leaked\ndescription: escaped the clone.\n---\n\nsecret\n",
+    );
+    try {
+      fs.symlinkSync(outside, path.join(clone, ".claude"));
+      const { skills } = await collect();
+      assert.deepEqual(skills, [], "a symlinked .claude parent must not be followed");
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
 });

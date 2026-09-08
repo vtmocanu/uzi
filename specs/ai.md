@@ -3055,17 +3055,24 @@ defense — `settingSources: []` — never loosens).
 Serves human: "repos may carry skills the worker detects; per-repo opt-in, default off".
 
 - **Only when `ClaimRepo.skills_enabled`** (the repo owner or an admin flipped
-  `repos.repo_skills_enabled`): after checkout the worker enumerates
-  `<clone>/.claude/skills/*/SKILL.md`, parses **only `name` + `description`** from the
-  frontmatter, and **drops every other frontmatter key** (`allowed-tools` and friends
-  **grant capabilities** — stripping them is the security point, and it matches how
-  server-stored skills carry body-only). It re-synthesizes escaped frontmatter with the
-  same materializer, applies the same name regex + size cap, and places repo skills at
-  **lowest precedence** (a delivered skill of the same name always wins; the repo skill
-  is skipped + logged).
-- **Symlinks are never followed**: the skills dir itself must be a real directory (a
-  symlinked dir is skipped), and a symlinked `SKILL.md` is never read (`lstat` +
-  `isDirectory`/`isFile` guards) — a repo can't escape its tree via a link.
+  `repos.repo_skills_enabled`): after checkout the worker enumerates **two** real-directory
+  roots — `<clone>/.claude/skills/*/SKILL.md` (what Claude Code reads) and
+  `<clone>/.agents/skills/*/SKILL.md` (the cross-agent root Codex reads, #1205) — parses
+  **only `name` + `description`** from the frontmatter, and **drops every other frontmatter
+  key** (`allowed-tools` and friends **grant capabilities** — stripping them is the security
+  point, and it matches how server-stored skills carry body-only). It re-synthesizes escaped
+  frontmatter with the same materializer, applies the same name regex + size cap, and places
+  repo skills at **lowest precedence** (a delivered skill of the same name always wins; the
+  repo skill is skipped + logged). On a real-vs-real name collision between the two roots,
+  `.claude/skills` wins and the shadowed `.agents/skills` copy is dropped + logged; in the
+  canonical layout `.claude/skills` is a symlink projection of `.agents/skills`, so it is the
+  real `.agents/skills` side that supplies the skills.
+- **Symlinks are never followed**, for BOTH roots: the skills dir and its immediate in-clone
+  parent (`.claude` / `.agents`) must each be a real directory (a symlinked dir is skipped),
+  and a symlinked `SKILL.md` is never read (`lstat` + `isDirectory`/`isFile` guards). Guarding
+  the parent matters because `lstat` follows a symlinked parent component, so `.agents -> …`
+  would otherwise redirect enumeration outside the clone — a repo can't escape its tree via a
+  link at any level below the trusted clone root.
 - **Repo skills carry no allocation, so they apply to ALL templates in the run**
   (appended to every subagent's `AgentDefinition.skills`, not just the lead's — the
   top-level union only covers the main-thread session, so without this a repo skill would

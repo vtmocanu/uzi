@@ -390,10 +390,11 @@ export interface ClaimRepo {
    *  still drives a GitLab run on a new worker (R8). The worker selects its forge
    *  client from this. */
   forge_type?: "gitlab" | "forgejo" | "github";
-  /** Repo owner's opt-in (PRD #16): load skills from the repo's own
-   *  .claude/skills at run time. Default false. When true the worker enumerates
-   *  repo skills after checkout, applies the caps, and ranks them below every
-   *  delivered skill (M6). Skills only — repo hooks/settings/commands never load. */
+  /** Repo owner's opt-in (PRD #16): load skills from the repo's own skill roots at
+   *  run time. Default false. When true the worker enumerates BOTH real-directory
+   *  roots after checkout — `.claude/skills` and `.agents/skills` (issue #1205) —
+   *  applies the caps, and ranks them below every delivered skill (M6). Skills only
+   *  — repo hooks/settings/commands never load. */
   skills_enabled?: boolean;
   /** Repo owner's opt-in (PRD #246): let the LEAD read the clone's root CLAUDE.md
    *  as a nonce-fenced UNTRUSTED/ADVISORY block. Default false. A sibling trust flag
