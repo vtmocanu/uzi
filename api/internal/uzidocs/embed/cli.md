@@ -1300,11 +1300,12 @@ readable the same way under `--json`.
 
 ### Run status, and what `--follow` waits for
 
-A run's `status` (on `run get` and `run list`) is one of exactly **ten** values:
-`queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
-`awaiting_followup`, `limit_wait`, `completed`, `failed`, `cancelled`. Only the
-last three are **terminal**, and `uzi run logs --follow` returns **only** on
-those three. The four non-terminal parks it will *not* stop at:
+A run's `status` (on `run get` and `run list`) is one of exactly **twelve**
+values: `queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
+`awaiting_followup`, `limit_wait`, `pool_wait`, `completed`, `failed`,
+`cancelled`, `paused`. Only `completed`, `failed` and `cancelled` are
+**terminal**, and `uzi run logs --follow` returns **only** on those three. The
+other non-terminal parks it will *not* stop at:
 
 - `awaiting_approval` — the plan gate;
 - `awaiting_input` — a clarifying question, answered with `run answer`;
@@ -1314,7 +1315,12 @@ those three. The four non-terminal parks it will *not* stop at:
   stop`, or let its worker-side idle timeout finalize it — see [Interactive
   mode](./handoff.md#interactive-mode);
 - `limit_wait` — parked while an Anthropic usage limit resets, promoted back to
-  `queued` once past its `retry_not_before`.
+  `queued` once past its `retry_not_before`;
+- `pool_wait` — an auto run held because its token pool is empty; add a token
+  to the pool and it resumes, or use `uzi run resume-now`;
+- `paused` — an owner-requested hold (`uzi run pause`), resumed on demand from
+  the run page or `uzi run resume <id>` — see [Pausing and resuming a
+  run](./run-pause.md). It does **not** auto-resume.
 
 So to wait for a plan gate or a clarification, use **`uzi run wait <id>`** (next
 section) — leaning on `--follow` there blocks until the run truly finishes, which
@@ -1327,7 +1333,7 @@ A `running` run whose agent is still drafting its plan, pre-approval, reads
 **planning** instead — in the STATUS column of `run list`/`run get`, in the
 TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
-It's still the same `running` value underneath, not an eleventh status.
+It's still the same `running` value underneath, not a thirteenth status.
 
 ### Waiting for a state: `uzi run wait`
 
@@ -1336,7 +1342,9 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `while … run get … sleep` poll loop. With no `--until` it stops on any
 **actionable or terminal** state (`awaiting_approval`, `awaiting_input`,
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
-rest (`queued`/`claimed`/`running`/`limit_wait`), so a bare `run wait` means
+rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`paused` — the
+first three still working, `limit_wait` and `pool_wait` resuming on their own,
+`paused` only on demand via `uzi run resume`), so a bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park, **or**
 the end".
 
@@ -1350,7 +1358,7 @@ the end".
   gate, so a bare wait cannot hang.
 - A single transient `6` (a server blip) is retried, not fatal; a `4` (not
   found) is immediate.
-- `--until <a,b>` overrides the stop set, validated against the ten statuses.
+- `--until <a,b>` overrides the stop set, validated against the twelve statuses.
 - `--min-plan-seq <n>` is for waiting on a REVISED plan after `uzi run
   revise`: it makes the wait stop at `awaiting_approval` only once a plan
   message with seq greater than `<n>` exists, so it does not return on the

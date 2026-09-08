@@ -62,11 +62,18 @@ The worker publishes its checkpoint **before** reporting `paused` (`agent/src/ru
 
 `ResumePausedRun` **banks** the parked wall-clock time into `budget_paused_seconds` and **keeps `started_at`** untouched — the run resumes with exactly the budget it had left. This is the *opposite* of `PromoteLimitWaitRuns`, which resets `started_at` and zeroes `budget_paused_seconds` so a limit-park resume gets a fresh full wall (Decision 6d, issue #35). Swapping the two would be a real regression in either direction: a fresh wall on a voluntary pause is an uncapped extension that makes any future budget cap pointless; the limit park's fresh wall exists because that park was never the owner's choice to make in the first place. A mutation test (flip `ResumePausedRun` to zero `budget_paused_seconds` instead of adding to it) is expected to redden the live-DB assertion that pins this.
 
+### I8 — `SetRunPaused` guards its own entry against a stale or reordered `paused` report
+
+`SetRunPaused` (`api/internal/store/queries/runtime.sql`) carries `AND pause_requested_at IS NOT NULL` beside its positive `status = 'running'` source guard. This is the **entry-side** analog of I3's `<> 'paused'` guards, which protect a *parked* run from being flipped back to `running` by a stale report; this guard instead protects a *still-running* row from being parked by a stale or delayed `paused` report once its pending request is no longer live. Between the worker deciding to park (checkpoint published, I6) and the `SetRunPaused` UPDATE landing, the pending request can have been withdrawn (`CancelPauseInput`), cleared by a failed publish elsewhere on the same run (`ClearPauseRequest`), or the run can have gone terminal (I5) — in every one of those cases the three pause columns are already `NULL`, and without this guard the late `paused` report would still park the run on a request nobody is holding anymore. With the guard, that report is a 0-row no-op, exactly the shape `SetRunLimitWait`'s own positive source guard already gives a re-delivered park report.
+
+What this guard does **not** do: correlate the *specific* pause request the worker is reporting against (call it P1) with whatever request is live when the report lands (P2, if the owner cancelled P1 and issued a fresh pause after the worker had already committed to parking on P1). `pause_requested_at IS NOT NULL` is satisfied by P2 just as it would have been by P1, so a P1-triggered park can land while P2 is the columns' actual owner. Distinguishing P1 from P2 needs a request identity the columns do not currently carry (e.g. a monotonic request id compared server-side, the way `codex_claim_epoch` disambiguates claims). This finer `pause_failed`/`ClearPauseRequest`-style request correlation remains a **deferred follow-up**, not a gap this guard claims to close: it closes the *withdrawn-or-terminal* case (the common one), not the *superseded-by-a-new-request* case.
+
 ## Consequences
 
 - A future ninth or tenth status added to this codebase gets its own audit against these six lists (I2) and three guards (I3) the same way `paused` got audited against `pool_wait`'s own PRD (#754) — this ADR is where that checklist should be extended, not re-derived.
 - Widening `CreatePauseInput`'s kind allowlist to admit `chat` is not a one-line change: it also obligates the `SweepIdleChatRuns` clear from I5.
 - A reason-carrying `pause_failed` → Slack DM seam remains open as a follow-up (I6); until it lands, `pause_failed` is discoverable only in-app.
+- The P1/P2 pause-request correlation I8 calls out remains open as a follow-up; a request identity on the pending-pause columns is the shape a fix would take.
 
 ## Linked from ARCHITECTURE.md
 
