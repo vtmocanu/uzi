@@ -74,7 +74,7 @@ const MAX_DIAGNOSTIC_CHARS = 120;
 // Documented aliases only: `Write`/`Edit`/`MultiEdit` are the Codex source aliases
 // for `apply_patch`; `Agent` is the alias for `spawn_agent`. `collaborationspawn_agent`
 // is a DISTINCT code-mode name, not an alias of `spawn_agent`, so it is not collapsed.
-export const CODEX_TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
+const CODEX_TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
   ["Write", "apply_patch"],
   ["Edit", "apply_patch"],
   ["MultiEdit", "apply_patch"],
