@@ -80,4 +80,53 @@ describe("mock engine: pause / pause_cancel timer separation (PRD #1190, finding
     expect(run.pause_mode).toBeNull();
     expect(typeof run.checkpoint_tip_at).toBe("string");
   });
+
+  // PRD #1190 (D6 / ADR I4): a pending milestone pause SURVIVES an involuntary park and
+  // re-arms. The demo's post-approval clarification question flips the run to awaiting_input
+  // at ~2100ms — BEFORE the milestone boundary fires at 2500ms — so the park is overtaken.
+  // The pause must NOT be silently dropped: it re-arms and lands once the answer returns the
+  // run to `running`. (Regression: before the re-arm the one-shot park no-op'd on the
+  // non-running status and pause_requested_at stayed set forever.)
+  it("a milestone pause overtaken by a clarification question still lands after the answer", () => {
+    // approve_plan resumes the run and schedules askScript (the clarification question fires at
+    // ~2100ms, flipping the run to awaiting_input).
+    handleInput(RUN_ID, "approve_plan", "");
+    expect(state.runs.get(RUN_ID)!.status).toBe("running");
+
+    // Request a milestone pause (boundary park at 2500ms) — a FLAG, not a stop.
+    expect(handleInput(RUN_ID, "pause", "milestone")).toBeNull();
+    expect(state.runs.get(RUN_ID)!.pause_requested_at).not.toBeNull();
+
+    // Advance PAST the question (~2100ms) but not past the park (2500ms): the involuntary
+    // park overtakes the pending pause — status becomes awaiting_input.
+    vi.advanceTimersByTime(2200);
+    expect(state.runs.get(RUN_ID)!.status).toBe("awaiting_input");
+    expect(state.runs.get(RUN_ID)!.pause_requested_at).not.toBeNull();
+
+    // Advance past the park window. The boundary timer fires while the run is awaiting_input,
+    // so the pending pause must SURVIVE and re-arm rather than no-op away — the run is still
+    // parked on the question and the pause request is still pending.
+    vi.advanceTimersByTime(2000);
+    const overtaken = state.runs.get(RUN_ID)!;
+    expect(overtaken.status).toBe("awaiting_input");
+    expect(overtaken.status).not.toBe("paused");
+    expect(overtaken.pause_requested_at).not.toBeNull();
+
+    // Answer the question → the run returns to `running` (schedules askAgainScript). The
+    // survived pause now has a `running` boundary to land on.
+    const answer = JSON.stringify({ question_id: "q-mock-0001", answers: ["Postgres table"] });
+    expect(handleInput(RUN_ID, "answer", answer)).toBeNull();
+    expect(state.runs.get(RUN_ID)!.status).toBe("running");
+
+    // Let the re-armed park land.
+    drain();
+
+    const run = state.runs.get(RUN_ID)!;
+    // The milestone pause EVENTUALLY landed after the involuntary park — not silently dropped.
+    expect(run.status).toBe("paused");
+    // …with the pause columns cleared and the checkpoint stamped on the park.
+    expect(run.pause_requested_at).toBeNull();
+    expect(run.pause_mode).toBeNull();
+    expect(typeof run.checkpoint_tip_at).toBe("string");
+  });
 });

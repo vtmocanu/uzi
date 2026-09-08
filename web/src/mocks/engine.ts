@@ -5,6 +5,9 @@
 // mirroring the real worker protocol's semantics.
 
 import type { IssueProposal, RunInputKind } from "../lib/api";
+// isTerminalRun comes from the leaf module (not the ../lib/api barrel) to stay clear of the
+// mock↔barrel runtime cycle the api-acyclic test guards.
+import { isTerminalRun } from "../lib/runStatus";
 import { HEARTBEAT_MILESTONES, SAMPLE_PLAN } from "./data";
 import { appendMessage, getRun, listMessages, nextProposalId, patchRun, putProposal } from "./store";
 
@@ -724,15 +727,36 @@ function pauseNotSupportedReason(run: { kind: string; interactive?: boolean }): 
 }
 
 // parkPaused moves a running run to `paused` — the mock's stand-in for the worker
-// publishing a checkpoint and reporting the park (D8). A no-op unless the run is still
-// running with the request live (a pause_cancel or another exit beat the timer). On the
-// park it stamps checkpoint_tip_at and clears the request columns, exactly as SetRunPaused
-// does on the wire.
+// publishing a checkpoint and reporting the park (D8). On the park it stamps
+// checkpoint_tip_at and clears the request columns, exactly as SetRunPaused does on the wire.
+//
+// PRD #1190 (D6 / ADR I4): a pending pause is a FLAG that SURVIVES an involuntary park and
+// RE-ARMS, not a fire-once timer. If the boundary timer fires while the run has been overtaken
+// by an involuntary park (e.g. a clarification question flipped it to awaiting_input before the
+// milestone boundary), the pause request stays pending and the park re-schedules itself, landing
+// at the next boundary once the run is `running` again. Without this a milestone pause requested
+// just after approve_plan is silently DROPPED when the demo's clarification question beats it to
+// the punch — a mock that misleads a developer into thinking the pause was lost.
+//
+// It cannot spin forever: it re-arms ONLY for a non-terminal, non-running park, and every such
+// state is transient — the scripts drive awaiting_input back to `running` on `answer`, a
+// pause_cancel clears the request (short-circuited below), a successful park clears the columns,
+// and a terminal run never returns to `running` (isTerminalRun blocks the re-arm).
 function parkPaused(runId: string): void {
   const run = getRun(runId);
   // The park-timer handle is spent whether or not the guard below lets the park proceed.
   clearParkTimer(runId);
-  if (!run || run.status !== "running" || !run.pause_requested_at) return;
+  // Run gone, or the request was withdrawn (pause_cancel) / already parked → the pending pause
+  // is over; do not re-arm.
+  if (!run || !run.pause_requested_at) return;
+  if (run.status !== "running") {
+    // Overtaken by an involuntary park with the pause still pending: re-arm so it lands at the
+    // next `running` boundary (D6 / ADR I4). A terminal run never returns to running, so guard
+    // against it — the mock's `cancel` leaves the pause columns set, so isTerminalRun is what
+    // actually stops the loop there, not a cleared request.
+    if (!isTerminalRun(run.status)) schedulePark(runId, 500);
+    return;
+  }
   // The park is landing NOW: stop the run's execution — nothing runs while paused (D3). The
   // execution timers were deliberately left running until this moment so the script kept
   // advancing while the pause was merely pending (finding [4]).
