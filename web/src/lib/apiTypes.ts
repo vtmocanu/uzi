@@ -2681,6 +2681,12 @@ export interface JudgeOccurrence {
   verdict: ReviewVerdict;
   confidence: "" | "low" | "medium" | "high";
   bucket: JudgeBacklogBucket;
+  // judged_at is rv.updated_at, the review's last-judging time and the backlog sort key
+  // (PRD #1183 M2): it lets the Judge page pick the newest open occurrence and compute the
+  // stale-link warning. OPTIONAL on the wire type by rollout-skew precedent — the server
+  // (non-omitempty) always sends it, but keeping it optional lets existing occurrence
+  // literals in tests and mocks compile without it.
+  judged_at?: string;
   // The disposition's PROVENANCE (PRD #98 Decision 6). Absent means a PERSON set it;
   // "issue_close" means the M6 poller sync did when the filed issue was closed. Both are
   // bucket "done", so the bucket alone cannot tell them apart and a client that ignores
