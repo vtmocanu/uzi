@@ -31,7 +31,7 @@ through `[0.52.0]`.)
 - **A bundled IBM Plex typeface option ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
   Settings → Appearance gains a Typeface choice: System (the platform default) or IBM Plex, shipped with the app so switching to it makes no external font request and the System choice downloads nothing.
 - **Further foundational work toward a Codex-based worker lane ([#1171](https://github.com/vtmocanu/uzi/issues/1171), [#1106](https://github.com/vtmocanu/uzi/issues/1106)).**
-  Behind the scenes and not user-visible yet: completes the Codex production adapter and execution-safety milestone (M3b), building on the credential and packaging groundwork shipped in 0.79.0.
+  Behind the scenes and not user-visible yet: ships the credential-free Codex adapter core and execution-safety foundations, building on the credential and packaging groundwork shipped in 0.79.0. Production integration remains pending.
 
 ### Changed
 

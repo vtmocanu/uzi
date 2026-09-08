@@ -745,7 +745,7 @@ Extends Feature #111 (auto-select) and issue #804 (ephemeral default).
 
 ## Feature #1167 — Lights on: light themes, system-follow appearance, typeface
 
-Tracked as GitHub issue vtmocanu/uzi#1167; PRD at `prds/1167-lights-on-themes.md`.
+Tracked as GitHub issue vtmocanu/uzi#1167; PRD at `prds/done/1167-lights-on-themes.md`.
 Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 
 - Three light themes — Dawn, Hall, Shadow — a light option for a dark-first tool, each keeping the dark factory somewhere on screen; ship all three, Hall the recommended light default. [user 2026-09-07]

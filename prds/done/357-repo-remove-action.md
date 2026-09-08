@@ -1,7 +1,7 @@
 # PRD #357: Explicit per-repo remove action
 
 **GitHub Issue**: [#357](https://github.com/vtmocanu/uzi/issues/357)
-**Status**: Draft (created 2026-08-18)
+**Status**: Complete (2026-08-20); M1-M4 shipped. Optional M5 remains outside the completed scope.
 **Priority**: Medium
 **Related**:
 - `ListProjects` (`api/internal/handler/forge.go:486-553`) — the add/update-only projects refresh whose lack of a prune is the root cause. This PRD does **not** add pruning to it (see D1); it adds a separate, explicit remove.

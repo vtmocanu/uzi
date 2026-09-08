@@ -1,8 +1,8 @@
 # PRD #1167: Lights on — light themes, system-follow appearance mode, typeface setting
 
 **Issue:** [#1167](https://github.com/vtmocanu/uzi/issues/1167)
-**Status:** Implemented (all milestones landed); in review as PR #1203.
-**Execution:** Queued for the nightly `Planned` sweep (auto-approve on, MR rework on). Web + api + docs, no workflow files.
+**Status:** Complete (2026-09-08); all milestones landed through PR #1203.
+**Execution:** Completed through PR #1203. Web + api + docs, no workflow files.
 **Mock:** `prds/mockups/1167-lights-on-themes-mock.html` (open locally; keys `1`/`2`/`3` switch proposal, `O`/`B`/`R`/`S`/`C` switch screen, `T` toggles the typeface, `N` the notes drawer). The mock is the accepted design for the three light themes, the Appearance settings card and the "Lights on / Lights off" vocabulary.
 
 uzi is a dark factory and ships dark-only: Ember and Mission control. Daytime and bright-room use has no light option, and the appearance picker is one explicit theme id with no way to follow the operating system or to hold a preferred theme per polarity. This PRD adds three light themes that each keep the dark factory somewhere on screen, gives every theme a polarity, replaces the single picker with a mode (System / Lights on / Lights off) plus one theme per polarity and admin instance defaults, and adds a per-user typeface setting (System or IBM Plex, bundled, no external font fetch).

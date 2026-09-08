@@ -6,7 +6,7 @@
 
 M3a [#1156](https://github.com/vtmocanu/uzi/issues/1156) packages pinned Codex 0.153.2 in both worker images and supplies one isolated, observed-clean supervisor-root launcher. M2 [#1146](https://github.com/vtmocanu/uzi/issues/1146) supplies the neutral run/advice harness boundary while preserving Claude behavior. M1 [#1147](https://github.com/vtmocanu/uzi/issues/1147) supplies named credentials, immutable run binding, per-claim capability authorization and coordinated refresh/recovery. The remaining M3 work is to connect those three foundations into a production Codex run and advice adapter without enabling public Codex routing yet.
 
-Use current `main` and a new working branch; never touch `main`. The accepted [ADR-1106 execution policy](../adr/1106-codex-harness.md#execution-policy), [neutral harness contract](../e2e/codex-m0/harness-contract.md#contracts), [M1 credential contract](done/1147-codex-credentials-foundation.md) and [M3a launcher contract](1156-codex-image-launcher.md) are authoritative. Complete only this child and hand off its PR. Do not start M4-M7, enable production routing, deploy, release, close the parent, or claim phase-1 Codex support.
+Use current `main` and a new working branch; never touch `main`. The accepted [ADR-1106 execution policy](../adr/1106-codex-harness.md#execution-policy), [neutral harness contract](../e2e/codex-m0/harness-contract.md#contracts), [M1 credential contract](done/1147-codex-credentials-foundation.md) and [M3a launcher contract](done/1156-codex-image-launcher.md) are authoritative. Complete only this child and hand off its PR. Do not start M4-M7, enable production routing, deploy, release, close the parent, or claim phase-1 Codex support.
 
 ## Problem and outcome
 
