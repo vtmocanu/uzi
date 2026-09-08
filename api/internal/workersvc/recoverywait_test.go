@@ -35,17 +35,20 @@ func TestRecoveryParkFallbackIsCappedExponential(t *testing.T) {
 
 	// The 5th park doubles past the 30m cap and every later one is clamped — and, unlike
 	// the usage-limit park, a HIGH count never fails the run: it just keeps parking at the
-	// cap. This is the "no lifetime cap" property, and the overflow guard is load-bearing
-	// here because recovery_wait_count is unbounded.
+	// cap. This is the "no lifetime cap" property. Any count at or above
+	// recoveryParkFallbackMaxShift short-circuits STRAIGHT to maxPark without shifting, so
+	// none of these large values (20, 21, 64, 1<<20) reach the doubling at all — the d < base
+	// overflow guard stays defensive, exercised only by a pathologically-large configured
+	// base, never by an unbounded count.
 	for _, priorParks := range []int32{5, 6, 19, 20, 21, 64, 1 << 20} {
 		got := svc.recoveryParkFallbackFor(priorParks)
 		if got != 30*time.Minute {
 			t.Fatalf("priorParks=%d: %v, want the 30m cap", priorParks, got)
 		}
 		if got <= 0 {
-			t.Fatalf("priorParks=%d produced a non-positive duration %v — an unbounded count "+
-				"shifted past 63 bits and wrapped, which is the promote->re-park loop this "+
-				"schedule exists to avoid", priorParks, got)
+			t.Fatalf("priorParks=%d produced a non-positive duration %v — every count must map "+
+				"to a finite positive stamp in the FUTURE; a non-positive one would be a stamp in "+
+				"the past and the promote->re-park loop this schedule exists to avoid", priorParks, got)
 		}
 	}
 

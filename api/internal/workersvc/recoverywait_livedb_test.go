@@ -142,7 +142,11 @@ func TestRecoveryWaitLiveDB(t *testing.T) {
 
 	t.Run("park preserves plan/session/worker/checkpoint and stamps the retry", func(t *testing.T) {
 		id := seedRun(1)
-		retry := now.Add(time.Minute)
+		// Postgres timestamptz stores MICROSECOND precision, so truncate the expected stamp to
+		// microseconds before it is both STORED and COMPARED — otherwise the sub-microsecond
+		// remainder of a nanosecond-precision time.Now() is lost in the round-trip and .Equal
+		// fails every run (same convention as store/schedule_pause_livedb_test.go).
+		retry := now.Add(time.Minute).Truncate(time.Microsecond)
 		if rows := park(id, retry); rows != 1 {
 			t.Fatalf("park rows = %d, want 1 (the running autopilot row must park)", rows)
 		}
