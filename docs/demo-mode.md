@@ -15,9 +15,9 @@ user is affected.
 
 ## Turning it on
 
-1. Go to **Settings** and find the **Demo mode** card, kept visually
-   separate from the theme picker above it — theme is a server setting that
-   follows you across browsers, demo mode is not.
+1. Go to **Settings → Appearance** and find the **Demo mode** card, kept
+   visually separate from the theme picker above it — theme is a server
+   setting that follows you across browsers, demo mode is not.
 2. Or use the quick toggle in the sidebar, in the user area next to your
    name, which also shows "Demo mode: On/Off" as a state cue.
 

@@ -45,12 +45,13 @@ rename a real GitLab label out from under you, and there's no undo for that
 from inside uzi. To adopt the new name by hand, see
 [Configuration](./configuration.md).
 
-**Hide empty columns.** The board toolbar has a **Hide empty** tick box: turn
-it on and any column with no cards drops out, with a **`N hidden`** count next
-to the box. The choice is remembered per board. Hiding is recomputed on every
-poll, so a column reappears on its own the moment a card lands in it (a run
-auto-move, a change made in GitLab); while you drag a card, the hidden lanes
-reappear dimmed so you can still drop into them.
+**Hide empty columns.** The board toolbar has a **Hide empty** tick box, **on
+by default**, so a board opens without its empty columns; a **`N hidden`** count
+sits next to the box. Untick it to show every column. The choice is remembered
+per board, so a board you've explicitly set to show empty columns keeps showing
+them. Hiding is recomputed on every poll, so a column reappears on its own the
+moment a card lands in it (a run auto-move, a change made in GitLab); while you
+drag a card, the hidden lanes reappear dimmed so you can still drop into them.
 
 ## More room for the board
 
@@ -156,10 +157,12 @@ Two consequences worth knowing:
 
 ## Search
 
-The toolbar's search field filters cards across every column at once, by
-title, `#iid`, or label — case-insensitive, with the matched text
-highlighted. Press **`/`** anywhere on the board to jump into it; **`Esc`**
-clears the query.
+The search field and the board's controls sit on their own full-width row
+beneath the board title, left-aligned at every width (so a wide window looks
+like a narrow one, with search top-left rather than pushed to the far edge).
+Search filters cards across every column at once, by title, `#iid`, or label —
+case-insensitive, with the matched text highlighted. Press **`/`** anywhere on
+the board to jump into it; **`Esc`** clears the query.
 
 While a query is active: a column with no matches drops out entirely, a
 capped column showing only some of its matches gets an `N/M` count (see
