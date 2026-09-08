@@ -1768,6 +1768,14 @@ export type RunStatus =
    *  moment a token is opted into the pool, and can be resumed on demand via
    *  `resumeRunNow` (POST /runs/{id}/resume-now). */
   | "pool_wait"
+  /** PRD #1190: a run its OWNER paused on demand. In the wait family beside limit_wait
+   *  and pool_wait (In Progress on the board, exempt from the timeout sweep, never
+   *  health-flagged, HOME never reclaimed), but UNLIKE those two it resumes ONLY on
+   *  demand (POST /runs/{id}/resume-now, widened by D14) and spends no budget while
+   *  parked (the clock stops; budget_paused_seconds banks the pause on resume).
+   *  NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES below. A PENDING
+   *  pause is a FLAG on a still-`running` run (pause_requested_at), never this status. */
+  | "paused"
   | "completed"
   | "failed"
   | "cancelled";
@@ -2157,6 +2165,33 @@ export interface Run {
    *  ACK and the claim payload (both built by runToDTO). OPTIONAL here only to avoid forcing
    *  mock-object updates; the server always sends it. */
   scope_ceiling?: number | null;
+  /** PRD #1190: the pause wire contract, all five OPTIONAL for api/web rollout skew (a
+   *  pre-feature api pod omits the keys) exactly like scope_ceiling / is_planning.
+   *
+   *  `pause_requested` is the SERVER-DECIDED, worker-facing ACK boolean that rides the
+   *  running-report ACK / claim (built by runToDTO beside scope_ceiling): true when the
+   *  boundary rule (D4) says the worker should park at its next boundary. The web reads
+   *  the three owner-facing intent columns below, not this — but it is on the DTO, so it
+   *  is typed here to match the recorded contract fixtures.
+   *
+   *  `pause_requested_at` / `pause_mode` / `pause_after_count` are the OWNER-ONLY intent
+   *  columns (owner-gated on the wire like health_reason): a pending pause an owner asked
+   *  for while the run was running. Non-null together while a request is pending; all
+   *  cleared to null when the pause lands (→ status "paused"), is cancelled, fails, or the
+   *  run goes terminal. `pause_mode` is "milestone" (park at the next milestone/turn
+   *  boundary) or "now" (drop the turn in flight); `pause_after_count` is
+   *  len(milestones_completed) captured at request time — the count milestone mode waits
+   *  to exceed.
+   *
+   *  `checkpoint_tip_at` is when the run's forge checkpoint was last pushed (SetRunCheckpointTip
+   *  stamps it), so a paused run can say how fresh the parked-on checkpoint is and the
+   *  "Pause now" menu can name what an immediate park would discard. null before any
+   *  checkpoint. */
+  pause_requested?: boolean;
+  pause_requested_at?: string | null;
+  pause_mode?: "milestone" | "now" | null;
+  pause_after_count?: number | null;
+  checkpoint_tip_at?: string | null;
   /** PRD #400: the task/handoff source ref a kind='task' run branched from — null when it
    *  inherited the caller's local HEAD, and on every non-task run. For a handoff created
    *  without --base (issue #403 F3) it is the resolved SEED COMMIT sha the auto-review uses
@@ -2841,7 +2876,13 @@ export type RunInputKind =
   | "reject_plan"
   | "revise_plan"
   | "cancel"
-  | "answer";
+  | "answer"
+  /** PRD #1190: an owner's pause request (`pause`, body = the mode "milestone"|"now")
+   *  and its withdrawal (`pause_cancel`), both POSTed to /runs/{id}/inputs. `resume` is
+   *  NOT a kind here — resume is the widened POST /runs/{id}/resume-now endpoint (D14),
+   *  so there is exactly one resume mechanism. */
+  | "pause"
+  | "pause_cancel";
 
 // SteerInput is one steer-queue entry (PRD #95, extended by PRD #634), from
 // GET /api/runs/{id}/inputs. `kind` is "follow_up" or "scope" (an operator

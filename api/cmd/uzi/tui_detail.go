@@ -723,6 +723,26 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(m.pal.state(crewStalled).Render(m.renderer.Plain(line, 120)) + "\n")
 	}
 
+	// The pause row-2 lines (PRD #1190 M4), drawn in the same slot and colour as the park
+	// line — an owner pause is a non-terminal hold like the rate-limit park, and the run's
+	// status word alone (‖ paused, or ● running for a pending request) does not say when the
+	// park lands or how much work is safe. Each builder is one physical row that sheds
+	// clauses from the right to fit m.width rather than clamping mid-word; the builder does
+	// the shedding, so Plain's cap here is only the D7 sanitize backstop. The two are
+	// mutually exclusive: the PAUSED line draws only for a `paused` run, and the pending
+	// line is gated on pause_requested_at (NOT status == running) for everything else —
+	// because a pending pause SURVIVES an involuntary park (limit_wait etc.), so it must
+	// show on such a parked run too, matching the web's pending chip and `run get`'s
+	// PAUSE_REQUESTED row. On a limit_wait run both this and the rate-limit park line above
+	// draw: the run is held on a limit AND carries a pending pause.
+	if d.run.Status == statusPaused {
+		line := pausedLine(d.run, time.Now(), m.width)
+		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, m.width)) + "\n")
+	} else if d.run.PauseRequestedAt != nil {
+		line := pauseRequestedLine(d.run, m.width)
+		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, m.width)) + "\n")
+	}
+
 	// The transport line is never silent about a degradation: a user watching a stale pane
 	// must see WHY it is stale. The healthy/transient states ("live", "connecting…") are the
 	// header tag above; only a degradation takes a full row here, where its longer text fits.

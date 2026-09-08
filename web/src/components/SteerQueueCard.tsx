@@ -1,5 +1,8 @@
-import type { SteerInput } from "../lib/api";
-import { Badge, Button, Card, type BadgeTone } from "./ui";
+import { useState } from "react";
+import type { Run, SteerInput } from "../lib/api";
+import { formatElapsed, milestoneBadge } from "../lib/runBadge";
+import { useNow } from "../lib/useNow";
+import { Badge, Button, Card, cx, type BadgeTone } from "./ui";
 import { FollowUpComposer } from "./FollowUpComposer";
 
 // SteerQueueCard is the run's steering surface (PRD #95): the follow-up queue with
@@ -112,6 +115,117 @@ function deliveryFor(input: SteerInput, terminal: boolean, parked: Delivery | un
   };
 }
 
+// PRD #1190 (D7): pause is meaningful only for the kinds that run for a while and do NOT
+// already park between turns. A chat run parks between turns; an interactive task parks at
+// awaiting_followup after every turn; judge/mr_rework/ci_fix are short and self-ending. So
+// the menu is offered for issue, non-interactive task, prompt and self_improve only — the
+// server enforces the same allowlist (a 409 with a per-kind reason), this is the UI
+// agreeing with it, not the enforcement.
+const PAUSABLE_KINDS = new Set(["issue", "task", "prompt", "self_improve"]);
+
+function isPausableRun(run: Run): boolean {
+  // An interactive task parks after each turn already, so it is never pausable even though
+  // its kind is in the set above (mirrors CreatePauseInput's `interactive = false` guard).
+  if (run.interactive) return false;
+  return PAUSABLE_KINDS.has(run.kind);
+}
+
+// PauseMenu is the "‖ Pause ▾" dropdown that sits beside Stop run for a running, pausable
+// run (PRD #1190). Two items: "After current milestone" (recommended; "After current
+// step" on a run with no frozen milestones) and "Pause now" (danger, names what an
+// immediate park discards). The milestone item is HIDDEN on the final milestone, since the
+// run completes anyway (the mock/server never offer a milestone park that equals finishing).
+function PauseMenu({
+  run,
+  busy,
+  onPause,
+}: {
+  run: Run;
+  busy: boolean;
+  onPause: (mode: "milestone" | "now") => void;
+}) {
+  const [open, setOpen] = useState(false);
+  // Freshen the checkpoint age only while the menu is open — no ticker for the life of the
+  // card. 30s is plenty for a "9m ago" that only needs to be roughly right when read.
+  const now = useNow(open ? 30_000 : null);
+
+  const mb = milestoneBadge(run);
+  const hasMilestones = mb != null;
+  // On the final milestone (only the last one remains, or all are done) a milestone park
+  // equals finishing the run, so the item is hidden. With no frozen list there is no
+  // "final milestone" to be on, so the "After current step" item always shows.
+  const onFinalMilestone = mb != null && mb.done >= mb.total - 1;
+  const showMilestoneItem = !onFinalMilestone;
+  const milestoneLabel = hasMilestones ? "After current milestone" : "After current step";
+
+  // The age of the last pushed checkpoint, named so the owner knows what "Pause now"
+  // costs before choosing it (D5). null checkpoint_tip_at → no age clause.
+  const cp = run.checkpoint_tip_at ? Date.parse(run.checkpoint_tip_at) : NaN;
+  const checkpointAge = Number.isFinite(cp) ? formatElapsed(now - cp) : null;
+  const nowCopy = checkpointAge
+    ? `Drops the turn in flight. Work since the last checkpoint (${checkpointAge} ago) is discarded.`
+    : "Drops the turn in flight. Work since the last checkpoint is discarded.";
+
+  return (
+    <div className="relative">
+      <Button
+        variant="secondary"
+        disabled={busy}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        ‖ Pause ▾
+      </Button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute left-0 z-10 mt-1 w-72 rounded-md border border-edge bg-raised p-1 shadow-lg"
+        >
+          {showMilestoneItem && (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={busy}
+              className="flex w-full flex-col gap-0.5 rounded-sm px-2 py-1.5 text-left hover:bg-edge/40"
+              onClick={() => {
+                setOpen(false);
+                onPause("milestone");
+              }}
+            >
+              <span className="flex items-center gap-1.5 text-sm font-medium text-fg">
+                {milestoneLabel}
+                <Badge tone="ok">recommended</Badge>
+              </span>
+              <span className="text-xs text-muted">
+                Finishes the work in flight, pushes a checkpoint, then parks. Nothing in flight is lost.
+              </span>
+            </button>
+          )}
+          <button
+            type="button"
+            role="menuitem"
+            disabled={busy}
+            className={cx(
+              "flex w-full flex-col gap-0.5 rounded-sm px-2 py-1.5 text-left hover:bg-danger/10",
+            )}
+            onClick={() => {
+              setOpen(false);
+              onPause("now");
+            }}
+          >
+            <span className="text-sm font-medium text-danger">Pause now</span>
+            <span className="text-xs text-muted">{nowCopy}</span>
+          </button>
+          <p className="px-2 py-1 text-[11px] text-faint">
+            Paused time does not count toward the budget. Nothing runs and nothing is spent while it waits.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function SteerQueueCard({
   inputs,
   terminal,
@@ -120,6 +234,8 @@ export function SteerQueueCard({
   busy,
   onStop,
   onSend,
+  run,
+  onPause,
 }: {
   inputs: SteerInput[];
   terminal: boolean;
@@ -135,6 +251,12 @@ export function SteerQueueCard({
   busy: boolean;
   onStop: () => void;
   onSend: (text: string) => void;
+  // PRD #1190: the full run + the pause callback, needed only for the "‖ Pause ▾" menu
+  // beside Stop run. OPTIONAL so every existing caller/test that renders the card without a
+  // pause affordance is unchanged — the menu renders only when BOTH are supplied AND the
+  // run is a running, pausable one with no pause already pending.
+  run?: Run;
+  onPause?: (mode: "milestone" | "now") => void;
 }) {
   // Render nothing when there is no queue to show AND no composer to offer: a finished
   // run with an empty queue (matching the pre-v2 "no composer once terminal" behavior),
@@ -200,15 +322,32 @@ export function SteerQueueCard({
               hold as limit_wait — blocked on a pooled token, resuming on its own — so a
               follow-up sent here will NOT un-park it; it is queued until the run resumes.
               The "queued until the run resumes" placeholder is resource-agnostic and
-              stays honest for a pool hold. */}
+              stays honest for a pool hold.
+
+              PRD #1190: `paused` sets parked too, matching the self-resuming holds. A
+              paused run is a deliberate owner hold — nothing runs until Resume — so a
+              follow-up sent here is NOT the next turn; it is queued until the run resumes.
+              The "resumes the agent" placeholder would be the opposite of what happens
+              (the same false promise limit_wait fixed), while "queued until the run
+              resumes" stays honest. The panel/card split matches limit_wait: PausedPanel
+              owns Resume + Stop, and this card keeps its own composer + Stop exactly as it
+              does beside LimitWaitPanel. */}
           <FollowUpComposer
             busy={busy}
             onSend={onSend}
-            parked={status === "limit_wait" || status === "pool_wait"}
+            parked={status === "limit_wait" || status === "pool_wait" || status === "paused"}
           />
-          <Button variant="danger" disabled={busy} onClick={onStop}>
-            Stop run
-          </Button>
+          {/* PRD #1190: Pause ▾ sits beside Stop run, offered only for a RUNNING, pausable
+              run with no pause already pending (a pending request has its own chip + actions
+              in the header). Unpausable kinds and any parked status show no menu. */}
+          <div className="flex flex-wrap items-center gap-2">
+            {run && onPause && status === "running" && !run.pause_requested_at && isPausableRun(run) && (
+              <PauseMenu run={run} busy={busy} onPause={onPause} />
+            )}
+            <Button variant="danger" disabled={busy} onClick={onStop}>
+              Stop run
+            </Button>
+          </div>
         </>
       )}
     </Card>

@@ -40,6 +40,7 @@ import { MessageBatcher } from "./batcher.js";
 import { rmTreeForce } from "./rmtree.js";
 import {
   SteeringChannel,
+  PauseNowSignal,
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
@@ -759,6 +760,22 @@ export class RunRunner {
         // NO reportState: the run stays non-terminal so the server's sweeper requeues
         // it. Reporting `failed` here would turn a recoverable interruption into a dead
         // run — the exact outcome the fetch-back exists to prevent.
+      } else if (err instanceof PauseNowSignal) {
+        // PRD #1190 M2: a `now` pause aborted a turn OUTSIDE the implement loop's own catch (e.g.
+        // during the plan turn), so the signal reached here. Caught BEFORE the generic terminal
+        // path (the LimitReachedError precedent above) so a pause NEVER becomes a `failed` run.
+        // Try to park it durably; on a park, flight.parked preserves the HOME exactly as a limit
+        // park does. If the checkpoint could not be published (handlePausePark reported
+        // pause_failed and left the run running), preserve the session and leave it for the
+        // sweeper to requeue rather than failing a run the owner asked to pause.
+        flight.parked = await this.handlePausePark(flight, { completedCount: 0 });
+        if (!flight.parked) {
+          flight.preserveSession = true;
+          runLog.info(
+            "pause could not park this run outside the loop; leaving it for requeue",
+          );
+        }
+        await batcher.close().catch(() => undefined);
       } else {
         // failure_reason goes straight to reportState, bypassing the batcher's
         // redactor, and the sdk-executor catch-all re-throws raw SDK errors into this
@@ -950,6 +967,20 @@ export class RunRunner {
     const { runLog, batcher, reportState, redactText, executor, runHome } = flight;
     const runId = claim.run_id;
     const result = flight.result!;
+    // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
+    // `paused` and set flight.parked). The run is non-terminal and already reported — there is
+    // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
+    // HOME for resume exactly as a limit park does. Close the batcher (handlePausePark only
+    // flushed it) and return. Keyed on the result the executor returned so a non-pause path can
+    // never reach this branch.
+    if (result.pausedAt) {
+      executor.killAgentTree?.();
+      await batcher.close().catch(() => undefined);
+      runLog.info("run parked on an owner-requested pause; skipping finalization", {
+        run_id: runId,
+      });
+      return;
+    }
     const runnerClone = flight.runnerClone!;
     const barePath = flight.barePath!;
     const lastPublishedTip = flight.lastPublishedTip;
@@ -2028,6 +2059,14 @@ export class RunRunner {
     // run's interactive park ends `stopped` immediately (steering.awaitFollowUp's arm-time
     // check) instead of waiting out the idle timeout. Absent ⇒ untouched (today's path).
     if (claim.stop_pending) steering.seedStopRequested();
+    // PRD #1190 M2: re-seed a PENDING pause from the durable claim columns (the direct analog of
+    // stop_pending above), so a worker that died with a pause pending re-arms it on resume with
+    // NO fresh input. The executor reads the seeded mode at its first loop boundary
+    // (ctx.pauseModeRequested → steering.getPauseMode) and PARKS there as an ACK-independent
+    // fallback (PRD #1190 rework N1): a resumed pause parks at its first boundary even if the
+    // running-report ACK's pauseRequested regressed. In the normal case the ACK also re-fires
+    // pauseRequested, so the seed is a real safety net rather than the sole trigger.
+    if (claim.pause_pending) steering.seedPauseRequested(claim.pause_mode);
 
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
@@ -2639,6 +2678,15 @@ export class RunRunner {
       // executor only reads it on the path that has no verdict to supply one.
       approvedSelection: claim.agent_selection,
       signal: cancel.signal,
+      // PRD #1190 rework (N2/N1): expose the steering channel's sticky pause/cancel state to the
+      // implement loop, because the single shared abort controller (cancel/ctx.signal) fires
+      // 'abort' exactly once and cannot deliver a second steering signal. cancelRequested lets the
+      // loop honor a cancel that lands after a declined `now`-park (the controller is spent);
+      // pauseModeRequested lets it honor a seeded/steered pause at its first boundary independent of
+      // the running-report ACK; onPauseNow re-arms the in-flight turn drop for a second `now` pause.
+      cancelRequested: () => steering.isCancelled(),
+      pauseModeRequested: () => steering.getPauseMode(),
+      onPauseNow: (cb) => steering.onPauseNow(cb),
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.
       onSessionId: (sessionId) => {
@@ -2821,6 +2869,10 @@ export class RunRunner {
             b.scopeCeiling = ack.scopeCeiling;
           if (typeof ack.completedCount === "number")
             b.completedCount = ack.completedCount;
+          // PRD #1190 M2: carry the server-decided pause boundary off the SAME ACK so the
+          // loop-top pause branch reads it off `served`.
+          if (typeof ack.pauseRequested === "boolean")
+            b.pauseRequested = ack.pauseRequested;
           // Without the scope/completed fields in this return guard, a non-budget-scaled
           // run's ACK (no budget fields) would return `undefined` and m3's loop-top gate at
           // `if (served)` would never see the ceiling. This is behavior-preserving for the
@@ -2830,7 +2882,8 @@ export class RunRunner {
           return b.maxIterations !== undefined ||
             b.wallSeconds !== undefined ||
             b.scopeCeiling !== undefined ||
-            b.completedCount !== undefined
+            b.completedCount !== undefined ||
+            b.pauseRequested !== undefined
             ? b
             : undefined;
         } catch (e) {
@@ -3023,6 +3076,11 @@ export class RunRunner {
         if (dirty === null) return null;
         return `${tip}\n${dirty.join("\n")}`;
       },
+      // PRD #1190 M2: park the run on an owner-requested pause. Delegates to handlePausePark,
+      // which publishes a checkpoint FIRST and reports `paused` only if it lands (Decision 8),
+      // returning whether the run parked. Called from the implement loop's pause boundary and
+      // its `now`-pause turn catch.
+      parkForPause: (pausedAt) => this.handlePausePark(flight, pausedAt),
     };
 
     // PRD #1064 M1: drain the per-run running-report chain before this phase yields control,
@@ -3388,6 +3446,177 @@ export class RunRunner {
       await batcher.close().catch(() => undefined);
       return false;
     }
+    return true;
+  }
+
+  /**
+   * PRD #1190 M2: park a run on an owner-requested pause (the ctx.parkForPause callback). Called
+   * from the implement loop at the server-decided pause boundary and when a `now` pause aborted
+   * the in-flight turn. Modeled on handleLimitReached, with two deliberate differences from a
+   * limit park (Decision 8):
+   *
+   *   1. the checkpoint is published FIRST and the park happens ONLY if it lands — a pause whose
+   *      committed work cannot be made durable on origin is a promise the resume cannot keep if
+   *      the worker rolls, so staying running is the honest fallback; and
+   *   2. a failed publish does NOT park — it reports `pause_failed` (the server clears the pending
+   *      request and keeps the run running), tells the owner, and returns false so the implement
+   *      loop CONTINUES the run (a `now` pause then restarts the aborted turn on the next
+   *      iteration).
+   *
+   * Returns true once the run is durably parked (checkpoint on origin AND the server ACKed
+   * `paused`, keyed off the RETURNED status being literally "paused" — the same ack contract as
+   * the limit park, never off `applied`); false otherwise. The batcher is only FLUSHED here, never
+   * closed: phasePublish closes it on the parked path, and the continue path keeps it open for the
+   * rest of the run. NO reap and NO overlay — the run may CONTINUE, so the agent tree must stay
+   * alive; the publish is on the credential-free join-token seam (checkpointPack local read →
+   * client.publishCheckpoint), exactly like the reap:false mid-run checkpoint, so it is safe with
+   * the agent alive.
+   */
+  private async handlePausePark(
+    flight: RunFlight,
+    pausedAt: { completedCount: number; total?: number },
+  ): Promise<boolean> {
+    const { runLog, batcher, reportState } = flight;
+    const barePath = flight.barePath;
+    const runnerClone = flight.runnerClone;
+    const branch = runnerClone?.branch ?? flight.branch;
+
+    // Announce the park on the feed BEFORE the state report (same ordering as the limit park),
+    // then FLUSH so the line lands ahead of it.
+    batcher.emit({
+      kind: "paused",
+      agent: "worker",
+      payload: {
+        completed: pausedAt.completedCount,
+        ...(pausedAt.total !== undefined ? { total: pausedAt.total } : {}),
+      },
+    });
+    await batcher.flush().catch(() => undefined);
+
+    // Make the clone's work durable in the BARE tracking ref BEFORE the publish. checkpointPack
+    // (inside publishCheckpointBestEffort) packs refs/uzi-runner/<branch> in the bare, NOT the
+    // runner clone's refs/heads/<branch>; before this fix handlePausePark published WITHOUT first
+    // fetching the clone's newer committed work back into that ref (unlike the sibling limit-wait
+    // park), so a `now` pause — or a milestone-boundary pause after commits since the last
+    // fetch-back — packed a STALE tip while still recording the NEWER cloneTip below as
+    // lastPublishedTip: the work between the two was lost on a cross-worker resume AND the
+    // bookkeeping named a tip that was never published. Mirror the limit-wait park: capture any
+    // uncommitted edits into a throwaway wip(park): marker, then fetch the clone tip back. NO reap
+    // — the run may CONTINUE (Decision 8), so the agent tree must stay alive; the marker (runner-uid
+    // local commit) and the fetch-back (file://) are credential-free, safe with the agent alive, the
+    // same class as the mid-run reap:false checkpoint.
+    //
+    // The fetch-back is GATED on the clone carrying NEW work this cycle (its tip moved beyond the
+    // reseed base, including a marker just made). When the clone is still AT its base — a `now` pause
+    // before any commit, or a resume with no new work — it is DELIBERATELY skipped: an unconditional
+    // fetch-back would create a spurious base tracking ref, and the broker would then publish a
+    // base-only checkpoint (published:true) and PARK an empty pause, violating Decision 8. Skipping
+    // it leaves the ref exactly as the reseed did (absent on a fresh run → checkpointPack null →
+    // pause_failed; the recovered tracking tip on a resume → re-published as before), i.e. today's
+    // behaviour. This is NOT the rejected base-tip SHORTCUT (which would SKIP the publish and CLAIM
+    // durability, unsafe on the seededFrom:"tracking" leg): the publish below always runs; only the
+    // redundant fetch-back is skipped when there is nothing new to move.
+    let markerCreated = false;
+    if (barePath && branch && runnerClone) {
+      markerCreated = await this.git.commitWipMarker(runnerClone.path).catch(() => false);
+      const preTip = await this.git
+        .branchTip(runnerClone.path, branch)
+        .catch(() => null);
+      if (preTip !== null && preTip !== runnerClone.baseCommit) {
+        await this.fetchBackBestEffort(
+          barePath,
+          runnerClone.path,
+          branch,
+          flight.runId,
+          runLog,
+        );
+      }
+    }
+
+    // Checkpoint FIRST (Decision 8). An already-durable tip (a prior mid-run publish
+    // confirmed-landed the committed work) is a successful pause with NO fresh pack — checkpointPack
+    // would return null for an unmoved tip, which must NOT read as a publish failure. Otherwise
+    // publish over the join-token seam and require a confirmed landing. An empty/unpublishable pack
+    // (a `now` pause before any commit lands durably) does NOT get a clean-park shortcut: it falls
+    // through to publishCheckpointBestEffort, whose false result yields pause_failed and keeps the
+    // run running — no park without a durable checkpoint on origin (Decision 8). A base-tip shortcut
+    // would be UNSAFE on the seededFrom:"tracking" resume leg, where baseCommit is the
+    // locally-recovered tracking-ref tip and is durable on origin only if the prior park's
+    // best-effort publish actually landed.
+    let published = false;
+    if (barePath && branch) {
+      const cloneTip = runnerClone
+        ? await this.git
+            .branchTip(runnerClone.path, branch)
+            .catch(() => null)
+        : null;
+      if (cloneTip !== null && cloneTip === flight.lastPublishedTip) {
+        published = true;
+      } else {
+        published = await this.publishCheckpointBestEffort(
+          flight,
+          barePath,
+          branch,
+          undefined,
+        );
+        if (published) flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+      }
+    }
+
+    if (!published) {
+      // The run CONTINUES (Decision 8), so a wip(park): marker we just made must not stay committed
+      // at the clone HEAD: it would ride into the eventual MR and the restarted turn would build on a
+      // throwaway commit. Restore its content to the uncommitted tree, the same shape the resume
+      // adopt gives a marker. Best-effort; only when we actually created one this call.
+      if (markerCreated && runnerClone) {
+        await this.git.undoWipMarker(runnerClone.path).catch(() => undefined);
+      }
+      // Decision 8: no durable checkpoint ⇒ no park. Report pause_failed (the server clears the
+      // pending request and keeps the run running), tell the owner the run is still running, and
+      // return false so the loop CONTINUES — a `now` pause restarts the aborted turn on the next
+      // iteration. The reason rides the worker's own feed message; the pause_failed report carries
+      // none (the server intercepts pause_failed BEFORE its status switch).
+      runLog.warn("could not publish a pause checkpoint; the run stays running", {
+        run_id: flight.runId,
+      });
+      batcher.emit({
+        kind: "pause_failed",
+        agent: "worker",
+        payload: {
+          text: "Could not pause: the checkpoint could not be published. The run is still running and has restarted the interrupted step.",
+        },
+      });
+      await reportState({ status: "pause_failed" }).catch((e) =>
+        runLog.error("could not report pause_failed", { error: errMessage(e) }),
+      );
+      return false;
+    }
+
+    let ack: StateAck;
+    try {
+      ack = await reportState({ status: "paused" });
+    } catch (e) {
+      // The park report never landed. Not parked: the loop keeps running (its next report
+      // self-heals), exactly as handleLimitReached cleans up when its park report throws.
+      runLog.error("could not report the pause park; the run stays running", {
+        error: errMessage(e),
+      });
+      return false;
+    }
+    if (ack.status !== "paused") {
+      // The server did not park this run (e.g. it was cancelled concurrently). Key off the
+      // RETURNED status being literally "paused", never off `applied` — the same ack contract as
+      // the limit park. Cleaned up as unparked; the loop keeps running.
+      runLog.warn("the server did not park this run on pause; the run stays running", {
+        applied: ack.applied,
+        server_status: ack.status ?? "unknown",
+      });
+      return false;
+    }
+    flight.parked = true;
+    runLog.info("run paused at the owner's request; preserving its HOME for resume", {
+      run_id: flight.runId,
+    });
     return true;
   }
 

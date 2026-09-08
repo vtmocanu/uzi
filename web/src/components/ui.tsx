@@ -407,6 +407,14 @@ export const RUN_STATUS_TONES: Record<
    *  reset countdown. The label overrides to "waiting for pool" below so the pill
    *  does not print the bare enum "pool wait". */
   pool_wait: { tone: "warning" },
+  /** PRD #1190: a run its OWNER paused. `info` tone (D11), deliberately DISTINCT from
+   *  the warning-toned involuntary holds (limit_wait / pool_wait / awaiting_*): those
+   *  are something to notice, a pause is something the owner did. NOT pulsing — a paused
+   *  run does nothing until the owner resumes it, and a pulse reads as live work. The
+   *  label overrides to "‖ paused" below so the pill carries the same glyph the board
+   *  badge (runBadge) and TUI use, and the two label surfaces stay in agreement
+   *  (ui.test.tsx's label-agreement loop). */
+  paused: { tone: "info" },
   completed: { tone: "ok" },
   failed: { tone: "danger" },
   cancelled: { tone: "neutral" },
@@ -432,6 +440,11 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   // matching "waiting for pool" label (the ui.test.tsx label-agreement loop over
   // RUN_STATUS_TONES asserts the two surfaces print one word).
   pool_wait: "waiting for pool",
+  // PRD #1190: the "‖" glyph tells a chosen pause apart from the rate-limit park's "~"
+  // (the TUI carries the same distinction). Kept in step with runBadge's matching
+  // "‖ paused" label — the ui.test.tsx label-agreement loop over RUN_STATUS_TONES asserts
+  // the pill and the board badge print one word for this status too.
+  paused: "‖ paused",
 };
 
 export function StatusPill({ status }: { status: string }) {

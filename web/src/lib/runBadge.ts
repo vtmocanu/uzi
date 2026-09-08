@@ -268,6 +268,10 @@ export function runStatusTone(
   // other "blocked on something outside the run" holds — never danger: it has not
   // failed and it resumes on its own when a token is pooled (or on demand).
   if (status === "pool_wait") return "warning";
+  // PRD #1190: a run its owner paused. INFO, not the warn the involuntary holds carry
+  // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
+  // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
+  if (status === "paused") return "info";
   if (isStoppedRun(status, stopKind)) return "neutral";
   if (status === "failed") return "danger";
   if (status === "completed") return "ok";
@@ -545,6 +549,19 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         pulse: false,
         title:
           "Waiting for a pooled Anthropic token. It resumes automatically once one is added to the pool.",
+      };
+    // PRD #1190: a run its owner paused. Info-toned and STATIC (no elapsed on the badge —
+    // the per-card duration token carries `paused <elapsed>` via runDurationLabel). The
+    // "‖" glyph matches StatusPill's "‖ paused" label so one status prints one word on
+    // both surfaces (ui.test.tsx label-agreement loop). Unlike the two self-resuming
+    // holds this resumes ONLY on demand, so the title says how, not "resumes on its own".
+    case "paused":
+      return {
+        kind: "badge",
+        label: "‖ paused",
+        tone: "info",
+        pulse: false,
+        title: "Paused by its owner. Resume it from the run page or with `uzi run resume`.",
       };
     case "failed":
       return {

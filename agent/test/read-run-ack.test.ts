@@ -32,6 +32,24 @@ describe("readRunAck", () => {
     assert.equal(out.scopeCeiling, 3);
   });
 
+  // PRD #1190 M2 — the server-decided pause boundary rides the same {run: RunDTO} body.
+  it("reads pause_requested:true off the run body", async () => {
+    const out = await readRunAck(jsonResponse({ run: { pause_requested: true } }));
+    assert.equal(out.pauseRequested, true, "the server-decided pause boundary is passed through");
+  });
+
+  it("reads pause_requested:false off the run body", async () => {
+    const out = await readRunAck(jsonResponse({ run: { pause_requested: false } }));
+    assert.equal(out.pauseRequested, false, "a false boundary is passed through, not dropped");
+  });
+
+  it("leaves pauseRequested absent when the field is missing or non-boolean (older server)", async () => {
+    const absent = await readRunAck(jsonResponse({ run: { milestones_completed: [] } }));
+    assert.equal(absent.pauseRequested, undefined, "absent field ⇒ absent (read as no pause)");
+    const nonBool = await readRunAck(jsonResponse({ run: { pause_requested: "yes" } }));
+    assert.equal(nonBool.pauseRequested, undefined, "a non-boolean value is ignored, never coerced");
+  });
+
   it("returns {} on an empty body (existing catch/total behavior)", async () => {
     const out = await readRunAck(new Response(""));
     assert.deepEqual(out, {}, "an empty body yields the fields absent");

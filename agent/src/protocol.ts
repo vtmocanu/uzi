@@ -28,6 +28,19 @@ export type RunState =
    *  the follow-up through the normal poll/consume path before it reports running. */
   | "awaiting_followup"
   | "limit_wait"
+  /** PRD #1190 M2: the owner-requested park. The worker REPORTS `paused` after it has
+   *  published a checkpoint to origin (Decision 8); the server's SetRunPaused keys off the
+   *  RETURNED status being literally "paused" (the same ack contract as limit_wait). A
+   *  non-terminal wait like limit_wait: it never enters TERMINAL_RUN_STATUSES, and the run's
+   *  HOME is preserved for resume. Distinct from limit_wait because a pause spends no budget
+   *  and resumes only on demand (Decision 1). */
+  | "paused"
+  /** PRD #1190 M2: NOT a status transition — a worker REPORT that the checkpoint for a
+   *  pending pause could not be published, so the run does NOT park (Decision 8). The server
+   *  intercepts it BEFORE the status switch, clears the pending-pause request, keeps the run
+   *  `running`, and the worker CONTINUES the run. The human-readable reason rides the worker's
+   *  own `pause_failed` feed message, not this report. */
+  | "pause_failed"
   | "completed"
   | "failed";
 
@@ -135,7 +148,17 @@ export type MessageKind =
    *  operator sees a directive was applied without parsing run state. A free-form
    *  run_messages kind (the column carries no DB CHECK; the message-ingest route
    *  accepts any non-empty kind), reusing the plan_feedback emit machinery. */
-  | "steer_ack";
+  | "steer_ack"
+  /** PRD #1190 M2: the run PARKED on an owner-requested pause. Emitted by the runner's pause
+   *  park path (mirroring `limit_wait`) once the checkpoint published and the server ACKed
+   *  `paused`. Payload `{ completed: number, total?: number }` — the milestone position the
+   *  park landed at. A free-form run_messages kind (the column carries no DB CHECK). */
+  | "paused"
+  /** PRD #1190 M2: a pending pause could NOT park because its checkpoint failed to publish
+   *  (Decision 8). Emitted by the runner instead of `paused`; the run stays running. Payload
+   *  `{ text: string }` — the human-readable reason, WORKER-authored (the server carries none
+   *  on the pause_failed report). A free-form run_messages kind. */
+  | "pause_failed";
 
 /** run_user_inputs.kind (PRD #4 §Schema; PRD #41 adds `revise_plan` — the user asks
  *  for a new plan version at the gate, body = their feedback text; PRD #88 adds
@@ -155,7 +178,17 @@ export type InputKind =
   | "answer"
   // PRD #517 M4: the graceful interactive wind-down. Consumed by the steering poll and
   // routed to SteeringChannel.route("stop"), which sets the sticky stop flag.
-  | "stop";
+  | "stop"
+  // PRD #1190 M2: an owner-requested pause. Body is the mode ("milestone" | "now"). Consumed
+  // by the steering poll and routed to SteeringChannel.route("pause"), which sets the sticky
+  // pauseMode and — for "now" — aborts the in-flight turn via PauseNowSignal. The server
+  // decides the actual park BOUNDARY (the running-report ACK's `pause_requested`); this input
+  // only carries the request/mode. `resume` NEVER reaches the worker (its own endpoint).
+  | "pause"
+  // PRD #1190 M2: withdraw a pending pause. Routed to SteeringChannel.route("pause_cancel"),
+  // which clears pauseMode. Consumed (not a server-only kind) because the worker's flag clear
+  // needs it.
+  | "pause_cancel";
 
 /** One question in an ask_user call (PRD #88 M1), mirroring the local
  *  AskUserQuestion tool's shape so the model has a familiar contract and the UI can
@@ -579,6 +612,11 @@ export interface IterationBudget {
    */
   scopeCeiling?: number;
   completedCount?: number;
+  /** PRD #1190 M2: the server-decided pause boundary, carried off the SAME running-report ACK
+   *  as the budget/scope fields (StateAck.pauseRequested). m2's loop-top pause branch reads it
+   *  to decide whether to park the run at this boundary; the worker honours the boolean and the
+   *  server owns the rule (Decision 4). Absent ⇒ no pause requested this iteration. */
+  pauseRequested?: boolean;
 }
 
 /** One human comment on the worked issue, snapshotted at run creation (PRD #381).
@@ -720,6 +758,17 @@ export interface ClaimResponse {
    *  true the resumed worker seeds stopRequested so the interactive park ends `stopped`
    *  immediately. Absent/false on an older server ⇒ the idle timeout stays the backstop. */
   stop_pending?: boolean;
+  /** PRD #1190 M2: a PENDING pause re-delivered on every claim (the direct analog of
+   *  `stop_pending`). The request lives durably in the runs.pause_* columns and survives every
+   *  requeue, so a worker that dies with a pause pending re-arms it on resume: `pause_pending`
+   *  is (pause_requested_at IS NOT NULL) and `pause_mode` passes the mode through
+   *  ("milestone" | "now"), omitted/empty when none is pending. The runner seeds the steering
+   *  channel's pauseMode from these (SteeringChannel.seedPauseRequested), so a resumed "now"
+   *  pause is honoured with NO fresh input. The actual park boundary is still decided
+   *  server-side (the running-report ACK's `pause_requested`), so a resumed run parks at its
+   *  first boundary regardless. Absent/false on an older server ⇒ no pending pause. */
+  pause_pending?: boolean;
+  pause_mode?: string;
   /** PRD #400 M2: the source ref a task run was branched from, for context/review.
    *  Meaningful only for kind="task" — the worker works the pre-seeded, server-named
    *  `branch` (uzi/task/<run-id>), not this ref; it is carried so an MR/review can name
@@ -1673,6 +1722,13 @@ export interface StateAck {
    *  gate reads them; both absent/non-numeric ⇒ no scope signal on this ACK. */
   scopeCeiling?: number;
   completedCount?: number;
+  /** PRD #1190 M2: the SERVER-DECIDED pause boundary, read off the SAME `{run: RunDTO}` body
+   *  as `status` (the DTO's `pause_requested` field). The server owns the boundary rule
+   *  (pause_mode='now', or 'milestone' once the in-flight milestone completed / on a run with
+   *  no frozen milestones — Decision 4); the worker just HONOURS the boolean. m2's loop-top
+   *  pause branch reads it (via IterationBudget). Absent/non-boolean (older server, unparseable
+   *  body) ⇒ treated as false = "no pause requested". */
+  pauseRequested?: boolean;
 }
 
 export interface UserInput {

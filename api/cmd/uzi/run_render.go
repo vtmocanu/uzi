@@ -203,6 +203,12 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
 	}
 	rows = append(rows, limitWaitRows(r, time.Now())...)
+	// The pause block (PRD #1190 M4): a PAUSED row while parked by an owner pause, or a
+	// PAUSE_REQUESTED row while a pause is pending and the run has not yet parked into
+	// `paused` (so it shows on a running run AND on one involuntarily parked — limit_wait
+	// etc. — that still carries the request). Empty for every other run, so a run that was
+	// never paused is byte-for-byte unchanged.
+	rows = append(rows, pauseDetailRows(r, time.Now())...)
 	// MR_REWORK rides every run like WAIT_ON_LIMIT above, and is tri-state (PRD #841):
 	// "inherit" (nil → follow the owner's account default), "on" or "off". An always-present
 	// row keeps "inherit" distinguishable from an old CLI that does not know the field.
@@ -278,6 +284,153 @@ func limitWaitRows(r apitypes.RunDTO, now time.Time) [][]string {
 		rows = append(rows, []string{"LIMIT_WAITS", itoa(int(r.LimitWaitCount)) + " (resumed)"})
 	}
 	return rows
+}
+
+// pauseDetailRows is the pause block of `uzi run get` (PRD #1190 M4). It renders at most
+// one row, and the two are mutually exclusive by construction: a PAUSED run has cleared its
+// pause_requested_at (SetRunPaused nulls it), and the PAUSE_REQUESTED row is gated to a run
+// that has NOT yet parked into `paused` (the PAUSED arm returns first). So a run is never both.
+//
+//   - PAUSED (status == paused): when the run parked, how long ago, its milestone progress,
+//     and how recently its checkpoint was pushed.
+//   - PAUSE_REQUESTED (pause_requested_at set, status != paused): the boundary the pending
+//     request waits for — the next milestone (milestone mode) or the next turn (`now`). This
+//     is gated on pause_requested_at, NOT on status == running, because a pending pause
+//     SURVIVES an involuntary park: limit_wait/pool_wait/awaiting_input leave the pause
+//     columns untouched, and the request lands at the first boundary after the run resumes
+//     (PRD D6). So this row shows on a running run AND on such a parked run that still carries
+//     the request — matching the web's pending chip (shown whenever pause_requested_at is set).
+//
+// It takes now so the elapsed clocks unit-test deterministically, matching limitWaitRows.
+func pauseDetailRows(r apitypes.RunDTO, now time.Time) [][]string {
+	if r.Status == statusPaused {
+		return [][]string{{"PAUSED", pausedSummary(r, now)}}
+	}
+	if r.PauseRequestedAt != nil {
+		return [][]string{{"PAUSE_REQUESTED", pauseBoundaryClause(r)}}
+	}
+	return nil
+}
+
+// pausedSummary is the value cell of the PAUSED row and the source of the TUI's paused line:
+// "since <hh:mm> (<dur>) · <c>/<n> milestones · checkpoint <age> ago". The milestone and
+// checkpoint clauses are dropped when the run carries no frozen milestones / no checkpoint,
+// so a prompt-kind pause (no milestones) or a pause before the first checkpoint reads
+// cleanly rather than with an empty "0/0" or "checkpoint -".
+//
+// The checkpoint clause renders the checkpoint's AGE, not a git sha: M1 puts only
+// checkpoint_tip_at (a timestamp) on the wire — the sha is not a DTO field — and that field
+// is explicitly the "(Nm ago)" signal, so the age is the honest rendering of what is served.
+func pausedSummary(r apitypes.RunDTO, now time.Time) string {
+	clauses := []string{pauseSinceClause(r, now)}
+	if done, total, _ := milestoneProgress(r); total > 0 {
+		clauses = append(clauses, fmt.Sprintf("%d/%d milestones", done, total))
+	}
+	if c := pauseCheckpointClause(r, now); c != "" {
+		clauses = append(clauses, c)
+	}
+	return strings.Join(clauses, " · ")
+}
+
+// pauseSinceClause renders "since <hh:mm> (<dur>)" from the run's status timestamp
+// (updated_at, stamped at the park by SetRunPaused). UTC, so the clock reads
+// deterministically and matches the CLI's other timestamp rows; the duration in parens is
+// the load-bearing part and disambiguates a pause that spans a day. A negative elapsed
+// (clock skew) floors to 0s.
+func pauseSinceClause(r apitypes.RunDTO, now time.Time) string {
+	d := now.Sub(r.UpdatedAt)
+	if d < 0 {
+		d = 0
+	}
+	return "since " + r.UpdatedAt.UTC().Format("15:04") + " (" + fmtUntil(d) + ")"
+}
+
+// pauseCheckpointClause renders "checkpoint <age> ago" from checkpoint_tip_at, or "" when no
+// checkpoint has been published yet. See pausedSummary for why it is an age, not a sha.
+func pauseCheckpointClause(r apitypes.RunDTO, now time.Time) string {
+	if r.CheckpointTipAt == nil {
+		return ""
+	}
+	d := now.Sub(*r.CheckpointTipAt)
+	if d < 0 {
+		d = 0
+	}
+	return "checkpoint " + fmtUntil(d) + " ago"
+}
+
+// pauseBoundaryClause renders the boundary a pending pause waits for: "now" for a now-mode
+// request, else "after M<N>" naming the milestone the run will finish before parking, or
+// "after the current step" on a run with no frozen milestones (where the pause lands at the
+// next turn boundary). N = pause_after_count + 1: pause_after_count is len(milestones_completed)
+// at request time (the count the milestone rule waits to EXCEED), so the run parks once the
+// (N)th milestone completes.
+func pauseBoundaryClause(r apitypes.RunDTO) string {
+	if r.PauseMode != nil && *r.PauseMode == "now" {
+		return "now"
+	}
+	if len(r.Milestones) == 0 {
+		return "after the current step"
+	}
+	n := 1
+	if r.PauseAfterCount != nil {
+		n = *r.PauseAfterCount + 1
+	}
+	return fmt.Sprintf("after M%d", n)
+}
+
+// joinSheddingClauses joins clauses with " · ", DROPPING trailing clauses (from the right)
+// until the joined line fits within width visual columns. clauses[0] is the load-bearing
+// lead and is never dropped — it survives even if it alone overflows width (the caller's
+// final clamp handles that pathological narrow case). Empty clauses are skipped. This is the
+// TUI row-2 shedding idiom (PRD #1190 M4 / #1170): shed clauses whole rather than clamp
+// mid-word, so a narrow terminal drops "checkpoint" then "done" but keeps "paused by you".
+func joinSheddingClauses(width int, clauses ...string) string {
+	parts := make([]string, 0, len(clauses))
+	for _, c := range clauses {
+		if c != "" {
+			parts = append(parts, c)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	for len(parts) > 1 {
+		if joined := strings.Join(parts, " · "); visualWidth(joined) <= width {
+			return joined
+		}
+		parts = parts[:len(parts)-1] // shed the rightmost clause
+	}
+	return parts[0]
+}
+
+// pausedLine is the run detail's row-2 line for a PAUSED run (PRD #1190 M4), drawn in the
+// wait colour beside the rate-limit park line. One physical row: it sheds clauses from the
+// right (checkpoint first, then done) to fit width, never clamping mid-word, with
+// "‖ paused by you · since …" always surviving. Built off the same clauses as the CLI's
+// PAUSED row so the two surfaces read the same.
+func pausedLine(r apitypes.RunDTO, now time.Time, width int) string {
+	lead := "‖ paused by you · " + pauseSinceClause(r, now)
+	var doneClause string
+	if done, total, _ := milestoneProgress(r); total > 0 {
+		doneClause = fmt.Sprintf("%d/%d done", done, total)
+	}
+	// Order matters: shedding drops from the right, so checkpoint (last) goes first, then
+	// done — the PRD's "checkpoint first, then done" rule.
+	return joinSheddingClauses(width, lead, doneClause, pauseCheckpointClause(r, now))
+}
+
+// pauseRequestedLine is the run detail's row-2 line for a run that carries a pending pause and
+// has not yet parked into `paused` (PRD #1190 M4) — a running run, or one involuntarily parked
+// (limit_wait etc.) that still carries the request. One physical row, wait colour, shedding
+// from the right: it drops the "manage …" hint first, then the "after M<N>" boundary, keeping
+// "pause requested" as the surviving lead.
+//
+// The hint is "manage from the web or CLI", deliberately NOT "cancel or pause now": the TUI
+// footer already binds `x` to CANCEL THE RUN, so a "cancel" here would read as that key, and
+// "pause now" duplicated the "now" the boundary clause already carries for a now-mode request.
+func pauseRequestedLine(r apitypes.RunDTO, width int) string {
+	return joinSheddingClauses(width,
+		"pause requested", pauseBoundaryClause(r), "manage from the web or CLI")
 }
 
 // milestoneRows renders a milestone-structured run's progress block for `uzi run get`
@@ -774,7 +927,10 @@ func limitWaitLine(r apitypes.RunDTO, now time.Time) string {
 	if r.Status != statusLimitWait {
 		return ""
 	}
-	line := "paused: Anthropic usage limit"
+	// PRD #1190 D13: the leading word is "waiting:", NOT "paused:". Once an owner pause
+	// exists, "paused:" on the rate-limit line would read as a user pause; "waiting:" says
+	// plainly that the run is held on a usage limit, not parked by its owner.
+	line := "waiting: Anthropic usage limit"
 	if t := cellText(strOr(r.RateLimitType, "")); t != "" {
 		line += " (" + t + ")"
 	}

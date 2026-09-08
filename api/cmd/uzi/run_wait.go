@@ -85,7 +85,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			lastStatus = run.Status
 			sawStatus = true
 		}
-		// A status outside the ten-value enum means the server is newer than this
+		// A status outside the twelve-value enum means the server is newer than this
 		// binary. Surface it once and keep waiting (it can never be a target — `--until`
 		// only names known statuses), so it is never a silent forever-wait; `--timeout`
 		// still bounds it (R1).
@@ -195,8 +195,9 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
 			strings.Join(defaultWaitStates, ", ") + ". It does NOT stop " +
-			"on queued/claimed/running (still working), limit_wait (auto-resumes), or pool_wait " +
-			"(an auto run held on an empty token pool; resumes when a token is pooled), so a bare " +
+			"on queued/claimed/running (still working), limit_wait (auto-resumes), pool_wait " +
+			"(an auto run held on an empty token pool; resumes when a token is pooled), or paused " +
+			"(an owner park; resumes on demand with `uzi run resume`), so a bare " +
 			"`uzi run wait <id>` waits for the plan gate OR the end.\n\n" +
 			"Transitions print to stderr; `--json` prints the final run object (same shape as " +
 			"`run get --json`) to stdout. Exit codes: 0 a target state was reached (including if " +

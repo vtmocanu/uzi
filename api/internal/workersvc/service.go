@@ -139,6 +139,22 @@ var (
 	// (not yet parked) is still valid. It is a run-state conflict, hence 409 (the CLI maps
 	// 409 → ExitConflict).
 	ErrStopNotInteractive = errors.New("run stop applies only to interactive task runs")
+	// ErrPauseNotRunning rejects a `pause` (PRD #1190 M1) on a run that is not currently
+	// `running` → 409. Only a running run holds the live worker a park report comes from, and
+	// every other non-terminal status is already a park with its own stopped clock (Decision
+	// 6), so the message names the current status ("run is awaiting_approval; the clock is
+	// already stopped"). Disambiguated from ErrPauseNotSupported by re-reading the run after a
+	// 0-row CreatePauseInput: this is the status half.
+	ErrPauseNotRunning = errors.New("run is not running")
+	// ErrPauseNotSupported rejects a `pause` (PRD #1190 M1, Decision 7) on a run whose kind or
+	// interactivity is outside the allowlist (issue / non-interactive task / prompt /
+	// self_improve) → 409. The other kinds either already park between turns or finish within
+	// minutes, so the message names why per kind ("chat runs already park between turns", …).
+	// The kind half of the two 0-row CreatePauseInput causes.
+	ErrPauseNotSupported = errors.New("pause is not supported for this run")
+	// ErrNoPausePending rejects a `pause_cancel` (PRD #1190 M1) when no pause is pending on a
+	// still-running run → 409. A 0-row CancelPauseInput is the only cause.
+	ErrNoPausePending = errors.New("no pause is pending")
 	// ErrScopeNotMilestoneRun rejects a `scope` (PRD #634 M2) on a run that is not a
 	// milestone-structured issue run (kind='issue' with a non-empty frozen milestone
 	// list) → 409. A scope ceiling bounds how many of the frozen milestones the run may
@@ -149,6 +165,11 @@ var (
 	// only a non-integer body is a caller error. (Named to avoid colliding with the unrelated
 	// judge-bulk ErrInvalidScope.)
 	ErrInvalidScopeCeiling = errors.New("scope ceiling must be an integer")
+	// ErrInvalidPauseMode rejects a `pause` (PRD #1190 M1) whose body is neither 'milestone'
+	// nor 'now' → 400. A dedicated input-validation sentinel (like ErrInvalidScopeCeiling)
+	// so CreateRunInput can map it to 400 with the reason verbatim, rather than letting an
+	// invalid mode fall through to the 500 default arm.
+	ErrInvalidPauseMode = errors.New("invalid pause mode")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -273,6 +294,19 @@ func (e *CapabilityUnmetError) Error() string {
 	return fmt.Sprintf("%s: %s", ErrCapabilityUnmet.Error(), strings.Join(e.Unmet, ", "))
 }
 func (e *CapabilityUnmetError) Unwrap() error { return ErrCapabilityUnmet }
+
+// PauseRefusedError carries the SPECIFIC user-facing reason a pause was refused (PRD #1190
+// M1) and unwraps to ErrPauseNotRunning or ErrPauseNotSupported, so the handler both matches
+// the sentinel (→ 409) and surfaces the run-specific sentence via err.Error(). The message is
+// built server-side from the already-loaded run row (its status names the not-running case;
+// its kind names the not-supported case), the same shape as CapabilityUnmetError.
+type PauseRefusedError struct {
+	Msg      string
+	Sentinel error
+}
+
+func (e *PauseRefusedError) Error() string { return e.Msg }
+func (e *PauseRefusedError) Unwrap() error { return e.Sentinel }
 
 // Agent-memory caps (PRD #90, OQ-C). Server-enforced (not client-trusted) and the
 // single Go source of truth the SDK tool schema mirrors: at most
@@ -482,6 +516,16 @@ type Store interface {
 	// second park.
 	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
+	// PRD #1190 M1 pause/resume. SetRunPaused parks a running run on the owner's request
+	// (positive source guard, like SetRunLimitWait); ResumePausedRun promotes it back
+	// (paused → queued) with gate-park accounting; ClearPauseRequest clears a pending
+	// request without parking (the worker's pause_failed report); CreatePauseInput /
+	// CancelPauseInput are the owner's request / withdrawal CTEs.
+	SetRunPaused(ctx context.Context, arg store.SetRunPausedParams) (int64, error)
+	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
+	ClearPauseRequest(ctx context.Context, arg store.ClearPauseRequestParams) (int64, error)
+	CreatePauseInput(ctx context.Context, arg store.CreatePauseInputParams) (store.RunUserInput, error)
+	CancelPauseInput(ctx context.Context, id uuid.UUID) (store.RunUserInput, error)
 	// The reactive-resume pass (PRD #754 M5): ListPoolWaitRuns is the pool_wait worklist
 	// (oldest first), and PromotePoolWaitRun promotes ONE held run (pool_wait → queued),
 	// owner-scoped so the sweeper passes each run's own user_id and resume-now cannot
@@ -1946,6 +1990,30 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		return store.Run{}, false, err
 	}
 	sessionID := stripNULParam(req.SessionID)
+	// PRD #1190 M1: pause_failed is a worker REPORT, not a status transition — the worker could
+	// not publish the checkpoint, so the run STAYS running (Decision 8) and only the pending
+	// pause is withdrawn. Handle it here, BEFORE the switch, so it bypasses the terminal-
+	// transition fan-out below (a running run enqueues no judge, files no proposal, tears down
+	// nothing). It clears the request keyed on the worker, re-reads the (unchanged) run,
+	// broadcasts its running status so the web drops the pause chip, and returns. The worker's
+	// own feed message carries the human-readable reason to the run's activity feed.
+	//
+	// pause_failed intentionally posts no Slack line — the notifier observes only status
+	// transitions and pause_failed is not one; the in-app feed message carries the reason. A
+	// Slack DM would need a reason-carrying handler→slacksvc seam (deferred).
+	if req.State == "pause_failed" {
+		if _, cerr := s.q.ClearPauseRequest(ctx, store.ClearPauseRequestParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)}); cerr != nil {
+			return store.Run{}, false, cerr
+		}
+		run, err = s.runOwnedByWorker(ctx, runID, wkr)
+		if err != nil {
+			return store.Run{}, false, err
+		}
+		if s.bcast != nil {
+			s.bcast.PublishState(runID, run.Status)
+		}
+		return run, true, nil
+	}
 	var rows int64
 	// PRD #634 M4: the disposition to settle the pending scope audit row(s) with, decided in
 	// the `completed` case and applied best-effort in the applied-transition block below.
@@ -2126,6 +2194,14 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		})
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
+	case "paused":
+		// PRD #1190 M1: the owner-requested park. SetRunPaused has the SAME positive-source-guard
+		// ack contract as limit_wait — the worker keys off the RETURNED status being literally
+		// "paused", never off applied — so a refused park (0 rows) surfaces as 409 and the worker
+		// cleans up. It clears the pending-pause columns (the request is now consumed).
+		rows, err = s.q.SetRunPaused(ctx, store.SetRunPausedParams{
+			SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+		})
 	case "failed":
 		// PRD #634 follow-up: a scope-directed run that terminates abnormally (failed/cancelled/
 		// stopped/plan-rejected) never applied the scope cap, so settle its pending audit row

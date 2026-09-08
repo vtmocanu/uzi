@@ -258,6 +258,13 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, 
 		// limit_wait (both are non-terminal holds), distinct word so a user can tell the
 		// two apart at a glance.
 		return "~", "pool wait"
+	case statusPaused:
+		// PRD #1190: an owner pause. The ‖ glyph (a pause bar) is its own vocabulary entry
+		// beside the two ~ parks — an owner did this, the ~ parks happened to the run — and
+		// it is the NO_COLOR twin of the wait ink below, legible under an Ascii profile the
+		// way ~ is. Without this the default arm would draw a faint "· paused", identical to
+		// queued, so a parked run would read as idle.
+		return "‖", "paused"
 	case "completed":
 		return "✓", "done"
 	case "failed":
@@ -286,9 +293,9 @@ func (p palette) stateColor(status, health string, isPlanning, isRevising bool) 
 	case "awaiting_approval", "awaiting_input", "awaiting_followup":
 		// awaiting_followup (PRD #517) is a needs-you park like the other two: amber.
 		return p.amber
-	case statusLimitWait, statusPoolWait:
-		// pool_wait (PRD #754) is a non-terminal hold like limit_wait, so it shares the
-		// wait colour — the glyph word distinguishes them, not the ink.
+	case statusLimitWait, statusPoolWait, statusPaused:
+		// pool_wait (PRD #754) and paused (PRD #1190) are non-terminal holds like limit_wait,
+		// so all three share the wait colour — the glyph word distinguishes them, not the ink.
 		return p.wait
 	case "failed":
 		return p.alarm

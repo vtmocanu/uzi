@@ -24,6 +24,7 @@ import {
   HealthFlag,
   LimitWaitPanel,
   MrReworkPanel,
+  PausedPanel,
   RunView,
   RunSummary,
   derivePlanRevision,
@@ -74,6 +75,11 @@ vi.mock("../lib/api", async (importOriginal) => {
       // null; setRunMrRework echoes an updated run).
       getMySettings: vi.fn().mockResolvedValue({ settings: { mr_rework_enabled: null } }),
       setRunMrRework: vi.fn().mockResolvedValue({ run: null }),
+      // PRD #1190: pause/resume mutations. Defaulted to resolve so a click + refreshRun
+      // settles; the paused cases assert the call args.
+      resumeRun: vi.fn().mockResolvedValue({ run: null }),
+      pauseRun: vi.fn().mockResolvedValue({ server_side: false }),
+      cancelPause: vi.fn().mockResolvedValue({ server_side: false }),
     },
   };
 });
@@ -1196,6 +1202,320 @@ describe("RunView — queue priority pill + Expedite action (PRD #320 M6)", () =
     expect(screen.queryByText("Expedited")).toBeNull();
     expect(screen.queryByRole("button", { name: "Expedite" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Undo expedite" })).toBeNull();
+  });
+});
+
+// PRD #1190: the paused header — the conditional Resume action (D14, modelled on Expedite)
+// and the pending-pause chip. Rendered whole-page (useRunStream mocked) so the controls are
+// exercised where they live.
+describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", () => {
+  function renderPage(over: Partial<Run>, canSteer: boolean) {
+    const refreshRun = vi.fn();
+    const submit = vi.fn();
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit,
+      refreshRun,
+      inputs: [],
+      canSteer,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const utils = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    return { ...utils, refreshRun, submit };
+  }
+
+  const PAUSED: Partial<Run> = {
+    status: "paused",
+    started_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T03:42:00Z",
+    branch: "agent/issue-33",
+    checkpoint_tip_at: "2026-01-01T01:00:00Z",
+  };
+
+  it("shows a Resume button for the owner of a paused run, and the '· clock stopped' elapsed", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByRole("button", { name: /resume/i }).length).toBeGreaterThan(0);
+    expect(screen.getByText(/clock stopped/i)).toBeTruthy();
+  });
+
+  it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
+    const { refreshRun } = renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /resume/i })[0]);
+    });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("a NON-OWNER sees inert 'only the owner can resume' text, never a Resume button", async () => {
+    renderPage(PAUSED, false);
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+    // Both the header and the panel state who can — assert at least one such sentence.
+    expect(screen.getAllByText(/only the run's owner can resume/i).length).toBeGreaterThan(0);
+  });
+
+  it("renders the pending-pause chip from pause_requested_at, with Cancel pause + Pause now (running owner)", async () => {
+    renderPage(
+      {
+        status: "running",
+        pause_requested_at: "2026-01-01T02:00:00Z",
+        pause_mode: "milestone",
+        pause_after_count: 3,
+        milestones: [
+          { id: "m1", title: "a" },
+          { id: "m2", title: "b" },
+          { id: "m3", title: "c" },
+          { id: "m4", title: "d" },
+        ],
+        milestones_completed: ["m1", "m2", "m3"],
+      },
+      true,
+    );
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText("Pause requested · after M4")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /cancel pause/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /pause now/i })).toBeTruthy();
+  });
+
+  it("the chip's Cancel posts pause_cancel via api.cancelPause(id)", async () => {
+    const { refreshRun } = renderPage(
+      { status: "running", pause_requested_at: "2026-01-01T02:00:00Z", pause_mode: "now" },
+      true,
+    );
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /cancel pause/i }));
+    });
+    await waitFor(() => expect(mockApi.cancelPause).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("hides 'Pause now' on the chip once the pending mode is already 'now'", async () => {
+    renderPage({ status: "running", pause_requested_at: "2026-01-01T02:00:00Z", pause_mode: "now" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText("Pause requested · now")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /cancel pause/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /pause now/i })).toBeNull();
+  });
+
+  it("shows the chip but NO actions when the request rode an involuntary park (not running)", async () => {
+    // M1 review: the server accepts pause_cancel ONLY while running, so a parked run with a
+    // surviving request shows the chip read-only — never a Cancel/Pause-now that would 409.
+    renderPage(
+      { status: "limit_wait", pause_requested_at: "2026-01-01T02:00:00Z", pause_mode: "milestone", wait_on_limit: true },
+      true,
+    );
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText(/Pause requested/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /cancel pause/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /pause now/i })).toBeNull();
+  });
+
+  it("only the status pill pulses — the pending chip never carries animate-pulse", async () => {
+    renderPage({ status: "running", pause_requested_at: "2026-01-01T02:00:00Z", pause_mode: "now" }, true);
+    await screen.findByText("Add rate limiting");
+    // The running pill pulses (its dot).
+    const pill = screen.getByText("running");
+    expect(pill.querySelector(".animate-pulse")).not.toBeNull();
+    // The chip does not — neither on itself nor anywhere in its subtree.
+    const chip = screen.getByText("Pause requested · now");
+    expect(chip.className).not.toContain("animate-pulse");
+    expect(chip.querySelector(".animate-pulse")).toBeNull();
+  });
+
+  // PRD #1190 Fix 1 (web-ux F2, extending #35/#754): the green "● live" chip is a running
+  // go-signal, so it must NOT render on a paused run — beside "‖ paused · clock stopped" it
+  // is a false all-clear, the very reason limit_wait and pool_wait already exclude it. The
+  // "Live" title is unique to that chip (the stage/health chips carry none), so its absence
+  // is a meaningful miss, paired with the running-run positive control below so the
+  // assertion cannot pass vacuously.
+  it("does NOT render the 'live' chip on a paused run (a false go-signal beside '‖ paused')", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByTitle("Live")).toBeNull();
+    // The clock-stopped elapsed is still there — the run is legitimately not live.
+    expect(screen.getByText(/clock stopped/i)).toBeTruthy();
+  });
+
+  it("DOES render the 'live' chip on a running run (the positive control for the exclusion)", async () => {
+    renderPage({ status: "running", started_at: "2026-01-01T00:00:00Z" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByTitle("Live")).toBeTruthy();
+  });
+
+  // PRD #1190 Fix 2/3: a paused run keeps SteerQueueCard with parked=true, MATCHING the
+  // limit_wait pattern (RunView renders SteerQueueCard unconditionally; on limit_wait both
+  // LimitWaitPanel and the card carry a "Stop run"). So the paused page is DELIBERATELY a
+  // panel/card split, not a single action surface, and this documents the PRD-intended
+  // pairs rather than de-duplicating them:
+  //   - TWO Resume paths — the header "▶ Resume" (D14, the Expedite pattern) + PausedPanel's
+  //     Resume. Both are PRD-spec'd.
+  //   - TWO Stop paths — PausedPanel's Stop + the card's Stop, exactly as limit_wait pairs
+  //     LimitWaitPanel's Stop with the card's Stop.
+  it("keeps the header+panel Resume pair and the panel/card Stop split, matching limit_wait", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: /stop run/i })).toHaveLength(2);
+  });
+
+  it("still offers the follow-up composer on a paused run, with the QUEUED (not 'resumes') copy", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    const box = screen.getByPlaceholderText(/send a follow-up message/i) as HTMLTextAreaElement;
+    expect(box.placeholder).toContain("queued until the run resumes");
+    expect(box.placeholder).not.toContain("resumes the agent as its next turn");
+  });
+});
+
+// PRD #1190 (finding, outside-diff): `paused` is non-terminal, but nothing runs while
+// paused — so the milestone checklist's live "now" strip (green/pulsing, derived
+// client-side from the newest tool_use frame) must NOT render. It is excluded in the
+// `activity` memo alongside terminal runs; limit_wait/pool_wait keep their own strip.
+describe("RunView — a paused run shows no live 'now' activity strip (PRD #1190)", () => {
+  const ACTIVITY_MSG: RunMessage[] = [
+    {
+      seq: 1,
+      kind: "tool_use",
+      agent: "coder",
+      agent_instance: null,
+      agent_label: "Wire the collector",
+      payload: { name: "Write", input: { file_path: "api/collector.go" } },
+      created_at: "2026-01-01T00:00:00Z",
+    } as unknown as RunMessage,
+  ];
+  const MILESTONES: Partial<Run> = {
+    milestones: [
+      { id: "m1", title: "First" },
+      { id: "m2", title: "Second" },
+    ],
+    milestones_completed: ["m1"],
+    milestones_in_progress: ["m2"],
+  };
+
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run({ ...MILESTONES, ...over }),
+      messages: ACTIVITY_MSG,
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  // The MilestoneNowStrip's root is the only `.border-l-2.py-1` on a running/paused page
+  // (the ActivityFeed's own left-bordered rows use py-3). The agent label alone is NOT a
+  // valid probe — it ALSO appears in the transcript feed as the lane label, so a text query
+  // would find it even with no strip.
+  const nowStrip = (c: HTMLElement) => c.querySelector(".border-l-2.py-1");
+
+  it("DOES render the live 'now' strip on a RUNNING milestone run (positive control)", async () => {
+    const { container } = renderPage({ status: "running", started_at: "2026-01-01T00:00:00Z" });
+    await screen.findByText("Add rate limiting");
+    expect(nowStrip(container)).not.toBeNull();
+  });
+
+  it("does NOT render the live 'now' strip on a PAUSED run", async () => {
+    const { container } = renderPage({
+      status: "paused",
+      started_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T03:42:00Z",
+    });
+    await screen.findByText("Add rate limiting");
+    // The checklist still renders (milestones are present) …
+    expect(screen.getByText(/reported complete/i)).toBeTruthy();
+    // … but the live "now" strip is gone (nothing runs while paused).
+    expect(nowStrip(container)).toBeNull();
+  });
+});
+
+// PRD #1190: the PausedPanel, mounted directly (it is exported, like LimitWaitPanel) so its
+// copy and owner-gating are asserted without the full page.
+describe("PausedPanel (PRD #1190)", () => {
+  const paused = (over: Partial<Run> = {}): Run =>
+    run({
+      status: "paused",
+      branch: "agent/issue-33",
+      started_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T03:42:00Z",
+      checkpoint_tip_at: "2026-01-01T01:00:00Z",
+      milestones: [
+        { id: "m1", title: "a" },
+        { id: "m2", title: "b" },
+        { id: "m3", title: "c" },
+        { id: "m4", title: "d" },
+        { id: "m5", title: "e" },
+        { id: "m6", title: "f" },
+      ],
+      milestones_completed: ["m1", "m2", "m3"],
+      ...over,
+    });
+
+  it("self-hides on a non-paused run", () => {
+    const { container } = render(<PausedPanel run={run({ status: "running" })} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("says the checkpoint is safe and that nothing runs or is spent while it waits", () => {
+    render(<PausedPanel run={paused()} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.getByText(/Milestone 3 is finished and its checkpoint is pushed \(agent\/issue-33\)\./)).toBeTruthy();
+    expect(screen.getByText("Nothing runs and nothing is spent while it waits.")).toBeTruthy();
+    expect(screen.getByText("What happens on resume")).toBeTruthy();
+  });
+
+  it("OMITS the budget-remaining sentence (PRD #1189's budget_total_seconds has not landed)", () => {
+    render(<PausedPanel run={paused()} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.queryByText(/left when you resume/i)).toBeNull();
+    expect(screen.queryByText(/budget remains/i)).toBeNull();
+    expect(screen.queryByText(/left when resumed/i)).toBeNull();
+    // And the action-row who-can line names two actions, not three (no "extend").
+    expect(screen.queryByText(/only the run's owner can resume, extend or stop/i)).toBeNull();
+  });
+
+  it("offers Resume + Stop for the owner", () => {
+    const onResume = vi.fn();
+    render(<PausedPanel run={paused()} busy={false} canSteer onResume={onResume} onStop={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /resume/i }));
+    expect(onResume).toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /stop run/i })).toBeTruthy();
+  });
+
+  it("a NON-OWNER sees inert text, never a Resume/Stop button", () => {
+    render(<PausedPanel run={paused()} busy={false} canSteer={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /stop run/i })).toBeNull();
+    expect(screen.getByText("Only the run's owner can resume or stop it.")).toBeTruthy();
+  });
+
+  // PRD #1190 (finding [5]): the heading MUST NOT carry role="status". A live region that
+  // mounts holding its first message is typically silent to assistive tech (Board.tsx S5),
+  // so the paused arrival is announced by RunView's persistent parkAnnounce region instead —
+  // role="status" here too would either be silent-on-mount or a duplicate announcement.
+  it("the heading carries NO role=\"status\" (parkAnnounce owns the announcement)", () => {
+    render(<PausedPanel run={paused()} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    const heading = screen.getByText(/Paused by you/);
+    expect(heading.getAttribute("role")).toBeNull();
+    // The standalone panel declares no live region of its own at all.
+    expect(document.querySelectorAll('[role="status"]').length).toBe(0);
   });
 });
 
@@ -3926,6 +4246,59 @@ describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () 
     await screen.findByText("Add rate limiting");
     const region = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
     expect(region.textContent).toBe("");
+  });
+});
+
+// PRD #1190 (finding [5]): a run parking into `paused` is a deliberate owner hold a
+// screen-reader user must be told about — it must announce through the SAME persistent
+// region as the other parks, on the CONTENT CHANGE (a region born holding text is silent).
+describe("RunView park announcement — paused (PRD #1190, a11y)", () => {
+  function setStream(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+  }
+
+  it("announces the paused park on a running→paused transition through the always-mounted region", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    setStream({ status: "running", started_at: "2026-01-01T00:00:00Z" });
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Add rate limiting");
+    // Running: the region exists but is empty (nothing to announce yet).
+    const before = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+    expect(before.textContent).toBe("");
+
+    // Transition to paused: the SAME region gains the paused message.
+    setStream({ status: "paused", started_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T03:42:00Z" });
+    rerender(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe(
+      "The run is paused. Resume it from this page or with the uzi run resume command.",
+    );
+    // Mutation guards: it is the paused copy, not another park's.
+    expect(region.textContent).not.toContain("asking you a question");
+    expect(region.textContent).not.toContain("pooled Anthropic token");
+    expect(region.textContent).not.toContain("next follow-up");
   });
 });
 

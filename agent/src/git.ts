@@ -1600,6 +1600,29 @@ export class GitCache {
   }
 
   /**
+   * PRD #1190 — undo a `commitWipMarker` commit, restoring its content to the UNCOMMITTED
+   * working tree (`git reset --mixed HEAD^`, runner uid). The pause park is the one caller
+   * that can create a marker and then NOT park (a failed checkpoint publish keeps the run
+   * RUNNING, Decision 8): the marker must not stay at the clone HEAD, or it would ride into
+   * the eventual MR and the restarted turn would build on a throwaway commit. This is the
+   * SAME restore the resume adopt does (#759 M2, `reset --soft` on the adopted marker), run
+   * inline here because a continuing run never reseeds. BEST-EFFORT: every error is caught
+   * and logged — a failed restore must never propagate, exactly as `commitWipMarker` never
+   * propagates a commit failure (D4). Only ever called after `commitWipMarker` returned true,
+   * so HEAD^ is the marker's parent (the clone was checked out at a real base commit).
+   */
+  async undoWipMarker(clonePath: string): Promise<void> {
+    try {
+      await this.runGitAsRunner(clonePath, ["reset", "--mixed", "HEAD^"]);
+    } catch (err) {
+      this.log.warn("WIP park marker undo failed (best-effort → marker left at HEAD)", {
+        cwd: clonePath,
+        error: gitErrorMessage(err),
+      });
+    }
+  }
+
+  /**
    * The unified diff of the reviewed `branch` against `base` (three-dot: the changes on
    * `branch` since it diverged from `base`), for a PRD #400 M4b diff-review run. `branch` is
    * resolved as the bare's remote-tracking ref (`refs/remotes/origin/<name>`, which every

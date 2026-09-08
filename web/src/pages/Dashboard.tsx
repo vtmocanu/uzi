@@ -202,7 +202,12 @@ export function Dashboard() {
   // false for a pool hold, so the honest generalization is the resource-agnostic phrase
   // that holds for both.
   const active = data?.runs.filter((r) => !isTerminalRun(r.status)) ?? [];
-  const waiting = active.filter((r) => r.status === "limit_wait" || r.status === "pool_wait");
+  // PRD #1190: a `paused` run joins the hold bucket too — non-terminal but not actively
+  // working (it waits for its owner to resume), the same KIND of hold as the two above.
+  // "waiting to resume" stays honest: a paused run does resume, on demand.
+  const waiting = active.filter(
+    (r) => r.status === "limit_wait" || r.status === "pool_wait" || r.status === "paused",
+  );
   const working = active.length - waiting.length;
   // "8 at work · 1 waiting to resume" only when there is something to disambiguate; a
   // factory with nothing parked keeps exactly the copy it had.
@@ -368,7 +373,10 @@ export function Dashboard() {
               // exactly as before (D5). The activity's untrusted fields render escaped
               // through stripUnsafeChars.
               const activity = r.current_activity;
-              const showNow = activity != null && !isTerminalRun(r.status);
+              // PRD #1190: a `paused` run is non-terminal but nothing runs while paused, so
+              // it must not render the live `bg-ok animate-pulse` "now" strip — exclude it
+              // alongside terminal runs.
+              const showNow = activity != null && !isTerminalRun(r.status) && r.status !== "paused";
               const nowMilestone = firstInProgressMilestoneId(r);
               return (
               // Issue #485 NB1: RunIssueRef renders a real forge <a>, which cannot nest
