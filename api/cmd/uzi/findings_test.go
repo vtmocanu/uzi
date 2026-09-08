@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -197,7 +198,8 @@ func TestFindingsBucketUsageMatchesServerEnum(t *testing.T) {
 		advertised[name] = true
 	}
 	for _, want := range []string{
-		workersvc.BucketToFile, workersvc.BucketFiled, workersvc.BucketDismissed, workersvc.BucketAll,
+		workersvc.BucketToFile, workersvc.BucketFiled, workersvc.BucketDone,
+		workersvc.BucketDismissed, workersvc.BucketAll,
 	} {
 		if !advertised[want] {
 			t.Errorf("--bucket help does not advertise the valid bucket %q", want)
@@ -331,5 +333,243 @@ func TestFindingsDismissNotFoundAndConflict(t *testing.T) {
 	fc2.DismissFindingErr = uzicli.Exitf(uzicli.ExitConflict, "cannot dismiss")
 	if _, _, code := runCLI(t, fakeEnv(fc2), "findings", "dismiss", "f-aaaa", "--reason", "wont-do"); code != uzicli.ExitConflict {
 		t.Fatalf("dismiss 409: exit = %d, want %d", code, uzicli.ExitConflict)
+	}
+}
+
+// -------------------------------------------------------------------------
+// PRD #1183 M5: the list renderer surfaces the dismiss reason and the issue-close done state,
+// --bucket accepts `done`, --json carries the new DTO fields, and the new `stats`/`undo` verbs.
+// -------------------------------------------------------------------------
+
+// A dismissed row shows its reason where the DTO carries one — "Dismissed · Won't do" /
+// "Dismissed · Not an issue" — the terminal twin of the web state chip, matching the judge
+// vocabulary. dismiss_reason is a closed enum, so it prints raw (no sanitizeTTY).
+func TestFindingsListRendersDismissReason(t *testing.T) {
+	fc := &uzicli.FakeClient{FindingsResult: apitypes.IncidentalFindingBacklogDTO{
+		Bucket: workersvc.BucketDismissed,
+		Findings: []apitypes.IncidentalFindingDTO{
+			{DispositionID: "d-1", FindingID: ptr("f-1"), Location: "a.go#f", RepoID: "repo-1", RepoPath: "team/api",
+				Status: dispStatusDismissed, LastTitle: "wont fix this", SeenInRuns: 2, DismissReason: dispReasonWontDo},
+			{DispositionID: "d-2", FindingID: ptr("f-2"), Location: "b.go#g", RepoID: "repo-1", RepoPath: "team/api",
+				Status: dispStatusDismissed, LastTitle: "false alarm", SeenInRuns: 1, DismissReason: dispReasonNotAnIssue},
+		},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "list", "--bucket", workersvc.BucketDismissed)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{"Dismissed · Won't do", "Dismissed · Not an issue"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dismissed row missing its reason %q:\n%s", want, out)
+		}
+	}
+}
+
+// A done row set by the issue-close sync reads "Done via #N" — the CLI form of the web's "Done
+// via #N" chip. set_via and filed_issue_iid are structural (enum + int), so they print raw.
+func TestFindingsListRendersDoneVia(t *testing.T) {
+	iid := int64(42)
+	fc := &uzicli.FakeClient{FindingsResult: apitypes.IncidentalFindingBacklogDTO{
+		Bucket: workersvc.BucketDone,
+		Findings: []apitypes.IncidentalFindingDTO{
+			{DispositionID: "d-1", Location: "a.go#f", RepoID: "repo-1", RepoPath: "team/api",
+				Status: dispStatusDone, LastTitle: "fixed by closing the issue", SeenInRuns: 1,
+				SetVia: "issue_close", FiledIssueIID: &iid},
+		},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "list", "--bucket", workersvc.BucketDone)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "Done via #42") {
+		t.Errorf("done-via-issue-close row must read \"Done via #N\":\n%s", out)
+	}
+}
+
+// `--bucket done` is accepted and forwarded VERBATIM — the fifth bucket the M3 server enum added.
+func TestFindingsListBucketDoneForwarded(t *testing.T) {
+	fc := findingsFake()
+	if _, _, code := runCLI(t, fakeEnv(fc), "findings", "list", "--bucket", workersvc.BucketDone); code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastFindingsBucket != workersvc.BucketDone {
+		t.Errorf("bucket forwarded as %q, want %q", fc.LastFindingsBucket, workersvc.BucketDone)
+	}
+}
+
+// --json carries the M3 DTO additions (disposition_id, dismiss_reason, set_via, evidence_preview,
+// occurrences) through unchanged — the renderer marshals the DTO, so an agent sees every field.
+func TestFindingsListJSONCarriesNewFields(t *testing.T) {
+	iid := int64(7)
+	fc := &uzicli.FakeClient{FindingsResult: apitypes.IncidentalFindingBacklogDTO{
+		Bucket: workersvc.BucketAll,
+		Findings: []apitypes.IncidentalFindingDTO{
+			{
+				DispositionID:   "disp-1",
+				FindingID:       ptr("f-1"),
+				Location:        "a.go#f",
+				RepoID:          "repo-1",
+				RepoPath:        "team/api",
+				Status:          dispStatusDismissed,
+				LastTitle:       "t",
+				SeenInRuns:      2,
+				DismissReason:   dispReasonWontDo,
+				SetVia:          "issue_close",
+				FiledIssueIID:   &iid,
+				EvidencePreview: "the loop never exits",
+				Occurrences: []apitypes.FindingOccurrenceDTO{
+					{RunID: "run-a", RunTitle: "add search", ReportedAt: time.Now(), Confidence: "high"},
+				},
+			},
+		},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "list", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var got apitypes.IncidentalFindingBacklogDTO
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("--json output is not an IncidentalFindingBacklogDTO: %v\n%s", err, out)
+	}
+	if len(got.Findings) != 1 {
+		t.Fatalf("--json lost the finding row: %d findings", len(got.Findings))
+	}
+	f := got.Findings[0]
+	if f.DispositionID != "disp-1" {
+		t.Errorf("--json dropped disposition_id, got %q", f.DispositionID)
+	}
+	if f.DismissReason != dispReasonWontDo || f.SetVia != "issue_close" {
+		t.Errorf("--json dropped dismiss_reason/set_via, got (%q,%q)", f.DismissReason, f.SetVia)
+	}
+	if f.EvidencePreview != "the loop never exits" {
+		t.Errorf("--json dropped evidence_preview, got %q", f.EvidencePreview)
+	}
+	if len(f.Occurrences) != 1 || f.Occurrences[0].RunID != "run-a" {
+		t.Errorf("--json dropped the occurrence detail: %+v", f.Occurrences)
+	}
+}
+
+// `findings stats` renders the human table with the Findings vocabulary ("TO TRIAGE", not the
+// judge's "TO DO") over the shared TriageDTO.
+func TestFindingsStatsTable(t *testing.T) {
+	fc := &uzicli.FakeClient{FindingsStatsResult: apitypes.TriageDTO{
+		Total: 9, Todo: 4, Filed: 2, Done: 2, Dismissed: 1, FalsePositives: 1,
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "stats")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{"TOTAL", "TO TRIAGE", "FILED", "DONE", "DISMISSED", "FALSE POSITIVES", "9"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stats table missing %q:\n%s", want, out)
+		}
+	}
+	// The open bucket reads "To triage" on Findings, never the judge's "TO DO".
+	if strings.Contains(out, "TO DO") {
+		t.Errorf("findings stats used the judge label 'TO DO' instead of 'TO TRIAGE':\n%s", out)
+	}
+}
+
+// `findings stats --json` emits the raw (unenveloped) TriageDTO, exactly like `review stats`.
+func TestFindingsStatsJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{FindingsStatsResult: apitypes.TriageDTO{Total: 3, FalsePositives: 1}}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "stats", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, `"total": 3`) || !strings.Contains(out, `"false_positives": 1`) {
+		t.Errorf("stats --json unexpected:\n%s", out)
+	}
+}
+
+// --repo narrows the tally and is forwarded VERBATIM; an unset flag omits the parameter so the
+// server tallies every repo. Substituting a default client-side would make the CLI a second
+// definition of it, and the two could drift.
+func TestFindingsStatsRepoForwarded(t *testing.T) {
+	fc := &uzicli.FakeClient{FindingsStatsResult: apitypes.TriageDTO{Total: 1}}
+	if _, _, code := runCLI(t, fakeEnv(fc), "findings", "stats", "--repo", "repo-9"); code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastFindingsStatsRepo != "repo-9" {
+		t.Errorf("repo forwarded as %q, want repo-9", fc.LastFindingsStatsRepo)
+	}
+
+	fc2 := &uzicli.FakeClient{FindingsStatsResult: apitypes.TriageDTO{Total: 1}}
+	if _, _, code := runCLI(t, fakeEnv(fc2), "findings", "stats"); code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc2.LastFindingsStatsRepo != "" {
+		t.Errorf("an unset --repo must send nothing (server default), got %q", fc2.LastFindingsStatsRepo)
+	}
+}
+
+// `findings undo <id>` forwards the disposition id and reports the reopen.
+func TestFindingsUndoSuccess(t *testing.T) {
+	fc := findingsFake()
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "undo", "disp-1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastUndoFindingID != "disp-1" {
+		t.Errorf("undo forwarded id %q, want disp-1", fc.LastUndoFindingID)
+	}
+	if !strings.Contains(out, "reopened") {
+		t.Errorf("undo output missing the outcome:\n%s", out)
+	}
+}
+
+// undo softens the not-dismissed sentinel (the endpoint's 404 for a non-dismissed/foreign id) to
+// a friendly line + exit 0 — treated as already-undone, never a crash. The write is still REACHED
+// with the right id before the softening.
+func TestFindingsUndoAlreadyUndoneExit0(t *testing.T) {
+	fc := findingsFake()
+	fc.UndoDismissFindingErr = uzicli.ErrFindingNotDismissed
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "undo", "disp-1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (already undone)", code)
+	}
+	if fc.LastUndoFindingID != "disp-1" {
+		t.Errorf("the undo call was never reached (id=%q)", fc.LastUndoFindingID)
+	}
+	if !strings.Contains(out, "no dismissal to undo") {
+		t.Errorf("want a friendly already-undone line, got:\n%s", out)
+	}
+}
+
+// The sentinel softening is distinct from a hard failure: a real error (e.g. a 401 from an
+// invalid CLI token) keeps its exit code rather than being swallowed as already-undone.
+func TestFindingsUndoHardErrorPropagates(t *testing.T) {
+	fc := findingsFake()
+	fc.UndoDismissFindingErr = uzicli.Exitf(uzicli.ExitAuth, "invalid CLI token")
+	_, _, code := runCLI(t, fakeEnv(fc), "findings", "undo", "disp-1")
+	if code != uzicli.ExitAuth {
+		t.Fatalf("exit = %d, want %d (auth)", code, uzicli.ExitAuth)
+	}
+	if fc.LastUndoFindingID != "disp-1" {
+		t.Errorf("the undo call was never reached (id=%q)", fc.LastUndoFindingID)
+	}
+}
+
+// undo --json emits a small envelope on both the success and the softened-sentinel paths, so a
+// --json consumer can tell reopened (undone:true) from already-undone (undone:false) without
+// parsing a human line.
+func TestFindingsUndoJSON(t *testing.T) {
+	fc := findingsFake()
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "undo", "disp-1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, `"undone": true`) {
+		t.Errorf("undo --json success must carry undone:true:\n%s", out)
+	}
+
+	fc2 := findingsFake()
+	fc2.UndoDismissFindingErr = uzicli.ErrFindingNotDismissed
+	out2, _, code2 := runCLI(t, fakeEnv(fc2), "findings", "undo", "disp-1", "--json")
+	if code2 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (already undone)", code2)
+	}
+	if !strings.Contains(out2, `"undone": false`) {
+		t.Errorf("undo --json already-undone must carry undone:false:\n%s", out2)
 	}
 }

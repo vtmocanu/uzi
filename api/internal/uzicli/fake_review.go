@@ -97,6 +97,28 @@ func (f *FakeClient) DismissFinding(_ context.Context, id, reason string) error 
 	return f.Err
 }
 
+// GetFindingsStats records the repo filter it was forwarded and returns the canned tally. Empty
+// repo means the flag was unset (the parameter omitted, server-default "all repos"), so the fake
+// records "" rather than substituting a repo — mirroring ListFindings' filter capture.
+func (f *FakeClient) GetFindingsStats(_ context.Context, repo string) (apitypes.TriageDTO, error) {
+	f.LastFindingsStatsRepo = repo
+	if f.Err != nil {
+		return apitypes.TriageDTO{}, f.Err
+	}
+	return f.FindingsStatsResult, nil
+}
+
+// UndoDismissFinding records the id it was asked to reopen. UndoDismissFindingErr wins over the
+// blanket Err so a test can model the not-dismissed sentinel (ErrFindingNotDismissed) or a hard
+// failure while the id capture still proves the call was reached.
+func (f *FakeClient) UndoDismissFinding(_ context.Context, id string) error {
+	f.LastUndoFindingID = id
+	if f.UndoDismissFindingErr != nil {
+		return f.UndoDismissFindingErr
+	}
+	return f.Err
+}
+
 // GetReviewIssueDraft records the (run, rec) it was asked about and returns the canned draft.
 // GetReviewIssueDraftErr wins over the blanket Err so a test can model a 404 on the read while
 // the capture still proves the read was reached.

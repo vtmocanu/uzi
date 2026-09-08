@@ -1,6 +1,9 @@
 package main
 
 import (
+	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -84,7 +87,42 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	dismiss.Flags().String("reason", "", "why it is dismissed: wont-do (valid, not worth it) | not-an-issue (false positive)")
 
-	cmd.AddCommand(list, file, dismiss)
+	stats := &cobra.Command{
+		Use:   "stats",
+		Short: "Show your findings triage totals across all your repos",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return runFindingsStats(env, gf, c, cmd)
+		},
+	}
+	// --repo narrows the tally to one repo, forwarded VERBATIM (empty omits the parameter, so the
+	// server tallies every repo). A well-formed but foreign/unknown id is an all-zero tally, never
+	// a 404 (no existence oracle); an unparseable id is the server's 400 → exit 2.
+	stats.Flags().String("repo", "", "narrow the tally to one repo id (as `uzi repo list` prints it); a foreign/unknown id is an all-zero tally, never a 404")
+
+	undo := &cobra.Command{
+		Use:   "undo <finding-id>",
+		Short: "Reopen a dismissed finding (undo a dismissal)",
+		Long: "Reopen a dismissed finding coordinate, undoing a dismissal (back to the to-file\n" +
+			"bucket). The id is the disposition id (present on every backlog row, including a\n" +
+			"dismissed one whose evidence was cascaded away). A coordinate that is not dismissed —\n" +
+			"unknown, foreign, or never dismissed — is treated as already-undone: a friendly line,\n" +
+			"exit 0, never a crash (mirroring the judge undo).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return runFindingsUndo(env, gf, c, cmd, args[0])
+		},
+	}
+
+	cmd.AddCommand(list, file, dismiss, stats, undo)
 	return cmd
 }
 
@@ -94,7 +132,7 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 // the validator, so a stale line here misinforms but cannot misbehave (an unknown bucket is the
 // server's 400 → exit 2, never a silently empty list). TestFindingsBucketUsageMatchesServerEnum
 // pins it to workersvc's finding-bucket set both ways so it cannot drift unnoticed.
-const findingsBucketFlagUsage = "filter by disposition bucket: to_file (default) | filed | dismissed | all"
+const findingsBucketFlagUsage = "filter by disposition bucket: to_file (default) | filed | done | dismissed | all"
 
 // runFindingsList fetches and renders the deduped backlog. --bucket/--repo/--run are forwarded
 // verbatim (empty omits the parameter, so the server's default applies — to_file for bucket, no
@@ -150,8 +188,111 @@ func renderFindingsBacklog(p *uzicli.Printer, b apitypes.IncidentalFindingBacklo
 				id = *f.FindingID
 			}
 			p.Printf("  %s  %s · seen in %s · %s\n",
-				id, sanitizeTTY(f.LastTitle), runsPhrase(f.SeenInRuns), f.Status)
+				id, sanitizeTTY(f.LastTitle), runsPhrase(f.SeenInRuns), findingStateLabel(f))
 		}
+	}
+	return nil
+}
+
+// findingStateLabel renders a coordinate's disposition state for the human view: the raw status,
+// enriched where the DTO now carries provenance (PRD #1183 M5). A dismissed row shows its reason
+// ("Dismissed · Won't do" / "Dismissed · Not an issue") so the terminal reads the same as the web
+// chip; a done row set by the issue-close sync shows the issue it was closed via ("Done via #N").
+// dismiss_reason and set_via are closed enums and filed_issue_iid is a structural int, so all three
+// print raw — no sanitizeTTY, unlike the agent-authored last_title.
+func findingStateLabel(f apitypes.IncidentalFindingDTO) string {
+	switch f.Status {
+	case dispStatusDismissed:
+		if label := dismissReasonLabel(f.DismissReason); label != "" {
+			return "Dismissed · " + label
+		}
+	case dispStatusDone:
+		if f.SetVia == findingSetViaIssueClose && f.FiledIssueIID != nil {
+			return fmt.Sprintf("Done via #%d", *f.FiledIssueIID)
+		}
+	}
+	return f.Status
+}
+
+// dismissReasonLabel maps a dismissal's wire reason to the human phrase the web chip uses, or ""
+// for an absent/unknown reason (an open coordinate carries none). Shared vocabulary with the
+// judge dismiss (wont_do → "Won't do", not_an_issue → "Not an issue").
+func dismissReasonLabel(reason string) string {
+	switch reason {
+	case dispReasonWontDo:
+		return "Won't do"
+	case dispReasonNotAnIssue:
+		return "Not an issue"
+	default:
+		return ""
+	}
+}
+
+// findingSetViaIssueClose is the one set_via provenance value a finding can carry today (PRD #1183
+// M3): a `done` coordinate the issue-close sync settled. Sourced as a local literal, not from
+// workersvc, so cmd/uzi never links the server stack (TestNoServerDeps).
+const findingSetViaIssueClose = "issue_close"
+
+// runFindingsStats fetches and renders the caller's Findings triage totals (PRD #1183 M5),
+// mirroring `uzi review stats`. --repo narrows the tally to one repo, forwarded verbatim (empty
+// omits the parameter, so the server tallies every repo); --json emits the raw (unenveloped)
+// TriageDTO.
+func runFindingsStats(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command) error {
+	repo, _ := cmd.Flags().GetString("repo")
+	t, err := c.GetFindingsStats(cmd.Context(), strings.TrimSpace(repo))
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(t)
+	}
+	// The findings vocabulary is "To triage" for the open bucket, so the row reads TO TRIAGE
+	// rather than the judge's TO DO (they share the TriageDTO but not the label).
+	rows := [][]string{
+		{"TOTAL", strconv.Itoa(t.Total)},
+		{"TO TRIAGE", strconv.Itoa(t.Todo)},
+		{"FILED", strconv.Itoa(t.Filed)},
+		{"DONE", strconv.Itoa(t.Done)},
+		{"DISMISSED", strconv.Itoa(t.Dismissed)},
+		{"FALSE POSITIVES", strconv.Itoa(t.FalsePositives)},
+	}
+	return p.Table(nil, rows)
+}
+
+// runFindingsUndo reopens a dismissed finding coordinate (PRD #1183 M5), mirroring `uzi review
+// undo`: the sentinel ErrFindingNotDismissed (the endpoint's 404 for a non-dismissed/foreign id)
+// is softened to a friendly "already undone" line and exit 0, never a crash. Any other failure
+// propagates with its real exit code. --json emits a small envelope.
+func runFindingsUndo(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, id string) error {
+	err := c.UndoDismissFinding(cmd.Context(), id)
+	if errors.Is(err, uzicli.ErrFindingNotDismissed) {
+		// Nothing to undo — treat as already-undone: friendly line, exit 0.
+		return reportFindingNotDismissed(env, gf, id)
+	}
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(map[string]any{"finding": id, "status": "reopened", "undone": true})
+	}
+	if !gf.quiet {
+		p.Printf("finding %s: dismissal undone (reopened)\n", id)
+	}
+	return nil
+}
+
+// reportFindingNotDismissed is the friendly already-undone report for `uzi findings undo` when the
+// coordinate had no dismissal to undo (the endpoint's 404, softened): exit 0, not a not-found
+// failure — mirroring reportNoDisposition on the judge undo.
+func reportFindingNotDismissed(env Env, gf *globalFlags, id string) error {
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(map[string]any{"finding": id, "status": "no dismissal to undo", "undone": false})
+	}
+	if !gf.quiet {
+		p.Printf("finding %s: no dismissal to undo\n", id)
 	}
 	return nil
 }
