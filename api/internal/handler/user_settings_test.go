@@ -83,6 +83,21 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if ids, ok := args[0].([]uuid.UUID); ok {
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
 		}
+	case strings.Contains(sql, "SET appearance_mode") && len(args) >= 4:
+		// SetUserAppearance writes all four columns at once (PRD #1167 M1):
+		// $1=appearance_mode, $2=light_theme, $3=dark_theme, $4=typeface, $5=id.
+		if m, ok := args[0].(pgtype.Text); ok {
+			f.apprMode = m
+		}
+		if l, ok := args[1].(pgtype.Text); ok {
+			f.lightTheme = l
+		}
+		if d, ok := args[2].(pgtype.Text); ok {
+			f.darkTheme = d
+		}
+		if tf, ok := args[3].(pgtype.Text); ok {
+			f.typeface = tf
+		}
 	}
 	return fakeSettingsRow{
 		model:      f.model,
@@ -123,6 +138,22 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[0].(*pgtype.Bool); ok {
 			*p = r.mrRework
+		}
+	case 4:
+		// SetUserAppearance RETURNING appearance_mode, light_theme, dark_theme,
+		// typeface (PRD #1167 M1). Discarded by the handler, captured here so the
+		// write is observable on a follow-up GetUserSettings.
+		if p, ok := dest[0].(*pgtype.Text); ok {
+			*p = r.apprMode
+		}
+		if p, ok := dest[1].(*pgtype.Text); ok {
+			*p = r.lightTheme
+		}
+		if p, ok := dest[2].(*pgtype.Text); ok {
+			*p = r.darkTheme
+		}
+		if p, ok := dest[3].(*pgtype.Text); ok {
+			*p = r.typeface
 		}
 	case 11:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
@@ -863,5 +894,353 @@ func TestPutMySettingsMrReworkOnlyLeavesModelUntouched(t *testing.T) {
 	}
 	if !db.model.Valid || db.model.String != "opus" {
 		t.Fatalf("default_model must be untouched by an mr_rework-only PUT, got %+v", db.model)
+	}
+}
+
+// --- Appearance (PRD #1167 M2): appearance_mode / light_theme / dark_theme / typeface ---
+
+// decodeAppearance pulls the four raw appearance override fields out of a
+// /me/settings response (each a nullable *string mirroring the stored column).
+func decodeAppearance(t *testing.T, body []byte) (mode, light, dark, typeface *string) {
+	t.Helper()
+	var resp struct {
+		Settings struct {
+			AppearanceMode *string `json:"appearance_mode"`
+			LightTheme     *string `json:"light_theme"`
+			DarkTheme      *string `json:"dark_theme"`
+			Typeface       *string `json:"typeface"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode settings response %s: %v", body, err)
+	}
+	return resp.Settings.AppearanceMode, resp.Settings.LightTheme, resp.Settings.DarkTheme, resp.Settings.Typeface
+}
+
+// GET reflects the four stored raw override columns (each NULL ⇒ JSON null).
+func TestGetMySettingsReturnsStoredAppearance(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{
+		apprMode:   pgtype.Text{String: "light", Valid: true},
+		lightTheme: pgtype.Text{String: "dawn", Valid: true},
+		darkTheme:  pgtype.Text{String: "mission", Valid: true},
+		typeface:   pgtype.Text{String: "plex", Valid: true},
+	})}
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	mode, light, dark, tf := decodeAppearance(t, rec.Body.Bytes())
+	if mode == nil || *mode != "light" || light == nil || *light != "dawn" ||
+		dark == nil || *dark != "mission" || tf == nil || *tf != "plex" {
+		t.Fatalf("appearance = mode=%v light=%v dark=%v typeface=%v, want light/dawn/mission/plex", mode, light, dark, tf)
+	}
+}
+
+// An unset appearance column serializes as JSON null (inherit the instance default).
+func TestGetMySettingsNullAppearanceSerializesAsNull(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{})}
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	mode, light, dark, tf := decodeAppearance(t, rec.Body.Bytes())
+	if mode != nil || light != nil || dark != nil || tf != nil {
+		t.Fatalf("unset appearance must be null, got mode=%v light=%v dark=%v typeface=%v", mode, light, dark, tf)
+	}
+}
+
+// Each field: a valid value round-trips through the store and back out on GET.
+func TestPutMySettingsAppearanceRoundTrip(t *testing.T) {
+	cases := []struct {
+		field string
+		value string
+	}{
+		{"appearance_mode", "light"},
+		{"light_theme", "dawn"},
+		{"dark_theme", "mission"},
+		{"typeface", "plex"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			db := &fakeSettingsDB{}
+			h := &Handler{q: store.New(db)}
+			rec := httptest.NewRecorder()
+			body := []byte(`{"` + tc.field + `":"` + tc.value + `"}`)
+			h.PutMySettings(rec, authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader(body))))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s: status = %d, want 200; body=%s", tc.field, rec.Code, rec.Body.String())
+			}
+
+			// A follow-up GET reflects the stored value.
+			getRec := httptest.NewRecorder()
+			h.GetMySettings(getRec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+			mode, light, dark, tf := decodeAppearance(t, getRec.Body.Bytes())
+			got := map[string]*string{"appearance_mode": mode, "light_theme": light, "dark_theme": dark, "typeface": tf}[tc.field]
+			if got == nil || *got != tc.value {
+				t.Fatalf("%s round-trip = %v, want %q", tc.field, got, tc.value)
+			}
+		})
+	}
+}
+
+// A present-null clears an appearance column back to NULL (inherit the default).
+func TestPutMySettingsNullAppearanceClearsToInherit(t *testing.T) {
+	db := &fakeSettingsDB{lightTheme: pgtype.Text{String: "dawn", Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"light_theme":null}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if db.lightTheme.Valid {
+		t.Fatalf("stored light_theme should be NULL after a null clear, got %+v", db.lightTheme)
+	}
+	if _, light, _, _ := decodeAppearance(t, rec.Body.Bytes()); light != nil {
+		t.Fatalf("response light_theme = %q, want null after clearing", *light)
+	}
+}
+
+// An absent appearance field leaves its stored column untouched (PATCH-like).
+func TestPutMySettingsAppearanceAbsentLeavesColumnUntouched(t *testing.T) {
+	db := &fakeSettingsDB{
+		apprMode:   pgtype.Text{String: "dark", Valid: true},
+		lightTheme: pgtype.Text{String: "dawn", Valid: true},
+		darkTheme:  pgtype.Text{String: "mission", Valid: true},
+		typeface:   pgtype.Text{String: "plex", Valid: true},
+	}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	// Only typeface is sent; the other three columns must survive the merge.
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"typeface":"system"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.apprMode.Valid || db.apprMode.String != "dark" {
+		t.Fatalf("appearance_mode must survive a typeface-only PUT, got %+v", db.apprMode)
+	}
+	if !db.lightTheme.Valid || db.lightTheme.String != "dawn" {
+		t.Fatalf("light_theme must survive a typeface-only PUT, got %+v", db.lightTheme)
+	}
+	if !db.darkTheme.Valid || db.darkTheme.String != "mission" {
+		t.Fatalf("dark_theme must survive a typeface-only PUT, got %+v", db.darkTheme)
+	}
+	if !db.typeface.Valid || db.typeface.String != "system" {
+		t.Fatalf("typeface should be updated, got %+v", db.typeface)
+	}
+}
+
+// Each invalid/polarity-wrong value is a 400 that names the field and never writes.
+func TestPutMySettingsRejectsInvalidAppearance(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"bad mode", `{"appearance_mode":"bright"}`, "appearance_mode"},
+		{"light slot given a dark theme", `{"light_theme":"ember"}`, "light_theme"},
+		{"dark slot given a light theme", `{"dark_theme":"dawn"}`, "dark_theme"},
+		{"unknown light theme", `{"light_theme":"neon"}`, "light_theme"},
+		{"bad typeface", `{"typeface":"comic"}`, "typeface"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := &fakeSettingsDB{apprMode: pgtype.Text{String: "dark", Valid: true}}
+			h := &Handler{q: store.New(db)}
+			rec := httptest.NewRecorder()
+			req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(tc.body))))
+			h.PutMySettings(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Fatalf("400 body %q should name the field %q", rec.Body.String(), tc.want)
+			}
+			// A rejected value must not touch any stored appearance column.
+			if !db.apprMode.Valid || db.apprMode.String != "dark" {
+				t.Fatalf("appearance_mode must be untouched by a rejected value, got %+v", db.apprMode)
+			}
+		})
+	}
+}
+
+// The light_theme wrong-polarity message is the theme.ValidateFor prose, prefixed
+// with the field so a client can tell "wrong slot" from "unknown id".
+func TestPutMySettingsLightThemePolarityMessage(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{})}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"light_theme":"ember"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	var errBody struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("decode error body %s: %v", rec.Body.String(), err)
+	}
+	if errBody.Error != `light_theme: theme "ember" is not a light theme` {
+		t.Fatalf("error = %q, want the prefixed polarity message", errBody.Error)
+	}
+}
+
+// Legacy theme mapping: a DARK theme folds into the dark slot AND sets mode=dark,
+// while still writing users.theme for the deprecated trio's consistency.
+func TestPutMySettingsLegacyThemeMapsDarkSlot(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"theme":"mission"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	// users.theme still written (deprecated trio consistency).
+	if !db.theme.Valid || db.theme.String != "mission" {
+		t.Fatalf("legacy users.theme = %+v, want mission", db.theme)
+	}
+	// Folded into the dark slot + mode=dark.
+	if !db.darkTheme.Valid || db.darkTheme.String != "mission" {
+		t.Fatalf("dark_theme = %+v, want mission (folded from legacy theme)", db.darkTheme)
+	}
+	if !db.apprMode.Valid || db.apprMode.String != "dark" {
+		t.Fatalf("appearance_mode = %+v, want dark (folded from legacy theme)", db.apprMode)
+	}
+	// GET reflects the fold.
+	mode, _, dark, _ := decodeAppearance(t, rec.Body.Bytes())
+	if mode == nil || *mode != "dark" || dark == nil || *dark != "mission" {
+		t.Fatalf("GET after legacy dark theme: mode=%v dark=%v, want dark/mission", mode, dark)
+	}
+}
+
+// Legacy theme mapping: a LIGHT theme folds into the light slot AND sets mode=light.
+func TestPutMySettingsLegacyThemeMapsLightSlot(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"theme":"dawn"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.theme.Valid || db.theme.String != "dawn" {
+		t.Fatalf("legacy users.theme = %+v, want dawn", db.theme)
+	}
+	if !db.lightTheme.Valid || db.lightTheme.String != "dawn" {
+		t.Fatalf("light_theme = %+v, want dawn (folded from legacy theme)", db.lightTheme)
+	}
+	if !db.apprMode.Valid || db.apprMode.String != "light" {
+		t.Fatalf("appearance_mode = %+v, want light (folded from legacy theme)", db.apprMode)
+	}
+}
+
+// A null legacy theme clears users.theme and must NOT touch the appearance columns.
+func TestPutMySettingsNullLegacyThemeLeavesAppearanceUntouched(t *testing.T) {
+	db := &fakeSettingsDB{
+		theme:    pgtype.Text{String: "mission", Valid: true},
+		apprMode: pgtype.Text{String: "dark", Valid: true},
+		darkTheme: pgtype.Text{
+			String: "mission", Valid: true,
+		},
+	}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"theme":null}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if db.theme.Valid {
+		t.Fatalf("users.theme should be cleared, got %+v", db.theme)
+	}
+	if !db.apprMode.Valid || db.apprMode.String != "dark" {
+		t.Fatalf("appearance_mode must be untouched by a null legacy theme, got %+v", db.apprMode)
+	}
+	if !db.darkTheme.Valid || db.darkTheme.String != "mission" {
+		t.Fatalf("dark_theme must be untouched by a null legacy theme, got %+v", db.darkTheme)
+	}
+}
+
+// Explicit new fields win over the legacy theme mapping when both are sent.
+func TestPutMySettingsExplicitAppearanceWinsOverLegacyTheme(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	// Legacy mission → dark slot + mode=dark; explicit mode=light and light=dawn win.
+	body := []byte(`{"theme":"mission","appearance_mode":"light","light_theme":"dawn"}`)
+	h.PutMySettings(rec, authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader(body))))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.apprMode.Valid || db.apprMode.String != "light" {
+		t.Fatalf("appearance_mode = %+v, want light (explicit wins over legacy dark)", db.apprMode)
+	}
+	if !db.lightTheme.Valid || db.lightTheme.String != "dawn" {
+		t.Fatalf("light_theme = %+v, want dawn (explicit)", db.lightTheme)
+	}
+	// The legacy fold's dark slot still lands (not overridden by an explicit dark_theme).
+	if !db.darkTheme.Valid || db.darkTheme.String != "mission" {
+		t.Fatalf("dark_theme = %+v, want mission (legacy fold, no explicit override)", db.darkTheme)
+	}
+}
+
+// Read-merge: an appearance_mode-only PUT preserves the other three columns.
+func TestPutMySettingsAppearanceModeOnlyLeavesSlotsUntouched(t *testing.T) {
+	db := &fakeSettingsDB{
+		apprMode:   pgtype.Text{String: "dark", Valid: true},
+		lightTheme: pgtype.Text{String: "dawn", Valid: true},
+		darkTheme:  pgtype.Text{String: "mission", Valid: true},
+		typeface:   pgtype.Text{String: "plex", Valid: true},
+	}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"appearance_mode":"light"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.apprMode.Valid || db.apprMode.String != "light" {
+		t.Fatalf("appearance_mode = %+v, want light", db.apprMode)
+	}
+	if !db.lightTheme.Valid || db.lightTheme.String != "dawn" {
+		t.Fatalf("light_theme must survive a mode-only PUT, got %+v", db.lightTheme)
+	}
+	if !db.darkTheme.Valid || db.darkTheme.String != "mission" {
+		t.Fatalf("dark_theme must survive a mode-only PUT, got %+v", db.darkTheme)
+	}
+	if !db.typeface.Valid || db.typeface.String != "plex" {
+		t.Fatalf("typeface must survive a mode-only PUT, got %+v", db.typeface)
+	}
+}
+
+// A PUT with no appearance/theme field must not issue an appearance write at all,
+// so a stored appearance is left completely untouched (no read-merge no-op).
+func TestPutMySettingsModelOnlyLeavesAppearanceUntouched(t *testing.T) {
+	db := &fakeSettingsDB{apprMode: pgtype.Text{String: "light", Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"default_model":"opus"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.apprMode.Valid || db.apprMode.String != "light" {
+		t.Fatalf("appearance_mode must be untouched by a model-only PUT, got %+v", db.apprMode)
 	}
 }

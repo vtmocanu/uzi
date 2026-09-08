@@ -39,6 +39,11 @@ const settings = (over: Partial<Settings> = {}): Settings => ({
   autopilot_label: "autopilot",
   uzi_label: "uzi",
   default_theme: "ember",
+  // PRD #1167 "Lights on" m2: instance appearance defaults (required AppSettings keys).
+  default_appearance_mode: "dark",
+  default_light_theme: "hall",
+  default_dark_theme: "ember",
+  default_typeface: "system",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",

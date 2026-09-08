@@ -25,6 +25,17 @@ const baseSession = (over: Partial<SessionResponse> = {}): SessionResponse => ({
   user,
   uzi_label: "uzi",
   autopilot_label: "autopilot",
+  // PRD #1167 "Lights on" m2: the resolved appearance object (required on SessionResponse).
+  // No overrides here, so it resolves to the instance defaults; the deprecated trio below
+  // stays for the pre-m2 picker.
+  appearance: {
+    mode: "dark",
+    light_theme: "hall",
+    dark_theme: "ember",
+    typeface: "system",
+    overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+    defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+  },
   theme: "ember",
   theme_override: null,
   default_theme: "ember",

@@ -32,12 +32,22 @@ type userSettingsDTO struct {
 	DefaultEffort *string `json:"default_effort"`
 	JudgeModel    *string `json:"judge_model"`
 	SummaryModel  *string `json:"summary_model"`
-	Theme         *string `json:"theme"`
+	// Theme is the DEPRECATED legacy single-theme override (PRD #21); kept one
+	// release. The appearance override lives in the four fields below (PRD #1167).
+	Theme *string `json:"theme"`
 	// MrReworkEnabled is the per-user opt-in to the MR review watcher (PRD #700 M5),
 	// which ships ON. null means "unset" = inherit the default-ON semantics (a
 	// NULL/absent user value is read as enabled); an explicit false is the opt-OUT.
 	MrReworkEnabled *bool    `json:"mr_rework_enabled"`
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
+	// The four appearance override fields (PRD #1167): the user's RAW per-field
+	// overrides (each NULL ⇒ JSON null ⇒ inherit the instance default). These are
+	// the stored override values, NOT the resolved appearance — the resolved
+	// appearance + defaults live on the session payload (me()), not here.
+	AppearanceMode *string `json:"appearance_mode"`
+	LightTheme     *string `json:"light_theme"`
+	DarkTheme      *string `json:"dark_theme"`
+	Typeface       *string `json:"typeface"`
 }
 
 // userSettingsResponse reads the user's settings row (one GetUserSettings query,
@@ -63,6 +73,10 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			Theme:           textPtrValue(s.Theme.Valid, s.Theme.String),
 			MrReworkEnabled: boolPtrValue(s.MrReworkEnabled),
 			SidebarTokenIds: uuidStrings(s.SidebarTokenIds),
+			AppearanceMode:  textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
+			LightTheme:      textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
+			DarkTheme:       textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
+			Typeface:        textPtrValue(s.Typeface.Valid, s.Typeface.String),
 		},
 	})
 }
@@ -103,6 +117,13 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		Theme           json.RawMessage `json:"theme"`
 		MrReworkEnabled json.RawMessage `json:"mr_rework_enabled"`
 		SidebarTokenIds json.RawMessage `json:"sidebar_token_ids"`
+		// The four appearance override fields (PRD #1167), same absent/null/value
+		// tri-state as theme: absent ⇒ column unchanged, null ⇒ clear to NULL
+		// (inherit), value ⇒ validated then set.
+		AppearanceMode json.RawMessage `json:"appearance_mode"`
+		LightTheme     json.RawMessage `json:"light_theme"`
+		DarkTheme      json.RawMessage `json:"dark_theme"`
+		Typeface       json.RawMessage `json:"typeface"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -197,22 +218,104 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if req.Theme != nil {
+	// The legacy theme field (DEPRECATED, PRD #1167) still writes users.theme via
+	// SetUserTheme for the deprecated trio's consistency, AND — when it carries a
+	// valid theme — folds into the appearance merge below. themeVal.Valid marks a
+	// foldable value; a null/blank theme clears users.theme and leaves appearance
+	// alone. themeVal/themePresent are hoisted so the appearance merge can read them.
+	var themeVal pgtype.Text
+	themePresent := req.Theme != nil
+	if themePresent {
 		var raw *string
 		if err := json.Unmarshal(req.Theme, &raw); err != nil {
 			httpx.Error(w, http.StatusBadRequest, "invalid theme")
 			return
 		}
-		themeVal, err := validateTheme(raw)
+		tv, err := validateTheme(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		themeVal = tv
 		if _, err := h.q.SetUserTheme(r.Context(), store.SetUserThemeParams{
 			ID:    user.ID,
 			Theme: themeVal,
 		}); err != nil {
 			slog.Error("set user theme", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	// Appearance write (PRD #1167 M2). SetUserAppearance writes ALL FOUR columns in
+	// one statement, so any appearance field — or a legacy theme that folds into a
+	// slot — needs a READ-MERGE-WRITE: read the current four columns, apply the
+	// legacy-theme mapping, then the explicit per-field deltas (explicit wins over
+	// the legacy mapping), then write once. Each field is the same absent/null/value
+	// tri-state: absent ⇒ keep the current column, null ⇒ clear to NULL (inherit),
+	// value ⇒ validated then set.
+	modePresent, modeDelta, err := decodeAppearanceField(req.AppearanceMode, "appearance_mode", validateAppearanceMode)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	lightPresent, lightDelta, err := decodeAppearanceField(req.LightTheme, "light_theme", validateLightTheme)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	darkPresent, darkDelta, err := decodeAppearanceField(req.DarkTheme, "dark_theme", validateDarkTheme)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	typefacePresent, typefaceDelta, err := decodeAppearanceField(req.Typeface, "typeface", validateTypeface)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A valid legacy theme folds into the slot for its polarity + sets the mode; a
+	// null/blank theme (themeVal.Valid == false) does not touch the appearance columns.
+	themeFold := themePresent && themeVal.Valid
+	if modePresent || lightPresent || darkPresent || typefacePresent || themeFold {
+		cur, err := h.q.GetUserSettings(r.Context(), user.ID)
+		if err != nil {
+			slog.Error("get user settings for appearance merge", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		mode, light, dark, typeface := cur.AppearanceMode, cur.LightTheme, cur.DarkTheme, cur.Typeface
+		// (a) legacy theme mapping first.
+		if themeFold {
+			if theme.Polarity(themeVal.String) == theme.PolarityLight {
+				light = pgtype.Text{String: themeVal.String, Valid: true}
+				mode = pgtype.Text{String: theme.ModeLight, Valid: true}
+			} else {
+				dark = pgtype.Text{String: themeVal.String, Valid: true}
+				mode = pgtype.Text{String: theme.ModeDark, Valid: true}
+			}
+		}
+		// (b) explicit per-field deltas win over the legacy mapping.
+		if modePresent {
+			mode = modeDelta
+		}
+		if lightPresent {
+			light = lightDelta
+		}
+		if darkPresent {
+			dark = darkDelta
+		}
+		if typefacePresent {
+			typeface = typefaceDelta
+		}
+		if _, err := h.q.SetUserAppearance(r.Context(), store.SetUserAppearanceParams{
+			ID:             user.ID,
+			AppearanceMode: mode,
+			LightTheme:     light,
+			DarkTheme:      dark,
+			Typeface:       typeface,
+		}); err != nil {
+			slog.Error("set user appearance", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
@@ -355,4 +458,64 @@ func validateTheme(raw *string) (pgtype.Text, error) {
 		return pgtype.Text{}, err
 	}
 	return pgtype.Text{String: v, Valid: true}, nil
+}
+
+// decodeAppearanceField decodes one tri-state appearance field (PRD #1167) into
+// its storage delta: raw nil ⇒ absent (present=false, leave the column
+// unchanged); JSON null ⇒ present clear (a zero pgtype.Text, Valid=false); a
+// string value ⇒ validated then set. A malformed body is a 400 ("invalid
+// <field>"); a value that fails the validator surfaces the validator's own
+// field-prefixed message so the client sees which field and why. Unlike the
+// legacy theme field, only JSON null clears — a blank/whitespace string is a
+// value and is rejected by the validator.
+func decodeAppearanceField(raw json.RawMessage, field string, validate func(string) error) (bool, pgtype.Text, error) {
+	if raw == nil {
+		return false, pgtype.Text{}, nil
+	}
+	var v *string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return true, pgtype.Text{}, fmt.Errorf("invalid %s", field)
+	}
+	if v == nil {
+		return true, pgtype.Text{}, nil
+	}
+	if err := validate(*v); err != nil {
+		return true, pgtype.Text{}, err
+	}
+	return true, pgtype.Text{String: *v, Valid: true}, nil
+}
+
+// validateAppearanceMode gates the appearance_mode field against the closed
+// system|light|dark set, returning the field-prefixed 400 message on a miss.
+func validateAppearanceMode(v string) error {
+	if !theme.ValidMode(v) {
+		return fmt.Errorf("appearance_mode: must be one of %s, %s, %s", theme.ModeSystem, theme.ModeLight, theme.ModeDark)
+	}
+	return nil
+}
+
+// validateLightTheme gates the light_theme field: a known theme whose polarity is
+// light. A wrong-polarity or unknown id gets theme.ValidateFor's distinct message,
+// prefixed with the field name.
+func validateLightTheme(v string) error {
+	if err := theme.ValidateFor(theme.PolarityLight, v); err != nil {
+		return fmt.Errorf("light_theme: %s", err)
+	}
+	return nil
+}
+
+// validateDarkTheme is the dark-slot companion to validateLightTheme.
+func validateDarkTheme(v string) error {
+	if err := theme.ValidateFor(theme.PolarityDark, v); err != nil {
+		return fmt.Errorf("dark_theme: %s", err)
+	}
+	return nil
+}
+
+// validateTypeface gates the typeface field against the closed system|plex set.
+func validateTypeface(v string) error {
+	if !theme.ValidTypeface(v) {
+		return fmt.Errorf("typeface: must be one of %s, %s", theme.TypefaceSystem, theme.TypefacePlex)
+	}
+	return nil
 }

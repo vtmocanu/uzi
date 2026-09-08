@@ -10,7 +10,16 @@ import {
   type UserSettingsPatch,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { isTheme, resolveTheme } from "../../lib/theme";
+import {
+  isAppearanceMode,
+  isDarkTheme,
+  isLightTheme,
+  isTheme,
+  isTypeface,
+  resolveAppearance,
+  THEME_POLARITY,
+  type Theme,
+} from "../../lib/theme";
 import { daysAgo, mockBuildInfo } from "../data";
 import { state } from "../store";
 import { delay, oidcDemo, requireSession, users } from "./shared";
@@ -30,13 +39,22 @@ import { secrets } from "./secrets";
 // Bumped to v3 for PRD #69 M4 (judge_enforce_all / judge_cooldown_seconds /
 // judge_daily_budget joined AppSettings, judge_model joined UserSettings): a stale v2
 // blob lacks them, so discarding it re-seeds a complete shape.
-const MOCK_SETTINGS_KEY = "uzi.mock.v3";
+// Bumped to v4 for PRD #1167 "Lights on" m2 (the four appearance override fields joined
+// UserSettings, the four default_* appearance fields joined AppSettings): a stale v3
+// blob lacks them, so discarding it re-seeds a complete shape.
+const MOCK_SETTINGS_KEY = "uzi.mock.v4";
 const SEED_USER_SETTINGS: UserSettings = {
   default_model: null,
   default_effort: null,
   judge_model: null,
   summary_model: null,
   theme: null,
+  // PRD #1167 "Lights on" m2: the four raw appearance overrides, all null = inherit
+  // the instance defaults.
+  appearance_mode: null,
+  light_theme: null,
+  dark_theme: null,
+  typeface: null,
   sidebar_token_ids: [],
   // PRD #700 M6: MR review watcher per-user opt-in. null = the default-ON state;
   // an explicit false opts the account out.
@@ -47,6 +65,14 @@ const SEED_APP_SETTINGS: AppSettings = {
   // PRD #764: the single run-eligibility label.
   uzi_label: "uzi",
   default_theme: "ember",
+  // PRD #1167 "Lights on" m2: the compiled instance appearance defaults. default_dark_theme
+  // mirrors the legacy default_theme ("ember"); the mode defaults to dark, the light-slot
+  // default is "hall", and the typeface default is the platform "system" — matching the
+  // theme.ts DEFAULT_* fallbacks.
+  default_appearance_mode: "dark",
+  default_light_theme: "hall",
+  default_dark_theme: "ember",
+  default_typeface: "system",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
@@ -117,6 +143,12 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-#362 blob stays valid; absent reads as inherit.
     (u.summary_model === undefined || u.summary_model === null || typeof u.summary_model === "string") &&
     (u.theme === null || typeof u.theme === "string") &&
+    // PRD #1167 "Lights on" m2: the four raw appearance overrides, each null-or-string
+    // (the SEED provides them going forward; the v4 key bump discards any older blob).
+    (u.appearance_mode === null || typeof u.appearance_mode === "string") &&
+    (u.light_theme === null || typeof u.light_theme === "string") &&
+    (u.dark_theme === null || typeof u.dark_theme === "string") &&
+    (u.typeface === null || typeof u.typeface === "string") &&
     // Optional so a pre-#700 blob stays valid; absent/null reads as the default-ON state.
     (u.mr_rework_enabled === undefined ||
       u.mr_rework_enabled === null ||
@@ -131,6 +163,12 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // from the seed default ("uzi") on load — but reject a malformed non-string.
     (a.uzi_label === undefined || typeof a.uzi_label === "string") &&
     typeof a.default_theme === "string" &&
+    // PRD #1167 "Lights on" m2: the four instance appearance defaults, each a string
+    // (the SEED provides them; the v4 key bump discards any older blob that lacked them).
+    typeof a.default_appearance_mode === "string" &&
+    typeof a.default_light_theme === "string" &&
+    typeof a.default_dark_theme === "string" &&
+    typeof a.default_typeface === "string" &&
     // PRD #649: accept legacy blobs that predate this field (undefined), but reject a
     // malformed non-string so a bad localStorage blob can't violate the AppSettings contract.
     (a.ephemeral_workers_enabled === undefined || typeof a.ephemeral_workers_enabled === "string") &&
@@ -313,16 +351,58 @@ function settingsResponse(): SettingsResponse {
 
 // sessionBody is the auth/session bootstrap payload: the signed-in user, the
 // current instance labels (PRD #19 M2, PRD #764: the single `uzi` label and the
-// autopilot label), and the three resolved theme fields (PRD #21), mirroring the real
-// API so the mocked SPA resolves them the same way.
+// autopilot label), and the resolved `appearance` object (PRD #1167 "Lights on" m2),
+// mirroring the real API so the mocked SPA resolves it the same way.
 export function sessionBody() {
+  // PRD #1167 "Lights on" m2: resolve the appearance from the raw user overrides
+  // against the instance defaults, using the SAME chain (theme.resolveAppearance) the
+  // server and the SPA use — a valid override wins, else the instance default, else the
+  // compiled fallback, polarity-aware for the theme slots.
+  const overrides = {
+    mode: userSettings.appearance_mode,
+    light: userSettings.light_theme,
+    dark: userSettings.dark_theme,
+    typeface: userSettings.typeface,
+  };
+  const defaults = {
+    mode: appSettings.default_appearance_mode,
+    light: appSettings.default_light_theme,
+    dark: appSettings.default_dark_theme,
+    typeface: appSettings.default_typeface,
+  };
+  const resolved = resolveAppearance(overrides, defaults);
   return {
     user: requireSession(),
     uzi_label: appSettings.uzi_label,
     autopilot_label: appSettings.autopilot_label,
-    theme: resolveTheme(userSettings.theme, appSettings.default_theme),
+    appearance: {
+      mode: resolved.mode,
+      light_theme: resolved.light,
+      dark_theme: resolved.dark,
+      typeface: resolved.typeface,
+      overrides: {
+        mode: userSettings.appearance_mode,
+        light_theme: userSettings.light_theme,
+        dark_theme: userSettings.dark_theme,
+        typeface: userSettings.typeface,
+      },
+      defaults: {
+        mode: appSettings.default_appearance_mode,
+        light_theme: appSettings.default_light_theme,
+        dark_theme: appSettings.default_dark_theme,
+        typeface: appSettings.default_typeface,
+      },
+    },
+    // Deprecated single-theme trio (PRD #21), derived from the resolved appearance so
+    // the pre-m2 picker stays coherent: `theme` is the resolved slot for the resolved
+    // mode (system falls to the dark slot), `theme_override` is the raw legacy override,
+    // and `default_theme` is the legacy-chained instance dark default.
+    theme: resolved.mode === "light" ? resolved.light : resolved.dark,
     theme_override: userSettings.theme,
-    default_theme: appSettings.default_theme,
+    default_theme: resolveAppearance(
+      {},
+      { dark: appSettings.default_dark_theme || appSettings.default_theme },
+    ).dark,
     // A passwordless (OIDC) demo user has no vault yet, so the SPA shows the
     // passphrase-create banner; a password demo user keeps the existing behavior.
     vault: oidcDemo().passwordless
@@ -496,6 +576,36 @@ export const settingsApi = {
       if (key === "default_theme") {
         if (!isTheme(value)) throw new ApiError(400, `default_theme: unknown theme: "${value}"`);
         nonSecret.default_theme = value;
+        continue;
+      }
+      // PRD #1167 "Lights on" m2: the four instance appearance defaults route to the
+      // theme registry like default_theme, polarity-aware for the two theme slots.
+      if (key === "default_appearance_mode") {
+        if (!isAppearanceMode(value)) {
+          throw new ApiError(400, "default_appearance_mode: must be one of system, light, dark");
+        }
+        nonSecret.default_appearance_mode = value;
+        continue;
+      }
+      if (key === "default_light_theme") {
+        if (!isLightTheme(value)) {
+          throw new ApiError(400, "default_light_theme: must be a light theme");
+        }
+        nonSecret.default_light_theme = value;
+        continue;
+      }
+      if (key === "default_dark_theme") {
+        if (!isDarkTheme(value)) {
+          throw new ApiError(400, "default_dark_theme: must be a dark theme");
+        }
+        nonSecret.default_dark_theme = value;
+        continue;
+      }
+      if (key === "default_typeface") {
+        if (!isTypeface(value)) {
+          throw new ApiError(400, "default_typeface: must be one of system, plex");
+        }
+        nonSecret.default_typeface = value;
         continue;
       }
       // slack_enabled / judge_enabled / … are strict bools, not labels — without this
@@ -801,7 +911,50 @@ export const settingsApi = {
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";
       if (t !== "" && !isTheme(t)) throw new ApiError(400, `unknown theme: "${t}"`);
-      userSettings = { ...userSettings, theme: t === "" ? null : t };
+      // PRD #1167 "Lights on" m2: a valid legacy theme value also FOLDS into the
+      // appearance columns — it sets the matching-polarity slot AND pins appearance_mode
+      // to that polarity, mirroring the Go legacy mapping. Any explicit appearance_* field
+      // in the same PUT wins, because those are applied AFTER this block below. An empty
+      // value clears only the legacy override and leaves the appearance columns untouched.
+      if (t === "") {
+        userSettings = { ...userSettings, theme: null };
+      } else {
+        const polarity = THEME_POLARITY[t as Theme];
+        userSettings = {
+          ...userSettings,
+          theme: t,
+          appearance_mode: polarity,
+          ...(polarity === "light" ? { light_theme: t } : { dark_theme: t }),
+        };
+      }
+    }
+    // PRD #1167 "Lights on" m2: the four raw appearance overrides. Tri-state like the rest
+    // of the patch — absent leaves the field, present-null clears it back to inherit, and a
+    // value is validated (polarity-aware for the theme slots) then set. Applied AFTER the
+    // legacy theme fold above, so an explicit field wins when both are sent in one PUT.
+    if (patch.appearance_mode !== undefined) {
+      if (patch.appearance_mode !== null && !isAppearanceMode(patch.appearance_mode)) {
+        throw new ApiError(400, "appearance_mode: must be one of system, light, dark");
+      }
+      userSettings = { ...userSettings, appearance_mode: patch.appearance_mode };
+    }
+    if (patch.light_theme !== undefined) {
+      if (patch.light_theme !== null && !isLightTheme(patch.light_theme)) {
+        throw new ApiError(400, "light_theme: must be a light theme");
+      }
+      userSettings = { ...userSettings, light_theme: patch.light_theme };
+    }
+    if (patch.dark_theme !== undefined) {
+      if (patch.dark_theme !== null && !isDarkTheme(patch.dark_theme)) {
+        throw new ApiError(400, "dark_theme: must be a dark theme");
+      }
+      userSettings = { ...userSettings, dark_theme: patch.dark_theme };
+    }
+    if (patch.typeface !== undefined) {
+      if (patch.typeface !== null && !isTypeface(patch.typeface)) {
+        throw new ApiError(400, "typeface: must be one of system, plex");
+      }
+      userSettings = { ...userSettings, typeface: patch.typeface };
     }
     if (patch.sidebar_token_ids !== undefined) {
       // Whole-set replace, mirroring how the real handler would treat a list

@@ -354,17 +354,26 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 	// the uzi label" runnable affordance. Best-effort like the other labels — a cold
 	// settings read yields the compiled-in default ("uzi"), never an error.
 	uziLabel, _ := h.settings.UziLabel(ctx)
-	// Theme resolution (PRD #21 Decision 2): the SPA needs three values, not just
-	// the resolved theme. With an override active, the Appearance picker also has
-	// to render "Use default (<name>)" and set its selected state, and the default
-	// lives in an admin-only endpoint — so carry the resolved theme, the user's
-	// raw override (nullable), and the instance default here. Best-effort like the
-	// labels: a cold settings read yields the registry default, never an error.
-	defaultTheme, _ := h.settings.DefaultTheme(ctx)
-	override := ""
-	if user.Theme.Valid {
-		override = user.Theme.String
-	}
+	// Appearance resolution (PRD #1167): the SPA needs the fully-resolved
+	// appearance (mode + light/dark slot themes + typeface), the user's RAW
+	// per-field overrides (each nullable, so the picker can render "Use default"
+	// and set its selected state), and the instance defaults. All four instance
+	// defaults are best-effort like the labels — a cold settings read yields the
+	// compiled-in fallback, never an error. iDark carries the legacy default_theme
+	// fallback chain (DefaultDarkTheme), which is why the deprecated default_theme
+	// key below is exactly iDark.
+	iMode, _ := h.settings.DefaultAppearanceMode(ctx)
+	iLight, _ := h.settings.DefaultLightTheme(ctx)
+	iDark, _ := h.settings.DefaultDarkTheme(ctx)
+	iTypeface, _ := h.settings.DefaultTypeface(ctx)
+	uMode := textValue(user.AppearanceMode)
+	uLight := textValue(user.LightTheme)
+	uDark := textValue(user.DarkTheme)
+	uTypeface := textValue(user.Typeface)
+	appr := theme.ResolveAppearance(uMode, uLight, uDark, uTypeface, iMode, iLight, iDark, iTypeface)
+	// override is the RAW legacy theme override, still carried on the deprecated
+	// theme_override key (unchanged) for one release.
+	override := textValue(user.Theme)
 	// Judge consent surface (PRD #69 M4): a non-admin cannot read
 	// /api/admin/settings, so the two facts the user needs to consent to their own
 	// token being spent ride the session payload. Both are resolved server-side and
@@ -395,10 +404,36 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		"user":            toDTO(user),
 		"autopilot_label": autopilotLabel,
 		// PRD #764: the single run-eligibility label.
-		"uzi_label":      uziLabel,
-		"theme":          theme.Resolve(override, defaultTheme),
+		"uzi_label": uziLabel,
+		// Appearance (PRD #1167): the resolved appearance, the user's raw per-field
+		// overrides (each nullable), and the instance defaults — everything the SPA
+		// needs to paint and to render the Appearance picker's "Use default (<name>)"
+		// affordances without the admin-only settings endpoint.
+		"appearance": map[string]any{
+			"mode":        appr.Mode,
+			"light_theme": appr.Light,
+			"dark_theme":  appr.Dark,
+			"typeface":    appr.Typeface,
+			"overrides": map[string]any{
+				"mode":        textPtrValue(user.AppearanceMode.Valid, user.AppearanceMode.String),
+				"light_theme": textPtrValue(user.LightTheme.Valid, user.LightTheme.String),
+				"dark_theme":  textPtrValue(user.DarkTheme.Valid, user.DarkTheme.String),
+				"typeface":    textPtrValue(user.Typeface.Valid, user.Typeface.String),
+			},
+			"defaults": map[string]any{
+				"mode":        iMode,
+				"light_theme": iLight,
+				"dark_theme":  iDark,
+				"typeface":    iTypeface,
+			},
+		},
+		// DEPRECATED theme trio (PRD #1167), kept one release for the pre-appearance
+		// SPA. "theme" is the painted-polarity slot of the resolved appearance;
+		// "theme_override" is the raw legacy override (unchanged); "default_theme" is
+		// the resolved instance DARK default (iDark = the legacy-chained value).
+		"theme":          paintedTheme(appr),
 		"theme_override": textPtrValue(override != "", override),
-		"default_theme":  defaultTheme,
+		"default_theme":  iDark,
 		// Vault status (PRD #32): the SPA shows a 🔒 badge + unlock banner and marks
 		// own queued runs "waiting for vault unlock" when locked. Delivered on the
 		// session payload so the shell needs no extra round-trip; the SPA refreshes
@@ -420,6 +455,27 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		"judge_enforced_by_admin": judgeEnforced,
 		"effective_judge_model":   effectiveJudgeModel,
 	}
+}
+
+// textValue returns the string of a nullable text column, or "" when NULL — the
+// "unset" sentinel the appearance resolver reads (PRD #1167), distinct from
+// textPtrValue's JSON-null-vs-value convention for the wire.
+func textValue(t pgtype.Text) string {
+	if !t.Valid {
+		return ""
+	}
+	return t.String
+}
+
+// paintedTheme is the single theme id the pre-appearance SPA renders from a
+// resolved appearance (PRD #1167): the light slot when the mode is light, else the
+// dark slot (mode dark AND mode system both paint dark). It backs the DEPRECATED
+// "theme" session key for one release.
+func paintedTheme(a theme.Appearance) string {
+	if a.Mode == theme.ModeLight {
+		return a.Light
+	}
+	return a.Dark
 }
 
 // vaultUnlocked reports whether the user's vault DEK is cached. A nil vault (only

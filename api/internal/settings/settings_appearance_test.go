@@ -107,6 +107,14 @@ func TestDefaultDarkThemeFallbackChain(t *testing.T) {
 	if got, _ := c.DefaultDarkTheme(ctx); got != "ember" {
 		t.Fatalf("DefaultDarkTheme (junk legacy) = %q; want ember", got)
 	}
+
+	// A legacy default_theme that is a valid but LIGHT theme must NOT leak into the
+	// dark slot (default_theme validates against the whole registry). The dark slot
+	// stays a dark theme: the light legacy value is dropped for the compiled "ember".
+	c = New(&fakeStore{rows: []store.AppSetting{row(KeyDefaultTheme, "dawn")}}, time.Minute)
+	if got, _ := c.DefaultDarkTheme(ctx); got != "ember" {
+		t.Fatalf("DefaultDarkTheme (light legacy) = %q; want ember (a light id must not feed the dark slot)", got)
+	}
 }
 
 // TestDefaultDarkThemePropagatesColdError pins that a genuine cold-cache store error

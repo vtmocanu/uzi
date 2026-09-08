@@ -218,13 +218,20 @@ func (c *Cache) DefaultDarkTheme(ctx context.Context) (string, error) {
 		return dark, nil
 	}
 	// No explicit (valid) dark theme, or a read error: fall back to the legacy
-	// single-theme setting, resolved with the PRD #21 chain (the instance default
-	// when valid, else "ember").
+	// single-theme setting — but ONLY if it is itself a DARK theme. default_theme
+	// validates against the whole registry (any polarity), so an admin who set it to
+	// a light id must not leak that light id into the dark slot; a dark-labelled slot
+	// always holds a dark theme. Anything else (unset, a light id, junk) is the
+	// compiled-in dark fallback ("ember"). This mirrors the web resolveAppearance,
+	// whose isDarkTheme filter drops a light legacy value the same way.
 	legacy, lerr := c.get(ctx, KeyDefaultTheme)
 	if err == nil {
 		err = lerr
 	}
-	return theme.Resolve("", legacy), err
+	if theme.ValidateFor(theme.PolarityDark, legacy) == nil {
+		return legacy, err
+	}
+	return theme.FallbackDark, err
 }
 
 // GithubProjectSyncEnabled reports whether the GitHub Projects v2 Status sync is
