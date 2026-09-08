@@ -38,8 +38,16 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
 
 ## The loop, per run
 
-1. **Resolve + pre-flight.** `uzi repo list --json` for the repo id; issue number from the
-   user. `uzi run list --json` for in-flight runs. **Only ask the user on a *confident*
+1. **Resolve + make eligible + pre-flight.** `uzi repo list --json` for the repo id;
+   issue number from the user. Confirm the issue carries the configured `uzi` eligibility
+   label. When the user has authorized dispatch and the label is missing, add it with the
+   native forge CLI (`gh issue edit ISSUE_NUM --repo OWNER/REPO --add-label uzi` in this
+   GitHub repo), then verify the forge reports it. A direct label edit reaches uzi's cache
+   on the next poller sync, so let step 2 attempt creation once; only if it returns the
+   specific "not marked as uzi's work" rejection while the forge still shows the label,
+   retry that same create call after short waits for at most one minute. Stop immediately
+   on any other error; never turn a generic failure into repeated create attempts.
+   `uzi run list --json` for in-flight runs. **Only ask the user on a *confident*
    cross-issue blocker** (the target depends on another run's code landing first, or a
    sharp same-file overlap). Independent issues parallelize fine — do not gate on ordinary
    parallelism; a file conflict that slips through is resolved at merge.
