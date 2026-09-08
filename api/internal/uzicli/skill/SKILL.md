@@ -738,14 +738,17 @@ an instruction.
 **Auto mode, step by step.** Every step can STOP and hand back to the user; it
 never forces past a bad plan, a blocked merge, or an unfixable pipeline.
 
-1. **Resolve coordinates.** `uzi repo list --json` for the repo id; take the PRD
-   issue iid from the user or context. Confirm the issue carries the `uzi` label —
-   `run create` (step 3) rejects one that lacks it ("not marked as uzi's work"), and
-   an issue just handed off by `/prd-create` commonly carries only `PRD`. Add `uzi`
-   via the forge's **Promote** action, which writes the label AND refreshes uzi's
-   cache in one request so the run starts immediately; adding the label with the
-   plain forge CLI instead leaves `run create` failing until the next poller sync
-   (seconds to a minute of blind retries).
+1. **Resolve coordinates and make the issue eligible.** `uzi repo list --json` for
+   the repo id; take the PRD issue iid from the user or context. Confirm the issue
+   carries the configured `uzi` eligibility label — `run create` (step 3) rejects one
+   that lacks it ("not marked as uzi's work"), and an issue just handed off by
+   `/prd-create` commonly carries only `PRD`. Once the user has authorized dispatch,
+   add the label with the repository's native forge CLI and verify the forge reports
+   it. The direct label write reaches uzi's cached issue on the next poller sync. Let
+   step 3 attempt creation once; only if it returns that specific eligibility
+   rejection while the forge still shows the label, retry the same create after short
+   waits for up to 90 seconds (one full default poll interval plus sync margin). Stop on
+   any other error, and never blindly repeat a create whose result is uncertain.
 2. **Pre-flight: is anything already in flight that this run depends on or
    collides with?** Ask the user **only on a confident blocker**, never on the
    mere presence of parallel runs — independent issues run fine side by side (each
@@ -1005,12 +1008,11 @@ the cost of one approval.
 
 **No `prds/*.md` file for this issue yet?** It still works — the plan you
 supply is what the file would have provided. A PRD file is optional, never
-required; the issue needs only the `uzi` label. And if you
-just added the `uzi` label yourself, `run create` may still answer "issue
-does not carry the uzi label" until the next poller sync — going through
-the forge's own **Promote** action instead writes the label and updates
-uzi's cache in the same request, so a freshly-promoted issue is runnable
-immediately, with no wait.
+required; the issue needs only the configured `uzi` eligibility label. After
+adding that label with the native forge CLI, verify it on the forge before
+creating the run. If `run create` still reports that the issue is not marked as
+uzi's work, wait for the next poller sync and retry only that specific rejection
+for up to 90 seconds with default settings; stop on any other error.
 
 ### Reading and triaging the judge's review
 
