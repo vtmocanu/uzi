@@ -84,6 +84,23 @@ describe("shadowSignal", () => {
     it("limit_wait is null", () => {
       expect(shadowSignal(run({ status: "limit_wait" }))).toBeNull();
     });
+    // Regression (review finding): the "in review" attention arm must be gated on a
+    // COMPLETED run. A non-completed run that still carries an OPEN mr (e.g. it
+    // failed or was cancelled after opening its MR, or a queued re-run of a
+    // still-open issue) must NOT light the Shadow attention rail. Pre-fix these
+    // returned "attention" (the check only tested mr_iid + open state).
+    it("failed with an OPEN mr is null (not attention)", () => {
+      expect(shadowSignal(run({ status: "failed", mr_iid: 9, mr_state: "opened" }))).toBeNull();
+    });
+    it("cancelled with an OPEN mr is null (not attention)", () => {
+      expect(shadowSignal(run({ status: "cancelled", mr_iid: 9, mr_state: null }))).toBeNull();
+    });
+    it("queued with an OPEN mr is null (not attention)", () => {
+      expect(shadowSignal(run({ status: "queued", mr_iid: 9, mr_state: "opened" }))).toBeNull();
+    });
+    it("limit_wait with an OPEN mr is null (not attention)", () => {
+      expect(shadowSignal(run({ status: "limit_wait", mr_iid: 9, mr_state: "opened" }))).toBeNull();
+    });
     // Pin the deliberate non-attention states from PRD #1167's enumeration: these are
     // human-adjacent waits that shadowSignal intentionally does NOT flag as attention.
     // They currently fall through to null; lock it so a future change is caught.

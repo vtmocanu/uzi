@@ -156,7 +156,7 @@ export function effectiveRunStatus(
 // shadowSignal derives the Shadow theme's per-run surface signal (PRD #1167 M4):
 // "live" when a machine is working, else "attention" for exactly the states PRD #1167
 // enumerates, else null. attention = awaiting_approval, or a re-plan (revising), or a
-// non-live run in review with an open PR — matching PRD #1167's concrete list. It is
+// COMPLETED run in review with an open PR — matching PRD #1167's concrete list. It is
 // NOT "any human decision": awaiting_input and awaiting_followup are deliberately NOT
 // flagged here (they fall through to null), and neither is pool_wait. Shadow is the
 // ONLY consumer — the app renders `data-live`/`data-attention` on the card/row/header
@@ -186,7 +186,13 @@ export function shadowSignal(
   const eff = effectiveRunStatus(run);
   if (eff === "claimed" || eff === "running" || eff === "planning") return "live";
   if (eff === "awaiting_approval" || eff === "revising") return "attention";
-  if (run.mr_iid != null && mrChipState(run.mr_state) === "open") return "attention";
+  // "in review" is a COMPLETED run whose MR is still open. Gate on eff === "completed"
+  // so a failed / cancelled / queued / limit_wait run that happens to carry an open MR
+  // (e.g. a run that failed after opening its MR) stays quiet rather than lighting the
+  // Shadow attention rail.
+  if (eff === "completed" && run.mr_iid != null && mrChipState(run.mr_state) === "open") {
+    return "attention";
+  }
   return null;
 }
 
