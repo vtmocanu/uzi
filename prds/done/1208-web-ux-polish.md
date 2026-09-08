@@ -1,7 +1,7 @@
 # PRD #1208: Web UX polish — Appearance settings tab, left-anchored board toolbar, Hide-empty default
 
 **Issue:** [#1208](https://github.com/vtmocanu/uzi/issues/1208)
-**Status:** Draft.
+**Status:** Complete and archived (2026-09-08) — all six milestones implemented and landed on branch `agent/issue-1208`; `gate:web`, `gate:repo`, and `gate:api` green (full web suite 211 files / 3736 tests).
 **Execution:** Send to uzi (Auto, MR rework on). Web + docs + specs only. **No `.github/workflows/**` touched** in implementation or validation (`.claude/rules/prds.md`).
 
 Three independent web-only UX rough edges, batched into one run because each is small, presentation-class, and offline-verifiable in mock mode. None touches the API, the DB, the wire contract, or the CLI.
