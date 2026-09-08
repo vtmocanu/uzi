@@ -13,14 +13,43 @@ import {
   setUnauthorizedHandler,
   setVaultLockedHandler,
   DEFAULT_AUTOPILOT_LABEL,
+  type AppearanceState,
   type SessionResponse,
   type User,
 } from "../lib/api";
-import { applyTheme, resolveTheme, DEFAULT_THEME, type Theme } from "../lib/theme";
+import {
+  applyAppearance,
+  isDarkTheme,
+  DEFAULT_LIGHT_THEME,
+  DEFAULT_DARK_THEME,
+} from "../lib/theme";
 
 // Compiled-in default for the single run-eligibility label (PRD #764). The SPA
 // uses it until the session bootstrap resolves the configured `uzi_label`.
 export const DEFAULT_UZI_LABEL = "uzi";
+
+// fallbackAppearance synthesises a minimal AppearanceState so the app still paints
+// when a server predates PRD #1167's `appearance` object (it sends only the
+// deprecated single-theme trio). The dark slot uses the legacy default_theme when
+// it is a valid dark id, else the compiled fallback; the rest take compiled
+// defaults with no overrides. Also seeds the provider's initial state before the
+// first session response resolves.
+function fallbackAppearance(defaultTheme: string): AppearanceState {
+  const dark = isDarkTheme(defaultTheme) ? defaultTheme : DEFAULT_DARK_THEME;
+  return {
+    mode: "dark",
+    light_theme: DEFAULT_LIGHT_THEME,
+    dark_theme: dark,
+    typeface: "system",
+    overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+    defaults: {
+      mode: "dark",
+      light_theme: DEFAULT_LIGHT_THEME,
+      dark_theme: dark,
+      typeface: "system",
+    },
+  };
+}
 
 interface AuthState {
   user: User | null;
@@ -31,14 +60,13 @@ interface AuthState {
   // single run-eligibility label: an issue is runnable iff it carries it.
   uziLabel: string;
   autopilotLabel: string;
-  // Theme state from the session bootstrap (PRD #21). theme is the resolved
-  // theme currently applied to <html>; themeOverride is the user's raw pick
-  // (null = "use default"); defaultTheme is the instance default the Appearance
-  // picker labels its "Use default (<name>)" option with. Applying the attribute
-  // itself happens in applySession — no component reads `theme` to branch.
-  theme: Theme;
-  themeOverride: string | null;
-  defaultTheme: Theme;
+  // Resolved appearance from the session bootstrap (PRD #1167 "Lights on"). It
+  // carries the resolved mode/light_theme/dark_theme/typeface the SPA stamps, plus
+  // the raw per-field `overrides` (each null = inherit) and the instance `defaults`
+  // the Appearance picker needs to render its controls and the "Use instance
+  // defaults" action. Stamping <html> happens in applySession via applyAppearance;
+  // no component reads this to branch — only the Appearance card renders from it.
+  appearance: AppearanceState;
   // Vault status (PRD #32): true when the user's secret vault is unlocked in the
   // server process. Rides the session payload; drives the header badge, the locked
   // banner, and the "waiting for vault unlock" run state. Defaults to true (a
@@ -70,9 +98,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [uziLabel, setUziLabel] = useState(DEFAULT_UZI_LABEL);
   const [autopilotLabel, setAutopilotLabel] = useState(DEFAULT_AUTOPILOT_LABEL);
-  const [theme, setTheme] = useState<Theme>(DEFAULT_THEME);
-  const [themeOverride, setThemeOverride] = useState<string | null>(null);
-  const [defaultTheme, setDefaultTheme] = useState<Theme>(DEFAULT_THEME);
+  const [appearance, setAppearance] = useState<AppearanceState>(() =>
+    fallbackAppearance("ember"),
+  );
   const [vaultUnlocked, setVaultUnlocked] = useState(true);
   const [vaultExists, setVaultExists] = useState(true);
   const [hasPassword, setHasPassword] = useState(true);
@@ -81,19 +109,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
-  // the label fields. It also resolves and applies the theme (PRD #21): the
-  // server sends the resolved theme, but we re-resolve from the override +
-  // default so a server that predates the theme fields still yields ember, then
-  // stamp <html data-theme> so a login/refresh restyles live.
+  // the label fields. It also stores the resolved appearance and stamps <html>
+  // (PRD #1167): the server sends the resolved appearance, but a server that
+  // predates the field is handled defensively by synthesising a minimal one from
+  // the deprecated single-theme trio so the app still paints. applyAppearance
+  // stamps data-theme/data-font and arms the live system-mode listener.
   const applySession = useCallback((session: SessionResponse) => {
     setUser(session.user);
     setUziLabel(session.uzi_label || DEFAULT_UZI_LABEL);
     setAutopilotLabel(session.autopilot_label || DEFAULT_AUTOPILOT_LABEL);
-    const resolved = resolveTheme(session.theme_override, session.default_theme);
-    setThemeOverride(session.theme_override ?? null);
-    setDefaultTheme(resolveTheme(session.default_theme, DEFAULT_THEME));
-    setTheme(resolved);
-    applyTheme(resolved);
+    // Read as possibly-absent: an older server omits `appearance` entirely.
+    const nextAppearance =
+      (session.appearance as AppearanceState | undefined) ??
+      fallbackAppearance(session.default_theme);
+    setAppearance(nextAppearance);
+    applyAppearance({
+      mode: nextAppearance.mode,
+      light: nextAppearance.light_theme,
+      dark: nextAppearance.dark_theme,
+      typeface: nextAppearance.typeface,
+    });
     // Absent field (older server) reads as unlocked, so no spurious banner.
     setVaultUnlocked(session.vault?.unlocked ?? true);
     // Absent → true so a password user / older server never sees the create dialog.
@@ -182,9 +217,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loading,
       uziLabel,
       autopilotLabel,
-      theme,
-      themeOverride,
-      defaultTheme,
+      appearance,
       vaultUnlocked,
       vaultExists,
       hasPassword,
@@ -200,9 +233,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loading,
       uziLabel,
       autopilotLabel,
-      theme,
-      themeOverride,
-      defaultTheme,
+      appearance,
       vaultUnlocked,
       vaultExists,
       hasPassword,

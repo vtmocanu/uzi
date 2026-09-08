@@ -30,7 +30,13 @@ import {
 import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
 import { DOC_ADMIN_SETTINGS } from "../lib/doclinks";
-import { THEMES, THEME_LABELS } from "../lib/theme";
+import {
+  LIGHT_THEMES,
+  DARK_THEMES,
+  THEME_LABELS,
+  isDarkTheme,
+  DEFAULT_DARK_THEME,
+} from "../lib/theme";
 import { JudgeSettingsCard } from "./adminSettings/JudgeSettingsCard";
 import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
@@ -76,6 +82,33 @@ function clientValidate(uziLabel: string, autopilotLabel: string): string | null
   return null;
 }
 
+// Instance-default appearance option lists (PRD #1167 "Lights on"). Mode/typeface
+// are small closed enums; the theme lists are polarity-filtered from the registry.
+const DEFAULT_MODE_OPTIONS: { value: string; label: string }[] = [
+  { value: "system", label: "System" },
+  { value: "light", label: "Lights on" },
+  { value: "dark", label: "Lights off" },
+];
+const DEFAULT_TYPEFACE_OPTIONS: { value: string; label: string }[] = [
+  { value: "system", label: "System" },
+  { value: "plex", label: "IBM Plex" },
+];
+
+// TYPEFACE_ENABLED gates the (still-rendered) instance-default typeface control,
+// exactly as the per-user picker in Settings.tsx does; flip it in m6 when the IBM
+// Plex family ships.
+const TYPEFACE_ENABLED = false;
+
+// resolveDarkDisplay surfaces the legacy fallback chain for the dark-default
+// control's current value: default_dark_theme when it is a valid dark id, else the
+// legacy default_theme when a valid dark id, else the compiled fallback. Writing
+// always sets default_dark_theme; the legacy default_theme is no longer edited here.
+function resolveDarkDisplay(s: AppSettings): string {
+  if (isDarkTheme(s.default_dark_theme)) return s.default_dark_theme;
+  if (isDarkTheme(s.default_theme)) return s.default_theme;
+  return DEFAULT_DARK_THEME;
+}
+
 export function AdminSettings() {
   const { refresh } = useAuth();
   const [saved, setSaved] = useState<AppSettings | null>(null);
@@ -92,7 +125,13 @@ export function AdminSettings() {
   const [oidcProviderName, setOidcProviderName] = useState("SSO");
   const [uziLabel, setUziLabel] = useState("");
   const [autopilotLabel, setAutopilotLabel] = useState("");
-  const [defaultTheme, setDefaultTheme] = useState("");
+  // PRD #1167 "Lights on": the four instance appearance defaults replace the single
+  // Default theme control. The legacy default_theme still rides the AppSettings blob
+  // (feeding the dark fallback) but is no longer surfaced or written here.
+  const [defaultAppearanceMode, setDefaultAppearanceMode] = useState("");
+  const [defaultLightTheme, setDefaultLightTheme] = useState("");
+  const [defaultDarkTheme, setDefaultDarkTheme] = useState("");
+  const [defaultTypeface, setDefaultTypeface] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -114,7 +153,10 @@ export function AdminSettings() {
     setOidcProviderName(resp.oidc_provider_name || "SSO");
     setUziLabel(settings.uzi_label);
     setAutopilotLabel(settings.autopilot_label);
-    setDefaultTheme(settings.default_theme);
+    setDefaultAppearanceMode(settings.default_appearance_mode);
+    setDefaultLightTheme(settings.default_light_theme);
+    setDefaultDarkTheme(resolveDarkDisplay(settings));
+    setDefaultTypeface(settings.default_typeface);
   }, []);
 
   // The settings form fields are seeded by applyResponse as a fetcher side effect
@@ -163,7 +205,10 @@ export function AdminSettings() {
     saved !== null &&
     (uziLabel !== saved.uzi_label ||
       autopilotLabel !== saved.autopilot_label ||
-      defaultTheme !== saved.default_theme);
+      defaultAppearanceMode !== saved.default_appearance_mode ||
+      defaultLightTheme !== saved.default_light_theme ||
+      defaultDarkTheme !== resolveDarkDisplay(saved) ||
+      defaultTypeface !== saved.default_typeface);
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
@@ -175,16 +220,20 @@ export function AdminSettings() {
       return;
     }
     setBusy(true);
-    // A label change (uzi or autopilot) triggers a repo resync; theme is
-    // presentation-only (mirrors the server's settings.LabelChanged). Computed against
-    // the pre-save `saved` so the notice only mentions propagation when it happens (N1).
+    // A label change (uzi or autopilot) triggers a repo resync; the appearance
+    // defaults are presentation-only (mirrors the server's settings.LabelChanged).
+    // Computed against the pre-save `saved` so the notice only mentions propagation
+    // when it happens (N1).
     const labelChanged =
       saved !== null && (uziLabel !== saved.uzi_label || autopilotLabel !== saved.autopilot_label);
     try {
       const payload: UpdateSettingsPayload = {
         uzi_label: uziLabel,
         autopilot_label: autopilotLabel,
-        default_theme: defaultTheme,
+        default_appearance_mode: defaultAppearanceMode,
+        default_light_theme: defaultLightTheme,
+        default_dark_theme: defaultDarkTheme,
+        default_typeface: defaultTypeface,
       };
       applyResponse(await api.updateSettings(payload));
       setNotice(
@@ -192,7 +241,7 @@ export function AdminSettings() {
           ? "Settings saved. Boards reflect the label change after the next sync."
           : "Settings saved.",
       );
-      // Re-resolve this admin's own theme: with no personal override, a changed
+      // Re-resolve this admin's own appearance: with no personal override, a changed
       // instance default restyles their session live.
       await refresh();
     } catch (err) {
@@ -318,24 +367,67 @@ export function AdminSettings() {
                 with no plan-approval step.
               </p>
             </div>
-            <div className="space-y-1.5 border-t border-edge pt-4">
-              <Field label="Default theme" htmlFor="default-theme">
+            <div className="space-y-4 border-t border-edge pt-4">
+              <p className="text-xs text-faint">
+                The appearance new users, and anyone without a personal choice, see. Each user
+                can override it under Settings → Appearance.
+              </p>
+              <Field label="Default appearance mode" htmlFor="default-appearance-mode">
                 <Select
-                  id="default-theme"
-                  value={defaultTheme}
-                  onChange={(e) => setDefaultTheme(e.target.value)}
+                  id="default-appearance-mode"
+                  value={defaultAppearanceMode}
+                  onChange={(e) => setDefaultAppearanceMode(e.target.value)}
                 >
-                  {THEMES.map((t) => (
+                  {DEFAULT_MODE_OPTIONS.map(({ value, label }) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Default light theme" htmlFor="default-light-theme">
+                <Select
+                  id="default-light-theme"
+                  value={defaultLightTheme}
+                  onChange={(e) => setDefaultLightTheme(e.target.value)}
+                >
+                  {LIGHT_THEMES.map((t) => (
                     <option key={t} value={t}>
                       {THEME_LABELS[t]}
                     </option>
                   ))}
                 </Select>
               </Field>
-              <p className="text-xs text-faint">
-                The theme new users, and anyone without a personal choice, see. Each user can
-                override it under Settings → Appearance.
-              </p>
+              <Field label="Default dark theme" htmlFor="default-dark-theme">
+                <Select
+                  id="default-dark-theme"
+                  value={defaultDarkTheme}
+                  onChange={(e) => setDefaultDarkTheme(e.target.value)}
+                >
+                  {DARK_THEMES.map((t) => (
+                    <option key={t} value={t}>
+                      {THEME_LABELS[t]}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Default typeface" htmlFor="default-typeface">
+                <Select
+                  id="default-typeface"
+                  value={defaultTypeface}
+                  disabled={!TYPEFACE_ENABLED}
+                  onChange={(e) => setDefaultTypeface(e.target.value)}
+                >
+                  {DEFAULT_TYPEFACE_OPTIONS.map(({ value, label }) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              {!TYPEFACE_ENABLED && (
+                <p className="text-xs text-faint">IBM Plex ships in a later step.</p>
+              )}
             </div>
             <Button type="submit" disabled={busy || !dirty}>
               {busy ? "Saving…" : "Save settings"}

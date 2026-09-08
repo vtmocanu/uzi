@@ -9,10 +9,10 @@
 
 import { useMemo, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api } from "../lib/api";
+import { api, type UserSettingsPatch } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "../components/ui";
+import { Alert, Button, Card, cx, SectionTitle, Toggle } from "../components/ui";
 import { AnthropicTokens } from "../components/AnthropicTokens";
 import { CodexCredentials } from "../components/CodexCredentials";
 import { SettingsShell } from "../components/SettingsShell";
@@ -21,15 +21,114 @@ import { VaultBadge, useVaultLock } from "../components/VaultControls";
 import { SlackNotifications } from "../components/SlackNotifications";
 import { prefs } from "../lib/prefs";
 import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
-import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/theme";
+import {
+  applyAppearance,
+  isTheme,
+  THEME_LABELS,
+  LIGHT_THEMES,
+  DARK_THEMES,
+  type Theme,
+} from "../lib/theme";
 import { useDemoMode, setDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName } from "../lib/demoMask";
 
 // One-time dismissal (per browser) of the rotate-your-legacy-token reminder.
 const ROTATE_NOTICE_KEY = "uzi.vault.rotateNoticeDismissed";
 
+// TYPEFACE_ENABLED gates the (still-rendered) typeface control. The IBM Plex
+// family ships in a later PRD #1167 milestone (m6); until then the picker renders
+// disabled with a hint. Flip this one const to turn it on when the font lands.
+const TYPEFACE_ENABLED = false;
+
+// Appearance-mode choices: the polarity switch. "system" follows the OS, the other
+// two pin a polarity ("Lights on" = light, "Lights off" = dark).
+const MODE_OPTIONS: { value: string; label: string }[] = [
+  { value: "system", label: "System" },
+  { value: "light", label: "Lights on" },
+  { value: "dark", label: "Lights off" },
+];
+
+// Typeface choices (m6). Rendered but disabled until TYPEFACE_ENABLED flips.
+const TYPEFACE_OPTIONS: { value: string; label: string }[] = [
+  { value: "system", label: "System" },
+  { value: "plex", label: "IBM Plex" },
+];
+
+// Representative swatch colours per theme id: the ground (page background) and the
+// brand accent, so each theme card previews at a glance without loading its CSS.
+// Hardcoded on purpose (the live tokens live in index.css and are not readable as
+// values here); a new theme adds one row alongside its theme.ts entry.
+const THEME_SWATCH: Record<Theme, { ground: string; brand: string }> = {
+  ember: { ground: "#080a0f", brand: "#fb923c" },
+  mission: { ground: "#05080f", brand: "#22d3ee" },
+  dawn: { ground: "#f2f4f7", brand: "#b93c0b" },
+  hall: { ground: "#eef1f5", brand: "#3b5bdb" },
+  shadow: { ground: "#e6e8ec", brand: "#7048e8" },
+};
+
+// ThemePicker renders a radio group of theme cards (a swatch + label each) for one
+// polarity. `dimmed` reduces opacity for the polarity that cannot currently apply
+// (the user can still change it — it is neither hidden nor disabled); `disabled`
+// (the in-flight busy flag) actually blocks input while a save is pending.
+function ThemePicker({
+  groupLabel,
+  themes,
+  selected,
+  dimmed,
+  disabled,
+  onPick,
+}: {
+  groupLabel: string;
+  themes: readonly Theme[];
+  selected: string;
+  dimmed: boolean;
+  disabled: boolean;
+  onPick: (t: Theme) => void;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label={groupLabel}
+      className={cx("grid grid-cols-2 gap-2 sm:grid-cols-3", dimmed && "opacity-60")}
+    >
+      {themes.map((t) => {
+        const sw = THEME_SWATCH[t];
+        const active = selected === t;
+        return (
+          <label
+            key={t}
+            className={cx(
+              "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+              active ? "border-brand bg-raised" : "border-edge hover:border-edge-strong",
+              disabled ? "cursor-not-allowed" : "cursor-pointer",
+            )}
+          >
+            <input
+              type="radio"
+              name={groupLabel}
+              value={t}
+              checked={active}
+              disabled={disabled}
+              onChange={() => onPick(t)}
+              className="sr-only"
+            />
+            <span
+              aria-hidden="true"
+              className="flex h-5 w-8 shrink-0 overflow-hidden rounded border border-edge"
+            >
+              <span className="h-full w-1/2" style={{ backgroundColor: sw.ground }} />
+              <span className="h-full w-1/2" style={{ backgroundColor: sw.brand }} />
+            </span>
+            <span className="text-fg">{THEME_LABELS[t]}</span>
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
 export function Settings() {
-  const { user, refresh, themeOverride, defaultTheme, vaultUnlocked } = useAuth();
+  const { user, refresh, appearance, vaultUnlocked } = useAuth();
   const [vaultNotice, setVaultNotice] = useState("");
   const { lock, locking } = useVaultLock(() =>
     setVaultNotice(
@@ -93,33 +192,90 @@ export function Settings() {
     }
   };
 
-  // Appearance: the per-user theme override. "" = use the instance default. The
-  // change is applied live (optimistic) then persisted; a failed save re-syncs
-  // from the server, reverting the optimistic stamp.
-  const [themeBusy, setThemeBusy] = useState(false);
-  const [themeError, setThemeError] = useState("");
+  // Appearance (PRD #1167 "Lights on"): the per-user mode + light/dark theme pair
+  // + typeface, each field a tri-state override (null = inherit the instance
+  // default). Every control follows one OPTIMISTIC pattern: compute the new
+  // resolved appearance locally, applyAppearance immediately so the change feels
+  // live, then persist and refresh; a failed save re-syncs from the server,
+  // reverting the optimistic stamp. `appearanceBusy` disables the controls while a
+  // request is in flight.
+  const [appearanceBusy, setAppearanceBusy] = useState(false);
+  const [appearanceError, setAppearanceError] = useState("");
 
-  // Demo mode: per-device localStorage flag (NOT the server-backed theme above),
-  // so it deliberately gets its own card below Appearance rather than sitting
-  // beside the "follows you across browsers" control. Live via useDemoMode().
+  // Demo mode: per-device localStorage flag (NOT the server-backed appearance
+  // above), so it deliberately gets its own card below Appearance rather than
+  // sitting beside the "follows you across browsers" control. Live via useDemoMode().
   const demoMode = useDemoMode();
 
-  const changeTheme = async (value: string) => {
-    setThemeError("");
-    const override = value === "" ? null : value;
+  // The current resolved appearance as applyAppearance's argument shape; each
+  // handler replaces exactly one field before stamping.
+  const current = {
+    mode: appearance.mode,
+    light: appearance.light_theme,
+    dark: appearance.dark_theme,
+    typeface: appearance.typeface,
+  };
+
+  const saveAppearance = async (
+    optimistic: { mode: string; light: string; dark: string; typeface: string },
+    patch: UserSettingsPatch,
+  ) => {
+    setAppearanceError("");
     // Apply immediately so the switch feels live; the server value reconciles.
-    applyTheme(resolveTheme(override, defaultTheme));
-    setThemeBusy(true);
+    applyAppearance(optimistic);
+    setAppearanceBusy(true);
     try {
-      await api.putMySettings({ theme: override });
-      await refresh(); // sync themeOverride + re-apply the authoritative theme
+      await api.putMySettings(patch);
+      await refresh(); // sync overrides + re-apply the authoritative appearance
     } catch (err) {
-      setThemeError(errorMessage(err, "Failed to save theme"));
+      setAppearanceError(errorMessage(err, "Failed to save appearance"));
       await refresh(); // revert the optimistic stamp to the server's truth
     } finally {
-      setThemeBusy(false);
+      setAppearanceBusy(false);
     }
   };
+
+  const pickMode = (mode: string) =>
+    saveAppearance({ ...current, mode }, { appearance_mode: mode });
+  const pickLight = (light: string) =>
+    saveAppearance({ ...current, light }, { light_theme: light });
+  const pickDark = (dark: string) =>
+    saveAppearance({ ...current, dark }, { dark_theme: dark });
+  const pickTypeface = (typeface: string) =>
+    saveAppearance({ ...current, typeface }, { typeface });
+  const useInstanceDefaults = () =>
+    saveAppearance(
+      {
+        mode: appearance.defaults.mode,
+        light: appearance.defaults.light_theme,
+        dark: appearance.defaults.dark_theme,
+        typeface: appearance.defaults.typeface,
+      },
+      { appearance_mode: null, light_theme: null, dark_theme: null, typeface: null },
+    );
+
+  // Which polarity currently paints (so the other picker is dimmed). An explicit
+  // mode names it; under "system" it is the OS preference, read via matchMedia
+  // (a hint only — it does not re-render on an OS flip).
+  const osDark =
+    typeof window !== "undefined" && window.matchMedia
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false;
+  const activePolarity: "light" | "dark" =
+    appearance.mode === "light"
+      ? "light"
+      : appearance.mode === "dark"
+        ? "dark"
+        : osDark
+          ? "dark"
+          : "light";
+  const themeLabel = (id: string) => (isTheme(id) ? THEME_LABELS[id] : id);
+  const activeTheme =
+    activePolarity === "light" ? appearance.light_theme : appearance.dark_theme;
+  const otherPolarity = activePolarity === "light" ? "dark" : "light";
+  const otherTheme =
+    otherPolarity === "light" ? appearance.light_theme : appearance.dark_theme;
+  const otherModeLabel = otherPolarity === "light" ? "Lights on" : "Lights off";
 
   return (
     <SettingsShell description="Your Anthropic tokens, OpenAI / Codex credentials, vault, appearance, and account.">
@@ -201,33 +357,135 @@ export function Settings() {
         </div>
       </Card>
 
-      <Card className="space-y-5">
+      <Card className="space-y-6">
         <div>
           <SectionTitle>Appearance</SectionTitle>
           <p className="mt-2 text-sm text-muted">
-            The theme uzi renders for you. It follows you across browsers. Leave it on{" "}
-            <em>Use default</em> to track the instance default your admin sets.
+            How uzi looks for you. Your choices follow you across browsers. Leave
+            everything untouched to track the instance defaults your admin sets, or
+            use <em>Use instance defaults</em> below to clear your choices.
           </p>
         </div>
 
-        {themeError && <Alert message={themeError} />}
+        {appearanceError && <Alert message={appearanceError} />}
 
-        <div className="max-w-sm">
-          <Field label="Theme" htmlFor="appearance-theme">
-            <Select
-              id="appearance-theme"
-              value={isTheme(themeOverride) ? themeOverride : ""}
-              disabled={themeBusy}
-              onChange={(e) => changeTheme(e.target.value)}
-            >
-              <option value="">Use default ({THEME_LABELS[defaultTheme]})</option>
-              {THEMES.map((t) => (
-                <option key={t} value={t}>
-                  {THEME_LABELS[t]}
-                </option>
-              ))}
-            </Select>
-          </Field>
+        {/* MODE: the light/dark polarity switch. */}
+        <div className="space-y-2">
+          <p className="text-sm font-medium text-muted">Mode</p>
+          <div
+            role="radiogroup"
+            aria-label="Appearance mode"
+            className="flex flex-wrap gap-2"
+          >
+            {MODE_OPTIONS.map(({ value, label }) => {
+              const active = appearance.mode === value;
+              return (
+                <label
+                  key={value}
+                  className={cx(
+                    "rounded-lg border px-3 py-1.5 text-sm transition-colors",
+                    active
+                      ? "border-brand bg-raised text-fg"
+                      : "border-edge text-muted hover:border-edge-strong",
+                    appearanceBusy ? "cursor-not-allowed" : "cursor-pointer",
+                  )}
+                >
+                  <input
+                    type="radio"
+                    name="appearance-mode"
+                    value={value}
+                    checked={active}
+                    disabled={appearanceBusy}
+                    onChange={() => pickMode(value)}
+                    className="sr-only"
+                  />
+                  {label}
+                </label>
+              );
+            })}
+          </div>
+          <p className="text-xs text-faint">
+            Showing {themeLabel(activeTheme)} ({activePolarity}). {otherModeLabel}{" "}
+            shows {themeLabel(otherTheme)}.
+          </p>
+        </div>
+
+        {/* LIGHTS ON (light-polarity) theme picker. Dimmed when dark is painting. */}
+        <div className="space-y-2">
+          <p className="text-sm font-medium text-muted">Lights on theme</p>
+          <ThemePicker
+            groupLabel="Lights on theme"
+            themes={LIGHT_THEMES}
+            selected={appearance.light_theme}
+            dimmed={activePolarity !== "light"}
+            disabled={appearanceBusy}
+            onPick={pickLight}
+          />
+        </div>
+
+        {/* LIGHTS OFF (dark-polarity) theme picker. Dimmed when light is painting. */}
+        <div className="space-y-2">
+          <p className="text-sm font-medium text-muted">Lights off theme</p>
+          <ThemePicker
+            groupLabel="Lights off theme"
+            themes={DARK_THEMES}
+            selected={appearance.dark_theme}
+            dimmed={activePolarity !== "dark"}
+            disabled={appearanceBusy}
+            onPick={pickDark}
+          />
+        </div>
+
+        {/* TYPEFACE: rendered but disabled until the IBM Plex family ships (m6). */}
+        <div className="space-y-2">
+          <p className="text-sm font-medium text-muted">Typeface</p>
+          <div
+            role="radiogroup"
+            aria-label="Typeface"
+            className={cx("flex flex-wrap gap-2", !TYPEFACE_ENABLED && "opacity-60")}
+          >
+            {TYPEFACE_OPTIONS.map(({ value, label }) => {
+              const active = appearance.typeface === value;
+              const disabled = !TYPEFACE_ENABLED || appearanceBusy;
+              return (
+                <label
+                  key={value}
+                  className={cx(
+                    "rounded-lg border px-3 py-1.5 text-sm transition-colors",
+                    active
+                      ? "border-brand bg-raised text-fg"
+                      : "border-edge text-muted",
+                    disabled ? "cursor-not-allowed" : "cursor-pointer hover:border-edge-strong",
+                  )}
+                >
+                  <input
+                    type="radio"
+                    name="appearance-typeface"
+                    value={value}
+                    checked={active}
+                    disabled={disabled}
+                    onChange={() => pickTypeface(value)}
+                    className="sr-only"
+                  />
+                  {label}
+                </label>
+              );
+            })}
+          </div>
+          {!TYPEFACE_ENABLED && (
+            <p className="text-xs text-faint">IBM Plex ships in a later step.</p>
+          )}
+        </div>
+
+        <div className="border-t border-edge pt-4">
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={appearanceBusy}
+            onClick={useInstanceDefaults}
+          >
+            Use instance defaults
+          </Button>
         </div>
       </Card>
 

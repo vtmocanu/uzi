@@ -261,7 +261,12 @@ describe("AdminSettings", () => {
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
         uzi_label: "runnable",
         autopilot_label: "autopilot",
-        default_theme: "ember",
+        // The appearance defaults ride the same label-form save (PRD #1167); the
+        // legacy default_theme key is no longer written here.
+        default_appearance_mode: "dark",
+        default_light_theme: "hall",
+        default_dark_theme: "ember",
+        default_typeface: "system",
       }),
     );
     // A changed label mentions the next-sync propagation (N1).
@@ -270,14 +275,34 @@ describe("AdminSettings", () => {
     expect(saveButton().disabled).toBe(true);
   });
 
-  it("saves the default theme selection (PRD #21)", async () => {
-    mockApi.updateSettings.mockResolvedValue(response({ default_theme: "mission" }));
+  it("loads the four appearance defaults with polarity-filtered theme options (PRD #1167)", async () => {
     renderPage();
     await screen.findByLabelText("uzi label");
-    const theme = screen.getByLabelText("Default theme") as HTMLSelectElement;
-    // Loads at the current instance default.
-    expect(theme.value).toBe("ember");
-    fireEvent.change(theme, { target: { value: "mission" } });
+    const mode = screen.getByLabelText("Default appearance mode") as HTMLSelectElement;
+    const light = screen.getByLabelText("Default light theme") as HTMLSelectElement;
+    const dark = screen.getByLabelText("Default dark theme") as HTMLSelectElement;
+    // Loaded at the fixture's instance defaults.
+    expect(mode.value).toBe("dark");
+    expect(light.value).toBe("hall");
+    expect(dark.value).toBe("ember");
+    // The light-theme select offers ONLY light themes; the dark-theme select ONLY dark.
+    const lightOptions = within(light).getAllByRole("option").map((o) => (o as HTMLOptionElement).value);
+    expect(lightOptions).toEqual(["dawn", "hall", "shadow"]);
+    const darkOptions = within(dark).getAllByRole("option").map((o) => (o as HTMLOptionElement).value);
+    expect(darkOptions).toEqual(["ember", "mission"]);
+    // The single legacy "Default theme" control is gone.
+    expect(screen.queryByLabelText("Default theme")).toBeNull();
+  });
+
+  it("saves the four appearance defaults, presentation-only (no resync notice) (PRD #1167)", async () => {
+    mockApi.updateSettings.mockResolvedValue(
+      response({ default_appearance_mode: "system", default_light_theme: "dawn", default_dark_theme: "mission" }),
+    );
+    renderPage();
+    await screen.findByLabelText("uzi label");
+    fireEvent.change(screen.getByLabelText("Default appearance mode"), { target: { value: "system" } });
+    fireEvent.change(screen.getByLabelText("Default light theme"), { target: { value: "dawn" } });
+    fireEvent.change(screen.getByLabelText("Default dark theme"), { target: { value: "mission" } });
 
     expect(saveButton().disabled).toBe(false);
     fireEvent.click(saveButton());
@@ -286,13 +311,37 @@ describe("AdminSettings", () => {
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
         uzi_label: "uzi",
         autopilot_label: "autopilot",
-        default_theme: "mission",
+        default_appearance_mode: "system",
+        default_light_theme: "dawn",
+        default_dark_theme: "mission",
+        default_typeface: "system",
       }),
     );
-    // A theme-only change is presentation-only: the notice must NOT claim a resync (N1).
+    // Appearance-only change is presentation-only: the notice must NOT claim a resync (N1).
     expect(await screen.findByText("Settings saved.")).toBeTruthy();
     expect(screen.queryByText(/next sync/i)).toBeNull();
     expect(saveButton().disabled).toBe(true);
+  });
+
+  it("resolves the dark-default display from legacy default_theme when default_dark_theme is unset", async () => {
+    // An older row carries only default_theme; default_dark_theme comes through empty.
+    // The control surfaces the legacy value (mission) rather than a blank select.
+    mockApi.getSettings.mockResolvedValue(
+      response({ default_dark_theme: "", default_theme: "mission" }),
+    );
+    renderPage();
+    await screen.findByLabelText("uzi label");
+    expect((screen.getByLabelText("Default dark theme") as HTMLSelectElement).value).toBe("mission");
+    // Seeded at the resolved value, so nothing is dirty on load.
+    expect(saveButton().disabled).toBe(true);
+  });
+
+  it("renders the instance default typeface control disabled (ships in a later step)", async () => {
+    renderPage();
+    await screen.findByLabelText("uzi label");
+    const typeface = screen.getByLabelText("Default typeface") as HTMLSelectElement;
+    expect(typeface.disabled).toBe(true);
+    expect(typeface.value).toBe("system");
   });
 
   it("surfaces a server validation error", async () => {

@@ -21,42 +21,10 @@ export const THEME_LABELS: Record<Theme, string> = {
   shadow: "Shadow",
 };
 
-// STORAGE_KEY is the pre-paint cache slot: the last resolved theme, read by the
-// inline <head> script in index.html before the bundle loads so the first paint
-// is themed (no flash of the wrong theme). The server-resolved value wins once
-// me() returns and refreshes this cache.
-const STORAGE_KEY = "uzi.theme";
-
 // isTheme narrows an untrusted value (localStorage, an API field) to a known
 // theme id.
 export function isTheme(v: unknown): v is Theme {
   return typeof v === "string" && (THEMES as readonly string[]).includes(v);
-}
-
-// resolveTheme mirrors the server chain (Go theme.Resolve): a valid override
-// wins, else a valid instance default, else ember. Invalid values fall through
-// defensively — writes are validated, so this only guards stale/tampered data.
-export function resolveTheme(
-  override: string | null | undefined,
-  instanceDefault: string | null | undefined,
-): Theme {
-  if (isTheme(override)) return override;
-  if (isTheme(instanceDefault)) return instanceDefault;
-  return DEFAULT_THEME;
-}
-
-// applyTheme stamps <html data-theme> and refreshes the pre-paint cache. Storage
-// access is guarded so a private-mode / locked-storage browser still themes (it
-// only loses flash-avoidance on the next cold load). Called live on a picker
-// change and whenever a session response resolves.
-export function applyTheme(theme: Theme): void {
-  document.documentElement.dataset.theme = theme;
-  try {
-    localStorage.setItem(STORAGE_KEY, theme);
-  } catch {
-    // Storage unavailable (private mode / disabled): theming still works; only
-    // the pre-paint cache is skipped.
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -64,9 +32,9 @@ export function applyTheme(theme: Theme): void {
 // Go registry in api/internal/theme: each theme carries a fixed polarity, and a
 // per-user Appearance splits into a light/dark theme pair plus a system/light/
 // dark mode switch and a typeface choice, each field resolved independently
-// (override > instance default > compiled fallback). This module only owns the
-// data and the resolution; stamping <html> from an Appearance (matchMedia, the
-// system-mode listener) is a later milestone and deliberately not here.
+// (override > instance default > compiled fallback). This module owns the data,
+// the resolution, and (m5) stamping <html> from an Appearance via applyAppearance
+// at the bottom — including the live system-mode matchMedia listener.
 // ---------------------------------------------------------------------------
 
 // Polarity is whether a theme reads as light-on-dark or dark-on-light. Every
@@ -189,4 +157,84 @@ export function resolveAppearance(
         ? defaults.typeface
         : DEFAULT_TYPEFACE,
   };
+}
+
+// ---------------------------------------------------------------------------
+// applyAppearance (PRD #1167 "Lights on", m5): stamp <html> from a resolved
+// appearance, refresh the pre-paint cache, and keep the live system-mode
+// listener in one place. Supersedes the legacy applyTheme: it stamps BOTH
+// data-theme (the painted polarity's theme) and data-font (the typeface), caches
+// the whole appearance under APPEARANCE_STORAGE_KEY for the pre-paint script, and
+// arms/tears down a single matchMedia listener so "system" mode re-themes live
+// when the OS colour scheme flips.
+// ---------------------------------------------------------------------------
+
+// APPEARANCE_STORAGE_KEY is the pre-paint cache slot the external
+// public/theme-preinit.js reads before the bundle loads (no flash of the wrong
+// theme). Its JSON shape and the literal polarity map in that script must track
+// this module's THEME_POLARITY.
+const APPEARANCE_STORAGE_KEY = "uzi.appearance";
+
+// prefersDark reports the OS colour-scheme preference, guarded for a non-browser
+// context or a browser without matchMedia (both read as light).
+function prefersDark(): boolean {
+  return typeof window !== "undefined" && window.matchMedia
+    ? window.matchMedia("(prefers-color-scheme: dark)").matches
+    : false;
+}
+
+// The single live system-mode listener. When mode==="system" we subscribe to the
+// OS colour-scheme media query and restamp data-theme on a change, so flipping the
+// OS between light/dark re-themes without a reload. Held module-level so each
+// applyAppearance call tears the previous one down before (re)arming — switching to
+// an explicit mode removes it, switching back to system re-adds one closed over the
+// call's current light/dark pair.
+let systemMql: MediaQueryList | null = null;
+let systemListener: (() => void) | null = null;
+
+export function applyAppearance(a: {
+  mode: string;
+  light: string;
+  dark: string;
+  typeface: string;
+}): void {
+  // Narrow defensively: cached / wire data may be stale or tampered, so every
+  // field falls back to its compiled default rather than stamping a bogus value.
+  const mode = isAppearanceMode(a.mode) ? a.mode : DEFAULT_APPEARANCE_MODE;
+  const light = isLightTheme(a.light) ? a.light : DEFAULT_LIGHT_THEME;
+  const dark = isDarkTheme(a.dark) ? a.dark : DEFAULT_DARK_THEME;
+  const typeface = isTypeface(a.typeface) ? a.typeface : DEFAULT_TYPEFACE;
+
+  const polarity: Polarity =
+    mode === "system" ? (prefersDark() ? "dark" : "light") : mode;
+  document.documentElement.dataset.theme = polarity === "dark" ? dark : light;
+  document.documentElement.dataset.font = typeface;
+
+  try {
+    localStorage.setItem(
+      APPEARANCE_STORAGE_KEY,
+      JSON.stringify({ mode, light, dark, typeface }),
+    );
+  } catch {
+    // Storage unavailable (private mode / disabled): theming still works; only
+    // the pre-paint cache is skipped on the next cold load.
+  }
+
+  // Tear the previous listener down unconditionally, then re-arm only for system
+  // mode. The new listener closes over THIS call's light/dark pair, so a later
+  // theme change is reflected on the next OS flip.
+  if (systemMql && systemListener) {
+    systemMql.removeEventListener("change", systemListener);
+    systemMql = null;
+    systemListener = null;
+  }
+  if (mode === "system" && typeof window !== "undefined" && window.matchMedia) {
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
+    const listener = () => {
+      document.documentElement.dataset.theme = mql.matches ? dark : light;
+    };
+    mql.addEventListener("change", listener);
+    systemMql = mql;
+    systemListener = listener;
+  }
 }

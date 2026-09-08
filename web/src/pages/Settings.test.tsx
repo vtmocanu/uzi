@@ -7,6 +7,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Settings } from "./Settings";
@@ -73,15 +74,28 @@ const baseUser: User = {
   last_login: null,
 };
 
-function mockAuth(user: User) {
+// A resolved AppearanceState fixture. Default: dark mode, hall/ember pair, system
+// typeface, no per-field overrides (so it tracks the instance defaults). Tests pass
+// `over` to exercise a different painted polarity or a synthesised-legacy shape.
+const baseAppearance = (
+  over: Partial<import("../lib/api").AppearanceState> = {},
+): import("../lib/api").AppearanceState => ({
+  mode: "dark",
+  light_theme: "hall",
+  dark_theme: "ember",
+  typeface: "system",
+  overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+  defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+  ...over,
+});
+
+function mockAuth(user: User, appearance = baseAppearance()) {
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
     uziLabel: "uzi",
     autopilotLabel: "autopilot",
-    theme: "ember",
-    themeOverride: null,
-    defaultTheme: "ember",
+    appearance,
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
@@ -137,36 +151,81 @@ describe("Settings — vault (PRD #32)", () => {
   });
 });
 
-describe("Settings — Appearance theme picker (PRD #21)", () => {
-  const themeSelect = () => screen.getByLabelText("Theme") as HTMLSelectElement;
+describe("Settings — Appearance card (PRD #1167 'Lights on')", () => {
+  const modeGroup = () => screen.getByRole("radiogroup", { name: "Appearance mode" });
+  const lightGroup = () => screen.getByRole("radiogroup", { name: "Lights on theme" });
+  const darkGroup = () => screen.getByRole("radiogroup", { name: "Lights off theme" });
+  const typefaceGroup = () => screen.getByRole("radiogroup", { name: "Typeface" });
 
-  it("offers 'Use default (<name>)' plus each theme and selects a null override as default", async () => {
+  it("renders the mode switch and both polarity theme pickers", async () => {
     render(
       <MemoryRouter>
         <Settings />
       </MemoryRouter>,
     );
-    await waitFor(() => expect(themeSelect()).toBeTruthy());
-    // The default option is labelled with the instance default's name.
-    expect(screen.getByRole("option", { name: /Use default \(Ember\)/i })).toBeTruthy();
-    expect(screen.getByRole("option", { name: "Mission control" })).toBeTruthy();
-    // A null override selects "use default" (value "").
-    expect(themeSelect().value).toBe("");
+    await waitFor(() => expect(modeGroup()).toBeTruthy());
+    // Mode: System / Lights on / Lights off, with the dark (default) painted.
+    expect(within(modeGroup()).getByRole("radio", { name: "Lights off" })).toBeTruthy();
+    expect(
+      (within(modeGroup()).getByRole("radio", { name: "Lights off" }) as HTMLInputElement).checked,
+    ).toBe(true);
+    // Lights-on picker offers the three light themes; lights-off the two dark ones.
+    expect(within(lightGroup()).getByRole("radio", { name: "Dawn" })).toBeTruthy();
+    expect(within(lightGroup()).getByRole("radio", { name: "Hall" })).toBeTruthy();
+    expect(within(lightGroup()).getByRole("radio", { name: "Shadow" })).toBeTruthy();
+    expect(within(darkGroup()).getByRole("radio", { name: "Ember" })).toBeTruthy();
+    expect(within(darkGroup()).getByRole("radio", { name: "Mission control" })).toBeTruthy();
+    // The resolved dark slot (ember) is the selected dark card.
+    expect(
+      (within(darkGroup()).getByRole("radio", { name: "Ember" }) as HTMLInputElement).checked,
+    ).toBe(true);
   });
 
-  it("applies live (optimistic) and persists the override on change", async () => {
+  it("dims the picker for the polarity that cannot currently apply", async () => {
+    // Dark mode paints the dark picker, so the LIGHT picker is dimmed (not disabled).
     render(
       <MemoryRouter>
         <Settings />
       </MemoryRouter>,
     );
-    await waitFor(() => expect(themeSelect()).toBeTruthy());
-    fireEvent.change(themeSelect(), { target: { value: "mission" } });
-    // Optimistic: <html data-theme> flips immediately, before the request resolves.
+    await waitFor(() => expect(lightGroup()).toBeTruthy());
+    expect(lightGroup().className).toContain("opacity-60");
+    expect(darkGroup().className).not.toContain("opacity-60");
+    // Dimmed, but still operable: its radios are not disabled.
+    expect(
+      (within(lightGroup()).getByRole("radio", { name: "Dawn" }) as HTMLInputElement).disabled,
+    ).toBe(false);
+  });
+
+  it("applies a dark-theme pick live (optimistic) and persists it", async () => {
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(darkGroup()).toBeTruthy());
+    fireEvent.click(within(darkGroup()).getByRole("radio", { name: "Mission control" }));
+    // Optimistic: <html data-theme> flips immediately (dark mode -> dark slot), before
+    // the request resolves.
     expect(document.documentElement.dataset.theme).toBe("mission");
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ theme: "mission" }));
-    // Reconciled by a session refresh (syncs the override + re-applies authoritative).
+    await waitFor(() =>
+      expect(mockApi.putMySettings).toHaveBeenCalledWith({ dark_theme: "mission" }),
+    );
+    // Reconciled by a session refresh (syncs overrides + re-applies authoritative).
     await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+
+  it("persists a mode change with the appearance_mode field", async () => {
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(modeGroup()).toBeTruthy());
+    fireEvent.click(within(modeGroup()).getByRole("radio", { name: "Lights on" }));
+    await waitFor(() =>
+      expect(mockApi.putMySettings).toHaveBeenCalledWith({ appearance_mode: "light" }),
+    );
   });
 
   it("surfaces an error and refreshes (reverts) on a failed save", async () => {
@@ -176,11 +235,72 @@ describe("Settings — Appearance theme picker (PRD #21)", () => {
         <Settings />
       </MemoryRouter>,
     );
-    await waitFor(() => expect(themeSelect()).toBeTruthy());
-    fireEvent.change(themeSelect(), { target: { value: "mission" } });
+    await waitFor(() => expect(darkGroup()).toBeTruthy());
+    fireEvent.click(within(darkGroup()).getByRole("radio", { name: "Mission control" }));
     expect(await screen.findByText("unknown theme")).toBeTruthy();
     // refresh is the revert mechanism: re-fetch me() and re-apply the server truth.
     await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+
+  it("renders the typeface control disabled (ships in a later step)", async () => {
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(typefaceGroup()).toBeTruthy());
+    expect(
+      (within(typefaceGroup()).getByRole("radio", { name: "IBM Plex" }) as HTMLInputElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (within(typefaceGroup()).getByRole("radio", { name: "System" }) as HTMLInputElement).disabled,
+    ).toBe(true);
+    expect(screen.getByText(/IBM Plex ships in a later step/i)).toBeTruthy();
+  });
+
+  it("'Use instance defaults' clears all four overrides", async () => {
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /use instance defaults/i })).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /use instance defaults/i }));
+    await waitFor(() =>
+      expect(mockApi.putMySettings).toHaveBeenCalledWith({
+        appearance_mode: null,
+        light_theme: null,
+        dark_theme: null,
+        typeface: null,
+      }),
+    );
+  });
+
+  it("renders a legacy fixture (appearance synthesised from the deprecated trio)", async () => {
+    // A pre-m5 server sends only the single-theme trio; AuthContext synthesises an
+    // appearance (mode dark, hall light slot, the legacy dark theme in the dark slot,
+    // no overrides). The card renders it just like a first-class appearance.
+    mockAuth(
+      baseUser,
+      baseAppearance({
+        dark_theme: "mission",
+        defaults: { mode: "dark", light_theme: "hall", dark_theme: "mission", typeface: "system" },
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(darkGroup()).toBeTruthy());
+    // The synthesised dark slot (mission) is the selected dark card and paints on load.
+    expect(
+      (within(darkGroup()).getByRole("radio", { name: "Mission control" }) as HTMLInputElement)
+        .checked,
+    ).toBe(true);
   });
 });
 
