@@ -51,6 +51,17 @@ describe("SettingsShell tabs", () => {
     expect(current("Account & tokens")).toBeNull();
   });
 
+  // The Appearance tab (theme/mode/typeface + demo mode, split out of Account &
+  // tokens) is the SECOND tab, immediately after Account & tokens, and lights on
+  // its own route without keeping the end-matched Account & tokens active.
+  it("puts Appearance second and lights it on /settings/appearance only", () => {
+    renderAt("/settings/appearance");
+    const tabs = screen.getAllByRole("link");
+    expect(tabs[1].textContent).toBe("Appearance");
+    expect(current("Appearance")).toBe("page");
+    expect(current("Account & tokens")).toBeNull();
+  });
+
   // Issue #204: at 390px a five-tab strip overflows (measured scrollWidth 401 vs
   // clientWidth 390 on the original five) and used to scroll the whole page body
   // sideways. jsdom has no layout engine, so this asserts the class contract that
@@ -63,7 +74,7 @@ describe("SettingsShell tabs", () => {
     expect(row.className).toContain("overflow-x-auto");
     // The underline still spans the row.
     expect(row.className).toMatch(/\bborder-b\b/);
-    for (const name of ["Account & tokens", "Run defaults", "Forge", "Access", "Memory"]) {
+    for (const name of ["Account & tokens", "Appearance", "Run defaults", "Forge", "Access", "Memory"]) {
       const tab = screen.getByRole("link", { name });
       expect(tab.className).toMatch(/\bshrink-0\b/);
       expect(tab.className).toContain("whitespace-nowrap");

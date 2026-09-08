@@ -1,7 +1,7 @@
 # PRD #456: Align a run's branch with the current default branch before the finalize push
 
 **GitHub Issue**: [#456](https://github.com/vtmocanu/uzi/issues/456)
-**Status**: Draft (created 2026-08-20)
+**Status**: Complete (2026-08-20); all committed milestones shipped. Post-align re-validation remains a deferred follow-up.
 **Priority**: High (data-loss: runs lose all committed work)
 **Prerequisite (landed)**: [#377](https://github.com/vtmocanu/uzi/issues/377) merged to `main` 2026-08-20 (PR #454). It added the `runs.preserved_patch` column, the `workflow_scope_missing` `fail_origin`, the `runs_fail_origin_check` widening (migration `00137`), the finalize workflow-modify guard in `agent/src/runner.ts` (after the `ci_fix` guard, before `pushBranch`), and the failed-run-card render in `web/src/pages/RunView.tsx`. This PRD **reuses** that machinery. All references below are verified against `origin/main` at or after `ca096926`.
 **Related code**:

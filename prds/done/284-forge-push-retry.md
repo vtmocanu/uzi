@@ -1,13 +1,13 @@
 # PRD #284: Retry transient forge push/MR failures instead of discarding completed runs
 
-**GitLab Issue**: [#284](https://github.com/vtmocanu/uzi/-/issues/284)
-**Status**: Draft (created 2026-08-09; revised the same day — an architect review verified every load-bearing citation and surfaced the `SweepRunningTimeout` constraint, after which the owner scoped this PRD to **Layer A + the failure-notification gap** and deferred **Layer B** (surviving a sustained outage) to a follow-up PRD)
+**GitHub Issue**: [#284](https://github.com/vtmocanu/uzi/issues/284)
+**Status**: Complete (2026-08-09); the committed Layer A and failure-notification scope shipped. Layer B remains a separate deferred follow-up.
 **Priority**: Medium
 **Related**:
-- [#46](https://github.com/vtmocanu/uzi/-/issues/46) — the in-app notification inbox (`api/internal/notifysvc`, `00060_notifications.sql`). This PRD adds the 5th `notifysvc.Notify` caller and closes the gap that a failed run emits no inbox notification.
-- [#47](https://github.com/vtmocanu/uzi/-/issues/47) — run-health flag (`⚠` + Slack nudge). The notification uses `notifysvc`, not health: health is server-derived from telemetry (`api/internal/workersvc/health.go`, single writer `SetRunHealth` at `health.go:171`), so the worker cannot push a reason. See D6.
-- [#35](https://github.com/vtmocanu/uzi/-/issues/35) — the `limit_wait` usage-limit park. Precedent for the **deferred** Layer B: a non-terminal status the wall sweep ignores, on-disk state preserved, promoted back to `queued` by the sweeper. The `SweepRunningTimeout` analysis (D5/D7) is what makes Layer B a deliberate follow-up rather than a quick add.
-- [#88](https://github.com/vtmocanu/uzi/-/issues/88) — clarification bounds (`question_max`, `question_timeout_seconds`). Config-plumbing precedent for the **deferred** Layer B: a worker-enforced limit configured server-side and shipped in `ClaimConfig` "because a worker env var is unreachable on hosted k8s" (`agent/src/protocol.ts:370-377`).
+- [#46](https://github.com/vtmocanu/uzi/issues/46) — the in-app notification inbox (`api/internal/notifysvc`, `00060_notifications.sql`). This PRD adds the 5th `notifysvc.Notify` caller and closes the gap that a failed run emits no inbox notification.
+- [#47](https://github.com/vtmocanu/uzi/issues/47) — run-health flag (`⚠` + Slack nudge). The notification uses `notifysvc`, not health: health is server-derived from telemetry (`api/internal/workersvc/health.go`, single writer `SetRunHealth` at `health.go:171`), so the worker cannot push a reason. See D6.
+- [#35](https://github.com/vtmocanu/uzi/issues/35) — the `limit_wait` usage-limit park. Precedent for the **deferred** Layer B: a non-terminal status the wall sweep ignores, on-disk state preserved, promoted back to `queued` by the sweeper. The `SweepRunningTimeout` analysis (D5/D7) is what makes Layer B a deliberate follow-up rather than a quick add.
+- [#88](https://github.com/vtmocanu/uzi/issues/88) — clarification bounds (`question_max`, `question_timeout_seconds`). Config-plumbing precedent for the **deferred** Layer B: a worker-enforced limit configured server-side and shipped in `ClaimConfig` "because a worker env var is unreachable on hosted k8s" (`agent/src/protocol.ts:370-377`).
 
 ## Problem
 
@@ -112,9 +112,9 @@ This is recorded, not built here, so the follow-up starts from the verified anal
 - Changing the requeue / worker-death recovery path.
 - Rebuilding MR-create idempotency (already exists — D3).
 
-## Open decisions (for the user)
+## Resolved decision
 
-1. **Failure-inbox-notify scope (M5).** Emit the in-app notification on **all** run failures (general — closes #46's gap broadly) or only on a subset? **Recommend general.** Confirm.
+1. **Failure-inbox-notify scope (M5).** General run failures emit the in-app notification, closing #46's gap broadly.
 
 *(The Layer B park mechanism, its window/cadence, and the entering-park signal are deferred with Layer B to a follow-up PRD — see D5/D7/D8/D10.)*
 

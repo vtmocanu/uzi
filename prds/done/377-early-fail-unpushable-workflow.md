@@ -2,7 +2,7 @@
 
 **Issue**: #377
 **Priority**: Medium
-**Status**: Draft
+**Status**: Complete (2026-08-20); M1, M2, and M4 shipped. M3 was explicitly dropped.
 
 ## Problem
 

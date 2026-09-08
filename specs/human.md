@@ -228,6 +228,7 @@ Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/done/23-web-ux-live-dashbo
 - Desktop sidebar is collapsible.
   - The collapse control must not consume a full sidebar row. [user 2026-08-14]
 - Empty board columns can be hidden.
+  - Hiding empty columns is the DEFAULT for a board the user has not configured; an explicit "show empty" choice still wins. [AI-synced 2026-09-08 (#1208)]
 - Web-only; no API/schema/agent changes.
 - "Board columns should auto refresh" — already satisfied by existing polling; no change shipped.
 
@@ -746,13 +747,13 @@ Extends Feature #111 (auto-select) and issue #804 (ephemeral default).
 
 ## Feature #1167 — Lights on: light themes, system-follow appearance, typeface
 
-Tracked as GitHub issue vtmocanu/uzi#1167; PRD at `prds/1167-lights-on-themes.md`.
+Tracked as GitHub issue vtmocanu/uzi#1167; PRD at `prds/done/1167-lights-on-themes.md`.
 Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 
 - Three light themes — Dawn, Hall, Shadow — a light option for a dark-first tool, each keeping the dark factory somewhere on screen; ship all three, Hall the recommended light default. [user 2026-09-07]
 - Theme ids and labels are English (dawn/hall/shadow), no Romanian anywhere. [user 2026-09-07]
 - Appearance mode System / Lights on / Lights off: System follows the OS; the other two hold one preferred theme per polarity, so the user picks one light theme and one dark theme. [user 2026-09-07]
-- Settings vocabulary is "Lights on" / "Lights off"; the Appearance card sits after Account & tokens. [user 2026-09-07]
+- Settings vocabulary is "Lights on" / "Lights off"; Appearance is its own Settings tab, second after Account & tokens, and also holds the per-device Demo mode toggle. [user 2026-09-07; AI-synced 2026-09-08 (#1208): promoted from a card inside Account & tokens to a dedicated tab, and Demo mode moved onto it, per the user's 2026-09-08 review]
 - Admin sets the instance defaults (mode plus a theme per polarity plus typeface); a user override wins — extends Feature #21's server-side theme default. [user 2026-09-07]
 - Per-user typeface — System or IBM Plex — independent of theme; bundled, no external font fetch. [user 2026-09-07]
 

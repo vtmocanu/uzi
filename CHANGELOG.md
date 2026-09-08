@@ -27,6 +27,12 @@ through `[0.52.0]`.)
 
 - **Judge and the run page's judge panel now share one triage row and one vocabulary ([#1183](https://github.com/vtmocanu/uzi/issues/1183)).**
   Every open recommendation, on `/judge` and on the run page, now shows File issue · Mark done · Dismiss ▾ at equal weight in one row, replacing the run page's lone File issue button on its own line and `/judge`'s per-run File issue buried inside the occurrence expander; the open state reads "To triage" everywhere it appears, the tab, the chip, the strip, and the status line, and a filed recommendation reads "Filed #N" in the same slot. On `/judge`, File issue no longer needs the expander open, it drafts straight from the group's newest open occurrence, the most recently judged run still open, tracked by a new `judged_at` field on the judge backlog occurrence API, while the group's other open runs stay open until you mark the whole group done.
+- **Appearance and Demo mode moved to their own Settings › Appearance tab ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
+  The theme / mode / typeface controls and the per-device Demo mode toggle now live on a dedicated **Appearance** tab, second after Account & tokens, instead of as cards buried inside the Account & tokens tab. The controls behave exactly as before — only their home changed — and Account & tokens no longer lists appearance in its description.
+- **The board search and toolbar are left-anchored on their own row ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
+  On a wide viewport the board's search and controls no longer fling to the far-right edge with a dead gap after the title: they render as their own full-width row beneath the board title, left-aligned at every width, so search stays top-left and a wide window matches the normal-width layout. Sticky positioning, the `/`-to-focus shortcut, and `Esc`-to-clear are unchanged.
+- **Boards open with empty columns hidden by default ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
+  The **Hide empty** toggle now defaults on, so a board you have never configured opens without its empty label lanes. The choice is still remembered per board, so a board you explicitly set to show empty columns keeps showing them.
 
 ## [0.80.0] - 2026-09-08
 
@@ -41,7 +47,7 @@ through `[0.52.0]`.)
 - **A bundled IBM Plex typeface option ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
   Settings → Appearance gains a Typeface choice: System (the platform default) or IBM Plex, shipped with the app so switching to it makes no external font request and the System choice downloads nothing.
 - **Further foundational work toward a Codex-based worker lane ([#1171](https://github.com/vtmocanu/uzi/issues/1171), [#1106](https://github.com/vtmocanu/uzi/issues/1106)).**
-  Behind the scenes and not user-visible yet: completes the Codex production adapter and execution-safety milestone (M3b), building on the credential and packaging groundwork shipped in 0.79.0.
+  Behind the scenes and not user-visible yet: ships the credential-free Codex adapter core and execution-safety foundations, building on the credential and packaging groundwork shipped in 0.79.0. Production integration remains pending.
 
 ### Changed
 

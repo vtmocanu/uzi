@@ -423,7 +423,31 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
   const drop = (lane: HTMLElement, iid: number) =>
     fireEvent.drop(lane, { dataTransfer: { getData: () => String(iid) } });
 
+  // Map-backed localStorage (this jsdom build does not expose window.localStorage),
+  // mirroring the sort-modes block's installStorage. This board's Backlog/Planned/Closed
+  // lanes are all empty, so with hideEmpty now defaulting ON (PRD #1208 M3) they would be
+  // hidden and every findByText("Backlog")/laneFor(...) here would time out. Seeding the
+  // stored pref to false keeps this block's pre-#1208 "empty lanes visible" baseline.
+  function installStorage(): Map<string, string> {
+    const m = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+        setItem: (k: string, v: string) => void m.set(k, String(v)),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: (i: number) => [...m.keys()][i] ?? null,
+        get length() {
+          return m.size;
+        },
+      } as Storage,
+    });
+    return m;
+  }
+
   beforeEach(() => {
+    installStorage().set("uzi.board.repo-1.hideEmpty", "false");
     vi.mocked(useAuth).mockReturnValue({
       user: null,
       loading: false,
@@ -559,6 +583,11 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
 
   beforeEach(() => {
     store = installStorage();
+    // hideEmpty now defaults ON (PRD #1208 M3), which would hide the empty lanes these
+    // tests look up (Closed after a reopen empties it, an all-empty board, etc.). Seed
+    // the stored pref to false so this block keeps its pre-#1208 "empty lanes visible"
+    // baseline; the default-on behaviour is exercised by its own block below.
+    store.set("uzi.board.repo-1.hideEmpty", "false");
     vi.mocked(useAuth).mockReturnValue({
       user: null,
       loading: false,
@@ -2511,7 +2540,31 @@ describe("ColumnSettings reorder (PRD #318 M2)", () => {
     ...over,
   });
 
+  // Map-backed localStorage (this jsdom build does not expose window.localStorage),
+  // mirroring the sort-modes block's installStorage. Only "In Progress" holds a card, so
+  // with hideEmpty now defaulting ON (PRD #1208 M3) the empty Backlog lane would be
+  // hidden and openSettings()'s findByText("Backlog") would time out. Seeding the stored
+  // pref to false keeps this block's pre-#1208 "empty lanes visible" baseline.
+  function installStorage(): Map<string, string> {
+    const m = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+        setItem: (k: string, v: string) => void m.set(k, String(v)),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: (i: number) => [...m.keys()][i] ?? null,
+        get length() {
+          return m.size;
+        },
+      } as Storage,
+    });
+    return m;
+  }
+
   beforeEach(() => {
+    installStorage().set("uzi.board.repo-1.hideEmpty", "false");
     vi.mocked(useAuth).mockReturnValue({
       user: null,
       loading: false,
@@ -2650,5 +2703,126 @@ describe("ColumnSettings reorder (PRD #318 M2)", () => {
       { label_name: "Planned" },
       { label_name: "Human Review" },
     ]);
+  });
+});
+
+// PRD #1208. Two board-level UX changes land together in Board.tsx: hide-empty now
+// DEFAULTS ON (M3), and the search + controls moved OUT of PageHeader.actions into their
+// own left-anchored toolbar row (M2). This block exercises the flipped default with NO
+// stored pref (the seeded blocks above deliberately pin it back to false), and proves
+// the toolbar left PageHeader.actions with a layout-free ancestor check.
+describe("Board — hide-empty defaults on + left-anchored toolbar (PRD #1208)", () => {
+  // Map-backed localStorage (this jsdom build does not expose window.localStorage). A
+  // FRESH, EMPTY store per test, so the default-on test below sees NO stored hideEmpty
+  // pref; the stored-false test seeds the key itself before rendering.
+  function installStorage(): Map<string, string> {
+    const m = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+        setItem: (k: string, v: string) => void m.set(k, String(v)),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: (i: number) => [...m.keys()][i] ?? null,
+        get length() {
+          return m.size;
+        },
+      } as Storage,
+    });
+    return m;
+  }
+
+  let store: Map<string, string>;
+
+  // One card in the implicit Backlog lane; Planned (and Closed) stay EMPTY. Backlog is
+  // always a visible lane to await, and Planned is the empty lane whose visibility the
+  // hide-empty default decides.
+  const aBoard = (over: Partial<BoardData> = {}): BoardData => ({
+    repo_id: "repo-1",
+    path_with_namespace: "grp/proj",
+    web_url: "https://gitlab.example.com/grp/proj",
+    forge_type: "gitlab",
+    columns: [{ label_name: "Planned" }] as BoardData["columns"],
+    cards: [aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"] })],
+    pipeline: null,
+    bot_forge_user_id: 0,
+    ...over,
+  });
+
+  beforeEach(() => {
+    store = installStorage();
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      uziLabel: "uzi",
+      autopilotLabel: "autopilot",
+      appearance: {
+        mode: "dark",
+        light_theme: "hall",
+        dark_theme: "ember",
+        typeface: "system",
+        overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+        defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+      },
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.setBoardPrefs.mockImplementation(async (_repoId, prefs) => prefs);
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.moveIssue.mockResolvedValue({ card: aCard({ iid: 1, column: "Planned" }) });
+    mockApi.reorderBoard.mockImplementation(async () => ({ board: aBoard() }));
+  });
+
+  const renderBoard = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  it("hides an empty lane by default when NO hide-empty pref is stored (default ON)", async () => {
+    // The store has no hideEmpty key, so prefs.get falls back to the new default (true).
+    // Backlog holds a card and renders; the empty Planned lane must be hidden. This is
+    // the mutation-discipline test: reverting Board.tsx's default to false makes
+    // hideEmpty start OFF, the Planned lane renders, and queryByText("Planned") is
+    // non-null → this assertion goes red.
+    renderBoard();
+    await screen.findByText("Backlog");
+    expect(screen.queryByText("Planned")).toBeNull();
+  });
+
+  it("keeps an empty lane visible when the stored pref is explicitly false (stored wins)", async () => {
+    // An explicit stored false must beat the new default-on: prefs.get returns the stored
+    // value when the key is present, so the empty Planned lane's header still renders.
+    store.set("uzi.board.repo-1.hideEmpty", "false");
+    renderBoard();
+    expect(await screen.findByText("Planned")).toBeTruthy();
+  });
+
+  it("renders the search box in its own toolbar row, not inside PageHeader's justify-between actions block", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    const search = screen.getByRole("searchbox", { name: "Search issues" });
+    // PageHeader wraps its title-block and actions-block in a single `justify-between`
+    // flex row (ui.tsx). While the toolbar lived in PageHeader.actions, the search input
+    // had that wrapper as an ancestor; after M2 it lives in its own row that is a SIBLING
+    // of the header block, so NO ancestor carries `justify-between`. Walking the ancestor
+    // chain and asserting that proves the toolbar moved out of PageHeader.actions, without
+    // depending on layout/geometry (which jsdom does not compute).
+    for (let el: HTMLElement | null = search; el; el = el.parentElement) {
+      expect(el.className).not.toContain("justify-between");
+    }
   });
 });

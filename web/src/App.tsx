@@ -11,6 +11,7 @@ import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
 import { AdminBranding } from "./pages/AdminBranding";
 import { Settings } from "./pages/Settings";
+import { AppearanceSettings } from "./pages/AppearanceSettings";
 import { RunDefaults } from "./pages/RunDefaults";
 import { AccessSettings } from "./pages/AccessSettings";
 import { MemorySettings } from "./pages/MemorySettings";
@@ -88,6 +89,8 @@ export const APP_ROUTES: AppRoute[] = [
   // Authenticated app.
   { path: "/dashboard", element: <Dashboard />, guard: "protected" },
   { path: "/settings", element: <Settings />, guard: "protected" },
+  // Appearance (theme/mode/typeface) + demo mode, split out of the Account tab.
+  { path: "/settings/appearance", element: <AppearanceSettings />, guard: "protected" },
   // Run-behavior defaults, split out of the overloaded Account tab.
   { path: "/settings/run-defaults", element: <RunDefaults />, guard: "protected" },
   { path: "/settings/forge", element: <ForgeSettings />, guard: "protected" },

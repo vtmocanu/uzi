@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #284 M1/M2 merged — Layer A only; Layer B is a deferred follow-up, see Consequences)
 **Date**: 2026-08-09
 **Deciders**: architect (design review that scoped the PRD to Layer A), coders, reviewers
-**PRD**: [prds/284-forge-push-retry.md](../prds/284-forge-push-retry.md) (GitLab issue [vtmocanu/uzi#284](https://github.com/vtmocanu/uzi/issues/284)) — the PRD carries the milestones, the two-layer split, and the decision log; this ADR carries the one invariant a future edit to the pattern list could silently break.
+**PRD**: [prds/done/284-forge-push-retry.md](../prds/done/284-forge-push-retry.md) (GitHub issue [vtmocanu/uzi#284](https://github.com/vtmocanu/uzi/issues/284)) — the PRD carries the milestones, the two-layer split, and the decision log; this ADR carries the one invariant a future edit to the pattern list could silently break.
 
 ## Decision (summary)
 
