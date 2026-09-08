@@ -1,16 +1,19 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
   type JudgeBacklogBucket,
   type JudgeOccurrence,
   type JudgeRecommendationGroup,
+  type PendingJudge,
   type Repo,
+  type RunReview,
 } from "../../lib/api";
 import { recommendationLabel } from "../../lib/judge";
-import { seenInRunsLabel } from "../../lib/judgeBacklog";
+import { openOfRunsLabel } from "../../lib/judgeBacklog";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { judgeBadge } from "../../lib/judgeBadge";
+import { Markdown } from "../../components/Markdown";
 import { TriageActions } from "../../components/triage/TriageActions";
 import { TriageStateChip } from "../../components/triage/TriageStateChip";
 import { IssueDraftCard } from "../../components/triage/IssueDraftCard";
@@ -30,9 +33,33 @@ import { ChevronDownIcon, ChevronRightIcon } from "../../components/icons";
 // The action row is TriageActions in DELEGATED mode (PRD #1183): File issue · Mark done ·
 // Dismiss ▾, all secondary weight. Mark done / Dismiss forward to the page's bulk dispose
 // fan-out; File issue opens the shared IssueDraftCard inside the row for the group's newest
-// OPEN occurrence — the first occurrence with bucket "todo", which the backlog grouper
-// delivers newest-first (rv.updated_at DESC). The per-occurrence File issue button is gone:
-// the expander is now for reading (run link · verdict · state chip), not acting.
+// OPEN occurrence (see newestOpenOccurrence below). The per-occurrence File issue button is
+// gone: the expander is now for reading (full rationale · run link · verdict · state chip),
+// not acting.
+//
+// fetchReview is the OMITTABLE capability that upgrades the expander's clamped preview to the
+// newest occurrence's full rationale on first expand (PRD #1183 M2). Judge.tsx passes
+// api.getRunReview; PRD #1184's admin scope has no run_id to fetch with and omits it, and the
+// expander then shows only the clamped preview.
+type FetchReview = (
+  runId: string,
+) => Promise<{ review: RunReview | null; pending_judge: PendingJudge | null }>;
+
+// newestOpenOccurrence picks the group's newest OPEN member — the coordinate the File-issue
+// draft targets. Among the bucket "todo" occurrences it takes the largest judged_at (RFC3339
+// sorts lexicographically = chronologically); a member missing judged_at never wins over one
+// carrying a later value, and with none present it falls back to wire order (the backlog query
+// delivers rv.updated_at DESC, so the first todo is already the newest).
+function newestOpenOccurrence(group: JudgeRecommendationGroup): JudgeOccurrence | undefined {
+  return group.occurrences
+    .filter((o) => o.bucket === "todo")
+    .reduce<JudgeOccurrence | undefined>((best, o) => {
+      if (!best) return o;
+      if (o.judged_at && (!best.judged_at || o.judged_at > best.judged_at)) return o;
+      return best;
+    }, undefined);
+}
+
 export function GroupRow({
   group,
   selected,
@@ -40,6 +67,7 @@ export function GroupRow({
   onDispose,
   repos,
   onFiled,
+  fetchReview,
 }: {
   group: JudgeRecommendationGroup;
   selected: boolean;
@@ -47,6 +75,7 @@ export function GroupRow({
   onDispose: (status: "done" | "dismissed", reason?: "wont_do" | "not_an_issue") => void;
   repos: Repo[];
   onFiled: () => void;
+  fetchReview?: FetchReview;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [filing, setFiling] = useState(false);
@@ -60,10 +89,40 @@ export function GroupRow({
   // (the row keeps its coordKey key).
   const [justFiled, setJustFiled] = useState<{ iid: number; web_url: string; warning: string } | null>(null);
   const openCount = group.open_count;
-  // The group's newest OPEN occurrence: the first occurrence bucketed "todo" in the grouper's
-  // wire order, which the backlog query sorts rv.updated_at DESC, so it is the newest review.
-  const newestOpen = group.occurrences.find((o) => o.bucket === "todo");
+  const newestOpen = newestOpenOccurrence(group);
+  const newestOpenRunId = newestOpen?.run_id;
   const canAct = openCount > 0;
+
+  // The newest open occurrence's FULL rationale, fetched ONCE on first expand via fetchReview
+  // and cached here per group (this component's key is the coordinate, so the cache survives
+  // an onFiled reload). Until it lands — and on error, or when fetchReview is omitted — the
+  // expander shows the clamped preview instead. null means "not loaded".
+  const [rationaleMd, setRationaleMd] = useState<string | null>(null);
+  const rationaleFetched = useRef(false);
+
+  useEffect(() => {
+    // Only after the user expands, only once, and only when the capability and an open
+    // occurrence to fetch it from are both present.
+    if (!expanded || rationaleFetched.current || !fetchReview || !newestOpenRunId) return;
+    rationaleFetched.current = true;
+    let alive = true;
+    void (async () => {
+      try {
+        const { review } = await fetchReview(newestOpenRunId);
+        // Pull the recommendation at this group's coordinate; its rationale_md is the full
+        // text the clamped preview was cut from.
+        const rec = review?.recommendations.find(
+          (r) => r.category === group.category && r.target === group.target,
+        );
+        if (alive && rec) setRationaleMd(rec.rationale_md);
+      } catch {
+        // Leave rationaleMd null so the clamped preview stays.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [expanded, fetchReview, newestOpenRunId, group.category, group.target]);
 
   return (
     <li className="rounded-lg border border-edge bg-raised/40">
@@ -83,7 +142,9 @@ export function GroupRow({
                 {stripUnsafeChars(group.target)}
               </code>
             )}
-            <span className="text-xs text-faint">{seenInRunsLabel(group.run_count)}</span>
+            {/* One frequency chip folding "seen in M runs" and the open count into one phrase
+                (PRD #1183 M2): "N open of M runs", or "M runs, all settled" once none remain. */}
+            <span className="text-xs text-faint">{openOfRunsLabel(group.open_count, group.run_count)}</span>
             {/* The local just-filed override wins and shows the "Filed #N" link chip; otherwise
                 the group rollup chip (never rendered for a still-`todo` group). */}
             {justFiled ? (
@@ -91,7 +152,6 @@ export function GroupRow({
             ) : (
               group.bucket !== "todo" && <TriageStateChip state={rollupState(group.bucket)} />
             )}
-            {openCount > 0 && <span className="text-xs text-faint">{openCount} open</span>}
           </div>
           {group.rationale_preview.trim() !== "" && (
             <p className="mt-1.5 line-clamp-3 whitespace-pre-wrap text-sm text-muted">
@@ -132,6 +192,14 @@ export function GroupRow({
           moves to the `filed` rung, so the group rollup may change) and closes the card. */}
       {filing && newestOpen && (
         <div className="border-t border-edge px-3 py-2.5">
+          {/* When more than one run is open, the draft targets the newest and the rest stay
+              open until the group is marked done — say so above the card (PRD #1183 M2). */}
+          {openCount > 1 && (
+            <p className="mb-2 text-xs text-muted">
+              Prefilled from the newest of {openCount} open runs. The other {openCount - 1} stay
+              open until you mark the group done.
+            </p>
+          )}
           <IssueDraftCard
             repos={repos}
             loadDraft={async () => {
@@ -163,11 +231,29 @@ export function GroupRow({
       )}
 
       {expanded && (
-        <ul className="space-y-2 border-t border-edge px-3 py-2.5">
-          {group.occurrences.map((occ) => (
-            <OccurrenceRow key={`${occ.run_id} ${occ.rec_id}`} occ={occ} />
-          ))}
-        </ul>
+        <div className="space-y-2 border-t border-edge px-3 py-2.5">
+          {/* The newest open occurrence's FULL rationale, above the occurrence list (PRD #1183
+              M2). It replaces the clamped preview once fetchReview lands; until then, on a
+              fetch error, or when fetchReview is omitted (PRD #1184 admin scope), the clamped
+              preview shows. Both render UNTRUSTED judge text through the hardened Markdown /
+              stripUnsafeChars path the run page uses. */}
+          {rationaleMd !== null ? (
+            <div className="judge-prose">
+              <Markdown content={stripUnsafeChars(rationaleMd)} />
+            </div>
+          ) : (
+            group.rationale_preview.trim() !== "" && (
+              <p className="line-clamp-3 whitespace-pre-wrap text-sm text-muted">
+                {stripUnsafeChars(group.rationale_preview)}
+              </p>
+            )
+          )}
+          <ul className="space-y-2">
+            {group.occurrences.map((occ) => (
+              <OccurrenceRow key={`${occ.run_id} ${occ.rec_id}`} occ={occ} />
+            ))}
+          </ul>
+        </div>
       )}
     </li>
   );

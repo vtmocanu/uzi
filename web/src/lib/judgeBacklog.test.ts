@@ -6,6 +6,7 @@ import {
   JUDGE_BUCKETS,
   verdictTrend,
   seenInRunsLabel,
+  openOfRunsLabel,
 } from "./judgeBacklog";
 import type { JudgeRecommendationGroup, TriageCounts } from "./api";
 
@@ -33,6 +34,16 @@ describe("judgeBacklog — evidence copy", () => {
   it("singularises 'seen in N runs'", () => {
     expect(seenInRunsLabel(1)).toBe("seen in 1 run");
     expect(seenInRunsLabel(3)).toBe("seen in 3 runs");
+  });
+
+  // PRD #1183 M2: the Judge group row's frequency chip folds the open count and the run
+  // count into one phrase, plural-correct on the runs and switching to "all settled" at zero.
+  it("reads 'N open of M runs', singular/plural on runs, and 'M runs, all settled' at zero open", () => {
+    expect(openOfRunsLabel(3, 5)).toBe("3 open of 5 runs");
+    expect(openOfRunsLabel(1, 1)).toBe("1 open of 1 run");
+    expect(openOfRunsLabel(2, 1)).toBe("2 open of 1 run"); // plural open, singular run
+    expect(openOfRunsLabel(0, 5)).toBe("5 runs, all settled");
+    expect(openOfRunsLabel(0, 1)).toBe("1 run, all settled");
   });
 });
 

@@ -28,6 +28,9 @@ vi.mock("../lib/api", async (importOriginal) => {
       // from the ROW, not a per-occurrence expander button).
       getIssueDraft: vi.fn(),
       fileIssue: vi.fn(),
+      // The expander's full-rationale fetch (PRD #1183 M2). Judge.tsx passes it to every
+      // GroupRow; a group renders without it and only calls it on first expand.
+      getRunReview: vi.fn(),
     },
   };
 });
@@ -86,6 +89,9 @@ beforeEach(() => {
   mockApi.getJudgeCategoryStats.mockResolvedValue({
     counts_by_bucket: { todo: {}, filed: {}, done: {}, dismissed: {}, all: {} },
   });
+  // The expander's rationale fetch defaults to "no matching recommendation", so an expand in
+  // any suite that is not about the rationale is a clean no-op and the clamped preview stays.
+  mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
 });
 afterEach(() => {
   cleanup();
@@ -106,8 +112,8 @@ describe("Judge — bucket tabs read the canonical triage, not the groups on scr
     renderJudge();
 
     await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
-    // Two deduped group rows…
-    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
+    // Two deduped group rows, plus the list-header select-all checkbox (PRD #1183 M2)…
+    expect(screen.getAllByRole("checkbox")).toHaveLength(3);
     // …but the To-triage tab shows the canonical per-recommendation count (5), NOT 2.
     const tab = screen.getByRole("tab", { name: /To triage/ });
     expect(tab.textContent).toContain("5");
@@ -162,8 +168,9 @@ describe("Judge — bidi/zero-width characters are stripped from backlog free te
     // looks like proof and measures something else is worse than no control: it is the
     // instrument that is blind, not the code that is clean. These three anchors are
     // stable under both states — a fixed aria-label prefix, a fixed button label, and a
-    // pattern the format character cannot break.
-    await screen.findByLabelText(/^Select /);
+    // pattern the format character cannot break. The select-all header is the anchor (the
+    // per-row "Select …" checkboxes carry the untrusted target, this one does not).
+    await screen.findByLabelText(/^Select all/);
     fireEvent.click(screen.getByLabelText("Expand occurrences"));
     await screen.findByText(/A .*run/);
 
@@ -478,8 +485,9 @@ describe("Judge — truncation is surfaced, never rendered as authoritative (PRD
     // response's coordinates would have removed it here — this getByText is the assertion.
     const survivor = screen.getByText("rg").closest("li")!;
     // Still open, and NOT swept to the acted-on group's new rollup. (A todo group renders no
-    // rollup badge — todo is the default state — so "still open" is the observable.)
-    expect(within(survivor).getByText("1 open")).toBeTruthy();
+    // rollup badge — todo is the default state — so "still open" is the observable; the
+    // frequency chip is the PRD #1183 "N open of M runs" phrasing now.)
+    expect(within(survivor).getByText("1 open of 1 run")).toBeTruthy();
     expect(within(survivor).queryByText("Dismissed")).toBeNull();
   });
 });
@@ -1101,11 +1109,19 @@ describe("Judge — the subtitle and filter-panel caption copy (#620)", () => {
     expect(subtitle.textContent).not.toContain("deduped by target");
   });
 
-  it("explains the count unit on the filter panel with a distinct caption", async () => {
+  it("explains the count unit on the filter chip row via its title, not a standing caption line", async () => {
     mockApi.getJudgeBacklog.mockResolvedValue(backlog());
     renderJudge();
 
-    expect(await screen.findByText("counts are groups, deduped by target")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+    // PRD #1183 M2: the caption moved off a standing line onto the inline chip row's title,
+    // so it is no longer rendered text but is still discoverable on the container.
+    expect(screen.queryByText("counts are groups, deduped by target")).toBeNull();
+    const row = screen.getByTitle("counts are groups, deduped by target");
+    expect(row).toBeTruthy();
+    // The chips live inside that same row (the inline group), with no surrounding box/eyebrow.
+    expect(within(row).getByRole("button", { name: /^Improve uzi,/ })).toBeTruthy();
+    expect(screen.queryByText("Filter by label")).toBeNull();
   });
 });
 
@@ -1123,8 +1139,8 @@ describe("Judge — bulk bar clears the w-60 sidebar at desktop width (#204)", (
       }),
     );
     renderJudge();
-    // Selecting a group reveals the MultiSelectBar.
-    fireEvent.click(await screen.findByLabelText(/^Select /));
+    // Selecting via the select-all header reveals the MultiSelectBar.
+    fireEvent.click(await screen.findByLabelText(/^Select all/));
     const bar = screen.getByText(/group selected/).closest("div.fixed") as HTMLElement;
     expect(bar).toBeTruthy();
     // Desktop inset matches the app layout's lg:pl-60 content inset…
@@ -1306,5 +1322,325 @@ describe("Judge — File issue on the group row (PRD #1183, folded from Occurren
     // The old green boxes are retired — filing is a chip now, so neither renders beside it.
     expect(screen.queryByText("Issue created.")).toBeNull();
     expect(screen.queryByText("Filed.")).toBeNull();
+  });
+});
+
+// PRD #1183 M2 — the list-header select-all. It checks/indeterminates off the groups on
+// screen and fans the WHOLE visible list into the selection the bulk bar acts on, so the
+// bulk call receives every visible coordinate rather than one.
+describe("Judge — select-all fans every visible coordinate into the bulk call (PRD #1183 M2)", () => {
+  it("checks all shown groups, then Mark done disposes every visible coordinate at once", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog()); // two groups
+    mockApi.bulkSetJudgeDisposition.mockResolvedValue({
+      updated: 4,
+      settled: [],
+      groups: [],
+      truncated: false,
+      triage: { total: 11, todo: 1, filed: 2, done: 6, dismissed: 2, false_positives: 1 },
+    });
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+
+    // The header names itself by the visible count and starts unchecked.
+    const selectAll = screen.getByRole("checkbox", { name: "Select all 2 shown" }) as HTMLInputElement;
+    expect(selectAll.checked).toBe(false);
+    fireEvent.click(selectAll);
+    expect(selectAll.checked).toBe(true);
+
+    // The bulk bar counts the whole selection…
+    const bar = screen.getByText("2 groups selected").closest("div.fixed") as HTMLElement;
+    fireEvent.click(within(bar).getByRole("button", { name: /Mark done/ }));
+
+    // …and the bulk call receives BOTH visible coordinates, not just one.
+    await waitFor(() =>
+      expect(mockApi.bulkSetJudgeDisposition).toHaveBeenCalledWith(
+        [
+          { category: "improve_uzi", target: "api/internal/poller" },
+          { category: "install_worker_tool", target: "shellcheck" },
+        ],
+        "done",
+        undefined,
+        "open",
+      ),
+    );
+  });
+
+  it("is indeterminate when only some groups are selected", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+
+    // Select one ROW checkbox (the target-bearing one), not the header.
+    fireEvent.click(screen.getByLabelText(/Select .* api\/internal\/poller/));
+    const selectAll = screen.getByRole("checkbox", { name: "Select all 2 shown" }) as HTMLInputElement;
+    expect(selectAll.checked).toBe(false);
+    expect(selectAll.indeterminate).toBe(true);
+  });
+});
+
+// PRD #1183 M2 — the expander's full rationale. It is fetched on FIRST expand via
+// api.getRunReview (not on mount), ONCE, and rendered through the hardened Markdown path;
+// until it lands (or on a no-match / error) the clamped preview stays.
+describe("Judge — the expander's full rationale, fetched on expand (PRD #1183 M2)", () => {
+  function reviewWith(rationale: string) {
+    return {
+      review: {
+        id: "rev-1",
+        target_run_id: "run-1",
+        verdict: "issues" as const,
+        summary_md: "",
+        judge_model: "m",
+        status: "complete" as const,
+        created_at: "2026-07-20T10:00:00Z",
+        updated_at: "2026-07-20T10:00:00Z",
+        recommendations: [
+          {
+            id: "rec-1",
+            category: "improve_uzi" as const,
+            target: "api/internal/poller",
+            rationale_md: rationale,
+            confidence: "high" as const,
+            created_at: "2026-07-20T10:00:00Z",
+          },
+        ],
+        filed_issues: [],
+        dispositions: [],
+        triage: { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+      },
+      pending_judge: null,
+    };
+  }
+
+  it("does not fetch on mount, fetches once on first expand, and shows the full rationale", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({ groups: [group()], triage: { total: 3, todo: 3, filed: 0, done: 0, dismissed: 0, false_positives: 0 } }),
+    );
+    mockApi.getRunReview.mockResolvedValue(reviewWith("The FULL rationale, well beyond the clamped preview."));
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+    // Not fetched before the user expands.
+    expect(mockApi.getRunReview).not.toHaveBeenCalled();
+
+    // First expand fetches once, keyed on the newest open occurrence's run.
+    fireEvent.click(screen.getByRole("button", { name: /Expand occurrences/ }));
+    await waitFor(() => expect(mockApi.getRunReview).toHaveBeenCalledWith("run-1"));
+    expect(await screen.findByText(/The FULL rationale, well beyond the clamped preview\./)).toBeTruthy();
+    expect(mockApi.getRunReview).toHaveBeenCalledTimes(1);
+
+    // Collapse and re-expand: still only one fetch (cached per group).
+    fireEvent.click(screen.getByRole("button", { name: /Collapse occurrences/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Expand occurrences/ }));
+    await waitFor(() => expect(screen.getByText(/The FULL rationale/)).toBeTruthy());
+    expect(mockApi.getRunReview).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the clamped preview when the review carries no matching recommendation", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({ groups: [group()], triage: { total: 3, todo: 3, filed: 0, done: 0, dismissed: 0, false_positives: 0 } }),
+    );
+    // beforeEach default is { review: null } → nothing to match, so the preview stays.
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Expand occurrences/ }));
+    await waitFor(() => expect(mockApi.getRunReview).toHaveBeenCalledTimes(1));
+    // The preview text is on the row and, absent a full rationale, in the expander too.
+    expect(screen.getAllByText(/Queue-to-claim latency dominated the run\./).length).toBeGreaterThan(0);
+  });
+});
+
+// PRD #1183 M2 — EXACTLY ONE status line under the tabs: the bridge when its gate holds,
+// otherwise the "Showing …" line, never both. The role="status" live region is preserved.
+describe("Judge — exactly one status line under the tabs (PRD #1183 M2)", () => {
+  const counts_by_bucket = {
+    todo: { improve_uzi: 10, install_worker_tool: 8 }, // sum 18
+    filed: {},
+    done: {},
+    dismissed: {},
+    all: { improve_uzi: 10, install_worker_tool: 8 },
+  };
+  // triage.todo deliberately unrelated to the group sum so a wrong source would be visible.
+  const triage = { total: 40, todo: 42, filed: 0, done: 0, dismissed: 0, false_positives: 0 };
+
+  it("bridge-eligible: renders the bridge line and NO 'Showing' line", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge();
+
+    const bridge = await screen.findByText("42 to triage recommendations across 18 groups");
+    expect(screen.queryByText(/Showing/)).toBeNull();
+    // The one line is the preserved live region.
+    const region = bridge.closest("[role='status']");
+    expect(region).not.toBeNull();
+    expect(region!.getAttribute("aria-live")).toBe("polite");
+  });
+
+  it("category-filtered: renders the 'Showing' line and NO bridge line", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge(["/judge?category=improve_uzi"]);
+
+    await waitFor(() => expect(screen.getByText(/Showing/)).toBeTruthy());
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
+
+  it("run-anchored: renders the 'Showing' line and NO bridge line", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ bucket: "all", run: "run-1", triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge(["/judge?run=run-1"]);
+
+    await waitFor(() => expect(screen.getByText(/Showing/)).toBeTruthy());
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
+
+  it("truncated: renders 'Showing N of M groups' off the canonical total and NO bridge line", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage, truncated: true }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge();
+
+    // Two groups on screen, 18 canonical → "Showing 2 of 18 groups".
+    const line = await screen.findByText(/Showing/);
+    expect(line.textContent).toContain("2");
+    expect(line.textContent).toContain("18");
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+    // The separate truncation Alert is still its own element.
+    expect(screen.getByText(/backlog is large and was truncated/i)).toBeTruthy();
+  });
+});
+
+// PRD #1183 M2 — the inline LabelFilter still exposes each chip's pressed state and count.
+describe("Judge — the inline LabelFilter chips keep aria-pressed and their counts (PRD #1183 M2)", () => {
+  it("renders a pressable, counted chip per category", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    mockApi.getJudgeCategoryStats.mockResolvedValue({
+      counts_by_bucket: {
+        todo: { improve_uzi: 6 },
+        filed: {},
+        done: {},
+        dismissed: {},
+        all: { improve_uzi: 6 },
+      },
+    });
+    renderJudge(["/judge?category=improve_uzi"]);
+
+    const chip = await screen.findByRole("button", { name: "Improve uzi, 6 groups" });
+    // The count rides the accessible name and the visible (aria-hidden) badge.
+    expect(chip.getAttribute("aria-pressed")).toBe("true");
+    expect(within(chip).getByText("6")).toBeTruthy();
+    // A different chip is not pressed.
+    expect(screen.getByRole("button", { name: /^Add a missing agent,/ }).getAttribute("aria-pressed")).toBe("false");
+  });
+});
+
+// PRD #1183 M2 — the File-issue draft targets the newest OPEN occurrence, picked by the
+// largest judged_at rather than wire position, with a missing stamp never beating a present
+// later one.
+describe("Judge — the draft targets the newest open occurrence by judged_at (PRD #1183 M2)", () => {
+  const draft: IssueDraft = {
+    default_repo_id: "repo1",
+    title: "t",
+    description: "d",
+    labels: [],
+    provenance: "p",
+    default_note: "",
+  };
+
+  it("picks the largest judged_at among open members, not wire order", async () => {
+    // Wire order is newest-first, but here the FIRST todo carries the OLDER judged_at.
+    const g = group({
+      open_count: 2,
+      run_count: 2,
+      occurrences: [
+        occ({ run_id: "run-older", rec_id: "rec-older", judged_at: "2026-07-01T00:00:00Z" }),
+        occ({ run_id: "run-newer", rec_id: "rec-newer", judged_at: "2026-07-09T00:00:00Z" }),
+      ],
+    });
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({ groups: [g], triage: { total: 2, todo: 2, filed: 0, done: 0, dismissed: 0, false_positives: 0 } }),
+    );
+    mockApi.getIssueDraft.mockResolvedValue({ draft });
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    await waitFor(() => expect(mockApi.getIssueDraft).toHaveBeenCalledWith("run-newer", "rec-newer"));
+    expect(mockApi.getIssueDraft).not.toHaveBeenCalledWith("run-older", "rec-older");
+  });
+
+  it("a member missing judged_at never wins over one carrying a later value", async () => {
+    const g = group({
+      open_count: 2,
+      run_count: 2,
+      occurrences: [
+        occ({ run_id: "run-nostamp", rec_id: "rec-nostamp" }), // no judged_at, wire-first
+        occ({ run_id: "run-stamped", rec_id: "rec-stamped", judged_at: "2026-07-09T00:00:00Z" }),
+      ],
+    });
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({ groups: [g], triage: { total: 2, todo: 2, filed: 0, done: 0, dismissed: 0, false_positives: 0 } }),
+    );
+    mockApi.getIssueDraft.mockResolvedValue({ draft });
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    await waitFor(() => expect(mockApi.getIssueDraft).toHaveBeenCalledWith("run-stamped", "rec-stamped"));
+  });
+});
+
+// PRD #1183 M2 — the multi-open draft note. Present with N/N-1 when more than one run is
+// open, absent when only one is.
+describe("Judge — the multi-open draft note (PRD #1183 M2)", () => {
+  const draft: IssueDraft = {
+    default_repo_id: "repo1",
+    title: "t",
+    description: "d",
+    labels: [],
+    provenance: "p",
+    default_note: "",
+  };
+
+  it("shows 'newest of N open runs / other N-1 stay open' when more than one run is open", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({
+        groups: [group({ open_count: 3, run_count: 3 })],
+        triage: { total: 3, todo: 3, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+      }),
+    );
+    mockApi.getIssueDraft.mockResolvedValue({ draft });
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    expect(
+      await screen.findByText(
+        /Prefilled from the newest of 3 open runs\. The other 2 stay open until you mark the group done\./,
+      ),
+    ).toBeTruthy();
+  });
+
+  it("omits the note when only one run is open", async () => {
+    const g = group({
+      open_count: 1,
+      run_count: 2,
+      occurrences: [
+        occ({ run_id: "run-open", rec_id: "rec-open", bucket: "todo" }),
+        occ({
+          run_id: "run-filed",
+          rec_id: "rec-filed",
+          bucket: "filed",
+          filed_issue: { issue_iid: 5, issue_url: "https://forge.example/5", filed_at: "2026-07-20T10:00:00Z" },
+        }),
+      ],
+    });
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({ groups: [g], triage: { total: 2, todo: 1, filed: 1, done: 0, dismissed: 0, false_positives: 0 } }),
+    );
+    mockApi.getIssueDraft.mockResolvedValue({ draft });
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    await screen.findByText("Draft issue");
+    expect(screen.queryByText(/stay open until you mark the group done/)).toBeNull();
   });
 });

@@ -75,9 +75,22 @@ export function bucketTabCount(triage: TriageCounts, bucket: JudgeBacklogBucket)
 
 // seenInRunsLabel is the frequency evidence chip. Singular/plural so "seen in 1 run"
 // never reads wrong — a group can legitimately be a single run (it just is not deduped
-// across any yet).
+// across any yet). Still consumed by the zero-state's recently-handled list; the Judge
+// group row now reads openOfRunsLabel instead (PRD #1183 M2).
 export function seenInRunsLabel(runCount: number): string {
   return `seen in ${runCount} ${runCount === 1 ? "run" : "runs"}`;
+}
+
+// openOfRunsLabel is the Judge group row's frequency chip (PRD #1183 M2): how many of the
+// runs a coordinate recurs in still have it open. "N open of M runs" while any are open, and
+// "M runs, all settled" once none are — both plural-correct on the run count. It folds the
+// old "seen in M runs" evidence and the separate "N open" count into one honest phrase.
+export function openOfRunsLabel(open: number, runs: number): string {
+  const runNoun = runs === 1 ? "run" : "runs";
+  if (open === 0) {
+    return `${runs} ${runNoun}, all settled`;
+  }
+  return `${open} open of ${runs} ${runNoun}`;
 }
 
 // judgeBridgeLine reconciles the two count units the Judge page shows: the per-ROW
