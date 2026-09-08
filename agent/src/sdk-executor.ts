@@ -82,6 +82,7 @@ import {
   SIGNAL_SERVER_NAME,
 } from "./signals.js";
 import { classifyLimitEvidence } from "./limit.js";
+import { PauseNowSignal } from "./steering.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -127,6 +128,11 @@ const PRD_DONE_PATH_MAX_LEN = 512;
 const REASON_WALL = "run exceeded its wall-clock timeout";
 const REASON_IDLE = "run stalled: no agent activity within the idle timeout";
 const REASON_CANCELLED = "run cancelled";
+// PRD #1190 M2: the internal trip reason for a `now` pause abort. Never a failure_reason — it
+// is converted to a thrown PauseNowSignal at every driveTurn throw site (tripError), which the
+// implement loop's turn catch takes to the pause-park path, so it never reaches a `failed`
+// report as text. DISTINCT from REASON_CANCELLED so the two aborts do not collide.
+const REASON_PAUSE_NOW = "run paused (now)";
 // Exported so the runner's failed-report site can map it to a fail_origin
 // (PRD #69 M7a): a missing Anthropic token is a credential_unavailable failure.
 export const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
@@ -290,11 +296,13 @@ export interface SdkExecutorOptions {
   contextUsageTimeoutMs?: number;
   /** issue #1197 (D-RC2b): base in-process backoff between POSITIVELY-EMPTY turn
    *  retries (increasing per attempt). Default {@link EMPTY_TURN_BACKOFF_BASE_MS};
-   *  tests lower it so the retry paths run without real multi-second sleeps. */
+   *  finite nonnegative overrides can lower it, including zero. Values above the
+   *  default are capped there; invalid values use the default. */
   emptyTurnBackoffBaseMs?: number;
   /** issue #1197 (D-RC2b): how many bounded in-process re-drives a positively-empty
    *  turn gets before escalating to {@link TransientRecoveryError}. Default
-   *  {@link EMPTY_TURN_MAX_RETRIES}; tests set it to drive exhaustion precisely. */
+   *  {@link EMPTY_TURN_MAX_RETRIES}; finite nonnegative overrides are floored,
+   *  with zero disabling in-process retries. Invalid values use the default. */
   emptyTurnMaxRetries?: number;
 }
 
@@ -551,14 +559,19 @@ export class SdkExecutor implements Executor {
       opts.summaryRunner ?? new SummaryRunner(this.log, { homeRoot: this.provisionHomeDir });
     this.contextUsageTimeoutMs =
       opts.contextUsageTimeoutMs ?? CONTEXT_USAGE_TIMEOUT_MS;
-    // issue #1197 (D-RC2b): empty-turn recovery knobs. A non-positive override falls
-    // back to the constant so a stray 0 cannot disable the backoff / retries.
+    // #1197: accept finite nonnegative overrides. Zero deliberately disables the
+    // delay/retries; invalid values fall back. The test backoff knob can lower
+    // the production delay, never extend it into an effectively unbounded wait.
     this.emptyTurnBackoffBaseMs =
-      opts.emptyTurnBackoffBaseMs !== undefined && opts.emptyTurnBackoffBaseMs >= 0
-        ? opts.emptyTurnBackoffBaseMs
+      typeof opts.emptyTurnBackoffBaseMs === "number"
+        && Number.isFinite(opts.emptyTurnBackoffBaseMs)
+        && opts.emptyTurnBackoffBaseMs >= 0
+        ? Math.min(opts.emptyTurnBackoffBaseMs, EMPTY_TURN_BACKOFF_BASE_MS)
         : EMPTY_TURN_BACKOFF_BASE_MS;
     this.emptyTurnMaxRetries =
-      opts.emptyTurnMaxRetries !== undefined && opts.emptyTurnMaxRetries >= 0
+      typeof opts.emptyTurnMaxRetries === "number"
+        && Number.isFinite(opts.emptyTurnMaxRetries)
+        && opts.emptyTurnMaxRetries >= 0
         ? Math.floor(opts.emptyTurnMaxRetries)
         : EMPTY_TURN_MAX_RETRIES;
     // The Claude adapter carries the SDK-aware run-lane behavior (decode, process
@@ -1080,13 +1093,32 @@ export class SdkExecutor implements Executor {
     // reclaims the dependency install (PRD #121 M2) — a cancelled run must not sit at
     // the join waiting out an install whose results nobody will read.
     const onSignal = (): void => {
-      this.trip(state, REASON_CANCELLED);
+      // PRD #1190 M2: a `now` pause aborts the SAME controller as a cancel, but with a
+      // PauseNowSignal as the abort reason. Trip with REASON_PAUSE_NOW so driveTurn throws a
+      // PauseNowSignal (via tripError) instead of Error(REASON_CANCELLED) — the loop then PARKS
+      // the run rather than failing it. Every other abort (a steering cancel, a shutdown) has
+      // the default reason and takes the cancel path unchanged.
+      this.trip(
+        state,
+        ctx.signal?.reason instanceof PauseNowSignal
+          ? REASON_PAUSE_NOW
+          : REASON_CANCELLED,
+      );
       depsAbort.abort();
     };
     if (ctx.signal) {
       if (ctx.signal.aborted) onSignal();
       else ctx.signal.addEventListener("abort", onSignal, { once: true });
     }
+
+    // PRD #1190 rework (N2): register the RE-ARMABLE pause-now interrupt. The shared cancel
+    // controller (ctx.signal) fires 'abort' exactly once, so a SECOND `now` pause after a declined
+    // park cannot re-fire it — the once-listener above is spent and an AbortController cannot reset.
+    // The steering channel invokes THIS on every `now` pause instead, and trip() is
+    // first-wins-per-turn (cleared after a declined park), so a `now` that lands after the loop
+    // cleared the prior trip still drops the (restarted) turn. `state` is the run-lifetime drive
+    // object, so this one registration covers every turn.
+    ctx.onPauseNow?.(() => this.trip(state, REASON_PAUSE_NOW));
 
     // The SDK session id evolves across turns; resume each turn from the last.
     let resumeId = ctx.sessionId ?? undefined;
@@ -1759,8 +1791,28 @@ export class SdkExecutor implements Executor {
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
       let scopeCapped: { completedCount: number; total?: number } | undefined;
+      // PRD #1190 M2: latched when an owner-requested pause parked the run (the loop-top pause
+      // branch, or the `now` pause caught around driveTurn below). Hoisted like scopeCapped so it
+      // survives the `break` into the ExecutorResult assembly. ANY kind (NOT gated on isIssueRun).
+      let pausedAt: { completedCount: number; total?: number } | undefined;
+      // PRD #1190 M2 (N1): honour a seeded/steered pause at the FIRST loop boundary as an
+      // ACK-independent fallback. On a resume claim.pause_pending seeded steering.pauseMode; read it
+      // here (ctx.pauseModeRequested) and treat a set mode as an initial pause request at the first
+      // boundary, so a resumed pause parks even if the running-report ACK's pauseRequested regressed
+      // (an older/buggy server). ONE-SHOT: the server ACK is the authoritative re-arm from the first
+      // boundary on (it clears the request after each attempt), so consulting the sticky mode every
+      // iteration would re-attempt a park on a run that already handled its pending pause.
+      let seedPauseFallback = ctx.pauseModeRequested?.() != null;
       for (;;) {
         iteration++;
+        // PRD #1190 rework (N2): re-check the steering cancel flag at each loop boundary. A cancel
+        // that arrives AFTER a declined `now`-park cannot re-fire the shared abort controller — the
+        // `now` pause already aborted it and its once-listener is spent — so without this re-check
+        // the run would ignore the cancel until it self-completed. The NORMAL in-flight cancel is
+        // unaffected: it aborts the LIVE turn, which throws Error(REASON_CANCELLED) from driveTurn
+        // before control returns here. Throwing the same error takes the identical terminal cancel
+        // path, so a late cancel is honored exactly like an in-flight one.
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
         // PRD #122 M2: report the iteration (carrying the latest milestone progress) and
         // apply the server-served effective budget. The cap only ever RISES (a scaled run
         // gets more turns; a single/zero-milestone run's ACK carries none, so this is
@@ -1819,6 +1871,32 @@ export class SdkExecutor implements Executor {
           });
           break;
         }
+        // PRD #1190 M2: owner-requested pause boundary. SEPARATE from the scope block above and
+        // deliberately NOT gated on isIssueRun — three of the four pausable kinds (task, prompt,
+        // self_improve) are not issue runs, so a prompt run with no frozen milestones must park on
+        // the first true ACK too. The SERVER owns the boundary decision (Decision 4): it answers
+        // `pauseRequested` on the running-report ACK (true for a `now` pause, or a `milestone`
+        // pause once the in-flight milestone completed / on a run with no frozen list). The worker
+        // just HONOURS the boolean here. parkForPause publishes the checkpoint FIRST and reports
+        // `paused` only if it lands; on a park it breaks, else the run CONTINUES (the server has
+        // cleared the request, so the next ACK carries false).
+        //
+        // PRD #1190 rework (N1): `seedPauseFallback` OR-s in a seeded/steered pause at the FIRST
+        // boundary as an ACK-independent fallback (see its declaration), so a resumed pause parks
+        // even if the ACK's pauseRequested regressed. It is consumed (set false) on the first
+        // boundary that evaluates it, so the server ACK is authoritative thereafter.
+        if (served?.pauseRequested || seedPauseFallback) {
+          seedPauseFallback = false; // one-shot: the server ACK is authoritative from here on
+          const at = {
+            completedCount:
+              served?.completedCount ?? latestProgress?.completed.length ?? 0,
+            total: frozenMilestones?.length,
+          };
+          if (await this.requestPause(ctx, at)) {
+            pausedAt = at;
+            break;
+          }
+        }
         ctx.emit({
           kind: "status",
           agent: "worker",
@@ -1839,7 +1917,7 @@ export class SdkExecutor implements Executor {
         // (0 turns, no activity) is retried in-process and, if still empty, escalated to
         // the recovery_wait park (TransientRecoveryError) instead of terminal-failing —
         // covering the RC2 resume-empty-turn incident on the implement path too.
-        const turn = await this.driveTurnWithEmptyRecovery(
+        const turnPromise = this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
           "implement",
@@ -1908,6 +1986,45 @@ export class SdkExecutor implements Executor {
           idleMs,
           onProgress,
         );
+        // PRD #1190 M2: await the turn through a catch for a `now` pause abort. driveTurn is an
+        // async function, so even a synchronous trip check surfaces as a REJECTED promise here
+        // (never a throw at the call above) — either way a PauseNowSignal lands in this catch. It
+        // is DISTINCT from a cancel (Error(REASON_CANCELLED)), so the run PARKS rather than fails.
+        // On a park take, break; else (the checkpoint could not be published, so the server
+        // cleared the request) CONTINUE — the aborted turn restarts on the next iteration, exactly
+        // as a cancelled-then-revised turn does. A non-pause error rethrows to the normal path.
+        let turn: TurnResult;
+        try {
+          turn = await turnPromise;
+        } catch (err) {
+          if (err instanceof PauseNowSignal) {
+            const at = {
+              // The server's fresh completed count off THIS iteration's ACK, matching the
+              // loop-top branch; fall back to the worker's own live progress if the ACK carried
+              // none (e.g. a run with no reportIteration budget).
+              completedCount:
+                served?.completedCount ?? latestProgress?.completed.length ?? 0,
+              total: frozenMilestones?.length,
+            };
+            if (await this.requestPause(ctx, at)) {
+              pausedAt = at;
+              break;
+            }
+            // The checkpoint could not be published (Decision 8): the server cleared the request
+            // and the run CONTINUES. Clear the sticky REASON_PAUSE_NOW trip so the restarted turn
+            // is not immediately re-thrown by driveTurn's top guard — the shared cancel controller
+            // stays aborted, but its onSignal is once:true and already fired, and each turn gets a
+            // fresh currentAbort, so the next turn runs cleanly. The consumed controller can no
+            // longer deliver a later steering signal, so both are re-checked WITHOUT it (PRD #1190
+            // rework N2): a cancel arriving after this point is honored by the loop-top cancel
+            // re-check (ctx.cancelRequested) on the next iteration, and a SECOND `now` pause drops
+            // the restarted turn via the re-armable ctx.onPauseNow interrupt (which trips this same
+            // REASON_PAUSE_NOW). Both were silently dropped before this rework.
+            state.tripReason = undefined;
+            continue;
+          }
+          throw err;
+        }
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
         // PRD #265 M1: latch the finished-milestone declaration the same way, so it
@@ -2242,6 +2359,12 @@ export class SdkExecutor implements Executor {
       // and every existing deepStrictEqual on it holds. runner.ts decides MR-vs-no-MR from the
       // actual diff, so no zero-slice special-casing here.
       if (isIssueRun && scopeCapped) result.scopeCapped = scopeCapped;
+      // PRD #1190 M2: forward the pause-park disposition. NOT gated on isIssueRun (unlike
+      // scopeCapped) — pause is meaningful for task/prompt/self_improve too. Set only when the
+      // run actually PARKED (ctx.parkForPause returned true); phasePublish reads it to SKIP
+      // finalization (the run already reported `paused`). OMITTED (not undefined) on every normal
+      // completion so the result shape is unchanged and existing deepStrictEqual assertions hold.
+      if (pausedAt) result.pausedAt = pausedAt;
       return result;
   }
 
@@ -2548,7 +2671,7 @@ export class SdkExecutor implements Executor {
     onProgress?: (progress: MilestoneProgress) => void,
   ): Promise<TurnResult> {
     // A trip may already be pending (e.g. a cancel that landed during the gate).
-    if (state.tripReason) throw new Error(state.tripReason);
+    if (state.tripReason) throw this.tripError(state);
 
     // The owner still owns the neutral abort signal (trip/cancel drives it); the
     // adapter links the SDK's own controller to it. state.currentChild is the sink
@@ -2581,7 +2704,7 @@ export class SdkExecutor implements Executor {
 
     this.armWall(state);
     // Budget already spent by earlier turns → fail now rather than run unbounded.
-    if (state.tripReason) throw new Error(state.tripReason);
+    if (state.tripReason) throw this.tripError(state);
     try {
       armIdle();
       // The owner hands the adapter the per-turn ClaudeTurnConfig ingredients (plan
@@ -2646,7 +2769,7 @@ export class SdkExecutor implements Executor {
       // wins over every other failure; then a query/iteration/close throw (handled
       // by the catch below); then a failed terminal is classified and materialized
       // into today's typed exception; a clean EOF returns the accumulated result.
-      if (state.tripReason) throw new Error(state.tripReason);
+      if (state.tripReason) throw this.tripError(state);
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         // PRD #35: classify at the completion point with Date.now() (not earlier in
         // the stream). A usage-limit death materializes as the TYPED LimitReachedError
@@ -2670,7 +2793,7 @@ export class SdkExecutor implements Executor {
     } catch (err) {
       // A watchdog/cancel trip surfaces as its static reason, not the raw
       // AbortError the aborted iterator throws.
-      if (state.tripReason) throw new Error(state.tripReason);
+      if (state.tripReason) throw this.tripError(state);
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
@@ -2694,8 +2817,8 @@ export class SdkExecutor implements Executor {
    *    wall is spent, and the next driveTurn's `armWall` trips REASON_WALL naturally —
    *    the genuine wall outcome, not a park. The between-turns wait is debited from the
    *    wall (disarmed between turns) so the next turn sees the true remaining budget.
-   *  - The re-drive uses the SAME resumeId — nothing was torn down, so a resumed
-   *    turn's SDK session is preserved.
+   *  - The re-drive resumes the last session observed, including a fresh empty
+   *    planning turn's session. The persisted first-session ID stays authoritative.
    * Only after the bounded retries are exhausted on a still-positively-empty result
    * does this throw {@link TransientRecoveryError} → the recovery_wait park (D-RC2c).
    */
@@ -2727,7 +2850,7 @@ export class SdkExecutor implements Executor {
     for (let attempt = 1; attempt <= this.emptyTurnMaxRetries; attempt++) {
       // A real cancel/idle/wall trip WINS and keeps its existing outcome — throw it
       // FIRST, before any backoff or re-drive, so it is never reclassified as recovery.
-      if (state.tripReason) throw new Error(state.tripReason);
+      if (state.tripReason) throw this.tripError(state);
       // Budget-accounted, cancel-safe backoff — SKIPPED when the wall is already spent
       // (let the next driveTurn's armWall trip REASON_WALL; budget exhaustion is NEVER
       // a recovery trigger). Increasing per attempt; small (seconds) — the long backoff
@@ -2743,8 +2866,10 @@ export class SdkExecutor implements Executor {
           text: "the model returned an empty result (0 turns, no activity); retrying…",
         },
       });
-      // Re-drive with the SAME resumeId — nothing was torn down, so a resumed turn's
-      // SDK session is preserved.
+      // An empty fresh turn can still initialize a session. Resume it on retry:
+      // the reducer already persisted that ID through its once-per-run callback.
+      // Starting a second session would leave recovery pointing at the first.
+      resumeId = turn.sessionId ?? resumeId;
       turn = await this.driveTurn(
         ctx,
         turnConfig,
@@ -2774,7 +2899,7 @@ export class SdkExecutor implements Executor {
       // A real cancel/idle/wall trip observed within a slice WINS — throw it, never
       // keep backing off. (Idle/wall are disarmed between turns, so realistically only
       // a cancel lands here, but the check is total by construction.)
-      if (state.tripReason) throw new Error(state.tripReason);
+      if (state.tripReason) throw this.tripError(state);
       // Budget already exhausted → stop sleeping and let the NEXT driveTurn's armWall
       // trip REASON_WALL. Never convert budget exhaustion into recovery.
       if (state.wallRemainingMs <= 0) return;
@@ -2782,14 +2907,52 @@ export class SdkExecutor implements Executor {
       const before = Date.now();
       await sleep(slice);
       // Catch a cancel that landed mid-sleep promptly, before debiting/looping.
-      if (state.tripReason) throw new Error(state.tripReason);
+      if (state.tripReason) throw this.tripError(state);
       // Debit the ACTUAL elapsed time (mirrors disarmWall) so the subsequent turn's
       // armWall sees the true remaining budget; the wall is disarmed between turns, so
       // this backoff is the only place the between-turns wait is charged.
       state.wallRemainingMs -= Date.now() - before;
       remaining -= slice;
     }
-    if (state.tripReason) throw new Error(state.tripReason);
+    if (state.tripReason) throw this.tripError(state);
+  }
+
+  /**
+   * PRD #1190 M2: honour an owner-requested pause at a loop boundary. Emits the `steer_ack`
+   * that acknowledges the pause directive (mirroring the scope cap's steer_ack) and delegates
+   * the actual park to the runner's ctx.parkForPause — which publishes a checkpoint FIRST and
+   * reports `paused` only if it lands (Decision 8). Returns whether the run PARKED: true ⇒ the
+   * caller latches pausedAt and breaks; false ⇒ the caller CONTINUES the run (a failed publish,
+   * or an executor with no parkForPause wired — the stub/tests, where a pause is inert).
+   */
+  private async requestPause(
+    ctx: RunContext,
+    at: { completedCount: number; total?: number },
+  ): Promise<boolean> {
+    ctx.emit({
+      kind: "steer_ack",
+      agent: "worker",
+      payload: {
+        text:
+          at.total !== undefined
+            ? `honoring your pause request after ${at.completedCount}/${at.total} milestone(s)`
+            : "honoring your pause request",
+        directive: "pause",
+        completed: at.completedCount,
+        ...(at.total !== undefined ? { total: at.total } : {}),
+      },
+    });
+    return (await ctx.parkForPause?.(at)) ?? false;
+  }
+
+  /** The error a tripped turn throws (PRD #1190 M2). A `now` pause trip (REASON_PAUSE_NOW)
+   *  throws a PauseNowSignal, which the implement loop's turn catch takes to the pause-park
+   *  path; every other trip reason throws its static Error(reason) exactly as before. Keeps the
+   *  REASON_PAUSE_NOW sentinel from ever surfacing as a `failed` report's text. */
+  private tripError(state: RunDrive): Error {
+    return state.tripReason === REASON_PAUSE_NOW
+      ? new PauseNowSignal()
+      : new Error(state.tripReason ?? REASON_CANCELLED);
   }
 
   /** Record a first-wins watchdog/cancel trip and stop the current turn. */
@@ -2896,6 +3059,8 @@ function describeSkillDrop(name: string, reason: string): string {
       return `skill "${name}" was dropped: its body exceeds the maximum allowed size`;
     case "repo_collision":
       return `repo skill "${name}" was skipped: a higher-precedence skill of the same name is already loaded`;
+    case "shadowed_by_claude":
+      return `repo skill "${name}" from .agents/skills was skipped: a real .claude/skills skill of the same name takes precedence`;
     case "repo_invalid":
       return `repo skill "${name}" was skipped: invalid name, description, or body`;
     default:

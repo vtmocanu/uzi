@@ -158,7 +158,8 @@ describe("MilestoneChecklist now line (PRD #1064 M3)", () => {
         activity={anActivity()}
       />,
     );
-    expect(screen.getByText("waiting on rate limit · 40s")).toBeTruthy();
+    expect(screen.getByText("waiting to recover · 40s")).toBeTruthy();
+    expect(screen.queryByText(/waiting on rate limit/)).toBeNull();
     expect(screen.queryByText("40s ago")).toBeNull();
   });
 

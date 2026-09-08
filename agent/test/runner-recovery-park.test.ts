@@ -5,14 +5,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
-import { RunRunner, type ExecutorFactory } from "../src/runner.js";
-import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
+import { type ExecutorFactory } from "../src/runner.js";
+import { WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
-import { nullLogger } from "./helpers.js";
 import {
   api,
-  client,
   fakeGitlab,
   fx,
   git,
@@ -24,14 +22,8 @@ import {
 
 installHarness();
 
-// issue #1197 (D-RC2c): the WORKER side of the recovery_wait park — run a best-effort
-// capture of the local restore point BEFORE reporting the park (the causal fence), then
-// ALWAYS report recovery_wait (like limit_wait's durability model), never stranding the run
-// on a local-capture shortfall. The capture's verified/published outcome drives only the
-// truthful feed wording (full-durability vs "resume from last durable checkpoint / a
-// cross-worker reclaim may restart from default"). Driven on the REAL runner + real git end
-// to end (a fake executor throws TransientRecoveryError, exactly as SdkExecutor's
-// driveTurnWithEmptyRecovery does on a persistently-empty turn).
+// #1197: verified capture must precede the promotable recovery_wait report.
+// Failure/retry/restart cases live in runner-recovery-capture-failure.test.ts.
 
 const GIT_ENV = {
   ...process.env,
@@ -221,87 +213,6 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
     }
   });
 
-  it("LOCAL capture shortfall: STILL parks recovery_wait (never strands), with the degraded feed line", async () => {
-    const { gitlab } = fakeGitlab();
-    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-rec-verifyfail-"));
-    try {
-      const iid = 304;
-      // A real GitCache whose ONLY broken method is the restore-point verification — the
-      // commit + fetch-back run, but verification never confirms the tracking ref covers
-      // HEAD, so the fresh local capture is a SHORTFALL (verified=false). The pre-regression
-      // behavior stranded the run here (set preserveSession, reported NO state, and — because
-      // the worker stays alive and keeps heart-beating — the stale-worker requeue never fired,
-      // so the run lingered `running` for hours / forever for an interactive run). It must now
-      // STILL park in recovery_wait: the committed work already sits on a prior durable
-      // checkpoint, so a reseed recovers it via the multi-ref fallback (like limit_wait).
-      const brokenGit = new GitCache(fx.dataDir, nullLogger());
-      brokenGit.verifyRunnerTrackingCovers = async () => false;
-      const pluginDir = skillsPluginDir(worktreeDirFor(iid));
-      let runHome = "";
-      const factory: ExecutorFactory = (runId) => {
-        runHome = path.join(homeRoot, runId);
-        return {
-          homeDir: runHome,
-          executor: {
-            run: async (ctx: RunContext): Promise<ExecutorResult> => {
-              fs.mkdirSync(pluginDir, { recursive: true });
-              fs.writeFileSync(path.join(pluginDir, "marker"), "x");
-              fs.mkdirSync(runHome, { recursive: true });
-              fs.writeFileSync(path.join(runHome, "session"), "transcript", "utf8");
-              commitInTree(ctx.worktreePath, "WORK.txt", "unverifiable work\n");
-              throw new TransientRecoveryError();
-            },
-          },
-        };
-      };
-      const claim = gitlabClaim(iid);
-      const runner = new RunRunner(client, brokenGit, factory, nullLogger(), 20, undefined, {
-        pollMs: 5,
-        planApprovalTimeoutMs: 0,
-        questionTimeoutMs: 600,
-        gitlab,
-      });
-      await runner.execute(claim);
-      // The run IS parked: a recovery_wait state report WAS sent (guards against
-      // re-introducing the strand — the defect was reporting NO state on this path).
-      assert.ok(
-        api.states.some((s) => s.body.status === "recovery_wait"),
-        "a local capture shortfall must STILL report a recovery_wait park (never strand)",
-      );
-      // And NOT a work-destroying terminal.
-      assert.strictEqual(
-        api.states.some((s) => s.body.status === "failed"),
-        false,
-        "a local capture shortfall must NOT report a terminal failed",
-      );
-      // The feed wording is the DEGRADED durability line — resume from the last durable
-      // checkpoint, a cross-worker reclaim may restart from default — NOT the full-durability
-      // "recovery checkpoint is saved" line the verified-capture path emits.
-      const texts = feedTexts(claim.run_id);
-      assert.ok(
-        texts.some((t) => /last durable checkpoint/.test(t) && /default branch/.test(t)),
-        "the shortfall path emits the truthful 'last durable checkpoint / restart from default' line",
-      );
-      assert.strictEqual(
-        texts.some((t) => /the recovery checkpoint is saved/.test(t)),
-        false,
-        "the shortfall path must NOT claim the full-durability 'checkpoint is saved' line",
-      );
-      // The run parked (flight.parked, NOT the shutdown preserveSession fallback), so the two
-      // resume dirs survive exactly as the verified-capture park does, and the clone is
-      // removed unconditionally (PRD #218 M6 — the reseed re-clones from the bare).
-      assert.strictEqual(fs.existsSync(pluginDir), true, "the plugin dir (session) is preserved on a park");
-      assert.strictEqual(fs.existsSync(runHome), true, "the session HOME is preserved on a park");
-      assert.strictEqual(
-        fs.existsSync(worktreeDirFor(iid)),
-        false,
-        "the clone leg is removed unconditionally (PRD #218 M6); durability is the tracking ref / prior checkpoint",
-      );
-    } finally {
-      fs.rmSync(homeRoot, { recursive: true, force: true });
-    }
-  });
-
   it("ack discrimination: a 200 that reports a DIFFERENT status than recovery_wait is NOT parked", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-rec-declined-"));
@@ -330,57 +241,6 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
     }
   });
 
-  it("ack error (thrown report): a non-409 4xx reporting recovery_wait throws → NOT parked, cleaned up", async () => {
-    const { gitlab } = fakeGitlab();
-    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-rec-throw-"));
-    try {
-      const iid = 306;
-      const { factory, paths } = recoveryFactory(homeRoot, iid, (wt) => {
-        commitInTree(wt, "WORK.txt", "work\n");
-      });
-      const claim = gitlabClaim(iid);
-      // Make ONLY the recovery_wait report fail with a non-409 4xx (400) that is neither
-      // transient (isTransient is false for a 400) nor "already terminal" (the body carries
-      // no /terminal/ text), so reportState does not retry and THROWS — the transport-failure
-      // shape handleRecoveryExhausted's catch handles. failStateWhen targets the recovery_wait
-      // body only (matched on body.status), so the ordinary `running` heartbeats fall through
-      // to the normal handler and the run reaches the park path exactly as verified-capture does.
-      api.failStateWhen(claim.run_id, (b) => b.status === "recovery_wait", {
-        httpStatus: 400,
-      });
-      await runnerWith(factory, gitlab).execute(claim);
-      const p = paths();
-      // Non-vacuity: handleRecoveryExhausted actually RAN — the park notice was FLUSHED to
-      // the feed just before the (throwing) report — so the cleanup below is the catch
-      // branch's unparked cleanup, not a run that died earlier and never reached the park.
-      const texts = feedTexts(claim.run_id);
-      assert.ok(
-        texts.some((t) => /paused to recover from an empty model result/.test(t)),
-        "the recovery park notice was emitted (the park path ran before the throw)",
-      );
-      // The throwing report is NOT persisted (the 400 returns before the fake records it),
-      // and NO terminal `failed` is reported in its place — the run stays non-terminal so the
-      // server's stale-worker requeue can pick it up (never a work-destroying double-report).
-      assert.strictEqual(
-        api.states.some((s) => s.body.status === "recovery_wait"),
-        false,
-        "a thrown recovery_wait report is not persisted (no park landed)",
-      );
-      assert.strictEqual(
-        api.states.some((s) => s.body.status === "failed"),
-        false,
-        "a thrown recovery park must NOT double-report a terminal failed",
-      );
-      // NOT parked → the whole session is cleaned up (no park carve-out): all three resume
-      // dirs are removed, exactly as the ack-discrimination case above.
-      assert.strictEqual(fs.existsSync(p.worktree), false, "clone removed (not parked)");
-      assert.strictEqual(fs.existsSync(p.pluginDir), false, "plugin dir removed (not parked)");
-      assert.strictEqual(fs.existsSync(p.runHome), false, "run HOME removed (not parked)");
-    } finally {
-      fs.rmSync(homeRoot, { recursive: true, force: true });
-    }
-  });
-
   it("ack error (409 refusal): the run moved on under the worker → NOT parked, cleaned up", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-rec-409-"));
@@ -398,12 +258,10 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
       api.refuseStateWith409(claim.run_id);
       await runnerWith(factory, gitlab).execute(claim);
       const p = paths();
-      // Non-vacuity: the park path ran (its notice reached the feed) before the 409 refusal.
-      const texts = feedTexts(claim.run_id);
-      assert.ok(
-        texts.some((t) => /paused to recover from an empty model result/.test(t)),
-        "the recovery park notice was emitted (the park path ran before the 409)",
-      );
+      // Capture precedes the refused park report; the saved tracking tip proves
+      // this ran through recovery rather than failing before the capture path.
+      assert.ok(shaInBare(git.barePathFor(fx.originPath), trackingRef(iid)));
+
       // NOT parked → the whole session is cleaned up: worktree, plugin dir and run HOME.
       assert.strictEqual(fs.existsSync(p.worktree), false, "clone removed (not parked)");
       assert.strictEqual(fs.existsSync(p.pluginDir), false, "plugin dir removed (not parked)");

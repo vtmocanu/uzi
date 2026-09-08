@@ -229,8 +229,14 @@ describe("runBadge taxonomy", () => {
   it("🔴 recovery_wait's badge is STATIC — no countdown, no elapsed, on any input", () => {
     // The backoff instant is server-owned and carries no DTO field, so there is nothing
     // here to count down from.
-    const early = runBadge(run({ status: "recovery_wait", created_at: "2026-07-04T11:00:00Z" }), NOW);
-    const late = runBadge(run({ status: "recovery_wait", created_at: "2026-07-04T11:59:00Z" }), NOW);
+    const early = runBadge(
+      run({ status: "recovery_wait", created_at: "2026-07-04T11:00:00Z", updated_at: "2026-07-04T11:55:00Z" }),
+      NOW,
+    );
+    const late = runBadge(
+      run({ status: "recovery_wait", created_at: "2026-07-04T11:59:00Z", updated_at: "2026-07-04T12:30:00Z" }),
+      NOW + 4 * 60 * 60 * 1000,
+    );
     expect(early).toEqual(late);
     if (early.kind === "badge") expect(early.label).toBe("recovery wait");
   });
@@ -241,6 +247,47 @@ describe("runBadge taxonomy", () => {
     // not flag it. Absent from the set ⇒ healthBadge returns null and the status wins.
     expect(isHealthFlaggableStatus("recovery_wait")).toBe(false);
     expect(shouldShowHealthFlag("stalled", "recovery_wait")).toBe(false);
+  });
+});
+
+// PRD #1190: a run its owner paused. It falls to its own case (not the default arm, which
+// would draw a neutral "paused" indistinguishable from cancelled) — an INFO-toned
+// "‖ paused" badge carrying the same glyph StatusPill uses.
+describe("paused (PRD #1190)", () => {
+  it("paused → info '‖ paused' badge, static (no elapsed)", () => {
+    const b = runBadge(run({ status: "paused" }), NOW);
+    expect(b.kind).toBe("badge");
+    if (b.kind === "badge") {
+      expect(b.label).toBe("‖ paused");
+      expect(b.tone).toBe("info");
+      expect(b.pulse).toBe(false);
+    }
+  });
+
+  it("its badge is STATIC — identical on any nowMs, like the other holds", () => {
+    const early = runBadge(run({ status: "paused", created_at: "2026-07-04T11:00:00Z" }), NOW);
+    const late = runBadge(run({ status: "paused", created_at: "2026-07-04T11:59:00Z" }), NOW);
+    expect(early).toEqual(late);
+  });
+
+  // 🔴 paused is DELIBERATELY ABSENT from HEALTH_FLAGGABLE_STATUSES (like limit_wait): the
+  // health detector's signals all describe a running agent, and a paused run does nothing
+  // by design, so flagging it would put a false "⚠ stalled" on a run behaving as intended.
+  it("is NOT health-flaggable — a paused run never shows a ⚠", () => {
+    expect(isHealthFlaggableStatus("paused")).toBe(false);
+    expect(shouldShowHealthFlag("stalled", "paused")).toBe(false);
+    // A health flag on a paused run must not win over the status badge.
+    const b = runBadge(
+      run({ status: "paused", health: "stalled", health_since: "2026-07-04T11:59:00Z" }),
+      NOW,
+    );
+    if (b.kind === "badge") expect(b.label).toBe("‖ paused");
+  });
+
+  // A non-terminal hold, the web twin of the worker's TERMINAL_RUN_STATUSES 🔴 note.
+  it("is NOT terminal (isTerminalRun false, absent from TERMINAL_RUN_STATUSES)", () => {
+    expect(isTerminalRun("paused")).toBe(false);
+    expect(TERMINAL_RUN_STATUSES).not.toContain("paused");
   });
 });
 
@@ -449,6 +496,15 @@ describe("RUN_STATUS_TONES ↔ runStatusTone agreement", () => {
     // map and the list-row tone so the two cannot drift.
     expect(RUN_STATUS_TONES["recovery_wait"]).toEqual({ tone: "warning" });
     expect(runStatusTone("recovery_wait", null)).toBe("warning");
+  });
+
+  it("covers paused specifically, on both surfaces (PRD #1190)", () => {
+    // Same reasoning as limit_wait/pool_wait: the loop iterates the pill map, so an absent
+    // key is an absent assertion. paused is INFO (a chosen hold), not the warn the
+    // involuntary holds carry — pinned on both the pill map and the list-row tone so the
+    // two cannot drift.
+    expect(RUN_STATUS_TONES["paused"]).toEqual({ tone: "info" });
+    expect(runStatusTone("paused", null)).toBe("info");
   });
 
   it("leaves the unknown-status fallback alone", () => {

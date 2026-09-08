@@ -161,6 +161,44 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return s.submitScopeCeiling(ctx, run, ceiling, auditBody)
 	}
 
+	// A `pause` (PRD #1190 M1) is an owner-only request to park a running run on a pushed
+	// checkpoint. CreatePauseInput writes the three pending-pause columns + the kind='pause'
+	// audit row in ONE statement and LEAVES the run running (Decision 3) — the worker parks at
+	// its boundary. The mode is the body: 'now' or (default) 'milestone'; a second pause
+	// replaces the mode, so `now` escalates a pending `milestone`. A 0-row result means the
+	// kind/interactive/status allowlist refused; it is disambiguated into the two 409 classes
+	// from the already-loaded run row (pauseRefusalReason), the way ResumeRunNow words its 409
+	// after GetRunByIDForUser. Same accepted TOCTOU as scope.
+	if kind == "pause" {
+		mode := strings.TrimSpace(body)
+		if mode == "" {
+			mode = "milestone"
+		}
+		if mode != "milestone" && mode != "now" {
+			return SubmitInputResult{}, fmt.Errorf("%w: pause mode must be 'milestone' or 'now'", ErrInvalidPauseMode)
+		}
+		if _, err := s.q.CreatePauseInput(ctx, store.CreatePauseInputParams{ID: runID, Mode: pgconv.TextOrNull(mode)}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return SubmitInputResult{}, pauseRefusalReason(run)
+			}
+			return SubmitInputResult{}, err
+		}
+		return SubmitInputResult{ServerSide: false}, nil
+	}
+
+	// A `pause_cancel` (PRD #1190 M1) withdraws a pending pause on a still-running run,
+	// clearing the three columns + writing the kind='pause_cancel' audit row (CancelPauseInput)
+	// in one statement. A 0-row result means nothing was pending → 409.
+	if kind == "pause_cancel" {
+		if _, err := s.q.CancelPauseInput(ctx, runID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return SubmitInputResult{}, ErrNoPausePending
+			}
+			return SubmitInputResult{}, err
+		}
+		return SubmitInputResult{ServerSide: false}, nil
+	}
+
 	// A graceful `stop` (PRD #517 M4) is the interactive-run wind-down: unlike cancel/
 	// reject_plan it has NO server-side !live transition branch, because only the worker can
 	// finalize it (push + open MR iff open_mr) and report `completed` with stop_kind='stopped'.
@@ -648,6 +686,34 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 	}
 	c := ceiling
 	return SubmitInputResult{ServerSide: false, ScopeCeiling: &c}, nil
+}
+
+// pauseRefusalReason turns a 0-row CreatePauseInput into the specific 409 the owner sees
+// (PRD #1190 M1), decided from the already-loaded run row — the two causes CreatePauseInput's
+// allowlist predicate collapses into "0 rows". Status first: a non-running run is a park with
+// its own stopped clock (Decision 6), so the message names the status. Otherwise the kind or
+// interactivity is outside the allowlist (Decision 7), so it names why per kind. The returned
+// *PauseRefusedError unwraps to the matching sentinel (→ 409) and carries the sentence the
+// handler surfaces verbatim.
+func pauseRefusalReason(run store.Run) error {
+	if run.Status != "running" {
+		return &PauseRefusedError{
+			Msg:      fmt.Sprintf("run is %s; the clock is already stopped", run.Status),
+			Sentinel: ErrPauseNotRunning,
+		}
+	}
+	var why string
+	switch {
+	case run.Kind == runkind.Chat:
+		why = "chat runs already park between turns"
+	case run.Kind == runkind.Task && run.Interactive:
+		why = "interactive tasks park after each turn"
+	case run.Kind == runkind.Judge || run.Kind == runkind.MRRework || run.Kind == runkind.CIFix:
+		why = "judge, mr_rework and ci_fix runs are short and finish on their own"
+	default:
+		why = "pause is not supported for this run"
+	}
+	return &PauseRefusedError{Msg: why, Sentinel: ErrPauseNotSupported}
 }
 
 func stopKindFor(kind string) string {

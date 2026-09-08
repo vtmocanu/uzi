@@ -111,7 +111,8 @@ func (f *fakeNotifStore) SetSlackRunMilestoneNotified(_ context.Context, arg sto
 }
 func (f *fakeNotifStore) SetSlackRunLimitPause(_ context.Context, arg store.SetSlackRunLimitPauseParams) (store.SlackRunMessage, error) {
 	f.limitPauseSet = append(f.limitPauseSet, arg)
-	f.msg.LimitPausedAt = arg.At // stateful: the next GetSlackRunMessage sees the marker
+	f.msg.LimitPausedAt = arg.At  // stateful: the next GetSlackRunMessage sees the marker
+	f.msg.ParkKind = arg.ParkKind // stateful: the resume reads which park set it (PRD #1190)
 	return f.msg, nil
 }
 func (f *fakeNotifStore) ClearSlackRunLimitPause(_ context.Context, arg store.ClearSlackRunLimitPauseParams) (store.SlackRunMessage, error) {
@@ -1285,10 +1286,11 @@ func TestHumanWait(t *testing.T) {
 }
 
 // resumeThreadBlocks with hasWait=false (a negative or implausible duration) omits the
-// waited fragment yet still renders the ▶️ Resumed section and the repo#iid fallback.
+// waited fragment yet still renders the ▶️ Resumed section and the repo#iid fallback. A
+// limit_wait park kind keeps the "· usage limit cleared" clause (#1116).
 func TestResumeThreadBlocksOmitsFragmentWhenNoWait(t *testing.T) {
 	rc := baseRun("running")
-	blocks, fallback := resumeThreadBlocks(rc, -5*time.Minute, false, "https://uzi.example")
+	blocks, fallback := resumeThreadBlocks(rc, -5*time.Minute, false, "https://uzi.example", "limit_wait")
 	_, section := blockSummary(blocks)
 	if !strings.Contains(section, "Resumed · usage limit cleared") {
 		t.Fatalf("resume section = %q, want the resume head", section)
@@ -1298,6 +1300,103 @@ func TestResumeThreadBlocksOmitsFragmentWhenNoWait(t *testing.T) {
 	}
 	if fallback != "Resumed · grp/repo#42" {
 		t.Fatalf("resume fallback = %q, want `Resumed · grp/repo#42`", fallback)
+	}
+}
+
+// resumeThreadBlocks words the section header from the anchor's park kind (PRD #1190): an
+// owner pause reads a plain "▶️ *Resumed*", while a usage-limit park — and a legacy row whose
+// park_kind is "" (NULL, written before the column existed) — keeps the exact #1116
+// "▶️ *Resumed · usage limit cleared*" wording. The waited/working detail is unchanged.
+// Reddening mutation: drop the parkKind branch → the `paused` case reads the usage-limit
+// clause and fails.
+func TestResumeThreadBlocksHeaderPerParkKind(t *testing.T) {
+	rc := baseRun("running")
+	for _, tc := range []struct {
+		parkKind string
+		want     string
+		notWant  string
+	}{
+		{"paused", "▶️ *Resumed*", "usage limit cleared"},
+		{"limit_wait", "▶️ *Resumed · usage limit cleared*", ""},
+		{"", "▶️ *Resumed · usage limit cleared*", ""}, // legacy row: NULL park_kind, pre-column
+	} {
+		blocks, _ := resumeThreadBlocks(rc, time.Hour, true, "https://uzi.example", tc.parkKind)
+		_, section := blockSummary(blocks)
+		if !strings.Contains(section, tc.want) {
+			t.Errorf("parkKind %q: section = %q, want it to contain %q", tc.parkKind, section, tc.want)
+		}
+		if tc.notWant != "" && strings.Contains(section, tc.notWant) {
+			t.Errorf("parkKind %q: section = %q, must NOT contain %q", tc.parkKind, section, tc.notWant)
+		}
+	}
+}
+
+// PRD #1190 end-to-end through handle: an owner PAUSE that later runs posts exactly one
+// plain "▶️ *Resumed*" reply — never the usage-limit clause — because recordLimitPause
+// stamped park_kind='paused' on the anchor and handleLimitResume words the reply from it.
+// The park_kind round-trips through the stateful fake, so this proves the wiring, not just
+// resumeThreadBlocks in isolation.
+func TestNotifierPausedResumeReadsPlainResumed(t *testing.T) {
+	rc := baseRun("paused")
+	rc.StatusSince = pgtype.Timestamptz{Time: time.Now().Add(-30 * time.Minute), Valid: true}
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	// Owner pause: stamps the marker with park_kind='paused'.
+	fs.rc.Status = "paused"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "paused"})
+	if len(fs.limitPauseSet) != 1 || fs.limitPauseSet[0].ParkKind.String != "paused" {
+		t.Fatalf("an owner pause must stamp park_kind='paused': %+v", fs.limitPauseSet)
+	}
+
+	// Resume: exactly one ▶️ Resumed reply, worded WITHOUT the usage-limit clause.
+	fs.rc.Status = "running"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+	rb := resumeBlocks(fp.blocks)
+	if len(rb) != 1 {
+		t.Fatalf("a paused resume must post exactly one ▶️ Resumed reply: %+v", fp.blocks)
+	}
+	if strings.Contains(rb[0].sectionText, "usage limit cleared") {
+		t.Fatalf("an owner-pause resume must NOT say `usage limit cleared`: %q", rb[0].sectionText)
+	}
+	if !strings.Contains(rb[0].sectionText, "▶️ *Resumed*") {
+		t.Fatalf("an owner-pause resume section = %q, want plain `▶️ *Resumed*`", rb[0].sectionText)
+	}
+}
+
+// PRD #1116 stays exact under the #1190 generalisation: a usage-limit park that later runs
+// keeps the "· usage limit cleared" wording (park_kind='limit_wait'), driven end-to-end.
+func TestNotifierLimitWaitResumeKeepsUsageLimitClause(t *testing.T) {
+	rc := baseRun("limit_wait")
+	rc.StatusSince = pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	fs.rc.Status = "limit_wait"
+	fs.rc.LimitWaitCount = 1
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "limit_wait"})
+	if len(fs.limitPauseSet) != 1 || fs.limitPauseSet[0].ParkKind.String != "limit_wait" {
+		t.Fatalf("a usage-limit park must stamp park_kind='limit_wait': %+v", fs.limitPauseSet)
+	}
+
+	fs.rc.Status = "running"
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+	rb := resumeBlocks(fp.blocks)
+	if len(rb) != 1 {
+		t.Fatalf("a usage-limit resume must post exactly one ▶️ Resumed reply: %+v", fp.blocks)
+	}
+	if !strings.Contains(rb[0].sectionText, "Resumed · usage limit cleared") {
+		t.Fatalf("a usage-limit resume must keep `· usage limit cleared`: %q", rb[0].sectionText)
 	}
 }
 
@@ -1386,6 +1485,48 @@ func TestRenderThreadBlocksScopeCappedCompletion(t *testing.T) {
 	}
 	if fallback != "Completed · grp/repo#42" {
 		t.Errorf("normal completed fallback = %q, want plain `Completed · grp/repo#42`", fallback)
+	}
+}
+
+// PRD #1190: the owner-pause thread event reads "‖ *Paused by you*" and, when the run has
+// published a checkpoint, carries `checkpoint <short>` — the first 7 chars of checkpoint_tip
+// — alongside the `after milestone N` clause and the resume hint. A run that never published
+// a checkpoint omits the clause (the arm's "omit when absent" convention).
+func TestRenderThreadBlocksPausedCarriesCheckpoint(t *testing.T) {
+	rc := milestoneRun(t, 2, 5, "")
+	rc.Status = "paused"
+	rc.CheckpointTip = txt("abc1234def5678") // >7 chars: must be truncated
+
+	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+	if !ok {
+		t.Fatal("a paused transition must thread an event")
+	}
+	_, section := blockSummary(blocks)
+	if !strings.Contains(section, "‖ *Paused by you*") {
+		t.Fatalf("paused section = %q, want the owner-pause header", section)
+	}
+	ctx := contextText(blocks)
+	if !strings.Contains(ctx, "checkpoint abc1234") {
+		t.Fatalf("paused context = %q, want `checkpoint abc1234` (first 7 chars)", ctx)
+	}
+	if strings.Contains(ctx, "abc1234def") {
+		t.Fatalf("paused context = %q, must truncate checkpoint_tip to 7 chars", ctx)
+	}
+	if !strings.Contains(ctx, "after milestone 2") {
+		t.Fatalf("paused context = %q, want the `after milestone 2` clause", ctx)
+	}
+	if !strings.Contains(ctx, "uzi run resume "+rc.ID.String()) {
+		t.Fatalf("paused context = %q, want the resume hint", ctx)
+	}
+	if !strings.Contains(fallback, "Paused by you") {
+		t.Fatalf("paused fallback = %q, want it to name the owner pause", fallback)
+	}
+
+	// A run with no published checkpoint omits the clause entirely.
+	rc.CheckpointTip = pgtype.Text{}
+	blocks, _, _ = renderThreadBlocks(rc, "https://uzi.example")
+	if strings.Contains(contextText(blocks), "checkpoint") {
+		t.Fatalf("a run with no checkpoint must omit the clause: %q", contextText(blocks))
 	}
 }
 

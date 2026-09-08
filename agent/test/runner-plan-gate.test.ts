@@ -884,11 +884,11 @@ describe("RunRunner — milestones on the plan gate (PRD #122 M1)", () => {
   // succeed — a 409 (the run moved on / was cancelled or parked concurrently) or a
   // thrown transport/4xx — the run must NOT proceed to implementation and must NOT
   // enter awaiting_approval; it ends in failure. Both cases are forced with the
-  // FakeApi.failStateWhen hook, which knocks out ONLY the report carrying
-  // agent_selection (the autopilot plan report), leaving the ordinary heartbeats so
+  // FakeApi.failStateWhen hook, which knocks out ONLY the report carrying the
+  // submitted plan_md (the autopilot plan report), leaving the ordinary heartbeats so
   // the run still reaches the gate.
   const isAutopilotPlanReport = (s: StateRequest): boolean =>
-    s.status === "running" && s.agent_selection !== undefined;
+    s.status === "running" && s.plan_md === "# PLAN\n- do it";
 
   it("AUTOPILOT: a 409 on the plan report (run moved on) does NOT enter implementation", async () => {
     const { gitlab, calls } = fakeGitlab();

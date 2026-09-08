@@ -94,6 +94,9 @@ uzi run revise <id> [--message <text>]
 uzi run cancel <id>
 uzi run stop <id> [--message <text>]
 uzi run scope <id> --through <n>
+uzi run pause <id> [--now|--cancel]
+uzi run resume <id>
+uzi run resume-now <id>
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
@@ -222,6 +225,28 @@ A few worth knowing:
   below, not in `scope`'s own output, since a read-back there would race
   the worker settling it. Owner-only; valid only on a milestone-structured
   issue run (409 otherwise).
+- **`run pause <id> [--now|--cancel]`** (PRD #1190) parks a running run on a
+  pushed checkpoint until you resume it — see [Pausing and resuming a
+  run](./run-pause.md) for the full picture. The default finishes the
+  milestone (or turn) already in flight, pushes a checkpoint, then parks;
+  `--now` drops the turn in flight and parks on the last checkpoint instead,
+  discarding whatever changed since; `--cancel` withdraws a pending request
+  and leaves the run running. `--now` and `--cancel` are mutually exclusive.
+  None of the three is synchronous — the park lands on the worker's next
+  report, so watch `uzi run get <id>`. Owner-only, and valid only on a
+  running issue, non-interactive task, prompt or self-improve run: a chat
+  run already parks between turns, an interactive task parks after every
+  turn, judge/mr-rework/ci-fix runs finish on their own, and a run already
+  at a gate or an involuntary park is refused too — all as a 409 (exit 5)
+  naming the reason.
+- **`run resume <id>`** resumes a run the owner paused: it moves the run
+  from `paused` back to `queued`, keeps the worker pin, and preserves the
+  remaining budget (the clock stopped while paused, so resuming does not
+  reset it). The claim then continues the same SDK session if that worker
+  is still alive, or recovers the branch from the checkpoint and re-plans
+  the remaining milestones if it's gone. A run that isn't paused is a 409
+  (exit 5). It posts to the same endpoint as `run resume-now` below, which
+  now also resumes a paused run in addition to a pool-held one.
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open
@@ -769,12 +794,14 @@ also the TUI's own fallback when the live channel is unreachable (below).
   For a milestone-structured run the rail also shows a
   `MILESTONES {done}/{total}` block below the lanes, one row per approved
   milestone in order, marked `✓` reported complete, `○` not started, or —
-  for the milestone in progress — a `◐` that blinks `◐`/`○` in the faint grey
+  for a milestone in progress — a `◕` that blinks `◕`/`○` in the faint grey
   colour (the same colour as a not-started `○`; the row is told apart by the
-  `◐` shape, its motion and a brighter title, never by colour), a static `◐`
+  `◕` shape, its motion and a brighter title, never by colour), a static `◕`
   under `UZI_TUI_NO_BLINK=1` or a non-tty render. The rail's eyebrow also
-  carries a compact `▰`/`▱` micro-bar whose in-progress cell blinks in
-  tungsten, the twin of the board's. The count reads "reported complete", not verified: uzi shows
+  carries a compact `▰`/`▱` micro-bar that blinks one cell per milestone in
+  progress in tungsten, the twin of the board's, and names the in-progress
+  milestone(s) after the count (e.g. `· m1, m2`, capped at two then `+N`).
+  The count reads "reported complete", not verified: uzi shows
   what the run reported and does not itself check the work. The
   in-progress row also carries a **now line** beneath it — `↳ <role> ·
   <age>` plus its task label — the crew rail's own current-activity read;
@@ -1275,11 +1302,11 @@ readable the same way under `--json`.
 
 ### Run status, and what `--follow` waits for
 
-A run's `status` (on `run get` and `run list`) is one of exactly **twelve** values:
+A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** values:
 `queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
-`awaiting_followup`, `limit_wait`, `pool_wait`, `recovery_wait`, `completed`,
+`awaiting_followup`, `limit_wait`, `pool_wait`, `recovery_wait`, `paused`, `completed`,
 `failed`, `cancelled`. Only the last three are **terminal**, and `uzi run logs
---follow` returns **only** on those three. The six non-terminal parks it will
+--follow` returns **only** on those three. The seven non-terminal parks it will
 *not* stop at:
 
 - `awaiting_approval` — the plan gate;
@@ -1298,6 +1325,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **twelve** valu
   (no model activity); the sweep auto-resumes it on a capped backoff until it
   recovers or you cancel it — see [Recovering from an empty
   turn](run-recovery-wait.md).
+- `paused`: an owner-requested hold (`uzi run pause`), resumed on demand from
+  the run page or `uzi run resume <id>`. See [Pausing and resuming a
+  run](run-pause.md). It does **not** auto-resume.
 
 `limit_wait` and `recovery_wait` auto-resume on their own on a timer — nothing
 to do but wait or cancel; `pool_wait` instead clears only when a token is
@@ -1315,7 +1345,7 @@ A `running` run whose agent is still drafting its plan, pre-approval, reads
 **planning** instead — in the STATUS column of `run list`/`run get`, in the
 TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
-It's still the same `running` value underneath, not a thirteenth status.
+It's still the same `running` value underneath, not an additional status.
 
 ### Waiting for a state: `uzi run wait`
 
@@ -1324,11 +1354,11 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `while … run get … sleep` poll loop. With no `--until` it stops on any
 **actionable or terminal** state (`awaiting_approval`, `awaiting_input`,
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
-rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait` —
-the three parks resume without a `run wait`-actionable step: `limit_wait` and
-`recovery_wait` on a timer, `pool_wait` once a token is pooled), so a bare
-`run wait` means "wait for the
-plan gate, a clarification, an interactive task's park, **or** the end".
+rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`):
+limit and recovery waits retry on a timer, pool waits need an available pooled token,
+and owner pauses need `uzi run resume`. A bare `run wait` means
+"wait for the plan gate, a clarification, an interactive task's park, **or**
+the end".
 
 - It **exits 0** the moment a target state is reached — including if the run is
   already in one when you call it.
@@ -1340,7 +1370,7 @@ plan gate, a clarification, an interactive task's park, **or** the end".
   gate, so a bare wait cannot hang.
 - A single transient `6` (a server blip) is retried, not fatal; a `4` (not
   found) is immediate.
-- `--until <a,b>` overrides the stop set, validated against the twelve statuses.
+- `--until <a,b>` overrides the stop set, validated against the thirteen statuses.
 - `--min-plan-seq <n>` is for waiting on a REVISED plan after `uzi run
   revise`: it makes the wait stop at `awaiting_approval` only once a plan
   message with seq greater than `<n>` exists, so it does not return on the

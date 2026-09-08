@@ -303,18 +303,31 @@ model); this section is the map. User-facing usage is
   there are no template rows, so every repo subagent receives the whole surviving
   set.
 - **Repo skills** (`agent/src/repo-skills.ts`), opt-in and default off. Only when
-  `ClaimRepo.skills_enabled`, the worker enumerates
-  `<clone>/.claude/skills/*/SKILL.md` after checkout, keeping only the `name` and
-  `description` frontmatter keys (every other key, e.g. `allowed-tools`, is
-  stripped, the security point) and re-synthesizing through the same escaped-YAML
-  materializer. Repo skills carry no allocation, so a surviving one attaches to
-  **every** template; they rank lowest (a name collision with any delivered skill
-  drops the repo skill) and are first evicted if the set exceeds
-  `skills_max_per_run`. This is the **only** clone-borne configuration the worker
-  reads (no hooks, settings, commands, or `CLAUDE.md`), which is why the toggle is
-  per repo: a repo's `.claude/` is exactly the config class `settingSources: []`
-  keeps closed, so loading even this much requires the repo owner or an admin to
-  vouch for that repo's review discipline.
+  `ClaimRepo.skills_enabled`, the worker enumerates two real-directory roots after
+  checkout — `<clone>/.claude/skills/*/SKILL.md` (what Claude Code reads) and
+  `<clone>/.agents/skills/*/SKILL.md` (the cross-agent root Codex reads, issue
+  #1205) — keeping only the `name` and `description` frontmatter keys (every other
+  key, e.g. `allowed-tools`, is stripped, the security point) and re-synthesizing
+  through the same escaped-YAML materializer. Both roots run the identical
+  validation, symlink refusal included (each root, each skill dir, and each
+  `SKILL.md` must be a real directory/file, so a hostile repo cannot redirect
+  enumeration outside the clone); on a real-vs-real name collision `.claude/skills`
+  wins and the shadowed `.agents/skills` entry is recorded as a drop. The canonical cross-agent layout
+  keeps the real bodies under `.agents/skills` and projects `.claude/skills` as a
+  symlink, so the symlink-refusing guard reads the `.agents/skills` side. The
+  symlink refusal covers each root's immediate in-clone parent too (`.claude` /
+  `.agents`), since `lstat` follows a symlinked parent (issue #1205 follow-up). Repo
+  skills carry no allocation, so a surviving one attaches to **every** template;
+  they rank lowest (a name collision with any delivered skill drops the repo skill)
+  and are first evicted if the set exceeds `skills_max_per_run`. These two roots are
+  the **only** clone-borne configuration the worker reads (no hooks, settings,
+  commands, or `CLAUDE.md`), and it reads them through its OWN enumeration, not the
+  SDK: `settingSources: []` keeps the SDK from auto-loading the clone's `.claude/`
+  config class (settings, hooks, commands, subagents, `CLAUDE.md`), and `.agents/`
+  is not an SDK setting source at all. The opt-in deliberately re-opens one narrow,
+  skills-only slice of that otherwise-closed clone-config class, which is why the
+  toggle is per repo: it requires the repo owner or an admin to vouch for that
+  repo's review discipline.
 - **Trust boundary.** `settingSources: []` stays `[]` with or without repo skills
   enabled; the plugin channel (`plugins: [{type: 'local', ...}]`) is a separate SDK
   option, so this delivery never loosens that isolation. A hostile repo skill still
@@ -584,6 +597,7 @@ queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiti
    ↳ (auto lane, token pool empty) → pool_wait → queued, once a token is pooled (or resume-now)
    ↳ (resumed turn came back empty) → recovery_wait → queued, on a capped backoff, no lifetime cap
    ↳ (interactive task, clean signal_done) → awaiting_followup, no auto-resume — wound down by run stop or idle timeout
+   ↳ (owner pause) → paused → queued, resume on demand (no limit on count) → running
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
 
@@ -610,8 +624,10 @@ chain in the diagram above, with no intervening `running`.
 
 - **running → limit_wait** (PRD #35, opt-in per run or per user) — a run that
   exhausts the owner's Anthropic usage limit **parks** instead of failing: the
-  worker's slot is released while its runner clone, skills plugin dir and per-run
-  SDK home stay on disk so the resume continues the same session. A sweeper
+  worker's slot is released while its skills plugin dir and per-run SDK home
+  stay on disk so a same-worker resume can continue the session. The clone is
+  normally removed and reseeded from the captured tracking/checkpoint refs
+  (verified 2026-09-08 during issue #1197 review). A sweeper
   promotes it back to `queued` once `retry_not_before` passes (server-timed and
   server-clamped, never worker-trusted: the earliest moment this user could spend
   anything across the whole credential pool), and the resume skips the plan gate
@@ -630,7 +646,7 @@ chain in the diagram above, with no intervening `running`.
   [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection property. See
   [adr/0759-protect-run-work-usage-limit-park.md](adr/0759-protect-run-work-usage-limit-park.md).
 
-- **running → pool_wait** (PRD #754) — an `auto`-lane worker's whole opted-in
+- **claimed → pool_wait** (PRD #754): an `auto`-lane worker's whole opted-in
   token pool is genuinely empty, so the run **holds** rather than reach for
   the owner's non-pooled default: non-locking (excluded from the
   one-non-terminal-run-per-issue index), so a held run never pins its issue.
@@ -639,17 +655,21 @@ chain in the diagram above, with no intervening `running`.
   See the Anthropic-credential discussion above and
   [docs/anthropic-token.md](docs/anthropic-token.md#waiting-for-a-token).
 
-- **running → recovery_wait → queued** (issue #1197) — a resumed SDK turn
+- **running → recovery_wait → queued** (issue #1197): an SDK turn
   that comes back **positively empty** (zero turns, no model activity) is
-  retried a bounded number of times in-process before the worker best-effort
-  captures the run's local restore point and parks it in `recovery_wait`. A
+  retried a bounded number of times in-process before the worker verifies
+  the run's local restore point and parks it in `recovery_wait`. Failed capture
+  keeps the execution active and retries with its source clone/session retained;
+  a worker-owned journal prevents destructive reseeding after restart. Remote
+  publication is best-effort and provides the cross-worker restore point. A
   sweeper promotes it back to `queued` on a **capped exponential backoff**
-  (doubling from a short base, clamped at a ceiling) — like `limit_wait` but
+  (doubling from a short base, clamped at a ceiling), like `limit_wait` but
   with **no lifetime cap and no terminal branch**: the park always becomes
   promotable again, so the run keeps recovering until it succeeds or the
-  owner cancels. It is the shared transient-recovery park primitive — any
+  owner cancels. Genuine running watchdogs still apply. It is the shared
+  transient-recovery park primitive: any
   transient cause can report `recovery_wait` and reuse the same
-  preserve→park→promote→reclaim lifecycle — so issue #1088's provider-error
+  preserve→park→promote→reclaim lifecycle, so issue #1088's provider-error
   classifier can adopt it without a competing mechanism. See
   [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md)
   and [docs/run-recovery-wait.md](docs/run-recovery-wait.md).
@@ -660,6 +680,24 @@ chain in the diagram above, with no intervening `running`.
   auto-resume on its own**: it is wound down explicitly with `uzi run stop`,
   or by its worker-side idle timeout. See
   [docs/handoff.md](docs/handoff.md#interactive-mode).
+- **running → paused** ([PRD #1190](prds/1190-run-pause-resume.md)) — the
+  owner-requested twin of `limit_wait`: `pause` (default: after the milestone
+  or turn in flight; `--now`: drop it) is a **flag** on the still-running run,
+  and the worker parks only after it publishes a checkpoint — a failed
+  publish clears the request and leaves the run running rather than parking
+  on an unrecoverable worker disk. `resume` moves `paused` back to `queued`
+  keeping the worker pin, exactly like the limit park's promotion, but its
+  budget accounting is the **gate-park** rule, not the limit park's: the
+  parked wall-clock is banked into `budget_paused_seconds` and `started_at`
+  is kept, so the clock stops rather than resetting and the remaining budget
+  is preserved. A pending request made before an involuntary park
+  (`limit_wait`/`pool_wait`/`awaiting_input`) survives it and re-arms at the
+  first boundary after the run resumes, since none of those parks clears the
+  pause columns. See [docs/run-pause.md](docs/run-pause.md) and
+  [adr/1190-run-pause-invariants.md](adr/1190-run-pause-invariants.md) for
+  the negative-space rules — the run-status lists `paused` must never enter,
+  and the guards that must not be relaxed — that a future edit could break
+  silently.
 
 - **Affinity holds through a worker roll** ([PRD #1030](prds/done/1030-worker-resume-durability.md)).
   The fix distinguishes a **roll** (sets `draining_since`, keeps the worker row)
@@ -671,6 +709,9 @@ chain in the diagram above, with no intervening `running`.
   publish outcomes now surface on the run feed, and every terminal transition
   deletes the run's `refs/uzi-checkpoints/<branch>`. See
   [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
+  This same affinity leg is what lets a **paused** run's `resume` fall open
+  to a different worker once the pinned one is stale or gone; see
+  [ADR-1190](adr/1190-run-pause-invariants.md).
 
 - **The checkpoint net survives a branch behind `main` on `.github/workflows`**
   ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), completing

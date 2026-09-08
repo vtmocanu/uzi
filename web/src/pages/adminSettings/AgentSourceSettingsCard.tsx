@@ -168,7 +168,7 @@ function AgentSourceStagedReview({
                   )}
                   {/* prompt_body is ALREADY server-sanitized (termsafe.SanitizeTTY) — a
                       plain text node, never dangerouslySetInnerHTML. */}
-                  <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-edge bg-ink p-3 text-xs text-muted">
+                  <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-edge bg-ink console p-3 text-xs text-muted">
                     {role.prompt_body}
                   </pre>
                 </div>

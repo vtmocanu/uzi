@@ -206,10 +206,11 @@ func milestoneCount(done, total int, reported bool) string {
 }
 
 // milestoneInProgress returns the FIRST frozen milestone (by frozen order) that is in the run's
-// in-progress set and not already completed — the D4 selection rule: the one id that blinks,
-// carries the `· <id>` eyebrow suffix and is named on the board second line. Completed ids are
-// excluded so a stale in-progress snapshot cannot double-count a ticked milestone. Returns
-// ("", "") when nothing is declared in progress.
+// in-progress set and not already completed — the one-activity-one-milestone selection rule: the
+// id named on the board second line (boardSecondLine) and the crew-rail now-line attach point.
+// Since #1176 the blinking micro-bar cells and the eyebrow `· <id>, <id>` suffix derive from
+// milestoneInProgressIDs, NOT this. Completed ids are excluded so a stale in-progress snapshot
+// cannot double-count a ticked milestone. Returns ("", "") when nothing is declared in progress.
 func milestoneInProgress(run apitypes.RunDTO) (id, title string) {
 	if len(run.MilestonesInProgress) == 0 || len(run.Milestones) == 0 {
 		return "", ""
@@ -230,6 +231,69 @@ func milestoneInProgress(run apitypes.RunDTO) (id, title string) {
 	return "", ""
 }
 
+// milestoneInProgressIDs returns EVERY frozen milestone id (in frozen order) that is in the run's
+// in-progress set and not already completed — the set the two milestone micro-bars count as
+// blinking cells and the eyebrow suffix lists (#1176). Iterating the frozen Milestones slice (NOT
+// MilestonesInProgress) is load-bearing: it drops an id absent from the frozen list, dedups a
+// repeated in-progress id, and bounds the result to total-done (every entry is a not-completed
+// frozen milestone), so a stale or duplicated snapshot can never overflow the bar. milestoneInProgress
+// stays the FIRST-by-frozen-order selection the naming (boardSecondLine) and now-line-attach sites need.
+func milestoneInProgressIDs(run apitypes.RunDTO) []string {
+	if len(run.MilestonesInProgress) == 0 || len(run.Milestones) == 0 {
+		return nil
+	}
+	inProg := make(map[string]bool, len(run.MilestonesInProgress))
+	for _, mid := range run.MilestonesInProgress {
+		inProg[mid] = true
+	}
+	completed := make(map[string]bool, len(run.MilestonesCompleted))
+	for _, mid := range run.MilestonesCompleted {
+		completed[mid] = true
+	}
+	var ids []string
+	for _, mi := range run.Milestones {
+		if inProg[mi.ID] && !completed[mi.ID] {
+			ids = append(ids, mi.ID)
+		}
+	}
+	return ids
+}
+
+// milestoneIPSuffix builds the eyebrow's `<id>, <id> +N` in-progress suffix from the frozen-order
+// in-progress id list, BUDGETED to fit maxWidth visual columns (the width the rail line can carry):
+// up to two ids joined by ", ", then " +N" for the rest (`m1`, `m1, m2`, `m1, m2 +1`), dropping to a
+// single id + a larger " +N" when two ids would overflow maxWidth — so a long-slug pair still fits
+// the fixed 26-col rail and the in-flight COUNT is folded into +N, never clamped away. Each id is
+// UNTRUSTED (a frozen key) and goes through renderer.Plain(id, 12); the +N is a plain integer.
+// Empty for no ids (or a maxWidth too small to hold one). Both this and the bar's cell count derive
+// from milestoneInProgressIDs, so the shown set never overstates what the bar counts.
+func (m tuiModel) milestoneIPSuffix(ids []string, maxWidth int) string {
+	if len(ids) == 0 || maxWidth < 1 {
+		return ""
+	}
+	// Prefer two ids; fall back to one when two would overflow the rail. The dropped ids always
+	// ride " +N", so the count is folded, never silently lost.
+	for _, show := range []int{2, 1} {
+		if show > len(ids) {
+			continue
+		}
+		parts := make([]string, 0, show)
+		for _, id := range ids[:show] {
+			parts = append(parts, m.renderer.Plain(id, 12))
+		}
+		s := strings.Join(parts, ", ")
+		if extra := len(ids) - show; extra > 0 {
+			s += " +" + itoa(extra)
+		}
+		if visualWidth(s) <= maxWidth {
+			return s
+		}
+	}
+	// Unreachable at the rail's budget (a single Plain-capped id + " +N" is <= ~18 cols), but keep
+	// the line bounded if maxWidth is ever pathologically small.
+	return clampVisual(m.renderer.Plain(ids[0], 12), maxWidth)
+}
+
 // milestoneCell renders the blinking in-progress milestone micro-bar cell (PRD #1136, recoloring
 // #1064 D4): ▰ when the model's blink phase is on, ▱ when off, in the tungsten colour (matching
 // the done fill; the blink and the empty ▱ off-frame, not the hue, set it apart — PRD #1136 D2).
@@ -245,10 +309,10 @@ func (m tuiModel) milestoneCell(bg color.Color) string {
 }
 
 // milestoneRowCell renders the crew-rail checklist's in-progress milestone ROW mark (PRD #1136
-// D4/D5): a ◐ ⇄ ○ half-circle blinking on the SAME tick as the micro-bar but in ANTI-PHASE, and
+// D4/D5): a ◕ ⇄ ○ half-circle blinking on the SAME tick as the micro-bar but in ANTI-PHASE, and
 // in the faint/grey colour (faintC) — the SAME colour a not-started ○ uses, so the ○ phase reads
 // as one of the row's not-yet-started siblings and the row reads as a single grey circle pulsing
-// toward done. The polarity is INVERTED relative to milestoneCell: blinkOn==false → ◐ (the
+// toward done. The polarity is INVERTED relative to milestoneCell: blinkOn==false → ◕ (the
 // presence frame), which is therefore ALSO the static / non-tty / UZI_TUI_NO_BLINK frame, keeping
 // the in-progress state legible by SHAPE when the tint is stripped and never collapsing to a bare
 // not-started ○. Not milestoneCell (opposite mapping, different glyphs and colour).
@@ -256,9 +320,9 @@ func (m tuiModel) milestoneCell(bg color.Color) string {
 // blink gates the animation to the SAME non-terminal condition the eyebrow micro-bar uses (D4):
 // blinkOn is a GLOBAL phase (any live board run drives the tick), so without this gate a terminal
 // run carrying a stale MilestonesInProgress would pulse its row to a bare ○ — the exact "never a
-// bare ○" case D4/SC3 exist to prevent. When !blink the row is the static ◐ presence frame.
+// bare ○" case D4/SC3 exist to prevent. When !blink the row is the static ◕ presence frame.
 func (m tuiModel) milestoneRowCell(blink bool) string {
-	g := "◐"
+	g := "◕"
 	if blink && m.blinkOn {
 		g = "○"
 	}
@@ -303,7 +367,7 @@ func activityLabel(act *apitypes.RunActivity) string {
 // renderMilestones is the crew rail's milestone progress block (the TUI twin of the web's
 // MilestoneChecklist and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
 // summary and one row per milestone in FROZEN order — done ✓, not started ○, and the
-// in-progress milestone as the blinking ▰/▱ wait-colour cell (PRD #1064 M4; no ◐ glyph).
+// in-progress milestone as a faint ◕ ⇄ ○ half-circle blink (milestoneRowCell; PRD #1136 D4/D5).
 //
 // Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run's
 // rail is byte-for-byte unchanged — the same back-compat contract the nil Milestones slice
@@ -335,11 +399,17 @@ func (m tuiModel) renderMilestones() string {
 	done, total, reported := milestoneProgress(m.detail.run)
 	terminal := terminalRunStatuses[m.detail.run.Status]
 
-	// The FIRST in-progress id (frozen order, D4) is the one that blinks, carries the `· <id>`
-	// eyebrow suffix and hosts the now line. A terminal run's in-progress snapshot is stale, so
-	// nothing blinks there.
+	// milestoneInProgress stays the FIRST-by-frozen-order id and now drives ONLY the now-line
+	// attach point (which milestone the crew's activity rides under). The micro-bar counts EVERY
+	// in-progress milestone and the eyebrow suffix lists them (#1176); a terminal run's in-progress
+	// snapshot is stale, so nothing blinks there.
 	ipID, _ := milestoneInProgress(m.detail.run)
-	blink := ipID != "" && done < total && !terminal
+	ipIDs := milestoneInProgressIDs(m.detail.run)
+	n := len(ipIDs)
+	if rem := total - done; n > rem {
+		n = rem
+	}
+	blink := n > 0 && done < total && !terminal
 	// The rail's "now" line comes from the crew rail's OWN frames via the same runactivity rule
 	// the server runs, so the DTO and the rail cannot disagree (D3). No now line on a terminal
 	// run — a finished run has no "now".
@@ -357,19 +427,28 @@ func (m tuiModel) renderMilestones() string {
 		empty := total - done
 		mid := ""
 		if blink {
-			mid = m.milestoneCell(nil)
-			empty--
+			mid = strings.Repeat(m.milestoneCell(nil), n)
+			empty -= n
 		}
 		bar = lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(strings.Repeat("▰", done)) +
 			mid + m.pal.faint.Render(strings.Repeat("▱", empty)) + " "
 	}
 	eyebrow := m.pal.faint.Render("MILESTONES") + " " + bar + m.pal.faint.Render(milestoneCount(done, total, reported))
-	if ipID != "" {
-		// `· <id>` names the milestone the crew is on, carrying the state without motion for a
-		// static/non-tty frame. The id is a validated frozen key, sanitized defensively.
-		eyebrow += m.pal.faint.Render(" · " + m.renderer.Plain(ipID, 12))
+	// `· <id>, <id> +N` lists the in-progress milestones (frozen order) the bar counts — the in-flight
+	// set carried without motion for a static/non-tty frame. joinColumns clamps EVERY rail line to
+	// laneRailWidth (26) in the composed View, so the suffix is budgeted to the rail's continuation
+	// width (milestoneIPSuffix folds a long-id overflow into " +N") and, when appending it inline
+	// would push the eyebrow past the rail, dropped to its own continuation line — so the line always
+	// fits the 26-col rail and the in-flight count never ellipsizes away in the composed view (#1176).
+	switch suffix := m.milestoneIPSuffix(ipIDs, laneRailWidth-visualWidth("· ")); {
+	case suffix == "":
+		sb.WriteString(eyebrow + "\n")
+	case visualWidth(eyebrow)+visualWidth(" · "+suffix) <= laneRailWidth:
+		sb.WriteString(eyebrow + m.pal.faint.Render(" · "+suffix) + "\n")
+	default:
+		sb.WriteString(eyebrow + "\n")
+		sb.WriteString(m.pal.faint.Render("· "+suffix) + "\n")
 	}
-	sb.WriteString(eyebrow + "\n")
 	// Nothing declared in progress but there IS activity: an unattached now line directly under
 	// the eyebrow (PRD #1064 mock; #390 D7 — declared, not inferred, so the milestone stays
 	// unmarked).
@@ -386,9 +465,9 @@ func (m tuiModel) renderMilestones() string {
 			// strikethrough (which lipgloss emits per-rune, bloating the frame for no signal).
 			style = m.pal.faint
 		case inProgress[mi.ID]:
-			// Every in-progress row is a ◐ ⇄ ○ half-circle blink in the faint/grey colour (PRD
-			// #1136 D4/D5), static ◐ under non-tty / NO_BLINK or on a terminal run (blink==false,
-			// same gate as the eyebrow micro-bar). The brighter (plain-fg) title, the ◐ shape, and
+			// Every in-progress row is a ◕ ⇄ ○ half-circle blink in the faint/grey colour (PRD
+			// #1136 D4/D5), static ◕ under non-tty / NO_BLINK or on a terminal run (blink==false,
+			// same gate as the eyebrow micro-bar). The brighter (plain-fg) title, the ◕ shape, and
 			// the motion — never the glyph colour — separate it from a not-started ○.
 			glyph = m.milestoneRowCell(blink)
 			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg

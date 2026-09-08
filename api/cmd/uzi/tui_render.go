@@ -221,13 +221,14 @@ func displayHealth(health string) string {
 // this is the single source that fixes that class of drift). The underlying status/health
 // strings still drive all logic, filtering and sorting; this only changes what is shown.
 //
-// HEALTH OVERRIDE: a WARN health flag (stalled/looping/slow) replaces the status token
+// HEALTH OVERRIDE: except during recovery_wait, a WARN health flag (stalled/looping/slow) replaces the status token
 // entirely with ▲ + the health word, because a run that needs attention is what the board
 // is FOR. ok/empty health shows the status token. The word is the DISPLAY word from
 // displayHealth, so the `slow` enum PRD #1170 kept (D1) reads as "near timeout" here while
 // every logic path still keys off the raw enum.
 func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, word string) {
-	if stalledHealth[health] {
+	// Recovery does no work while parked; stale health must not hide its wait state.
+	if status != statusRecoveryWait && stalledHealth[health] {
 		return "▲", displayHealth(health)
 	}
 	switch effectiveRunStatus(status, isPlanning, isRevising) {
@@ -263,6 +264,13 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, 
 		// Same wait-family glyph as limit_wait/pool_wait (all non-terminal holds), distinct
 		// word so a user can tell them apart at a glance.
 		return "~", "recovery wait"
+	case statusPaused:
+		// PRD #1190: an owner pause. The ‖ glyph (a pause bar) is its own vocabulary entry
+		// beside the two ~ parks — an owner did this, the ~ parks happened to the run — and
+		// it is the NO_COLOR twin of the wait ink below, legible under an Ascii profile the
+		// way ~ is. Without this the default arm would draw a faint "· paused", identical to
+		// queued, so a parked run would read as idle.
+		return "‖", "paused"
 	case "completed":
 		return "✓", "done"
 	case "failed":
@@ -275,9 +283,10 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, 
 }
 
 // stateColor is the colour half of the state token, resolved from the same ANDON tokens.
-// Health warn wins (→ stall orange); otherwise the status maps to its material.
+// Health warn wins (→ stall orange), except recovery_wait ignores stale health;
+// otherwise the status maps to its material.
 func (p palette) stateColor(status, health string, isPlanning, isRevising bool) color.Color {
-	if stalledHealth[health] {
+	if status != statusRecoveryWait && stalledHealth[health] {
 		return p.stall
 	}
 	switch effectiveRunStatus(status, isPlanning, isRevising) {
@@ -291,10 +300,8 @@ func (p palette) stateColor(status, health string, isPlanning, isRevising bool) 
 	case "awaiting_approval", "awaiting_input", "awaiting_followup":
 		// awaiting_followup (PRD #517) is a needs-you park like the other two: amber.
 		return p.amber
-	case statusLimitWait, statusPoolWait, statusRecoveryWait:
-		// pool_wait (PRD #754) and recovery_wait (issue #1197) are non-terminal holds like
-		// limit_wait, so they share the wait colour — the glyph word distinguishes them,
-		// not the ink.
+	case statusLimitWait, statusPoolWait, statusRecoveryWait, statusPaused:
+		// All four holds share the wait colour; the glyph and word distinguish them.
 		return p.wait
 	case "failed":
 		return p.alarm

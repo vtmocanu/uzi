@@ -695,6 +695,9 @@ func TestNormalizeRunEventTable(t *testing.T) {
 		// consumer AS "limit_wait". Dropping it from knownRunStatuses turns this into
 		// RunStatusUnknown here rather than anywhere visible in the CLI's own code.
 		{"limit_wait survives the decode boundary", apitypes.RunEventDTO{Type: "state", Status: "limit_wait"}, "state", "limit_wait"},
+		// PRD #1190: an owner pause is non-terminal and must reach the consumer AS "paused"
+		// (not RunStatusUnknown), so `run wait` and the TUI keep waiting on it and print it.
+		{"paused survives the decode boundary", apitypes.RunEventDTO{Type: "state", Status: "paused"}, "state", "paused"},
 		{"unknown status is made inert", apitypes.RunEventDTO{Type: "state", Status: "ascended"}, "state", RunStatusUnknown},
 		{"empty status on a state frame is inert too", apitypes.RunEventDTO{Type: "state"}, "state", RunStatusUnknown},
 		{"unknown type is made inert and loses its status", apitypes.RunEventDTO{Type: "teleport", Status: "running"}, RunEventTypeUnknown, ""},
@@ -731,7 +734,10 @@ func TestIsTerminalRunStatus(t *testing.T) {
 	// terminal would stop `uzi run logs --follow` (run.go's own terminalRunStatuses),
 	// stop this stream's reconcile ticker, and make the TUI draw every lane `done` —
 	// three surfaces going quiet on a run that is about to start talking again.
-	for _, s := range []string{"queued", "claimed", "running", "awaiting_approval", "limit_wait", RunStatusUnknown, ""} {
+	// paused (PRD #1190) joins this list for limit_wait's exact reason: an owner park
+	// resumes on demand, so calling it terminal would stop the follow loop, the reconcile
+	// ticker and the TUI on a run that is about to resume.
+	for _, s := range []string{"queued", "claimed", "running", "awaiting_approval", "limit_wait", "paused", RunStatusUnknown, ""} {
 		if IsTerminalRunStatus(s) {
 			t.Errorf("IsTerminalRunStatus(%q) = true, want false — treating a live run as terminal stops the reconcile that would have corrected it", s)
 		}
@@ -754,9 +760,9 @@ func TestIsTerminalRunStatus(t *testing.T) {
 // map, and the count in its comment.
 func TestKnownRunStatusesMatchTheDocumentedCount(t *testing.T) {
 	// Bump BOTH this number and knownRunStatuses' comment when the CHECK widens.
-	// 12 since issue #1197 added 'recovery_wait' alongside PRD #754's 'pool_wait',
-	// PRD #517's 'awaiting_followup', PRD #88's 'awaiting_input' and PRD #35's 'limit_wait'.
-	const documented = 12
+	// 13 after PRD #1190 added 'paused' and issue #1197 added 'recovery_wait'
+	// alongside the existing non-terminal holds.
+	const documented = 13
 	if len(knownRunStatuses) != documented {
 		t.Errorf("len(knownRunStatuses) = %d, want %d — the map and the count its own comment states have drifted; one of the two was edited alone", len(knownRunStatuses), documented)
 	}
@@ -868,12 +874,17 @@ func TestStreamRunCloseWhileConsumerIsNotReading(t *testing.T) {
 // CLAUDE.md documents for the repo-root fixtures/ directory.
 //
 // 🔴 THE RESIDUAL — one case, and it is narrower than "a rename breaks this". The scan
-// selects the last migration whose UP half names `runs_status_check`. Measured against
-// the three ways that name can move:
+// selects the last migration whose UP half BOTH names `runs_status_check` AND defines it
+// with a `CHECK (status IN (...))`. Requiring the CHECK, not just the name, is what lets a
+// migration that only REFERENCES the constraint be skipped rather than mis-selected — e.g.
+// 00205's `VALIDATE CONSTRAINT runs_status_check`, or a bare `DROP CONSTRAINT`, names it
+// but carries no CHECK, so it is passed over and the real defining migration is chosen.
+// Measured against the ways that name can move:
 //
 //	renamed in place (no migration names it)     -> FATAL, loudly: "reading the wrong thing"
-//	new migration DROPs it and ADDs a new name   -> caught: the DROP still names it, so
+//	new migration DROPs it and ADDs a new name   -> caught: the ADD carries the new CHECK, so
 //	                                                that file is chosen and its new CHECK parsed
+//	new migration only VALIDATEs / DROPs it      -> skipped: no CHECK, so it is not selected
 //	new migration widens WITHOUT ever naming it  -> SILENT PASS. This is the hole.
 //
 // Only the third is uncovered, and no amount of parsing here can see it: the scan has
@@ -898,7 +909,11 @@ func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
 	sort.Strings(paths)
 
 	// Take the LAST declaration, not the first: the domain is widened by successive
-	// migrations and only the most recent one describes the live constraint.
+	// migrations and only the most recent one describes the live constraint. Selection
+	// requires the UP half to both NAME runs_status_check and carry a `CHECK (status IN
+	// (...))`; a migration that only references the constraint without a CHECK (00205's
+	// `VALIDATE CONSTRAINT`, a bare `DROP CONSTRAINT`) is skipped, per the residual note.
+	statusCheckRe := regexp.MustCompile(`(?is)CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)`)
 	var chosen, upHalf string
 	for _, p := range paths {
 		raw, err := os.ReadFile(p) //nolint:gosec // G304: p comes from a fixed repo-relative migrations dir glob, never external input
@@ -912,7 +927,8 @@ func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if strings.Contains(stripSQLComments(up), "runs_status_check") {
+		stripped := stripSQLComments(up)
+		if strings.Contains(stripped, "runs_status_check") && statusCheckRe.MatchString(stripped) {
 			chosen, upHalf = p, up
 		}
 	}
@@ -923,7 +939,7 @@ func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
 	// The prose in these files names statuses freely, so a regex over raw text would
 	// happily collect them and agree with itself.
 	stmt := stripSQLComments(upHalf)
-	checks := regexp.MustCompile(`(?is)CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)`).FindAllStringSubmatch(stmt, -1)
+	checks := statusCheckRe.FindAllStringSubmatch(stmt, -1)
 	if len(checks) != 1 {
 		t.Fatalf("found %d `CHECK (status IN (...))` statements in %s's UP half, want exactly 1; the file's shape changed and this parse can no longer be trusted", len(checks), chosen)
 	}

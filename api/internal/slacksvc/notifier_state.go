@@ -113,8 +113,8 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		// Resume-then-progress: consume a PRIOR park's marker (post ▶️ Resumed on the first
 		// running), then stamp THIS event's marker if it is itself a park, before the
 		// milestone line (PRD #1116). handleLimitResume reads `existing` (the marker from a
-		// prior park); recordLimitPause is a no-op unless this event IS a limit_wait, so on a
-		// resume event these do not conflict.
+		// prior park); recordLimitPause is a no-op unless this event IS a park (limit_wait or
+		// paused), so on a resume event these do not conflict.
 		n.handleLimitResume(ctx, rc, existing, base)
 		n.recordLimitPause(ctx, rc)
 		n.handleMilestone(ctx, rc, existing)
@@ -125,21 +125,28 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 }
 
 // recordLimitPause stamps the pending park's start onto the run's anchor when this
-// event IS the park (limit_wait), so the later resume can read how long it waited and
-// dedupe against a redelivered running report (PRD #1116). Best-effort: a failure is
-// logged and never affects the run. The value is the run's own status_since — the exact
-// instant SetRunLimitWait stamped the park (runtime.sql); promotion re-stamps status_since,
-// so copying it here is what preserves the pause start. status_since is NOT NULL on runs
-// (migration 00163); the now() fallback is belt-and-braces for a row that predates it.
+// event IS a park, so the later resume can read how long it waited and dedupe against a
+// redelivered running report (PRD #1116). It records ANY park kind (PRD #1190): the
+// usage-limit park (limit_wait) AND the owner-requested park (paused), which reuse the
+// same marker and the same ▶️ Resumed reply on the first running after. Best-effort: a
+// failure is logged and never affects the run. The value is the run's own status_since —
+// the exact instant SetRunLimitWait/SetRunPaused stamped the park (runtime.sql); promotion
+// re-stamps status_since, so copying it here is what preserves the pause start.
+// status_since is NOT NULL on runs (migration 00163); the now() fallback is belt-and-braces
+// for a row that predates it.
+//
+// It also records WHICH park this was in park_kind (PRD #1190) — the run's own status at the
+// park, guaranteed here to be "limit_wait" or "paused" — so handleLimitResume can word the
+// resume reply honestly (an owner pause never says "· usage limit cleared").
 func (n *Notifier) recordLimitPause(ctx context.Context, rc store.GetSlackRunContextRow) {
-	if rc.Status != "limit_wait" {
+	if rc.Status != "limit_wait" && rc.Status != "paused" {
 		return
 	}
 	at := rc.StatusSince
 	if !at.Valid {
 		at = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	}
-	if _, err := n.store.SetSlackRunLimitPause(ctx, store.SetSlackRunLimitPauseParams{RunID: rc.ID, At: at}); err != nil {
+	if _, err := n.store.SetSlackRunLimitPause(ctx, store.SetSlackRunLimitPauseParams{RunID: rc.ID, At: at, ParkKind: pgconv.Text(rc.Status)}); err != nil {
 		n.logf("record limit pause", err)
 	}
 }
@@ -168,7 +175,10 @@ func (n *Notifier) handleLimitResume(ctx context.Context, rc store.GetSlackRunCo
 	case "running":
 		waited := time.Since(anchor.LimitPausedAt.Time)
 		hasWait := waited >= 0 && waited <= maxPlausibleWait
-		blocks, fallback := resumeThreadBlocks(rc, waited, hasWait, base)
+		// anchor.ParkKind records which park set this marker (PRD #1190). NULL/empty on a
+		// legacy row written before the column existed reads as a usage-limit park, keeping
+		// the exact #1116 wording.
+		blocks, fallback := resumeThreadBlocks(rc, waited, hasWait, base, anchor.ParkKind.String)
 		if _, perr := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, fallback, blocks); perr != nil {
 			n.logf("post resume", perr)
 			return // leave the marker set; the next running report retries
@@ -184,8 +194,8 @@ func (n *Notifier) handleLimitResume(ctx context.Context, rc store.GetSlackRunCo
 			n.logf("clear limit pause", err)
 		}
 	default:
-		// queued, claimed, limit_wait (re-park), pool_wait, recovery_wait: eligible again or
-		// re-parked, but not working — leave the marker for the eventual running (D3).
+		// queued, claimed, limit_wait, pool_wait, recovery_wait, paused: eligible again or
+		// re-parked, but not working; leave the marker for the eventual running (D3).
 	}
 }
 
@@ -201,9 +211,19 @@ const maxPlausibleWait = 8 * 24 * time.Hour
 // one context block carrying the waited duration, the pause count (from the second park),
 // the in-progress milestone title, and the run deep link — each omitted when absent, none
 // invented, every untrusted field escaped+scrubbed exactly like renderThreadBlocks does.
-func resumeThreadBlocks(rc store.GetSlackRunContextRow, waited time.Duration, hasWait bool, base string) (blocks []slack.Block, fallback string) {
+//
+// parkKind (PRD #1190) is the anchor's recorded park kind, so the section header matches the
+// park that was cleared: an owner pause reads a plain "▶️ *Resumed*", while a usage-limit park
+// (parkKind "limit_wait" OR empty/NULL on a legacy row) keeps the exact #1116
+// "▶️ *Resumed · usage limit cleared*" wording — the detail line (waited/working) is accurate
+// for both and is unchanged.
+func resumeThreadBlocks(rc store.GetSlackRunContextRow, waited time.Duration, hasWait bool, base, parkKind string) (blocks []slack.Block, fallback string) {
 	repo := ScrubSecrets(EscapeMrkdwn(rc.PathWithNamespace))
-	blocks = []slack.Block{threadSectionBlock("▶️ *Resumed · usage limit cleared*")}
+	header := "▶️ *Resumed · usage limit cleared*"
+	if parkKind == "paused" {
+		header = "▶️ *Resumed*"
+	}
+	blocks = []slack.Block{threadSectionBlock(header)}
 
 	var detail strings.Builder
 	if hasWait {
@@ -712,6 +732,34 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 			blocks = append(blocks, slack.NewContextBlock("slack_thread_limit_ctx", ctxElems...))
 		}
 		return blocks, fmt.Sprintf("Paused · usage limit · %s#%d", repo, iid(rc.IssueIid)), true
+
+	case "paused":
+		// PRD #1190 M1: the owner-requested park. Led with "‖ Paused by you" so a reader can
+		// tell a user pause from the ⏸️ usage-limit line above. The last checkpoint-published
+		// branch tip (checkpoint_tip) rides the detail as `checkpoint <short>` — its first 7
+		// chars — when present, and is omitted when the run has published none (the "omit when
+		// absent" convention); the resume hint names both surfaces. checkpoint_tip is worker-
+		// supplied, so it is EscapeMrkdwn'd like every other such field before the whole detail
+		// is ScrubSecrets'd. All non-terminal, like limit_wait above.
+		blocks = []slack.Block{threadSectionBlock("‖ *Paused by you*")}
+		var detail strings.Builder
+		if n := len(decodeMilestoneIDs(rc.MilestonesCompleted)); n > 0 {
+			fmt.Fprintf(&detail, "after milestone %d · ", n)
+		}
+		if tip := strings.TrimSpace(rc.CheckpointTip.String); tip != "" {
+			short := tip
+			if len(short) > 7 {
+				short = short[:7]
+			}
+			detail.WriteString("checkpoint " + EscapeMrkdwn(short) + " · ")
+		}
+		detail.WriteString("resume from the run page or `uzi run resume " + rc.ID.String() + "`")
+		ctxElems := []slack.MixedElement{threadMrkdwnElem(ScrubSecrets(detail.String()))}
+		if el, has := linkElem(); has {
+			ctxElems = append(ctxElems, el)
+		}
+		blocks = append(blocks, slack.NewContextBlock("slack_thread_paused_ctx", ctxElems...))
+		return blocks, fmt.Sprintf("Paused by you · %s#%d", repo, iid(rc.IssueIid)), true
 
 	default:
 		return nil, "", false

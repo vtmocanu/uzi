@@ -174,6 +174,33 @@ func TestRecoveryWaitLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("a stale approval report cannot unpark or replace the recovery plan", func(t *testing.T) {
+		id := seedRun(8)
+		if rows := park(id, now.Add(time.Hour)); rows != 1 {
+			t.Fatalf("park rows = %d, want 1", rows)
+		}
+		before := reread(id)
+		rows, err := q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+			PlanMd:    pgconv.TextOrNull("stale pre-park plan"),
+			SessionID: pgconv.TextOrNull("stale pre-park session"),
+			ID:        id,
+			WorkerID:  pgconv.UUID(wkrID),
+		})
+		if err != nil {
+			t.Fatalf("SetRunAwaitingApproval: %v", err)
+		}
+		if rows != 0 {
+			t.Fatalf("stale approval report rows = %d, want 0; recovery_wait may exit only through server promotion or owner cancel", rows)
+		}
+		after := reread(id)
+		if after.Status != "recovery_wait" || after.PlanMd != before.PlanMd ||
+			after.PlanSource != before.PlanSource || after.AutoApprove != before.AutoApprove ||
+			after.SessionID != before.SessionID || after.RecoveryWaitCount != before.RecoveryWaitCount ||
+			after.RecoveryRetryNotBefore != before.RecoveryRetryNotBefore || after.UpdatedAt != before.UpdatedAt {
+			t.Fatal("a refused approval report mutated the recovery hold or its preserved plan/session")
+		}
+	})
+
 	t.Run("repeated parks increment the count monotonically", func(t *testing.T) {
 		id := seedRun(2)
 		for want := int32(1); want <= 3; want++ {

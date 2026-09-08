@@ -512,6 +512,10 @@ type Run struct {
 	CodexAccountRevision   pgtype.Int8        `json:"codex_account_revision"`
 	CodexClaimEpoch        int64              `json:"codex_claim_epoch"`
 	CodexCapHash           []byte             `json:"codex_cap_hash"`
+	PauseRequestedAt       pgtype.Timestamptz `json:"pause_requested_at"`
+	PauseMode              pgtype.Text        `json:"pause_mode"`
+	PauseAfterCount        pgtype.Int4        `json:"pause_after_count"`
+	CheckpointTipAt        pgtype.Timestamptz `json:"checkpoint_tip_at"`
 	RecoveryWaitCount      int32              `json:"recovery_wait_count"`
 	RecoveryRetryNotBefore pgtype.Timestamptz `json:"recovery_retry_not_before"`
 }
@@ -632,6 +636,7 @@ type SlackRunMessage struct {
 	MilestonesNotifiedCompleted pgtype.Int4        `json:"milestones_notified_completed"`
 	StatusTs                    pgtype.Text        `json:"status_ts"`
 	LimitPausedAt               pgtype.Timestamptz `json:"limit_paused_at"`
+	ParkKind                    pgtype.Text        `json:"park_kind"`
 }
 
 type TaskReview struct {
@@ -701,6 +706,10 @@ type User struct {
 	SchedulesPaused         bool               `json:"schedules_paused"`
 	SchedulesPausedUntil    pgtype.Timestamptz `json:"schedules_paused_until"`
 	JudgeAnthropicBindMode  string             `json:"judge_anthropic_bind_mode"`
+	AppearanceMode          pgtype.Text        `json:"appearance_mode"`
+	LightTheme              pgtype.Text        `json:"light_theme"`
+	DarkTheme               pgtype.Text        `json:"dark_theme"`
+	Typeface                pgtype.Text        `json:"typeface"`
 }
 
 type UserSecret struct {

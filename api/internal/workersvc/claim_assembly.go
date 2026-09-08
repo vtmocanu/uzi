@@ -348,6 +348,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// the park down instead of waiting out the idle timeout. Never set for a terminal
 		// run (a finished run has nothing left to wind down).
 		StopPending: run.Interactive && run.StopKind.Valid && run.StopKind.String == "stopped" && !terminalStatuses[run.Status],
+		// PRD #1190 M1: re-deliver a pending pause so a worker that died with one set re-arms
+		// it on resume. Derived from the loaded row like StopPending/OpenQuestionID; the
+		// columns survive every requeue, so the re-claim carries the intent forward.
+		PausePending: run.PauseRequestedAt.Valid,
+		PauseMode:    run.PauseMode.String,
 		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
 		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
 		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),

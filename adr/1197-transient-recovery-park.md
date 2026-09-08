@@ -1,46 +1,99 @@
-# ADR-1197: `recovery_wait` is a shared transient-recovery park primitive
+# ADR-1197: verified capture before an automatic transient-recovery park
 
-**Status**: Accepted (issue #1197 — implements only the empty-SDK-result trigger; a provider-error trigger is deferred, see Consequences)
+**Status**: Accepted for issue #1197; provider-error classification is deferred to #1088.
 **Date**: 2026-09-08
-**Deciders**: architect, coders, reviewers
-**Issue**: GitHub issue [vtmocanu/uzi#1197](https://github.com/vtmocanu/uzi/issues/1197)
-
-## Decision (summary)
-
-A resumed SDK turn that comes back **positively empty** (zero turns, no model activity, no plan/questions/done) is retried a bounded number of times in-process, and only if it is *still* empty does the run enter recovery: the worker best-effort captures its local restore point **before** reporting the park (the causal fence — a server promotion or reseed can never race an in-flight capture), then always reports `status: "recovery_wait"`. The server parks the run on a **capped exponential backoff** — doubling from a short base, clamped at a ceiling, jittered to spread a promoted wave — and a sweep auto-promotes it back to `queued` once that backoff elapses, preserving `plan_md`, `session_id` and the worker's on-disk checkpoint exactly as a resume needs them. There is **no lifetime park cap and no terminal branch**: `recovery_wait` always becomes promotable again, so a run keeps recovering until it succeeds or the owner cancels it (`CancelRunServerSide`'s negative admit-set already covers a parked run for free).
-
-`recovery_wait` is deliberately built as a **reusable primitive**, not a one-off fix: any transient cause can report it and reuse the same preserve→park→promote→reclaim lifecycle. This issue implements only the trigger for a positively-empty SDK result; issue #1088's provider-error classifier is expected to adopt the same status and lifecycle later, without building a competing mechanism.
+**Issue**: [vtmocanu/uzi#1197](https://github.com/vtmocanu/uzi/issues/1197)
 
 ## Context
 
-Before this change, a resumed SDK turn that returned zero turns and no model activity was thrown as `REASON_NO_PLAN` and terminally failed the run — destroying resumable session and checkpoint state over what is frequently a transient blip (the model's own empty response to a resumed turn), not a genuine defect in the run. There was no non-terminal outcome for "the model gave us nothing, try again later" distinct from a genuine wall/idle/cancel trip or a turn that legitimately ran but produced no plan.
+The failed run reported a zero-turn SDK result with no model activity.
+The previous executor discarded that metadata and treated the missing plan
+as a terminal failure. The upstream reason for the empty result was not
+established. Separately, autopilot plans were not durably persisted, so a
+resume could re-plan instead of continuing the approved work.
 
-The existing park precedent, `limit_wait` ([ADR-0035](0035-run-limit-retry.md), PRD #35), already proved out the shape — non-terminal status, server-owned backoff, sweep-driven promotion, checkpoint preservation — for a **usage-limit** pause. `recovery_wait` is modelled closely on it, but is a different thing: it is not a usage limit, it does not touch any credential's rate-limit gauge, and (unlike `limit_wait`'s `RUN_LIMIT_MAX_WAITS`) it carries no lifetime park cap at all, because there is no budget being exhausted — only a transient signal that may take an unknown number of attempts to clear.
+The existing usage-limit park provides a preserve, park, promote, reclaim
+lifecycle. Empty-result recovery needs a distinct status: it is not a token
+limit and must not alter credential rate-limit accounting.
 
-## The decision, in detail
+## Decision
 
-### Bounded in-process retry, then a truthful park
+### Durable autopilot plans
 
-`driveTurnWithEmptyRecovery` (`agent/src/sdk-executor.ts`) wraps a turn: the common case (any non-empty return, including a turn that ran but did not submit a plan, or one with missing metrics) passes through unchanged. Only a **positively-empty** result — checked by `isPositivelyEmpty`, which excludes missing metrics, a plan, questions, `done`, or any model activity — enters a small number of short, budget-accounted, cancel-safe in-process retries against the *same* `resumeId`, so a resumed turn's SDK session is never torn down mid-recovery. A genuine cancel/idle/wall trip always wins over recovery: `state.tripReason` is polled and thrown first on every attempt, and budget exhaustion is never itself a recovery trigger — the between-turns wait is debited from the wall so the next turn's own `armWall` trips the true `REASON_WALL` outcome rather than being reclassified as a park.
+Persist autopilot plan text through a dedicated worker-owned, running-state,
+provenance-guarded update. Require positive acknowledgment before continuing
+implementation. Re-delivery is idempotent; a stale plan report must not
+overwrite a preserved plan or unpark a run.
 
-### Capture before report — the causal fence
+### Bounded retry with accurate classification
 
-Only once those bounded retries are exhausted does the worker escalate to `TransientRecoveryError`, handled by `handleRecoveryExhausted` (`agent/src/runner.ts`). Unlike `limit_wait`'s park (which reports first, then captures via the shared `execute()` block), the recovery path captures the local restore point **first** and reports the park **after** — a deliberate ordering so a server-side promotion or reseed can never fire while a capture is still in flight. The capture is a runner-uid dirty/clean split, `commitWipMarker`-on-dirty, `fetchAgentBranch` (which throws on failure, unlike the best-effort `fetchBackBestEffort`), then a positive verification that the bare's tracking ref actually covers the captured tip — because capture *attempt* completion is not capture *success* (`commitWipMarker` returns `false` for both a clean tree and a failed commit). The park always happens regardless of whether the capture verified or not — a local-capture shortfall no longer strands the run behind a `running` status nobody is driving; it always parks, and the feed line states truthfully whether a verified local restore point or a landed origin publish backs the park, or whether the run instead falls back to its last durable checkpoint.
+Only positively empty SDK results enter bounded in-process retries:
+zero reported turns, no model activity, and no plan, question or completion.
+Missing metrics and nonempty turns retain their existing outcomes.
+Carry forward any SDK session ID returned by an empty attempt, including
+when the first attempt started a new session.
 
-The ack is discriminated the same way `handleLimitReached` discriminates its own ack: only the literal `ack.status === "recovery_wait"` counts as parked, never `applied` alone — a server that refuses or coerces the park still answers 200 with a different status.
+Retry backoff consumes the turn's wall budget. Genuine wall/idle timeout,
+typed pause and cancellation remain higher-priority outcomes; budget
+exhaustion is not itself a reason to enter recovery.
 
-### Server-owned capped backoff, no lifetime cap
+### Verified capture before a promotable park
 
-`setRecoveryWait` (`api/internal/workersvc/recoverywait.go`) computes `retry_not_before = now + recoveryParkFallbackFor(recovery_wait_count) + jitter` and calls `SetRunRecoveryWait` (`api/internal/store/queries/runtime.sql`), whose positive `status = 'running'` source guard makes a re-delivered or out-of-order report a 0-row, idempotent no-op. `recoveryParkFallbackFor` is a capped exponential — doubling per prior park from `RUN_RECOVERY_PARK_BASE` (default 1m), clamped at `RUN_RECOVERY_MAX_PARK` (default 30m) — and, unlike the limit park's `recoveryParkFallbackFor` analogue, **always returns a finite positive duration**: there is no terminal or hold branch, so a park always becomes promotable again. `PromoteRecoveryWaitRuns` (same file) is the sweep's half: a single `UPDATE` that releases every row whose `recovery_retry_not_before` has passed back to `queued`, run every tick beside (never folded into) `PromoteLimitWaitRuns`, because it is a distinct clock-based hold.
+After retries exhaust, reap the agent tree before inspecting its clone.
+Read the dirty/clean state as the runner identity, require a successful WIP
+commit for dirty work, fetch into the worker-owned bare repository, and
+positively verify that its tracking ref covers the current clone HEAD.
+Only then report `recovery_wait`. Remote checkpoint publication remains
+best-effort and is reported separately from local verification.
 
-### No lifetime cap, no terminal branch — the load-bearing difference from `limit_wait`
+A failed or unverified capture keeps the execution and steering poller
+active, preserves the source clone and session, and retries with bounded,
+cancellation-aware delays. A failed park acknowledgment is also retried:
+a live worker heartbeat does not cause an abandoned running row to be
+requeued. Cancellation is reported through the existing terminal protocol;
+work is not discarded merely because a cancellation report failed.
 
-`limit_wait` bounds how long a run may hold the one-active-run-per-issue lock (`RunLimitMaxWaits × RunLimitMaxPark`), because a usage limit's exhaustion is itself bounded and a runaway park is a sign something else is wrong. `recovery_wait` has no such bound by design: a transient empty-turn condition (a provider-side blip, a degraded model) may legitimately take an unknown number of cycles to clear, and failing the run after some arbitrary number of parks would throw away a session and checkpoint that a slightly longer wait would have recovered. The guard against a runaway loop instead lives in the exponential backoff's cap (`RUN_RECOVERY_MAX_PARK`) and in the owner's own cancel — never in a lifetime counter. `recoveryParkFallbackMaxShift` bounds the *exponent* only, so an unbounded `recovery_wait_count` can never overflow the backoff duration into a negative (past) timestamp that would spin the sweeper.
+Before model execution, record clone ownership in worker-owned bare Git
+configuration. Retain that record with an unverified clone on shutdown.
+A later same-run claim recaptures it before reseeding; a different run or
+malformed ownership record cannot authorize deletion. Clone retention never
+guards secret eviction, poller shutdown or registry cleanup.
+
+Serialize duplicate claims for the same run through factory setup and all
+final cleanup. After the prior batcher closes, refresh a queued claim's
+message cursor through every remaining page before starting its batcher.
+This prevents delayed park acknowledgments from causing overlapping clone
+cleanup or dropping late messages through stale sequence reuse.
+
+### Server-owned backoff
+
+`SetRunRecoveryWait` admits only the owning worker's running, non-judge run.
+A repeated report is an idempotent no-op; acceptance depends on the returned
+status, not `applied` alone. `PromoteRecoveryWaitRuns` returns due rows to
+`queued` while retaining their plan/session/checkpoint fields. Stale
+approval reports cannot exit the park.
+
+The server uses a capped exponential backoff, from `RUN_RECOVERY_PARK_BASE`
+(default 1m) to `RUN_RECOVERY_MAX_PARK` (default 30m), with jitter. There is
+no lifetime park cap or terminal branch caused solely by repeated empty
+results. Normal running watchdogs and owner cancellation still apply.
+The exponent is bounded to avoid duration overflow.
 
 ## Consequences
 
-**A run that hits a transient empty-turn result now recovers instead of terminal-failing**, preserving its plan, session and checkpoint across as many recovery cycles as it takes. The cost is symmetrical with `limit_wait`: a persistently-recovering run holds its worker's disk and its issue's run slot for as long as it takes, which is the trade this park always makes in exchange for never discarding recoverable work.
+An empty result no longer immediately destroys resumable work. A persistent
+capture failure consumes an active worker slot and storage while retrying;
+a parked run retains its issue slot and recovery state. A different worker
+can recover only a successfully published checkpoint. Local verification
+does not protect against loss of the original persistent volume.
 
-**This issue implements only the empty-SDK-result trigger.** No provider-error classifier is built here — issue #1088 is expected to reuse `recovery_wait` and its preserve→park→promote→reclaim lifecycle for a transient provider error, rather than invent a second, competing park status. Reviewing #1088 against this ADR should confirm it reports the same `recovery_wait` literal and reuses `SetRunRecoveryWait`/`PromoteRecoveryWaitRuns` rather than adding a new status or a parallel backoff mechanism.
+`recovery_wait` is the shared recovery primitive intended for #1088's later
+provider-error classifier, not a second implementation of that classifier.
 
-**Key files**: `api/internal/store/queries/runtime.sql` (`SetRunRecoveryWait`, `PromoteRecoveryWaitRuns`), `api/internal/workersvc/recoverywait.go` (`setRecoveryWait`, `recoveryParkFallbackFor`, `recoveryParkJitter`), `api/internal/workersvc/sweep.go` (the promote pass), `agent/src/sdk-executor.ts` (`driveTurnWithEmptyRecovery`, `isPositivelyEmpty`), `agent/src/runner.ts` (`handleRecoveryExhausted`, `captureRecoveryRestorePoint`).
+**Verification correction, 2026-09-08:** the initial implementation claimed
+a prior checkpoint made it safe to park after failed capture. Real-Git
+regressions with failed WIP commits and fetches disproved that claim: the
+only current work copy could be deleted. The decision above requires
+verified capture or retained-source retry instead. Additional red/green
+regressions cover cancellation reporting, restart recovery, duplicate-claim
+cleanup serialization and message-cursor refresh.

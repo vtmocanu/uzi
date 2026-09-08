@@ -278,7 +278,29 @@ single global cutoff, so a scaled run is not swept to failed at the plain
 real stall detector no matter how large the scaled iteration or wall-clock budget
 gets.
 
-**A parked run's disk cost.** A run that parks at `limit_wait` deliberately keeps its git clone/worktree, its skills plugin dir, and its per-run SDK home on the worker's disk instead of cleaning up, so a resume can pick up the same session rather than starting fresh. One run's SDK home alone has been measured holding 167.3 MB of Go module cache (see `UZI_HOME_RECLAIM` below). So size worker disk for roughly `RUN_LIMIT_MAX_WAITS` concurrently parked runs times (one clone + one plugin dir + up to ~170 MB of run HOME) — the caps above bound *how many* parks and *how long*, not how much each one holds on disk. A `recovery_wait` park (above) keeps this same on-disk state for the same reason, but isn't part of this sizing math: it has no lifetime cap, so it's bounded by retry cadence and owner cancellation rather than a count you can multiply here.
+**A parked run's disk cost.** `limit_wait`, `recovery_wait` and owner-requested
+`paused` runs retain their skills plugin directory and per-run SDK home for
+same-worker session resume, plus recovery refs in the shared bare repository.
+The runner clone is normally removed after capture. A failed recovery capture
+also retains its source clone until capture succeeds or a terminal outcome is
+acknowledged. One SDK home was measured holding 167.3 MB of Go module cache
+(see `UZI_HOME_RECLAIM` below); this is an example, not an upper bound.
+
+Size storage for shared repositories plus active clones, all retained
+plugin/HOME directories, pending-capture clones and operating headroom.
+Measure the high-water size of those directories under your workloads and
+multiply by your chosen operational allowance for concurrent retained runs.
+Monitor both retained-run count and free bytes/inodes, and alert before that
+allowance or storage headroom is exhausted. Expand storage or explicitly
+cancel unwanted runs; do not delete nonterminal recovery state to reclaim space.
+
+There is **no built-in hard bound on the number of parked runs per worker**:
+parks release execution slots, so worker concurrency does not bound retained
+directories. `RUN_LIMIT_MAX_WAITS` limits cycles for one usage-limited run, not
+concurrent parked runs. Recovery parks and owner pauses have no lifetime cap;
+backoff limits retry frequency, not disk use. Do not treat either value as a
+fleet capacity bound. These cleanup and capacity distinctions were verified
+against runner cleanup and the recovery lifecycle on 2026-09-08.
 
 **The two caps are asymmetric on purpose, and there is no env spelling that removes the park ceiling.** `RUN_LIMIT_MAX_WAITS=0` is honored and means "never park" — a legitimate policy choice an operator may zero away. `RUN_LIMIT_MAX_PARK=0` is not honored: it silently falls back to `192h` (see its own row), because it is a security bound rather than a policy knob, and a bound with an off switch is not a bound.
 

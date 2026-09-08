@@ -40,6 +40,7 @@ import { MessageBatcher } from "./batcher.js";
 import { rmTreeForce } from "./rmtree.js";
 import {
   SteeringChannel,
+  PauseNowSignal,
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
@@ -47,7 +48,8 @@ import { GitLabClient, ForgejoClient, GitHubClient, type ForgeClient } from "./f
 import { withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
-import { errMessage, RUN_ID_RE } from "./util.js";
+import { errMessage, RUN_ID_RE, sleep } from "./util.js";
+import { PendingRecoveryCaptureError } from "./git.js";
 import {
   buildCheckEnv,
   defaultCheckRunner,
@@ -353,6 +355,8 @@ interface RunFlight {
   active: ActiveRun | undefined;
   parked: boolean;
   preserveSession: boolean;
+  /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
+  preserveRecoveryClone: boolean;
   lastPublish: number;
   lastPublishedTip: string | undefined;
   /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<branch>` as this run last
@@ -410,6 +414,8 @@ export interface RunnerOptions {
    *  budget note at the shutdown branch. Injectable so a test can drive the timeout
    *  deterministically against a hanging publish. */
   shutdownPublishTimeoutMs?: number;
+  /** Delay between local recovery capture / state-report attempts (capped at 30s). */
+  recoveryRetryMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
   /** Injectable answer-deadline timer for tests; defaults to setTimeout (unref'd)
@@ -454,6 +460,7 @@ export class RunRunner {
   private readonly checkpointIntervalMs: number;
   /** PRD #1030 M4: client-side cap (ms) on the graceful-shutdown durability sequence. */
   private readonly shutdownPublishTimeoutMs: number;
+  private readonly recoveryRetryMs: number;
   /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable.
    *  Also feeds the PRD #88 answer-deadline math (askUser), so that budget is testable
    *  on the same clock. */
@@ -500,6 +507,9 @@ export class RunRunner {
    *  runner clone exists (there is nothing to fetch back before that) and deregistered
    *  in the terminal finally. */
   private readonly activeRuns = new Map<string, ActiveRun>();
+  /** Whole-execution ownership, including factory setup, batcher close and every
+   * finally cleanup. A promoted claim can arrive before an old park ACK returns. */
+  private readonly executionTails = new Map<string, Promise<void>>();
   /** PRD #218 M1: set by `shutdown()`. Read when a run registers so a run that starts
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
    *  to completion past the grace window. */
@@ -528,6 +538,7 @@ export class RunRunner {
     this.checkRunner = opts.checkRunner;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
+    this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
     this.now = opts.now ?? (() => Date.now());
     this.setTimer =
       opts.setTimer ??
@@ -549,6 +560,51 @@ export class RunRunner {
     // Content-free message: never echo the (rejected) id into a log/failure_reason.
     if (!RUN_ID_RE.test(runId))
       throw new Error("refusing to execute a run with an invalid run id");
+    const previous = this.executionTails.get(runId);
+    let release!: () => void;
+    const tail = new Promise<void>((resolve) => { release = resolve; });
+    // Install synchronously before factory work. A third claim must queue behind
+    // the second even while the second is waiting for the first's cleanup.
+    this.executionTails.set(runId, tail);
+    try {
+      if (previous) {
+        await previous;
+        claim = await this.refreshQueuedClaimCursor(claim);
+      }
+      await this.executeClaim(claim);
+    } finally {
+      if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
+      release();
+    }
+  }
+
+  private async refreshQueuedClaimCursor(claim: ClaimResponse): Promise<ClaimResponse> {
+    let after = claim.last_seq;
+    for (;;) {
+      if (this.shuttingDownGlobal) throw new Error("worker shut down before a queued run could start");
+      let page;
+      try {
+        // The worker-user read surface covers issue runs too. Its cap is 200;
+        // consume pages through EOF after the predecessor closed its batcher.
+        page = await this.client.getChatRunMessages(claim.run_id, after, 200);
+      } catch (err) {
+        if (err instanceof RequestError && err.status < 500 && err.status !== 429) throw err;
+        await sleep(this.recoveryRetryMs);
+        continue;
+      }
+      if (page.length === 0) return { ...claim, last_seq: after };
+      const previous = after;
+      for (const message of page) {
+        if (!Number.isSafeInteger(message.seq) || message.seq <= previous) {
+          throw new Error("queued run message cursor did not advance");
+        }
+        after = Math.max(after, message.seq);
+      }
+    }
+  }
+
+  private async executeClaim(claim: ClaimResponse): Promise<void> {
+    const runId = claim.run_id;
     // This run's OWN executor + private HOME (PRD #42 Decisions 4/5), built fresh
     // per execution so nothing subprocess-scoped is shared with a concurrent run.
     const { executor, homeDir: runHome } = this.makeExecutor(runId);
@@ -674,24 +730,9 @@ export class RunRunner {
           await batcher.close().catch(() => undefined);
         }
       } else if (err instanceof TransientRecoveryError) {
-        // issue #1197 (D-RC2c): a POSITIVELY-empty SDK turn (0 turns, no activity)
-        // persisted past the bounded in-process retries. Like limit_wait, recovery ALWAYS
-        // parks in recovery_wait — the committed work already sits on a prior durable
-        // checkpoint, so a reseed recovers it via the multi-ref fallback even when a fresh
-        // capture falls short. The one difference from limit_wait is ORDERING: recovery
-        // runs the best-effort capture BEFORE reporting the park (the causal fence that
-        // stops a server promotion/reseed from firing while a capture is in flight),
-        // rather than report-then-capture via the shared block above. The capture's
-        // verified/published outcome drives only the truthful feed wording, never a
-        // park/strand decision — a local capture shortfall no longer strands the run. All
-        // of capture, the park report and the single batcher.close happen INSIDE
-        // handleRecoveryExhausted; the shared post-park capture block above is deliberately
-        // NOT run for this branch (it would double-capture). The method returns true
-        // (flight.parked → the finally preserves session/HOME) whenever the server
-        // acknowledges the recovery_wait park, and false ONLY when the server did not park
-        // it (a concurrent cancel/park moved the run on, or a thrown report) — never on a
-        // local-capture failure. activeRuns is dropped by the finally on both paths,
-        // exactly as the limit/shutdown branches.
+        // Retry capture without abandoning the live claim. Only verified local
+        // durability permits automatic promotion; shutdown retains uncaptured work
+        // behind the worker-owned journal so the next claim recovers it first.
         flight.parked = await this.handleRecoveryExhausted(
           err,
           claim,
@@ -787,6 +828,22 @@ export class RunRunner {
         // NO reportState: the run stays non-terminal so the server's sweeper requeues
         // it. Reporting `failed` here would turn a recoverable interruption into a dead
         // run — the exact outcome the fetch-back exists to prevent.
+      } else if (err instanceof PauseNowSignal) {
+        // PRD #1190 M2: a `now` pause aborted a turn OUTSIDE the implement loop's own catch (e.g.
+        // during the plan turn), so the signal reached here. Caught BEFORE the generic terminal
+        // path (the LimitReachedError precedent above) so a pause NEVER becomes a `failed` run.
+        // Try to park it durably; on a park, flight.parked preserves the HOME exactly as a limit
+        // park does. If the checkpoint could not be published (handlePausePark reported
+        // pause_failed and left the run running), preserve the session and leave it for the
+        // sweeper to requeue rather than failing a run the owner asked to pause.
+        flight.parked = await this.handlePausePark(flight, { completedCount: 0 });
+        if (!flight.parked) {
+          flight.preserveSession = true;
+          runLog.info(
+            "pause could not park this run outside the loop; leaving it for requeue",
+          );
+        }
+        await batcher.close().catch(() => undefined);
       } else {
         // failure_reason goes straight to reportState, bypassing the batcher's
         // redactor, and the sdk-executor catch-all re-throws raw SDK errors into this
@@ -879,21 +936,11 @@ export class RunRunner {
       // them. The widening warning below applies to `preserveSession` too — it must
       // never be extended to cover any of those.)
       //
-      // (PRD #218 M6, 2026-08-04: the runner clone is no longer preserved on a
-      // park — the clone leg below runs unconditionally now. `runnerCloneForBranch`
-      // unconditionally deletes the clone on every claim and re-seeds it from a
-      // bare ref, so a parked run's own commits were never recovered from the
-      // preserved clone directory in the first place. PRD #218 M1/M2 moved the real
-      // durability off the clone: the agent's committed branch is fetched back into
-      // this worker's bare repo on both the park and shutdown paths, anchored to
-      // the writing run's id, and an owned resume reseeds off that tracking ref.
-      // That made preserving the clone redundant, and M7 proved it live on
-      // dev-cluster (2026-08-04): a real worker eviction recovered committed work
-      // from the tracking ref, seeded_from=tracking, marker byte-identical. So the
-      // clone leg is removed here — dropping the whole guard is wrong (`worktreePath`
-      // is the undefined guard and `removeRunnerClone(undefined)` would fire), only
-      // the `&& !parked` is gone. The plugin-dir and HOME legs are UNCHANGED and
-      // still load-bearing exactly as the sentence above says.)
+      // #1197, verified 2026-09-08: normal cleanup removes the clone and its
+      // worker-owned ownership journal. Unverified recovery work keeps both:
+      // preserveRecoveryClone guards only this filesystem removal, and the next
+      // same-run claim recaptures the retained source before reseeding. A verified
+      // tracking snapshot restores PRD #218 M6's normal removal behavior.
       //
       // The other four statements in this block — the steering poller stop, the two
       // gate-map deletes, and the secret eviction above — MUST still run on a park.
@@ -914,12 +961,15 @@ export class RunRunner {
       //     CLAUDE.md before concluding flake — `node --test` prints `ℹ fail 0`
       //     for a timeout, so the tally will say everything passed while the exit
       //     code says otherwise. A hang here is this bug until proven otherwise.
-      if (flight.worktreePath) {
-        await this.git.removeRunnerClone(flight.worktreePath).catch((e) =>
-          runLog.warn("runner clone cleanup failed", {
-            error: errMessage(e),
-          }),
-        );
+      if (flight.worktreePath && !flight.preserveRecoveryClone) {
+        try {
+          await this.git.removeRunnerClone(flight.worktreePath);
+          if (flight.barePath && flight.branch) {
+            await this.git.clearRecoveryCapture(flight.barePath, flight.branch, runId);
+          }
+        } catch (e) {
+          runLog.warn("runner clone cleanup failed", { error: errMessage(e) });
+        }
       }
       // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
       // M4). It is OUTSIDE the runner clone, so removeRunnerClone does not reach it;
@@ -954,7 +1004,7 @@ export class RunRunner {
         // what is being held and why — an operator reading disk pressure needs to
         // connect it to a parked run rather than to a leak.
         runLog.info(
-          "run parked on a usage limit; preserving its plugin dir and HOME for resume",
+          "run parked; preserving its plugin dir and HOME for resume",
           {
             run_home: runHome,
           },
@@ -978,6 +1028,20 @@ export class RunRunner {
     const { runLog, batcher, reportState, redactText, executor, runHome } = flight;
     const runId = claim.run_id;
     const result = flight.result!;
+    // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
+    // `paused` and set flight.parked). The run is non-terminal and already reported — there is
+    // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
+    // HOME for resume exactly as a limit park does. Close the batcher (handlePausePark only
+    // flushed it) and return. Keyed on the result the executor returned so a non-pause path can
+    // never reach this branch.
+    if (result.pausedAt) {
+      executor.killAgentTree?.();
+      await batcher.close().catch(() => undefined);
+      runLog.info("run parked on an owner-requested pause; skipping finalization", {
+        run_id: runId,
+      });
+      return;
+    }
     const runnerClone = flight.runnerClone!;
     const barePath = flight.barePath!;
     const lastPublishedTip = flight.lastPublishedTip;
@@ -2056,6 +2120,14 @@ export class RunRunner {
     // run's interactive park ends `stopped` immediately (steering.awaitFollowUp's arm-time
     // check) instead of waiting out the idle timeout. Absent ⇒ untouched (today's path).
     if (claim.stop_pending) steering.seedStopRequested();
+    // PRD #1190 M2: re-seed a PENDING pause from the durable claim columns (the direct analog of
+    // stop_pending above), so a worker that died with a pause pending re-arms it on resume with
+    // NO fresh input. The executor reads the seeded mode at its first loop boundary
+    // (ctx.pauseModeRequested → steering.getPauseMode) and PARKS there as an ACK-independent
+    // fallback (PRD #1190 rework N1): a resumed pause parks at its first boundary even if the
+    // running-report ACK's pauseRequested regressed. In the normal case the ACK also re-fires
+    // pauseRequested, so the seed is a real safety net rather than the sole trigger.
+    if (claim.pause_pending) steering.seedPauseRequested(claim.pause_mode);
 
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
@@ -2110,13 +2182,14 @@ export class RunRunner {
       // rather than in the catch so the finally can see it; false is the safe default,
       // so every path that never reaches the park logic cleans up exactly as before.
       parked: false,
-      // PRD #556 M1: set ONLY by a worker-shutdown interrupt (the `active?.shuttingDown`
-      // catch branch). Like `parked`, it gates EXACTLY the two filesystem removals in the
+      // PRD #556 M1 / #1197: set by shutdown or a pending recovery capture/report.
+      // Like `parked`, it gates EXACTLY the two filesystem removals in the
       // finally (the sibling skills plugin dir and the per-run HOME) and nothing else — so
       // a same-worker re-claim within the affinity grace can resume the SDK session. It is
       // a distinct flag from `parked` on purpose: `parked` also drives park-only report
       // semantics, resume seeding, and the park log, none of which apply to a shutdown.
       preserveSession: false,
+      preserveRecoveryClone: false,
       ciFixHumanApproved: false,
       runnerClone: undefined,
       result: undefined,
@@ -2160,23 +2233,36 @@ export class RunRunner {
       claim.secrets.forge_pat,
       claim.secrets.forge_username,
     ));
-    const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
-    flight.worktreePath = runnerClone.path;
-    flight.branch = runnerClone.branch;
-    // PRD #218 M1: register for the shutdown fetch-back now that a clone exists to
-    // fetch from. The late-register guard covers the race where shutdown() already
-    // fired before this run reached here — abort it at once so it does not run to
-    // completion past the grace window.
+    let retained = false;
+    try {
+      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+      flight.worktreePath = runnerClone.path;
+      flight.branch = runnerClone.branch;
+    } catch (err) {
+      if (!(err instanceof PendingRecoveryCaptureError)) throw err;
+      // The git layer stopped BEFORE rm. Capture this same run's retained source
+      // clone with the ordinary recovery loop; never start a model on it first.
+      flight.worktreePath = err.clonePath;
+      flight.branch = err.branch;
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      retained = true;
+    }
     const active: ActiveRun = (flight.active = { cancel, shuttingDown: false });
     this.activeRuns.set(runId, active);
     if (this.shuttingDownGlobal) {
       active.shuttingDown = true;
       cancel.abort();
     }
+    if (retained) throw new TransientRecoveryError("recovering retained work before reseeding");
+
+    // Journal ownership before any model can write. The worker-owned bare config
+    // survives failed captures, process restarts, and runner-owned clone tampering.
+    await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId);
     batcher.emit({
       kind: "status",
       agent: "worker",
-      payload: { text: `runner clone ready on ${runnerClone.branch}` },
+      payload: { text: `runner clone ready on ${flight.branch}` },
     });
   }
 
@@ -2667,6 +2753,15 @@ export class RunRunner {
       // executor only reads it on the path that has no verdict to supply one.
       approvedSelection: claim.agent_selection,
       signal: cancel.signal,
+      // PRD #1190 rework (N2/N1): expose the steering channel's sticky pause/cancel state to the
+      // implement loop, because the single shared abort controller (cancel/ctx.signal) fires
+      // 'abort' exactly once and cannot deliver a second steering signal. cancelRequested lets the
+      // loop honor a cancel that lands after a declined `now`-park (the controller is spent);
+      // pauseModeRequested lets it honor a seeded/steered pause at its first boundary independent of
+      // the running-report ACK; onPauseNow re-arms the in-flight turn drop for a second `now` pause.
+      cancelRequested: () => steering.isCancelled(),
+      pauseModeRequested: () => steering.getPauseMode(),
+      onPauseNow: (cb) => steering.onPauseNow(cb),
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.
       onSessionId: (sessionId) => {
@@ -2849,6 +2944,10 @@ export class RunRunner {
             b.scopeCeiling = ack.scopeCeiling;
           if (typeof ack.completedCount === "number")
             b.completedCount = ack.completedCount;
+          // PRD #1190 M2: carry the server-decided pause boundary off the SAME ACK so the
+          // loop-top pause branch reads it off `served`.
+          if (typeof ack.pauseRequested === "boolean")
+            b.pauseRequested = ack.pauseRequested;
           // Without the scope/completed fields in this return guard, a non-budget-scaled
           // run's ACK (no budget fields) would return `undefined` and m3's loop-top gate at
           // `if (served)` would never see the ceiling. This is behavior-preserving for the
@@ -2858,7 +2957,8 @@ export class RunRunner {
           return b.maxIterations !== undefined ||
             b.wallSeconds !== undefined ||
             b.scopeCeiling !== undefined ||
-            b.completedCount !== undefined
+            b.completedCount !== undefined ||
+            b.pauseRequested !== undefined
             ? b
             : undefined;
         } catch (e) {
@@ -3051,6 +3151,11 @@ export class RunRunner {
         if (dirty === null) return null;
         return `${tip}\n${dirty.join("\n")}`;
       },
+      // PRD #1190 M2: park the run on an owner-requested pause. Delegates to handlePausePark,
+      // which publishes a checkpoint FIRST and reports `paused` only if it lands (Decision 8),
+      // returning whether the run parked. Called from the implement loop's pause boundary and
+      // its `now`-pause turn catch.
+      parkForPause: (pausedAt) => this.handlePausePark(flight, pausedAt),
     };
 
     // PRD #1064 M1: drain the per-run running-report chain before this phase yields control,
@@ -3420,48 +3525,17 @@ export class RunRunner {
   }
 
   /**
-   * issue #1197 (D-RC2c) — handle a positively-empty SDK turn that persisted past the
-   * bounded in-process retries ({@link TransientRecoveryError}). Returns whether the run
-   * is PARKED (the sole input to the finally's cleanup carve-out, like handleLimitReached).
+   * #1197, verified 2026-09-08: keep the execution and steering poller active
+   * while retrying local capture, and report a promotable recovery_wait ONLY
+   * after current HEAD is verified in the worker-owned tracking ref. A failed
+   * park report is retried too: live worker heartbeats preclude stale requeue.
    *
-   * 🔴 THE ANSWER IS `ack.status === "recovery_wait"`, NEVER `applied` — the same trap
-   * handleLimitReached warns about: a server that refuses/coerces the park still answers
-   * 200 with `applied` true and a different status, so a park is claimed ONLY on the
-   * positive `recovery_wait` literal.
-   *
-   * Like limit_wait, this ALWAYS parks — the recovery park mirrors limit_wait's durability
-   * model, in which the committed work already sits on a PRIOR durable checkpoint (an empty
-   * turn produces no new work; prior implement iterations run a fallback checkpoint; a
-   * resumed run was reseeded from a checkpoint), so a reseed recovers it via the multi-ref
-   * fallback (refs/uzi-runner/<branch> → refs/uzi-checkpoints/<branch> → default) even when
-   * a fresh capture falls short. Gating the park on local-capture SUCCESS (the prior
-   * behavior) STRANDED the run instead: the worker stays alive and keeps heart-beating on
-   * this path, so the stale-worker requeue never fires, and a non-terminal `running` run
-   * lingers until SweepRunningTimeout fails it hours later (or, for an interactive run —
-   * exempt from that sweep — forever). So the failure fallback no longer strands; it parks.
-   *
-   * ORDERING DIFFERS FROM handleLimitReached ON PURPOSE (capture BEFORE report — the causal
-   * fence): limit_wait reports the park then captures via the shared execute() block;
-   * recovery captures FIRST so a server promotion/reseed can never fire while a capture is
-   * in flight. So this method:
-   *   1. reaps the agent tree (the security boundary before touching the runner clone),
-   *   2. runs the BEST-EFFORT capture (a runner-uid dirty/clean split →
-   *      commitWipMarker-required-true-on-dirty → fetchAgentBranch (throws) →
-   *      verifyRunnerTrackingCovers, then a best-effort origin publish), which returns the
-   *      two durability facts (`verified` local restore point, `published` origin
-   *      checkpoint) that drive ONLY the truthful feed wording — never a park/strand
-   *      decision,
-   *   3. ALWAYS reports `recovery_wait`, discriminating the ack exactly like
-   *      handleLimitReached: `recovery_wait` ⇒ parked (return true; the finally preserves
-   *      session/HOME); any other ack (e.g. a 409 because the run was concurrently
-   *      cancelled/parked) or a thrown report ⇒ clean up as unparked (return false). Those
-   *      ack-says-not-parked cases are the ONLY "not parked" outcomes now — a local-capture
-   *      shortfall no longer strands the run.
-   * The feed line is truthful about the durability achieved: a verified local restore point
-   * (a same-worker reseed recovers exactly this tip) or a landed publish (any worker
-   * recovers it) means the park checkpoint is saved; otherwise the run resumes from its last
-   * durable checkpoint and a cross-worker reclaim may restart from the default branch —
-   * mirroring the limit-park publish wording, never claiming a durability it did not achieve.
+   * The worker-owned clone journal fences destructive reseeding after restart.
+   * Shutdown retains an unverified clone and its session; cancellation and a
+   * confirmed terminal state retain their existing cleanup semantics. The
+   * clone-retention flag guards only the clone removal, never secret eviction,
+   * registry cleanup or poller shutdown. Park acceptance uses the returned
+   * recovery_wait status, including an idempotent 409 after a lost success ACK.
    */
   private async handleRecoveryExhausted(
     err: TransientRecoveryError,
@@ -3472,91 +3546,307 @@ export class RunRunner {
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
   ): Promise<boolean> {
-    // Reap the agent tree before reading the runner-owned clone (the security boundary),
-    // exactly as the other capture branches do. This also makes the publish overlay's
-    // PAT default-fetch permitted (the REAP-BEFORE-GIT invariant).
     executor.killAgentTree?.();
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    let capture: { verified: boolean; published: boolean } | undefined;
+    let notified = false;
+    const terminal = new Set(["cancelled", "completed", "failed"]);
+    try {
+      for (;;) {
+        if (flight.active?.shuttingDown) return false;
+        // A live heartbeat cannot requeue an abandoned running row. Keep this
+        // execution and its steering poller active while retrying, and stop once
+        // ownership or a real terminal state changes underneath it.
+        let status: string;
+        try {
+          status = (await this.client.getRunOwnership(flight.runId)).status;
+        } catch (probeError) {
+          if (probeError instanceof RequestError && probeError.status === 404) return false;
+          await this.waitRecoveryRetry(flight);
+          continue;
+        }
+        if (status !== "running") {
+          if (terminal.has(status)) {
+            flight.preserveRecoveryClone = false;
+            flight.preserveSession = false;
+          }
+          return status === "recovery_wait";
+        }
+        if (flight.steering.isCancelled()) {
+          try {
+            // Consuming cancel only stamps stop_kind. This existing terminal
+            // report is what makes Service route it to CancelRunByWorker.
+            const ack = await reportState({ status: "failed", failure_reason: "run cancelled" });
+            if (ack.status && terminal.has(ack.status)) {
+              flight.preserveRecoveryClone = false;
+              flight.preserveSession = false;
+              return false;
+            }
+            if (ack.status && ack.status !== "running") return false;
+          } catch (cancelError) {
+            runLog.warn("could not report recovery cancellation; retaining work and retrying", {
+              error: errMessage(cancelError),
+            });
+          }
+          // Do not busy-loop on the sticky cancel or its spent abort signal.
+          // Shutdown can still stop the retry with clone and session retained.
+          await this.waitRecoveryRetry(flight, false);
+          continue;
+        }
+        if (!capture) {
+          try {
+            const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog);
+            if (attempt.verified) {
+              capture = attempt;
+              flight.preserveRecoveryClone = false;
+            }
+          } catch (captureError) {
+            runLog.warn("recovery capture failed; retaining work for retry", {
+              error: errMessage(captureError),
+            });
+          }
+          if (!capture) {
+            if (!notified) {
+              batcher.emit({
+                kind: "status",
+                agent: "worker",
+                payload: {
+                  text: "Recovery checkpoint could not be verified. Keeping the local work and session and retrying capture before automatic resume.",
+                },
+              });
+              await batcher.flush().catch(() => undefined);
+              notified = true;
+            }
+            await this.waitRecoveryRetry(flight);
+            continue;
+          }
+        }
+        // Cancellation/shutdown may have arrived during local git or publish.
+        if (flight.active?.shuttingDown || flight.steering.isCancelled()) continue;
+        try {
+          const ack = await reportState({ status: "recovery_wait" });
+          if (ack.status === "recovery_wait") {
+            runLog.info("run parked for transient recovery", { detail: err.message });
+            batcher.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: capture.published
+                  ? "paused to recover from an empty model result; the recovery checkpoint is published and it resumes automatically"
+                  : "paused to recover from an empty model result; the recovery checkpoint is saved on this worker and it resumes automatically",
+              },
+            });
+            return true;
+          }
+          if (ack.status && ack.status !== "running") {
+            if (terminal.has(ack.status)) {
+              flight.preserveRecoveryClone = false;
+              flight.preserveSession = false;
+            }
+            return false;
+          }
+        } catch (reportError) {
+          // Bounded HTTP retries can fail while this worker keeps heartbeating.
+          // Retain ownership and retry the idempotent park until its ACK is known.
+          runLog.warn("could not report recovery park; retaining session and retrying", {
+            error: errMessage(reportError),
+          });
+        }
+        await this.waitRecoveryRetry(flight);
+      }
+    } finally {
+      await batcher.close().catch(() => undefined);
+    }
+  }
 
-    // BEST-EFFORT capture the local restore point BEFORE reporting the park (the causal
-    // fence: a server promotion/reseed can never fire while a capture is in flight). The
-    // verified/published outcome drives only the truthful feed wording below — the park
-    // happens regardless (limit_wait's durability model).
-    const capture = await this.captureRecoveryRestorePoint(claim, flight, runLog);
+  private async waitRecoveryRetry(flight: RunFlight, cancelStopsWait = true): Promise<void> {
+    // Short slices also observe sticky cancellation after a pause consumed the
+    // shared AbortController. An already-aborted pause signal must not busy-loop.
+    let remaining = this.recoveryRetryMs;
+    while (remaining > 0 && !flight.active?.shuttingDown
+      && (!cancelStopsWait || !flight.steering.isCancelled())) {
+      const slice = Math.min(250, remaining);
+      await sleep(slice, flight.cancel.signal.aborted ? undefined : flight.cancel.signal);
+      remaining -= slice;
+    }
+  }
 
-    // A verified LOCAL restore point (a same-worker reseed recovers exactly this tip) OR a
-    // landed publish (any worker recovers it from origin) means the park checkpoint is
-    // saved. Otherwise this fresh capture fell short: the run still resumes from its LAST
-    // durable checkpoint, but a cross-worker reclaim may restart from default — stated
-    // truthfully (mirrors the limit-park publish line) rather than implying full durability.
-    const durable = capture.verified || capture.published;
-    runLog.info("requesting a recovery_wait park", {
-      detail: err.message,
-      verified: capture.verified,
-      published: capture.published,
-    });
+  /**
+   * PRD #1190 M2: park a run on an owner-requested pause (the ctx.parkForPause callback). Called
+   * from the implement loop at the server-decided pause boundary and when a `now` pause aborted
+   * the in-flight turn. Modeled on handleLimitReached, with two deliberate differences from a
+   * limit park (Decision 8):
+   *
+   *   1. the checkpoint is published FIRST and the park happens ONLY if it lands — a pause whose
+   *      committed work cannot be made durable on origin is a promise the resume cannot keep if
+   *      the worker rolls, so staying running is the honest fallback; and
+   *   2. a failed publish does NOT park — it reports `pause_failed` (the server clears the pending
+   *      request and keeps the run running), tells the owner, and returns false so the implement
+   *      loop CONTINUES the run (a `now` pause then restarts the aborted turn on the next
+   *      iteration).
+   *
+   * Returns true once the run is durably parked (checkpoint on origin AND the server ACKed
+   * `paused`, keyed off the RETURNED status being literally "paused" — the same ack contract as
+   * the limit park, never off `applied`); false otherwise. The batcher is only FLUSHED here, never
+   * closed: phasePublish closes it on the parked path, and the continue path keeps it open for the
+   * rest of the run. NO reap and NO overlay — the run may CONTINUE, so the agent tree must stay
+   * alive; the publish is on the credential-free join-token seam (checkpointPack local read →
+   * client.publishCheckpoint), exactly like the reap:false mid-run checkpoint, so it is safe with
+   * the agent alive.
+   */
+  private async handlePausePark(
+    flight: RunFlight,
+    pausedAt: { completedCount: number; total?: number },
+  ): Promise<boolean> {
+    const { runLog, batcher, reportState } = flight;
+    const barePath = flight.barePath;
+    const runnerClone = flight.runnerClone;
+    const branch = runnerClone?.branch ?? flight.branch;
+
+    // Announce the park on the feed BEFORE the state report (same ordering as the limit park),
+    // then FLUSH so the line lands ahead of it.
     batcher.emit({
-      kind: "status",
+      kind: "paused",
       agent: "worker",
       payload: {
-        text: durable
-          ? "paused to recover from an empty model result; the recovery checkpoint is saved and it resumes automatically"
-          : "paused to recover from an empty model result; it resumes automatically from its last durable checkpoint (a resume on another worker will restart from the default branch)",
+        completed: pausedAt.completedCount,
+        ...(pausedAt.total !== undefined ? { total: pausedAt.total } : {}),
       },
     });
-    // FLUSH (not close) so the feed lines land before the state report; the single close
-    // below fires on every path this method returns.
     await batcher.flush().catch(() => undefined);
+
+    // Make the clone's work durable in the BARE tracking ref BEFORE the publish. checkpointPack
+    // (inside publishCheckpointBestEffort) packs refs/uzi-runner/<branch> in the bare, NOT the
+    // runner clone's refs/heads/<branch>; before this fix handlePausePark published WITHOUT first
+    // fetching the clone's newer committed work back into that ref (unlike the sibling limit-wait
+    // park), so a `now` pause — or a milestone-boundary pause after commits since the last
+    // fetch-back — packed a STALE tip while still recording the NEWER cloneTip below as
+    // lastPublishedTip: the work between the two was lost on a cross-worker resume AND the
+    // bookkeeping named a tip that was never published. Mirror the limit-wait park: capture any
+    // uncommitted edits into a throwaway wip(park): marker, then fetch the clone tip back. NO reap
+    // — the run may CONTINUE (Decision 8), so the agent tree must stay alive; the marker (runner-uid
+    // local commit) and the fetch-back (file://) are credential-free, safe with the agent alive, the
+    // same class as the mid-run reap:false checkpoint.
+    //
+    // The fetch-back is GATED on the clone carrying NEW work this cycle (its tip moved beyond the
+    // reseed base, including a marker just made). When the clone is still AT its base — a `now` pause
+    // before any commit, or a resume with no new work — it is DELIBERATELY skipped: an unconditional
+    // fetch-back would create a spurious base tracking ref, and the broker would then publish a
+    // base-only checkpoint (published:true) and PARK an empty pause, violating Decision 8. Skipping
+    // it leaves the ref exactly as the reseed did (absent on a fresh run → checkpointPack null →
+    // pause_failed; the recovered tracking tip on a resume → re-published as before), i.e. today's
+    // behaviour. This is NOT the rejected base-tip SHORTCUT (which would SKIP the publish and CLAIM
+    // durability, unsafe on the seededFrom:"tracking" leg): the publish below always runs; only the
+    // redundant fetch-back is skipped when there is nothing new to move.
+    let markerCreated = false;
+    if (barePath && branch && runnerClone) {
+      markerCreated = await this.git.commitWipMarker(runnerClone.path).catch(() => false);
+      const preTip = await this.git
+        .branchTip(runnerClone.path, branch)
+        .catch(() => null);
+      if (preTip !== null && preTip !== runnerClone.baseCommit) {
+        await this.fetchBackBestEffort(
+          barePath,
+          runnerClone.path,
+          branch,
+          flight.runId,
+          runLog,
+        );
+      }
+    }
+
+    // Checkpoint FIRST (Decision 8). An already-durable tip (a prior mid-run publish
+    // confirmed-landed the committed work) is a successful pause with NO fresh pack — checkpointPack
+    // would return null for an unmoved tip, which must NOT read as a publish failure. Otherwise
+    // publish over the join-token seam and require a confirmed landing. An empty/unpublishable pack
+    // (a `now` pause before any commit lands durably) does NOT get a clean-park shortcut: it falls
+    // through to publishCheckpointBestEffort, whose false result yields pause_failed and keeps the
+    // run running — no park without a durable checkpoint on origin (Decision 8). A base-tip shortcut
+    // would be UNSAFE on the seededFrom:"tracking" resume leg, where baseCommit is the
+    // locally-recovered tracking-ref tip and is durable on origin only if the prior park's
+    // best-effort publish actually landed.
+    let published = false;
+    if (barePath && branch) {
+      const cloneTip = runnerClone
+        ? await this.git
+            .branchTip(runnerClone.path, branch)
+            .catch(() => null)
+        : null;
+      if (cloneTip !== null && cloneTip === flight.lastPublishedTip) {
+        published = true;
+      } else {
+        published = await this.publishCheckpointBestEffort(
+          flight,
+          barePath,
+          branch,
+          undefined,
+        );
+        if (published) flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+      }
+    }
+
+    if (!published) {
+      // The run CONTINUES (Decision 8), so a wip(park): marker we just made must not stay committed
+      // at the clone HEAD: it would ride into the eventual MR and the restarted turn would build on a
+      // throwaway commit. Restore its content to the uncommitted tree, the same shape the resume
+      // adopt gives a marker. Best-effort; only when we actually created one this call.
+      if (markerCreated && runnerClone) {
+        await this.git.undoWipMarker(runnerClone.path).catch(() => undefined);
+      }
+      // Decision 8: no durable checkpoint ⇒ no park. Report pause_failed (the server clears the
+      // pending request and keeps the run running), tell the owner the run is still running, and
+      // return false so the loop CONTINUES — a `now` pause restarts the aborted turn on the next
+      // iteration. The reason rides the worker's own feed message; the pause_failed report carries
+      // none (the server intercepts pause_failed BEFORE its status switch).
+      runLog.warn("could not publish a pause checkpoint; the run stays running", {
+        run_id: flight.runId,
+      });
+      batcher.emit({
+        kind: "pause_failed",
+        agent: "worker",
+        payload: {
+          text: "Could not pause: the checkpoint could not be published. The run is still running and has restarted the interrupted step.",
+        },
+      });
+      await reportState({ status: "pause_failed" }).catch((e) =>
+        runLog.error("could not report pause_failed", { error: errMessage(e) }),
+      );
+      return false;
+    }
 
     let ack: StateAck;
     try {
-      ack = await reportState({ status: "recovery_wait" });
+      ack = await reportState({ status: "paused" });
     } catch (e) {
-      // The park request never landed (a transport failure after the client's bounded
-      // retries). Clean up as an unparked run (exactly like handleLimitReached): this run
-      // is NOT parked. The committed work is durable in the bare's tracking ref (captured
-      // before this report) and/or a prior checkpoint, so full cleanup loses no committed
-      // work — a preserved HOME nothing will ever claim would be an unbounded leak. The
-      // server's stale-worker requeue handles the still-`running` row.
-      runLog.error(
-        "could not report the recovery park; cleaning up as an unparked run",
-        { error: errMessage(e) },
-      );
-      await batcher.close().catch(() => undefined);
+      // The park report never landed. Not parked: the loop keeps running (its next report
+      // self-heals), exactly as handleLimitReached cleans up when its park report throws.
+      runLog.error("could not report the pause park; the run stays running", {
+        error: errMessage(e),
+      });
       return false;
     }
-
-    if (ack.status !== "recovery_wait") {
-      // The server did not recovery-park this run — the run moved on concurrently (a cancel
-      // or a park landed first, e.g. a 409), an older server, or a coerced 200 whose
-      // `applied` is true but status differs. Clean up as unparked (return false), exactly
-      // like handleLimitReached — the committed work is already durable in the tracking ref.
-      runLog.warn("the server did not recovery-park this run; cleaning up", {
+    if (ack.status !== "paused") {
+      // The server did not park this run (e.g. it was cancelled concurrently). Key off the
+      // RETURNED status being literally "paused", never off `applied` — the same ack contract as
+      // the limit park. Cleaned up as unparked; the loop keeps running.
+      runLog.warn("the server did not park this run on pause; the run stays running", {
         applied: ack.applied,
         server_status: ack.status ?? "unknown",
       });
-      await batcher.close().catch(() => undefined);
       return false;
     }
-    await batcher.close().catch(() => undefined);
+    flight.parked = true;
+    runLog.info("run paused at the owner's request; preserving its HOME for resume", {
+      run_id: flight.runId,
+    });
     return true;
   }
 
   /**
-   * issue #1197 (D-RC2c) — best-effort capture of the LOCAL restore point for a recovery
-   * park: a runner-uid dirty/clean split → commitWipMarker on a dirty tree → fetchAgentBranch
-   * → verifyRunnerTrackingCovers, then a best-effort origin publish. Returns the two
-   * durability facts the caller's truthful feed line keys on, and NEITHER blocks the park:
-   *   - `verified`: the bare's tracking ref (refs/uzi-runner/<branch>, what a same-worker
-   *     reseed reads) now covers the run's current tip (incl. any WIP marker) — a same-worker
-   *     reclaim recovers exactly this tip. This is the fetch-back success signal the
-   *     `void`-returning fetchBackBestEffort cannot give, and the reason capture *attempt*
-   *     completion is not capture *success* (commitWipMarker returns false for BOTH a clean
-   *     tree and an error; fetchBackBestEffort swallows a failed fetch).
-   *   - `published`: the origin checkpoint publish confirmably landed — a cross-worker reclaim
-   *     recovers it from refs/uzi-checkpoints/<branch>.
-   * The park ALWAYS happens (limit_wait's durability model — a reseed recovers the committed
-   * work from a prior durable checkpoint via the multi-ref fallback even when this fresh
-   * capture falls short). Absent clone paths ⇒ nothing to capture ⇒ both false.
+   * Capture dirty work as a WIP marker, fetch it into the worker-owned tracking
+   * ref, and positively verify HEAD equality before attempting origin publish.
+   * False/throw means the source clone remains the authoritative copy.
    */
   private async captureRecoveryRestorePoint(
     claim: ClaimResponse,
@@ -3575,7 +3865,7 @@ export class RunRunner {
     // Distinguish dirty vs clean EXPLICITLY (runner-uid porcelain) rather than trusting
     // commitWipMarker's ambiguous false (false = a clean tree OR a commit error).
     // worktreeStatus returns null on an UNREADABLE status → cannot assert clean → not
-    // verified (fall back to a prior durable checkpoint for the feed wording).
+    // verified. Retain this clone and retry; a prior checkpoint may lack its work.
     const status = await this.git.worktreeStatus(worktreePath);
     if (status === null) {
       runLog.warn("recovery capture: worktree status unreadable (cannot assert clean)");
@@ -3608,6 +3898,7 @@ export class RunRunner {
       worktreePath,
       branch,
     );
+    if (!verified) return { verified: false, published: false };
     // Remote publish is SEPARATE and best-effort. The agent tree was reaped by the caller,
     // so the overlay's PAT default-fetch is permitted. publishCheckpointBestEffort already
     // surfaces the specific HTTP/skip outcome (deduped) on the feed; the caller's park

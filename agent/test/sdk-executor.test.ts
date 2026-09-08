@@ -4357,6 +4357,81 @@ describe("SdkExecutor empty-turn recovery (issue #1197 D-RC2b)", () => {
     emptyTurnMaxRetries: maxRetries,
   });
 
+  it("an infinite retry override falls back to the finite retry default", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [resultEmpty()], [resultEmpty()], [resultEmpty()],
+      () => { throw new Error("retry override escaped the finite default"); },
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn,
+        emptyTurnBackoffBaseMs: 0,
+        emptyTurnMaxRetries: Number.POSITIVE_INFINITY,
+      }).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+    assert.equal(turns.length, 3, "one original drive plus the default two retries");
+  });
+
+  for (const backoff of [Number.POSITIVE_INFINITY, Number.MAX_VALUE]) {
+    it(`the ${backoff} backoff override stays within the finite backoff bound`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [resultEmpty()],
+        [submitPlan("# Plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({ config: { run_timeout_seconds: 4 } });
+      await new SdkExecutor(nullLogger(), homeDir, {
+        queryFn,
+        emptyTurnBackoffBaseMs: backoff,
+      }).run(probe.ctx);
+      assert.equal(turns.length, 3, "the bounded backoff permits recovery before the wall expires");
+      assert.deepEqual(probe.gated, ["# Plan"]);
+    });
+  }
+
+  it("zero recovery overrides remain valid and skip in-process retries", async () => {
+    const { queryFn, turns } = fakeTurns([[resultEmpty()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn, emptyTurnBackoffBaseMs: 0, emptyTurnMaxRetries: 0,
+      }).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+    assert.equal(turns.length, 1);
+  });
+
+  it("fresh empty planning retries keep the persisted session for implementation", async () => {
+    const resumes: Array<string | undefined> = [];
+    let call = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      const current = call++;
+      resumes.push(params.options.resume);
+      const session = params.options.resume ?? `retry-session-${current}`;
+      return (async function* () {
+        for await (const _prompt of params.prompt) { /* drain the SDK prompt */ }
+        if (current === 0) {
+          yield resultEmpty(session);
+        } else if (current === 1) {
+          yield submitPlan("# Retry plan", session);
+          yield resultSuccess(session);
+        } else {
+          yield signalDone(session);
+          yield resultSuccess(session);
+        }
+      })();
+    };
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.deepEqual({
+      persisted: probe.sessionIds,
+      resumes,
+    }, {
+      persisted: ["retry-session-0"],
+      resumes: [undefined, "retry-session-0", "retry-session-0"],
+    }, "the retry and implementation must resume the session saved for later recovery");
+  });
+
   it("retries a positively-empty planning turn and returns the real plan (no throw)", async () => {
     const { queryFn, turns } = fakeTurns([
       [resultEmpty()], // planning turn 0: positively empty (num_turns:0, no frames)

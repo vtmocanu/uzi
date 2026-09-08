@@ -29,6 +29,7 @@ import (
 var runInputKinds = map[string]bool{
 	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true, "revise_plan": true,
 	"answer": true, "stop": true, "scope": true, // PRD #634 M2: accept a scope directive (CLI verb is m5)
+	"pause": true, "pause_cancel": true, // PRD #1190 M1: owner-only pause request / withdrawal (resume is /resume-now, not an /inputs kind)
 }
 
 // -------------------------------------------------------------------------
@@ -573,7 +574,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !runInputKinds[req.Kind] {
-		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan, answer, stop, scope")
+		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan, answer, stop, scope, pause, pause_cancel")
 		return
 	}
 
@@ -605,6 +606,19 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			// 409: a run-state conflict. A scope ceiling is meaningful only on a
 			// milestone-structured issue run (PRD #634 M2).
 			httpx.Error(w, http.StatusConflict, "scope applies only to milestone-structured issue runs")
+		case errors.Is(err, workersvc.ErrPauseNotRunning), errors.Is(err, workersvc.ErrPauseNotSupported):
+			// PRD #1190 M1: a pause refused because the run is not running (its clock is
+			// already stopped) or its kind/interactivity is outside the allowlist → 409. The
+			// service built the run-specific sentence (PauseRefusedError.Msg), so surface it
+			// verbatim rather than a static string.
+			httpx.Error(w, http.StatusConflict, err.Error())
+		case errors.Is(err, workersvc.ErrNoPausePending):
+			// PRD #1190 M1: pause_cancel with nothing pending → 409.
+			httpx.Error(w, http.StatusConflict, "no pause is pending")
+		case errors.Is(err, workersvc.ErrInvalidPauseMode):
+			// PRD #1190 M1: the pause body was neither 'milestone' nor 'now' → 400 (a caller
+			// error). The service built the reason clause, so surface it verbatim.
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidScopeCeiling):
 			// 400: the scope body did not parse as an integer ceiling. Out-of-range
 			// values are clamped, not rejected — only a non-integer is a caller error.

@@ -1,16 +1,16 @@
 # PRD #1171: Complete Codex production adapter and execution safety
 
 **Parent:** [#1106](https://github.com/vtmocanu/uzi/issues/1106), remaining M3 (M3b) only.
-**Status (verified 2026-09-08):** The first authorized run delivered the partial credential-free dark core, merged via [#1188](https://github.com/vtmocanu/uzi/pull/1188) at `a46e1d6f`. No run is active; the deferred production integration remains, and this issue must stay without the `uzi` label until the user explicitly authorizes another run.
+**Status (verified 2026-09-08):** The first authorized run delivered the partial credential-free dark core, merged via [#1188](https://github.com/vtmocanu/uzi/pull/1188) at `a46e1d6f`. The latest issue body records authorization for the remaining Auto run with MR rework enabled, gated on #1197 merging; keep the issue without `uzi` until that prerequisite is satisfied. The earlier handoff's #1190 pause dependency merged through PR #1200 at `3278480e`; its new paused durability sink remains part of this child's integration. Recheck live issue/run state before dispatch. This documentation correction starts no run.
 **Execution:** When authorized, use a gated run so the milestone count scales the budget. Pre-flight must select a worker reporting `docker:true` with this repo allowlisted; block dispatch if none is available. Decide the MR-rework override at dispatch time. Implementation effort: high.
 
 M3a [#1156](https://github.com/vtmocanu/uzi/issues/1156) packages pinned Codex 0.153.2 in both worker images and supplies one isolated, observed-clean supervisor-root launcher. M2 [#1146](https://github.com/vtmocanu/uzi/issues/1146) supplies the neutral run/advice harness boundary while preserving Claude behavior. M1 [#1147](https://github.com/vtmocanu/uzi/issues/1147) supplies named credentials, immutable run binding, per-claim capability authorization and coordinated refresh/recovery. The remaining M3 work is to connect those three foundations into a production Codex run and advice adapter without enabling public Codex routing yet.
 
-Use current `main` and a new working branch; never touch `main`. The accepted [ADR-1106 execution policy](../adr/1106-codex-harness.md#execution-policy), [neutral harness contract](../e2e/codex-m0/harness-contract.md#contracts), [M1 credential contract](done/1147-codex-credentials-foundation.md) and [M3a launcher contract](1156-codex-image-launcher.md) are authoritative. Complete only this child and hand off its PR. Do not start M4-M7, enable production routing, deploy, release, close the parent, or claim phase-1 Codex support.
+Use current `main` and a new working branch; never touch `main`. The accepted [ADR-1106 execution policy](../adr/1106-codex-harness.md#execution-policy), [neutral harness contract](../e2e/codex-m0/harness-contract.md#contracts), [M1 credential contract](done/1147-codex-credentials-foundation.md) and [M3a launcher contract](done/1156-codex-image-launcher.md) are authoritative. Complete only this child and hand off its PR. Do not start M4-M7, enable production routing, deploy, release, close the parent, or claim phase-1 Codex support.
 
 ## Problem and outcome
 
-The repository can store Codex credentials and launch one isolated Codex process root, but the live worker still constructs only `ClaudeHarness`/`ClaudeAdviceHarness`. It has no stock app-server transport, worker-owned callback authority, synchronous child-thread delegation, all-roots registry, matching-epoch safety permit, Codex credential-refresh bridge, or production Codex prompt renderer. Consequently no run can safely execute on Codex, and M4 conformance plus M5 routing remain blocked.
+The repository can store Codex credentials and contains the stock app-server transport, callback broker, registry/safety owner, run/advice adapters and renderer delivered by #1188. The live worker still constructs only `ClaudeHarness`/`ClaudeAdviceHarness`: the merged Codex core has not been connected to production credential callbacks, child delegation, executor composition or durability sinks. M4 conformance and M5 routing remain blocked on that integration and acceptance. (AI-synced 2026-09-08)
 
 Deliver the complete **production execution spine** for a Codex-selected, already-bound claim:
 
@@ -70,6 +70,8 @@ The gated plan must name the concrete modules, state transitions and failure pre
 
 ## Remaining execution graph after #1188
 
+**Account-meter coordination (#1209, verified 2026-09-08):** [Codex account limits](1209-codex-account-rate-limits.md) is a separate visibility PRD. This child retains ownership of `codexauth.Client` production injection, worker release/refresh authorization and runtime durability boundaries. #1209 sequences its shared credential integration after this implementation lands, then adds an internal API-side account reader over the same coordinator. Do not add meter polling, UI or a worker callback for it here. #1209 does not depend on M4-M7 or authorize this child's dispatch.
+
 The merged dark core is a prerequisite, not work to reproduce. Preserve its transport, registry/safety owner, broker authority, renderer, run/advice harnesses, fd-anchored session store, file helper and OS identities. The new run implements only the deferred items recorded in the progress log.
 
 | Phase | Milestones | Dependencies | Primary files | Repo |
@@ -126,6 +128,8 @@ If this live acceptance cannot be performed safely, merge may still close child 
 - **Unsafe live validation:** no uzi worker performs real-provider testing. If maintainer isolation or safe secret injection is unavailable, record the exact blocker and leave parent M3 open.
 
 ## Progress log
+
+- 2026-09-08 (account-meter conflict check): verified the latest issue body and PR #1200 while preparing #1209. Corrected the stale header requesting new authorization and the present-tense claim that the #1188 core did not exist. The issue already records conditional Auto authorization, with #1197 still pending; #1190 has merged. Added the separate meter PRD's file/authority boundary. Historical baseline facts below retain their original commit/date; no milestone or dispatch state was changed by this documentation update.
 
 - 2026-09-08 (remaining-work redispatch decision): the user chose to continue the existing #1171 child rather than fragment the rationale into another PRD. The milestone list now contains only work deferred by #1188, grouped as Phase 1 parallel credential/callback prerequisites, Phase 2 sequential production composition and sink integration, then Phase 3 packaged proof. The delivered dark core is an explicit prerequisite and must not be reimplemented. Dispatch is gated in Auto mode with MR rework enabled; the updated PRD must land on `main` before the issue is promoted and the new run is created.
 

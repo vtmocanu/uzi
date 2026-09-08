@@ -5,5 +5,9 @@
   "summary_model": null,
   "theme": null,
   "mr_rework_enabled": null,
-  "sidebar_token_ids": null
+  "sidebar_token_ids": null,
+  "appearance_mode": null,
+  "light_theme": null,
+  "dark_theme": null,
+  "typeface": null
 }

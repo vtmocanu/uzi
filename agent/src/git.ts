@@ -172,6 +172,18 @@ function runnerTrackingOwnerKey(branch: string): string {
   return `uzi-trackowner.${branch}.owner`;
 }
 
+/** A same-run clone survived recovery; the runner must capture it before reseeding. */
+export class PendingRecoveryCaptureError extends Error {
+  constructor(readonly clonePath: string, readonly branch: string) {
+    super("retained recovery work must be captured before reseeding");
+    this.name = "PendingRecoveryCaptureError";
+  }
+}
+
+function recoveryCaptureKey(branch: string): string {
+  return `uzi-recovery.${branch}.clone`;
+}
+
 // issue #909 — the PRE-#887 flattened owner-key form. Kept ONLY so a resume can still READ a
 // stamp a persistent bare wrote under old code during the rollout window. flatten() is lossy
 // (`/`, `.` -> `-`), so this key is NOT branch-injective: never WRITE under it, and read it only
@@ -523,6 +535,19 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const repoDir = path.basename(barePath).replace(/\.git$/, "");
       const clonePath = path.join(this.runnerRoot, repoDir, key);
+      // #1197, verified 2026-09-08: the clone is the only remaining copy when a
+      // recovery capture failed. The journal is in WORKER-owned bare config, never
+      // in the runner-owned clone. An unreadable journal fails closed before rm.
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending && await fs.lstat(pending.clonePath).then(() => true, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return false;
+        throw err;
+      })) {
+        if (pending.runId !== runId || pending.clonePath !== clonePath) {
+          throw new Error("refusing to replace a retained clone owned by another run");
+        }
+        throw new PendingRecoveryCaptureError(clonePath, branch);
+      }
       await fs.rm(clonePath, { recursive: true, force: true });
       // The clone's parent dir. Under the M4 split it must be group-`runner`-writable so
       // the runner-uid `git clone` can create <key> inside it: /data/runner is
@@ -1304,6 +1329,40 @@ export class GitCache {
     }
   }
 
+  /** Record clone ownership BEFORE running the model, so disk pressure during a
+   * later capture cannot prevent the restart guard from knowing whose work it is.
+   * The runner clears this journal only after removing a safely disposable clone. */
+  async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string): Promise<void> {
+    await this.withLock(barePath, async () => {
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify({ runId, clonePath })]);
+    });
+  }
+
+  async clearRecoveryCapture(barePath: string, branch: string, runId: string): Promise<void> {
+    await this.withLock(barePath, async () => {
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending?.runId === runId) {
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      }
+    });
+  }
+
+  private async readRecoveryCapture(barePath: string, branch: string): Promise<{ runId: string; clonePath: string } | undefined> {
+    // Unlike tryGitStdout, --list succeeds when the key is absent and throws on
+    // an unreadable/corrupt config. Never interpret a failed read as no journal.
+    const entries = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+    const prefix = `${recoveryCaptureKey(branch)}\n`;
+    const entry = entries.filter((item) => item.startsWith(prefix)).at(-1);
+    const value = entry?.slice(prefix.length);
+    if (!value) return undefined;
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null || !("runId" in parsed) || !("clonePath" in parsed)
+        || typeof parsed.runId !== "string" || typeof parsed.clonePath !== "string") {
+      throw new Error("invalid retained recovery clone journal");
+    }
+    return { runId: parsed.runId, clonePath: parsed.clonePath };
+  }
+
   /**
    * PRD #122 M8 — the delta packfile of `<exclude>..refs/uzi-runner/<branch>`, for a
    * brokered origin publish at a checkpoint. Returns `{ tipOid, pack }` where `tipOid`
@@ -1638,6 +1697,29 @@ export class GitCache {
         error: gitErrorMessage(err),
       });
       return false;
+    }
+  }
+
+  /**
+   * PRD #1190 — undo a `commitWipMarker` commit, restoring its content to the UNCOMMITTED
+   * working tree (`git reset --mixed HEAD^`, runner uid). The pause park is the one caller
+   * that can create a marker and then NOT park (a failed checkpoint publish keeps the run
+   * RUNNING, Decision 8): the marker must not stay at the clone HEAD, or it would ride into
+   * the eventual MR and the restarted turn would build on a throwaway commit. This is the
+   * SAME restore the resume adopt does (#759 M2, `reset --soft` on the adopted marker), run
+   * inline here because a continuing run never reseeds. BEST-EFFORT: every error is caught
+   * and logged — a failed restore must never propagate, exactly as `commitWipMarker` never
+   * propagates a commit failure (D4). Only ever called after `commitWipMarker` returned true,
+   * so HEAD^ is the marker's parent (the clone was checked out at a real base commit).
+   */
+  async undoWipMarker(clonePath: string): Promise<void> {
+    try {
+      await this.runGitAsRunner(clonePath, ["reset", "--mixed", "HEAD^"]);
+    } catch (err) {
+      this.log.warn("WIP park marker undo failed (best-effort → marker left at HEAD)", {
+        cwd: clonePath,
+        error: gitErrorMessage(err),
+      });
     }
   }
 

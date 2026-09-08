@@ -1,18 +1,19 @@
 // Settings → Account & tokens: the account card (moved here from the old
-// dashboard), the Anthropic token lifecycle, the vault, and appearance. Lives
-// inside SettingsShell so tokens/forge/access are one discoverable area. The
-// token LIST itself is AnthropicTokens (PRD #104 M6) — this page owns the fetch
-// so the list and the rate-limit meters refresh together. Run-behavior defaults
+// dashboard), the Anthropic token lifecycle, and the vault. Lives inside
+// SettingsShell so tokens/forge/access are one discoverable area. The token
+// LIST itself is AnthropicTokens (PRD #104 M6) — this page owns the fetch so the
+// list and the rate-limit meters refresh together. Run-behavior defaults
 // (autopilot, usage-limit park, judge, CI autofix, MR review rework, worker
-// model) moved to the Run defaults tab (RunDefaults.tsx): this tab is who you
-// are and what you hold, that one is how your runs behave.
+// model) moved to the Run defaults tab (RunDefaults.tsx), and appearance +
+// demo-mode moved to the Appearance tab (AppearanceSettings.tsx): this tab is
+// who you are and what you hold, those are how your runs behave and how uzi looks.
 
 import { useMemo, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "../components/ui";
+import { Alert, Button, Card, SectionTitle } from "../components/ui";
 import { AnthropicTokens } from "../components/AnthropicTokens";
 import { CodexCredentials } from "../components/CodexCredentials";
 import { SettingsShell } from "../components/SettingsShell";
@@ -21,15 +22,14 @@ import { VaultBadge, useVaultLock } from "../components/VaultControls";
 import { SlackNotifications } from "../components/SlackNotifications";
 import { prefs } from "../lib/prefs";
 import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
-import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/theme";
-import { useDemoMode, setDemoMode } from "../lib/demoMode";
+import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName } from "../lib/demoMask";
 
 // One-time dismissal (per browser) of the rotate-your-legacy-token reminder.
 const ROTATE_NOTICE_KEY = "uzi.vault.rotateNoticeDismissed";
 
 export function Settings() {
-  const { user, refresh, themeOverride, defaultTheme, vaultUnlocked } = useAuth();
+  const { user, vaultUnlocked } = useAuth();
   const [vaultNotice, setVaultNotice] = useState("");
   const { lock, locking } = useVaultLock(() =>
     setVaultNotice(
@@ -93,36 +93,13 @@ export function Settings() {
     }
   };
 
-  // Appearance: the per-user theme override. "" = use the instance default. The
-  // change is applied live (optimistic) then persisted; a failed save re-syncs
-  // from the server, reverting the optimistic stamp.
-  const [themeBusy, setThemeBusy] = useState(false);
-  const [themeError, setThemeError] = useState("");
-
-  // Demo mode: per-device localStorage flag (NOT the server-backed theme above),
-  // so it deliberately gets its own card below Appearance rather than sitting
-  // beside the "follows you across browsers" control. Live via useDemoMode().
+  // Demo mode: per-device localStorage flag, read here so the account status card
+  // below can mask the email/display name for screenshots (the toggle that sets it
+  // lives on the Appearance tab). Live via useDemoMode().
   const demoMode = useDemoMode();
 
-  const changeTheme = async (value: string) => {
-    setThemeError("");
-    const override = value === "" ? null : value;
-    // Apply immediately so the switch feels live; the server value reconciles.
-    applyTheme(resolveTheme(override, defaultTheme));
-    setThemeBusy(true);
-    try {
-      await api.putMySettings({ theme: override });
-      await refresh(); // sync themeOverride + re-apply the authoritative theme
-    } catch (err) {
-      setThemeError(errorMessage(err, "Failed to save theme"));
-      await refresh(); // revert the optimistic stamp to the server's truth
-    } finally {
-      setThemeBusy(false);
-    }
-  };
-
   return (
-    <SettingsShell description="Your Anthropic tokens, OpenAI / Codex credentials, vault, appearance, and account.">
+    <SettingsShell description="Your Anthropic tokens, OpenAI / Codex credentials, vault, and account.">
       {(loadError || error) && <Alert message={loadError || error} />}
       {notice && <Alert tone="success" message={notice} />}
 
@@ -198,62 +175,6 @@ export function Settings() {
           ) : (
             <span className="text-sm text-muted">Locked — unlock from the banner above.</span>
           )}
-        </div>
-      </Card>
-
-      <Card className="space-y-5">
-        <div>
-          <SectionTitle>Appearance</SectionTitle>
-          <p className="mt-2 text-sm text-muted">
-            The theme uzi renders for you. It follows you across browsers. Leave it on{" "}
-            <em>Use default</em> to track the instance default your admin sets.
-          </p>
-        </div>
-
-        {themeError && <Alert message={themeError} />}
-
-        <div className="max-w-sm">
-          <Field label="Theme" htmlFor="appearance-theme">
-            <Select
-              id="appearance-theme"
-              value={isTheme(themeOverride) ? themeOverride : ""}
-              disabled={themeBusy}
-              onChange={(e) => changeTheme(e.target.value)}
-            >
-              <option value="">Use default ({THEME_LABELS[defaultTheme]})</option>
-              {THEMES.map((t) => (
-                <option key={t} value={t}>
-                  {THEME_LABELS[t]}
-                </option>
-              ))}
-            </Select>
-          </Field>
-        </div>
-      </Card>
-
-      {/* Demo mode (PRD #886). Deliberately its OWN card below Appearance so it is
-          not confused with the server-backed theme control that "follows you across
-          browsers" — this one is per-device (localStorage) and screenshot-only. */}
-      <Card className="space-y-5">
-        <div>
-          <SectionTitle>Demo mode</SectionTitle>
-          <p id="demo-mode-desc" className="mt-2 text-sm text-muted">
-            This device only. Masks emails, repo names, forge host, and other
-            identifying info in what you see — for screenshots. Doesn&apos;t change
-            your data or affect anyone else.
-          </p>
-        </div>
-
-        <div className="flex items-center justify-between rounded-lg border border-edge bg-raised/60 px-4 py-3">
-          <span className="text-sm font-medium text-fg">
-            Demo mode: {demoMode ? "On" : "Off"}
-          </span>
-          <Toggle
-            checked={demoMode}
-            onChange={setDemoMode}
-            label="Demo mode"
-            aria-describedby="demo-mode-desc"
-          />
         </div>
       </Card>
 

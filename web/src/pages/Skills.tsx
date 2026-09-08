@@ -460,7 +460,7 @@ function SkillView({
       />
       <Card>
         <span className="text-sm font-medium text-muted">Body</span>
-        <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap rounded-lg border border-edge bg-ink p-3 text-xs text-muted">
+        <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap rounded-lg border border-edge bg-ink console p-3 text-xs text-muted">
           {skill.body}
         </pre>
       </Card>

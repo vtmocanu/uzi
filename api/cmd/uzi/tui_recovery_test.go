@@ -48,9 +48,32 @@ func TestStateColorRecoveryWait(t *testing.T) {
 	if recovery == bgFillSGR(p.faintC) {
 		t.Error("recovery_wait resolved to the faint default; its explicit wait case is not being read")
 	}
-	// Health precedence is unchanged: a stalled hold is still the stall colour.
-	if bgFillSGR(p.stateColor(statusRecoveryWait, "stalled", false, false)) != bgFillSGR(p.stall) {
-		t.Error("stalled health no longer overrides the recovery_wait bucket; the precedence rule regressed")
+}
+
+// A recovery park performs no work, so health frozen at park time cannot replace its
+// wait token. Verified 2026-09-08: the old health-first ladder hid the recovery state
+// behind stalled/looping/near-timeout text and stall ink on every TUI surface.
+func TestRecoveryWaitIgnoresStaleHealth(t *testing.T) {
+	for _, health := range []string{"stalled", "looping", "slow"} {
+		t.Run(health, func(t *testing.T) {
+			glyph, word := stateGlyphWord(statusRecoveryWait, health, false, false)
+			if glyph != "~" || word != "recovery wait" {
+				t.Errorf("recovery park with stale %s = (%q, %q), want (~, recovery wait)", health, glyph, word)
+			}
+			for _, dark := range []bool{false, true} {
+				p := newPalette(dark)
+				if got := bgFillSGR(p.stateColor(statusRecoveryWait, health, false, false)); got != bgFillSGR(p.wait) {
+					t.Errorf("recovery park with stale %s, dark=%t uses %q, want wait ink", health, dark, got)
+				}
+				// Positive control: an actually running unhealthy agent still needs attention.
+				if got := bgFillSGR(p.stateColor("running", health, false, false)); got != bgFillSGR(p.stall) {
+					t.Errorf("running %s agent, dark=%t lost its stall ink", health, dark)
+				}
+			}
+			if glyph, word := stateGlyphWord("running", health, false, false); glyph != "▲" || word != displayHealth(health) {
+				t.Errorf("running %s agent lost its health token: (%q, %q)", health, glyph, word)
+			}
+		})
 	}
 }
 

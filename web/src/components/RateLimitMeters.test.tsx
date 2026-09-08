@@ -18,7 +18,7 @@ beforeEach(() => {
   // Default-only chosen set unless a test overrides it; SidebarRateLimits fetches
   // this on mount, so an unstubbed mock would throw inside the effect.
   mockApi.getMySettings.mockResolvedValue({
-    settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null, sidebar_token_ids: [] },
+    settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: [] },
   });
 });
 
@@ -241,7 +241,7 @@ describe("SidebarRateLimits", () => {
   // only the default renders, however hot the other one runs.
   it("shows only the default token plus a '+N more' link when nothing else is checked", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null, sidebar_token_ids: [] },
+      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: [] },
     });
     mockApi.getMyRateLimits.mockResolvedValue({
       tokens: [
@@ -272,7 +272,7 @@ describe("SidebarRateLimits", () => {
 
   it("also shows a checked extra token, and drops the link when nothing is hidden", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null, sidebar_token_ids: ["sec-2"] },
+      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: ["sec-2"] },
     });
     mockApi.getMyRateLimits.mockResolvedValue({
       tokens: [

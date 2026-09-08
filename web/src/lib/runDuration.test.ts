@@ -103,6 +103,18 @@ describe("runDurationLabel", () => {
     }
   });
 
+  it("paused renders `paused <elapsed>` off updated_at, not the parks' `waiting` (PRD #1190)", () => {
+    // A pause is a chosen hold, so it gets its OWN verb — mutation guard: rendering it as
+    // "waiting" (or falling to the default "") would redden this. The anchor is updated_at
+    // (status_since), the same as the involuntary parks.
+    expect(
+      runDurationLabel(
+        { status: "paused", created_at: isoBefore(200), updated_at: isoBefore(160) },
+        NOW,
+      ),
+    ).toBe("paused 2h 40m");
+  });
+
   it("terminal completed reports the static ran-span", () => {
     const run: RunDurationInput = {
       status: "completed",

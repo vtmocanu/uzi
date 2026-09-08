@@ -156,11 +156,13 @@ uzi run revise <run-id> [--message <text>]
 uzi run cancel <run-id>
 uzi run stop <run-id> [--message <text>]
 uzi run scope <run-id> --through <n>
+uzi run pause <run-id> [--now] [--cancel]
 uzi run follow-up <run-id> [--message <text>]
 uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
 uzi run resume-now <run-id>
+uzi run resume <run-id>
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues]
 uzi schedule list
@@ -290,13 +292,13 @@ uzi version
   from the wrong key is indistinguishable from a message with no content; read
   `payload`.**
 
-  **The twelve `status` values, and what `--follow` actually waits for.** A run's
-  `status` (on `run get` and `run list`) is one of exactly twelve values:
+  **The thirteen `status` values, and what `--follow` actually waits for.** A run's
+  `status` (on `run get` and `run list`) is one of exactly thirteen values:
   `queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
-  `awaiting_followup`, `limit_wait`, `pool_wait`, `recovery_wait`, `completed`,
-  `failed`, `cancelled`. Only
-  the last three are **terminal**, and `uzi run logs --follow` returns ONLY on
-  those three. The six non-terminal parks/holds it will **not** stop at are
+  `awaiting_followup`, `limit_wait`, `pool_wait`, `recovery_wait`, `paused`,
+  `completed`, `failed`, `cancelled`. Only
+  `completed`, `failed` and `cancelled` are **terminal**, and `uzi run logs --follow` returns ONLY on
+  those three. The seven non-terminal parks/holds it will **not** stop at are
   `awaiting_approval` (the plan gate), `awaiting_input` (a clarifying
   question, answered with `run answer`), `awaiting_followup` (an interactive
   task — `uzi handoff --interactive` — parked after a clean `signal_done`,
@@ -305,16 +307,17 @@ uzi version
   `limit_wait` (parked while an Anthropic usage limit resets; the sweep
   promotes it back to `queued` once past its `retry_not_before`),
   `pool_wait` (an `auto` run held because its token pool is empty — add a token
-  to the pool and it resumes), and `recovery_wait` (parked to recover from a
-  resumed turn that came back empty — no model activity; the sweep
-  auto-resumes it on a capped backoff, same as limit_wait/pool_wait). So to
+  to the pool and it resumes), `recovery_wait` (parked after an empty model turn;
+  the sweep retries it on a capped backoff), and `paused` (an owner-requested hold, `uzi
+  run pause`, resumed on demand from the run page or `uzi run resume <id>`;
+  it does not auto-resume). So to
   wait for a plan gate or a clarification park, use **`uzi run wait <id>`** (see
   below) — relying on `--follow` there blocks until the run truly finishes, which
   may be never if it is waiting on you. (If you ever see a `status` outside this list,
   the server is newer than this binary — upgrade rather than trusting the value
   to mean "active". The live `/api/ws` stream and `uzi tui` go further and
   rewrite an unrecognised status to `unknown`, but plain `run get`/`run list
-  --json` pass it through verbatim, so this twelve-value list is what you branch
+  --json` pass it through verbatim, so this thirteen-value list is what you branch
   on.)
 
   **Paging is internal and transparent; treat it as all-or-nothing.** A large
@@ -336,9 +339,9 @@ uzi version
   task parked awaiting your next follow-up — it does not auto-resume, so a
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
-  `recovery_wait` (all three auto-resume on their own, so a bare wait with no
-  `--until` rides out a `recovery_wait` park exactly like limit_wait/pool_wait
-  rather than stopping there). So a bare
+  `recovery_wait`/`paused`: limit and recovery waits retry on a timer, pool waits
+  need an available pooled token, and owner pauses need `uzi run resume`.
+  So a bare
   `uzi run wait <id>` is "wait for the plan gate, a clarification, an
   interactive park, OR the end". It **exits 0** the
   moment a target state is reached (including if the run is already in one),
@@ -348,7 +351,7 @@ uzi version
   gives **exit 7** if it elapses first (there is no default timeout — a healthy
   gated run stops at its gate, so a bare wait cannot hang). A single transient
   `6` (server blip) is ridden out, not fatal. `--until <a,b>` overrides the stop
-  set (validated against the twelve statuses).
+  set (validated against the thirteen statuses).
 
   **Narrow the wait after you approve.** A run lingers at `awaiting_approval` for
   a beat after a successful `run approve` (the async flip to `running`), so the
@@ -356,18 +359,28 @@ uzi version
   `uzi run wait <id> --until completed,failed,cancelled`. A bare `run wait` there
   would return immediately at the gate it just approved.
 
-  **Long runs in a harness that reaps background processes: poll `run get`, do
-  NOT lean on a single long-lived `run wait`.** `run wait` is the right primitive
-  wherever the process running it survives — a foreground shell, a CI job. But a
-  large gated run (a multi-milestone PRD driven end-to-end) can take hours, and if
-  you launch `run wait` as a *detached/background* watcher inside an agent harness
-  that kills long-lived background processes, the watcher dies before the run
-  finishes and you never learn it completed. Measured: Claude Code reaped a
-  backgrounded `run wait` repeatedly (`status: killed`), while the run itself kept
-  going. There, do not depend on one long wait — poll `uzi run get <id> --field
-  status` from the harness's own scheduler (a cron / wakeup) and branch on the
-  status, so a killed watcher simply re-fires on the next tick. Keep `run wait` for
-  the foreground/CI case where its process is not at risk of being reaped.
+  **One wait process per run.** Start `run wait` once; reserve `--timeout` for a
+  real deadline, not a short timer to regain tool control. A tool returning a
+  process/session/task id has yielded, not killed the process: continue waiting
+  through that tool's wait/resume mechanism. Do not start another watcher while
+  the first is alive. `run wait` already polls the server; do not add parallel
+  `run get`, `run list`, or `run logs` checks while it is healthy. Inspect the
+  returned state and fetch the plan/question/error when the wait reaches it.
+  Earlier inspection needs a concrete failure signal or an explicit user request.
+
+  **If the harness actually reaps the wait process, use scheduled status polling.**
+  Claude Code has reaped detached watchers (`status: killed`) during long runs
+  while the run itself continued. After observing that failure, replace the dead
+  watcher with `uzi run get <id> --field status` on the harness's scheduler;
+  retain its original `--until` stop set, any deadline and `--min-plan-seq` watermark.
+  If a watermark was set, accept `awaiting_approval` only after a successful
+  `uzi run logs <id> --json` fetch proves the highest **plan** message seq is greater
+  than that watermark. Stale, missing or unreadable plan messages mean keep waiting;
+  other requested stop states are not gated by plan sequence. In particular, keep
+  excluding the cleared approval gate during the post-approval wait. Read logs only
+  for this freshness check or when action is needed. Use one monitoring mechanism,
+  never both. A normal tool yield or an unchanged run state is not
+  evidence that a watcher was reaped.
 
   **`--min-plan-seq <n>`** is for waiting on a REVISED plan after `uzi run
   revise`. It makes the wait stop at `awaiting_approval` only once a plan
@@ -775,8 +788,14 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
 
    with no `--plan-file`, so the lead plans and the budget scales to its
    milestones.
-4. **Wait for the gate.** `uzi run wait <run-id>` stops at `awaiting_approval` (or
-   a terminal state). If it went terminal, report and stop.
+4. **Wait for the gate.** Start `uzi run wait <run-id>` once, following the
+   one-wait rule above. It stops at the plan gate, an actionable question/park,
+   or a terminal state. Handle the returned state; a terminal failure stops here.
+   While planning is active, defer PR/merge-rule checks, worktree preparation and
+   review tooling until a PR exists. Do not use the wait as spare time for later
+   workflow stages. Announce dispatch once; subsequent updates need a state change,
+   an actionable question, a failure or a user request. If the host requires periodic
+   updates, keep them brief and use the known state without extra diagnostic calls.
 5. **Review the plan, then approve, revise, or reject.** Read the submitted plan
    from `uzi run logs <run-id> --json` (the `submit_plan` message). Judge it as you
    would any plan, and run the *Hazards while driving* checks below. Sound approves
@@ -797,8 +816,8 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    than `<seq>` actually exists. Not sound rejects with
    `uzi run reject <run-id> -m '<specific reason>'`, then STOP.
 6. **Wait for the MR.** After approving, narrow past the gate you just cleared:
-   `uzi run wait <run-id> --until completed,failed,cancelled`. A `failed` or
-   `cancelled` result stops here; report it.
+   `uzi run wait <run-id> --until completed,failed,cancelled`. Keep the same
+   one-wait discipline; a `failed` or `cancelled` result stops here, so report it.
 7. **Get the MR URL.** `uzi run get <run-id> --field mr_web_url`.
 8. **Review, then merge the MR.** Review the diff (invoke `/code-review`, or read
    it via the forge CLI).

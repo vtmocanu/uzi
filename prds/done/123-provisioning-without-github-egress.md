@@ -135,7 +135,7 @@ Nothing here is an oversight. PRD #18 M3/M4 built provisioning when the worker w
 4. **Gate the allowlist to the seed** (M3) — drift becomes an admin-time error instead of a run-time hang.
 5. **Bound tier-2** (M4) — Decision 3-B, whose branch is determined by M0(c).
 
-**Egress stays at three FQDNs.** Re-adding github (#82 option 3) was tried and reverted (`prds/69-judge-mode-and-per-user-model.md:42`).
+**Egress stays at three FQDNs.** Re-adding github (#82 option 3) was tried and reverted (`prds/done/69-judge-mode-and-per-user-model.md:42`).
 
 ## Design Decisions
 

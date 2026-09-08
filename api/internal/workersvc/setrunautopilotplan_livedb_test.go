@@ -240,4 +240,25 @@ func TestSetRunAutopilotPlanLiveDB(t *testing.T) {
 			t.Fatal("ClaimPayload.PlanApproved = false, want true (auto_approve=true) — the resumed run must enter implementation, not the gate")
 		}
 	})
+
+	t.Run("a different worker cannot write the plan", func(t *testing.T) {
+		id := seedRun(7, "running", "agent", true, nil)
+		before := reread(id)
+		rows, err := q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
+			PlanMd:   pgconv.TextOrNull(planBody),
+			ID:       id,
+			WorkerID: pgconv.UUID(uuid.New()),
+		})
+		if err != nil {
+			t.Fatalf("SetRunAutopilotPlan: %v", err)
+		}
+		if rows != 0 {
+			t.Fatalf("wrong-worker plan write rows = %d, want 0", rows)
+		}
+		after := reread(id)
+		if after.PlanMd != before.PlanMd || after.PlanSource != before.PlanSource ||
+			after.WorkerID != before.WorkerID || after.UpdatedAt != before.UpdatedAt {
+			t.Fatal("a refused wrong-worker plan write mutated the run")
+		}
+	})
 }

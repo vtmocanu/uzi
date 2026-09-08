@@ -92,4 +92,8 @@ for the pooled-token wait. `recovery_wait` means a resumed turn came back
 empty (no model activity), not a limit or an empty pool at all — see
 [Recovering from an empty turn](run-recovery-wait.md).
 
-Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Configuration](configuration.md) · [Slack notifications](slack.md) · [Recovering from an empty turn](run-recovery-wait.md)
+## Not the same as pausing
+
+A `limit_wait` park (this page) happens *to* the run — a token it was spending hit its rate limit — and it resumes on its own, with a fresh clock, once the window resets. [Pausing](run-pause.md) is something the run's owner asks for, on demand, and it only ever resumes when the owner says so, handing back exactly the budget that was left rather than a fresh clock. The two can overlap: a pause requested while a run is still `running` survives a `limit_wait` park that overtakes it, and takes effect at the first boundary once the run is working again — you don't have to ask twice.
+
+Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Pausing and resuming a run](run-pause.md) · [Configuration](configuration.md) · [Slack notifications](slack.md) · [Recovering from an empty turn](run-recovery-wait.md)

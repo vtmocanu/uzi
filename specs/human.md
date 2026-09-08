@@ -228,6 +228,7 @@ Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/done/23-web-ux-live-dashbo
 - Desktop sidebar is collapsible.
   - The collapse control must not consume a full sidebar row. [user 2026-08-14]
 - Empty board columns can be hidden.
+  - Hiding empty columns is the DEFAULT for a board the user has not configured; an explicit "show empty" choice still wins. [AI-synced 2026-09-08 (#1208)]
 - Web-only; no API/schema/agent changes.
 - "Board columns should auto refresh" — already satisfied by existing polling; no change shipped.
 
@@ -551,7 +552,7 @@ Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
 - A worker's reported version must be the release it is actually running — no more a frozen informational string. [user, accepted from the mock 2026-07-22]
 - Workers needing attention are those that **failed to upgrade** or are **behind**; a worker mid-upgrade is informational and must not raise an alert. [user 2026-07-22]
 - Diagnostics are **read-only** in v1: no restart, retry, or auto-rollback of a failed upgrade. [user 2026-07-22]
-- Dark-only, matching the product's two dark themes; no light variant. [user 2026-07-22]
+- Dark-only, matching the product's two dark themes; no light variant. [user 2026-07-22] [superseded by PRD #1167: the panel is token-driven and now renders in every theme, light included; the light themes were approved in that PRD's decision log 2026-09-07 (AI-synced 2026-09-08)]
 - The mock is the accepted design for the fleet panel, the per-worker badges, the failed-worker detail strip, and the Workers-menu alert badge. [user 2026-07-22]
 
 **Deviations from the accepted mock, taken by the team during implementation — ratified [user 2026-07-26]:**
@@ -607,6 +608,12 @@ ADR at `adr/0035-run-limit-retry.md`.
 - `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
 - When a run parked on a usage limit resumes, the owner gets a Slack message in the run's thread. [user 2026-09-05, PRD #1116]
+
+## Feature #1190 — Pause and resume a run on demand
+
+Tracked as GitHub issue vtmocanu/uzi#1190; PRD at `prds/1190-run-pause-resume.md`.
+
+- A run's owner can pause it (after the current milestone, or at once) and resume it later; the run parks on a pushed checkpoint, spends nothing while paused, and its budget clock stops. [user, #1190]
 
 ## Feature #218 — A park or shutdown must not lose the agent's committed work
 
@@ -736,6 +743,18 @@ Extends Feature #111 (auto-select) and issue #804 (ephemeral default).
 
 - Every new worker — external (join-token mint) or hosted (provisioned) — defaults its Anthropic bind mode to auto-select when the owner has a pooled token, else the default token: the SAME rule ephemeral/throwaway workers already use (#804). A worker pinned to a named token stays pinned; existing workers are not retroactively changed. [user 2026-09-05]
 - The judge lane (run retrospectives and self-improvement runs) gets that same auto mode as its DEFAULT, spreading retrospectives across the owner's pooled tokens instead of always billing one fixed account. On an empty pool the judge spends the default token (it does not hold). [user 2026-09-05]
+
+## Feature #1167 — Lights on: light themes, system-follow appearance, typeface
+
+Tracked as GitHub issue vtmocanu/uzi#1167; PRD at `prds/done/1167-lights-on-themes.md`.
+Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
+
+- Three light themes — Dawn, Hall, Shadow — a light option for a dark-first tool, each keeping the dark factory somewhere on screen; ship all three, Hall the recommended light default. [user 2026-09-07]
+- Theme ids and labels are English (dawn/hall/shadow), no Romanian anywhere. [user 2026-09-07]
+- Appearance mode System / Lights on / Lights off: System follows the OS; the other two hold one preferred theme per polarity, so the user picks one light theme and one dark theme. [user 2026-09-07]
+- Settings vocabulary is "Lights on" / "Lights off"; Appearance is its own Settings tab, second after Account & tokens, and also holds the per-device Demo mode toggle. [user 2026-09-07; AI-synced 2026-09-08 (#1208): promoted from a card inside Account & tokens to a dedicated tab, and Demo mode moved onto it, per the user's 2026-09-08 review]
+- Admin sets the instance defaults (mode plus a theme per polarity plus typeface); a user override wins — extends Feature #21's server-side theme default. [user 2026-09-07]
+- Per-user typeface — System or IBM Plex — independent of theme; bundled, no external font fetch. [user 2026-09-07]
 
 ## Startup admin seed
 

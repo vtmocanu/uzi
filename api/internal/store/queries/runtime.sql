@@ -1059,6 +1059,13 @@ WHERE runs.id = @id AND worker_id = @worker_id
   -- recovery-parked run resumes only via PromoteRecoveryWaitRuns, which lands it at 'queued'
   -- before the worker reports.
   AND status <> 'recovery_wait'
+  -- paused (PRD #1190) needs the same explicit exclusion, for the same
+  -- reason: a paused run's worker has EXITED (it freed its slot), so a reordered pre-park
+  -- `running` heartbeat that landed after SetRunPaused would flip paused back to running
+  -- under a worker that is gone, and the run would sit ownerless until RUN_TIMEOUT. The
+  -- negative predicate above admits it; a resume lands it at 'queued' server-side before any
+  -- worker reports, so this never blocks a legitimate resume.
+  AND status <> 'paused'
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
@@ -1294,7 +1301,16 @@ WHERE id = @id AND worker_id = @worker_id
   -- argument (its legitimate pre-run path passes THROUGH awaiting_approval) does not apply
   -- to a held run, which never gates.
   AND status <> 'limit_wait'
-  AND status <> 'pool_wait';
+  AND status <> 'pool_wait'
+  -- A stale plan report must not replace a recovery park's preserved plan/session
+  -- or bypass PromoteRecoveryWaitRuns (verified by the #1197 stale-gate regression).
+  AND status <> 'recovery_wait'
+  -- paused IS excluded (PRD #1190), on the same reasoning as limit_wait/pool_wait above and
+  -- UNLIKE awaiting_input: a paused run's only exit is a server-side resume to 'queued', so a
+  -- stale/re-delivered gate report must not un-pause it into awaiting_approval under a worker
+  -- that has already exited. A pause is only ever requested on a running run, so no legitimate
+  -- awaiting_approval report is expected from a paused row.
+  AND status <> 'paused';
 
 -- name: ClearRunRequiredCapabilities :execrows
 -- PRD #84 M4 (unit 4c): the user override ("run without the capability", Decision 12).
@@ -1599,6 +1615,100 @@ UPDATE runs SET
 WHERE status = 'recovery_wait' AND recovery_retry_not_before <= @now
 RETURNING id, user_id, status;
 
+-- name: SetRunPaused :execrows
+-- Park a run on the owner's explicit request (PRD #1190 M1). running -> paused,
+-- NON-TERMINAL: the run keeps its issue, its session, its worker affinity and its message
+-- history, and the owner promotes it back to queued ON DEMAND via ResumePausedRun (there is
+-- no server-side clock, unlike the limit park's retry_not_before). Mirrors SetRunLimitWait's
+-- shape and inherits its reasons:
+--
+-- THE SOURCE GUARD IS POSITIVE (status = 'running'), exactly as SetRunLimitWait's is and for
+-- the same reasons: only a running run holds the live worker whose park report this is, so
+-- queued/claimed/awaiting_*/limit_wait/pool_wait -> paused are all 0-row no-ops the service
+-- surfaces as 409 / applied=false. Re-delivery is idempotent, and the worker's cleanup
+-- carve-out keys off the RETURNED status, so a refused park cleans up rather than leaking.
+--
+-- THE PENDING-REQUEST GUARD (pause_requested_at IS NOT NULL) is the entry-side analog of
+-- ADR-1190 I3's <> 'paused' stale-report guards on SetRunRunning/SetRunAwaitingApproval: a
+-- delayed 'paused' report must not park a run whose pending request was already CLEARED — by a
+-- CancelPauseInput withdrawal, the pause_failed ClearPauseRequest, or a terminal transition —
+-- between the worker deciding to park and this UPDATE landing. Without it a withdrawn pause
+-- could still park the run on the in-flight report; with it that report is a 0-row no-op.
+--
+-- The pending-pause columns are CLEARED here — the request has now been CONSUMED (the run
+-- reached the park it asked for), so nothing re-arms the ACK after a resume. This is one of
+-- the four sites that clear them (with CancelPauseInput on withdrawal, ClearPauseRequest on a
+-- failed publish, and the terminal transitions); the INVOLUNTARY parks deliberately do NOT
+-- clear them, so a pending pause survives a limit/pool park and re-arms on the first running
+-- report after promotion.
+--
+-- THE HEALTH RESET IS MANDATORY, for SetRunLimitWait's reason: ListActiveRunsForHealth is a
+-- positive allowlist that never revisits a park, so a flag live at park time would freeze for
+-- the whole pause. No counter is bumped: a voluntary pause spends no budget. session_id is
+-- COALESCE'd (sqlc.narg) so an omitting report preserves it.
+UPDATE runs SET
+    status             = 'paused',
+    status_since       = now(),
+    session_id         = COALESCE(sqlc.narg('session_id'), session_id),
+    pause_requested_at = NULL,
+    pause_mode         = NULL,
+    pause_after_count  = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running'
+  AND pause_requested_at IS NOT NULL;
+
+-- name: ResumePausedRun :one
+-- Owner-scoped resume of ONE paused run (PRD #1190 M1): paused -> queued, the on-demand
+-- counterpart to PromoteLimitWaitRuns but with the GATE-PARK accounting (Decision 2), NOT the
+-- limit park's fresh-wall reset. The user_id predicate is what makes it unable to resume a
+-- foreign run.
+--
+-- THE BUDGET RULE IS THE GATE-PARK ONE (issue #783), the OPPOSITE of PromoteLimitWaitRuns
+-- (Decision 6d): started_at is KEPT (never NULL'd) and the parked wall-clock time is BANKED
+-- into budget_paused_seconds, so the run resumes with exactly the remaining budget it had and
+-- SweepRunningTimeout's deadline excludes the pause. A fresh wall would be an uncapped
+-- extension; consuming budget would punish the owner for waiting. status_since is NOT NULL
+-- (migration 00163), so the banked interval is never NULL.
+--
+-- session_id, last_seq, started_at and worker_id are UNTOUCHED (resume affinity: the same disk
+-- + session reclaim the run if the pinned worker is alive; ADR-628's affinity leg falls open to
+-- any live worker once it is stale). requeue_count is NOT bumped — a resume is not a worker
+-- death. codex_cap_hash/codex_claim_epoch are revoked/bumped exactly as the other park->queued
+-- transitions do (PRD #1147 F7): a queued run has no live owner until re-claimed. Health is
+-- reset because the detector's allowlist includes 'queued'.
+--
+-- THE SOURCE GUARD IS POSITIVE (status = 'paused'): a run that is not paused is a 0-row no-op,
+-- which lets the resume handler tell "not paused" (409) from "not yours / absent" (404).
+-- RETURNING id, user_id, status matches PromoteLimitWaitRuns so the caller can publish the
+-- resume through the broadcaster/notifier fan-out.
+UPDATE runs SET
+    status                = 'queued',
+    status_since          = now(),
+    budget_paused_seconds = budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at            = now()
+WHERE id = @id AND user_id = @user_id
+  AND status = 'paused'
+RETURNING id, user_id, status;
+
+-- name: ClearPauseRequest :execrows
+-- Clear a pending pause request WITHOUT parking (PRD #1190 M1), for the worker's
+-- `pause_failed` report: the worker could not publish the checkpoint, so the run STAYS running
+-- and the request is withdrawn (Decision 8 — a failed publish means no park). Keyed on id AND
+-- worker_id so only the worker holding the run can clear it; it does not touch status. One of
+-- the four sites that clear the pending-pause columns (with SetRunPaused, CancelPauseInput and
+-- the terminal transitions).
+UPDATE runs SET
+    pause_requested_at = NULL,
+    pause_mode         = NULL,
+    pause_after_count  = NULL,
+    updated_at         = now()
+WHERE id = @id AND worker_id = @worker_id;
+
 -- name: SetRunAwaitingInput :execrows
 -- PRD #88 M1: the clarification park. Sibling of SetRunAwaitingApproval, and it
 -- carries the same PRD #47 exit contract for the same reason.
@@ -1797,6 +1907,15 @@ UPDATE runs SET
     -- 'chat'-only, and progressParams gates milestone writes to issue runs, so its snapshot
     -- is always NULL — the clear there would be a no-op and is deliberately omitted.)
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause. Clearing the three
+    -- pause columns on every terminal transition makes the design true at the root:
+    -- a run that completes, fails or is cancelled while carrying an owner's pending
+    -- pause never leaves a stale "pause requested" ACK/chip on a dead run. A no-op
+    -- for a run with no pending pause (the columns are already NULL). The other
+    -- terminal writers (SetRunFailed / MarkRunFailedByID / CancelRunServerSide /
+    -- CancelRunByWorker / FailRunAutoStop / RejectRunServerSide / SweepRunningTimeout
+    -- and the stale-worker failers below) clear them for the same reason.
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Arm the M5 patch marker. Explicit rather than left to the column default,
     -- because SetRunCompleted can in principle run on a row that already carries a
     -- stamp from an earlier terminal transition.
@@ -1856,6 +1975,8 @@ UPDATE runs SET
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -1880,6 +2001,8 @@ UPDATE runs SET
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -1898,6 +2021,8 @@ UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancell
     stop_reason = @stop_reason,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -1935,6 +2060,8 @@ UPDATE runs SET
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -1981,6 +2108,8 @@ UPDATE runs SET status = 'failed', status_since = now(),
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -2022,13 +2151,19 @@ WHERE id = @id
   -- today only by autostop.go's single `if run.Status != "running"` line, unmentioned in
   -- that line's comment, and exposed the day someone relaxes it — so this is its SQL backstop.
   AND status <> 'pool_wait'
-  -- recovery_wait (issue #1197) is the fifth park and the same argument transfers verbatim: a
+  -- recovery_wait (issue #1197) needs the same guard: a
   -- recovery-parked run's writes have STOPPED (the worker parked after a positively-empty
   -- turn, awaiting the server-owned backoff promotion), not looped, so auto-stopping one
   -- would be wrong on the merits. It is excluded today only by autostop.go's single
   -- `if run.Status != "running"` line, unmentioned in that line's comment, and exposed the
   -- day someone relaxes it — so this is its SQL backstop.
-  AND status <> 'recovery_wait';
+  AND status <> 'recovery_wait'
+  -- paused (PRD #1190) needs the same guard: a
+  -- paused run's writes have STOPPED (the worker parked on the owner's request and freed its
+  -- slot), not looped, so auto-stopping one would be wrong on the merits. It is excluded today
+  -- only by autostop.go's single `if run.Status != "running"` line, unmentioned in that line's
+  -- comment, and exposed the day someone relaxes it — so this is its SQL backstop.
+  AND status <> 'paused';
 
 -- name: RejectRunServerSide :execrows
 -- Server-side plan rejection → failed → origin restore → stamp. stop_kind is
@@ -2041,6 +2176,8 @@ UPDATE runs SET status = 'failed', status_since = now(), stop_kind = 'plan_rejec
     failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -2253,6 +2390,8 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -2279,6 +2418,8 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -2331,6 +2472,8 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -2901,6 +3044,61 @@ RETURNING *;
 UPDATE run_user_inputs SET disposition = @disposition
 WHERE run_id = @run_id AND kind = 'scope' AND disposition IS NULL;
 
+-- name: CreatePauseInput :one
+-- Request a pause on a running run AND write the kind='pause' audit row in ONE statement
+-- (PRD #1190 M1), mirroring CreateScopeCeilingInput's atomicity (workersvc.Store exposes no
+-- transaction seam). The UPDATE sets the three pending-pause columns; pause_after_count is
+-- len(milestones_completed) captured NOW — the floor the milestone mode waits to exceed. The
+-- run STAYS running (Decision 3): a pending pause is a flag, not a status.
+--
+-- The predicate is the kind/interactive/status ALLOWLIST (Decisions 6/7): only a running,
+-- non-interactive issue/task/prompt/self_improve run accepts a pause. A 0-row result is
+-- disambiguated in Go (re-read the run: status != running -> ErrPauseNotRunning; kind or
+-- interactive outside the allowlist -> ErrPauseNotSupported). On 0 rows the INSERT selects
+-- from the empty CTE and writes NO audit row, so a refused pause leaves no trace.
+--
+-- A second pause while one is pending REPLACES the mode (the UPDATE overwrites), so a `now`
+-- escalates a pending `milestone`; each accepted request still writes its own audit row.
+--
+-- The FINAL statement is the audit INSERT with RETURNING (CreateScopeCeilingInput's shape),
+-- selecting from the UPDATE CTE — so a REFUSED request (UPDATE matched 0 rows) inserts 0 rows
+-- and yields pgx.ErrNoRows, which the service maps to the 409 classes. On success the returned
+-- run_user_inputs row is unused (the service re-reads the already-fetched run for the DTO).
+WITH paused_req AS (
+    UPDATE runs SET
+        pause_requested_at = now(),
+        pause_mode         = @mode,
+        pause_after_count  = COALESCE(jsonb_array_length(runs.milestones_completed), 0),
+        updated_at         = now()
+    WHERE runs.id = @id AND runs.status = 'running'
+      AND runs.kind IN ('issue', 'task', 'prompt', 'self_improve')
+      AND runs.interactive = false
+    RETURNING runs.id
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+SELECT paused_req.id, 'pause', @mode FROM paused_req
+RETURNING *;
+
+-- name: CancelPauseInput :one
+-- Withdraw a pending pause AND write the kind='pause_cancel' audit row in ONE statement
+-- (PRD #1190 M1), mirroring CreatePauseInput/CreateScopeCeilingInput. Clears the three
+-- pending-pause columns where a request is actually pending on a still-running run; a 0-row
+-- result (no pause pending, or the run is no longer running) is surfaced by Go as 409 "no
+-- pause is pending". The FINAL statement is the audit INSERT with RETURNING (CreatePauseInput's
+-- shape): a 0-row UPDATE yields pgx.ErrNoRows, which the service maps to the 409.
+WITH cancelled AS (
+    UPDATE runs SET
+        pause_requested_at = NULL,
+        pause_mode         = NULL,
+        pause_after_count  = NULL,
+        updated_at         = now()
+    WHERE runs.id = @id AND runs.pause_requested_at IS NOT NULL AND runs.status = 'running'
+    RETURNING runs.id
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+SELECT cancelled.id, 'pause_cancel', NULL::text FROM cancelled
+RETURNING *;
+
 -- name: ConsumeRunInputs :many
 -- FIFO consume: mark and return every pending input for the run, oldest first.
 -- FOR UPDATE SKIP LOCKED keeps two concurrent polls from returning the same row.
@@ -2909,8 +3107,12 @@ WITH pending AS (
     -- PRD #634 M2: the scope audit row (kind='scope') is server-side ONLY — the control it
     -- carries travels as runs.scope_ceiling on the ACK/claim, never through this queue — so
     -- the worker must NEVER drain it. Draining would hit SteeringChannel.route's default arm
-    -- and log a spurious "unknown input kind". Everything else consumes as before.
-    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind <> 'scope'
+    -- and log a spurious "unknown input kind". PRD #1190 adds 'resume' to that server-only
+    -- set (the resume endpoint writes it as an audit row; the run's return to 'queued' is a
+    -- server-side transition, not a worker steering input). 'pause' and 'pause_cancel' are
+    -- NOT excluded — the worker DOES consume them (the `now` abort and the flag clear).
+    -- Everything else consumes as before.
+    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume')
     ORDER BY p.id ASC
     FOR UPDATE SKIP LOCKED
 ),
@@ -3058,7 +3260,11 @@ WHERE id = @id;
 -- internal bookkeeping written on every publish, and perturbing updated_at would
 -- disturb the claim-affinity ordering (ClaimRun reads r.updated_at for queued rows)
 -- for a value no user ever sees.
-UPDATE runs SET checkpoint_tip = @checkpoint_tip WHERE id = @id;
+--
+-- PRD #1190: also stamp checkpoint_tip_at (a separate timestamp, not updated_at) so the
+-- pause UI can name the age of the last checkpoint — the "work since the last checkpoint"
+-- a `now` pause discards. It is written on every publish alongside checkpoint_tip.
+UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHERE id = @id;
 
 -- Run health detector (PRD #47) ----------------------------------------------
 

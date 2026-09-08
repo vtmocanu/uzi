@@ -734,6 +734,8 @@ describe("guardrail-deny 'blocked' chip (PRD #116)", () => {
     // The chip reuses the neutral success frame verbatim…
     expect(chip.className).toContain("border-edge bg-raised/50 text-muted hover:border-edge-strong");
     expect(pre?.className).toContain("border-edge bg-ink");
+    // NEUTRAL_BODY carries the `console` scope so the pane stays dark on light themes.
+    expect(pre?.className).toContain("console");
     // …and only the glyph is warn-tinted (Decision 4: no full warn chip). Assert the
     // glyph EXISTS first, so a regression that drops it reports that rather than
     // "the given combination of arguments (undefined and string) is invalid".

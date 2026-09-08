@@ -40,6 +40,7 @@ function parseTs(iso: string | null | undefined): number | null {
  *     limit_wait /
  *     pool_wait /
  *     recovery_wait        → `waiting <elapsed>` since updated_at (time parked in that state)
+ *   - paused               → `paused <elapsed>`  since updated_at (PRD #1190, its own verb)
  *   - completed / failed /
  *     cancelled (terminal) → `ran <elapsed>`, the STATIC span finished_at − started_at, i.e.
  *                            how long it actually ran, independent of nowMs
@@ -74,6 +75,12 @@ export function runDurationLabel(run: RunDurationInput, nowMs: number): string {
     // default "" and show no duration token at all.
     case "recovery_wait":
       return liveToken("waiting", run.updated_at, nowMs);
+    // PRD #1190: a run its owner paused. Its OWN verb — `paused <elapsed>` since it
+    // entered the state (updated_at) — deliberately NOT the parks' "waiting": a pause is
+    // a chosen hold, not a wait on something outside the run, and the word carries the
+    // difference the info tone also draws.
+    case "paused":
+      return liveToken("paused", run.updated_at, nowMs);
     case "completed":
     case "failed":
     case "cancelled": {

@@ -246,7 +246,7 @@ export function UpdatesSettingsCard() {
                   )}
 
                   {/* Copyable upgrade runbook. */}
-                  <div className="relative rounded-lg border border-edge bg-ink p-3">
+                  <div className="relative rounded-lg border border-edge bg-ink console p-3">
                     <button
                       type="button"
                       onClick={copyRunbook}

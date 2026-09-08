@@ -155,9 +155,28 @@ type RunDTO struct {
 	// run may complete over the immutable frozen list; NULL = unbounded. Like the budget
 	// fields it rides the running-report ACK and the claim payload (both built by runToDTO),
 	// so the worker honors it at the loop top and across a re-claim.
-	ScopeCeiling *int    `json:"scope_ceiling"`
-	WorkerID     *string `json:"worker_id"`
-	Branch       *string `json:"branch"`
+	ScopeCeiling *int `json:"scope_ceiling"`
+	// PauseRequested is the SERVER-DECIDED pause boundary (PRD #1190 M1, Decision 4): true when
+	// the worker holding this run should park at its next boundary. It rides the running-report
+	// ACK exactly like ScopeCeiling (a worker-facing field, NOT owner-gated), and the boundary
+	// rule (pause_mode='now', or 'milestone' once the in-flight milestone completed) lives in
+	// ONE place (runToDTO's pauseRequestedRule). false whenever no pause is pending.
+	PauseRequested bool `json:"pause_requested"`
+	// PauseRequestedAt / PauseMode / PauseAfterCount describe a PENDING pause request on a
+	// still-running run (PRD #1190 M1): a flag, not a status (Decision 3). All null when no
+	// pause is pending. They carry an owner's intent, so they ride only the owner/admin RunDTO
+	// (GetRun, own-scoped ListRuns, admin AdminListRuns) — never the cross-user board card
+	// (latestRunDTO carries only the status). pause_after_count is len(milestones_completed) at
+	// request time (the count the milestone mode waits to exceed).
+	PauseRequestedAt *time.Time `json:"pause_requested_at"`
+	PauseMode        *string    `json:"pause_mode"`
+	PauseAfterCount  *int       `json:"pause_after_count"`
+	// CheckpointTipAt is when the run's branch tip was last checkpoint-published (PRD #1190 M1),
+	// null before the first publish. Not owner-gated — it is just a timestamp — and it drives the
+	// "work since the last checkpoint (Nm ago)" a `now` pause discards.
+	CheckpointTipAt *time.Time `json:"checkpoint_tip_at"`
+	WorkerID        *string    `json:"worker_id"`
+	Branch          *string    `json:"branch"`
 	// BaseBranch and OpenMr are the task/handoff columns (PRD #400), meaningful only
 	// for a kind='task' run. BaseBranch is the source ref the task branched from (null
 	// when it inherited the caller's local HEAD, and on every non-task run); OpenMr is
@@ -642,9 +661,9 @@ type RunEventDTO struct {
 	// 'limit_wait' by 00091_run_limit_wait.sql, with 'awaiting_input' by
 	// 00092_run_awaiting_input.sql, with 'awaiting_followup' by
 	// 00146_interactive_task_runs.sql, with 'pool_wait' by 00170_run_pool_wait.sql, and
-	// with 'recovery_wait' by 00203_run_recovery_wait.sql): queued, claimed, running,
+	// with 'recovery_wait' by 00206_run_recovery_wait.sql): queued, claimed, running,
 	// awaiting_approval, awaiting_input, awaiting_followup, limit_wait, pool_wait,
-	// recovery_wait, completed, failed, cancelled — TWELVE values. It is the field that
+	// recovery_wait, paused, completed, failed, cancelled: THIRTEEN values. It is the field that
 	// decides whether a run reads as still live, so an unrecognised value must never reach
 	// a consumer as-is.
 	Status string `json:"status,omitempty"` // set on "state" frames

@@ -107,6 +107,15 @@ export interface UserSettings {
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
   summary_model: string | null;
   theme: string | null;
+  /** PRD #1167 "Lights on" (m2): the four RAW per-user appearance overrides, each
+   *  null = inherit the instance default. appearance_mode is system|light|dark;
+   *  light_theme / dark_theme are theme ids of the matching polarity; typeface is
+   *  system|plex. Resolved against the instance defaults by theme.resolveAppearance.
+   *  These supersede the single-value `theme` above, which stays for the legacy chain. */
+  appearance_mode: string | null;
+  light_theme: string | null;
+  dark_theme: string | null;
+  typeface: string | null;
   /** Ids of NON-default tokens whose rate meters the user also wants on the
    *  sidebar rail. The default token always shows and is never listed here.
    *  Absent (older server) reads as []: default-only, the pre-feature look. */
@@ -130,6 +139,14 @@ export interface UserSettingsPatch {
   /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
   summary_model?: string | null;
   theme?: string | null;
+  /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
+   *  the field unchanged, present-null clears it back to inherit, a value sets it
+   *  (validated server-side by the polarity-aware theme narrowers). Explicit fields win
+   *  over the legacy `theme` mapping when both are present in one PUT. */
+  appearance_mode?: string | null;
+  light_theme?: string | null;
+  dark_theme?: string | null;
+  typeface?: string | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
   /** Per-user MR-review-watcher opt-in (PRD #700 M6); present-false opts out,
@@ -713,6 +730,16 @@ export interface AppSettings {
   // iff it carries this label; served as a raw string like every other setting.
   uzi_label: string;
   default_theme: string;
+  // PRD #1167 "Lights on" (m2): the instance appearance DEFAULTS — the value each
+  // per-user field inherits when the user has no override. Served in the admin
+  // settings map like every other key. default_dark_theme mirrors the legacy
+  // default_theme (the dark-polarity default kept in lockstep); the other three are
+  // the new admin-set instance defaults for the mode switch, the light-polarity theme,
+  // and the typeface.
+  default_appearance_mode: string;
+  default_light_theme: string;
+  default_dark_theme: string;
+  default_typeface: string;
   // Slack integration non-secret keys (PRD #25). slack_enabled is the text
   // "true"/"false"; public_base_url is the http(s) base for deep links in Slack
   // messages. The two Slack TOKENS are secret and never returned here — see
@@ -985,20 +1012,55 @@ export interface AgentSourceApplyResult {
 // PRD #764 for the `uzi` run-eligibility label).
 export const DEFAULT_AUTOPILOT_LABEL = "autopilot";
 
+// AppearanceState is the fully-resolved appearance the session bootstrap carries
+// (PRD #1167 "Lights on", m2). `mode`/`light_theme`/`dark_theme`/`typeface` are the
+// RESOLVED values the SPA stamps; `overrides` is the user's RAW per-field choices
+// (each null = inherit) and `defaults` the instance defaults they resolve against,
+// so the Appearance picker can render "inherit (…)" placeholders without a second
+// fetch. Mirrors the Go wire object (theme.ResolveAppearance + the raw halves).
+export interface AppearanceState {
+  mode: string;
+  light_theme: string;
+  dark_theme: string;
+  typeface: string;
+  overrides: {
+    mode: string | null;
+    light_theme: string | null;
+    dark_theme: string | null;
+    typeface: string | null;
+  };
+  defaults: {
+    mode: string;
+    light_theme: string;
+    dark_theme: string;
+    typeface: string;
+  };
+}
+
 // SessionResponse is the auth/session bootstrap body (login, register, me). It
 // carries the user, the instance forge labels the board and issue-creation UI
 // need before their first call (PRD #19 M2, PRD #764: the single `uzi`
-// run-eligibility label and the autopilot label), and the three theme fields the
-// Appearance picker needs (PRD #21: resolved theme, the user's raw override with
-// null = none, and the instance default).
+// run-eligibility label and the autopilot label), and the resolved `appearance`
+// object the Appearance picker needs (PRD #1167 "Lights on": the resolved
+// mode/theme pair/typeface plus the raw overrides and instance defaults).
 export interface SessionResponse {
   user: User;
   // PRD #764: the single run-eligibility label. An issue is runnable iff it carries
   // this label; the board renders it as a runnable marker + filter facet.
   uzi_label: string;
   autopilot_label: string;
+  // PRD #1167 "Lights on" (m2): the resolved appearance the SPA stamps, with the raw
+  // overrides + instance defaults for the picker. Supersedes the deprecated trio below.
+  appearance: AppearanceState;
+  /** @deprecated PRD #1167: use `appearance.mode` + `appearance.light_theme` /
+   *  `appearance.dark_theme` instead. Kept for the pre-m2 single-theme picker: the
+   *  resolved theme (the light or dark slot per the resolved mode). */
   theme: string;
+  /** @deprecated PRD #1167: use `appearance.overrides` instead. The user's raw
+   *  single-theme override (null = none). */
   theme_override: string | null;
+  /** @deprecated PRD #1167: use `appearance.defaults.dark_theme` instead. The instance
+   *  dark-polarity default (the legacy single-theme instance default). */
   default_theme: string;
   // Vault status (PRD #32): whether the user's per-user secret vault is unlocked
   // in the server process. Optional so a server that predates the field reads as
@@ -1714,6 +1776,14 @@ export type RunStatus =
    *  exponential backoff until the run recovers or the owner cancels it; unlike
    *  pool_wait there is no resume-now verb (the backoff is server-owned). */
   | "recovery_wait"
+  /** PRD #1190: a run its OWNER paused on demand. In the wait family beside limit_wait
+   *  and pool_wait (In Progress on the board, exempt from the timeout sweep, never
+   *  health-flagged, HOME never reclaimed), but UNLIKE those two it resumes ONLY on
+   *  demand (POST /runs/{id}/resume-now, widened by D14) and spends no budget while
+   *  parked (the clock stops; budget_paused_seconds banks the pause on resume).
+   *  NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES below. A PENDING
+   *  pause is a FLAG on a still-`running` run (pause_requested_at), never this status. */
+  | "paused"
   | "completed"
   | "failed"
   | "cancelled";
@@ -2103,6 +2173,33 @@ export interface Run {
    *  ACK and the claim payload (both built by runToDTO). OPTIONAL here only to avoid forcing
    *  mock-object updates; the server always sends it. */
   scope_ceiling?: number | null;
+  /** PRD #1190: the pause wire contract, all five OPTIONAL for api/web rollout skew (a
+   *  pre-feature api pod omits the keys) exactly like scope_ceiling / is_planning.
+   *
+   *  `pause_requested` is the SERVER-DECIDED, worker-facing ACK boolean that rides the
+   *  running-report ACK / claim (built by runToDTO beside scope_ceiling): true when the
+   *  boundary rule (D4) says the worker should park at its next boundary. The web reads
+   *  the three owner-facing intent columns below, not this — but it is on the DTO, so it
+   *  is typed here to match the recorded contract fixtures.
+   *
+   *  `pause_requested_at` / `pause_mode` / `pause_after_count` are the OWNER-ONLY intent
+   *  columns (owner-gated on the wire like health_reason): a pending pause an owner asked
+   *  for while the run was running. Non-null together while a request is pending; all
+   *  cleared to null when the pause lands (→ status "paused"), is cancelled, fails, or the
+   *  run goes terminal. `pause_mode` is "milestone" (park at the next milestone/turn
+   *  boundary) or "now" (drop the turn in flight); `pause_after_count` is
+   *  len(milestones_completed) captured at request time — the count milestone mode waits
+   *  to exceed.
+   *
+   *  `checkpoint_tip_at` is when the run's forge checkpoint was last pushed (SetRunCheckpointTip
+   *  stamps it), so a paused run can say how fresh the parked-on checkpoint is and the
+   *  "Pause now" menu can name what an immediate park would discard. null before any
+   *  checkpoint. */
+  pause_requested?: boolean;
+  pause_requested_at?: string | null;
+  pause_mode?: "milestone" | "now" | null;
+  pause_after_count?: number | null;
+  checkpoint_tip_at?: string | null;
   /** PRD #400: the task/handoff source ref a kind='task' run branched from — null when it
    *  inherited the caller's local HEAD, and on every non-task run. For a handoff created
    *  without --base (issue #403 F3) it is the resolved SEED COMMIT sha the auto-review uses
@@ -2787,7 +2884,13 @@ export type RunInputKind =
   | "reject_plan"
   | "revise_plan"
   | "cancel"
-  | "answer";
+  | "answer"
+  /** PRD #1190: an owner's pause request (`pause`, body = the mode "milestone"|"now")
+   *  and its withdrawal (`pause_cancel`), both POSTed to /runs/{id}/inputs. `resume` is
+   *  NOT a kind here — resume is the widened POST /runs/{id}/resume-now endpoint (D14),
+   *  so there is exactly one resume mechanism. */
+  | "pause"
+  | "pause_cancel";
 
 // SteerInput is one steer-queue entry (PRD #95, extended by PRD #634), from
 // GET /api/runs/{id}/inputs. `kind` is "follow_up" or "scope" (an operator
@@ -2967,4 +3070,3 @@ export interface RunSocketLike {
   onerror: (() => void) | null;
   close(): void;
 }
-

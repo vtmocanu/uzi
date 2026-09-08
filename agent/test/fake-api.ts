@@ -41,6 +41,11 @@ export class FakeApi {
   private msgFailStatus = 503;
   private readonly alreadyTerminal = new Set<string>();
   private readonly stateStatusOverride = new Map<string, string>();
+  // PRD #1190 M2: runs whose running-report ACK carries `pause_requested: true` (the
+  // server-decided pause boundary). The real server sets it on the RunDTO the ACK wraps; the
+  // worker reads it off the same body (readRunAck). A resumed run whose pause columns survived a
+  // requeue answers true here WITHOUT any pause input being delivered.
+  private readonly pauseRequestedRuns = new Set<string>();
   private readonly stateRawOverride = new Map<
     string,
     { status: number; body: string }
@@ -228,6 +233,15 @@ export class FakeApi {
    *  neither a 404 nor a terminal status, so the skip path logs and PROCEEDS. */
   failOwnership(runId: string, httpStatus = 503): void {
     this.ownershipByRun.set(runId, { httpStatus });
+  }
+
+  /** PRD #1190 M2: make this run's running-report ACK carry `pause_requested: true` — the
+   *  server-decided pause boundary the worker's loop-top pause branch honours. Set (or clear)
+   *  it to drive a run into the pause-park path with no pause input delivered, exactly as a
+   *  resumed run whose pause columns survived a requeue would. */
+  setPauseRequestedAck(runId: string, requested = true): void {
+    if (requested) this.pauseRequestedRuns.add(runId);
+    else this.pauseRequestedRuns.delete(runId);
   }
 
   /** Observe each /state report as it lands, so a test can react to a value the
@@ -446,6 +460,9 @@ export class FakeApi {
       run: {
         id: runId,
         status: this.stateStatusOverride.get(runId) ?? body.status,
+        // PRD #1190 M2: the server-decided pause boundary rides the RunDTO the ACK wraps. Only
+        // present when a test armed it; otherwise absent (the worker reads it as "no pause").
+        ...(this.pauseRequestedRuns.has(runId) ? { pause_requested: true } : {}),
       },
     });
   }

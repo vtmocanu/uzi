@@ -36,6 +36,7 @@ import {
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
+  shadowSignal,
   shouldShowHealthFlag,
 } from "../lib/runBadge";
 import { activityAge, latestActivity } from "../lib/runActivity";
@@ -213,7 +214,7 @@ function MilestoneMark({ state }: { state: "done" | "in_progress" | "left" }) {
 //                its real age, not a lie).
 //   - waiting  — the run is parked on a self-resuming hold (limit_wait/pool_wait, or the
 //                transient-recovery park recovery_wait, issue #1197): a warn border +
-//                "waiting on rate limit · <age>", so the strip does not pretend the lane
+//                a waiting reason and age, so the strip does not pretend the lane
 //                is working while it is blocked.
 //   - unattached — activity exists but no milestone is declared in progress: a faint
 //                border, sitting directly under the header.
@@ -235,6 +236,7 @@ function MilestoneNowStrip({
 }) {
   const waiting =
     status === "limit_wait" || status === "pool_wait" || status === "recovery_wait";
+  const waitingLabel = status === "recovery_wait" ? "waiting to recover" : "waiting on rate limit";
   const age = activityAge(activity.at, now);
   const role = stripUnsafeChars(activity.agent);
   const label = stripUnsafeChars(activity.agent_label);
@@ -251,7 +253,7 @@ function MilestoneNowStrip({
       {label && <span className="min-w-0 flex-1 truncate italic text-muted">{label}</span>}
       {toolText && <span className="min-w-0 shrink truncate font-mono text-faint">{toolText}</span>}
       <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
-        {waiting ? `waiting on rate limit${age ? ` · ${age}` : ""}` : age ? `${age} ago` : ""}
+        {waiting ? `${waitingLabel}${age ? ` · ${age}` : ""}` : age ? `${age} ago` : ""}
       </span>
     </div>
   );
@@ -679,6 +681,114 @@ export function LimitWaitPanel({
   );
 }
 
+// PRD #1190: the pending-pause chip's text. "· now" for an immediate pause; "· after M<N>"
+// on a milestone-structured run (N = pause_after_count + 1, the milestone the request waits
+// to see complete); "· after the current step" on a milestone mode request against a run
+// with no frozen list (milestone mode then parks at the next turn boundary).
+function pauseRequestedLabel(run: Run): string {
+  if (run.pause_mode === "now") return "Pause requested · now";
+  const hasMilestones = milestoneBadge(run) != null;
+  if (!hasMilestones) return "Pause requested · after the current step";
+  const n = (run.pause_after_count ?? 0) + 1;
+  return `Pause requested · after M${n}`;
+}
+
+// checkpointLine renders the PausedPanel's "the checkpoint is safe" sentence from the
+// run's milestone progress and branch — the fields the DTO actually carries (there is no
+// checkpoint-sha field). "Milestone N is finished and its checkpoint is pushed (<branch>)."
+// on a milestone run past its first; a branch-only sentence otherwise.
+function checkpointLine(run: Run): string {
+  const mb = milestoneBadge(run);
+  const where = run.branch ? ` (${stripUnsafeChars(run.branch)})` : "";
+  if (mb && mb.reported && mb.done > 0) {
+    return `Milestone ${mb.done} is finished and its checkpoint is pushed${where}.`;
+  }
+  return `The last checkpoint is pushed${where}.`;
+}
+
+/**
+ * PRD #1190: the paused-run panel, modelled on LimitWaitPanel — a full-width parked card
+ * rendered under `run.status === "paused"`. It says four things (mock frame C): the
+ * checkpoint is safe, that nothing runs or is spent while it waits, what happens on resume
+ * (behind a disclosure), and offers the one action row (Resume + Stop). It deliberately
+ * OMITS the "N of the budget remains when you resume" sentence and the "Extend time…"
+ * action — both depend on PRD #1189's budget_total_seconds, which has not landed; the copy
+ * lands with #1189, not here (so the "Only the run's owner can resume or stop it." line
+ * names two actions, not three).
+ *
+ * Non-owner (canSteer=false): the two live controls are replaced by inert text (never a
+ * button that 404s), the same rule LimitWaitPanel/QuestionPanel follow.
+ */
+export function PausedPanel({
+  run,
+  busy,
+  canSteer = true,
+  onResume,
+  onStop,
+}: {
+  run: Run;
+  busy: boolean;
+  canSteer?: boolean;
+  onResume: () => void;
+  onStop: () => void;
+}) {
+  if (run.status !== "paused") return null;
+
+  // The pause landed when the run entered the state; updated_at is status_since on the
+  // wire. Rendered as a local wall-clock time ("11:02"), matching the mock heading.
+  const pausedMs = Date.parse(run.updated_at);
+  const pausedAt = Number.isFinite(pausedMs)
+    ? new Date(pausedMs).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+    : null;
+
+  return (
+    <div className="rounded-xl border border-info/40 bg-info/10 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          {/* PRD #1190: NO role="status" here. A live region that MOUNTS with its first
+              message is typically silent to assistive tech (Board.tsx S5; the parkAnnounce
+              note above), so the paused arrival is announced by RunView's persistent
+              parkAnnounce region instead — putting role="status" here too would duplicate it. */}
+          <p className="text-sm font-semibold text-info">
+            <span aria-hidden="true">‖ </span>
+            Paused by you{pausedAt ? ` at ${pausedAt}` : ""}
+          </p>
+          <p className="mt-0.5 text-xs text-muted">{checkpointLine(run)}</p>
+          <p className="mt-1.5 text-xs text-muted">
+            Nothing runs and nothing is spent while it waits.
+          </p>
+          {/* Worker / re-planning mechanics live behind a disclosure so the panel stays
+              four sentences by default (mock note 7). */}
+          <details className="mt-1.5 text-xs text-muted">
+            <summary className="cursor-pointer select-none text-fg">What happens on resume</summary>
+            <p className="mt-1">
+              If the same worker is still alive, the session continues where it stopped. If the
+              worker was replaced, the branch is recovered from the checkpoint and the remaining
+              milestones are re-planned from the approved plan.
+            </p>
+          </details>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          {/* Non-owner (mirrors LimitWaitPanel): no live Resume/Stop, inert text stating who
+              can, never a greyed button that 404s. */}
+          {canSteer ? (
+            <>
+              <Button size="sm" disabled={busy} onClick={onResume}>
+                ▶ Resume
+              </Button>
+              <Button variant="danger" size="sm" disabled={busy} onClick={onStop}>
+                Stop run
+              </Button>
+            </>
+          ) : (
+            <span className="text-xs text-muted">Only the run's owner can resume or stop it.</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /**
  * PRD #841: the per-run "auto-rework this MR's review comments" toggle. Mirrors the
  * LimitWaitPanel checkbox block, with two deliberate divergences (D2/D3):
@@ -986,8 +1096,12 @@ export function RunView() {
   // from the live WS frames rather than the DTO, so it tracks the transcript without a
   // DTO re-read (the fold re-runs as messages grow, the same shape as `usage` above).
   // null for a terminal run: a finished run has no "now".
+  // PRD #1190: a `paused` run is non-terminal but nothing runs while paused, so it has no
+  // "live now" either — excluded here so the checklist does not render a green/pulsing strip
+  // for a deliberately-stopped run. (limit_wait/pool_wait keep their strip — MilestoneNowStrip
+  // renders those as the "waiting on rate limit" variant, which is left untouched.)
   const activity = useMemo(
-    () => (run == null || isTerminalRun(run.status) ? null : latestActivity(messages)),
+    () => (run == null || isTerminalRun(run.status) || run.status === "paused" ? null : latestActivity(messages)),
     [messages, run],
   );
 
@@ -1028,6 +1142,11 @@ export function RunView() {
   // in the same tick as its content, and a region created with its first content is
   // typically silent to assistive tech, so the panel's own role="status" cannot be
   // relied on. One stable key ("recovery_wait"), like pool_wait.
+  // PRD #1190: a `paused` run announces too — a deliberate owner hold a screen-reader user
+  // must be told about, just like the follow-up and pool_wait parks. One stable key
+  // ("paused") since a pause has no per-instance identity to re-announce on. The persistent
+  // region owns this so the announcement is not missed on mount — PausedPanel's heading
+  // therefore drops its own role="status" to avoid a duplicate announcement.
   const parkKey =
     questionId !== ""
       ? `question:${questionId}`
@@ -1037,6 +1156,8 @@ export function RunView() {
           ? "pool_wait"
           : run?.status === "recovery_wait"
             ? "recovery_wait"
+            : run?.status === "paused"
+              ? "paused"
             : "";
   useEffect(() => {
     if (parkKey === "") {
@@ -1050,6 +1171,8 @@ export function RunView() {
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "recovery_wait"
             ? "This run paused to recover from a transient empty result and will resume automatically."
+            : parkKey === "paused"
+              ? "The run is paused. Resume it from this page or with the uzi run resume command."
             : "The agent is asking you a question. The run is parked until you answer.",
     );
   }, [parkKey]);
@@ -1083,12 +1206,20 @@ export function RunView() {
     run.started_at && run.finished_at
       ? formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime())
       : null;
+  // PRD #1167 M4: Shadow's per-run surface signal, rendered as data-live/data-attention
+  // on the run header block (the titleNode wrapping the breadcrumb, title and status).
+  // Inert on every other theme (only Shadow styles them); computed once per render.
+  const shadow = shadowSignal(run);
 
   return (
     <div className="space-y-5">
       <PageHeader
         titleNode={
-          <div className="min-w-0">
+          <div
+            className="min-w-0 run-head"
+            data-live={shadow === "live" ? "" : undefined}
+            data-attention={shadow === "attention" ? "" : undefined}
+          >
             {/* PRD #12: in-app board + issue links (the issue view is served
                 by IssueView, not the forge). */}
             <nav className="mb-2 flex items-center gap-1.5 text-xs text-faint">
@@ -1158,6 +1289,72 @@ export function RunView() {
                       : "Only the run's owner can expedite it."}
                   </span>
                 ))}
+              {/* PRD #1190 (D14): the conditional Resume action on a paused run, modelled
+                  on the queued-only Expedite above — a primary Button for the owner, inert
+                  text for a non-owner (never a button that would 404). It self-hides on
+                  every other status. */}
+              {run.status === "paused" &&
+                (canSteer ? (
+                  <Button
+                    size="sm"
+                    disabled={busy}
+                    onClick={() =>
+                      act(async () => {
+                        await api.resumeRun(run.id);
+                        await refreshRun();
+                      })
+                    }
+                  >
+                    ▶ Resume
+                  </Button>
+                ) : (
+                  <span className="text-xs text-muted">Only the run's owner can resume it.</span>
+                ))}
+              {/* PRD #1190: the pending-pause chip. Shown whenever a request is pending
+                  (pause_requested_at set) — including on a run overtaken by an involuntary
+                  park, where the intent survives (D6). Info-toned and, unlike the status
+                  pill, DELIBERATELY NOT pulsing (only one thing on the header pulses; the
+                  chip must never carry animate-pulse). Its two actions are gated on
+                  status === "running": the server accepts pause_cancel ONLY while running
+                  (M1 review), so a parked run shows the chip with no actions rather than
+                  offering a Cancel that would 409. */}
+              {run.pause_requested_at && (
+                <span className="inline-flex flex-wrap items-center gap-2">
+                  <Badge tone="info">{pauseRequestedLabel(run)}</Badge>
+                  {canSteer && run.status === "running" && (
+                    <>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() =>
+                          act(async () => {
+                            await api.cancelPause(run.id);
+                            await refreshRun();
+                          })
+                        }
+                      >
+                        Cancel pause
+                      </Button>
+                      {run.pause_mode !== "now" && (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() =>
+                            act(async () => {
+                              await api.pauseRun(run.id, "now");
+                              await refreshRun();
+                            })
+                          }
+                        >
+                          Pause now
+                        </Button>
+                      )}
+                    </>
+                  )}
+                </span>
+              )}
               {run.auto_approve && (
                 <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
                   autopilot
@@ -1205,17 +1402,17 @@ export function RunView() {
                   Issue #754: `pool_wait` is excluded for the SAME reason as limit_wait —
                   it is a self-resuming hold (blocked on a pooled token, resumes on its
                   own hours later), so a green "live" chip beside its amber wait pill is
-                  the same false all-clear. The two self-resuming holds are excluded; the
-                  needs-you gates keep the chip.
+                  the same false all-clear.
 
-                  Issue #1197: `recovery_wait` is excluded for the SAME reason again — a
-                  transient-recovery park is a self-resuming hold (it backs off and retries
-                  on its own until it recovers or the owner cancels), so a green "live" chip
-                  beside its amber "recovery wait" pill would be the same false all-clear. */}
+                  Issue #1197 and PRD #1190: recovery_wait and paused are excluded too.
+                  No work runs during either hold: recovery_wait retries automatically
+                  after backoff, while paused waits for an explicit Resume. The needs-you
+                  gates retain the connection chip. */}
               {!terminal &&
                 run.status !== "limit_wait" &&
                 run.status !== "pool_wait" &&
-                run.status !== "recovery_wait" && (
+                run.status !== "recovery_wait" &&
+                run.status !== "paused" && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}
                   className={cx(
@@ -1228,6 +1425,15 @@ export function RunView() {
                 </span>
               )}
               {run.status === "running" && run.started_at && <LiveElapsed since={run.started_at} />}
+              {/* PRD #1190: a paused run's elapsed is the STATIC active span (started_at →
+                  the pause at updated_at) with "· clock stopped", not a live ticker — the
+                  clock stops while paused. The budget-remaining clause ("… left when
+                  resumed") lands with #1189's budget_total_seconds, not here. */}
+              {run.status === "paused" && run.started_at && (
+                <span className="text-xs tabular-nums text-faint">
+                  {formatDuration(Date.parse(run.updated_at) - Date.parse(run.started_at))} · clock stopped
+                </span>
+              )}
               {run.iteration_count > 0 && (
                 <Badge tone="neutral" title="implement ⇄ review iterations">
                   iteration {run.iteration_count}
@@ -1301,6 +1507,22 @@ export function RunView() {
           disturb the limit_wait/pool_wait layouts. It carries no control of its own — the
           backoff is automatic and cancel is the separate Stop control. */}
       <RecoveryWaitPanel run={run} />
+
+      {/* PRD #1190: the paused-run panel. Self-hides on every status but `paused`. Resume
+          hits the widened /resume-now (api.resumeRun) then refetches; Stop mirrors the
+          limit-wait panel's own Stop (a cancel input). */}
+      <PausedPanel
+        run={run}
+        busy={busy}
+        canSteer={canSteer}
+        onResume={() =>
+          act(async () => {
+            await api.resumeRun(run.id);
+            await refreshRun();
+          })
+        }
+        onStop={() => act(() => submit("cancel"))}
+      />
 
       {/* PRD #35: the usage-limit strip. High in the stack because on a parked run it
           carries the only thing the user came to find out — when it resumes — and low
@@ -1616,6 +1838,15 @@ export function RunView() {
         busy={busy}
         onStop={() => act(() => submit("cancel"))}
         onSend={(text) => act(() => submit("follow_up", text))}
+        // PRD #1190: the "‖ Pause ▾" menu. The card decides whether to show it (running +
+        // pausable kind + no pause pending); here we only wire the request → refetch.
+        run={run}
+        onPause={(mode) =>
+          act(async () => {
+            await api.pauseRun(run.id, mode);
+            await refreshRun();
+          })
+        }
       />
     </div>
   );
@@ -1733,7 +1964,11 @@ export function RunCompletedLine({
 export function RunHeading({ run }: { run: Run }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2">
-      <h1 className="truncate text-xl font-semibold tracking-tight">{stripUnsafeChars(run.issue_title)}</h1>
+      {/* `text-fg` so the title consumes --fg: on Shadow's dark live header band the
+          [data-live] remap sets --fg to ember-light (this h1 would otherwise inherit
+          the light-theme dark page color and vanish, ~1.07:1). No visual change off
+          the live band — text-fg is the normal foreground everywhere else. */}
+      <h1 className="truncate text-xl font-semibold tracking-tight text-fg">{stripUnsafeChars(run.issue_title)}</h1>
       <RunIssueRef
         issueIid={run.issue_iid}
         issueWebUrl={run.issue_web_url}

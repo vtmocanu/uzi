@@ -85,6 +85,15 @@ type ClaimPayload struct {
 	// Additive on the wire — an old worker ignores the key and the idle timeout stays the
 	// backstop.
 	StopPending bool `json:"stop_pending"`
+	// PausePending / PauseMode re-deliver a PENDING pause request on every claim (PRD #1190
+	// M1), the direct analog of StopPending: the request lives durably in the runs columns
+	// (no requeue writer touches them), so a worker that dies with a pause pending re-arms it
+	// on resume — the re-claim seeds the flag, and pause_after_count still compares against the
+	// monotone milestones_completed. PausePending is (pause_requested_at IS NOT NULL);
+	// PauseMode passes the mode through ('milestone'|'now'), empty/omitted when none is
+	// pending. Additive on the wire — an old worker ignores both keys.
+	PausePending bool   `json:"pause_pending"`
+	PauseMode    string `json:"pause_mode,omitempty"`
 	// BaseBranch is the source ref a task run was branched from (PRD #400 M2),
 	// meaningful only for kind='task'. It is carried for context/review — the worker
 	// works the pre-seeded, server-named Branch (uzi/task/<run-id>), not this ref —
