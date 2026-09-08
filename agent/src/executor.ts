@@ -282,7 +282,8 @@ export interface RunContext {
    * verdict. The plan-summary hook rides it: the summary's stale-write guard value is
    * `runs.plan_md`, so the POST can only match once the gate has persisted it — posting
    * before the gate always 409s against a NULL/previous plan_md and is silently dropped.
-   * It is NEVER invoked on the autopilot short-circuit (which never persists plan_md),
+   * It is NEVER invoked on the autopilot short-circuit (which DOES persist plan_md via
+   * its running report / SetRunAutopilotPlan, RC1 #1197, but never invokes this callback),
    * so an auto-approved run generates no plan summary. The gate swallows any throw.
    */
   gatePlan?(

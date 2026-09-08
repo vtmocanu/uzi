@@ -551,7 +551,8 @@ export class SdkExecutor implements Executor {
    * awaiting_approval (SetRunAwaitingApproval writes `approvedPlan`, NUL-stripped, to
    * runs.plan_md) and THEN invokes this, so `planMd` here is the exact persisted text and
    * the guard matches (a superseded plan → 409, dropped). The autopilot short-circuit
-   * never persists plan_md and never invokes the callback, so it generates no plan summary.
+   * persists plan_md via its running report (SetRunAutopilotPlan, RC1 #1197) but never
+   * invokes the callback, so it generates no plan summary.
    *
    * ADVISORY: issue runs only, token + client + resolved-PRD present, and EVERYTHING is
    * wrapped — a null (timeout / model error / unusable output), a 409 stale, a 400 bad
@@ -1376,8 +1377,9 @@ export class SdkExecutor implements Executor {
         // (the summary's stale-write guard value) and BEFORE the verdict wait — blocking
         // gate ENTRY up to the model timeout but NEVER the terminal outcome. Posting it
         // before the gate (as an earlier revision did) always 409s against a NULL/previous
-        // plan_md and is silently dropped. The autopilot short-circuit never invokes the
-        // callback, so an auto-approved run generates no plan summary. Advisory — the
+        // plan_md and is silently dropped. The autopilot short-circuit persists plan_md via
+        // its running report (SetRunAutopilotPlan, RC1 #1197) but never invokes the callback,
+        // so an auto-approved run generates no plan summary. Advisory — the
         // helper swallows every failure.
         let verdict = await ctx.gatePlan(approvedPlan, candidateMilestones, (planMd) =>
           this.generateAndPostPlanSummary(ctx, planMd, prdInputP),

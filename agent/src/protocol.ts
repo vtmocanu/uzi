@@ -1454,7 +1454,8 @@ export type PublishResult =
 
 export interface StateRequest {
   status: RunState;
-  /** awaiting_approval carries the captured plan. */
+  /** awaiting_approval carries the captured plan; an autopilot `running` report also
+   *  carries it, persisted durably via SetRunAutopilotPlan (RC1 #1197). */
   plan_md?: string;
   /** awaiting_input carries the identity of the question being asked (PRD #88).
    *  REQUIRED on that transition — the api rejects the report without it, because a

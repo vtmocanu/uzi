@@ -10,6 +10,7 @@ import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, STUB_ASK_SENTINEL,
 import { AUTOPILOT_SENTINEL_ANSWER } from "../src/runner.js";
 import { CI_CONFIG_MARKER } from "../src/prompt.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import type { StateRequest } from "../src/protocol.js";
 import {
   api,
   assistant,
@@ -868,6 +869,101 @@ describe("RunRunner — milestones on the plan gate (PRD #122 M1)", () => {
     )!;
     assert.ok(autopilotReport, "autopilot agent-selection running report present");
     assert.deepStrictEqual(autopilotReport.milestones, MS);
+    // RC1 (#1197): the approved plan rides this SAME running report so the server
+    // persists it durably via SetRunAutopilotPlan — an autopilot run never reports
+    // awaiting_approval, so this is the only channel that carries plan_md.
+    assert.strictEqual(
+      autopilotReport.plan_md,
+      "# PLAN\n- do it",
+      "the autopilot running report carries the submitted plan_md",
+    );
+  });
+
+  // RC1 (#1197): an autopilot run enters implementation ONLY on proof the plan was
+  // durably stored (the running-report ack). If the plan-carrying report does NOT
+  // succeed — a 409 (the run moved on / was cancelled or parked concurrently) or a
+  // thrown transport/4xx — the run must NOT proceed to implementation and must NOT
+  // enter awaiting_approval; it ends in failure. Both cases are forced with the
+  // FakeApi.failStateWhen hook, which knocks out ONLY the report carrying
+  // agent_selection (the autopilot plan report), leaving the ordinary heartbeats so
+  // the run still reaches the gate.
+  const isAutopilotPlanReport = (s: StateRequest): boolean =>
+    s.status === "running" && s.agent_selection !== undefined;
+
+  it("AUTOPILOT: a 409 on the plan report (run moved on) does NOT enter implementation", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(1197, { auto_approve: true });
+    // The plan-carrying running report is refused with a 409 whose body reports the
+    // run cancelled — the client reads it as { applied: false, status: "cancelled" }.
+    api.failStateWhen(claim.run_id, isAutopilotPlanReport, {
+      httpStatus: 409,
+      runStatus: "cancelled",
+    });
+    await runner(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn: planWithMilestonesThenDoneQuery(MS),
+      }),
+      gitlab,
+    ).execute(claim);
+
+    const bodies = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body);
+    const statuses = bodies.map((s) => s.status);
+    assert.ok(
+      !statuses.includes("awaiting_approval"),
+      "autopilot run never enters awaiting_approval",
+    );
+    assert.ok(
+      !statuses.includes("completed"),
+      "the run must NOT complete when the plan was not durably stored",
+    );
+    assert.ok(
+      statuses.includes("failed"),
+      "the run ends in failure when the plan report was refused",
+    );
+    assert.strictEqual(calls.length, 0, "no MR opened — never entered implementation");
+    // The plan audit message is still emitted (it is flushed before the report).
+    assert.strictEqual(
+      api.messages(claim.run_id).filter((m) => m.kind === "plan").length,
+      1,
+    );
+  });
+
+  it("AUTOPILOT: a thrown 4xx on the plan report does NOT enter implementation", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(11970, { auto_approve: true });
+    // A 400 on the plan-carrying report: not transient and not "already terminal", so
+    // the client throws a RequestError that propagates out of gatePlan.
+    api.failStateWhen(claim.run_id, isAutopilotPlanReport, { httpStatus: 400 });
+    await runner(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn: planWithMilestonesThenDoneQuery(MS),
+      }),
+      gitlab,
+    ).execute(claim);
+
+    const bodies = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body);
+    const statuses = bodies.map((s) => s.status);
+    assert.ok(
+      !statuses.includes("awaiting_approval"),
+      "autopilot run never enters awaiting_approval",
+    );
+    assert.ok(
+      !statuses.includes("completed"),
+      "the run must NOT complete when the plan report threw",
+    );
+    assert.ok(
+      statuses.includes("failed"),
+      "the run ends in failure when the plan report threw",
+    );
+    assert.strictEqual(calls.length, 0, "no MR opened — never entered implementation");
+    assert.strictEqual(
+      api.messages(claim.run_id).filter((m) => m.kind === "plan").length,
+      1,
+    );
   });
 });
 

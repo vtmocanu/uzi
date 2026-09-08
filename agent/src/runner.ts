@@ -2360,7 +2360,7 @@ export class RunRunner {
           payload: {
             text:
               "this run was picked up again and its earlier session was found on this worker — " +
-              "continuing WITH its prior context (no re-plan)",
+              "continuing WITH its prior context",
             event: RESUME_CONTINUED_EVENT,
           },
         });
@@ -3540,8 +3540,10 @@ export class RunRunner {
     // runner-uid `git status --porcelain` there to surface plan-turn worktree writes.
     worktreePath: string,
     // PRD #362 M3c: advisory hook fired AFTER the awaiting_approval report persists
-    // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never reached
-    // on the autopilot branch, which returns above without persisting plan_md.
+    // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never invoked
+    // on the autopilot branch: that branch DOES persist plan_md durably (RC1 #1197, via
+    // its running report / SetRunAutopilotPlan) but never invokes onAwaitingApproval, so
+    // it still generates no plan summary.
     onAwaitingApproval?: (planMd: string) => Promise<void>,
   ): Promise<PlanVerdict> {
     batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
@@ -3583,11 +3585,28 @@ export class RunRunner {
       // report (an autopilot run never reports awaiting_approval), each field only when
       // non-empty — same conditional-spread discipline as milestones/repo_agents above.
       Object.assign(autopilotState, toolchainReportFields(toolchainDetection));
-      await reportState(autopilotState).catch((e) =>
-        runLog.warn("could not persist autopilot agent selection", {
-          error: errMessage(e),
-        }),
-      );
+      // RC1 (#1197): the approved autopilot plan rides this running report so the
+      // server persists it durably via the guarded SetRunAutopilotPlan write — an
+      // autopilot run never reports awaiting_approval, the channel the human-gated
+      // branch below uses to persist plan_md. This is the durable plan the resume
+      // guard reads; without it a resumed autopilot run re-plans instead of
+      // implementing (the RC1 incident).
+      autopilotState.plan_md = planMd;
+      // AWAIT the ack and gate the approve on PROVEN storage — no `.catch` swallow.
+      // The ack is the storage proof: HTTP 200 ⟺ the plan is durably stored, because
+      // the server errors BEFORE the running write on a 0-row plan refusal (the guarded
+      // write). So a transport/4xx failure THROWS out of reportState (and out of
+      // gatePlan) — the run must NOT enter implementation with no durable plan; it
+      // propagates to execute()'s existing pre-implementation failure handling (no new
+      // checkpoint-preservation logic here). A 409 (applied === false) means the run
+      // moved on — cancelled/parked concurrently — so the plan was NOT stored; throw
+      // here rather than returning an approve verdict. Only a 200 (applied) proceeds.
+      const ack = await reportState(autopilotState);
+      if (!ack.applied) {
+        throw new Error(
+          `autopilot plan not durably stored — the run is ${ack.status ?? "no longer running"}`,
+        );
+      }
       batcher.emit({
         kind: "status",
         agent: "worker",
@@ -3640,7 +3659,9 @@ export class RunRunner {
     // PRD #362 M3c: plan_md is now persisted (the awaiting_approval report above), so the
     // plan-summary POST's stale-write guard (`plan_md = @expected`) can match. Fire the
     // hook HERE — after persist, before the verdict wait — never on the autopilot branch,
-    // which returned above without persisting plan_md. ADVISORY: swallow any throw so a
+    // which returned above. That branch DOES persist plan_md durably (RC1 #1197, via
+    // SetRunAutopilotPlan) but never invokes this hook, so it generates no plan summary.
+    // ADVISORY: swallow any throw so a
     // summary failure can never wedge the gate or change the run's outcome (the hook
     // itself also swallows internally; this is belt-and-suspenders).
     if (onAwaitingApproval) {
