@@ -318,6 +318,11 @@ function implementScript(runId: string): Timed[] {
           mr_iid: 57,
           branch,
           iteration_count: 2,
+          // Every terminal transition clears a pending pause (ADR-1190 I5): a completed
+          // run never renders a stale "pause requested".
+          pause_requested_at: null,
+          pause_mode: null,
+          pause_after_count: null,
           // PRD #122: the run finished — every milestone reported complete, none left in
           // progress, so the checklist reads a full count on the completed hero.
           milestones: HEARTBEAT_MILESTONES,
@@ -621,6 +626,7 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
     }
     case "cancel":
       clearTimers(runId);
+      clearParkTimer(runId);
       openQuestions.delete(runId);
       appendMessage(runId, "status", null, { text: "cancel requested" });
       patchRun(runId, {
@@ -631,6 +637,13 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
         stop_kind: "cancelled",
         stop_reason: "wrong branch, restarting",
         finished_at: new Date().toISOString(),
+        // Every terminal transition clears a pending pause on the wire (ADR-1190 I5,
+        // commit ff6d3518), so a dead run never renders a stale "pause requested". Mirror
+        // that here — it also makes parkPaused's cleared-request short-circuit the natural
+        // terminator for a re-armed pause on cancel.
+        pause_requested_at: null,
+        pause_mode: null,
+        pause_after_count: null,
       });
       return null;
     case "follow_up":
@@ -738,10 +751,13 @@ function pauseNotSupportedReason(run: { kind: string; interactive?: boolean }): 
 // just after approve_plan is silently DROPPED when the demo's clarification question beats it to
 // the punch — a mock that misleads a developer into thinking the pause was lost.
 //
-// It cannot spin forever: it re-arms ONLY for a non-terminal, non-running park, and every such
-// state is transient — the scripts drive awaiting_input back to `running` on `answer`, a
-// pause_cancel clears the request (short-circuited below), a successful park clears the columns,
-// and a terminal run never returns to `running` (isTerminalRun blocks the re-arm).
+// The re-arm is a low-frequency idle poll while the run holds at a non-terminal, non-running
+// state (only awaiting_input is reachable here, and it is HUMAN-gated — an `answer` drives it
+// back to `running`, at which point the park lands). It is bounded by the run's lifecycle, not a
+// fixed count, and it always terminates: a pause_cancel clears the request (short-circuited
+// below), a successful park clears the columns, and every terminal transition both clears the
+// columns (ADR-1190 I5) and is caught by isTerminalRun. It never accumulates timers
+// (schedulePark replaces the handle) and emits no messages while polling.
 function parkPaused(runId: string): void {
   const run = getRun(runId);
   // The park-timer handle is spent whether or not the guard below lets the park proceed.
@@ -752,8 +768,8 @@ function parkPaused(runId: string): void {
   if (run.status !== "running") {
     // Overtaken by an involuntary park with the pause still pending: re-arm so it lands at the
     // next `running` boundary (D6 / ADR I4). A terminal run never returns to running, so guard
-    // against it — the mock's `cancel` leaves the pause columns set, so isTerminalRun is what
-    // actually stops the loop there, not a cleared request.
+    // against it — belt-and-braces beside the cleared-request short-circuit above, now that the
+    // terminal transitions clear the pause columns (mirroring the wire's ADR-I5 behavior).
     if (!isTerminalRun(run.status)) schedulePark(runId, 500);
     return;
   }

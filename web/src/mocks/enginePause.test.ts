@@ -81,6 +81,33 @@ describe("mock engine: pause / pause_cancel timer separation (PRD #1190, finding
     expect(typeof run.checkpoint_tip_at).toBe("string");
   });
 
+  // ADR-1190 I5: every terminal transition clears a pending pause, so a dead run never
+  // renders a stale "pause requested" (the wire clears them — commit ff6d3518). A cancel
+  // while a pause is pending must null the three pause columns, not leave them set.
+  it("cancelling a run with a pending pause clears the pause columns (no stale pause on a dead run)", () => {
+    handleInput(RUN_ID, "approve_plan", "");
+    expect(state.runs.get(RUN_ID)!.status).toBe("running");
+
+    expect(handleInput(RUN_ID, "pause", "milestone")).toBeNull();
+    expect(state.runs.get(RUN_ID)!.pause_requested_at).not.toBeNull();
+
+    // Cancel the whole run while the pause is still pending (before the park fires).
+    expect(handleInput(RUN_ID, "cancel", "")).toBeNull();
+
+    const run = state.runs.get(RUN_ID)!;
+    // A running run cancels to `failed` with a `cancelled` stop_kind (calm badge).
+    expect(run.status).toBe("failed");
+    expect(run.stop_kind).toBe("cancelled");
+    // The pending pause columns are cleared — no false "pause requested" on the dead run.
+    expect(run.pause_requested_at).toBeNull();
+    expect(run.pause_mode).toBeNull();
+    expect(run.pause_after_count).toBeNull();
+
+    // No park fires afterward: the re-arm terminates on the cleared request / terminal status.
+    drain();
+    expect(state.runs.get(RUN_ID)!.status).toBe("failed");
+  });
+
   // PRD #1190 (D6 / ADR I4): a pending milestone pause SURVIVES an involuntary park and
   // re-arms. The demo's post-approval clarification question flips the run to awaiting_input
   // at ~2100ms — BEFORE the milestone boundary fires at 2500ms — so the park is overtaken.
