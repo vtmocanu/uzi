@@ -20,7 +20,7 @@ INSERT INTO runs (
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'mr_rework'
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), $10
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -41,9 +41,17 @@ type CreateAutoMRReworkRunParams struct {
 	TargetRunID      pgtype.UUID `json:"target_run_id"`
 	ReviewComments   []byte      `json:"review_comments"`
 	WaitOnLimit      bool        `json:"wait_on_limit"`
+	TriggerSource    string      `json:"trigger_source"`
 }
 
-// Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). issue_iid stays
+// Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). The NAME is
+// historical: PRD #1202 added an on-demand (manual) trigger, so @trigger_source is now
+// the ONLY thing that differs between the two callers — 'mr_rework' from the poller
+// detector, 'manual' from the on-demand endpoint. The name is deliberately kept because
+// a live-DB lock probe (mr_rework_branch_guard_livedb_test.go) keys on the generated
+// `-- name: CreateAutoMRReworkRun` header. kind stays 'mr_rework' regardless of the
+// trigger; both flavours are the same run kind, distinguished only by trigger_source (D7).
+// issue_iid stays
 // NULL (kind='mr_rework'); issue_title/issue_description carry the synthesized human
 // summary. pipeline_ref = the agent branch (agent/issue-N, uzi/prompt-…, or
 // uzi/self-improve/… — PRD #908) is written AT INSERT so the cross-kind branch
@@ -81,6 +89,208 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 		arg.TargetRunID,
 		arg.ReviewComments,
 		arg.WaitOnLimit,
+		arg.TriggerSource,
+	)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+		&i.PreservedPatch,
+		&i.RequiredCapabilities,
+		&i.StopReason,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.Interactive,
+		&i.OpenFollowupID,
+		&i.PlanChangedFiles,
+		&i.ScopeCeiling,
+		&i.StatusSince,
+		&i.ReviewComments,
+		&i.BudgetPausedSeconds,
+		&i.MrReworkEnabled,
+		&i.TriggerSource,
+		&i.CheckpointTip,
+		&i.UsageRefolded,
+		&i.CodexSecretID,
+		&i.CodexAuthMode,
+		&i.CodexSecretLabel,
+		&i.CodexAccountKey,
+		&i.CodexMaterialRevision,
+		&i.CodexAccountRevision,
+		&i.CodexClaimEpoch,
+		&i.CodexCapHash,
+		&i.PauseRequestedAt,
+		&i.PauseMode,
+		&i.PauseAfterCount,
+		&i.CheckpointTipAt,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
+	)
+	return i, err
+}
+
+const createManualMRReworkRunAndAdvance = `-- name: CreateManualMRReworkRunAndAdvance :one
+WITH led AS (
+    INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
+    SELECT $2::uuid, $5, $10
+    WHERE NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE repo_id = $2::uuid
+          AND kind = 'ci_fix'
+          AND pipeline_ref = $5
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+    )
+    ON CONFLICT (repo_id, ref) DO UPDATE
+    SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
+        halt_notified = false,
+        updated_at    = now()
+)
+INSERT INTO runs (
+    user_id, repo_id, kind, issue_title, issue_description,
+    pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source
+)
+SELECT
+    $1, $2::uuid, 'mr_rework', $3, $4,
+    $5, $6, $7, $8::jsonb, true, $9,
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'manual'
+WHERE NOT EXISTS (
+    SELECT 1 FROM runs
+    WHERE repo_id = $2::uuid
+      AND kind = 'ci_fix'
+      AND pipeline_ref = $5
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+)
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before
+`
+
+type CreateManualMRReworkRunAndAdvanceParams struct {
+	UserID           uuid.UUID   `json:"user_id"`
+	RepoID           uuid.UUID   `json:"repo_id"`
+	IssueTitle       string      `json:"issue_title"`
+	IssueDescription string      `json:"issue_description"`
+	PipelineRef      pgtype.Text `json:"pipeline_ref"`
+	MrIid            pgtype.Int8 `json:"mr_iid"`
+	TargetRunID      pgtype.UUID `json:"target_run_id"`
+	ReviewComments   []byte      `json:"review_comments"`
+	WaitOnLimit      bool        `json:"wait_on_limit"`
+	HighWater        int64       `json:"high_water"`
+}
+
+// ATOMIC on-demand (manual) mr_rework create + ledger advance (PRD #1202, review-finding
+// hardening of !1207). Folds the run INSERT and the manual high-water advance into ONE
+// statement so Postgres commits BOTH or NEITHER: previously StartMRReworkForRun created the
+// run, then called AdvanceMRReworkHighWater separately and only LOGGED an advance failure —
+// returning success with an unadvanced ledger, which let the automatic watcher re-fire on the
+// same comments once the manual run went terminal.
+//
+// The `runs` INSERT is the OUTER statement (RETURNING * -> the Run model) and is byte-for-byte
+// the CreateAutoMRReworkRun body except trigger_source is hard-coded 'manual' (the only caller
+// is the on-demand path). Keep the two INSERT bodies in sync.
+//
+// The `led` CTE mirrors AdvanceMRReworkHighWater's ON CONFLICT body (GREATEST high_water,
+// reset halt_notified, attempt_count NEVER named -> non-counting, PRD D1) and self-gates on
+// the SAME cross-kind `WHERE NOT EXISTS` predicate as the run INSERT, evaluated on the same
+// snapshot, so: branch-in-use -> both insert 0 rows (ErrBranchInUse, ledger untouched);
+// same-MR/active-branch 23505 -> whole statement aborts, ledger rolled back
+// (ErrActiveMRReworkExists/ErrBranchInUse); success -> run + ledger commit together. `ref` on
+// the ledger is the pipeline_ref (the branch), exactly as the two-step path passed it.
+func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg CreateManualMRReworkRunAndAdvanceParams) (Run, error) {
+	row := q.db.QueryRow(ctx, createManualMRReworkRunAndAdvance,
+		arg.UserID,
+		arg.RepoID,
+		arg.IssueTitle,
+		arg.IssueDescription,
+		arg.PipelineRef,
+		arg.MrIid,
+		arg.TargetRunID,
+		arg.ReviewComments,
+		arg.WaitOnLimit,
+		arg.HighWater,
 	)
 	var i Run
 	err := row.Scan(

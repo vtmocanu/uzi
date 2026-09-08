@@ -191,6 +191,7 @@ func TestScheduledBranchConcurrencyGuardsLiveDB(t *testing.T) {
 		TargetRunID:      pgtype.UUID{Bytes: srcOccupied, Valid: true},
 		ReviewComments:   []byte(`{"comments":[{"id":1}],"truncated":false}`),
 		WaitOnLimit:      false,
+		TriggerSource:    "mr_rework",
 	}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("CreateAutoMRReworkRun on a ci_fix-occupied scheduled branch: err = %v, want pgx.ErrNoRows (cross-kind WHERE NOT EXISTS → 0 rows)", err)
 	}
@@ -216,6 +217,7 @@ func TestScheduledBranchConcurrencyGuardsLiveDB(t *testing.T) {
 		TargetRunID:      pgtype.UUID{Bytes: srcFree, Valid: true},
 		ReviewComments:   []byte(`{"comments":[{"id":2}],"truncated":false}`),
 		WaitOnLimit:      false,
+		TriggerSource:    "mr_rework",
 	})
 	if err != nil {
 		t.Fatalf("first CreateAutoMRReworkRun on a free scheduled branch: %v", err)
@@ -234,6 +236,7 @@ func TestScheduledBranchConcurrencyGuardsLiveDB(t *testing.T) {
 		TargetRunID:      pgtype.UUID{Bytes: srcFree, Valid: true},
 		ReviewComments:   []byte(`{"comments":[{"id":3}],"truncated":false}`),
 		WaitOnLimit:      false,
+		TriggerSource:    "mr_rework",
 	})
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {

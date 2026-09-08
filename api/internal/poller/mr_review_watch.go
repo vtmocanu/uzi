@@ -297,12 +297,15 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 }
 
 // notifyHalt lands the mr_rework_halted inbox row for the MR owner (best-effort,
-// nil-safe). No RunID (no run was started). Slack is nil (inbox-only), mirroring the
-// ci-autofix halt notification.
+// nil-safe). It anchors the row to the SOURCE run (PRD #1202 D10) so the inbox row links
+// to the run page — where the owner can now press "Rework now" past the cap; the web's
+// notificationLink turns any kind carrying a run_id into a /runs/<id> link. Slack is nil
+// (inbox-only), mirroring the ci-autofix halt notification.
 func (d *MRReviewWatch) notifyHalt(ctx context.Context, cand store.ListMRReworkCandidatesRow, issueIID int64, capLimit int) {
 	if d.notifier == nil {
 		return
 	}
+	runID := cand.SourceRunID
 	if _, err := d.notifier.Notify(ctx, notifysvc.Notification{
 		UserID: cand.UserID,
 		Kind:   "mr_rework_halted",
@@ -311,7 +314,7 @@ func (d *MRReviewWatch) notifyHalt(ctx context.Context, cand store.ListMRReworkC
 			IssueIID: issueIID,
 			Reason:   fmt.Sprintf("reached the %d-cycle MR rework limit", capLimit),
 		},
-		RunID: nil,
+		RunID: &runID,
 		Slack: nil,
 	}); err != nil {
 		slog.Warn("poller: mr-rework notify halt", "user", cand.UserID.String(), "error", err)
@@ -325,6 +328,7 @@ func mrReworkHaltCommentBody(capLimit int, mrIID int64) string {
 	return fmt.Sprintf(
 		"**Automatic MR rework stopped.**\n\n"+
 			"uzi has reached the automatic rework-cycle limit (%d) for merge request !%d and will not rework the review comments automatically anymore. "+
-			"Please review the remaining comments and resolve them yourself, or make the changes and push to the branch.",
+			"Please review the remaining comments and resolve them yourself, or make the changes and push to the branch. "+
+			"To run one more cycle yourself, open the run in uzi and press Rework now, or run `uzi run rework <run-id>`; on-demand cycles do not count against this limit.",
 		capLimit, mrIID)
 }

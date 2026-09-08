@@ -204,6 +204,7 @@ func TestMRReworkLiveDB(t *testing.T) {
 		TargetRunID:      pgtype.UUID{Bytes: src7, Valid: true},
 		ReviewComments:   []byte(`{"comments":[{"id":120}],"truncated":false}`),
 		WaitOnLimit:      false,
+		TriggerSource:    "mr_rework",
 	}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("CreateAutoMRReworkRun on an occupied branch: err = %v, want pgx.ErrNoRows (WHERE NOT EXISTS → 0 rows)", err)
 	}
@@ -221,6 +222,7 @@ func TestMRReworkLiveDB(t *testing.T) {
 		TargetRunID:      pgtype.UUID{Bytes: src7, Valid: true},
 		ReviewComments:   []byte(`{"comments":[{"id":120}],"truncated":false}`),
 		WaitOnLimit:      false,
+		TriggerSource:    "mr_rework",
 	})
 	if err != nil {
 		t.Fatalf("CreateAutoMRReworkRun (valid shape): %v", err)

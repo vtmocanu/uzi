@@ -58,7 +58,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "pause", "resume"},
+		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "pause", "resume", "rework"},
 		// backlog is the PRD #98 M7 read; `file` (PRD #365 M2) files a recommendation
 		// as a forge issue from the CLI, mirroring `findings file`.
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats", "file"},
@@ -1911,5 +1911,125 @@ func TestRunResumeNowJSON(t *testing.T) {
 	}
 	if !strings.Contains(out, `"status": "queued"`) {
 		t.Errorf("--json output = %q, want status queued", out)
+	}
+}
+
+// PRD #1202 M3: `uzi run rework <id>` starts one on-demand MR-rework cycle. The guidance
+// is OPTIONAL and rides from -m or, when -m is absent, stdin (like revise/follow-up) —
+// but unlike those an empty guidance is a valid trigger, so a bare invocation still
+// reaches the write. The fake gates the 404 on the run map, so a success case seeds it.
+func TestRunReworkVerb(t *testing.T) {
+	newFake := func() *uzicli.FakeClient {
+		return &uzicli.FakeClient{
+			RunByID:   map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "completed"}},
+			ReworkRun: apitypes.RunDTO{ID: "r2", Kind: "mr_rework", Status: "queued"},
+		}
+	}
+
+	// -m delivers the guidance verbatim.
+	t.Run("message flag", func(t *testing.T) {
+		fc := newFake()
+		out, _, code := runCLI(t, fakeEnv(fc), "run", "rework", "r1", "-m", "please fix the failing tests")
+		if code != uzicli.ExitOK {
+			t.Fatalf("exit = %d, want 0", code)
+		}
+		if fc.LastReworkRunID != "r1" {
+			t.Errorf("targeted run %q, want r1", fc.LastReworkRunID)
+		}
+		if fc.LastReworkGuidance != "please fix the failing tests" {
+			t.Errorf("guidance = %q, want the -m text", fc.LastReworkGuidance)
+		}
+		if !strings.Contains(out, "r2") {
+			t.Errorf("output missing created run id r2:\n%s", out)
+		}
+	})
+
+	// stdin delivers the guidance when -m is absent (non-TTY), mirroring revise/follow-up.
+	t.Run("stdin", func(t *testing.T) {
+		fc := newFake()
+		env := fakeEnv(fc)
+		env.Stdin = strings.NewReader("rework from stdin\n")
+		env.StdinTTY = false
+		_, _, code := runCLI(t, env, "run", "rework", "r1")
+		if code != uzicli.ExitOK {
+			t.Fatalf("exit = %d, want 0", code)
+		}
+		if fc.LastReworkGuidance != "rework from stdin" {
+			t.Errorf("guidance = %q, want the piped stdin text (trimmed)", fc.LastReworkGuidance)
+		}
+	})
+
+	// A bare invocation with no -m and empty stdin still triggers: empty guidance is valid.
+	t.Run("empty guidance is a valid trigger", func(t *testing.T) {
+		fc := newFake()
+		_, _, code := runCLI(t, fakeEnv(fc), "run", "rework", "r1")
+		if code != uzicli.ExitOK {
+			t.Fatalf("exit = %d, want 0", code)
+		}
+		if fc.LastReworkRunID != "r1" {
+			t.Errorf("targeted run %q, want r1 — an empty guidance must still reach the write", fc.LastReworkRunID)
+		}
+		if fc.LastReworkGuidance != "" {
+			t.Errorf("guidance = %q, want empty", fc.LastReworkGuidance)
+		}
+	})
+}
+
+// A refusal (disabled / not reworkable / already running / nothing new) is a 409 →
+// ExitConflict (5); the CLI must propagate it AND surface the server message on stderr.
+func TestRunReworkConflict(t *testing.T) {
+	fc := &uzicli.FakeClient{RunReworkErr: uzicli.Exitf(uzicli.ExitConflict, "nothing to rework")}
+	_, errOut, code := runCLI(t, fakeEnv(fc), "run", "rework", "r1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d (conflict)", code, uzicli.ExitConflict)
+	}
+	if fc.LastReworkRunID != "r1" {
+		t.Errorf("targeted run %q, want r1 — the write must still have been reached", fc.LastReworkRunID)
+	}
+	if !strings.Contains(errOut, "nothing to rework") {
+		t.Errorf("stderr = %q, want the server 409 message", errOut)
+	}
+}
+
+// A foreign/unknown run is a 404 → ExitNotFound (4); the CLI must propagate it.
+func TestRunReworkNotFound(t *testing.T) {
+	fc := &uzicli.FakeClient{RunReworkErr: uzicli.Exitf(uzicli.ExitNotFound, "run not found")}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "rework", "r1")
+	if code != uzicli.ExitNotFound {
+		t.Fatalf("exit = %d, want %d (not found)", code, uzicli.ExitNotFound)
+	}
+	if fc.LastReworkRunID != "r1" {
+		t.Errorf("targeted run %q, want r1 — the write must still have been reached", fc.LastReworkRunID)
+	}
+}
+
+// --json emits the SAME {"run": <dto>} envelope `uzi run create` uses (a new run is
+// created), NOT a bare RunDTO. Asserted structurally so a future re-wrap is caught.
+func TestRunReworkJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		RunByID:   map[string]apitypes.RunDTO{"r1": {ID: "r1"}},
+		ReworkRun: apitypes.RunDTO{ID: "r2", Kind: "mr_rework", Status: "queued"},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "rework", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	raw, ok := env["run"]
+	if !ok {
+		t.Fatalf("--json output has no top-level \"run\" key (want the run-create envelope):\n%s", out)
+	}
+	if _, isBareDTO := env["id"]; isBareDTO {
+		t.Errorf("--json output is a bare RunDTO, want the {\"run\": ...} envelope:\n%s", out)
+	}
+	var run apitypes.RunDTO
+	if err := json.Unmarshal(raw, &run); err != nil {
+		t.Fatalf("envelope \"run\" is not a RunDTO: %v", err)
+	}
+	if run.ID != "r2" || run.Kind != "mr_rework" {
+		t.Errorf("envelope run = %+v, want the created mr_rework run r2", run)
 	}
 }
