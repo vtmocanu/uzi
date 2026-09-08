@@ -362,10 +362,31 @@ describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", (
       trust_level: "untrusted",
     });
     const features = config.features as Record<string, boolean>;
-    assert.equal(features.code_mode, false);
-    assert.equal(features.unified_exec, false);
-    assert.equal(features.hooks, false);
-    assert.equal(features.multi_agent, false);
+    assert.deepEqual(
+      Object.keys(features).sort(),
+      [
+        "apps",
+        "code_mode",
+        "code_mode_host",
+        "code_mode_only",
+        "code_mode_prewarm",
+        "enable_request_compression",
+        "hooks",
+        "multi_agent",
+        "multi_agent_v2",
+        "plugins",
+        "remote_models",
+        "shell_snapshot",
+        "shell_snapshot_v2",
+        "unified_exec",
+      ],
+      "the complete characterized feature ceiling stays explicit",
+    );
+    assert.deepEqual(
+      Object.entries(features).filter(([, enabled]) => enabled !== false),
+      [],
+      "every declared advice feature is disabled",
+    );
     assert.equal((config.agents as Record<string, unknown>).enabled, false);
     assert.equal(params.approvalPolicy, "never");
     // No hook-trust bypass anywhere in the start params.
@@ -396,7 +417,22 @@ describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", (
 describe("CodexAdviceHarness: credential isolation", () => {
   it("forwards the credential to the launch spec ONLY, never into a thread/turn param", async () => {
     const CRED = "sk-super-secret-advice-credential-value";
-    const bits = makeHarness({ credentialValue: CRED });
+    const captured: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+    const record = (message: string, fields?: Record<string, unknown>): void => {
+      captured.push({ message, fields });
+    };
+    const log: Logger = {
+      debug: record,
+      info: record,
+      warn: record,
+      error: record,
+      addSecret() {},
+      removeSecret() {},
+      child() {
+        return this;
+      },
+    };
+    const bits = makeHarness({ credentialValue: CRED, log });
     bits.transport.push(threadStarted()).push(turnCompleted("completed")).end();
     await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
 
@@ -407,6 +443,10 @@ describe("CodexAdviceHarness: credential isolation", () => {
     for (const r of bits.transport.requests) {
       assert.ok(!JSON.stringify(r.params).includes(CRED), `${r.method} params must not carry the credential`);
     }
+    assert.ok(
+      !JSON.stringify(captured).includes(CRED),
+      "no captured log message or metadata carries the credential",
+    );
   });
 });
 
@@ -454,11 +494,16 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
 
   it("a launch failure rejects and disposes NOTHING (the launcher owns its partial cleanup)", async () => {
     const boom = new Error("launch failed");
+    let launchCalls = 0;
+    let disposeAttempts = 0;
     const launchRoot: LaunchAdviceRootSeam = async () => {
+      launchCalls += 1;
       throw boom;
     };
     const harness = new CodexAdviceHarness({ launchRoot, provider, log: noopLog });
     await assert.rejects(harness.run(makeAdviceRequest(), noThrowPolicy), (e: unknown) => e === boom);
+    assert.equal(launchCalls, 1, "the failing launch seam was exercised");
+    assert.equal(disposeAttempts, 0, "no disposer exists when launch never returns a root");
   });
 
   it("a HOME cleanup failure NEVER replaces the primary result (a dispose throw is swallowed + warned)", async () => {

@@ -197,6 +197,21 @@ describe("ExecutionRegistry: registerRoot returns a checked result (finding 6)",
     assert.equal(reg.rootCount(), 0); // the mismatched root was never admitted
   });
 
+  it("validates the caller's reservation copy against the stored reservation", () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const reserved = reg.reserveLaunch("provider");
+    assert.equal(reserved.kind, "reserved");
+    if (reserved.kind !== "reserved") return;
+    // A structurally forged copy keeps the valid id but substitutes a kind that
+    // matches the produced root. Comparing root.kind only with the caller's copy
+    // admits it; the registry must bind both to the stored reservation instead.
+    const substituted = { ...reserved.reservation, kind: "command" as const };
+    const result = reg.registerRoot(substituted, new FakeRoot("command"));
+    assert.equal(result.ok, false);
+    assert.equal(reg.isPoisoned(), true);
+    assert.equal(reg.rootCount(), 0);
+  });
+
   it("returns ok:false AND poisons on an unknown/already-settled reservation", () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const reserved = reg.reserveLaunch("provider");
@@ -489,6 +504,26 @@ describe("ExecutionRegistry: disposal and poison stickiness", () => {
     const res = await reg.disposeTools(DEADLINE);
     assert.equal(res.kind, "incomplete");
     assert.equal(reg.state(), "poisoned");
+  });
+
+  it("retries one failed root disposal without clearing poison evidence", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let calls = 0;
+    registerRoot(
+      reg,
+      new FakeRoot("provider", async () => ({ ok: true }), async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("first disposal failed");
+      }),
+    );
+
+    const first = await reg.disposeTools(DEADLINE);
+    assert.equal(first.kind, "incomplete");
+    assert.equal(reg.isPoisoned(), true);
+    const second = await reg.disposeTools(DEADLINE);
+    assert.equal(second.kind, "disposed");
+    assert.equal(calls, 2, "only the previously failed root is retried once");
+    assert.equal(reg.isPoisoned(), true, "successful retry does not erase prior poison evidence");
   });
 
   it("isPoisoned() is sticky and survives disposal masking state() as 'disposed'", async () => {

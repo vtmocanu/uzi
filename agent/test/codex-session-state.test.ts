@@ -49,7 +49,14 @@ async function collectRelFiles(dir: string): Promise<string[]> {
   return out.sort();
 }
 
-describe("CodexSessionStore", () => {
+describe(
+  "CodexSessionStore",
+  {
+    skip: process.platform === "linux"
+      ? false
+      : "fd-anchored copy requires Linux /proc/self/fd; production workers are Linux containers",
+  },
+  () => {
   let root: string;
   let codexHome: string;
   let storeDir: string;
@@ -143,6 +150,13 @@ describe("CodexSessionStore", () => {
     const junk = join(root, "junk-store");
     await writeFileAt(join(junk, "sessions", "notes.txt"), "not a rollout");
     assert.equal(await CodexSessionStore.inspect(junk), "absent");
+  });
+
+  it("inspect returns unknown when its bounded scan cannot classify the store", async () => {
+    const uncertain = join(root, "uncertain-store");
+    await writeFileAt(join(uncertain, "sessions", "one.txt"), "x");
+    await writeFileAt(join(uncertain, "sessions", "two.txt"), "x");
+    assert.equal(await CodexSessionStore.inspect(uncertain, { scanCap: 1 }), "unknown");
   });
 
   it("cross-worker: a non-existent store → inspect absent, adopt no-op (fresh session)", async () => {
@@ -528,6 +542,20 @@ describe("CodexSessionStore", () => {
       0,
       "a too-deep store is not adopted (fail-safe stop, no throw)",
     );
+
+    const validStore = join(root, "valid-store");
+    await writeFileAt(join(validStore, "sessions", "rollout-ok.jsonl"), '{"ok":true}\n');
+    const validHome = join(root, "valid-home");
+    assert.equal(
+      (await CodexSessionStore.adopt(validStore, validHome)).files,
+      1,
+      "control: a within-depth store is adopted successfully",
+    );
+    assert.deepEqual(
+      await collectRelFiles(freshHome),
+      [],
+      "the too-deep rollout copied no file before the fail-safe stop",
+    );
   });
 
   it("the allowlist/denylist constants encode the credential-free contract", () => {
@@ -538,4 +566,5 @@ describe("CodexSessionStore", () => {
       assert.ok(SESSION_DENY_NAME_SUBSTRINGS.includes(deny), `deny list must include ${deny}`);
     }
   });
-});
+  },
+);

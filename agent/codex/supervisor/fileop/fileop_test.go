@@ -29,12 +29,14 @@ func newTestServer(t *testing.T) (*server, string) {
 	t.Cleanup(func() { unix.Close(fd) })
 	s := newServer(fd)
 	// Probe openat2 directly so a missing kernel feature is an explicit failure.
-	if _, perr := s.openBeneath(".", unix.O_PATH, 0); perr != nil {
+	probeFD, perr := s.openBeneath(".", unix.O_PATH, 0)
+	if perr != nil {
 		if errors.Is(perr, unix.ENOSYS) {
 			t.Fatalf("openat2 unavailable (ENOSYS): this helper REQUIRES openat2; not falling back to a realpath check")
 		}
 		t.Fatalf("openat2 probe on root failed: %v", perr)
 	}
+	unix.Close(probeFD)
 	return s, root
 }
 
@@ -217,6 +219,26 @@ func TestEscapeDotDotBlocked(t *testing.T) {
 	// A bare ".." final component is refused before any syscall.
 	wantErr(t, s.handle(request{ID: 4, Op: opUnlink, Path: ".."}), codeEscape)
 	wantErr(t, s.handle(request{ID: 5, Op: opMkdir, Path: "a/.."}), codeEscape)
+}
+
+func TestOpenBeneathKernelRejectsEscapeWithoutPathValidation(t *testing.T) {
+	s, root := newTestServer(t)
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o700); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	for _, candidate := range []string{"../etc/passwd", "sub/../../etc/passwd"} {
+		fd, err := s.openBeneath(candidate, unix.O_PATH, 0)
+		if fd >= 0 {
+			unix.Close(fd)
+			t.Fatalf("openBeneath(%q) escaped the root", candidate)
+		}
+		if !errors.Is(err, unix.EXDEV) {
+			t.Fatalf("openBeneath(%q) error = %v, want EXDEV", candidate, err)
+		}
+		if got := classify(err); got != codeEscape {
+			t.Fatalf("classify(openBeneath(%q)) = %q, want %q", candidate, got, codeEscape)
+		}
+	}
 }
 
 func TestSymlinkComponentOutsideBlocked(t *testing.T) {

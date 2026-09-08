@@ -184,6 +184,13 @@ describe("CodexCallbackBroker: shell (screenBashCommand integration)", () => {
     assertDenied(r, "path_denied");
     assert.equal(h.spawn.calls.length, 0);
   });
+
+  it("denies an absolute cwd outside the worktree without spawning", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(rt(), "Bash", { command: "pwd", cwd: "/etc" }, "root");
+    assertDenied(r, "path_denied");
+    assert.equal(h.spawn.calls.length, 0);
+  });
 });
 
 describe("CodexCallbackBroker: file effects through the fileop client", () => {
@@ -295,6 +302,15 @@ describe("CodexCallbackBroker: root-only signals", () => {
     const r = await h.broker.handleToolCall(rt(), "signal_done", { summary: "done" }, "unknown");
     assertDenied(r, "signal_root_only");
   });
+
+  it("denies a signal callback whose payload parses to no signal", async () => {
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["report_progress"]) }),
+    });
+    const r = await h.broker.handleToolCall(rt(), "report_progress", {}, "root");
+    assertDenied(r, "invalid_signal");
+    assert.equal(h.registry.inFlightCallbackCount(), 0, "the denied callback still settles");
+  });
 });
 
 describe("CodexCallbackBroker: delegation", () => {
@@ -320,6 +336,25 @@ describe("CodexCallbackBroker: delegation", () => {
     const r = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "intruder" }, "root");
     assertDenied(r, "unknown_role");
     assert.equal(h.delegate.calls.length, 0);
+  });
+
+  it("bounds and sanitizes a delegated child failure", async () => {
+    const delegate = new DelegateSpy({
+      ok: false,
+      code: "attacker_code",
+      message: `failed\u001b[2J\n${"x".repeat(500)}`,
+    });
+    const h = makeBroker({ delegate: delegate.seam });
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "spawn_agent",
+      { subagent_type: "reviewer" },
+      "root",
+    );
+    assertDenied(r, "child_failed");
+    assert.ok(!hasRawControlChars(r.message), `message carried a control char: ${JSON.stringify(r.message)}`);
+    assert.ok(r.message.length <= 121, "the child message is bounded by the diagnostic cap plus ellipsis");
+    assert.equal(delegate.calls.length, 1);
   });
 });
 

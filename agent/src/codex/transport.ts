@@ -36,6 +36,10 @@ import type { HarnessError, HarnessErrorCategory } from "../harness.js";
 const DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024;
 /** Bound on serialized frames buffered for write while the peer applies backpressure. */
 const DEFAULT_MAX_OUTBOUND_FRAMES = 1024;
+/** A single outbound JSONL frame may not exceed the characterized inbound frame cap. */
+const DEFAULT_MAX_OUTBOUND_FRAME_BYTES = DEFAULT_MAX_FRAME_BYTES;
+/** Aggregate serialized bytes retained in the transport's own outbound queue. */
+const DEFAULT_MAX_OUTBOUND_BYTES = 64 * 1024 * 1024;
 /** Bound on decoded notifications buffered while no consumer is draining them. */
 const DEFAULT_MAX_INBOUND_NOTIFICATIONS = 4096;
 /**
@@ -112,6 +116,8 @@ export interface CodexTransportOptions {
   readonly outbound: Writable;
   readonly maxFrameBytes?: number;
   readonly maxOutboundFrames?: number;
+  readonly maxOutboundFrameBytes?: number;
+  readonly maxOutboundBytes?: number;
   readonly maxInboundNotifications?: number;
   readonly maxInboundBytes?: number;
 }
@@ -154,7 +160,12 @@ export interface CodexTransport {
 
 interface Pending {
   onResponse(msg: Record<string, unknown>): void;
-  onError(err: CodexTransportError): void;
+  onError(err: unknown): void;
+}
+
+interface QueuedFrame {
+  readonly line: string;
+  readonly bytes: number;
 }
 
 function readStringProp(obj: unknown, key: string): string | undefined {
@@ -170,6 +181,8 @@ class CodexTransportImpl implements CodexTransport {
   private readonly outbound: Writable;
   private readonly maxFrameBytes: number;
   private readonly maxOutbound: number;
+  private readonly maxOutboundFrameBytes: number;
+  private readonly maxOutboundBytes: number;
   private readonly maxInbound: number;
   private readonly maxInboundBytes: number;
 
@@ -180,7 +193,8 @@ class CodexTransportImpl implements CodexTransport {
   private closed = false;
   private terminalError: CodexTransportError | undefined;
 
-  private readonly sendQueue: string[] = [];
+  private readonly sendQueue: QueuedFrame[] = [];
+  private sendBytes = 0;
   private draining = false;
 
   private readonly notesQueue: Array<{ note: CodexNotification; bytes: number }> = [];
@@ -198,6 +212,8 @@ class CodexTransportImpl implements CodexTransport {
     this.outbound = opts.outbound;
     this.maxFrameBytes = opts.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     this.maxOutbound = opts.maxOutboundFrames ?? DEFAULT_MAX_OUTBOUND_FRAMES;
+    this.maxOutboundFrameBytes = opts.maxOutboundFrameBytes ?? DEFAULT_MAX_OUTBOUND_FRAME_BYTES;
+    this.maxOutboundBytes = opts.maxOutboundBytes ?? DEFAULT_MAX_OUTBOUND_BYTES;
     this.maxInbound = opts.maxInboundNotifications ?? DEFAULT_MAX_INBOUND_NOTIFICATIONS;
     this.maxInboundBytes = opts.maxInboundBytes ?? DEFAULT_MAX_INBOUND_BYTES;
 
@@ -248,13 +264,6 @@ class CodexTransportImpl implements CodexTransport {
         onError: (err) => finish(() => reject(err)),
       };
       this.pending.set(id, entry);
-      try {
-        this.enqueueFrame(params === undefined ? { id, method } : { id, method, params });
-      } catch (err) {
-        this.pending.delete(id);
-        reject(err);
-        return;
-      }
       const deadlineMs = opts?.deadlineMs;
       if (deadlineMs !== undefined && deadlineMs > 0) {
         timer = setTimeout(() => entry.onError(fail("timeout", "codex transport request deadline exceeded")), deadlineMs);
@@ -262,6 +271,20 @@ class CodexTransportImpl implements CodexTransport {
       if (signal) {
         onAbort = (): void => entry.onError(fail("aborted", "codex transport request aborted"));
         signal.addEventListener("abort", onAbort, { once: true });
+        // Close the pre-check/listener-install race. AbortSignal dispatch is
+        // synchronous, so a signal that flipped between those two points is now
+        // observed before any frame is sent.
+        if (signal.aborted) {
+          entry.onError(fail("aborted", "codex transport request aborted before send"));
+          return;
+        }
+      }
+      try {
+        this.enqueueFrame(params === undefined ? { id, method } : { id, method, params });
+      } catch (err) {
+        // Use the common settlement path so a serialization/queue failure removes
+        // the pending entry, timer, and abort listener exactly once.
+        entry.onError(err);
       }
     });
   }
@@ -320,7 +343,21 @@ class CodexTransportImpl implements CodexTransport {
     if (this.sendQueue.length >= this.maxOutbound) {
       throw fail("transport", "codex transport outbound queue is full");
     }
-    this.sendQueue.push(`${JSON.stringify(frame)}\n`);
+    let line: string;
+    try {
+      line = `${JSON.stringify(frame)}\n`;
+    } catch {
+      throw fail("transport", "codex transport could not serialize outbound frame");
+    }
+    const bytes = Buffer.byteLength(line, "utf8");
+    if (bytes > this.maxOutboundFrameBytes) {
+      throw fail("transport", "codex transport outbound frame exceeds size cap");
+    }
+    if (this.sendBytes + bytes > this.maxOutboundBytes) {
+      throw fail("transport", "codex transport outbound byte queue is full");
+    }
+    this.sendQueue.push({ line, bytes });
+    this.sendBytes += bytes;
     this.kickDrain();
   }
 
@@ -336,9 +373,10 @@ class CodexTransportImpl implements CodexTransport {
         this.draining = false;
         return;
       }
-      const line = this.sendQueue.shift();
-      if (line === undefined) break;
-      if (!this.outbound.write(line)) {
+      const queued = this.sendQueue.shift();
+      if (queued === undefined) break;
+      this.sendBytes -= queued.bytes;
+      if (!this.outbound.write(queued.line)) {
         // Peer is applying backpressure; resume once the buffer drains.
         this.outbound.once("drain", () => {
           if (!this.closed) this.drainLoop();
@@ -499,6 +537,8 @@ class CodexTransportImpl implements CodexTransport {
     this.inbound.removeListener("close", this.onEndHandler);
     this.inbound.removeListener("error", this.onInboundError);
     this.outbound.removeListener("error", this.onOutboundError);
+    this.sendQueue.length = 0;
+    this.sendBytes = 0;
 
     // A bare terminate() is a caller-initiated close (or a clean EOF with no request in
     // flight) — a transport closure, not a `protocol` framing/EOF violation. Genuine

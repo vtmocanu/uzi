@@ -196,13 +196,19 @@ export class CodexHarness implements RunHarness {
   // notifications() iterator is single-consumer so it is obtained exactly once).
   private transport?: CodexTransport;
   private notes?: AsyncIterableIterator<CodexNotification>;
+  // At most one notifications().next() may be outstanding. If a turn aborts while
+  // it is pending, the promise is retained and consumed by the next turn rather than
+  // abandoning a waiter that would silently eat the next provider notification.
+  private pendingNote?: Promise<IteratorResult<CodexNotification>>;
   private threadId?: string;
   private currentModel?: string;
+  private closed = false;
 
   // Per-turn state (turns run strictly sequentially).
   private activeTurnId?: string;
   private turnClosed = false;
   private terminalEmitted = false;
+  private stopRequested = false;
   // Resolves the current turn's abort race (see runTurn). The owner-aborted signal
   // resolves it via the listener; requestStop()/close() resolve it directly so a turn
   // WEDGED in a pending broker callback (a never-settling model-selected effect) still
@@ -227,6 +233,9 @@ export class CodexHarness implements RunHarness {
   }
 
   startTurn(request: RunTurnRequest): HarnessTurn {
+    if (this.closed) {
+      throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
+    }
     // Render synchronously so a render throw surfaces to the caller here; the rest of
     // the setup (launch, thread/start, turn/start) is deferred into the events
     // generator so a setup throw surfaces to the owner's for-await (its trip > throw >
@@ -236,6 +245,8 @@ export class CodexHarness implements RunHarness {
     this.turnClosed = false;
     this.terminalEmitted = false;
     this.activeTurnId = undefined;
+    this.stopRequested = false;
+    this.stopTurn = undefined;
 
     return {
       events: this.runTurn(request, rendered),
@@ -266,6 +277,7 @@ export class CodexHarness implements RunHarness {
    *  a CANCELLATION REQUEST, not a process kill (rule: "request root stop"). Best-effort
    *  and fire-and-forget; a failed interrupt never surfaces as a turn failure. */
   private requestStop(_reason: "terminal" | "cancel" | "timeout"): void {
+    this.stopRequested = true;
     const transport = this.transport;
     const threadId = this.threadId;
     const turnId = this.activeTurnId;
@@ -276,9 +288,8 @@ export class CodexHarness implements RunHarness {
           /* interrupt is best-effort; the terminal/EOF path settles the turn */
         });
     }
-    // End the stream even when it is wedged in a pending broker callback: the run loop
-    // otherwise only races notes.next(), so resolve the turn's stop promise to settle the
-    // abort race and return the generator promptly. A no-op before the stream starts.
+    // End the stream even when it is wedged in a pending broker callback. The sticky
+    // stopRequested bit also covers the lazy-generator window before stopTurn exists.
     this.stopTurn?.();
   }
 
@@ -294,7 +305,10 @@ export class CodexHarness implements RunHarness {
    *  the shared root transport (idempotent); it does NOT drain children, kill groups or
    *  reap — that is quiesce/reap/dispose. */
   private async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
     this.turnClosed = true;
+    this.stopRequested = true;
     // Wake a run loop wedged in a pending broker callback so the generator returns rather
     // than hang on that await while the transport is torn down underneath it.
     this.stopTurn?.();
@@ -319,9 +333,11 @@ export class CodexHarness implements RunHarness {
     // requestStop()/close() also settle it via `stopTurn`, so a turn wedged in a pending
     // broker callback ends promptly and does not depend on a new notification arriving.
     let onAbort: (() => void) | undefined;
+    let settleStop: (() => void) | undefined;
     const abortPromise = new Promise<"aborted">((resolve) => {
-      this.stopTurn = (): void => resolve("aborted");
-      if (request.signal.aborted) {
+      settleStop = (): void => resolve("aborted");
+      this.stopTurn = settleStop;
+      if (request.signal.aborted || this.stopRequested) {
         resolve("aborted");
         return;
       }
@@ -330,6 +346,12 @@ export class CodexHarness implements RunHarness {
     });
 
     try {
+      // startTurn returns a lazy iterable. A stop may arrive before its first next();
+      // honor that request without launching a provider root or starting model work.
+      if (request.signal.aborted || this.stopRequested) {
+        this.turnClosed = true;
+        return;
+      }
       // 1. Ensure the provider root + transport (launched once, reused after).
       await this.ensureRoot();
       const transport = this.transport;
@@ -349,16 +371,31 @@ export class CodexHarness implements RunHarness {
 
       // 3. Start the turn with the rendered prompt / model / effort.
       this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal);
+      if (request.signal.aborted || this.stopRequested) {
+        // A stop during launch/thread/turn setup could not name a turn earlier. Now
+        // that activeTurnId exists, issue the best-effort interrupt and end cleanly.
+        this.endTurnOnStop();
+        return;
+      }
 
       // 4. Consume the notification stream, mapping each raw frame to ONE neutral event.
       for (;;) {
         if (this.turnClosed) return;
-        const step = await Promise.race([notes.next(), abortPromise]);
+        const notePromise = this.pendingNote ?? notes.next();
+        this.pendingNote = notePromise;
+        let step: IteratorResult<CodexNotification> | "aborted";
+        try {
+          step = await Promise.race([notePromise, abortPromise]);
+        } catch (error) {
+          if (this.pendingNote === notePromise) this.pendingNote = undefined;
+          throw error;
+        }
         if (step === "aborted") {
           // Owner cancel/watchdog wins: interrupt the turn and end the stream cleanly.
           this.endTurnOnStop();
           return;
         }
+        if (this.pendingNote === notePromise) this.pendingNote = undefined;
         if (step.done) {
           // A deliberate close or an already-emitted terminal ends cleanly. Otherwise
           // this is Codex's own unexpected EOF → a protocol throw (rule 9), never a
@@ -387,6 +424,7 @@ export class CodexHarness implements RunHarness {
       }
     } finally {
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
+      if (this.stopTurn === settleStop) this.stopTurn = undefined;
     }
   }
 
@@ -484,7 +522,11 @@ export class CodexHarness implements RunHarness {
       },
       { signal: request.signal },
     );
-    return res?.thread?.id ?? resumeId ?? "";
+    const id = res?.thread?.id;
+    if (typeof id !== "string" || id.length === 0) {
+      throw new CodexHarnessError({ category: "protocol", message: "codex thread/resume returned no thread id" });
+    }
+    return id;
   }
 
   private async startTurnRpc(
@@ -540,7 +582,12 @@ export class CodexHarness implements RunHarness {
           if (note.method === "item/tool/call") {
             await this.routeToolCall(transport, note.requestId, note.params);
           } else {
-            transport.respond(note.requestId, { error: { code: -32601, message: "unsupported request" } });
+            try {
+              transport.respond(note.requestId, { error: { code: -32601, message: "unsupported request" } });
+            } catch {
+              // The owner may close the run-scoped transport while this reply is
+              // being prepared. An undeliverable fail-closed response is dropped.
+            }
           }
           return { kind: "activity", sessionId: this.threadId };
         }

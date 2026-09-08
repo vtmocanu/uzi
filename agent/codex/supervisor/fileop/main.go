@@ -39,6 +39,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -65,7 +66,21 @@ func run(args []string, in io.Reader, out io.Writer, errw io.Writer) int {
 		return 2
 	}
 	defer unix.Close(rootFD)
-	if serr := serve(newServer(rootFD), in, out); serr != nil {
+	server := newServer(rootFD)
+	// Fail before accepting requests if the load-bearing containment syscall is
+	// unavailable or blocked. Serving first and discovering this per operation would
+	// make the helper look healthy while every model effect fails.
+	probeFD, perr := server.openBeneath(".", unix.O_PATH, 0)
+	if perr != nil {
+		if errors.Is(perr, unix.ENOSYS) {
+			io.WriteString(errw, "fileop: openat2 unavailable\n")
+		} else {
+			io.WriteString(errw, "fileop: openat2 probe failed\n")
+		}
+		return 2
+	}
+	unix.Close(probeFD)
+	if serr := serve(server, in, out); serr != nil {
 		io.WriteString(errw, "fileop: transport error\n")
 		return 1
 	}

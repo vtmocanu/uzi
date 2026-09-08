@@ -70,6 +70,7 @@ function defaultResponder(method: string): unknown {
 class FakeTransport implements CodexTransport {
   requests: { method: string; params: unknown }[] = [];
   responses: { requestId: number | string; response: unknown }[] = [];
+  respondAttempts = 0;
   notifies: { method: string; params: unknown }[] = [];
   closes = 0;
 
@@ -115,6 +116,7 @@ class FakeTransport implements CodexTransport {
     requestId: number | string,
     response: { readonly result: unknown } | { readonly error: { readonly code: number; readonly message: string } },
   ): void {
+    this.respondAttempts += 1;
     // Mirror the real transport's closed-guard: a respond after close throws, so a broker
     // reply that settles after the turn is torn down exercises routeToolCall's guard.
     if (this.closedFlag) throw new Error("codex transport is closed");
@@ -188,6 +190,10 @@ function toolCall(
   callId = "c1",
 ): CodexNotification {
   return { kind: "activity", method: "item/tool/call", requestId, params: { threadId, turnId, callId, tool, arguments: args, namespace: null } };
+}
+
+function serverRequest(requestId: number, method = "unknown/request"): CodexNotification {
+  return { kind: "activity", method, requestId, params: { value: true } };
 }
 
 /** An item/tool/call whose params OMIT threadId entirely (an absent/non-string id can never
@@ -348,6 +354,23 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.equal(config.project_doc_max_bytes, 0);
     assert.deepEqual(rec(config.projects)[WORKSPACE], { trust_level: "untrusted" });
     assert.doesNotMatch(JSON.stringify(params), /bypass_hook_trust/);
+  });
+
+  it("rejects a thread/resume response without a non-empty thread id", async () => {
+    const transport = new FakeTransport((method) => {
+      if (method === "thread/resume") return { thread: {} };
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport });
+    await assert.rejects(
+      collect(harness.startTurn(makeRequest({ resumeSessionId: "requested-session" })).events),
+      (err: unknown) => err instanceof CodexHarnessError && /thread\/resume returned no thread id/.test(err.message),
+    );
+    assert.equal(
+      transport.requests.some((r) => r.method === "turn/start"),
+      false,
+      "a malformed resume response never starts model work",
+    );
   });
 
   it("starts the turn with the rendered prompt + model + effort", async () => {
@@ -601,6 +624,30 @@ describe("CodexHarness: server→client tool-call routing", () => {
     assert.equal(transport.responses.length, 1);
     assert.equal(rec(rec(transport.responses[0]!.response).result).success, false);
   });
+
+  it("refuses a non-tool server request and never calls the broker", async () => {
+    let brokerCalls = 0;
+    const broker = stubBroker(async () => {
+      brokerCalls += 1;
+      return { ok: true, output: {} };
+    });
+    const { harness, transport } = makeHarness({ broker });
+    transport
+      .push(threadStarted())
+      .push(serverRequest(17, "account/login/refresh"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    assert.equal(brokerCalls, 0);
+    assert.ok(events.some((event) => event.kind === "activity"));
+    assert.equal(transport.respondAttempts, 1);
+    assert.equal(transport.responses.length, 1);
+    assert.deepEqual(transport.responses[0], {
+      requestId: 17,
+      response: { error: { code: -32601, message: "unsupported request" } },
+    });
+  });
 });
 
 describe("CodexHarness: tool-call is bound fail-closed to the active (thread, turn)", () => {
@@ -803,7 +850,61 @@ describe("CodexHarness: owner abort cancels a turn wedged in a broker callback",
     release({ ok: true, output: {} });
     await tick();
     await tick();
+    assert.equal(transport.respondAttempts, 1, "the broker reply reached the guarded respond seam once");
     assert.equal(transport.responses.length, 0, "the undeliverable reply was dropped");
+  });
+});
+
+describe("CodexHarness: sequential turn lifecycle", () => {
+  it("reuses the thread and transport across two clean turns", async () => {
+    let turnNumber = 0;
+    const transport = new FakeTransport((method) => {
+      if (method === "turn/start") {
+        turnNumber += 1;
+        return { turn: { id: `tn-${turnNumber}` } };
+      }
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport });
+
+    transport.push(threadStarted()).push(turnCompleted("completed", undefined, "th-1", "tn-1"));
+    await collect(harness.startTurn(makeRequest()).events);
+    transport.push(turnCompleted("completed", undefined, "th-1", "tn-2"));
+    await collect(harness.startTurn(makeRequest()).events);
+
+    assert.equal(transport.requests.filter((r) => r.method === "thread/start").length, 1);
+    assert.equal(transport.requests.filter((r) => r.method === "turn/start").length, 2);
+    assert.equal(transport.closes, 0);
+  });
+
+  it("retains an abandoned notification read for the next turn after owner abort", async () => {
+    let turnNumber = 0;
+    const transport = new FakeTransport((method) => {
+      if (method === "turn/start") {
+        turnNumber += 1;
+        return { turn: { id: `tn-${turnNumber}` } };
+      }
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport });
+    const firstAbort = new AbortController();
+    transport.push(threadStarted());
+    const first = harness.startTurn(makeRequest({ signal: firstAbort.signal })).events[Symbol.asyncIterator]();
+    assert.equal((await first.next()).done, false);
+    const abandonedRead = first.next();
+    await tick();
+    firstAbort.abort();
+    assert.equal((await abandonedRead).done, true);
+
+    const secondEvents = collect(harness.startTurn(makeRequest()).events);
+    await tick();
+    // The retained read receives a stale terminal and maps it to liveness; the real
+    // second-turn terminal is then consumed normally instead of being lost.
+    transport.push(turnCompleted("completed", undefined, "th-1", "tn-1"));
+    await tick();
+    transport.push(turnCompleted("completed", undefined, "th-1", "tn-2"));
+    const events = await secondEvents;
+    assert.deepEqual(events.map((event) => event.kind), ["activity", "turn_finished"]);
   });
 });
 
@@ -886,6 +987,14 @@ describe("CodexHarness: error precedence + lifecycle", () => {
     assert.deepEqual(interrupt.params, { threadId: "th-1", turnId: "tn-1" });
   });
 
+  it("honors requestStop between startTurn and the iterable's first next", async () => {
+    const { harness, transport } = makeHarness();
+    const turn = harness.startTurn(makeRequest());
+    turn.requestStop("cancel");
+    assert.deepEqual(await collect(turn.events), []);
+    assert.equal(transport.requests.length, 0, "the stopped lazy turn launches no model work");
+  });
+
   it("close() is idempotent and does NOT reap / dispose / quiesce the registry", async () => {
     const { harness, transport, registry } = makeHarness();
     transport.push(threadStarted()).push(turnCompleted("completed")).end();
@@ -894,11 +1003,16 @@ describe("CodexHarness: error precedence + lifecycle", () => {
 
     await turn.close();
     await turn.close(); // idempotent — no throw
-    assert.equal(transport.closes, 2, "close closes the transport idempotently");
+    assert.equal(transport.closes, 1, "close closes the run-scoped transport exactly once");
     // The registry was never quiesced/reaped/disposed by close(): it stays open with the
     // one registered provider root.
     assert.equal(registry.state(), "open");
     assert.equal(registry.rootCount(), 1);
+    assert.throws(
+      () => harness.startTurn(makeRequest()),
+      (err: unknown) => err instanceof CodexHarnessError && /harness is closed/.test(err.message),
+      "a closed cached transport can never be reused by a later turn",
+    );
   });
 
   it("readContext is bounded and returns undefined on absence", async () => {

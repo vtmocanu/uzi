@@ -224,6 +224,39 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
     assert.notEqual(reg.state(), "poisoned");
   });
 
+  it("drains an action admitted while an earlier boundary-action batch is settling", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const first = defer<ReapOutcome>();
+    const second = defer<ReapOutcome>();
+    let spawnCalls = 0;
+    const seam: SpawnRootSeam = async () => {
+      spawnCalls += 1;
+      const reap = spawnCalls === 1 ? first.promise : second.promise;
+      return new FakeRoot("boundary_action", async () => reap);
+    };
+    const safety = createCodexExecutionSafety(reg, seam);
+    let boundarySettled = false;
+    const boundary = safety
+      .withBoundary(req("finalize"), async (permit) => {
+        void safety.spawnBoundaryAction(permit, ["first"], "command");
+        setTimeout(() => {
+          void safety.spawnBoundaryAction(permit, ["admitted-during-drain"], "command");
+        }, 0);
+      })
+      .then(() => {
+        boundarySettled = true;
+      });
+
+    await tick();
+    assert.equal(spawnCalls, 2, "the second action was admitted while the first batch drained");
+    first.resolve({ ok: true });
+    await tick();
+    assert.equal(boundarySettled, false, "the second batch still holds the boundary permit");
+    second.resolve({ ok: true });
+    await boundary;
+    assert.equal(boundarySettled, true);
+  });
+
   it("a timed-out boundary-action child poisons the epoch (never 'clean')", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const { seam } = spawnCounter(failReap);
@@ -288,6 +321,25 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
     const outcome = await safety.spawnBoundaryAction(captured, ["x"], "command");
     assert.equal(outcome.kind, "refused");
     if (outcome.kind === "refused") assert.equal(outcome.reason, "stale_permit");
+    assert.equal(spawnState.calls, 0);
+  });
+
+  it("refuses a permit captured from an earlier boundary inside a later boundary", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(9));
+    const { state: spawnState, seam } = spawnCounter();
+    const safety = createCodexExecutionSafety(reg, seam);
+    let captured: BoundaryPermit | undefined;
+    await safety.withBoundary(req("checkpoint"), async (permit) => {
+      captured = permit;
+    });
+    if (!captured) throw new Error("permit was not captured");
+
+    let outcome: BoundaryActionOutcome | undefined;
+    await safety.withBoundary(req("credentialed_git"), async () => {
+      outcome = await safety.spawnBoundaryAction(captured!, ["git", "push"], "worker_pat");
+    });
+    assert.equal(outcome?.kind, "refused");
+    if (outcome?.kind === "refused") assert.equal(outcome.reason, "stale_permit");
     assert.equal(spawnState.calls, 0);
   });
 });

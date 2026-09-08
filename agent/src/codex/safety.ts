@@ -88,8 +88,10 @@ export class CodexBoundaryError extends Error {
 // stops honest code from shaping a permit-typed literal, but it enforces nothing at
 // runtime and is defeatable by `as unknown as BoundaryPermit`. The RUNTIME authority
 // is the safety owner's HELD state: `spawnBoundaryAction` admits an action only while
-// `heldEpoch` is set AND `permit.epoch === heldEpoch` (see runBoundaryAction's
-// stale_permit guard), so a forged or stale permit cannot reach a sink out of band.
+// the exact permit object minted for the active boundary is held (see
+// runBoundaryAction's stale_permit guard), so a forged permit or a permit retained from
+// an earlier boundary cannot reach a sink out of band even though the registry epoch is
+// intentionally stable for the whole run.
 // This matches harness-contract.md:637 ("the epoch number is descriptive; the
 // module-private brand and safety owner's held state enforce authority"). This
 // trusted minter is the sole legitimate construction point.
@@ -107,7 +109,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   private queueTail: Promise<void> = Promise.resolve();
 
   // Live only while an action is running under a held permit.
-  private heldEpoch: number | undefined;
+  private heldPermit: BoundaryPermit | undefined;
   private currentDeadlineMs = 0;
   private pendingActions: Promise<unknown>[] = [];
 
@@ -172,7 +174,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     // holding it. The permit/closed epoch is held through the full async action and
     // every boundary-action child; release only after actual settlement.
     const permit = mintPermit(epoch, request.boundary);
-    this.heldEpoch = epoch;
+    this.heldPermit = permit;
     this.currentDeadlineMs = request.deadlineMs;
     this.pendingActions = [];
 
@@ -182,12 +184,17 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     } catch (e) {
       outcome = { ok: false, error: e };
     }
-    // Wait for every boundary-action child spawned during the action, even one the
-    // action body did not itself await. A timed-out/late child poisons here.
-    await Promise.allSettled(this.pendingActions);
+    // Drain in batches until no action remains. Promise.allSettled snapshots an array
+    // synchronously, so a single await would miss an action admitted while an earlier
+    // batch was settling. There is no await between the empty check and clearing the
+    // held permit, therefore a still-later call is refused synchronously below.
+    while (this.pendingActions.length > 0) {
+      const batch = this.pendingActions;
+      this.pendingActions = [];
+      await Promise.allSettled(batch);
+    }
 
-    this.heldEpoch = undefined;
-    this.pendingActions = [];
+    this.heldPermit = undefined;
 
     if (this.registry.state() === "poisoned") {
       // Preserve BOTH the cleanup/poison evidence AND the action's own thrown error
@@ -226,6 +233,12 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     argv: readonly string[],
     identity: BoundaryActionIdentity,
   ): Promise<BoundaryActionOutcome> {
+    // Refuse before creating/tracking a promise. Besides making the permit check
+    // synchronous with admission, this prevents repeated out-of-boundary calls from
+    // accumulating already-settled refusal promises in pendingActions.
+    if (this.heldPermit !== permit) {
+      return Promise.resolve({ kind: "refused", reason: "stale_permit" });
+    }
     const p = this.runBoundaryAction(permit, argv, identity);
     this.pendingActions.push(p);
     return p;
@@ -236,8 +249,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     argv: readonly string[],
     identity: BoundaryActionIdentity,
   ): Promise<BoundaryActionOutcome> {
-    // Permit must match the currently held boundary epoch.
-    if (this.heldEpoch === undefined || permit.epoch !== this.heldEpoch) {
+    // Object identity binds the permit to THIS acquisition. The epoch is stable for
+    // the run, so comparing only its number would admit a permit from an earlier
+    // checkpoint inside a later credentialed_git/finalize boundary.
+    if (this.heldPermit !== permit) {
       return { kind: "refused", reason: "stale_permit" };
     }
     // [R3-2] guard for PAT-bearing actions.

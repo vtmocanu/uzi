@@ -56,6 +56,8 @@ function makePair(
   opts: {
     maxFrameBytes?: number;
     maxOutboundFrames?: number;
+    maxOutboundFrameBytes?: number;
+    maxOutboundBytes?: number;
     maxInboundNotifications?: number;
     maxInboundBytes?: number;
   } = {},
@@ -347,6 +349,40 @@ describe("codex transport: cancellation", () => {
     await transport.close();
   });
 
+  it("observes an abort fired synchronously by outbound.write", async () => {
+    const inbound = new PassThrough();
+    const ac = new AbortController();
+    const outbound = new Writable({
+      write(_chunk, _encoding, callback): void {
+        ac.abort();
+        callback();
+      },
+    });
+    const transport = createCodexTransport({ inbound, outbound });
+    await assert.rejects(
+      transport.request("thread/start", {}, { signal: ac.signal, deadlineMs: 100 }),
+      (err: unknown) => err instanceof CodexTransportError && err.failure.category === "aborted",
+    );
+    await transport.close();
+  });
+
+  it("handles a response delivered synchronously by outbound.write", async () => {
+    const inbound = new PassThrough();
+    const outbound = new Writable({
+      write(chunk, _encoding, callback): void {
+        const request = JSON.parse(String(chunk)) as { id: number };
+        writeFrame(inbound, { id: request.id, result: { synchronous: true } });
+        callback();
+      },
+    });
+    const transport = createCodexTransport({ inbound, outbound });
+    assert.deepEqual(
+      await transport.request("thread/start", {}, { signal: new AbortController().signal, deadlineMs: 100 }),
+      { synchronous: true },
+    );
+    await transport.close();
+  });
+
   it("a deadline elapsing rejects the pending request with a timeout failure", async () => {
     const { transport } = makePair();
     const p = transport.request("thread/start", {}, { deadlineMs: 5 });
@@ -382,6 +418,40 @@ describe("codex transport: backpressure", () => {
     assert.equal((overflow as CodexTransportError).failure.category, "transport");
     assert.match((overflow as CodexTransportError).message, /outbound queue is full/);
 
+    await transport.close();
+  });
+
+  it("rejects on queued bytes before the frame-count ceiling", async () => {
+    const stalled = new Writable({
+      highWaterMark: 1,
+      write(): void {
+        /* deliberately never call the callback */
+      },
+    });
+    const inbound = new PassThrough();
+    const transport = createCodexTransport({
+      inbound,
+      outbound: stalled,
+      maxOutboundFrames: 100,
+      maxOutboundFrameBytes: 1024,
+      maxOutboundBytes: 180,
+    });
+
+    transport.notify("first", { body: "x".repeat(80) }); // held by Writable
+    transport.notify("queued", { body: "x".repeat(80) });
+    assert.throws(
+      () => transport.notify("overflow", { body: "x".repeat(80) }),
+      (err: unknown) => err instanceof CodexTransportError && /byte queue/.test(err.message),
+    );
+    await transport.close();
+  });
+
+  it("rejects one oversized outbound frame", async () => {
+    const { transport } = makePair({ maxOutboundFrameBytes: 64, maxOutboundBytes: 1024 });
+    assert.throws(
+      () => transport.notify("oversized", { body: "x".repeat(128) }),
+      (err: unknown) => err instanceof CodexTransportError && /frame exceeds/.test(err.message),
+    );
     await transport.close();
   });
 });

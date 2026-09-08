@@ -626,7 +626,10 @@ export const CodexSessionStore = {
    * "unknown" only on a genuine I/O uncertainty (e.g. EACCES, or a tree too large to
    * scan within bounds).
    */
-  async inspect(storeDir: string): Promise<SessionPresence> {
+  async inspect(
+    storeDir: string,
+    opts: { scanCap?: number } = {},
+  ): Promise<SessionPresence> {
     const srcSessions = join(storeDir, SESSION_ALLOWED_SUBDIR);
     try {
       const st = await fsp.lstat(srcSessions);
@@ -637,7 +640,10 @@ export const CodexSessionStore = {
       return "unknown"; // EACCES/ELOOP/… — genuinely cannot tell
     }
     try {
-      const found = await hasAllowlistedArtifact(srcSessions, DEFAULT_SESSION_STORE_BOUNDS.maxFiles);
+      const found = await hasAllowlistedArtifact(
+        srcSessions,
+        opts.scanCap ?? DEFAULT_SESSION_STORE_BOUNDS.maxFiles,
+      );
       return found ? "present" : "absent";
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;

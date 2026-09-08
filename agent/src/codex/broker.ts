@@ -106,6 +106,16 @@ const DELEGATE_TOOLS: ReadonlySet<string> = new Set([
   "SubagentStop",
 ]);
 
+/** Stable delegated-child failures the broker permits onto its public result. Any
+ *  future child runner must deliberately extend this vocabulary and its tests rather
+ *  than forwarding an arbitrary provider/model-controlled code. */
+const CHILD_FAILURE_CODES: ReadonlySet<string> = new Set([
+  "child_failed",
+  "child_aborted",
+  "child_timeout",
+  "child_denied",
+]);
+
 /** The capability the broker binds a callback to, decided from the tool NAME +
  *  grants — never from the arguments. */
 type Capability = "shell" | "file_write" | "file_read" | "signal" | "delegate" | "mcp" | "unknown";
@@ -661,6 +671,9 @@ export class CodexCallbackBroker {
         ],
       },
     });
+    if (Object.keys(scanned).length === 0) {
+      return deny("invalid_signal", `signal "${safeId(canonical)}" carried no valid payload`);
+    }
     return { ok: true, output: scanned };
   }
 
@@ -685,7 +698,13 @@ export class CodexCallbackBroker {
     // Await the child SYNCHRONOUSLY: the parent callback resolves only after it settles.
     const child = await this.delegateSeam({ tool: canonical, role, args, parent: rt });
     if (child.ok) return { ok: true, output: child.output };
-    return deny(child.code ?? "child_failed", child.message ?? "the delegated child failed");
+    const code = child.code !== undefined && CHILD_FAILURE_CODES.has(child.code)
+      ? child.code
+      : "child_failed";
+    const message = child.message === undefined
+      ? "the delegated child failed"
+      : safeId(child.message);
+    return deny(code, message);
   }
 
   // --- memory/forge/findings/skills pass-through ------------------------------

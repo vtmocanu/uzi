@@ -2052,7 +2052,8 @@ tasks:
       - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
 
   test:codex-supervisor:
-    desc: Opt-in gofmt vet and unit tests for the static Codex process supervisor module
+    desc: Opt-in Linux-only gofmt vet and unit tests for the static Codex process supervisor module
+    platforms: [linux]
     # A SEPARATE Go module (uzi.local/codex-supervisor), deliberately NOT part of gate:api
     # and NOT under gate. GOTOOLCHAIN=local pins the host toolchain (the module go.mod floors
     # go 1.25); -mod=vendor builds offline from the committed vendor tree; -buildvcs=false

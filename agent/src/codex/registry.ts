@@ -297,7 +297,7 @@ export class ExecutionRegistry {
       this.poison(error);
       return { ok: false, error };
     }
-    if (root.kind !== reservation.kind) {
+    if (reservation.kind !== held.kind || root.kind !== held.kind) {
       const error: HarnessError = {
         category: "protocol",
         message: "registerRoot: root kind does not match reservation",
