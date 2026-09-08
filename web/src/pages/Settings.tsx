@@ -7,7 +7,7 @@
 // model) moved to the Run defaults tab (RunDefaults.tsx): this tab is who you
 // are and what you hold, that one is how your runs behave.
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useSyncExternalStore } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -53,6 +53,35 @@ const TYPEFACE_OPTIONS: { value: string; label: string }[] = [
   { value: "system", label: "System" },
   { value: "plex", label: "IBM Plex" },
 ];
+
+// Keyboard-focus ring on the appearance option cards (WCAG 2.4.7). Every card is a
+// <label> wrapping an sr-only radio, so the global input:focus-visible ring lands on
+// the clipped input and is invisible; project it onto the card with :has(:focus-visible).
+// Same utility the AgentPicker cards use, kept identical for one focus language.
+const CARD_FOCUS_RING =
+  "has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-brand has-[:focus-visible]:outline-offset-2";
+
+// prefersDarkSnapshot / subscribe back a useSyncExternalStore so the Appearance UI
+// tracks the OS colour-scheme LIVE. Under "system" mode the painted theme already
+// re-stamps on an OS flip (theme.ts applyAppearance's matchMedia listener); this
+// keeps the Settings UI (which polarity paints, the picker dimming, the "Showing…"
+// line) in step instead of stale until the next render. No-matchMedia / SSR reads false.
+function prefersDarkSnapshot(): boolean {
+  return typeof window !== "undefined" && !!window.matchMedia
+    ? window.matchMedia("(prefers-color-scheme: dark)").matches
+    : false;
+}
+
+function subscribePrefersDark(onChange: () => void): () => void {
+  if (typeof window === "undefined" || !window.matchMedia) return () => {};
+  const mql = window.matchMedia("(prefers-color-scheme: dark)");
+  mql.addEventListener("change", onChange);
+  return () => mql.removeEventListener("change", onChange);
+}
+
+function usePrefersDark(): boolean {
+  return useSyncExternalStore(subscribePrefersDark, prefersDarkSnapshot, () => false);
+}
 
 // The three light themes (dawn/hall/shadow) share ONE token set in index.css
 // ([data-theme="dawn"],[data-theme="hall"],[data-theme="shadow"]): the cool-steel
@@ -115,6 +144,7 @@ function ThemePicker({
             key={t}
             className={cx(
               "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+              CARD_FOCUS_RING,
               active ? "border-brand bg-raised" : "border-edge hover:border-edge-strong",
               disabled ? "cursor-not-allowed" : "cursor-pointer",
             )}
@@ -295,12 +325,9 @@ export function Settings() {
     );
 
   // Which polarity currently paints (so the other picker is dimmed). An explicit
-  // mode names it; under "system" it is the OS preference, read via matchMedia
-  // (a hint only — it does not re-render on an OS flip).
-  const osDark =
-    typeof window !== "undefined" && window.matchMedia
-      ? window.matchMedia("(prefers-color-scheme: dark)").matches
-      : false;
+  // mode names it; under "system" it is the OS preference, tracked reactively so an
+  // OS light/dark flip re-renders this UI (not just the painted theme).
+  const osDark = usePrefersDark();
   const activePolarity: "light" | "dark" =
     appearance.mode === "light"
       ? "light"
@@ -424,6 +451,7 @@ export function Settings() {
                   key={value}
                   className={cx(
                     "rounded-lg border px-3 py-1.5 text-sm transition-colors",
+                    CARD_FOCUS_RING,
                     active
                       ? "border-brand bg-raised text-fg"
                       : "border-edge text-muted hover:border-edge-strong",
@@ -492,6 +520,7 @@ export function Settings() {
                   key={value}
                   className={cx(
                     "rounded-lg border px-3 py-1.5 text-sm transition-colors",
+                    CARD_FOCUS_RING,
                     active
                       ? "border-brand bg-raised text-fg"
                       : "border-edge text-muted",

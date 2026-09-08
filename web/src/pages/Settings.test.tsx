@@ -89,6 +89,33 @@ const baseAppearance = (
   ...over,
 });
 
+// installMatchMedia stubs window.matchMedia (jsdom ships none) with a controllable
+// (prefers-color-scheme: dark) query: `flip` changes `matches` and notifies the
+// change listeners, modelling an OS light/dark switch. Returns { flip, restore }.
+function installMatchMedia(initialDark: boolean) {
+  const original = window.matchMedia;
+  let dark = initialDark;
+  const listeners = new Set<() => void>();
+  const mql = {
+    get matches() {
+      return dark;
+    },
+    media: "(prefers-color-scheme: dark)",
+    addEventListener: (_: string, cb: () => void) => listeners.add(cb),
+    removeEventListener: (_: string, cb: () => void) => listeners.delete(cb),
+  };
+  window.matchMedia = (() => mql) as unknown as typeof window.matchMedia;
+  return {
+    flip(next: boolean) {
+      dark = next;
+      listeners.forEach((cb) => cb());
+    },
+    restore() {
+      window.matchMedia = original;
+    },
+  };
+}
+
 function mockAuth(user: User, appearance = baseAppearance()) {
   vi.mocked(useAuth).mockReturnValue({
     user,
@@ -285,6 +312,50 @@ describe("Settings — Appearance card (PRD #1167 'Lights on')", () => {
         typeface: null,
       }),
     );
+  });
+
+  it("gives each appearance option card a keyboard focus ring (WCAG 2.4.7)", async () => {
+    // The radio input is sr-only, so the global input:focus-visible ring is clipped
+    // and invisible; the visible ring must sit on the wrapping label card via
+    // :has(:focus-visible). Assert the card class is present in every group so a
+    // keyboard user gets a focus indicator (removing it reddens this).
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(modeGroup()).toBeTruthy());
+    const cardOf = (radio: HTMLElement) => radio.closest("label");
+    expect(cardOf(within(modeGroup()).getByRole("radio", { name: "System" }))?.className).toContain(
+      "has-[:focus-visible]:outline",
+    );
+    expect(cardOf(within(darkGroup()).getByRole("radio", { name: "Ember" }))?.className).toContain(
+      "has-[:focus-visible]:outline",
+    );
+    expect(
+      cardOf(within(typefaceGroup()).getByRole("radio", { name: "IBM Plex" }))?.className,
+    ).toContain("has-[:focus-visible]:outline");
+  });
+
+  it("updates the polarity hint live when the OS scheme flips under system mode", async () => {
+    // System mode + OS light paints the light slot (hall); flipping the OS to dark
+    // must re-render the "Showing…" hint to the dark slot (ember) without a manual
+    // re-render — the reactive matchMedia hook, not a once-at-render sample.
+    const mm = installMatchMedia(false);
+    try {
+      mockAuth(baseUser, baseAppearance({ mode: "system" }));
+      render(
+        <MemoryRouter>
+          <Settings />
+        </MemoryRouter>,
+      );
+      const modeSection = () => modeGroup().parentElement as HTMLElement;
+      await waitFor(() => expect(modeSection().textContent).toMatch(/Showing Hall \(light\)/));
+      act(() => mm.flip(true));
+      await waitFor(() => expect(modeSection().textContent).toMatch(/Showing Ember \(dark\)/));
+    } finally {
+      mm.restore();
+    }
   });
 
   it("renders a legacy fixture (appearance synthesised from the deprecated trio)", async () => {
