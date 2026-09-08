@@ -148,7 +148,12 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (a.summary_model === undefined || typeof a.summary_model === "string") &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
-    typeof a.health_near_timeout_pct === "string" &&
+    // PRD #1170 replaced health_slow_seconds with this key WITHOUT bumping the v3
+    // storage key, so accept a legacy blob that predates it (undefined) — a missing
+    // value is filled from the seed default ("85") on load — but reject a malformed
+    // non-string. This preserves a developer's saved config instead of discarding the
+    // whole blob and reseeding.
+    (a.health_near_timeout_pct === undefined || typeof a.health_near_timeout_pct === "string") &&
     typeof a.health_queued_seconds === "string" &&
     typeof a.health_approval_seconds === "string" &&
     typeof a.health_nudge_cooldown_seconds === "string" &&
@@ -162,11 +167,15 @@ function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings 
     if (raw) {
       const parsed: unknown = JSON.parse(raw);
       if (isPersistedSettings(parsed)) {
+        // Merge over the seed so a pre-#362 blob (no summary_model on either
+        // side) still yields a complete shape; the persisted values win where present.
+        const appSettings = { ...SEED_APP_SETTINGS, ...parsed.appSettings };
+        // PRD #1170: drop the retired health_slow_seconds key a pre-migration v3 blob
+        // carries, so it doesn't ride along into the served settings / get re-persisted.
+        delete (appSettings as Record<string, unknown>).health_slow_seconds;
         return {
-          // Merge over the seed so a pre-#362 blob (no summary_model on either
-          // side) still yields a complete shape; the persisted values win where present.
           userSettings: { ...SEED_USER_SETTINGS, ...parsed.userSettings },
-          appSettings: { ...SEED_APP_SETTINGS, ...parsed.appSettings },
+          appSettings,
         };
       }
     }
