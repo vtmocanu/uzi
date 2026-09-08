@@ -141,6 +141,16 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 			wantErr: ErrReworkNoMR,
 		},
 		{
+			name:    "no branch (null)",
+			mutate:  func(f *fakeStore) { f.runByID.Branch = pgtype.Text{} },
+			wantErr: ErrReworkNoBranch,
+		},
+		{
+			name:    "no branch (empty)",
+			mutate:  func(f *fakeStore) { f.runByID.Branch = pgconv.Text("") },
+			wantErr: ErrReworkNoBranch,
+		},
+		{
 			name:    "MR merged (not open)",
 			mutate:  func(f *fakeStore) { f.runByID.MrState = pgconv.Text("merged") },
 			wantErr: ErrReworkMRNotOpen,

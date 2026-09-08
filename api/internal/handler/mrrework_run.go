@@ -168,6 +168,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrReworkKindUnsupported),
 			errors.Is(err, workersvc.ErrReworkRunNotCompleted),
 			errors.Is(err, workersvc.ErrReworkNoMR),
+			errors.Is(err, workersvc.ErrReworkNoBranch),
 			errors.Is(err, workersvc.ErrReworkMRNotOpen),
 			errors.Is(err, workersvc.ErrReworkNoToken),
 			errors.Is(err, workersvc.ErrReworkNothingNew):

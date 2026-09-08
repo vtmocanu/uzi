@@ -204,6 +204,7 @@ var (
 	ErrReworkKindUnsupported = errors.New("only a completed issue, prompt or self-improvement run can be reworked")
 	ErrReworkRunNotCompleted = errors.New("only a completed issue, prompt or self-improvement run can be reworked")
 	ErrReworkNoMR            = errors.New("this run has no merge request")
+	ErrReworkNoBranch        = errors.New("this run has no merge request branch")
 	ErrReworkMRNotOpen       = errors.New("the merge request is not open")
 	ErrReworkNoToken         = errors.New("add an Anthropic token first")
 	ErrReworkNothingNew      = errors.New("nothing to rework: no new review comments since the last cycle, and no guidance given")
@@ -218,8 +219,9 @@ var (
 // debounce, the head-SHA staleness check, and the green-pipeline requirement — a human
 // pressing the button is attended spend on their own token, Decision 1/2) and keeps every
 // CORRECTNESS guard: the run must be a completed issue/prompt/self_improve run whose MR is
-// open, its owner must hold an Anthropic token, and the create-time cross-kind branch guard
-// + one-active-mr_rework index still run inside CreateManualMRReworkRun. The admin
+// open and whose branch is present, its owner must hold an Anthropic token, and the
+// create-time cross-kind branch guard + one-active-mr_rework index still run inside
+// CreateManualMRReworkRun. The admin
 // kill-switch is enforced by the handler (the settings cache is out of workersvc's reach).
 //
 // snapshot is the FULL MR review-comment snapshot the handler read from the forge (nil is
@@ -261,6 +263,13 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	}
 	if run.MrState.String != "opened" {
 		return store.Run{}, ErrReworkMRNotOpen
+	}
+	// A completed issue/prompt/self_improve run's branch is nullable (only 'task' forces
+	// branch NOT NULL), and an empty-but-valid branch would slip through the mr_rework
+	// pipeline_ref-NOT-NULL constraint and then fail at worker claim assembly ("mr_rework
+	// run claim is missing its MR branch (pipeline_ref)"). Refuse before token/ledger/create.
+	if !run.Branch.Valid || run.Branch.String == "" {
+		return store.Run{}, ErrReworkNoBranch
 	}
 
 	repoID := uuid.UUID(run.RepoID.Bytes)
