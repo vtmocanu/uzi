@@ -258,12 +258,13 @@
    undefined alias would make --bg guaranteed-invalid on the dark pair.
    Scoped ONLY under the light themes: ember/mission never match this selector,
    so on those themes `.console` is an inert no-op that inherits the theme's own
-   palette. The --queue-*/--neutral-*/--syn-*/--tool-rail aliases are DELIBERATELY
-   not redefined here: the Dawn block defines them as var() aliases (--queue-fg:
-   var(--muted), --syn-cmd: var(--brand), …), and CSS var() substitutes at
-   use-time in the element's own scope, so each re-resolves against these
-   overridden base tokens per element — a scoped neutral pill or shell token
-   automatically picks up the dark values. */
+   palette. The queue, neutral, syn and tool-rail aliases are RE-DECLARED in the
+   rule below (not just the base palette): a custom property inherits its already
+   RESOLVED value, so a `--queue-fg: var(--muted)` declared on the [data-theme]
+   ancestor resolves to the theme's LIGHT muted and would inherit that light value
+   into a nested `.console` unchanged. Declaring the aliases ON `.console`, where
+   the base tokens are the ember dark set, makes each var() resolve to the dark
+   value on this element, so a scoped neutral pill or shell token reads ember. */
 [data-theme="dawn"] .console, [data-theme="hall"] .console, [data-theme="shadow"] .console,
 [data-theme="dawn"] .docs-prose pre, [data-theme="hall"] .docs-prose pre, [data-theme="shadow"] .docs-prose pre {
   color-scheme: dark;
@@ -272,6 +273,11 @@
   --brand: 251 146 60; --brand-hover: 253 186 116; --on-brand: 26 16 8;
   --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133; --info: 56 189 248; --plan: 129 140 248;
   --ring: var(--brand);
+  /* Aliases re-declared here (see the note above) so they resolve against the
+     dark base tokens set just above, not the theme's inherited light values. */
+  --queue-fg: var(--muted); --queue-border: var(--edge); --queue-surface: var(--raised);
+  --neutral-fg: var(--muted); --neutral-border: var(--edge); --neutral-surface: var(--raised);
+  --syn-cmd: var(--brand); --syn-flag: var(--info); --syn-str: var(--ok); --syn-op: var(--brand-hover); --syn-comment: var(--faint); --syn-arg: var(--fg); --tool-rail: var(--edge);
 }
 
 body {
