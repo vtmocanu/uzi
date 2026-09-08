@@ -397,6 +397,45 @@ func TestAuthorizeCodexScopeNotApplicableAPIKeyLiveDB(t *testing.T) {
 	}
 }
 
+// TestAuthorizeCodexUnownedRunNoAuthModeOracleLiveDB proves the ownership gate precedes the
+// mode-dependent scope-applicability check, so an UNOWNED run cannot be used as a
+// cross-tenant oracle for its auth_mode. A worker probing a foreign api_key run with
+// ScopeStartRefresh must get ErrCodexWorkerMismatch (handler → 404), NOT
+// ErrCodexScopeNotApplicable (→ 403): a 403-vs-404 split would otherwise disclose that the
+// foreign run is api_key.
+//
+// FAIL-OLD / PASS-FIXED: before the reorder, scope.appliesTo(authMode) ran BEFORE the
+// ownership check, so a foreign worker's start-refresh on an api_key run returned
+// ErrCodexScopeNotApplicable and leaked the auth_mode. Ownership-first makes every unowned
+// run return the same ErrCodexWorkerMismatch regardless of mode.
+func TestAuthorizeCodexUnownedRunNoAuthModeOracleLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	staticKey := codexToken("sk")
+	aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), staticKey)
+	runID := env.seedCodexRun(t, userID, workerID, repoID)
+	svc := &Service{q: env.q, box: env.box}
+	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); err != nil {
+		t.Fatalf("FreezeCodexBinding: %v", err)
+	}
+	owner := store.Worker{ID: workerID, UserID: userID}
+	capOwner := env.mintCap(t, runID, workerID)
+
+	// A DIFFERENT worker (a foreign tenant) probes the run it does not own. The ownership
+	// gate fires before scope.appliesTo, so the mode-dependent reject is never reached and
+	// the auth_mode does not leak.
+	foreign := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	if _, err := svc.AuthorizeCodexCredentialOp(env.ctx, foreign, runID, capOwner, ScopeStartRefresh); !errors.Is(err, ErrCodexWorkerMismatch) {
+		t.Fatalf("unowned api_key start-refresh: want ErrCodexWorkerMismatch (no auth_mode oracle), got %v", err)
+	}
+
+	// Sanity: the true owner still gets the mode-dependent reject — the fix reordered the
+	// checks, it did not suppress scope-applicability for owned runs.
+	if _, err := svc.AuthorizeCodexCredentialOp(env.ctx, owner, runID, capOwner, ScopeStartRefresh); !errors.Is(err, ErrCodexScopeNotApplicable) {
+		t.Fatalf("owner api_key start-refresh: want ErrCodexScopeNotApplicable, got %v", err)
+	}
+}
+
 // quarantineAccount parks the subscription account behind the alias in 'quarantined'.
 func (e codexTestEnv) quarantineAccount(t *testing.T, aliasID uuid.UUID) {
 	t.Helper()

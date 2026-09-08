@@ -43,7 +43,7 @@ const (
 	codexErrInvalid            = "invalid request"
 	codexErrRunNotFound        = "run not found"
 	codexErrNotAuthorized      = "codex credential operation not authorized"
-	codexErrCredUnavailable    = "codex credential is not available"
+	codexErrCredUnavailable    = "codex credential is not available" //nolint:gosec // G101: static user-facing error message, not a credential
 	codexErrRefreshContended   = "codex refresh is contended; retry"
 	codexErrRefreshUnavailable = "codex refresh is unavailable"
 	codexErrRefreshNoClient    = "codex refresh is not available"
@@ -106,8 +106,13 @@ func (h *Handler) WorkerCodexRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	var req codexReleaseRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
-		// Malformed JSON, a trailing value, OR any unknown field (a body-supplied run id,
-		// user/secret/account id, or token/login field) — all fail closed as 400 here.
+		// Strict decode: httpx.DecodeJSON DisallowUnknownFields on the single decoded body,
+		// so malformed JSON OR any unknown field (a body-supplied run id, user/secret/account
+		// id, or token/login field) fails closed as 400 here. It does NOT reject a trailing
+		// value after the first, but a trailing value is simply not decoded — it cannot
+		// smuggle a run id or credential field into req, because only the first value is
+		// decoded and that value's unknown fields are already rejected. The path {id} remains
+		// the sole run identity regardless.
 		httpx.Error(w, http.StatusBadRequest, codexErrInvalid)
 		return
 	}

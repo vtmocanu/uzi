@@ -105,9 +105,11 @@ var (
 // codexProviderRequestTimeout bounds ONE Codex provider HTTP call (oauth token refresh or
 // the nonrotating identity re-verify) in the production codexauth.Client (PRD #1171 M1).
 // It is the innermost of the nested refresh budget documented at the wsvc.SetCodexRefresh
-// call site: two serial provider calls at 4s each = 8s worst case, inside the 8s refresh
-// lease TTL and under the ~9s server budget, keeping the whole worker→API→provider→commit→
-// callback round trip below the pinned app-server 10-second external-auth deadline.
+// call site: two serial provider calls at 4s each = 8s worst case, which MEETS (does not
+// exceed) the 8s refresh lease TTL and stays under the ~9s server budget, keeping the whole
+// worker→API→provider→commit→callback round trip below the pinned app-server 10-second
+// external-auth deadline. A lease that expires mid-exchange safely routes to
+// reconcile/quarantine, and the app-server retries idempotently with the same operation id.
 const codexProviderRequestTimeout = 4 * time.Second
 
 func main() {
@@ -496,11 +498,15 @@ func run() error {
 	//	                                                          oauth token refresh, then the
 	//	                                                          nonrotating identity
 	//	                                                          re-verify — so 2×4s = 8s worst
-	//	                                                          case, still inside the 8s
-	//	                                                          refresh lease TTL
-	//	                                                          (codexRefreshLeaseTTL) and the
-	//	                                                          ~9s server budget, leaving the
-	//	                                                          durable commit its margin)
+	//	                                                          case, which MEETS (does not
+	//	                                                          exceed) the 8s refresh lease
+	//	                                                          TTL (codexRefreshLeaseTTL) and
+	//	                                                          stays under the ~9s server
+	//	                                                          budget. A lease that expires
+	//	                                                          mid-exchange routes to
+	//	                                                          reconcile/quarantine and the
+	//	                                                          app-server retries idempotently
+	//	                                                          with the same operation id)
 	wsvc.SetCodexRefresh(codexauth.NewClient(
 		codexauth.WithPerRequestTimeout(codexProviderRequestTimeout),
 	))

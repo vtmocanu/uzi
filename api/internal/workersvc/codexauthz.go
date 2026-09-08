@@ -491,15 +491,22 @@ type CodexAuthContext struct {
 // id — so a worker cannot point an operation at a credential it was not handed.
 //
 // It returns a distinct sentinel unless ALL of the following hold (checked in order):
-//  1. the run is Codex-bound with a valid auth mode, and the scope applies to that mode;
-//  2. the run is currently owned by this worker (checked BEFORE the capability so a
-//     non-owner cannot use the capability/epoch sentinels as an oracle for another
-//     user's claim epoch);
-//  3. the presented capability is tied to the CURRENT claim: its in-band epoch equals
+//  1. the run is Codex-bound with a valid auth mode;
+//  2. the run is currently owned by this worker. This tenant gate is checked BEFORE the
+//     scope-applicability AND capability checks — ownership must precede ANY mode-dependent
+//     or capability-specific reject. scope.appliesTo depends on the run's auth_mode, so a
+//     mode-dependent reject on an UNOWNED run would leak it: an authenticated worker probing
+//     a foreign run with ScopeStartRefresh would get ErrCodexScopeNotApplicable (handler →
+//  403. iff that run is api_key and ErrCodexWorkerMismatch (→ 404) otherwise, a
+//     cross-tenant single-bit disclosure of the run's auth_mode. Ownership-first likewise
+//     keeps the capability/epoch sentinels from being an oracle for the run's claim epoch;
+//  3. the requested scope applies to the run's auth mode (start-refresh / persist-recovery
+//     are subscription-only; release applies to both) — safe to reveal only after ownership;
+//  4. the presented capability is tied to the CURRENT claim: its in-band epoch equals
 //     the run's codex_claim_epoch (a prior-epoch capability is rejected even if its
 //     secret hash-matches), and its secret's sha256 constant-time-equals the run's
 //     stored codex_cap_hash;
-//  4. the scope-family predicate holds (evalCodexReleasePredicate for the release family,
+//  5. the scope-family predicate holds (evalCodexReleasePredicate for the release family,
 //     evalCodexPersistRecoveryPredicate for persist-recovery), covering: kind↔mode
 //     consistency (release family only), actively-claimed status, per-alias
 //     material_revision, and — subscription only — the frozen identity tuple match,
@@ -530,7 +537,9 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 		return CodexAuthContext{}, fmt.Errorf("codex authorize: read auth context: %w", err)
 	}
 
-	// (1) bound + valid mode + scope applies to the mode.
+	// (1) bound + valid mode. Scope-applicability is DELIBERATELY not checked here — it
+	// depends on authMode, so it runs only AFTER the ownership gate below (step 3), else a
+	// mode-dependent reject on an unowned run would leak the run's auth_mode (see step 2).
 	if !row.CodexSecretID.Valid || !row.CodexAuthMode.Valid {
 		return CodexAuthContext{}, ErrCodexRunNotBound
 	}
@@ -538,20 +547,29 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 	if authMode != codexAuthModeSubscription && authMode != codexAuthModeAPIKey {
 		return CodexAuthContext{}, ErrCodexRunNotBound
 	}
-	if !scope.appliesTo(authMode) {
-		return CodexAuthContext{}, ErrCodexScopeNotApplicable
-	}
 
-	// (2) currently-owning worker — checked BEFORE the capability so a caller who does
-	// not own the run cannot use the distinct capability/epoch sentinels as an oracle to
-	// learn another user's claim epoch (GetRunCodexAuthContext reads by run id, so the
-	// row belongs to whatever run the guessed id names; the ownership gate is the tenant
-	// boundary and must precede any capability-specific reject).
+	// (2) currently-owning worker — the tenant gate, checked BEFORE both the
+	// scope-applicability check (step 3) and the capability check (step 4). It MUST precede
+	// scope.appliesTo because that reject is mode-dependent: on an UNOWNED run it would leak
+	// the run's auth_mode — a worker probing a foreign run with ScopeStartRefresh would get
+	// ErrCodexScopeNotApplicable (handler → 403) iff the run is api_key and
+	// ErrCodexWorkerMismatch (→ 404) otherwise, a cross-tenant single-bit disclosure of the
+	// auth_mode. Ownership-first likewise stops the capability/epoch sentinels being an oracle
+	// for the run's claim epoch (GetRunCodexAuthContext reads by run id, so the row belongs to
+	// whatever run the guessed id names; the ownership gate is the tenant boundary and must
+	// precede any mode-dependent or capability-specific reject).
 	if !row.WorkerID.Valid || uuid.UUID(row.WorkerID.Bytes) != wkr.ID {
 		return CodexAuthContext{}, ErrCodexWorkerMismatch
 	}
 
-	// (3) capability: epoch first (a stale-epoch capability is rejected even if its
+	// (3) scope applies to the run's auth mode (start-refresh / persist-recovery are
+	// subscription-only; release applies to both). Now safe to reveal: the caller owns the
+	// run, so ErrCodexScopeNotApplicable here is no longer a cross-tenant auth_mode signal.
+	if !scope.appliesTo(authMode) {
+		return CodexAuthContext{}, ErrCodexScopeNotApplicable
+	}
+
+	// (4) capability: epoch first (a stale-epoch capability is rejected even if its
 	// hash was cleared or would otherwise match), then the constant-time hash compare.
 	presentedEpoch, secret, parsed := parseCodexCapability(presentedCapability)
 	if !parsed {
@@ -567,7 +585,7 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 		return CodexAuthContext{}, ErrCodexCapabilityMismatch
 	}
 
-	// (4-6) The scope-family predicate. This is the SINGLE SOURCE OF TRUTH for the
+	// (5) The scope-family predicate. This is the SINGLE SOURCE OF TRUTH for the
 	// frozen-vs-current authority set, replacing the former inline checks 4-6 AND adding
 	// the audit-flagged quarantine + kind↔mode checks. Two families, deliberately
 	// asymmetric (PRD #1147 audit #3):
