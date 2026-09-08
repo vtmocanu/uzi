@@ -126,9 +126,11 @@ uzi review resolve <id> <rec> | --category <c> --target <t>
 uzi review dismiss <id> <rec> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <id> <rec> | stats [--json]
 uzi review file <id> <rec> [--repo <repo-id>]
-uzi findings list [--repo <id>] [--bucket to_file|filed|dismissed|all] [--run <id>]
+uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
+uzi findings undo <finding-id>
+uzi findings stats [--repo <id>] [--json]
 uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
 uzi handoff rm <run-id> | review <run-id>
 uzi token list
@@ -918,8 +920,9 @@ uzi review file <run-id> <rec-id> --repo <repo-id>           # file against a sp
 ```
 
 `show` is one run. `backlog` is every recommendation across **all** your runs,
-deduped by `(category, target)`, so one that recurs in five runs is a single
-row reading `seen in 5 runs` — the terminal form of the
+deduped by `(category, target)`, so a recommendation open in two of the five
+runs it recurs in is a single row reading `2 open of 5 runs` (`5 runs, all
+settled` once none are open) — the terminal form of the
 [Judge menu](./judge-menu.md):
 
 ```sh
@@ -1042,20 +1045,24 @@ deduped by `(repo, location)` across runs, that you triage from the terminal the
 way as the [judge backlog](#reviewing-and-triaging-from-the-cli).
 
 ```sh
-uzi findings list                                            # what still needs filing
-uzi findings list --bucket all --json                        # filed + dismissed too, for an agent
+uzi findings list                                            # what still needs triage
+uzi findings list --bucket all --json                        # filed, done and dismissed too, for an agent
 uzi findings list --repo <repo-id>                           # one repo
 uzi findings list --run <run-id>                             # coordinates that also occur in that run
 uzi findings file <finding-id>                               # file a forge issue from a coordinate
 uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
 uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
+uzi findings undo <finding-id>                               # reopen a dismissal
+uzi findings stats [--repo <repo-id>]                        # your triage totals, across your repos
 ```
 
 `list` prints one row per `(repo, location)` coordinate, grouped by repo, carrying
-the actionable `finding_id`, the latest title, `seen in N runs`, and a status; the
-`open_count` (what still needs filing) prints as a meta line and rides the `--json`
+the actionable `finding_id`, the latest title, `seen in N runs`, and a state — a
+dismissed row shows its reason (`Dismissed · Won't do` / `Dismissed · Not an issue`)
+and a coordinate the issue-close sync settled (below) reads `Done via #N`. The
+`open_count` (what still needs triage) prints as a meta line and rides the `--json`
 envelope. `--bucket` filters by disposition and defaults to `to_file`; `filed`,
-`dismissed` and `all` show the settled coordinates. `--repo <repo-id>` (from
+`done`, `dismissed` and `all` show the rest. `--repo <repo-id>` (from
 `uzi repo list`) and `--run <run-id>` narrow the list. As with `review backlog`, an
 unknown `--bucket` is a usage error (exit 2), never a silently empty list, while a
 well-formed but foreign or unknown `--repo`/`--run` returns an **empty list** — no
@@ -1075,6 +1082,20 @@ across later runs (`not-an-issue` is a false positive, `wont-do` is valid-but-sk
 A missing or invalid `--reason` is a usage error (exit 2) raised before any request is
 sent; a coordinate that is not dismissable (already filed, being filed, or already
 dismissed) is a conflict (exit 5), and an unknown or foreign id is not-found (exit 4).
+
+`undo` reopens a dismissed coordinate back to `to_file`. It keys on the coordinate's
+`disposition_id`, **not** the `finding_id` the human `list` view and `file`/`dismiss`
+use — `disposition_id` is always present (a dismissed coordinate can outlive its own
+evidence, while `finding_id` goes nil once that evidence is gone), so read it off
+`--json`, not off `list`'s table. A coordinate that is not currently dismissed —
+unknown, foreign, or never dismissed — is treated as already-undone: a friendly line,
+exit 0, never a crash.
+
+`stats` prints your Findings triage totals (total, to triage, filed, done, dismissed,
+false positives) across every repo you own; `--repo <repo-id>` narrows it to one (a
+foreign or unknown id is an all-zero tally, never a 404). `--json` emits the raw
+totals object. It's the same number the web nav badge and the Findings tabs show for
+the same repo scope.
 
 `<finding-id>` is the id `list` prints as the first column of each coordinate; paste
 it straight into `file`/`dismiss`. Treat `location`, the title and `repo_path` as

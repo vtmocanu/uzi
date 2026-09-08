@@ -31,16 +31,18 @@ Either surface lands you on the same place: the **Findings** backlog.
 ## The Findings backlog
 
 **Findings**, in the sidebar's **Work** group, carries a badge for how many
-findings still need filing. It's a per-repo, deduped list collected across
+findings still need triage. It's a per-repo, deduped list collected across
 every run, grouped by repo (a single-repo view drops the redundant repo
 header).
 
 Findings dedupe on **where** they are, not **which run** found them: the same
 bug seen in five different runs is one row reading **"seen in 5 runs"**, not
-five things to triage. Three buckets — **To file**, **Filed**, **Dismissed** —
-each a tab on the page; there's no "All" tab here, since the backlog is a
-triage queue, not an archive browser (the CLI's `uzi findings list --bucket
-all` covers that — see [docs/cli.md](./cli.md)).
+five things to triage. Five tabs carry the count — **To triage**, **Filed**,
+**Done**, **Dismissed**, **All** — straight from the server, scoped to
+whichever repo you have selected, the same tally the nav badge reads (never a
+count of what's rendered on screen). Expand a row (the chevron) to see its
+**evidence**, a preview of the newest report, and **the runs it was seen in**,
+each a link straight to that run.
 
 ## Filing a finding
 
@@ -52,17 +54,40 @@ back to the issue it became.
 
 ## Dismissing a finding
 
-Click **Dismiss** and pick a reason — **Won't do** (valid, but not worth
-doing) or **Not an issue** (the worker got it wrong). A dismissed finding
-**stays dismissed**: if a later run trips over the exact same bug again, it
-does **not** re-notify you and does **not** reappear in To file. Only a
-**materially different** finding at that same spot re-opens it — so
-dismissing something is a real "stop nagging me about this," not a snooze.
+Click **Dismiss ▾** and pick a reason — **Won't do** (valid, but not worth
+doing) or **Not an issue** (the worker got it wrong). Tick several rows first
+and the same menu, from the selection bar, dismisses all of them at once with
+one shared reason; **Undo** in the toast that follows reverses exactly the
+ones that action settled.
+
+A dismissed finding **stays dismissed**: if a later run trips over the exact
+same bug again, it does **not** re-notify you and does **not** reappear in To
+triage. Only a **materially different** finding at that same spot re-opens
+it — so dismissing something is a real "stop nagging me about this," not a
+snooze.
 
 An old finding card can lag the backlog (it's a historical record of the
 moment it was posted, not a live view) — clicking **File** on a card for a
 coordinate someone already filed or dismissed just shows "already filed or
 resolved," never an error.
+
+## Closing a filed issue marks it done
+
+When the issue you filed from a finding is **closed** on the forge, uzi moves
+that coordinate to **Done** by itself, labelled **"Done via #N"** so it reads
+differently from a finding you never filed at all. It fires **once**, on the
+close, and never overwrites you — a coordinate you already dismissed keeps
+your verdict — and reopening the *filed issue* on the forge does not undo it.
+
+If the same bug **reappears** in a later run — a materially different report
+at that same spot — the coordinate goes back to **To triage**, even one
+already marked Done, so a fix that didn't actually stick gets your attention
+again.
+
+There's no forge call of its own here and no token spent: it rides the normal
+issue poll, reading the cache that same tick just refreshed. The repo has to
+still be **enabled** in uzi for that poll to run at all — a disabled repo's
+closes are never seen.
 
 ## Untrusted text
 
@@ -78,10 +103,16 @@ anything reaches the forge.
 Everything here is also available from the [uzi CLI](./cli.md#incidental-findings-uzi-findings):
 
 ```sh
-uzi findings list                                       # what still needs filing
+uzi findings list                                       # what still needs triage
 uzi findings file <finding-id>                           # file it
 uzi findings dismiss <finding-id> --reason wont-do       # or not-an-issue
+uzi findings undo <finding-id>                           # undo a dismissal
+uzi findings stats                                       # your triage totals, across all repos
 ```
+
+`--bucket done` lists the coordinates the issue-close sync settled. `undo`
+takes the coordinate's `disposition_id`, not the `finding_id` the human `list`
+view prints — read it off `--json`.
 
 ## Good to know
 
