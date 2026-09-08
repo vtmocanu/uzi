@@ -741,8 +741,11 @@ export function PausedPanel({
     <div className="rounded-xl border border-info/40 bg-info/10 p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          {/* role="status" announces the park when this panel mounts, like LimitWaitPanel. */}
-          <p role="status" className="text-sm font-semibold text-info">
+          {/* PRD #1190: NO role="status" here. A live region that MOUNTS with its first
+              message is typically silent to assistive tech (Board.tsx S5; the parkAnnounce
+              note above), so the paused arrival is announced by RunView's persistent
+              parkAnnounce region instead — putting role="status" here too would duplicate it. */}
+          <p className="text-sm font-semibold text-info">
             <span aria-hidden="true">‖ </span>
             Paused by you{pausedAt ? ` at ${pausedAt}` : ""}
           </p>
@@ -1038,8 +1041,12 @@ export function RunView() {
   // from the live WS frames rather than the DTO, so it tracks the transcript without a
   // DTO re-read (the fold re-runs as messages grow, the same shape as `usage` above).
   // null for a terminal run: a finished run has no "now".
+  // PRD #1190: a `paused` run is non-terminal but nothing runs while paused, so it has no
+  // "live now" either — excluded here so the checklist does not render a green/pulsing strip
+  // for a deliberately-stopped run. (limit_wait/pool_wait keep their strip — MilestoneNowStrip
+  // renders those as the "waiting on rate limit" variant, which is left untouched.)
   const activity = useMemo(
-    () => (run == null || isTerminalRun(run.status) ? null : latestActivity(messages)),
+    () => (run == null || isTerminalRun(run.status) || run.status === "paused" ? null : latestActivity(messages)),
     [messages, run],
   );
 
@@ -1073,6 +1080,11 @@ export function RunView() {
   // screen-reader user must be told about, exactly like the follow-up park. One
   // stable key ("pool_wait"), since a pool hold has no per-instance identity to
   // re-announce on the way awaiting_input keys on the question.
+  // PRD #1190: a `paused` run announces too — a deliberate owner hold a screen-reader user
+  // must be told about, just like the follow-up and pool_wait parks. One stable key
+  // ("paused") since a pause has no per-instance identity to re-announce on. The persistent
+  // region owns this so the announcement is not missed on mount — PausedPanel's heading
+  // therefore drops its own role="status" to avoid a duplicate announcement.
   const parkKey =
     questionId !== ""
       ? `question:${questionId}`
@@ -1080,7 +1092,9 @@ export function RunView() {
         ? "followup"
         : run?.status === "pool_wait"
           ? "pool_wait"
-          : "";
+          : run?.status === "paused"
+            ? "paused"
+            : "";
   useEffect(() => {
     if (parkKey === "") {
       setParkAnnounce("");
@@ -1091,7 +1105,9 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
-          : "The agent is asking you a question. The run is parked until you answer.",
+          : parkKey === "paused"
+            ? "The run is paused. Resume it from this page or with the uzi run resume command."
+            : "The agent is asking you a question. The run is parked until you answer.",
     );
   }, [parkKey]);
 

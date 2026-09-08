@@ -479,6 +479,41 @@ describe("Dashboard milestone badge (PRD #122)", () => {
   });
 });
 
+// PRD #1190: `paused` is non-terminal, but nothing runs while paused — so the recent-runs
+// row must NOT render the live `bg-ok animate-pulse` "now" strip for a paused run, the same
+// way it is hidden on a terminal run.
+describe("Dashboard live 'now' strip excludes a paused run (PRD #1190)", () => {
+  const flush = () => act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+  const activity = {
+    agent: "coder",
+    agent_label: "Wiring the collector",
+    tool: "Write",
+    detail: "api/collector.go",
+    at: "2026-07-05T12:00:00Z",
+    seq: 5,
+  };
+
+  it("shows the live now strip for a RUNNING run (positive control)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ issue_title: "Running now", status: "running", current_activity: activity })],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText("Running now")).toBeTruthy();
+    expect(screen.getByText("Wiring the collector")).toBeTruthy();
+  });
+
+  it("hides the live now strip for a PAUSED run (nothing runs while paused)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ issue_title: "Paused now", status: "paused", current_activity: activity })],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText("Paused now")).toBeTruthy();
+    expect(screen.queryByText("Wiring the collector")).toBeNull();
+  });
+});
+
 describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () => {
   const flush = async () => {
     await act(async () => {

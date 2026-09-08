@@ -373,7 +373,10 @@ export function Dashboard() {
               // exactly as before (D5). The activity's untrusted fields render escaped
               // through stripUnsafeChars.
               const activity = r.current_activity;
-              const showNow = activity != null && !isTerminalRun(r.status);
+              // PRD #1190: a `paused` run is non-terminal but nothing runs while paused, so
+              // it must not render the live `bg-ok animate-pulse` "now" strip — exclude it
+              // alongside terminal runs.
+              const showNow = activity != null && !isTerminalRun(r.status) && r.status !== "paused";
               const nowMilestone = firstInProgressMilestoneId(r);
               return (
               // Issue #485 NB1: RunIssueRef renders a real forge <a>, which cannot nest

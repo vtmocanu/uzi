@@ -1378,6 +1378,76 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
   });
 });
 
+// PRD #1190 (finding, outside-diff): `paused` is non-terminal, but nothing runs while
+// paused — so the milestone checklist's live "now" strip (green/pulsing, derived
+// client-side from the newest tool_use frame) must NOT render. It is excluded in the
+// `activity` memo alongside terminal runs; limit_wait/pool_wait keep their own strip.
+describe("RunView — a paused run shows no live 'now' activity strip (PRD #1190)", () => {
+  const ACTIVITY_MSG: RunMessage[] = [
+    {
+      seq: 1,
+      kind: "tool_use",
+      agent: "coder",
+      agent_instance: null,
+      agent_label: "Wire the collector",
+      payload: { name: "Write", input: { file_path: "api/collector.go" } },
+      created_at: "2026-01-01T00:00:00Z",
+    } as unknown as RunMessage,
+  ];
+  const MILESTONES: Partial<Run> = {
+    milestones: [
+      { id: "m1", title: "First" },
+      { id: "m2", title: "Second" },
+    ],
+    milestones_completed: ["m1"],
+    milestones_in_progress: ["m2"],
+  };
+
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run({ ...MILESTONES, ...over }),
+      messages: ACTIVITY_MSG,
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  // The MilestoneNowStrip's root is the only `.border-l-2.py-1` on a running/paused page
+  // (the ActivityFeed's own left-bordered rows use py-3). The agent label alone is NOT a
+  // valid probe — it ALSO appears in the transcript feed as the lane label, so a text query
+  // would find it even with no strip.
+  const nowStrip = (c: HTMLElement) => c.querySelector(".border-l-2.py-1");
+
+  it("DOES render the live 'now' strip on a RUNNING milestone run (positive control)", async () => {
+    const { container } = renderPage({ status: "running", started_at: "2026-01-01T00:00:00Z" });
+    await screen.findByText("Add rate limiting");
+    expect(nowStrip(container)).not.toBeNull();
+  });
+
+  it("does NOT render the live 'now' strip on a PAUSED run", async () => {
+    const { container } = renderPage({
+      status: "paused",
+      started_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T03:42:00Z",
+    });
+    await screen.findByText("Add rate limiting");
+    // The checklist still renders (milestones are present) …
+    expect(screen.getByText(/reported complete/i)).toBeTruthy();
+    // … but the live "now" strip is gone (nothing runs while paused).
+    expect(nowStrip(container)).toBeNull();
+  });
+});
+
 // PRD #1190: the PausedPanel, mounted directly (it is exported, like LimitWaitPanel) so its
 // copy and owner-gating are asserted without the full page.
 describe("PausedPanel (PRD #1190)", () => {
@@ -1434,6 +1504,18 @@ describe("PausedPanel (PRD #1190)", () => {
     expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /stop run/i })).toBeNull();
     expect(screen.getByText("Only the run's owner can resume or stop it.")).toBeTruthy();
+  });
+
+  // PRD #1190 (finding [5]): the heading MUST NOT carry role="status". A live region that
+  // mounts holding its first message is typically silent to assistive tech (Board.tsx S5),
+  // so the paused arrival is announced by RunView's persistent parkAnnounce region instead —
+  // role="status" here too would either be silent-on-mount or a duplicate announcement.
+  it("the heading carries NO role=\"status\" (parkAnnounce owns the announcement)", () => {
+    render(<PausedPanel run={paused()} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    const heading = screen.getByText(/Paused by you/);
+    expect(heading.getAttribute("role")).toBeNull();
+    // The standalone panel declares no live region of its own at all.
+    expect(document.querySelectorAll('[role="status"]').length).toBe(0);
   });
 });
 
@@ -4164,6 +4246,59 @@ describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () 
     await screen.findByText("Add rate limiting");
     const region = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
     expect(region.textContent).toBe("");
+  });
+});
+
+// PRD #1190 (finding [5]): a run parking into `paused` is a deliberate owner hold a
+// screen-reader user must be told about — it must announce through the SAME persistent
+// region as the other parks, on the CONTENT CHANGE (a region born holding text is silent).
+describe("RunView park announcement — paused (PRD #1190, a11y)", () => {
+  function setStream(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+  }
+
+  it("announces the paused park on a running→paused transition through the always-mounted region", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    setStream({ status: "running", started_at: "2026-01-01T00:00:00Z" });
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Add rate limiting");
+    // Running: the region exists but is empty (nothing to announce yet).
+    const before = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+    expect(before.textContent).toBe("");
+
+    // Transition to paused: the SAME region gains the paused message.
+    setStream({ status: "paused", started_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T03:42:00Z" });
+    rerender(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe(
+      "The run is paused. Resume it from this page or with the uzi run resume command.",
+    );
+    // Mutation guards: it is the paused copy, not another park's.
+    expect(region.textContent).not.toContain("asking you a question");
+    expect(region.textContent).not.toContain("pooled Anthropic token");
+    expect(region.textContent).not.toContain("next follow-up");
   });
 });
 
