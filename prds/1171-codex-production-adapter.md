@@ -1,7 +1,7 @@
 # PRD #1171: Complete Codex production adapter and execution safety
 
 **Parent:** [#1106](https://github.com/vtmocanu/uzi/issues/1106), remaining M3 (M3b) only.
-**Status:** Prepared for later dispatch; no uzi run has been created and this issue must remain without the `uzi` label until the user explicitly authorizes sending it.
+**Status (verified 2026-09-08):** The first authorized run delivered the partial credential-free dark core, merged via [#1188](https://github.com/vtmocanu/uzi/pull/1188) at `a46e1d6f`. No run is active; the deferred production integration remains, and this issue must stay without the `uzi` label until the user explicitly authorizes another run.
 **Execution:** When authorized, use a gated run so the milestone count scales the budget. Pre-flight must select a worker reporting `docker:true` with this repo allowlisted; block dispatch if none is available. Decide the MR-rework override at dispatch time. Implementation effort: high.
 
 M3a [#1156](https://github.com/vtmocanu/uzi/issues/1156) packages pinned Codex 0.153.2 in both worker images and supplies one isolated, observed-clean supervisor-root launcher. M2 [#1146](https://github.com/vtmocanu/uzi/issues/1146) supplies the neutral run/advice harness boundary while preserving Claude behavior. M1 [#1147](https://github.com/vtmocanu/uzi/issues/1147) supplies named credentials, immutable run binding, per-claim capability authorization and coordinated refresh/recovery. The remaining M3 work is to connect those three foundations into a production Codex run and advice adapter without enabling public Codex routing yet.
