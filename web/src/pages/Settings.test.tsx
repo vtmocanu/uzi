@@ -122,6 +122,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   document.documentElement.removeAttribute("data-theme");
+  document.documentElement.removeAttribute("data-font");
 });
 
 describe("Settings — vault (PRD #32)", () => {
@@ -242,21 +243,28 @@ describe("Settings — Appearance card (PRD #1167 'Lights on')", () => {
     await waitFor(() => expect(refresh).toHaveBeenCalled());
   });
 
-  it("renders the typeface control disabled (ships in a later step)", async () => {
+  it("enables the typeface control and persists a pick (PRD #1167 m6)", async () => {
     render(
       <MemoryRouter>
         <Settings />
       </MemoryRouter>,
     );
     await waitFor(() => expect(typefaceGroup()).toBeTruthy());
+    // The control is now live (IBM Plex bundled in m6): its radios are enabled.
     expect(
       (within(typefaceGroup()).getByRole("radio", { name: "IBM Plex" }) as HTMLInputElement)
         .disabled,
-    ).toBe(true);
+    ).toBe(false);
     expect(
       (within(typefaceGroup()).getByRole("radio", { name: "System" }) as HTMLInputElement).disabled,
-    ).toBe(true);
-    expect(screen.getByText(/IBM Plex ships in a later step/i)).toBeTruthy();
+    ).toBe(false);
+    // The "ships in a later step" hint is gone now that the family ships.
+    expect(screen.queryByText(/IBM Plex ships in a later step/i)).toBeNull();
+    // Picking Plex stamps <html data-font> optimistically and persists the typeface field.
+    fireEvent.click(within(typefaceGroup()).getByRole("radio", { name: "IBM Plex" }));
+    expect(document.documentElement.dataset.font).toBe("plex");
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ typeface: "plex" }));
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
   });
 
   it("'Use instance defaults' clears all four overrides", async () => {

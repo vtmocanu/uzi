@@ -35,10 +35,10 @@ import { maskEmail, maskName } from "../lib/demoMask";
 // One-time dismissal (per browser) of the rotate-your-legacy-token reminder.
 const ROTATE_NOTICE_KEY = "uzi.vault.rotateNoticeDismissed";
 
-// TYPEFACE_ENABLED gates the (still-rendered) typeface control. The IBM Plex
-// family ships in a later PRD #1167 milestone (m6); until then the picker renders
-// disabled with a hint. Flip this one const to turn it on when the font lands.
-const TYPEFACE_ENABLED = false;
+// TYPEFACE_ENABLED gates the typeface control. The IBM Plex family is now bundled
+// (PRD #1167 m6, @fontsource/ibm-plex-{sans,mono} imported in main.tsx), so the
+// picker is live. Kept as the single on/off switch the m6 flip turned on.
+const TYPEFACE_ENABLED = true;
 
 // Appearance-mode choices: the polarity switch. "system" follows the OS, the other
 // two pin a polarity ("Lights on" = light, "Lights off" = dark).
@@ -48,7 +48,7 @@ const MODE_OPTIONS: { value: string; label: string }[] = [
   { value: "dark", label: "Lights off" },
 ];
 
-// Typeface choices (m6). Rendered but disabled until TYPEFACE_ENABLED flips.
+// Typeface choices (PRD #1167 m6): the platform default or the bundled IBM Plex.
 const TYPEFACE_OPTIONS: { value: string; label: string }[] = [
   { value: "system", label: "System" },
   { value: "plex", label: "IBM Plex" },
@@ -476,7 +476,7 @@ export function Settings() {
           />
         </div>
 
-        {/* TYPEFACE: rendered but disabled until the IBM Plex family ships (m6). */}
+        {/* TYPEFACE: live since m6 — IBM Plex is bundled (@fontsource). */}
         <div className="space-y-2">
           <p className="text-sm font-medium text-muted">Typeface</p>
           <div
@@ -512,9 +512,6 @@ export function Settings() {
               );
             })}
           </div>
-          {!TYPEFACE_ENABLED && (
-            <p className="text-xs text-faint">IBM Plex ships in a later step.</p>
-          )}
         </div>
 
         <div className="border-t border-edge pt-4">

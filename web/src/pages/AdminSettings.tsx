@@ -94,10 +94,10 @@ const DEFAULT_TYPEFACE_OPTIONS: { value: string; label: string }[] = [
   { value: "plex", label: "IBM Plex" },
 ];
 
-// TYPEFACE_ENABLED gates the (still-rendered) instance-default typeface control,
-// exactly as the per-user picker in Settings.tsx does; flip it in m6 when the IBM
-// Plex family ships.
-const TYPEFACE_ENABLED = false;
+// TYPEFACE_ENABLED gates the instance-default typeface control, exactly as the
+// per-user picker in Settings.tsx does. Flipped on in PRD #1167 m6 now that the
+// IBM Plex family is bundled (@fontsource/ibm-plex-{sans,mono}).
+const TYPEFACE_ENABLED = true;
 
 // resolveDarkDisplay surfaces the legacy fallback chain for the dark-default
 // control's current value: default_dark_theme when it is a valid dark id, else the
@@ -425,9 +425,6 @@ export function AdminSettings() {
                   ))}
                 </Select>
               </Field>
-              {!TYPEFACE_ENABLED && (
-                <p className="text-xs text-faint">IBM Plex ships in a later step.</p>
-              )}
             </div>
             <Button type="submit" disabled={busy || !dirty}>
               {busy ? "Saving…" : "Save settings"}

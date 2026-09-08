@@ -336,12 +336,29 @@ describe("AdminSettings", () => {
     expect(saveButton().disabled).toBe(true);
   });
 
-  it("renders the instance default typeface control disabled (ships in a later step)", async () => {
+  it("enables the instance default typeface control and persists a change (PRD #1167 m6)", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ default_typeface: "plex" }));
     renderPage();
     await screen.findByLabelText("uzi label");
     const typeface = screen.getByLabelText("Default typeface") as HTMLSelectElement;
-    expect(typeface.disabled).toBe(true);
+    // The control is now live (IBM Plex bundled in m6): the select is enabled.
+    expect(typeface.disabled).toBe(false);
     expect(typeface.value).toBe("system");
+    // The "ships in a later step" hint is gone now that the family ships.
+    expect(screen.queryByText(/IBM Plex ships in a later step/i)).toBeNull();
+    fireEvent.change(typeface, { target: { value: "plex" } });
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({
+        uzi_label: "uzi",
+        autopilot_label: "autopilot",
+        default_appearance_mode: "dark",
+        default_light_theme: "hall",
+        default_dark_theme: "ember",
+        default_typeface: "plex",
+      }),
+    );
   });
 
   it("surfaces a server validation error", async () => {

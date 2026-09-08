@@ -80,9 +80,8 @@
   /* Radii: one base value, everything derived. */
   --radius: 0.625rem;
 
-  /* Typography */
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* Typography: --font-* now live in the typeface layer below (orthogonal to
+     theme; selected by data-font), not per theme block. */
 
   /* Backdrop grid: ember has none. The body rule consumes these tokens; a theme
      (mission) supplies a blueprint grid without touching any component. */
@@ -153,9 +152,8 @@
   /* Sharper corners (every radius derives from this one value). */
   --radius: 0.25rem;
 
-  /* Typography */
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  /* Typography: --font-* now live in the typeface layer below; mission's former
+     "Liberation Mono" fallback is folded into that shared --font-mono. */
 
   /* Faint blueprint grid, drawn by the body rule; reads as "console" while
      staying far below content contrast. */
@@ -241,10 +239,8 @@
   /* Radii: ember's base value. */
   --radius: 0.625rem;
 
-  /* Typography (kept here for now; a later milestone moves --font-* to a
-     typeface layer shared by every theme). */
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* Typography: --font-* now live in the typeface layer below (PRD #1167 M6),
+     shared by every theme. */
 
   /* Backdrop grid: Dawn has none. */
   --grid-image: none;
@@ -349,6 +345,21 @@
 [data-theme="hall"] .inset-well,
 [data-theme="shadow"] .inset-well {
   background-color: rgb(var(--surface));
+}
+
+/* ── Typeface layer (PRD #1167 M6) ──────────────────────────────────────────
+   --font-* live here, NOT in the theme blocks, so typeface and theme are
+   orthogonal: data-font (stamped by applyAppearance / theme-preinit.js) selects
+   the family independently of data-theme. System is the platform UI stack (no
+   download); Plex is the bundled IBM Plex family (font files imported below /
+   in main.tsx). Placed after every [data-theme] block so no theme can override. */
+:root {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+:root[data-font="plex"] {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
 body {
