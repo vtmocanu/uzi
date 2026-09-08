@@ -30,22 +30,32 @@ export const DEFAULT_UZI_LABEL = "uzi";
 
 // fallbackAppearance synthesises a minimal AppearanceState so the app still paints
 // when a server predates PRD #1167's `appearance` object (it sends only the
-// deprecated single-theme trio). The dark slot uses the legacy default_theme when
-// it is a valid dark id, else the compiled fallback; the rest take compiled
-// defaults with no overrides. Also seeds the provider's initial state before the
-// first session response resolves.
-function fallbackAppearance(defaultTheme: string): AppearanceState {
-  const dark = isDarkTheme(defaultTheme) ? defaultTheme : DEFAULT_DARK_THEME;
+// deprecated single-theme trio). Pre-#1167 themes are all dark, so the RESOLVED
+// theme paints the dark slot pinned to dark mode. Crucially it keys off
+// `resolvedTheme` (session.theme — the user's override already applied by the old
+// server), not only the instance default, so a user who saved e.g. mission is not
+// repainted as the instance-default ember. The raw override rides overrides.dark
+// (for the picker); defaults.dark carries the instance default; everything else
+// takes compiled defaults. Also seeds the provider's initial state before the
+// first session response resolves (resolvedTheme === defaultTheme, no override).
+function fallbackAppearance(
+  resolvedTheme: string,
+  themeOverride: string | null,
+  defaultTheme: string,
+): AppearanceState {
+  const dark = isDarkTheme(resolvedTheme) ? resolvedTheme : DEFAULT_DARK_THEME;
+  const defaultDark = isDarkTheme(defaultTheme) ? defaultTheme : DEFAULT_DARK_THEME;
+  const overrideDark = isDarkTheme(themeOverride) ? themeOverride : null;
   return {
     mode: "dark",
     light_theme: DEFAULT_LIGHT_THEME,
     dark_theme: dark,
     typeface: "system",
-    overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+    overrides: { mode: null, light_theme: null, dark_theme: overrideDark, typeface: null },
     defaults: {
       mode: "dark",
       light_theme: DEFAULT_LIGHT_THEME,
-      dark_theme: dark,
+      dark_theme: defaultDark,
       typeface: "system",
     },
   };
@@ -99,7 +109,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [uziLabel, setUziLabel] = useState(DEFAULT_UZI_LABEL);
   const [autopilotLabel, setAutopilotLabel] = useState(DEFAULT_AUTOPILOT_LABEL);
   const [appearance, setAppearance] = useState<AppearanceState>(() =>
-    fallbackAppearance("ember"),
+    fallbackAppearance("ember", null, "ember"),
   );
   const [vaultUnlocked, setVaultUnlocked] = useState(true);
   const [vaultExists, setVaultExists] = useState(true);
@@ -118,10 +128,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(session.user);
     setUziLabel(session.uzi_label || DEFAULT_UZI_LABEL);
     setAutopilotLabel(session.autopilot_label || DEFAULT_AUTOPILOT_LABEL);
-    // Read as possibly-absent: an older server omits `appearance` entirely.
+    // Read as possibly-absent: an older server omits `appearance` entirely, so we
+    // synthesise one from its resolved theme trio (which already reflects the user's
+    // override), not just the instance default_theme.
     const nextAppearance =
       (session.appearance as AppearanceState | undefined) ??
-      fallbackAppearance(session.default_theme);
+      fallbackAppearance(session.theme, session.theme_override, session.default_theme);
     setAppearance(nextAppearance);
     applyAppearance({
       mode: nextAppearance.mode,
