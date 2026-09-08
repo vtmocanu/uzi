@@ -1034,7 +1034,7 @@ export function ActivityFeed({
           // announced. Meaningful transitions route through the sr-only region above.
           aria-live="off"
           aria-label="Run activity"
-          className="space-y-3 rounded-lg border border-edge bg-ink/60 p-3"
+          className="space-y-3 rounded-lg border border-edge bg-ink/60 console p-3"
         >
           {capped && (
             <button

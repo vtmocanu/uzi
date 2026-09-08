@@ -166,6 +166,114 @@
   --grid-size: 36px 36px;
 }
 
+/* ── Dawn light theme ──────────────────────────────────────────────────────
+   The first of three light themes (PRD #1167). Dawn keeps the dark factory
+   only on console surfaces (activity feed, code/log blocks, CLI token boxes)
+   via the `console` scope below; sidebar and all chrome go light. Cards are
+   LIGHTER than the page ground (the inverse of dark elevation, no shadows),
+   elevated cool-steel greys rather than pure white. All triples are WCAG 2.2
+   AA verified (fg/muted/faint and every status tone ≥ 4.5:1 on bg/surface/
+   raised and each tone's own 10% pill tint; enforced by contrast.test.ts).
+   Ember's bright orange fails AA on light ground, so the brand splits: rust
+   here, ember inside the dark `console` scope. Like mission this is a full
+   token set — the `:root:not([data-theme])` guard means the base block does
+   NOT apply once data-theme is set, so every token the app reads is redefined. */
+[data-theme="dawn"] {
+  color-scheme: light;
+
+  /* Palette: cool-steel ground, white cards lifted above it, rust accent */
+  --bg: 242 244 247;
+  --surface: 255 255 255;
+  --raised: 235 238 243;
+  --edge: 214 219 228;
+  --edge-strong: 174 182 196;
+  --fg: 21 26 34;
+  --muted: 74 85 103;
+  /* #5F6A82, ≥ 4.9:1 on all three light grounds (PRD #1167): app-wide
+     de-emphasised text (text-faint) clears WCAG AA 4.5:1 with margin (APCA on
+     thin light-ground text is stricter, so it was pushed past 4.5). Stays
+     visibly fainter than --muted (#4A5567). Also backs --syn-comment below. */
+  --faint: 95 106 130;
+  --brand: 185 60 11;
+  --brand-hover: 154 52 18;
+  --on-brand: 255 255 255;
+
+  /* Keyboard focus ring: brand-tinted (rust) so it reads as on-theme against
+     the light surfaces. */
+  --ring: var(--brand);
+
+  /* Status colors — darkened tones so text-tone clears AA on white and on its
+     own 10% pill tint (the bg-tone/10 text-tone pattern ships unchanged). */
+  --ok: 3 112 90;
+  --warn: 154 74 5;
+  --danger: 190 18 60;
+  --info: 3 105 161;
+  --plan: 79 70 229;
+
+  /* Queue + idle/stopped status tones. Same anatomy as ember (border/surface/fg
+     mapped onto edge/raised/muted) so the neutral pill keeps its shape, on the
+     light values. */
+  --queue-fg: var(--muted);
+  --queue-border: var(--edge);
+  --queue-surface: var(--raised);
+  --neutral-fg: var(--muted);
+  --neutral-border: var(--edge);
+  --neutral-surface: var(--raised);
+
+  /* Shell syntax highlighting (PRD #38): the plain ember aliases, resolving to
+     Dawn's light palette. On the `console` scope these re-resolve against the
+     overridden dark base tokens (see below), so scoped code stays legible. */
+  --syn-cmd: var(--brand);
+  --syn-flag: var(--info);
+  --syn-str: var(--ok);
+  --syn-op: var(--brand-hover);
+  --syn-comment: var(--faint);
+  --syn-arg: var(--fg);
+  --tool-rail: var(--edge);
+
+  /* Radii: ember's base value. */
+  --radius: 0.625rem;
+
+  /* Typography (kept here for now; a later milestone moves --font-* to a
+     typeface layer shared by every theme). */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Backdrop grid: Dawn has none. */
+  --grid-image: none;
+  --grid-size: auto;
+}
+
+/* ── The `console` scope ───────────────────────────────────────────────────
+   A machine surface (code/log/command panes, the live activity feed) must look
+   exactly like ember on every theme — dark, whatever the chrome does. So under
+   each LIGHT theme, an element carrying `.console` (and the CSS-only docs code
+   block `.docs-prose pre`, which has no class to add) remaps the palette back to
+   the CURRENT EMBER dark triples and sets color-scheme:dark, so every nested
+   `bg-ink` / `text-muted` / `border-edge` utility keeps working unchanged — no
+   `bg-console` token, no component branching. The literals are ember's exact
+   channel triples (read from the ember block above): the M4 frame-equality test
+   and the M8 ember/mission snapshot both pin this to ember token-for-token, and
+   a `.console { --bg: var(--console-bg) }` indirection is rejected because an
+   undefined alias would make --bg guaranteed-invalid on the dark pair.
+   Scoped ONLY under the light themes: ember/mission never match this selector,
+   so on those themes `.console` is an inert no-op that inherits the theme's own
+   palette. The --queue-*/--neutral-*/--syn-*/--tool-rail aliases are DELIBERATELY
+   not redefined here: the Dawn block defines them as var() aliases (--queue-fg:
+   var(--muted), --syn-cmd: var(--brand), …), and CSS var() substitutes at
+   use-time in the element's own scope, so each re-resolves against these
+   overridden base tokens per element — a scoped neutral pill or shell token
+   automatically picks up the dark values. */
+[data-theme="dawn"] .console, [data-theme="hall"] .console, [data-theme="shadow"] .console,
+[data-theme="dawn"] .docs-prose pre, [data-theme="hall"] .docs-prose pre, [data-theme="shadow"] .docs-prose pre {
+  color-scheme: dark;
+  --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+  --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
+  --brand: 251 146 60; --brand-hover: 253 186 116; --on-brand: 26 16 8;
+  --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133; --info: 56 189 248; --plan: 129 140 248;
+  --ring: var(--brand);
+}
+
 body {
   @apply bg-ink text-fg antialiased;
   font-family: var(--font-sans);
