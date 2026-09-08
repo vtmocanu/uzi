@@ -1299,8 +1299,10 @@ A run's `status` (on `run get` and `run list`) is one of exactly **twelve** valu
   recovers or you cancel it — see [Recovering from an empty
   turn](run-recovery-wait.md).
 
-All three of `limit_wait`, `pool_wait` and `recovery_wait` auto-resume on
-their own; none of them needs you to do anything but wait or cancel.
+`limit_wait` and `recovery_wait` auto-resume on their own on a timer — nothing
+to do but wait or cancel; `pool_wait` instead clears only when a token is
+opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
+does not resume it.
 
 So to wait for a plan gate or a clarification, use **`uzi run wait <id>`** (next
 section) — leaning on `--follow` there blocks until the run truly finishes, which
@@ -1323,7 +1325,9 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 **actionable or terminal** state (`awaiting_approval`, `awaiting_input`,
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait` —
-all three auto-resume on their own), so a bare `run wait` means "wait for the
+the three parks resume without a `run wait`-actionable step: `limit_wait` and
+`recovery_wait` on a timer, `pool_wait` once a token is pooled), so a bare
+`run wait` means "wait for the
 plan gate, a clarification, an interactive task's park, **or** the end".
 
 - It **exits 0** the moment a target state is reached — including if the run is
