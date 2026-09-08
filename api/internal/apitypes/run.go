@@ -408,6 +408,18 @@ type RunDTO struct {
 	// the wire means "no per-run opinion", which the web renders as the effective
 	// inherited value. It is what the per-run checkbox / `uzi run mr-rework` read back.
 	MrReworkEnabled *bool `json:"mr_rework_enabled"`
+	// MrReworkAutoCycles and MrReworkAutoCap are the OWNER-ONLY view of the automatic
+	// rework loop guard (PRD #1202 D11), so the owner can see WHY the watcher stopped and
+	// decide whether to rework on demand. MrReworkAutoCycles is the ledger's attempt_count
+	// (automatic cycles spent, 0 when no row); MrReworkAutoCap is the live admin cap. Both
+	// are nullable and populated ONLY on the run-detail read (GetRun), and only when the
+	// viewer is the run's OWNER (GetRun reads through GetRunForViewer, so an admin sees any
+	// run — an owner-only field needs the explicit check), the run is a completed
+	// issue/prompt/self_improve run, and its MR is open; null otherwise (a non-owner, the
+	// wrong kind, or a non-open MR), so the pair leaks nothing about another user's MR.
+	// runToDTO stays pure — these are enriched in the GetRun caller.
+	MrReworkAutoCycles *int `json:"mr_rework_auto_cycles"`
+	MrReworkAutoCap    *int `json:"mr_rework_auto_cap"`
 	// LimitResetsAt is when the exhausted window reopens, as REPORTED by the worker
 	// off the SDK frame. RetryNotBefore is when the server will actually promote the
 	// run back to queued.

@@ -376,6 +376,14 @@ type fakeStore struct {
 	mrReworkRunResult store.Run
 	mrReworkRunErr    error
 	mrReworkRunParams *store.CreateAutoMRReworkRunParams
+	// On-demand mr_rework (PRD #1202). StartMRReworkForRun reads the ledger + token gate
+	// and advances the non-counting high-water; these back those reads/writes.
+	mrReworkLedger       store.MrReworkLedger
+	mrReworkLedgerErr    error
+	hasAnthropicToken    bool
+	hasAnthropicTokenErr error
+	advanceHighWater     *store.AdvanceMRReworkHighWaterParams
+	advanceHighWaterErr  error
 
 	// Scheduled prompt (PRD #241). promptRunParams stays nil until CreatePromptRun's
 	// insert runs, so a #66 guardrail test can assert the gate blocked before the insert.
@@ -1166,6 +1174,16 @@ func (f *fakeStore) CreateCIFixRun(_ context.Context, arg store.CreateCIFixRunPa
 func (f *fakeStore) CreateAutoMRReworkRun(_ context.Context, arg store.CreateAutoMRReworkRunParams) (store.Run, error) {
 	f.mrReworkRunParams = &arg
 	return f.mrReworkRunResult, f.mrReworkRunErr
+}
+func (f *fakeStore) GetMRReworkLedger(_ context.Context, _ store.GetMRReworkLedgerParams) (store.MrReworkLedger, error) {
+	return f.mrReworkLedger, f.mrReworkLedgerErr
+}
+func (f *fakeStore) AdvanceMRReworkHighWater(_ context.Context, arg store.AdvanceMRReworkHighWaterParams) error {
+	f.advanceHighWater = &arg
+	return f.advanceHighWaterErr
+}
+func (f *fakeStore) UserHasAnthropicToken(context.Context, uuid.UUID) (bool, error) {
+	return f.hasAnthropicToken, f.hasAnthropicTokenErr
 }
 func (f *fakeStore) CreatePromptRun(_ context.Context, arg store.CreatePromptRunParams) (store.Run, error) {
 	f.promptRunParams = &arg

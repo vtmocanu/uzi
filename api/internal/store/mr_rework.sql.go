@@ -12,6 +12,39 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const advanceMRReworkHighWater = `-- name: AdvanceMRReworkHighWater :exec
+INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
+VALUES ($1::uuid, $2, $3)
+ON CONFLICT (repo_id, ref) DO UPDATE
+SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
+    halt_notified = false,
+    updated_at    = now()
+`
+
+type AdvanceMRReworkHighWaterParams struct {
+	RepoID    uuid.UUID `json:"repo_id"`
+	Ref       string    `json:"ref"`
+	HighWater int64     `json:"high_water"`
+}
+
+// The MANUAL (on-demand) rework path's ledger write (PRD #1202). Like UpsertMRReworkLedger
+// it advances the consumed high-water (GREATEST, advance-only) and RESETS halt_notified to
+// false so the manual cycle opens a NEW halt episode — a genuinely-new comment that later
+// hits the cap is announced once more rather than silently refused.
+//
+// 🔴 INVARIANT: attempt_count is NEVER mentioned, so a NEW row starts at the column DEFAULT
+// (0) and an EXISTING row keeps its count UNCHANGED. This is the key difference from
+// UpsertMRReworkLedger, which INSERTs count=1 and increments on conflict. A manual cycle
+// consumes review comments and opens a new halt episode but NEVER spends an automatic cycle
+// (the cap bounds unattended spend; a human pressing the button spends their own token —
+// PRD #1202 Decision 1). It is called on EVERY successful manual create, including a
+// guidance-only one: GREATEST preserves the mark when nothing is new, and the halt_notified
+// reset is what the manual path promises (Decision 9), so it must not be conditional.
+func (q *Queries) AdvanceMRReworkHighWater(ctx context.Context, arg AdvanceMRReworkHighWaterParams) error {
+	_, err := q.db.Exec(ctx, advanceMRReworkHighWater, arg.RepoID, arg.Ref, arg.HighWater)
+	return err
+}
+
 const createAutoMRReworkRun = `-- name: CreateAutoMRReworkRun :one
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
@@ -20,7 +53,7 @@ INSERT INTO runs (
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'mr_rework'
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), $10
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -41,9 +74,17 @@ type CreateAutoMRReworkRunParams struct {
 	TargetRunID      pgtype.UUID `json:"target_run_id"`
 	ReviewComments   []byte      `json:"review_comments"`
 	WaitOnLimit      bool        `json:"wait_on_limit"`
+	TriggerSource    string      `json:"trigger_source"`
 }
 
-// Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). issue_iid stays
+// Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). The NAME is
+// historical: PRD #1202 added an on-demand (manual) trigger, so @trigger_source is now
+// the ONLY thing that differs between the two callers — 'mr_rework' from the poller
+// detector, 'manual' from the on-demand endpoint. The name is deliberately kept because
+// a live-DB lock probe (mr_rework_branch_guard_livedb_test.go) keys on the generated
+// `-- name: CreateAutoMRReworkRun` header. kind stays 'mr_rework' regardless of the
+// trigger; both flavours are the same run kind, distinguished only by trigger_source (D7).
+// issue_iid stays
 // NULL (kind='mr_rework'); issue_title/issue_description carry the synthesized human
 // summary. pipeline_ref = the agent branch (agent/issue-N, uzi/prompt-…, or
 // uzi/self-improve/… — PRD #908) is written AT INSERT so the cross-kind branch
@@ -81,6 +122,7 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 		arg.TargetRunID,
 		arg.ReviewComments,
 		arg.WaitOnLimit,
+		arg.TriggerSource,
 	)
 	var i Run
 	err := row.Scan(

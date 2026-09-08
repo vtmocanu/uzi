@@ -176,6 +176,9 @@ var runDTOKeys = []string{
 	// tell "no per-run opinion" (null) from an explicit true/false and render the
 	// effective inherited value.
 	"mr_rework_enabled",
+	// PRD #1202 D11: the owner-only automatic-rework loop-guard view (cycles spent / live
+	// cap), both nullable *int, populated only on the owner's run-detail read.
+	"mr_rework_auto_cycles", "mr_rework_auto_cap",
 	// PRD #300: the per-schedule model a schedule froze onto the run at fire time (nil ⇒
 	// null ⇒ the run inherited the owner's per-user default). Always on the wire.
 	"model",

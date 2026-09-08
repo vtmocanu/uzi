@@ -1868,6 +1868,13 @@ export interface Run {
    *  per-run override. Kept `boolean | null` (never `any`) to preserve the
    *  omitted-vs-null-vs-value distinction, exactly like mr_state's nullability. */
   mr_rework_enabled?: boolean | null;
+  /** PRD #1202 D11: the OWNER-ONLY view of the automatic rework loop guard, so the owner
+   *  can see why the watcher stopped. `mr_rework_auto_cycles` is the automatic cycles spent
+   *  (0 when none), `mr_rework_auto_cap` the live admin cap. Both are populated only on the
+   *  run-detail read, for the run's owner, on a completed issue/prompt/self_improve run with
+   *  an open MR; `null` (or absent on an older api pod) everywhere else. */
+  mr_rework_auto_cycles?: number | null;
+  mr_rework_auto_cap?: number | null;
   failure_reason: string | null;
   /** Server-stamped stop signal (PRD #33, widened by #108 M5): "cancelled" or
    *  "plan_rejected" (human), "auto_stopped" (server), null otherwise. isStoppedRun

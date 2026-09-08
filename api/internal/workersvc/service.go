@@ -324,6 +324,13 @@ type Store interface {
 	// MR review-watcher rework runs (PRD #700 M3): the create path + its create-time
 	// cross-kind branch guard.
 	CreateAutoMRReworkRun(ctx context.Context, arg store.CreateAutoMRReworkRunParams) (store.Run, error)
+	// On-demand mr_rework (PRD #1202): StartMRReworkForRun reads the loop-guard ledger
+	// (what is new since the last cycle) and advances the consumed high-water WITHOUT
+	// spending an automatic cycle; UserHasAnthropicToken is the door-check that the owner
+	// can pay for the run the endpoint would mint.
+	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
+	AdvanceMRReworkHighWater(ctx context.Context, arg store.AdvanceMRReworkHighWaterParams) error
+	UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	// Self-improvement runs (PRD #46 Decision 10).
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
 	// Scheduled prompt runs (PRD #241).

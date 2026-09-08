@@ -344,6 +344,69 @@ func TestMRReworkCommentAtOrBelowHighWaterNoFire(t *testing.T) {
 	}
 }
 
+// TestMRReworkPostManualLedgerStateNoRefire proves the automatic watcher's view of the
+// ledger AFTER an on-demand (manual) cycle (PRD #1202): the manual path advanced high_water
+// to its max actionable id, left attempt_count at the cap, and reset halt_notified=false.
+// On the SAME comment set the automatic detector does NOT re-fire and does NOT re-halt
+// (nothing is past the mark); only a genuinely-new comment re-halts, and because the manual
+// cycle reset the latch it comments once more (Decision 9). The poller is not in the live-DB
+// sweep, so this exercises the detector directly against the seeded ledger — it never calls
+// StartMRReworkForRun.
+func TestMRReworkPostManualLedgerStateNoRefire(t *testing.T) {
+	const cap = 5
+	// Post-manual ledger: high_water = the max actionable id the manual cycle consumed (200),
+	// attempt_count still at the cap (the manual cycle did NOT spend an automatic one), latch
+	// reset.
+	postManual := store.MrReworkLedger{Ref: mrwRef, AttemptCount: cap, HighWater: 200, HaltNotified: false}
+
+	t.Run("same comment set does not fire or halt", func(t *testing.T) {
+		st := &mrwStore{
+			candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
+			ledgers:    map[string]store.MrReworkLedger{mrwRef: postManual},
+		}
+		runs := &mrwRuns{}
+		notifier := &mrwNotifier{}
+		f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
+
+		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: cap}).detect(context.Background(), mrwRepoRow(), f)
+
+		if len(runs.calls) != 0 {
+			t.Fatalf("no comment past the manual high-water must not fire, got %d runs", len(runs.calls))
+		}
+		if len(f.notes) != 0 || len(notifier.calls) != 0 || len(st.haltSets) != 0 {
+			t.Fatalf("nothing past the mark must not re-halt: notes=%d notifs=%d halts=%d",
+				len(f.notes), len(notifier.calls), len(st.haltSets))
+		}
+	})
+
+	t.Run("a genuinely-new comment re-halts and comments once", func(t *testing.T) {
+		st := &mrwStore{
+			candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
+			ledgers:    map[string]store.MrReworkLedger{mrwRef: postManual},
+		}
+		runs := &mrwRuns{}
+		notifier := &mrwNotifier{}
+		// id 300 > high_water 200: past the mark, so GATE 3 clears; attempt_count == cap →
+		// GATE 4 halts; halt_notified was reset by the manual cycle → it comments once more.
+		f := landedForge(mrwComment(200, landed(), mrwHeadSHA), mrwComment(300, landed(), mrwHeadSHA))
+
+		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: cap}).detect(context.Background(), mrwRepoRow(), f)
+
+		if len(runs.calls) != 0 {
+			t.Fatalf("a capped MR must not start a run, got %d", len(runs.calls))
+		}
+		if len(st.haltSets) != 1 {
+			t.Fatalf("expected one halt latch write after the reset, got %d", len(st.haltSets))
+		}
+		if len(f.notes) != 1 {
+			t.Fatalf("expected one cap-halt comment on the re-halt, got %d", len(f.notes))
+		}
+		if len(notifier.calls) != 1 || notifier.calls[0].kind != "mr_rework_halted" {
+			t.Fatalf("expected one halted notification on the re-halt, got %+v", notifier.calls)
+		}
+	})
+}
+
 func TestMRReworkStrictlyAboveHighWaterFires(t *testing.T) {
 	// The other half of SC3: one comment STRICTLY ABOVE the mark fires and advances it.
 	st := &mrwStore{
@@ -389,8 +452,11 @@ func TestMRReworkAtCapHaltsOnceThenSilent(t *testing.T) {
 	if len(f.notes) != 1 || !strings.Contains(f.notes[0].body, "rework-cycle limit (5)") {
 		t.Fatalf("expected one cap-halt comment naming the limit, got %+v", f.notes)
 	}
-	if len(notifier.calls) != 1 || notifier.calls[0].kind != "mr_rework_halted" || notifier.calls[0].runID != nil {
-		t.Fatalf("expected one halted notification with no run anchor, got %+v", notifier.calls)
+	// PRD #1202 D10: the halt notification now anchors to the SOURCE run so the inbox row
+	// links to the run page (where the owner can press "Rework now").
+	if len(notifier.calls) != 1 || notifier.calls[0].kind != "mr_rework_halted" ||
+		notifier.calls[0].runID == nil || *notifier.calls[0].runID != mrwSourceRunID {
+		t.Fatalf("expected one halted notification anchored to the source run, got %+v", notifier.calls)
 	}
 
 	// Second tick: the latch is set → NO second comment, NO second notify.
@@ -564,8 +630,11 @@ func TestMRReworkIssuelessBranchDecoupled(t *testing.T) {
 		if len(f.notes) != 0 {
 			t.Fatalf("an issueless cap-halt must post NO issue comment, got %+v", f.notes)
 		}
-		if len(notifier.calls) != 1 || notifier.calls[0].kind != "mr_rework_halted" || notifier.calls[0].runID != nil {
-			t.Fatalf("expected one halted notification with no run anchor, got %+v", notifier.calls)
+		// PRD #1202 D10: even an issueless halt (no MR comment posted) anchors the inbox row
+		// to the source run so it links to the run page.
+		if len(notifier.calls) != 1 || notifier.calls[0].kind != "mr_rework_halted" ||
+			notifier.calls[0].runID == nil || *notifier.calls[0].runID != mrwSourceRunID {
+			t.Fatalf("expected one halted notification anchored to the source run, got %+v", notifier.calls)
 		}
 	})
 }

@@ -70,6 +70,8 @@
   "anthropic_headroom_pct": null,
   "wait_on_limit": false,
   "mr_rework_enabled": null,
+  "mr_rework_auto_cycles": null,
+  "mr_rework_auto_cap": null,
   "limit_resets_at": null,
   "retry_not_before": null,
   "limit_wait_count": 0,
