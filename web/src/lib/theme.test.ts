@@ -176,7 +176,7 @@ describe("resolveAppearance (per-field: override > default > compiled fallback)"
     expect(DEFAULT_LIGHT_THEME).toBe("hall");
     expect(DEFAULT_DARK_THEME).toBe("ember");
     expect(DEFAULT_TYPEFACE).toBe("system");
-    // DEFAULT_THEME (legacy single-theme chain) is unchanged.
+    // DEFAULT_THEME (the web mirror of Go theme.Default) is unchanged.
     expect(DEFAULT_THEME).toBe("ember");
   });
 });

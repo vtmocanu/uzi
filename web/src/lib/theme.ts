@@ -109,8 +109,9 @@ export function isDarkTheme(v: unknown): v is Theme {
 
 // Compiled fallbacks: the appearance applied when neither the user override nor
 // the instance default provides a valid value for a field. Mirrors the Go
-// defaults. DEFAULT_THEME (above) stays "ember" for the legacy single-theme
-// chain; the dark-slot fallback here is the same ember.
+// defaults. DEFAULT_THEME (above) is kept as the web mirror of Go theme.Default
+// (the compiled ember default), still exported for parity; the dark-slot fallback
+// here is the same ember.
 export const DEFAULT_APPEARANCE_MODE: AppearanceMode = "dark";
 export const DEFAULT_LIGHT_THEME: Theme = "hall";
 export const DEFAULT_DARK_THEME: Theme = "ember";

@@ -54,16 +54,32 @@ const TYPEFACE_OPTIONS: { value: string; label: string }[] = [
   { value: "plex", label: "IBM Plex" },
 ];
 
+// The three light themes (dawn/hall/shadow) share ONE token set in index.css
+// ([data-theme="dawn"],[data-theme="hall"],[data-theme="shadow"]): the cool-steel
+// ground #F2F4F7 and the rust brand #B93C0B. They differ only in WHERE the dark
+// factory shows through — the console pane (dawn), the sidebar frame (hall), or
+// live-run cards (shadow). DARK_FACTORY is the ember dark the factory reveals
+// (index.css sets --bg to that dark ground on .console/.frame/[data-live]).
+const LIGHT_GROUND = "#f2f4f7";
+const LIGHT_BRAND = "#b93c0b";
+const DARK_FACTORY = "#0e1218";
+
 // Representative swatch colours per theme id: the ground (page background) and the
 // brand accent, so each theme card previews at a glance without loading its CSS.
 // Hardcoded on purpose (the live tokens live in index.css and are not readable as
-// values here); a new theme adds one row alongside its theme.ts entry.
-const THEME_SWATCH: Record<Theme, { ground: string; brand: string }> = {
+// values here); a new theme adds one row alongside its theme.ts entry. `accent`
+// (light themes only) names WHERE the shared light palette reveals the dark
+// factory, so the three otherwise-identical light swatches read distinctly — the
+// ThemePicker markup places a small dark chip accordingly.
+const THEME_SWATCH: Record<
+  Theme,
+  { ground: string; brand: string; accent?: "console" | "frame" | "live" }
+> = {
   ember: { ground: "#080a0f", brand: "#fb923c" },
   mission: { ground: "#05080f", brand: "#22d3ee" },
-  dawn: { ground: "#f2f4f7", brand: "#b93c0b" },
-  hall: { ground: "#eef1f5", brand: "#3b5bdb" },
-  shadow: { ground: "#e6e8ec", brand: "#7048e8" },
+  dawn: { ground: LIGHT_GROUND, brand: LIGHT_BRAND, accent: "console" },
+  hall: { ground: LIGHT_GROUND, brand: LIGHT_BRAND, accent: "frame" },
+  shadow: { ground: LIGHT_GROUND, brand: LIGHT_BRAND, accent: "live" },
 };
 
 // ThemePicker renders a radio group of theme cards (a swatch + label each) for one
@@ -114,10 +130,34 @@ function ThemePicker({
             />
             <span
               aria-hidden="true"
-              className="flex h-5 w-8 shrink-0 overflow-hidden rounded border border-edge"
+              className="relative flex h-5 w-8 shrink-0 overflow-hidden rounded border border-edge"
             >
+              {/* Ground + brand: accurate for every theme (the three light themes
+                  share one palette, so these are identical across dawn/hall/shadow). */}
               <span className="h-full w-1/2" style={{ backgroundColor: sw.ground }} />
               <span className="h-full w-1/2" style={{ backgroundColor: sw.brand }} />
+              {/* Light themes only: a small dark chip placed to signal WHERE this
+                  theme reveals the dark factory, so the shared palette still reads as
+                  three distinct themes. Dawn = a dark console-pane block; Hall = a
+                  dark sidebar strip down the left edge; Shadow = a dark live-run pill. */}
+              {sw.accent === "console" && (
+                <span
+                  className="absolute left-1 top-1 h-2.5 w-3 rounded-sm"
+                  style={{ backgroundColor: DARK_FACTORY }}
+                />
+              )}
+              {sw.accent === "frame" && (
+                <span
+                  className="absolute inset-y-0 left-0 w-1.5"
+                  style={{ backgroundColor: DARK_FACTORY }}
+                />
+              )}
+              {sw.accent === "live" && (
+                <span
+                  className="absolute bottom-0.5 right-0.5 h-2 w-2.5 rounded-full"
+                  style={{ backgroundColor: DARK_FACTORY }}
+                />
+              )}
             </span>
             <span className="text-fg">{THEME_LABELS[t]}</span>
           </label>
