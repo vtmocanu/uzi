@@ -28,8 +28,14 @@ and the run branches after it (`:70-98`), into the one-row-per-`(repo, ref)` cac
 handler (`api/internal/handler/pipeline_status.go:37`). The poller then runs
 `SyncPipelines` (`api/internal/poller/poller.go:411`), `ciAutoFix.detect` (`:438`) and
 `mrReviewWatch.detect` (`:450`) in that order, so at detector time the default-branch
-row is at least as fresh as every branch row. The capability to read the baseline
-exists; no detector uses it.
+row is *normally* at least as fresh as every branch row — but only when step 1's fetch
+succeeds. When it does not, `syncOneRef` keeps the existing row *without* upserting
+(`pipeline_sync.go:143-149`, `:164-166`; it returns `keep=true` to survive eviction and
+retry next tick), so a later run-branch fetch that *does* succeed leaves the baseline
+stale relative to the branch. `synced_at` — stamped `now()` only on a successful upsert
+(`pipeline_statuses.sql:5`, `:15`) — is the witness that tells "refreshed this tick"
+from "preserved from a prior tick" apart, and M1's gate below must read it. The
+capability to read the baseline exists; no detector uses it.
 
 **What neither detector does with it.** The autofix candidate query joins only the
 *branch's own* pipeline row and mentions the default branch once, to exclude it:
@@ -126,19 +132,37 @@ failure?*
 
 - **Candidate query.** `ListCIAutofixCandidateRefs` (`ci_autofix.sql:7-87`) gains a
   `LEFT JOIN pipeline_statuses dbps ON dbps.repo_id = @repo_id::uuid AND dbps.ref =
-  rp.default_branch`, selecting `dbps.status` and `dbps.pipeline_id` as two nullable
-  columns. The join shape is the one `ListDefaultBranchPipelineStatuses` already proves
-  (`pipeline_statuses.sql:38`). **Zero extra forge calls** — the row was written by the
-  same tick's step 1. Do **not** add a second `IN ('failed','failure',…)` literal:
+  rp.default_branch`, selecting `dbps.status`, `dbps.pipeline_id` **and `dbps.synced_at`**
+  as three nullable columns. `dbps.synced_at` is the freshness signal GATE 0 reads (below),
+  tested absolutely against `now()` rather than against any branch row (the gate says why).
+  The join shape — and the `synced_at` select — are the ones
+  `ListDefaultBranchPipelineStatuses` already proves (`pipeline_statuses.sql:35`, `:38`).
+  **Zero extra forge calls** — the row was written by the same tick's step 1 *when that
+  fetch succeeded*; `synced_at` is what proves it did (a failed step-1 fetch preserves a
+  stale row, so the freshness gate below must not trust `status` alone). Do **not** add a
+  second `IN ('failed','failure',…)` literal:
   select the raw status and classify in Go with `pipelinestatus.IsFailed`
   (`api/internal/pipelinestatus/pipelinestatus.go:51`), so the drift guard
   `api/internal/store/ci_autofix_drift_test.go` (which pins the existing literal list
   to `pipelinestatus.FailedStatuses()`, `:25-31`, for the reason `ci_autofix.sql:69-75`
   records — issue #1005) keeps guarding exactly one copy.
-- **GATE 0, coarse, in `detectOne`.** If the default-branch status is absent or not
-  failed, behave exactly as today (fail-open toward current behaviour: a repo with no
-  CI on its default branch, or an MR-only project whose default branch honestly caches
-  nothing per `pipeline_sync.go:61-63`, is unaffected).
+- **GATE 0, coarse, in `detectOne`.** Suppression requires evidence that the
+  default-branch baseline was *successfully refreshed on the current tick* — the freshness
+  invariant. If the default-branch status is absent, not failed, **or stale**, behave
+  exactly as today (fail-open toward current behaviour: fix the branch). *Stale* means the
+  baseline was not refreshed on the current tick, tested **absolutely**: `now() -
+  dbps.synced_at` exceeds a small freshness window keyed to the poll cadence (under ~two
+  poll intervals, with margin for poll jitter). It must be this absolute test, **not** a
+  comparison against the candidate branch's own `ps.synced_at`: the branch row is subject
+  to the *same* stale-preservation — `syncOneRef` runs for run branches too
+  (`pipeline_sync.go:95`) and keeps their stale row on a branch fetch failure — so if both
+  fetches fail on one tick the branch anchor is co-stale and a relative test would read the
+  baseline as fresh, reopening the very hazard this gate closes. That is precisely the
+  case where step 1's fetch failed and `syncOneRef` preserved a stale row
+  (`pipeline_sync.go:143-149`, `:164-166`) while the branch's own row refreshed: an
+  obsolete red baseline must never suppress a live branch. The already-covered fail-open cases stand — a repo with no CI on
+  its default branch, or an MR-only project whose default branch honestly caches nothing
+  per `pipeline_sync.go:61-63`, is unaffected.
 - **The precise gate, after the snapshot.** When the baseline *is* red, build the
   default branch's snapshot once per repo per *new* default-branch pipeline
   (`workersvc.BuildFailureSnapshot`, `ci_fix_snapshot.go:62` — the same call the manual
@@ -216,9 +240,9 @@ documents amended rather than quietly contradicted.
 
 ### Where it lives / what it touches
 
-- `api/internal/store/queries/ci_autofix.sql` — the default-branch LEFT JOIN + two
-  columns; optionally the same on `mr_rework.sql` if M2's explanation is surfaced per
-  candidate
+- `api/internal/store/queries/ci_autofix.sql` — the default-branch LEFT JOIN + three
+  columns (`status`, `pipeline_id`, `synced_at`); optionally the same on `mr_rework.sql`
+  if M2's explanation is surfaced per candidate
 - `api/internal/poller/ci_autofix.go` — GATE 0 + the signature compare; the baseline
   snapshot memo
 - `api/internal/forgesvc/pipeline_sync.go` + `api/internal/store/queries/pipeline_statuses.sql`
@@ -255,6 +279,17 @@ documents amended rather than quietly contradicted.
   suppression is inert, so nothing is spent from the branch's budget while it waits.
   Cap the blast radius by making the gate honour the existing `ci_autofix_enabled`
   admin kill-switch.
+- **Baseline freshness — fail open on stale.** A failed default-branch fetch does not
+  clear the cached row: `syncOneRef` keeps it and retries next tick
+  (`pipeline_sync.go:143-149`, `:164-166`), so the baseline is not guaranteed to be from
+  the current tick, and a later run-branch fetch can be newer. Gate 0 therefore reads
+  `dbps.synced_at` (stamped `now()` only on a successful upsert, `pipeline_statuses.sql:5`,
+  `:8`, `:15`) and suppresses **only** when the baseline was refreshed this tick; a
+  baseline whose `synced_at` did not advance is treated as absent, and the branch is fixed
+  as today. This keeps an obsolete red baseline from suppressing a branch on stale failure
+  data and preserves the design's "fail open toward current behaviour" property throughout.
+  No schema change: `synced_at` already exists and `ListDefaultBranchPipelineStatuses`
+  already selects it (`pipeline_statuses.sql:35`).
 - **Poll-based, so the episode boundaries are coarse.** `pipeline_statuses` keeps only
   the latest row per ref, so a red episode that opens and closes between two ticks is
   invisible, and `red_since` is only as precise as the poll cadence. This is PRD #6's
