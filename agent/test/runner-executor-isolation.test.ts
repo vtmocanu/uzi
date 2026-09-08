@@ -352,4 +352,48 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
       "the executor factory must not be reached for an invalid run id",
     );
   });
+
+  it("(NB3) registers the codex access-token + capability canaries ONLY when the claim carries secrets.codex, and evicts them on terminal", async () => {
+    // PRD #1171 M3 (redactor canary hoist): executeClaim addSecret's the codex token +
+    // capability BEFORE makeExecutor (so a construction throw can never log an unredacted
+    // token) and buildFlight appends them to both redactors. Both are absent on an ordinary
+    // Claude claim, so its secret set is unchanged.
+    const CODEX_TOKEN = "fixture-codex-access-token-abc123";
+    const CODEX_CAP = "fixture-codex-capability-abc123";
+
+    // WITH a codex block: both canaries are registered (before makeExecutor) and evicted.
+    {
+      const { gitlab } = fakeGitlab();
+      const { logger, added, removed } = secretRecordingLogger();
+      const claim = gitlabClaim(80, {
+        secrets: {
+          forge_pat: "fixture-forge-pat-codex-01",
+          anthropic_oauth_token: "dummy-oauth-codex-000001",
+          forge_username: "bot",
+          codex: { auth_mode: "subscription", access_token: CODEX_TOKEN, capability: CODEX_CAP, generation: 3 },
+        },
+      });
+      await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, logger).execute(claim);
+      assert.ok(added.includes(CODEX_TOKEN), "the codex access token was registered as a canary");
+      assert.ok(added.includes(CODEX_CAP), "the codex capability was registered as a canary");
+      assert.ok(removed.includes(CODEX_TOKEN), "the codex token canary was evicted on terminal");
+      assert.ok(removed.includes(CODEX_CAP), "the codex capability canary was evicted on terminal");
+    }
+
+    // WITHOUT a codex block (the ordinary Claude claim): NO codex canary is registered.
+    {
+      const { gitlab } = fakeGitlab();
+      const { logger, added } = secretRecordingLogger();
+      const claim = gitlabClaim(81, {
+        secrets: {
+          forge_pat: "fixture-forge-pat-codex-02",
+          anthropic_oauth_token: "dummy-oauth-codex-000002",
+          forge_username: "bot",
+        },
+      });
+      await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, logger).execute(claim);
+      assert.ok(!added.includes(CODEX_TOKEN), "no codex token canary for a claim without secrets.codex");
+      assert.ok(!added.includes(CODEX_CAP), "no codex capability canary for a claim without secrets.codex");
+    }
+  });
 });

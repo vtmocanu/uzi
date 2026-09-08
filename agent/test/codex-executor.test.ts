@@ -7,6 +7,9 @@ import {
   CodexAdviceCredentialBridge,
   makeCodexAdviceHarness,
   CODEX_PRODUCTION_PROVIDER,
+  makeDefaultSpawnCommand,
+  MAX_COMMAND_CAPTURE_BYTES,
+  COMMAND_CAPTURE_KILLED_CODE,
   type CodexExecutorDeps,
 } from "../src/codex/codex-executor.js";
 import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
@@ -49,6 +52,52 @@ const noopLog: Logger = {
     return noopLog;
   },
 };
+
+// A RECORDING logger that faithfully mirrors src/log.ts's reference-counted secret
+// registry (>= 8-char floor, split/join scrub) and records every added/removed secret and
+// every (already-scrubbed) emitted line — so a test can assert a secret was registered,
+// evicted, and never rode a log line verbatim.
+interface RecordingLog {
+  log: Logger;
+  added: string[];
+  removed: string[];
+  lines: string[];
+}
+function recordingLog(): RecordingLog {
+  const counts = new Map<string, number>();
+  const added: string[] = [];
+  const removed: string[] = [];
+  const lines: string[] = [];
+  const scrub = (s: string): string => {
+    let out = s;
+    for (const sec of counts.keys()) out = out.split(sec).join("***REDACTED***");
+    return out;
+  };
+  const emit = (level: string, msg: string, fields?: Record<string, unknown>): void => {
+    lines.push(scrub(JSON.stringify({ level, msg, ...fields })));
+  };
+  const log: Logger = {
+    debug: (m, f) => emit("debug", m, f),
+    info: (m, f) => emit("info", m, f),
+    warn: (m, f) => emit("warn", m, f),
+    error: (m, f) => emit("error", m, f),
+    addSecret: (s) => {
+      added.push(s);
+      if (s && s.length >= 8) counts.set(s, (counts.get(s) ?? 0) + 1);
+    },
+    removeSecret: (s) => {
+      removed.push(s);
+      const n = counts.get(s);
+      if (n === undefined) return;
+      if (n <= 1) counts.delete(s);
+      else counts.set(s, n - 1);
+    },
+    child() {
+      return log;
+    },
+  };
+  return { log, added, removed, lines };
+}
 
 function rec(v: unknown): Record<string, unknown> {
   return (v ?? {}) as Record<string, unknown>;
@@ -348,9 +397,9 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
   };
 }
 
-function makeExecutor(rig: Rig, binding: CodexBinding): CodexExecutor {
+function makeExecutor(rig: Rig, binding: CodexBinding, log: Logger = noopLog): CodexExecutor {
   return new CodexExecutor(
-    noopLog,
+    log,
     "/data/agent-home/run-1",
     { binding, client: rig.client as never, provider },
     rig.deps,
@@ -440,13 +489,21 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     assert.ok(texts.some((t) => t.includes("working on it")), "the accumulated agent text was emitted");
   });
 
-  it("(8) a failed turn_finished materializes+throws ONCE (never double-thrown)", async () => {
+  it("(8) a failed turn_finished is represented as DATA once and materializes+throws ONCE (never double-thrown)", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted()).push(turnCompleted("failed")).end();
+    const { ctx, emitted } = makeCtx();
     await assert.rejects(
-      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "failed run"),
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "failed run"),
       /codex turn failed/,
     );
+    // "ONCE" is gated observably, not just by the rejection message: the provider terminal
+    // failure is surfaced as neutral DATA (a single error result message from the reducer's
+    // terminal projection) AND thrown exactly once (the rejection above). If the harness
+    // ALSO threw a separate terminal, or the terminal were double-decoded, there would be
+    // zero or two error results here — not exactly one.
+    const errorResults = emitted.filter((m) => m.kind === "error" && rec(m.payload).event === "result");
+    assert.equal(errorResults.length, 1, "the failed terminal is materialized as data exactly once");
   });
 
   it("(10) an unexpected EOF (no terminal) throws a protocol error, never a fabricated success", async () => {
@@ -513,11 +570,12 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
 
 // ================================================================================
 describe("CodexExecutor: credential bridge + isolation", () => {
-  it("(11) a provider-root start releases a FRESH token with the binding capability; the token reaches ONLY the launcher", async () => {
+  it("(11) a provider-root start releases a FRESH token with the binding capability; the token rides into the launcher env, is registered as a logger secret then evicted at terminal cleanup, and never appears in an emitted payload (redaction itself is covered by (15))", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted()).push(turnCompleted("completed")).end();
     const { ctx, emitted } = makeCtx();
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "release run");
+    const rlog = recordingLog();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION), rlog.log).run(ctx), 3000, "release run");
     assert.equal(rig.client.releaseCalls.length, 1, "releaseCodex called once per provider root");
     const rel = rig.client.releaseCalls[0];
     assert.ok(rel);
@@ -526,6 +584,13 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.equal((rig.transport as unknown as { credential?: string }).credential, FRESH_TOKEN, "the fresh token rode into the launcher");
     // The fresh token NEVER appears in an emitted message payload.
     assert.doesNotMatch(JSON.stringify(emitted), new RegExp(FRESH_TOKEN));
+    // The token is registered with the logger (so any accidental log embedding would be
+    // scrubbed) AND evicted at terminal cleanup — the addSecret is balanced by a
+    // removeSecret, so a long-lived worker's secret set does not grow per provider root
+    // (part C). No emitted log line carries the token verbatim.
+    assert.deepEqual(rlog.added, [FRESH_TOKEN], "the fresh token was registered as a logger secret exactly once");
+    assert.deepEqual(rlog.removed, [FRESH_TOKEN], "the fresh token was evicted at terminal cleanup (add balanced by remove)");
+    assert.doesNotMatch(rlog.lines.join("\n"), new RegExp(FRESH_TOKEN));
   });
 
   it("(3-run) an api_key run NEVER calls refresh", async () => {
@@ -678,7 +743,61 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.ok(rig.spawnCommandCalls.some((s) => JSON.stringify(s.argv).includes("echo root")));
     assert.ok(emitted.flatMap((m) => (typeof m.payload.text === "string" ? [m.payload.text] : [])).some((t) => t.includes("a plain root turn")));
   });
+
+  it("(20) a delegation whose child streams frames spanning longer than idleMs does NOT falsely trip REASON_IDLE — each demuxed child frame re-arms the root idle watchdog (fail-old/pass-fixed for B)", async () => {
+    const IDLE_MS = 120;
+    const GAP_MS = 30; // each child frame arrives well within IDLE_MS of the previous one
+    const STEPS = 8; // the child turn spans ~STEPS*GAP_MS ≈ 240ms, TWICE the idle window
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        // The CHILD turn: stream liveness frames GAP_MS apart, total span > IDLE_MS. With
+        // the fix each demuxed child frame yields a CONTENT-FREE root `activity` that re-arms
+        // idle; with the OLD bare `continue` the root idle timer never re-armed during the
+        // delegation and REASON_IDLE tripped mid-child.
+        const t = c.transport;
+        let n = 0;
+        const pump = (): void => {
+          n += 1;
+          if (n <= STEPS) {
+            t.push(agentMessage(`child liveness ${n}`, "th-child"));
+            setTimeout(pump, GAP_MS).unref?.();
+          } else {
+            t.push(turnCompleted("completed", "th-child", "tn-child"));
+          }
+        };
+        setTimeout(pump, GAP_MS).unref?.();
+        return { turn: { id: "tn-child" } };
+      }
+      if (c.method === "turn/interrupt") return {};
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.deps = { ...rig.deps, idleMs: IDLE_MS, wallMs: 5000 };
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+
+    const { ctx } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+
+    // The idle watchdog is live throughout the child stream — a false trip would reject runP
+    // (with /idle timeout/) before the parent ever replies. The parent spawn_agent callback
+    // resolves only after the child fully settles; once it has, close the root turn.
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply", 5000);
+    rig.transport.push(turnCompleted("completed", "th-1", "tn-1")).end();
+    const result = await withTimeout(runP, 5000, "delegation-liveness run");
+    assert.equal(result.branch, "agent/issue-42", "the root turn completed instead of tripping REASON_IDLE");
+    assert.equal(rig.transport.turnStartCount, 2, "the child turn ran on the same transport");
+    assert.equal(replyOf1(rig).success, true, "the parent spawn_agent callback succeeded after the child settled");
+  });
 });
+
+/** The success flag of the reply the transport was told to send for requestId 1. */
+function replyOf1(rig: Rig): { success?: boolean } {
+  const entry = rig.transport.responses.find((r) => r.requestId === 1);
+  const response = rec(entry?.response);
+  return rec(response.result) as { success?: boolean };
+}
 
 // ================================================================================
 describe("CodexExecutor: advice auth bridge + factory (part F)", () => {
@@ -736,5 +855,44 @@ describe("CodexExecutor: advice auth bridge + factory (part F)", () => {
     };
     const deadBridge = new CodexAdviceCredentialBridge("run-1", failing as never, bindingOf(SUBSCRIPTION));
     await assert.rejects(makeCodexAdviceHarness(deadBridge, CODEX_PRODUCTION_PROVIDER, fakeAdviceLaunch, noopLog), /capability revoked/);
+  });
+});
+
+// ================================================================================
+describe("CodexExecutor: default command capture is byte-capped (A — untrusted-input OOM)", () => {
+  // A REAL spawn: without UZI_UID_SPLIT, commandRootCommand is a pass-through, so the
+  // default seam spawns the bare command. A custom (non-scrubbed) env is used only so the
+  // shell resolves the coreutils it needs — env scrubbing is (13)'s concern, not this test's.
+  const runEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C", TMPDIR: "/tmp" };
+
+  it("(A) caps combined stdout+stderr at MAX_COMMAND_CAPTURE_BYTES, SIGKILLs the child, and RESOLVES (never rejects) with the truncated result", async () => {
+    const spawnCommand = makeDefaultSpawnCommand(runEnv);
+    // The child would emit 8 MiB (>> the 1 MiB cap). WITHOUT the cap the seam would
+    // accumulate the whole 8 MiB (and an UNBOUNDED producer like `yes` would grow the JS
+    // string until the worker OOMs). WITH the cap it stops at 1 MiB and kills the child.
+    const bytesToEmit = 8 * 1024 * 1024;
+    const res = await withTimeout(
+      spawnCommand(["/bin/sh", "-c", `head -c ${bytesToEmit} /dev/zero`], { cwd: "/tmp" }),
+      30000,
+      "capped command",
+    );
+    // Killed at the cap → the SIGKILL sentinel code (not the child's own clean 0).
+    assert.equal(res.code, COMMAND_CAPTURE_KILLED_CODE, "a cap-kill reports the SIGKILL sentinel exit code");
+    const captured = Buffer.byteLength(res.stdout, "utf8") + Buffer.byteLength(res.stderr, "utf8");
+    assert.ok(captured <= MAX_COMMAND_CAPTURE_BYTES, `captured ${captured} is bounded at the cap ${MAX_COMMAND_CAPTURE_BYTES}`);
+    assert.ok(captured >= MAX_COMMAND_CAPTURE_BYTES - 64 * 1024, "captured up to the cap (truncated, not empty)");
+    assert.ok(captured < bytesToEmit, "far below what the child would have produced (proves truncation)");
+  });
+
+  it("(A) does NOT cap or kill a command whose output is under the cap (clean exit code preserved)", async () => {
+    const spawnCommand = makeDefaultSpawnCommand(runEnv);
+    const res = await withTimeout(
+      spawnCommand(["/bin/sh", "-c", "printf 'hello world'; printf 'oops' 1>&2"], { cwd: "/tmp" }),
+      30000,
+      "small command",
+    );
+    assert.equal(res.code, 0, "a clean exit reports the child's own code, not the kill sentinel");
+    assert.equal(res.stdout, "hello world");
+    assert.equal(res.stderr, "oops");
   });
 });

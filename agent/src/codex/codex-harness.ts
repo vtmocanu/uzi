@@ -488,15 +488,24 @@ export class CodexHarness implements RunHarness {
           });
         }
         // CHILD-THREAD DEMUX (part C). A frame carrying a REGISTERED child thread id is a
-        // delegated child's frame: route it to the child controller's sink and keep
-        // reading, NEVER map/yield it on the root loop. The `size > 0` guard makes the
-        // non-delegation path (no child sinks) BYTE-IDENTICAL to before this edit.
+        // delegated child's frame: route its CONTENT to the child controller's sink and
+        // NEVER map/yield that content on the root loop. But routing must still count as
+        // LIVENESS for the root's idle watchdog: the root driveCodexTurn re-arms idle on
+        // every event it consumes (codex-executor.ts), so a bare `continue` here would
+        // starve that re-arm for the whole delegation, and a subagent turn longer than
+        // `idleMs` would falsely trip REASON_IDLE while the child is actively producing.
+        // So after routing, yield a CONTENT-FREE `activity` carrying ONLY the ROOT thread
+        // id (no items, no child text) — enough to re-arm idle without leaking any child
+        // content onto the root frame stream. The reducer treats `activity` as pure
+        // liveness (no message, no frame). The `size > 0` guard keeps the non-delegation
+        // path (no child sinks) BYTE-IDENTICAL to before this edit.
         if (this.childSinks.size > 0) {
           const childId = noteThreadId(step.value);
           if (childId !== undefined) {
             const sink = this.childSinks.get(childId);
             if (sink !== undefined) {
               sink.push(step.value);
+              yield { kind: "activity", sessionId: this.threadId };
               continue;
             }
           }

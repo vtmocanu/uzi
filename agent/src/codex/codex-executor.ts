@@ -359,6 +359,13 @@ export class CodexExecutor implements Executor {
     const storeDir = path.join(this.homeRoot, "codex-session-store");
     const boundaryDeadlineMs = this.deps.boundaryDeadlineMs ?? DEFAULT_BOUNDARY_DEADLINE_MS;
 
+    // (C) Every FRESH provider token released this run is registered with the logger's
+    // secret set (`addSecret`) before use; without a matching `removeSecret` a long-lived
+    // worker's secret set would grow permanently, one entry per provider-root start. Track
+    // them here and evict them ONLY at terminal cleanup (never mid-run, where a late log
+    // line could still carry the token) — over-retention is the safe direction.
+    const releasedTokens = new Set<string>();
+
     // (1) The immutable per-run local-execution-epoch registry.
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
 
@@ -427,6 +434,7 @@ export class CodexExecutor implements Executor {
     const providerLaunchSeam: LaunchRootSeam = async (spec) => {
       const released = await this.opts.client.releaseCodex(ctx.runId, { capability: binding.capability });
       this.log.addSecret(released.access_token); // BEFORE any use
+      releasedTokens.add(released.access_token); // evicted at terminal cleanup (part C)
       const codexHome = path.join(spec.ownedDataRoot, "codex");
       // Best-effort credential-free seed. NOTE (m3b/m4): under the uid split the fresh home
       // is runner-owned 0700, so this cross-uid seed moves into the launcher's runner-
@@ -487,6 +495,11 @@ export class CodexExecutor implements Executor {
       // Terminal cleanup: reap every registered root (quiesce → reap → dispose), close the
       // harness/transport, dispose the fileop handle, and remove the credential-free store.
       await this.terminalCleanup(registry, harness, fileopHandle, storeDir, boundaryDeadlineMs);
+      // (C) Evict every fresh released token from the logger's secret set — AFTER the
+      // harness/transport is closed above, so no late log line can still carry the token.
+      // `removeSecret` is reference-counted, so this only un-scrubs a token whose last
+      // holder is this run.
+      for (const token of releasedTokens) this.log.removeSecret(token);
     }
   }
 
@@ -733,12 +746,28 @@ export class CodexExecutor implements Executor {
 }
 
 // ─── production seam defaults (DARK; tests inject fakes) ────────────────────────
+/** The HARD byte cap on ONE command's combined stdout+stderr capture. A model-steered
+ *  `Bash` (`yes`, `base64 /dev/zero`, `cat /dev/urandom`) would otherwise grow these JS
+ *  strings without bound and OOM the worker BEFORE the broker's post-accumulation 64 KiB
+ *  display cap can run. 1 MiB is comfortably above that display cap yet firmly bounded; at
+ *  the cap we STOP accumulating (keep the byte-bounded prefix) and SIGKILL the child, then
+ *  RESOLVE (never reject) with the truncated output so the broker still applies its own cap.
+ *  NOTE: cancelling a running command on a turn abort (threading a signal to kill mid-run) is
+ *  deliberately DEFERRED to m4 with R2 (registering the command process as a supervisor
+ *  root); m3 adds only this untrusted-input byte cap + kill. */
+export const MAX_COMMAND_CAPTURE_BYTES = 1 << 20; // 1 MiB
+/** The exit code reported when a command is SIGKILLed AT the capture cap. 137 = 128 + 9
+ *  (SIGKILL), the conventional shell convention, so a capped result is distinguishable from
+ *  a clean exit while still being a plain non-zero code the broker/reducer already tolerate. */
+export const COMMAND_CAPTURE_KILLED_CODE = 137;
+
 /** Run a shell effect as the credential-free command identity. R2 (m4 hook): this is a
  *  DIRECT `child_process.spawn`, NOT yet a registered supervisor root — m4 must reserve +
  *  register a `command` root in the {@link ExecutionRegistry} HERE so the reap barrier
  *  covers it before any credentialed boundary action runs. The seam SHAPE stays stable so
- *  m4 can wrap it without changing the broker contract. */
-function makeDefaultSpawnCommand(commandEnv: NodeJS.ProcessEnv): SpawnCommandSeam {
+ *  m4 can wrap it without changing the broker contract. Exported for a direct unit test of
+ *  the capture cap; production wires it through the default `spawnCommand` seam. */
+export function makeDefaultSpawnCommand(commandEnv: NodeJS.ProcessEnv): SpawnCommandSeam {
   return (argv, opts) =>
     new Promise<SpawnCommandResult>((resolve, reject) => {
       const [cmd, ...rest] = argv;
@@ -750,16 +779,40 @@ function makeDefaultSpawnCommand(commandEnv: NodeJS.ProcessEnv): SpawnCommandSea
       });
       let stdout = "";
       let stderr = "";
+      let capturedBytes = 0;
+      let killedAtCap = false;
+      // Accumulate up to MAX_COMMAND_CAPTURE_BYTES combined across BOTH streams. On the
+      // chunk that would cross the cap, keep only the byte-bounded prefix, mark the capture
+      // truncated, and SIGKILL the child (an unbounded producer cannot be allowed to OOM the
+      // worker). A later chunk is dropped once truncated. The child is killed AT the cap.
+      const accumulate = (chunk: string, onto: "stdout" | "stderr"): void => {
+        if (killedAtCap) return;
+        const remaining = MAX_COMMAND_CAPTURE_BYTES - capturedBytes;
+        const chunkBytes = Buffer.byteLength(chunk, "utf8");
+        if (chunkBytes <= remaining) {
+          capturedBytes += chunkBytes;
+          if (onto === "stdout") stdout += chunk;
+          else stderr += chunk;
+          return;
+        }
+        // The chunk crosses the cap: keep the byte-bounded prefix only, then kill.
+        const prefix = Buffer.from(chunk, "utf8").subarray(0, remaining).toString("utf8");
+        if (onto === "stdout") stdout += prefix;
+        else stderr += prefix;
+        capturedBytes = MAX_COMMAND_CAPTURE_BYTES;
+        killedAtCap = true;
+        child.kill("SIGKILL"); // kill the child AT the cap — never accumulate past it
+      };
       child.stdout?.setEncoding("utf8");
-      child.stdout?.on("data", (c: string) => {
-        stdout += c;
-      });
+      child.stdout?.on("data", (c: string) => accumulate(c, "stdout"));
       child.stderr?.setEncoding("utf8");
-      child.stderr?.on("data", (c: string) => {
-        stderr += c;
-      });
+      child.stderr?.on("data", (c: string) => accumulate(c, "stderr"));
       child.on("error", reject);
-      child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+      // On close, resolve with the (possibly truncated) capture. A cap-kill reports the
+      // SIGKILL sentinel code; otherwise the child's own close code (or -1 if absent).
+      child.on("close", (code) =>
+        resolve({ code: killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : code ?? -1, stdout, stderr }),
+      );
     });
 }
 
