@@ -351,18 +351,23 @@ uzi version
   `uzi run wait <id> --until completed,failed,cancelled`. A bare `run wait` there
   would return immediately at the gate it just approved.
 
-  **Long runs in a harness that reaps background processes: poll `run get`, do
-  NOT lean on a single long-lived `run wait`.** `run wait` is the right primitive
-  wherever the process running it survives — a foreground shell, a CI job. But a
-  large gated run (a multi-milestone PRD driven end-to-end) can take hours, and if
-  you launch `run wait` as a *detached/background* watcher inside an agent harness
-  that kills long-lived background processes, the watcher dies before the run
-  finishes and you never learn it completed. Measured: Claude Code reaped a
-  backgrounded `run wait` repeatedly (`status: killed`), while the run itself kept
-  going. There, do not depend on one long wait — poll `uzi run get <id> --field
-  status` from the harness's own scheduler (a cron / wakeup) and branch on the
-  status, so a killed watcher simply re-fires on the next tick. Keep `run wait` for
-  the foreground/CI case where its process is not at risk of being reaped.
+  **One wait process per run.** Start `run wait` once; reserve `--timeout` for a
+  real deadline, not a short timer to regain tool control. A tool returning a
+  process/session/cell id has yielded, not killed the process: continue waiting
+  through that tool's wait/resume mechanism. Do not start another watcher while
+  the first is alive. `run wait` already polls the server; do not add parallel
+  `run get`, `run list`, or `run logs` checks while it is healthy. Inspect the
+  returned state and fetch the plan/question/error when the wait reaches it.
+  Earlier inspection needs a concrete failure signal or an explicit user request.
+
+  **If the harness actually reaps the wait process, use scheduled status polling.**
+  Claude Code has reaped detached watchers (`status: killed`) during long runs
+  while the run itself continued. After observing that failure, replace the dead
+  watcher with `uzi run get <id> --field status` on the harness's scheduler;
+  branch on status and read logs only when action is needed. Use one monitoring
+  mechanism, never both. A normal tool yield or an unchanged run state is not
+  evidence that a watcher was reaped. This distinction was verified after a
+  session repeatedly restarted short waits and fetched redundant logs (2026-09-08).
 
   **`--min-plan-seq <n>`** is for waiting on a REVISED plan after `uzi run
   revise`. It makes the wait stop at `awaiting_approval` only once a plan
@@ -770,8 +775,14 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
 
    with no `--plan-file`, so the lead plans and the budget scales to its
    milestones.
-4. **Wait for the gate.** `uzi run wait <run-id>` stops at `awaiting_approval` (or
-   a terminal state). If it went terminal, report and stop.
+4. **Wait for the gate.** Start `uzi run wait <run-id>` once, following the
+   one-wait rule above. It stops at the plan gate, an actionable question/park,
+   or a terminal state. Handle the returned state; a terminal failure stops here.
+   While planning is active, defer PR/merge-rule checks, worktree preparation and
+   review tooling until a PR exists. Do not use the wait as spare time for later
+   workflow stages. Announce dispatch once; subsequent updates need a state change,
+   an actionable question, a failure or a user request. If the host requires periodic
+   updates, keep them brief and use the known state without extra diagnostic calls.
 5. **Review the plan, then approve, revise, or reject.** Read the submitted plan
    from `uzi run logs <run-id> --json` (the `submit_plan` message). Judge it as you
    would any plan, and run the *Hazards while driving* checks below. Sound approves
@@ -792,8 +803,8 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    than `<seq>` actually exists. Not sound rejects with
    `uzi run reject <run-id> -m '<specific reason>'`, then STOP.
 6. **Wait for the MR.** After approving, narrow past the gate you just cleared:
-   `uzi run wait <run-id> --until completed,failed,cancelled`. A `failed` or
-   `cancelled` result stops here; report it.
+   `uzi run wait <run-id> --until completed,failed,cancelled`. Keep the same
+   one-wait discipline; a `failed` or `cancelled` result stops here, so report it.
 7. **Get the MR URL.** `uzi run get <run-id> --field mr_web_url`.
 8. **Review, then merge the MR.** Review the diff (invoke `/code-review`, or read
    it via the forge CLI).
