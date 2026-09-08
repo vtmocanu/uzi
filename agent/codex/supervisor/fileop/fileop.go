@@ -39,6 +39,7 @@ const (
 	opStat   = "stat"
 	opRead   = "read"
 	opWrite  = "write"
+	opApply  = "apply"
 	opMkdir  = "mkdir"
 	opRename = "rename"
 	opUnlink = "unlink"
@@ -65,6 +66,8 @@ const (
 	codePerm      = "E_PERM"       // EACCES/EPERM
 	codeInternal  = "E_INTERNAL"   // a response could not be encoded
 	codeIO        = "E_IO"         // any other bounded I/O failure
+	codeNoMatch   = "E_NO_MATCH"   // apply: the old text is absent from the file
+	codeAmbiguous = "E_AMBIGUOUS"  // apply: the old text occurs more than once
 )
 
 // Internal rejection sentinels, mapped to a code by classify. Kept distinct so
@@ -79,13 +82,15 @@ var (
 )
 
 // request is one parsed, validated operation frame. NewPath is meaningful only for
-// rename; Data is base64-encoded bytes for write.
+// rename; Data is base64-encoded bytes for write (and the REPLACEMENT text for apply);
+// Old is base64-encoded bytes of the text apply must find-and-replace.
 type request struct {
 	ID      int    `json:"id"`
 	Op      string `json:"op"`
 	Path    string `json:"path"`
 	NewPath string `json:"newPath"`
 	Data    string `json:"data"`
+	Old     string `json:"old"`
 }
 
 // server holds the worktree-root dirfd opened ONCE (O_DIRECTORY|O_PATH) and the
@@ -173,6 +178,8 @@ func (s *server) handle(req request) map[string]any {
 		return s.doRead(req)
 	case opWrite:
 		return s.doWrite(req)
+	case opApply:
+		return s.doApply(req)
 	case opMkdir:
 		return s.doMkdir(req)
 	case opRename:
@@ -354,6 +361,100 @@ func (s *server) doWrite(req request) map[string]any {
 		return errResp(req.ID, codeIO)
 	}
 	return okResp(req.ID, map[string]any{"size": int64(len(data))})
+}
+
+// doApply applies an old→new text replacement to an EXISTING regular file
+// ATOMICALLY on ONE held fd: it opens the target once beneath root (openat2, no
+// symlink), reads its current bytes, replaces the (unique) `old` occurrence with
+// `new`, then truncates and rewrites through the SAME descriptor. This is the
+// Claude Edit/apply_patch vocabulary the renderer maps, applied race-safely: there
+// is no read-then-reopen window a mutator could redirect, because the whole
+// read-modify-write rides the fd that openat2 already resolved and pinned. A swap
+// of the pathname after the open cannot move the write off the pinned inode, and a
+// swap that races the open is refused by RESOLVE_NO_SYMLINKS (E_SYMLINK), never
+// followed. `old` MUST be non-empty and occur EXACTLY once (an absent match is
+// E_NO_MATCH, multiple matches are E_AMBIGUOUS); the plain create-or-overwrite case
+// is the `write` op, never this one. `old`/`new` ride base64 in Old/Data. O_TRUNC is
+// NOT set on the open (it must not truncate before the regular-file check); the
+// explicit Ftruncate after the fstat resets the length on a confirmed regular file.
+func (s *server) doApply(req request) map[string]any {
+	if err := validatePath(req.Path); err != nil {
+		return errResp(req.ID, classify(err))
+	}
+	oldBytes, oerr := base64.StdEncoding.DecodeString(req.Old)
+	if oerr != nil {
+		return errResp(req.ID, codeMalformed)
+	}
+	newBytes, nerr := base64.StdEncoding.DecodeString(req.Data)
+	if nerr != nil {
+		return errResp(req.ID, codeMalformed)
+	}
+	// An empty `old` is not a replacement; the create/overwrite path is the write op.
+	if len(oldBytes) == 0 {
+		return errResp(req.ID, codeMalformed)
+	}
+	// Bound the replacement body before touching the file, mirroring doWrite: a huge
+	// `new` is rejected before the open so it neither truncates nor grows the file.
+	if len(newBytes) > s.maxWrite {
+		return errResp(req.ID, codeOversize)
+	}
+	fd, err := s.openBeneath(req.Path, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return errResp(req.ID, classify(err))
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return errResp(req.ID, classify(err))
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			return errResp(req.ID, codeIsDir)
+		}
+		return errResp(req.ID, codeNotFile)
+	}
+	if err := unix.SetNonblock(fd, false); err != nil {
+		unix.Close(fd)
+		return errResp(req.ID, codeIO)
+	}
+	f := os.NewFile(uintptr(fd), "apply")
+	if f == nil {
+		unix.Close(fd)
+		return errResp(req.ID, codeIO)
+	}
+	defer f.Close()
+	if st.Size > int64(s.maxRead) {
+		return errResp(req.ID, codeOversize)
+	}
+	content, rerr := io.ReadAll(io.LimitReader(f, int64(s.maxRead)+1))
+	if rerr != nil {
+		return errResp(req.ID, codeIO)
+	}
+	if len(content) > s.maxRead {
+		return errResp(req.ID, codeOversize)
+	}
+	count := bytes.Count(content, oldBytes)
+	if count == 0 {
+		return errResp(req.ID, codeNoMatch)
+	}
+	if count > 1 {
+		return errResp(req.ID, codeAmbiguous)
+	}
+	updated := bytes.Replace(content, oldBytes, newBytes, 1)
+	if len(updated) > s.maxWrite {
+		return errResp(req.ID, codeOversize)
+	}
+	if err := unix.Ftruncate(fd, 0); err != nil {
+		return errResp(req.ID, codeIO)
+	}
+	// WriteAt writes at an ABSOLUTE offset (the file was not opened O_APPEND), so the
+	// post-read fd offset is irrelevant and the freshly-truncated file is rewritten
+	// from byte 0 on the same held descriptor.
+	if _, werr := f.WriteAt(updated, 0); werr != nil {
+		return errResp(req.ID, codeIO)
+	}
+	return okResp(req.ID, map[string]any{"size": int64(len(updated))})
 }
 
 // doMkdir creates one directory beneath root.

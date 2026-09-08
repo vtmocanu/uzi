@@ -264,6 +264,128 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     assertDenied(r, "write_denied_in_plan");
     assert.equal(h.fileop.calls.length, 0);
   });
+
+  it("routes an Edit (old_string/new_string) to the fd-anchored apply op", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "Edit",
+      { path: "src/x.ts", old_string: "foo", new_string: "bar" },
+      "root",
+    );
+    assert.equal(r.ok, true);
+    if (r.ok) assert.deepEqual(r.output, { applied: 1 });
+    assert.equal(h.fileop.calls.length, 1);
+    const req = h.fileop.calls[0]!;
+    assert.equal(req.op, "apply");
+    assert.equal(req.path, "src/x.ts");
+    assert.equal(req.old, Buffer.from("foo", "utf8").toString("base64"));
+    assert.equal(req.data, Buffer.from("bar", "utf8").toString("base64"));
+  });
+
+  it("allows an Edit whose new_string is empty (a deletion)", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "Edit",
+      { path: "src/x.ts", old_string: "delete me", new_string: "" },
+      "root",
+    );
+    assert.equal(r.ok, true);
+    assert.equal(h.fileop.calls.length, 1);
+    assert.equal(h.fileop.calls[0]!.data, "");
+  });
+
+  it("routes a MultiEdit to an ORDERED sequence of apply ops", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "MultiEdit",
+      {
+        path: "src/x.ts",
+        edits: [
+          { old_string: "a", new_string: "1" },
+          { old_string: "b", new_string: "2" },
+        ],
+      },
+      "root",
+    );
+    assert.equal(r.ok, true);
+    if (r.ok) assert.deepEqual(r.output, { applied: 2 });
+    assert.equal(h.fileop.calls.length, 2);
+    assert.deepEqual(h.fileop.calls.map((c) => c.op), ["apply", "apply"]);
+    assert.equal(h.fileop.calls[0]!.old, Buffer.from("a", "utf8").toString("base64"));
+    assert.equal(h.fileop.calls[1]!.old, Buffer.from("b", "utf8").toString("base64"));
+  });
+
+  it("stops a MultiEdit at the FIRST failing apply and reports the denial", async () => {
+    // The fileop spy fails every op; the batch must stop after the first, not apply the rest.
+    const fileop = new FileopSpy({ ok: false, code: "E_NO_MATCH" });
+    const h = makeBroker({ fileop });
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "MultiEdit",
+      { path: "src/x.ts", edits: [{ old_string: "a", new_string: "1" }, { old_string: "b", new_string: "2" }] },
+      "root",
+    );
+    assertDenied(r, "fileop_denied");
+    assert.match(r.message, /E_NO_MATCH/);
+    assert.equal(fileop.calls.length, 1);
+  });
+
+  it("maps the apply no-match / ambiguous codes to a neutral denial", async () => {
+    for (const code of ["E_NO_MATCH", "E_AMBIGUOUS"]) {
+      const fileop = new FileopSpy({ ok: false, code });
+      const h = makeBroker({ fileop });
+      const r = await h.broker.handleToolCall(
+        rt(),
+        "Edit",
+        { path: "src/x.ts", old_string: "foo", new_string: "bar" },
+        "root",
+      );
+      assertDenied(r, "fileop_denied");
+      assert.match(r.message, new RegExp(code));
+    }
+  });
+
+  it("denies an apply_patch/Edit with neither content nor an old_string/new_string pair", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(rt(), "Edit", { path: "src/x.ts", new_string: "bar" }, "root");
+    assertDenied(r, "bad_args");
+    assert.equal(h.fileop.calls.length, 0);
+  });
+
+  it("denies a MultiEdit whose edits array is empty or malformed (fail-closed)", async () => {
+    const h1 = makeBroker();
+    const empty = await h1.broker.handleToolCall(rt(), "MultiEdit", { path: "src/x.ts", edits: [] }, "root");
+    assertDenied(empty, "bad_args");
+    assert.equal(h1.fileop.calls.length, 0);
+
+    const h2 = makeBroker();
+    const malformed = await h2.broker.handleToolCall(
+      rt(),
+      "MultiEdit",
+      { path: "src/x.ts", edits: [{ old_string: "a", new_string: "1" }, { new_string: "no-old" }] },
+      "root",
+    );
+    assertDenied(malformed, "bad_args");
+    // Not even the first, well-formed edit runs: the whole batch fails closed on parse.
+    assert.equal(h2.fileop.calls.length, 0);
+  });
+
+  it("denies an Edit's .git path with the jail and never issues a fileop", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(rt(), "Edit", { path: ".git/config", old_string: "a", new_string: "b" }, "root");
+    assertDenied(r, "path_denied");
+    assert.equal(h.fileop.calls.length, 0);
+  });
+
+  it("denies an Edit during the plan phase (no fileop)", async () => {
+    const h = makeBroker({ grants: grants({ phase: "plan" }) });
+    const r = await h.broker.handleToolCall(rt(), "Edit", { path: "src/x.ts", old_string: "a", new_string: "b" }, "root");
+    assertDenied(r, "write_denied_in_plan");
+    assert.equal(h.fileop.calls.length, 0);
+  });
 });
 
 describe("CodexCallbackBroker: authority is bound to the grant, not the args", () => {

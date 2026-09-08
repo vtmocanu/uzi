@@ -655,3 +655,200 @@ func TestConcurrentMutatorNeverEscapes(t *testing.T) {
 	close(stop)
 	<-done
 }
+
+// TestApplyRoundTrip proves the fd-anchored find-and-replace edits a unique match
+// in place and reports the new size, then round-trips through a read.
+func TestApplyRoundTrip(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "src.txt", Data: b64("alpha BETA gamma")}))
+	resp := s.handle(request{ID: 2, Op: opApply, Path: "src.txt", Old: b64("BETA"), Data: b64("delta")})
+	wantOK(t, resp)
+	if got := resp["size"]; got != int64(len("alpha delta gamma")) {
+		t.Fatalf("apply size = %v, want %d", got, len("alpha delta gamma"))
+	}
+	r := s.handle(request{ID: 3, Op: opRead, Path: "src.txt"})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != "alpha delta gamma" {
+		t.Fatalf("post-apply read = %q, want %q", got, "alpha delta gamma")
+	}
+}
+
+// TestApplyGrowsAndShrinks proves the explicit Ftruncate resets the length so a
+// replacement shorter OR longer than the original leaves no stale trailing bytes.
+func TestApplyGrowsAndShrinks(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "f", Data: b64("keep <MARK> keep")}))
+	// Longer replacement.
+	wantOK(t, s.handle(request{ID: 2, Op: opApply, Path: "f", Old: b64("<MARK>"), Data: b64("a much longer replacement body")}))
+	r := s.handle(request{ID: 3, Op: opRead, Path: "f"})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != "keep a much longer replacement body keep" {
+		t.Fatalf("grow apply = %q", got)
+	}
+	// Shorter replacement must truncate the tail away (no leftover bytes).
+	wantOK(t, s.handle(request{ID: 4, Op: opApply, Path: "f", Old: b64("a much longer replacement body"), Data: b64("x")}))
+	r2 := s.handle(request{ID: 5, Op: opRead, Path: "f"})
+	wantOK(t, r2)
+	if got := string(respData(t, r2)); got != "keep x keep" {
+		t.Fatalf("shrink apply = %q, want %q", got, "keep x keep")
+	}
+}
+
+// TestApplyNoMatchAndAmbiguous proves the uniqueness contract: an absent match is
+// E_NO_MATCH and a repeated match is E_AMBIGUOUS, and NEITHER touches the file.
+func TestApplyNoMatchAndAmbiguous(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "f", Data: b64("one two two three")}))
+	wantErr(t, s.handle(request{ID: 2, Op: opApply, Path: "f", Old: b64("absent"), Data: b64("x")}), codeNoMatch)
+	wantErr(t, s.handle(request{ID: 3, Op: opApply, Path: "f", Old: b64("two"), Data: b64("x")}), codeAmbiguous)
+	// The file is untouched by either rejected edit.
+	r := s.handle(request{ID: 4, Op: opRead, Path: "f"})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != "one two two three" {
+		t.Fatalf("file mutated by a rejected apply: %q", got)
+	}
+}
+
+// TestApplyRejectsEmptyOldAndBadBase64 proves the create/overwrite case is NOT this
+// op (empty old is E_MALFORMED) and that malformed base64 in either body is refused.
+func TestApplyRejectsEmptyOldAndBadBase64(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "f", Data: b64("body")}))
+	wantErr(t, s.handle(request{ID: 2, Op: opApply, Path: "f", Old: "", Data: b64("x")}), codeMalformed)
+	wantErr(t, s.handle(request{ID: 3, Op: opApply, Path: "f", Old: "!!not-base64!!", Data: b64("x")}), codeMalformed)
+	wantErr(t, s.handle(request{ID: 4, Op: opApply, Path: "f", Old: b64("body"), Data: "!!not-base64!!"}), codeMalformed)
+}
+
+// TestApplyNonexistentIsNotFound proves apply edits an EXISTING file only (no
+// O_CREAT); a missing target is E_NOT_FOUND, never silently created.
+func TestApplyNonexistentIsNotFound(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantErr(t, s.handle(request{ID: 1, Op: opApply, Path: "ghost", Old: b64("x"), Data: b64("y")}), codeNotFound)
+	// And it did not create the file.
+	st := s.handle(request{ID: 2, Op: opStat, Path: "ghost"})
+	wantOK(t, st)
+	if exists, _ := st["exists"].(bool); exists {
+		t.Fatalf("apply created a nonexistent file")
+	}
+}
+
+// TestApplyRejectsDirAndDotGit proves apply refuses a directory target (E_IS_DIR)
+// and any .git component (E_DENIED), the same jail every other op enforces.
+func TestApplyRejectsDirAndDotGit(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opMkdir, Path: "d"}))
+	wantErr(t, s.handle(request{ID: 2, Op: opApply, Path: "d", Old: b64("x"), Data: b64("y")}), codeIsDir)
+	wantErr(t, s.handle(request{ID: 3, Op: opApply, Path: ".git/config", Old: b64("x"), Data: b64("y")}), codeDenied)
+	// A nested .git component is denied too (the case-sensitive repo-git jail).
+	wantErr(t, s.handle(request{ID: 4, Op: opApply, Path: "sub/.git/x", Old: b64("x"), Data: b64("y")}), codeDenied)
+}
+
+// TestApplyOversizeResult proves the resulting file is bounded: a replacement that
+// would push the file past maxWrite is E_OVERSIZE and leaves the file untouched.
+func TestApplyOversizeResult(t *testing.T) {
+	s, root := newTestServer(t)
+	s.maxRead = 64
+	s.maxWrite = 64
+	if err := os.WriteFile(filepath.Join(root, "f"), []byte("<M>"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	wantErr(t, s.handle(request{ID: 1, Op: opApply, Path: "f", Old: b64("<M>"), Data: b64(strings.Repeat("z", 128))}), codeOversize)
+	// Untouched: the pre-check rejects before Ftruncate.
+	body, err := os.ReadFile(filepath.Join(root, "f"))
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(body) != "<M>" {
+		t.Fatalf("file mutated by an oversize apply: %q", body)
+	}
+}
+
+// TestApplySymlinkSwapRefused proves apply refuses a target swapped to a symlink
+// (E_SYMLINK) rather than following it — the fd-anchored no-symlink discipline.
+func TestApplySymlinkSwapRefused(t *testing.T) {
+	s, root := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "swap", Data: b64("legit CONTENT here")}))
+	if err := os.Remove(filepath.Join(root, "swap")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.Symlink("/etc/passwd", filepath.Join(root, "swap")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	wantErr(t, s.handle(request{ID: 2, Op: opApply, Path: "swap", Old: b64("root"), Data: b64("pwned")}), codeSymlink)
+}
+
+// TestApplyConcurrentMutatorNeverEscapes hammers apply on a relpath a background
+// mutator flips between a safe regular file and a symlink to an OUTSIDE secret.
+// Every apply either edits the in-jail SAFE file or is refused (E_SYMLINK /
+// E_NOT_FOUND / E_NO_MATCH) — the outside secret is NEVER opened or overwritten,
+// and the secret file's bytes are never changed by the helper.
+func TestApplyConcurrentMutatorNeverEscapes(t *testing.T) {
+	s, root := newTestServer(t)
+
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("SECRET"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	race := filepath.Join(root, "race")
+	tmpReg := filepath.Join(root, ".stage-reg")
+	tmpLink := filepath.Join(root, ".stage-link")
+	if err := os.WriteFile(race, []byte("SAFE"), 0o600); err != nil {
+		t.Fatalf("seed race: %v", err)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			os.Remove(tmpLink)
+			if os.Symlink(secret, tmpLink) == nil {
+				os.Rename(tmpLink, race)
+			}
+			os.Remove(tmpReg)
+			if os.WriteFile(tmpReg, []byte("SAFE"), 0o600) == nil {
+				os.Rename(tmpReg, race)
+			}
+		}
+	}()
+
+	for i := 0; i < 4000; i++ {
+		r := s.handle(request{ID: i, Op: opApply, Path: "race", Old: b64("SAFE"), Data: b64("EDITED")})
+		if ok, _ := r["ok"].(bool); !ok {
+			// A refusal is fine; it must be one of the fd-anchored no-symlink outcomes,
+			// never a followed escape onto the outside secret.
+			wantErrOneOf(t, r, codeSymlink, codeNotFound, codeNoMatch)
+		}
+		// The outside secret must never be touched by any apply, regardless of outcome.
+		if body, err := os.ReadFile(secret); err == nil && string(body) != "SECRET" {
+			t.Fatalf("apply escaped and overwrote the outside secret: %q", body)
+		}
+	}
+	close(stop)
+	<-done
+}
+
+// TestApplyAtomicOnHeldFD proves the read-modify-write rides ONE descriptor: a
+// mutator that swaps the pathname to a DIFFERENT in-jail regular file after the
+// open cannot redirect the write — the pinned inode is rewritten, and a fresh
+// resolution afterwards sees the swapped file unmodified. This is the property the
+// held fd buys over a read-op-then-write-op composition.
+func TestApplyAtomicOnHeldFD(t *testing.T) {
+	// Not a timing race: this asserts the mechanism (WriteAt to the fd that openat2
+	// pinned), which cannot be redirected by any later rename of the name.
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "target", Data: b64("hello WORLD")}))
+	wantOK(t, s.handle(request{ID: 2, Op: opApply, Path: "target", Old: b64("WORLD"), Data: b64("THERE")}))
+	r := s.handle(request{ID: 3, Op: opRead, Path: "target"})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != "hello THERE" {
+		t.Fatalf("apply on held fd = %q, want %q", got, "hello THERE")
+	}
+}

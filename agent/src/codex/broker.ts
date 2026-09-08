@@ -171,13 +171,15 @@ export type CallbackResult =
 /** One fileop request, mapped to the NDJSON op protocol
  *  (agent/codex/supervisor/fileop). `path`/`newPath` are worktree-RELATIVE (the
  *  helper anchors them at the root dirfd and rejects an absolute/`..`/`.git`
- *  component itself); `data` is base64 for a write. The `id` correlation is the
- *  production client's job, not the broker's. */
+ *  component itself); `data` is base64 for a write (and the REPLACEMENT text for
+ *  `apply`); `old` is base64 of the text `apply` must find-and-replace on a held fd.
+ *  The `id` correlation is the production client's job, not the broker's. */
 export interface FileopRequest {
-  readonly op: "stat" | "read" | "write" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
+  readonly op: "stat" | "read" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
   readonly path: string;
   readonly newPath?: string;
   readonly data?: string;
+  readonly old?: string;
 }
 
 /** One fileop response. `ok:false` carries a bounded error code from the helper's
@@ -304,6 +306,35 @@ function firstStrField(args: unknown, keys: readonly string[]): string | undefin
     if (v !== undefined) return v;
   }
   return undefined;
+}
+
+/** A string field of `args` that MAY be the empty string (e.g. an Edit `new_string`
+ *  that deletes text), distinct from {@link strField}'s non-empty contract. Returns
+ *  undefined only when the key is absent or not a string. */
+function anyStrField(args: unknown, key: string): string | undefined {
+  const v = asObject(args)?.[key];
+  return typeof v === "string" ? v : undefined;
+}
+
+/** One parsed Claude-vocabulary edit: a non-empty `oldStr` to find and a (possibly
+ *  empty) `newStr` to replace it with. This is the `apply_patch`/`Edit`/`MultiEdit`
+ *  argument shape the renderer maps, normalized for the fd-anchored `apply` op. */
+interface ParsedEdit {
+  readonly oldStr: string;
+  readonly newStr: string;
+}
+
+/** Parse a single `{ old_string, new_string }` edit object (the Edit tool shape and
+ *  each MultiEdit entry). Returns undefined when the shape is not a valid edit so the
+ *  caller can fail closed with `bad_args`. `old_string` must be a non-empty string (an
+ *  empty old is the create/overwrite case, which is the `content` write path, never an
+ *  apply); `new_string` must be a string but MAY be empty (a deletion). */
+function parseEdit(value: unknown): ParsedEdit | undefined {
+  const oldStr = strField(value, "old_string");
+  if (oldStr === undefined) return undefined;
+  const newStr = anyStrField(value, "new_string");
+  if (newStr === undefined) return undefined;
+  return { oldStr, newStr };
 }
 
 function boundedString(s: string, maxBytes: number): string {
@@ -605,21 +636,74 @@ export class CodexCallbackBroker {
     }
     const candidate = firstStrField(args, ["path", "file_path"]);
     if (candidate === undefined) return deny("bad_args", "a file write requires a string 'path'");
-    // M2 wires the full-file write primitive (a `content` body); incremental
-    // Edit/patch application (old_string/new_string) lands in a later milestone.
+
+    // The `apply_patch` capability covers the whole Claude write vocabulary the renderer
+    // maps (Write/Edit/MultiEdit → apply_patch). Which EFFECT it is comes from the args,
+    // but the args NEVER widen authority — the capability was already granted. Precedence:
+    //   1. a full-file `content` body           → the `write` op (create-or-truncate);
+    //   2. a `edits` array (MultiEdit)           → a SEQUENCE of fd-anchored `apply` ops;
+    //   3. a single `old_string`/`new_string`    → ONE fd-anchored `apply` op.
+    // EVERY branch goes through the openat2 no-symlink fileop helper — a model-selected
+    // file effect never falls back to pathname check-then-use node `fs`. The `content`
+    // branch stays byte-for-byte the M2 behaviour so its existing control is unaffected.
     const content = firstStrField(args, ["content", "data", "text"]);
-    if (content === undefined) return deny("bad_args", "a file write requires a string 'content'");
+    if (content !== undefined) {
+      const screened = this.screenAndRelativize(candidate);
+      if ("ok" in screened) return screened;
+      const res = await this.fileop.op({
+        op: "write",
+        path: screened.rel,
+        data: Buffer.from(content, "utf8").toString("base64"),
+      });
+      if (!res.ok) return this.mapFileopError(res);
+      return { ok: true, output: { written: true, size: res.size } };
+    }
+
+    const edits = this.parseEdits(args);
+    if (edits === undefined) {
+      return deny("bad_args", "a file write requires 'content', an 'edits' array, or an 'old_string'/'new_string' pair");
+    }
 
     const screened = this.screenAndRelativize(candidate);
     if ("ok" in screened) return screened;
 
-    const res = await this.fileop.op({
-      op: "write",
-      path: screened.rel,
-      data: Buffer.from(content, "utf8").toString("base64"),
-    });
-    if (!res.ok) return this.mapFileopError(res);
-    return { ok: true, output: { written: true, size: res.size } };
+    // Apply each edit as its OWN atomic fd-anchored op (the Go helper holds one fd per
+    // apply for the whole read-modify-write, so there is no check-then-use window). A
+    // multi-edit is a sequence of atomic edits, not one atomic transaction — the first
+    // failure stops and is returned so a partial application is reported, never masked.
+    let applied = 0;
+    for (const edit of edits) {
+      const res = await this.fileop.op({
+        op: "apply",
+        path: screened.rel,
+        old: Buffer.from(edit.oldStr, "utf8").toString("base64"),
+        data: Buffer.from(edit.newStr, "utf8").toString("base64"),
+      });
+      if (!res.ok) return this.mapFileopError(res);
+      applied += 1;
+    }
+    return { ok: true, output: { applied } };
+  }
+
+  /** Parse the Claude Edit/MultiEdit argument vocabulary into an ordered list of
+   *  {@link ParsedEdit}s, or undefined when the args carry no valid edit. `edits` (the
+   *  MultiEdit array) takes precedence over a bare `old_string`/`new_string` pair; an
+   *  `edits` value that is present but not a non-empty array of valid edits is a
+   *  fail-closed undefined (never silently treated as zero edits). */
+  private parseEdits(args: unknown): readonly ParsedEdit[] | undefined {
+    const raw = asObject(args)?.edits;
+    if (raw !== undefined) {
+      if (!Array.isArray(raw) || raw.length === 0) return undefined;
+      const parsed: ParsedEdit[] = [];
+      for (const entry of raw) {
+        const edit = parseEdit(entry);
+        if (edit === undefined) return undefined; // one malformed entry fails the whole batch closed
+        parsed.push(edit);
+      }
+      return parsed;
+    }
+    const single = parseEdit(args);
+    return single === undefined ? undefined : [single];
   }
 
   private async dispatchFileRead(args: unknown): Promise<CallbackResult> {
