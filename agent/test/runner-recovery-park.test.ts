@@ -329,4 +329,87 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
+
+  it("ack error (thrown report): a non-409 4xx reporting recovery_wait throws → NOT parked, cleaned up", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-rec-throw-"));
+    try {
+      const iid = 306;
+      const { factory, paths } = recoveryFactory(homeRoot, iid, (wt) => {
+        commitInTree(wt, "WORK.txt", "work\n");
+      });
+      const claim = gitlabClaim(iid);
+      // Make ONLY the recovery_wait report fail with a non-409 4xx (400) that is neither
+      // transient (isTransient is false for a 400) nor "already terminal" (the body carries
+      // no /terminal/ text), so reportState does not retry and THROWS — the transport-failure
+      // shape handleRecoveryExhausted's catch handles. failStateWhen targets the recovery_wait
+      // body only (matched on body.status), so the ordinary `running` heartbeats fall through
+      // to the normal handler and the run reaches the park path exactly as verified-capture does.
+      api.failStateWhen(claim.run_id, (b) => b.status === "recovery_wait", {
+        httpStatus: 400,
+      });
+      await runnerWith(factory, gitlab).execute(claim);
+      const p = paths();
+      // Non-vacuity: handleRecoveryExhausted actually RAN — the park notice was FLUSHED to
+      // the feed just before the (throwing) report — so the cleanup below is the catch
+      // branch's unparked cleanup, not a run that died earlier and never reached the park.
+      const texts = feedTexts(claim.run_id);
+      assert.ok(
+        texts.some((t) => /paused to recover from an empty model result/.test(t)),
+        "the recovery park notice was emitted (the park path ran before the throw)",
+      );
+      // The throwing report is NOT persisted (the 400 returns before the fake records it),
+      // and NO terminal `failed` is reported in its place — the run stays non-terminal so the
+      // server's stale-worker requeue can pick it up (never a work-destroying double-report).
+      assert.strictEqual(
+        api.states.some((s) => s.body.status === "recovery_wait"),
+        false,
+        "a thrown recovery_wait report is not persisted (no park landed)",
+      );
+      assert.strictEqual(
+        api.states.some((s) => s.body.status === "failed"),
+        false,
+        "a thrown recovery park must NOT double-report a terminal failed",
+      );
+      // NOT parked → the whole session is cleaned up (no park carve-out): all three resume
+      // dirs are removed, exactly as the ack-discrimination case above.
+      assert.strictEqual(fs.existsSync(p.worktree), false, "clone removed (not parked)");
+      assert.strictEqual(fs.existsSync(p.pluginDir), false, "plugin dir removed (not parked)");
+      assert.strictEqual(fs.existsSync(p.runHome), false, "run HOME removed (not parked)");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("ack error (409 refusal): the run moved on under the worker → NOT parked, cleaned up", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-rec-409-"));
+    try {
+      const iid = 307;
+      const { factory, paths } = recoveryFactory(homeRoot, iid, (wt) => {
+        commitInTree(wt, "WORK.txt", "work\n");
+      });
+      const claim = gitlabClaim(iid);
+      // The recovery_wait report is refused with a 409 carrying a DIFFERENT run status (the
+      // run was cancelled/parked concurrently under the worker). reportState reads a 409
+      // inline as { applied: false, status: "cancelled" }, so ack.status !== "recovery_wait"
+      // → handleRecoveryExhausted returns false → NOT parked. Mirrors the limit_wait suite's
+      // "cleans up fully when the park is refused with a 409".
+      api.refuseStateWith409(claim.run_id);
+      await runnerWith(factory, gitlab).execute(claim);
+      const p = paths();
+      // Non-vacuity: the park path ran (its notice reached the feed) before the 409 refusal.
+      const texts = feedTexts(claim.run_id);
+      assert.ok(
+        texts.some((t) => /paused to recover from an empty model result/.test(t)),
+        "the recovery park notice was emitted (the park path ran before the 409)",
+      );
+      // NOT parked → the whole session is cleaned up: worktree, plugin dir and run HOME.
+      assert.strictEqual(fs.existsSync(p.worktree), false, "clone removed (not parked)");
+      assert.strictEqual(fs.existsSync(p.pluginDir), false, "plugin dir removed (not parked)");
+      assert.strictEqual(fs.existsSync(p.runHome), false, "run HOME removed (not parked)");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
 });
