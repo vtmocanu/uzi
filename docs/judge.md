@@ -226,15 +226,17 @@ stays live and reads **Run judge** (or **Re-run judge**).
 
 ## Filing an issue from a recommendation
 
-Each recommendation on the run page has a **File issue** button. Click it and
-uzi templates an editable draft — title, description, and a repo picker —
-from the recommendation, the review, and the judged run, entirely from data
-already stored. Nothing new is sent to the judge model and no token is spent.
-Edit the draft if you like, pick a repo, and click **Create**: uzi files the
-issue on GitLab as your connection's bot (uzi has no per-user forge identity,
-so every issue, note, and label it creates is authored by the same bot as
-everything else) and remembers the link so the same recommendation can't be
-filed twice.
+Each recommendation on the run page carries one triage row of three actions
+at equal weight: **File issue**, **Mark done**, and **Dismiss ▾**, the same
+row [the Judge menu](./judge-menu.md#2-triage-a-whole-group-at-once) uses.
+Click **File issue** and uzi templates an editable draft, title, description,
+and a repo picker, from the recommendation, the review, and the judged run,
+entirely from data already stored. Nothing new is sent to the judge model and
+no token is spent. Edit the draft if you like, pick a repo, and click
+**Create**: uzi files the issue on GitLab as your connection's bot (uzi has
+no per-user forge identity, so every issue, note, and label it creates is
+authored by the same bot as everything else) and remembers the link so the
+same recommendation can't be filed twice.
 
 The filed issue carries the `uzi` label — it shows up on the board and can
 start a run in one click, with no PRD file needed — but **never** the
@@ -267,11 +269,11 @@ Each one also carries a **triage state** you set with one click: **Mark
 done**, or **Dismiss ▾** and pick a reason — **Won't do** (valid, but not
 worth acting on) or **Not an issue** (the judge got it wrong — a false
 positive). **Undo** clears it back to whatever it was before: **Filed** if
-you'd already filed an issue for it, otherwise **To do**.
+you'd already filed an issue for it, otherwise **To triage**.
 
 A recommendation is always in exactly one of four states, ranked highest
 wins when more than one applies: **Dismissed** > **Done** > **Filed** > **To
-do**. Filing and triaging are independent actions, so you can file an issue
+triage**. Filing and triaging are independent actions, so you can file an issue
 and later mark it done — a filed-and-done row shows as done, not filed.
 
 **It survives a re-run of the judge.** Dismiss a false positive, click **Run
@@ -337,7 +339,7 @@ dismissal still lands. And it costs nothing permanent if the match is ever wrong
 — the dismissal is **visible and reversible** like any other. Click **Undo** on
 the row (or run `uzi review undo <run-id> <rec-id>` — see [Reviewing and triaging
 from the CLI](./cli.md#reviewing-and-triaging-from-the-cli)) and it returns to
-**To do** for you to triage by hand.
+**To triage** for you to work by hand.
 
 ## Which runs are judged
 
