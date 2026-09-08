@@ -133,8 +133,9 @@ function pauseFactory(homeRoot: string): {
 }
 
 /** An executor that requests a pause WITHOUT committing or checkpointing anything — a `now` pause
- *  before any work. The clone's branch tip is still its base commit, so handlePausePark's empty-pack
- *  detection must park cleanly rather than reporting pause_failed. */
+ *  before any work. The clone's branch tip is still its base commit, so there is nothing to publish:
+ *  handlePausePark falls through to publishCheckpointBestEffort, whose false result reports
+ *  pause_failed and keeps the run running (Decision 8: no park without a durable checkpoint). */
 function emptyPauseFactory(homeRoot: string): {
   factory: ExecutorFactory;
   parkResults: (boolean | undefined)[];
@@ -238,23 +239,42 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
     }
   });
 
-  it("parks cleanly on an EMPTY pack (a `now` pause before any commit), not pause_failed", async () => {
+  it("reports `pause_failed` and KEEPS RUNNING on an EMPTY/unpublishable pack (a `now` pause before any commit)", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1190-empty-"));
-    // A FAILING publish spy: if the empty-pack case wrongly reached the publish path it would report
-    // pause_failed. The empty-pack detection must bypass publish entirely and park cleanly, so with
-    // this spy in place a `paused` (not `pause_failed`) proves publish was never attempted.
+    // A `now` pause dropped the first turn before any commit landed durably, so there is nothing to
+    // publish. Decision 8: an empty/unpublishable pack does NOT get a clean-park shortcut — it falls
+    // through to publishCheckpointBestEffort, whose false result reports pause_failed and the run
+    // keeps running. (A base-tip shortcut would be UNSAFE on the seededFrom:"tracking" resume leg,
+    // where baseCommit is durable on origin only if the prior park's best-effort publish landed.)
     const { restore } = spyPublishHttpError(500);
     try {
       const { factory, parkResults } = emptyPauseFactory(homeRoot);
       const claim = gitlabClaim(1105);
       await runnerWithGit(factory, gitlab).execute(claim);
 
-      assert.deepEqual(parkResults, [true], "an empty-pack pause parks cleanly (nothing to lose)");
+      assert.deepEqual(parkResults, [false], "an empty/unpublishable pack does NOT park");
       const statuses = stateStatuses(claim.run_id);
-      assert.ok(statuses.includes("paused"), `a paused report was sent, got ${JSON.stringify(statuses)}`);
-      assert.ok(!statuses.includes("pause_failed"), "an empty pack must NOT report pause_failed");
-      assert.ok(!statuses.includes("completed"), "a parked run does not finalize");
+      assert.ok(
+        statuses.includes("pause_failed"),
+        `a pause_failed report was sent, got ${JSON.stringify(statuses)}`,
+      );
+      assert.ok(!statuses.includes("paused"), "an empty pack must NOT report paused");
+      // The run KEEPS RUNNING past the declined park and finalizes rather than staying parked. This
+      // fake commits nothing, so the continued run terminates as `failed` (no work to submit) — the
+      // load-bearing point is that it did NOT park (a real run would restart the interrupted turn).
+      assert.ok(
+        statuses.includes("failed") || statuses.includes("completed"),
+        `the run continued to a terminal state, not parked, got ${JSON.stringify(statuses)}`,
+      );
+      const feed = api.messages(claim.run_id);
+      const pf = feed.find((m) => m.kind === "pause_failed");
+      assert.ok(pf, "a pause_failed feed message was emitted");
+      assert.match(
+        String(pf!.payload.text),
+        /still running/i,
+        "the pause_failed message tells the owner the run is still running",
+      );
     } finally {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
