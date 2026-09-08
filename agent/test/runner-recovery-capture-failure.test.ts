@@ -336,4 +336,86 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       await execution;
     }
   });
+
+  for (const outcome of ["valid ACK", "cancel", "shutdown"] as const) {
+    it(`a statusless recovery ACK retains the active session until ${outcome}`, async () => {
+      const { gitlab } = fakeGitlab();
+      const iid = outcome === "valid ACK" ? 1310 : outcome === "cancel" ? 1311 : 1312;
+      const claim = gitlabClaim(iid);
+      const fixture = factoryFor(claim);
+      const retryReached = deferred();
+      const releaseRetry = deferred();
+      const report = client.reportState.bind(client);
+      let reports = 0;
+      let cancelReports = 0;
+      let statuslessResponses = 0;
+      let allowValidAck = false;
+      client.reportState = async (runId, body) => {
+        if (body.status === "recovery_wait") {
+          if (++reports === 2) { retryReached.resolve(); await releaseRetry.promise; }
+          if (allowValidAck) {
+            api.setOwnershipStatus(runId, "recovery_wait");
+            api.sendRawState(runId, 200, JSON.stringify({ run: { status: "recovery_wait" } }));
+          } else {
+            // Exercise the REAL WorkerClient HTTP204 parser. This response does
+            // not move the fake's authoritative ownership state from running.
+            api.sendRawState(runId, 204, "");
+          }
+          const ack = await report(runId, body);
+          if (!allowValidAck) {
+            assert.deepEqual(ack, { applied: true, status: undefined });
+            statuslessResponses++;
+          }
+          return ack;
+        }
+        if (body.status === "failed" && body.failure_reason === "run cancelled") {
+          cancelReports++;
+          // The queued cancel has stamped stop_kind; Service's failed report
+          // routes to CancelRunByWorker and returns this authoritative state.
+          api.setOwnershipStatus(runId, "cancelled");
+          api.sendRawState(runId, 200, JSON.stringify({ run: { status: "cancelled" } }));
+        }
+        return report(runId, body);
+      };
+      const runner = runnerWith(fixture.factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
+      const execution = runner.execute(claim);
+      try {
+        await Promise.race([
+          retryReached.promise,
+          execution.then(() => { throw new Error("statusless ACK abandoned the live recovery execution"); }),
+        ]);
+        assert.equal(statuslessResponses, 1, "one real HTTP204 response triggered a retry");
+        await client.heartbeat();
+        assert.equal(api.heartbeats, 1, "the worker remains healthy, so stale-worker recovery cannot rescue an abandoned row");
+        assert.equal((await client.getRunOwnership(claim.run_id)).status, "running");
+        assert.equal(fs.existsSync(path.join(fixture.runHome, "session")), true);
+        assert.equal(fs.existsSync(path.join(skillsPluginDir(fixture.clone()), "marker")), true);
+        if (outcome === "valid ACK") allowValidAck = true;
+        if (outcome === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+        if (outcome === "shutdown") runner.shutdown();
+        releaseRetry.resolve();
+        await execution;
+        assert.equal(fixture.calls(), 1, "status-report retries never restart the model");
+        if (outcome === "valid ACK") {
+          assert.equal(reports, 2);
+          assert.equal((await client.getRunOwnership(claim.run_id)).status, "recovery_wait");
+          assert.equal(fs.existsSync(path.join(fixture.runHome, "session")), true);
+        } else if (outcome === "cancel") {
+          assert.equal(cancelReports, 1);
+          assert.equal((await client.getRunOwnership(claim.run_id)).status, "cancelled");
+          assert.equal(fs.existsSync(fixture.runHome), false);
+        } else {
+          assert.equal(cancelReports, 0);
+          assert.equal((await client.getRunOwnership(claim.run_id)).status, "running");
+          assert.equal(fs.existsSync(path.join(fixture.runHome, "session")), true);
+          assert.equal(fs.existsSync(path.join(skillsPluginDir(fixture.clone()), "marker")), true);
+          assert.equal(gitRead(git.barePathFor(fx.originPath), "show", `refs/uzi-runner/agent/issue-${iid}:ONLY_COPY.txt`), "must survive recovery");
+        }
+      } finally {
+        releaseRetry.resolve();
+        runner.shutdown();
+        await execution;
+      }
+    });
+  }
 });

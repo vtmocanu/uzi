@@ -656,7 +656,8 @@ chain in the diagram above, with no intervening `running`.
   [docs/anthropic-token.md](docs/anthropic-token.md#waiting-for-a-token).
 
 - **running → recovery_wait → queued** (issue #1197): an SDK turn
-  that comes back **positively empty** (zero turns, no model activity) is
+  that comes back **positively empty** (zero reported turns, no model activity,
+  no plan, no question and no completion signal) is
   retried a bounded number of times in-process before the worker verifies
   the run's local restore point and parks it in `recovery_wait`. Failed capture
   keeps the execution active and retries with its source clone/session retained;

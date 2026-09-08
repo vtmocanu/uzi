@@ -3646,6 +3646,10 @@ export class RunRunner {
             }
             return false;
           }
+          // A statusless ACK (including HTTP204) proves neither a park nor a
+          // terminal handoff. Retain the session and retry after re-reading
+          // ownership: returning while it is still running would strand the row
+          // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
           // Bounded HTTP retries can fail while this worker keeps heartbeating.
           // Retain ownership and retry the idempotent park until its ACK is known.

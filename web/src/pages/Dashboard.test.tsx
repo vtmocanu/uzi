@@ -502,10 +502,9 @@ describe("Dashboard milestone badge (PRD #122)", () => {
   });
 });
 
-// PRD #1190: `paused` is non-terminal, but nothing runs while paused — so the recent-runs
-// row must NOT render the live `bg-ok animate-pulse` "now" strip for a paused run, the same
-// way it is hidden on a terminal run.
-describe("Dashboard live 'now' strip excludes a paused run (PRD #1190)", () => {
+// Non-terminal holds may retain current_activity from their last tool-use frame. None
+// should present that stale activity as live work (PRD #1190 and issue #1197).
+describe("Dashboard live 'now' strip excludes parked runs", () => {
   const flush = () => act(async () => { await new Promise((r) => setTimeout(r, 0)); });
   const activity = {
     agent: "coder",
@@ -524,17 +523,23 @@ describe("Dashboard live 'now' strip excludes a paused run (PRD #1190)", () => {
     await flush();
     expect(screen.getByText("Running now")).toBeTruthy();
     expect(screen.getByText("Wiring the collector")).toBeTruthy();
+    expect(screen.getByText("Running now").closest("li")?.querySelector(".bg-ok.animate-pulse")).toBeTruthy();
   });
 
-  it("hides the live now strip for a PAUSED run (nothing runs while paused)", async () => {
-    mockApi.listRuns.mockResolvedValue({
-      runs: [aRun({ issue_title: "Paused now", status: "paused", current_activity: activity })],
-    });
-    renderDashboard();
-    await flush();
-    expect(screen.getByText("Paused now")).toBeTruthy();
-    expect(screen.queryByText("Wiring the collector")).toBeNull();
-  });
+  it.each(["paused", "limit_wait", "pool_wait", "recovery_wait"] as const)(
+    "hides stale live activity on %s even when current_activity is populated",
+    async (status) => {
+      const title = `Held ${status}`;
+      mockApi.listRuns.mockResolvedValue({
+        runs: [aRun({ issue_title: title, status, current_activity: activity })],
+      });
+      renderDashboard();
+      await flush();
+      expect(screen.getByText(title)).toBeTruthy();
+      expect(screen.queryByText("Wiring the collector")).toBeNull();
+      expect(screen.getByText(title).closest("li")?.querySelector(".bg-ok.animate-pulse")).toBeNull();
+    },
+  );
 });
 
 describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () => {

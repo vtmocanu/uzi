@@ -374,16 +374,20 @@ export function Dashboard() {
               const msBadge = ms
                 ? milestoneBadgeText(ms, (r.milestones_in_progress?.length ?? 0) > 0)
                 : null;
-              // PRD #1064 M3: the "now" line under the title, for ANY non-terminal run
-              // that has a current_activity (the DTO field, present on the RunListItem).
-              // Hidden when null or terminal — a pre-feature run and a finished run read
-              // exactly as before (D5). The activity's untrusted fields render escaped
-              // through stripUnsafeChars.
+              // PRD #1064 M3: the "now" line under the title uses current_activity from
+              // the RunListItem. Hidden when null, terminal, or held; untrusted fields
+              // render escaped through stripUnsafeChars.
               const activity = r.current_activity;
-              // PRD #1190: a `paused` run is non-terminal but nothing runs while paused, so
-              // it must not render the live `bg-ok animate-pulse` "now" strip — exclude it
-              // alongside terminal runs.
-              const showNow = activity != null && !isTerminalRun(r.status) && r.status !== "paused";
+              // Verified 2026-09-08: the API includes all non-terminal runs in its last
+              // tool-use lookup, so holds can retain stale activity. The four waiting
+              // states must not turn that history into a pulsing live-work indicator.
+              const showNow =
+                activity != null &&
+                !isTerminalRun(r.status) &&
+                r.status !== "paused" &&
+                r.status !== "limit_wait" &&
+                r.status !== "pool_wait" &&
+                r.status !== "recovery_wait";
               const nowMilestone = firstInProgressMilestoneId(r);
               return (
               // Issue #485 NB1: RunIssueRef renders a real forge <a>, which cannot nest

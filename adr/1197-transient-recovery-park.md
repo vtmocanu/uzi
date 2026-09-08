@@ -53,6 +53,12 @@ a live worker heartbeat does not cause an abandoned running row to be
 requeued. Cancellation is reported through the existing terminal protocol;
 work is not discarded merely because a cancellation report failed.
 
+A statusless 2xx response is not a positive park acknowledgment. If the
+ownership probe still reports `running`, retain and retry the live execution;
+do not delete its session or release it on the strength of `applied` alone.
+Owner cancellation, authoritative terminal status and worker shutdown remain
+explicit exit paths. Verified with real HTTP 204 responses on 2026-09-08.
+
 Before model execution, record clone ownership in worker-owned bare Git
 configuration. Retain that record with an unverified clone on shutdown.
 A later same-run claim recaptures it before reseeding; a different run or

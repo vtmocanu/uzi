@@ -24129,7 +24129,7 @@ Cross-refs: PRD #1208 Decision Log (2026-09-08); §626 (PRD #1167, the appearanc
 Verified and integrated with the owner-pause status on 2026-09-08.
 
 - An autopilot approval writes its plan through an owned, source-status-guarded, agent-provenance-guarded query. An identical retry is idempotent; a different, blank, protected or stale body is refused. The worker implements only after the durable write is acknowledged.
-- Positively empty SDK turns retry with bounded backoff while retaining the observed session identity. Missing metrics or real model/tool activity are not empty-turn evidence; genuine cancellation and watchdog outcomes retain precedence.
+- Positively empty SDK turns require all five conditions: zero reported turns, no model/tool activity, no plan, no question and no completion signal. They retry with bounded backoff while retaining the observed session identity. Missing metrics are not empty-turn evidence; genuine cancellation and watchdog outcomes retain precedence. (Predicate clarified against `isPositivelyEmpty`, 2026-09-08.)
 - Exhausted empty-turn retries use non-terminal `recovery_wait`, with server-owned capped exponential backoff and automatic promotion. Recovery attempts have no terminal lifetime cap and do not pretend to be usage limits.
 - A promotable recovery park requires a verified restore point. Capture failure must preserve the source clone and session rather than deleting the only work copy; recovery retention does not suppress secret eviction or poller cleanup.
 - Stale running and approval reports cannot unpark `recovery_wait`. Both `paused` and `recovery_wait` remain in the thirteen-value status domain; involuntary recovery leaves a pending owner-pause request intact.

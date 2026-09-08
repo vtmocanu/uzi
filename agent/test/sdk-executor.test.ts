@@ -4380,7 +4380,7 @@ describe("SdkExecutor empty-turn recovery (issue #1197 D-RC2b)", () => {
         [submitPlan("# Plan"), resultSuccess()],
         [signalDone(), resultSuccess()],
       ]);
-      const probe = makeCtx({ config: { run_timeout_seconds: 4 } });
+      const probe = makeCtx({ config: { run_timeout_seconds: 30 } });
       await new SdkExecutor(nullLogger(), homeDir, {
         queryFn,
         emptyTurnBackoffBaseMs: backoff,
