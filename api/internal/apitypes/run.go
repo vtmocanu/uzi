@@ -238,7 +238,13 @@ type RunDTO struct {
 	Health       string     `json:"health"`
 	HealthReason *string    `json:"health_reason"`
 	HealthSince  *time.Time `json:"health_since"`
-	PlanMd       *string    `json:"plan_md"`
+	// DeadlineAt is the server-computed wall-clock deadline a running run will be
+	// stopped at (PRD #1170 D9): started_at + COALESCE(budget_wall_seconds, RUN_TIMEOUT)
+	// + budget_paused_seconds. Null when the run has no wall deadline (not running, a
+	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
+	// to it; the reason string stays static, so nothing stored ever ages (D4).
+	DeadlineAt *time.Time `json:"deadline_at"`
+	PlanMd     *string    `json:"plan_md"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB

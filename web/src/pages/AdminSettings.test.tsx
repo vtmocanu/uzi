@@ -50,7 +50,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
-  health_slow_seconds: "2700",
+  health_near_timeout_pct: "85",
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
@@ -379,7 +379,7 @@ describe("AdminSettings", () => {
       expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_stall_seconds: "120" }),
     );
     // Untouched thresholds are not sent.
-    expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("health_slow_seconds");
+    expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("health_near_timeout_pct");
   });
 
   it("rejects an out-of-range health threshold client-side and disables save (PRD #47)", async () => {
@@ -415,6 +415,32 @@ describe("AdminSettings", () => {
     fireEvent.click(btn);
     await waitFor(() =>
       expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_queued_seconds: "0" }),
+    );
+  });
+
+  it("rejects 100 for the near-timeout percent field and disables save (PRD #1170)", async () => {
+    // 100 discriminates the percent rule from the old seconds rule: the seconds validator
+    // accepted it, the percent validator rejects it (the sweeper fires the timeout at 100%).
+    renderPage();
+    const pct = (await screen.findByLabelText(/Near timeout at/i)) as HTMLInputElement;
+    fireEvent.change(pct, { target: { value: "100" } });
+
+    expect(screen.getByText(/between 50 and 99 percent/i)).toBeTruthy();
+    const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("accepts 50 for the near-timeout percent field and saves it (PRD #1170)", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ health_near_timeout_pct: "50" }));
+    renderPage();
+    const pct = (await screen.findByLabelText(/Near timeout at/i)) as HTMLInputElement;
+    fireEvent.change(pct, { target: { value: "50" } });
+
+    const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_near_timeout_pct: "50" }),
     );
   });
 });

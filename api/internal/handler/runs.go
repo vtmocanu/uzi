@@ -88,7 +88,7 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
 		item := apitypes.RunListItemDTO{
-			RunDTO:     runToDTO(row.Run, row.PriorityClass),
+			RunDTO:     runToDTO(row.Run, row.PriorityClass, h.cfg.RunTimeout),
 			RepoPath:   row.RepoPath,
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 		}
@@ -148,7 +148,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		email := row.OwnerEmail
 		item := apitypes.RunListItemDTO{
-			RunDTO:     runToDTO(row.Run, row.PriorityClass),
+			RunDTO:     runToDTO(row.Run, row.PriorityClass, h.cfg.RunTimeout),
 			RepoPath:   row.RepoPath,
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 			OwnerEmail: &email,

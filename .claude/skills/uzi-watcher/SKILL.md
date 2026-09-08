@@ -203,11 +203,10 @@ workflow-file pieces locally, because your own token has `workflow` scope (confi
 
 **A push-rejected run's work is usually NOT lost.** On hosted (k8s) workers the branch
 survives in the worker's persistent volume at `refs/uzi-runner/agent/issue-N` (the
-worker-side tracking ref — the branch tip with every commit); only the worker *container* is
-torn down, its data volume persists. Recovered #422's full 12 commits this way, 2026-08-20.
-Needs kube access to your deployment's worker namespace — **read the context and namespace
-from your own kubeconfig; they are deployment-specific, do not hard-code them** (and this is
-a public file).
+worker-side tracking ref); only the worker *container* is torn down, its data volume
+persists. Recovered #422's full 12 commits this way, 2026-08-20. Needs kube access to your
+deployment's worker namespace — **read the context and namespace from your own kubeconfig;
+they are deployment-specific, do not hard-code them** (and this is a public file).
 
 1. **Find the worker — but do NOT trust the run's *current* `worker_id` after a
    resume.** `uzi run get RUN --json | jq -r .worker_id` names the worker the run is
@@ -224,11 +223,19 @@ a public file).
    run was re-claimed on a fresh worker and cold-started from the default branch while its
    full reviewed tip sat on the previous worker's PVC; `jq .worker_id` pointed at the cold
    worker.) Its pod is `uzi-hw-WORKER_ID-*` in the worker namespace.
-2. **Bundle the branch out** of the bare clone on the worker's data volume, base excluded so
-   it stays small: `git --git-dir=BARE bundle create /tmp/r.bundle
-   refs/uzi-runner/agent/issue-N ^MERGEBASE` (where `MERGEBASE` = `git
-   --git-dir=BARE merge-base refs/uzi-runner/agent/issue-N refs/remotes/origin/main`),
-   then `kubectl cp` it out.
+2. **Bundle the branch out**, base excluded so it stays small. The bare tracking ref
+   advances only at checkpoint boundaries (milestone/iteration checkpoints, park, shutdown via
+   `fetchBackBestEffort`; finalize via `fetchAgentBranch`), not on every commit, so after a
+   hard mid-milestone kill the **working-clone branch HEAD** is the fresher committed tip. For
+   a run still claimed on the worker holding the clone, `scripts/backup-runs.sh RUN` is easiest
+   and also saves the uncommitted patch + untracked files separately. By hand (committed
+   history only; add `git -C <clone> diff HEAD` and an untracked tar for WIP):
+   `git --git-dir=/data/runner/<slug>/issue-N/.git bundle create /tmp/r.bundle <branch> --not
+   origin/main`. Use the bare ref when the current worker has no clone (cold-reassignment,
+   step 1 — `backup-runs.sh` searches only the current `worker_id` and skips terminal runs) or
+   the clone is gone: `git --git-dir=BARE bundle create /tmp/r.bundle
+   refs/uzi-runner/agent/issue-N ^MERGEBASE` (`MERGEBASE` = `git --git-dir=BARE merge-base
+   refs/uzi-runner/agent/issue-N refs/remotes/origin/main`). Then `kubectl cp` it out.
 3. **Fetch into a branch + an ISOLATED worktree** (never the `main` worktree): `git fetch
    BUNDLE 'refs/uzi-runner/agent/issue-N:refs/heads/recover/issue-N'`; `git worktree
    add DIR recover/issue-N`.
@@ -245,7 +252,8 @@ a public file).
 
 The remote `refs/uzi-checkpoints/agent/issue-N` ref is the other recovery source, but a
 behind-on-workflows run leaves none (its checkpoint push hit the same rejection). The PVC
-tracking ref is the reliable source.
+tracking ref is the reliable source once the run has checkpointed; before that, prefer the
+working-clone HEAD (step 2).
 
 The steps above are the **issue-run** shape; a **task run** (`uzi handoff`) uses
 `uzi/task/<RUN>` / `refs/uzi-runner/uzi/task/<RUN>` and often has its work entirely
@@ -377,6 +385,17 @@ by anything on the PR itself.
    runs carry **`repo_id` and `mr_iid`, never `issue_iid`** (their `branch`/`mr_web_url`/
    `source_run_id` may read null while running — do not key on those). A non-terminal one
    means uzi is on it.
+
+   **Handing a finding to `mr_rework` yourself: post it as a TOP-LEVEL PR comment, never an
+   inline one.** The trigger keys on ONE scalar high-water (`mr_rework_ledger.high_water`)
+   over GitHub's DISJOINT comment id sequences (top-level/issue vs inline-review vs
+   review-summary, `github_mr.go` Sources A/B/C). An inline finding is silently skipped when
+   a prior rework already consumed a higher-id top-level/issue comment (classically your own
+   `@coderabbitai review` nudges): its id sits below the mark, so GATE 3 in
+   `mr_review_watch.go` never fires and no run appears though the finding is the newest,
+   actionable comment. A fresh TOP-LEVEL PR comment lands above the mark and fires it.
+   Fail-safe (a skipped comment just falls back to human review), so the tell is silence, not
+   an error. Durable per-sequence-high-water fix tracked in #1199.
 2. **If uzi is (or is about to be) reworking, DEFER — do not fix locally, do not merge.**
    The trigger needs a green pipeline + settled review, so the run may not have spawned yet
    even though it will; if the findings are uzi-fixable (below) and the owner is opted in,

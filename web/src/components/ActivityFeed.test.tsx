@@ -194,11 +194,11 @@ describe("ActivityFeed crew roster", () => {
     expect(container.querySelector(".animate-pulse")).toBeNull();
   });
 
-  it("a `slow` run's active speaker still reads `working` — slow is wall-clock, not no-progress", () => {
-    // `slow` is a pure wall-clock signal: the server raises it at ~45 min
-    // (health_slow_seconds) regardless of activity, so a run can be `slow` while it is
-    // actively emitting. The currently-speaking lane is genuinely working and must keep
-    // its green pulsing dot — only `stalled`/`looping` (real no-progress) read amber.
+  it("a `slow` run's active speaker still reads `working` — near timeout is a budget fact, not no-progress", () => {
+    // Since PRD #1170 `slow` means "near timeout": the run has used most of its wall-clock
+    // budget while running — a fact about its deadline, not about activity — so a run can be
+    // `slow` while it is actively emitting. The currently-speaking lane is genuinely working
+    // and must keep its green pulsing dot — only `stalled`/`looping` (real no-progress) read amber.
     const { getByTitle, queryByTitle, container } = renderFeed([m(1, "text", { text: "hi" }, "lead")], {
       status: "running",
       health: "slow",

@@ -12,6 +12,7 @@ import {
   type StopKind,
 } from "./api";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
+import { formatCountdown } from "./limitWait";
 import { stripUnsafeChars } from "./safeText";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
@@ -247,7 +248,9 @@ export function formatElapsed(ms: number): string {
 const HEALTH_FLAG_LABELS: Record<Exclude<RunHealth, "ok">, string> = {
   stalled: "stalled",
   looping: "looping",
-  slow: "slow",
+  // PRD #1170: the `slow` enum value survives (D1) but every human word changes — it
+  // now means "near timeout" (has used most of its wall-clock budget while running).
+  slow: "near timeout",
   waiting_worker: "waiting for worker",
   approval_idle: "needs approval",
 };
@@ -261,7 +264,7 @@ const HEALTH_FLAG_LABELS: Record<Exclude<RunHealth, "ok">, string> = {
 // why this note is here. The server's ListActiveRunsForHealth is the same positive
 // allowlist, so nothing ever re-examines a parked run; the fix for that is the park
 // query CLEARING the health columns on entry, not making a park flaggable. The
-// detector's three signals (stalled / looping / slow) all describe a *running*
+// detector's signals (stalled / looping / near timeout) all describe a *running*
 // agent, and a run that is waiting on a clock by design would trip every one of
 // them. Adding the status here would put "⚠ stalled" on a run that is behaving
 // exactly as intended — the false alarm this design exists to avoid.
@@ -299,13 +302,36 @@ export type HealthFlaggable = {
   health_since: string | null;
   health_reason: string | null;
   status: string;
+  // PRD #1170: the server-computed wall-clock deadline for a RUNNING run, or null when
+  // the run's clock is not running (chat/judge/interactive, or not `running`). The
+  // near-timeout flag ("slow") counts DOWN to it; optional for api/web rollout skew —
+  // an older api pod omits it and the badge falls back to the since-flagged suffix.
+  deadline_at?: string | null;
 };
 
+// healthSuffix is the trailing clause on a flagged run's pill. For the NEAR-TIMEOUT flag
+// ("slow", PRD #1170) it counts DOWN to the run's server-computed deadline — `· 1h 5m
+// left`, or `· stopping` once the deadline has passed (the sweeper runs on a ticker, so a
+// passed deadline is a run waiting on the next tick, not a fault). When deadline_at is
+// absent (a pre-#1170 api pod — rollout skew) it falls back to the since-flagged elapsed,
+// which is the suffix every OTHER flag keeps unchanged ("stuck for Xm"). deadline_at must
+// not leak into any flag but near-timeout: a stalled run near its budget still counts up.
+function healthSuffix(run: HealthFlaggable, nowMs: number): string {
+  if (run.health === "slow" && run.deadline_at != null) {
+    const countdown = formatCountdown(run.deadline_at, nowMs);
+    return countdown ? ` · ${countdown} left` : " · stopping";
+  }
+  return run.health_since
+    ? ` · ${formatElapsed(nowMs - Date.parse(run.health_since))}`
+    : "";
+}
+
 // healthBadge is the warn-variant pill for a flagged run (PRD #47): `⚠ <label> ·
-// <elapsed-since-flagged>` in the warn tone, keeping the pulse so it still reads as
-// live. Returns null when the run is healthy or not in a flaggable status, so the
-// caller falls through to the normal status badge. The elapsed counts from
-// health_since ("stuck for Xm"), not created_at. title carries the owner-only
+// <suffix>` in the warn tone, keeping the pulse so it still reads as live. Returns null
+// when the run is healthy or not in a flaggable status, so the caller falls through to
+// the normal status badge. The suffix is a countdown to the deadline for near timeout
+// (PRD #1170) and the since-flagged elapsed ("stuck for Xm", from health_since not
+// created_at) for every other flag — see healthSuffix. title carries the owner-only
 // reason when present (a non-owner's health_reason is null → no tooltip).
 export function healthBadge(
   run: HealthFlaggable,
@@ -313,12 +339,9 @@ export function healthBadge(
 ): RunBadge | null {
   if (!shouldShowHealthFlag(run.health, run.status)) return null;
   const label = healthFlagLabel(run.health);
-  const elapsed = run.health_since
-    ? ` · ${formatElapsed(nowMs - Date.parse(run.health_since))}`
-    : "";
   return {
     kind: "badge",
-    label: `⚠ ${label}${elapsed}`,
+    label: `⚠ ${label}${healthSuffix(run, nowMs)}`,
     tone: "warning",
     pulse: true,
     title: badgeTitle(run.health_reason),
@@ -378,7 +401,7 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
   }
   const eff = effectiveRunStatus(run);
   // A health flag overrides the normal status label while the run is alive but looks
-  // slow/stuck/looping (PRD #47). Only ever fires for a flaggable status.
+  // stuck, looping, or near its timeout (PRD #47, #1170). Only fires for a flaggable status.
   //
   // issue #750: EXCEPT while a run is revising. A run re-planning after a revise keeps
   // raw status `awaiting_approval` (so it is still health-flaggable) even though

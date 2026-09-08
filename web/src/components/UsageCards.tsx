@@ -19,6 +19,32 @@ function breakdown(u: RunUsage): { fresh: number; cached: number; out: number; t
   return { fresh, cached, out, total: fresh + cached + out, cost: u.cost_usd };
 }
 
+// Largest-remainder (Hamilton) rounding: integer percentages that sum to exactly
+// 100. Floor each row's raw share, then award the leftover point(s) to the largest
+// fractional remainders. Deterministic tie-break (the leftover often ties): larger
+// raw total first, then row order — so per-row output is pinnable. Integer-exact
+// (remainder == total*100 % factoryTotal) so ties compare exactly. Guards a
+// non-positive factory total to all zeros; forcing 100 is correct only because the
+// rows partition the factory total (AdminUsagePerUser and AdminUsageTotals sum the
+// same non-chat runs).
+function tokenShares(totals: number[], factoryTotal: number): number[] {
+  if (factoryTotal <= 0) return totals.map(() => 0);
+  const scaled = totals.map((t) => t * 100);
+  const floors = scaled.map((s) => Math.floor(s / factoryTotal));
+  const remainders = scaled.map((s, i) => s - floors[i] * factoryTotal); // exact s % factoryTotal
+  const leftover = 100 - floors.reduce((a, b) => a + b, 0);
+  const order = totals
+    .map((_, i) => i)
+    .sort((a, b) => {
+      if (remainders[b] !== remainders[a]) return remainders[b] - remainders[a]; // largest remainder first
+      if (totals[b] !== totals[a]) return totals[b] - totals[a]; // then larger raw total
+      return a - b; // then row order
+    });
+  const shares = floors.slice();
+  for (let k = 0; k < leftover && k < shares.length; k++) shares[order[k]] += 1;
+  return shares;
+}
+
 // Decision 8: a $0 cost (subscription auth) with nonzero tokens renders "—", never a
 // misleading "$0.00".
 const money = (usd: number): string => (usd > 0 ? formatCost(usd) : "—");
@@ -125,6 +151,7 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
   const demo = useDemoMode();
   const factory = breakdown(admin.factory.lifetime);
   const rows = admin.users.map((u) => ({ ...u, b: breakdown(u.usage) }));
+  const shares = tokenShares(rows.map((r) => r.b.total), factory.total);
   return (
     <Card>
       <SectionTitle>Per-user breakdown · admin</SectionTitle>
@@ -144,9 +171,10 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
               </tr>
             </thead>
             <tbody>
-              {rows.map((u) => {
+              {rows.map((u, i) => {
                 // Share is by total tokens (not cost) — matches the mock's percentages.
-                const pct = factory.total > 0 ? Math.round((u.b.total / factory.total) * 100) : 0;
+                // Largest-remainder rounding (see tokenShares) so the column sums to 100%.
+                const pct = shares[i];
                 return (
                   <tr key={u.user_id}>
                     <Td left>{maskEmail(u.email, demo)}</Td>

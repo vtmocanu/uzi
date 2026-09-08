@@ -24,7 +24,7 @@ func TestRunToDTOPrdLink(t *testing.T) {
 			ID:                uuid.New(),
 			PrdDonePath:       pgtype.Text{String: "prds/done/72-x.md", Valid: true},
 			PrdPatchSettledAt: pgtype.Timestamptz{Time: settled, Valid: true},
-		}, "normal")
+		}, "normal", 0)
 		if dto.PrdDonePath == nil || *dto.PrdDonePath != "prds/done/72-x.md" {
 			t.Fatalf("prd_done_path = %v, want prds/done/72-x.md", dto.PrdDonePath)
 		}
@@ -34,7 +34,7 @@ func TestRunToDTOPrdLink(t *testing.T) {
 	})
 
 	t.Run("neither set: both nil", func(t *testing.T) {
-		dto := runToDTO(store.Run{ID: uuid.New()}, "normal")
+		dto := runToDTO(store.Run{ID: uuid.New()}, "normal", 0)
 		if dto.PrdDonePath != nil {
 			t.Fatalf("prd_done_path = %v, want nil — a run that moved no PRD must not fabricate a path", *dto.PrdDonePath)
 		}
@@ -59,7 +59,7 @@ func TestRunToDTOHasPRDLink(t *testing.T) {
 			ID:               uuid.New(),
 			IssueIid:         pgtype.Int8{Int64: 764, Valid: true},
 			IssueDescription: "Fixes the thing.\n\nSpec: prds/764-uzi-eligibility-label.md",
-		}, "normal")
+		}, "normal", 0)
 		if !dto.HasPRDLink {
 			t.Fatalf("HasPRDLink = false, want true for a description linking prds/764-uzi-eligibility-label.md")
 		}
@@ -84,7 +84,7 @@ func TestRunToDTOHasPRDLink(t *testing.T) {
 		dto := runToDTO(store.Run{
 			ID:               uuid.New(),
 			IssueDescription: "A chat run with no issue and no prds reference at all.",
-		}, "normal")
+		}, "normal", 0)
 		if dto.HasPRDLink {
 			t.Fatalf("HasPRDLink = true, want false for a description with no prds link")
 		}
@@ -112,7 +112,7 @@ func TestRunToDTOHasPRDLink(t *testing.T) {
 		dto := runToDTO(store.Run{
 			ID:               uuid.New(),
 			IssueDescription: "Please review prds/764-uzi-eligibility-label.md and improve it.",
-		}, "normal")
+		}, "normal", 0)
 		if dto.HasPRDLink {
 			t.Fatalf("HasPRDLink = true, want false for an issue-less run even though its prompt links a prds/*.md")
 		}

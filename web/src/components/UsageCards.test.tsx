@@ -102,4 +102,32 @@ describe("FactoryTotalCard + PerUserUsageTable", () => {
     // One share bar per user, labelled as a fraction of factory tokens.
     expect(container.querySelectorAll('[aria-label$="of factory tokens"]').length).toBe(2);
   });
+
+  it("per-user SHARE% uses largest-remainder rounding so the column sums to exactly 100%", () => {
+    // factory total 1000; user totals 905 / 85 / 10 -> raw 90.5 / 8.5 / 1.0.
+    // Naive per-row Math.round = 91 + 9 + 1 = 101; Hamilton = 91 + 8 + 1 = 100.
+    // The leftover point ties (0.5 vs 0.5); the tie-break awards it to the larger
+    // raw total (905), pinning the exact per-row values below.
+    const admin3: AdminUsage = {
+      factory: { lifetime: bundle(1000, 0, 0, 0), last_7_days: bundle(0, 0, 0, 0), run_count: 3 },
+      users: [
+        { user_id: "a", email: "a@x", usage: bundle(905, 0, 0, 0), run_count: 1 },
+        { user_id: "b", email: "b@x", usage: bundle(85, 0, 0, 0), run_count: 1 },
+        { user_id: "c", email: "c@x", usage: bundle(10, 0, 0, 0), run_count: 1 },
+      ],
+      earliest_run: null,
+    };
+    const { container } = wrap(<PerUserUsageTable admin={admin3} />);
+    const labels = Array.from(container.querySelectorAll('[aria-label$="of factory tokens"]')).map((el) =>
+      el.getAttribute("aria-label"),
+    );
+    expect(labels).toEqual([
+      "91 percent of factory tokens",
+      "8 percent of factory tokens",
+      "1 percent of factory tokens",
+    ]);
+    // Bar width reads the same corrected value (not the naive 91/9/1).
+    const firstBar = container.querySelector('[aria-label="91 percent of factory tokens"] > span') as HTMLElement | null;
+    expect(firstBar?.style.width).toBe("91%");
+  });
 });

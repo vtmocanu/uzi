@@ -24,6 +24,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // defaultColumnColor is used when a user adds a brand-new column whose label
@@ -137,6 +138,11 @@ type latestRunDTO struct {
 	Health       string     `json:"health"`
 	HealthReason *string    `json:"health_reason"`
 	HealthSince  *time.Time `json:"health_since"`
+	// DeadlineAt is the server-computed wall-clock deadline a running run will be stopped
+	// at (PRD #1170 D9), null when the run has no wall deadline (not running, chat/judge/
+	// interactive, or no started_at). Non-sensitive like HealthSince, so it rides the
+	// shared card unconditionally; the near-timeout badge counts down to it.
+	DeadlineAt *time.Time `json:"deadline_at"`
 	// IsPlanning is issue #321's planning-phase display flag on the board card;
 	// non-sensitive, rides the shared card unconditionally like Status. Server-computed
 	// (running, iteration_count 0, no persisted plan yet; chat/judge excluded).
@@ -165,7 +171,7 @@ type latestRunDTO struct {
 // the email (PRD #33 Decision 5): a shared board must not leak another user's email
 // on a card, and the web already renders a no-owner badge for empty. The query no
 // longer even selects the email, so there is nothing to fall back to here.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind, stopReason pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind, stopReason pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds int32, interactive bool, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID, globalTimeout time.Duration) *latestRunDTO {
 	dto := &latestRunDTO{
 		ID:          runID.String(),
 		Status:      status,
@@ -174,12 +180,15 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 		StopKind:    textPtrValue(stopKind.Valid, stopKind.String),
 		Health:      health,
 		HealthSince: timePtr(healthSince.Valid, healthSince.Time),
-		IsPlanning:  isPlanningPhase(kind, status, iterationCount, hasPlanMd),
-		WorkerName:  textPtrValue(workerName.Valid, workerName.String),
-		IsMine:      ownerID == viewerID,
-		RunCount:    runCount,
-		CreatedAt:   createdAt.Time,
-		UpdatedAt:   updatedAt.Time,
+		// PRD #1170: the wall-clock deadline the near-timeout badge counts down to; nil
+		// for a run with no wall deadline (not running, chat/judge/interactive, no start).
+		DeadlineAt: workersvc.RunDeadline(startedAt, budgetWallSeconds, budgetPausedSeconds, kind, interactive, status, globalTimeout),
+		IsPlanning: isPlanningPhase(kind, status, iterationCount, hasPlanMd),
+		WorkerName: textPtrValue(workerName.Valid, workerName.String),
+		IsMine:     ownerID == viewerID,
+		RunCount:   runCount,
+		CreatedAt:  createdAt.Time,
+		UpdatedAt:  updatedAt.Time,
 	}
 	// failure_reason and health_reason are owner-only (Decisions 5 & 6): both can carry
 	// text about the owner (a verbatim reject reason, a raw agent error, "your vault is
@@ -448,7 +457,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	// repo.UserID is the board viewer (the connection owner); IsMine gates the
 	// owner-only run-view link. repo.ForgeType stamps every card's forge for the
 	// per-card MR/PR noun (all cards on one board share the repo's connection).
-	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType, revising)
+	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType, revising, h.cfg.RunTimeout)
 
 	return boardDTO{
 		RepoID:         repo.ID.String(),
@@ -567,12 +576,13 @@ func nonNilAssigneeIDs(ids []int64) []int64 {
 // resolves each card's column. viewerID drives IsMine. revising is the set of run
 // ids whose latest plan-ish message is a plan_revising (issue #750); a nil map leaves
 // every IsRevising false.
-func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, position map[string]int, viewerID uuid.UUID, forgeType string, revising map[uuid.UUID]bool) []cardDTO {
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, position map[string]int, viewerID uuid.UUID, forgeType string, revising map[uuid.UUID]bool, globalTimeout time.Duration) []cardDTO {
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		dto := mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
 			rr.MrState, rr.FailureReason, rr.StopKind, rr.StopReason, rr.Health, rr.HealthReason, rr.HealthSince,
-			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
+			rr.StartedAt, rr.BudgetWallSeconds, rr.BudgetPausedSeconds, rr.Interactive,
+			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID, globalTimeout)
 		dto.IsRevising = revising[rr.ID] // nil map ⇒ false (issue #750)
 		latestByIID[rr.IssueIid.Int64] = dto
 	}
@@ -973,7 +983,8 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince,
-			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.Interactive,
+			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
@@ -1077,7 +1088,8 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince,
-			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.Interactive,
+			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for promoted card", "error", err)

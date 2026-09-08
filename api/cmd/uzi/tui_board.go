@@ -545,7 +545,7 @@ func (m tuiModel) versionClientOnly() string {
 
 const (
 	boardIDWidth         = 8  // short run id (first 8 of the UUID)
-	boardStatusWordWidth = 12 // status word cell (fits the longest word, "rate-limited")
+	boardStatusWordWidth = 12 // status word cell (fits the longest words, "rate-limited" / "near timeout")
 	boardAgeWidth        = 4  // AGE cell (relAge, single-unit)
 	boardMileWidth       = 9  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or done/total | –/N text above that)
 	boardMileCap         = 9  // above this many milestones the micro-bar falls back to N/M text

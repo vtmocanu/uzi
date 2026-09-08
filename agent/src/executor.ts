@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
+import type { CodexExecutionSafety } from "./harness.js";
 import type {
   AgentSelection,
   AgentSource,
@@ -470,6 +471,9 @@ export interface Executor {
    * it; the SDK executor also self-reaps in its own run() finally.
    */
   killAgentTree?(): void;
+  /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;
+   * absence preserves Claude/stub callers (they take the literal legacy killAgentTree branch). */
+  safety?: CodexExecutionSafety;
 }
 
 /**

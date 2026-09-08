@@ -1,12 +1,18 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  COMMAND_UID,
+  RUNNER_UID,
+  WORKER_UID,
+  commandRootCommand,
   killRunnerGroup,
   runnerCommand,
   runnerPath,
   runnerTmpdir,
+  setprivArgsForUid,
   setprivRunnerArgs,
   uidSplitActive,
+  workerBoundaryCommand,
 } from "../src/runner-uid.js";
 
 // PRD #51 M4 — the worker→runner uid boundary primitive. The split is gated on
@@ -125,5 +131,92 @@ describe("runner-uid: split detection", () => {
     assert.equal(killRunnerGroup(undefined), false);
     assert.equal(killRunnerGroup(0), false);
     assert.equal(killRunnerGroup(-5), false);
+  });
+});
+
+// PRD #1171 (M3, plan §2.8) — the Codex adapter parameterizes the setpriv identity so
+// three OS identities share ONE flag discipline: provider roots stay `runner`
+// (unchanged), command roots become `runner-cmd` (COMMAND_UID), and credentialed
+// boundary actions run UNWRAPPED as the already-`worker` process.
+describe("runner-uid: codex command/boundary identities (#1171)", () => {
+  // The EXACT argv setprivRunnerArgs produced before #1171. Byte-for-byte pinned so a
+  // future refactor of setprivArgsForUid cannot silently change the established #51
+  // Claude/launcher path (drift guard).
+  const RUNNER_SETPRIV_LITERAL = [
+    "--reuid", "runner",
+    "--regid", "runner",
+    "--init-groups",
+    "--bounding-set", "-all",
+    "--inh-caps", "-all",
+    "--ambient-caps", "-all",
+    "--",
+  ];
+
+  let savedSplit: string | undefined;
+  beforeEach(() => {
+    savedSplit = process.env.UZI_UID_SPLIT;
+    delete process.env.UZI_UID_SPLIT;
+  });
+  afterEach(() => {
+    if (savedSplit === undefined) delete process.env.UZI_UID_SPLIT;
+    else process.env.UZI_UID_SPLIT = savedSplit;
+  });
+
+  it("uid consts match the image-baked accounts (Dockerfile:37-46)", () => {
+    assert.equal(RUNNER_UID, 10002);
+    assert.equal(COMMAND_UID, 10003);
+    assert.equal(WORKER_UID, 10001);
+  });
+
+  it("DRIFT GUARD: setprivRunnerArgs output is byte-for-byte the pre-#1171 literal", () => {
+    assert.deepEqual(setprivRunnerArgs(), RUNNER_SETPRIV_LITERAL);
+  });
+
+  it("setprivRunnerArgs is exactly setprivArgsForUid(RUNNER_UID) — one source of truth", () => {
+    assert.deepEqual(setprivRunnerArgs(), setprivArgsForUid(RUNNER_UID));
+  });
+
+  it("setprivArgsForUid(COMMAND_UID) reuids/regids to 10003 with the same cap discipline", () => {
+    assert.deepEqual(setprivArgsForUid(COMMAND_UID), [
+      "--reuid", "10003",
+      "--regid", "10003",
+      "--init-groups",
+      "--bounding-set", "-all",
+      "--inh-caps", "-all",
+      "--ambient-caps", "-all",
+      "--",
+    ]);
+  });
+
+  it("commandRootCommand is a PASSTHROUGH single-uid (no setpriv)", () => {
+    const { command, args } = commandRootCommand("bash", ["-c", "ls"]);
+    assert.equal(command, "bash");
+    assert.deepEqual(args, ["-c", "ls"]);
+  });
+
+  it("commandRootCommand wraps in setpriv-to-10003 under the split", () => {
+    process.env.UZI_UID_SPLIT = "1";
+    const { command, args } = commandRootCommand("bash", ["-c", "ls"]);
+    assert.equal(command, "/bin/setpriv");
+    assert.deepEqual(args, [...setprivArgsForUid(COMMAND_UID), "bash", "-c", "ls"]);
+    const s = args.join(" ");
+    assert.match(s, /--reuid 10003/);
+    assert.match(s, /--regid 10003/);
+    // Distinct from the provider `runner` uid — the OS boundary, not name/glob.
+    assert.doesNotMatch(s, /--reuid runner/);
+    assert.ok(args.indexOf("--") < args.indexOf("bash"), "the command must follow the -- separator");
+  });
+
+  it("workerBoundaryCommand is UNWRAPPED in BOTH modes (the worker IS uid 10001)", () => {
+    // The credentialed boundary root must run as the PAT holder itself — no setpriv.
+    assert.deepEqual(workerBoundaryCommand("git", ["push", "origin", "HEAD"]), {
+      command: "git",
+      args: ["push", "origin", "HEAD"],
+    });
+    process.env.UZI_UID_SPLIT = "1";
+    assert.deepEqual(workerBoundaryCommand("git", ["push", "origin", "HEAD"]), {
+      command: "git",
+      args: ["push", "origin", "HEAD"],
+    });
   });
 });

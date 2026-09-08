@@ -446,10 +446,67 @@ describe("runBadge health warn variant (PRD #47)", () => {
   it("labels every flag", () => {
     expect(healthFlagLabel("stalled")).toBe("stalled");
     expect(healthFlagLabel("looping")).toBe("looping");
-    expect(healthFlagLabel("slow")).toBe("slow");
+    // PRD #1170: the `slow` enum value survives (D1) but its human word is "near timeout".
+    expect(healthFlagLabel("slow")).toBe("near timeout");
     expect(healthFlagLabel("waiting_worker")).toBe("waiting for worker");
     expect(healthFlagLabel("approval_idle")).toBe("needs approval");
     expect(healthFlagLabel("ok")).toBeNull();
+  });
+
+  // PRD #1170: the near-timeout flag ("slow") counts DOWN to deadline_at instead of the
+  // since-flagged elapsed. NOW is 12:04:00Z; a deadline 1h05m out is 13:09:00Z.
+  it("near timeout (slow) counts down to deadline_at: ⚠ near timeout · 1h 5m left", () => {
+    const b = healthBadge(
+      run({
+        status: "running",
+        health: "slow",
+        // 3m before NOW — deliberately DIFFERENT from the 1h 5m countdown so the two
+        // numbers can never coincide and mask a since-flagged fallback.
+        health_since: "2026-07-04T12:01:00Z",
+        deadline_at: "2026-07-04T13:09:00Z", // 1h 5m after NOW
+      }),
+      NOW,
+    );
+    expect(b).toMatchObject({ label: "⚠ near timeout · 1h 5m left", tone: "warning", pulse: true });
+  });
+
+  it("near timeout past its deadline reads ⚠ near timeout · stopping", () => {
+    const b = healthBadge(
+      run({
+        status: "running",
+        health: "slow",
+        health_since: "2026-07-04T12:01:00Z",
+        deadline_at: "2026-07-04T12:03:00Z", // 1m BEFORE NOW → the deadline has passed
+      }),
+      NOW,
+    );
+    expect(b).toMatchObject({ label: "⚠ near timeout · stopping" });
+  });
+
+  it("near timeout with no deadline_at falls back to the since-flagged suffix (rollout skew)", () => {
+    const b = healthBadge(
+      run({
+        status: "running",
+        health: "slow",
+        health_since: "2026-07-04T12:03:00Z", // 1m before NOW
+        // deadline_at absent — an older api pod that predates PRD #1170.
+      }),
+      NOW,
+    );
+    expect(b).toMatchObject({ label: "⚠ near timeout · 1m" });
+  });
+
+  it("deadline_at does NOT leak into another flag: stalled still counts up from health_since", () => {
+    const b = healthBadge(
+      run({
+        status: "running",
+        health: "stalled",
+        health_since: "2026-07-04T12:03:00Z", // 1m before NOW
+        deadline_at: "2026-07-04T13:09:00Z", // present, but must be ignored for stalled
+      }),
+      NOW,
+    );
+    expect(b).toMatchObject({ label: "⚠ stalled · 1m" });
   });
 
   it("a healthy run keeps its normal status badge (no ⚠)", () => {

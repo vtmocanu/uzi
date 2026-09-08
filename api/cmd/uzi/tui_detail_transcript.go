@@ -406,8 +406,11 @@ func (m tuiModel) transcriptViewport() int {
 		return strings.Count(s, "\n") + 1
 	}
 	chrome := len(m.detailHeaderLines()) // the priority header: always 1 row (detailHeaderLines)
-	if limitWaitLine(m.detail.run, time.Now()) != "" {
-		chrome++ // the park / limit-wait line
+	if limitWaitLine(m.detail.run, time.Now()) != "" || nearTimeoutLine(m.detail.run, time.Now()) != "" {
+		chrome++ // the park / limit-wait line, or the near-timeout row (PRD #1170) — mutually
+		// exclusive (a limit_wait run is not running, so it has no deadline_at), so the two
+		// together still add at most one physical row that renderDetail must be charged for.
+		// The width-shed fitNearTimeoutLine draws the same single row; presence is width-free.
 	}
 	if m.transportLine() != "" {
 		chrome++ // the degraded transport line (a healthy "live"/"connecting…" folds into the header)

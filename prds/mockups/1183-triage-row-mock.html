@@ -1,0 +1,1000 @@
+<title>Judge & Findings Triage Row</title>
+<style>
+  /* uzi's shipped "ember" tokens (web/src/index.css). uzi is a dark-only product, so this
+     mock commits to that one world and paints every colour explicitly. */
+  :root {
+    color-scheme: dark;
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.45;
+  }
+  .page { max-width: 1500px; margin: 0 auto; padding: 36px 28px 72px; display: flex; flex-direction: column; gap: 44px; }
+
+  /* ── page chrome ─────────────────────────────────────────────── */
+  .lede .eyebrow { margin: 0 0 8px; font-size: .68rem; letter-spacing: .1em; text-transform: uppercase; font-weight: 650; color: rgb(var(--brand)); }
+  .lede h1 { margin: 0 0 10px; font-size: 1.6rem; font-weight: 650; letter-spacing: -.02em; text-wrap: balance; max-width: 30ch; }
+  .lede p { margin: 0; color: rgb(var(--muted)); max-width: 68ch; font-size: .95rem; }
+  .lede p + p { margin-top: 6px; }
+  .pair h2 { margin: 0 0 12px; font-size: 1.05rem; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .pair h2 .glyph { color: rgb(var(--brand)); }
+  .pair h2 code { font-family: var(--font-mono); font-size: .78rem; color: rgb(var(--faint)); font-weight: 400; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 1080px) { .cols { grid-template-columns: 1fr; } }
+
+  .notes { margin: 14px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px 26px; }
+  .notes li { display: flex; gap: 10px; font-size: .86rem; color: rgb(var(--muted)); line-height: 1.5; }
+  .notes li b { color: rgb(var(--fg)); font-weight: 600; }
+  .notes li .mark { margin-top: 3px; }
+  .mark {
+    display: inline-flex; align-items: center; justify-content: center; flex: none;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: rgb(var(--brand)); color: rgb(var(--on-brand));
+    font-size: .68rem; font-weight: 700; margin-left: 4px; vertical-align: middle; line-height: 1;
+  }
+
+  /* ── frames: one app screen each ─────────────────────────────── */
+  .frame { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; min-width: 0; }
+  .frame.after { border-color: rgb(var(--brand) / .45); }
+  .frame-bar {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    padding: 8px 14px; border-bottom: 1px solid rgb(var(--edge));
+    font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 650; color: rgb(var(--muted));
+  }
+  .frame.after .frame-bar { color: rgb(var(--brand)); background: rgb(var(--brand) / .06); border-bottom-color: rgb(var(--brand) / .25); }
+  .frame-bar code { text-transform: none; letter-spacing: 0; font-weight: 400; font-family: var(--font-mono); font-size: .68rem; color: rgb(var(--faint)); }
+  .app { padding: 18px 18px 22px; font-size: 13px; display: flex; flex-direction: column; gap: 14px; }
+  .app h3 { margin: 0; font-size: 1.15rem; font-weight: 600; letter-spacing: -.01em; display: flex; gap: 8px; align-items: center; }
+  .app h3 .glyph { color: rgb(var(--brand)); }
+  .app h3 .glyph.bug { color: rgb(var(--info)); }
+  .app .desc { margin: 0; color: rgb(var(--muted)); }
+  .omitted { border: 1px dashed rgb(var(--edge-strong)); border-radius: 8px; padding: 6px 12px; font-size: .72rem; color: rgb(var(--faint)); }
+
+  .strip { border: 1px solid rgb(var(--edge)); border-radius: var(--radius); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .strip .lab { display: flex; justify-content: space-between; gap: 10px; font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; font-weight: 650; color: rgb(var(--muted)); }
+  .strip .lab span:last-child { text-transform: none; letter-spacing: 0; font-weight: 400; color: rgb(var(--faint)); }
+  .bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; }
+  .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; color: rgb(var(--faint)); }
+  .legend b { color: rgb(var(--fg)); font-size: .95rem; letter-spacing: 0; margin-right: 4px; font-variant-numeric: tabular-nums; }
+  .legend .plain { text-transform: none; letter-spacing: 0; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+
+  .selector { display: flex; align-items: center; gap: 10px; }
+  .selector .lab { font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; font-weight: 650; color: rgb(var(--muted)); }
+  .select { border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); border-radius: 6px; padding: 4px 10px; font-size: .82rem; }
+  .select::after { content: " ⌄"; color: rgb(var(--faint)); }
+
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid rgb(var(--edge)); }
+  .tab { padding: 8px 12px; margin-bottom: -1px; border-bottom: 2px solid transparent; color: rgb(var(--faint)); font-weight: 500; font-size: .9rem; }
+  .tab.active { color: rgb(var(--fg)); border-bottom-color: rgb(var(--brand)); }
+  .tab.active.info { border-bottom-color: rgb(var(--info)); }
+  .tab .n { color: rgb(var(--faint)); margin-left: 6px; font-variant-numeric: tabular-nums; }
+  .bridge { margin: 0; color: rgb(var(--muted)); font-size: .86rem; }
+  .repohead { margin: 0; font-family: var(--font-mono); font-size: .72rem; font-weight: 600; color: rgb(var(--muted)); }
+
+  .rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .row { border: 1px solid rgb(var(--edge)); border-radius: 8px; background: rgb(var(--raised) / .4); }
+  .row-head { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; flex-wrap: wrap; }
+  .cb { width: 15px; height: 15px; border: 1px solid rgb(var(--edge-strong)); border-radius: 3px; margin-top: 3px; flex: none; background: rgb(var(--surface)); position: relative; }
+  .cb.on { background: rgb(var(--brand)); border-color: rgb(var(--brand)); }
+  .cb.on::after { content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px; border: solid rgb(var(--on-brand)); border-width: 0 2px 2px 0; transform: rotate(45deg); }
+  .main { flex: 1 1 240px; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .title { margin: 0; font-weight: 500; }
+  .badge { display: inline-flex; align-items: center; gap: 4px; border: 1px solid; border-radius: 999px; padding: 1px 8px; font-size: .7rem; font-weight: 500; white-space: nowrap; line-height: 1.5; }
+  .b-info { border-color: rgb(var(--info) / .4); background: rgb(var(--info) / .1); color: rgb(var(--info)); }
+  .b-ok { border-color: rgb(var(--ok) / .4); background: rgb(var(--ok) / .1); color: rgb(var(--ok)); }
+  .b-warn { border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .1); color: rgb(var(--warn)); }
+  .b-danger { border-color: rgb(var(--danger) / .4); background: rgb(var(--danger) / .1); color: rgb(var(--danger)); }
+  .b-brand { border-color: rgb(var(--brand) / .4); background: rgb(var(--brand) / .1); color: rgb(var(--brand)); }
+  .b-neutral { border-color: rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--muted)); }
+  .link { color: rgb(var(--info)); text-decoration: underline; text-underline-offset: 2px; font-size: .72rem; font-weight: 500; white-space: nowrap; }
+  .code { font-family: var(--font-mono); font-size: .72rem; background: rgb(var(--raised)); border-radius: 4px; padding: 2px 6px; color: rgb(var(--fg)); }
+  .code.loc { color: rgb(var(--faint)); overflow-wrap: anywhere; }
+  .faint { color: rgb(var(--faint)); font-size: .72rem; }
+  .preview { margin: 0; color: rgb(var(--muted)); font-size: .86rem; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .preview.prose { display: block; }
+  .actions { display: flex; align-items: center; gap: 6px; flex: none; margin-left: auto; flex-wrap: wrap; }
+  .actions.left { margin-left: 0; }
+  .btn { display: inline-flex; align-items: center; gap: 4px; height: 28px; padding: 0 10px; border-radius: 6px; font-size: .75rem; font-weight: 500; border: 1px solid transparent; white-space: nowrap; }
+  .btn-secondary { border-color: rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--fg)); }
+  .btn-primary { background: rgb(var(--brand)); color: rgb(var(--on-brand)); }
+  .btn-ghost { color: rgb(var(--muted)); }
+  .chev { color: rgb(var(--faint)); padding: 0 4px; font-size: .9rem; }
+  .stack { display: flex; flex-direction: column; gap: 8px; padding: 0 12px 10px; }
+  .stack .actions { margin-left: 0; }
+  .resolved { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 0 12px 10px; font-size: .72rem; color: rgb(var(--faint)); }
+  .resolved .undo { text-decoration: underline; text-underline-offset: 2px; font-weight: 500; }
+
+  .filedbox { border: 1px solid rgb(var(--ok) / .4); background: rgb(var(--ok) / .1); border-radius: 8px; padding: 6px 12px; font-size: .82rem; color: rgb(var(--ok)); }
+  .filedbox.small { font-size: .72rem; padding: 5px 10px; }
+  .filedbox b { font-weight: 600; }
+  .filedbox .dim { color: rgb(var(--ok) / .8); }
+
+  .occs { list-style: none; margin: 0; padding: 10px 12px; border-top: 1px solid rgb(var(--edge)); display: flex; flex-direction: column; gap: 8px; }
+  .occ { border: 1px solid rgb(var(--edge)); background: rgb(var(--surface) / .6); border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+  .occ .line { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .occ .run { font-weight: 500; font-size: .82rem; text-decoration: underline; text-underline-offset: 2px; text-decoration-color: rgb(var(--edge-strong)); }
+
+  .menu-wrap { position: relative; }
+  .menu { position: absolute; right: 0; top: calc(100% + 4px); width: 228px; background: rgb(var(--surface)); border: 1px solid rgb(var(--edge-strong)); border-radius: 8px; padding: 4px; box-shadow: 0 12px 30px rgb(0 0 0 / .55); z-index: 5; }
+  .mi { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 6px; font-size: .82rem; color: rgb(var(--fg)); }
+  .mi.hover { background: rgb(var(--raised)); }
+  .mi small { color: rgb(var(--faint)); font-size: .7rem; }
+
+  .draft { margin: 0 12px 12px; border: 1px solid rgb(var(--brand) / .4); background: rgb(var(--brand) / .06); border-radius: 10px; overflow: hidden; }
+  .draft-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 12px; background: rgb(var(--brand) / .1); border-bottom: 1px solid rgb(var(--brand) / .2); font-size: .72rem; font-weight: 600; color: rgb(var(--brand)); }
+  .draft-body { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .field label { display: block; font-size: .7rem; color: rgb(var(--muted)); margin-bottom: 4px; }
+  .input { border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); border-radius: 6px; padding: 6px 8px; font-size: .8rem; color: rgb(var(--fg)); }
+  .input.mono { font-family: var(--font-mono); font-size: .7rem; color: rgb(var(--muted)); white-space: pre-wrap; line-height: 1.5; }
+  .input.ro { color: rgb(var(--muted)); }
+  .source { border: 1px solid rgb(var(--edge)); background: rgb(var(--raised) / .5); border-radius: 6px; padding: 6px 10px; font-size: .72rem; color: rgb(var(--muted)); }
+  .source b { color: rgb(var(--fg)); }
+  .note { font-size: .72rem; color: rgb(var(--info)); border: 1px solid rgb(var(--info) / .4); background: rgb(var(--info) / .1); border-radius: 6px; padding: 6px 10px; display: flex; align-items: center; gap: 6px; }
+  .labels { display: flex; flex-wrap: wrap; gap: 4px; }
+  .hint { margin: 4px 0 0; font-size: .7rem; color: rgb(var(--faint)); }
+
+  .selbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; border: 1px solid rgb(var(--brand) / .35); background: rgb(var(--brand) / .06); border-radius: 8px; padding: 6px 10px; font-size: .8rem; }
+  .selbar .clear { color: rgb(var(--faint)); font-size: .72rem; margin-left: auto; }
+  .toast { align-self: flex-start; display: inline-flex; align-items: center; gap: 14px; border: 1px solid rgb(var(--edge-strong)); background: rgb(var(--raised)); border-radius: 8px; padding: 8px 12px; font-size: .8rem; box-shadow: 0 10px 24px rgb(0 0 0 / .45); }
+  .toast .undo { color: rgb(var(--brand)); font-weight: 600; }
+
+  /* ── admin scope ─────────────────────────────────────────────── */
+  .scope { display: inline-flex; border: 1px solid rgb(var(--edge)); border-radius: 8px; padding: 2px; margin-left: auto; }
+  .scope span { padding: 3px 10px; border-radius: 6px; font-size: .78rem; color: rgb(var(--muted)); }
+  .scope span.on { background: rgb(var(--raised)); color: rgb(var(--fg)); font-weight: 500; }
+  .headrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .inset { border: 1px solid rgb(var(--edge)); border-radius: 8px; padding: 10px 12px; background: rgb(var(--raised) / .3); display: flex; flex-direction: column; gap: 8px; }
+  .inset .lab { font-size: .66rem; letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--faint)); font-weight: 650; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .chips .badge { gap: 6px; }
+  .chips .badge .n { color: rgb(var(--faint)); }
+  .chips .badge.off { opacity: .45; }
+  .chips .why { font-size: .68rem; color: rgb(var(--faint)); }
+
+  /* ── other improvements ──────────────────────────────────────── */
+  .extras-head h2 { margin: 0 0 6px; font-size: 1.05rem; font-weight: 600; }
+  .extras-head p { margin: 0 0 14px; color: rgb(var(--muted)); font-size: .9rem; max-width: 68ch; }
+  .extras { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
+  .extra { border: 1px solid rgb(var(--edge)); border-radius: var(--radius); padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; background: rgb(var(--surface)); }
+  .extra h4 { margin: 0; font-size: .92rem; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .tag { font-size: .6rem; letter-spacing: .08em; text-transform: uppercase; font-weight: 650; border: 1px solid; border-radius: 999px; padding: 1px 7px; line-height: 1.6; }
+  .tag.web { color: rgb(var(--ok)); border-color: rgb(var(--ok) / .4); background: rgb(var(--ok) / .1); }
+  .tag.api { color: rgb(var(--warn)); border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .1); }
+  .extra p { margin: 0; color: rgb(var(--muted)); font-size: .84rem; }
+  .extra p code, .extra h4 code { font-family: var(--font-mono); font-size: .72rem; color: rgb(var(--faint)); }
+  .snippet { border: 1px dashed rgb(var(--edge-strong)); border-radius: 8px; padding: 10px 12px; font-size: 12px; display: flex; flex-direction: column; gap: 8px; background: rgb(var(--raised) / .3); margin-top: 2px; }
+  .snippet .tabs { border-bottom-color: rgb(var(--edge-strong)); }
+  .snippet .tab { padding: 5px 9px; font-size: .8rem; }
+  .snippet .badge.chip { gap: 6px; }
+  .snippet .badge.chip .n { color: rgb(var(--faint)); }
+  .snippet .badge.chip.off { opacity: .45; }
+  .ev { margin: 0; font-size: .78rem; color: rgb(var(--muted)); border-left: 2px solid rgb(var(--edge-strong)); padding-left: 8px; }
+
+  /* ── summary table ───────────────────────────────────────────── */
+  .summary h2 { margin: 0 0 6px; font-size: 1.05rem; font-weight: 600; }
+  .summary p { margin: 0 0 14px; color: rgb(var(--muted)); font-size: .9rem; max-width: 68ch; }
+  .tablewrap { overflow-x: auto; border: 1px solid rgb(var(--edge)); border-radius: var(--radius); }
+  table { border-collapse: collapse; width: 100%; min-width: 900px; font-size: .82rem; }
+  th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid rgb(var(--edge)); }
+  tr:last-child td { border-bottom: 0; }
+  th { font-size: .66rem; text-transform: uppercase; letter-spacing: .08em; color: rgb(var(--muted)); font-weight: 650; background: rgb(var(--raised) / .5); }
+  td { color: rgb(var(--muted)); }
+  td:first-child { color: rgb(var(--fg)); font-weight: 500; white-space: nowrap; }
+  td:last-child { color: rgb(var(--fg)); border-left: 1px solid rgb(var(--brand) / .3); background: rgb(var(--brand) / .04); }
+  th:last-child { color: rgb(var(--brand)); border-left: 1px solid rgb(var(--brand) / .3); }
+  td code { font-family: var(--font-mono); font-size: .74rem; color: rgb(var(--fg)); }
+</style>
+
+<main class="page">
+  <header class="lede">
+    <p class="eyebrow">uzi · web · proposal</p>
+    <h1>One triage row for Judge, the run page and Findings</h1>
+    <p>Left: what main renders today (ad1025a4), rebuilt from the components with the rows from your screenshots. Right: the proposal. Orange markers on the right are keyed to the notes under each pair.</p>
+    <p>Filter boxes and the sidebar are unchanged and left out so the rows line up.</p>
+  </header>
+
+  <!-- ══════════════ 1. JUDGE PAGE ══════════════ -->
+  <section class="pair">
+    <h2><span class="glyph">⚖</span> Judge page <code>/judge</code></h2>
+    <div class="cols">
+
+      <!-- BEFORE -->
+      <article class="frame before">
+        <div class="frame-bar"><span>Before · today</span><code>pages/judge/GroupRow.tsx:65 · :199</code></div>
+        <div class="app">
+          <h3><span class="glyph">⚖</span> Judge</h3>
+          <p class="desc">Recommendations across all your runs. Triage a whole group in one action.</p>
+
+          <div class="strip">
+            <div class="lab"><span>Recommendations · all your runs</span><span>all time</span></div>
+            <div class="bar"><i style="width:51%;background:rgb(var(--warn))"></i><i style="width:31%;background:rgb(var(--ok))"></i><i style="width:18%;background:rgb(var(--faint))"></i></div>
+            <div class="legend">
+              <span><span class="dot" style="background:rgb(var(--warn))"></span><b>267</b> to do</span>
+              <span><span class="dot" style="background:rgb(var(--info))"></span><b>0</b> filed</span>
+              <span><span class="dot" style="background:rgb(var(--ok))"></span><b>162</b> done</span>
+              <span><span class="dot" style="background:rgb(var(--faint))"></span><b>95</b> dismissed</span>
+              <span class="plain">4 of 95 dismissed were false positives</span>
+            </div>
+          </div>
+          <div class="omitted">Filter by label · unchanged, left out</div>
+
+          <div class="tabs">
+            <span class="tab active">To triage<span class="n">267</span></span>
+            <span class="tab">Filed<span class="n">0</span></span>
+            <span class="tab">Done<span class="n">162</span></span>
+            <span class="tab">Dismissed<span class="n">95</span></span>
+            <span class="tab">All<span class="n">524</span></span>
+          </div>
+          <p class="bridge">267 to-do recommendations across 172 groups</p>
+
+          <ul class="rows">
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Improve uzi</span>
+                    <span class="code">run context working directory repo root</span>
+                    <span class="faint">seen in 33 runs</span>
+                    <span class="faint">19 open</span>
+                  </div>
+                  <p class="preview">The lead's first researcher subagent started with a malformed worktree path (`github.com+vtmocanu/uzi/...`, slash instead of `+`), failed twice, ran a global `find / -maxdepth 6`, and then gathered its file:line planning evidence from `/opt/uzi-src`, a baked source copy that is…</p>
+                </div>
+                <div class="actions">
+                  <span class="btn btn-secondary">Mark done</span>
+                  <span class="btn btn-secondary">Dismiss ▾</span>
+                  <span class="chev">⌄</span>
+                </div>
+              </div>
+              <ul class="occs">
+                <li class="occ">
+                  <div class="line"><span class="run">docs(prd-1171): prepare Codex production adapter M3b</span><span class="badge b-warn">⚖ issues</span><span class="badge b-neutral">To do</span></div>
+                  <div><span class="btn btn-secondary">File issue</span></div>
+                </li>
+                <li class="occ">
+                  <div class="line"><span class="run">fix(e2e): stop the autofix poller racing the manual ci-fix</span><span class="badge b-warn">⚖ issues</span><span class="badge b-neutral">To do</span></div>
+                  <div><span class="btn btn-secondary">File issue</span></div>
+                </li>
+                <li class="occ">
+                  <div class="line"><span class="run">chore(release): v0.79.0</span><span class="badge b-warn">⚖ issues</span><span class="badge b-ok">✓ Done</span></div>
+                </li>
+              </ul>
+            </li>
+
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Improve uzi</span>
+                    <span class="code">guardrail read only access to agent produced artifacts outside the worktree</span>
+                    <span class="faint">seen in 30 runs</span>
+                    <span class="faint">24 open</span>
+                  </div>
+                  <p class="preview">At seq 24–26 a large tool output was persisted by the harness itself to a file under `/data/agent-home/.../tool-results/`, and the lead's immediate Read of that harness-provided path was denied by the worktree guardrail, forcing a re-run of the command with different filters. The…</p>
+                </div>
+                <div class="actions">
+                  <span class="btn btn-secondary">Mark done</span>
+                  <span class="btn btn-secondary">Dismiss ▾</span>
+                  <span class="chev">›</span>
+                </div>
+              </div>
+            </li>
+
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Improve uzi</span>
+                    <span class="code">command not found pre scan</span>
+                    <span class="faint">seen in 16 runs</span>
+                    <span class="faint">7 open</span>
+                  </div>
+                  <p class="preview">The judge's command-not-found pre-scan matched tool names inside file-read content, producing an install_worker_tool recommendation for a binary the run never invoked…</p>
+                </div>
+                <div class="actions">
+                  <span class="btn btn-secondary">Mark done</span>
+                  <span class="btn btn-secondary">Dismiss ▾</span>
+                  <span class="chev">›</span>
+                </div>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- AFTER -->
+      <article class="frame after">
+        <div class="frame-bar"><span>After · proposal</span><code>same components, one action row</code></div>
+        <div class="app">
+          <h3><span class="glyph">⚖</span> Judge</h3>
+          <p class="desc">Recommendations across all your runs. Triage a whole group in one action.</p>
+
+          <div class="strip">
+            <div class="lab"><span>Recommendations · all your runs</span><span>all time</span></div>
+            <div class="bar"><i style="width:51%;background:rgb(var(--warn))"></i><i style="width:31%;background:rgb(var(--ok))"></i><i style="width:18%;background:rgb(var(--faint))"></i></div>
+            <div class="legend">
+              <span><span class="dot" style="background:rgb(var(--warn))"></span><b>267</b> to triage<span class="mark">2</span></span>
+              <span><span class="dot" style="background:rgb(var(--info))"></span><b>0</b> filed</span>
+              <span><span class="dot" style="background:rgb(var(--ok))"></span><b>162</b> done</span>
+              <span><span class="dot" style="background:rgb(var(--faint))"></span><b>95</b> dismissed</span>
+              <span class="plain">4 of 95 dismissed were false positives</span>
+            </div>
+          </div>
+          <div class="omitted">Filter by label · unchanged, left out</div>
+
+          <div class="tabs">
+            <span class="tab active">To triage<span class="n">267</span></span>
+            <span class="tab">Filed<span class="n">0</span></span>
+            <span class="tab">Done<span class="n">162</span></span>
+            <span class="tab">Dismissed<span class="n">95</span></span>
+            <span class="tab">All<span class="n">524</span></span>
+          </div>
+          <p class="bridge">267 recommendations to triage across 172 groups<span class="mark">2</span></p>
+
+          <ul class="rows">
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Improve uzi</span>
+                    <span class="code">run context working directory repo root</span>
+                    <span class="faint">seen in 33 runs</span>
+                    <span class="faint">19 open</span>
+                  </div>
+                  <p class="preview">The lead's first researcher subagent started with a malformed worktree path (`github.com+vtmocanu/uzi/...`, slash instead of `+`), failed twice, ran a global `find / -maxdepth 6`, and then gathered its file:line planning evidence from `/opt/uzi-src`, a baked source copy that is…</p>
+                </div>
+                <div class="actions">
+                  <span class="btn btn-secondary">File issue</span><span class="mark">1</span>
+                  <span class="btn btn-secondary">Mark done</span>
+                  <span class="btn btn-secondary">Dismiss ▾</span>
+                  <span class="chev">›</span>
+                </div>
+              </div>
+              <div class="draft">
+                <div class="draft-head"><span>▤ Draft issue</span><span class="badge b-brand">needs your review</span></div>
+                <div class="draft-body">
+                  <div class="note">Prefilled from the newest of 19 open runs. The other 18 stay open until you mark the group done.<span class="mark">1</span></div>
+                  <div class="source"><b>Source:</b> your run <em>docs(prd-1171): prepare Codex production adapter M3b</em>, judged 2h ago</div>
+                  <div class="field"><label>Repo</label><div class="input">vtmocanu/uzi ⌄</div></div>
+                  <div class="field"><label>Title</label><div class="input">Run context: worktree path is malformed for '+'-joined clone names</div></div>
+                  <div class="field"><label>Description</label><div class="input mono">## What the judge saw
+The lead's first researcher subagent started with a malformed worktree path
+(`github.com+vtmocanu/uzi/...`, slash instead of `+`), failed twice, …</div></div>
+                  <div class="field"><label>Labels</label><div class="labels"><span class="badge b-neutral">uzi</span><span class="badge b-neutral">judge</span></div>
+                    <p class="hint">Lands on the board and is startable without a PRD file. No autopilot label; nothing runs until you click Start.</p></div>
+                  <div class="actions left"><span class="btn btn-primary">Create issue</span><span class="btn btn-secondary">Cancel</span></div>
+                </div>
+              </div>
+            </li>
+
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Improve uzi</span>
+                    <span class="code">guardrail read only access to agent produced artifacts outside the worktree</span>
+                    <span class="faint">seen in 30 runs</span>
+                    <span class="faint">24 open</span>
+                  </div>
+                  <p class="preview">At seq 24–26 a large tool output was persisted by the harness itself to a file under `/data/agent-home/.../tool-results/`, and the lead's immediate Read of that harness-provided path was denied by the worktree guardrail, forcing a re-run of the command with different filters. The…</p>
+                </div>
+                <div class="actions">
+                  <span class="btn btn-secondary">File issue</span>
+                  <span class="btn btn-secondary">Mark done</span>
+                  <span class="btn btn-secondary">Dismiss ▾</span>
+                  <span class="chev">⌄</span>
+                </div>
+              </div>
+              <ul class="occs">
+                <li class="occ">
+                  <div class="line"><span class="run">fix(e2e): stop the autofix poller racing the manual ci-fix</span><span class="badge b-warn">⚖ issues</span><span class="badge b-neutral">To triage</span><span class="mark">3</span></div>
+                </li>
+                <li class="occ">
+                  <div class="line"><span class="run">docs(prd-1170): create PRD #1170 - near-timeout run-health flag</span><span class="badge b-warn">⚖ issues</span><span class="link">Filed #1181 ↗</span></div>
+                </li>
+                <li class="occ">
+                  <div class="line"><span class="run">chore(release): v0.79.0</span><span class="badge b-warn">⚖ issues</span><span class="badge b-ok">✓ Done</span></div>
+                </li>
+              </ul>
+            </li>
+
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Improve uzi</span>
+                    <span class="code">command not found pre scan</span>
+                    <span class="faint">seen in 16 runs</span>
+                    <span class="faint">7 open</span>
+                  </div>
+                  <p class="preview">The judge's command-not-found pre-scan matched tool names inside file-read content, producing an install_worker_tool recommendation for a binary the run never invoked…</p>
+                </div>
+                <div class="actions">
+                  <span class="btn btn-secondary">File issue</span>
+                  <span class="btn btn-secondary">Mark done</span>
+                  <span class="btn btn-secondary">Dismiss ▾</span>
+                  <span class="chev">›</span>
+                </div>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </article>
+    </div>
+
+    <ol class="notes">
+      <li><span class="mark">1</span><span><b>File issue joins the group's action row, first.</b> Same secondary weight as its neighbours. It opens the same draft card the run page uses, prefilled from the group's newest occurrence; with more members open, the card says so. The later bulk-file follow-up (PRD #98 Decision 3) turns this same button into "file the whole group" with no layout change.</span></li>
+      <li><span class="mark">2</span><span><b>One word for the open state.</b> "To triage" on the tab, the strip, the bridge line and the chip. Today the same state reads To triage / TO DO / to-do / To do depending on where you look.</span></li>
+      <li><span class="mark">3</span><span><b>The expander is for reading, not acting.</b> Occurrence rows keep the run link, verdict and state (a filed one keeps its "Filed #N ↗" link); the per-occurrence File issue button goes, since filing now lives on the row.</span></li>
+    </ol>
+  </section>
+
+  <!-- ══════════════ 2. RUN PAGE JUDGE PANEL ══════════════ -->
+  <section class="pair">
+    <h2><span class="glyph">⚖</span> Run page · Judge panel <code>/runs/:id</code></h2>
+    <div class="cols">
+
+      <!-- BEFORE -->
+      <article class="frame before">
+        <div class="frame-bar"><span>Before · today</span><code>runView/JudgePanel.tsx:687 · :970</code></div>
+        <div class="app">
+          <div class="meta"><h3><span class="glyph">⚖</span> Judge</h3><span class="badge b-warn">⚖ issues · 2</span><span class="faint">reviewed 2h ago</span></div>
+          <ul class="rows">
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Improve uzi</span>
+                    <span class="code">run context working directory repo root</span>
+                    <span class="faint">high confidence</span>
+                    <span class="badge b-neutral" style="margin-left:auto">To do</span>
+                  </div>
+                  <p class="preview prose">The lead's first researcher subagent started with a malformed worktree path (<code class="code">github.com+vtmocanu/uzi/...</code>, slash instead of <code class="code">+</code>), failed twice, and gathered planning evidence from a baked source copy instead of the worktree.</p>
+                </div>
+              </div>
+              <div class="stack">
+                <div class="actions"><span class="btn btn-primary">File issue</span></div>
+                <div class="actions"><span class="btn btn-secondary">Mark done</span><span class="btn btn-secondary">Dismiss ▾</span></div>
+              </div>
+            </li>
+
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Install a worker tool</span>
+                    <span class="code">shellcheck</span>
+                    <span class="faint">medium confidence</span>
+                    <span class="badge b-info" style="margin-left:auto">Filed</span>
+                  </div>
+                  <p class="preview prose">Three shell edits went out unlinted because the worker image has no shellcheck; the gate caught them one CI round later.</p>
+                </div>
+              </div>
+              <div class="stack">
+                <div class="filedbox"><b>Issue created.</b> <u>#1180 ↗</u><span class="dim"> — open it on the board to start a run.</span></div>
+                <div class="actions"><span class="btn btn-secondary">Mark done</span><span class="btn btn-secondary">Dismiss ▾</span></div>
+              </div>
+            </li>
+
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Cost efficiency</span>
+                    <span class="code">model routing</span>
+                    <span class="faint">low confidence</span>
+                    <span class="badge b-neutral" style="margin-left:auto">Dismissed · Won't do</span>
+                  </div>
+                  <p class="preview prose">The documenter role ran on opus for a docs-only diff; a sonnet-tier role would have cost a third.</p>
+                </div>
+              </div>
+              <div class="resolved"><span>resolved 2d ago</span><span class="undo">Undo</span></div>
+            </li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- AFTER -->
+      <article class="frame after">
+        <div class="frame-bar"><span>After · proposal</span><code>same row as /judge and /findings</code></div>
+        <div class="app">
+          <div class="meta"><h3><span class="glyph">⚖</span> Judge</h3><span class="badge b-warn">⚖ issues · 2</span><span class="faint">reviewed 2h ago</span></div>
+          <ul class="rows">
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Improve uzi</span>
+                    <span class="code">run context working directory repo root</span>
+                    <span class="faint">high confidence</span>
+                    <span class="badge b-neutral" style="margin-left:auto">To triage</span>
+                  </div>
+                  <p class="preview prose">The lead's first researcher subagent started with a malformed worktree path (<code class="code">github.com+vtmocanu/uzi/...</code>, slash instead of <code class="code">+</code>), failed twice, and gathered planning evidence from a baked source copy instead of the worktree.</p>
+                </div>
+              </div>
+              <div class="stack">
+                <div class="actions"><span class="btn btn-secondary">File issue</span><span class="mark">4</span><span class="btn btn-secondary">Mark done</span><span class="btn btn-secondary">Dismiss ▾</span></div>
+              </div>
+            </li>
+
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Install a worker tool</span>
+                    <span class="code">shellcheck</span>
+                    <span class="faint">medium confidence</span>
+                    <span class="link" style="margin-left:auto">Filed #1180 ↗</span><span class="mark">5</span>
+                  </div>
+                  <p class="preview prose">Three shell edits went out unlinted because the worker image has no shellcheck; the gate caught them one CI round later.</p>
+                </div>
+              </div>
+              <div class="stack">
+                <div class="actions"><span class="btn btn-secondary">Mark done</span><span class="btn btn-secondary">Dismiss ▾</span></div>
+              </div>
+            </li>
+
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <div class="meta">
+                    <span class="badge b-info">Cost efficiency</span>
+                    <span class="code">model routing</span>
+                    <span class="faint">low confidence</span>
+                    <span class="badge b-neutral" style="margin-left:auto">Dismissed · Won't do</span>
+                  </div>
+                  <p class="preview prose">The documenter role ran on opus for a docs-only diff; a sonnet-tier role would have cost a third.</p>
+                </div>
+              </div>
+              <div class="resolved"><span>resolved 2d ago</span><span class="undo">Undo</span></div>
+            </li>
+          </ul>
+        </div>
+      </article>
+    </div>
+
+    <ol class="notes">
+      <li><span class="mark">4</span><span><b>One action row per recommendation.</b> File issue · Mark done · Dismiss ▾, all at the same weight. Today File issue is a lone orange button on its own line above the other two, so it reads as a different kind of thing.</span></li>
+      <li><span class="mark">5</span><span><b>Filed is a chip, the same chip everywhere.</b> "Filed #1180 ↗" in the state slot replaces the green "Issue created. #1180, open it on the board to start a run." box. The File issue button hides once filed, as it does today.</span></li>
+    </ol>
+  </section>
+
+  <!-- ══════════════ 3. FINDINGS PAGE ══════════════ -->
+  <section class="pair">
+    <h2><span class="glyph" style="color:rgb(var(--info))">🐞</span> Findings page <code>/findings</code></h2>
+    <div class="cols">
+
+      <!-- BEFORE -->
+      <article class="frame before">
+        <div class="frame-bar"><span>Before · today</span><code>pages/Findings.tsx:395 · :405</code></div>
+        <div class="app">
+          <h3><span class="glyph bug">🐞</span> Findings</h3>
+          <p class="desc">Off-task bugs your workers flagged mid-run, deduped per repo. File one as a real issue or dismiss it.</p>
+
+          <div class="selector"><span class="lab">Repo</span><span class="select">All repos</span></div>
+
+          <div class="tabs">
+            <span class="tab active info">To file</span>
+            <span class="tab">Filed</span>
+            <span class="tab">Dismissed</span>
+          </div>
+
+          <p class="repohead">vtmocanu/uzi</p>
+          <ul class="rows">
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <p class="title">lint:shell (gate:repo) is red on vendored x/sys build scripts committed by the M2 supervisor</p>
+                  <div class="meta"><span class="code loc">scripts/lint-shell.sh#files</span><span class="faint">seen in 1 run</span><span class="badge b-info">To file</span></div>
+                </div>
+                <div class="actions"><span class="btn btn-secondary">File</span><span class="btn btn-secondary">Dismiss</span></div>
+              </div>
+            </li>
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <p class="title">Codex supervisor launches the child with an EMPTY environment (drops the launcher's replaced-env allowlist)</p>
+                  <div class="meta"><span class="code loc">agent/codex/supervisor/main.go#launchchild</span><span class="faint">seen in 1 run</span><span class="badge b-info">To file</span></div>
+                </div>
+                <div class="actions"><span class="btn btn-secondary">Won't do</span><span class="btn btn-secondary">Not an issue</span><span class="btn btn-ghost">Cancel</span></div>
+              </div>
+            </li>
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <p class="title">CodexCredentials delete button comment claims a server 409 the server never returns</p>
+                  <div class="meta"><span class="code loc">web/src/components/codexcredentials.tsx#rowactions</span><span class="faint">seen in 1 run</span><span class="link">Filed #1179</span></div>
+                </div>
+              </div>
+            </li>
+            <li class="row">
+              <div class="row-head">
+                <div class="main">
+                  <p class="title">PatchAnthropicToken rotate-only response drops CreatedAt/UpdatedAt timestamps</p>
+                  <div class="meta"><span class="code loc">api/internal/handler/secrets.go#patchanthropictoken</span><span class="faint">seen in 1 run</span><span class="badge b-neutral">Dismissed</span></div>
+                </div>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- AFTER -->
+      <article class="frame after">
+        <div class="frame-bar"><span>After · proposal</span><code>Judge's skeleton, Judge's row</code></div>
+        <div class="app">
+          <h3><span class="glyph bug">🐞</span> Findings</h3>
+          <p class="desc">Off-task bugs your workers flagged mid-run, deduped per repo. File one as a real issue or dismiss it.</p>
+
+          <div class="strip">
+            <div class="lab"><span>Findings · all your repos<span class="mark">6</span></span><span>all time</span></div>
+            <div class="bar"><i style="width:80%;background:rgb(var(--warn))"></i><i style="width:14%;background:rgb(var(--info))"></i><i style="width:6%;background:rgb(var(--faint))"></i></div>
+            <div class="legend">
+              <span><span class="dot" style="background:rgb(var(--warn))"></span><b>70</b> to triage</span>
+              <span><span class="dot" style="background:rgb(var(--info))"></span><b>12</b> filed</span>
+              <span><span class="dot" style="background:rgb(var(--faint))"></span><b>5</b> dismissed</span>
+              <span class="plain">2 of 5 dismissed were false positives</span>
+            </div>
+          </div>
+
+          <div class="selector"><span class="lab">Repo</span><span class="select">All repos</span></div>
+
+          <div class="tabs">
+            <span class="tab active">To triage<span class="n">70</span></span>
+            <span class="tab">Filed<span class="n">12</span></span>
+            <span class="tab">Dismissed<span class="n">5</span></span>
+          </div>
+
+          <div class="selbar"><span><b>1</b> selected</span><span class="btn btn-secondary">Dismiss ▾</span><span class="mark">8</span><span class="clear">Clear</span></div>
+
+          <p class="repohead">vtmocanu/uzi</p>
+          <ul class="rows">
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <p class="title">lint:shell (gate:repo) is red on vendored x/sys build scripts committed by the M2 supervisor</p>
+                  <div class="meta"><span class="code loc">scripts/lint-shell.sh#files</span><span class="faint">seen in 1 run</span><span class="badge b-neutral">To triage</span><span class="mark">9</span></div>
+                </div>
+                <div class="actions"><span class="btn btn-secondary">File issue</span><span class="mark">7</span><span class="btn btn-secondary">Dismiss ▾</span></div>
+              </div>
+            </li>
+            <li class="row">
+              <div class="row-head">
+                <span class="cb on"></span>
+                <div class="main">
+                  <p class="title">Codex supervisor launches the child with an EMPTY environment (drops the launcher's replaced-env allowlist)</p>
+                  <div class="meta"><span class="code loc">agent/codex/supervisor/main.go#launchchild</span><span class="faint">seen in 1 run</span><span class="badge b-neutral">To triage</span></div>
+                </div>
+                <div class="actions">
+                  <span class="btn btn-secondary">File issue</span>
+                  <span class="menu-wrap"><span class="btn btn-secondary">Dismiss ▾</span><span class="mark">7</span>
+                    <div class="menu">
+                      <div class="mi hover">Won't do<small>Valid, but not worth acting on</small></div>
+                      <div class="mi">Not an issue<small>False positive, the worker got it wrong</small></div>
+                    </div>
+                  </span>
+                </div>
+              </div>
+            </li>
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <p class="title">CodexCredentials delete button comment claims a server 409 the server never returns</p>
+                  <div class="meta"><span class="code loc">web/src/components/codexcredentials.tsx#rowactions</span><span class="faint">seen in 1 run</span><span class="link">Filed #1179 ↗</span></div>
+                </div>
+              </div>
+            </li>
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <p class="title">PatchAnthropicToken rotate-only response drops CreatedAt/UpdatedAt timestamps</p>
+                  <div class="meta"><span class="code loc">api/internal/handler/secrets.go#patchanthropictoken</span><span class="faint">seen in 1 run</span><span class="badge b-neutral">Dismissed · Won't do</span><span class="mark">9</span></div>
+                </div>
+              </div>
+            </li>
+          </ul>
+
+          <div class="toast"><span>Dismissed 1 finding as won't do</span><span class="undo">Undo</span><span class="mark">8</span></div>
+        </div>
+      </article>
+    </div>
+
+    <ol class="notes">
+      <li><span class="mark">6</span><span><b>Judge's header strip and counted tabs.</b> To triage · Filed · Dismissed, with numbers, and the brand-orange active tab (today's Findings tab underline is blue, Judge's is orange). Needs per-bucket counts from the findings API; the open count already feeds the nav badge.</span></li>
+      <li><span class="mark">7</span><span><b>Judge's action row.</b> "File issue" opens the shared draft card (repo fixed by the coordinate, title and body editable, one "Create issue" click), replacing today's one-click "File" with no preview. "Dismiss ▾" is the same menu with the same reason copy, instead of the row swapping into Won't do / Not an issue / Cancel.</span></li>
+      <li><span class="mark">8</span><span><b>Multi-select and Undo, lifted from Judge.</b> Checkboxes, the selection bar, and the undo toast after an action. The bar offers bulk Dismiss only; bulk File is N forge writes and stays a separate decision.</span></li>
+      <li><span class="mark">9</span><span><b>Chip wording aligned.</b> "To triage" (was "To file", in blue) as the quiet neutral chip Judge uses, and "Dismissed · Won't do" / "Dismissed · Not an issue" where the reason is known, as the run page already shows.</span></li>
+    </ol>
+  </section>
+
+  <!-- ══════════════ 4. ADMIN: ALL USERS ══════════════ -->
+  <section class="pair">
+    <h2><span class="glyph">⚖</span> Judge page, signed in as an admin <code>/judge?scope=all</code></h2>
+    <div class="cols">
+
+      <!-- BEFORE -->
+      <article class="frame before">
+        <div class="frame-bar"><span>Before · today</span><code>judge_recommendations.go:21 · judge.go:399</code></div>
+        <div class="app">
+          <h3><span class="glyph">⚖</span> Judge</h3>
+          <p class="desc">Recommendations across all your runs. Triage a whole group in one action.</p>
+          <div class="tabs">
+            <span class="tab active">To triage<span class="n">267</span></span>
+            <span class="tab">Filed<span class="n">0</span></span>
+            <span class="tab">Done<span class="n">162</span></span>
+            <span class="tab">Dismissed<span class="n">95</span></span>
+            <span class="tab">All<span class="n">524</span></span>
+          </div>
+          <p class="bridge">Your own runs only. The backlog never consults IsAdmin.</p>
+          <ul class="rows">
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta"><span class="badge b-info">Improve uzi</span><span class="code">run context working directory repo root</span><span class="faint">seen in 33 runs</span><span class="faint">19 open</span></div>
+                  <p class="preview">The lead's first researcher subagent started with a malformed worktree path (`github.com+vtmocanu/uzi/...`, slash instead of `+`), failed twice…</p>
+                </div>
+                <div class="actions"><span class="btn btn-secondary">Mark done</span><span class="btn btn-secondary">Dismiss ▾</span><span class="chev">›</span></div>
+              </div>
+            </li>
+          </ul>
+
+          <div class="inset">
+            <span class="lab">How an admin reads another user's recommendations today: open their run</span>
+            <div class="meta"><span class="code">/runs/8f3a…</span><span class="title" style="font-size:.85rem">fix(payments): retry the webhook on 502</span><span class="faint">owner: dana</span><span class="badge b-warn">⚖ issues · 2</span></div>
+            <div class="row">
+              <div class="row-head">
+                <div class="main">
+                  <div class="meta"><span class="badge b-info">Improve uzi</span><span class="code">run context working directory repo root</span><span class="faint">high confidence</span><span class="badge b-neutral" style="margin-left:auto">To do</span></div>
+                  <p class="preview prose">The researcher started with a malformed worktree path under `acme/payments/...` and fell back to a baked source copy.</p>
+                </div>
+              </div>
+              <div class="stack">
+                <div class="actions"><span class="btn btn-primary">File issue</span></div>
+                <div class="source"><b>Source:</b> dana's run <em>fix(payments): retry the webhook on 502</em>, judged 3h ago</div>
+              </div>
+            </div>
+            <p class="faint" style="margin:0">Full attribution, one run at a time, no roll-up across users.</p>
+          </div>
+        </div>
+      </article>
+
+      <!-- AFTER -->
+      <article class="frame after">
+        <div class="frame-bar"><span>After · proposal</span><code>new RequireAdmin query, same row</code></div>
+        <div class="app">
+          <div class="headrow">
+            <h3><span class="glyph">⚖</span> Judge</h3>
+            <span class="scope"><span>Mine</span><span class="on">All users</span></span><span class="mark">10</span>
+          </div>
+          <p class="desc">Recommendations across every user's runs, attribution hidden. Instance-level categories by default.</p>
+
+          <div class="strip">
+            <div class="lab"><span>Recommendations · all users</span><span>all time</span></div>
+            <div class="bar"><i style="width:58%;background:rgb(var(--warn))"></i><i style="width:3%;background:rgb(var(--info))"></i><i style="width:26%;background:rgb(var(--ok))"></i><i style="width:13%;background:rgb(var(--faint))"></i></div>
+            <div class="legend">
+              <span><span class="dot" style="background:rgb(var(--warn))"></span><b>1,204</b> to triage</span>
+              <span><span class="dot" style="background:rgb(var(--info))"></span><b>61</b> filed</span>
+              <span><span class="dot" style="background:rgb(var(--ok))"></span><b>540</b> done</span>
+              <span><span class="dot" style="background:rgb(var(--faint))"></span><b>270</b> dismissed</span>
+              <span class="plain">across 9 users</span>
+            </div>
+          </div>
+
+          <div class="chips">
+            <span class="badge b-brand">Install a worker tool<span class="n">14</span></span>
+            <span class="badge b-brand">Adjust an agent template<span class="n">31</span></span>
+            <span class="badge b-brand">Improve an agent<span class="n">40</span></span>
+            <span class="badge b-brand">Add a missing agent<span class="n">2</span></span>
+            <span class="badge b-brand">Improve uzi<span class="n">212</span></span>
+            <span class="badge b-neutral off">Enable a tool or skill<span class="n">38</span></span>
+            <span class="badge b-neutral off">Cost efficiency<span class="n">190</span></span>
+            <span class="why">per-user config and spend, off by default</span><span class="mark">12</span>
+          </div>
+
+          <div class="tabs">
+            <span class="tab active">To triage<span class="n">299</span></span>
+            <span class="tab">Filed<span class="n">9</span></span>
+            <span class="tab">Done<span class="n">211</span></span>
+            <span class="tab">Dismissed<span class="n">44</span></span>
+            <span class="tab">All<span class="n">563</span></span>
+          </div>
+          <p class="bridge">299 recommendations to triage across 118 groups</p>
+
+          <ul class="rows">
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta"><span class="badge b-info">Improve uzi</span><span class="code">run context working directory repo root</span><span class="faint">61 open of 97 runs</span><span class="faint">6 users</span><span class="mark">11</span></div>
+                  <p class="preview">The lead's first researcher subagent started with a malformed worktree path (slash instead of `+` in the clone name), failed twice, and gathered planning evidence from a baked source copy instead of the worktree…</p>
+                </div>
+                <div class="actions"><span class="btn btn-secondary">File issue</span><span class="btn btn-secondary">Mark done</span><span class="mark">13</span><span class="chev">⌄</span></div>
+              </div>
+              <ul class="occs">
+                <li class="occ"><div class="line"><span class="faint" style="font-size:.82rem">A run, judged 2h ago</span><span class="badge b-warn">⚖ issues</span><span class="badge b-neutral">To triage</span></div></li>
+                <li class="occ"><div class="line"><span class="faint" style="font-size:.82rem">A run, judged yesterday</span><span class="badge b-warn">⚖ issues</span><span class="badge b-neutral">To triage</span></div></li>
+                <li class="occ"><div class="line"><span class="faint" style="font-size:.82rem">A run, judged 3 days ago</span><span class="badge b-warn">⚖ issues</span><span class="badge b-info">Filed</span></div></li>
+              </ul>
+            </li>
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta"><span class="badge b-info">Install a worker tool</span><span class="code">shellcheck</span><span class="faint">12 open of 12 runs</span><span class="faint">4 users</span></div>
+                  <p class="preview">Shell edits went out unlinted because the worker image has no shellcheck; the gate caught them one CI round later…</p>
+                </div>
+                <div class="actions"><span class="btn btn-secondary">File issue</span><span class="btn btn-secondary">Mark done</span><span class="chev">›</span></div>
+              </div>
+            </li>
+            <li class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta"><span class="badge b-info">Adjust an agent template</span><span class="code">reviewer</span><span class="faint">9 open of 20 runs</span><span class="faint">3 users</span></div>
+                  <p class="preview">The builtin reviewer re-reads the whole diff on every rework round instead of the changed hunks; the template could tell it to diff against the previous round…</p>
+                </div>
+                <div class="actions"><span class="btn btn-secondary">File issue</span><span class="btn btn-secondary">Mark done</span><span class="chev">›</span></div>
+              </div>
+            </li>
+          </ul>
+
+          <div class="inset">
+            <span class="lab">What dana sees on their own Judge page after the admin marks the first group done</span>
+            <div class="row">
+              <div class="row-head">
+                <span class="cb"></span>
+                <div class="main">
+                  <div class="meta"><span class="badge b-info">Improve uzi</span><span class="code">run context working directory repo root</span><span class="faint">4 runs, all settled</span><span class="badge b-ok">✓ Done by an admin via #1182</span><span class="mark">13</span></div>
+                </div>
+                <div class="actions"><span class="faint" style="text-decoration:underline">Undo</span><span class="chev">›</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </article>
+    </div>
+
+    <ol class="notes">
+      <li><span class="mark">10</span><span><b>Mine / All users, admins only, remembered per browser.</b> The switch Notifications already has. Default is Mine; the last choice is saved through the existing per-browser preference wrapper (<code>web/src/lib/prefs.ts</code>, the one theme and board order use), so an admin who switches to All users lands there next time, in that browser only, and a non-admin never sees the switch. Today the backlog is owner-scoped and never consults IsAdmin; the run page is owner-or-admin, so an admin already sees every recommendation, one run at a time, with the owner's name on it. This adds the roll-up and takes the name off.</span></li>
+      <li><span class="mark">11</span><span><b>Attribution hidden, honestly.</b> No owner, no run title, no run link, and no filed-issue link either (a forge URL carries the owner's namespace); occurrences are "a run, judged 2h ago" with a bare state chip; "6 users" says how widespread it is. Rationale text can still name a repo or a file, so the docs say "aggregated across users", never "anonymous", and users who opt into the judge are told an admin sees the aggregate.</span></li>
+      <li><span class="mark">12</span><span><b>Instance-level categories by default.</b> Improve uzi, Install a worker tool and the three template categories are things only an admin can act on. Enable a tool and Cost efficiency are one user's config and spend: off by default, one click to widen.</span></li>
+      <li><span class="mark">13</span><span><b>File and Mark done, no Dismiss.</b> Filing across users already exists (PRD #68). Mark done fans out to every user's open occurrence with a new provenance value <code>admin</code>, so their row reads "Done by an admin via #N" and keeps its Undo, next to the existing "Done via issue close". Dismissing someone else's recommendation is their judgment, so the button is not there.</span></li>
+    </ol>
+  </section>
+
+  <!-- ══════════════ OTHER IMPROVEMENTS ══════════════ -->
+  <section class="extras-wrap">
+    <div class="extras-head">
+      <h2>Other things worth fixing while the row is being rebuilt</h2>
+      <p>Found reading the two pages and the code, not part of the feedback. Each is tagged by what it needs.</p>
+    </div>
+    <div class="extras">
+
+      <div class="extra">
+        <h4>Judge: read the whole rationale in place <span class="tag web">web only</span></h4>
+        <p>The preview is clamped to three lines with no way to expand it (<code>GroupRow.tsx:60</code>); the chevron opens the occurrence list, not the text. Reading a recommendation means opening a run page. Let the chevron open the newest occurrence's full rationale above the occurrence list, or make the preview itself the toggle.</p>
+      </div>
+
+      <div class="extra">
+        <h4>Judge: select all in view <span class="tag web">web only</span></h4>
+        <p>Multi-select is one checkbox per row; there is no select-all. Clearing a whole category on a 172-group backlog is 172 clicks. A header checkbox selects everything shown, wired to the existing bulk endpoint.</p>
+        <div class="snippet">
+          <div class="meta"><span class="cb on"></span><span style="font-size:.8rem">Select all 172 shown</span><span class="faint">267 recommendations to triage</span></div>
+          <div class="selbar"><span><b>172</b> selected</span><span class="btn btn-secondary">Mark done</span><span class="btn btn-secondary">Dismiss ▾</span><span class="clear">Clear</span></div>
+        </div>
+      </div>
+
+      <div class="extra">
+        <h4>Judge: rows above the fold <span class="tag web">web only</span></h4>
+        <p>In your screenshot the first row starts about 770px down: a stats strip, a boxed label filter with its own title and caption, tabs, and two count lines that say the same thing ("267 to-do recommendations across 172 groups" and "Showing 172 groups"). Inline the chips, drop the box and caption, and keep one count line that only grows to "Showing 100 of 172 groups" when the page is truncated.</p>
+        <div class="snippet">
+          <div class="meta" style="gap:6px">
+            <span class="badge b-neutral chip off">Enable a tool or skill<span class="n">0</span></span>
+            <span class="badge b-neutral chip">Install a worker tool<span class="n">3</span></span>
+            <span class="badge b-neutral chip">Adjust an agent template<span class="n">10</span></span>
+            <span class="badge b-brand chip">Improve uzi<span class="n">70</span></span>
+            <span class="badge b-neutral chip">Cost efficiency<span class="n">77</span></span>
+          </div>
+          <div class="tabs"><span class="tab active">To triage<span class="n">70</span></span><span class="tab">Filed<span class="n">0</span></span><span class="tab">Done<span class="n">41</span></span><span class="tab">Dismissed<span class="n">12</span></span><span class="tab">All<span class="n">123</span></span></div>
+          <p class="bridge" style="font-size:.8rem">70 recommendations to triage across 41 groups</p>
+        </div>
+      </div>
+
+      <div class="extra">
+        <h4>Judge: one phrase for the two counts <span class="tag web">web only</span></h4>
+        <p>"seen in 33 runs" next to "19 open" makes the reader do the subtraction. "19 open of 33 runs" says it once, and "33 runs, all settled" on a closed group.</p>
+        <div class="snippet">
+          <div class="meta"><span class="badge b-info">Improve uzi</span><span class="code">run context working directory repo root</span><span class="faint">19 open of 33 runs</span></div>
+        </div>
+      </div>
+
+      <div class="extra">
+        <h4>Findings: show the evidence and the runs <span class="tag api">needs API</span></h4>
+        <p>A finding row is a title and a location. The worker's evidence and the runs it was seen in are not in the DTO (<code>apiTypes.ts:2683</code>), so "seen in 3 runs" links to nothing and you decide to file from the title alone. Give Findings the same expander Judge has: the evidence excerpt plus one line per run. The server already has both; it builds the issue draft from them.</p>
+        <div class="snippet">
+          <div class="meta"><span class="title" style="font-size:.85rem">Codex supervisor launches the child with an EMPTY environment</span><span class="chev">⌄</span></div>
+          <p class="ev">launchChild builds cmd.Env from scratch and never copies the launcher's replaced-env allowlist, so PATH and HOME arrive empty in the child…</p>
+          <div class="occ"><div class="line"><span class="run">feat(codex): production adapter M3b</span><span class="faint">2h ago</span></div></div>
+          <div class="occ"><div class="line"><span class="run">fix(codex): seat-lock race</span><span class="faint">yesterday</span></div></div>
+        </div>
+      </div>
+
+      <div class="extra">
+        <h4>Findings: a filed finding never settles <span class="tag api">needs API</span></h4>
+        <p>Judge marks a recommendation "Done via #N" when its filed issue closes (the PRD #98 poller sync). Findings has no done state, so the Filed tab only ever grows. Reuse the same sync: a closed issue moves the finding to a "Done via #N" chip, and Filed becomes a queue you can drain.</p>
+      </div>
+
+      <div class="extra">
+        <h4>Run page: one findings card, same row <span class="tag web">web only</span></h4>
+        <p>The run page's finding card offers File, Edit &amp; file and Dismiss (<code>FindingCard.tsx:163</code>). With the shared row it becomes File issue · Dismiss ▾, and its private editor is replaced by the shared draft card.</p>
+      </div>
+
+      <div class="extra">
+        <h4>Both: quiet "seen in 1 run" <span class="tag web">web only</span></h4>
+        <p>Nearly every Findings row and many Judge rows say "seen in 1 run". The count is the ranking signal, so keep it, but only print it from 2 upwards; at 1 it is noise between the location and the state chip.</p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ══════════════ SUMMARY ══════════════ -->
+  <section class="summary">
+    <h2>What changes, in one table</h2>
+    <p>The three surfaces would render one triage-row component. Everything in the last column is web-only except the API additions tagged above: findings bucket counts, evidence and run links, the issue-close sync, and later the bulk-file endpoint.</p>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Element</th><th>Judge page today</th><th>Run page today</th><th>Findings today</th><th>Proposed, everywhere</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Open state, word</td><td>Tab "To triage", strip "TO DO", bridge "to-do", chip "To do"</td><td>Chip "To do"</td><td>Tab and chip "To file"</td><td>"To triage"</td></tr>
+          <tr><td>File action</td><td>Per occurrence, inside the expander, "File issue" secondary</td><td>"File issue", primary, own line</td><td>"File", one click, no draft (run card: File + Edit &amp; file)</td><td>"File issue", first in the row, secondary, opens the shared draft card</td></tr>
+          <tr><td>Dismiss</td><td>"Dismiss ▾" menu, reasons explained</td><td>Same</td><td>"Dismiss" swaps the row to Won't do / Not an issue / Cancel</td><td>"Dismiss ▾" menu, same reason copy</td></tr>
+          <tr><td>Mark done</td><td>Group fan-out</td><td>Per recommendation</td><td>None (no done state)</td><td>Unchanged; Findings still has none</td></tr>
+          <tr><td>Filed state</td><td>Occurrence: green "Filed." box or "Filed #N ↗"</td><td>Green "Issue created. #N, open it on the board…" box</td><td>"Filed #N" link</td><td>"Filed #N ↗" link chip in the state slot</td></tr>
+          <tr><td>Dismissed state</td><td>"Dismissed"</td><td>"Dismissed · Won't do" / "· Not an issue"</td><td>"Dismissed"</td><td>Reasoned chip wherever the reason is known</td></tr>
+          <tr><td>Multi-select + Undo</td><td>Yes</td><td>n/a</td><td>No</td><td>Both backlog pages</td></tr>
+          <tr><td>Header strip + counted tabs</td><td>Yes, orange active tab</td><td>n/a</td><td>No counts, blue active tab</td><td>Both backlog pages, orange</td></tr>
+          <tr><td>Draft card</td><td>Repo / title / description / labels</td><td>Same card, separate copy of the code</td><td>None on the backlog; the run card has its own editor</td><td>One shared card</td></tr>
+          <tr><td>Scope</td><td>Mine only; IsAdmin never consulted</td><td>Owner-or-admin, full attribution</td><td>Mine only</td><td>Judge gains Mine / All users for admins, attribution hidden, File + Mark done only</td></tr>
+          <tr><td>Where it lives</td><td><code>judge/GroupRow.tsx</code> + <code>OccurrenceFileIssue.tsx</code></td><td><code>runView/JudgePanel.tsx</code></td><td><code>Findings.tsx</code> + <code>FindingCard.tsx</code></td><td>One <code>TriageRow</code> + one <code>IssueDraftCard</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>

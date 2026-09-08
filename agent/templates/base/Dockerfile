@@ -34,16 +34,27 @@ WORKDIR /app
 RUN n=0; until apk add --no-cache git bash tini curl xz tar setpriv docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
     && /bin/setpriv --help 2>&1 | grep -q -- --reuid
 
-# Two runtime uids (PRD #51 A1). `worker` (uid 10001) holds the run credentials
-# (join token, forge PAT, Anthropic token) and does all credentialed work;
-# `runner` (uid 10002) is the distinct, cap-less uid the worker spawns the
-# untrusted code-execution surfaces under (M4). Numbered to match the k8s
-# remote-worker design intent (worker 10001 / runner 10002). `worker` joins group
-# `runner` so it can reach runner-group trees. Created EARLY so /nix + /data can be
-# chowned to them below; the entrypoint drops root -> worker at run time.
+# Three runtime uids (PRD #51 A1 + PRD #1171 M1). `worker` (uid 10001) holds the run
+# credentials (join token, forge PAT, Anthropic token) and does all credentialed work;
+# `runner` (uid 10002) is the distinct, cap-less uid the worker spawns the untrusted
+# code-execution surfaces under (M4). uid 10003 (`runner-cmd`) is the PRD #1171
+# credential-free command-root identity (the Codex adapter's shell + fileop callbacks),
+# OS-isolated from the provider credential (uid 10002) -- a distinct uid means it cannot
+# read the provider root's mode-0400 /proc/<pid>/environ or its 0700 HOME/CODEX_HOME. It
+# is given NO credential/PAT and is NOT in group `worker`; its primary group `runner-cmd`
+# (gid 10003) lets setpriv `--regid 10003` resolve, and it joins group `runner` as a
+# supplementary member so `--init-groups` grants the `runner` group -- letting a command
+# root write the shared run worktree (a later #1171 unit makes it setgid group=runner,
+# group-writable) and read the group-accessible /nix toolchain (`/nix` is worker:runner),
+# exactly as the `runner` uid does today. Numbered to match the k8s remote-worker design
+# intent (worker 10001 / runner 10002 / runner-cmd 10003). `worker` joins group `runner`
+# so it can reach runner-group trees. Created EARLY so /nix + /data can be chowned to them
+# below; the entrypoint drops root -> worker at run time.
 RUN addgroup -g 10001 worker && adduser -u 10001 -G worker -h /home/worker -D worker \
     && addgroup -g 10002 runner && adduser -u 10002 -G runner -h /home/runner -D runner \
-    && addgroup worker runner
+    && addgroup -g 10003 runner-cmd && adduser -u 10003 -G runner-cmd -h /home/runner-cmd -D runner-cmd \
+    && addgroup worker runner \
+    && addgroup runner-cmd runner
 # The worker's HOME: the image default is /root (setpriv does not set HOME), so pin
 # a worker-owned home for the worker's git/npm metadata. Per-run SDK HOME is
 # overridden onto /data (buildSdkEnv) regardless.

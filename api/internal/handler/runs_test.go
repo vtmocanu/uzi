@@ -253,7 +253,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	stamped := runToDTO(store.Run{
 		Status:   "failed",
 		StopKind: pgtype.Text{String: "plan_rejected", Valid: true},
-	}, "normal")
+	}, "normal", 0)
 	if stamped.StopKind == nil {
 		t.Fatal("a stamped stop_kind must reach the RunDTO, got nil")
 	}
@@ -262,7 +262,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	}
 
 	// NULL column ⇒ nil pointer (omitted from JSON), never "".
-	unstamped := runToDTO(store.Run{Status: "completed"}, "normal")
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0)
 	if unstamped.StopKind != nil {
 		t.Errorf("an unstamped stop_kind must map to nil, got %q", *unstamped.StopKind)
 	}
@@ -275,7 +275,7 @@ func TestRunToDTOStopReason(t *testing.T) {
 	stamped := runToDTO(store.Run{
 		Status:     "cancelled",
 		StopReason: pgtype.Text{String: "wrong approach, restarting", Valid: true},
-	}, "normal")
+	}, "normal", 0)
 	if stamped.StopReason == nil {
 		t.Fatal("a stamped stop_reason must reach the RunDTO, got nil")
 	}
@@ -284,9 +284,43 @@ func TestRunToDTOStopReason(t *testing.T) {
 	}
 
 	// NULL column ⇒ nil pointer (omitted from JSON), never "".
-	unstamped := runToDTO(store.Run{Status: "completed"}, "normal")
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0)
 	if unstamped.StopReason != nil {
 		t.Errorf("an unstamped stop_reason must map to nil, got %q", *unstamped.StopReason)
+	}
+}
+
+// TestRunToDTODeadlineAt pins the PRD #1170 wall-clock deadline the near-timeout badge
+// counts down to (served on GET /api/runs/{id} via runToDTO): a running issue run with a
+// started_at and a frozen budget carries deadline_at = started + budget + paused, while a
+// running chat run (which the sweep exempts) carries null.
+func TestRunToDTODeadlineAt(t *testing.T) {
+	start := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	const globalTimeout = 2 * time.Hour
+
+	// A running issue run with a frozen 8h budget → deadline_at = started + 8h.
+	issue := runToDTO(store.Run{
+		Kind:              "issue",
+		Status:            "running",
+		StartedAt:         pgtype.Timestamptz{Time: start, Valid: true},
+		BudgetWallSeconds: pgtype.Int4{Int32: 8 * 60 * 60, Valid: true},
+	}, "normal", globalTimeout)
+	if issue.DeadlineAt == nil {
+		t.Fatal("a running issue run must carry a deadline_at, got nil")
+	}
+	if want := start.Add(8 * time.Hour); !issue.DeadlineAt.Equal(want) {
+		t.Errorf("deadline_at = %v, want %v", *issue.DeadlineAt, want)
+	}
+
+	// A running chat run never times out (the sweep exempts chat/judge), so deadline_at
+	// is null even with a started_at set.
+	chat := runToDTO(store.Run{
+		Kind:      "chat",
+		Status:    "running",
+		StartedAt: pgtype.Timestamptz{Time: start, Valid: true},
+	}, "normal", globalTimeout)
+	if chat.DeadlineAt != nil {
+		t.Errorf("a running chat run must carry deadline_at null, got %v", *chat.DeadlineAt)
 	}
 }
 
@@ -301,7 +335,7 @@ func TestRunToDTORequirementSet(t *testing.T) {
 		RequiredCapabilities: []string{"docker"},
 		RequiredTools:        []string{"go", "node"},
 		SizeClass:            "m",
-	}, "normal")
+	}, "normal", 0)
 	if len(populated.RequiredCapabilities) != 1 || populated.RequiredCapabilities[0] != "docker" {
 		t.Errorf("required_capabilities = %v, want [docker]", populated.RequiredCapabilities)
 	}
@@ -313,7 +347,7 @@ func TestRunToDTORequirementSet(t *testing.T) {
 	}
 
 	// Empty columns ⇒ non-nil empty slices ([] over null) and "" for size_class.
-	empty := runToDTO(store.Run{Status: "queued"}, "normal")
+	empty := runToDTO(store.Run{Status: "queued"}, "normal", 0)
 	if empty.RequiredCapabilities == nil || len(empty.RequiredCapabilities) != 0 {
 		t.Errorf("required_capabilities = %v, want non-nil empty", empty.RequiredCapabilities)
 	}

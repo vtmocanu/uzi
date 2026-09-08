@@ -10,9 +10,9 @@
    Token contract mirrors web/src/index.css: --bg --surface --raised --edge
    --edge-strong --fg --muted --faint --brand --brand-hover --on-brand --ok --warn
    --danger --info --plan. A proposal is a remap of those slots in a scope:
-     zori   : nothing extra (console panes only)
-     hala   : + the sidebar scope
-     umbra  : + every [data-live] element
+     dawn   : nothing extra (console panes only)
+     hall   : + the sidebar scope
+     shadow  : + every [data-live] element
    ────────────────────────────────────────────────────────────────────────── */
 :root {
   color-scheme: light;
@@ -22,7 +22,7 @@
   --lt-fg: #151A22; --lt-muted: #4A5567; --lt-faint: #5F6A82;
   --lt-brand: #B93C0B; --lt-brand-hover: #9A3412; --lt-on-brand: #FFFFFF;
   --lt-ok: #03705A; --lt-warn: #9A4A05; --lt-danger: #BE123C; --lt-info: #0369A1; --lt-plan: #4F46E5;
-  /* Dark set = today's ember values. Console panes, Hală's frame, Umbră's live cards. */
+  /* Dark set = today's ember values. Console panes, Hall's frame, Shadow's live cards. */
   --dk-bg: #0E1218; --dk-surface: #12161E; --dk-raised: #1A1F2A;
   --dk-edge: #2A3140; --dk-edge-strong: #3A4256;
   --dk-fg: #E4E8F0; --dk-muted: #949EB0; --dk-faint: #7A859A;
@@ -76,26 +76,26 @@ svg.i { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-widt
 }
 /* The dark remap. One rule, three scopes. */
 .console,
-.shell[data-proposal="hala"] .sidebar,
-.shell[data-proposal="umbra"] [data-live] {
+.shell[data-proposal="hall"] .sidebar,
+.shell[data-proposal="shadow"] [data-live] {
   --bg: var(--dk-bg); --surface: var(--dk-surface); --raised: var(--dk-raised); --edge: var(--dk-edge); --edge-strong: var(--dk-edge-strong);
   --fg: var(--dk-fg); --muted: var(--dk-muted); --faint: var(--dk-faint);
   --brand: var(--dk-brand); --brand-hover: var(--dk-brand-hover); --on-brand: var(--dk-on-brand); --ring: var(--dk-brand);
   --ok: var(--dk-ok); --warn: var(--dk-warn); --danger: var(--dk-danger); --info: var(--dk-info); --plan: var(--dk-plan);
   color: var(--fg); color-scheme: dark;
 }
-/* Umbră: "your turn" is the only warm thing at rest. */
-.shell[data-proposal="umbra"] [data-yours] { border-left: 3px solid var(--brand); background: var(--brand-tint); }
-.shell[data-proposal="umbra"] [data-live] { background: var(--surface); border-color: var(--edge); }
-.shell[data-proposal="umbra"] .run-head[data-live] { background: var(--surface); border-color: var(--edge); }
+/* Shadow: "your turn" is the only warm thing at rest. */
+.shell[data-proposal="shadow"] [data-yours] { border-left: 3px solid var(--brand); background: var(--brand-tint); }
+.shell[data-proposal="shadow"] [data-live] { background: var(--surface); border-color: var(--edge); }
+.shell[data-proposal="shadow"] .run-head[data-live] { background: var(--surface); border-color: var(--edge); }
 
 /* ── Sidebar (structure mirrors AppShell) ───────────────────────────────── */
 .sidebar { width: 264px; flex: none; display: flex; flex-direction: column; background: var(--surface); color: var(--fg); border-right: 1px solid var(--edge); overflow-y: auto; }
 .brand { display: flex; align-items: center; gap: 12px; padding: 18px 20px 14px; }
 .brand .tile { width: 40px; height: 40px; border-radius: 10px; background: var(--dk-brand); display: grid; place-items: center; flex: none; }
-.shell[data-proposal="zori"] .brand .tile, .shell[data-proposal="umbra"] .brand .tile { background: var(--lt-brand); }
+.shell[data-proposal="dawn"] .brand .tile, .shell[data-proposal="shadow"] .brand .tile { background: var(--lt-brand); }
 .brand .tile svg { width: 22px; height: 22px; stroke: #1A1008; stroke-width: 2; fill: none; }
-.shell[data-proposal="zori"] .brand .tile svg, .shell[data-proposal="umbra"] .brand .tile svg { stroke: #fff; }
+.shell[data-proposal="dawn"] .brand .tile svg, .shell[data-proposal="shadow"] .brand .tile svg { stroke: #fff; }
 .brand b { display: block; font-size: 16px; line-height: 1.2; }
 .brand span { font-size: 12px; color: var(--muted); }
 .nav { padding: 4px 12px; display: flex; flex-direction: column; gap: 2px; }
@@ -175,8 +175,8 @@ h2.sec { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; colo
 .run-row + .run-row { border-top-color: transparent; }
 .runs-list .run-row { border-top: 1px solid var(--edge); border-radius: 0; margin: 0; padding: 12px 0; }
 .runs-list .run-row:first-child { border-top: 0; }
-.shell[data-proposal="umbra"] .runs-list .run-row[data-live] { border: 1px solid var(--edge); border-radius: 8px; padding: 12px 14px; margin: 4px 0; }
-.shell[data-proposal="umbra"] .runs-list .run-row[data-yours] { border: 1px solid color-mix(in srgb, var(--brand) 30%, transparent); border-left-width: 3px; border-radius: 8px; padding: 12px 14px; margin: 4px 0; }
+.shell[data-proposal="shadow"] .runs-list .run-row[data-live] { border: 1px solid var(--edge); border-radius: 8px; padding: 12px 14px; margin: 4px 0; }
+.shell[data-proposal="shadow"] .runs-list .run-row[data-yours] { border: 1px solid color-mix(in srgb, var(--brand) 30%, transparent); border-left-width: 3px; border-radius: 8px; padding: 12px 14px; margin: 4px 0; }
 .now { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
 .now .mbar { font-size: 12px; }
 .big { font: 500 34px/1.1 var(--font-mono); font-variant-numeric: tabular-nums; margin: 8px 0 12px; }
@@ -352,9 +352,9 @@ tr.total td { font-weight: 600; border-bottom: 0; }
   <div class="title"><span class="mark"><svg viewBox="0 0 24 24"><use href="#i-factory"/></svg></span>Lights on <small>three light-theme proposals for uzi · sample data</small></div>
   <span class="lbl">Proposal</span>
   <div class="seg" id="seg-proposal" aria-label="Proposal">
-    <button type="button" data-proposal="zori" aria-pressed="false"><kbd>1</kbd>Zori</button>
-    <button type="button" data-proposal="hala" aria-pressed="true"><kbd>2</kbd>Hală</button>
-    <button type="button" data-proposal="umbra" aria-pressed="false"><kbd>3</kbd>Umbră</button>
+    <button type="button" data-proposal="dawn" aria-pressed="false"><kbd>1</kbd>Dawn</button>
+    <button type="button" data-proposal="hall" aria-pressed="true"><kbd>2</kbd>Hall</button>
+    <button type="button" data-proposal="shadow" aria-pressed="false"><kbd>3</kbd>Shadow</button>
   </div>
   <span class="lbl">Screen</span>
   <div class="seg" id="seg-screen" aria-label="Screen">
@@ -374,7 +374,7 @@ tr.total td { font-weight: 600; border-bottom: 0; }
 </div>
 
 <div class="stage" id="stage" data-screen="overview">
-<div class="shell" id="shell" data-proposal="hala">
+<div class="shell" id="shell" data-proposal="hall">
   <aside class="sidebar" aria-label="Main navigation">
     <div class="brand"><span class="tile"><svg viewBox="0 0 24 24"><use href="#i-factory"/></svg></span><div><b>uzi</b><span>uzinele întunecate</span></div></div>
     <nav class="nav">
@@ -566,7 +566,7 @@ tr.total td { font-weight: 600; border-bottom: 0; }
           <div class="card">
             <div class="head"><h2 class="sec">Milestones (reported complete)</h2><span class="faint" style="font-size:12.5px">3 of 5</span></div>
             <ol class="ms">
-              <li><span class="st done" aria-label="done">✓</span><span>Token block <code class="num" style="font-size:12.5px">[data-theme="zori"]</code> in index.css</span><span class="dur">4m 12s</span></li>
+              <li><span class="st done" aria-label="done">✓</span><span>Token block <code class="num" style="font-size:12.5px">[data-theme="dawn"]</code> in index.css</span><span class="dur">4m 12s</span></li>
               <li><span class="st done" aria-label="done">✓</span><span>Theme registry entries, Go and web</span><span class="dur">2m 05s</span></li>
               <li><span class="st cur" aria-label="in progress">◐</span><span>Console tokens on the activity feed and code panes</span><span class="dur">6m 40s</span>
                 <span class="nowline"><span class="mbar" aria-hidden="true">▰▱</span>now: replacing <code class="num" style="font-size:12px">bg-ink/60</code> in ActivityFeed.tsx:1037</span></li>
@@ -592,7 +592,7 @@ tr.total td { font-weight: 600; border-bottom: 0; }
 
           <div class="card">
             <div class="head"><h2 class="sec">Plan</h2><span class="pill ok nodot">approved by you · 14 min ago</span></div>
-            <div class="plan-sum">Add a third theme, <code class="num" style="font-size:12.5px">zori</code>, as one token block over the same component tree. Split the brand orange into rust for light ground and ember for dark panes; give the machine surfaces their own token family so logs stay dark.
+            <div class="plan-sum">Add a third theme, <code class="num" style="font-size:12.5px">dawn</code>, as one token block over the same component tree. Split the brand orange into rust for light ground and ember for dark panes; give the machine surfaces their own token family so logs stay dark.
               <ol><li>Token block and contrast tests</li><li>Registry entries (Go, web) and picker label</li><li>Console tokens on the four <code class="num" style="font-size:12px">bg-ink</code> log surfaces</li><li>Settings picker, docs, specs sync</li></ol>
             </div>
             <div style="margin-top:12px"><a class="link" href="#">View full plan</a></div>
@@ -636,24 +636,24 @@ tr.total td { font-weight: 600; border-bottom: 0; }
               <button type="button" role="radio" data-mode="light" aria-checked="false">Lights on</button>
               <button type="button" role="radio" data-mode="dark" aria-checked="false">Lights off</button>
             </div>
-            <p class="hint">macOS is in light mode right now, so you are seeing <b>Hală</b>. After sunset it switches to <b>Ember</b>.</p>
+            <p class="hint">macOS is in light mode right now, so you are seeing <b>Hall</b>. After sunset it switches to <b>Ember</b>.</p>
           </div>
         </div>
         <div class="pickers" data-mode="system">
           <div class="field picker-light">
             <div class="lab"><b>Lights on theme</b><span>Used when the system is light, or always when Mode is Lights on.</span></div>
             <div class="tgrid" role="radiogroup" aria-label="Lights on theme">
-              <button type="button" class="tcard" role="radio" data-light="zori" aria-checked="false">
+              <button type="button" class="tcard" role="radio" data-light="dawn" aria-checked="false">
                 <span class="tsw" style="--sw-ground:#F2F4F7;--sw-side:#FFFFFF;--sw-edge:#D6DBE4;--sw-card:#FFFFFF;--sw-card2:#0E1218;--sw-accent:#B93C0B;--sw-text:#151A22"><i></i><span><em></em><em></em></span></span>
-                <div><b>Zori<span class="tick">✓</span></b><span>Light throughout; logs stay dark.</span></div>
+                <div><b>Dawn<span class="tick">✓</span></b><span>Light throughout; logs stay dark.</span></div>
               </button>
-              <button type="button" class="tcard" role="radio" data-light="hala" aria-checked="true">
+              <button type="button" class="tcard" role="radio" data-light="hall" aria-checked="true">
                 <span class="tsw" style="--sw-ground:#F2F4F7;--sw-side:#12161E;--sw-edge:#D6DBE4;--sw-card:#FFFFFF;--sw-card2:#0E1218;--sw-accent:#B93C0B;--sw-text:#151A22"><i></i><span><em></em><em></em></span></span>
-                <div><b>Hală<span class="tick">✓</span></b><span>Dark frame, light workspace.</span></div>
+                <div><b>Hall<span class="tick">✓</span></b><span>Dark frame, light workspace.</span></div>
               </button>
-              <button type="button" class="tcard" role="radio" data-light="umbra" aria-checked="false">
+              <button type="button" class="tcard" role="radio" data-light="shadow" aria-checked="false">
                 <span class="tsw" style="--sw-ground:#F2F4F7;--sw-side:#FFFFFF;--sw-edge:#D6DBE4;--sw-card:#12161E;--sw-card2:#FBF4F0;--sw-accent:#FB923C;--sw-text:#B93C0B"><i></i><span><em></em><em></em></span></span>
-                <div><b>Umbră<span class="tick">✓</span></b><span>Dark only where runs are live.</span></div>
+                <div><b>Shadow<span class="tick">✓</span></b><span>Dark only where runs are live.</span></div>
               </button>
             </div>
           </div>
@@ -671,7 +671,7 @@ tr.total td { font-weight: 600; border-bottom: 0; }
             </div>
           </div>
         </div>
-        <div class="inst"><span>Instance defaults set by your admin:</span><span class="chip">lights on · Hală</span><span class="chip">lights off · Ember</span><button class="btn quiet sm" style="margin-left:auto">Use instance defaults</button></div>
+        <div class="inst"><span>Instance defaults set by your admin:</span><span class="chip">lights on · Hall</span><span class="chip">lights off · Ember</span><button class="btn quiet sm" style="margin-left:auto">Use instance defaults</button></div>
       </div>
     </div>
   </main>
@@ -682,9 +682,9 @@ tr.total td { font-weight: 600; border-bottom: 0; }
 <aside class="notes" id="notes" data-open="true" aria-label="Design notes">
   <div class="in">
     <div class="pick" role="tablist" aria-label="Notes for">
-      <button type="button" role="tab" data-note="zori" aria-pressed="false">Zori</button>
-      <button type="button" role="tab" data-note="hala" aria-pressed="true">Hală</button>
-      <button type="button" role="tab" data-note="umbra" aria-pressed="false">Umbră</button>
+      <button type="button" role="tab" data-note="dawn" aria-pressed="false">Dawn</button>
+      <button type="button" role="tab" data-note="hall" aria-pressed="true">Hall</button>
+      <button type="button" role="tab" data-note="shadow" aria-pressed="false">Shadow</button>
       <button type="button" role="tab" data-note="common" aria-pressed="false">Shared</button>
       <button type="button" role="tab" data-note="mode" aria-pressed="false">Mode</button>
     </div>
@@ -692,12 +692,12 @@ tr.total td { font-weight: 600; border-bottom: 0; }
     <section data-note="mode" hidden>
       <h2>Mode and pairing</h2>
       <p class="ro">system-follow with one theme per polarity</p>
-      <p>Every theme declares a polarity. Ember and Mission control are dark; Zori, Hală and Umbră are light. A user picks a mode and one theme for each polarity; the resolver decides which one paints.</p>
+      <p>Every theme declares a polarity. Ember and Mission control are dark; Dawn, Hall and Shadow are light. A user picks a mode and one theme for each polarity; the resolver decides which one paints.</p>
       <h3>Model</h3>
       <ul>
         <li><b>Registry</b>: <code>polarity: light | dark</code> on each theme in <code>api/internal/theme</code> and <code>web/src/lib/theme.ts</code>. The Go side validates that the light slot only accepts a light theme, and vice versa, so a stale or tampered value cannot pair them wrong.</li>
         <li><b>User settings</b>: <code>mode</code> (system, lights_on, lights_off), <code>lights_on_theme</code>, <code>lights_off_theme</code>. The UI says Lights on / Lights off; polarity stays light/dark in the registry. Today's single <code>theme</code> override migrates into the dark slot with <code>mode = dark</code>, so nobody's screen changes on upgrade.</li>
-        <li><b>Instance defaults</b>: the admin sets one theme per polarity; an empty user slot falls back to it, then to the shipped default (Ember / Hală).</li>
+        <li><b>Instance defaults</b>: the admin sets one theme per polarity; an empty user slot falls back to it, then to the shipped default (Ember / Hall).</li>
         <li><b>Resolver</b>: <code>mode = system</code> reads <code>prefers-color-scheme</code> and listens for changes, so the app flips live at sunset without a reload. Lights on and Lights off ignore the OS.</li>
         <li><b>First paint</b>: the pre-paint cache in <code>index.html</code> stores both slots plus the mode and evaluates the media query before the bundle loads, so there is no flash of the wrong polarity.</li>
         <li><b>CLI</b>: <code>uzi settings appearance</code> mirrors the three fields, per the rule that every web setting has a CLI twin.</li>
@@ -710,8 +710,8 @@ tr.total td { font-weight: 600; border-bottom: 0; }
       </ul>
     </section>
 
-    <section data-note="zori" hidden>
-      <h2>Zori</h2>
+    <section data-note="dawn" hidden>
+      <h2>Dawn</h2>
       <p class="ro">dawn · the same factory at first light</p>
       <p>Everything a person reads goes light. Everything the machines say (the activity feed, code, commands) stays in today's ember dark, so a run log looks exactly as it does now and sits in the page like an inspection window.</p>
       <h3>Where the dark goes</h3>
@@ -723,17 +723,17 @@ tr.total td { font-weight: 600; border-bottom: 0; }
       <h3>Why it works</h3>
       <ul><li>Zero new UX to learn; identical layout, identical pills, identical nav.</li><li>Logs keep syntax colours tuned for dark, which is where they read best.</li><li>Cards are the lightest thing on the page: elevation by lightness, the inverse of dark mode, no shadows needed.</li></ul>
       <h3>Ship cost</h3>
-      <ul><li>One <code>[data-theme="zori"]</code> block in <code>index.css</code>, one entry in the Go and web theme registries.</li><li>A <code>--console-*</code> token family consumed by the six <code>bg-ink</code> log/code surfaces (ActivityFeed, AgentTemplateEditor, CliTokens, AgentDetail, ScheduleModal). That is the only component touch.</li></ul>
+      <ul><li>One <code>[data-theme="dawn"]</code> block in <code>index.css</code>, one entry in the Go and web theme registries.</li><li>A <code>--console-*</code> token family consumed by the six <code>bg-ink</code> log/code surfaces (ActivityFeed, AgentTemplateEditor, CliTokens, AgentDetail, ScheduleModal). That is the only component touch.</li></ul>
       <h3>Risk</h3>
       <p>Lowest of the three. The visible change of identity: the ember orange must become rust on white (5.65:1), so the brand reads cooler at rest; the bright ember survives inside the dark panes and the brand tile.</p>
     </section>
 
-    <section data-note="hala">
-      <h2>Hală</h2>
+    <section data-note="hall">
+      <h2>Hall</h2>
       <p class="ro">the hall · the building stays dark, the floor is lit</p>
       <p>The sidebar is the factory's steel frame and keeps today's ember look pixel for pixel: brand tile, active item, badges, rate-limit meters. The workspace goes light because that is where you read and decide. The product still reads as uzi from across the room.</p>
       <h3>Where the dark goes</h3>
-      <ul><li>Sidebar (and the mobile top bar), plus the console surfaces from Zori.</li><li>Content area is fully light, including run headers and board cards.</li></ul>
+      <ul><li>Sidebar (and the mobile top bar), plus the console surfaces from Dawn.</li><li>Content area is fully light, including run headers and board cards.</li></ul>
       <h3>Palette</h3>
       <div class="sw">
         <div style="background:#12161E;color:#E4E8F0;border-color:#12161E"><b>Frame</b>#12161E</div><div style="background:#F2F4F7"><b>Ground</b>#F2F4F7</div><div style="background:#FFFFFF"><b>Card</b>#FFFFFF</div><div style="background:#FB923C;color:#1A1008;border-color:#FB923C"><b>Ember</b>#FB923C</div><div style="background:#B93C0B;color:#fff;border-color:#B93C0B"><b>Rust</b>#B93C0B</div>
@@ -741,14 +741,14 @@ tr.total td { font-weight: 600; border-bottom: 0; }
       <h3>Why it works</h3>
       <ul><li>Strongest figure/ground of the three: chrome recedes, content is the lightest surface on screen, so the eye lands on the work.</li><li>Nav badges (99+, 70, 8) keep the high-contrast dark ground they were tuned on; the rate-limit meters keep their ember colouring.</li><li>No white-wall fatigue on wide screens: the dark column anchors the layout.</li><li>Brand continuity: the first 264px of every screen are unchanged, so existing users keep their spatial memory.</li></ul>
       <h3>Ship cost</h3>
-      <ul><li>Zori, plus a <code>--nav-*</code> token family (or a scoped remap) read by the sidebar in <code>AppShell</code>. One component touch, no per-theme branching.</li></ul>
+      <ul><li>Dawn, plus a <code>--nav-*</code> token family (or a scoped remap) read by the sidebar in <code>AppShell</code>. One component touch, no per-theme branching.</li></ul>
       <h3>Risk</h3>
       <p>Two adaptation zones side by side. Keep the seam a 1px edge with no shadow or gradient, and keep the sidebar's text ramp the ember one (AA-verified on dark), not a lightened copy.</p>
-      <div class="rec"><b>Recommended default.</b> Proven pattern for light modes of dark-branded tools, lowest relearning cost, and it composes with Umbră's live cards later as an opt-in.</div>
+      <div class="rec"><b>Recommended default.</b> Proven pattern for light modes of dark-branded tools, lowest relearning cost, and it composes with Shadow's live cards later as an opt-in.</div>
     </section>
 
-    <section data-note="umbra" hidden>
-      <h2>Umbră</h2>
+    <section data-note="shadow" hidden>
+      <h2>Shadow</h2>
       <p class="ro">shadow · the factory is dark where it is working</p>
       <p>Dark is not chrome here; it travels with live machine work. A running run's card, the live run header and the activity feed are dark. Everything at rest is light. Anything waiting on you gets the one warm mark: a rust rail and tint. Three states you can tell apart without reading a pill.</p>
       <h3>Where the dark goes</h3>
@@ -760,7 +760,7 @@ tr.total td { font-weight: 600; border-bottom: 0; }
       <h3>Why it works</h3>
       <ul><li>Pre-attentive pop-out: on a thirty-card board the eye lands on the two or three dark cards without scanning status pills.</li><li>The approval item is the only warm thing on the page, so "what needs me" is answered before reading.</li><li>The dark ↔ light flip on a card is an event you notice from the corner of your eye when a run starts or finishes.</li></ul>
       <h3>Ship cost</h3>
-      <ul><li>Zori, plus a <code>data-live</code> attribute on the issue card, in-flight rows and the run header (derived from run status), and a <code>--live-*</code> family. Two component touches plus tests.</li></ul>
+      <ul><li>Dawn, plus a <code>data-live</code> attribute on the issue card, in-flight rows and the run header (derived from run status), and a <code>--live-*</code> family. Two component touches plus tests.</li></ul>
       <h3>Risk</h3>
       <p>Mixed polarity inside the content area. Mitigations: live cards keep the same radius, padding and 1px edge (no glow), the state is capped to the two machine-working statuses, and <code>awaiting_approval</code> is deliberately light so your decision surface never sits inside a dark card.</p>
     </section>
@@ -797,10 +797,10 @@ tr.total td { font-weight: 600; border-bottom: 0; }
   var notes = document.getElementById('notes');
   var notesBtn = document.getElementById('notes-btn');
   var compare = document.getElementById('compare');
-  var state = { proposal: 'hala', screen: 'overview', font: 'plex', notes: true, mode: 'system', dark: 'ember' };
+  var state = { proposal: 'hall', screen: 'overview', font: 'plex', notes: true, mode: 'system', dark: 'ember' };
   try { var saved = JSON.parse(localStorage.getItem('uzi-lights-on') || 'null'); if (saved) Object.assign(state, saved); } catch (e) {}
 
-  var NAMES = { zori: ['Zori', 'dawn · dark only in the console'], hala: ['Hală', 'the hall · dark frame, lit floor'], umbra: ['Umbră', 'shadow · dark where machines work'] };
+  var NAMES = { dawn: ['Dawn', 'dawn · dark only in the console'], hall: ['Hall', 'the hall · dark frame, lit floor'], shadow: ['Shadow', 'shadow · dark where machines work'] };
 
   function press(segId, attr, value) {
     document.querySelectorAll('#' + segId + ' button').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset[attr] === value)); });
@@ -812,7 +812,7 @@ tr.total td { font-weight: 600; border-bottom: 0; }
   function buildCompare() {
     compare.innerHTML = '';
     var screen = state.screen === 'compare' ? 'board' : state.screen;
-    ['zori', 'hala', 'umbra'].forEach(function (p) {
+    ['dawn', 'hall', 'shadow'].forEach(function (p) {
       var box = document.createElement('div'); box.className = 'mini';
       var h = document.createElement('h3'); h.textContent = NAMES[p][0]; var s = document.createElement('span'); s.textContent = NAMES[p][1]; h.appendChild(s);
       var frame = document.createElement('div'); frame.className = 'frame';
@@ -854,7 +854,7 @@ tr.total td { font-weight: 600; border-bottom: 0; }
     var l = e.target.closest('[data-light]'); if (l) { state.proposal = l.dataset.light; state.note = state.proposal; render(); return; }
     var d = e.target.closest('[data-dark]'); if (d) { state.dark = d.dataset.dark; render(); }
   });
-  if (!NAMES[state.proposal]) state.proposal = 'hala'; if (!DARK[state.dark]) state.dark = 'ember'; if (['system','light','dark'].indexOf(state.mode) < 0) state.mode = 'system';
+  if (!NAMES[state.proposal]) state.proposal = 'hall'; if (!DARK[state.dark]) state.dark = 'ember'; if (['system','light','dark'].indexOf(state.mode) < 0) state.mode = 'system';
   var hs = location.hash.slice(1).split('/'); if (NAMES[hs[0]]) { state.proposal = hs[0]; state.note = hs[0]; } if (['overview','board','run','settings','compare'].indexOf(hs[1]) >= 0) state.screen = hs[1];
   state.note = state.note || state.proposal;
 
@@ -868,7 +868,7 @@ tr.total td { font-weight: 600; border-bottom: 0; }
   document.addEventListener('keydown', function (e) {
     if (e.metaKey || e.ctrlKey || e.altKey || /input|textarea/i.test(e.target.tagName)) return;
     var k = e.key.toLowerCase();
-    if (k === '1') state.proposal = 'zori'; else if (k === '2') state.proposal = 'hala'; else if (k === '3') state.proposal = 'umbra';
+    if (k === '1') state.proposal = 'dawn'; else if (k === '2') state.proposal = 'hall'; else if (k === '3') state.proposal = 'shadow';
     else if (k === 'o') state.screen = 'overview'; else if (k === 'b') state.screen = 'board'; else if (k === 'r') state.screen = 'run'; else if (k === 's') state.screen = 'settings'; else if (k === 'c') state.screen = 'compare';
     else if (k === 'n') state.notes = !state.notes; else if (k === 't') state.font = state.font === 'plex' ? 'system' : 'plex';
     else return;

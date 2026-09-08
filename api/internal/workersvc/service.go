@@ -1026,19 +1026,13 @@ type Service struct {
 	// the flag DEFAULTS ON, so tests and deployments without a settings cache route
 	// capability-aware exactly as a live instance whose admin left the default in place.
 	capabilitySettings CapabilityScheduleReader
-	// lastSlowClampWarn is the last health_slow_seconds value the read-time clamp
-	// warned about (PRD #47), so the warning logs once per distinct misconfigured
-	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
-	// (slowThreshold, reached via detectRunHealth ← Sweep), so it needs no lock.
-	lastSlowClampWarn time.Duration
 	// persistFail counts consecutive AppendMessages failures per run (PRD #108 M4),
 	// the signal a persistence wedge cannot suppress because the wedge IS the event
 	// being counted. Always non-nil (New constructs it).
 	//
-	// Unlike lastSlowClampWarn directly above, it is NOT sweeper-only: it is written
-	// by every HTTP handler goroutine serving /messages and read by the sweeper, so
-	// it carries its own mutex. Do not copy that field's lock-free reasoning here —
-	// see persistfail.go.
+	// It is NOT sweeper-only: it is written by every HTTP handler goroutine serving
+	// /messages and read by the sweeper, so it carries its own mutex — see
+	// persistfail.go.
 	persistFail *persistFailTracker
 	// forgeBaseURLAllowed is the SSRF gate for the M8 checkpoint-publish path (PRD
 	// #122): it reports whether a run's forge base URL is on the configured
