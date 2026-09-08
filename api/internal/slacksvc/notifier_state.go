@@ -113,8 +113,8 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		// Resume-then-progress: consume a PRIOR park's marker (post ▶️ Resumed on the first
 		// running), then stamp THIS event's marker if it is itself a park, before the
 		// milestone line (PRD #1116). handleLimitResume reads `existing` (the marker from a
-		// prior park); recordLimitPause is a no-op unless this event IS a limit_wait, so on a
-		// resume event these do not conflict.
+		// prior park); recordLimitPause is a no-op unless this event IS a park (limit_wait or
+		// paused), so on a resume event these do not conflict.
 		n.handleLimitResume(ctx, rc, existing, base)
 		n.recordLimitPause(ctx, rc)
 		n.handleMilestone(ctx, rc, existing)

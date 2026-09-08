@@ -45,7 +45,7 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS checkpoint_tip_at timestamptz;
 -- writes, EXCLUDED from ConsumeRunInputs so the worker never drains it. Re-deriving the
 -- list from anything but the live constraint silently deletes whatever it forgets (00092
 -- documents exactly that failure).
-ALTER TABLE run_user_inputs DROP CONSTRAINT run_user_inputs_kind_check;
+ALTER TABLE run_user_inputs DROP CONSTRAINT IF EXISTS run_user_inputs_kind_check;
 ALTER TABLE run_user_inputs ADD CONSTRAINT run_user_inputs_kind_check
     CHECK (kind IN ('follow_up', 'approve_plan', 'reject_plan', 'cancel', 'revise_plan', 'answer', 'stop', 'scope', 'pause', 'pause_cancel', 'resume'));
 

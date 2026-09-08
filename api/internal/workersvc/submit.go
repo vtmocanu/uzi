@@ -175,7 +175,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			mode = "milestone"
 		}
 		if mode != "milestone" && mode != "now" {
-			return SubmitInputResult{}, fmt.Errorf("%w: pause mode must be 'milestone' or 'now'", ErrInvalidState)
+			return SubmitInputResult{}, fmt.Errorf("%w: pause mode must be 'milestone' or 'now'", ErrInvalidPauseMode)
 		}
 		if _, err := s.q.CreatePauseInput(ctx, store.CreatePauseInputParams{ID: runID, Mode: pgconv.TextOrNull(mode)}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {

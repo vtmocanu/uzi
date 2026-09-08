@@ -165,6 +165,11 @@ var (
 	// only a non-integer body is a caller error. (Named to avoid colliding with the unrelated
 	// judge-bulk ErrInvalidScope.)
 	ErrInvalidScopeCeiling = errors.New("scope ceiling must be an integer")
+	// ErrInvalidPauseMode rejects a `pause` (PRD #1190 M1) whose body is neither 'milestone'
+	// nor 'now' → 400. A dedicated input-validation sentinel (like ErrInvalidScopeCeiling)
+	// so CreateRunInput can map it to 400 with the reason verbatim, rather than letting an
+	// invalid mode fall through to the 500 default arm.
+	ErrInvalidPauseMode = errors.New("invalid pause mode")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is

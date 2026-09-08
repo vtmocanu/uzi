@@ -615,6 +615,10 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrNoPausePending):
 			// PRD #1190 M1: pause_cancel with nothing pending → 409.
 			httpx.Error(w, http.StatusConflict, "no pause is pending")
+		case errors.Is(err, workersvc.ErrInvalidPauseMode):
+			// PRD #1190 M1: the pause body was neither 'milestone' nor 'now' → 400 (a caller
+			// error). The service built the reason clause, so surface it verbatim.
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidScopeCeiling):
 			// 400: the scope body did not parse as an integer ceiling. Out-of-range
 			// values are clamped, not rejected — only a non-integer is a caller error.
