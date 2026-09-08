@@ -829,7 +829,7 @@ export function MrReworkPanel({
                 <span>Guidance (optional)</span>
                 <textarea
                   id="mr-rework-guidance"
-                  className="min-h-[4.5rem] w-full rounded-lg border border-border bg-bg px-2 py-1.5 text-xs text-fg focus:border-brand focus:outline-none"
+                  className="min-h-[4.5rem] w-full rounded-lg border border-edge bg-raised px-2 py-1.5 text-xs text-fg focus:border-brand focus:outline-none"
                   value={guidance}
                   disabled={reworkBusy}
                   onChange={(e) => setGuidance(e.target.value)}
