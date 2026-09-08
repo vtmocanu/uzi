@@ -52,9 +52,11 @@ func TestClearSlackRunLimitPauseLiveDB(t *testing.T) {
 		t.Fatalf("a fresh anchor carries no park marker: %+v", anchor.LimitPausedAt)
 	}
 
-	// Set the park marker to at1 (the run's status_since captured at the park).
+	// Set the park marker to at1 (the run's status_since captured at the park), recording the
+	// park kind (PRD #1190) so a later resume can be worded honestly. Only a real Postgres
+	// proves the park_kind column write and read-back — the fake NotifierStore runs no SQL.
 	if _, err := f.q.SetSlackRunLimitPause(ctx, store.SetSlackRunLimitPauseParams{
-		RunID: f.runID, At: at1,
+		RunID: f.runID, At: at1, ParkKind: pgtype.Text{String: "paused", Valid: true},
 	}); err != nil {
 		t.Fatalf("SetSlackRunLimitPause: %v", err)
 	}
@@ -64,6 +66,9 @@ func TestClearSlackRunLimitPauseLiveDB(t *testing.T) {
 	}
 	if !reread.LimitPausedAt.Valid || !reread.LimitPausedAt.Time.Equal(at1.Time) {
 		t.Fatalf("the park start must be legible on the anchor: got %+v want %v", reread.LimitPausedAt, at1.Time)
+	}
+	if !reread.ParkKind.Valid || reread.ParkKind.String != "paused" {
+		t.Fatalf("the park kind must round-trip on the anchor: got %+v want `paused`", reread.ParkKind)
 	}
 
 	// A STALE clear (at2 != the stored at1) must be REFUSED by the compare-and-swap guard:

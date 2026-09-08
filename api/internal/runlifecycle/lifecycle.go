@@ -202,7 +202,13 @@ func reconcilerDecision(status string, origin pgtype.Text) decision {
 	// default arm would trip the give-up warn on every hold. It is In Progress (a held
 	// run is still working), and Notify's partial map is deliberately NOT extended: a
 	// hold moves no card, so there is nothing to notify about.
-	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait":
+	//
+	// paused (PRD #1190) is the owner-requested park and belongs here for the same reasons:
+	// a paused run keeps its issue, session and worker affinity, resumes on demand, and
+	// routinely outlasts 30 minutes by design — so the default arm would trip the give-up
+	// warn as the normal case. It is In Progress (a paused run is still an active piece of
+	// work), and Notify's partial map is deliberately NOT extended: a pause moves no card.
+	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "paused":
 		return decision{act: true, target: board.ColumnInProgress}
 	case "completed":
 		return decision{act: true, target: board.ColumnHumanReview}

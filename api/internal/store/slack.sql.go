@@ -16,7 +16,7 @@ const clearSlackRunLimitPause = `-- name: ClearSlackRunLimitPause :one
 UPDATE slack_run_messages
 SET limit_paused_at = NULL, updated_at = now()
 WHERE run_id = $1 AND limit_paused_at = $2
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind
 `
 
 type ClearSlackRunLimitPauseParams struct {
@@ -47,6 +47,7 @@ func (q *Queries) ClearSlackRunLimitPause(ctx context.Context, arg ClearSlackRun
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
@@ -231,6 +232,7 @@ SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.health, r.plan_md,
        r.rate_limit_type, r.retry_not_before, r.limit_wait_count, r.status_since,
        r.milestones_frozen, r.milestones_completed, r.milestones_in_progress,
+       r.checkpoint_tip,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
@@ -265,6 +267,7 @@ type GetSlackRunContextRow struct {
 	MilestonesFrozen     []byte             `json:"milestones_frozen"`
 	MilestonesCompleted  []byte             `json:"milestones_completed"`
 	MilestonesInProgress []byte             `json:"milestones_in_progress"`
+	CheckpointTip        pgtype.Text        `json:"checkpoint_tip"`
 	PathWithNamespace    string             `json:"path_with_namespace"`
 	WebUrl               string             `json:"web_url"`
 	ForgeType            string             `json:"forge_type"`
@@ -317,6 +320,13 @@ type GetSlackRunContextRow struct {
 // resume line: on a limit_wait park the notifier copies it onto slack_run_messages
 // .limit_paused_at, and the waited duration is now − that instant. It is NOT NULL on runs
 // (migration 00163), stamped now() on every status transition including the park.
+//
+// checkpoint_tip (PRD #1190) is selected FROM THE RUNS ROW, for the same "explicit column
+// list" reason as stop_kind/rate_limit_type above: the `‖ Paused by you · checkpoint <short>`
+// line in the paused thread arm needs the last checkpoint-published branch tip, and there is
+// no other way to reach it through this query. It is a nullable TEXT column (00185), NULL/empty
+// for a run that never published a checkpoint, which the Go side omits (the arm's "omit when
+// absent" convention).
 func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlackRunContextRow, error) {
 	row := q.db.QueryRow(ctx, getSlackRunContext, id)
 	var i GetSlackRunContextRow
@@ -341,6 +351,7 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 		&i.MilestonesFrozen,
 		&i.MilestonesCompleted,
 		&i.MilestonesInProgress,
+		&i.CheckpointTip,
 		&i.PathWithNamespace,
 		&i.WebUrl,
 		&i.ForgeType,
@@ -350,7 +361,7 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 }
 
 const getSlackRunMessage = `-- name: GetSlackRunMessage :one
-SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at FROM slack_run_messages WHERE run_id = $1
+SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind FROM slack_run_messages WHERE run_id = $1
 `
 
 // The DM anchor for a run (threading + edit target). Absent = not yet notified.
@@ -370,12 +381,13 @@ func (q *Queries) GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (Slac
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
 
 const getSlackRunMessageByRoot = `-- name: GetSlackRunMessageByRoot :one
-SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at FROM slack_run_messages WHERE channel_id = $1 AND root_ts = $2
+SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind FROM slack_run_messages WHERE channel_id = $1 AND root_ts = $2
 `
 
 type GetSlackRunMessageByRootParams struct {
@@ -402,6 +414,7 @@ func (q *Queries) GetSlackRunMessageByRoot(ctx context.Context, arg GetSlackRunM
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
@@ -439,7 +452,7 @@ func (q *Queries) GetUserSlackLink(ctx context.Context, id uuid.UUID) (GetUserSl
 const insertSlackChatAnchor = `-- name: InsertSlackChatAnchor :one
 INSERT INTO slack_run_messages (run_id, channel_id, root_ts, status_ts, updated_at)
 VALUES ($1, $2, $3, $4, now())
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind
 `
 
 type InsertSlackChatAnchorParams struct {
@@ -477,6 +490,7 @@ func (q *Queries) InsertSlackChatAnchor(ctx context.Context, arg InsertSlackChat
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
@@ -556,7 +570,7 @@ const setSlackRunGate = `-- name: SetSlackRunGate :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, updated_at = now()
 WHERE run_id = $3
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind
 `
 
 type SetSlackRunGateParams struct {
@@ -586,6 +600,7 @@ func (q *Queries) SetSlackRunGate(ctx context.Context, arg SetSlackRunGateParams
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
@@ -594,7 +609,7 @@ const setSlackRunGateGen = `-- name: SetSlackRunGateGen :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, gate_generation = $3, updated_at = now()
 WHERE run_id = $4 AND (gate_generation IS NULL OR gate_generation < $3)
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind
 `
 
 type SetSlackRunGateGenParams struct {
@@ -630,6 +645,7 @@ func (q *Queries) SetSlackRunGateGen(ctx context.Context, arg SetSlackRunGateGen
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
@@ -638,7 +654,7 @@ const setSlackRunGateIf = `-- name: SetSlackRunGateIf :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, updated_at = now()
 WHERE run_id = $3 AND gate_ts = $4 AND gate_state = $5
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind
 `
 
 type SetSlackRunGateIfParams struct {
@@ -677,31 +693,35 @@ func (q *Queries) SetSlackRunGateIf(ctx context.Context, arg SetSlackRunGateIfPa
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
 
 const setSlackRunLimitPause = `-- name: SetSlackRunLimitPause :one
 UPDATE slack_run_messages
-SET limit_paused_at = $1, updated_at = now()
-WHERE run_id = $2
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at
+SET limit_paused_at = $1, park_kind = $2, updated_at = now()
+WHERE run_id = $3
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind
 `
 
 type SetSlackRunLimitPauseParams struct {
-	At    pgtype.Timestamptz `json:"at"`
-	RunID uuid.UUID          `json:"run_id"`
+	At       pgtype.Timestamptz `json:"at"`
+	ParkKind pgtype.Text        `json:"park_kind"`
+	RunID    uuid.UUID          `json:"run_id"`
 }
 
-// Stamp the pending usage-limit park's start on the run's anchor (PRD #1116): @at is the
-// run's own status_since captured at the park. It is its OWN column, not a reuse of the
-// gate/question anchors, for the same reason gate_generation and milestones_notified_completed
-// are their own columns — a distinct dedupe fact (a park awaiting its resume line), so a park
-// can never clear a gate and a gate can never clear a park. Overwrite is correct: a re-park
-// always follows a consumed resume (the park SQL guards on status='running', and the resumed
-// worker reports running first), so a set never clobbers a live pending park.
+// Stamp the pending park's start on the run's anchor (PRD #1116, generalised by PRD #1190):
+// @at is the run's own status_since captured at the park, and @park_kind records WHICH park it
+// was ('limit_wait' or 'paused') so the eventual resume reply can be worded honestly — a
+// usage-limit park clears "· usage limit cleared", an owner pause does not. It is its OWN
+// column, not a reuse of the gate/question anchors, for the same reason gate_generation and
+// milestones_notified_completed are their own columns — a distinct dedupe fact (a park awaiting
+// its resume line), so a park can never clear a gate and a gate can never clear a park. Overwrite
+// is correct: a re-park always follows a consumed resume (the park SQL guards on status='running',
+// and the resumed worker reports running first), so a set never clobbers a live pending park.
 func (q *Queries) SetSlackRunLimitPause(ctx context.Context, arg SetSlackRunLimitPauseParams) (SlackRunMessage, error) {
-	row := q.db.QueryRow(ctx, setSlackRunLimitPause, arg.At, arg.RunID)
+	row := q.db.QueryRow(ctx, setSlackRunLimitPause, arg.At, arg.ParkKind, arg.RunID)
 	var i SlackRunMessage
 	err := row.Scan(
 		&i.RunID,
@@ -716,6 +736,7 @@ func (q *Queries) SetSlackRunLimitPause(ctx context.Context, arg SetSlackRunLimi
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
@@ -724,7 +745,7 @@ const setSlackRunMilestoneNotified = `-- name: SetSlackRunMilestoneNotified :one
 UPDATE slack_run_messages
 SET milestones_notified_completed = $1, updated_at = now()
 WHERE run_id = $2 AND (milestones_notified_completed IS NULL OR milestones_notified_completed < $1)
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind
 `
 
 type SetSlackRunMilestoneNotifiedParams struct {
@@ -759,6 +780,7 @@ func (q *Queries) SetSlackRunMilestoneNotified(ctx context.Context, arg SetSlack
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
@@ -767,7 +789,7 @@ const setSlackRunQuestion = `-- name: SetSlackRunQuestion :one
 UPDATE slack_run_messages
 SET question_id = $1, question_ts = $2, updated_at = now()
 WHERE run_id = $3
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind
 `
 
 type SetSlackRunQuestionParams struct {
@@ -805,6 +827,7 @@ func (q *Queries) SetSlackRunQuestion(ctx context.Context, arg SetSlackRunQuesti
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
@@ -921,7 +944,7 @@ ON CONFLICT (run_id) DO UPDATE
     SET channel_id = EXCLUDED.channel_id,
         root_ts    = EXCLUDED.root_ts,
         updated_at = now()
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts, limit_paused_at, park_kind
 `
 
 type UpsertSlackRunMessageParams struct {
@@ -948,6 +971,7 @@ func (q *Queries) UpsertSlackRunMessage(ctx context.Context, arg UpsertSlackRunM
 		&i.MilestonesNotifiedCompleted,
 		&i.StatusTs,
 		&i.LimitPausedAt,
+		&i.ParkKind,
 	)
 	return i, err
 }
