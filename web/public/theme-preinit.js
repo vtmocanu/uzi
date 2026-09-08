@@ -19,6 +19,14 @@
   var DARK = { ember: 1, mission: 1 };
   var el = document.documentElement;
 
+  // Own-property membership only: a cached (or tampered) light/dark id of
+  // "__proto__" / "constructor" / "toString" must NOT read as a valid theme via
+  // the object's prototype chain, which would stamp an unknown data-theme. Guards
+  // every LIGHT/DARK lookup below.
+  function known(map, id) {
+    return typeof id === "string" && Object.prototype.hasOwnProperty.call(map, id);
+  }
+
   // paint stamps data-theme/data-font for a resolved appearance. matchMedia is
   // guarded here so a "system" mode without matchMedia falls to the light polarity
   // rather than throwing (leaving data-theme unset).
@@ -52,15 +60,15 @@
       var a = JSON.parse(raw);
       if (a && typeof a === "object") {
         if (a.mode === "system" || a.mode === "light" || a.mode === "dark") mode = a.mode;
-        if (LIGHT[a.light]) light = a.light;
-        if (DARK[a.dark]) dark = a.dark;
+        if (known(LIGHT, a.light)) light = a.light;
+        if (known(DARK, a.dark)) dark = a.dark;
         if (a.typeface === "system" || a.typeface === "plex") typeface = a.typeface;
       }
     } else {
       // No uzi.appearance yet: migrate a stale pre-m5 "uzi.theme" cache. A dark id
       // becomes the dark slot pinned by mode="dark"; anything else keeps defaults.
       var stale = localStorage.getItem("uzi.theme");
-      if (DARK[stale]) {
+      if (known(DARK, stale)) {
         dark = stale;
         mode = "dark";
       }

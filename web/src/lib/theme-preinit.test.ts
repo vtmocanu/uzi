@@ -93,4 +93,32 @@ describe("theme-preinit.js pre-paint stamp (PRD #1167 m5)", () => {
     const attrs = run({ storage: { "uzi.theme": "mission" }, osDark: false });
     expect(attrs["data-theme"]).toBe("mission");
   });
+
+  // A hostile / corrupt cache whose light|dark id is an Object.prototype member
+  // ("__proto__", "constructor", "toString") must NOT pass the polarity check via
+  // the prototype chain — it falls back to the compiled default, never stamping a
+  // bogus data-theme.
+  it("ignores prototype-chain ids in the cached light/dark slots", () => {
+    for (const evil of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+      const attrs = run({
+        storage: { "uzi.appearance": appearance({ mode: "light", light: evil }) },
+        osDark: false,
+      });
+      expect(attrs["data-theme"]).toBe("hall"); // compiled light fallback, not `evil`
+    }
+    for (const evil of ["__proto__", "constructor", "toString"]) {
+      const attrs = run({
+        storage: { "uzi.appearance": appearance({ mode: "dark", dark: evil }) },
+        osDark: false,
+      });
+      expect(attrs["data-theme"]).toBe("ember"); // compiled dark fallback, not `evil`
+    }
+  });
+
+  // The legacy uzi.theme migration lookup is guarded the same way: a prototype
+  // member there does not migrate as a dark id.
+  it("ignores a prototype-chain id in the stale uzi.theme migration", () => {
+    const attrs = run({ storage: { "uzi.theme": "toString" }, osDark: false });
+    expect(attrs["data-theme"]).toBe("hall"); // no-cache OS-light default, not "toString"
+  });
 });
