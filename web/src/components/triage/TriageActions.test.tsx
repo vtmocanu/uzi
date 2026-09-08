@@ -106,4 +106,15 @@ describe("TriageActions — the live region (owned mode)", () => {
     expect(region.getAttribute("aria-live")).toBe("polite");
     expect(region.className).toContain("sr-only");
   });
+
+  it("renders NO internal region when the caller hosts its own (owned mode)", () => {
+    // The owned caller (run page) hosts a persistent region a level up because its row swaps
+    // TriageActions out on a mutation; passing callerHostsLiveRegion suppresses the doomed
+    // internal one so the two do not double-announce.
+    const { container } = render(
+      <TriageActions onMarkDone={vi.fn()} announce="Marked done" callerHostsLiveRegion />,
+    );
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(screen.queryByText("Marked done")).toBeNull();
+  });
 });

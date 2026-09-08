@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "../../components/ui";
+import { dismissMenuItems } from "../../components/triage/triageCopy";
 
 // MultiSelectBar is the sticky action bar for the checkbox selection: it fans one verdict
-// out across every selected group in one bulk call (Decision 3's multi-select).
+// out across every selected group in one bulk call (Decision 3's multi-select). It matches
+// the shared TriageActions Dismiss ▾ behaviour — Escape + outside-click close, the menu
+// button carrying aria-haspopup="menu" — and sources its two reasoned menu items from
+// triageCopy so the sublines cannot drift from the row's (PRD #1183). The menu opens UPWARD
+// (`bottom-full`), unlike TriageActions' downward menu, because this bar is pinned to the
+// bottom of the viewport.
 export function MultiSelectBar({
   count,
   onClear,
@@ -15,13 +21,26 @@ export function MultiSelectBar({
   const [menuOpen, setMenuOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
+  // Escape closes the menu and returns focus to the Dismiss trigger (the first button in the
+  // wrapper); a pointerdown outside closes it. Wired only while open, torn down on close —
+  // the same discipline as TriageActions.
   useEffect(() => {
     if (!menuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMenuOpen(false);
+        wrapRef.current?.querySelector<HTMLElement>("button")?.focus();
+      }
+    };
     const onPointerDown = (e: Event) => {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setMenuOpen(false);
     };
+    document.addEventListener("keydown", onKey);
     document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onPointerDown);
+    };
   }, [menuOpen]);
 
   // Issue #204: inset the bar past the sidebar at the desktop breakpoint. `inset-x-0`
@@ -60,30 +79,21 @@ export function MultiSelectBar({
                 role="menu"
                 className="absolute bottom-full right-0 z-10 mb-1 w-56 rounded-lg border border-edge-strong bg-surface p-1 shadow-lg"
               >
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onDispose("dismissed", "wont_do");
-                  }}
-                  className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised"
-                >
-                  Won't do
-                  <span className="text-xs text-faint">Valid, but not worth acting on</span>
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onDispose("dismissed", "not_an_issue");
-                  }}
-                  className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised"
-                >
-                  Not an issue
-                  <span className="text-xs text-faint">False positive — the judge got it wrong</span>
-                </button>
+                {dismissMenuItems("judge").map((item) => (
+                  <button
+                    key={item.reason}
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      onDispose("dismissed", item.reason);
+                    }}
+                    className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised"
+                  >
+                    {item.label}
+                    <span className="text-xs text-faint">{item.subline}</span>
+                  </button>
+                ))}
               </div>
             )}
           </div>

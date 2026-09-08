@@ -12,11 +12,14 @@ import { dismissMenuItems } from "./triageCopy";
 // its issue closing). The mutation itself lives in the CALLER's handler, which decides between
 // the two modes the PRD describes:
 //   * owned (run page, finding card): the handler does the optimistic call, the single-row
-//     refetch, and passes `announce` for the live region below; the caller also owns the
-//     successor-focus move onto Undo.
+//     refetch, and owns the successor-focus move onto Undo. Because its row swaps THIS
+//     component out for TriageDisposedRow on a mutation, an announce hosted here would unmount
+//     with the message mid-read — so the owned caller hosts its OWN persistent live region a
+//     level up and passes `callerHostsLiveRegion`, and we render no second one here.
 //   * delegated (Judge group row, both multi-select bars): the handler forwards to the page's
-//     bulk call and toast Undo, with no live region and no successor focus (a settled group may
-//     leave the bucket on reload, so there is no successor to focus).
+//     bulk call and toast Undo, with no successor focus (a settled group may leave the bucket
+//     on reload, so there is no successor to focus). The row is not swapped under it, so the
+//     region below is enough — these callers omit `callerHostsLiveRegion` and keep it.
 //
 // The Dismiss ▾ menu (aria-haspopup="menu", Escape + outside-click close) is lifted from the
 // judge's GroupDisposeControls / DispositionControls, with the two reasoned items sourced from
@@ -28,6 +31,7 @@ export function TriageActions({
   dismissCopy = "judge",
   busy = false,
   announce = "",
+  callerHostsLiveRegion = false,
 }: {
   onFile?: () => void;
   onMarkDone?: () => void;
@@ -35,6 +39,11 @@ export function TriageActions({
   dismissCopy?: "judge" | "finding";
   busy?: boolean;
   announce?: string;
+  // Set by an owned-mode caller that hosts its OWN persistent live region because its row
+  // swaps this component out on a mutation (see the mode note above). When true we render no
+  // internal region — the caller's survives the swap. Default false keeps the delegated
+  // callers' behaviour (and this component's own region) unchanged.
+  callerHostsLiveRegion?: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuWrapRef = useRef<HTMLDivElement>(null);
@@ -64,11 +73,15 @@ export function TriageActions({
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      {/* A polite sr-only live region for the owned mode's announcement. It always renders so
-          the message survives the caller's row swap after a mutation. */}
-      <span className="sr-only" role="status" aria-live="polite">
-        {announce}
-      </span>
+      {/* A polite sr-only live region for the delegated mode's announcement. The owned mode
+          (run page, finding card) instead hosts its OWN persistent region a level up and passes
+          callerHostsLiveRegion, because its row swaps this component out for TriageDisposedRow
+          on a mutation and a region here would unmount with the message mid-read. */}
+      {!callerHostsLiveRegion && (
+        <span className="sr-only" role="status" aria-live="polite">
+          {announce}
+        </span>
+      )}
       {onFile && (
         <Button size="sm" variant="secondary" disabled={busy} onClick={onFile}>
           File issue

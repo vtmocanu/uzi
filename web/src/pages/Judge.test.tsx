@@ -6,6 +6,7 @@ import { Judge } from "./Judge";
 import {
   api,
   ApiError,
+  type IssueDraft,
   type JudgeBacklog,
   type JudgeRecommendationGroup,
   type JudgeDispositionResult,
@@ -22,6 +23,11 @@ vi.mock("../lib/api", async (importOriginal) => {
       bulkSetJudgeDisposition: vi.fn(),
       deleteDisposition: vi.fn(),
       listRepos: vi.fn().mockResolvedValue({ repos: [] }),
+      // The group-row File issue reaches the shared IssueDraftCard, which drives these two
+      // (folded here from the deleted OccurrenceFileIssue.test.tsx — the draft is now reached
+      // from the ROW, not a per-occurrence expander button).
+      getIssueDraft: vi.fn(),
+      fileIssue: vi.fn(),
     },
   };
 });
@@ -984,7 +990,7 @@ describe("Judge — the row-vs-group bridge line (#620)", () => {
     renderJudge();
 
     // triage.todo (42) is the rec half; the todo matrix slice (10+8) is the group half.
-    expect(await screen.findByText("42 to-do recommendations across 18 groups")).toBeTruthy();
+    expect(await screen.findByText("42 to triage recommendations across 18 groups")).toBeTruthy();
   });
 
   it("re-scopes to the active bucket on a tab switch (Done → done count and done sum)", async () => {
@@ -992,7 +998,7 @@ describe("Judge — the row-vs-group bridge line (#620)", () => {
     mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
     renderJudge();
 
-    expect(await screen.findByText("42 to-do recommendations across 18 groups")).toBeTruthy();
+    expect(await screen.findByText("42 to triage recommendations across 18 groups")).toBeTruthy();
 
     // /Done/ addresses the Done tab only — "Dismissed" does not contain "Done".
     fireEvent.click(screen.getByRole("tab", { name: /Done/ }));
@@ -1071,7 +1077,7 @@ describe("Judge — the row-vs-group bridge line (#620)", () => {
     });
 
     renderJudge();
-    expect(await screen.findByText("42 to-do recommendations across 18 groups")).toBeTruthy();
+    expect(await screen.findByText("42 to triage recommendations across 18 groups")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /Mark done/ }));
 
@@ -1081,7 +1087,7 @@ describe("Judge — the row-vs-group bridge line (#620)", () => {
 
     // Once the refetch lands, the bridge returns with the updated recommendation half.
     releaseStats?.();
-    expect(await screen.findByText("40 to-do recommendations across 18 groups")).toBeTruthy();
+    expect(await screen.findByText("40 to triage recommendations across 18 groups")).toBeTruthy();
   });
 });
 
@@ -1131,5 +1137,143 @@ describe("Judge — bulk bar clears the w-60 sidebar at desktop width (#204)", (
     expect(bar.className).toContain("z-20");
     expect(bar.className).not.toContain("z-30");
     expect(bar.className).not.toContain("z-40");
+  });
+});
+
+// PRD #1183 M1: filing moved from the per-occurrence expander button (OccurrenceFileIssue,
+// now deleted) onto the group's action row, reaching the shared IssueDraftCard. The
+// component-level draft behaviour (the gate, provenance, seed strip, retry/cancel, create
+// failure) is covered by triage/IssueDraftCard.test.tsx; these fold in the JUDGE-PAGE wiring
+// the deleted OccurrenceFileIssue.test.tsx used to own: which occurrence is drafted, the
+// re-read after a file, and the paired negative that the old green "Issue created."/"Filed."
+// boxes are gone (a filed coordinate is a chip now).
+describe("Judge — File issue on the group row (PRD #1183, folded from OccurrenceFileIssue)", () => {
+  function draftFixture(over: Partial<IssueDraft> = {}): IssueDraft {
+    return {
+      default_repo_id: "repo1",
+      title: "Improve the poller",
+      description: "## What the judge found\n\nrationale",
+      labels: ["uzi"],
+      provenance: "from a worker, run 8f2c1d04",
+      default_note: "Defaulted to the judged run's repo.",
+      ...over,
+    };
+  }
+
+  // A group whose FIRST occurrence in wire order is a settled (filed) member and whose only
+  // OPEN member is second: the row must draft the first `todo` in wire order (run-open), not
+  // occurrences[0] (run-filed). One shared (run, rec) pair would satisfy the wiring either
+  // way — the divergence is what makes this discriminate the pick.
+  function mixedGroup(): JudgeRecommendationGroup {
+    return group({
+      open_count: 1,
+      run_count: 2,
+      occurrences: [
+        occ({
+          run_id: "run-filed",
+          rec_id: "rec-filed",
+          bucket: "filed",
+          filed_issue: { issue_iid: 5, issue_url: "https://forge.example/5", filed_at: "2026-07-20T10:00:00Z" },
+        }),
+        occ({ run_id: "run-open", rec_id: "rec-open" }),
+      ],
+    });
+  }
+
+  const mixedTriage = { total: 2, todo: 1, filed: 1, done: 0, dismissed: 0, false_positives: 0 };
+
+  it("opens the shared draft card from the ROW's File issue and drafts the newest OPEN occurrence", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ groups: [mixedGroup()], triage: mixedTriage }));
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+
+    // The occurrence expander is collapsed, yet File issue is present — filing lives on the
+    // row now, not inside the expander.
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+
+    // Drafted for the first `todo` in wire order (run-open), NOT occurrences[0] which is a
+    // settled/filed member here.
+    await waitFor(() => expect(mockApi.getIssueDraft).toHaveBeenCalledWith("run-open", "rec-open"));
+    expect(mockApi.getIssueDraft).not.toHaveBeenCalledWith("run-filed", "rec-filed");
+    expect(await screen.findByText("Draft issue")).toBeTruthy();
+  });
+
+  it("Create posts the occurrence address and the draft fields, then re-reads the backlog", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ groups: [mixedGroup()], triage: mixedTriage }));
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    mockApi.fileIssue.mockResolvedValue({
+      issue: { iid: 71, web_url: "https://forge.example/71", title: "t" },
+    });
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+    expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    fireEvent.click(await screen.findByText("Create issue"));
+
+    // The write carries the clicked group's newest-open (run, rec) address and the draft's
+    // fields verbatim (the seed is stripped by the card, a no-op on this clean fixture).
+    await waitFor(() =>
+      expect(mockApi.fileIssue).toHaveBeenCalledWith("run-open", "rec-open", {
+        repo_id: "repo1",
+        title: draftFixture().title,
+        description: draftFixture().description,
+      }),
+    );
+    // onFiled is the page's reloadAfterMutation: the coordinate moved to the `filed` rung, so
+    // the backlog is re-read rather than the row being patched client-side.
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps the draft open with the user's edits when the forge rejects the create", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ groups: [mixedGroup()], triage: mixedTriage }));
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    mockApi.fileIssue.mockRejectedValue(new ApiError(429, "too many forge requests, slow down"));
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    fireEvent.click(await screen.findByText("Create issue"));
+
+    // The server's own message surfaces, and the card did NOT collapse to a filed row — a
+    // failed write must not look like a filing.
+    expect(await screen.findByText(/too many forge requests, slow down/i)).toBeTruthy();
+    expect(screen.getByText("Create issue")).toBeTruthy();
+    // The backlog was NOT re-read (nothing was filed).
+    expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(1);
+  });
+
+  it("a filed occurrence shows the 'Filed #N' link chip, never the old 'Issue created.'/'Filed.' box", async () => {
+    const filedGroup = group({
+      bucket: "filed",
+      open_count: 0,
+      occurrences: [
+        occ({
+          run_id: "run-filed",
+          rec_id: "rec-filed",
+          bucket: "filed",
+          filed_issue: { issue_iid: 71, issue_url: "https://forge.example/71", filed_at: "2026-07-20T10:00:00Z" },
+        }),
+      ],
+    });
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({
+        bucket: "filed",
+        groups: [filedGroup],
+        triage: { total: 1, todo: 0, filed: 1, done: 0, dismissed: 0, false_positives: 0 },
+      }),
+    );
+    renderJudge(["/judge?bucket=filed"]);
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Expand occurrences/ }));
+
+    // The state slot is the shared chip: a filed coordinate is a "Filed #N" link, reached
+    // from the read-only expander row.
+    const link = await screen.findByRole("link", { name: /Filed #71/ });
+    expect(link.getAttribute("href")).toBe("https://forge.example/71");
+    // The old green boxes are retired — filing is a chip now, so neither renders beside it.
+    expect(screen.queryByText("Issue created.")).toBeNull();
+    expect(screen.queryByText("Filed.")).toBeNull();
   });
 });
