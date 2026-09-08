@@ -8,7 +8,7 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { SteerQueueCard } from "./SteerQueueCard";
-import type { SteerInput } from "../lib/api";
+import type { Run, SteerInput } from "../lib/api";
 
 afterEach(cleanup);
 
@@ -368,6 +368,219 @@ describe("SteerQueueCard — the composer does not promise resumption on a parke
       <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
     );
     expect(placeholder()).toContain("resumes the agent as its next turn");
+  });
+});
+
+// PRD #1190: the "‖ Pause ▾" menu beside Stop run, for a RUNNING, pausable run. The card
+// only reads a handful of run fields, so a subset cast keeps each case readable (a paused
+// run reads none of the omitted lifecycle fields).
+function pauseRun(over: Partial<Run> = {}): Run {
+  return {
+    kind: "issue",
+    interactive: false,
+    status: "running",
+    milestones: null,
+    milestones_completed: null,
+    checkpoint_tip_at: null,
+    pause_requested_at: null,
+    ...over,
+  } as Run;
+}
+
+describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
+  const PAUSE_BTN = /pause ▾/i;
+
+  it("is ABSENT on a chat run (unpausable kind — chat parks between turns)", () => {
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+        run={pauseRun({ kind: "chat" })}
+        onPause={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: PAUSE_BTN })).toBeNull();
+    // Stop run is still there — only the pause affordance is withheld.
+    expect(screen.getByText("Stop run")).toBeTruthy();
+  });
+
+  it("is ABSENT on an interactive task (it parks after each turn)", () => {
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+        run={pauseRun({ kind: "task", interactive: true })}
+        onPause={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: PAUSE_BTN })).toBeNull();
+  });
+
+  it("is ABSENT when run/onPause are omitted (every pre-#1190 caller is unchanged)", () => {
+    render(
+      <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(screen.queryByRole("button", { name: PAUSE_BTN })).toBeNull();
+  });
+
+  it("is ABSENT once a pause is already pending (the header chip owns it then)", () => {
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+        run={pauseRun({ kind: "issue", pause_requested_at: "2026-07-20T10:00:00Z" })}
+        onPause={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: PAUSE_BTN })).toBeNull();
+  });
+
+  it("is PRESENT on an issue run, and its milestone item says 'After current milestone'", () => {
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+        run={pauseRun({
+          kind: "issue",
+          milestones: [
+            { id: "m1", title: "one" },
+            { id: "m2", title: "two" },
+            { id: "m3", title: "three" },
+          ],
+          milestones_completed: ["m1"],
+        })}
+        onPause={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: PAUSE_BTN }));
+    expect(screen.getByRole("menuitem", { name: /after current milestone/i })).toBeTruthy();
+    expect(screen.queryByText(/after current step/i)).toBeNull();
+    // Both items present, including the danger "Pause now".
+    expect(screen.getByRole("menuitem", { name: /pause now/i })).toBeTruthy();
+  });
+
+  it("says 'After current step' on a prompt run with no frozen milestones", () => {
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+        run={pauseRun({ kind: "prompt", milestones: null, milestones_completed: null })}
+        onPause={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: PAUSE_BTN }));
+    expect(screen.getByRole("menuitem", { name: /after current step/i })).toBeTruthy();
+    expect(screen.queryByText(/after current milestone/i)).toBeNull();
+  });
+
+  it("HIDES the milestone item on the final milestone (only Pause now remains)", () => {
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+        run={pauseRun({
+          kind: "issue",
+          milestones: [
+            { id: "m1", title: "one" },
+            { id: "m2", title: "two" },
+            { id: "m3", title: "three" },
+          ],
+          // two of three done → the third (final) is in flight → milestone park == finishing.
+          milestones_completed: ["m1", "m2"],
+        })}
+        onPause={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: PAUSE_BTN }));
+    expect(screen.queryByText(/after current milestone/i)).toBeNull();
+    expect(screen.queryByText(/after current step/i)).toBeNull();
+    expect(screen.getByRole("menuitem", { name: /pause now/i })).toBeTruthy();
+  });
+
+  it("'Pause now' names the checkpoint age from checkpoint_tip_at", () => {
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+        run={pauseRun({
+          kind: "issue",
+          checkpoint_tip_at: new Date(Date.now() - 9 * 60_000).toISOString(),
+        })}
+        onPause={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: PAUSE_BTN }));
+    // The age is NAMED — the invariant the copy exists for (D5), pinned by the shape, not a
+    // brittle exact minute.
+    expect(screen.getByText(/Work since the last checkpoint \(.+ ago\) is discarded\./)).toBeTruthy();
+    // And it is roughly the value we seeded.
+    expect(screen.getByText(/\(9m ago\)/)).toBeTruthy();
+  });
+
+  it("'Pause now' drops the age clause when no checkpoint has been pushed yet", () => {
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+        run={pauseRun({ kind: "issue", checkpoint_tip_at: null })}
+        onPause={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: PAUSE_BTN }));
+    expect(screen.getByText("Drops the turn in flight. Work since the last checkpoint is discarded.")).toBeTruthy();
+  });
+
+  it("clicking an item calls onPause with the mode and closes the menu", () => {
+    const onPause = vi.fn();
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+        run={pauseRun({ kind: "issue" })}
+        onPause={onPause}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: PAUSE_BTN }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /pause now/i }));
+    expect(onPause).toHaveBeenCalledWith("now");
+    // Menu closed after a choice.
+    expect(screen.queryByRole("menuitem", { name: /pause now/i })).toBeNull();
   });
 
   it("still ACCEPTS a follow-up while parked — the fix is honesty about when, not a block", () => {

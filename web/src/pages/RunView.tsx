@@ -677,6 +677,111 @@ export function LimitWaitPanel({
   );
 }
 
+// PRD #1190: the pending-pause chip's text. "· now" for an immediate pause; "· after M<N>"
+// on a milestone-structured run (N = pause_after_count + 1, the milestone the request waits
+// to see complete); "· after the current step" on a milestone mode request against a run
+// with no frozen list (milestone mode then parks at the next turn boundary).
+function pauseRequestedLabel(run: Run): string {
+  if (run.pause_mode === "now") return "Pause requested · now";
+  const hasMilestones = milestoneBadge(run) != null;
+  if (!hasMilestones) return "Pause requested · after the current step";
+  const n = (run.pause_after_count ?? 0) + 1;
+  return `Pause requested · after M${n}`;
+}
+
+// checkpointLine renders the PausedPanel's "the checkpoint is safe" sentence from the
+// run's milestone progress and branch — the fields the DTO actually carries (there is no
+// checkpoint-sha field). "Milestone N is finished and its checkpoint is pushed (<branch>)."
+// on a milestone run past its first; a branch-only sentence otherwise.
+function checkpointLine(run: Run): string {
+  const mb = milestoneBadge(run);
+  const where = run.branch ? ` (${stripUnsafeChars(run.branch)})` : "";
+  if (mb && mb.reported && mb.done > 0) {
+    return `Milestone ${mb.done} is finished and its checkpoint is pushed${where}.`;
+  }
+  return `The last checkpoint is pushed${where}.`;
+}
+
+/**
+ * PRD #1190: the paused-run panel, modelled on LimitWaitPanel — a full-width parked card
+ * rendered under `run.status === "paused"`. It says four things (mock frame C): the
+ * checkpoint is safe, that nothing runs or is spent while it waits, what happens on resume
+ * (behind a disclosure), and offers the one action row (Resume + Stop). It deliberately
+ * OMITS the "N of the budget remains when you resume" sentence and the "Extend time…"
+ * action — both depend on PRD #1189's budget_total_seconds, which has not landed; the copy
+ * lands with #1189, not here (so the "Only the run's owner can resume or stop it." line
+ * names two actions, not three).
+ *
+ * Non-owner (canSteer=false): the two live controls are replaced by inert text (never a
+ * button that 404s), the same rule LimitWaitPanel/QuestionPanel follow.
+ */
+export function PausedPanel({
+  run,
+  busy,
+  canSteer = true,
+  onResume,
+  onStop,
+}: {
+  run: Run;
+  busy: boolean;
+  canSteer?: boolean;
+  onResume: () => void;
+  onStop: () => void;
+}) {
+  if (run.status !== "paused") return null;
+
+  // The pause landed when the run entered the state; updated_at is status_since on the
+  // wire. Rendered as a local wall-clock time ("11:02"), matching the mock heading.
+  const pausedMs = Date.parse(run.updated_at);
+  const pausedAt = Number.isFinite(pausedMs)
+    ? new Date(pausedMs).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+    : null;
+
+  return (
+    <div className="rounded-xl border border-info/40 bg-info/10 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          {/* role="status" announces the park when this panel mounts, like LimitWaitPanel. */}
+          <p role="status" className="text-sm font-semibold text-info">
+            <span aria-hidden="true">‖ </span>
+            Paused by you{pausedAt ? ` at ${pausedAt}` : ""}
+          </p>
+          <p className="mt-0.5 text-xs text-muted">{checkpointLine(run)}</p>
+          <p className="mt-1.5 text-xs text-muted">
+            Nothing runs and nothing is spent while it waits.
+          </p>
+          {/* Worker / re-planning mechanics live behind a disclosure so the panel stays
+              four sentences by default (mock note 7). */}
+          <details className="mt-1.5 text-xs text-muted">
+            <summary className="cursor-pointer select-none text-fg">What happens on resume</summary>
+            <p className="mt-1">
+              If the same worker is still alive, the session continues where it stopped. If the
+              worker was replaced, the branch is recovered from the checkpoint and the remaining
+              milestones are re-planned from the approved plan.
+            </p>
+          </details>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          {/* Non-owner (mirrors LimitWaitPanel): no live Resume/Stop, inert text stating who
+              can, never a greyed button that 404s. */}
+          {canSteer ? (
+            <>
+              <Button size="sm" disabled={busy} onClick={onResume}>
+                ▶ Resume
+              </Button>
+              <Button variant="danger" size="sm" disabled={busy} onClick={onStop}>
+                Stop run
+              </Button>
+            </>
+          ) : (
+            <span className="text-xs text-muted">Only the run's owner can resume or stop it.</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /**
  * PRD #841: the per-run "auto-rework this MR's review comments" toggle. Mirrors the
  * LimitWaitPanel checkbox block, with two deliberate divergences (D2/D3):
@@ -1094,6 +1199,72 @@ export function RunView() {
                       : "Only the run's owner can expedite it."}
                   </span>
                 ))}
+              {/* PRD #1190 (D14): the conditional Resume action on a paused run, modelled
+                  on the queued-only Expedite above — a primary Button for the owner, inert
+                  text for a non-owner (never a button that would 404). It self-hides on
+                  every other status. */}
+              {run.status === "paused" &&
+                (canSteer ? (
+                  <Button
+                    size="sm"
+                    disabled={busy}
+                    onClick={() =>
+                      act(async () => {
+                        await api.resumeRun(run.id);
+                        await refreshRun();
+                      })
+                    }
+                  >
+                    ▶ Resume
+                  </Button>
+                ) : (
+                  <span className="text-xs text-muted">Only the run's owner can resume it.</span>
+                ))}
+              {/* PRD #1190: the pending-pause chip. Shown whenever a request is pending
+                  (pause_requested_at set) — including on a run overtaken by an involuntary
+                  park, where the intent survives (D6). Info-toned and, unlike the status
+                  pill, DELIBERATELY NOT pulsing (only one thing on the header pulses; the
+                  chip must never carry animate-pulse). Its two actions are gated on
+                  status === "running": the server accepts pause_cancel ONLY while running
+                  (M1 review), so a parked run shows the chip with no actions rather than
+                  offering a Cancel that would 409. */}
+              {run.pause_requested_at && (
+                <span className="inline-flex flex-wrap items-center gap-2">
+                  <Badge tone="info">{pauseRequestedLabel(run)}</Badge>
+                  {canSteer && run.status === "running" && (
+                    <>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() =>
+                          act(async () => {
+                            await api.cancelPause(run.id);
+                            await refreshRun();
+                          })
+                        }
+                      >
+                        Cancel pause
+                      </Button>
+                      {run.pause_mode !== "now" && (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() =>
+                            act(async () => {
+                              await api.pauseRun(run.id, "now");
+                              await refreshRun();
+                            })
+                          }
+                        >
+                          Pause now
+                        </Button>
+                      )}
+                    </>
+                  )}
+                </span>
+              )}
               {run.auto_approve && (
                 <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
                   autopilot
@@ -1156,6 +1327,15 @@ export function RunView() {
                 </span>
               )}
               {run.status === "running" && run.started_at && <LiveElapsed since={run.started_at} />}
+              {/* PRD #1190: a paused run's elapsed is the STATIC active span (started_at →
+                  the pause at updated_at) with "· clock stopped", not a live ticker — the
+                  clock stops while paused. The budget-remaining clause ("… left when
+                  resumed") lands with #1189's budget_total_seconds, not here. */}
+              {run.status === "paused" && run.started_at && (
+                <span className="text-xs tabular-nums text-faint">
+                  {formatDuration(Date.parse(run.updated_at) - Date.parse(run.started_at))} · clock stopped
+                </span>
+              )}
               {run.iteration_count > 0 && (
                 <Badge tone="neutral" title="implement ⇄ review iterations">
                   iteration {run.iteration_count}
@@ -1219,6 +1399,22 @@ export function RunView() {
           status but pool_wait, so on a limit_wait run the strip below is still the
           first thing rendered here. */}
       <PoolWaitPanel run={run} canSteer={canSteer} onResumed={refreshRun} />
+
+      {/* PRD #1190: the paused-run panel. Self-hides on every status but `paused`. Resume
+          hits the widened /resume-now (api.resumeRun) then refetches; Stop mirrors the
+          limit-wait panel's own Stop (a cancel input). */}
+      <PausedPanel
+        run={run}
+        busy={busy}
+        canSteer={canSteer}
+        onResume={() =>
+          act(async () => {
+            await api.resumeRun(run.id);
+            await refreshRun();
+          })
+        }
+        onStop={() => act(() => submit("cancel"))}
+      />
 
       {/* PRD #35: the usage-limit strip. High in the stack because on a parked run it
           carries the only thing the user came to find out — when it resumes — and low
@@ -1534,6 +1730,15 @@ export function RunView() {
         busy={busy}
         onStop={() => act(() => submit("cancel"))}
         onSend={(text) => act(() => submit("follow_up", text))}
+        // PRD #1190: the "‖ Pause ▾" menu. The card decides whether to show it (running +
+        // pausable kind + no pause pending); here we only wire the request → refetch.
+        run={run}
+        onPause={(mode) =>
+          act(async () => {
+            await api.pauseRun(run.id, mode);
+            await refreshRun();
+          })
+        }
       />
     </div>
   );

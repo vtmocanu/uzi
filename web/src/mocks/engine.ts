@@ -640,6 +640,40 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       schedule(runId, open === MOCK_QUESTION_ID ? askAgainScript(runId) : implementScript(runId));
       return null;
     }
+    // PRD #1190: an owner's pause request. Mirrors CreatePauseInput — only a RUNNING run
+    // of a pausable kind (D6/D7); a 409 names WHY otherwise. A request is a FLAG, not a
+    // status (D3): the run stays running and only the three pause columns are set. The park
+    // to `paused` then lands on a timer (the mock's stand-in for the worker's next report /
+    // turn abort): quickly for "now", after a beat for "milestone" (the boundary rule).
+    case "pause": {
+      if (run.status !== "running")
+        return { status: 409, message: `run is ${run.status}; the clock is already stopped` };
+      if (!isPausableMock(run)) return { status: 409, message: pauseNotSupportedReason(run) };
+      const mode: "milestone" | "now" = body === "now" ? "now" : "milestone";
+      patchRun(runId, {
+        pause_requested_at: new Date().toISOString(),
+        pause_mode: mode,
+        pause_after_count: (run.milestones_completed ?? []).length,
+      });
+      appendMessage(runId, "status", null, {
+        text: mode === "now" ? "pause requested (now)" : "pause requested",
+      });
+      // Stop the live script and schedule the park; a later pause_cancel clears it.
+      clearTimers(runId);
+      schedule(runId, [{ delay: mode === "now" ? 600 : 2500, step: () => parkPaused(runId) }]);
+      return null;
+    }
+    // PRD #1190: withdraw a pending pause. Server accepts it ONLY while running (M1 review),
+    // so a 409 "no pause is pending" on any other status or with no request set. Clears the
+    // scheduled park and the three columns; the run keeps running.
+    case "pause_cancel": {
+      if (run.status !== "running" || !run.pause_requested_at)
+        return { status: 409, message: "no pause is pending" };
+      clearTimers(runId);
+      patchRun(runId, { pause_requested_at: null, pause_mode: null, pause_after_count: null });
+      appendMessage(runId, "status", null, { text: "pause request withdrawn — the run continues" });
+      return null;
+    }
     default: {
       // Exhaustiveness guard — see the header. If this line stops compiling, a new
       // RunInputKind was added and this switch must learn it; do NOT widen the type
@@ -649,6 +683,42 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       return null;
     }
   }
+}
+
+// PRD #1190 (D7): the kinds a pause is meaningful for. Mirrors the server allowlist —
+// chat/judge/mr_rework/ci_fix and interactive tasks already park or self-end.
+const MOCK_PAUSABLE_KINDS = new Set(["issue", "task", "prompt", "self_improve"]);
+
+function isPausableMock(run: { kind: string; interactive?: boolean }): boolean {
+  if (run.interactive) return false;
+  return MOCK_PAUSABLE_KINDS.has(run.kind);
+}
+
+// pauseNotSupportedReason is the per-kind 409 sentence CreatePauseInput maps to (D7).
+function pauseNotSupportedReason(run: { kind: string; interactive?: boolean }): string {
+  if (run.kind === "chat") return "chat runs already park between turns";
+  if (run.interactive) return "interactive tasks park after each turn";
+  return "judge, mr_rework and ci_fix runs are short and finish on their own";
+}
+
+// parkPaused moves a running run to `paused` — the mock's stand-in for the worker
+// publishing a checkpoint and reporting the park (D8). A no-op unless the run is still
+// running with the request live (a pause_cancel or another exit beat the timer). On the
+// park it stamps checkpoint_tip_at and clears the request columns, exactly as SetRunPaused
+// does on the wire.
+function parkPaused(runId: string): void {
+  const run = getRun(runId);
+  if (!run || run.status !== "running" || !run.pause_requested_at) return;
+  const nowIso = new Date().toISOString();
+  patchRun(runId, {
+    status: "paused",
+    pause_requested_at: null,
+    pause_mode: null,
+    pause_after_count: null,
+    checkpoint_tip_at: nowIso,
+    updated_at: nowIso,
+  });
+  appendMessage(runId, "status", null, { text: "‖ paused — checkpoint pushed, clock stopped" });
 }
 
 // countPlanFeedback counts the revision rounds already recorded, so the `plan_revising`
