@@ -6,10 +6,12 @@ audience: user
 
 # Run health
 
-uzi watches every active run and can flag one that looks slow, stuck, or
-looping — a **⚠** badge on the board, dashboard, runs list, and run view, and
-(if you've set up [Slack](./slack.md)) a DM. The badge's elapsed time counts
-from when the flag was raised, not from when the run started.
+uzi watches every active run and can flag one that looks stuck, looping, or
+close to its timeout — a **⚠** badge on the board, dashboard, runs list, and
+run view, and (if you've set up [Slack](./slack.md)) a DM. The badge's
+elapsed time counts from when the flag was raised, not from when the run
+started — except **near timeout**, whose badge instead counts down the time
+left to the deadline (e.g. `1h 5m left`).
 
 ## What the flags mean
 
@@ -17,7 +19,7 @@ from when the flag was raised, not from when the run started.
 |---|---|---|
 | ⚠ looping | The agent has repeated the exact same tool call 4+ times recently — or its updates can't be saved, so it keeps resending them. | Open the run view and check what it's stuck repeating (or whether it's stuck retrying a save); it may need a nudge or a cancel. |
 | ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
-| ⚠ slow | Running much longer than typical, wall clock. | Usually fine for a big task; worth a look if unexpected. |
+| ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will be stopped at the timeout. | Let it finish if it is on its last milestone, or `uzi run scope --through N` / `run stop` to finalize what is committed, or raise `RUN_TIMEOUT`. |
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it. | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
 
@@ -68,7 +70,9 @@ right at the threshold may take one more sweep before the badge shows up.
 An admin can change any threshold, or disable a single signal entirely by
 setting it to `0`, from **Admin → Instance settings → Run health** — see
 [Admin settings](./admin-settings.md#run-health). The loop-detection window
-itself (how many repeats, over how large a window) isn't tunable; only the
-time-based signals are.
+itself (how many repeats, over how large a window) isn't tunable; every other
+signal is — the plain seconds thresholds, and **near timeout**'s share of the
+run's wall-clock budget (a percent, not a duration, so it means the same
+thing regardless of the run's timeout or frozen budget).
 
 Related: [Paused on a usage limit](run-limit-wait.md) · [Why was my run stopped automatically?](run-auto-stopped.md) · [Configuration](configuration.md)

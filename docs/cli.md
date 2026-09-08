@@ -1230,6 +1230,16 @@ pending). Both are emit-only-when-set on the human view too — `run get`
 prints them as `PRD_MOVE` and `PRD_PATCH_SETTLED_AT` rows only when the run
 has declared a move — and appear the same way under `--json`.
 
+A running run's wall-clock stop time — the same clock a `slow`/near-timeout
+[run-health](./run-health.md) flag counts down to — is readable the same way:
+`uzi run get <id> --field deadline_at` (an RFC3339 timestamp, an empty line
+when the run has none). It's set only while a non-`chat`, non-`judge`,
+non-`interactive` run is actually `running`, so a queued run, a gated run, a
+chat, and a finished run all print nothing. `run get`'s human view prints it
+as a `DEADLINE` row right after `HEALTH`, folded to local time plus a
+countdown (`15:20 · 1h05m left`, or `15:20 · stopping` once past) instead of
+the raw timestamp, emit-only-when-set the same way `PRD_MOVE` is above.
+
 `run get` also prints a `NOW` row right after the `MILESTONES` block: the
 run's server-derived current activity, folded to
 `<agent> · <agent_label> · <tool> <detail> · <age> ago` — the CLI twin of
