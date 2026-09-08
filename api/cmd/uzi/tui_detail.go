@@ -714,6 +714,15 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)) + "\n")
 	}
 
+	// The near-timeout countdown (PRD #1170), the run detail's OTHER conditional second
+	// row. Drawn only while the run is flagged `slow` and carries a deadline_at, in the
+	// stall colour that matches the ▲ token above. fitNearTimeoutLine sheds clauses to
+	// m.width so it stays one physical row (the #379 invariant); it returns "" when the run
+	// carries no near-timeout deadline, so the row is silent for every other run.
+	if line := fitNearTimeoutLine(d.run, time.Now(), m.width); line != "" {
+		sb.WriteString(m.pal.state(crewStalled).Render(m.renderer.Plain(line, 120)) + "\n")
+	}
+
 	// The transport line is never silent about a degradation: a user watching a stale pane
 	// must see WHY it is stale. The healthy/transient states ("live", "connecting…") are the
 	// header tag above; only a degradation takes a full row here, where its longer text fits.

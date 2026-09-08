@@ -149,7 +149,7 @@ type palette struct {
 	tungsten color.Color // chrome / selection accent / eyebrows
 	amber    color.Color // andon attention: needs-you, the gate band, ⚑ ✎
 	alarm    color.Color // failed, judge "issues", high severity
-	stall    color.Color // stalled / looping / slow health
+	stall    color.Color // stalled / looping / near-timeout health
 	sage     color.Color // running (deliberately dimmer — running is normal)
 	indigo   color.Color // planning
 	wait     color.Color // rate-limited, crew-waiting, reconnecting
@@ -202,6 +202,19 @@ func (p palette) state(s crewState) lipgloss.Style {
 	return p.faint
 }
 
+// displayHealth maps a health enum to its human DISPLAY word. Only `slow` is remapped:
+// PRD #1170 kept the enum value (D1) but relabels every human surface "near timeout", so
+// the token, the board strip and the CLI HEALTH row all read the same word through this one
+// map. Every other value (stalled, looping, ok, waiting_worker, …) passes through unchanged.
+// "near timeout" is 12 cells, tying the existing longest word ("rate-limited"), so no column
+// widens. Logic, filtering and sorting still key off the raw enum; this only changes display.
+func displayHealth(health string) string {
+	if health == "slow" {
+		return "near timeout"
+	}
+	return health
+}
+
 // stateGlyphWord is the DISPLAY vocabulary for a run's state — a single-cell glyph and a
 // human word — shared by the board row, the board strip and the detail header so they can
 // never disagree (the baseline rendered `stalled` differently on the board and the header;
@@ -210,10 +223,12 @@ func (p palette) state(s crewState) lipgloss.Style {
 //
 // HEALTH OVERRIDE: a WARN health flag (stalled/looping/slow) replaces the status token
 // entirely with ▲ + the health word, because a run that needs attention is what the board
-// is FOR. ok/empty health shows the status token.
+// is FOR. ok/empty health shows the status token. The word is the DISPLAY word from
+// displayHealth, so the `slow` enum PRD #1170 kept (D1) reads as "near timeout" here while
+// every logic path still keys off the raw enum.
 func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, word string) {
 	if stalledHealth[health] {
-		return "▲", health
+		return "▲", displayHealth(health)
 	}
 	switch effectiveRunStatus(status, isPlanning, isRevising) {
 	case "running":

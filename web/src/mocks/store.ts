@@ -214,6 +214,7 @@ const CARD_MIRRORED_FIELDS = [
   "health",
   "health_reason",
   "health_since",
+  "deadline_at",
 ] as const;
 
 // The other half of the partition: fields a card carries that a RUN PATCH must never

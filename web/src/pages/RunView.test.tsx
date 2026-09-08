@@ -874,6 +874,50 @@ describe("HealthFlag — the health reason (#124, text channel)", () => {
   });
 });
 
+// PRD #1170: the near-timeout flag ("slow") counts DOWN to run.deadline_at (`· 1h 5m
+// left`) instead of the since-flagged "stuck for Xm" every other flag keeps, falling
+// back to "stuck for Xm" when deadline_at is absent (rollout skew). HealthFlag ticks off
+// useNow(Date.now()), so these seed deadline_at / health_since relative to Date.now().
+describe("HealthFlag — near timeout countdown (PRD #1170)", () => {
+  it("a `slow` run with a future deadline_at shows the countdown, not since-flagged", () => {
+    const { container } = render(
+      <HealthFlag
+        run={run({
+          status: "running",
+          health: "slow",
+          // 42m in the past: a since-flagged fallback (which must NOT fire here) would read
+          // a different, larger number than the 1h 5m countdown, so this can't mask it.
+          health_since: new Date(Date.now() - 42 * 60_000).toISOString(),
+          // 1h 5m ahead (+30s buffer so the countdown stays "1h 5m" across the render).
+          deadline_at: new Date(Date.now() + 65 * 60_000 + 30_000).toISOString(),
+        })}
+      />,
+    );
+    const text = container.textContent ?? "";
+    expect(text).toContain("near timeout");
+    expect(text).toContain("1h 5m left");
+    // The since-flagged "stuck for" clause must NOT appear for near timeout.
+    expect(text).not.toContain("stuck for");
+  });
+
+  it("a `slow` run with NO deadline_at falls back to `· stuck for Xm` (rollout skew)", () => {
+    const { container } = render(
+      <HealthFlag
+        run={run({
+          status: "running",
+          health: "slow",
+          health_since: new Date(Date.now() - 5 * 60_000).toISOString(),
+          // deadline_at absent — an older api pod that predates PRD #1170.
+        })}
+      />,
+    );
+    const text = container.textContent ?? "";
+    expect(text).toContain("near timeout");
+    expect(text).toContain("stuck for 5m");
+    expect(text).not.toContain("left");
+  });
+});
+
 // Issue #185: the live region must be ALWAYS MOUNTED and the visible pill must NOT be a
 // live region. A region created in the same tick as its first message is silent (assistive
 // tech announces CHANGES to a region that already existed — Board.tsx S5), so role="status"

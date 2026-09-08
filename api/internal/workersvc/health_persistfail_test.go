@@ -30,7 +30,7 @@ func wedge(svc *Service, runID uuid.UUID, n int, since time.Duration) {
 
 func TestHealthPersistFailingFlagsLoopingWithATruthfulReason(t *testing.T) {
 	r := runRow("running")
-	r.StartedAt = ago(3 * time.Minute)      // nowhere near the 45m slow threshold
+	r.StartedAt = ago(3 * time.Minute)      // nowhere near the near-timeout threshold
 	r.LastActivityAt = ago(3 * time.Minute) // and under the 5m stall threshold
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc := healthSvc(fs, defaultHealthSettings())
@@ -174,7 +174,7 @@ func TestHealthPersistFailingStillRidesTheHealthToggle(t *testing.T) {
 	r := runRow("running")
 	r.StartedAt = ago(3 * time.Minute)
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
-	svc := healthSvc(fs, fakeHealthSettings{enabled: false, stall: 300, slow: 2700})
+	svc := healthSvc(fs, fakeHealthSettings{enabled: false, stall: 300, nearTimeoutPct: 85})
 	wedge(svc, r.ID, persistFlagStreak*4, persistFlagWindow+time.Minute)
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {

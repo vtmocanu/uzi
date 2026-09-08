@@ -145,7 +145,7 @@ func TestHealthLoopingResumeBoundaryReflag(t *testing.T) {
 
 func TestHealthLoopingBeatsStalledAndSlow(t *testing.T) {
 	r := runRow("running")
-	r.StartedAt = ago(50 * time.Minute)      // slow
+	r.StartedAt = ago(110 * time.Minute)     // near timeout (91.6% of the 2h test RunTimeout)
 	r.LastActivityAt = ago(10 * time.Minute) // stalled
 	window := []store.ListRunToolWindowRow{
 		useMsg(t, 14, "id4", "Bash", map[string]any{"command": "go build ./..."}),

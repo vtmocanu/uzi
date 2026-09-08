@@ -98,7 +98,7 @@ func healthRootLabel(health string) string {
 	case healthLooping:
 		return "looping"
 	case healthSlow:
-		return "slow"
+		return "near timeout"
 	case healthWaitingWorker:
 		return "waiting for a worker"
 	case healthApprovalIdle:
@@ -143,7 +143,10 @@ func healthNudgeHead(health, reason string) string {
 		}
 		return "🔁 This run looks like it's repeating the same step."
 	case healthSlow:
-		return "🐢 This run is taking longer than usual."
+		// PRD #1170 reframes the wall-clock `slow` flag as a budget-relative near-timeout
+		// warning: the enum value survives (D1) but every human-facing word changes, so the
+		// nudge now names the actual consequence — the run will be stopped at its timeout.
+		return "⏰ This run is close to its timeout and will be stopped when it reaches it."
 	case healthWaitingWorker:
 		// Issue #182 ADDED this arm; it did not change the one below it. The existing
 		// sentence stays exactly as written for the unclaimed-run cause it was written
