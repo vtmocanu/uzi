@@ -22,6 +22,12 @@ through `[0.52.0]`.)
 
 - **Pause a running run and resume it later, right where it left off ([#1190](https://github.com/vtmocanu/uzi/issues/1190)).**
   A run's owner can now park a running issue, task, prompt or self-improve run on demand — after the milestone in flight (the default) or immediately with `--now`, which drops the turn in flight and discards work since the last checkpoint — and resume it later with the remaining budget untouched, since the clock stops rather than resetting while it waits. The worker publishes a checkpoint before parking, so if that publish fails the run stays running and the owner is told in its activity feed instead of losing the park silently; resuming continues the same session on the original worker or recovers the branch and re-plans only the unfinished milestones on another. Reachable from the run page (a `‖ Pause ▾` menu, a pending-pause chip, a Resume button), the CLI (`uzi run pause <id> [--now|--cancel]`, `uzi run resume <id>`), and the TUI (a `‖ paused` word and detail line, read-only).
+- **Three light themes: Dawn, Hall, and Shadow ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
+  Each keeps the dark factory somewhere on screen: Dawn stays dark only on machine surfaces (the run activity feed, code/log/CLI blocks); Hall adds a dark sidebar and mobile top bar; Shadow additionally keeps a board card, run row, or run header dark while that run is actively working, staying light with a rust accent while it waits on a human. All three share one WCAG 2.2 AA-verified light palette and reuse ember's own dark values for every dark surface, so a machine pane looks identical across every theme.
+- **A System / Lights on / Lights off appearance mode, with one theme held per polarity and matching admin instance defaults ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
+  Settings → Appearance now holds a mode alongside a "Lights on theme" and a "Lights off theme"; System follows the OS's `prefers-color-scheme` live, with no reload. An admin can set the same four fields (mode, light theme, dark theme, typeface) as instance-wide defaults from Admin → Instance settings; the legacy single "Default theme" keeps feeding the dark slot, so nobody's screen changes on upgrade.
+- **A bundled IBM Plex typeface option ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
+  Settings → Appearance gains a Typeface choice: System (the platform default) or IBM Plex, shipped with the app so switching to it makes no external font request and the System choice downloads nothing.
 
 ### Changed
 

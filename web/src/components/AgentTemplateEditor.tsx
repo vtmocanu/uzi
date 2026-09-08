@@ -303,7 +303,7 @@ export const AgentTemplateEditor = forwardRef<
         <span className="text-sm font-medium text-muted">
           Rendered subagent file (preview)
         </span>
-        <pre className="mt-1.5 overflow-x-auto rounded-lg border border-edge bg-ink p-3 text-xs text-muted">
+        <pre className="mt-1.5 overflow-x-auto rounded-lg border border-edge bg-ink console p-3 text-xs text-muted">
           {preview}
         </pre>
       </div>
@@ -428,7 +428,7 @@ function DiffField({ label, children }: { label: string; children: ReactNode }) 
   return (
     <div className="space-y-1">
       <span className="text-xs font-medium uppercase tracking-wide text-faint">{label}</span>
-      <pre className="overflow-x-auto whitespace-pre-wrap rounded border border-edge bg-ink p-2 font-mono text-xs">
+      <pre className="overflow-x-auto whitespace-pre-wrap rounded border border-edge bg-ink console p-2 font-mono text-xs">
         {children}
       </pre>
     </div>

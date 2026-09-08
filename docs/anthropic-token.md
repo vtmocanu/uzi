@@ -282,4 +282,4 @@ Click **Delete** on the token's row. Two rules:
   further down the Settings page, to pick or override the Claude model your
   runs use.
 - **Looking for the theme picker?** It's the **Appearance** section further
-  down this same Settings page; see [Theming](./theming.md).
+  down this same Settings page; see [Appearance](./appearance.md).

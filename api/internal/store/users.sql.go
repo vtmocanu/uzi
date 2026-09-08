@@ -38,7 +38,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, display_name, is_admin)
 VALUES ($1, $2, $3, $4)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type CreateUserParams struct {
@@ -90,6 +90,10 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
@@ -97,7 +101,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 const createUserOIDC = `-- name: CreateUserOIDC :one
 INSERT INTO users (email, password_hash, display_name, is_admin, oidc_issuer, oidc_subject)
 VALUES ($1, NULL, $2, $3, $4, $5)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type CreateUserOIDCParams struct {
@@ -154,6 +158,10 @@ func (q *Queries) CreateUserOIDC(ctx context.Context, arg CreateUserOIDCParams) 
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
@@ -173,7 +181,7 @@ func (q *Queries) GetUserAttributionEnabled(ctx context.Context, id uuid.UUID) (
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode FROM users WHERE email = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -213,12 +221,16 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode FROM users WHERE id = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -258,12 +270,16 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
 
 const getUserByOIDCSubject = `-- name: GetUserByOIDCSubject :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2
 `
 
 type GetUserByOIDCSubjectParams struct {
@@ -309,6 +325,10 @@ func (q *Queries) GetUserByOIDCSubject(ctx context.Context, arg GetUserByOIDCSub
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
@@ -397,7 +417,7 @@ func (q *Queries) GetUserSchedulePause(ctx context.Context, id uuid.UUID) (GetUs
 }
 
 const getUserSettings = `-- name: GetUserSettings :one
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled FROM users WHERE id = $1
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface FROM users WHERE id = $1
 `
 
 type GetUserSettingsRow struct {
@@ -408,6 +428,10 @@ type GetUserSettingsRow struct {
 	Theme           pgtype.Text `json:"theme"`
 	SidebarTokenIds []uuid.UUID `json:"sidebar_token_ids"`
 	MrReworkEnabled pgtype.Bool `json:"mr_rework_enabled"`
+	AppearanceMode  pgtype.Text `json:"appearance_mode"`
+	LightTheme      pgtype.Text `json:"light_theme"`
+	DarkTheme       pgtype.Text `json:"dark_theme"`
+	Typeface        pgtype.Text `json:"typeface"`
 }
 
 // The current user's own (non-secret) settings surface: default worker model
@@ -419,6 +443,8 @@ type GetUserSettingsRow struct {
 // surface (GetUserSummaryModel stays the narrow read for issue-run claim
 // assembly), so the settings response needs no second query. mr_rework_enabled
 // (PRD #700 M5) rides it too; NULL there means the default-ON per-user opt-in.
+// The four appearance columns (PRD #1167 M1) ride this read as well; each NULL means
+// "inherit the instance default", resolved by theme.ResolveAppearance at read time.
 func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSettingsRow, error) {
 	row := q.db.QueryRow(ctx, getUserSettings, id)
 	var i GetUserSettingsRow
@@ -430,6 +456,10 @@ func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSet
 		&i.Theme,
 		&i.SidebarTokenIds,
 		&i.MrReworkEnabled,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
@@ -453,7 +483,7 @@ func (q *Queries) GetUserSummaryModel(ctx context.Context, id uuid.UUID) (pgtype
 const linkUserOIDC = `-- name: LinkUserOIDC :one
 UPDATE users SET oidc_issuer = $2, oidc_subject = $3
 WHERE id = $1 AND oidc_subject IS NULL
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type LinkUserOIDCParams struct {
@@ -504,12 +534,16 @@ func (q *Queries) LinkUserOIDC(ctx context.Context, arg LinkUserOIDCParams) (Use
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode FROM users ORDER BY created_at ASC
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface FROM users ORDER BY created_at ASC
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -555,6 +589,10 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.SchedulesPaused,
 			&i.SchedulesPausedUntil,
 			&i.JudgeAnthropicBindMode,
+			&i.AppearanceMode,
+			&i.LightTheme,
+			&i.DarkTheme,
+			&i.Typeface,
 		); err != nil {
 			return nil, err
 		}
@@ -582,7 +620,7 @@ SET is_active = $1,
     -- reactivation leaves it untouched.
     token_version = CASE WHEN $1 THEN token_version ELSE token_version + 1 END
 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserActiveParams struct {
@@ -627,13 +665,17 @@ func (q *Queries) SetUserActive(ctx context.Context, arg SetUserActiveParams) (U
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
 
 const setUserAdmin = `-- name: SetUserAdmin :one
 UPDATE users SET is_admin = $1 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserAdminParams struct {
@@ -683,13 +725,77 @@ func (q *Queries) SetUserAdmin(ctx context.Context, arg SetUserAdminParams) (Use
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
+	)
+	return i, err
+}
+
+const setUserAppearance = `-- name: SetUserAppearance :one
+UPDATE users
+SET appearance_mode = CASE WHEN $1::bool THEN $2 ELSE appearance_mode END,
+    light_theme = CASE WHEN $3::bool THEN $4 ELSE light_theme END,
+    dark_theme = CASE WHEN $5::bool THEN $6 ELSE dark_theme END,
+    typeface = CASE WHEN $7::bool THEN $8 ELSE typeface END
+WHERE id = $9
+RETURNING appearance_mode, light_theme, dark_theme, typeface
+`
+
+type SetUserAppearanceParams struct {
+	SetMode        bool        `json:"set_mode"`
+	AppearanceMode pgtype.Text `json:"appearance_mode"`
+	SetLight       bool        `json:"set_light"`
+	LightTheme     pgtype.Text `json:"light_theme"`
+	SetDark        bool        `json:"set_dark"`
+	DarkTheme      pgtype.Text `json:"dark_theme"`
+	SetTypeface    bool        `json:"set_typeface"`
+	Typeface       pgtype.Text `json:"typeface"`
+	ID             uuid.UUID   `json:"id"`
+}
+
+type SetUserAppearanceRow struct {
+	AppearanceMode pgtype.Text `json:"appearance_mode"`
+	LightTheme     pgtype.Text `json:"light_theme"`
+	DarkTheme      pgtype.Text `json:"dark_theme"`
+	Typeface       pgtype.Text `json:"typeface"`
+}
+
+// PATCHes the current user's appearance (PRD #1167 M1) in ONE atomic statement:
+// each of the four fields is written only when its @set_* flag is true, otherwise
+// the current column value is kept (the CASE keeps the row's own value). A true
+// flag with a NULL value CLEARS that field back to the instance default (the
+// resolver treats a NULL column as inherit). Because every unset field re-writes
+// its own stored value inside the single UPDATE, two concurrent saves that touch
+// different fields cannot clobber each other, and the handler needs no
+// read-merge-write (which raced) to preserve the untouched fields. Own-user only;
+// the caller passes the session user's id.
+func (q *Queries) SetUserAppearance(ctx context.Context, arg SetUserAppearanceParams) (SetUserAppearanceRow, error) {
+	row := q.db.QueryRow(ctx, setUserAppearance,
+		arg.SetMode,
+		arg.AppearanceMode,
+		arg.SetLight,
+		arg.LightTheme,
+		arg.SetDark,
+		arg.DarkTheme,
+		arg.SetTypeface,
+		arg.Typeface,
+		arg.ID,
+	)
+	var i SetUserAppearanceRow
+	err := row.Scan(
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
 
 const setUserAttributionEnabled = `-- name: SetUserAttributionEnabled :one
 UPDATE users SET attribution_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserAttributionEnabledParams struct {
@@ -737,13 +843,17 @@ func (q *Queries) SetUserAttributionEnabled(ctx context.Context, arg SetUserAttr
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
 
 const setUserAutopilotEnabled = `-- name: SetUserAutopilotEnabled :one
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserAutopilotEnabledParams struct {
@@ -790,13 +900,17 @@ func (q *Queries) SetUserAutopilotEnabled(ctx context.Context, arg SetUserAutopi
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
 
 const setUserCIAutofixEnabled = `-- name: SetUserCIAutofixEnabled :one
 UPDATE users SET ci_autofix_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserCIAutofixEnabledParams struct {
@@ -845,6 +959,10 @@ func (q *Queries) SetUserCIAutofixEnabled(ctx context.Context, arg SetUserCIAuto
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
@@ -889,7 +1007,7 @@ func (q *Queries) SetUserDefaultModel(ctx context.Context, arg SetUserDefaultMod
 
 const setUserEphemeralWorkersEnabled = `-- name: SetUserEphemeralWorkersEnabled :one
 UPDATE users SET ephemeral_workers_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserEphemeralWorkersEnabledParams struct {
@@ -940,6 +1058,10 @@ func (q *Queries) SetUserEphemeralWorkersEnabled(ctx context.Context, arg SetUse
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
@@ -949,7 +1071,7 @@ UPDATE users
 SET judge_anthropic_bind_mode = $1,
     judge_anthropic_secret_id = $2
 WHERE id = $3
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserJudgeAnthropicBindingParams struct {
@@ -1007,13 +1129,17 @@ func (q *Queries) SetUserJudgeAnthropicBinding(ctx context.Context, arg SetUserJ
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
 
 const setUserJudgeEnabled = `-- name: SetUserJudgeEnabled :one
 UPDATE users SET judge_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserJudgeEnabledParams struct {
@@ -1062,6 +1188,10 @@ func (q *Queries) SetUserJudgeEnabled(ctx context.Context, arg SetUserJudgeEnabl
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
@@ -1110,7 +1240,7 @@ func (q *Queries) SetUserMrReworkEnabled(ctx context.Context, arg SetUserMrRewor
 
 const setUserNotifyEarlyReset = `-- name: SetUserNotifyEarlyReset :one
 UPDATE users SET notify_early_limit_reset = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserNotifyEarlyResetParams struct {
@@ -1159,6 +1289,10 @@ func (q *Queries) SetUserNotifyEarlyReset(ctx context.Context, arg SetUserNotify
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }
@@ -1252,7 +1386,7 @@ func (q *Queries) SetUserTheme(ctx context.Context, arg SetUserThemeParams) (pgt
 
 const setUserWaitOnLimit = `-- name: SetUserWaitOnLimit :one
 UPDATE users SET wait_on_limit = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserWaitOnLimitParams struct {
@@ -1306,6 +1440,10 @@ func (q *Queries) SetUserWaitOnLimit(ctx context.Context, arg SetUserWaitOnLimit
 		&i.SchedulesPaused,
 		&i.SchedulesPausedUntil,
 		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
 	)
 	return i, err
 }

@@ -153,6 +153,49 @@ export function effectiveRunStatus(
   return run.status;
 }
 
+// shadowSignal derives the Shadow theme's per-run surface signal (PRD #1167 M4):
+// "live" when a machine is working, else "attention" for exactly the states PRD #1167
+// enumerates, else null. attention = awaiting_approval, or a re-plan (revising), or a
+// COMPLETED run in review with an open PR — matching PRD #1167's concrete list. It is
+// NOT "any human decision": awaiting_input and awaiting_followup are deliberately NOT
+// flagged here (they fall through to null), and neither is pool_wait. Shadow is the
+// ONLY consumer — the app renders `data-live`/`data-attention` on the card/row/header
+// of every theme, but only Shadow styles them (live → the ember-dark remap, attention
+// → a rust left rail); on every other theme the attributes are inert, and returning
+// null keeps them off.
+//
+// It flows through effectiveRunStatus so the derived planning/revising phases are
+// handled the same as everywhere else: "planning" is a running run (machine working)
+// → live, and "revising" is a run re-planning after a revise → attention, matching
+// the calm-but-live badge those phases already get. A completed run is quiet EXCEPT
+// while it is in review — mr_iid set AND the MR still open (mrChipState "open"); a
+// merged/closed MR, and every queued/failed/cancelled/limit_wait/null run, are null.
+export function shadowSignal(
+  run:
+    | {
+        status: string;
+        is_planning?: boolean;
+        is_revising?: boolean;
+        mr_iid?: number | null;
+        mr_state?: string | null;
+      }
+    | null
+    | undefined,
+): "live" | "attention" | null {
+  if (run == null) return null;
+  const eff = effectiveRunStatus(run);
+  if (eff === "claimed" || eff === "running" || eff === "planning") return "live";
+  if (eff === "awaiting_approval" || eff === "revising") return "attention";
+  // "in review" is a COMPLETED run whose MR is still open. Gate on eff === "completed"
+  // so a failed / cancelled / queued / limit_wait run that happens to carry an open MR
+  // (e.g. a run that failed after opening its MR) stays quiet rather than lighting the
+  // Shadow attention rail.
+  if (eff === "completed" && run.mr_iid != null && mrChipState(run.mr_state) === "open") {
+    return "attention";
+  }
+  return null;
+}
+
 // priorityBadge is the pure class→pill map for a run's queue priority (PRD #320 D8),
 // the single source both the Runs list and the run view render from — the same split
 // runStatusTone/healthBadge use, so the wording and tone live in one place. Tones come

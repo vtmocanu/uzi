@@ -36,6 +36,7 @@ import {
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
+  shadowSignal,
   shouldShowHealthFlag,
 } from "../lib/runBadge";
 import { activityAge, latestActivity } from "../lib/runActivity";
@@ -1140,12 +1141,20 @@ export function RunView() {
     run.started_at && run.finished_at
       ? formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime())
       : null;
+  // PRD #1167 M4: Shadow's per-run surface signal, rendered as data-live/data-attention
+  // on the run header block (the titleNode wrapping the breadcrumb, title and status).
+  // Inert on every other theme (only Shadow styles them); computed once per render.
+  const shadow = shadowSignal(run);
 
   return (
     <div className="space-y-5">
       <PageHeader
         titleNode={
-          <div className="min-w-0">
+          <div
+            className="min-w-0 run-head"
+            data-live={shadow === "live" ? "" : undefined}
+            data-attention={shadow === "attention" ? "" : undefined}
+          >
             {/* PRD #12: in-app board + issue links (the issue view is served
                 by IssueView, not the forge). */}
             <nav className="mb-2 flex items-center gap-1.5 text-xs text-faint">
@@ -1879,7 +1888,11 @@ export function RunCompletedLine({
 export function RunHeading({ run }: { run: Run }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2">
-      <h1 className="truncate text-xl font-semibold tracking-tight">{stripUnsafeChars(run.issue_title)}</h1>
+      {/* `text-fg` so the title consumes --fg: on Shadow's dark live header band the
+          [data-live] remap sets --fg to ember-light (this h1 would otherwise inherit
+          the light-theme dark page color and vanish, ~1.07:1). No visual change off
+          the live band — text-fg is the normal foreground everywhere else. */}
+      <h1 className="truncate text-xl font-semibold tracking-tight text-fg">{stripUnsafeChars(run.issue_title)}</h1>
       <RunIssueRef
         issueIid={run.issue_iid}
         issueWebUrl={run.issue_web_url}

@@ -551,7 +551,7 @@ Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
 - A worker's reported version must be the release it is actually running — no more a frozen informational string. [user, accepted from the mock 2026-07-22]
 - Workers needing attention are those that **failed to upgrade** or are **behind**; a worker mid-upgrade is informational and must not raise an alert. [user 2026-07-22]
 - Diagnostics are **read-only** in v1: no restart, retry, or auto-rollback of a failed upgrade. [user 2026-07-22]
-- Dark-only, matching the product's two dark themes; no light variant. [user 2026-07-22]
+- Dark-only, matching the product's two dark themes; no light variant. [user 2026-07-22] [superseded by PRD #1167: the panel is token-driven and now renders in every theme, light included; the light themes were approved in that PRD's decision log 2026-09-07 (AI-synced 2026-09-08)]
 - The mock is the accepted design for the fleet panel, the per-worker badges, the failed-worker detail strip, and the Workers-menu alert badge. [user 2026-07-22]
 
 **Deviations from the accepted mock, taken by the team during implementation — ratified [user 2026-07-26]:**
@@ -742,6 +742,18 @@ Extends Feature #111 (auto-select) and issue #804 (ephemeral default).
 
 - Every new worker — external (join-token mint) or hosted (provisioned) — defaults its Anthropic bind mode to auto-select when the owner has a pooled token, else the default token: the SAME rule ephemeral/throwaway workers already use (#804). A worker pinned to a named token stays pinned; existing workers are not retroactively changed. [user 2026-09-05]
 - The judge lane (run retrospectives and self-improvement runs) gets that same auto mode as its DEFAULT, spreading retrospectives across the owner's pooled tokens instead of always billing one fixed account. On an empty pool the judge spends the default token (it does not hold). [user 2026-09-05]
+
+## Feature #1167 — Lights on: light themes, system-follow appearance, typeface
+
+Tracked as GitHub issue vtmocanu/uzi#1167; PRD at `prds/1167-lights-on-themes.md`.
+Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
+
+- Three light themes — Dawn, Hall, Shadow — a light option for a dark-first tool, each keeping the dark factory somewhere on screen; ship all three, Hall the recommended light default. [user 2026-09-07]
+- Theme ids and labels are English (dawn/hall/shadow), no Romanian anywhere. [user 2026-09-07]
+- Appearance mode System / Lights on / Lights off: System follows the OS; the other two hold one preferred theme per polarity, so the user picks one light theme and one dark theme. [user 2026-09-07]
+- Settings vocabulary is "Lights on" / "Lights off"; the Appearance card sits after Account & tokens. [user 2026-09-07]
+- Admin sets the instance defaults (mode plus a theme per polarity plus typeface); a user override wins — extends Feature #21's server-side theme default. [user 2026-09-07]
+- Per-user typeface — System or IBM Plex — independent of theme; bundled, no external font fetch. [user 2026-09-07]
 
 ## Startup admin seed
 

@@ -152,7 +152,7 @@ export function CliTokens() {
             its hash is stored). You won’t be able to see this value later.
           </p>
           <div className="flex items-center gap-2">
-            <code className="flex-1 overflow-x-auto rounded-lg border border-edge bg-ink px-3 py-2 font-mono text-sm text-ok">
+            <code className="flex-1 overflow-x-auto rounded-lg border border-edge bg-ink console px-3 py-2 font-mono text-sm text-ok">
               {minted.token}
             </code>
             <Button variant="secondary" onClick={copy}>

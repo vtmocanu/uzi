@@ -794,12 +794,14 @@ also the TUI's own fallback when the live channel is unreachable (below).
   For a milestone-structured run the rail also shows a
   `MILESTONES {done}/{total}` block below the lanes, one row per approved
   milestone in order, marked `✓` reported complete, `○` not started, or —
-  for the milestone in progress — a `◐` that blinks `◐`/`○` in the faint grey
+  for a milestone in progress — a `◕` that blinks `◕`/`○` in the faint grey
   colour (the same colour as a not-started `○`; the row is told apart by the
-  `◐` shape, its motion and a brighter title, never by colour), a static `◐`
+  `◕` shape, its motion and a brighter title, never by colour), a static `◕`
   under `UZI_TUI_NO_BLINK=1` or a non-tty render. The rail's eyebrow also
-  carries a compact `▰`/`▱` micro-bar whose in-progress cell blinks in
-  tungsten, the twin of the board's. The count reads "reported complete", not verified: uzi shows
+  carries a compact `▰`/`▱` micro-bar that blinks one cell per milestone in
+  progress in tungsten, the twin of the board's, and names the in-progress
+  milestone(s) after the count (e.g. `· m1, m2`, capped at two then `+N`).
+  The count reads "reported complete", not verified: uzi shows
   what the run reported and does not itself check the work. The
   in-progress row also carries a **now line** beneath it — `↳ <role> ·
   <age>` plus its task label — the crew rail's own current-activity read;

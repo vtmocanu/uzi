@@ -87,9 +87,20 @@ precedence) are the ones dropped first.
 ## Repo skills (opt-in, default off)
 
 A repo can carry its own skills in `.claude/skills/*/SKILL.md`, the same
-layout Claude Code itself uses. uzi never loads these automatically: on the
+layout Claude Code itself uses. uzi also reads `.agents/skills/*/SKILL.md`,
+the equally-valid cross-agent root (the layout Codex reads), under the same
+rules; the two roots are merged. If the same skill name is a real skill under
+both roots, the `.claude/skills` copy wins and the `.agents/skills` copy is
+dropped (and logged). uzi never loads any of these automatically: on the
 **Repos** page, an owner (or an admin) must click **Load repo skills** for
 that specific repo and accept the warning.
+
+Cross-agent repos usually keep the real skill bodies under `.agents/skills`
+and make `.claude/skills` a symlink to them (per skill, or the whole
+directory). uzi never follows a symlink for either root, so on that layout it
+reads the real `.agents/skills` side; the symlinked `.claude/skills` side is
+skipped, which is why both roots exist. A repo whose `.claude/skills` is a
+real directory keeps working exactly as before.
 
 When enabled, uzi loads **only** `name` and `description` plus the body from
 each `SKILL.md` in that repo, at the **lowest** precedence (a delivered

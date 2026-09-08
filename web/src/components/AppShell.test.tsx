@@ -164,9 +164,14 @@ beforeEach(() => {
     loading: false,
     uziLabel: "uzi",
     autopilotLabel: "autopilot",
-    theme: "ember",
-    themeOverride: null,
-    defaultTheme: "ember",
+    appearance: {
+      mode: "dark",
+      light_theme: "hall",
+      dark_theme: "ember",
+      typeface: "system",
+      overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+      defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+    },
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
@@ -338,6 +343,31 @@ describe("AppShell sidebar collapse", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
     expect(window.localStorage.getItem("uzi.sidebar.collapsed")).toBe("false");
+  });
+});
+
+// PRD #1167 M4 (Hall): `frame` must sit on the chrome elements that CARRY `bg-surface`,
+// not on the shared SidebarContent child. CSS custom properties inherit to DESCENDANTS,
+// not ancestors, so Hall's dark-remap only reaches a panel's own background when `frame`
+// is on the same element as `bg-surface`. When `frame` lived on the SidebarContent child
+// the ancestor <aside>/drawer kept its light bg-surface → white sidebar under Hall. Pin
+// both surfaces so `frame` cannot drift back onto a chrome-less element.
+describe("Hall frame markers on the chrome surfaces (PRD #1167 M4)", () => {
+  it("puts BOTH frame and bg-surface on the desktop <aside> and the mobile drawer", async () => {
+    const { container } = renderShell("/dashboard");
+    await screen.findByText("Workers");
+
+    const aside = container.querySelector("aside");
+    expect(aside, "desktop sidebar <aside> not found").toBeTruthy();
+    expect(aside!.className).toContain("frame");
+    expect(aside!.className).toContain("bg-surface");
+
+    // Open the mobile drawer; its container is the direct parent of the Close button.
+    fireEvent.click(screen.getByLabelText("Open navigation"));
+    const drawer = screen.getByLabelText("Close navigation").parentElement;
+    expect(drawer, "mobile drawer container not found").toBeTruthy();
+    expect(drawer!.className).toContain("frame");
+    expect(drawer!.className).toContain("bg-surface");
   });
 });
 

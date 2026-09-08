@@ -1,5 +1,5 @@
 # agnix (agent-spec linter) configuration.
-# Run: `agnix .claude/skills/<name>/SKILL.md` when authoring a skill.
+# Run: `agnix .agents/skills/<name>/SKILL.md` when authoring a skill.
 
 [rules]
 # AS-013 ("file reference deeper than one level") flags any backtick/prose token

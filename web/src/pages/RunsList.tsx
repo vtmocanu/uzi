@@ -33,6 +33,7 @@ import {
   milestoneBadge,
   milestoneBadgeText,
   mrChipState,
+  shadowSignal,
 } from "../lib/runBadge";
 import { activityAge } from "../lib/runActivity";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
@@ -250,6 +251,10 @@ export function RunRow({
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
   // that into the pill's status so the shared StatusPill palette renders it calm.
   const pillStatus = isStoppedRun(run.status, run.stop_kind) ? "stopped" : effectiveRunStatus(run);
+  // PRD #1167 M4: Shadow's per-row surface signal, rendered as data-live/data-attention
+  // on the row's card-chrome <div> (the carded surface, not the bare <li>), so a live
+  // row is a solid dark --surface card. Inert on every other theme; computed once.
+  const shadow = shadowSignal(run);
   // MR chip state (PRD #33): open renders exactly as before; merged/closed get a
   // label and closed is muted + struck. This is a per-run frozen hint.
   const mrState = mrChipState(run.mr_state);
@@ -320,7 +325,11 @@ export function RunRow({
         }`}
         className="absolute inset-0 rounded-lg"
       />
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors group-hover:border-edge-strong group-hover:bg-raised/70">
+      <div
+        className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors group-hover:border-edge-strong group-hover:bg-raised/70"
+        data-live={shadow === "live" ? "" : undefined}
+        data-attention={shadow === "attention" ? "" : undefined}
+      >
         {/* w-full below sm stacks the badge cluster UNDER the title (review-wave
             fix 1): with min-w-0 alone the title column could shrink to nothing, so
             at 390px the unshrinkable badges starved it to a few characters before

@@ -80,9 +80,8 @@
   /* Radii: one base value, everything derived. */
   --radius: 0.625rem;
 
-  /* Typography */
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* Typography: --font-* now live in the typeface layer below (orthogonal to
+     theme; selected by data-font), not per theme block. */
 
   /* Backdrop grid: ember has none. The body rule consumes these tokens; a theme
      (mission) supplies a blueprint grid without touching any component. */
@@ -153,9 +152,8 @@
   /* Sharper corners (every radius derives from this one value). */
   --radius: 0.25rem;
 
-  /* Typography */
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  /* Typography: --font-* now live in the typeface layer below; mission's former
+     "Liberation Mono" fallback is folded into that shared --font-mono. */
 
   /* Faint blueprint grid, drawn by the body rule; reads as "console" while
      staying far below content contrast. */
@@ -164,6 +162,204 @@
     linear-gradient(var(--grid-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
   --grid-size: 36px 36px;
+}
+
+/* ── The light theme token set: Dawn, Hall & Shadow ─────────────────────────
+   PRD #1167's THREE light themes SHARE this one token set — declared once, on a
+   comma-list selector, so they can never drift apart — and differ ONLY in WHERE
+   the dark factory shows, expressed by the scopes below: Dawn keeps the dark
+   only on `console` surfaces (activity feed, code/log blocks, CLI token boxes);
+   Hall additionally darkens the `frame` (the sidebar + mobile top bar); Shadow
+   darkens live run surfaces (`[data-live]`) and gives attention surfaces
+   (`[data-attention]`) a rust rail. Cards are LIGHTER than the page ground (the
+   inverse of dark elevation, no shadows), elevated cool-steel greys rather than
+   pure white. All triples are WCAG 2.2 AA verified (fg/muted/faint and every
+   status tone ≥ 4.5:1 on bg/surface/raised and each tone's own 10% pill tint;
+   enforced by contrast.test.ts, which registers all three names off this shared
+   selector, so hall/shadow are covered token-for-token with no new test data).
+   Ember's bright orange fails AA on light ground, so the brand splits: rust
+   here, ember inside the dark scopes below. Like mission this is a full token
+   set — the `:root:not([data-theme])` guard means the base block does NOT apply
+   once data-theme is set, so every token the app reads is redefined. */
+[data-theme="dawn"],
+[data-theme="hall"],
+[data-theme="shadow"] {
+  color-scheme: light;
+
+  /* Palette: cool-steel ground, white cards lifted above it, rust accent */
+  --bg: 242 244 247;
+  --surface: 255 255 255;
+  --raised: 235 238 243;
+  --edge: 214 219 228;
+  --edge-strong: 174 182 196;
+  --fg: 21 26 34;
+  --muted: 74 85 103;
+  /* #5F6A82, ≥ 4.9:1 on all three light grounds (PRD #1167): app-wide
+     de-emphasised text (text-faint) clears WCAG AA 4.5:1 with margin (APCA on
+     thin light-ground text is stricter, so it was pushed past 4.5). Stays
+     visibly fainter than --muted (#4A5567). Also backs --syn-comment below. */
+  --faint: 95 106 130;
+  --brand: 185 60 11;
+  --brand-hover: 154 52 18;
+  --on-brand: 255 255 255;
+
+  /* Keyboard focus ring: brand-tinted (rust) so it reads as on-theme against
+     the light surfaces. */
+  --ring: var(--brand);
+
+  /* Status colors — darkened tones so text-tone clears AA on white and on its
+     own 10% pill tint (the bg-tone/10 text-tone pattern ships unchanged). */
+  --ok: 3 112 90;
+  --warn: 154 74 5;
+  --danger: 190 18 60;
+  --info: 3 105 161;
+  --plan: 79 70 229;
+
+  /* Queue + idle/stopped status tones. Same anatomy as ember (border/surface/fg
+     mapped onto edge/raised/muted) so the neutral pill keeps its shape, on the
+     light values. */
+  --queue-fg: var(--muted);
+  --queue-border: var(--edge);
+  --queue-surface: var(--raised);
+  --neutral-fg: var(--muted);
+  --neutral-border: var(--edge);
+  --neutral-surface: var(--raised);
+
+  /* Shell syntax highlighting (PRD #38): the plain ember aliases, resolving to
+     Dawn's light palette. On the `console` scope these re-resolve against the
+     overridden dark base tokens (see below), so scoped code stays legible. */
+  --syn-cmd: var(--brand);
+  --syn-flag: var(--info);
+  --syn-str: var(--ok);
+  --syn-op: var(--brand-hover);
+  --syn-comment: var(--faint);
+  --syn-arg: var(--fg);
+  --tool-rail: var(--edge);
+
+  /* Radii: ember's base value. */
+  --radius: 0.625rem;
+
+  /* Typography: --font-* now live in the typeface layer below (PRD #1167 M6),
+     shared by every theme. */
+
+  /* Backdrop grid: Dawn has none. */
+  --grid-image: none;
+  --grid-size: auto;
+}
+
+/* ── The `console` scope ───────────────────────────────────────────────────
+   A machine surface (code/log/command panes, the live activity feed) must look
+   exactly like ember on every theme — dark, whatever the chrome does. So under
+   each LIGHT theme, an element carrying `.console` (and the CSS-only docs code
+   block `.docs-prose pre`, which has no class to add) remaps the palette back to
+   the CURRENT EMBER dark triples and sets color-scheme:dark, so every nested
+   `bg-ink` / `text-muted` / `border-edge` utility keeps working unchanged — no
+   `bg-console` token, no component branching. The literals are ember's exact
+   channel triples (read from the ember block above): the M4 frame-equality test
+   and the M8 ember/mission snapshot both pin this to ember token-for-token, and
+   a `.console { --bg: var(--console-bg) }` indirection is rejected because an
+   undefined alias would make --bg guaranteed-invalid on the dark pair.
+   Scoped ONLY under the light themes: ember/mission never match this selector,
+   so on those themes `.console` is an inert no-op that inherits the theme's own
+   palette. The queue, neutral, syn and tool-rail aliases are RE-DECLARED in the
+   rule below (not just the base palette): a custom property inherits its already
+   RESOLVED value, so a `--queue-fg: var(--muted)` declared on the [data-theme]
+   ancestor resolves to the theme's LIGHT muted and would inherit that light value
+   into a nested `.console` unchanged. Declaring the aliases ON `.console`, where
+   the base tokens are the ember dark set, makes each var() resolve to the dark
+   value on this element, so a scoped neutral pill or shell token reads ember.
+
+   PRD #1167 M4 REUSES this exact remap (base palette + every alias +
+   color-scheme:dark) for two more scopes appended to the selector list below,
+   so the frame and the live cards are ember token-for-token, identical to the
+   console panes: Hall's `.frame` (the sidebar + mobile top bar go ember-dark
+   under Hall) and Shadow's `[data-live]` (a live run's card/row/header goes
+   ember-dark under Shadow). Sharing one rule is what makes that equality
+   provable — console-scope.test.ts checks both selectors ride this rule. */
+[data-theme="dawn"] .console, [data-theme="hall"] .console, [data-theme="shadow"] .console,
+[data-theme="dawn"] .docs-prose pre, [data-theme="hall"] .docs-prose pre, [data-theme="shadow"] .docs-prose pre,
+[data-theme="hall"] .frame,
+[data-theme="shadow"] [data-live] {
+  color-scheme: dark;
+  --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+  --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
+  --brand: 251 146 60; --brand-hover: 253 186 116; --on-brand: 26 16 8;
+  --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133; --info: 56 189 248; --plan: 129 140 248;
+  --ring: var(--brand);
+  /* Aliases re-declared here (see the note above) so they resolve against the
+     dark base tokens set just above, not the theme's inherited light values. */
+  --queue-fg: var(--muted); --queue-border: var(--edge); --queue-surface: var(--raised);
+  --neutral-fg: var(--muted); --neutral-border: var(--edge); --neutral-surface: var(--raised);
+  --syn-cmd: var(--brand); --syn-flag: var(--info); --syn-str: var(--ok); --syn-op: var(--brand-hover); --syn-comment: var(--faint); --syn-arg: var(--fg); --tool-rail: var(--edge);
+}
+
+/* PRD #1167 M4 (mock lines 89-90): a live surface is a solid dark --surface card,
+   not just recoloured text. The shared rule above set the ember vars + color-scheme
+   on [data-live]; this gives it the dark background + edge border so a live board
+   card, run row and run header read as dark cards (and the run header, which has no
+   bg utility of its own, is legible instead of ember-light text on the light page). */
+[data-theme="shadow"] [data-live] {
+  background-color: rgb(var(--surface));
+  border-color: rgb(var(--edge));
+}
+/* The run header has no card chrome of its own; give it the band (border+radius+
+   padding) under Shadow when a run is live or needs attention, so the rail/tint and
+   the dark surface read as a header band rather than hugging the text. */
+[data-theme="shadow"] .run-head[data-live],
+[data-theme="shadow"] .run-head[data-attention] {
+  border: 1px solid rgb(var(--edge));
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+}
+
+/* Shadow's attention surfaces (PRD #1167 M4). A run waiting on a human decision
+   or in review carries `data-attention`; under Shadow it gets a LIGHT treatment,
+   deliberately NOT the dark remap above — a rust left rail plus a 6%-rust tint
+   over white, so the human's decision surface (awaiting_approval) never sits
+   inside a dark card. box-shadow:inset draws the rail with no layout reflow
+   (unlike border-left), and the background-color intentionally overrides the
+   card's Tailwind bg utility on Shadow (unlayered + higher specificity wins).
+   Scoped to Shadow, so `data-attention` is inert on every other theme. */
+[data-theme="shadow"] [data-attention] {
+  /* rust left rail + a 6%-rust tint over white; awaiting_approval stays LIGHT so the
+     human's decision surface never sits inside a dark card (PRD #1167). */
+  box-shadow: inset 3px 0 0 rgb(var(--brand));
+  background-color: rgb(251 244 240);
+}
+
+/* Non-console inset surfaces (modal footers, preview/read-only boxes, side
+   panels, empty-state placeholders) carry `inset-panel` beside their bg-ink/NN
+   wash. On the dark themes the wash stands (darker than the card). On a LIGHT
+   theme that wash is the near-white ground over a white card — invisible — so
+   remap to an opaque --raised step, a visible recess. Higher specificity than the
+   utility and unlayered, so it applies ONLY under a light theme and leaves
+   ember/mission byte-identical. */
+[data-theme="dawn"] .inset-panel,
+[data-theme="hall"] .inset-panel,
+[data-theme="shadow"] .inset-panel {
+  background-color: rgb(var(--raised));
+}
+/* A well that sits ON a --raised chip (the judge label-filter count pill): a
+   --raised fill would match its parent, so lift to --surface on light instead. */
+[data-theme="dawn"] .inset-well,
+[data-theme="hall"] .inset-well,
+[data-theme="shadow"] .inset-well {
+  background-color: rgb(var(--surface));
+}
+
+/* ── Typeface layer (PRD #1167 M6) ──────────────────────────────────────────
+   --font-* live here, NOT in the theme blocks, so typeface and theme are
+   orthogonal: data-font (stamped by applyAppearance / theme-preinit.js) selects
+   the family independently of data-theme. System is the platform UI stack (no
+   download); Plex is the bundled IBM Plex family (font files imported below /
+   in main.tsx). Placed after every [data-theme] block so no theme can override. */
+:root {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+:root[data-font="plex"] {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
 body {

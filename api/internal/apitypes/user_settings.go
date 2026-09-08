@@ -12,10 +12,19 @@ type UserSettingsDTO struct {
 	DefaultEffort *string `json:"default_effort"`
 	JudgeModel    *string `json:"judge_model"`
 	SummaryModel  *string `json:"summary_model"`
-	Theme         *string `json:"theme"`
+	// Theme is the DEPRECATED legacy single-theme override mirror (PRD #21); kept
+	// one release. The appearance override lives in the four fields below (PRD #1167).
+	Theme *string `json:"theme"`
 	// MrReworkEnabled is the CLI decode mirror of the per-user MR review-watcher
 	// opt-in (PRD #700 M5). Fidelity only — carried so a decode never drops it; null
 	// means unset = the default-ON state.
 	MrReworkEnabled *bool    `json:"mr_rework_enabled"`
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
+	// The four appearance override mirrors (PRD #1167): the user's RAW per-field
+	// overrides (each null ⇒ inherit the instance default). Fidelity only — carried
+	// so a decode never drops them; there is no CLI setter.
+	AppearanceMode *string `json:"appearance_mode"`
+	LightTheme     *string `json:"light_theme"`
+	DarkTheme      *string `json:"dark_theme"`
+	Typeface       *string `json:"typeface"`
 }

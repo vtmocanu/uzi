@@ -7,6 +7,7 @@ import {
   needsHumanAttention,
   retryHint,
   runBadge,
+  shadowSignal,
 } from "../../lib/runBadge";
 import { runDurationLabel } from "../../lib/runDuration";
 import { boundedChips } from "../../lib/labelChips";
@@ -157,6 +158,10 @@ export function IssueCard({
   // (Board.tsx passes `!card.closed` for both), since the Closed lane has no order.
   const draggable = true;
   const run = card.latest_run;
+  // PRD #1167 M4: Shadow's per-card surface signal, rendered as data-live/data-attention
+  // on the card root. Inert on every other theme (only Shadow styles the attributes);
+  // computed once here so both attributes read one derivation.
+  const shadow = shadowSignal(run);
   const badge = run ? runBadge(run, Date.now()) : null;
   // Uniform per-card duration token (issue #256 M4, Decision 4): a faint mono span
   // beside the badge carrying `running 1h 30m` / `queued 4m` / `ran 42m`, "" for
@@ -193,6 +198,8 @@ export function IssueCard({
       onDragOver={onCardDragOver}
       onDragLeave={onCardDragLeave}
       onDrop={onCardDrop}
+      data-live={shadow === "live" ? "" : undefined}
+      data-attention={shadow === "attention" ? "" : undefined}
       className={cx(
         "group rounded-lg border p-3 text-sm transition-colors",
         // D17. Dashed rather than dimmed: opacity-40 already means "being dragged

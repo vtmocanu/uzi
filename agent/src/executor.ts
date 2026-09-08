@@ -157,8 +157,8 @@ export interface RunContext {
    *  over-limit). The worker owns the gapless seq, so it logs these. */
   skillsDropped?: ClaimSkillDrop[];
   /** M6 (PRD #16): the repo owner opted in to loading skills from the clone's own
-   *  .claude/skills. Only then does the worker enumerate them (skills only, lowest
-   *  precedence); default off. */
+   *  skill roots (`.claude/skills` and `.agents/skills`, issue #1205). Only then
+   *  does the worker enumerate them (skills only, lowest precedence); default off. */
   repoSkillsEnabled?: boolean;
   /** PRD #246: the repo owner opted in to the lead reading the clone's ROOT CLAUDE.md
    *  as nonce-fenced UNTRUSTED/ADVISORY context (lead-only, `settingSources` untouched);

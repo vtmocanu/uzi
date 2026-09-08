@@ -175,7 +175,8 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 		return r
 	}
 	// A milestone-structured run (PRD #122) so `tui --demo` exercises the crew rail's
-	// milestone block: 2 of 4 frozen milestones reported complete, one in progress.
+	// milestone block: 2 of 4 frozen milestones reported complete, two in progress (so the
+	// board/eyebrow micro-bars blink two cells and the eyebrow suffix lists two ids — #1176).
 	scheduler := mk("a1b2c3d4-1111-2222-3333-444444444444", "issue", "running", "Add rate-limit headroom to the scheduler poll", "", nil, 0, 4*time.Minute)
 	scheduler.Milestones = []apitypes.Milestone{
 		{ID: "m1", Title: "Wire the rate-limit headroom into the poll loop"},
@@ -184,7 +185,7 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 		{ID: "m4", Title: "Update the scheduler docs"},
 	}
 	scheduler.MilestonesCompleted = []string{"m1", "m2"}
-	scheduler.MilestonesInProgress = []string{"m3"}
+	scheduler.MilestonesInProgress = []string{"m3", "m4"}
 	// A realistic spread of credentials. The TUI board and detail show just the muted LABEL
 	// (meta/personal); the select reason/mode is surfaced only by `uzi run <id>`, not the TUI, so
 	// these reasons are realistic data rather than something the demo draws a dot or colour for.
