@@ -21,7 +21,7 @@ through `[0.52.0]`.)
 ### Changed
 
 - **The `slow` run-health flag is now a budget-relative "near timeout" warning instead of a bare wall-clock timer ([#1170](https://github.com/vtmocanu/uzi/issues/1170)).**
-  It fires once a run's active running time (wall clock since start, gate waits excluded) has used a configurable share of its wall-clock budget (default 85%, `health_near_timeout_pct` replacing `health_slow_seconds`); the badge, TUI, CLI, and Slack now read "near timeout" everywhere and count down the time left to the deadline (e.g. `1h 5m left`) instead of the time since the flag was raised.
+  It fires once a run's active running time (wall clock since start, gate waits excluded) has used a configurable share of its wall-clock budget (default 85%, `health_near_timeout_pct` replacing `health_slow_seconds`); the flag reads "near timeout" everywhere, and the badge, TUI, and CLI human views now count down the time left to the deadline (e.g. `1h 5m left`) instead of the time since it was raised, while Slack relabels the flag and glyph without a countdown and the machine-readable `health` field keeps reporting `slow`.
 
 ## [0.79.0] - 2026-09-07
 
