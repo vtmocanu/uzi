@@ -442,31 +442,32 @@ export function Findings() {
       </div>
 
       {/* Five counted tabs (PRD #1183 M4), counts straight from the canonical stats aggregate, brand
-          active underline — mirroring the Judge bucket tabs. */}
-      {stats && (
-        <div role="tablist" aria-label="Findings bucket" className="flex flex-wrap gap-1 border-b border-edge">
-          {FINDING_BUCKETS.map((b) => {
-            const active = b === bucket;
-            return (
-              <button
-                key={b}
-                role="tab"
-                aria-selected={active}
-                onClick={() => setBucket(b)}
-                className={cx(
-                  "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-                  active
-                    ? "border-brand text-fg"
-                    : "border-transparent text-faint hover:border-edge-strong hover:text-muted",
-                )}
-              >
-                {TAB_LABEL[b]}
-                <span className="ml-1.5 tabular-nums text-faint">{tabCount(stats, b)}</span>
-              </button>
-            );
-          })}
-        </div>
-      )}
+          active underline — mirroring the Judge bucket tabs. The strip renders UNCONDITIONALLY: it is
+          the only affordance that calls setBucket, so a failed stats fetch must not strand the user in
+          the current bucket. Only the per-bucket count is canonical-stats-only and is simply absent
+          when the stats fetch failed. */}
+      <div role="tablist" aria-label="Findings bucket" className="flex flex-wrap gap-1 border-b border-edge">
+        {FINDING_BUCKETS.map((b) => {
+          const active = b === bucket;
+          return (
+            <button
+              key={b}
+              role="tab"
+              aria-selected={active}
+              onClick={() => setBucket(b)}
+              className={cx(
+                "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+                active
+                  ? "border-brand text-fg"
+                  : "border-transparent text-faint hover:border-edge-strong hover:text-muted",
+              )}
+            >
+              {TAB_LABEL[b]}
+              {stats && <span className="ml-1.5 tabular-nums text-faint">{tabCount(stats, b)}</span>}
+            </button>
+          );
+        })}
+      </div>
 
       {loading && <ListSkeleton rows={4} />}
 

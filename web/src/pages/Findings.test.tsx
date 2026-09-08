@@ -7,6 +7,7 @@ import { AppShell } from "../components/AppShell";
 import { useAuth } from "../auth/AuthContext";
 import {
   api,
+  ApiError,
   type IncidentalFinding,
   type IncidentalFindingBacklog,
   type TriageCounts,
@@ -147,6 +148,20 @@ describe("Findings page — counted tabs (PRD #1183 M4)", () => {
   it("switches the fetched bucket when the Done tab is clicked", async () => {
     renderFindings();
     await waitFor(() => expect(screen.getByText("Leaked ticker in sweepLoop")).toBeTruthy());
+    fireEvent.click(screen.getByRole("tab", { name: /^Done/ }));
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("done", undefined, undefined));
+  });
+
+  it("keeps the bucket tabs when the stats fetch fails, so the user is not stranded", async () => {
+    // The stats fetcher swallows errors to ""; a failed GET /findings/stats must not unmount the
+    // tab strip (the only affordance that calls setBucket). The counts are simply absent.
+    mockApi.getFindingsStats.mockRejectedValue(new ApiError(500, "boom"));
+    renderFindings();
+    await waitFor(() => expect(screen.getByText("Leaked ticker in sweepLoop")).toBeTruthy());
+
+    // The strip still renders even with no stats.
+    expect(screen.getByRole("tab", { name: /To triage/ })).toBeTruthy();
+    // And the bucket switch still works.
     fireEvent.click(screen.getByRole("tab", { name: /^Done/ }));
     await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("done", undefined, undefined));
   });
@@ -357,6 +372,33 @@ describe("Findings page — select-all, bulk dismiss + bounded Undo", () => {
     });
     await waitFor(() => expect(mockApi.undoDismissFinding).toHaveBeenCalledTimes(8));
     expect(maxInFlight).toBe(6);
+  });
+
+  it("reports a partial undo honestly", async () => {
+    const rows = Array.from({ length: 3 }, (_, i) =>
+      finding({ disposition_id: `disp-${i + 1}`, finding_id: `find-${i + 1}`, last_title: `bug ${i + 1}`, location: `f${i + 1}.go#x` }),
+    );
+    mockApi.listFindings.mockResolvedValue(backlog({ repo: "repo-uzi", findings: rows, open_count: 3 }));
+    mockApi.getFindingsStats.mockResolvedValue(triage({ total: 3, todo: 3, filed: 0, done: 0, dismissed: 0 }));
+    mockApi.dismissFindings.mockResolvedValue({
+      updated: 3,
+      findings: rows.map((r) => ({ ...r, status: "dismissed", dismiss_reason: "wont_do" as const })),
+    });
+    // One of the three reopens fails.
+    mockApi.undoDismissFinding.mockImplementation(async (id: string) => {
+      if (id === "disp-2") throw new ApiError(500, "boom");
+      return finding({ disposition_id: id, status: "open" });
+    });
+
+    renderFindings(["/findings?repo=repo-uzi"]);
+    await waitFor(() => expect(screen.getByText("bug 1")).toBeTruthy());
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select all 3 shown/ }));
+    const bar = (await screen.findByText(/3 findings selected/)).parentElement as HTMLElement;
+    fireEvent.click(within(bar).getByRole("button", { name: "Dismiss ▾" }));
+    fireEvent.click(within(screen.getByRole("menu")).getByText("Won't do"));
+    fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
+
+    expect(await screen.findByText(/Partly undone: 2 of 3 reopened, 1 failed/)).toBeTruthy();
   });
 });
 

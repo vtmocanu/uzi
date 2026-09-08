@@ -1200,7 +1200,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   // global open count) rather than the deprecated backlog `open_count` meta — so the badge, the
   // Findings To-triage tab and the summary strip are one number, and the FindingsOpenContext below
   // lets the page keep the badge fresh after a dismiss without a navigation. A failed fetch keeps
-  // the last known count rather than blanking the badge.
+  // the last known count rather than blanking the badge. NOTE on scope: while the Findings page is
+  // mounted it re-scopes this badge to the active ?repo= filter through FindingsOpenContext (that
+  // page's tabs, summary strip and this badge are one number PER repo scope, by design); this
+  // on-navigation poll publishes the GLOBAL count and restores it on the next pathname change.
   useEffect(() => {
     if (!user) {
       setFindingsOpen(0);
