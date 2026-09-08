@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **On-demand MR rework past the automatic cap, with optional guidance ([#1202](https://github.com/vtmocanu/uzi/issues/1202)).**
+  An owner can start one rework cycle on a completed run whose MR is open even after the automatic cap — from the run page's Rework now control, `uzi run rework <run-id> [-m <guidance>]`, or `POST /api/runs/{id}/rework` — bypassing the cap, debounce, staleness and green-pipeline gates while keeping the branch/one-active/kill-switch/token/open-MR guards; the cycle never counts against the automatic cap, advances the consumed high-water so the watcher never re-fires on the same comments, and the cap halt comment/notification now point at it.
+
 ### Changed
 
 - **The `slow` run-health flag is now a budget-relative "near timeout" warning instead of a bare wall-clock timer ([#1170](https://github.com/vtmocanu/uzi/issues/1170)).**
