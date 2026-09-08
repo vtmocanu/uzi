@@ -129,7 +129,7 @@ uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
-uzi findings undo <finding-id>
+uzi findings undo <disposition-id>
 uzi findings stats [--repo <id>] [--json]
 uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
 uzi handoff rm <run-id> | review <run-id>
@@ -1052,7 +1052,7 @@ uzi findings list --run <run-id>                             # coordinates that 
 uzi findings file <finding-id>                               # file a forge issue from a coordinate
 uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
 uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
-uzi findings undo <finding-id>                               # reopen a dismissal
+uzi findings undo <disposition-id>                           # reopen a dismissal
 uzi findings stats [--repo <repo-id>]                        # your triage totals, across your repos
 ```
 

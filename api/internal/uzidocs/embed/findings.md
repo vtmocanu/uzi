@@ -106,7 +106,7 @@ Everything here is also available from the [uzi CLI](./cli.md#incidental-finding
 uzi findings list                                       # what still needs triage
 uzi findings file <finding-id>                           # file it
 uzi findings dismiss <finding-id> --reason wont-do       # or not-an-issue
-uzi findings undo <finding-id>                           # undo a dismissal
+uzi findings undo <disposition-id>                       # undo a dismissal
 uzi findings stats                                       # your triage totals, across all repos
 ```
 

@@ -105,7 +105,7 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	stats.Flags().String("repo", "", "narrow the tally to one repo id (as `uzi repo list` prints it); a foreign/unknown id is an all-zero tally, never a 404")
 
 	undo := &cobra.Command{
-		Use:   "undo <finding-id>",
+		Use:   "undo <disposition-id>",
 		Short: "Reopen a dismissed finding (undo a dismissal)",
 		Long: "Reopen a dismissed finding coordinate, undoing a dismissal (back to the to-file\n" +
 			"bucket). The id is the disposition id (present on every backlog row, including a\n" +
