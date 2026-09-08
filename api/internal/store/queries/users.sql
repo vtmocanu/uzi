@@ -230,17 +230,20 @@ UPDATE users SET theme = @theme WHERE id = @id
 RETURNING theme;
 
 -- name: SetUserAppearance :one
--- Sets the current user's whole appearance (PRD #1167 M1) in ONE statement: the mode,
--- the light-slot and dark-slot themes, and the typeface. A NULL in any param CLEARS
--- that field back to the instance default (the resolver treats a NULL column as
--- inherit). Per-field granularity is the handler's job — it reads the current values
--- and writes all four — so a single 4-column UPDATE is enough here. Own-user only;
+-- PATCHes the current user's appearance (PRD #1167 M1) in ONE atomic statement:
+-- each of the four fields is written only when its @set_* flag is true, otherwise
+-- the current column value is kept (the CASE keeps the row's own value). A true
+-- flag with a NULL value CLEARS that field back to the instance default (the
+-- resolver treats a NULL column as inherit). Because every unset field re-writes
+-- its own stored value inside the single UPDATE, two concurrent saves that touch
+-- different fields cannot clobber each other, and the handler needs no
+-- read-merge-write (which raced) to preserve the untouched fields. Own-user only;
 -- the caller passes the session user's id.
 UPDATE users
-SET appearance_mode = @appearance_mode,
-    light_theme = @light_theme,
-    dark_theme = @dark_theme,
-    typeface = @typeface
+SET appearance_mode = CASE WHEN @set_mode::bool THEN @appearance_mode ELSE appearance_mode END,
+    light_theme = CASE WHEN @set_light::bool THEN @light_theme ELSE light_theme END,
+    dark_theme = CASE WHEN @set_dark::bool THEN @dark_theme ELSE dark_theme END,
+    typeface = CASE WHEN @set_typeface::bool THEN @typeface ELSE typeface END
 WHERE id = @id
 RETURNING appearance_mode, light_theme, dark_theme, typeface;
 

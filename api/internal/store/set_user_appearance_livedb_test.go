@@ -17,19 +17,22 @@ import (
 )
 
 // TestSetUserAppearanceLiveDB exercises the store.SetUserAppearance WRITE seam
-// (PRD #1167 M2): the single 4-column `UPDATE users SET appearance_mode = $1,
-// light_theme = $2, dark_theme = $3, typeface = $4 ... RETURNING ...` that backs
+// (PRD #1167 M2): the single conditional `UPDATE users SET appearance_mode =
+// CASE WHEN $1 THEN $2 ELSE appearance_mode END, ... RETURNING ...` that backs
 // PUT /api/me/settings. TestUserAppearanceBackfillLiveDB (M1) only proves the
 // migration's one-shot backfill; it never calls SetUserAppearance itself. This
-// test does, against a real Postgres, and checks three shapes of the write:
+// test does, against a real Postgres, and checks the PATCH contract:
 //
-//  1. all four set to valid registry values -> RETURNING and a subsequent
+//  1. all four flags set to valid registry values -> RETURNING and a subsequent
 //     GetUserSettings both reflect them;
-//  2. all four cleared to SQL NULL (pgtype.Text{Valid:false}) -> RETURNING and a
-//     re-read both show NULL again (the resolver's "inherit" sentinel);
-//  3. a partial write (only dark_theme set, the other three NULL) -> RETURNING
-//     and a re-read agree, proving the statement does not silently preserve a
-//     stale value in an unset column (a 4-column UPDATE with no COALESCE would).
+//  2. a patch with only set_dark true (a new dark_theme, the other three flags
+//     false) -> dark_theme changes while the other three KEEP their step-1 values,
+//     proving an unset field is preserved (the whole point of the conditional
+//     UPDATE: two concurrent saves of different fields cannot clobber each other);
+//  3. a set flag with a NULL value (set_mode true, value NULL) -> that field
+//     CLEARS to NULL (the resolver's "inherit" sentinel) while the still-unset
+//     fields stay put;
+//  4. all four flags set to NULL -> RETURNING and a re-read both show all NULL.
 //
 // Mirrors TestUserAppearanceBackfillLiveDB's DB-per-test setup (an isolated
 // database, CREATE/DROP via a fresh admin pool, cleanup via t.Cleanup), but
@@ -122,11 +125,15 @@ func TestSetUserAppearanceLiveDB(t *testing.T) {
 		t.Fatalf("baseline appearance columns not all NULL: %+v", base)
 	}
 
-	// --- (a) Set all four to valid registry values.
+	// --- (a) Set all four flags to valid registry values.
 	set, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{
+		SetMode:        true,
 		AppearanceMode: pgtype.Text{String: "light", Valid: true},
+		SetLight:       true,
 		LightTheme:     pgtype.Text{String: "dawn", Valid: true},
+		SetDark:        true,
 		DarkTheme:      pgtype.Text{String: "mission", Valid: true},
+		SetTypeface:    true,
 		Typeface:       pgtype.Text{String: "plex", Valid: true},
 		ID:             user.ID,
 	})
@@ -146,15 +153,58 @@ func TestSetUserAppearanceLiveDB(t *testing.T) {
 		t.Errorf("GetUserSettings(after all-set) = %+v, want {light dawn mission plex}", afterSet)
 	}
 
-	// --- (b) Clear all four back to NULL (the "inherit" sentinel). A 4-column
-	// UPDATE that forgot a column, or one that COALESCEd instead of overwriting,
-	// would leave a stale value here.
-	cleared, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{
+	// --- (b) Patch ONLY dark_theme (set_dark true, the other three flags false).
+	// dark_theme must change to ember while mode/light/typeface KEEP their step-(a)
+	// values. This is the contract that makes concurrent saves of different fields
+	// non-clobbering: an unset field re-writes its own stored value.
+	patched, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{
+		SetDark:   true,
+		DarkTheme: pgtype.Text{String: "ember", Valid: true},
+		ID:        user.ID,
+	})
+	if err != nil {
+		t.Fatalf("SetUserAppearance(patch dark only): %v", err)
+	}
+	if !patched.DarkTheme.Valid || patched.DarkTheme.String != "ember" {
+		t.Errorf("SetUserAppearance(patch) RETURNING dark_theme = %+v, want {ember true}", patched.DarkTheme)
+	}
+	if patched.AppearanceMode.String != "light" || patched.LightTheme.String != "dawn" || patched.Typeface.String != "plex" {
+		t.Errorf("SetUserAppearance(patch) clobbered an unset field: %+v, want mode=light light=dawn typeface=plex", patched)
+	}
+	afterPatch, err := q.GetUserSettings(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetUserSettings(after patch): %v", err)
+	}
+	if afterPatch.DarkTheme.String != "ember" || afterPatch.AppearanceMode.String != "light" ||
+		afterPatch.LightTheme.String != "dawn" || afterPatch.Typeface.String != "plex" {
+		t.Errorf("GetUserSettings(after patch) = %+v, want dark=ember mode=light light=dawn typeface=plex", afterPatch)
+	}
+
+	// --- (c) A set flag with a NULL value CLEARS that field (set_mode true, value
+	// NULL) while the still-unset fields stay put.
+	clearedMode, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{
+		SetMode:        true,
 		AppearanceMode: pgtype.Text{Valid: false},
-		LightTheme:     pgtype.Text{Valid: false},
-		DarkTheme:      pgtype.Text{Valid: false},
-		Typeface:       pgtype.Text{Valid: false},
 		ID:             user.ID,
+	})
+	if err != nil {
+		t.Fatalf("SetUserAppearance(clear mode): %v", err)
+	}
+	if clearedMode.AppearanceMode.Valid {
+		t.Errorf("SetUserAppearance(clear mode) RETURNING mode = %+v, want NULL", clearedMode.AppearanceMode)
+	}
+	if clearedMode.DarkTheme.String != "ember" || clearedMode.LightTheme.String != "dawn" || clearedMode.Typeface.String != "plex" {
+		t.Errorf("SetUserAppearance(clear mode) clobbered an unset field: %+v", clearedMode)
+	}
+
+	// --- (d) Clear all four (every flag true, every value NULL) -> all NULL, on
+	// both the RETURNING row and a fresh re-read.
+	cleared, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{
+		SetMode:     true,
+		SetLight:    true,
+		SetDark:     true,
+		SetTypeface: true,
+		ID:          user.ID,
 	})
 	if err != nil {
 		t.Fatalf("SetUserAppearance(clear-all): %v", err)
@@ -168,43 +218,5 @@ func TestSetUserAppearanceLiveDB(t *testing.T) {
 	}
 	if afterClear.AppearanceMode.Valid || afterClear.LightTheme.Valid || afterClear.DarkTheme.Valid || afterClear.Typeface.Valid {
 		t.Errorf("GetUserSettings(after clear-all) = %+v, want all NULL", afterClear)
-	}
-
-	// --- (c) A partial write: only dark_theme set, the other three NULL. Proves
-	// the RETURNING row and a fresh re-read agree field-by-field, including the
-	// three that must come back NULL rather than silently keeping whatever the
-	// previous write left there.
-	partial, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{
-		AppearanceMode: pgtype.Text{Valid: false},
-		LightTheme:     pgtype.Text{Valid: false},
-		DarkTheme:      pgtype.Text{String: "ember", Valid: true},
-		Typeface:       pgtype.Text{Valid: false},
-		ID:             user.ID,
-	})
-	if err != nil {
-		t.Fatalf("SetUserAppearance(partial): %v", err)
-	}
-	if partial.AppearanceMode.Valid || partial.LightTheme.Valid || partial.Typeface.Valid {
-		t.Errorf("SetUserAppearance(partial) RETURNING left a non-dark field non-NULL: %+v", partial)
-	}
-	if !partial.DarkTheme.Valid || partial.DarkTheme.String != "ember" {
-		t.Errorf("SetUserAppearance(partial) RETURNING dark_theme = %+v, want {ember true}", partial.DarkTheme)
-	}
-	afterPartial, err := q.GetUserSettings(ctx, user.ID)
-	if err != nil {
-		t.Fatalf("GetUserSettings(after partial): %v", err)
-	}
-	if afterPartial.AppearanceMode.Valid || afterPartial.LightTheme.Valid || afterPartial.Typeface.Valid {
-		t.Errorf("GetUserSettings(after partial) left a non-dark field non-NULL: %+v", afterPartial)
-	}
-	if !afterPartial.DarkTheme.Valid || afterPartial.DarkTheme.String != "ember" {
-		t.Errorf("GetUserSettings(after partial) dark_theme = %+v, want {ember true}", afterPartial.DarkTheme)
-	}
-	// RETURNING and the fresh re-read must agree exactly (proves the RETURNING
-	// clause isn't reporting the parameters back verbatim while the actual row
-	// diverges).
-	if partial.AppearanceMode != afterPartial.AppearanceMode || partial.LightTheme != afterPartial.LightTheme ||
-		partial.DarkTheme != afterPartial.DarkTheme || partial.Typeface != afterPartial.Typeface {
-		t.Errorf("RETURNING %+v does not match re-read %+v", partial, afterPartial)
 	}
 }

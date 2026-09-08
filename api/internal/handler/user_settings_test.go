@@ -83,20 +83,31 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if ids, ok := args[0].([]uuid.UUID); ok {
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
 		}
-	case strings.Contains(sql, "SET appearance_mode") && len(args) >= 4:
-		// SetUserAppearance writes all four columns at once (PRD #1167 M1):
-		// $1=appearance_mode, $2=light_theme, $3=dark_theme, $4=typeface, $5=id.
-		if m, ok := args[0].(pgtype.Text); ok {
-			f.apprMode = m
+	case strings.Contains(sql, "SET appearance_mode") && len(args) >= 8:
+		// SetUserAppearance PATCHes the four columns in one conditional UPDATE
+		// (PRD #1167 M2): $1=set_mode(bool), $2=appearance_mode, $3=set_light,
+		// $4=light_theme, $5=set_dark, $6=dark_theme, $7=set_typeface, $8=typeface,
+		// $9=id. A field is written only when its set flag is true, mirroring the
+		// SQL's CASE WHEN — so an unset field keeps its stored value.
+		if set, _ := args[0].(bool); set {
+			if m, ok := args[1].(pgtype.Text); ok {
+				f.apprMode = m
+			}
 		}
-		if l, ok := args[1].(pgtype.Text); ok {
-			f.lightTheme = l
+		if set, _ := args[2].(bool); set {
+			if l, ok := args[3].(pgtype.Text); ok {
+				f.lightTheme = l
+			}
 		}
-		if d, ok := args[2].(pgtype.Text); ok {
-			f.darkTheme = d
+		if set, _ := args[4].(bool); set {
+			if d, ok := args[5].(pgtype.Text); ok {
+				f.darkTheme = d
+			}
 		}
-		if tf, ok := args[3].(pgtype.Text); ok {
-			f.typeface = tf
+		if set, _ := args[6].(bool); set {
+			if tf, ok := args[7].(pgtype.Text); ok {
+				f.typeface = tf
+			}
 		}
 	}
 	return fakeSettingsRow{
@@ -1146,14 +1157,17 @@ func TestPutMySettingsLegacyThemeMapsLightSlot(t *testing.T) {
 	}
 }
 
-// A null legacy theme clears users.theme and must NOT touch the appearance columns.
-func TestPutMySettingsNullLegacyThemeLeavesAppearanceUntouched(t *testing.T) {
+// A null legacy theme ("use default" from a pre-appearance client) clears
+// users.theme AND the migrated appearance override (00203 backfilled dark_theme +
+// mode=dark from theme), so the reset actually clears the effective pref rather
+// than leaving the migrated columns in force. A surviving light_theme (set by a
+// new client) is left alone — the legacy world only ever populated the dark slot.
+func TestPutMySettingsNullLegacyThemeClearsMigratedAppearance(t *testing.T) {
 	db := &fakeSettingsDB{
-		theme:    pgtype.Text{String: "mission", Valid: true},
-		apprMode: pgtype.Text{String: "dark", Valid: true},
-		darkTheme: pgtype.Text{
-			String: "mission", Valid: true,
-		},
+		theme:      pgtype.Text{String: "mission", Valid: true},
+		apprMode:   pgtype.Text{String: "dark", Valid: true},
+		darkTheme:  pgtype.Text{String: "mission", Valid: true},
+		lightTheme: pgtype.Text{String: "dawn", Valid: true},
 	}
 	h := &Handler{q: store.New(db)}
 	rec := httptest.NewRecorder()
@@ -1166,11 +1180,39 @@ func TestPutMySettingsNullLegacyThemeLeavesAppearanceUntouched(t *testing.T) {
 	if db.theme.Valid {
 		t.Fatalf("users.theme should be cleared, got %+v", db.theme)
 	}
-	if !db.apprMode.Valid || db.apprMode.String != "dark" {
-		t.Fatalf("appearance_mode must be untouched by a null legacy theme, got %+v", db.apprMode)
+	if db.apprMode.Valid {
+		t.Fatalf("appearance_mode should be cleared by a null legacy theme, got %+v", db.apprMode)
 	}
-	if !db.darkTheme.Valid || db.darkTheme.String != "mission" {
-		t.Fatalf("dark_theme must be untouched by a null legacy theme, got %+v", db.darkTheme)
+	if db.darkTheme.Valid {
+		t.Fatalf("dark_theme (migrated from the legacy theme) should be cleared, got %+v", db.darkTheme)
+	}
+	if !db.lightTheme.Valid || db.lightTheme.String != "dawn" {
+		t.Fatalf("light_theme must survive a legacy reset (never a legacy slot), got %+v", db.lightTheme)
+	}
+}
+
+// Finding: the theme write must not commit before the appearance fields validate.
+// {theme:"mission", light_theme:"ember"} carries a dark id in the light slot, so
+// the whole PUT is a clean 400 that writes NOTHING — users.theme stays cleared and
+// no appearance column moves.
+func TestPutMySettingsInvalidAppearanceLeavesLegacyThemeUnwritten(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	body := []byte(`{"theme":"mission","light_theme":"ember"}`)
+	h.PutMySettings(rec, authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader(body))))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (dark id in the light slot); body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "light_theme") {
+		t.Fatalf("400 body %q should name light_theme", rec.Body.String())
+	}
+	if db.theme.Valid {
+		t.Fatalf("users.theme must NOT be written when a later field 400s, got %+v", db.theme)
+	}
+	if db.darkTheme.Valid || db.apprMode.Valid || db.lightTheme.Valid {
+		t.Fatalf("no appearance column may be written on a 400, got mode=%+v light=%+v dark=%+v", db.apprMode, db.lightTheme, db.darkTheme)
 	}
 }
 

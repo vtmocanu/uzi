@@ -735,18 +735,22 @@ func (q *Queries) SetUserAdmin(ctx context.Context, arg SetUserAdminParams) (Use
 
 const setUserAppearance = `-- name: SetUserAppearance :one
 UPDATE users
-SET appearance_mode = $1,
-    light_theme = $2,
-    dark_theme = $3,
-    typeface = $4
-WHERE id = $5
+SET appearance_mode = CASE WHEN $1::bool THEN $2 ELSE appearance_mode END,
+    light_theme = CASE WHEN $3::bool THEN $4 ELSE light_theme END,
+    dark_theme = CASE WHEN $5::bool THEN $6 ELSE dark_theme END,
+    typeface = CASE WHEN $7::bool THEN $8 ELSE typeface END
+WHERE id = $9
 RETURNING appearance_mode, light_theme, dark_theme, typeface
 `
 
 type SetUserAppearanceParams struct {
+	SetMode        bool        `json:"set_mode"`
 	AppearanceMode pgtype.Text `json:"appearance_mode"`
+	SetLight       bool        `json:"set_light"`
 	LightTheme     pgtype.Text `json:"light_theme"`
+	SetDark        bool        `json:"set_dark"`
 	DarkTheme      pgtype.Text `json:"dark_theme"`
+	SetTypeface    bool        `json:"set_typeface"`
 	Typeface       pgtype.Text `json:"typeface"`
 	ID             uuid.UUID   `json:"id"`
 }
@@ -758,17 +762,24 @@ type SetUserAppearanceRow struct {
 	Typeface       pgtype.Text `json:"typeface"`
 }
 
-// Sets the current user's whole appearance (PRD #1167 M1) in ONE statement: the mode,
-// the light-slot and dark-slot themes, and the typeface. A NULL in any param CLEARS
-// that field back to the instance default (the resolver treats a NULL column as
-// inherit). Per-field granularity is the handler's job — it reads the current values
-// and writes all four — so a single 4-column UPDATE is enough here. Own-user only;
+// PATCHes the current user's appearance (PRD #1167 M1) in ONE atomic statement:
+// each of the four fields is written only when its @set_* flag is true, otherwise
+// the current column value is kept (the CASE keeps the row's own value). A true
+// flag with a NULL value CLEARS that field back to the instance default (the
+// resolver treats a NULL column as inherit). Because every unset field re-writes
+// its own stored value inside the single UPDATE, two concurrent saves that touch
+// different fields cannot clobber each other, and the handler needs no
+// read-merge-write (which raced) to preserve the untouched fields. Own-user only;
 // the caller passes the session user's id.
 func (q *Queries) SetUserAppearance(ctx context.Context, arg SetUserAppearanceParams) (SetUserAppearanceRow, error) {
 	row := q.db.QueryRow(ctx, setUserAppearance,
+		arg.SetMode,
 		arg.AppearanceMode,
+		arg.SetLight,
 		arg.LightTheme,
+		arg.SetDark,
 		arg.DarkTheme,
+		arg.SetTypeface,
 		arg.Typeface,
 		arg.ID,
 	)

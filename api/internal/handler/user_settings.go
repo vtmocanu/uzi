@@ -100,6 +100,12 @@ func (h *Handler) GetMySettings(w http.ResponseWriter, r *http.Request) {
 // validateModel used for agent templates (PRD #17); default_effort by the
 // closed-enum validateEffort (PRD #617); theme by the same theme registry the
 // admin default surface uses (PRD #21), so no pair of write paths can drift.
+//
+// The handler runs in two phases: it DECODES + VALIDATES every present field
+// first, and only then WRITES. A bad field can therefore no longer leave an
+// earlier field already persisted — e.g. {theme:"mission", light_theme:"ember"}
+// (a dark id in the light slot) is a clean 400 that writes nothing, where the old
+// order committed users.theme before the light_theme validation ran.
 func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -130,49 +136,44 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.DefaultModel != nil {
+	// ---- Phase 1: decode + validate every present field. No column is written
+	// until all fields validate.
+
+	var modelVal pgtype.Text
+	modelPresent := req.DefaultModel != nil
+	if modelPresent {
 		var raw *string
 		if err := json.Unmarshal(req.DefaultModel, &raw); err != nil {
 			httpx.Error(w, http.StatusBadRequest, "invalid default_model")
 			return
 		}
-		model, err := validateModel(raw)
+		v, err := validateModel(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if _, err := h.q.SetUserDefaultModel(r.Context(), store.SetUserDefaultModelParams{
-			ID:           user.ID,
-			DefaultModel: model,
-		}); err != nil {
-			slog.Error("set user default model", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
+		modelVal = v
 	}
 
-	if req.DefaultEffort != nil {
+	var effortVal pgtype.Text
+	effortPresent := req.DefaultEffort != nil
+	if effortPresent {
 		var raw *string
 		if err := json.Unmarshal(req.DefaultEffort, &raw); err != nil {
 			httpx.Error(w, http.StatusBadRequest, "invalid default_effort")
 			return
 		}
-		effort, err := validateEffort(raw)
+		v, err := validateEffort(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if _, err := h.q.SetUserDefaultEffort(r.Context(), store.SetUserDefaultEffortParams{
-			ID:            user.ID,
-			DefaultEffort: effort,
-		}); err != nil {
-			slog.Error("set user default effort", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
+		effortVal = v
 	}
 
-	if req.JudgeModel != nil {
+	var judgeVal pgtype.Text
+	judgePresent := req.JudgeModel != nil
+	if judgePresent {
 		var raw *string
 		if err := json.Unmarshal(req.JudgeModel, &raw); err != nil {
 			httpx.Error(w, http.StatusBadRequest, "invalid judge_model")
@@ -180,22 +181,17 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// Same validator as default_model (PRD #69 M2, Decision 4): nil/blank
 		// trims to NULL = inherit the instance judge_model; a bad model is a 400.
-		model, err := validateModel(raw)
+		v, err := validateModel(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if _, err := h.q.SetUserJudgeModel(r.Context(), store.SetUserJudgeModelParams{
-			ID:         user.ID,
-			JudgeModel: model,
-		}); err != nil {
-			slog.Error("set user judge model", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
+		judgeVal = v
 	}
 
-	if req.SummaryModel != nil {
+	var summaryVal pgtype.Text
+	summaryPresent := req.SummaryModel != nil
+	if summaryPresent {
 		var raw *string
 		if err := json.Unmarshal(req.SummaryModel, &raw); err != nil {
 			httpx.Error(w, http.StatusBadRequest, "invalid summary_model")
@@ -203,26 +199,20 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// Same validator as judge_model (PRD #362 M2): nil/blank trims to NULL =
 		// inherit the instance summary_model; a bad model is a 400.
-		model, err := validateModel(raw)
+		v, err := validateModel(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if _, err := h.q.SetUserSummaryModel(r.Context(), store.SetUserSummaryModelParams{
-			ID:           user.ID,
-			SummaryModel: model,
-		}); err != nil {
-			slog.Error("set user summary model", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
+		summaryVal = v
 	}
 
 	// The legacy theme field (DEPRECATED, PRD #1167) still writes users.theme via
-	// SetUserTheme for the deprecated trio's consistency, AND — when it carries a
-	// valid theme — folds into the appearance merge below. themeVal.Valid marks a
-	// foldable value; a null/blank theme clears users.theme and leaves appearance
-	// alone. themeVal/themePresent are hoisted so the appearance merge can read them.
+	// SetUserTheme for the deprecated trio's consistency, AND folds into the
+	// appearance patch below: a valid theme maps into its polarity slot + mode; a
+	// null/blank theme (themeVal.Valid == false) clears users.theme AND the
+	// migrated appearance override (00203 backfilled dark_theme + mode from theme),
+	// so an old client's "use default" reset actually clears the effective pref.
 	var themeVal pgtype.Text
 	themePresent := req.Theme != nil
 	if themePresent {
@@ -231,29 +221,14 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "invalid theme")
 			return
 		}
-		tv, err := validateTheme(raw)
+		v, err := validateTheme(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		themeVal = tv
-		if _, err := h.q.SetUserTheme(r.Context(), store.SetUserThemeParams{
-			ID:    user.ID,
-			Theme: themeVal,
-		}); err != nil {
-			slog.Error("set user theme", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
+		themeVal = v
 	}
 
-	// Appearance write (PRD #1167 M2). SetUserAppearance writes ALL FOUR columns in
-	// one statement, so any appearance field — or a legacy theme that folds into a
-	// slot — needs a READ-MERGE-WRITE: read the current four columns, apply the
-	// legacy-theme mapping, then the explicit per-field deltas (explicit wins over
-	// the legacy mapping), then write once. Each field is the same absent/null/value
-	// tri-state: absent ⇒ keep the current column, null ⇒ clear to NULL (inherit),
-	// value ⇒ validated then set.
 	modePresent, modeDelta, err := decodeAppearanceField(req.AppearanceMode, "appearance_mode", validateAppearanceMode)
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
@@ -274,54 +249,10 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// A valid legacy theme folds into the slot for its polarity + sets the mode; a
-	// null/blank theme (themeVal.Valid == false) does not touch the appearance columns.
-	themeFold := themePresent && themeVal.Valid
-	if modePresent || lightPresent || darkPresent || typefacePresent || themeFold {
-		cur, err := h.q.GetUserSettings(r.Context(), user.ID)
-		if err != nil {
-			slog.Error("get user settings for appearance merge", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-		mode, light, dark, typeface := cur.AppearanceMode, cur.LightTheme, cur.DarkTheme, cur.Typeface
-		// (a) legacy theme mapping first.
-		if themeFold {
-			if theme.Polarity(themeVal.String) == theme.PolarityLight {
-				light = pgtype.Text{String: themeVal.String, Valid: true}
-				mode = pgtype.Text{String: theme.ModeLight, Valid: true}
-			} else {
-				dark = pgtype.Text{String: themeVal.String, Valid: true}
-				mode = pgtype.Text{String: theme.ModeDark, Valid: true}
-			}
-		}
-		// (b) explicit per-field deltas win over the legacy mapping.
-		if modePresent {
-			mode = modeDelta
-		}
-		if lightPresent {
-			light = lightDelta
-		}
-		if darkPresent {
-			dark = darkDelta
-		}
-		if typefacePresent {
-			typeface = typefaceDelta
-		}
-		if _, err := h.q.SetUserAppearance(r.Context(), store.SetUserAppearanceParams{
-			ID:             user.ID,
-			AppearanceMode: mode,
-			LightTheme:     light,
-			DarkTheme:      dark,
-			Typeface:       typeface,
-		}); err != nil {
-			slog.Error("set user appearance", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-	}
 
-	if req.MrReworkEnabled != nil {
+	var mrVal pgtype.Bool
+	mrPresent := req.MrReworkEnabled != nil
+	if mrPresent {
 		// PATCH semantics like the model fields: present-bool sets the opt-in,
 		// present-null clears back to NULL = the default-ON state (PRD #700 M5). A
 		// non-bool body is a 400. There is no closed-enum to validate — a bool is a
@@ -331,21 +262,14 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "invalid mr_rework_enabled")
 			return
 		}
-		var val pgtype.Bool
 		if raw != nil {
-			val = pgtype.Bool{Bool: *raw, Valid: true}
-		}
-		if _, err := h.q.SetUserMrReworkEnabled(r.Context(), store.SetUserMrReworkEnabledParams{
-			ID:              user.ID,
-			MrReworkEnabled: val,
-		}); err != nil {
-			slog.Error("set user mr rework enabled", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
+			mrVal = pgtype.Bool{Bool: *raw, Valid: true}
 		}
 	}
 
-	if req.SidebarTokenIds != nil {
+	var sidebarIDs []uuid.UUID
+	sidebarPresent := req.SidebarTokenIds != nil
+	if sidebarPresent {
 		var raw *[]string
 		if err := json.Unmarshal(req.SidebarTokenIds, &raw); err != nil {
 			httpx.Error(w, http.StatusBadRequest, "invalid sidebar_token_ids")
@@ -364,9 +288,140 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		sidebarIDs = ids
+	}
+
+	// ---- Phase 2: writes. Every present field has validated, so nothing below
+	// leaves the row half-updated on a bad input. Each SetUser* is its own
+	// single-column statement (PATCH semantics); the four appearance columns go in
+	// ONE atomic conditional UPDATE (no read-merge-write, so two concurrent saves
+	// of different fields cannot clobber each other).
+
+	if modelPresent {
+		if _, err := h.q.SetUserDefaultModel(r.Context(), store.SetUserDefaultModelParams{
+			ID:           user.ID,
+			DefaultModel: modelVal,
+		}); err != nil {
+			slog.Error("set user default model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if effortPresent {
+		if _, err := h.q.SetUserDefaultEffort(r.Context(), store.SetUserDefaultEffortParams{
+			ID:            user.ID,
+			DefaultEffort: effortVal,
+		}); err != nil {
+			slog.Error("set user default effort", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if judgePresent {
+		if _, err := h.q.SetUserJudgeModel(r.Context(), store.SetUserJudgeModelParams{
+			ID:         user.ID,
+			JudgeModel: judgeVal,
+		}); err != nil {
+			slog.Error("set user judge model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if summaryPresent {
+		if _, err := h.q.SetUserSummaryModel(r.Context(), store.SetUserSummaryModelParams{
+			ID:           user.ID,
+			SummaryModel: summaryVal,
+		}); err != nil {
+			slog.Error("set user summary model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if themePresent {
+		if _, err := h.q.SetUserTheme(r.Context(), store.SetUserThemeParams{
+			ID:    user.ID,
+			Theme: themeVal,
+		}); err != nil {
+			slog.Error("set user theme", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	// Appearance patch (PRD #1167 M2). Build the four per-field (set, value) deltas:
+	// an explicit appearance field wins, otherwise the legacy theme folds in — a
+	// valid theme into its polarity slot + mode, a cleared theme clearing the
+	// migrated dark_theme + mode. Unset fields carry set=false and the statement
+	// keeps their current column, so no prior read is needed.
+	setMode, mode := modePresent, modeDelta
+	setLight, light := lightPresent, lightDelta
+	setDark, dark := darkPresent, darkDelta
+	setTypeface, typeface := typefacePresent, typefaceDelta
+	if themePresent {
+		if themeVal.Valid {
+			if theme.Polarity(themeVal.String) == theme.PolarityLight {
+				if !setLight {
+					setLight, light = true, pgtype.Text{String: themeVal.String, Valid: true}
+				}
+				if !setMode {
+					setMode, mode = true, pgtype.Text{String: theme.ModeLight, Valid: true}
+				}
+			} else {
+				if !setDark {
+					setDark, dark = true, pgtype.Text{String: themeVal.String, Valid: true}
+				}
+				if !setMode {
+					setMode, mode = true, pgtype.Text{String: theme.ModeDark, Valid: true}
+				}
+			}
+		} else {
+			// theme:null ("use default") clears the migrated appearance override so
+			// the reset takes effect (finding: legacy reset left the new pref stale).
+			if !setMode {
+				setMode = true
+			}
+			if !setDark {
+				setDark = true
+			}
+		}
+	}
+	if setMode || setLight || setDark || setTypeface {
+		if _, err := h.q.SetUserAppearance(r.Context(), store.SetUserAppearanceParams{
+			ID:             user.ID,
+			SetMode:        setMode,
+			AppearanceMode: mode,
+			SetLight:       setLight,
+			LightTheme:     light,
+			SetDark:        setDark,
+			DarkTheme:      dark,
+			SetTypeface:    setTypeface,
+			Typeface:       typeface,
+		}); err != nil {
+			slog.Error("set user appearance", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if mrPresent {
+		if _, err := h.q.SetUserMrReworkEnabled(r.Context(), store.SetUserMrReworkEnabledParams{
+			ID:              user.ID,
+			MrReworkEnabled: mrVal,
+		}); err != nil {
+			slog.Error("set user mr rework enabled", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if sidebarPresent {
 		if _, err := h.q.SetUserSidebarTokens(r.Context(), store.SetUserSidebarTokensParams{
 			ID:              user.ID,
-			SidebarTokenIds: ids,
+			SidebarTokenIds: sidebarIDs,
 		}); err != nil {
 			slog.Error("set user sidebar tokens", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
