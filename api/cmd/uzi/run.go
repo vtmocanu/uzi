@@ -57,6 +57,19 @@ const statusLimitWait = "limit_wait"
 // terminal would make `--follow` exit on a run that is about to produce more messages.
 const statusPoolWait = "pool_wait"
 
+// statusRecoveryWait is the status a run carries while parked in a transient-recovery
+// park (issue #1197): a resumed SDK turn came back positively empty, so after bounded
+// in-process retries the worker parks the run and the server promotes it back to
+// `queued` on a capped exponential backoff. Named for the same reason as
+// statusLimitWait/statusPoolWait: the follow loop, the steer-queue delivery label and
+// `uzi run get`'s detail block compare against one literal.
+//
+// NON-TERMINAL, like limit_wait/pool_wait, and with NO lifetime cap: a park always
+// becomes promotable again after its capped backoff, so the run auto-resumes repeatedly
+// until it recovers or the owner cancels. Treating it as terminal would make `--follow`
+// exit on a run that is about to produce more messages.
+const statusRecoveryWait = "recovery_wait"
+
 // logsPollInterval is how often `uzi run logs --follow` re-polls
 // /api/runs/{id}/messages?after=<seq>. REST polling ships instead of a WebSocket
 // (PRD #64 Out of scope). A var, not a const, only so tests can shrink the wait;
@@ -80,7 +93,7 @@ var terminalRunStatuses = map[string]bool{
 }
 
 // allRunStatusesOrder is the run status enum in wire/enum order (matching
-// runs_status_check — last rewritten by migration 00165, eleven values), the ONE source
+// runs_status_check — last rewritten by migration 00203, twelve values), the ONE source
 // of truth both allRunStatuses (membership)
 // and the `--until` validation-error's "valid: …" list derive from — so a status added
 // here can never be silently omitted from the human-readable enumeration.
@@ -93,13 +106,14 @@ var allRunStatusesOrder = []string{
 	"awaiting_followup",
 	statusLimitWait,
 	statusPoolWait,
+	statusRecoveryWait,
 	"completed",
 	"failed",
 	"cancelled",
 }
 
 // allRunStatuses is the run status enum the skill documents and migration
-// 00165 constrains (runs_status_check). It is the source of truth `run wait`
+// 00203 constrains (runs_status_check). It is the source of truth `run wait`
 // validates `--until` against, so a typo'd target is a clean usage error rather than
 // a silent forever-wait. A status the SERVER reports that is NOT in this set is a
 // newer server than this binary (surfaced, treated non-terminal — never a target,
@@ -121,7 +135,9 @@ var allRunStatuses = func() map[string]bool {
 // parking on it is legitimate) AND pool_wait (PRD #754: a held run resumes on its own
 // once a token is pooled, so it is legitimate to wait through, exactly like limit_wait),
 // so a bare `uzi run wait <id>` returns at the plan gate, a clarification park, a
-// follow-up park, or a terminal — the common "wait for the gate OR the end" case.
+// follow-up park, or a terminal — the common "wait for the gate OR the end" case. It also
+// OMITS recovery_wait (issue #1197: a transient-recovery park auto-resumes on a capped
+// backoff, so it is legitimate to wait through, exactly like limit_wait/pool_wait).
 var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled"}
 
 // run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,
@@ -145,8 +161,9 @@ var (
 //   - running   → time since StartedAt (when the agent began), or CreatedAt if unstamped.
 //   - claimed   → time since ClaimedAt (when a worker took it), or CreatedAt if unstamped.
 //   - queued    → time since CreatedAt (how long it has waited to be claimed).
-//   - awaiting_approval / awaiting_input / awaiting_followup / limit_wait / pool_wait →
-//     time since UpdatedAt, i.e. how long it has been parked/held in that waiting state.
+//   - awaiting_approval / awaiting_input / awaiting_followup / limit_wait / pool_wait /
+//     recovery_wait → time since UpdatedAt, i.e. how long it has been parked/held in that
+//     waiting state.
 //   - completed / failed / cancelled → the STATIC span FinishedAt−StartedAt, how long it
 //     actually ran, independent of now. A terminal run with no StartedAt (cancelled or
 //     failed before it ever started) never ran, so it renders "-".
@@ -173,7 +190,7 @@ func runAgeCell(r apitypes.RunDTO, now time.Time) string {
 		}
 	case "queued":
 		anchor = &r.CreatedAt
-	case "awaiting_approval", "awaiting_input", "awaiting_followup", statusLimitWait, statusPoolWait:
+	case "awaiting_approval", "awaiting_input", "awaiting_followup", statusLimitWait, statusPoolWait, statusRecoveryWait:
 		anchor = &r.UpdatedAt
 	case "completed", "failed", "cancelled":
 		// A static ran-span, not a live age: only meaningful when the run both started

@@ -211,9 +211,10 @@ function MilestoneMark({ state }: { state: "done" | "in_progress" | "left" }) {
 //   - active   — a milestone is in progress: ok-green border + pulsing dot, the role and
 //                its task, its last tool, and a client-side age (R7: a stalled lane reads
 //                its real age, not a lie).
-//   - waiting  — the run is parked on a rate/pool limit (limit_wait/pool_wait): a warn
-//                border + "waiting on rate limit · <age>", so the strip does not pretend
-//                the lane is working while it is blocked.
+//   - waiting  — the run is parked on a self-resuming hold (limit_wait/pool_wait, or the
+//                transient-recovery park recovery_wait, issue #1197): a warn border +
+//                "waiting on rate limit · <age>", so the strip does not pretend the lane
+//                is working while it is blocked.
 //   - unattached — activity exists but no milestone is declared in progress: a faint
 //                border, sitting directly under the header.
 //
@@ -232,7 +233,8 @@ function MilestoneNowStrip({
   now: number;
   variant: "active" | "unattached";
 }) {
-  const waiting = status === "limit_wait" || status === "pool_wait";
+  const waiting =
+    status === "limit_wait" || status === "pool_wait" || status === "recovery_wait";
   const age = activityAge(activity.at, now);
   const role = stripUnsafeChars(activity.agent);
   const label = stripUnsafeChars(activity.agent_label);
@@ -856,6 +858,54 @@ export function PoolWaitPanel({
   );
 }
 
+/**
+ * Issue #1197: the transient-recovery park panel — the analogue of PoolWaitPanel for
+ * `recovery_wait`, and deliberately COPY ONLY.
+ *
+ * A run parks at `recovery_wait` when a resumed model turn came back positively empty
+ * (zero turns, no model activity) and the bounded in-process retries were exhausted. It
+ * is NOT a usage-limit park and NOT a pooled-token hold, so — like PoolWaitPanel — it
+ * shows NO reset countdown. Unlike PoolWaitPanel it also has NO "Resume now" control:
+ * the retry cadence is a server-owned capped backoff with no resume-now verb, so the
+ * only honest thing this panel does is explain the hold. It auto-resumes until the run
+ * recovers or the owner cancels it (cancel is the separate Stop control, not offered
+ * here — same rule as LimitWaitPanel's parked state).
+ *
+ * Exported like the sibling panels so its copy is reachable without mounting the page.
+ */
+export function RecoveryWaitPanel({ run }: { run: Run }) {
+  // Only for a run actually recovering. Every other status (including terminal and the
+  // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
+  // limit_wait, and this self-hides on both so mounting all three side by side is safe.
+  if (run.status !== "recovery_wait") return null;
+
+  return (
+    <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
+      <div className="min-w-0">
+        {/* role="status" announces the hold when this panel mounts, mirroring
+            PoolWaitPanel's heading — recovery_wait is a non-terminal park a screen-reader
+            user must be told about, and (like limit_wait) this panel is what announces it,
+            so it is deliberately NOT also in RunView's page-level parkAnnounce region. */}
+        <p role="status" className="text-sm font-semibold text-warn">
+          <span aria-hidden="true">⏸ </span>
+          Recovering and resuming automatically
+        </p>
+        <p className="mt-0.5 text-xs text-muted">
+          This run paused to recover from a transient empty model result. It resumes on
+          its own on a capped backoff — no action is needed. If it never recovers it holds
+          here so you can cancel it.
+        </p>
+        {/* No countdown, deliberately: the retry instant is a server-owned backoff with
+            no DTO field to count down to (distinct from limit_wait, which carries a reset
+            window, and from pool_wait, which resumes on a pooled-token event). */}
+        <p className="mt-1.5 text-xs text-muted">
+          Nothing is lost — the run keeps its branch and its history and picks up where it left off.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 export function RunView() {
   const { id = "" } = useParams();
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
@@ -1142,8 +1192,16 @@ export function RunView() {
                   it is a self-resuming hold (blocked on a pooled token, resumes on its
                   own hours later), so a green "live" chip beside its amber wait pill is
                   the same false all-clear. The two self-resuming holds are excluded; the
-                  needs-you gates keep the chip. */}
-              {!terminal && run.status !== "limit_wait" && run.status !== "pool_wait" && (
+                  needs-you gates keep the chip.
+
+                  Issue #1197: `recovery_wait` is excluded for the SAME reason again — a
+                  transient-recovery park is a self-resuming hold (it backs off and retries
+                  on its own until it recovers or the owner cancels), so a green "live" chip
+                  beside its amber "recovery wait" pill would be the same false all-clear. */}
+              {!terminal &&
+                run.status !== "limit_wait" &&
+                run.status !== "pool_wait" &&
+                run.status !== "recovery_wait" && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}
                   className={cx(
@@ -1219,6 +1277,16 @@ export function RunView() {
           status but pool_wait, so on a limit_wait run the strip below is still the
           first thing rendered here. */}
       <PoolWaitPanel run={run} canSteer={canSteer} onResumed={refreshRun} />
+
+      {/* Issue #1197: the transient-recovery hold. Ordered here beside PoolWaitPanel and
+          above the usage-limit strip for the SAME reason (web-ux): on a recovery_wait run
+          the strip below renders its NON-parked "Wait out future Anthropic usage limits"
+          toggle, and two Anthropic-adjacent controls stacked let a user misread that
+          usage-limit checkbox as the way to un-wait the recovery hold, which it is not.
+          RecoveryWaitPanel self-hides on every status but recovery_wait, so it does not
+          disturb the limit_wait/pool_wait layouts. It carries no control of its own — the
+          backoff is automatic and cancel is the separate Stop control. */}
+      <RecoveryWaitPanel run={run} />
 
       {/* PRD #35: the usage-limit strip. High in the stack because on a parked run it
           carries the only thing the user came to find out — when it resumes — and low

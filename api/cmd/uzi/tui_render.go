@@ -258,6 +258,11 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, 
 		// limit_wait (both are non-terminal holds), distinct word so a user can tell the
 		// two apart at a glance.
 		return "~", "pool wait"
+	case statusRecoveryWait:
+		// issue #1197: a transient-recovery park that auto-resumes on a capped backoff.
+		// Same wait-family glyph as limit_wait/pool_wait (all non-terminal holds), distinct
+		// word so a user can tell them apart at a glance.
+		return "~", "recovery wait"
 	case "completed":
 		return "✓", "done"
 	case "failed":
@@ -286,9 +291,10 @@ func (p palette) stateColor(status, health string, isPlanning, isRevising bool) 
 	case "awaiting_approval", "awaiting_input", "awaiting_followup":
 		// awaiting_followup (PRD #517) is a needs-you park like the other two: amber.
 		return p.amber
-	case statusLimitWait, statusPoolWait:
-		// pool_wait (PRD #754) is a non-terminal hold like limit_wait, so it shares the
-		// wait colour — the glyph word distinguishes them, not the ink.
+	case statusLimitWait, statusPoolWait, statusRecoveryWait:
+		// pool_wait (PRD #754) and recovery_wait (issue #1197) are non-terminal holds like
+		// limit_wait, so they share the wait colour — the glyph word distinguishes them,
+		// not the ink.
 		return p.wait
 	case "failed":
 		return p.alarm

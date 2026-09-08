@@ -363,6 +363,17 @@ describe("SteerQueueCard — the composer does not promise resumption on a parke
     expect(placeholder()).not.toContain("resumes the agent as its next turn");
   });
 
+  // Issue #1197: a recovery_wait run is the same self-resuming hold again — a follow-up
+  // sent here does NOT un-park it (it auto-resumes on a capped backoff), so the composer
+  // must show the "queued until the run resumes" copy, never the resumption promise.
+  it("says QUEUED on a recovery_wait run too, never that it resumes the agent", () => {
+    render(
+      <SteerQueueCard inputs={[]} terminal={false} status="recovery_wait" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(placeholder()).toContain("queued until the run resumes");
+    expect(placeholder()).not.toContain("resumes the agent as its next turn");
+  });
+
   it("leaves the copy untouched on a live run", () => {
     render(
       <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,

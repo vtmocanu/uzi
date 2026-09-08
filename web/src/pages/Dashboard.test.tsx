@@ -407,18 +407,36 @@ describe("Dashboard — parked runs are not 'agents at work' (PRD #35)", () => {
     expect(screen.queryByText(/waiting on a usage limit/)).toBeNull();
   });
 
-  it("🔴 counts both hold kinds together in the waiting bucket", async () => {
-    // Both self-resuming holds share one honest bucket; the working count drops by both.
+  // Issue #1197: recovery_wait is the same kind of self-resuming hold again — a
+  // transient-recovery park that auto-resumes on a capped backoff — so it must NOT be
+  // counted as "at work" either. Same generalized "waiting to resume" copy.
+  it("🔴 counts a recovery_wait run as waiting-to-resume, not as work", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ status: "running" }),
+        aRun({ id: "r2", status: "queued" }),
+        aRun({ id: "r3", status: "recovery_wait" }),
+      ],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.queryByText("agents at work")).toBeNull();
+    expect(screen.getByText("2 at work · 1 waiting to resume")).toBeTruthy();
+  });
+
+  it("🔴 counts all three hold kinds together in the waiting bucket", async () => {
+    // The three self-resuming holds share one honest bucket; the working count drops by all.
     mockApi.listRuns.mockResolvedValue({
       runs: [
         aRun({ status: "running" }),
         aRun({ id: "r2", status: "limit_wait" }),
         aRun({ id: "r3", status: "pool_wait" }),
+        aRun({ id: "r4", status: "recovery_wait" }),
       ],
     });
     renderDashboard();
     await flush();
-    expect(screen.getByText("1 at work · 2 waiting to resume")).toBeTruthy();
+    expect(screen.getByText("1 at work · 3 waiting to resume")).toBeTruthy();
   });
 
   it("🔴 still COUNTS the parked run — splitting the hint must not hide it", async () => {

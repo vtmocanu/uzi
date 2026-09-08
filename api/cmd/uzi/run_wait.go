@@ -85,7 +85,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			lastStatus = run.Status
 			sawStatus = true
 		}
-		// A status outside the ten-value enum means the server is newer than this
+		// A status outside the twelve-value enum means the server is newer than this
 		// binary. Surface it once and keep waiting (it can never be a target — `--until`
 		// only names known statuses), so it is never a silent forever-wait; `--timeout`
 		// still bounds it (R1).

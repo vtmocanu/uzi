@@ -353,7 +353,12 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 	// revisited on a held run (ListActiveRunsForHealth is a positive allowlist that omits
 	// it), so the active-speaker rung would read a FROZEN flag as `stalled`. One rung
 	// placed high fixes both.
-	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runStatus == "awaiting_followup" || runStatus == statusLimitWait || runStatus == statusPoolWait || runHealth == "waiting_worker" {
+	// recovery_wait (issue #1197) is a transient-recovery park that auto-resumes on a
+	// capped backoff. It rides this same waiting rung for the identical reasons as
+	// limit_wait/pool_wait: a park routinely outlasts the recency window (so the split
+	// below would wrongly read `idle`), and health cannot be revisited on a parked run, so
+	// the active-speaker rung would read a FROZEN flag as `stalled`.
+	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runStatus == "awaiting_followup" || runStatus == statusLimitWait || runStatus == statusPoolWait || runStatus == statusRecoveryWait || runHealth == "waiting_worker" {
 		return crewWaiting
 	}
 	if activeActor != "" && actor == activeActor {

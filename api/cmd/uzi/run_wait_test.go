@@ -137,6 +137,40 @@ func TestRunWaitUntilFollowupValidates(t *testing.T) {
 	}
 }
 
+func TestRunWaitUntilRecoveryWaitValidates(t *testing.T) {
+	// issue #1197: `uzi run wait --until recovery_wait` must validate (not a usage error)
+	// and stop on the park. Mutation that reddens this: dropping statusRecoveryWait from
+	// allRunStatusesOrder → the --until validator rejects it and the CLI exits 2 (ExitUsage)
+	// instead of 0, so the exit-code assertion fails.
+	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("running"), okStep("recovery_wait"))}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1",
+		"--until", "recovery_wait", "--interval", "1ms")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 — --until recovery_wait must validate (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "→ recovery_wait") {
+		t.Errorf("should have stopped at the transient-recovery park, stderr = %q", stderr)
+	}
+}
+
+func TestRunWaitPassesThroughRecoveryWait(t *testing.T) {
+	// issue #1197: a bare `uzi run wait <id>` must WAIT THROUGH recovery_wait — a
+	// transient-recovery park auto-resumes on a capped backoff, so it is legitimate to wait
+	// past it, exactly like limit_wait/pool_wait. Mutation that reddens this: adding
+	// recovery_wait to defaultWaitStates → the wait stops AT the park and never reaches the
+	// later completed step, so the "→ completed" guard below fails.
+	fc := &uzicli.FakeClient{GetRunHook: scriptHook(
+		okStep("running"), okStep("recovery_wait"), okStep("completed"),
+	)}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "→ completed") {
+		t.Errorf("bare wait must pass through the auto-resuming recovery_wait park to completed; stderr = %q", stderr)
+	}
+}
+
 func TestRunWaitTimeoutExitsSeven(t *testing.T) {
 	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("running"))}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1",
@@ -307,7 +341,7 @@ func TestRunWaitMinPlanSeqDoesNotDelayTerminal(t *testing.T) {
 }
 
 func TestRunWaitUnknownStatusSurfacedAndNonTerminal(t *testing.T) {
-	// A status outside the ten-value enum must be surfaced and NOT treated as a stop
+	// A status outside the twelve-value enum must be surfaced and NOT treated as a stop
 	// state (it is never in --until), so the wait continues to a real target.
 	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("teleporting"), okStep("completed"))}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")

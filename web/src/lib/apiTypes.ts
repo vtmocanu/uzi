@@ -1706,6 +1706,14 @@ export type RunStatus =
    *  moment a token is opted into the pool, and can be resumed on demand via
    *  `resumeRunNow` (POST /runs/{id}/resume-now). */
   | "pool_wait"
+  /** Issue #1197: a transient-recovery park. A run parks here when a resumed SDK
+   *  turn came back positively empty (zero turns, no model activity) and the bounded
+   *  in-process retries were exhausted. NON-terminal — deliberately absent from
+   *  TERMINAL_RUN_STATUSES below. Like pool_wait it carries no reset window and no
+   *  countdown and it ships with no dedicated DTO fields. It auto-resumes on a capped
+   *  exponential backoff until the run recovers or the owner cancels it; unlike
+   *  pool_wait there is no resume-now verb (the backoff is server-owned). */
+  | "recovery_wait"
   | "completed"
   | "failed"
   | "cancelled";

@@ -127,6 +127,10 @@ describe("StatusPill", () => {
     // RUN_STATUS_LABELS entry would leave StatusPill printing "pool wait" against
     // runBadge's "waiting for pool", which this loop then catches.
     expect(checked).toContain("pool_wait");
+    // Issue #1197: recovery_wait de-underscores to "recovery wait", which is exactly the
+    // word runBadge uses, so it deliberately has NO RUN_STATUS_LABELS override — this
+    // loop pins the two surfaces to that one word so a later override on only one drifts.
+    expect(checked).toContain("recovery_wait");
     expect(checked.length).toBeGreaterThanOrEqual(5);
   });
 });

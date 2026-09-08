@@ -205,6 +205,43 @@ describe("runBadge taxonomy", () => {
     expect(early).toEqual(late);
     if (early.kind === "badge") expect(early.label).toBe("waiting for pool");
   });
+
+  // Issue #1197. Like the sibling parks, recovery_wait would otherwise fall to the
+  // `default:` arm and render as a neutral grey "recovery wait" pill — wrong for a
+  // non-terminal, self-resuming hold.
+  it("recovery_wait → warn 'recovery wait', with a title that explains the auto-resume", () => {
+    const b = runBadge(run({ status: "recovery_wait" }), NOW);
+    expect(b).toMatchObject({
+      kind: "badge",
+      label: "recovery wait",
+      tone: "warning",
+      pulse: false,
+    });
+    // NOT a usage-limit / pooled-token park: the title speaks of a transient empty result
+    // and an automatic resume, never a reset window or a pooled token.
+    if (b.kind === "badge") {
+      expect(b.title).toMatch(/resumes automatically/i);
+      expect(b.title).not.toMatch(/window reopens/i);
+      expect(b.title).not.toMatch(/pooled/i);
+    }
+  });
+
+  it("🔴 recovery_wait's badge is STATIC — no countdown, no elapsed, on any input", () => {
+    // The backoff instant is server-owned and carries no DTO field, so there is nothing
+    // here to count down from.
+    const early = runBadge(run({ status: "recovery_wait", created_at: "2026-07-04T11:00:00Z" }), NOW);
+    const late = runBadge(run({ status: "recovery_wait", created_at: "2026-07-04T11:59:00Z" }), NOW);
+    expect(early).toEqual(late);
+    if (early.kind === "badge") expect(early.label).toBe("recovery wait");
+  });
+
+  it("🔴 recovery_wait is NOT health-flaggable — a parked run never shows '⚠ stalled'", () => {
+    // Same reasoning as the limit_wait note in HEALTH_FLAGGABLE_STATUSES: a run backing
+    // off to retry is behaving exactly as designed, so the stalled/looping detector must
+    // not flag it. Absent from the set ⇒ healthBadge returns null and the status wins.
+    expect(isHealthFlaggableStatus("recovery_wait")).toBe(false);
+    expect(shouldShowHealthFlag("stalled", "recovery_wait")).toBe(false);
+  });
 });
 
 // issue #321 M3. The pre-approval PLANNING phase is wired onto every status surface via
@@ -404,6 +441,14 @@ describe("RUN_STATUS_TONES ↔ runStatusTone agreement", () => {
     // and the list-row tone so the two cannot drift.
     expect(RUN_STATUS_TONES["pool_wait"]).toEqual({ tone: "warning" });
     expect(runStatusTone("pool_wait", null)).toBe("warning");
+  });
+
+  it("covers recovery_wait specifically, on both surfaces (issue #1197)", () => {
+    // Same reasoning as the sibling parks: the loop iterates the pill map, so an absent
+    // key is an absent assertion — this pins recovery_wait to warning on BOTH the pill
+    // map and the list-row tone so the two cannot drift.
+    expect(RUN_STATUS_TONES["recovery_wait"]).toEqual({ tone: "warning" });
+    expect(runStatusTone("recovery_wait", null)).toBe("warning");
   });
 
   it("leaves the unknown-status fallback alone", () => {

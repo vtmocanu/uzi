@@ -201,8 +201,15 @@ export function Dashboard() {
   // old "waiting on a usage limit": that older wording is TRUE only for limit_wait and
   // false for a pool hold, so the honest generalization is the resource-agnostic phrase
   // that holds for both.
+  //
+  // Issue #1197: recovery_wait is the same KIND again — a non-terminal, self-resuming
+  // hold (a transient-recovery park that auto-resumes on a capped backoff). It counts
+  // as waiting, not "at work", for exactly the reasons limit_wait/pool_wait do; the
+  // resource-agnostic "waiting to resume" copy holds for it too.
   const active = data?.runs.filter((r) => !isTerminalRun(r.status)) ?? [];
-  const waiting = active.filter((r) => r.status === "limit_wait" || r.status === "pool_wait");
+  const waiting = active.filter(
+    (r) => r.status === "limit_wait" || r.status === "pool_wait" || r.status === "recovery_wait",
+  );
   const working = active.length - waiting.length;
   // "8 at work · 1 waiting to resume" only when there is something to disambiguate; a
   // factory with nothing parked keeps exactly the copy it had.

@@ -200,11 +200,19 @@ export function SteerQueueCard({
               hold as limit_wait — blocked on a pooled token, resuming on its own — so a
               follow-up sent here will NOT un-park it; it is queued until the run resumes.
               The "queued until the run resumes" placeholder is resource-agnostic and
-              stays honest for a pool hold. */}
+              stays honest for a pool hold.
+
+              Issue #1197: recovery_wait sets parked too, for the same reason again — a
+              transient-recovery park self-resumes on a capped backoff, so a follow-up
+              sent here does NOT un-park it; it is queued until the run resumes. */}
           <FollowUpComposer
             busy={busy}
             onSend={onSend}
-            parked={status === "limit_wait" || status === "pool_wait"}
+            parked={
+              status === "limit_wait" ||
+              status === "pool_wait" ||
+              status === "recovery_wait"
+            }
           />
           <Button variant="danger" disabled={busy} onClick={onStop}>
             Stop run

@@ -78,18 +78,21 @@ describe("runDurationLabel", () => {
     ).toBe("running 5m");
   });
 
-  it("awaiting_approval, awaiting_input, awaiting_followup, limit_wait, and pool_wait wait off updated_at", () => {
+  it("awaiting_approval, awaiting_input, awaiting_followup, limit_wait, pool_wait, and recovery_wait wait off updated_at", () => {
     // PRD #517: awaiting_followup joins the waiting arm — mutation guard: dropping it
     // makes runDurationLabel fall to the default "" and this assert reddens (the board
     // card would then show an empty duration token for a parked interactive run).
     // Issue #754: pool_wait joins it too — it renders elapsed-waiting, NOT a countdown
     // (there is no reset window to count down to).
+    // Issue #1197: recovery_wait joins it too — same mutation guard, so a transient-
+    // recovery park shows "waiting <elapsed>" rather than an empty token.
     for (const status of [
       "awaiting_approval",
       "awaiting_input",
       "awaiting_followup",
       "limit_wait",
       "pool_wait",
+      "recovery_wait",
     ]) {
       expect(
         runDurationLabel(
