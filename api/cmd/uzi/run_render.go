@@ -78,7 +78,16 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		{"TITLE", runTitle(r)},
 		{"BRANCH", strOr(r.Branch, "-")},
 		{mrAbbrev(r.ForgeType), int64Or(r.MrIID, "-")},
-		{"HEALTH", r.Health},
+		// The human HEALTH word goes through the display map, so the `slow` enum PRD #1170
+		// kept (D1) prints "near timeout" here, matching the TUI token. --json is unchanged
+		// and still carries the raw enum (machine-facing, D1).
+		{"HEALTH", displayHealth(r.Health)},
+	}
+	// DEADLINE (PRD #1170): the run's wall-clock stop time and countdown, emitted only when
+	// the server set a deadline (a running issue run) — right after HEALTH, and emit-only-
+	// when-set like HEALTH_REASON below, so a chat/judge/non-running run prints no new row.
+	if r.DeadlineAt != nil {
+		rows = append(rows, []string{"DEADLINE", deadlineCell(*r.DeadlineAt, time.Now())})
 	}
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
@@ -779,6 +788,81 @@ func limitWaitLine(r apitypes.RunDTO, now time.Time) string {
 		line += " · attempt " + itoa(int(r.LimitWaitCount))
 	}
 	return line
+}
+
+// nearTimeoutClauseParts is the near-timeout row's raw pieces (PRD #1170), split so both
+// the full-width nearTimeoutLine and the width-shed fitNearTimeoutLine build the same
+// clauses from one place. ok is false when the run carries no near-timeout deadline — the
+// flag is not `slow` (the enum PRD #1170 kept, D1) or DeadlineAt is nil (a run the sweeper
+// never times out: not running, or a chat/judge/interactive kind).
+//
+// floor is the never-cut head ("▲ near timeout · 1h05m left"); ofBudget and stopsAt are
+// the two optional, tail-shed clauses. Once the deadline has PASSED (now >= DeadlineAt),
+// floor is "▲ near timeout · stopping" and both optional clauses are empty — the sweeper
+// runs on a ticker, so a passed deadline is a run waiting on the next tick, not a fault.
+// ofBudget is empty when BudgetWallSeconds is nil.
+func nearTimeoutClauseParts(r apitypes.RunDTO, now time.Time) (floor, ofBudget, stopsAt string, ok bool) {
+	if r.Health != "slow" || r.DeadlineAt == nil {
+		return "", "", "", false
+	}
+	if !now.Before(*r.DeadlineAt) {
+		return "▲ near timeout · stopping", "", "", true
+	}
+	floor = "▲ near timeout · " + fmtUntil(r.DeadlineAt.Sub(now)) + " left"
+	if r.BudgetWallSeconds != nil {
+		// shortDuration elides a whole-hour budget's "00m" so an 8h budget reads "of 8h"
+		// (PRD #1170 Surfaces table), not "of 8h00m"; a mixed budget still reads "1h30m".
+		ofBudget = " · of " + shortDuration(time.Duration(*r.BudgetWallSeconds)*time.Second)
+	}
+	stopsAt = " · stops at " + r.DeadlineAt.Local().Format("15:04")
+	return floor, ofBudget, stopsAt, true
+}
+
+// nearTimeoutLine is the TUI run detail's conditional second row for a near-timeout run
+// (PRD #1170 D9): `▲ near timeout · <time> left · of <budget> · stops at <HH:MM local>`,
+// the countdown read off the server-computed deadline_at so the reason string can stay
+// static (D4). "" when the run carries no near-timeout deadline, which makes it safe to
+// call unconditionally beside limitWaitLine. This renders every applicable clause at full
+// width; fitNearTimeoutLine sheds them to keep the row one physical line.
+func nearTimeoutLine(r apitypes.RunDTO, now time.Time) string {
+	floor, ofBudget, stopsAt, ok := nearTimeoutClauseParts(r, now)
+	if !ok {
+		return ""
+	}
+	return floor + ofBudget + stopsAt
+}
+
+// fitNearTimeoutLine is nearTimeoutLine shed to fit a physical width — the one-row #379
+// invariant, kept out of the render path's string arithmetic. Clauses drop by PRIORITY,
+// not by display position: `· of <budget>` sheds first, then `· stops at <HH:MM>`; the
+// floor ("▲ near timeout · 1h05m left") is never cut, even when it alone overflows a very
+// narrow terminal (which realistic terminals never reach, the same contract the header
+// floor carries). "" when the run carries no near-timeout deadline.
+func fitNearTimeoutLine(r apitypes.RunDTO, now time.Time, width int) string {
+	floor, ofBudget, stopsAt, ok := nearTimeoutClauseParts(r, now)
+	if !ok {
+		return ""
+	}
+	// Widest first, then shed of-budget, then stops-at. visualWidth (not len) so a
+	// multi-byte glyph or an East-Asian-wide cell is measured in columns.
+	for _, cand := range []string{floor + ofBudget + stopsAt, floor + stopsAt, floor} {
+		if visualWidth(cand) <= width {
+			return cand
+		}
+	}
+	return floor
+}
+
+// deadlineCell is the `uzi run get` DEADLINE row value (PRD #1170): the wall-clock stop
+// time in local HH:MM plus the remaining countdown ("15:20 · 1h05m left"), or
+// "15:20 · stopping" once the deadline has passed. The caller emits the row only when
+// DeadlineAt is non-nil, so a chat/judge/non-running run prints nothing new.
+func deadlineCell(deadline time.Time, now time.Time) string {
+	local := deadline.Local().Format("15:04")
+	if !now.Before(deadline) {
+		return local + " · stopping"
+	}
+	return local + " · " + fmtUntil(deadline.Sub(now)) + " left"
 }
 
 // resumesIn renders the promotion clock for a parked run.

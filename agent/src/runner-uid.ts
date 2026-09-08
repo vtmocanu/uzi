@@ -34,6 +34,35 @@ const RUNNER_USER = "runner";
  *  drop uses. Absolute so the worker never resolves it from a runner-writable PATH. */
 const SETPRIV = "/bin/setpriv";
 
+// PRD #1171 (M3) — the Codex production adapter needs THREE OS identities where the
+// #51 split previously needed one. The numbers are the image-baked uids; see the
+// worker/runner/runner-cmd accounts in agent/templates/base/Dockerfile (`addgroup`/
+// `adduser` for worker 10001, runner 10002, runner-cmd 10003). These consts are
+// additive; the existing `runner` (provider) identity and its argv are preserved
+// byte-for-byte below.
+
+/** uid 10002 — `runner`, the EXISTING cap-less identity. Provider roots (the app-server
+ *  processes that hold the selected Codex credential) and every pre-#1171 untrusted
+ *  surface run as this uid. Image account: the `runner` account in
+ *  agent/templates/base/Dockerfile. */
+export const RUNNER_UID = 10002;
+/** uid 10003 — `runner-cmd`, a NEW distinct cap-less identity for command roots (the
+ *  model-authorized shell + fileop effect surface). Credential-free, primary group
+ *  `runner-cmd` (gid 10003) and a supplementary member of group `runner`, so its
+ *  worktree writes are group-`runner` and group-writable under the setgid+umask
+ *  discipline landing in a later #1171 unit. Distinct from RUNNER_UID so a command root
+ *  cannot read a provider root's auth/session state at the OS level (plan §2.8). The
+ *  `runner-cmd` account now EXISTS in the images — group gid 10003 plus a `runner-cmd`
+ *  passwd entry that is a supplementary member of group `runner` — numbered above the
+ *  existing pair; see the worker/runner/runner-cmd accounts in
+ *  agent/templates/base/Dockerfile. */
+export const COMMAND_UID = 10003;
+/** uid 10001 — `worker`, the PAT-holding worker process itself. Credentialed
+ *  boundary-action roots ARE this process, so becoming `worker` needs no setpriv (see
+ *  {@link workerBoundaryCommand}). Image account: the `worker` account in
+ *  agent/templates/base/Dockerfile. */
+export const WORKER_UID = 10001;
+
 /** True when the entrypoint established the worker/runner uid split (A1 root start). */
 export function uidSplitActive(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.UZI_UID_SPLIT === "1";
@@ -67,14 +96,26 @@ export function runnerTmpdir(env: NodeJS.ProcessEnv = process.env): string | und
 }
 
 /**
- * The setpriv argv prefix that reuids to `runner` and drops all caps. Terminated by
- * `--` so the target command + args follow literally (no shell re-parse). Exported for
- * the boundary tests.
+ * The setpriv argv prefix that reuids/regids to `uid` and drops all caps. Terminated
+ * by `--` so the target command + args follow literally (no shell re-parse). This is
+ * the ONE source of truth for the cap-clear flag discipline; {@link setprivRunnerArgs}
+ * and {@link commandRootCommand} both route through it so the two identities can never
+ * drift in how they drop capabilities.
+ *
+ * The reuid/regid TOKEN is the image account NAME for RUNNER_UID and the numeric uid
+ * otherwise. setpriv treats a name and its numeric uid identically, but emitting the
+ * `runner` name for RUNNER_UID keeps the argv the established #51 Claude/launcher paths
+ * produce BYTE-FOR-BYTE identical to the pre-#1171 literal (a drift guard pins it).
+ * COMMAND_UID is emitted numerically (setpriv resolves a name or its numeric uid the
+ * same way). Its `runner-cmd` account now EXISTS in the images — group gid 10003 plus a
+ * `runner-cmd` passwd entry that is a supplementary member of group `runner` — so
+ * `--regid 10003 --init-groups` resolves the account and grants the `runner` group.
  */
-export function setprivRunnerArgs(): string[] {
+export function setprivArgsForUid(uid: number): string[] {
+  const identity = uid === RUNNER_UID ? RUNNER_USER : String(uid);
   return [
-    "--reuid", RUNNER_USER,
-    "--regid", RUNNER_USER,
+    "--reuid", identity,
+    "--regid", identity,
     "--init-groups",
     // NOTE (audit M4): `--bounding-set -all` is effectively a NO-OP here — the worker
     // lacks CAP_SETPCAP, so it cannot shrink the child's bounding set (it stays 0xc0).
@@ -93,10 +134,47 @@ export function setprivRunnerArgs(): string[] {
   ];
 }
 
+/**
+ * The setpriv argv prefix that reuids to `runner` and drops all caps. Preserved as a
+ * named export (the #51 boundary tests and the M3a launcher import it); reimplemented
+ * as a thin call to {@link setprivArgsForUid} so its output stays byte-for-byte what it
+ * produced before while the flag discipline has a single owner.
+ */
+export function setprivRunnerArgs(): string[] {
+  return setprivArgsForUid(RUNNER_UID);
+}
+
 /** Wrap a command so it runs as `runner` under the split, or unchanged single-uid. */
 export function runnerCommand(command: string, args: readonly string[]): { command: string; args: string[] } {
   if (!uidSplitActive()) return { command, args: [...args] };
   return { command: SETPRIV, args: [...setprivRunnerArgs(), command, ...args] };
+}
+
+/**
+ * Wrap a command so it runs as the command-root uid `runner-cmd` (COMMAND_UID) under
+ * the split, or unchanged single-uid. This is the credential-free shell + fileop effect
+ * surface the Codex adapter admits while a credentialed provider root is live; running
+ * it as a DISTINCT uid from the provider `runner` is what makes "same uid + mode 0700 is
+ * not evidence" (plan §2.8) into a real OS boundary. Mirrors {@link runnerCommand}'s
+ * shape exactly, differing only in the target uid.
+ */
+export function commandRootCommand(command: string, args: readonly string[]): { command: string; args: string[] } {
+  if (!uidSplitActive()) return { command, args: [...args] };
+  return { command: SETPRIV, args: [...setprivArgsForUid(COMMAND_UID), command, ...args] };
+}
+
+/**
+ * The credentialed boundary-action identity: the PAT-holding `worker` (WORKER_UID).
+ * The worker process ALREADY IS uid 10001, so a boundary root must run UNWRAPPED —
+ * there is no identity to `setpriv` into, and wrapping it would strip the very
+ * capabilities/credentials the action needs. Returns the command/args verbatim in BOTH
+ * modes; it exists as an explicit "run as the worker" seam symmetric with
+ * {@link runnerCommand}/{@link commandRootCommand}, so the Codex safety lane never
+ * reaches for a bare spawn. Reaping every command root BEFORE a credentialed boundary
+ * action runs is enforced by that safety lane (a later #1171 unit), not here.
+ */
+export function workerBoundaryCommand(command: string, args: readonly string[]): { command: string; args: string[] } {
+  return { command, args: [...args] };
 }
 
 /**

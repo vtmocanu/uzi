@@ -54,6 +54,7 @@
   "health": "x",
   "health_reason": "x",
   "health_since": "2020-01-02T03:04:05Z",
+  "deadline_at": "2020-01-02T03:04:05Z",
   "plan_md": "x",
   "plan_source": "x",
   "summary_intent": "x",

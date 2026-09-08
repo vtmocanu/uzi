@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -59,8 +60,10 @@ func (h *Handler) runPriorityClass(ctx context.Context, r store.Run) string {
 // runToDTO maps a bare run row to its wire DTO. priorityClass is the D8 display class
 // (from fn_run_priority_class via a list column or h.runPriorityClass), passed in
 // explicitly so this mapper stays a PURE function of its inputs — no now()/config
-// reaches into it.
-func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
+// reaches into it. globalTimeout is the instance RUN_TIMEOUT (h.cfg.RunTimeout),
+// passed in the same way, so RunDeadline can be computed here without config access
+// (PRD #1170).
+func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) apitypes.RunDTO {
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
 		Kind:             r.Kind,
@@ -95,8 +98,12 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		Health:        r.Health,
 		HealthReason:  textPtrValue(r.HealthReason.Valid, r.HealthReason.String),
 		HealthSince:   timePtr(r.HealthSince.Valid, r.HealthSince.Time),
-		PlanMd:        textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
-		PlanSource:    r.PlanSource,
+		// PRD #1170: the server-computed wall-clock deadline the near-timeout badge
+		// counts down to. RunDeadline returns nil for a run with no wall deadline
+		// (not running, chat/judge/interactive, or no started_at).
+		DeadlineAt: workersvc.RunDeadline(r.StartedAt, r.BudgetWallSeconds, r.BudgetPausedSeconds, r.Kind, r.Interactive, r.Status, globalTimeout),
+		PlanMd:     textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
+		PlanSource: r.PlanSource,
 		// PRD #362 M1: plain-English summaries. Intent/plan are nullable text; deltas
 		// are decoded below (tolerate-on-read) so a malformed value cannot fail the read.
 		SummaryIntent: textPtrValue(r.SummaryIntent.Valid, r.SummaryIntent.String),

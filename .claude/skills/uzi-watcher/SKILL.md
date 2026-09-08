@@ -385,6 +385,17 @@ by anything on the PR itself.
    runs carry **`repo_id` and `mr_iid`, never `issue_iid`** (their `branch`/`mr_web_url`/
    `source_run_id` may read null while running — do not key on those). A non-terminal one
    means uzi is on it.
+
+   **Handing a finding to `mr_rework` yourself: post it as a TOP-LEVEL PR comment, never an
+   inline one.** The trigger keys on ONE scalar high-water (`mr_rework_ledger.high_water`)
+   over GitHub's DISJOINT comment id sequences (top-level/issue vs inline-review vs
+   review-summary, `github_mr.go` Sources A/B/C). An inline finding is silently skipped when
+   a prior rework already consumed a higher-id top-level/issue comment (classically your own
+   `@coderabbitai review` nudges): its id sits below the mark, so GATE 3 in
+   `mr_review_watch.go` never fires and no run appears though the finding is the newest,
+   actionable comment. A fresh TOP-LEVEL PR comment lands above the mark and fires it.
+   Fail-safe (a skipped comment just falls back to human review), so the tell is silence, not
+   an error. Durable per-sequence-high-water fix tracked in #1199.
 2. **If uzi is (or is about to be) reworking, DEFER — do not fix locally, do not merge.**
    The trigger needs a green pipeline + settled review, so the run may not have spawned yet
    even though it will; if the findings are uzi-fixable (below) and the owner is opted in,
