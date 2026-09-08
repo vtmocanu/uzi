@@ -598,6 +598,10 @@ export interface LatestRun {
   health: RunHealth;
   health_reason: string | null;
   health_since: string | null;
+  // deadline_at (PRD #1170): the server-computed wall-clock deadline for a RUNNING run,
+  // null for a non-running/chat/judge/interactive run. Optional for the same api/web
+  // rollout skew as is_planning: a pre-feature api pod omits the key.
+  deadline_at?: string | null;
   owner_name: string;
   worker_name: string | null;
   is_mine: boolean;
@@ -778,12 +782,13 @@ export interface AppSettings {
   // generator runs on (haiku by default), served as a raw string like every other
   // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
   summary_model: string;
-  // Run-health detector keys (PRD #47). health_enabled is the text "true"/"false";
-  // the rest are integer seconds as strings (the API serves every setting as a
-  // string). 0 disables that one signal.
+  // Run-health detector keys (PRD #47, #1170). health_enabled is the text "true"/"false".
+  // The four *_seconds keys are integer seconds as strings; health_near_timeout_pct is a
+  // percent of the run's wall-clock budget (0 to disable, else [50, 99]). The API serves
+  // every setting as a string. 0 disables that one signal.
   health_enabled: string;
   health_stall_seconds: string;
-  health_slow_seconds: string;
+  health_near_timeout_pct: string;
   health_queued_seconds: string;
   health_approval_seconds: string;
   health_nudge_cooldown_seconds: string;
@@ -1791,10 +1796,12 @@ export type StopKind =
   | "stopped";
 
 // RunHealth is the server-side run-health flag (PRD #47): a non-terminal,
-// self-clearing signal that a run looks slow, stuck, or looping. "ok" is the
-// healthy default. It is orthogonal to RunStatus and never kills a run — the
+// self-clearing signal that a run looks stuck, looping, or close to its timeout. "ok"
+// is the healthy default. It is orthogonal to RunStatus and never kills a run — the
 // existing timeouts remain the only liveness backstops. runBadge renders the warn
-// variant only while the run is in a flaggable status.
+// variant only while the run is in a flaggable status. PRD #1170 kept the `slow` enum
+// value (D1) but repurposed it: it now means "near timeout" (has used most of its
+// wall-clock budget while running), not the old bare wall-clock timer.
 /** The judge's verdict on a run (PRD #46). Mirrors run_reviews.verdict's CHECK. */
 export type JudgeVerdict = "ideal" | "ok" | "issues";
 
@@ -1938,6 +1945,10 @@ export interface Run {
   health: RunHealth;
   health_reason: string | null;
   health_since: string | null;
+  // deadline_at (PRD #1170): the server-computed wall-clock deadline for a RUNNING run,
+  // null for a non-running/chat/judge/interactive run. Optional for the same api/web
+  // rollout skew as is_planning: a pre-feature api pod omits the key.
+  deadline_at?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH

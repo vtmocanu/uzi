@@ -157,7 +157,11 @@ func TestCrewStateForLadder(t *testing.T) {
 		{"waiting_worker dominates", "running", "waiting_worker", me, me, fresh, crewWaiting},
 		// Rungs 3 and 4: the active speaker reads health, never recency.
 		{"active + stalled health", "running", "stalled", me, me, fresh, crewStalled},
-		{"active + slow health", "running", "slow", me, me, fresh, crewStalled},
+		// PRD #1170 D6: near-timeout (`slow`) is a BUDGET fact, not evidence the speaker is
+		// unhealthy, so it no longer ambers the active lane (laneStalledHealth excludes it,
+		// matching the web's STALLED_HEALTH). The status token still flags it; the lane dot
+		// does not.
+		{"active + slow health", "running", "slow", me, me, fresh, crewWorking},
 		{"active + looping health", "running", "looping", me, me, fresh, crewStalled},
 		{"active + ok health", "running", "ok", me, me, fresh, crewWorking},
 		// Rungs 5 and 6: the non-active recency split.
@@ -368,5 +372,13 @@ func TestBuildLanesGroupsByInvocationInFirstSeenOrder(t *testing.T) {
 	}
 	if lanes[1].Label != wantLabel {
 		t.Errorf("lane label = %q, want %q", lanes[1].Label, wantLabel)
+	}
+}
+
+func TestLaneDotWaitingIsFilledCircle(t *testing.T) {
+	// The crew-rail waiting-lane dot shares the rail column with ○/● and must be an
+	// in-font, ○-sized glyph; the old dot U+25D0 falls back to a mismatched-size font (#1176).
+	if got := laneDot(crewWaiting); got != "◕" {
+		t.Errorf("laneDot(crewWaiting) = %q, want ◕", got)
 	}
 }

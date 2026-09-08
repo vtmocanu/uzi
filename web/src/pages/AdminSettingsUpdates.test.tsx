@@ -58,7 +58,7 @@ const settings = (over: Partial<Settings> = {}): Settings => ({
   summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
-  health_slow_seconds: "2700",
+  health_near_timeout_pct: "85",
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",

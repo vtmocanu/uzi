@@ -166,7 +166,7 @@ The state dots themselves, in both places:
 | State | Meaning |
 |---|---|
 | working (pulsing) | The newest speaker, and the run is healthy — see [Run health](./run-health.md). Stays `working` through a long tool call (a build, a test suite); it does not time out on its own. **Exactly one lane** pulses, even when one role has two live invocations. |
-| stalled (amber) | The newest speaker, but the run's health has flagged it (`stalled`, `slow`, or `looping`) — a looping agent never reads as healthy green. |
+| stalled (amber) | The newest speaker, but the run's health has flagged it `stalled` or `looping` — a looping agent never reads as healthy green. A **near timeout** flag is a budget fact about the run, not evidence the speaker is unhealthy, so it does **not** turn the lane amber. |
 | waiting | Either everything, while the run is blocked on a plan approval or has no worker claimed yet; or a lane that spoke recently but isn't the newest. |
 | idle | A lane that hasn't spoken in a while. |
 | done | Everything, once the run has finished (completed, failed, or cancelled). |
@@ -292,16 +292,17 @@ with activity but nothing declared in progress shows an unattached now
 line under the milestone header instead.
 
 **On the TUI**, the in-progress milestone shows up two ways. In the crew
-rail's milestone checklist it's a `◐` that blinks `◐`/`○` on a half-second
+rail's milestone checklist it's a `◕` that blinks `◕`/`○` on a half-second
 tick in the **faint grey** colour — the same colour as a not-started `○`, so
-the row reads as one grey circle pulsing between half-filled and empty; it's
-told apart from a not-started row by the `◐` shape, its motion, and a brighter
+the row reads as one grey circle pulsing between mostly-filled and empty; it's
+told apart from a not-started row by the `◕` shape, its motion, and a brighter
 title, never by colour. The board's per-run micro-bar and the crew rail's
 eyebrow micro-bar instead blink `▰`/`▱` in the **tungsten** colour (the same
-warm accent as the done fill). A static frame renders when the terminal isn't
-interactive (a piped or offline render) or when blink is turned off — the
-checklist row's static frame is the filled `◐` (never a bare `○`, which would
-be indistinguishable from a not-started sibling) and the micro-bar's is `▱`.
+warm accent as the done fill), one cell per milestone in progress. A static
+frame renders when the terminal isn't interactive (a piped or offline render)
+or when blink is turned off — the checklist row's static frame is the filled
+`◕` (never a bare `○`, which would be indistinguishable from a not-started
+sibling) and the micro-bar's is `▱`.
 Set `UZI_TUI_NO_BLINK=1` to pin the static frame yourself, a reduced-motion
 opt-out. The crew rail
 carries its own now line under the in-progress row (`↳ <role> · <age>`,

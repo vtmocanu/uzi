@@ -111,7 +111,9 @@ function LiveElapsed({ since }: { since: string }) {
 // Decision 10): `⚠ <label> · stuck for Xm — <reason>`. The run view is owner/admin
 // only, so health_reason is always present here (no gating needed). It ticks the
 // "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
-// re-render. The VISIBLE pill renders only for a flagged, flaggable run; the sr-only
+// re-render. The near-timeout flag ("slow", PRD #1170) instead counts DOWN to the run's
+// deadline_at (`· 1h 5m left`, or `· stopping` past it), falling back to "stuck for Xm"
+// when deadline_at is absent (rollout skew). The VISIBLE pill renders only for a flagged, flaggable run; the sr-only
 // live region beside it is ALWAYS mounted (empty otherwise) — see the note at its
 // render for why the announcement cannot ride the pill itself (#185).
 /**
@@ -123,7 +125,20 @@ export function HealthFlag({ run }: { run: Run }) {
   const now = useNow(30_000);
   const show = shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
-  const stuck = show && Number.isFinite(since) ? ` · stuck for ${formatElapsed(now - since)}` : "";
+  // Near timeout ("slow", PRD #1170) counts DOWN to run.deadline_at instead of the
+  // since-flagged "stuck for Xm" every other flag keeps: `· 1h 5m left`, or `· stopping`
+  // once it has passed. When deadline_at is absent (a pre-#1170 api pod, rollout skew) it
+  // falls back to "stuck for Xm" — deadline_at never leaks into another flag's suffix.
+  const nearTimeout = run.health === "slow" && run.deadline_at != null;
+  const countdown = nearTimeout ? formatCountdown(run.deadline_at ?? null, now) : null;
+  const suffix = nearTimeout
+    ? countdown
+      ? ` · ${countdown} left`
+      : " · stopping"
+    : Number.isFinite(since)
+      ? ` · stuck for ${formatElapsed(now - since)}`
+      : "";
+  const stuck = show ? suffix : "";
   // What the live region announces — the flag's short label, once, when it arrives.
   // DELIBERATELY NOT the ticking "stuck for Xm": that changes every 30s and would make
   // the region re-announce on every tick, the same countdown-in-a-live-region hostility

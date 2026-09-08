@@ -198,7 +198,7 @@ deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 
 ## Run health
 
-uzi can flag a run that looks slow, stuck, or looping — see
+uzi can flag a run that looks stuck, looping, or close to its timeout — see
 [Run health](./run-health.md) for what each flag means. Tune it, or turn a
 signal off, from **Admin → Instance settings → Run health**:
 
@@ -206,7 +206,7 @@ signal off, from **Admin → Instance settings → Run health**:
 |---|---|---|
 | Enable run-health detection | on | Turns the whole detector on or off. |
 | Stalled after | 300s (5m) | Seconds of silence, with no tool call in flight, before a running run is flagged stalled. |
-| Slow after | 2700s (45m) | Wall-clock seconds since start before a running run is flagged slow. For a milestone-scaled run (frozen `budget_wall_seconds`, PRD #122) this threshold scales up with the run's budget, so a long-budget run isn't flagged at the flat default while it is still working. |
+| Near timeout at (% of wall-clock budget) | 85 | `health_near_timeout_pct` — the share of a run's wall-clock budget (`RUN_TIMEOUT`, or its frozen `budget_wall_seconds` for a milestone-scaled run, PRD #122) it must have used, in **active** running time only (time parked at a gate is excluded), before it's flagged near timeout. |
 | Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. |
 | Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
 | Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
@@ -267,16 +267,20 @@ the same picture from a terminal instead of the web UI — see
 - The `uzi` and autopilot labels must be distinct. An equal pair would
   autopilot every runnable issue, conflating "uzi's to run" with "skip the
   plan gate".
-- Each field accepts `0` or a whole number of seconds from 60 to 86400 (one
-  day); anything else — negative, non-integer, or 1–59 — is rejected, so a
-  fat-fingered value can't silently misconfigure a signal for a day or more.
-  For the four detection thresholds (stalled, slow, stuck queued, awaiting
-  approval), `0` **disables that signal**. For the Slack nudge cooldown, `0`
+- The near-timeout share is a **percent**, not a duration: `0` disables it,
+  or a whole number from 50 to 99; anything else — negative, non-integer,
+  below 50, or 100 and above — is rejected. The floor keeps a fat-fingered
+  low value from recreating the noise a bare timer used to cause; 100 is
+  excluded because the run is stopped at exactly that point, so the flag
+  would fire at the same instant.
+- The remaining detection thresholds (stalled, stuck queued, awaiting
+  approval) and the Slack nudge cooldown each accept `0` or a whole number of
+  seconds from 60 to 86400 (one day); anything else — negative, non-integer,
+  or 1–59 — is rejected, so a fat-fingered value can't silently misconfigure
+  a signal for a day or more. For the three seconds-based detection
+  thresholds, `0` **disables that signal**. For the Slack nudge cooldown, `0`
   means something different: no rate limit, so a nudge fires on every
-  ok→flagged transition instead of at most once per window. The slow
-  threshold is further clamped, at read time, to stay below `RUN_TIMEOUT`
-  ([Configuration](./configuration.md)) — a value at or past the timeout
-  would never fire, since the run fails first.
+  ok→flagged transition instead of at most once per window.
 - An invalid save is rejected before anything is written. The same rules run
   client-side first for immediate feedback, but the server is the source of
   truth.

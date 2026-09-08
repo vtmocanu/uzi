@@ -455,9 +455,11 @@ func Validate(key, value string) error {
 		return validateAgentSourceRef(value)
 	case KeyAgentSourceFolder:
 		return validateAgentSourceFolder(value)
-	case KeyHealthStallSeconds, KeyHealthSlowSeconds, KeyHealthQueuedSeconds,
+	case KeyHealthStallSeconds, KeyHealthQueuedSeconds,
 		KeyHealthApprovalSeconds, KeyHealthNudgeCooldownSeconds:
 		return validateHealthSeconds(value)
+	case KeyHealthNearTimeoutPct:
+		return validateHealthPercent(value)
 	case KeyJudgeCooldownSeconds:
 		// {0} ∪ [60, 86400], identical to the run-health seconds bounds (PRD #69 M5
 		// Decision 9), so validateHealthSeconds enforces it verbatim — 0 disables the

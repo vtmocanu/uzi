@@ -121,7 +121,12 @@ var runDTOKeys = []string{
 	// PRD #411: the forge issue's web URL for the run's clickable #<iid> link. Null for
 	// issue-less runs and when the issue is no longer cached. Always on the wire.
 	"issue_web_url",
-	"stop_kind", "stop_reason", "health", "health_reason", "health_since", "plan_md",
+	"stop_kind", "stop_reason", "health", "health_reason", "health_since",
+	// PRD #1170: the server-computed wall-clock deadline the near-timeout badge counts
+	// down to. Null when the run has no wall deadline (not running, chat/judge/interactive,
+	// or no started_at), but the key is always on the wire.
+	"deadline_at",
+	"plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
 	"plan_source",
 	// PRD #362 M1: plain-English run summaries. All three null until the worker posts

@@ -47,9 +47,21 @@ const (
 // the active lane would flip every long healthy tool call to idle.
 const laneStaleAfter = 45 * time.Second
 
-// stalledHealth are the PRD #47 WARN flags that turn an ACTIVE lane amber rather than
-// green. A looping agent is spinning without progress and must never read as healthy.
+// stalledHealth is the WARN set for the status TOKEN and the board strip: all three
+// PRD #47 flags (stalled, slow, looping) replace the status word with ▲ + the health
+// word, because a run that needs a glance is what the board is FOR. It drives
+// stateGlyphWord/stateColor (tui_render.go) and the board-summary ▲ counter
+// (tui_board.go). "slow" is the enum value PRD #1170 kept (D1); the token DISPLAYS it as
+// "near timeout" via displayHealth, but it is still a WARN flag on the board.
 var stalledHealth = map[string]bool{"stalled": true, "slow": true, "looping": true}
+
+// laneStalledHealth is the narrower set that turns an ACTIVE lane amber (crewStalled):
+// only stalled and looping, NOT slow/near-timeout. A near-timeout run is a fact about the
+// run's BUDGET, not evidence the speaker is unhealthy — a coder working normally at 90% of
+// its wall-clock budget is still working — so it must not flip the lane dot (PRD #1170 D6).
+// This mirrors the web's STALLED_HEALTH (web/src/components/ActivityFeed.tsx), which
+// already excluded slow; the TUI had diverged.
+var laneStalledHealth = map[string]bool{"stalled": true, "looping": true}
 
 // laneStatePriority is the rollup order for a role's single dot: WORST state wins, not
 // newest (ActivityFeed.tsx:262-268). One stalled tester must surface over a working one.
@@ -345,8 +357,11 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 		return crewWaiting
 	}
 	if activeActor != "" && actor == activeActor {
-		// The active speaker trusts run.health and NEVER the recency timer.
-		if stalledHealth[runHealth] {
+		// The active speaker trusts run.health and NEVER the recency timer. The LANE set
+		// excludes slow/near-timeout (laneStalledHealth, matching the web's STALLED_HEALTH):
+		// a run near its wall-clock budget is not evidence its speaker is unhealthy, so it
+		// stays working here even while the status token flags it (PRD #1170 D6).
+		if laneStalledHealth[runHealth] {
 			return crewStalled
 		}
 		return crewWorking
@@ -396,7 +411,7 @@ func laneDot(s crewState) string {
 	case crewStalled:
 		return "▲"
 	case crewWaiting:
-		return "◐"
+		return "◕"
 	case crewDone:
 		return "✓"
 	default:

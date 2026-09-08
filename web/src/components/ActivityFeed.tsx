@@ -229,11 +229,12 @@ const STALE_MS = 45_000;
 
 // `stalled`/`looping` are PRD #47 no-progress WARN flags → amber `stalled`, never green
 // `working` (a looping agent is spinning without progress; it must not read as healthy).
-// `slow` is DELIBERATELY EXCLUDED: it is a pure wall-clock signal the server raises at
-// ~45 min (health_slow_seconds) regardless of activity or in-flight state, so a run can
-// be `slow` while it is actively emitting messages. The actively-speaking lane on a
-// `slow` run is genuinely working, so it must keep its green pulsing `working` dot — the
-// run-level `slow` badge (RunHealthBadge) already carries the wall-clock warning.
+// `slow` is DELIBERATELY EXCLUDED: since PRD #1170 it means "near timeout" — the run has
+// used most of its wall-clock budget while running — which is a fact about the run's
+// deadline, NOT about the speaker's progress, so a run can be `slow` while it is actively
+// emitting messages. The actively-speaking lane on a near-timeout run is genuinely
+// working, so it must keep its green pulsing `working` dot — the run-level "near timeout"
+// badge (RunHealthBadge) already carries the budget warning, with its own countdown.
 const STALLED_HEALTH = new Set<string>(["stalled", "looping"]);
 
 // crewStateFor is the Decision-2 ladder. Precedence: terminal → gate/worker-wait →

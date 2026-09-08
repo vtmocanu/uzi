@@ -769,12 +769,14 @@ also the TUI's own fallback when the live channel is unreachable (below).
   For a milestone-structured run the rail also shows a
   `MILESTONES {done}/{total}` block below the lanes, one row per approved
   milestone in order, marked `✓` reported complete, `○` not started, or —
-  for the milestone in progress — a `◐` that blinks `◐`/`○` in the faint grey
+  for a milestone in progress — a `◕` that blinks `◕`/`○` in the faint grey
   colour (the same colour as a not-started `○`; the row is told apart by the
-  `◐` shape, its motion and a brighter title, never by colour), a static `◐`
+  `◕` shape, its motion and a brighter title, never by colour), a static `◕`
   under `UZI_TUI_NO_BLINK=1` or a non-tty render. The rail's eyebrow also
-  carries a compact `▰`/`▱` micro-bar whose in-progress cell blinks in
-  tungsten, the twin of the board's. The count reads "reported complete", not verified: uzi shows
+  carries a compact `▰`/`▱` micro-bar that blinks one cell per milestone in
+  progress in tungsten, the twin of the board's, and names the in-progress
+  milestone(s) after the count (e.g. `· m1, m2`, capped at two then `+N`).
+  The count reads "reported complete", not verified: uzi shows
   what the run reported and does not itself check the work. The
   in-progress row also carries a **now line** beneath it — `↳ <role> ·
   <age>` plus its task label — the crew rail's own current-activity read;
@@ -1229,6 +1231,17 @@ the PRD-link patch lifecycle has settled, an empty line while still
 pending). Both are emit-only-when-set on the human view too — `run get`
 prints them as `PRD_MOVE` and `PRD_PATCH_SETTLED_AT` rows only when the run
 has declared a move — and appear the same way under `--json`.
+
+A running run's wall-clock stop time — the same clock the **near timeout**
+[run-health](./run-health.md) flag (its `slow` value under `--json`) counts down
+to — is readable the same way:
+`uzi run get <id> --field deadline_at` (an RFC3339 timestamp, an empty line
+when the run has none). It's set only while a non-`chat`, non-`judge`,
+non-`interactive` run is actually `running`, so a queued run, a gated run, a
+chat, and a finished run all print nothing. `run get`'s human view prints it
+as a `DEADLINE` row right after `HEALTH`, folded to local time plus a
+countdown (`15:20 · 1h05m left`, or `15:20 · stopping` once past) instead of
+the raw timestamp, emit-only-when-set the same way `PRD_MOVE` is above.
 
 `run get` also prints a `NOW` row right after the `MILESTONES` block: the
 run's server-derived current activity, folded to

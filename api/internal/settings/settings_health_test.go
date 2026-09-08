@@ -24,6 +24,28 @@ func TestValidateHealthSeconds(t *testing.T) {
 	}
 }
 
+func TestValidateHealthPercent(t *testing.T) {
+	// {0} ∪ [50, 99]: 0 disables, the floor rejects noisy low thresholds, and 100 is
+	// excluded because the sweeper fires at 100%.
+	ok := []string{"0", "50", "85", "99", " 85 "}
+	for _, v := range ok {
+		if err := Validate(KeyHealthNearTimeoutPct, v); err != nil {
+			t.Errorf("Validate(health_near_timeout_pct, %q) = %v, want nil", v, err)
+		}
+	}
+	bad := []string{"-1", "49", "100", "abc", "85.5", "", "1e2"}
+	for _, v := range bad {
+		if err := Validate(KeyHealthNearTimeoutPct, v); err == nil {
+			t.Errorf("Validate(health_near_timeout_pct, %q) = nil, want a rejection", v)
+		}
+	}
+	// The out-of-range message is exact (the admin card mirrors it).
+	if err := Validate(KeyHealthNearTimeoutPct, "49"); err == nil ||
+		err.Error() != "must be 0 (disabled) or between 50 and 99 percent" {
+		t.Errorf("Validate(health_near_timeout_pct, 49) = %v, want the exact percent message", err)
+	}
+}
+
 func TestValidateHealthEnabledIsBool(t *testing.T) {
 	if err := Validate(KeyHealthEnabled, "true"); err != nil {
 		t.Errorf("Validate(health_enabled, true) = %v, want nil", err)
@@ -49,7 +71,7 @@ func TestHealthAccessorsFallBackToDefaults(t *testing.T) {
 		want int
 	}{
 		{"stall", c.HealthStallSeconds, 300},
-		{"slow", c.HealthSlowSeconds, 2700},
+		{"near-timeout", c.HealthNearTimeoutPct, 85},
 		{"queued", c.HealthQueuedSeconds, 600},
 		{"approval", c.HealthApprovalSeconds, 3600},
 		{"cooldown", c.HealthNudgeCooldownSeconds, 1800},
@@ -64,7 +86,7 @@ func TestHealthAccessorsReadStoredRows(t *testing.T) {
 	c := New(&fakeStore{rows: []store.AppSetting{
 		row(KeyHealthEnabled, "false"),
 		row(KeyHealthStallSeconds, "120"),
-		row(KeyHealthSlowSeconds, "0"), // disabled
+		row(KeyHealthNearTimeoutPct, "0"), // disabled
 	}}, time.Minute)
 	ctx := context.Background()
 
@@ -74,8 +96,8 @@ func TestHealthAccessorsReadStoredRows(t *testing.T) {
 	if got, _ := c.HealthStallSeconds(ctx); got != 120 {
 		t.Errorf("HealthStallSeconds = %d, want 120", got)
 	}
-	if got, _ := c.HealthSlowSeconds(ctx); got != 0 {
-		t.Errorf("HealthSlowSeconds = %d, want 0 (disabled)", got)
+	if got, _ := c.HealthNearTimeoutPct(ctx); got != 0 {
+		t.Errorf("HealthNearTimeoutPct = %d, want 0 (disabled)", got)
 	}
 }
 
@@ -89,7 +111,7 @@ func TestHealthEnabledJunkDefaultsOn(t *testing.T) {
 
 func TestHealthKeysKnownAndInDefaults(t *testing.T) {
 	for _, k := range []string{
-		KeyHealthEnabled, KeyHealthStallSeconds, KeyHealthSlowSeconds,
+		KeyHealthEnabled, KeyHealthStallSeconds, KeyHealthNearTimeoutPct,
 		KeyHealthQueuedSeconds, KeyHealthApprovalSeconds, KeyHealthNudgeCooldownSeconds,
 	} {
 		if !Known(k) {
