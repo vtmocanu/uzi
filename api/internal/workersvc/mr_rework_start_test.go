@@ -48,39 +48,43 @@ func TestStartMRReworkForRunHappyPathStampsManual(t *testing.T) {
 	if run.ID != newRun {
 		t.Fatalf("returned run id = %s, want %s", run.ID, newRun)
 	}
-	if fs.mrReworkRunParams == nil {
-		t.Fatal("CreateManualMRReworkRun store call not made")
+	// The manual/atomic path was taken: the combined create+advance call fired (its params
+	// have NO TriggerSource field — trigger_source='manual' is hard-coded in the SQL). The
+	// trigger-source intent is proved by the returned run (from the fake result); the exact
+	// SQL literal is covered by the live-DB test.
+	if fs.mrReworkAndAdvanceParams == nil {
+		t.Fatal("CreateManualMRReworkRunAndAdvance store call not made (manual/atomic path not taken)")
 	}
-	if fs.mrReworkRunParams.TriggerSource != "manual" {
-		t.Fatalf("trigger_source = %q, want manual", fs.mrReworkRunParams.TriggerSource)
+	if run.TriggerSource != "manual" {
+		t.Fatalf("returned run trigger_source = %q, want manual", run.TriggerSource)
 	}
 	// The FULL snapshot rides the run (Decision 3).
 	var snap ReviewCommentsSnapshot
-	if err := json.Unmarshal(fs.mrReworkRunParams.ReviewComments, &snap); err != nil {
+	if err := json.Unmarshal(fs.mrReworkAndAdvanceParams.ReviewComments, &snap); err != nil {
 		t.Fatalf("review_comments not valid jsonb: %v", err)
 	}
 	if len(snap.Comments) != 1 || snap.Comments[0].ID != 120 {
 		t.Fatalf("snapshot did not ride the run: %+v", snap)
 	}
 	// Guidance is folded into the description via the shared composer.
-	if !strings.Contains(fs.mrReworkRunParams.IssueDescription, "only fix the migration thread") {
-		t.Fatalf("description missing the guidance section: %q", fs.mrReworkRunParams.IssueDescription)
+	if !strings.Contains(fs.mrReworkAndAdvanceParams.IssueDescription, "only fix the migration thread") {
+		t.Fatalf("description missing the guidance section: %q", fs.mrReworkAndAdvanceParams.IssueDescription)
 	}
-	// The non-counting high-water advance ran with the snapshot's max actionable id, on the ref.
-	if fs.advanceHighWater == nil {
-		t.Fatal("AdvanceMRReworkHighWater not called")
+	// The non-counting high-water advance is folded into the SAME atomic call, carrying the
+	// snapshot's max actionable id, on the ref.
+	if fs.mrReworkAndAdvanceParams.HighWater != 120 || fs.mrReworkAndAdvanceParams.PipelineRef.String != "agent/issue-7" {
+		t.Fatalf("combined call = %+v, want high_water 120 on agent/issue-7", fs.mrReworkAndAdvanceParams)
 	}
-	if fs.advanceHighWater.HighWater != 120 || fs.advanceHighWater.Ref != "agent/issue-7" {
-		t.Fatalf("advance = %+v, want high_water 120 on agent/issue-7", fs.advanceHighWater)
-	}
-	if uuid.UUID(fs.advanceHighWater.RepoID) != repo {
-		t.Fatalf("advance repo = %s, want %s", uuid.UUID(fs.advanceHighWater.RepoID), repo)
+	if fs.mrReworkAndAdvanceParams.RepoID != repo {
+		t.Fatalf("combined call repo = %s, want %s", fs.mrReworkAndAdvanceParams.RepoID, repo)
 	}
 }
 
 // TestStartMRReworkForRunGuidanceOnlyStillAdvances proves a guidance-only trigger with
 // NOTHING new past the high-water still proceeds AND still advances the ledger
-// unconditionally (GREATEST keeps the mark; the call resets halt_notified — Decision 9).
+// unconditionally (GREATEST keeps the mark; the advance resets halt_notified — Decision 9).
+// The advance is now INSEPARABLE from the create — one atomic call — so a guidance-only
+// cycle cannot create the run without also advancing the ledger.
 func TestStartMRReworkForRunGuidanceOnlyStillAdvances(t *testing.T) {
 	user, repo, runID := uuid.New(), uuid.New(), uuid.New()
 	fs := &fakeStore{
@@ -96,13 +100,15 @@ func TestStartMRReworkForRunGuidanceOnlyStillAdvances(t *testing.T) {
 	if _, err := svc.StartMRReworkForRun(context.Background(), user, runID, "please redo the naming nits", sampleReviewSnapshot()); err != nil {
 		t.Fatalf("guidance-only trigger with nothing new should proceed: %v", err)
 	}
-	if fs.advanceHighWater == nil {
-		t.Fatal("AdvanceMRReworkHighWater must run even on a guidance-only cycle (halt-latch reset)")
+	// The advance is inseparable from the create: the combined atomic call MUST have fired
+	// even on a guidance-only cycle (it is what resets the halt latch — Decision 9).
+	if fs.mrReworkAndAdvanceParams == nil {
+		t.Fatal("CreateManualMRReworkRunAndAdvance must run even on a guidance-only cycle (halt-latch reset)")
 	}
 	// GREATEST(500, 120) leaves the mark at 500 in the DB; the call passes the computed max
 	// actionable id (120), and the query's GREATEST preserves the higher stored value.
-	if fs.advanceHighWater.HighWater != 120 {
-		t.Fatalf("advance passed high_water %d, want the computed max actionable id 120", fs.advanceHighWater.HighWater)
+	if fs.mrReworkAndAdvanceParams.HighWater != 120 {
+		t.Fatalf("advance passed high_water %d, want the computed max actionable id 120", fs.mrReworkAndAdvanceParams.HighWater)
 	}
 }
 
@@ -171,9 +177,10 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 			if err != tc.wantErr {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
 			}
-			// A refused trigger must not have created a run.
-			if fs.mrReworkRunParams != nil {
-				t.Fatalf("a refused trigger created a run: %+v", fs.mrReworkRunParams)
+			// A refused trigger must not have created a run (the manual path goes through the
+			// combined create+advance call).
+			if fs.mrReworkAndAdvanceParams != nil {
+				t.Fatalf("a refused trigger created a run: %+v", fs.mrReworkAndAdvanceParams)
 			}
 		})
 	}

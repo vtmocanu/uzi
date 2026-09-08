@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 
 	"github.com/google/uuid"
@@ -61,7 +60,7 @@ var ErrActiveMRReworkExists = errors.New("an active MR-rework run already exists
 //
 // The detector swallows all of these and retries next tick, exactly as ci-autofix does.
 func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot) (store.Run, error) {
-	return s.createMRReworkRun(ctx, userID, repoID, ref, mrIID, sourceRunID, title, description, snapshot, "mr_rework")
+	return s.createMRReworkRun(ctx, userID, repoID, ref, mrIID, sourceRunID, title, description, snapshot, "mr_rework", nil)
 }
 
 // CreateManualMRReworkRun is the ON-DEMAND sibling of CreateAutoMRReworkRun (PRD #1202): the
@@ -70,18 +69,32 @@ func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid
 // kinds of rework are distinguishable in every listing (Decision 7) while running the SAME
 // correctness guards (the create-time cross-kind branch guard and the
 // one-active-mr_rework-per-MR index). auto_approve stays true — a rework has no CI-config
-// dimension and the owner has just read the findings (Decision 4). The higher-level
-// run-state checks and the non-counting ledger advance live in StartMRReworkForRun.
-func (s *Service) CreateManualMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot) (store.Run, error) {
-	return s.createMRReworkRun(ctx, userID, repoID, ref, mrIID, sourceRunID, title, description, snapshot, "manual")
+// dimension and the owner has just read the findings (Decision 4).
+//
+// The non-counting ledger high-water advance is now folded into the create as ONE atomic
+// statement (CreateManualMRReworkRunAndAdvance): highWater is the max actionable comment id
+// StartMRReworkForRun computed, and Postgres commits the run INSERT and the advance together
+// or rolls both back. Previously the advance was a separate best-effort call whose failure
+// was only logged — a review finding, since a create that returned success with an
+// unadvanced ledger let the automatic watcher re-fire on the same comments (see
+// StartMRReworkForRun).
+func (s *Service) CreateManualMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, highWater int64) (store.Run, error) {
+	return s.createMRReworkRun(ctx, userID, repoID, ref, mrIID, sourceRunID, title, description, snapshot, "manual", &highWater)
 }
 
 // createMRReworkRun is the shared body of the automatic and manual mr_rework create paths.
-// triggerSource ('mr_rework' | 'manual') is the ONLY difference — it becomes
-// runs.trigger_source; every other step (repo-ownership check, the snapshot marshal, the
-// atomic INSERT … WHERE NOT EXISTS cross-kind guard, the 23505 mappings, the queued notify)
-// is identical, so the two paths cannot drift.
-func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, triggerSource string) (store.Run, error) {
+// Everything except which store query runs (the repo-ownership check, the snapshot marshal,
+// the atomic INSERT … WHERE NOT EXISTS cross-kind guard, the 23505 mappings, the queued
+// notify) is identical, so the two paths cannot drift.
+//
+// highWater discriminates the two callers:
+//   - nil (automatic path): CreateAutoMRReworkRun, stamping trigger_source=triggerSource; the
+//     ledger is advanced separately by the poller's proceed step.
+//   - non-nil (manual path): CreateManualMRReworkRunAndAdvance, which stamps
+//     trigger_source='manual' in SQL AND folds the non-counting high-water advance
+//     (GREATEST(*highWater), halt_notified reset) into the SAME atomic statement, so the run
+//     and the ledger commit together or not at all. triggerSource is unused in this branch.
+func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, triggerSource string, highWater *int64) (store.Run, error) {
 	// Repo-ownership / existence check, mirroring createCIFixRun so an unknown repo is
 	// a clean ErrRepoNotFound rather than an FK error at INSERT.
 	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
@@ -104,23 +117,48 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 		reviewJSON = b
 	}
 
-	run, err := s.q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
-		UserID:           userID,
-		RepoID:           repoID,
-		IssueTitle:       title,
-		IssueDescription: description,
-		PipelineRef:      pgtype.Text{String: ref, Valid: true},
-		MrIid:            pgtype.Int8{Int64: mrIID, Valid: true},
-		TargetRunID:      pgtype.UUID{Bytes: sourceRunID, Valid: true},
-		ReviewComments:   reviewJSON,
-		// PRD #35: the OWNER's default. An automatic mr_rework run is created by the poller
-		// with no user in the loop; the on-demand path is the owner acting, and either way
-		// there is no per-run wait_on_limit request to honour.
-		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
-		// PRD #1202: 'mr_rework' from the poller detector, 'manual' from the on-demand
-		// endpoint. kind stays 'mr_rework' either way; only this discriminates them (D7).
-		TriggerSource: triggerSource,
-	})
+	// PRD #35: the OWNER's default. An automatic mr_rework run is created by the poller with
+	// no user in the loop; the on-demand path is the owner acting, and either way there is no
+	// per-run wait_on_limit request to honour.
+	waitOnLimit := s.resolveWaitOnLimit(ctx, userID, nil)
+
+	var (
+		run store.Run
+		err error
+	)
+	if highWater == nil {
+		// Automatic path: the poller advances the ledger separately in its proceed step.
+		// PRD #1202: trigger_source is 'mr_rework' from the poller detector. kind stays
+		// 'mr_rework' either way; only trigger_source discriminates them (D7).
+		run, err = s.q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
+			UserID:           userID,
+			RepoID:           repoID,
+			IssueTitle:       title,
+			IssueDescription: description,
+			PipelineRef:      pgtype.Text{String: ref, Valid: true},
+			MrIid:            pgtype.Int8{Int64: mrIID, Valid: true},
+			TargetRunID:      pgtype.UUID{Bytes: sourceRunID, Valid: true},
+			ReviewComments:   reviewJSON,
+			WaitOnLimit:      waitOnLimit,
+			TriggerSource:    triggerSource,
+		})
+	} else {
+		// Manual (on-demand) path: the run INSERT and the non-counting high-water advance
+		// commit atomically as ONE statement — trigger_source='manual' is hard-coded in the
+		// query, so it is not a param here (PRD #1202 review-finding hardening).
+		run, err = s.q.CreateManualMRReworkRunAndAdvance(ctx, store.CreateManualMRReworkRunAndAdvanceParams{
+			UserID:           userID,
+			RepoID:           repoID,
+			IssueTitle:       title,
+			IssueDescription: description,
+			PipelineRef:      pgtype.Text{String: ref, Valid: true},
+			MrIid:            pgtype.Int8{Int64: mrIID, Valid: true},
+			TargetRunID:      pgtype.UUID{Bytes: sourceRunID, Valid: true},
+			ReviewComments:   reviewJSON,
+			WaitOnLimit:      waitOnLimit,
+			HighWater:        *highWater,
+		})
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// WHERE NOT EXISTS matched an active cross-kind ci_fix sibling on this pipeline_ref:
@@ -186,9 +224,18 @@ var (
 //
 // snapshot is the FULL MR review-comment snapshot the handler read from the forge (nil is
 // fine — a guidance-only trigger still proceeds). On success it advances the consumed
-// high-water WITHOUT spending an automatic cycle and resets the halt latch (Decision 1/9),
-// so the automatic watcher never re-fires on the same comments and a genuinely-new comment
-// that later hits the cap is announced once more.
+// high-water WITHOUT spending an automatic cycle (GREATEST/advance-only, attempt_count
+// untouched) and resets the halt latch (halt_notified→false, unconditional even on a
+// guidance-only cycle) — Decision 1/9 — so the automatic watcher never re-fires on the same
+// comments and a genuinely-new comment that later hits the cap is announced once more.
+//
+// That advance is now performed ATOMICALLY with the create, in ONE SQL statement
+// (CreateManualMRReworkRunAndAdvance): Postgres commits both the run and the ledger advance
+// or neither. Previously the create and the advance were two non-atomic steps and an advance
+// failure was only logged while the create returned success — leaving an unadvanced ledger
+// that let the automatic watcher fire a DUPLICATE cycle on the same comments once the manual
+// run went terminal. Folding them into one statement closes that window (the review finding
+// this hardening addresses).
 func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UUID, guidance string, snapshot *ReviewCommentsSnapshot) (store.Run, error) {
 	// Owner-scoped read — never trust a handler-supplied row. A foreign/missing run is
 	// ErrRunNotFound, which the handler maps to 404 (never 403).
@@ -265,22 +312,16 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	description := ComposeRunDescription(body, guidance)
 	title := fmt.Sprintf("Rework MR review (on demand): %s (!%d)", ref, mrIID)
 
-	run, err = s.CreateManualMRReworkRun(ctx, userID, repoID, ref, mrIID, run.ID, title, description, snapshot)
+	// The create and the non-counting high-water advance are ONE atomic statement
+	// (CreateManualMRReworkRunAndAdvance): maxActionableID is the mark to advance to
+	// (UNCONDITIONAL — GREATEST keeps it where it is on a guidance-only trigger, and the
+	// advance is what resets halt_notified for the new halt episode, Decision 9). Postgres
+	// commits the run and the advance together or rolls both back, so a returned run can
+	// never leave the ledger unadvanced.
+	run, err = s.CreateManualMRReworkRun(ctx, userID, repoID, ref, mrIID, run.ID, title, description, snapshot, maxActionableID)
 	if err != nil {
 		// ErrBranchInUse / ErrActiveMRReworkExists map straight through to the handler's 409s.
 		return store.Run{}, err
-	}
-
-	// CREATE-THEN-RECORD, like the detector. The advance is UNCONDITIONAL (not gated on
-	// isNew): GREATEST keeps the mark where it is on a guidance-only trigger, and the call
-	// is what resets halt_notified for the new halt episode (Decision 9). A failure here is
-	// logged, not fatal — the one-active index keeps the next tick from doubling.
-	if err := s.q.AdvanceMRReworkHighWater(ctx, store.AdvanceMRReworkHighWaterParams{
-		RepoID:    repoID,
-		Ref:       ref,
-		HighWater: maxActionableID,
-	}); err != nil {
-		slog.Error("workersvc: advance mr_rework high-water", "run_id", run.ID, "ref", ref, "error", err)
 	}
 
 	return run, nil

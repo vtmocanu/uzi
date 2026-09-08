@@ -12,39 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const advanceMRReworkHighWater = `-- name: AdvanceMRReworkHighWater :exec
-INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
-VALUES ($1::uuid, $2, $3)
-ON CONFLICT (repo_id, ref) DO UPDATE
-SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
-    halt_notified = false,
-    updated_at    = now()
-`
-
-type AdvanceMRReworkHighWaterParams struct {
-	RepoID    uuid.UUID `json:"repo_id"`
-	Ref       string    `json:"ref"`
-	HighWater int64     `json:"high_water"`
-}
-
-// The MANUAL (on-demand) rework path's ledger write (PRD #1202). Like UpsertMRReworkLedger
-// it advances the consumed high-water (GREATEST, advance-only) and RESETS halt_notified to
-// false so the manual cycle opens a NEW halt episode — a genuinely-new comment that later
-// hits the cap is announced once more rather than silently refused.
-//
-// 🔴 INVARIANT: attempt_count is NEVER mentioned, so a NEW row starts at the column DEFAULT
-// (0) and an EXISTING row keeps its count UNCHANGED. This is the key difference from
-// UpsertMRReworkLedger, which INSERTs count=1 and increments on conflict. A manual cycle
-// consumes review comments and opens a new halt episode but NEVER spends an automatic cycle
-// (the cap bounds unattended spend; a human pressing the button spends their own token —
-// PRD #1202 Decision 1). It is called on EVERY successful manual create, including a
-// guidance-only one: GREATEST preserves the mark when nothing is new, and the halt_notified
-// reset is what the manual path promises (Decision 9), so it must not be conditional.
-func (q *Queries) AdvanceMRReworkHighWater(ctx context.Context, arg AdvanceMRReworkHighWaterParams) error {
-	_, err := q.db.Exec(ctx, advanceMRReworkHighWater, arg.RepoID, arg.Ref, arg.HighWater)
-	return err
-}
-
 const createAutoMRReworkRun = `-- name: CreateAutoMRReworkRun :one
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
@@ -123,6 +90,201 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 		arg.ReviewComments,
 		arg.WaitOnLimit,
 		arg.TriggerSource,
+	)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+		&i.PreservedPatch,
+		&i.RequiredCapabilities,
+		&i.StopReason,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.Interactive,
+		&i.OpenFollowupID,
+		&i.PlanChangedFiles,
+		&i.ScopeCeiling,
+		&i.StatusSince,
+		&i.ReviewComments,
+		&i.BudgetPausedSeconds,
+		&i.MrReworkEnabled,
+		&i.TriggerSource,
+		&i.CheckpointTip,
+		&i.UsageRefolded,
+		&i.CodexSecretID,
+		&i.CodexAuthMode,
+		&i.CodexSecretLabel,
+		&i.CodexAccountKey,
+		&i.CodexMaterialRevision,
+		&i.CodexAccountRevision,
+		&i.CodexClaimEpoch,
+		&i.CodexCapHash,
+	)
+	return i, err
+}
+
+const createManualMRReworkRunAndAdvance = `-- name: CreateManualMRReworkRunAndAdvance :one
+WITH led AS (
+    INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
+    SELECT $2::uuid, $5, $10
+    WHERE NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE repo_id = $2::uuid
+          AND kind = 'ci_fix'
+          AND pipeline_ref = $5
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+    )
+    ON CONFLICT (repo_id, ref) DO UPDATE
+    SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
+        halt_notified = false,
+        updated_at    = now()
+)
+INSERT INTO runs (
+    user_id, repo_id, kind, issue_title, issue_description,
+    pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source
+)
+SELECT
+    $1, $2::uuid, 'mr_rework', $3, $4,
+    $5, $6, $7, $8::jsonb, true, $9,
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'manual'
+WHERE NOT EXISTS (
+    SELECT 1 FROM runs
+    WHERE repo_id = $2::uuid
+      AND kind = 'ci_fix'
+      AND pipeline_ref = $5
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+)
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash
+`
+
+type CreateManualMRReworkRunAndAdvanceParams struct {
+	UserID           uuid.UUID   `json:"user_id"`
+	RepoID           uuid.UUID   `json:"repo_id"`
+	IssueTitle       string      `json:"issue_title"`
+	IssueDescription string      `json:"issue_description"`
+	PipelineRef      pgtype.Text `json:"pipeline_ref"`
+	MrIid            pgtype.Int8 `json:"mr_iid"`
+	TargetRunID      pgtype.UUID `json:"target_run_id"`
+	ReviewComments   []byte      `json:"review_comments"`
+	WaitOnLimit      bool        `json:"wait_on_limit"`
+	HighWater        int64       `json:"high_water"`
+}
+
+// ATOMIC on-demand (manual) mr_rework create + ledger advance (PRD #1202, review-finding
+// hardening of !1207). Folds the run INSERT and the manual high-water advance into ONE
+// statement so Postgres commits BOTH or NEITHER: previously StartMRReworkForRun created the
+// run, then called AdvanceMRReworkHighWater separately and only LOGGED an advance failure —
+// returning success with an unadvanced ledger, which let the automatic watcher re-fire on the
+// same comments once the manual run went terminal.
+//
+// The `runs` INSERT is the OUTER statement (RETURNING * -> the Run model) and is byte-for-byte
+// the CreateAutoMRReworkRun body except trigger_source is hard-coded 'manual' (the only caller
+// is the on-demand path). Keep the two INSERT bodies in sync.
+//
+// The `led` CTE mirrors AdvanceMRReworkHighWater's ON CONFLICT body (GREATEST high_water,
+// reset halt_notified, attempt_count NEVER named -> non-counting, PRD D1) and self-gates on
+// the SAME cross-kind `WHERE NOT EXISTS` predicate as the run INSERT, evaluated on the same
+// snapshot, so: branch-in-use -> both insert 0 rows (ErrBranchInUse, ledger untouched);
+// same-MR/active-branch 23505 -> whole statement aborts, ledger rolled back
+// (ErrActiveMRReworkExists/ErrBranchInUse); success -> run + ledger commit together. `ref` on
+// the ledger is the pipeline_ref (the branch), exactly as the two-step path passed it.
+func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg CreateManualMRReworkRunAndAdvanceParams) (Run, error) {
+	row := q.db.QueryRow(ctx, createManualMRReworkRunAndAdvance,
+		arg.UserID,
+		arg.RepoID,
+		arg.IssueTitle,
+		arg.IssueDescription,
+		arg.PipelineRef,
+		arg.MrIid,
+		arg.TargetRunID,
+		arg.ReviewComments,
+		arg.WaitOnLimit,
+		arg.HighWater,
 	)
 	var i Run
 	err := row.Scan(

@@ -98,27 +98,6 @@ SET attempt_count = mr_rework_ledger.attempt_count + 1,
     halt_notified = false,
     updated_at    = now();
 
--- name: AdvanceMRReworkHighWater :exec
--- The MANUAL (on-demand) rework path's ledger write (PRD #1202). Like UpsertMRReworkLedger
--- it advances the consumed high-water (GREATEST, advance-only) and RESETS halt_notified to
--- false so the manual cycle opens a NEW halt episode — a genuinely-new comment that later
--- hits the cap is announced once more rather than silently refused.
---
--- 🔴 INVARIANT: attempt_count is NEVER mentioned, so a NEW row starts at the column DEFAULT
--- (0) and an EXISTING row keeps its count UNCHANGED. This is the key difference from
--- UpsertMRReworkLedger, which INSERTs count=1 and increments on conflict. A manual cycle
--- consumes review comments and opens a new halt episode but NEVER spends an automatic cycle
--- (the cap bounds unattended spend; a human pressing the button spends their own token —
--- PRD #1202 Decision 1). It is called on EVERY successful manual create, including a
--- guidance-only one: GREATEST preserves the mark when nothing is new, and the halt_notified
--- reset is what the manual path promises (Decision 9), so it must not be conditional.
-INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
-VALUES (@repo_id::uuid, @ref, @high_water)
-ON CONFLICT (repo_id, ref) DO UPDATE
-SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
-    halt_notified = false,
-    updated_at    = now();
-
 -- name: SetMRReworkHaltNotified :exec
 -- The HALT comment-once latch: once the per-MR cap halt has posted its explanatory
 -- comment, set halt_notified so it is never posted again for this ref. Written as an
@@ -185,6 +164,57 @@ SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source
+WHERE NOT EXISTS (
+    SELECT 1 FROM runs
+    WHERE repo_id = @repo_id::uuid
+      AND kind = 'ci_fix'
+      AND pipeline_ref = @pipeline_ref
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+)
+RETURNING *;
+
+-- name: CreateManualMRReworkRunAndAdvance :one
+-- ATOMIC on-demand (manual) mr_rework create + ledger advance (PRD #1202, review-finding
+-- hardening of !1207). Folds the run INSERT and the manual high-water advance into ONE
+-- statement so Postgres commits BOTH or NEITHER: previously StartMRReworkForRun created the
+-- run, then called AdvanceMRReworkHighWater separately and only LOGGED an advance failure —
+-- returning success with an unadvanced ledger, which let the automatic watcher re-fire on the
+-- same comments once the manual run went terminal.
+--
+-- The `runs` INSERT is the OUTER statement (RETURNING * -> the Run model) and is byte-for-byte
+-- the CreateAutoMRReworkRun body except trigger_source is hard-coded 'manual' (the only caller
+-- is the on-demand path). Keep the two INSERT bodies in sync.
+--
+-- The `led` CTE mirrors AdvanceMRReworkHighWater's ON CONFLICT body (GREATEST high_water,
+-- reset halt_notified, attempt_count NEVER named -> non-counting, PRD D1) and self-gates on
+-- the SAME cross-kind `WHERE NOT EXISTS` predicate as the run INSERT, evaluated on the same
+-- snapshot, so: branch-in-use -> both insert 0 rows (ErrBranchInUse, ledger untouched);
+-- same-MR/active-branch 23505 -> whole statement aborts, ledger rolled back
+-- (ErrActiveMRReworkExists/ErrBranchInUse); success -> run + ledger commit together. `ref` on
+-- the ledger is the pipeline_ref (the branch), exactly as the two-step path passed it.
+WITH led AS (
+    INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
+    SELECT @repo_id::uuid, @pipeline_ref, @high_water
+    WHERE NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE repo_id = @repo_id::uuid
+          AND kind = 'ci_fix'
+          AND pipeline_ref = @pipeline_ref
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+    )
+    ON CONFLICT (repo_id, ref) DO UPDATE
+    SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
+        halt_notified = false,
+        updated_at    = now()
+)
+INSERT INTO runs (
+    user_id, repo_id, kind, issue_title, issue_description,
+    pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source
+)
+SELECT
+    @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
+    @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'manual'
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid

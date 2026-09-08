@@ -329,7 +329,11 @@ type Store interface {
 	// spending an automatic cycle; UserHasAnthropicToken is the door-check that the owner
 	// can pay for the run the endpoint would mint.
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
-	AdvanceMRReworkHighWater(ctx context.Context, arg store.AdvanceMRReworkHighWaterParams) error
+	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
+	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
+	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that
+	// lets the automatic watcher re-fire on the same comments.
+	CreateManualMRReworkRunAndAdvance(ctx context.Context, arg store.CreateManualMRReworkRunAndAdvanceParams) (store.Run, error)
 	UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	// Self-improvement runs (PRD #46 Decision 10).
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
