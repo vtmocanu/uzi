@@ -114,9 +114,16 @@ rm -f "$OUT/.untracked"
   echo "clone_origin_main=$(git rev-parse origin/main 2>/dev/null)"
   echo "real_remote_main=${REALMAIN:-unknown}"
   echo "bundle_base=${BASE:-<none: full-history bundle>}"
-  echo "merge_base=$(git merge-base HEAD "${BASE:-origin/main}" 2>/dev/null)"
-  echo "--- new commits (${BASE:-origin/main}..HEAD  = what the bundle carries):"
-  git log --oneline "${BASE:-origin/main}..HEAD" 2>/dev/null
+  if [ -n "$BASE" ]; then
+    echo "merge_base=$(git merge-base HEAD "$BASE" 2>/dev/null)"
+    echo "--- new commits ($BASE..HEAD  = what the bundle carries):"
+    git log --oneline "$BASE..HEAD" 2>/dev/null
+  else
+    echo "merge_base=(none; full-history bundle)"
+    echo "--- commits (full history = what the bundle carries; count + newest 10):"
+    echo "count=$(git rev-list --count HEAD 2>/dev/null)"
+    git log --oneline -10 HEAD 2>/dev/null
+  fi
   echo "--- git status --porcelain:"
   git status --porcelain 2>/dev/null
   echo "--- git diff --stat HEAD:"
