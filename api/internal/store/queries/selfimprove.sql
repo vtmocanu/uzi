@@ -6,13 +6,18 @@
 -- self_improve kind-shape CHECK), auto_approve=true (autopilot-style: no human plan
 -- gate), kind='self_improve'.
 --
--- The plan is still emitted as a `plan` run_message and is inspectable on the feed,
--- but runs.plan_md stays NULL for every self_improve run: SetRunAwaitingApproval
--- (runtime.sql) is the ONLY writer of that column in the whole schema, and the
--- autopilot branch of the worker's gatePlan reports {status:"running"}, never
--- entering awaiting_approval. This comment used to say plan_md was "stored", which
--- would send any reader of the column to a silent no-op on exactly the mode with no
--- human in the loop (corrected 2026-07-26, PRD #121 M3).
+-- The plan is emitted as a `plan` run_message and is inspectable on the feed. For an
+-- AUTOPILOT self_improve run the approved plan is now ALSO persisted durably to
+-- runs.plan_md via SetRunAutopilotPlan (runtime.sql): the autopilot branch of the
+-- worker's gatePlan reports {status:"running"} and never enters awaiting_approval, so
+-- that self-contained `running` report is what carries and stores the plan. plan_md
+-- therefore no longer stays NULL for a self_improve run once its plan is approved
+-- (issue #1197, RC1) — a resume reads the stored plan and implements instead of
+-- re-planning. runs.plan_md has several writers (the create-time INSERT at birth for a
+-- seeded plan, SetRunAwaitingApproval at the human plan gate, and SetRunAutopilotPlan on
+-- the autopilot path), so no single query owns the column; an earlier version of this
+-- comment wrongly called SetRunAwaitingApproval the ONLY writer and claimed plan_md
+-- stayed NULL for every self_improve run (both corrected when RC1 landed).
 --
 -- Shaped like CreateCIFixRun — a dedicated insert, NOT createRun, because the normal path
 -- requires the issue to be in the poller cache and to carry a PRD link, neither of

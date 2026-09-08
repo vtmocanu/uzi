@@ -194,8 +194,8 @@ func (n *Notifier) handleLimitResume(ctx context.Context, rc store.GetSlackRunCo
 			n.logf("clear limit pause", err)
 		}
 	default:
-		// queued, claimed, limit_wait (re-park), pool_wait, paused (re-park): eligible again or
-		// re-parked, but not working — leave the marker for the eventual running (D3, PRD #1190).
+		// queued, claimed, limit_wait, pool_wait, recovery_wait, paused: eligible again or
+		// re-parked, but not working; leave the marker for the eventual running (D3).
 	}
 }
 
@@ -845,6 +845,14 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 		return "💬", "Awaiting your follow-up"
 	case "limit_wait":
 		return "⏸️", "Paused · usage limit"
+	case "recovery_wait":
+		// issue #1197: a transient-recovery park that auto-resumes on a capped backoff.
+		// Without this case the default arm below renders the raw enum `recovery_wait` on
+		// the root line of a user-facing DM (Slack has no _→space fallback, PRD #88 M3
+		// added the explicit awaiting_input/awaiting_followup cases for exactly this bug).
+		// A distinct 🔄 glyph and "Recovering" label, not limit_wait's ⏸️ pause, because
+		// this is not a usage limit.
+		return "🔄", "Recovering"
 	case "completed":
 		return "✅", "Completed"
 	case "failed":

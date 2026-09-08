@@ -44,7 +44,7 @@ INSERT INTO runs (
     -- subquery reusing @repo_id, so no new Go struct field. Same expression CreateRun uses.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'self_improve'
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before
 `
 
 type CreateSelfImproveRunParams struct {
@@ -65,13 +65,18 @@ type CreateSelfImproveRunParams struct {
 // self_improve kind-shape CHECK), auto_approve=true (autopilot-style: no human plan
 // gate), kind='self_improve'.
 //
-// The plan is still emitted as a `plan` run_message and is inspectable on the feed,
-// but runs.plan_md stays NULL for every self_improve run: SetRunAwaitingApproval
-// (runtime.sql) is the ONLY writer of that column in the whole schema, and the
-// autopilot branch of the worker's gatePlan reports {status:"running"}, never
-// entering awaiting_approval. This comment used to say plan_md was "stored", which
-// would send any reader of the column to a silent no-op on exactly the mode with no
-// human in the loop (corrected 2026-07-26, PRD #121 M3).
+// The plan is emitted as a `plan` run_message and is inspectable on the feed. For an
+// AUTOPILOT self_improve run the approved plan is now ALSO persisted durably to
+// runs.plan_md via SetRunAutopilotPlan (runtime.sql): the autopilot branch of the
+// worker's gatePlan reports {status:"running"} and never enters awaiting_approval, so
+// that self-contained `running` report is what carries and stores the plan. plan_md
+// therefore no longer stays NULL for a self_improve run once its plan is approved
+// (issue #1197, RC1) — a resume reads the stored plan and implements instead of
+// re-planning. runs.plan_md has several writers (the create-time INSERT at birth for a
+// seeded plan, SetRunAwaitingApproval at the human plan gate, and SetRunAutopilotPlan on
+// the autopilot path), so no single query owns the column; an earlier version of this
+// comment wrongly called SetRunAwaitingApproval the ONLY writer and claimed plan_md
+// stayed NULL for every self_improve run (both corrected when RC1 landed).
 //
 // Shaped like CreateCIFixRun — a dedicated insert, NOT createRun, because the normal path
 // requires the issue to be in the poller cache and to carry a PRD link, neither of
@@ -226,6 +231,8 @@ func (q *Queries) CreateSelfImproveRun(ctx context.Context, arg CreateSelfImprov
 		&i.PauseMode,
 		&i.PauseAfterCount,
 		&i.CheckpointTipAt,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
 	)
 	return i, err
 }

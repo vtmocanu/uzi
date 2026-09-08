@@ -491,6 +491,16 @@ type Store interface {
 	ReopenDispositionOnHashMismatch(ctx context.Context, arg store.ReopenDispositionOnHashMismatchParams) (int64, error)
 	UpdateDispositionLastTitle(ctx context.Context, arg store.UpdateDispositionLastTitleParams) (int64, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
+	// SetRunAutopilotPlan durably persists an AUTOPILOT run's approved plan_md on its
+	// self-contained `running` report (RC1, issue #1197). The autopilot gate never enters
+	// awaiting_approval, so SetRunAwaitingApproval — the other plan_md writer — never runs
+	// for it, and a resume would otherwise re-plan on a NULL plan_md. Guarded + idempotent:
+	// the affected-row count PROVES storage — rows>0 ⟺ @plan_md is durably stored (fresh or
+	// an identical body matched idempotently); rows==0 ⟺ refusal (terminal/parked row,
+	// human-gated auto_approve=false, seeded plan_source, a different body already stored,
+	// or not-owned) with no mutation. Runs BEFORE SetRunRunning in the running arm so a
+	// successful running ack proves the plan was stored.
+	SetRunAutopilotPlan(ctx context.Context, arg store.SetRunAutopilotPlanParams) (int64, error)
 	// ClearRunMilestonesCompleted (PRD #628 M4) is the only non-union writer of
 	// milestones_completed: it resets the column to empty on a cross-worker re-claim that
 	// reseeds from the DEFAULT branch (no committed work recovered), so pass-1's stale
@@ -527,6 +537,13 @@ type Store interface {
 	// second park.
 	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
+	// SetRunRecoveryWait parks a run in the transient-recovery hold (issue #1197);
+	// PromoteRecoveryWaitRuns is the sweeper pass that auto-promotes it once its capped
+	// backoff elapses. Like the limit-wait park its source guard is POSITIVE
+	// (status = 'running'), so a re-delivered or out-of-order report is a 0-row no-op; but
+	// it has NO per-run cap, so promotion always fires and the run recovers repeatedly.
+	SetRunRecoveryWait(ctx context.Context, arg store.SetRunRecoveryWaitParams) (int64, error)
+	PromoteRecoveryWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error)
 	// PRD #1190 M1 pause/resume. SetRunPaused parks a running run on the owner's request
 	// (positive source guard, like SetRunLimitWait); ResumePausedRun promotes it back
 	// (paused → queued) with gate-park accounting; ClearPauseRequest clears a pending
@@ -899,6 +916,15 @@ type Params struct {
 	// the two agree; the defaults live in config.go, where the envs are read.
 	RunLimitMaxWaits int
 	RunLimitMaxPark  time.Duration
+
+	// Transient-recovery park (issue #1197), mirrored from config. RunRecoveryParkBase is
+	// the FIRST recovery park's wait (the exponential backoff's base); each subsequent
+	// park doubles it, clamped at RunRecoveryMaxPark. UNLIKE the usage-limit knobs above,
+	// NEITHER can fail a run: there is no per-run park cap, so a 'recovery_wait' run always
+	// becomes promotable again after its capped backoff (until it recovers or the owner
+	// cancels). recovery_wait_count shapes the curve only. The defaults live in config.go.
+	RunRecoveryParkBase time.Duration
+	RunRecoveryMaxPark  time.Duration
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -2032,6 +2058,50 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	var settleScopeDisposition string
 	switch req.State {
 	case "running":
+		// RC1 (issue #1197): an AUTOPILOT run auto-approves its own plan and NEVER reports
+		// awaiting_approval, so its approved plan text rides THIS self-contained `running`
+		// report instead. Persist it via the guarded, idempotent SetRunAutopilotPlan whose
+		// affected-row count PROVES storage, BEFORE SetRunRunning acknowledges the report —
+		// so a successful running ack means the plan is durably stored and a resume enters
+		// implementation instead of re-planning. Present body only (req.PlanMd is *string;
+		// nil ⇒ an ordinary heartbeat, unchanged). A present-but-blank body is REJECTED (not
+		// silently dropped to "omitted"), mirroring the awaiting_input qid rejection: a
+		// running report that carries a plan_md key means the worker intends to store a plan.
+		if req.PlanMd != nil {
+			// Reuse the awaiting_approval NUL-strip conversion (stripNULParam), and
+			// separately trim to reject a blank/whitespace body.
+			planBody := stripNULParam(req.PlanMd)
+			clean, _ := stripNUL(*req.PlanMd)
+			if strings.TrimSpace(clean) == "" {
+				return store.Run{}, false, fmt.Errorf("%w: running report carries a blank plan_md", ErrInvalidState)
+			}
+			var planRows int64
+			planRows, err = s.q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
+				PlanMd:   planBody,
+				ID:       runID,
+				WorkerID: pgconv.UUID(wkr.ID),
+			})
+			if err != nil {
+				return store.Run{}, false, err
+			}
+			if planRows == 0 {
+				// A concurrent cancel/park is a state refusal, not an invalid plan.
+				// Re-read after the guarded write so the worker receives the authoritative
+				// state through the ordinary applied=false / 409 contract. The initial
+				// ownership snapshot predates the race (issue #1197, verified 2026-09-08).
+				current, readErr := s.runOwnedByWorker(ctx, runID, wkr)
+				if readErr != nil {
+					return store.Run{}, false, readErr
+				}
+				if current.Status != "claimed" && current.Status != "running" {
+					return current, false, nil
+				}
+				// While still writable, a human-gated/seeded/different-body refusal
+				// remains an invalid request. Never acknowledge the plan as stored or
+				// continue to SetRunRunning after either kind of refusal.
+				return store.Run{}, false, fmt.Errorf("%w: autopilot plan_md was not durably stored (run not in a writable autopilot-approved state)", ErrInvalidState)
+			}
+		}
 		// PRD #37: the roster and (for autopilot) the resolved selection ride the
 		// `running` report. Both are re-validated here — the worker capped them, but
 		// the API does not take a worker's word for the shape of what it persists and
@@ -2205,6 +2275,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		})
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
+	case "recovery_wait":
+		// Transient-recovery park (issue #1197): a positively-empty SDK turn survived the
+		// worker's bounded in-process retries, so the run parks on a server-owned capped
+		// backoff and the sweeper auto-promotes it. This is the reusable transient-recovery
+		// park primitive (any transient cause reports it and reuses the park->promote
+		// lifecycle); it is NOT a usage limit — see setRecoveryWait / recoverywait.go.
+		rows, err = s.setRecoveryWait(ctx, owned, wkr, req, sessionID)
 	case "paused":
 		// PRD #1190 M1: the owner-requested park. SetRunPaused has the SAME positive-source-guard
 		// ack contract as limit_wait — the worker keys off the RETURNED status being literally
@@ -3146,10 +3223,10 @@ func (s *Service) deleteCheckpointBestEffort(runID uuid.UUID, kind string, issue
 // CreateWorker issues a worker for the user and returns the plaintext join token
 // exactly once (only its hash is stored).
 // tokenLabel is the optional mint-time Anthropic token binding (PRD #104 M3):
-// empty means "no binding", i.e. the worker spends its owner's default. A label
-// that names none of the user's tokens is ErrUnknownSecretLabel — minting a worker
-// pointed at a credential that does not exist would produce a worker that only
-// fails at its first claim.
+// empty means no pinned token: creation chooses auto when the pool is non-empty,
+// otherwise default. A label that names none of the user's tokens returns
+// ErrUnknownSecretLabel: minting a worker pointed at a credential that does not
+// exist would produce a worker that only fails at its first claim.
 func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, templateDeclared, tokenLabel string) (store.Worker, string, error) {
 	secretID, err := s.resolveSecretLabel(ctx, userID, tokenLabel)
 	if err != nil {
@@ -3173,8 +3250,11 @@ func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, temp
 	// a resolved label is `pinned` regardless of the pool; its absence is `auto` when
 	// the owner has ≥1 auto_eligible anthropic_token (a non-empty auto-select pool),
 	// else `default`. So a pooled-up owner's new worker spends the pool by default
-	// instead of the owner's single default token, and it never parks a run in
-	// pool_wait because `auto` is only chosen when the pool is non-empty.
+	// instead of the owner's single default token. This choice happens at creation,
+	// not at every claim: removing the pooled tokens later leaves an auto worker in
+	// auto mode, and recoverClaimAssembly holds its run in pool_wait on errAutoPoolEmpty.
+	// Corrected 2026-09-08 against that claim-time branch; the former "never parks"
+	// comment incorrectly extended the creation-time pool check to later claims.
 	bindMode := BindModeDefault
 	switch {
 	case secretID.Valid:
@@ -3997,7 +4077,13 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	// other runs, but it is never polling this held run, so a cancel routed to a poller
 	// would sit unconsumed (worse than limit_wait — there is no promotion pass in M4).
 	// It must go server-side, so it must read as "no live poller" here too.
-	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || !run.WorkerID.Valid {
+	//
+	// Issue #1197: recovery_wait is a worker-held park of the SAME shape as limit_wait —
+	// the run keeps its worker_id for affinity and that worker keeps heartbeating for its
+	// other runs, but it is NOT polling this parked run (the worker parked it and awaits the
+	// server-owned promotion), so a cancel routed to a poller would sit unconsumed. It must
+	// go server-side too, so it reads as "no live poller" here alongside the other parks.
+	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || run.Status == "recovery_wait" || !run.WorkerID.Valid {
 		return false, nil
 	}
 	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
@@ -4043,6 +4129,11 @@ type SweepResult struct {
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
 	// busy resume it climbs one owner at a time across ticks. Normally 0.
 	PoolResumed int64
+	// RecoveryPromoted is the number of runs this pass auto-promoted from recovery_wait to
+	// queued because their recovery_retry_not_before elapsed (issue #1197). Normally 0: the
+	// partial index this reads covers only parked runs, a set that is empty on a healthy
+	// instance. Counted like LimitPromoted (len of the returned slice).
+	RecoveryPromoted int64
 }
 
 // -------------------------------------------------------------------------

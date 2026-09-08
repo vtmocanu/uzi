@@ -596,6 +596,9 @@ queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiti
                                                                                                                    → failed
    ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
    ↳ (Anthropic usage limit, opt-in) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
+   ↳ (auto lane, token pool empty) → pool_wait → queued, once a token is pooled (or resume-now)
+   ↳ (resumed turn came back empty) → recovery_wait → queued, on a capped backoff, no lifetime cap
+   ↳ (interactive task, clean signal_done) → awaiting_followup, no auto-resume — wound down by run stop or idle timeout
    ↳ (owner pause) → paused → queued, resume on demand (no limit on count) → running
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
@@ -623,8 +626,10 @@ chain in the diagram above, with no intervening `running`.
 
 - **running → limit_wait** (PRD #35, opt-in per run or per user) — a run that
   exhausts the owner's Anthropic usage limit **parks** instead of failing: the
-  worker's slot is released while its runner clone, skills plugin dir and per-run
-  SDK home stay on disk so the resume continues the same session. A sweeper
+  worker's slot is released while its skills plugin dir and per-run SDK home
+  stay on disk so a same-worker resume can continue the session. The clone is
+  normally removed and reseeded from the captured tracking/checkpoint refs
+  (verified 2026-09-08 during issue #1197 review). A sweeper
   promotes it back to `queued` once `retry_not_before` passes (server-timed and
   server-clamped, never worker-trusted: the earliest moment this user could spend
   anything across the whole credential pool), and the resume skips the plan gate
@@ -643,6 +648,41 @@ chain in the diagram above, with no intervening `running`.
   [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection property. See
   [adr/0759-protect-run-work-usage-limit-park.md](adr/0759-protect-run-work-usage-limit-park.md).
 
+- **claimed → pool_wait** (PRD #754): an `auto`-lane worker's whole opted-in
+  token pool is genuinely empty, so the run **holds** rather than reach for
+  the owner's non-pooled default: non-locking (excluded from the
+  one-non-terminal-run-per-issue index), so a held run never pins its issue.
+  It resumes on its own the moment the owner opts a token into the pool, or
+  on demand via `uzi run resume-now` / the run view's "Resume now" control.
+  See the Anthropic-credential discussion above and
+  [docs/anthropic-token.md](docs/anthropic-token.md#waiting-for-a-token).
+
+- **running → recovery_wait → queued** (issue #1197): an SDK turn
+  that comes back **positively empty** (zero reported turns, no model activity,
+  no plan, no question and no completion signal) is
+  retried a bounded number of times in-process before the worker verifies
+  the run's local restore point and parks it in `recovery_wait`. Failed capture
+  keeps the execution active and retries with its source clone/session retained;
+  a worker-owned journal prevents destructive reseeding after restart. Remote
+  publication is best-effort and provides the cross-worker restore point. A
+  sweeper promotes it back to `queued` on a **capped exponential backoff**
+  (doubling from a short base, clamped at a ceiling), like `limit_wait` but
+  with **no lifetime cap and no terminal branch**: the park always becomes
+  promotable again, so the run keeps recovering until it succeeds or the
+  owner cancels. Genuine running watchdogs still apply. It is the shared
+  transient-recovery park primitive: any
+  transient cause can report `recovery_wait` and reuse the same
+  preserve→park→promote→reclaim lifecycle, so issue #1088's provider-error
+  classifier can adopt it without a competing mechanism. See
+  [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md)
+  and [docs/run-recovery-wait.md](docs/run-recovery-wait.md).
+
+- **running ⇄ awaiting_followup** (PRD #517, `uzi handoff --interactive`) — a
+  clean `signal_done` on an interactive task parks the run awaiting the
+  user's next `uzi run follow-up` instead of finalizing, and **does not
+  auto-resume on its own**: it is wound down explicitly with `uzi run stop`,
+  or by its worker-side idle timeout. See
+  [docs/handoff.md](docs/handoff.md#interactive-mode).
 - **running → paused** ([PRD #1190](prds/1190-run-pause-resume.md)) — the
   owner-requested twin of `limit_wait`: `pause` (default: after the milestone
   or turn in flight; `--now`: drop it) is a **flag** on the still-running run,

@@ -293,13 +293,13 @@ uzi version
   from the wrong key is indistinguishable from a message with no content; read
   `payload`.**
 
-  **The twelve `status` values, and what `--follow` actually waits for.** A run's
-  `status` (on `run get` and `run list`) is one of exactly twelve values:
+  **The thirteen `status` values, and what `--follow` actually waits for.** A run's
+  `status` (on `run get` and `run list`) is one of exactly thirteen values:
   `queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
-  `awaiting_followup`, `limit_wait`, `pool_wait`, `completed`, `failed`, `cancelled`,
-  `paused`. Only
+  `awaiting_followup`, `limit_wait`, `pool_wait`, `recovery_wait`, `paused`,
+  `completed`, `failed`, `cancelled`. Only
   `completed`, `failed` and `cancelled` are **terminal**, and `uzi run logs --follow` returns ONLY on
-  those three. The six non-terminal parks/holds it will **not** stop at are
+  those three. The seven non-terminal parks/holds it will **not** stop at are
   `awaiting_approval` (the plan gate), `awaiting_input` (a clarifying
   question, answered with `run answer`), `awaiting_followup` (an interactive
   task — `uzi handoff --interactive` — parked after a clean `signal_done`,
@@ -308,8 +308,9 @@ uzi version
   `limit_wait` (parked while an Anthropic usage limit resets; the sweep
   promotes it back to `queued` once past its `retry_not_before`),
   `pool_wait` (an `auto` run held because its token pool is empty — add a token
-  to the pool and it resumes), and `paused` (an owner-requested hold — `uzi
-  run pause` — resumed on demand from the run page or `uzi run resume <id>`;
+  to the pool and it resumes), `recovery_wait` (parked after an empty model turn;
+  the sweep retries it on a capped backoff), and `paused` (an owner-requested hold, `uzi
+  run pause`, resumed on demand from the run page or `uzi run resume <id>`;
   it does not auto-resume). So to
   wait for a plan gate or a clarification park, use **`uzi run wait <id>`** (see
   below) — relying on `--follow` there blocks until the run truly finishes, which
@@ -317,7 +318,7 @@ uzi version
   the server is newer than this binary — upgrade rather than trusting the value
   to mean "active". The live `/api/ws` stream and `uzi tui` go further and
   rewrite an unrecognised status to `unknown`, but plain `run get`/`run list
-  --json` pass it through verbatim, so this twelve-value list is what you branch
+  --json` pass it through verbatim, so this thirteen-value list is what you branch
   on.)
 
   **Paging is internal and transparent; treat it as all-or-nothing.** A large
@@ -338,9 +339,10 @@ uzi version
   `awaiting_input` (a clarification park), `awaiting_followup` (an interactive
   task parked awaiting your next follow-up — it does not auto-resume, so a
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
-  waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait` (the
-  latter two resume on their own) and `paused` (resumed on demand with `uzi
-  run resume`). So a bare
+  waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
+  `recovery_wait`/`paused`: limit and recovery waits retry on a timer, pool waits
+  need an available pooled token, and owner pauses need `uzi run resume`.
+  So a bare
   `uzi run wait <id>` is "wait for the plan gate, a clarification, an
   interactive park, OR the end". It **exits 0** the
   moment a target state is reached (including if the run is already in one),
@@ -350,7 +352,7 @@ uzi version
   gives **exit 7** if it elapses first (there is no default timeout — a healthy
   gated run stops at its gate, so a bare wait cannot hang). A single transient
   `6` (server blip) is ridden out, not fatal. `--until <a,b>` overrides the stop
-  set (validated against the twelve statuses).
+  set (validated against the thirteen statuses).
 
   **Narrow the wait after you approve.** A run lingers at `awaiting_approval` for
   a beat after a successful `run approve` (the async flip to `running`), so the

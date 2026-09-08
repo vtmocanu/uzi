@@ -28,6 +28,13 @@ export type RunState =
    *  the follow-up through the normal poll/consume path before it reports running. */
   | "awaiting_followup"
   | "limit_wait"
+  /** issue #1197 (D-RC2c): a non-terminal, resumable park entered when a POSITIVELY-empty
+   *  SDK turn (0 turns, no model activity) persists after bounded in-process retries. The
+   *  server stamps a promotable, capped-backoff retry_not_before; the run auto-promotes
+   *  until it recovers or the owner cancels. The worker reports it ONLY after it has
+   *  captured AND positively verified the local restore point (handleRecoveryExhausted),
+   *  so a reseed can never wipe the un-verified work. No checkpoint/session is deleted. */
+  | "recovery_wait"
   /** PRD #1190 M2: the owner-requested park. The worker REPORTS `paused` after it has
    *  published a checkpoint to origin (Decision 8); the server's SetRunPaused keys off the
    *  RETURNED status being literally "paused" (the same ack contract as limit_wait). A
@@ -56,9 +63,11 @@ export type RunState =
 //
 // WHERE THE DISTINCTION IS ACTUALLY ENFORCED — corrected, because the first version
 // of this note named three places and two of them do not enforce terminality at all:
-// the `RunState` union above is the reportable DOMAIN (all five statuses a worker may
+// the `RunState` union above is the reportable DOMAIN (every status a worker may
 // send, terminal or not), and the server's status CHECK is likewise a domain
-// constraint over all eight. Neither says anything about which are terminal.
+// constraint over every run status. Neither says anything about which are terminal.
+// (Counts are deliberately not quoted here — the union and the server CHECK both grow
+// as parks are added, e.g. recovery_wait in issue #1197, and a hardcoded tally rots.)
 //
 // The one that matters, and that the first version omitted, is
 // **`TERMINAL_RUN_STATUSES` in `home-reclaim.ts`** — same package, the only live
@@ -1504,7 +1513,8 @@ export type PublishResult =
 
 export interface StateRequest {
   status: RunState;
-  /** awaiting_approval carries the captured plan. */
+  /** awaiting_approval carries the captured plan; an autopilot `running` report also
+   *  carries it, persisted durably via SetRunAutopilotPlan (RC1 #1197). */
   plan_md?: string;
   /** awaiting_input carries the identity of the question being asked (PRD #88).
    *  REQUIRED on that transition — the api rejects the report without it, because a

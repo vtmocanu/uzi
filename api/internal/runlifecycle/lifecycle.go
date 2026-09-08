@@ -202,13 +202,19 @@ func reconcilerDecision(status string, origin pgtype.Text) decision {
 	// default arm would trip the give-up warn on every hold. It is In Progress (a held
 	// run is still working), and Notify's partial map is deliberately NOT extended: a
 	// hold moves no card, so there is nothing to notify about.
+	// recovery_wait (issue #1197) is the transient-recovery park and belongs here for the
+	// very same reasons as limit_wait/pool_wait: a recovery-parked run keeps its issue and
+	// worker affinity, auto-resumes on the server-owned capped backoff, and routinely
+	// outlasts 30 minutes — so leaving it in the default arm would trip the give-up warn on
+	// every park. It is In Progress (a recovering run is still working), and Notify's partial
+	// map is deliberately NOT extended: a park moves no card, so there is nothing to notify.
 	//
 	// paused (PRD #1190) is the owner-requested park and belongs here for the same reasons:
 	// a paused run keeps its issue, session and worker affinity, resumes on demand, and
 	// routinely outlasts 30 minutes by design — so the default arm would trip the give-up
 	// warn as the normal case. It is In Progress (a paused run is still an active piece of
 	// work), and Notify's partial map is deliberately NOT extended: a pause moves no card.
-	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "paused":
+	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "paused", "recovery_wait":
 		return decision{act: true, target: board.ColumnInProgress}
 	case "completed":
 		return decision{act: true, target: board.ColumnHumanReview}

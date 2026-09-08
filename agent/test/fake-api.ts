@@ -51,6 +51,22 @@ export class FakeApi {
     { status: number; body: string }
   >();
   private readonly refuseAllStates = new Set<string>();
+  // m2 (#1197): fail the FIRST /state report for a run that matches a predicate,
+  // leaving every other report handled normally — so a test can knock out ONE
+  // specific report (e.g. the autopilot running report carrying plan_md,
+  // which persists plan_md via SetRunAutopilotPlan) without also 409ing the ordinary
+  // heartbeats the way refuseAllStates does (which would stop the run reaching the
+  // gate). Fires once (`fired`), so a retried transient status falls through to the
+  // normal handler on the next attempt.
+  private readonly stateFailWhen = new Map<
+    string,
+    {
+      matchesState: (body: StateRequest) => boolean;
+      httpStatus: number;
+      runStatus?: string;
+      fired: boolean;
+    }
+  >();
   // issue #559 M3: the read-only ownership probe (GET /runs/{id}/ownership). A run
   // with no override answers 200 {status:"running"} — the "still ours, keep going"
   // default the skip path proceeds on. An override expresses a terminal status, a
@@ -173,6 +189,28 @@ export class FakeApi {
    *  precisely the case PRD #35's park has to survive. */
   refuseStateWith409(runId: string): void {
     this.refuseAllStates.add(runId);
+  }
+
+  /**
+   * m2 (#1197): make the FIRST /state report for `runId` whose body matches `match`
+   * fail, then handle every subsequent report normally. Targets ONE specific report
+   * (unlike refuseStateWith409, which refuses every report). Two shapes:
+   *  - a 409 (the default) carrying `{ run: { status: runStatus } }` models the run
+   *    moving on concurrently — the client reads it as `{ applied: false, status }`.
+   *  - any other 4xx (e.g. 400) models a transport/refusal the client throws on
+   *    (isTransient/isAlreadyTerminal both false → RequestError propagates).
+   */
+  failStateWhen(
+    runId: string,
+    matchesState: (body: StateRequest) => boolean,
+    opts: { httpStatus?: number; runStatus?: string } = {},
+  ): void {
+    this.stateFailWhen.set(runId, {
+      matchesState,
+      httpStatus: opts.httpStatus ?? 409,
+      runStatus: opts.runStatus,
+      fired: false,
+    });
   }
 
   setInputs(runId: string, inputs: UserInput[]): void {
@@ -388,6 +426,22 @@ export class FakeApi {
         error: "run already terminal",
         run: { id: runId, status: "cancelled" },
       });
+    }
+    // m2 (#1197): a per-run predicate can knock out ONE matching report (see
+    // failStateWhen). Checked BEFORE recording, so a refused report is not applied —
+    // matching the real server, which does not persist a report it declines.
+    const when = this.stateFailWhen.get(runId);
+    // This is a typed test predicate, not String.match or a dynamic regex.
+    // Name verified against CodeQL js/regex-injection's false match, 2026-09-08.
+    if (when && !when.fired && when.matchesState(body)) {
+      when.fired = true;
+      if (when.httpStatus === 409) {
+        return send(res, 409, {
+          error: "run already moved on",
+          run: { id: runId, status: when.runStatus ?? "cancelled" },
+        });
+      }
+      return send(res, when.httpStatus, { error: "injected state failure" });
     }
     const terminal = body.status === "completed" || body.status === "failed";
     // Both answers carry `{"run": {...}}` because BOTH real handlers do

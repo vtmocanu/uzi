@@ -38,7 +38,8 @@ function parseTs(iso: string | null | undefined): number | null {
  *     awaiting_input /
  *     awaiting_followup /
  *     limit_wait /
- *     pool_wait            → `waiting <elapsed>` since updated_at (time parked in that state)
+ *     pool_wait /
+ *     recovery_wait        → `waiting <elapsed>` since updated_at (time parked in that state)
  *   - paused               → `paused <elapsed>`  since updated_at (PRD #1190, its own verb)
  *   - completed / failed /
  *     cancelled (terminal) → `ran <elapsed>`, the STATIC span finished_at − started_at, i.e.
@@ -68,6 +69,11 @@ export function runDurationLabel(run: RunDurationInput, nowMs: number): string {
     // waiting elapsed since it entered the state (updated_at), NOT a countdown —
     // there is no reset window to count down to.
     case "pool_wait":
+    // Issue #1197: a transient-recovery park. Same waiting-elapsed treatment as the
+    // sibling parks — since updated_at, never a countdown (the capped backoff instant
+    // carries no DTO field). Without this arm a recovery_wait run would fall to the
+    // default "" and show no duration token at all.
+    case "recovery_wait":
       return liveToken("waiting", run.updated_at, nowMs);
     // PRD #1190: a run its owner paused. Its OWN verb — `paused <elapsed>` since it
     // entered the state (updated_at) — deliberately NOT the parks' "waiting": a pause is

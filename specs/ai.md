@@ -24135,6 +24135,19 @@ Serves the human bullet "Judge and Findings share one triage row and one vocabul
 - **Judge page chrome.** Exactly one status line: the bridge line when its gates hold, else "Showing N groups". Plus an inline `LabelFilter` chip row, a select-all header, and `openOfRunsLabel` ("N open of M runs") on the group row.
 - **SCOPE, this is Child A only.** The Findings-page parity is DEFERRED to Child B (PRD M3/M4/M5) and gets its own specs/ai.md section then: counted tabs reusing `TriageDTO`, per-coordinate evidence + the runs it was seen in, per-bucket counts, the finding issue-close to Done sync backed by a new `done` status, the All-tab reversal of PRD #333, and bulk dismiss + undo. None of that is implemented here, so do not read it as done.
 
+## 629. Issue #1197: durable autopilot plans and empty-turn recovery
+
+Verified and integrated with the owner-pause status on 2026-09-08.
+
+- An autopilot approval writes its plan through an owned, source-status-guarded, agent-provenance-guarded query. An identical retry is idempotent; a different, blank, protected or stale body is refused. The worker implements only after the durable write is acknowledged.
+- Positively empty SDK turns require all five conditions: zero reported turns, no model/tool activity, no plan, no question and no completion signal. They retry with bounded backoff while retaining the observed session identity. Missing metrics are not empty-turn evidence; genuine cancellation and watchdog outcomes retain precedence. (Predicate clarified against `isPositivelyEmpty`, 2026-09-08.)
+- Exhausted empty-turn retries use non-terminal `recovery_wait`, with server-owned capped exponential backoff and automatic promotion. Recovery attempts have no terminal lifetime cap and do not pretend to be usage limits.
+- A promotable recovery park requires a verified restore point. Capture failure must preserve the source clone and session rather than deleting the only work copy; recovery retention does not suppress secret eviction or poller cleanup.
+- Stale running and approval reports cannot unpark `recovery_wait`. Both `paused` and `recovery_wait` remain in the thirteen-value status domain; involuntary recovery leaves a pending owner-pause request intact.
+- This is the shared recovery primitive for #1088's future provider-error classification. User docs, CLI/stream vocabulary and the embedded docs mirror describe the same behavior.
+
+Cross-refs: `adr/1197-transient-recovery-park.md`; `docs/run-recovery-wait.md`; migrations `00206_run_recovery_wait.sql`, `00207_validate_run_recovery_wait.sql` and `00208_index_run_recovery_wait.sql`.
+
 ## 630. PRD #1202 — On-demand MR rework past the automatic cap, with optional guidance
 
 Serves human Feature #1202 (an owner can start one MR rework cycle on demand, with optional guidance, past the automatic cap; on-demand cycles never count against it) [user, #1202]. Adds the manual sibling PRD #700 explicitly deferred (§580's Decision-13 non-scope, "no manual rework now button/CLI verb"), the way ci-autofix's manual **Fix CI** button is the escape hatch for that loop's cap. Three surfaces on one endpoint: `POST /api/runs/{id}/rework`, a run-page **Rework now** control, and `uzi run rework <run-id> [-m|--message]`. Terse contract here; PRD #1202's Decision Log (D1-D13) is the richer rationale.

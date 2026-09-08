@@ -1049,6 +1049,13 @@ func TestRunAgeCell(t *testing.T) {
 			want: "20m",
 		},
 		{
+			// recovery_wait (issue #1197) is a park like limit_wait/pool_wait — it anchors
+			// on UpdatedAt and renders a waiting duration, NOT "-".
+			name: "recovery_wait off UpdatedAt",
+			r:    apitypes.RunDTO{Status: statusRecoveryWait, UpdatedAt: now.Add(-15 * time.Minute)},
+			want: "15m",
+		},
+		{
 			// Terminal is a static span FinishedAt−StartedAt, so a now far from either end
 			// does not change it: this run ran for 2h whenever it is listed.
 			name: "completed is a static ran-span",
@@ -1287,6 +1294,15 @@ func TestSteerStateOnAParkedRun(t *testing.T) {
 	// were ever added to it.
 	if strings.Contains(steerState(kindFollowUp, nil, nil, statusLimitWait), "run finished") {
 		t.Error(`steerState(unconsumed, limit_wait) claims the run finished — a parked run resumes and its queue drains, so the follow-up has NOT been dropped`)
+	}
+
+	// recovery_wait (issue #1197) is the sibling transient-recovery park: the queue state
+	// is likewise UNCHANGED, and the suffix names the recovery reason (not a usage limit).
+	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait); !strings.HasPrefix(got, "queued") || !strings.Contains(got, "recovering") {
+		t.Errorf("steerState(unconsumed, recovery_wait) = %q, want a queued row naming the transient-recovery park", got)
+	}
+	if got := steerState(kindFollowUp, &consumed, nil, statusRecoveryWait); !strings.HasPrefix(got, "delivered") || !strings.Contains(got, "recovering") {
+		t.Errorf("steerState(consumed, recovery_wait) = %q, want a delivered row naming the transient-recovery park", got)
 	}
 
 	// Every other status is untouched.

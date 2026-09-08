@@ -407,6 +407,12 @@ export const RUN_STATUS_TONES: Record<
    *  reset countdown. The label overrides to "waiting for pool" below so the pill
    *  does not print the bare enum "pool wait". */
   pool_wait: { tone: "warning" },
+  /** Issue #1197: a transient-recovery park. Warn-toned like the other self-resuming
+   *  holds (limit_wait / pool_wait), and deliberately NOT pulsing — a parked run does
+   *  no work while it backs off to retry. No RUN_STATUS_LABELS override below: "recovery
+   *  wait" de-underscores fine, so the default label already matches runBadge's word
+   *  (the ui.test.tsx label-agreement loop over this map asserts the two surfaces agree). */
+  recovery_wait: { tone: "warning" },
   /** PRD #1190: a run its OWNER paused. `info` tone (D11), deliberately DISTINCT from
    *  the warning-toned involuntary holds (limit_wait / pool_wait / awaiting_*): those
    *  are something to notice, a pause is something the owner did. NOT pulsing — a paused
