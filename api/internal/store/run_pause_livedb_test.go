@@ -371,4 +371,109 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 			t.Fatal("promotion must leave the pending-pause columns intact so the ACK re-arms")
 		}
 	})
+
+	// --- every terminal transition clears a pending pause ---------------------
+	// PRD #1190 M1 root-cause fix: a run can carry a pending pause only while running,
+	// and when it then reaches a terminal status the three pause columns MUST be cleared.
+	// Otherwise a completed/failed/cancelled run keeps its stale pause_requested_at set,
+	// and the CLI/TUI PAUSE_REQUESTED surface plus the web pending chip render a stale
+	// "pause requested" on a dead run. Each case arms a pending pause on a running run,
+	// asserts it is SET first (so the clear assertion is non-vacuous), fires ONE terminal
+	// transition, then asserts the run is terminal AND the three columns are all NULL.
+	t.Run("every terminal transition clears a pending pause", func(t *testing.T) {
+		// armedRunning inserts a running issue run under this worker carrying a pending
+		// milestone pause (after-count 2), and asserts the columns actually landed SET —
+		// the control half that keeps the post-transition clear assertion honest.
+		armedRunning := func(t *testing.T, requeueCount int32, startedOld bool) uuid.UUID {
+			t.Helper()
+			id := insertRun(t, "running", "issue", false, true, startedOld, requeueCount, "milestone", 2)
+			if at, mode, after := pauseCols(t, id); !at.Valid || mode.String != "milestone" || after.Int32 != 2 {
+				t.Fatalf("precondition: pending pause not armed (at.Valid=%v mode=%q after=%d)", at.Valid, mode.String, after.Int32)
+			}
+			return id
+		}
+		assertCleared := func(t *testing.T, id uuid.UUID, wantStatus string) {
+			t.Helper()
+			if got := status(t, id); got != wantStatus {
+				t.Fatalf("status = %q, want %q", got, wantStatus)
+			}
+			if at, mode, after := pauseCols(t, id); at.Valid || mode.Valid || after.Valid {
+				t.Fatalf("terminal transition must clear the pending-pause columns (at.Valid=%v mode.Valid=%v after.Valid=%v)", at.Valid, mode.Valid, after.Valid)
+			}
+		}
+
+		t.Run("SetRunCompleted", func(t *testing.T) {
+			id := armedRunning(t, 0, false)
+			if rows, err := q.SetRunCompleted(ctx, store.SetRunCompletedParams{ID: id, WorkerID: workerID, Branch: pgconvText("b")}); err != nil || rows != 1 {
+				t.Fatalf("SetRunCompleted = (%d,%v), want (1,nil)", rows, err)
+			}
+			assertCleared(t, id, "completed")
+		})
+		t.Run("SetRunFailed", func(t *testing.T) {
+			id := armedRunning(t, 0, false)
+			if rows, err := q.SetRunFailed(ctx, store.SetRunFailedParams{ID: id, WorkerID: workerID, FailureReason: pgconvText("boom"), FailOrigin: pgconvText("agent_failure")}); err != nil || rows != 1 {
+				t.Fatalf("SetRunFailed = (%d,%v), want (1,nil)", rows, err)
+			}
+			assertCleared(t, id, "failed")
+		})
+		t.Run("MarkRunFailedByID", func(t *testing.T) {
+			id := armedRunning(t, 0, false)
+			if rows, err := q.MarkRunFailedByID(ctx, store.MarkRunFailedByIDParams{ID: id, FailureReason: pgconvText("no secrets"), FailOrigin: pgconvText("credential_unavailable")}); err != nil || rows != 1 {
+				t.Fatalf("MarkRunFailedByID = (%d,%v), want (1,nil)", rows, err)
+			}
+			assertCleared(t, id, "failed")
+		})
+		t.Run("CancelRunServerSide", func(t *testing.T) {
+			id := armedRunning(t, 0, false)
+			if rows, err := q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{ID: id, UserID: userID, StopReason: pgconvText("operator")}); err != nil || rows != 1 {
+				t.Fatalf("CancelRunServerSide = (%d,%v), want (1,nil)", rows, err)
+			}
+			assertCleared(t, id, "cancelled")
+		})
+		t.Run("CancelRunByWorker", func(t *testing.T) {
+			id := armedRunning(t, 0, false)
+			if rows, err := q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: id, WorkerID: workerID}); err != nil || rows != 1 {
+				t.Fatalf("CancelRunByWorker = (%d,%v), want (1,nil)", rows, err)
+			}
+			assertCleared(t, id, "cancelled")
+		})
+		t.Run("FailRunAutoStop", func(t *testing.T) {
+			id := armedRunning(t, 0, false)
+			if rows, err := q.FailRunAutoStop(ctx, store.FailRunAutoStopParams{ID: id, FailureReason: pgconvText("auto")}); err != nil || rows != 1 {
+				t.Fatalf("FailRunAutoStop = (%d,%v), want (1,nil)", rows, err)
+			}
+			assertCleared(t, id, "failed")
+		})
+		t.Run("RejectRunServerSide", func(t *testing.T) {
+			id := armedRunning(t, 0, false)
+			if rows, err := q.RejectRunServerSide(ctx, store.RejectRunServerSideParams{ID: id, UserID: userID, FailureReason: pgconvText("rejected")}); err != nil || rows != 1 {
+				t.Fatalf("RejectRunServerSide = (%d,%v), want (1,nil)", rows, err)
+			}
+			assertCleared(t, id, "failed")
+		})
+		t.Run("SweepRunningTimeout", func(t *testing.T) {
+			id := armedRunning(t, 0, true /*startedOld*/)
+			if _, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
+				FailureReason: pgconvText("timeout"), Now: pgtype.Timestamptz{Time: nowUTC(), Valid: true}, GlobalTimeoutSeconds: 1}); err != nil {
+				t.Fatalf("SweepRunningTimeout: %v", err)
+			}
+			assertCleared(t, id, "failed")
+		})
+		t.Run("FailRunsOfStaleWorkersOverCap", func(t *testing.T) {
+			id := armedRunning(t, 9 /*over cap*/, false)
+			if _, err := q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
+				FailureReason: pgconvText("worker lost"), MaxRequeues: 5, Cutoff: pgtype.Timestamptz{Time: nowUTC(), Valid: true}}); err != nil {
+				t.Fatalf("FailRunsOfStaleWorkersOverCap: %v", err)
+			}
+			assertCleared(t, id, "failed")
+		})
+		t.Run("FailWorkerRunsOverCap", func(t *testing.T) {
+			id := armedRunning(t, 9 /*over cap*/, false)
+			if _, err := q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
+				FailureReason: pgconvText("orphaned"), WorkerID: workerID, MaxRequeues: 5}); err != nil {
+				t.Fatalf("FailWorkerRunsOverCap: %v", err)
+			}
+			assertCleared(t, id, "failed")
+		})
+	})
 }
