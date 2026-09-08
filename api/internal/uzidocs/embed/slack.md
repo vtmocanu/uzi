@@ -136,7 +136,7 @@ with the bot, so the sender is already `uzi`. Glyph legend:
 | ❌ Failed | 🚫 Cancelled | 🔀 View MR/PR |
 | 🧩 N/M milestones | 🔗 Open in uzi | 💬 Chat |
 | 🔎 Judge review (verdict ✅ ideal/ok · ⚠️ issues) | 🔧 Self-improvement | 📝 Issue proposal |
-| 💤 Stalled | 🔁 Looping | 🐢 Slow |
+| 💤 Stalled | 🔁 Looping | ⏰ Near timeout |
 | ⏳ Waiting for a worker | ⏸️ Awaiting approval | 🔒 Vault locked |
 
 - **Plan gate**: the `awaiting_approval` DM carries **Approve** /
@@ -241,14 +241,14 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   cycle-started / cycle-skipped messages above, so you don't get noise like
   "judge run completed" for a run you never see on the board.
 - **Run health nudges**: if a run you own gets flagged (stalled, looping,
-  slow, waiting for a worker, or stuck too long awaiting approval — see
-  [Run health](./run-health.md)), the root DM's `context` block picks up a
-  `⚠️ <flag>` element (the status label itself doesn't change), and you get
+  near timeout, waiting for a worker, or stuck too long awaiting approval —
+  see [Run health](./run-health.md)), the root DM's `context` block picks up
+  a `⚠️ <flag>` element (the status label itself doesn't change), and you get
   one threaded nudge — leading with a per-state glyph (💤 stalled, 🔁 looping,
-  🐢 slow, ⏳ waiting for a worker, ⏸️ awaiting approval) — at most once per
-  cooldown window (30 minutes by default, admin-tunable) even if the run
-  flaps between flags in that time. An approval-idle nudge threads under the
-  existing plan-gate message, right next to its action buttons.
+  ⏰ near timeout, ⏳ waiting for a worker, ⏸️ awaiting approval) — at most
+  once per cooldown window (30 minutes by default, admin-tunable) even if the
+  run flaps between flags in that time. An approval-idle nudge threads under
+  the existing plan-gate message, right next to its action buttons.
   When the run recovers, the `⚠️ <flag>` context element drops off on its own
   and nudging stops — no action needed.
 - **Vault-locked nudge**: if your vault is locked (e.g. after a deploy

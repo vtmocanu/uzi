@@ -49,5 +49,5 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusConflict, "run is not waiting for a pooled token")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout)})
 }

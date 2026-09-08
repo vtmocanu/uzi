@@ -404,6 +404,7 @@ Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/done/47-loop-hang-detectio
     is that there is now a NEW watchdog, and it kills. Recorded here rather than rewritten,
     because a requirement that changed is not the same artifact as one that was wrong.
     [AI-proposed; NEEDS USER RATIFICATION]
+- The "slow" health flag is a near-timeout warning at a share of the run's wall-clock budget, not a bare timer. [user, #1170]
 
 ## Feature #49 — Worker resource stats (live per-worker CPU/memory)
 

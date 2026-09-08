@@ -65,12 +65,13 @@ func TestHealthNudgeHeadStalledLeadsWithTheSleepGlyph(t *testing.T) {
 	}
 }
 
-// TestHealthNudgeHeadSlowLeadsWithTheTurtleGlyph pins the PRD #268 M3 glyph swap
-// (⚠️→🐢) on the slow "taking longer than usual" head.
-func TestHealthNudgeHeadSlowLeadsWithTheTurtleGlyph(t *testing.T) {
-	const want = "🐢 This run is taking longer than usual."
+// TestHealthNudgeHeadNearTimeoutLeadsWithTheClockGlyph pins the PRD #1170 rewording of
+// the `slow` head: the enum value survives (D1) but the wall-clock "taking longer than
+// usual" wording becomes the ⏰ near-timeout sentence that names the actual consequence.
+func TestHealthNudgeHeadNearTimeoutLeadsWithTheClockGlyph(t *testing.T) {
+	const want = "⏰ This run is close to its timeout and will be stopped when it reaches it."
 	if got := healthNudgeHead(healthSlow, ""); got != want {
-		t.Fatalf("slow nudge head = %q, want %q — the M3 🐢 swap must hold and the sentence stay as written", got, want)
+		t.Fatalf("near-timeout nudge head = %q, want %q — the PRD #1170 ⏰ reword must hold and the sentence stay as written", got, want)
 	}
 }
 

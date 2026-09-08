@@ -66,9 +66,11 @@ const (
 	// compiled-in default; no seeded row (an absent row synthesizes to the default).
 	KeyEphemeralWorkersEnabled = "ephemeral_workers_enabled"
 	// Run-health detector keys (PRD #47). health_enabled is a bool ("true"/"false");
-	// the rest are integer seconds validated as {0} ∪ [60, 86400] — 0 disables that
-	// one signal, and the upper bound stops a fat-fingered value silently disabling
-	// it. No new env vars: these are runtime-tunable from the Admin Settings page.
+	// the seconds thresholds are integer seconds validated as {0} ∪ [60, 86400] — 0
+	// disables that one signal, and the upper bound stops a fat-fingered value silently
+	// disabling it. health_near_timeout_pct (PRD #1170) is the exception: a percentage
+	// of the run's wall-clock budget, {0} ∪ [50, 99], validated separately. No new env
+	// vars: these are runtime-tunable from the Admin Settings page.
 	KeyHealthEnabled = "health_enabled"
 	// Capability-aware scheduling kill-switch (PRD #84 Decision 13). A bool
 	// ("true"/"false"), default TRUE. It gates ONLY #84's added behavior — the
@@ -79,9 +81,13 @@ const (
 	// `NOT capability_aware OR (required ⊆ caps)`, so "off" neutralizes only the added
 	// subset clause. OFF is an explicit, documented degraded mode (best-effort claiming;
 	// a docker-needing run may be claimed by a non-docker worker and fail mid-run).
-	KeyCapabilityAwareScheduling  = "capability_aware_scheduling"
-	KeyHealthStallSeconds         = "health_stall_seconds"
-	KeyHealthSlowSeconds          = "health_slow_seconds"
+	KeyCapabilityAwareScheduling = "capability_aware_scheduling"
+	KeyHealthStallSeconds        = "health_stall_seconds"
+	// KeyHealthNearTimeoutPct (PRD #1170) replaces the retired seconds-based health-slow
+	// setting. A percentage of the run's effective wall-clock budget (0 = disabled, else [50, 99])
+	// at which a running run is flagged near timeout — validated by validateHealthPercent,
+	// NOT validateHealthSeconds.
+	KeyHealthNearTimeoutPct       = "health_near_timeout_pct"
 	KeyHealthQueuedSeconds        = "health_queued_seconds"
 	KeyHealthApprovalSeconds      = "health_approval_seconds"
 	KeyHealthNudgeCooldownSeconds = "health_nudge_cooldown_seconds"
@@ -285,7 +291,7 @@ const (
 	// hatch if inference false-positives start blocking runs.
 	DefaultCapabilityAwareScheduling  = "true"
 	DefaultHealthStallSeconds         = "300"  // 5m of silence (no tool in flight)
-	DefaultHealthSlowSeconds          = "2700" // 45m wall clock, clamped < RUN_TIMEOUT at read time
+	DefaultHealthNearTimeoutPct       = "85"   // PRD #1170: flag at 85% of the run's wall-clock budget
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
 	DefaultHealthApprovalSeconds      = "3600" // 1h idle awaiting approval
 	DefaultHealthNudgeCooldownSeconds = "1800" // 30m between Slack nudges per run
@@ -399,7 +405,7 @@ var Defaults = map[string]string{
 	// settings page on every instance and no migration seeds it.
 	KeyCapabilityAwareScheduling:  DefaultCapabilityAwareScheduling,
 	KeyHealthStallSeconds:         DefaultHealthStallSeconds,
-	KeyHealthSlowSeconds:          DefaultHealthSlowSeconds,
+	KeyHealthNearTimeoutPct:       DefaultHealthNearTimeoutPct,
 	KeyHealthQueuedSeconds:        DefaultHealthQueuedSeconds,
 	KeyHealthApprovalSeconds:      DefaultHealthApprovalSeconds,
 	KeyHealthNudgeCooldownSeconds: DefaultHealthNudgeCooldownSeconds,

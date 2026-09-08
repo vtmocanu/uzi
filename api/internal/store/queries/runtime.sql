@@ -2939,9 +2939,12 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip WHERE id = @id;
 -- broadcast) when nothing changed, and health_since so it can PRESERVE the original
 -- flag time when only the reason changes within the same enum (a queued run whose
 -- reason flips no-worker → waiting must not reset the UI's "stuck for Xm").
--- PRD #122 M2 (Decision 5b): budget_wall_seconds rides this read so the running-run
--- "slow" clamp uses the run's EFFECTIVE timeout, not the global one — a scaled run must
--- not render slow for its whole extended life. NULL for a run on the global default.
+-- PRD #1170: budget_wall_seconds, budget_paused_seconds and interactive ride this read
+-- so the running-run near-timeout arm mirrors SweepRunningTimeout's exact clock — active
+-- running time is wall clock since started_at MINUS budget_paused_seconds, measured against
+-- the run's EFFECTIVE timeout (budget_wall_seconds when frozen, else the global RUN_TIMEOUT).
+-- budget_wall_seconds is NULL for a run on the global default. interactive lets the arm skip
+-- interactive runs, which SweepRunningTimeout never times out.
 -- PRD #84 M3: repo_id, kind and required_capabilities ride this read so the queued
 -- arm can surface a capability-specific "no eligible worker" reason (required caps not
 -- a subset of any online worker's effective caps). kind was previously only a WHERE
@@ -2950,7 +2953,7 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip WHERE id = @id;
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
-       budget_wall_seconds,
+       budget_wall_seconds, budget_paused_seconds, interactive,
        repo_id, kind, required_capabilities
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')

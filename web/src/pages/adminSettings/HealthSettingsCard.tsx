@@ -9,20 +9,31 @@ import {
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 
-const HEALTH_FIELDS: { key: keyof AppSettings; label: string; hint?: string }[] = [
+// Each health field carries its OWN validator (PRD #1170): the four thresholds are in
+// seconds (validateHealthSeconds), while health_near_timeout_pct is a percent of the
+// run's wall-clock budget (validateHealthPercent) — the field types diverged when the
+// wall-clock "slow" timer became a budget-relative "near timeout" flag.
+const HEALTH_FIELDS: {
+  key: keyof AppSettings;
+  label: string;
+  hint?: string;
+  validate: (value: string) => string | null;
+}[] = [
   {
     key: "health_stall_seconds",
     label: "Stalled after (seconds of silence)",
     hint: "No new activity while no tool call is in flight.",
+    validate: validateHealthSeconds,
   },
   {
-    key: "health_slow_seconds",
-    label: "Slow after (seconds running)",
-    hint: "Wall clock since the run started; clamped below RUN_TIMEOUT.",
+    key: "health_near_timeout_pct",
+    label: "Near timeout at (% of wall-clock budget)",
+    hint: "Active running time, excluding time parked at a human gate, as a share of RUN_TIMEOUT or the run's frozen budget. 0 disables.",
+    validate: validateHealthPercent,
   },
-  { key: "health_queued_seconds", label: "Stuck queued after (seconds)" },
-  { key: "health_approval_seconds", label: "Awaiting approval after (seconds)" },
-  { key: "health_nudge_cooldown_seconds", label: "Slack nudge cooldown (seconds)" },
+  { key: "health_queued_seconds", label: "Stuck queued after (seconds)", validate: validateHealthSeconds },
+  { key: "health_approval_seconds", label: "Awaiting approval after (seconds)", validate: validateHealthSeconds },
+  { key: "health_nudge_cooldown_seconds", label: "Slack nudge cooldown (seconds)", validate: validateHealthSeconds },
 ];
 
 // validateHealthSeconds mirrors the server's write-time rule (Decision 5) for
@@ -38,8 +49,24 @@ function validateHealthSeconds(value: string): string | null {
   return null;
 }
 
-// HealthSettingsCard is the admin surface for the run-health detector (PRD #47): an
-// enable toggle plus the five integer-seconds thresholds. It saves independently of
+// validateHealthPercent mirrors the server's write-time rule (PRD #1170) for immediate
+// feedback: a base-10 integer that is 0 (disable) or in [50, 99]. The floor keeps an
+// operator from recreating this flag's old noise with a low threshold; 100 is excluded
+// because the sweeper fires the timeout at 100%. The message matches the server's; the
+// server stays the source of truth.
+function validateHealthPercent(value: string): string | null {
+  const v = value.trim();
+  const msg = "must be 0 (disabled) or between 50 and 99 percent";
+  if (!/^-?\d+$/.test(v)) return msg;
+  const n = Number(v);
+  if (n === 0) return null;
+  if (n < 50 || n > 99) return msg;
+  return null;
+}
+
+// HealthSettingsCard is the admin surface for the run-health detector (PRD #47, #1170):
+// an enable toggle plus five thresholds — four in seconds and one (near timeout) a
+// percent of the run's wall-clock budget. It saves independently of
 // the other cards, sending only the fields that changed. The health keys are never
 // env-sourced (Decision 5: no env vars), but the env guard is kept for symmetry —
 // the server rejects an env write anyway.
@@ -62,7 +89,7 @@ export function HealthSettingsCard({
 
   const isEnv = (key: string) => sources[key] === "env";
 
-  const fieldError = HEALTH_FIELDS.map((f) => validateHealthSeconds(values[f.key])).find(Boolean) ?? null;
+  const fieldError = HEALTH_FIELDS.map((f) => f.validate(values[f.key])).find(Boolean) ?? null;
 
   const dirty =
     (enabled ? "true" : "false") !== settings.health_enabled ||
@@ -107,7 +134,7 @@ export function HealthSettingsCard({
       <div>
         <SectionTitle>Run health</SectionTitle>
         <p className="mt-2 text-sm text-muted">
-          Flag runs that look slow, stuck, or looping on the board and in Slack. This is an early
+          Flag runs that look stuck, looping, or close to their timeout on the board and in Slack. This is an early
           warning only — it never stops a run (RUN_TIMEOUT and the idle/iteration caps still do
           that). Set any threshold to 0 to disable that one signal.
         </p>
@@ -129,7 +156,7 @@ export function HealthSettingsCard({
 
         <div className="grid gap-4 sm:grid-cols-2">
           {HEALTH_FIELDS.map((f) => {
-            const err = validateHealthSeconds(values[f.key]);
+            const err = f.validate(values[f.key]);
             return (
               <div key={f.key} className="space-y-1">
                 <Field label={f.label} htmlFor={f.key}>
