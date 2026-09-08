@@ -1,8 +1,12 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // Issue #1197 M5: the TUI/CLI must render recovery_wait — a transient-recovery park that
@@ -74,6 +78,30 @@ func TestRecoveryWaitIgnoresStaleHealth(t *testing.T) {
 				t.Errorf("running %s agent lost its health token: (%q, %q)", health, glyph, word)
 			}
 		})
+	}
+}
+
+// The board summary must agree with the recovery row: a frozen health flag cannot
+// inflate the attention count while that row correctly displays a recovery wait.
+func TestRecoveryWaitBoardSummaryIgnoresStaleHealth(t *testing.T) {
+	runs := []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "recovery-1", Kind: "issue", Status: statusRecoveryWait, Health: "stalled", IssueTitle: "recovering"}},
+		{RunDTO: apitypes.RunDTO{ID: "running-2", Kind: "issue", Status: "running", Health: "looping", IssueTitle: "needs attention"}},
+	}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+	out := stripANSI(m.View().Content)
+	if !strings.Contains(out, "▲ 1") || strings.Contains(out, "▲ 2") {
+		t.Errorf("only the running unhealthy agent belongs in the attention count:\n%s", out)
+	}
+	// Keep the parked row as a positive control when the warning cluster disappears.
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs[:1]})
+	out = stripANSI(m.View().Content)
+	if !strings.Contains(out, "recover") || !strings.Contains(out, "1 runs") {
+		t.Fatalf("the recovery run disappeared instead of losing its health warning:\n%s", out)
+	}
+	if strings.Contains(out, "▲") {
+		t.Errorf("a recovery-only board must not show stale health attention:\n%s", out)
 	}
 }
 

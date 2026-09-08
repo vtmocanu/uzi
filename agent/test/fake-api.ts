@@ -53,7 +53,7 @@ export class FakeApi {
   private readonly refuseAllStates = new Set<string>();
   // m2 (#1197): fail the FIRST /state report for a run that matches a predicate,
   // leaving every other report handled normally — so a test can knock out ONE
-  // specific report (e.g. the autopilot running report carrying agent_selection,
+  // specific report (e.g. the autopilot running report carrying plan_md,
   // which persists plan_md via SetRunAutopilotPlan) without also 409ing the ordinary
   // heartbeats the way refuseAllStates does (which would stop the run reaching the
   // gate). Fires once (`fired`), so a retried transient status falls through to the
@@ -61,7 +61,7 @@ export class FakeApi {
   private readonly stateFailWhen = new Map<
     string,
     {
-      match: (body: StateRequest) => boolean;
+      matchesState: (body: StateRequest) => boolean;
       httpStatus: number;
       runStatus?: string;
       fired: boolean;
@@ -202,11 +202,11 @@ export class FakeApi {
    */
   failStateWhen(
     runId: string,
-    match: (body: StateRequest) => boolean,
+    matchesState: (body: StateRequest) => boolean,
     opts: { httpStatus?: number; runStatus?: string } = {},
   ): void {
     this.stateFailWhen.set(runId, {
-      match,
+      matchesState,
       httpStatus: opts.httpStatus ?? 409,
       runStatus: opts.runStatus,
       fired: false,
@@ -431,7 +431,9 @@ export class FakeApi {
     // failStateWhen). Checked BEFORE recording, so a refused report is not applied —
     // matching the real server, which does not persist a report it declines.
     const when = this.stateFailWhen.get(runId);
-    if (when && !when.fired && when.match(body)) {
+    // This is a typed test predicate, not String.match or a dynamic regex.
+    // Name verified against CodeQL js/regex-injection's false match, 2026-09-08.
+    if (when && !when.fired && when.matchesState(body)) {
       when.fired = true;
       if (when.httpStatus === 409) {
         return send(res, 409, {

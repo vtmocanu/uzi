@@ -690,7 +690,8 @@ func (m tuiModel) boardSummary() string {
 		case "awaiting_followup":
 			followups++
 		}
-		if stalledHealth[r.Health] {
+		// Match the recovery row's token: health frozen while parked needs no attention.
+		if r.Status != statusRecoveryWait && stalledHealth[r.Health] {
 			warn++
 		}
 	}
