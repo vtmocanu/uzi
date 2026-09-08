@@ -24,10 +24,9 @@
 //   - a non-empty allowlist / inherit gains the incidental-findings tool;
 //   - enabling a skill NEVER widens the tool allowlist (skills ride `allowedSkills`).
 //
-// The canonical tool vocabulary here MIRRORS broker.ts's module-private
-// `TOOL_ALIASES` / `SIGNAL_TOOLS` / `DELEGATE_TOOLS` / `canonicalName` /
-// `capabilityOf`. Those are not exported, so they are reproduced (not imported);
-// codex-render.test.ts pins the mapping so the two cannot drift silently.
+// The canonical tool vocabulary comes from broker.ts, the enforcing boundary. The
+// renderer imports its aliases, root-only sets, canonicalizer and recognition predicate
+// directly so a broker-side vocabulary change cannot silently grant or strip authority.
 
 import type {
   AdviceRequest,
@@ -36,9 +35,13 @@ import type {
   HarnessToolSet,
   RunTurnRequest,
 } from "../harness.js";
-import type { RunGrants } from "./broker.js";
-
-import { SIGNAL_SERVER_NAME } from "../signals.js";
+import {
+  CODEX_DELEGATE_TOOLS,
+  CODEX_SIGNAL_TOOLS,
+  canonicalizeCodexToolName,
+  isRecognizedCodexTool,
+  type RunGrants,
+} from "./broker.js";
 import { MEMORY_SERVER_NAME } from "../memory-tools.js";
 import { reportIncidentalIssueToolName } from "../findings-tools.js";
 import { SKILL_NAME_RE } from "../skills-plugin.js";
@@ -55,41 +58,6 @@ const SPAWN_AGENT = "spawn_agent";
 /** The incidental-findings callback name (`mcp__findings__report_incidental_issue`),
  *  granted to every inherit / non-empty-allow role exactly as agents.ts does. */
 const FINDINGS_TOOL_NAME = reportIncidentalIssueToolName();
-
-/** Codex source aliases → the canonical callback name. Mirrors broker.ts
- *  `TOOL_ALIASES`: `Write`/`Edit`/`MultiEdit` are the source aliases for
- *  `apply_patch`; `Agent` is the alias for `spawn_agent`. `MultiEdit` is INCLUDED
- *  for broker parity — broker.ts's `TOOL_ALIASES` maps it too, so both sides collapse
- *  it to `apply_patch`. `NotebookEdit` is DELIBERATELY absent because neither the ADR
- *  nor broker.ts maps it; it therefore falls through to the unknown-tool path and
- *  fails closed to unknown_tool. */
-const TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
-  ["Write", APPLY_PATCH],
-  ["Edit", APPLY_PATCH],
-  ["MultiEdit", APPLY_PATCH],
-  ["Agent", SPAWN_AGENT],
-]);
-
-/** The five workflow signalling tools, bare (agents.ts / signals.ts). Root-only:
- *  the broker latches a signal only from the root origin, and agents.ts denies the
- *  whole `mcp__uzi` server to every subagent. */
-const SIGNAL_TOOLS: ReadonlySet<string> = new Set([
-  "submit_plan",
-  "signal_done",
-  "ask_user",
-  "report_progress",
-  "checkpoint",
-]);
-
-/** The delegation family (broker.ts `DELEGATE_TOOLS`): `spawn_agent` plus the
- *  code-mode child-lifecycle callbacks. All root-only and non-nested. */
-const DELEGATE_TOOLS: ReadonlySet<string> = new Set([
-  "spawn_agent",
-  "collaborationspawn_agent",
-  "collaborationwait_agent",
-  "SubagentStart",
-  "SubagentStop",
-]);
 
 // --- model + effort contract (adr/1106-codex-harness.md §Model and effort) -----
 
@@ -172,37 +140,12 @@ export interface RenderedCodexAdvice {
 
 type MutableDiagnostics = CodexRenderDiagnostic[];
 
-/** Canonicalize one Claude tool name to its Codex callback name — MIRRORS
- *  broker.ts `canonicalName`: alias map first, then `mcp__uzi__<sig>` → bare
- *  signal. Any other name is returned unchanged (its recognition is decided
- *  separately). */
-function canonicalizeToolName(name: string): string {
-  const alias = TOOL_ALIASES.get(name);
-  if (alias !== undefined) return alias;
-  const prefix = `mcp__${SIGNAL_SERVER_NAME}__`;
-  if (name.startsWith(prefix)) {
-    const bare = name.slice(prefix.length);
-    if (SIGNAL_TOOLS.has(bare)) return bare;
-  }
-  return name;
-}
-
-/** Whether a canonical name is a recognized Codex callback — MIRRORS broker.ts
- *  `capabilityOf` returning something other than `unknown`. An unrecognized name
- *  is what gets stripped with an `unknown_tool` diagnostic. */
-function isRecognizedCanonical(canonical: string): boolean {
-  if (canonical === BASH_TOOL || canonical === APPLY_PATCH || canonical === READ_TOOL) return true;
-  if (SIGNAL_TOOLS.has(canonical)) return true;
-  if (DELEGATE_TOOLS.has(canonical)) return true;
-  return canonical === SKILL_TOOL || canonical.startsWith("mcp__");
-}
-
 /** The authority a SUBAGENT can never hold — the canonical mirror of the
  *  unconditional `disallowedTools` agents.ts puts on every subagent: no nested
  *  spawn/delegation, no workflow signals, no cross-run memory writes. */
 function isSubagentForbidden(canonical: string): boolean {
-  if (DELEGATE_TOOLS.has(canonical)) return true;
-  if (SIGNAL_TOOLS.has(canonical)) return true;
+  if (CODEX_DELEGATE_TOOLS.has(canonical)) return true;
+  if (CODEX_SIGNAL_TOOLS.has(canonical)) return true;
   return canonical.startsWith(`mcp__${MEMORY_SERVER_NAME}__`);
 }
 
@@ -212,7 +155,7 @@ function isSubagentForbidden(canonical: string): boolean {
 function fullVocabulary(isRoot: boolean): readonly string[] {
   const base = [BASH_TOOL, APPLY_PATCH, READ_TOOL, SKILL_TOOL, FINDINGS_TOOL_NAME];
   if (!isRoot) return base;
-  return [...base, SPAWN_AGENT, ...SIGNAL_TOOLS];
+  return [...base, SPAWN_AGENT, ...CODEX_SIGNAL_TOOLS];
 }
 
 /** A stable, insertion-ordered set built from a sorted copy, so any serialized
@@ -246,8 +189,8 @@ function buildAllowedTools(
     for (const t of fullVocabulary(isRoot)) allowed.add(t);
   } else {
     for (const raw of tools.names) {
-      const canonical = canonicalizeToolName(raw);
-      if (!isRecognizedCanonical(canonical)) {
+      const canonical = canonicalizeCodexToolName(raw);
+      if (!isRecognizedCodexTool(canonical)) {
         diagnostics.push({ kind: "unknown_tool", role, name: sanitizeName(raw) });
         continue;
       }
@@ -262,7 +205,7 @@ function buildAllowedTools(
   // and a subagent can never spawn, signal, or write cross-run memory even if its
   // allowlist named one (the broker also root-gates these at dispatch). Filtered in
   // one pass into a fresh set rather than deleting from `allowed` while iterating it.
-  const denied = new Set(deniedTools.map(canonicalizeToolName));
+  const denied = new Set(deniedTools.map(canonicalizeCodexToolName));
   const kept: string[] = [];
   for (const t of allowed) {
     if (denied.has(t)) continue;

@@ -74,7 +74,7 @@ const MAX_DIAGNOSTIC_CHARS = 120;
 // Documented aliases only: `Write`/`Edit`/`MultiEdit` are the Codex source aliases
 // for `apply_patch`; `Agent` is the alias for `spawn_agent`. `collaborationspawn_agent`
 // is a DISTINCT code-mode name, not an alias of `spawn_agent`, so it is not collapsed.
-const TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
+export const CODEX_TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
   ["Write", "apply_patch"],
   ["Edit", "apply_patch"],
   ["MultiEdit", "apply_patch"],
@@ -84,7 +84,7 @@ const TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
 // The five workflow signalling tools (agent/src/signals.ts:28-32). Bare names; the
 // `mcp__uzi__<name>` qualified forms normalize to these. scanSignals remains the
 // authoritative parser — this set is only for recognition/routing.
-const SIGNAL_TOOLS: ReadonlySet<string> = new Set([
+export const CODEX_SIGNAL_TOOLS: ReadonlySet<string> = new Set([
   "submit_plan",
   "signal_done",
   "ask_user",
@@ -98,7 +98,7 @@ const SIGNAL_TOOLS: ReadonlySet<string> = new Set([
 // synchronous `delegate` seam (which carries the tool name so a later milestone can
 // distinguish spawn from wait/lifecycle). Recognizing them here is what keeps a
 // code-mode name off the "unknown tool" deny path.
-const DELEGATE_TOOLS: ReadonlySet<string> = new Set([
+export const CODEX_DELEGATE_TOOLS: ReadonlySet<string> = new Set([
   "spawn_agent",
   "collaborationspawn_agent",
   "collaborationwait_agent",
@@ -119,6 +119,34 @@ const CHILD_FAILURE_CODES: ReadonlySet<string> = new Set([
 /** The capability the broker binds a callback to, decided from the tool NAME +
  *  grants — never from the arguments. */
 type Capability = "shell" | "file_write" | "file_read" | "signal" | "delegate" | "mcp" | "unknown";
+
+/** Canonical callback name shared by the renderer and the enforcing broker. */
+export function canonicalizeCodexToolName(name: string): string {
+  const alias = CODEX_TOOL_ALIASES.get(name);
+  if (alias !== undefined) return alias;
+  const prefix = `mcp__${SIGNAL_SERVER_NAME}__`;
+  if (name.startsWith(prefix)) {
+    const bare = name.slice(prefix.length);
+    if (CODEX_SIGNAL_TOOLS.has(bare)) return bare;
+  }
+  return name;
+}
+
+function capabilityOf(canonical: string): Capability {
+  if (canonical === "Bash") return "shell";
+  if (canonical === "apply_patch") return "file_write";
+  if (canonical === "Read") return "file_read";
+  if (CODEX_SIGNAL_TOOLS.has(canonical)) return "signal";
+  if (CODEX_DELEGATE_TOOLS.has(canonical)) return "delegate";
+  if (canonical === "Skill" || canonical.startsWith("mcp__")) return "mcp";
+  return "unknown";
+}
+
+/** Recognition shared with rendering; execution still requires an immutable grant
+ *  and, for MCP, a concrete handler in the broker. */
+export function isRecognizedCodexTool(canonical: string): boolean {
+  return capabilityOf(canonical) !== "unknown";
+}
 
 /** The (thread, turn, call) tuple a callback is keyed by — the same identity the
  *  {@link ExecutionRegistry} reserves against. */
@@ -480,35 +508,14 @@ export class CodexCallbackBroker {
 
   // --- step 3 + 4: authority and dispatch ------------------------------------
 
-  private canonicalName(name: string): string {
-    const alias = TOOL_ALIASES.get(name);
-    if (alias !== undefined) return alias;
-    const prefix = `mcp__${SIGNAL_SERVER_NAME}__`;
-    if (name.startsWith(prefix)) {
-      const bare = name.slice(prefix.length);
-      if (SIGNAL_TOOLS.has(bare)) return bare; // mcp__uzi__submit_plan -> submit_plan
-    }
-    return name;
-  }
-
-  private capabilityOf(canonical: string): Capability {
-    if (canonical === "Bash") return "shell";
-    if (canonical === "apply_patch") return "file_write";
-    if (canonical === "Read") return "file_read";
-    if (SIGNAL_TOOLS.has(canonical)) return "signal";
-    if (DELEGATE_TOOLS.has(canonical)) return "delegate";
-    if (canonical === "Skill" || canonical.startsWith("mcp__")) return "mcp";
-    return "unknown";
-  }
-
   private async authorizeAndDispatch(
     rt: CallbackRuntimeId,
     name: string,
     args: unknown,
     origin: CallbackOrigin,
   ): Promise<CallbackResult> {
-    const canonical = this.canonicalName(name);
-    const cap = this.capabilityOf(canonical);
+    const canonical = canonicalizeCodexToolName(name);
+    const cap = capabilityOf(canonical);
 
     // An unrecognized tool never executes: deny with a diagnostic naming it.
     if (cap === "unknown") {

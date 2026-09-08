@@ -167,6 +167,15 @@ describe("renderCodexRun — tool mapping", () => {
     assert.equal(hasDiagnostic(run.diagnostics, "unknown_tool", "reviewer", "Grep"), true);
     assert.equal(hasDiagnostic(run.diagnostics, "unknown_tool", "reviewer", "FrobnicateXYZ"), true);
   });
+
+  it("recognizes an arbitrary MCP callback through the broker-owned vocabulary", () => {
+    const tool = "mcp__custom__read";
+    const run = renderCodexRun(
+      runRequest({ agents: { researcher: agent({ tools: allow([tool]) }) } }),
+    );
+    assert.ok(toolsOf(run, "researcher").has(tool));
+    assert.equal(hasDiagnostic(run.diagnostics, "unknown_tool", "researcher", tool), false);
+  });
 });
 
 describe("renderCodexRun — inherit vs allow, denied, skills", () => {
