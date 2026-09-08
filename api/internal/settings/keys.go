@@ -83,8 +83,8 @@ const (
 	// a docker-needing run may be claimed by a non-docker worker and fail mid-run).
 	KeyCapabilityAwareScheduling = "capability_aware_scheduling"
 	KeyHealthStallSeconds        = "health_stall_seconds"
-	// KeyHealthNearTimeoutPct (PRD #1170) replaces the retired health_slow_seconds. A
-	// percentage of the run's effective wall-clock budget (0 = disabled, else [50, 99])
+	// KeyHealthNearTimeoutPct (PRD #1170) replaces the retired seconds-based health-slow
+	// setting. A percentage of the run's effective wall-clock budget (0 = disabled, else [50, 99])
 	// at which a running run is flagged near timeout — validated by validateHealthPercent,
 	// NOT validateHealthSeconds.
 	KeyHealthNearTimeoutPct       = "health_near_timeout_pct"

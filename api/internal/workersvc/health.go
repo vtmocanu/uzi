@@ -686,7 +686,7 @@ func healthDur(secs int, _ error) time.Duration {
 // a read that fell back to a bad value) to 0 the caller reads as "signal off". The
 // error is already logged by the accessor's default fallback path (mirrors healthDur);
 // a strict re-log here would be noise. There is NO upper clamp and no RUN_TIMEOUT warn
-// — unlike the retired health_slow_seconds, a percentage of a run's own budget is below
+// — unlike the retired wall-clock seconds threshold, a percentage of a run's own budget is below
 // that run's deadline by construction (PRD #1170).
 func healthPct(pct int, _ error) int {
 	if pct <= 0 {
