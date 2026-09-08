@@ -49,6 +49,7 @@ import type {
   ForgeConfig,
   ForgeConnection,
   HostedConfig,
+  IncidentalFinding,
   IncidentalFindingBacklog,
   IncidentalFindingBucket,
   IncidentalFindingFileResult,
@@ -1291,9 +1292,31 @@ const realApi = {
   fileFinding: (id: string, body?: { title?: string; description?: string; labels?: string[] }) =>
     request<IncidentalFindingFileResult>("POST", `/findings/${id}/issue`, body ?? {}),
   // dismissFinding triages one coordinate to `dismissed` with a required reason from the
-  // closed enum (M5). A LOCAL write — no forge call, no token spend.
+  // closed enum (M5). A LOCAL write — no forge call, no token spend. Keys on the evidence
+  // id (finding_id), like fileFinding.
   dismissFinding: (id: string, reason: "wont_do" | "not_an_issue") =>
     request<{ status: string; reason: string }>("POST", `/findings/${id}/dismiss`, { reason }),
+  // getFindingsStats is the Findings per-status tally (PRD #1183 M3): the finding twin of
+  // getJudgeStats, reusing TriageCounts (`{total, todo, filed, done, dismissed, false_positives}`).
+  // Repo-scoped like the nav badge and IGNORES ?run= server-side, so the badge, the counted tabs
+  // and the summary strip are one number per repo scope. Render it directly, never re-derive from
+  // the rows on screen (the same canonical-count rule the Judge page follows).
+  getFindingsStats: (repo?: string) =>
+    request<TriageCounts>("GET", `/findings/stats${repo ? `?repo=${encodeURIComponent(repo)}` : ""}`),
+  // dismissFindings is the BULK dismiss (PRD #1183 M3): it fans one reason across up to 100
+  // owned OPEN coordinates in one statement, SKIPPING non-open/foreign ids silently (so `updated`
+  // can be < ids.length). It keys on `disposition_id`, NOT the evidence id — a dismissed/done
+  // coordinate always has a disposition_id even when its evidence is gone, which is why undo keys
+  // on it too (the row-level single dismiss routes here as well, so undo stays symmetric). A LOCAL
+  // write — no forge call, no token spend. Returns {updated, findings} with the re-read rows.
+  dismissFindings: (ids: string[], reason: "wont_do" | "not_an_issue") =>
+    request<{ updated: number; findings: IncidentalFinding[] }>("POST", "/findings/dismiss", { ids, reason }),
+  // undoDismissFinding reopens a dismissed coordinate (dismissed → open, PRD #1183 M3), keyed on
+  // the `disposition_id` — the same key dismissFindings acts on, so a dismiss/undo pair is
+  // symmetric. Returns the reopened coordinate so the caller can reconcile the row in place; a 404
+  // means there was nothing dismissed to undo. A LOCAL write.
+  undoDismissFinding: (dispositionId: string) =>
+    request<IncidentalFinding>("DELETE", `/findings/${dispositionId}/dismiss`),
 
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/

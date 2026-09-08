@@ -29,9 +29,12 @@ vi.mock("../lib/api", () => ({
     // zero so these navigation tests assert the nav STRUCTURE without a badge in the way.
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
     listSchedules: vi.fn().mockResolvedValue([]),
-    // PRD #333 M7: AppShell polls the Findings open-count badge on mount; zero + empty so
-    // these navigation tests assert the nav STRUCTURE without a findings badge in the way.
+    // PRD #333 M7 / PRD #1183 M4: AppShell polls the Findings open-count badge on navigation from
+    // getFindingsStats().todo (the canonical tally) now, not the deprecated listFindings open_count
+    // meta. Zero so these navigation tests assert the nav STRUCTURE without a findings badge in the
+    // way. listFindings stays stubbed for any residual caller.
     listFindings: vi.fn().mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 0, findings: [] }),
+    getFindingsStats: vi.fn().mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     // The status favicon (PRD #70) polls listRuns on mount via useFavicon; stub it
     // so the poll resolves to an empty run set instead of throwing on an undefined
     // mock (the throw is synchronous, so the hook's own .catch never sees it).
@@ -244,12 +247,12 @@ describe("AppShell navigation", () => {
     expect(judge.textContent).not.toContain("12");
   });
 
-  it("badges the Findings nav item with the GET /api/findings open_count meta (PRD #333 M7)", async () => {
-    mockApi.listFindings.mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 4, findings: [] });
+  it("badges the Findings nav item with the GET /api/findings/stats todo count (PRD #333 M7 / PRD #1183 M4)", async () => {
+    mockApi.getFindingsStats.mockResolvedValue({ total: 9, todo: 4, filed: 3, done: 1, dismissed: 1, false_positives: 0 });
     renderShell("/dashboard");
 
-    // The Findings link lives in the Work group and its badge is the open-findings count,
-    // read from the response meta (D8) with no repo filter (the global count).
+    // The Findings link lives in the Work group and its badge is the canonical open (To triage)
+    // count, read from GET /api/findings/stats with no repo filter (the global count).
     const findings = await screen.findByRole("link", { name: /Findings/ });
     await waitFor(() => expect(findings.textContent).toContain("4"));
     expect(findings.getAttribute("href")).toBe("/findings");

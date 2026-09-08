@@ -2780,7 +2780,7 @@ export interface JudgeDispositionResult {
 
 // IncidentalFindingBucket is the GET /api/findings ?bucket= filter (D7). The default
 // (`to_file`) is the backlog's reason to exist — what still needs filing.
-export type IncidentalFindingBucket = "to_file" | "filed" | "dismissed" | "all";
+export type IncidentalFindingBucket = "to_file" | "filed" | "done" | "dismissed" | "all";
 
 // FindingOccurrence is one run's report of a finding coordinate (PRD #1183 M3): the finding
 // twin of JudgeOccurrence. `run_title` and `reported_at` mirror the run's issue_title and the
