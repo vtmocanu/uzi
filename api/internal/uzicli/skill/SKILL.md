@@ -192,7 +192,7 @@ uzi findings list [--repo <repo-id>] [--bucket to_file|filed|done|dismissed|all]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings stats [--repo <repo-id>]
-uzi findings undo <finding-id>
+uzi findings undo <disposition-id>
 uzi worker list
 uzi worker rm <worker-id>
 uzi worker set-token <worker-id> <label>
@@ -1134,7 +1134,7 @@ which you triage from the terminal exactly like the judge backlog.
   stats`. `--repo` scopes the tally to one repo (a foreign/unknown id is an all-zero
   tally, never a 404); `--json` emits the raw totals object. Same number the web nav
   badge and the Findings tabs show for the same repo scope.
-- `uzi findings undo <finding-id>` — reopen a dismissed coordinate (undo a dismissal),
+- `uzi findings undo <disposition-id>` — reopen a dismissed coordinate (undo a dismissal),
   back to the to-file bucket. The id is the coordinate's `disposition_id` (always
   present, unlike `finding_id` which is nil once its evidence was cascaded away). A
   coordinate that is not dismissed — unknown, foreign, or never dismissed — is treated

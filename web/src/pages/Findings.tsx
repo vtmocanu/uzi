@@ -135,9 +135,11 @@ export function Findings() {
   const setFindingsOpen = useSetFindingsOpen();
 
   // The canonical per-status tally: repo-scoped, run-ignored (the server does not read ?run= here),
-  // so the summary strip, the tabs and the nav badge are ONE number per repo scope. Publishing
-  // stats.todo on every fetch (mount, repo change, and every reloadStats() after a mutation) is what
-  // moves the badge without a navigation. Best-effort: a failed fetch leaves the strip/tabs hidden.
+  // so the summary strip and the tab COUNTS are ONE number per repo scope, and it drives the nav
+  // badge. Publishing stats.todo on every fetch (mount, repo change, and every reloadStats() after a
+  // mutation) is what moves the badge without a navigation. Best-effort: a failed fetch hides the
+  // summary strip and the per-bucket counts, but the tab STRIP itself always renders — it is the only
+  // affordance that switches buckets.
   const { data: statsData, reload: reloadStats } = useAsyncData(
     async ({ isCurrent }) => {
       const stats = await api.getFindingsStats(repoFilter || undefined);
