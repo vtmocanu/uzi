@@ -1566,6 +1566,30 @@ describe("Judge — the draft targets the newest open occurrence by judged_at (P
     expect(mockApi.getIssueDraft).not.toHaveBeenCalledWith("run-older", "rec-older");
   });
 
+  it("prefers the later occurrence when fractional-second precision differs (.1 vs .12)", async () => {
+    // Lexicographically "…00.1Z" > "…00.12Z" ('Z' 0x5A > '2' 0x32), yet .1s is EARLIER than
+    // .12s — so a string compare would target the WRONG (older) occurrence. Wire order puts the
+    // older .1Z todo first, so a wrong pick also can't be masked by falling back to wire order.
+    const g = group({
+      open_count: 2,
+      run_count: 2,
+      occurrences: [
+        occ({ run_id: "run-p1", rec_id: "rec-p1", judged_at: "2026-07-09T00:00:00.1Z" }),
+        occ({ run_id: "run-p12", rec_id: "rec-p12", judged_at: "2026-07-09T00:00:00.12Z" }),
+      ],
+    });
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({ groups: [g], triage: { total: 2, todo: 2, filed: 0, done: 0, dismissed: 0, false_positives: 0 } }),
+    );
+    mockApi.getIssueDraft.mockResolvedValue({ draft });
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    await waitFor(() => expect(mockApi.getIssueDraft).toHaveBeenCalledWith("run-p12", "rec-p12"));
+    expect(mockApi.getIssueDraft).not.toHaveBeenCalledWith("run-p1", "rec-p1");
+  });
+
   it("a member missing judged_at never wins over one carrying a later value", async () => {
     const g = group({
       open_count: 2,

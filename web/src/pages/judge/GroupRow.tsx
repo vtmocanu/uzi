@@ -46,16 +46,21 @@ type FetchReview = (
 ) => Promise<{ review: RunReview | null; pending_judge: PendingJudge | null }>;
 
 // newestOpenOccurrence picks the group's newest OPEN member — the coordinate the File-issue
-// draft targets. Among the bucket "todo" occurrences it takes the largest judged_at (RFC3339
-// sorts lexicographically = chronologically); a member missing judged_at never wins over one
-// carrying a later value, and with none present it falls back to wire order (the backlog query
-// delivers rv.updated_at DESC, so the first todo is already the newest).
+// draft targets. Among the bucket "todo" occurrences it takes the largest judged_at compared
+// as a PARSED timestamp, not as a string: RFC3339 does NOT sort lexicographically once the
+// fractional-second precision differs (e.g. "…00.1Z" sorts AFTER "…00.12Z" because 'Z' > '2',
+// yet .1s is earlier than .12s), which would target the wrong occurrence. A member missing (or
+// unparseable) judged_at never wins over one carrying a valid later value, and with none present
+// it falls back to wire order (the backlog query delivers rv.updated_at DESC, so the first todo
+// is already the newest).
 function newestOpenOccurrence(group: JudgeRecommendationGroup): JudgeOccurrence | undefined {
   return group.occurrences
     .filter((o) => o.bucket === "todo")
     .reduce<JudgeOccurrence | undefined>((best, o) => {
       if (!best) return o;
-      if (o.judged_at && (!best.judged_at || o.judged_at > best.judged_at)) return o;
+      const ot = o.judged_at ? Date.parse(o.judged_at) : NaN;
+      const bt = best.judged_at ? Date.parse(best.judged_at) : NaN;
+      if (!Number.isNaN(ot) && (Number.isNaN(bt) || ot > bt)) return o;
       return best;
     }, undefined);
 }
@@ -93,18 +98,25 @@ export function GroupRow({
   const newestOpenRunId = newestOpen?.run_id;
   const canAct = openCount > 0;
 
-  // The newest open occurrence's FULL rationale, fetched ONCE on first expand via fetchReview
-  // and cached here per group (this component's key is the coordinate, so the cache survives
-  // an onFiled reload). Until it lands — and on error, or when fetchReview is omitted — the
-  // expander shows the clamped preview instead. null means "not loaded".
+  // The newest open occurrence's FULL rationale, fetched ONCE per newest-open run on first
+  // expand via fetchReview and cached here (this component's key is the coordinate, so the
+  // cache survives an onFiled reload). The cache is keyed to the newest-open RUN: when a
+  // backlog reload changes which run is newest-open, the stale rationale is dropped and the new
+  // run is fetched. Until it lands — and on error, or when fetchReview is omitted — the expander
+  // shows the clamped preview instead. null means "not loaded".
   const [rationaleMd, setRationaleMd] = useState<string | null>(null);
-  const rationaleFetched = useRef(false);
+  const rationaleFetchedFor = useRef<string | null>(null);
 
   useEffect(() => {
-    // Only after the user expands, only once, and only when the capability and an open
-    // occurrence to fetch it from are both present.
-    if (!expanded || rationaleFetched.current || !fetchReview || !newestOpenRunId) return;
-    rationaleFetched.current = true;
+    // Only after the user expands, and only when the capability and an open occurrence to fetch
+    // it from are both present.
+    if (!expanded || !fetchReview || !newestOpenRunId) return;
+    // Fetch once per newest-open run. When the run changes across a backlog reload, drop the
+    // previous run's rationale (so the clamped preview shows until the refetch lands) and fetch
+    // the new one; when it is unchanged, keep the cached rationale and skip.
+    if (rationaleFetchedFor.current === newestOpenRunId) return;
+    rationaleFetchedFor.current = newestOpenRunId;
+    setRationaleMd(null);
     let alive = true;
     void (async () => {
       try {
