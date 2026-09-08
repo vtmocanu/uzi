@@ -922,6 +922,28 @@ describe("RunRunner — milestones on the plan gate (PRD #122 M1)", () => {
       statuses.includes("failed"),
       "the run ends in failure when the plan report was refused",
     );
+    // NON-VACUITY #1 (direct proof the run never entered implementation): the implement
+    // loop's running reports carry iteration_count >= 1 (reportIteration), whereas the
+    // pre-gate/heartbeat reports and the autopilot plan report carry 0/absent. Under the
+    // swallow-and-proceed regression this branch guards against (a .catch on the plan
+    // report instead of gating the approve on the ack), the run DOES enter the loop, so a
+    // body with iteration_count: 1 appears and this assertion reddens — even though the
+    // run still ends `failed` downstream on the incidental "no changes were committed"
+    // guard, which is exactly why the terminal-status assertions above are not enough.
+    assert.ok(
+      !bodies.some((s) => (s.iteration_count ?? 0) >= 1),
+      "no /state report carries an implementation-loop iteration (iteration_count >= 1): the run never entered implementation",
+    );
+    // NON-VACUITY #2 (failed for the RIGHT reason): the terminal failure names the
+    // plan-storage failure, not the harness's incidental "signal_done ... no changes were
+    // committed" guard the reverted code trips after wrongly entering implementation. A 409
+    // (applied === false) makes the worker throw `autopilot plan not durably stored — ...`.
+    const failed = bodies.find((s) => s.status === "failed")!;
+    assert.match(
+      failed.failure_reason ?? "",
+      /durably stored/,
+      "the run fails BECAUSE the plan was not durably stored, not on a downstream incidental guard",
+    );
     assert.strictEqual(calls.length, 0, "no MR opened — never entered implementation");
     // The plan audit message is still emitted (it is flushed before the report).
     assert.strictEqual(
@@ -958,6 +980,27 @@ describe("RunRunner — milestones on the plan gate (PRD #122 M1)", () => {
     assert.ok(
       statuses.includes("failed"),
       "the run ends in failure when the plan report threw",
+    );
+    // NON-VACUITY #1 (direct proof the run never entered implementation): identical to the
+    // 409 case — the implement loop's running reports carry iteration_count >= 1, so under
+    // the swallow-and-proceed regression a body with iteration_count: 1 appears here and
+    // this reddens, while the run still ends `failed` on the incidental commit guard.
+    assert.ok(
+      !bodies.some((s) => (s.iteration_count ?? 0) >= 1),
+      "no /state report carries an implementation-loop iteration (iteration_count >= 1): the run never entered implementation",
+    );
+    // NON-VACUITY #2 (failed for the RIGHT reason): the propagated RequestError names the
+    // REFUSED plan-storage report (a 400 on /state), not the incidental "no changes were
+    // committed" guard the reverted code trips downstream. In production the server's 400
+    // body carries the m1 "autopilot plan_md was not durably stored" message, but the
+    // FakeApi's injected 400 body does not, so this asserts the state-report error shape
+    // (`returned 400`) rather than the "durably stored" wording — either way it can only
+    // hold on the plan-report-throw path, never on the downstream commit guard.
+    const failed = bodies.find((s) => s.status === "failed")!;
+    assert.match(
+      failed.failure_reason ?? "",
+      /returned 400/,
+      "the run fails BECAUSE the plan-storage report threw a 400, not on a downstream incidental guard",
     );
     assert.strictEqual(calls.length, 0, "no MR opened — never entered implementation");
     assert.strictEqual(
