@@ -125,9 +125,12 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           uzi_label: "runnable",
           default_theme: "mission",
           // A v4 blob carries the four instance appearance defaults (PRD #1167 "Lights on" m2).
+          // The legacy default_theme feeds the dark slot (§1167 contract), so
+          // default_dark_theme is kept in lockstep with it — a mismatch would be
+          // invalid instance state the migration test must not rely on.
           default_appearance_mode: "dark",
           default_light_theme: "hall",
-          default_dark_theme: "ember",
+          default_dark_theme: "mission",
           default_typeface: "system",
           slack_enabled: "false",
           public_base_url: "http://127.0.0.1:8080",
