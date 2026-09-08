@@ -361,7 +361,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, recovery_wait_count, recovery_retry_not_before
 `
 
 type ClaimRunParams struct {
@@ -535,6 +535,8 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.CodexAccountRevision,
 		&i.CodexClaimEpoch,
 		&i.CodexCapHash,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
 	)
 	return i, err
 }
@@ -1020,7 +1022,7 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source)
 VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17, $18::jsonb, $19::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), $20)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, recovery_wait_count, recovery_retry_not_before
 `
 
 type CreateRunParams struct {
@@ -1241,6 +1243,8 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.CodexAccountRevision,
 		&i.CodexClaimEpoch,
 		&i.CodexCapHash,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
 	)
 	return i, err
 }
@@ -1711,6 +1715,13 @@ WHERE id = $2
   -- today only by autostop.go's single ` + "`" + `if run.Status != "running"` + "`" + ` line, unmentioned in
   -- that line's comment, and exposed the day someone relaxes it — so this is its SQL backstop.
   AND status <> 'pool_wait'
+  -- recovery_wait (issue #1197) is the fifth park and the same argument transfers verbatim: a
+  -- recovery-parked run's writes have STOPPED (the worker parked after a positively-empty
+  -- turn, awaiting the server-owned backoff promotion), not looped, so auto-stopping one
+  -- would be wrong on the merits. It is excluded today only by autostop.go's single
+  -- ` + "`" + `if run.Status != "running"` + "`" + ` line, unmentioned in that line's comment, and exposed the
+  -- day someone relaxes it — so this is its SQL backstop.
+  AND status <> 'recovery_wait'
 `
 
 type FailRunAutoStopParams struct {
@@ -1859,7 +1870,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 }
 
 const getActiveMRReworkRunForMR = `-- name: GetActiveMRReworkRunForMR :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash FROM runs
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, recovery_wait_count, recovery_retry_not_before FROM runs
 WHERE repo_id = $1::uuid AND mr_iid = $2
   AND kind = 'mr_rework'
   AND status NOT IN ('completed', 'failed', 'cancelled')
@@ -1991,6 +2002,8 @@ func (q *Queries) GetActiveMRReworkRunForMR(ctx context.Context, arg GetActiveMR
 		&i.CodexAccountRevision,
 		&i.CodexClaimEpoch,
 		&i.CodexCapHash,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
 	)
 	return i, err
 }
@@ -2014,7 +2027,7 @@ func (q *Queries) GetForgeTypeForRepo(ctx context.Context, repoID uuid.UUID) (st
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, recovery_wait_count, recovery_retry_not_before FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -2135,12 +2148,14 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.CodexAccountRevision,
 		&i.CodexClaimEpoch,
 		&i.CodexCapHash,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, recovery_wait_count, recovery_retry_not_before FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -2263,6 +2278,8 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.CodexAccountRevision,
 		&i.CodexClaimEpoch,
 		&i.CodexCapHash,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
 	)
 	return i, err
 }
@@ -2585,7 +2602,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, recovery_wait_count, recovery_retry_not_before FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -2709,6 +2726,8 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.CodexAccountRevision,
 		&i.CodexClaimEpoch,
 		&i.CodexCapHash,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
 	)
 	return i, err
 }
@@ -3080,7 +3099,7 @@ func (q *Queries) LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) 
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, r.recovery_wait_count, r.recovery_retry_not_before, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
@@ -3234,6 +3253,8 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff p
 			&i.Run.CodexAccountRevision,
 			&i.Run.CodexClaimEpoch,
 			&i.Run.CodexCapHash,
+			&i.Run.RecoveryWaitCount,
+			&i.Run.RecoveryRetryNotBefore,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -4015,7 +4036,7 @@ func (q *Queries) ListRunUsageFrames(ctx context.Context, runID uuid.UUID) ([]Ru
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, rp.path_with_namespace AS repo_path, w.name AS worker_name,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, r.recovery_wait_count, r.recovery_retry_not_before, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
@@ -4232,6 +4253,8 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.CodexAccountRevision,
 			&i.Run.CodexClaimEpoch,
 			&i.Run.CodexCapHash,
+			&i.Run.RecoveryWaitCount,
+			&i.Run.RecoveryRetryNotBefore,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.ForgeType,
@@ -4333,7 +4356,7 @@ func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWork
 }
 
 const listRunsPendingUsageRefold = `-- name: ListRunsPendingUsageRefold :many
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash FROM runs
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, recovery_wait_count, recovery_retry_not_before FROM runs
 WHERE NOT usage_refolded AND status IN ('completed', 'failed', 'cancelled')
   AND id <> ALL(COALESCE($1::uuid[], '{}'::uuid[]))
 ORDER BY created_at
@@ -4480,6 +4503,8 @@ func (q *Queries) ListRunsPendingUsageRefold(ctx context.Context, arg ListRunsPe
 			&i.CodexAccountRevision,
 			&i.CodexClaimEpoch,
 			&i.CodexCapHash,
+			&i.RecoveryWaitCount,
+			&i.RecoveryRetryNotBefore,
 		); err != nil {
 			return nil, err
 		}
@@ -5115,6 +5140,68 @@ func (q *Queries) PromotePoolWaitRun(ctx context.Context, arg PromotePoolWaitRun
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const promoteRecoveryWaitRuns = `-- name: PromoteRecoveryWaitRuns :many
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    -- Revoke the per-claim Codex capability on park->queued, exactly as PromoteLimitWaitRuns:
+    -- a promoted run has no live owner until re-claimed, so clearing the hash and bumping the
+    -- epoch supersedes any capability minted for the prior claim.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE status = 'recovery_wait' AND recovery_retry_not_before <= $1
+RETURNING id, user_id, status
+`
+
+type PromoteRecoveryWaitRunsRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// The sweeper's transient-recovery promotion pass (issue #1197): recovery_wait -> queued
+// once the clock passes recovery_retry_not_before. Backed by idx_runs_recovery_wait_retry,
+// a partial index on exactly this predicate, so the pass costs an index scan over a set
+// that is empty on a healthy instance rather than a seq scan of runs. Mirrors
+// PromoteLimitWaitRuns field-for-field.
+//
+// Unlike limit_wait there is NO lifetime cap: recovery_wait_count is left in place (it
+// keeps shaping the next park's backoff) and this promotion always fires once the stamp
+// passes, so the run auto-resumes repeatedly at the capped cadence until it recovers or the
+// owner cancels (CancelRunServerSide's negative admit-set covers a recovery_wait run).
+//
+// started_at = NULL so the resumed run gets a FRESH RUN_TIMEOUT wall, and
+// budget_paused_seconds = 0 so the pause banked against the OLD baseline is not
+// over-credited — both exactly as PromoteLimitWaitRuns does. NULL <= @now is UNKNOWN, so a
+// run whose recovery_retry_not_before is NULL is never promoted (harmless: a park always
+// writes a finite stamp).
+//
+// session_id, worker_id and recovery_retry_not_before are left in place as affinity/history
+// exactly as PromoteLimitWaitRuns leaves limit_wait's. A stale recovery_retry_not_before
+// cannot re-fire this statement because the status predicate has already moved.
+func (q *Queries) PromoteRecoveryWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]PromoteRecoveryWaitRunsRow, error) {
+	rows, err := q.db.Query(ctx, promoteRecoveryWaitRuns, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PromoteRecoveryWaitRunsRow{}
+	for rows.Next() {
+		var i PromoteRecoveryWaitRunsRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const reconcileRunMR = `-- name: ReconcileRunMR :execrows
@@ -6816,6 +6903,80 @@ func (q *Queries) SetRunPriority(ctx context.Context, arg SetRunPriorityParams) 
 	return result.RowsAffected(), nil
 }
 
+const setRunRecoveryWait = `-- name: SetRunRecoveryWait :execrows
+UPDATE runs SET
+    status                    = 'recovery_wait',
+    status_since              = now(),
+    recovery_wait_count       = recovery_wait_count + 1,
+    recovery_retry_not_before = $1,
+    session_id                = COALESCE($2, session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                = now()
+WHERE id = $3 AND worker_id = $4
+  AND status = 'running'
+  AND kind <> 'judge'
+`
+
+type SetRunRecoveryWaitParams struct {
+	RetryNotBefore pgtype.Timestamptz `json:"retry_not_before"`
+	SessionID      pgtype.Text        `json:"session_id"`
+	ID             uuid.UUID          `json:"id"`
+	WorkerID       pgtype.UUID        `json:"worker_id"`
+}
+
+// Park a run in the TRANSIENT-RECOVERY hold (issue #1197). running -> recovery_wait,
+// non-terminal: the run keeps its issue, its session, its worker affinity, its message
+// history and its plan_md, and the sweeper (PromoteRecoveryWaitRuns) promotes it back to
+// queued once recovery_retry_not_before passes. It is modelled CLOSELY on SetRunLimitWait
+// but is a DISTINCT park with a distinct purpose:
+//
+// 🔴 recovery_wait IS NOT A USAGE LIMIT. A worker enters it after a positively-empty SDK
+// turn survived bounded in-process retries — a transient recovery, not credential
+// exhaustion. So this query MUST NOT touch any limit/credential gauge: limit_wait_count,
+// limit_resets_at, retry_not_before, rate_limit_type and limit_dead_secret_id are ALL left
+// untouched. Its own recovery_wait_count/recovery_retry_not_before are the only park
+// bookkeeping, and recovery_wait_count is a backoff SHAPER, never a cap (there is no
+// lifetime-park cap and no terminal branch — a park always becomes promotable again).
+//
+// 🔴 THE SOURCE GUARD IS POSITIVE (status = 'running'), exactly as SetRunLimitWait's, and
+// for the same reasons: a negative guard would admit queued/claimed -> recovery_wait (a
+// stale report parking a run no worker holds), awaiting_approval -> recovery_wait
+// (swallowing a pending human approval), and recovery_wait -> recovery_wait (a re-delivered
+// report bumping the backoff count a second time on one event). With the positive guard
+// each is a 0-row no-op, surfaced to the worker as 409 / applied=false, so re-delivery is
+// idempotent and the worker's cleanup carve-out keys off the RETURNED STATUS.
+//
+// kind <> 'judge' mirrors SetRunLimitWait (Decision 14): a judge run is executed by a
+// different runner with its own error path and is never re-enqueued.
+//
+// recovery_retry_not_before is computed in GO and passed in (now + capped exponential
+// backoff + jitter; see workersvc/recoverywait.go), never derived here.
+//
+// recovery_wait_count bumps HERE, in the same statement as the transition, so a run cannot
+// end up parked without its backoff shaper advancing. It is distinct from limit_wait_count
+// and requeue_count on purpose — a shared counter would let one park's budget leak into
+// another's curve.
+//
+// The health reset is MANDATORY for the same reason SetRunLimitWait's is: a parked run is
+// absent from ListActiveRunsForHealth (a POSITIVE allowlist), so whatever flag was live at
+// park time would FREEZE for the whole park with nothing able to clear it. Do NOT "fix" it
+// by adding recovery_wait to that allowlist: stalled/looping/slow describe a RUNNING agent.
+// plan_md and worker_id are PRESERVED (worker_id is in the WHERE, never the SET). This is a
+// NON-TERMINAL transition, so the run's checkpoint is NOT deleted (that fires only on
+// terminal transitions).
+func (q *Queries) SetRunRecoveryWait(ctx context.Context, arg SetRunRecoveryWaitParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunRecoveryWait,
+		arg.RetryNotBefore,
+		arg.SessionID,
+		arg.ID,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setRunRunning = `-- name: SetRunRunning :execrows
 UPDATE runs SET
     status           = 'running',
@@ -6974,6 +7135,12 @@ WHERE runs.id = $16 AND worker_id = $17
   -- explicitly here alongside limit_wait — a held run resumes only via the server-side
   -- promote (reactive or resume-now), which lands it at 'queued' before the worker reports.
   AND status <> 'pool_wait'
+  -- recovery_wait is the SAME shape of park (issue #1197): a reordered pre-park ` + "`" + `running` + "`" + `
+  -- report must not un-park a transient-recovery hold, exactly as for limit_wait/pool_wait.
+  -- The negative predicate above admits it, so it is excluded explicitly here — a
+  -- recovery-parked run resumes only via PromoteRecoveryWaitRuns, which lands it at 'queued'
+  -- before the worker reports.
+  AND status <> 'recovery_wait'
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = $16

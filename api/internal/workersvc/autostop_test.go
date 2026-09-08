@@ -1053,6 +1053,13 @@ func (f *autoStopSweepStore) PromoteLimitWaitRuns(context.Context, pgtype.Timest
 	return nil, nil
 }
 
+// Issue #1197's transient-recovery promotion pass. Empty for the same reason as
+// PromoteLimitWaitRuns above: this fixture's subject is the auto-stop streak, so no run
+// is recovery-parked and Sweep still runs end to end.
+func (f *autoStopSweepStore) PromoteRecoveryWaitRuns(context.Context, pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error) {
+	return nil, nil
+}
+
 // PRD #754 M5's reactive-resume pass. Empty for the same reason as PromoteLimitWaitRuns
 // above: this fixture's subject is the auto-stop streak, so the pool worklist is empty
 // and Sweep still runs end to end.

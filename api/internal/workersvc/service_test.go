@@ -501,6 +501,18 @@ type fakeStore struct {
 	promoteLimitWaitErr error
 	promoteLimitWaitAt  []pgtype.Timestamptz
 
+	// Issue #1197 transient-recovery park. setRecoveryWait captures the park params (where
+	// the computed recovery_retry_not_before is asserted); setRecoveryWaitRows models the
+	// SQL's POSITIVE source guard, so 0 means "the guard refused" and the service must map
+	// that to applied=false rather than to a park. promoteRecoveryWaitAt records every `now`
+	// the sweeper passed the recovery promotion pass.
+	setRecoveryWait        *store.SetRunRecoveryWaitParams
+	setRecoveryWaitRows    int64
+	setRecoveryWaitErr     error
+	promotedRecoveryWait   []store.PromoteRecoveryWaitRunsRow
+	promoteRecoveryWaitErr error
+	promoteRecoveryWaitAt  []pgtype.Timestamptz
+
 	// PRD #754 M5 reactive-resume: poolWaitRuns is what ListPoolWaitRuns returns (the
 	// oldest-first pool_wait worklist) and poolWaitRunsErr fails that read. promotedPoolWait
 	// records every PromotePoolWaitRun arg in order (so a test can assert WHICH held run was
@@ -904,6 +916,19 @@ func (f *fakeStore) PromoteLimitWaitRuns(_ context.Context, now pgtype.Timestamp
 	return f.promotedLimitWait, f.promoteLimitWaitErr
 }
 
+// Issue #1197. setRecoveryWaitRows defaults to 0 — the SQL guard refusing — so a fixture
+// that wants a park to land must say so, matching the safe default for a fake whose real
+// query carries a positive source guard (same convention as SetRunLimitWait above).
+func (f *fakeStore) SetRunRecoveryWait(_ context.Context, arg store.SetRunRecoveryWaitParams) (int64, error) {
+	f.setRecoveryWait = &arg
+	return f.setRecoveryWaitRows, f.setRecoveryWaitErr
+}
+
+func (f *fakeStore) PromoteRecoveryWaitRuns(_ context.Context, now pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error) {
+	f.promoteRecoveryWaitAt = append(f.promoteRecoveryWaitAt, now)
+	return f.promotedRecoveryWait, f.promoteRecoveryWaitErr
+}
+
 func (f *fakeStore) ListPoolWaitRuns(_ context.Context) ([]store.ListPoolWaitRunsRow, error) {
 	return f.poolWaitRuns, f.poolWaitRunsErr
 }
@@ -1278,6 +1303,10 @@ func testParams() Params {
 		ChatMaxTurns:           50,
 		WorkerChatIdleTimeout:  60 * time.Minute,
 		WorkerChatTurnTimeout:  10 * time.Minute,
+		// Issue #1197 transient-recovery park: the config defaults, so a svc built from
+		// testParams() computes a real recovery backoff (1m base doubling to a 30m cap).
+		RunRecoveryParkBase: time.Minute,
+		RunRecoveryMaxPark:  30 * time.Minute,
 	}
 }
 

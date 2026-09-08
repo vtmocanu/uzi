@@ -287,6 +287,11 @@ func run() error {
 		// event: the worker asks to park, the server decides for how long and how often.
 		RunLimitMaxWaits: cfg.RunLimitMaxWaits,
 		RunLimitMaxPark:  cfg.RunLimitMaxPark,
+		// Transient-recovery park (issue #1197): the base/ceiling of the server-owned
+		// exponential backoff the sweeper auto-promotes a 'recovery_wait' run on. No
+		// per-run cap — a park always becomes promotable again.
+		RunRecoveryParkBase: cfg.RunRecoveryParkBase,
+		RunRecoveryMaxPark:  cfg.RunRecoveryMaxPark,
 	})
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /

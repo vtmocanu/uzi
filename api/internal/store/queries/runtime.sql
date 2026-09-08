@@ -1053,6 +1053,12 @@ WHERE runs.id = @id AND worker_id = @worker_id
   -- explicitly here alongside limit_wait — a held run resumes only via the server-side
   -- promote (reactive or resume-now), which lands it at 'queued' before the worker reports.
   AND status <> 'pool_wait'
+  -- recovery_wait is the SAME shape of park (issue #1197): a reordered pre-park `running`
+  -- report must not un-park a transient-recovery hold, exactly as for limit_wait/pool_wait.
+  -- The negative predicate above admits it, so it is excluded explicitly here — a
+  -- recovery-parked run resumes only via PromoteRecoveryWaitRuns, which lands it at 'queued'
+  -- before the worker reports.
+  AND status <> 'recovery_wait'
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
@@ -1505,6 +1511,94 @@ UPDATE runs SET
 WHERE status = 'limit_wait' AND retry_not_before <= @now
 RETURNING id, user_id, status;
 
+-- name: SetRunRecoveryWait :execrows
+-- Park a run in the TRANSIENT-RECOVERY hold (issue #1197). running -> recovery_wait,
+-- non-terminal: the run keeps its issue, its session, its worker affinity, its message
+-- history and its plan_md, and the sweeper (PromoteRecoveryWaitRuns) promotes it back to
+-- queued once recovery_retry_not_before passes. It is modelled CLOSELY on SetRunLimitWait
+-- but is a DISTINCT park with a distinct purpose:
+--
+-- 🔴 recovery_wait IS NOT A USAGE LIMIT. A worker enters it after a positively-empty SDK
+-- turn survived bounded in-process retries — a transient recovery, not credential
+-- exhaustion. So this query MUST NOT touch any limit/credential gauge: limit_wait_count,
+-- limit_resets_at, retry_not_before, rate_limit_type and limit_dead_secret_id are ALL left
+-- untouched. Its own recovery_wait_count/recovery_retry_not_before are the only park
+-- bookkeeping, and recovery_wait_count is a backoff SHAPER, never a cap (there is no
+-- lifetime-park cap and no terminal branch — a park always becomes promotable again).
+--
+-- 🔴 THE SOURCE GUARD IS POSITIVE (status = 'running'), exactly as SetRunLimitWait's, and
+-- for the same reasons: a negative guard would admit queued/claimed -> recovery_wait (a
+-- stale report parking a run no worker holds), awaiting_approval -> recovery_wait
+-- (swallowing a pending human approval), and recovery_wait -> recovery_wait (a re-delivered
+-- report bumping the backoff count a second time on one event). With the positive guard
+-- each is a 0-row no-op, surfaced to the worker as 409 / applied=false, so re-delivery is
+-- idempotent and the worker's cleanup carve-out keys off the RETURNED STATUS.
+--
+-- kind <> 'judge' mirrors SetRunLimitWait (Decision 14): a judge run is executed by a
+-- different runner with its own error path and is never re-enqueued.
+--
+-- recovery_retry_not_before is computed in GO and passed in (now + capped exponential
+-- backoff + jitter; see workersvc/recoverywait.go), never derived here.
+--
+-- recovery_wait_count bumps HERE, in the same statement as the transition, so a run cannot
+-- end up parked without its backoff shaper advancing. It is distinct from limit_wait_count
+-- and requeue_count on purpose — a shared counter would let one park's budget leak into
+-- another's curve.
+--
+-- The health reset is MANDATORY for the same reason SetRunLimitWait's is: a parked run is
+-- absent from ListActiveRunsForHealth (a POSITIVE allowlist), so whatever flag was live at
+-- park time would FREEZE for the whole park with nothing able to clear it. Do NOT "fix" it
+-- by adding recovery_wait to that allowlist: stalled/looping/slow describe a RUNNING agent.
+-- plan_md and worker_id are PRESERVED (worker_id is in the WHERE, never the SET). This is a
+-- NON-TERMINAL transition, so the run's checkpoint is NOT deleted (that fires only on
+-- terminal transitions).
+UPDATE runs SET
+    status                    = 'recovery_wait',
+    status_since              = now(),
+    recovery_wait_count       = recovery_wait_count + 1,
+    recovery_retry_not_before = @retry_not_before,
+    session_id                = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running'
+  AND kind <> 'judge';
+
+-- name: PromoteRecoveryWaitRuns :many
+-- The sweeper's transient-recovery promotion pass (issue #1197): recovery_wait -> queued
+-- once the clock passes recovery_retry_not_before. Backed by idx_runs_recovery_wait_retry,
+-- a partial index on exactly this predicate, so the pass costs an index scan over a set
+-- that is empty on a healthy instance rather than a seq scan of runs. Mirrors
+-- PromoteLimitWaitRuns field-for-field.
+--
+-- Unlike limit_wait there is NO lifetime cap: recovery_wait_count is left in place (it
+-- keeps shaping the next park's backoff) and this promotion always fires once the stamp
+-- passes, so the run auto-resumes repeatedly at the capped cadence until it recovers or the
+-- owner cancels (CancelRunServerSide's negative admit-set covers a recovery_wait run).
+--
+-- started_at = NULL so the resumed run gets a FRESH RUN_TIMEOUT wall, and
+-- budget_paused_seconds = 0 so the pause banked against the OLD baseline is not
+-- over-credited — both exactly as PromoteLimitWaitRuns does. NULL <= @now is UNKNOWN, so a
+-- run whose recovery_retry_not_before is NULL is never promoted (harmless: a park always
+-- writes a finite stamp).
+--
+-- session_id, worker_id and recovery_retry_not_before are left in place as affinity/history
+-- exactly as PromoteLimitWaitRuns leaves limit_wait's. A stale recovery_retry_not_before
+-- cannot re-fire this statement because the status predicate has already moved.
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    -- Revoke the per-claim Codex capability on park->queued, exactly as PromoteLimitWaitRuns:
+    -- a promoted run has no live owner until re-claimed, so clearing the hash and bumping the
+    -- epoch supersedes any capability minted for the prior claim.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE status = 'recovery_wait' AND recovery_retry_not_before <= @now
+RETURNING id, user_id, status;
+
 -- name: SetRunAwaitingInput :execrows
 -- PRD #88 M1: the clarification park. Sibling of SetRunAwaitingApproval, and it
 -- carries the same PRD #47 exit contract for the same reason.
@@ -1927,7 +2021,14 @@ WHERE id = @id
   -- token), not looped, so auto-stopping one would be wrong on the merits. It is excluded
   -- today only by autostop.go's single `if run.Status != "running"` line, unmentioned in
   -- that line's comment, and exposed the day someone relaxes it — so this is its SQL backstop.
-  AND status <> 'pool_wait';
+  AND status <> 'pool_wait'
+  -- recovery_wait (issue #1197) is the fifth park and the same argument transfers verbatim: a
+  -- recovery-parked run's writes have STOPPED (the worker parked after a positively-empty
+  -- turn, awaiting the server-owned backoff promotion), not looped, so auto-stopping one
+  -- would be wrong on the merits. It is excluded today only by autostop.go's single
+  -- `if run.Status != "running"` line, unmentioned in that line's comment, and exposed the
+  -- day someone relaxes it — so this is its SQL backstop.
+  AND status <> 'recovery_wait';
 
 -- name: RejectRunServerSide :execrows
 -- Server-side plan rejection → failed → origin restore → stamp. stop_kind is

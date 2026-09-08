@@ -492,6 +492,13 @@ type Store interface {
 	// second park.
 	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
+	// SetRunRecoveryWait parks a run in the transient-recovery hold (issue #1197);
+	// PromoteRecoveryWaitRuns is the sweeper pass that auto-promotes it once its capped
+	// backoff elapses. Like the limit-wait park its source guard is POSITIVE
+	// (status = 'running'), so a re-delivered or out-of-order report is a 0-row no-op; but
+	// it has NO per-run cap, so promotion always fires and the run recovers repeatedly.
+	SetRunRecoveryWait(ctx context.Context, arg store.SetRunRecoveryWaitParams) (int64, error)
+	PromoteRecoveryWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error)
 	// The reactive-resume pass (PRD #754 M5): ListPoolWaitRuns is the pool_wait worklist
 	// (oldest first), and PromotePoolWaitRun promotes ONE held run (pool_wait → queued),
 	// owner-scoped so the sweeper passes each run's own user_id and resume-now cannot
@@ -854,6 +861,15 @@ type Params struct {
 	// the two agree; the defaults live in config.go, where the envs are read.
 	RunLimitMaxWaits int
 	RunLimitMaxPark  time.Duration
+
+	// Transient-recovery park (issue #1197), mirrored from config. RunRecoveryParkBase is
+	// the FIRST recovery park's wait (the exponential backoff's base); each subsequent
+	// park doubles it, clamped at RunRecoveryMaxPark. UNLIKE the usage-limit knobs above,
+	// NEITHER can fail a run: there is no per-run park cap, so a 'recovery_wait' run always
+	// becomes promotable again after its capped backoff (until it recovers or the owner
+	// cancels). recovery_wait_count shapes the curve only. The defaults live in config.go.
+	RunRecoveryParkBase time.Duration
+	RunRecoveryMaxPark  time.Duration
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -2170,6 +2186,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		})
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
+	case "recovery_wait":
+		// Transient-recovery park (issue #1197): a positively-empty SDK turn survived the
+		// worker's bounded in-process retries, so the run parks on a server-owned capped
+		// backoff and the sweeper auto-promotes it. This is the reusable transient-recovery
+		// park primitive (any transient cause reports it and reuses the park->promote
+		// lifecycle); it is NOT a usage limit — see setRecoveryWait / recoverywait.go.
+		rows, err = s.setRecoveryWait(ctx, owned, wkr, req, sessionID)
 	case "failed":
 		// PRD #634 follow-up: a scope-directed run that terminates abnormally (failed/cancelled/
 		// stopped/plan-rejected) never applied the scope cap, so settle its pending audit row
@@ -3954,7 +3977,13 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	// other runs, but it is never polling this held run, so a cancel routed to a poller
 	// would sit unconsumed (worse than limit_wait — there is no promotion pass in M4).
 	// It must go server-side, so it must read as "no live poller" here too.
-	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || !run.WorkerID.Valid {
+	//
+	// Issue #1197: recovery_wait is a worker-held park of the SAME shape as limit_wait —
+	// the run keeps its worker_id for affinity and that worker keeps heartbeating for its
+	// other runs, but it is NOT polling this parked run (the worker parked it and awaits the
+	// server-owned promotion), so a cancel routed to a poller would sit unconsumed. It must
+	// go server-side too, so it reads as "no live poller" here alongside the other parks.
+	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || run.Status == "recovery_wait" || !run.WorkerID.Valid {
 		return false, nil
 	}
 	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
@@ -4000,6 +4029,11 @@ type SweepResult struct {
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
 	// busy resume it climbs one owner at a time across ticks. Normally 0.
 	PoolResumed int64
+	// RecoveryPromoted is the number of runs this pass auto-promoted from recovery_wait to
+	// queued because their recovery_retry_not_before elapsed (issue #1197). Normally 0: the
+	// partial index this reads covers only parked runs, a set that is empty on a healthy
+	// instance. Counted like LimitPromoted (len of the returned slice).
+	RecoveryPromoted int64
 }
 
 // -------------------------------------------------------------------------

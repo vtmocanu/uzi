@@ -202,7 +202,13 @@ func reconcilerDecision(status string, origin pgtype.Text) decision {
 	// default arm would trip the give-up warn on every hold. It is In Progress (a held
 	// run is still working), and Notify's partial map is deliberately NOT extended: a
 	// hold moves no card, so there is nothing to notify about.
-	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait":
+	// recovery_wait (issue #1197) is the transient-recovery park and belongs here for the
+	// very same reasons as limit_wait/pool_wait: a recovery-parked run keeps its issue and
+	// worker affinity, auto-resumes on the server-owned capped backoff, and routinely
+	// outlasts 30 minutes — so leaving it in the default arm would trip the give-up warn on
+	// every park. It is In Progress (a recovering run is still working), and Notify's partial
+	// map is deliberately NOT extended: a park moves no card, so there is nothing to notify.
+	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "recovery_wait":
 		return decision{act: true, target: board.ColumnInProgress}
 	case "completed":
 		return decision{act: true, target: board.ColumnHumanReview}
