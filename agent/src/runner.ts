@@ -62,11 +62,18 @@ import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js"
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
-import { REASON_NO_TOKEN } from "./sdk-executor.js";
+import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
+
+/** issue #1197 (D-RC2c): bounded LOCAL-capture retries in handleRecoveryExhausted — one
+ *  retry of the commit+fetch+verify sequence before falling back to preserve-and-do-not
+ *  -promote. Small: a local git commit/fetch failure that persists across a retry is not
+ *  going to clear on a third, and the fallback (preserve the clone + session) loses
+ *  nothing. */
+const RECOVERY_CAPTURE_MAX_ATTEMPTS = 2;
 
 /** PRD #974 follow-up (#1077): a terminal push_secret_blocked report whose reportState
  *  exhausted its bounded retries and threw. Carrying the typed origin + safe reason through
@@ -673,6 +680,29 @@ export class RunRunner {
           // for every parked run, including the edge where the paths above were absent.
           await batcher.close().catch(() => undefined);
         }
+      } else if (err instanceof TransientRecoveryError) {
+        // issue #1197 (D-RC2c): a POSITIVELY-empty SDK turn (0 turns, no activity)
+        // persisted past the bounded in-process retries. Unlike limit_wait, which reports
+        // the park THEN captures via the shared block above, recovery CAPTURES AND
+        // POSITIVELY VERIFIES the local restore point FIRST and only then reports a
+        // promotable recovery_wait — the causal fence that stops a promotion/reseed from
+        // wiping unverified work. All of capture, the park report and the single
+        // batcher.close happen INSIDE handleRecoveryExhausted; the shared post-park
+        // capture block above is deliberately NOT run for this branch (it would
+        // double-capture). On a verified capture the method reports the park and returns
+        // true (flight.parked → the finally preserves session/HOME); on a local
+        // capture/verification failure it sets flight.preserveSession and returns false
+        // (preserve the clone + session locally, report no promotable park). activeRuns is
+        // dropped by the finally on both paths, exactly as the limit/shutdown branches.
+        flight.parked = await this.handleRecoveryExhausted(
+          err,
+          claim,
+          flight,
+          executor,
+          batcher,
+          reportState,
+          runLog,
+        );
       } else if (flight.active?.shuttingDown) {
         // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
         // run mid-flight. The DISCRIMINATOR is the flag, never the error: a user
@@ -3388,6 +3418,243 @@ export class RunRunner {
       await batcher.close().catch(() => undefined);
       return false;
     }
+    return true;
+  }
+
+  /**
+   * issue #1197 (D-RC2c) — handle a positively-empty SDK turn that persisted past the
+   * bounded in-process retries ({@link TransientRecoveryError}). Returns whether the run
+   * is PARKED (the sole input to the finally's cleanup carve-out, like handleLimitReached).
+   *
+   * 🔴 THE ANSWER IS `ack.status === "recovery_wait"`, NEVER `applied` — the same trap
+   * handleLimitReached warns about: a server that refuses/coerces the park still answers
+   * 200 with `applied` true and a different status, so a promotable park is claimed ONLY
+   * on the positive `recovery_wait` literal.
+   *
+   * ORDERING DIFFERS FROM handleLimitReached ON PURPOSE (capture BEFORE report, blocking
+   * point 2 / amendment B): limit_wait reports the park then captures via the shared
+   * execute() block; recovery must not, because capture *attempt* completion is not
+   * capture *success* (commitWipMarker returns false for BOTH a clean tree and an error;
+   * fetchBackBestEffort swallows a failed fetch). So this method:
+   *   1. reaps the agent tree (the security boundary before touching the runner clone),
+   *   2. CAPTURES and POSITIVELY VERIFIES the local restore point (a runner-uid dirty/
+   *      clean split → commitWipMarker-required-true-on-dirty → fetchAgentBranch (throws)
+   *      → verifyRunnerTrackingCovers), with one bounded local retry, then
+   *   3a. on a VERIFIED restore point reports `recovery_wait` and discriminates the ack
+   *       exactly like handleLimitReached (parked ⇒ true), OR
+   *   3b. on a local capture/verification FAILURE preserves the source clone AND session
+   *       (flight.preserveSession — the shutdown-branch preservation) and returns NOT
+   *       parked, so no promotion/reseed can wipe the unverified work and no work-
+   *       destroying terminal is reported.
+   * A REMOTE publish failure is best-effort and NEVER blocks the park (a cross-worker
+   * reclaim reseeds from default with a truthful feed line, same as limit_wait).
+   */
+  private async handleRecoveryExhausted(
+    err: TransientRecoveryError,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    executor: Executor,
+    batcher: MessageBatcher,
+    reportState: (body: StateRequest) => Promise<StateAck>,
+    runLog: Logger,
+  ): Promise<boolean> {
+    // Reap the agent tree before reading the runner-owned clone (the security boundary),
+    // exactly as the other capture branches do. This also makes the publish overlay's
+    // PAT default-fetch permitted (the REAP-BEFORE-GIT invariant).
+    executor.killAgentTree?.();
+
+    // CAPTURE + POSITIVELY VERIFY the local restore point BEFORE reporting the park.
+    const captured = await this.captureRecoveryRestorePoint(claim, flight, runLog);
+
+    if (!captured) {
+      // Local capture/verification FAILED after the bounded retry. Do NOT report a
+      // promotable park: leave the run non-promoted (still `running` server-side, so the
+      // ordinary stale-worker requeue handles it) so no promotion/reseed can fire onto the
+      // un-verified restore point. PRESERVE THE SESSION (flight.preserveSession, the
+      // shutdown-branch carve-out): the plugin dir + per-run HOME survive so a same-worker
+      // retry resumes the SDK transcript. (The clone leg is removed unconditionally by the
+      // finally per PRD #218 M6 — the reseed re-clones from the bare — so preserveSession
+      // preserves exactly the two dirs the shutdown branch does, no more.) NOT a work-
+      // destroying terminal report.
+      flight.preserveSession = true;
+      runLog.warn(
+        "recovery capture could not be verified; preserving the session locally and reporting NO promotable park",
+        { detail: err.message },
+      );
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "could not verify a recovery restore point; preserved this run's session locally for a same-worker retry (no park reported)",
+        },
+      });
+      await batcher.close().catch(() => undefined);
+      return false;
+    }
+
+    // The local restore point is VERIFIED → report the promotable recovery_wait park (the
+    // server stamps the capped-backoff, promotable retry_not_before).
+    runLog.info("recovery restore point verified; requesting a recovery_wait park", {
+      detail: err.message,
+    });
+    batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: "paused to recover from an empty model result; it resumes automatically",
+      },
+    });
+    // FLUSH (not close) so the feed lines land before the state report; the single close
+    // below fires on every path this method returns.
+    await batcher.flush().catch(() => undefined);
+
+    let ack: StateAck;
+    try {
+      ack = await reportState({ status: "recovery_wait" });
+    } catch (e) {
+      // The park request never landed. Clean up as an unparked run (exactly like
+      // handleLimitReached): this run is NOT parked. The captured work is durable in the
+      // bare's tracking ref (captured before this report), so full cleanup loses no
+      // committed work — a preserved HOME nothing will ever claim would be an unbounded
+      // leak. The server's stale-worker requeue handles the still-`running` row.
+      runLog.error(
+        "could not report the recovery park; cleaning up as an unparked run",
+        { error: errMessage(e) },
+      );
+      await batcher.close().catch(() => undefined);
+      return false;
+    }
+
+    if (ack.status !== "recovery_wait") {
+      // The server did not recovery-park this run (a concurrent cancel/terminal won, an
+      // older server, or a coerced 200 whose `applied` is true but status differs). Clean
+      // up as unparked (return false), exactly like handleLimitReached — the captured work
+      // is already durable in the tracking ref.
+      runLog.warn("the server did not recovery-park this run; cleaning up", {
+        applied: ack.applied,
+        server_status: ack.status ?? "unknown",
+      });
+      await batcher.close().catch(() => undefined);
+      return false;
+    }
+    await batcher.close().catch(() => undefined);
+    return true;
+  }
+
+  /**
+   * issue #1197 (D-RC2c) — capture and positively verify the LOCAL restore point for a
+   * recovery park, with a bounded local retry ({@link RECOVERY_CAPTURE_MAX_ATTEMPTS}).
+   * Returns true IFF a verified restore point exists (the bare's tracking ref covers the
+   * run's current tip, so a same-worker reseed recovers it). Absent clone paths ⇒ there is
+   * no local restore point to verify ⇒ false (fail closed: preserve, do not promote).
+   */
+  private async captureRecoveryRestorePoint(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+  ): Promise<boolean> {
+    const barePath = flight.barePath;
+    const worktreePath = flight.worktreePath;
+    const branch = flight.branch;
+    if (!barePath || !worktreePath || !branch) {
+      runLog.warn(
+        "recovery capture skipped: no clone paths on the flight; cannot verify a restore point",
+      );
+      return false;
+    }
+    for (let attempt = 1; attempt <= RECOVERY_CAPTURE_MAX_ATTEMPTS; attempt++) {
+      const ok = await this.captureAndVerifyRecoveryOnce(
+        claim,
+        flight,
+        barePath,
+        worktreePath,
+        branch,
+        runLog,
+      );
+      if (ok) return true;
+      runLog.warn("recovery capture attempt failed; will retry if budget remains", {
+        attempt,
+        max: RECOVERY_CAPTURE_MAX_ATTEMPTS,
+      });
+    }
+    return false;
+  }
+
+  /**
+   * issue #1197 (D-RC2c) — one commit+fetch+verify capture attempt. Returns true only
+   * when the LOCAL restore point is positively verified. The remote publish is separate
+   * and best-effort (a failure NEVER blocks the park — same truthful degradation as
+   * limit_wait).
+   */
+  private async captureAndVerifyRecoveryOnce(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    barePath: string,
+    worktreePath: string,
+    branch: string,
+    runLog: Logger,
+  ): Promise<boolean> {
+    // Distinguish dirty vs clean EXPLICITLY (runner-uid porcelain) rather than trusting
+    // commitWipMarker's ambiguous false (false = a clean tree OR a commit error).
+    // worktreeStatus returns null on an UNREADABLE status → treat as a capture failure
+    // (cannot assert clean), never as "no changes".
+    const status = await this.git.worktreeStatus(worktreePath);
+    if (status === null) {
+      runLog.warn("recovery capture: worktree status unreadable (cannot assert clean)");
+      return false;
+    }
+    if (status.length > 0) {
+      // DIRTY → commit the WIP marker and REQUIRE it committed. Because we already know the
+      // tree is dirty, a `false` here is unambiguously a commit FAILURE (not the clean-tree
+      // no-op case), so it is a capture failure.
+      const committed = await this.git.commitWipMarker(worktreePath);
+      if (!committed) {
+        runLog.warn("recovery capture: WIP commit of a dirty tree failed");
+        return false;
+      }
+    }
+    // Fetch the run's tip into the worker bare's tracking ref (refs/uzi-runner/<branch>).
+    // fetchAgentBranch THROWS on failure (unlike the void fetchBackBestEffort), so a
+    // failed fetch-back is caught here as a capture failure rather than being swallowed.
+    try {
+      await this.git.fetchAgentBranch(barePath, worktreePath, branch, flight.runId);
+    } catch (e) {
+      runLog.warn("recovery capture: fetch-back failed", { error: errMessage(e) });
+      return false;
+    }
+    // POSITIVELY VERIFY the LOCAL restore point: the bare's tracking ref now covers the
+    // run's current HEAD (incl. any WIP marker), so a same-worker reseed recovers exactly
+    // this tip. This is the fetch-back success signal fetchBackBestEffort's void does not
+    // give. A clean tree whose already-committed tip already matches is a no-op success.
+    const verified = await this.git.verifyRunnerTrackingCovers(
+      barePath,
+      worktreePath,
+      branch,
+    );
+    if (!verified) {
+      runLog.warn("recovery capture: tracking ref does not cover HEAD (not verified)");
+      return false;
+    }
+    // Remote publish is SEPARATE and best-effort: a publish FAILURE does NOT block the
+    // park (a cross-worker reclaim reseeds from default with the truthful feed line below,
+    // same as limit_wait); only the LOCAL verification above blocks it. The agent tree was
+    // reaped by the caller, so the overlay's PAT default-fetch is permitted.
+    const overlay = await this.buildCheckpointOverlay(claim, flight, barePath);
+    const published = await this.publishCheckpointBestEffort(
+      flight,
+      barePath,
+      branch,
+      overlay,
+    );
+    flight.batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: published
+          ? "recovery checkpoint published to origin"
+          : "recovery checkpoint NOT published — a resume on another worker will restart from the default branch",
+      },
+    });
     return true;
   }
 

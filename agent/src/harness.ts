@@ -366,6 +366,17 @@ export interface ReducedTurnResult extends TurnSignals {
   sessionId?: string;
   finalText?: string;
   subagentActivity?: boolean;
+  /** issue #1197 (D-RC2a): the SDK terminal's POSITIVELY-reported turn count
+   *  (`terminal.metrics.wire.num_turns`), coerced to a number ONLY when it is a
+   *  finite number (mirrors limit.ts normalizeResetsAt's shape). Missing or garbage
+   *  metrics leave it `undefined` — NEVER defaulted to 0 — so a turn that ran but
+   *  reported no count is never mistaken for a positively-empty (zero-turn) result. */
+  numTurns?: number;
+  /** issue #1197 (D-RC2a): true when ANY assistant/tool frame (items) or usage was
+   *  folded this turn — the positive "the model did something" signal. Left false/
+   *  undefined only when the turn streamed no model output at all. Paired with
+   *  `numTurns === 0` it is the evidence a turn was positively empty. */
+  sawModelActivity?: boolean;
 }
 
 export interface TurnReduction {

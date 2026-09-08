@@ -154,6 +154,43 @@ const STALL_LIMIT = 3;
 const REASON_NO_PROGRESS =
   "the lead declined the task and made no progress: it repeated the same response with no new commits, no working-tree changes, and no subagent activity across consecutive iterations. Stopped early rather than exhausting the iteration budget; see the lead's response on the run feed.";
 
+// issue #1197 (D-RC2b): bounded, budget-safe in-process retries on a POSITIVELY-EMPTY
+// SDK turn (0 turns, no model activity, no plan/questions/done). ONLY a positively-empty
+// RETURN is retried — a genuine wall/idle/cancel trip (state.tripReason) wins first, and
+// a turn with MISSING metrics (numTurns undefined) is never treated as empty.
+const EMPTY_TURN_MAX_RETRIES = 2;
+// Base in-process backoff between empty-turn retries, MULTIPLIED by the attempt number
+// (2s, 4s, …). Deliberately small — SECONDS — because the LONG backoff is the
+// server-owned recovery_wait park (D-RC2c); this only smooths a transient blip. The
+// wait is budget-accounted (debited from the wall) and cancel-safe (polled in slices).
+const EMPTY_TURN_BACKOFF_BASE_MS = 2_000;
+// The cancel-poll / budget-debit slice length for the between-retry backoff sleep. The
+// backoff sleeps in slices this long so a cancel is observed (and the wall debited)
+// promptly rather than only at the end of a multi-second wait.
+const EMPTY_TURN_BACKOFF_SLICE_MS = 250;
+
+/**
+ * issue #1197 (D-RC2b): a POSITIVELY-EMPTY SDK turn (0 turns, no model activity, no
+ * plan/questions/done) persisted after the bounded in-process retries. Thrown by
+ * {@link SdkExecutor.driveTurnWithEmptyRecovery} to escalate to the worker's
+ * `recovery_wait` park (runner.ts `handleRecoveryExhausted`), which captures and
+ * verifies the local restore point BEFORE reporting a promotable, resumable park —
+ * never a work-destroying terminal `failed`.
+ *
+ * This is NEVER thrown for a genuine wall/idle/cancel trip (those keep their existing
+ * terminal/cancelled outcome) nor for a turn that RAN but did not submit a plan (that
+ * stays REASON_NO_PLAN). A distinct typed error is what lets the runner catch route it
+ * to the non-terminal park instead of the generic failure path.
+ */
+export class TransientRecoveryError extends Error {
+  constructor(
+    message = "the model returned a positively-empty result (0 turns, no activity) after bounded in-process retries",
+  ) {
+    super(message);
+    this.name = "TransientRecoveryError";
+  }
+}
+
 // PRD #517 M3/M5: the FALLBACK idle bound for an INTERACTIVE task's follow-up park — how
 // long the run waits at awaiting_followup for the next follow-up before the park ENDS and
 // the run finalizes. As of M5 the live value is server-configured via
@@ -251,6 +288,14 @@ export interface SdkExecutorOptions {
    *  Default {@link CONTEXT_USAGE_TIMEOUT_MS} (2s); tests lower it so the hang case
    *  resolves fast. */
   contextUsageTimeoutMs?: number;
+  /** issue #1197 (D-RC2b): base in-process backoff between POSITIVELY-EMPTY turn
+   *  retries (increasing per attempt). Default {@link EMPTY_TURN_BACKOFF_BASE_MS};
+   *  tests lower it so the retry paths run without real multi-second sleeps. */
+  emptyTurnBackoffBaseMs?: number;
+  /** issue #1197 (D-RC2b): how many bounded in-process re-drives a positively-empty
+   *  turn gets before escalating to {@link TransientRecoveryError}. Default
+   *  {@link EMPTY_TURN_MAX_RETRIES}; tests set it to drive exhaustion precisely. */
+  emptyTurnMaxRetries?: number;
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -293,6 +338,16 @@ interface TurnResult {
   /** Issue #281: true when any subagent produced a frame this turn (work in flight),
    *  which disqualifies the turn from counting as a no-progress stall. */
   subagentActivity?: boolean;
+  /** issue #1197 (D-RC2a): the SDK terminal's positively-reported turn count, coerced
+   *  by the reducer to a number ONLY when finite (missing/garbage stays undefined,
+   *  never 0). Mirrored here so `driveTurn`'s returned result (reducer.finish().result)
+   *  carries it to callers deciding whether a turn was positively empty. */
+  numTurns?: number;
+  /** issue #1197 (D-RC2a): true when any assistant/tool frame or usage was folded this
+   *  turn — the positive "the model did something" signal. Mirrored from ReducedTurnResult
+   *  so callers can distinguish a positively-empty turn (numTurns===0 && !sawModelActivity)
+   *  from a genuine "ran but no plan" turn. */
+  sawModelActivity?: boolean;
 }
 
 /** PRD #88 feed notices for a question that could NOT be put to a human. Both are
@@ -434,6 +489,12 @@ export class SdkExecutor implements Executor {
   private readonly summaryRunner: SummaryRunner;
   /** PRD #516 M1: timeout for the per-turn `getContextUsage()` control call. */
   private readonly contextUsageTimeoutMs: number;
+  /** issue #1197 (D-RC2b): base in-process backoff between positively-empty turn
+   *  retries (× the attempt number). Injectable so tests run the retry paths fast. */
+  private readonly emptyTurnBackoffBaseMs: number;
+  /** issue #1197 (D-RC2b): bounded in-process re-drive count for a positively-empty
+   *  turn before escalating to {@link TransientRecoveryError}. Injectable for tests. */
+  private readonly emptyTurnMaxRetries: number;
   /** Every pid spawned across the current run's turns, for the done-path reap.
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
    *  4), so two concurrent runs can never wipe/kill each other's set. Shared with
@@ -490,6 +551,16 @@ export class SdkExecutor implements Executor {
       opts.summaryRunner ?? new SummaryRunner(this.log, { homeRoot: this.provisionHomeDir });
     this.contextUsageTimeoutMs =
       opts.contextUsageTimeoutMs ?? CONTEXT_USAGE_TIMEOUT_MS;
+    // issue #1197 (D-RC2b): empty-turn recovery knobs. A non-positive override falls
+    // back to the constant so a stray 0 cannot disable the backoff / retries.
+    this.emptyTurnBackoffBaseMs =
+      opts.emptyTurnBackoffBaseMs !== undefined && opts.emptyTurnBackoffBaseMs >= 0
+        ? opts.emptyTurnBackoffBaseMs
+        : EMPTY_TURN_BACKOFF_BASE_MS;
+    this.emptyTurnMaxRetries =
+      opts.emptyTurnMaxRetries !== undefined && opts.emptyTurnMaxRetries >= 0
+        ? Math.floor(opts.emptyTurnMaxRetries)
+        : EMPTY_TURN_MAX_RETRIES;
     // The Claude adapter carries the SDK-aware run-lane behavior (decode, process
     // ownership, context read, terminal). All its deps are construction-available.
     this.harness = new ClaudeHarness({
@@ -1764,7 +1835,11 @@ export class SdkExecutor implements Executor {
           latestProgress,
           frozenMilestones,
         );
-        const turn = await this.driveTurn(
+        // issue #1197 (D-RC2b): a resumed implement turn that returns POSITIVELY empty
+        // (0 turns, no activity) is retried in-process and, if still empty, escalated to
+        // the recovery_wait park (TransientRecoveryError) instead of terminal-failing —
+        // covering the RC2 resume-empty-turn incident on the implement path too.
+        const turn = await this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
           "implement",
@@ -2303,7 +2378,12 @@ export class SdkExecutor implements Executor {
     // question would loop here forever, never planning and never failing.
     const maxRounds = questionMax(ctx.config ?? null) + 1;
     for (let round = 0; ; round++) {
-      const turn = await this.driveTurn(
+      // issue #1197 (D-RC2b): a POSITIVELY-empty planning turn is retried in-process,
+      // then escalated to TransientRecoveryError (the recovery_wait park) by the
+      // wrapper — which throws BEFORE the REASON_NO_PLAN control below is reached. A
+      // NON-empty turn that neither planned nor asked still falls through to
+      // REASON_NO_PLAN, so un-gated work is never pushed (contract preserved).
+      const turn = await this.driveTurnWithEmptyRecovery(
         ctx,
         config,
         "plan",
@@ -2599,6 +2679,119 @@ export class SdkExecutor implements Executor {
     }
   }
 
+  /**
+   * issue #1197 (D-RC2b): drive one turn, then bounded/budget-safe/cancel-safe
+   * in-process retries when — and ONLY when — that turn returned POSITIVELY empty
+   * (0 turns, no model activity, no plan/questions/done). Every other return, including
+   * a turn that ran but did not submit a plan (which stays REASON_NO_PLAN in the caller)
+   * and a turn with MISSING metrics (numTurns undefined), returns unchanged.
+   *
+   * Invariants (the reason this is a wrapper, not inlined in driveTurn):
+   *  - A genuine cancel/idle/wall trip WINS: `state.tripReason` is thrown FIRST each
+   *    attempt and polled during the backoff, so a real trip keeps its existing
+   *    terminal/cancelled outcome and is NEVER reclassified as recovery.
+   *  - Budget exhaustion is NEVER a recovery trigger: the backoff is skipped once the
+   *    wall is spent, and the next driveTurn's `armWall` trips REASON_WALL naturally —
+   *    the genuine wall outcome, not a park. The between-turns wait is debited from the
+   *    wall (disarmed between turns) so the next turn sees the true remaining budget.
+   *  - The re-drive uses the SAME resumeId — nothing was torn down, so a resumed
+   *    turn's SDK session is preserved.
+   * Only after the bounded retries are exhausted on a still-positively-empty result
+   * does this throw {@link TransientRecoveryError} → the recovery_wait park (D-RC2c).
+   */
+  private async driveTurnWithEmptyRecovery(
+    ctx: RunContext,
+    turnConfig: ClaudeTurnConfig,
+    phase: "plan" | "implement",
+    resumeId: string | undefined,
+    prompt: string,
+    state: RunDrive,
+    idleMs: number,
+    onProgress?: (progress: MilestoneProgress) => void,
+  ): Promise<TurnResult> {
+    let turn = await this.driveTurn(
+      ctx,
+      turnConfig,
+      phase,
+      resumeId,
+      prompt,
+      state,
+      idleMs,
+      onProgress,
+    );
+    // The common path: a non-empty turn returns unchanged. Recovery is entered ONLY on
+    // a positively-empty return (isPositivelyEmpty excludes missing metrics, plan,
+    // questions, done and any model activity).
+    if (!isPositivelyEmpty(turn)) return turn;
+
+    for (let attempt = 1; attempt <= this.emptyTurnMaxRetries; attempt++) {
+      // A real cancel/idle/wall trip WINS and keeps its existing outcome — throw it
+      // FIRST, before any backoff or re-drive, so it is never reclassified as recovery.
+      if (state.tripReason) throw new Error(state.tripReason);
+      // Budget-accounted, cancel-safe backoff — SKIPPED when the wall is already spent
+      // (let the next driveTurn's armWall trip REASON_WALL; budget exhaustion is NEVER
+      // a recovery trigger). Increasing per attempt; small (seconds) — the long backoff
+      // is the server-owned recovery_wait park.
+      if (state.wallRemainingMs > 0) {
+        await this.emptyTurnBackoff(state, this.emptyTurnBackoffBaseMs * attempt);
+      }
+      // A truthful feed notice each attempt, right before the re-drive.
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "the model returned an empty result (0 turns, no activity); retrying…",
+        },
+      });
+      // Re-drive with the SAME resumeId — nothing was torn down, so a resumed turn's
+      // SDK session is preserved.
+      turn = await this.driveTurn(
+        ctx,
+        turnConfig,
+        phase,
+        resumeId,
+        prompt,
+        state,
+        idleMs,
+        onProgress,
+      );
+      if (!isPositivelyEmpty(turn)) return turn;
+    }
+    // Bounded retries exhausted, still positively empty → escalate to the recovery park.
+    throw new TransientRecoveryError();
+  }
+
+  /**
+   * issue #1197 (D-RC2b): the between-retry backoff — a cancel-safe, budget-accounted
+   * sleep. Sleeps in short slices so a cancel is observed (thrown) and the wall debited
+   * promptly rather than only at the end of a multi-second wait. Returns early the
+   * moment the wall is spent, so budget exhaustion falls through to the next turn's
+   * armWall (REASON_WALL) rather than continuing to wait.
+   */
+  private async emptyTurnBackoff(state: RunDrive, totalMs: number): Promise<void> {
+    let remaining = totalMs;
+    while (remaining > 0) {
+      // A real cancel/idle/wall trip observed within a slice WINS — throw it, never
+      // keep backing off. (Idle/wall are disarmed between turns, so realistically only
+      // a cancel lands here, but the check is total by construction.)
+      if (state.tripReason) throw new Error(state.tripReason);
+      // Budget already exhausted → stop sleeping and let the NEXT driveTurn's armWall
+      // trip REASON_WALL. Never convert budget exhaustion into recovery.
+      if (state.wallRemainingMs <= 0) return;
+      const slice = Math.min(EMPTY_TURN_BACKOFF_SLICE_MS, remaining);
+      const before = Date.now();
+      await sleep(slice);
+      // Catch a cancel that landed mid-sleep promptly, before debiting/looping.
+      if (state.tripReason) throw new Error(state.tripReason);
+      // Debit the ACTUAL elapsed time (mirrors disarmWall) so the subsequent turn's
+      // armWall sees the true remaining budget; the wall is disarmed between turns, so
+      // this backoff is the only place the between-turns wait is charged.
+      state.wallRemainingMs -= Date.now() - before;
+      remaining -= slice;
+    }
+    if (state.tripReason) throw new Error(state.tripReason);
+  }
+
   /** Record a first-wins watchdog/cancel trip and stop the current turn. */
   private trip(state: RunDrive, reason: string): void {
     if (state.tripReason) return; // first trip wins
@@ -2641,6 +2834,33 @@ export class SdkExecutor implements Executor {
 function seconds(value: number | undefined, fallback: number): number {
   const s = typeof value === "number" && value > 0 ? value : fallback;
   return Math.round(s * 1000);
+}
+
+/** A plain ref'd sleep (the backoff must actually resolve, unlike the unref'd
+ *  watchdog timers). */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * issue #1197 (D-RC2b): a turn is POSITIVELY empty iff it produced NO plan, NO
+ * questions, is NOT done, the SDK POSITIVELY reported ZERO turns, AND no model activity
+ * was folded. A turn carrying a plan, tool result, questions, done, or any activity is
+ * NOT empty. Crucially, MISSING metrics (`numTurns === undefined`) is NOT empty either —
+ * a turn that ran but reported no count still flows to the existing REASON_NO_PLAN
+ * control, never into recovery (requirement 5). Only a positively-empty result is
+ * eligible for the bounded in-process retry / recovery park.
+ */
+function isPositivelyEmpty(turn: TurnResult): boolean {
+  return (
+    turn.plan === undefined &&
+    !turn.questions?.length &&
+    !turn.done &&
+    turn.numTurns === 0 &&
+    !turn.sawModelActivity
+  );
 }
 
 /** A positive integer override, else the fallback. */

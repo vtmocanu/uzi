@@ -1263,6 +1263,48 @@ export class GitCache {
   }
 
   /**
+   * issue #1197 (D-RC2c): positively verify the LOCAL restore point after a recovery
+   * capture. Compares the WORKER bare's tracking ref (`refs/uzi-runner/<branch>`, what a
+   * reseed reads) against the runner clone's current HEAD, and returns true IFF both
+   * resolve to the SAME commit — i.e. `fetchAgentBranch` moved the tracking ref up to the
+   * run's current tip (including any WIP-marker commit `commitWipMarker` made), so a
+   * same-worker reclaim's reseed will recover exactly this tip. A clean tree whose already
+   * -committed tip already matches is a no-op success. This is the fetch-back success
+   * signal the `void`-returning `fetchBackBestEffort` cannot give.
+   *
+   * The bare ref read runs worker-uid (the bare is worker-owned, like trackingTip); the
+   * HEAD read runs RUNNER-uid (`runGitAsRunner`) because the clone is runner-owned and a
+   * worker-uid read there would hit the B2 dubious-ownership boundary (git.ts B2). Reading
+   * HEAD is a pure ref read (no checkout/diff), so no attacker-chosen filter driver fires.
+   * Swallows every error to `false`: an unresolvable ref, an unreadable clone, or a
+   * mismatch all mean "restore point NOT verified", which the caller treats as a capture
+   * failure (preserve, do not promote).
+   */
+  async verifyRunnerTrackingCovers(
+    barePath: string,
+    worktreePath: string,
+    branch: string,
+  ): Promise<boolean> {
+    try {
+      const trackingRef = runnerTrackingRef(branch);
+      const bareTip = (
+        await this.runGit(barePath, ["rev-parse", "--verify", `${trackingRef}^{commit}`])
+      ).trim();
+      const headTip = (
+        await this.runGitAsRunner(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"])
+      ).trim();
+      return /^[0-9a-f]{40}$/.test(bareTip) && bareTip === headTip;
+    } catch (err) {
+      this.log.warn("recovery restore-point verification failed (→ not verified)", {
+        bare: barePath,
+        cwd: worktreePath,
+        error: gitErrorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /**
    * PRD #122 M8 — the delta packfile of `<exclude>..refs/uzi-runner/<branch>`, for a
    * brokered origin publish at a checkpoint. Returns `{ tipOid, pack }` where `tipOid`
    * is the tracking-ref tip (the same the checkpoint fetched back) and `pack` STREAMS the

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, embedSeededPlan, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneProgress } from "../src/protocol.js";
@@ -97,6 +97,18 @@ function signalDone(sessionId = "sess-1", input: Record<string, unknown> = {}): 
 }
 function resultSuccess(sessionId = "sess-1"): SDKMessage {
   return { type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: sessionId } as unknown as SDKMessage;
+}
+// issue #1197 (D-RC2a): a POSITIVELY-empty terminal — num_turns:0 and (scripted with) NO
+// assistant frames — so the reducer folds numTurns===0 && !sawModelActivity. A turn whose
+// script is `[resultEmpty()]` is the positively-empty turn the recovery wrapper retries.
+function resultEmpty(sessionId = "sess-1"): SDKMessage {
+  return { type: "result", subtype: "success", is_error: false, num_turns: 0, session_id: sessionId } as unknown as SDKMessage;
+}
+// issue #1197 (D-RC2a): a success terminal with NO num_turns field at all → the reducer
+// leaves numTurns UNDEFINED (never 0), so the turn is NOT positively-empty even with no
+// activity — it flows to the existing REASON_NO_PLAN control, never into recovery.
+function resultNoTurns(sessionId = "sess-1"): SDKMessage {
+  return { type: "result", subtype: "success", is_error: false, session_id: sessionId } as unknown as SDKMessage;
 }
 // Issue #281: a subagent frame — `subagent_type` makes mapSdkMessage attribute it to
 // that agent (em.agent = "coder"), which the no-progress detector reads as activity.
@@ -4329,6 +4341,140 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
       withContext(probe.emits).length,
       0,
       "the read never fired (no lead usage frame), so no frame carries context",
+    );
+  });
+});
+
+// issue #1197 (D-RC2b): bounded, budget-safe, cancel-safe in-process retry on a
+// POSITIVELY-empty SDK turn, then escalation to TransientRecoveryError. The wrapper is
+// wired on BOTH the planning turn and the implement loop. Backoff/retries are injected
+// small so the retry paths run without real multi-second sleeps.
+describe("SdkExecutor empty-turn recovery (issue #1197 D-RC2b)", () => {
+  const RETRY_NOTICE = /empty result \(0 turns, no activity\); retrying/;
+  const fastRecovery = (queryFn: SdkQueryFn, maxRetries = 2): SdkExecutorOptions => ({
+    queryFn,
+    emptyTurnBackoffBaseMs: 1, // no real multi-second sleeps in tests
+    emptyTurnMaxRetries: maxRetries,
+  });
+
+  it("retries a positively-empty planning turn and returns the real plan (no throw)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [resultEmpty()], // planning turn 0: positively empty (num_turns:0, no frames)
+      [submitPlan("# The Plan\n- step 1"), resultSuccess()], // retry: a real plan
+      [assistantText("implementing"), signalDone(), resultSuccess()], // implement done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.deepStrictEqual(probe.gated, ["# The Plan\n- step 1"], "the retried plan reaches the gate");
+    // turn0 empty → turn1 plan → implement done = 3 drives.
+    assert.strictEqual(turns.length, 3);
+    assert.ok(
+      probe.emits.some((m) => m.kind === "status" && RETRY_NOTICE.test(String(m.payload["text"]))),
+      "a truthful retry notice is emitted",
+    );
+  });
+
+  it("throws TransientRecoveryError (NOT REASON_NO_PLAN) when a planning turn stays positively empty", async () => {
+    const { queryFn, turns } = fakeTurns([[resultEmpty()]]); // every drive is empty
+    const probe = makeCtx();
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn, 2)).run(probe.ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+    assert.deepStrictEqual(probe.gated, [], "an all-empty run never reaches the gate");
+    assert.strictEqual(turns.length, 3, "bounded to maxRetries+1 drives before escalating");
+  });
+
+  it("control: a NON-empty planning turn that neither plans nor asks still fails REASON_NO_PLAN (not retried)", async () => {
+    // num_turns:1 + an assistant frame ⇒ activity ⇒ NOT positively empty ⇒ no retry;
+    // drivePlanningTurn's existing REASON_NO_PLAN control fires.
+    const { queryFn, turns } = fakeTurns([[assistantText("I did nothing"), resultSuccess()]]);
+    const probe = makeCtx();
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /without submitting a plan/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    assert.strictEqual(turns.length, 1, "a non-empty no-plan turn is NOT retried");
+  });
+
+  it("missing-metrics: a plan turn with num_turns ABSENT is not treated as empty (plan returned)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan"), resultNoTurns()], // plan set, but no num_turns
+      [assistantText("impl"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.deepStrictEqual(probe.gated, ["# Plan"], "the plan is returned, never discarded/retried");
+    assert.strictEqual(turns.length, 2, "no retry — missing metrics is not positively empty");
+    assert.ok(
+      !probe.emits.some((m) => m.kind === "status" && RETRY_NOTICE.test(String(m.payload["text"]))),
+      "no retry notice for a missing-metrics turn",
+    );
+  });
+
+  it("missing-metrics: a no-plan turn with num_turns ABSENT fails REASON_NO_PLAN, not recovery", async () => {
+    const { queryFn, turns } = fakeTurns([[resultNoTurns()]]); // no plan, no frames, no count
+    const probe = makeCtx();
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /without submitting a plan/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    assert.strictEqual(turns.length, 1, "missing metrics ⇒ not empty ⇒ not retried");
+  });
+
+  it("cancellation during the backoff throws REASON_CANCELLED (never reclassified as recovery)", async () => {
+    const { queryFn } = fakeTurns([[resultEmpty()]]); // always empty → enters the backoff
+    const ac = new AbortController();
+    const probe = makeCtx({ signal: ac.signal });
+    // Abort after turn0 completes (fast) but during the backoff (base 1000ms here).
+    const t = setTimeout(() => ac.abort(), 40);
+    try {
+      await assert.rejects(
+        new SdkExecutor(nullLogger(), homeDir, {
+          queryFn,
+          emptyTurnBackoffBaseMs: 1000,
+          emptyTurnMaxRetries: 2,
+        }).run(probe.ctx),
+        (err: unknown) => err instanceof Error && /run cancelled/.test(err.message) && !(err instanceof TransientRecoveryError),
+      );
+    } finally {
+      clearTimeout(t);
+    }
+  });
+
+  it("budget exhaustion trips the genuine wall outcome (not a recovery park) with no unbounded SDK calls", async () => {
+    const { queryFn, turns } = fakeTurns([[resultEmpty()]]); // always empty
+    // A comfortable-but-small wall so turn0 completes, then the backoff debits it to <=0
+    // and the next driveTurn's armWall trips REASON_WALL — never a TransientRecoveryError.
+    const probe = makeCtx({ config: { run_timeout_seconds: 0.5 } });
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn,
+        emptyTurnBackoffBaseMs: 2000, // > the wall, so the backoff exhausts it
+        emptyTurnMaxRetries: 2,
+      }).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /wall-clock timeout/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    // The wall bounds the drives: at most turn0 + one wall-tripped redrive that throws
+    // before an SDK call. It never grows with the retry budget.
+    assert.ok(turns.length <= 2, `bounded SDK calls, got ${turns.length}`);
+  });
+
+  it("retries a resumed positively-empty IMPLEMENT turn (the wrapper is wired on the loop too)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()], // plan → gate
+      [resultEmpty()], // implement iter 1: positively empty → retried
+      [assistantText("impl"), signalDone(), resultSuccess()], // retry: real work + done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.strictEqual(turns.length, 3, "plan + empty implement + retried implement");
+    assert.ok(
+      probe.emits.some((m) => m.kind === "status" && RETRY_NOTICE.test(String(m.payload["text"]))),
+      "the implement empty turn emitted a retry notice",
     );
   });
 });
