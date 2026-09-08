@@ -270,6 +270,26 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
     });
   });
 
+  it("rejects a mixed valid+invalid appearance PUT atomically (no field half-applied)", async () => {
+    installStorage();
+    const api = await reload();
+
+    // Seed a known appearance so a half-apply would be observable.
+    await api.putMySettings({ appearance_mode: "dark", light_theme: "hall" });
+    expect((await api.getMySettings()).settings.appearance_mode).toBe("dark");
+
+    // A body whose first field is valid (appearance_mode) and second is not
+    // (light_theme:"ember" is a dark id in the light slot) must 400 and leave the
+    // stored appearance UNCHANGED — the valid appearance_mode:"light" must not stick.
+    await expect(
+      api.putMySettings({ appearance_mode: "light", light_theme: "ember" }),
+    ).rejects.toMatchObject({ status: 400, message: expect.stringContaining("light_theme") });
+
+    const s = (await api.getMySettings()).settings;
+    expect(s.appearance_mode).toBe("dark"); // not "light" — the rejected PUT changed nothing
+    expect(s.light_theme).toBe("hall");
+  });
+
   it("folds a valid legacy theme value into the matching appearance slot + mode", async () => {
     installStorage();
     const api = await reload();

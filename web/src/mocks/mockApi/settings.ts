@@ -900,10 +900,15 @@ export const settingsApi = {
   getMySettings: async () => delay({ settings: { ...userSettings } }),
   putMySettings: async (patch: UserSettingsPatch) => {
     // PATCH-like: apply only the fields present in the body, mirroring the real
-    // handler so a theme-only save never clears the model and vice versa.
+    // handler so a theme-only save never clears the model and vice versa. Staged
+    // into a LOCAL copy first and committed only after every field validates, so a
+    // body whose first field is valid and second is not (e.g. appearance_mode:"light"
+    // + light_theme:"ember") returns 400 without half-applying — matching the real
+    // handler's validate-all-then-write ordering.
+    let next = { ...userSettings };
     if (patch.default_model !== undefined) {
       const trimmed = patch.default_model?.trim() ?? "";
-      userSettings = { ...userSettings, default_model: trimmed === "" ? null : trimmed };
+      next = { ...next, default_model: trimmed === "" ? null : trimmed };
     }
     if (patch.default_effort !== undefined) {
       // Closed enum (PRD #617 M5): blank clears to inherit; any other value must be one
@@ -912,7 +917,7 @@ export const settingsApi = {
       if (trimmed !== "" && !["low", "medium", "high", "xhigh", "max"].includes(trimmed)) {
         throw new ApiError(400, "effort must be one of low, medium, high, xhigh, max");
       }
-      userSettings = { ...userSettings, default_effort: trimmed === "" ? null : trimmed };
+      next = { ...next, default_effort: trimmed === "" ? null : trimmed };
     }
     if (patch.judge_model !== undefined) {
       // Same rules as default_model (PRD #69 M2): blank clears to inherit, a value with
@@ -921,7 +926,7 @@ export const settingsApi = {
       if (trimmed !== "" && /\s/.test(trimmed)) {
         throw new ApiError(400, "judge_model must be a single token with no spaces");
       }
-      userSettings = { ...userSettings, judge_model: trimmed === "" ? null : trimmed };
+      next = { ...next, judge_model: trimmed === "" ? null : trimmed };
     }
     if (patch.summary_model !== undefined) {
       // Same rules as judge_model (PRD #362 M2): blank clears to inherit, a value with
@@ -930,7 +935,7 @@ export const settingsApi = {
       if (trimmed !== "" && /\s/.test(trimmed)) {
         throw new ApiError(400, "summary_model must be a single token with no spaces");
       }
-      userSettings = { ...userSettings, summary_model: trimmed === "" ? null : trimmed };
+      next = { ...next, summary_model: trimmed === "" ? null : trimmed };
     }
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";
@@ -939,13 +944,14 @@ export const settingsApi = {
       // appearance columns — it sets the matching-polarity slot AND pins appearance_mode
       // to that polarity, mirroring the Go legacy mapping. Any explicit appearance_* field
       // in the same PUT wins, because those are applied AFTER this block below. An empty
-      // value clears only the legacy override and leaves the appearance columns untouched.
+      // value clears the legacy override AND the migrated appearance override (mode +
+      // dark slot), mirroring the server's legacy-reset coherence.
       if (t === "") {
-        userSettings = { ...userSettings, theme: null };
+        next = { ...next, theme: null, appearance_mode: null, dark_theme: null };
       } else {
         const polarity = THEME_POLARITY[t as Theme];
-        userSettings = {
-          ...userSettings,
+        next = {
+          ...next,
           theme: t,
           appearance_mode: polarity,
           ...(polarity === "light" ? { light_theme: t } : { dark_theme: t }),
@@ -960,38 +966,40 @@ export const settingsApi = {
       if (patch.appearance_mode !== null && !isAppearanceMode(patch.appearance_mode)) {
         throw new ApiError(400, "appearance_mode: must be one of system, light, dark");
       }
-      userSettings = { ...userSettings, appearance_mode: patch.appearance_mode };
+      next = { ...next, appearance_mode: patch.appearance_mode };
     }
     if (patch.light_theme !== undefined) {
       if (patch.light_theme !== null && !isLightTheme(patch.light_theme)) {
         throw new ApiError(400, "light_theme: must be a light theme");
       }
-      userSettings = { ...userSettings, light_theme: patch.light_theme };
+      next = { ...next, light_theme: patch.light_theme };
     }
     if (patch.dark_theme !== undefined) {
       if (patch.dark_theme !== null && !isDarkTheme(patch.dark_theme)) {
         throw new ApiError(400, "dark_theme: must be a dark theme");
       }
-      userSettings = { ...userSettings, dark_theme: patch.dark_theme };
+      next = { ...next, dark_theme: patch.dark_theme };
     }
     if (patch.typeface !== undefined) {
       if (patch.typeface !== null && !isTypeface(patch.typeface)) {
         throw new ApiError(400, "typeface: must be one of system, plex");
       }
-      userSettings = { ...userSettings, typeface: patch.typeface };
+      next = { ...next, typeface: patch.typeface };
     }
     if (patch.sidebar_token_ids !== undefined) {
       // Whole-set replace, mirroring how the real handler would treat a list
       // value; null clears back to default-only. Ids are stored as given — a
       // stale id (deleted token) is harmless, it just matches nothing.
-      userSettings = { ...userSettings, sidebar_token_ids: patch.sidebar_token_ids ?? [] };
+      next = { ...next, sidebar_token_ids: patch.sidebar_token_ids ?? [] };
     }
     if (patch.mr_rework_enabled !== undefined) {
       // Tri-state (PRD #700 M6): present-false opts out, present-true re-enables,
       // present-null clears back to the default-ON state (stored as null). Mirrors
       // the server treating an absent/null value as ON.
-      userSettings = { ...userSettings, mr_rework_enabled: patch.mr_rework_enabled ?? null };
+      next = { ...next, mr_rework_enabled: patch.mr_rework_enabled ?? null };
     }
+    // Every field validated: commit the staged copy in one shot, then persist.
+    userSettings = next;
     persistSettings();
     return delay({ settings: { ...userSettings } });
   },
