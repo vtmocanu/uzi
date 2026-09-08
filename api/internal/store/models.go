@@ -699,6 +699,10 @@ type User struct {
 	SchedulesPaused         bool               `json:"schedules_paused"`
 	SchedulesPausedUntil    pgtype.Timestamptz `json:"schedules_paused_until"`
 	JudgeAnthropicBindMode  string             `json:"judge_anthropic_bind_mode"`
+	AppearanceMode          pgtype.Text        `json:"appearance_mode"`
+	LightTheme              pgtype.Text        `json:"light_theme"`
+	DarkTheme               pgtype.Text        `json:"dark_theme"`
+	Typeface                pgtype.Text        `json:"typeface"`
 }
 
 type UserSecret struct {

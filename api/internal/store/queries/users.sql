@@ -203,7 +203,9 @@ RETURNING summary_model;
 -- surface (GetUserSummaryModel stays the narrow read for issue-run claim
 -- assembly), so the settings response needs no second query. mr_rework_enabled
 -- (PRD #700 M5) rides it too; NULL there means the default-ON per-user opt-in.
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled FROM users WHERE id = $1;
+-- The four appearance columns (PRD #1167 M1) ride this read as well; each NULL means
+-- "inherit the instance default", resolved by theme.ResolveAppearance at read time.
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch
@@ -226,6 +228,24 @@ RETURNING schedules_paused, schedules_paused_until;
 -- NULL falls the user back to the instance default. Own-user only.
 UPDATE users SET theme = @theme WHERE id = @id
 RETURNING theme;
+
+-- name: SetUserAppearance :one
+-- PATCHes the current user's appearance (PRD #1167 M1) in ONE atomic statement:
+-- each of the four fields is written only when its @set_* flag is true, otherwise
+-- the current column value is kept (the CASE keeps the row's own value). A true
+-- flag with a NULL value CLEARS that field back to the instance default (the
+-- resolver treats a NULL column as inherit). Because every unset field re-writes
+-- its own stored value inside the single UPDATE, two concurrent saves that touch
+-- different fields cannot clobber each other, and the handler needs no
+-- read-merge-write (which raced) to preserve the untouched fields. Own-user only;
+-- the caller passes the session user's id.
+UPDATE users
+SET appearance_mode = CASE WHEN @set_mode::bool THEN @appearance_mode ELSE appearance_mode END,
+    light_theme = CASE WHEN @set_light::bool THEN @light_theme ELSE light_theme END,
+    dark_theme = CASE WHEN @set_dark::bool THEN @dark_theme ELSE dark_theme END,
+    typeface = CASE WHEN @set_typeface::bool THEN @typeface ELSE typeface END
+WHERE id = @id
+RETURNING appearance_mode, light_theme, dark_theme, typeface;
 
 -- name: SetUserSidebarTokens :one
 -- Replaces the user's whole sidebar token-meter set (00123): the non-default

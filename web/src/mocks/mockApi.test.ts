@@ -8,7 +8,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 // would. This jsdom build does not expose window.localStorage, so back it with a
 // Map-based Storage stub (same approach as prefs.test.ts / theme.test.ts).
 
-const KEY = "uzi.mock.v3";
+const KEY = "uzi.mock.v4";
 
 function installStorage(initial: Record<string, string> = {}): void {
   const m = new Map<string, string>(Object.entries(initial));
@@ -41,11 +41,25 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     installStorage({
       [KEY]: JSON.stringify({
         v: 1,
-        userSettings: { default_model: "opus", judge_model: "haiku", theme: "mission" },
+        userSettings: {
+          default_model: "opus",
+          judge_model: "haiku",
+          theme: "mission",
+          // PRD #1167 "Lights on" m2: the four raw appearance overrides round-trip too.
+          appearance_mode: "light",
+          light_theme: "dawn",
+          dark_theme: "mission",
+          typeface: "plex",
+        },
         appSettings: {
           autopilot_label: "autopilot",
           uzi_label: "runnable",
           default_theme: "mission",
+          // PRD #1167 "Lights on" m2: the four instance appearance defaults round-trip too.
+          default_appearance_mode: "light",
+          default_light_theme: "dawn",
+          default_dark_theme: "mission",
+          default_typeface: "plex",
           slack_enabled: "true",
           public_base_url: "https://uzi.example",
           judge_enabled: "false",
@@ -68,9 +82,19 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     const user = (await api.getMySettings()).settings;
     expect(user.theme).toBe("mission");
     expect(user.default_model).toBe("opus");
+    // PRD #1167 "Lights on" m2: the four raw appearance overrides restore from the blob.
+    expect(user.appearance_mode).toBe("light");
+    expect(user.light_theme).toBe("dawn");
+    expect(user.dark_theme).toBe("mission");
+    expect(user.typeface).toBe("plex");
 
     const app = (await api.getSettings()).settings;
     expect(app.default_theme).toBe("mission");
+    // PRD #1167 "Lights on" m2: the four instance appearance defaults restore too.
+    expect(app.default_appearance_mode).toBe("light");
+    expect(app.default_light_theme).toBe("dawn");
+    expect(app.default_dark_theme).toBe("mission");
+    expect(app.default_typeface).toBe("plex");
     // The uzi run-eligibility label round-trips too (PRD #764).
     expect(app.uzi_label).toBe("runnable");
     // The Slack non-secret keys round-trip too (PRD #25 M1).
@@ -85,11 +109,29 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     installStorage({
       [KEY]: JSON.stringify({
         v: 1,
-        userSettings: { default_model: "opus", theme: "mission" },
+        userSettings: {
+          default_model: "opus",
+          theme: "mission",
+          // A v4 blob carries the four appearance overrides (PRD #1167 "Lights on" m2);
+          // null = inherit the instance defaults. Present so the blob validates under the
+          // v4 key while still exercising the #1170 health migration below.
+          appearance_mode: null,
+          light_theme: null,
+          dark_theme: null,
+          typeface: null,
+        },
         appSettings: {
           autopilot_label: "autopilot",
           uzi_label: "runnable",
           default_theme: "mission",
+          // A v4 blob carries the four instance appearance defaults (PRD #1167 "Lights on" m2).
+          // The legacy default_theme feeds the dark slot (§1167 contract), so
+          // default_dark_theme is kept in lockstep with it — a mismatch would be
+          // invalid instance state the migration test must not rely on.
+          default_appearance_mode: "dark",
+          default_light_theme: "hall",
+          default_dark_theme: "mission",
+          default_typeface: "system",
           slack_enabled: "false",
           public_base_url: "http://127.0.0.1:8080",
           judge_enabled: "false",
@@ -162,6 +204,195 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     // present from the seed, never from persisted state.
     const runs = (await api.listRuns()).runs;
     expect(runs.length).toBeGreaterThan(0);
+  });
+});
+
+describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
+  it("putMySettings validates and persists each raw appearance override across a reload", async () => {
+    installStorage();
+    let api = await reload();
+
+    await api.putMySettings({
+      appearance_mode: "light",
+      light_theme: "dawn",
+      dark_theme: "mission",
+      typeface: "plex",
+    });
+
+    // Echoed back immediately from the same instance…
+    const echoed = (await api.getMySettings()).settings;
+    expect(echoed.appearance_mode).toBe("light");
+    expect(echoed.light_theme).toBe("dawn");
+    expect(echoed.dark_theme).toBe("mission");
+    expect(echoed.typeface).toBe("plex");
+
+    // …and they survive a hard reload (write-through the persistence blob).
+    api = await reload();
+    const restored = (await api.getMySettings()).settings;
+    expect(restored.appearance_mode).toBe("light");
+    expect(restored.light_theme).toBe("dawn");
+    expect(restored.dark_theme).toBe("mission");
+    expect(restored.typeface).toBe("plex");
+  });
+
+  it("clears a single appearance field back to inherit with present-null, leaving the rest", async () => {
+    installStorage();
+    const api = await reload();
+
+    await api.putMySettings({ appearance_mode: "light", light_theme: "hall" });
+    expect((await api.getMySettings()).settings.light_theme).toBe("hall");
+
+    await api.putMySettings({ light_theme: null });
+    const s = (await api.getMySettings()).settings;
+    expect(s.light_theme).toBeNull();
+    // PATCH semantics: a present-null on one field leaves the others untouched.
+    expect(s.appearance_mode).toBe("light");
+  });
+
+  it("putMySettings rejects an invalid or polarity-wrong appearance value with a 400 naming the field", async () => {
+    installStorage();
+    const api = await reload();
+
+    await expect(api.putMySettings({ appearance_mode: "sideways" })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("appearance_mode"),
+    });
+    // Polarity-wrong: a DARK theme in the light slot is rejected (isLightTheme).
+    await expect(api.putMySettings({ light_theme: "ember" })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("light_theme"),
+    });
+    // …and a LIGHT theme in the dark slot (isDarkTheme).
+    await expect(api.putMySettings({ dark_theme: "dawn" })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("dark_theme"),
+    });
+    await expect(api.putMySettings({ typeface: "comic" })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("typeface"),
+    });
+  });
+
+  it("rejects a mixed valid+invalid appearance PUT atomically (no field half-applied)", async () => {
+    installStorage();
+    const api = await reload();
+
+    // Seed a known appearance so a half-apply would be observable.
+    await api.putMySettings({ appearance_mode: "dark", light_theme: "hall" });
+    expect((await api.getMySettings()).settings.appearance_mode).toBe("dark");
+
+    // A body whose first field is valid (appearance_mode) and second is not
+    // (light_theme:"ember" is a dark id in the light slot) must 400 and leave the
+    // stored appearance UNCHANGED — the valid appearance_mode:"light" must not stick.
+    await expect(
+      api.putMySettings({ appearance_mode: "light", light_theme: "ember" }),
+    ).rejects.toMatchObject({ status: 400, message: expect.stringContaining("light_theme") });
+
+    const s = (await api.getMySettings()).settings;
+    expect(s.appearance_mode).toBe("dark"); // not "light" — the rejected PUT changed nothing
+    expect(s.light_theme).toBe("hall");
+  });
+
+  it("folds a valid legacy theme value into the matching appearance slot + mode", async () => {
+    installStorage();
+    const api = await reload();
+
+    // A light legacy theme sets the light slot and pins the mode to light.
+    await api.putMySettings({ theme: "dawn" });
+    let s = (await api.getMySettings()).settings;
+    expect(s.theme).toBe("dawn");
+    expect(s.light_theme).toBe("dawn");
+    expect(s.appearance_mode).toBe("light");
+
+    // A dark legacy theme sets the dark slot and pins the mode to dark.
+    await api.putMySettings({ theme: "mission" });
+    s = (await api.getMySettings()).settings;
+    expect(s.theme).toBe("mission");
+    expect(s.dark_theme).toBe("mission");
+    expect(s.appearance_mode).toBe("dark");
+  });
+
+  it("lets an explicit appearance field win over the legacy theme mapping in one PUT", async () => {
+    installStorage();
+    const api = await reload();
+
+    // theme=dawn alone would fold to light_theme=dawn, but the explicit light_theme wins.
+    await api.putMySettings({ theme: "dawn", light_theme: "hall" });
+    const s = (await api.getMySettings()).settings;
+    expect(s.theme).toBe("dawn");
+    expect(s.light_theme).toBe("hall");
+    expect(s.appearance_mode).toBe("light");
+  });
+
+  it("sessionBody resolves the appearance object from overrides + instance defaults", async () => {
+    installStorage();
+    const api = await reload();
+    await api.login("admin@uzi.local", "whatever");
+
+    // No overrides yet: appearance resolves to the seed instance defaults, and the raw
+    // overrides are all null.
+    let session = await api.me();
+    expect(session.appearance).toEqual({
+      mode: "dark",
+      light_theme: "hall",
+      dark_theme: "ember",
+      typeface: "system",
+      overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+      defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+    });
+
+    // Set some overrides; the resolved values AND the raw overrides both move, while an
+    // un-overridden field (dark_theme) still resolves to the instance default.
+    await api.putMySettings({ appearance_mode: "light", light_theme: "dawn", typeface: "plex" });
+    session = await api.me();
+    expect(session.appearance.mode).toBe("light");
+    expect(session.appearance.light_theme).toBe("dawn");
+    expect(session.appearance.typeface).toBe("plex");
+    expect(session.appearance.dark_theme).toBe("ember");
+    expect(session.appearance.overrides.light_theme).toBe("dawn");
+    expect(session.appearance.overrides.dark_theme).toBeNull();
+    // The deprecated trio stays coherent: resolved mode light → the resolved light slot.
+    expect(session.theme).toBe("dawn");
+  });
+
+  it("admin updateSettings accepts the four appearance default keys and echoes them", async () => {
+    installStorage();
+    const api = await reload();
+
+    const res = await api.updateSettings({
+      default_appearance_mode: "light",
+      default_light_theme: "dawn",
+      default_dark_theme: "mission",
+      default_typeface: "plex",
+    });
+    expect(res.settings.default_appearance_mode).toBe("light");
+    expect(res.settings.default_light_theme).toBe("dawn");
+    expect(res.settings.default_dark_theme).toBe("mission");
+    expect(res.settings.default_typeface).toBe("plex");
+  });
+
+  it("admin updateSettings rejects a polarity-mismatched or invalid appearance default with 400", async () => {
+    installStorage();
+    const api = await reload();
+
+    // A dark theme in the light-default slot.
+    await expect(api.updateSettings({ default_light_theme: "ember" })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("default_light_theme"),
+    });
+    // A light theme in the dark-default slot.
+    await expect(api.updateSettings({ default_dark_theme: "dawn" })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("default_dark_theme"),
+    });
+    await expect(api.updateSettings({ default_appearance_mode: "sideways" })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("default_appearance_mode"),
+    });
+    await expect(api.updateSettings({ default_typeface: "comic" })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("default_typeface"),
+    });
   });
 });
 

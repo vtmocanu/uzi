@@ -51,14 +51,27 @@ one, whether or not that run needed it to start. See
 - A label value may not be empty, longer than 64 characters, or contain a
   comma (GitLab's own label-list separator).
 
-## Default theme
+## Default appearance
 
-Which theme a user with no personal choice sees — new users, and anyone who
-hasn't picked one under Settings → Appearance. A user's own pick, once made,
-always wins over this setting. Saving restyles the admin's own session live;
-every other un-overridden user picks up the change on their next `me`
-refresh (in practice, their next login or reload — there's no push). See
-[Theming](./theming.md) for how themes work and how to add one.
+The appearance new users, and anyone without a personal choice, see — four
+keys, one per field: **Default appearance mode** (System / Lights on /
+Lights off), **Default light theme** and **Default dark theme** (each a
+dropdown filtered to that polarity's themes — a dark theme can't be picked
+for the light slot or vice versa), and **Default typeface** (System / IBM
+Plex). A user's own pick, once made under Settings → Appearance, always wins
+over the matching key here; each field resolves independently, so a user who
+only overrode their typeface still tracks the instance default for mode and
+both theme slots. Saving restyles the admin's own session live; every other
+un-overridden user picks up the change on their next `me` refresh (in
+practice, their next login or reload — there's no push).
+
+**The legacy `default_theme` key still feeds the dark slot** when
+`default_dark_theme` is unset, so an instance that only ever set the old
+single theme setting is unchanged on upgrade: its dark default keeps
+applying, and the compiled mode fallback is `dark` (not `system`), so
+nobody's screen changes until an admin or a user opts into `system` mode or
+a light theme. See [Theming](./theming.md) for how themes and polarity work
+and how to add a theme.
 
 ## Run judge
 

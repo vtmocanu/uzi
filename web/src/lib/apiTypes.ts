@@ -107,6 +107,15 @@ export interface UserSettings {
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
   summary_model: string | null;
   theme: string | null;
+  /** PRD #1167 "Lights on" (m2): the four RAW per-user appearance overrides, each
+   *  null = inherit the instance default. appearance_mode is system|light|dark;
+   *  light_theme / dark_theme are theme ids of the matching polarity; typeface is
+   *  system|plex. Resolved against the instance defaults by theme.resolveAppearance.
+   *  These supersede the single-value `theme` above, which stays for the legacy chain. */
+  appearance_mode: string | null;
+  light_theme: string | null;
+  dark_theme: string | null;
+  typeface: string | null;
   /** Ids of NON-default tokens whose rate meters the user also wants on the
    *  sidebar rail. The default token always shows and is never listed here.
    *  Absent (older server) reads as []: default-only, the pre-feature look. */
@@ -130,6 +139,14 @@ export interface UserSettingsPatch {
   /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
   summary_model?: string | null;
   theme?: string | null;
+  /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
+   *  the field unchanged, present-null clears it back to inherit, a value sets it
+   *  (validated server-side by the polarity-aware theme narrowers). Explicit fields win
+   *  over the legacy `theme` mapping when both are present in one PUT. */
+  appearance_mode?: string | null;
+  light_theme?: string | null;
+  dark_theme?: string | null;
+  typeface?: string | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
   /** Per-user MR-review-watcher opt-in (PRD #700 M6); present-false opts out,
@@ -713,6 +730,16 @@ export interface AppSettings {
   // iff it carries this label; served as a raw string like every other setting.
   uzi_label: string;
   default_theme: string;
+  // PRD #1167 "Lights on" (m2): the instance appearance DEFAULTS — the value each
+  // per-user field inherits when the user has no override. Served in the admin
+  // settings map like every other key. default_dark_theme mirrors the legacy
+  // default_theme (the dark-polarity default kept in lockstep); the other three are
+  // the new admin-set instance defaults for the mode switch, the light-polarity theme,
+  // and the typeface.
+  default_appearance_mode: string;
+  default_light_theme: string;
+  default_dark_theme: string;
+  default_typeface: string;
   // Slack integration non-secret keys (PRD #25). slack_enabled is the text
   // "true"/"false"; public_base_url is the http(s) base for deep links in Slack
   // messages. The two Slack TOKENS are secret and never returned here — see
@@ -985,20 +1012,55 @@ export interface AgentSourceApplyResult {
 // PRD #764 for the `uzi` run-eligibility label).
 export const DEFAULT_AUTOPILOT_LABEL = "autopilot";
 
+// AppearanceState is the fully-resolved appearance the session bootstrap carries
+// (PRD #1167 "Lights on", m2). `mode`/`light_theme`/`dark_theme`/`typeface` are the
+// RESOLVED values the SPA stamps; `overrides` is the user's RAW per-field choices
+// (each null = inherit) and `defaults` the instance defaults they resolve against,
+// so the Appearance picker can render "inherit (…)" placeholders without a second
+// fetch. Mirrors the Go wire object (theme.ResolveAppearance + the raw halves).
+export interface AppearanceState {
+  mode: string;
+  light_theme: string;
+  dark_theme: string;
+  typeface: string;
+  overrides: {
+    mode: string | null;
+    light_theme: string | null;
+    dark_theme: string | null;
+    typeface: string | null;
+  };
+  defaults: {
+    mode: string;
+    light_theme: string;
+    dark_theme: string;
+    typeface: string;
+  };
+}
+
 // SessionResponse is the auth/session bootstrap body (login, register, me). It
 // carries the user, the instance forge labels the board and issue-creation UI
 // need before their first call (PRD #19 M2, PRD #764: the single `uzi`
-// run-eligibility label and the autopilot label), and the three theme fields the
-// Appearance picker needs (PRD #21: resolved theme, the user's raw override with
-// null = none, and the instance default).
+// run-eligibility label and the autopilot label), and the resolved `appearance`
+// object the Appearance picker needs (PRD #1167 "Lights on": the resolved
+// mode/theme pair/typeface plus the raw overrides and instance defaults).
 export interface SessionResponse {
   user: User;
   // PRD #764: the single run-eligibility label. An issue is runnable iff it carries
   // this label; the board renders it as a runnable marker + filter facet.
   uzi_label: string;
   autopilot_label: string;
+  // PRD #1167 "Lights on" (m2): the resolved appearance the SPA stamps, with the raw
+  // overrides + instance defaults for the picker. Supersedes the deprecated trio below.
+  appearance: AppearanceState;
+  /** @deprecated PRD #1167: use `appearance.mode` + `appearance.light_theme` /
+   *  `appearance.dark_theme` instead. Kept for the pre-m2 single-theme picker: the
+   *  resolved theme (the light or dark slot per the resolved mode). */
   theme: string;
+  /** @deprecated PRD #1167: use `appearance.overrides` instead. The user's raw
+   *  single-theme override (null = none). */
   theme_override: string | null;
+  /** @deprecated PRD #1167: use `appearance.defaults.dark_theme` instead. The instance
+   *  dark-polarity default (the legacy single-theme instance default). */
   default_theme: string;
   // Vault status (PRD #32): whether the user's per-user secret vault is unlocked
   // in the server process. Optional so a server that predates the field reads as

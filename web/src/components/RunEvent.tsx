@@ -286,7 +286,7 @@ export function CommandBlock({ command }: { command: string }) {
   const clamped = clampable && !expanded;
   return (
     <div className="mt-1.5">
-      <div className="rounded-md border border-edge bg-ink px-2.5 py-2 font-mono text-xs leading-relaxed">
+      <div className="rounded-md border border-edge bg-ink console px-2.5 py-2 font-mono text-xs leading-relaxed">
         {/* Clamp on this padding-free inner wrapper via max-height (2 line boxes),
             NOT line-clamp: line-clamp forces display:-webkit-box on its target,
             which drops the inline ❯ prompt onto its own line above the text. Here
@@ -674,7 +674,7 @@ function ToolDuration({
 // one cannot silently drift from the other.
 const NEUTRAL_CHIP =
   "border-edge bg-raised/50 text-muted hover:border-edge-strong";
-const NEUTRAL_BODY = "border-edge bg-ink";
+const NEUTRAL_BODY = "border-edge bg-ink console";
 
 // Per-state chip/body presentation (PRD #116 Decision 4). "blocked" reuses the
 // NEUTRAL success frame — only its ⊘ glyph is warn-tinted, because --warn is

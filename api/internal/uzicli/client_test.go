@@ -158,7 +158,9 @@ func TestHTTPClientGetMySettings(t *testing.T) {
 			t.Errorf("request = %s %s", r.Method, r.URL.Path)
 		}
 		_, _ = w.Write([]byte(`{"settings":{"default_model":"claude","judge_model":null,` +
-			`"summary_model":null,"theme":null,"sidebar_token_ids":["a","b"]}}`))
+			`"summary_model":null,"theme":null,"sidebar_token_ids":["a","b"],` +
+			// PRD #1167: two appearance overrides carry values, two decode from null.
+			`"appearance_mode":"light","light_theme":"dawn","dark_theme":null,"typeface":null}}`))
 	}))
 	defer srv.Close()
 	s, err := newTestClient(srv).GetMySettings(context.Background())
@@ -173,6 +175,16 @@ func TestHTTPClientGetMySettings(t *testing.T) {
 	}
 	if s.JudgeModel != nil || s.Theme != nil {
 		t.Errorf("nullable fields should decode to nil, got judge=%v theme=%v", s.JudgeModel, s.Theme)
+	}
+	// PRD #1167: value appearance overrides decode to their string, null ⇒ nil.
+	if s.AppearanceMode == nil || *s.AppearanceMode != "light" {
+		t.Errorf("appearance_mode = %v, want light", s.AppearanceMode)
+	}
+	if s.LightTheme == nil || *s.LightTheme != "dawn" {
+		t.Errorf("light_theme = %v, want dawn", s.LightTheme)
+	}
+	if s.DarkTheme != nil || s.Typeface != nil {
+		t.Errorf("null appearance overrides should decode to nil, got dark=%v typeface=%v", s.DarkTheme, s.Typeface)
 	}
 }
 

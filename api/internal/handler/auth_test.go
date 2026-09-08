@@ -108,6 +108,131 @@ func TestSessionPayloadJudgeConsentFields(t *testing.T) {
 	}
 }
 
+// sessionAppearance is the decoded appearance surface of a session payload (PRD
+// #1167): resolved values + raw nullable overrides + instance defaults, plus the
+// deprecated theme trio, all read via a JSON round-trip so the *string overrides
+// decode cleanly.
+type sessionAppearance struct {
+	Appearance struct {
+		Mode       string `json:"mode"`
+		LightTheme string `json:"light_theme"`
+		DarkTheme  string `json:"dark_theme"`
+		Typeface   string `json:"typeface"`
+		Overrides  struct {
+			Mode       *string `json:"mode"`
+			LightTheme *string `json:"light_theme"`
+			DarkTheme  *string `json:"dark_theme"`
+			Typeface   *string `json:"typeface"`
+		} `json:"overrides"`
+		Defaults struct {
+			Mode       string `json:"mode"`
+			LightTheme string `json:"light_theme"`
+			DarkTheme  string `json:"dark_theme"`
+			Typeface   string `json:"typeface"`
+		} `json:"defaults"`
+	} `json:"appearance"`
+	Theme         string  `json:"theme"`
+	ThemeOverride *string `json:"theme_override"`
+	DefaultTheme  string  `json:"default_theme"`
+}
+
+func decodeSessionAppearance(t *testing.T, payload map[string]any) sessionAppearance {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var got sessionAppearance
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode payload %s: %v", raw, err)
+	}
+	return got
+}
+
+// TestSessionPayloadAppearance pins the PRD #1167 appearance surface: each field
+// resolves user-value-wins over the instance default, the raw overrides are the
+// per-field nullable user values (an unset column ⇒ JSON null), and the deprecated
+// trio is derived — theme is the painted-polarity slot (light slot under mode
+// light), theme_override is the raw legacy override, default_theme is the instance
+// dark default.
+func TestSessionPayloadAppearance(t *testing.T) {
+	h := newSettingsHandler(
+		store.AppSetting{Key: settings.KeyDefaultAppearanceMode, Value: "system"},
+		store.AppSetting{Key: settings.KeyDefaultLightTheme, Value: "shadow"},
+		store.AppSetting{Key: settings.KeyDefaultDarkTheme, Value: "mission"},
+		store.AppSetting{Key: settings.KeyDefaultTypeface, Value: "plex"},
+	)
+	user := store.User{
+		AppearanceMode: pgtype.Text{String: "light", Valid: true},
+		LightTheme:     pgtype.Text{String: "dawn", Valid: true},
+		// DarkTheme unset ⇒ inherits the instance default "mission".
+		Typeface: pgtype.Text{String: "system", Valid: true},
+		Theme:    pgtype.Text{String: "ember", Valid: true},
+	}
+	got := decodeSessionAppearance(t, h.sessionPayload(context.Background(), user))
+
+	// Resolved: user value wins per field; the unset dark slot inherits "mission".
+	if got.Appearance.Mode != "light" || got.Appearance.LightTheme != "dawn" ||
+		got.Appearance.DarkTheme != "mission" || got.Appearance.Typeface != "system" {
+		t.Errorf("resolved appearance = %+v, want light/dawn/mission/system", got.Appearance)
+	}
+	// Overrides: the raw user values; the unset dark slot is JSON null.
+	ov := got.Appearance.Overrides
+	if ov.Mode == nil || *ov.Mode != "light" || ov.LightTheme == nil || *ov.LightTheme != "dawn" ||
+		ov.Typeface == nil || *ov.Typeface != "system" {
+		t.Errorf("overrides = %+v, want light/dawn/*/system", ov)
+	}
+	if ov.DarkTheme != nil {
+		t.Errorf("dark_theme override = %q, want null (unset ⇒ inherit)", *ov.DarkTheme)
+	}
+	// Defaults: the instance values (dark = the legacy-chained DefaultDarkTheme).
+	if got.Appearance.Defaults.Mode != "system" || got.Appearance.Defaults.LightTheme != "shadow" ||
+		got.Appearance.Defaults.DarkTheme != "mission" || got.Appearance.Defaults.Typeface != "plex" {
+		t.Errorf("defaults = %+v, want system/shadow/mission/plex", got.Appearance.Defaults)
+	}
+	// Deprecated trio: theme = painted light slot (mode light); theme_override = raw
+	// legacy override; default_theme = the instance dark default.
+	if got.Theme != "dawn" {
+		t.Errorf("theme = %q, want dawn (painted light slot under mode light)", got.Theme)
+	}
+	if got.ThemeOverride == nil || *got.ThemeOverride != "ember" {
+		t.Errorf("theme_override = %v, want ember (raw legacy override)", got.ThemeOverride)
+	}
+	if got.DefaultTheme != "mission" {
+		t.Errorf("default_theme = %q, want mission (instance dark default)", got.DefaultTheme)
+	}
+}
+
+// With no user overrides and no instance settings, the appearance resolves to the
+// compiled-in fallbacks (mode dark, light hall, dark ember, typeface system) and
+// the deprecated trio paints the dark slot (mode dark).
+func TestSessionPayloadAppearanceFallbacks(t *testing.T) {
+	h := newSettingsHandler()
+	got := decodeSessionAppearance(t, h.sessionPayload(context.Background(), store.User{}))
+
+	if got.Appearance.Mode != "dark" || got.Appearance.LightTheme != "hall" ||
+		got.Appearance.DarkTheme != "ember" || got.Appearance.Typeface != "system" {
+		t.Errorf("resolved fallback = %+v, want dark/hall/ember/system", got.Appearance)
+	}
+	ov := got.Appearance.Overrides
+	if ov.Mode != nil || ov.LightTheme != nil || ov.DarkTheme != nil || ov.Typeface != nil {
+		t.Errorf("overrides must all be null with nothing set, got %+v", ov)
+	}
+	if got.Appearance.Defaults.Mode != "dark" || got.Appearance.Defaults.LightTheme != "hall" ||
+		got.Appearance.Defaults.DarkTheme != "ember" || got.Appearance.Defaults.Typeface != "system" {
+		t.Errorf("default fallback = %+v, want dark/hall/ember/system", got.Appearance.Defaults)
+	}
+	if got.Theme != "ember" {
+		t.Errorf("theme = %q, want ember (painted dark slot under mode dark)", got.Theme)
+	}
+	if got.ThemeOverride != nil {
+		t.Errorf("theme_override = %q, want null with no legacy override", *got.ThemeOverride)
+	}
+	if got.DefaultTheme != "ember" {
+		t.Errorf("default_theme = %q, want ember (compiled dark default)", got.DefaultTheme)
+	}
+}
+
 func TestEmailDomainExtraction(t *testing.T) {
 	cases := map[string]string{
 		"alice@example.com":         "example.com",

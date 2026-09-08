@@ -675,7 +675,9 @@ func TestUserSettingsDTOTags(t *testing.T) {
 	assertTags(t, "UserSettingsDTO", UserSettingsDTO{},
 		"default_model", "default_effort", "judge_model", "summary_model", "theme", "sidebar_token_ids",
 		// PRD #700 M5: the per-user MR-review-watcher opt-in (default ON; null clears to default).
-		"mr_rework_enabled")
+		"mr_rework_enabled",
+		// PRD #1167: the four raw per-field appearance overrides (each null ⇒ inherit).
+		"appearance_mode", "light_theme", "dark_theme", "typeface")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the

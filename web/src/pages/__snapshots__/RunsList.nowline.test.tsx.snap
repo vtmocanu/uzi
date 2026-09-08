@@ -13,6 +13,7 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
     />
     <div
       class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors group-hover:border-edge-strong group-hover:bg-raised/70"
+      data-live=""
     >
       <div
         class="w-full min-w-0 sm:w-auto sm:flex-1"

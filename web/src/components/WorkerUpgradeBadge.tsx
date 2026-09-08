@@ -416,7 +416,7 @@ export function FleetUpgradePanel({
           fleet's own stale version as the target. A reader who pinned deliberately sees
           their pin confirmed; a reader who did not sees something to investigate. */}
       {divergentCount > 0 && (
-        <p className="mt-2 rounded border border-edge bg-ink p-2 text-xs text-faint">
+        <p className="mt-2 rounded border border-edge bg-ink console p-2 text-xs text-faint">
           {divergentTargets.length === 1 ? (
             <>
               {divergentCount === 1 ? "One hosted worker targets" : `${divergentCount} hosted workers target`}{" "}
@@ -435,7 +435,7 @@ export function FleetUpgradePanel({
       )}
 
       {classified > 0 && (
-        <div className="mt-2 flex h-1.5 overflow-hidden rounded bg-ink" role="presentation">
+        <div className="mt-2 flex h-1.5 overflow-hidden rounded bg-raised" role="presentation">
           {segments.map(({ key, cls }) =>
             counts[key] > 0 ? (
               <div key={key} className={cls} style={{ width: `${(counts[key] / classified) * 100}%` }} />

@@ -330,7 +330,7 @@ function ReadOnlyView({ template }: { template: AgentTemplate }) {
       </dl>
       <div>
         <span className="text-sm font-medium text-muted">Rendered subagent file</span>
-        <pre className="mt-1.5 overflow-x-auto rounded-lg border border-edge bg-ink p-3 text-xs text-muted">
+        <pre className="mt-1.5 overflow-x-auto rounded-lg border border-edge bg-ink console p-3 text-xs text-muted">
           {renderSubagent(template)}
         </pre>
       </div>
