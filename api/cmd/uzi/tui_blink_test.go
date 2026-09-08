@@ -517,16 +517,16 @@ func boardMileLine(t *testing.T, run apitypes.RunListItemDTO, on bool) string {
 	return ""
 }
 
-// railEyebrow renders the crew-rail milestone block for a run and returns the stripped eyebrow
-// (first) line. It asserts on renderMilestones() directly rather than the full View: the detail
-// view clamps the rail column to laneRailWidth (26), which truncates a multi-id `· <id>, <id>`
-// suffix with an ellipsis, so the eyebrow's bar+suffix must be read from the unclamped block.
+// railEyebrow renders the crew-rail milestone block through the COMPOSED detail view
+// (m.View().Content) — the same laneRailWidth (26) clamp a user sees, via joinColumns. Asserting
+// here rather than on the unclamped renderMilestones() proves the #1176 in-flight suffix survives
+// end to end: a multi-id `· <id>, <id>` suffix reflows to its own rail line instead of ellipsizing.
 func railEyebrow(t *testing.T, run apitypes.RunDTO, on bool) string {
 	t.Helper()
-	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID) // width defaults to 120
 	m = applyDetail(m, run, nil)
 	m.blinkOn = on
-	return strings.SplitN(stripANSI(m.renderMilestones()), "\n", 2)[0]
+	return stripANSI(m.View().Content)
 }
 
 // milestoneRailRun builds a milestone-structured RunDTO for the crew-rail eyebrow tests.

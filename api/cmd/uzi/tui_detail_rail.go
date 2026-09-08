@@ -206,10 +206,11 @@ func milestoneCount(done, total int, reported bool) string {
 }
 
 // milestoneInProgress returns the FIRST frozen milestone (by frozen order) that is in the run's
-// in-progress set and not already completed — the D4 selection rule: the one id that blinks,
-// carries the `· <id>` eyebrow suffix and is named on the board second line. Completed ids are
-// excluded so a stale in-progress snapshot cannot double-count a ticked milestone. Returns
-// ("", "") when nothing is declared in progress.
+// in-progress set and not already completed — the one-activity-one-milestone selection rule: the
+// id named on the board second line (boardSecondLine) and the crew-rail now-line attach point.
+// Since #1176 the blinking micro-bar cells and the eyebrow `· <id>, <id>` suffix derive from
+// milestoneInProgressIDs, NOT this. Completed ids are excluded so a stale in-progress snapshot
+// cannot double-count a ticked milestone. Returns ("", "") when nothing is declared in progress.
 func milestoneInProgress(run apitypes.RunDTO) (id, title string) {
 	if len(run.MilestonesInProgress) == 0 || len(run.Milestones) == 0 {
 		return "", ""
@@ -424,12 +425,21 @@ func (m tuiModel) renderMilestones() string {
 			mid + m.pal.faint.Render(strings.Repeat("▱", empty)) + " "
 	}
 	eyebrow := m.pal.faint.Render("MILESTONES") + " " + bar + m.pal.faint.Render(milestoneCount(done, total, reported))
-	if suffix := m.milestoneIPSuffix(ipIDs); suffix != "" {
-		// `· <id>, <id> +N` lists every in-progress milestone (frozen order, capped) — the same set
-		// the bar counts — carrying the in-flight set without motion for a static/non-tty frame.
-		eyebrow += m.pal.faint.Render(" · " + suffix)
+	// `· <id>, <id> +N` lists every in-progress milestone (frozen order, capped) — the same set the
+	// bar counts — carrying the in-flight set without motion for a static/non-tty frame. joinColumns
+	// clamps EVERY rail line to laneRailWidth (26) in the composed View, so an inline suffix that
+	// would push the eyebrow past the rail is dropped to its own continuation line (`· <id>, <id>`,
+	// always <= the rail) where the full set survives the clamp; a suffix that still fits keeps the
+	// one-line `MILESTONES … · <id>` form (#1176).
+	switch suffix := m.milestoneIPSuffix(ipIDs); {
+	case suffix == "":
+		sb.WriteString(eyebrow + "\n")
+	case visualWidth(eyebrow)+visualWidth(" · "+suffix) <= laneRailWidth:
+		sb.WriteString(eyebrow + m.pal.faint.Render(" · "+suffix) + "\n")
+	default:
+		sb.WriteString(eyebrow + "\n")
+		sb.WriteString(m.pal.faint.Render("· "+suffix) + "\n")
 	}
-	sb.WriteString(eyebrow + "\n")
 	// Nothing declared in progress but there IS activity: an unattached now line directly under
 	// the eyebrow (PRD #1064 mock; #390 D7 — declared, not inferred, so the milestone stays
 	// unmarked).
