@@ -280,6 +280,55 @@ export const runsApi = {
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
+  // PRD #1202: start an ON-DEMAND MR-review-rework run for a run's open MR. Mirrors the
+  // server's shape: 404 on an unknown run (the demo caller owns every non-other-user run,
+  // so ownership is not modelled separately). On success it fabricates a NEW `mr_rework`
+  // run DERIVED from the source run — a fresh id, folding onto the source's existing
+  // branch + MR (like the automatic watcher's run), issue-LESS (CreateAutoMRReworkRun
+  // leaves issue_iid NULL), trigger_source "manual", queued — with the guidance folded
+  // into issue_description. It carries none of the source's automatic-loop guard readings
+  // (a fresh manual run has spent zero automatic cycles). Persisted to the store so the
+  // fabricated run is retrievable, then echoed back under { run }.
+  startRunRework: async (id: string, guidance?: string) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    const now = new Date().toISOString();
+    const g = (guidance ?? "").trim();
+    const newRun: Run = {
+      ...run,
+      id: nextRunId(),
+      kind: "mr_rework",
+      trigger_source: "manual",
+      status: "queued",
+      issue_iid: null,
+      issue_web_url: null,
+      issue_description: g ? `On-demand MR rework.\n\nGuidance:\n${g}` : "On-demand MR rework.",
+      requeue_count: 0,
+      iteration_count: 0,
+      // A fresh manual rework has no automatic-loop guard readings of its own.
+      mr_rework_auto_cycles: null,
+      mr_rework_auto_cap: null,
+      milestones: null,
+      milestones_completed: null,
+      milestones_in_progress: null,
+      milestones_candidate: null,
+      stop_kind: null,
+      stop_reason: null,
+      failure_reason: null,
+      health: "ok",
+      health_reason: null,
+      health_since: null,
+      plan_md: null,
+      claimed_at: null,
+      started_at: null,
+      finished_at: null,
+      created_at: now,
+      updated_at: now,
+    };
+    state.runs.set(newRun.id, newRun);
+    return delay({ run: { ...newRun } }, 80);
+  },
+
   // Issue #754: resume an auto-lane run parked at `pool_wait` right now. Mirrors the
   // server: owner-scoped (the demo caller owns every non-other-user run) and
   // pool_wait-ONLY — a 409 ("run is not waiting for a pooled token") on any other
