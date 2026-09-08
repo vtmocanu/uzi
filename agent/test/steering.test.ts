@@ -171,6 +171,53 @@ describe("SteeringChannel — pause (PRD #1190 M2)", () => {
     );
     await ch.stop();
   });
+
+  // PRD #1190 rework (N2): the sticky cancel flag is exposed via isCancelled() so the executor can
+  // re-check it at each loop boundary — a cancel that lands after the shared controller was spent by
+  // a `now` pause is still honored because this durable flag records it.
+  it("isCancelled() reports the sticky cancel flag", async () => {
+    const { ch } = makeChannel([[inp("cancel")]]);
+    assert.strictEqual(ch.isCancelled(), false, "no cancel seen on a fresh channel");
+    ch.start();
+    await tick();
+    assert.strictEqual(ch.isCancelled(), true, "a cancel input sets the sticky flag");
+    await ch.stop();
+  });
+
+  // PRD #1190 rework (N2): onPauseNow is a RE-ARMABLE interrupt invoked on EVERY `now` pause, so a
+  // second `now` after the shared controller is already aborted still fires it — this is what lets
+  // the executor drop the restarted turn on a second `now`.
+  it("onPauseNow fires on every now pause, even after the controller is already aborted", async () => {
+    // Two `now` pauses in separate batches; the controller aborts on the FIRST and cannot re-abort,
+    // so the second `now` can only be delivered by the re-armable interrupt.
+    const { ch, cancel } = makeChannel([[inp("pause", "now")], [inp("pause", "now")]]);
+    let fired = 0;
+    ch.onPauseNow(() => {
+      fired++;
+    });
+    ch.start();
+    await tick(30); // let both batches route (pollMs=1)
+    assert.strictEqual(cancel.signal.aborted, true, "the first now pause aborted the shared controller");
+    assert.strictEqual(
+      fired,
+      2,
+      "the interrupt fired for BOTH now pauses — re-armed even after the controller was already spent",
+    );
+    await ch.stop();
+  });
+
+  // A `milestone` pause must NOT fire the pause-now interrupt (only `now` drops the turn).
+  it("onPauseNow does NOT fire for a milestone pause", async () => {
+    const { ch } = makeChannel([[inp("pause", "milestone")]]);
+    let fired = 0;
+    ch.onPauseNow(() => {
+      fired++;
+    });
+    ch.start();
+    await tick();
+    assert.strictEqual(fired, 0, "a milestone pause never drops the in-flight turn");
+    await ch.stop();
+  });
 });
 
 // issue #559 M2: the channel tracks the highest follow_up input id it has already DELIVERED

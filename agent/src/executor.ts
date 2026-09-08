@@ -368,6 +368,32 @@ export interface RunContext {
    */
   parkForPause?(pausedAt: { completedCount: number; total?: number }): Promise<boolean>;
   /**
+   * PRD #1190 rework (N2): true when a `cancel` input has been seen (steering.isCancelled). The
+   * implement loop re-checks this at each loop boundary so a cancel that arrives AFTER the shared
+   * abort controller was already spent by a declined `now`-park — the controller fires 'abort' once
+   * and its once-listener is gone — is still honored (the loop throws to the terminal cancel path).
+   * The NORMAL in-flight cancel is unaffected: it aborts the live turn, which throws the cancel
+   * error before control returns to the loop top. Absent on the stub/test executors ⇒ the re-check
+   * is inert (a bare `ctx.cancelRequested?.()` is undefined).
+   */
+  cancelRequested?(): boolean;
+  /**
+   * PRD #1190 M2 (N1): the steering channel's sticky pause mode (steering.getPauseMode) — the mode
+   * of a pending owner pause, or null. The implement loop reads it at its FIRST boundary so a
+   * seeded (resume, from claim.pause_pending) or steered pause parks even if the running-report
+   * ACK's pauseRequested regressed — an ACK-independent fallback. Absent on the stub/test executors
+   * ⇒ no fallback (the ACK's pauseRequested is then the sole park trigger, as before).
+   */
+  pauseModeRequested?(): "milestone" | "now" | null;
+  /**
+   * PRD #1190 rework (N2): register a RE-ARMABLE interrupt (steering.onPauseNow) the steering
+   * channel invokes on EVERY `now` pause, so a second `now` after a declined park still drops the
+   * in-flight turn — the shared abort controller only fires once. The executor passes a callback
+   * that trips the current turn as a pause (REASON_PAUSE_NOW). Absent on the stub/test executors ⇒
+   * no re-arm (the first `now` still drops the turn via ctx.signal).
+   */
+  onPauseNow?(cb: () => void): void;
+  /**
    * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
    * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies
    * the ack (the park must actually take, mirroring askUser's ack check), then (b) blocks on

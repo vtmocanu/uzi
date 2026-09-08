@@ -75,8 +75,13 @@ interface Turn {
   promptText?: string;
 }
 
+// A scripted turn is either a fixed message list or a function of the turn's abort signal (so a
+// turn can HANG until the run's cancel/pause aborts it — a genuine in-flight abort), mirroring
+// sdk-executor.test.ts.
+type Script = SDKMessage[] | ((signal: AbortSignal) => AsyncIterable<unknown>);
+
 /** A fake `query` that replays one scripted stream per turn (invocation). */
-function fakeTurns(scripts: SDKMessage[][]): { queryFn: SdkQueryFn; turns: Turn[] } {
+function fakeTurns(scripts: Script[]): { queryFn: SdkQueryFn; turns: Turn[] } {
   const turns: Turn[] = [];
   let i = 0;
   const queryFn: SdkQueryFn = (params) => {
@@ -90,10 +95,34 @@ function fakeTurns(scripts: SDKMessage[][]): { queryFn: SdkQueryFn; turns: Turn[
         const content = rec.message?.content;
         turn.promptText = typeof content === "string" ? content : JSON.stringify(content);
       }
-      for (const m of script) yield m;
+      const s = typeof script === "function" ? script(params.options.abortController!.signal) : script;
+      if (Array.isArray(s)) for (const m of s) yield m;
+      else yield* s as AsyncIterable<SDKMessage>;
     })();
   };
   return { queryFn, turns };
+}
+
+/** A turn that never yields until its signal aborts — a genuinely in-flight turn (same shape and
+ *  reason as sdk-executor.test.ts's copy). */
+function hangUntilAbort(signal: AbortSignal): AsyncIterable<unknown> {
+  return {
+    // eslint-disable-next-line require-yield
+    async *[Symbol.asyncIterator]() {
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) return resolve();
+        const keepAlive = setInterval(() => {}, 1_000);
+        signal.addEventListener(
+          "abort",
+          () => {
+            clearInterval(keepAlive);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    },
+  };
 }
 
 interface Probe {
@@ -333,5 +362,185 @@ describe("PRD #1190 M2 — worker pause honor gate (loop-top)", () => {
     assert.equal(result.branch, "agent/issue-5", "the restarted turn completed the run");
     assert.equal(probe.parkCalls.length, 1, "parkForPause was attempted once for the now pause");
     assert.deepEqual(probe.iterations, [1, 2], "the loop restarted at the next iteration after the declined park");
+  });
+});
+
+// PRD #1190 rework — the two review findings against the M2 worker pause code:
+//   N2: a cancel that arrives AFTER a declined `now`-park was dropped (the shared abort controller
+//       was already spent), and a SECOND `now` pause silently degraded to a milestone-boundary park.
+//   N1: the seeded pause mode was write-only; now the executor reads it as a first-boundary,
+//       ACK-independent park fallback.
+describe("PRD #1190 rework — cancel re-check, now-pause re-arm, and the seed fallback", () => {
+  // N2 headline: a cancel arriving after a declined `now`-park is HONORED at the next loop-top.
+  // Before the rework the `now` pause left the shared controller aborted with its once-listener
+  // spent, so a subsequent cancel could neither re-fire the abort nor was re-checked — the run
+  // ignored the cancel until it self-completed.
+  it("honors a cancel that lands after a declined now-park (loop-top cancel re-check)", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones("# Plan", THREE_MILESTONES), resultSuccess()], // planning turn
+      // iter 1: a `now` pause aborts the turn; the park is declined; a cancel arrives during the
+      // declined park; iter 2's loop-top re-check must throw to the terminal cancel path.
+      [assistantText("iter 2 would run if the cancel were dropped"), signalDone(), resultSuccess()],
+    ]);
+    const cancel = new AbortController();
+    let cancelPending = false;
+    const probe = makeCtx(
+      {
+        signal: cancel.signal,
+        // The runner wires this to steering.isCancelled(); the sticky flag survives the spent
+        // controller, which is the whole point of re-reading it here.
+        cancelRequested: () => cancelPending,
+        reportIteration: async (n) => {
+          probe.iterations.push(n);
+          if (n === 1) cancel.abort(new PauseNowSignal()); // a `now` pause drops iter-1's turn
+          return { pauseRequested: false, completedCount: 0 };
+        },
+      },
+      () => {
+        // parkForPause declines (publish failed) AND a cancel lands right now (the owner cancels a
+        // run that could not pause). The steering channel's sticky `cancelled` flag is now set.
+        cancelPending = true;
+        return false;
+      },
+    );
+    await assert.rejects(
+      () => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      /run cancelled/,
+      "the cancel is honored at the next loop-top rather than being ignored",
+    );
+    // iter 1 attempted (and was declined) the now-park, then `continue`d to iter 2, whose loop-top
+    // cancel re-check threw BEFORE reportIteration — so reportIteration ran once (iter 1 only) yet
+    // the run still rejected with the cancel error, which is only reachable via the iter-2 re-check.
+    assert.equal(probe.parkCalls.length, 1, "the declined now-park happened at iteration 1");
+    assert.deepEqual(probe.iterations, [1], "iter 2's cancel re-check short-circuited before its reportIteration");
+    // If the loop-top re-check were removed, iter 2 would drive scripts[1] and complete via
+    // signal_done instead of rejecting — so this assertion is non-vacuous.
+  });
+
+  // N2 no-regression: a NORMAL in-flight cancel (aborting a live turn) still fails the run via the
+  // turn's own abort, EVEN with cancelRequested wired — the loop-top re-check is a backstop, not a
+  // replacement, and must not change the in-flight path.
+  it("a normal in-flight cancel still aborts the live turn (loop-top re-check does not break it)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones("# Plan", THREE_MILESTONES), resultSuccess()], // planning turn
+      (signal) => hangUntilAbort(signal), // iter 1: a genuinely in-flight turn, aborted mid-stream
+    ]);
+    const cancel = new AbortController();
+    const probe = makeCtx({
+      signal: cancel.signal,
+      cancelRequested: () => cancel.signal.aborted, // realistic: a cancel both aborts AND sticks
+      reportIteration: async (n) => {
+        probe.iterations.push(n);
+        // Abort the LIVE turn shortly after it starts hanging — a real steering cancel mid-turn.
+        if (n === 1) setTimeout(() => cancel.abort(), 10);
+        return { pauseRequested: false, completedCount: 0 };
+      },
+    });
+    await assert.rejects(
+      () => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      /run cancelled/,
+      "an in-flight cancel fails the run via the turn abort",
+    );
+    // The iter-1 implement turn DID start streaming (it hung), so queryFn recorded it — proving the
+    // cancel aborted a live turn, not the loop-top backstop.
+    assert.equal(turns.length, 2, "the planning turn and the in-flight implement turn both drove");
+    assert.deepEqual(probe.iterations, [1], "the run failed at iteration 1's live turn, not a later loop-top");
+  });
+
+  // N2 re-arm: a SECOND `now` pause still drops the (restarted) turn, delivered via the re-armable
+  // ctx.onPauseNow interrupt. The shared controller is already spent by the first `now`, so the OLD
+  // code degraded the second `now` to a milestone-boundary park; the interrupt re-arms the drop.
+  it("re-arms: a SECOND now pause (via onPauseNow) drops the restarted turn after a declined park", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones("# Plan", THREE_MILESTONES), resultSuccess()], // planning turn
+      // iter 1: first `now` via ctx.signal → declined → restart.
+      // iter 2: second `now` via onPauseNow (ctx.signal already aborted) → declined → restart.
+      [assistantText("final turn"), signalDone(), resultSuccess()], // iter 3 → done
+    ]);
+    const cancel = new AbortController();
+    let pauseNowCb: (() => void) | undefined;
+    let parkCount = 0;
+    const probe = makeCtx(
+      {
+        signal: cancel.signal,
+        onPauseNow: (cb) => {
+          pauseNowCb = cb;
+        },
+        reportIteration: async (n) => {
+          probe.iterations.push(n);
+          if (n === 1) cancel.abort(new PauseNowSignal()); // first now-pause (shared controller)
+          // Second now-pause: the controller is already aborted and its once-listener spent, so the
+          // ONLY thing that can drop the turn is the re-armable interrupt.
+          if (n === 2) pauseNowCb?.();
+          return { pauseRequested: false, completedCount: 0 };
+        },
+      },
+      () => {
+        parkCount++;
+        return false; // decline both parks so the loop continues to iteration 3
+      },
+    );
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.equal(parkCount, 2, "BOTH now pauses attempted a park — the second re-armed via onPauseNow");
+    assert.equal(result.branch, "agent/issue-5", "the run completed after both declined now-parks");
+    assert.equal(result.pausedAt, undefined, "neither park took (both declined)");
+    assert.deepEqual(probe.iterations, [1, 2, 3], "the loop restarted after each declined now-park");
+    // If ctx.onPauseNow were not registered, iter 2 would drive scripts[1] and complete — parkCount
+    // would be 1 — so this proves the re-arm wiring is load-bearing.
+  });
+
+  // N1: the seeded/steered pause mode is now READ by the executor at its first boundary as an
+  // ACK-independent fallback. Here the ACK carries pauseRequested:FALSE (simulating an older/buggy
+  // server), yet the run parks purely because ctx.pauseModeRequested reports a pending mode.
+  it("parks at the first boundary from the seeded pause mode even when the ACK regresses (N1 fallback)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones("# Plan", THREE_MILESTONES), resultSuccess()], // planning turn
+      // iter 1: ACK says pauseRequested:false, but the seeded mode makes the loop park anyway.
+    ]);
+    const probe = makeCtx({
+      // The runner wires this to steering.getPauseMode(); "now" here stands in for a resume that
+      // seeded the mode from claim.pause_pending/pause_mode.
+      pauseModeRequested: () => "now",
+      reportIteration: async (n) => {
+        probe.iterations.push(n);
+        return { pauseRequested: false, completedCount: 2 }; // the ACK does NOT request a pause
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.ok(result.pausedAt, "the seeded pause mode parks the run at its first boundary via the fallback");
+    assert.equal(result.pausedAt!.completedCount, 2, "the latch carries the server's completed count");
+    assert.deepEqual(probe.parkCalls, [{ completedCount: 2, total: 3 }], "parkForPause fired from the seed fallback");
+    assert.equal(turns.length, 1, "only the planning turn drove; the fallback fired before any implement turn");
+    // Deleting the ctx.pauseModeRequested read (or the seed wiring) drops the only park trigger
+    // here (the ACK is false), so the run would complete instead of park — this is non-vacuous.
+  });
+
+  // N1 one-shot: the seed fallback fires at the FIRST boundary only. If that first park is declined,
+  // the run continues and does NOT re-attempt a park every iteration off the sticky seeded mode
+  // (the server ACK is authoritative thereafter).
+  it("the seed fallback is one-shot: a declined first park does not re-park every iteration", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones("# Plan", THREE_MILESTONES), resultSuccess()], // planning turn
+      [assistantText("iter 1 work"), resultSuccess()], // iter 1: seed park declined → proceeds
+      [assistantText("iter 2 work"), signalDone(), resultSuccess()], // iter 2: no re-park → done
+    ]);
+    const probe = makeCtx(
+      {
+        pauseModeRequested: () => "milestone", // stays set across the run (sticky), as in production
+        reportIteration: async (n) => {
+          probe.iterations.push(n);
+          return { pauseRequested: false, completedCount: 0 }; // ACK never requests a pause
+        },
+      },
+      () => false, // decline the (single) seed-fallback park
+    );
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.equal(result.pausedAt, undefined, "the declined seed park did not park the run");
+    assert.equal(result.branch, "agent/issue-5", "the run continued and completed");
+    assert.equal(probe.parkCalls.length, 1, "the seed fallback attempted a park exactly ONCE (iteration 1)");
+    assert.deepEqual(probe.iterations, [1, 2], "the loop proceeded past the declined first-boundary park");
   });
 });

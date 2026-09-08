@@ -148,7 +148,12 @@ export class SteeringChannel {
   /** An approve/reject that arrived before the executor asked for one (no lost wakeup),
    *  stamped with the epoch it landed under. Latest-wins if several land before a read. */
   private bufferedVerdict: { verdict: PlanVerdict; epoch: number } | undefined;
-  /** Cancel is sticky and epoch-exempt: once seen it always wins, at any epoch. */
+  /** Cancel is sticky and epoch-exempt: once seen it always wins, at any epoch. Also read by the
+   *  executor's loop-top cancel re-check (PRD #1190 rework, via ctx.cancelRequested → isCancelled):
+   *  a cancel that arrives AFTER the shared abort controller was already spent by a declined
+   *  `now`-park cannot re-fire the turn abort (an AbortController fires once and its once-listener
+   *  is gone), so the implement loop re-reads this durable flag each iteration and takes the
+   *  terminal cancel path. Before the rework such a late cancel was silently dropped. */
   private cancelled = false;
   /** PRD #517 M4: a graceful `stop` is sticky. Once seen it ends an interactive park with
    *  { kind:"ended", reason:"stopped" }, serviced AHEAD of a buffered follow-up (an explicit
@@ -159,10 +164,20 @@ export class SteeringChannel {
    *  a `pause` input (route), cleared by `pause_cancel`, and seeded from the claim on a resume
    *  (seedPauseRequested). Sticky like stopRequested (~:137): it survives across turns until the
    *  worker parks or the owner withdraws it. The actual park BOUNDARY is decided server-side
-   *  (the running-report ACK's pause_requested); this flag exists so a live "now" pause can
-   *  abort the in-flight turn at once (the server cannot), and so the worker/runner can see a
-   *  pause is pending. DISTINCT slot from stopRequested — a stop and a pause are independent. */
+   *  (the running-report ACK's pause_requested); this flag RECORDS the pending mode so the
+   *  executor can honour a seeded/steered pause at its FIRST loop boundary as an ACK-independent
+   *  fallback (getPauseMode → ctx.pauseModeRequested, PRD #1190 rework N1). The immediate turn-drop
+   *  of a `now` pause is done by the abort + the re-armable interrupt in route(), NOT by this flag.
+   *  DISTINCT slot from stopRequested — a stop and a pause are independent. */
   private pauseMode: "milestone" | "now" | null = null;
+  /** PRD #1190 rework (N2): a RE-ARMABLE interrupt the executor registers (via ctx.onPauseNow) so a
+   *  `now` pause can drop the in-flight turn EVERY time — not only the first. The shared cancel
+   *  AbortController fires 'abort' exactly once, so a SECOND `now` after a declined park (which
+   *  already aborted it) cannot re-fire it; this callback is invoked on every `now` pause instead,
+   *  and the executor's trip() is first-wins-per-turn, so re-calling it after the loop cleared the
+   *  prior trip re-arms the drop. The shared-controller abort is KEPT alongside it as the
+   *  pre-registration safety net for the very first `now` (before the executor registers this). */
+  private pauseNowInterrupt: (() => void) | undefined;
   /** FIFO queue of revision feedback (PRD #41), each stamped with its arrival epoch. */
   private readonly reviseQueue: { feedback: string; epoch: number }[] = [];
   /** The gate waiter parked on awaitGateEvent, with the epoch it is waiting for. */
@@ -228,18 +243,41 @@ export class SteeringChannel {
    *  runs.pause_* columns and survives every requeue, but the steering input that carried it is
    *  consume-on-read, so a resumed worker's fresh channel starts pauseMode=null. The claim
    *  re-delivers the durable fact (pause_pending + pause_mode); seeding it here reconstructs the
-   *  same state a live `pause` input would have set, so a resumed "now" pause aborts its first
-   *  turn with NO fresh input. The server's ACK re-fires pause_requested regardless, so a
-   *  resumed run parks at its first boundary either way. Only seeds a recognised mode; ignores
-   *  a garbage value (leaves pauseMode null). Idempotent with a later live `pause` input. */
+   *  same state a live `pause` input would have set. The executor then reads this seeded mode at
+   *  its FIRST loop boundary (ctx.pauseModeRequested → getPauseMode) and honours it as an initial
+   *  pause request there, so a resumed pause PARKS at its first boundary as an ACK-INDEPENDENT
+   *  fallback — a real safety net if the running-report ACK's pause_requested regresses (an
+   *  older/buggy server). In the normal case the ACK also re-fires pause_requested, so the seed is
+   *  redundant; making it load-bearing means a resumed pause no longer depends solely on the ACK.
+   *  (It PARKS at the boundary; it does not abort a turn — there is no in-flight turn at a loop
+   *  boundary. The immediate turn-drop of a live `now` pause is route()'s job.) Only seeds a
+   *  recognised mode; ignores a garbage value (leaves pauseMode null). Idempotent with a later
+   *  live `pause` input. */
   seedPauseRequested(mode: string | undefined): void {
     if (mode === "milestone" || mode === "now") this.pauseMode = mode;
   }
 
-  /** The sticky owner-requested pause mode, or null when none is pending (PRD #1190 M2).
-   *  Exposed for the runner/executor and the M2 tests to read the seeded/routed state. */
+  /** The sticky owner-requested pause mode, or null when none is pending (PRD #1190 M2). Read in
+   *  PRODUCTION by the executor at its first loop boundary (via the runner's ctx.pauseModeRequested
+   *  wiring) so a seeded/steered pause parks even if the running-report ACK's pauseRequested
+   *  regressed — see seedPauseRequested. Also read by the M2 tests. */
   getPauseMode(): "milestone" | "now" | null {
     return this.pauseMode;
+  }
+
+  /** True once a `cancel` input has been seen (sticky, PRD #1190 rework N2). The executor reads it
+   *  at each loop boundary (ctx.cancelRequested) so a cancel that arrives after the shared abort
+   *  controller was already consumed by a `now` pause is still honored — the controller cannot
+   *  re-fire, so this sticky flag is the durable record the loop re-checks. */
+  isCancelled(): boolean {
+    return this.cancelled;
+  }
+
+  /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).
+   *  Last-wins; the runner wires it to the executor's per-run trip so a `now` pause drops the
+   *  current turn even after the shared abort controller has been spent by an earlier `now`. */
+  onPauseNow(cb: () => void): void {
+    this.pauseNowInterrupt = cb;
   }
 
   /** Start the poll loop (idempotent). Runs until stop(). */
@@ -565,17 +603,26 @@ export class SteeringChannel {
       case "pause": {
         // PRD #1190 M2: an owner-requested pause. The body is the mode; default to "milestone"
         // for an absent/garbage body (the safe, non-destructive mode). Set the sticky flag, and
-        // for "now" ALSO abort the in-flight turn — the server decides the milestone boundary
-        // (the running-report ACK) but cannot drop a turn, so only the worker can. Abort with
-        // PauseNowSignal as the reason (DISTINCT from cancel, which uses the default AbortError),
-        // so the executor's cancel listener trips the turn as a pause, not a cancel. Guarded on
-        // !aborted so a `now` after a `cancel` does not double-abort (cancel already won, and it
-        // is terminal). A pause escalation (a `now` replacing a pending `milestone`) re-aborts
-        // if a turn is in flight, matching "now escalates a pending milestone".
+        // for "now" ALSO drop the in-flight turn — the server decides the milestone boundary
+        // (the running-report ACK) but cannot drop a turn, so only the worker can. Two mechanisms,
+        // both invoked for "now" (PRD #1190 rework N2):
+        //  - the shared cancel controller, aborted with a PauseNowSignal reason (DISTINCT from
+        //    cancel, which uses the default AbortError) so the executor's cancel listener trips the
+        //    turn as a pause, not a cancel. Guarded on !aborted so a `now` after a `cancel` does
+        //    not double-abort (cancel already won, and it is terminal). This is the pre-registration
+        //    safety net for the very FIRST `now` (before the executor registers the interrupt).
+        //  - the re-armable pauseNowInterrupt, invoked on EVERY `now`. The shared controller fires
+        //    'abort' exactly once, so a SECOND `now` after a declined park (which already aborted
+        //    it) cannot re-fire it; the interrupt trips the executor's current turn each time, so
+        //    the second `now` still drops the (restarted) turn instead of degrading to a
+        //    milestone-boundary park. Before the rework a second `now` silently degraded.
         const mode = body?.trim() === "now" ? "now" : "milestone";
         this.pauseMode = mode;
-        if (mode === "now" && !this.cancel.signal.aborted)
-          this.cancel.abort(new PauseNowSignal());
+        if (mode === "now") {
+          if (!this.cancel.signal.aborted)
+            this.cancel.abort(new PauseNowSignal());
+          this.pauseNowInterrupt?.();
+        }
         break;
       }
       case "pause_cancel":

@@ -132,6 +132,30 @@ function pauseFactory(homeRoot: string): {
   return { factory, parkResults };
 }
 
+/** An executor that requests a pause WITHOUT committing or checkpointing anything — a `now` pause
+ *  before any work. The clone's branch tip is still its base commit, so handlePausePark's empty-pack
+ *  detection must park cleanly rather than reporting pause_failed. */
+function emptyPauseFactory(homeRoot: string): {
+  factory: ExecutorFactory;
+  parkResults: (boolean | undefined)[];
+} {
+  const parkResults: (boolean | undefined)[] = [];
+  const factory: ExecutorFactory = (runId) => ({
+    homeDir: path.join(homeRoot, runId),
+    executor: {
+      run: async (ctx: RunContext): Promise<ExecutorResult> => {
+        fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+        // No commit, no ctx.checkpoint: a `now` pause dropped the first turn before any work.
+        const at = { completedCount: 0 };
+        const parked = await ctx.parkForPause?.(at);
+        parkResults.push(parked);
+        return parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+      },
+    },
+  });
+  return { factory, parkResults };
+}
+
 const stateStatuses = (runId: string): string[] =>
   api.states.filter((s) => s.runId === runId).map((s) => s.body.status);
 
@@ -208,6 +232,29 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       assert.ok(statuses.includes("paused"), "a paused report WAS attempted");
       // Cleaned up as unparked: the run continued and finalized rather than parking.
       assert.ok(statuses.includes("completed"), "the run cleaned up as unparked and completed");
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("parks cleanly on an EMPTY pack (a `now` pause before any commit), not pause_failed", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1190-empty-"));
+    // A FAILING publish spy: if the empty-pack case wrongly reached the publish path it would report
+    // pause_failed. The empty-pack detection must bypass publish entirely and park cleanly, so with
+    // this spy in place a `paused` (not `pause_failed`) proves publish was never attempted.
+    const { restore } = spyPublishHttpError(500);
+    try {
+      const { factory, parkResults } = emptyPauseFactory(homeRoot);
+      const claim = gitlabClaim(1105);
+      await runnerWithGit(factory, gitlab).execute(claim);
+
+      assert.deepEqual(parkResults, [true], "an empty-pack pause parks cleanly (nothing to lose)");
+      const statuses = stateStatuses(claim.run_id);
+      assert.ok(statuses.includes("paused"), `a paused report was sent, got ${JSON.stringify(statuses)}`);
+      assert.ok(!statuses.includes("pause_failed"), "an empty pack must NOT report pause_failed");
+      assert.ok(!statuses.includes("completed"), "a parked run does not finalize");
     } finally {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });

@@ -1032,6 +1032,15 @@ export class SdkExecutor implements Executor {
       else ctx.signal.addEventListener("abort", onSignal, { once: true });
     }
 
+    // PRD #1190 rework (N2): register the RE-ARMABLE pause-now interrupt. The shared cancel
+    // controller (ctx.signal) fires 'abort' exactly once, so a SECOND `now` pause after a declined
+    // park cannot re-fire it — the once-listener above is spent and an AbortController cannot reset.
+    // The steering channel invokes THIS on every `now` pause instead, and trip() is
+    // first-wins-per-turn (cleared after a declined park), so a `now` that lands after the loop
+    // cleared the prior trip still drops the (restarted) turn. `state` is the run-lifetime drive
+    // object, so this one registration covers every turn.
+    ctx.onPauseNow?.(() => this.trip(state, REASON_PAUSE_NOW));
+
     // The SDK session id evolves across turns; resume each turn from the last.
     let resumeId = ctx.sessionId ?? undefined;
 
@@ -1706,8 +1715,24 @@ export class SdkExecutor implements Executor {
       // branch, or the `now` pause caught around driveTurn below). Hoisted like scopeCapped so it
       // survives the `break` into the ExecutorResult assembly. ANY kind (NOT gated on isIssueRun).
       let pausedAt: { completedCount: number; total?: number } | undefined;
+      // PRD #1190 M2 (N1): honour a seeded/steered pause at the FIRST loop boundary as an
+      // ACK-independent fallback. On a resume claim.pause_pending seeded steering.pauseMode; read it
+      // here (ctx.pauseModeRequested) and treat a set mode as an initial pause request at the first
+      // boundary, so a resumed pause parks even if the running-report ACK's pauseRequested regressed
+      // (an older/buggy server). ONE-SHOT: the server ACK is the authoritative re-arm from the first
+      // boundary on (it clears the request after each attempt), so consulting the sticky mode every
+      // iteration would re-attempt a park on a run that already handled its pending pause.
+      let seedPauseFallback = ctx.pauseModeRequested?.() != null;
       for (;;) {
         iteration++;
+        // PRD #1190 rework (N2): re-check the steering cancel flag at each loop boundary. A cancel
+        // that arrives AFTER a declined `now`-park cannot re-fire the shared abort controller — the
+        // `now` pause already aborted it and its once-listener is spent — so without this re-check
+        // the run would ignore the cancel until it self-completed. The NORMAL in-flight cancel is
+        // unaffected: it aborts the LIVE turn, which throws Error(REASON_CANCELLED) from driveTurn
+        // before control returns here. Throwing the same error takes the identical terminal cancel
+        // path, so a late cancel is honored exactly like an in-flight one.
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
         // PRD #122 M2: report the iteration (carrying the latest milestone progress) and
         // apply the server-served effective budget. The cap only ever RISES (a scaled run
         // gets more turns; a single/zero-milestone run's ACK carries none, so this is
@@ -1775,9 +1800,16 @@ export class SdkExecutor implements Executor {
         // just HONOURS the boolean here. parkForPause publishes the checkpoint FIRST and reports
         // `paused` only if it lands; on a park it breaks, else the run CONTINUES (the server has
         // cleared the request, so the next ACK carries false).
-        if (served?.pauseRequested) {
+        //
+        // PRD #1190 rework (N1): `seedPauseFallback` OR-s in a seeded/steered pause at the FIRST
+        // boundary as an ACK-independent fallback (see its declaration), so a resumed pause parks
+        // even if the ACK's pauseRequested regressed. It is consumed (set false) on the first
+        // boundary that evaluates it, so the server ACK is authoritative thereafter.
+        if (served?.pauseRequested || seedPauseFallback) {
+          seedPauseFallback = false; // one-shot: the server ACK is authoritative from here on
           const at = {
-            completedCount: served.completedCount ?? 0,
+            completedCount:
+              served?.completedCount ?? latestProgress?.completed.length ?? 0,
             total: frozenMilestones?.length,
           };
           if (await this.requestPause(ctx, at)) {
@@ -1898,9 +1930,12 @@ export class SdkExecutor implements Executor {
             // and the run CONTINUES. Clear the sticky REASON_PAUSE_NOW trip so the restarted turn
             // is not immediately re-thrown by driveTurn's top guard — the shared cancel controller
             // stays aborted, but its onSignal is once:true and already fired, and each turn gets a
-            // fresh currentAbort, so the next turn runs cleanly. (A cancel arriving AFTER this
-            // point does not re-abort the consumed controller; the server-side cancel reconciles
-            // the run — a narrow, accepted edge of the single per-run controller.)
+            // fresh currentAbort, so the next turn runs cleanly. The consumed controller can no
+            // longer deliver a later steering signal, so both are re-checked WITHOUT it (PRD #1190
+            // rework N2): a cancel arriving after this point is honored by the loop-top cancel
+            // re-check (ctx.cancelRequested) on the next iteration, and a SECOND `now` pause drops
+            // the restarted turn via the re-armable ctx.onPauseNow interrupt (which trips this same
+            // REASON_PAUSE_NOW). Both were silently dropped before this rework.
             state.tripReason = undefined;
             continue;
           }

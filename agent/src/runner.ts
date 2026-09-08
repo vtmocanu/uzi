@@ -2061,8 +2061,11 @@ export class RunRunner {
     if (claim.stop_pending) steering.seedStopRequested();
     // PRD #1190 M2: re-seed a PENDING pause from the durable claim columns (the direct analog of
     // stop_pending above), so a worker that died with a pause pending re-arms it on resume with
-    // NO fresh input — a resumed `now` pause aborts its first turn. The server's ACK re-fires
-    // pauseRequested regardless, so the run also parks at its first boundary either way.
+    // NO fresh input. The executor reads the seeded mode at its first loop boundary
+    // (ctx.pauseModeRequested → steering.getPauseMode) and PARKS there as an ACK-independent
+    // fallback (PRD #1190 rework N1): a resumed pause parks at its first boundary even if the
+    // running-report ACK's pauseRequested regressed. In the normal case the ACK also re-fires
+    // pauseRequested, so the seed is a real safety net rather than the sole trigger.
     if (claim.pause_pending) steering.seedPauseRequested(claim.pause_mode);
 
     // Last SDK session id the executor observed; carried on EVERY state report so
@@ -2675,6 +2678,15 @@ export class RunRunner {
       // executor only reads it on the path that has no verdict to supply one.
       approvedSelection: claim.agent_selection,
       signal: cancel.signal,
+      // PRD #1190 rework (N2/N1): expose the steering channel's sticky pause/cancel state to the
+      // implement loop, because the single shared abort controller (cancel/ctx.signal) fires
+      // 'abort' exactly once and cannot deliver a second steering signal. cancelRequested lets the
+      // loop honor a cancel that lands after a declined `now`-park (the controller is spent);
+      // pauseModeRequested lets it honor a seeded/steered pause at its first boundary independent of
+      // the running-report ACK; onPauseNow re-arms the in-flight turn drop for a second `now` pause.
+      cancelRequested: () => steering.isCancelled(),
+      pauseModeRequested: () => steering.getPauseMode(),
+      onPauseNow: (cb) => steering.onPauseNow(cb),
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.
       onSessionId: (sessionId) => {
@@ -3445,7 +3457,9 @@ export class RunRunner {
    *
    *   1. the checkpoint is published FIRST and the park happens ONLY if it lands — a pause whose
    *      committed work cannot be made durable on origin is a promise the resume cannot keep if
-   *      the worker rolls, so staying running is the honest fallback; and
+   *      the worker rolls, so staying running is the honest fallback. An EMPTY pack (a `now` pause
+   *      before any commit, so there is nothing to publish and nothing to lose) is NOT a failed
+   *      publish — it parks cleanly, exactly as the limit park treats an empty pack as harmless; and
    *   2. a failed publish does NOT park — it reports `pause_failed` (the server clears the pending
    *      request and keeps the run running), tells the owner, and returns false so the implement
    *      loop CONTINUES the run (a `now` pause then restarts the aborted turn on the next
@@ -3481,10 +3495,21 @@ export class RunRunner {
     });
     await batcher.flush().catch(() => undefined);
 
-    // Checkpoint FIRST (Decision 8). An already-durable tip (a prior mid-run publish
-    // confirmed-landed the committed work) is a successful pause with NO fresh pack — checkpointPack
-    // would return null for an unmoved tip, which must NOT read as a publish failure. Otherwise
-    // publish over the join-token seam and require a confirmed landing.
+    // Checkpoint FIRST (Decision 8). Three cases park cleanly with NO fresh publish, and none is a
+    // failure:
+    //   - an already-durable tip (a prior publish confirmed-landed the work): cloneTip ===
+    //     lastPublishedTip, so there is nothing new to send;
+    //   - an EMPTY pack — nothing was committed THIS run (a `now` pause before any commit): the
+    //     clone's branch tip still equals its base commit (RunnerClone.baseCommit — the fresh-run
+    //     fork point, or on a resume the branch's previously-PUSHED tip, either way already durable).
+    //     There is nothing to publish and nothing to lose, so park cleanly rather than reporting
+    //     pause_failed — a `now` pause with no committed work must park, not keep running against the
+    //     owner's pause request. This mirrors the limit park, which treats an empty pack as harmless.
+    //     (Keyed on the base tip, NOT on checkpointPack returning null: a `now` pause that DID commit
+    //     but whose work was not yet fetched back has cloneTip != baseCommit, so it falls through to
+    //     the publish path — whose checkpointPack-null → pause_failed correctly refuses to park work
+    //     it cannot make durable, exactly as before.)
+    // Otherwise publish over the join-token seam and require a confirmed landing before parking.
     let published = false;
     if (barePath && branch) {
       const cloneTip = runnerClone
@@ -3493,6 +3518,10 @@ export class RunRunner {
             .catch(() => null)
         : null;
       if (cloneTip !== null && cloneTip === flight.lastPublishedTip) {
+        published = true;
+      } else if (cloneTip !== null && cloneTip === runnerClone?.baseCommit) {
+        // Empty pack: no commit was added this run (a `now` pause before any commit). Nothing to
+        // publish, nothing to lose — park cleanly.
         published = true;
       } else {
         published = await this.publishCheckpointBestEffort(
