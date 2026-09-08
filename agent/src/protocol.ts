@@ -403,6 +403,27 @@ export interface ClaimRepo {
 }
 
 /**
+ * The Codex secret block on a claim (PRD #1171 M3/M4). A discriminated union on
+ * `auth_mode` mirroring the planned Go wire (`ClaimCodexSecrets`, emitted by
+ * `claim_assembly.go` ONLY when `runs.codex_secret_id` is frozen):
+ *
+ *   * "subscription" carries the account's committed `generation` — the worker's
+ *     initial observedGeneration for coordinated refresh. Subscription is the only
+ *     mode that may refresh.
+ *   * "api_key" has NO `generation` and can never refresh; an api_key run must
+ *     never invoke refresh.
+ *
+ * Present ONLY for an internally-bound Codex run (ships DARK — M5 still owns public
+ * routing). Ordinary Claude claims OMIT it, so their wire is byte-identical: the
+ * field is optional/omitted, an existing Claude claim's JSON is unchanged, and
+ * existing consumers are unaffected. Delivered ONLY in the claim response; never
+ * persisted beyond the run, never logged (the access token/capability are secrets).
+ */
+export type ClaimCodexSecrets =
+  | { auth_mode: "subscription"; access_token: string; capability: string; generation: number }
+  | { auth_mode: "api_key"; access_token: string; capability: string };
+
+/**
  * Per-run secrets. Delivered ONLY in the claim response (PRD: "the claim
  * payload is the only delivery path"). Never persisted beyond the run, never
  * logged. The worker (not the agent) holds forge_pat and performs every
@@ -416,6 +437,10 @@ export interface ClaimSecrets {
   // Bot login for the git commit identity + MR authorship. Used in M4; M2
   // ignores it.
   forge_username?: string;
+  /** The Codex secret block (PRD #1171 M3/M4). Present ONLY for an internally-bound
+   *  Codex run (ships DARK); ordinary Claude claims omit it so their wire is
+   *  byte-identical. See {@link ClaimCodexSecrets}. */
+  codex?: ClaimCodexSecrets;
 }
 
 /** Per-run caps the server may push down (PRD §Configuration). Advisory in M2.

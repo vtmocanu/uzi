@@ -432,6 +432,11 @@ export const mockRuns: Run[] = [
     },
     budget_max_iterations: 12,
     budget_wall_seconds: 7200,
+    // PRD #1170: a running run with a frozen wall-clock budget carries a server-computed
+    // deadline (started_at + budget). ~2h out here (started 1m ago, 7200s budget). The
+    // near-timeout badge counts down to it once the run is flagged; this run is healthy,
+    // so no countdown renders, but the field rides the wire like the real DTO.
+    deadline_at: minsAhead(119),
     anthropic_secret_id: "sec-console",
     anthropic_secret_label: "console-key",
     // M5: the headline case, and D20's own example — `console-key — auto, 62% headroom`.

@@ -55,7 +55,7 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           judge_daily_budget: "0",
           health_enabled: "false",
           health_stall_seconds: "120",
-          health_slow_seconds: "2700",
+          health_near_timeout_pct: "85",
           health_queued_seconds: "600",
           health_approval_seconds: "3600",
           health_nudge_cooldown_seconds: "1800",
@@ -79,6 +79,46 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     // The run-health keys round-trip too (PRD #47).
     expect(app.health_enabled).toBe("false");
     expect(app.health_stall_seconds).toBe("120");
+  });
+
+  it("migrates a legacy v3 blob (health_slow_seconds → health_near_timeout_pct) without discarding config", async () => {
+    installStorage({
+      [KEY]: JSON.stringify({
+        v: 1,
+        userSettings: { default_model: "opus", theme: "mission" },
+        appSettings: {
+          autopilot_label: "autopilot",
+          uzi_label: "runnable",
+          default_theme: "mission",
+          slack_enabled: "false",
+          public_base_url: "http://127.0.0.1:8080",
+          judge_enabled: "false",
+          judge_model: "opus",
+          judge_enforce_all: "false",
+          judge_cooldown_seconds: "60",
+          judge_daily_budget: "0",
+          health_enabled: "true",
+          health_stall_seconds: "300",
+          // Pre-#1170 shape: the retired wall-clock key, and NO health_near_timeout_pct.
+          health_slow_seconds: "2700",
+          health_queued_seconds: "600",
+          health_approval_seconds: "3600",
+          health_nudge_cooldown_seconds: "1800",
+          docker_repo_allowlist: "",
+        },
+      }),
+    });
+    const api = await reload();
+
+    // The saved config survives instead of being reseeded back to defaults.
+    expect((await api.getMySettings()).settings.theme).toBe("mission");
+    const app = (await api.getSettings()).settings;
+    expect(app.uzi_label).toBe("runnable");
+    expect(app.default_theme).toBe("mission");
+    // The new key is filled from the seed default…
+    expect(app.health_near_timeout_pct).toBe("85");
+    // …and the retired key is stripped, not carried along.
+    expect("health_slow_seconds" in app).toBe(false);
   });
 
   it("falls back to seed on a corrupt blob", async () => {

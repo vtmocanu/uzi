@@ -166,7 +166,7 @@ The state dots themselves, in both places:
 | State | Meaning |
 |---|---|
 | working (pulsing) | The newest speaker, and the run is healthy — see [Run health](./run-health.md). Stays `working` through a long tool call (a build, a test suite); it does not time out on its own. **Exactly one lane** pulses, even when one role has two live invocations. |
-| stalled (amber) | The newest speaker, but the run's health has flagged it (`stalled`, `slow`, or `looping`) — a looping agent never reads as healthy green. |
+| stalled (amber) | The newest speaker, but the run's health has flagged it `stalled` or `looping` — a looping agent never reads as healthy green. A **near timeout** flag is a budget fact about the run, not evidence the speaker is unhealthy, so it does **not** turn the lane amber. |
 | waiting | Either everything, while the run is blocked on a plan approval or has no worker claimed yet; or a lane that spoke recently but isn't the newest. |
 | idle | A lane that hasn't spoken in a while. |
 | done | Everything, once the run has finished (completed, failed, or cancelled). |

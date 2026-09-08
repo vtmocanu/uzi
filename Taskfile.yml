@@ -2052,7 +2052,8 @@ tasks:
       - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
 
   test:codex-supervisor:
-    desc: Opt-in gofmt vet and unit tests for the static Codex process supervisor module
+    desc: Opt-in Linux-only gofmt vet and unit tests for the static Codex process supervisor module
+    platforms: [linux]
     # A SEPARATE Go module (uzi.local/codex-supervisor), deliberately NOT part of gate:api
     # and NOT under gate. GOTOOLCHAIN=local pins the host toolchain (the module go.mod floors
     # go 1.25); -mod=vendor builds offline from the committed vendor tree; -buildvcs=false
@@ -2126,6 +2127,25 @@ tasks:
           UZI_M3A_DOCKERFILE="agent/templates/${template}/Dockerfile" \
             ../e2e/codex-m3a/run-lifecycle.sh
         done
+
+  test:codex-m3b:
+    desc: Opt-in aggregate of the credential-free Codex adapter unit and state controls (PRD 1171 M1)
+    # An aggregate of the Codex adapter UNIT/state controls that exist today: the
+    # agent-side registry/safety/transport suites plus the runner-uid identity-boundary
+    # tests (including the runner-cmd command-root uid). The individual unit files run in
+    # node's DEFAULT PARALLEL mode (one child process per file), exactly like the sibling
+    # test:agent -- there is no --test-concurrency=1 here. Pure in-process unit tests over
+    # the adapter's pure functions and the setpriv argv builders -- no SDK query, no
+    # container, no credentials, no network. Runs from `dir: agent` so tsx + the SDK/zod
+    # deps resolve out of agent/node_modules, matching test:agent / test:harness-m2.
+    #
+    # A later PRD 1171 milestone (the Codex harness milestone) EXTENDS this aggregate by
+    # appending test:codex-m3b:packaged as an additional SERIAL step -- the both-image
+    # integration whose packaged test file does not exist yet -- so this target grows that
+    # entry then. Do NOT add test:codex-m3b:packaged until that milestone lands.
+    dir: agent
+    cmds:
+      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts test/codex-render.test.ts test/codex-harness.test.ts test/codex-advice-harness.test.ts test/codex-select.test.ts test/codex-session-state.test.ts
 
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)

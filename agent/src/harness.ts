@@ -258,11 +258,95 @@ export interface HarnessTurn {
   close(): Promise<void>;
 }
 
+// ---------------------------------------------------------------------------
+// M3/M4 process-safety surface (PRD #1171). These types were deliberately omitted
+// from the M2 subset (see the file header, lines 9-11) so knip's zero-unused-export
+// gate stayed green; they are added here for the Codex adapter's fail-closed
+// execution spine. Shapes are the accepted contract's, implemented EXACTLY
+// (harness-contract.md §Contracts, lines 270-332). `HarnessError` (above) is reused.
+// ---------------------------------------------------------------------------
+
+export type SafeBoundary =
+  | "checkpoint"
+  | "park"
+  | "shutdown"
+  | "terminal"
+  | "finalize"
+  | "credentialed_git";
+
+export interface BoundaryRequest {
+  boundary: SafeBoundary;
+  deadlineMs: number; // absolute wall-clock deadline, never an unbounded wait
+}
+
+export type ChildQuiescence =
+  | { kind: "quiescent"; epoch: number }
+  | { kind: "legacy_unobserved" }
+  | { kind: "incomplete"; errors: readonly HarnessError[] };
+
+export type ProcessReap =
+  | {
+      kind: "observed_empty";
+      // The safety owner supplies this only after every registered supervisor
+      // root has reaped its descendants, including process-group escapees.
+      evidence: "supervisor_echild";
+      epoch: number; // must match the quiescent epoch held by the safety owner
+    }
+  | { kind: "legacy_dispatched" }
+  | { kind: "incomplete"; errors: readonly HarnessError[] };
+
+export type ToolDisposal =
+  | { kind: "disposed" }
+  | { kind: "legacy_in_process" }
+  | { kind: "incomplete"; errors: readonly HarnessError[] };
+
 export interface RunHarness {
   readonly kind: HarnessKind;
   inspectSession(id: string): Promise<SessionPresence>;
   startTurn(request: RunTurnRequest): HarnessTurn;
+  // The three process-safety methods below are OPTIONAL here, UNLIKE the contract's
+  // non-optional listing (harness-contract.md:298-315). This divergence is deliberate
+  // and load-bearing: making them optional keeps the existing `ClaudeHarness` and the
+  // test stub byte-for-byte unchanged — they simply never implement these, so their
+  // legacy `killAgentTree` cleanup branch stays literal and Claude behavior is
+  // preserved. ONLY `CodexHarness` (a later M3 unit) implements them. Do not remove
+  // or reorder the three members above.
+  //
+  // Closes admission to spawn/tool callbacks, settles accepted callbacks,
+  // resolves all owned child turns,
+  // cancels/settles owned provider cells/terminals, accounts for discovery races.
+  // Successful quiescence freezes the epoch until an explicit later startTurn.
+  quiesceChildren?(request: BoundaryRequest): Promise<ChildQuiescence>;
+  // OS operation over recorded ownership only; cannot establish remote child
+  // quiescence. Every registered supervisor must observe ECHILD, using __WALL where
+  // required, rather than infer emptiness from CLI exit or its original PGID.
+  // Must never select unrelated processes by namespace/glob.
+  reapProcesses?(request: BoundaryRequest, closedEpoch: number): Promise<ProcessReap>;
+  // Revokes per-run callback authorization, rejects pending admissions, drains
+  // handlers, closes listeners/transports, and drops token/handler references.
+  disposeTools?(request: BoundaryRequest): Promise<ToolDisposal>;
 }
+
+// Module-private brand; callers cannot manufacture a permit from observations.
+declare const boundaryPermitBrand: unique symbol;
+
+export interface BoundaryPermit {
+  readonly [boundaryPermitBrand]: true;
+  readonly epoch: number;
+  readonly boundary: SafeBoundary;
+}
+
+export interface CodexExecutionSafety {
+  readonly kind: "codex";
+  withBoundary<T>(
+    request: BoundaryRequest,
+    action: (permit: BoundaryPermit) => Promise<T>,
+  ): Promise<T>;
+}
+
+// M3 addition required on the existing outer Executor contract in executor.ts:
+// safety?: CodexExecutionSafety;
+// This facade is owned by uzi, so the adapter does not gain git/workflow policy.
 
 export interface TurnSignals {
   plan?: string;

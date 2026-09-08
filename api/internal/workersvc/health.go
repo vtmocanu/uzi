@@ -31,7 +31,7 @@ import (
 type Settings interface {
 	HealthEnabled(ctx context.Context) (bool, error)
 	HealthStallSeconds(ctx context.Context) (int, error)
-	HealthSlowSeconds(ctx context.Context) (int, error)
+	HealthNearTimeoutPct(ctx context.Context) (int, error)
 	HealthQueuedSeconds(ctx context.Context) (int, error)
 	HealthApprovalSeconds(ctx context.Context) (int, error)
 	// HealthNudgeCooldownSeconds bounds how often a single run may DM its owner
@@ -58,7 +58,7 @@ const (
 const (
 	reasonStalled       = "the agent stopped sending updates"
 	reasonLooping       = "the agent keeps repeating the same action"
-	reasonSlow          = "this run is taking longer than usual"
+	reasonNearTimeout   = "this run is close to its wall-clock timeout and will be stopped when it reaches it"
 	reasonApprovalIdle  = "waiting for the plan to be approved"
 	reasonVaultLocked   = "your vault is locked, so this run can't start"
 	reasonNoWorker      = "no worker is online to pick up this run"
@@ -76,11 +76,11 @@ const (
 	// written, so the agent keeps re-sending them. Same contract as its siblings —
 	// fixed, server-controlled, no tool name, no repo content, no live duration.
 	//
-	// It names the MECHANISM rather than the symptom, unlike the `slow` this
-	// replaces: the incident reported "this run is taking longer than usual" for a
-	// run that was neither slow nor working. No migration is owed — runs.health_reason
-	// is plain text with no CHECK (00057), and only runs.health is constrained, where
-	// 'looping' already exists.
+	// It names the MECHANISM rather than the symptom: the incident reported a bare
+	// wall-clock delay for a run that was neither behind nor working, so the fix was to
+	// describe what actually went wrong (updates can't be saved). No migration is owed —
+	// runs.health_reason is plain text with no CHECK (00057), and only runs.health is
+	// constrained, where 'looping' already exists.
 	reasonPersistFailing = "the agent's updates can't be saved, so it keeps resending them"
 	// reasonVerdictUndelivered is issue #182's reason: the owner answered the approval
 	// gate and the worker has not acted on it yet. Same contract as its siblings — no
@@ -155,11 +155,14 @@ const toolWindowFetch = 40
 
 // healthThresholds are the per-tick resolved thresholds. A zero duration means the
 // signal is disabled (the admin set 0, or a read failed and defaulted to 0).
+// nearTimeoutPct is a percentage of the run's effective wall-clock budget (0 =
+// disabled): unlike the seconds thresholds it needs no clamp, since a percentage is
+// below the run's own deadline by construction (PRD #1170).
 type healthThresholds struct {
-	stall    time.Duration
-	slow     time.Duration
-	queued   time.Duration
-	approval time.Duration
+	stall          time.Duration
+	nearTimeoutPct int
+	queued         time.Duration
+	approval       time.Duration
 }
 
 // detectRunHealth runs one health pass over every active run and returns the number
@@ -279,9 +282,9 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 }
 
 // runningTarget computes the flag for a running run, priority persist-looping >
-// tool-looping > stalled > slow (Decision 3, extended by PRD #108 M4): looping is
-// the strongest evidence of pathology, and slow is a wall-clock backstop that must
-// not mask a more specific signal.
+// tool-looping > stalled > near-timeout (Decision 3, extended by PRD #108 M4 and
+// #1170 D5): looping is the strongest evidence of pathology, and near-timeout is a
+// budget-relative backstop that must not mask a more specific signal.
 func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
 	// looping, persistence flavour (PRD #108 M4). Checked FIRST, and deliberately
 	// NOT from run_messages: the arm below reads ListRunToolWindow, and this wedge IS
@@ -335,29 +338,18 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 		}
 	}
 
-	// slow: wall clock since start, regardless of activity or in-flight state. The RAW
-	// threshold (th.slow) is first SCALED to the run's budget, then clamped PER-RUN
-	// against this run's EFFECTIVE timeout (PRD #122 M2, Decision 5b): the global
-	// RUN_TIMEOUT unless the run froze a scaled budget, in which case its persisted
-	// budget_wall_seconds.
-	effTimeout := s.p.RunTimeout
-	if r.BudgetWallSeconds.Valid && r.BudgetWallSeconds.Int32 > 0 {
-		effTimeout = time.Duration(r.BudgetWallSeconds.Int32) * time.Second
-	}
-	// issue #323: a run that froze a scaled budget lives far longer than the global
-	// RUN_TIMEOUT, so a flat health_slow_seconds wears "slow" for most of that life even
-	// while actively emitting. Scale the raw threshold by the run's budget ratio so
-	// "slow" means the same fraction-of-budget for a scaled run as it does for a default
-	// run — respecting the admin's configured health_slow_seconds rather than ignoring
-	// it. Only ever RAISES the threshold (effTimeout > RunTimeout guard), so an unscaled
-	// run is byte-for-byte unchanged, and the per-run clampSlow below still keeps the
-	// flag firing before the run's own timeout.
-	rawSlow := th.slow
-	if s.p.RunTimeout > 0 && effTimeout > s.p.RunTimeout {
-		rawSlow = time.Duration(float64(th.slow) * float64(effTimeout) / float64(s.p.RunTimeout))
-	}
-	if slow := clampSlow(rawSlow, effTimeout); slow > 0 && r.StartedAt.Valid && now.Sub(r.StartedAt.Time) >= slow {
-		return healthSlow, reasonSlow
+	// near timeout: active running time (wall clock since start minus paused-at-a-gate
+	// seconds) has reached nearTimeoutPct% of the run's effective wall-clock timeout —
+	// the exact clock SweepRunningTimeout kills on (D3). runWallClock is shared with
+	// RunDeadline so the arm and the served deadline_at can never disagree (D9). Static
+	// reason; the live number rides deadline_at on the DTO (D4).
+	if th.nearTimeoutPct > 0 {
+		if effTimeout, ok := runWallClock(r.BudgetWallSeconds, r.Kind, r.Interactive, r.Status, r.StartedAt.Valid, s.p.RunTimeout); ok {
+			active := now.Sub(r.StartedAt.Time) - time.Duration(r.BudgetPausedSeconds)*time.Second
+			if active >= effTimeout/100*time.Duration(th.nearTimeoutPct) { // divide first: no overflow, sub-100ns loss
+				return healthSlow, reasonNearTimeout
+			}
+		}
 	}
 
 	return healthOK, ""
@@ -671,10 +663,10 @@ func (s *Service) queuedPriorityClass(ctx context.Context, now time.Time, r stor
 // on a read error; healthDur maps a non-positive value to a disabled (zero) signal.
 func (s *Service) healthThresholds(ctx context.Context) healthThresholds {
 	return healthThresholds{
-		stall:    healthDur(s.healthSettings.HealthStallSeconds(ctx)),
-		slow:     s.slowThreshold(ctx),
-		queued:   healthDur(s.healthSettings.HealthQueuedSeconds(ctx)),
-		approval: healthDur(s.healthSettings.HealthApprovalSeconds(ctx)),
+		stall:          healthDur(s.healthSettings.HealthStallSeconds(ctx)),
+		nearTimeoutPct: healthPct(s.healthSettings.HealthNearTimeoutPct(ctx)),
+		queued:         healthDur(s.healthSettings.HealthQueuedSeconds(ctx)),
+		approval:       healthDur(s.healthSettings.HealthApprovalSeconds(ctx)),
 	}
 }
 
@@ -689,54 +681,49 @@ func healthDur(secs int, _ error) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// slowThreshold reads health_slow_seconds and returns it RAW (unclamped) — the clamp
-// against a run's effective timeout is applied PER-RUN in runningTarget (PRD #122 M2,
-// Decision 5b), not here, because a scaled run's ceiling is its persisted
-// budget_wall_seconds, not the global RUN_TIMEOUT, and this pass has no run in hand.
-//
-// The once-per-value operator-misconfig WARN stays here: a health_slow_seconds at or
-// beyond the GLOBAL RUN_TIMEOUT is a misconfiguration worth a log, since the common
-// (unscaled) run is still failed by the global timeout first and the flag would never
-// fire for it. RUN_TIMEOUT is an env value that can change across restarts, which is
-// why this lives here and not in the pure settings.Validate().
-func (s *Service) slowThreshold(ctx context.Context) time.Duration {
-	slow := healthDur(s.healthSettings.HealthSlowSeconds(ctx))
-	if slow == 0 {
-		s.lastSlowClampWarn = 0 // reset so a later re-break warns again
+// healthPct turns the near-timeout percentage accessor's (pct, err) into the threshold
+// the near-timeout arm compares against, mapping a non-positive value (0 = disabled, or
+// a read that fell back to a bad value) to 0 the caller reads as "signal off". The
+// error is already logged by the accessor's default fallback path (mirrors healthDur);
+// a strict re-log here would be noise. There is NO upper clamp and no RUN_TIMEOUT warn
+// — unlike the retired wall-clock seconds threshold, a percentage of a run's own budget is below
+// that run's deadline by construction (PRD #1170).
+func healthPct(pct int, _ error) int {
+	if pct <= 0 {
 		return 0
 	}
-	if s.p.RunTimeout > 0 && slow >= s.p.RunTimeout {
-		// Log once per distinct misconfigured value, not on every 15s sweep: the check
-		// is re-evaluated each pass, so an unconditional Warn would spam the log for as
-		// long as the misconfiguration stands.
-		if s.lastSlowClampWarn != slow {
-			slog.Warn("health: health_slow_seconds >= RUN_TIMEOUT; the slow flag will be clamped per-run so it can fire before a run is timed out",
-				"configured", slow.String(), "run_timeout", s.p.RunTimeout.String())
-			s.lastSlowClampWarn = slow
-		}
-		return slow
-	}
-	s.lastSlowClampWarn = 0 // configured below the timeout now; a later re-break warns again
-	return slow
+	return pct
 }
 
-// clampSlow clamps a RAW slow threshold against a run's EFFECTIVE timeout (PRD #122
-// M2, Decision 5b): a threshold at or beyond the effective timeout would never fire —
-// the run is failed by the timeout first — so it is pulled just under. Returns raw
-// unchanged when raw < eff (the common case, byte-for-byte today for an unscaled run),
-// eff - 1m otherwise (or eff/2 when that would be non-positive), and 0 when raw is 0.
-func clampSlow(raw, eff time.Duration) time.Duration {
-	if raw == 0 {
-		return 0
+// runWallClock returns the run's effective wall-clock timeout and whether the run
+// has a wall deadline at all (the SweepRunningTimeout exclusion set: not chat/judge,
+// not interactive, running, started_at present, positive effTimeout). Shared by
+// RunDeadline and the near-timeout health arm so they cannot disagree (D9).
+func runWallClock(budgetWallSeconds pgtype.Int4, kind string, interactive bool, status string, startedValid bool, globalTimeout time.Duration) (effTimeout time.Duration, ok bool) {
+	if !startedValid || interactive || status != "running" || kind == "chat" || kind == "judge" {
+		return 0, false
 	}
-	if eff <= 0 || raw < eff {
-		return raw
+	effTimeout = globalTimeout
+	if budgetWallSeconds.Valid && budgetWallSeconds.Int32 > 0 {
+		effTimeout = time.Duration(budgetWallSeconds.Int32) * time.Second
 	}
-	clamped := eff - time.Minute
-	if clamped <= 0 {
-		clamped = eff / 2
+	if effTimeout <= 0 {
+		return 0, false
 	}
-	return clamped
+	return effTimeout, true
+}
+
+// RunDeadline is the one server-computed wall-clock deadline every surface shares
+// (D9): started_at + COALESCE(budget_wall_seconds, globalTimeout) + budget_paused_seconds,
+// or nil when the run has no wall deadline (not running, chat/judge, interactive, or no
+// started_at). Pure. The extend/pause follow-up adds budget_extension_seconds here.
+func RunDeadline(startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds int32, kind string, interactive bool, status string, globalTimeout time.Duration) *time.Time {
+	effTimeout, ok := runWallClock(budgetWallSeconds, kind, interactive, status, startedAt.Valid, globalTimeout)
+	if !ok {
+		return nil
+	}
+	d := startedAt.Time.Add(effTimeout + time.Duration(budgetPausedSeconds)*time.Second)
+	return &d
 }
 
 // -------------------------------------------------------------------------
