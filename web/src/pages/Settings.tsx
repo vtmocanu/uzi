@@ -88,10 +88,11 @@ function usePrefersDark(): boolean {
 // ground #F2F4F7 and the rust brand #B93C0B. They differ only in WHERE the dark
 // factory shows through — the console pane (dawn), the sidebar frame (hall), or
 // live-run cards (shadow). DARK_FACTORY is the ember dark the factory reveals
-// (index.css sets --bg to that dark ground on .console/.frame/[data-live]).
+// (index.css sets --bg to that dark ground — 8 10 15 = #080a0f, the live ember
+// --bg — on .console/.frame/[data-live]), so the swatch chip matches what ships.
 const LIGHT_GROUND = "#f2f4f7";
 const LIGHT_BRAND = "#b93c0b";
-const DARK_FACTORY = "#0e1218";
+const DARK_FACTORY = "#080a0f";
 
 // Representative swatch colours per theme id: the ground (page background) and the
 // brand accent, so each theme card previews at a glance without loading its CSS.

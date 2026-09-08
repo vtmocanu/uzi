@@ -8,19 +8,19 @@ audience: user
 
 **Settings → Appearance** controls how uzi looks for you: a light/dark
 mode, a theme for each polarity, and a typeface. Every choice is
-server-side — it persists to your account and follows you across browsers
+server-side: it persists to your account and follows you across browsers
 and devices, the same as your Anthropic tokens. A pick applies immediately;
 if the save fails, it reverts and shows why.
 
 ## Mode
 
-- **System** — follows your OS's light/dark setting, live: flipping your
+- **System**: follows your OS's light/dark setting, live. Flipping your
   OS between light and dark restyles uzi immediately, with no reload.
-- **Lights on** — always paints your chosen light theme.
-- **Lights off** — always paints your chosen dark theme.
+- **Lights on**: always paints your chosen light theme.
+- **Lights off**: always paints your chosen dark theme.
 
 You hold one theme for **Lights on** and one for **Lights off**, so
-switching mode — including to **System**, which follows the OS — never asks
+switching mode (including to **System**, which follows the OS) never asks
 you to re-pick: it just decides which of the two you've already chosen
 paints right now.
 
@@ -36,13 +36,13 @@ palette and differing only in where the dark "factory" still shows through:
 
 | Theme | Where it stays dark |
 |---|---|
-| **Dawn** | Only machine surfaces — the run activity feed and code/log/CLI blocks. Everything else is light. |
+| **Dawn** | Only machine surfaces: the run activity feed and code/log/CLI blocks. Everything else is light. |
 | **Hall** | Dawn, plus the sidebar and mobile top bar. |
-| **Shadow** | Dawn, plus a board card, run row, or run header while that run is actively working (claimed, running, or planning). A run waiting on you — awaiting approval, in review — stays light with a rust accent, so your decision surface is never inside a dark card. |
+| **Shadow** | Dawn, plus a board card, run row, or run header while that run is actively working (claimed, running, or planning). A run waiting on you (awaiting approval, in review) stays light with a rust accent, so your decision surface is never inside a dark card. |
 
 ## Typeface
 
-**System** uses your platform's default UI font — nothing downloaded.
+**System** uses your platform's default UI font, nothing downloaded.
 **IBM Plex** is bundled with uzi, so switching to it fetches no external
 font either; the files ship with the app.
 
