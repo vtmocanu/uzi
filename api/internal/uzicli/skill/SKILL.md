@@ -736,8 +736,8 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    it. The direct label write reaches uzi's cached issue on the next poller sync. Let
    step 3 attempt creation once; only if it returns that specific eligibility
    rejection while the forge still shows the label, retry the same create after short
-   waits for at most one minute. Stop on any other error, and never blindly repeat a
-   create whose result is uncertain.
+   waits for up to 90 seconds (one full default poll interval plus sync margin). Stop on
+   any other error, and never blindly repeat a create whose result is uncertain.
 2. **Pre-flight: is anything already in flight that this run depends on or
    collides with?** Ask the user **only on a confident blocker**, never on the
    mere presence of parallel runs — independent issues run fine side by side (each
@@ -1001,7 +1001,7 @@ required; the issue needs only the configured `uzi` eligibility label. After
 adding that label with the native forge CLI, verify it on the forge before
 creating the run. If `run create` still reports that the issue is not marked as
 uzi's work, wait for the next poller sync and retry only that specific rejection
-for at most one minute; stop on any other error.
+for up to 90 seconds with default settings; stop on any other error.
 
 ### Reading and triaging the judge's review
 
