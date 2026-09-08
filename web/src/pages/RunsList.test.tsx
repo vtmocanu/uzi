@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
+import { RunRow, RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
 import { api, type RunListItem, type SecretMeta } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
@@ -1170,5 +1170,44 @@ describe("RunsList — live poll (PRD #518)", () => {
     expect(mockApi.adminListRuns).toHaveBeenCalledTimes(2);
     expect(mockApi.adminListWorkers).toHaveBeenCalledTimes(2);
     expect(screen.getByText("Second factory run")).toBeTruthy();
+  });
+});
+
+// PRD #1167 M4: shadowSignal drives data-live / data-attention on the RunRow's card-chrome
+// <div> (the visible carded surface, a direct child of the <li>, NOT the bare <li> which has
+// no card chrome), which only the Shadow theme styles (live → dark --surface card, attention
+// → rust rail). The row is rendered directly (it is exported for exactly this kind of
+// assertion) and the attributes are read off that card div; the CSS is proven separately by
+// console-scope.test.ts.
+describe("RunRow Shadow surface attributes (PRD #1167 M4)", () => {
+  const renderRow = (over: Partial<RunListItem> = {}) =>
+    render(
+      <MemoryRouter>
+        <ul>
+          <RunRow run={aRun(over)} now={Date.parse("2026-07-05T12:04:00Z")} />
+        </ul>
+      </MemoryRouter>,
+    );
+
+  // The card-chrome div is the <li>'s only direct child <div> (the stretched <Link> is an
+  // <a>), so `li > div` addresses exactly the carded surface the attributes now ride.
+  const cardOf = (container: HTMLElement) => container.querySelector("li > div") as HTMLElement;
+
+  it("a running run marks the row data-live", () => {
+    const card = cardOf(renderRow({ status: "running" }).container);
+    expect(card.hasAttribute("data-live")).toBe(true);
+    expect(card.hasAttribute("data-attention")).toBe(false);
+  });
+
+  it("an awaiting_approval run marks the row data-attention", () => {
+    const card = cardOf(renderRow({ status: "awaiting_approval" }).container);
+    expect(card.hasAttribute("data-attention")).toBe(true);
+    expect(card.hasAttribute("data-live")).toBe(false);
+  });
+
+  it("a queued run marks neither", () => {
+    const card = cardOf(renderRow({ status: "queued" }).container);
+    expect(card.hasAttribute("data-live")).toBe(false);
+    expect(card.hasAttribute("data-attention")).toBe(false);
   });
 });

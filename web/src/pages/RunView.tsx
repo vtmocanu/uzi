@@ -36,6 +36,7 @@ import {
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
+  shadowSignal,
   shouldShowHealthFlag,
 } from "../lib/runBadge";
 import { activityAge, latestActivity } from "../lib/runActivity";
@@ -1004,12 +1005,20 @@ export function RunView() {
     run.started_at && run.finished_at
       ? formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime())
       : null;
+  // PRD #1167 M4: Shadow's per-run surface signal, rendered as data-live/data-attention
+  // on the run header block (the titleNode wrapping the breadcrumb, title and status).
+  // Inert on every other theme (only Shadow styles them); computed once per render.
+  const shadow = shadowSignal(run);
 
   return (
     <div className="space-y-5">
       <PageHeader
         titleNode={
-          <div className="min-w-0">
+          <div
+            className="min-w-0 run-head"
+            data-live={shadow === "live" ? "" : undefined}
+            data-attention={shadow === "attention" ? "" : undefined}
+          >
             {/* PRD #12: in-app board + issue links (the issue view is served
                 by IssueView, not the forge). */}
             <nav className="mb-2 flex items-center gap-1.5 text-xs text-faint">

@@ -671,7 +671,10 @@ function SidebarContent({
     !(branding.brand_mode === "logo" && branding.brand_placement === "topright");
 
   return (
-    <div className="flex h-full flex-col">
+    // `frame` (PRD #1167 M4) marks the chrome scope Hall darkens: this shared
+    // SidebarContent root mounts in BOTH the desktop <aside> and the mobile drawer,
+    // so one class covers both. Inert on every theme except Hall (index.css).
+    <div className="frame flex h-full flex-col">
       {/* Header cluster: the app wordmark/logo Link and the below-wordmark "powered
           by" row share ONE bottom divider, so the border bounds the whole cluster
           rather than only the Link (issue #828). */}
@@ -1264,7 +1267,9 @@ export function AppShell({ children }: { children: ReactNode }) {
       </aside>
 
       {/* Mobile top bar + sheet */}
-      <div className="sticky top-0 z-20 flex items-center gap-3 border-b border-edge bg-surface px-4 py-3 lg:hidden">
+      {/* `frame` (PRD #1167 M4): the mobile top bar is separate from SidebarContent, so
+          it carries its own frame marker to go ember-dark under Hall. Inert elsewhere. */}
+      <div className="frame sticky top-0 z-20 flex items-center gap-3 border-b border-edge bg-surface px-4 py-3 lg:hidden">
         <button
           onClick={() => setMobileOpen(true)}
           aria-label="Open navigation"

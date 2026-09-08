@@ -332,6 +332,63 @@ describe("IssueCard duration token (issue #256 M4)", () => {
   });
 });
 
+// PRD #1167 M4: shadowSignal drives data-live / data-attention on the card ROOT, which
+// only the Shadow theme styles (live → ember-dark card, attention → rust rail). The
+// attributes render present-or-absent, so these assert their presence off the root's
+// live status, not any Shadow-specific rendering (the CSS is proven by console-scope.test.ts).
+describe("IssueCard Shadow surface attributes (PRD #1167 M4)", () => {
+  const shadowRun = (over: Partial<LatestRun> = {}): LatestRun =>
+    ({
+      id: "run-1",
+      status: "running",
+      mr_iid: null,
+      mr_web_url: null,
+      mr_state: null,
+      failure_reason: null,
+      stop_kind: null,
+      health: "ok",
+      health_reason: null,
+      health_since: null,
+      owner_name: "someone",
+      worker_name: "laptop",
+      is_mine: true,
+      run_count: 1,
+      created_at: "2026-07-04T12:00:00Z",
+      updated_at: "2026-07-04T12:00:00Z",
+      ...over,
+    }) as LatestRun;
+
+  it("a running run marks the card data-live", () => {
+    const { container } = renderCard({ latest_run: shadowRun({ status: "running" }) });
+    const root = container.firstChild as HTMLElement;
+    expect(root.hasAttribute("data-live")).toBe(true);
+    expect(root.hasAttribute("data-attention")).toBe(false);
+  });
+
+  it("an awaiting_approval run marks the card data-attention", () => {
+    const { container } = renderCard({
+      latest_run: shadowRun({ status: "awaiting_approval" }),
+    });
+    const root = container.firstChild as HTMLElement;
+    expect(root.hasAttribute("data-attention")).toBe(true);
+    expect(root.hasAttribute("data-live")).toBe(false);
+  });
+
+  it("a queued run marks neither", () => {
+    const { container } = renderCard({ latest_run: shadowRun({ status: "queued" }) });
+    const root = container.firstChild as HTMLElement;
+    expect(root.hasAttribute("data-live")).toBe(false);
+    expect(root.hasAttribute("data-attention")).toBe(false);
+  });
+
+  it("a card with no run marks neither", () => {
+    const { container } = renderCard({ latest_run: null });
+    const root = container.firstChild as HTMLElement;
+    expect(root.hasAttribute("data-live")).toBe(false);
+    expect(root.hasAttribute("data-attention")).toBe(false);
+  });
+});
+
 // PRD #102 Decision 14a. M1 renames the implicit column's DISPLAY string only. Two
 // strings must survive it: `OPEN_KEY` (the internal "") and the literal `"open"`
 // move() sends, which the server matches with EqualFold. A blind Open→Backlog replace

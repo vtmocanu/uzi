@@ -166,19 +166,26 @@
   --grid-size: 36px 36px;
 }
 
-/* ── Dawn light theme ──────────────────────────────────────────────────────
-   The first of three light themes (PRD #1167). Dawn keeps the dark factory
-   only on console surfaces (activity feed, code/log blocks, CLI token boxes)
-   via the `console` scope below; sidebar and all chrome go light. Cards are
-   LIGHTER than the page ground (the inverse of dark elevation, no shadows),
-   elevated cool-steel greys rather than pure white. All triples are WCAG 2.2
-   AA verified (fg/muted/faint and every status tone ≥ 4.5:1 on bg/surface/
-   raised and each tone's own 10% pill tint; enforced by contrast.test.ts).
+/* ── The light theme token set: Dawn, Hall & Shadow ─────────────────────────
+   PRD #1167's THREE light themes SHARE this one token set — declared once, on a
+   comma-list selector, so they can never drift apart — and differ ONLY in WHERE
+   the dark factory shows, expressed by the scopes below: Dawn keeps the dark
+   only on `console` surfaces (activity feed, code/log blocks, CLI token boxes);
+   Hall additionally darkens the `frame` (the sidebar + mobile top bar); Shadow
+   darkens live run surfaces (`[data-live]`) and gives attention surfaces
+   (`[data-attention]`) a rust rail. Cards are LIGHTER than the page ground (the
+   inverse of dark elevation, no shadows), elevated cool-steel greys rather than
+   pure white. All triples are WCAG 2.2 AA verified (fg/muted/faint and every
+   status tone ≥ 4.5:1 on bg/surface/raised and each tone's own 10% pill tint;
+   enforced by contrast.test.ts, which registers all three names off this shared
+   selector, so hall/shadow are covered token-for-token with no new test data).
    Ember's bright orange fails AA on light ground, so the brand splits: rust
-   here, ember inside the dark `console` scope. Like mission this is a full
-   token set — the `:root:not([data-theme])` guard means the base block does
-   NOT apply once data-theme is set, so every token the app reads is redefined. */
-[data-theme="dawn"] {
+   here, ember inside the dark scopes below. Like mission this is a full token
+   set — the `:root:not([data-theme])` guard means the base block does NOT apply
+   once data-theme is set, so every token the app reads is redefined. */
+[data-theme="dawn"],
+[data-theme="hall"],
+[data-theme="shadow"] {
   color-scheme: light;
 
   /* Palette: cool-steel ground, white cards lifted above it, rust accent */
@@ -264,9 +271,19 @@
    ancestor resolves to the theme's LIGHT muted and would inherit that light value
    into a nested `.console` unchanged. Declaring the aliases ON `.console`, where
    the base tokens are the ember dark set, makes each var() resolve to the dark
-   value on this element, so a scoped neutral pill or shell token reads ember. */
+   value on this element, so a scoped neutral pill or shell token reads ember.
+
+   PRD #1167 M4 REUSES this exact remap (base palette + every alias +
+   color-scheme:dark) for two more scopes appended to the selector list below,
+   so the frame and the live cards are ember token-for-token, identical to the
+   console panes: Hall's `.frame` (the sidebar + mobile top bar go ember-dark
+   under Hall) and Shadow's `[data-live]` (a live run's card/row/header goes
+   ember-dark under Shadow). Sharing one rule is what makes that equality
+   provable — console-scope.test.ts checks both selectors ride this rule. */
 [data-theme="dawn"] .console, [data-theme="hall"] .console, [data-theme="shadow"] .console,
-[data-theme="dawn"] .docs-prose pre, [data-theme="hall"] .docs-prose pre, [data-theme="shadow"] .docs-prose pre {
+[data-theme="dawn"] .docs-prose pre, [data-theme="hall"] .docs-prose pre, [data-theme="shadow"] .docs-prose pre,
+[data-theme="hall"] .frame,
+[data-theme="shadow"] [data-live] {
   color-scheme: dark;
   --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
   --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
@@ -278,6 +295,40 @@
   --queue-fg: var(--muted); --queue-border: var(--edge); --queue-surface: var(--raised);
   --neutral-fg: var(--muted); --neutral-border: var(--edge); --neutral-surface: var(--raised);
   --syn-cmd: var(--brand); --syn-flag: var(--info); --syn-str: var(--ok); --syn-op: var(--brand-hover); --syn-comment: var(--faint); --syn-arg: var(--fg); --tool-rail: var(--edge);
+}
+
+/* PRD #1167 M4 (mock lines 89-90): a live surface is a solid dark --surface card,
+   not just recoloured text. The shared rule above set the ember vars + color-scheme
+   on [data-live]; this gives it the dark background + edge border so a live board
+   card, run row and run header read as dark cards (and the run header, which has no
+   bg utility of its own, is legible instead of ember-light text on the light page). */
+[data-theme="shadow"] [data-live] {
+  background-color: rgb(var(--surface));
+  border-color: rgb(var(--edge));
+}
+/* The run header has no card chrome of its own; give it the band (border+radius+
+   padding) under Shadow when a run is live or needs attention, so the rail/tint and
+   the dark surface read as a header band rather than hugging the text. */
+[data-theme="shadow"] .run-head[data-live],
+[data-theme="shadow"] .run-head[data-attention] {
+  border: 1px solid rgb(var(--edge));
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+}
+
+/* Shadow's attention surfaces (PRD #1167 M4). A run waiting on a human decision
+   or in review carries `data-attention`; under Shadow it gets a LIGHT treatment,
+   deliberately NOT the dark remap above — a rust left rail plus a 6%-rust tint
+   over white, so the human's decision surface (awaiting_approval) never sits
+   inside a dark card. box-shadow:inset draws the rail with no layout reflow
+   (unlike border-left), and the background-color intentionally overrides the
+   card's Tailwind bg utility on Shadow (unlayered + higher specificity wins).
+   Scoped to Shadow, so `data-attention` is inert on every other theme. */
+[data-theme="shadow"] [data-attention] {
+  /* rust left rail + a 6%-rust tint over white; awaiting_approval stays LIGHT so the
+     human's decision surface never sits inside a dark card (PRD #1167). */
+  box-shadow: inset 3px 0 0 rgb(var(--brand));
+  background-color: rgb(251 244 240);
 }
 
 /* Non-console inset surfaces (modal footers, preview/read-only boxes, side

@@ -148,4 +148,62 @@ describe("console scope == ember", () => {
     // "undefined"; if it resolves to a light value it mismatches ember.
     expect(resolveIn(scope, token), `console ${token}`).toEqual(resolveIn(ember, token));
   });
+
+  // PRD #1167 M4: Hall's frame and Shadow's live cards RIDE this same rule, so they
+  // inherit the ember base+alias remap proven token-for-token above — they are dark
+  // exactly like a console pane BECAUSE they share the rule whose tokens equal ember's.
+  // This asserts both selectors are on the rule; the token equality above then covers them.
+  it("the dark-remap rule also scopes Hall's .frame and Shadow's [data-live]", () => {
+    expect(consoleRule?.selector, "Hall frame not on the ember remap rule").toContain(
+      '[data-theme="hall"] .frame',
+    );
+    expect(consoleRule?.selector, "Shadow live cards not on the ember remap rule").toContain(
+      '[data-theme="shadow"] [data-live]',
+    );
+  });
+});
+
+// ── PRD #1167 M4: Shadow's attention surfaces get a LIGHT treatment ──────────
+// awaiting_approval (and in-review) surfaces carry `data-attention`; under Shadow
+// they must NOT go dark like [data-live] — they get a rust left rail + a rust
+// tint over white so the human's decision surface stays light (PRD #1167).
+describe("Shadow attention rule", () => {
+  const rules = topLevelRules(stripComments(css));
+  const attentionRule = rules.find((r) => /\[data-theme="shadow"\]\s+\[data-attention\]/.test(r.selector));
+
+  it("a [data-theme=\"shadow\"] [data-attention] rule exists", () => {
+    expect(attentionRule, "Shadow [data-attention] rule not found").toBeTruthy();
+  });
+
+  it("sets a box-shadow inset rail in the brand and a background tint", () => {
+    const body = attentionRule?.body ?? "";
+    // The rail is an inset box-shadow in the theme brand (rust), no layout reflow.
+    expect(body, "attention rail box-shadow missing").toMatch(/box-shadow:\s*inset[^;]*var\(--brand\)/);
+    // The tint overrides the card's bg utility with an opaque rust-over-white color.
+    expect(body, "attention background tint missing").toMatch(/background-color:\s*rgb\(/);
+  });
+});
+
+// ── PRD #1167 M4: Shadow's live surfaces get a solid dark --surface background ──
+// The mock (lines 89-90) applies TWO rules to every [data-live]: the shared dark
+// var-remap (proven above) AND a second rule giving it `background: var(--surface)`
+// so a live board card, run row and run header read as solid dark cards, not just
+// recoloured text on the light page. This guards against regressing to the
+// unreadable-header state (ember-light text on the light ground) if that second rule
+// is dropped. NOTE two selectors mention [data-live] now — the shared var-remap rule
+// and this bg rule — so match the one whose body sets the dark background.
+describe("Shadow live-surface background", () => {
+  const rules = topLevelRules(stripComments(css));
+  const liveBgRule = rules.find(
+    (r) =>
+      r.selector.trim() === '[data-theme="shadow"] [data-live]' &&
+      /background-color/.test(r.body),
+  );
+
+  it("a [data-theme=\"shadow\"] [data-live] rule sets the dark --surface background", () => {
+    expect(liveBgRule, "Shadow [data-live] background rule not found").toBeTruthy();
+    expect(liveBgRule?.body, "live background not var(--surface)").toMatch(
+      /background-color:\s*rgb\(var\(--surface\)\)/,
+    );
+  });
 });

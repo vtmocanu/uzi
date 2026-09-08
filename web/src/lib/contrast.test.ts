@@ -1,12 +1,15 @@
-// Contrast oracle (PRD #1167 M3). This test READS web/src/index.css from disk,
-// auto-discovers every `[data-theme="X"]` block (the ember base block's
-// `:root:not([data-theme]), [data-theme="ember"]` selector counts, so ember,
-// mission and dawn are all picked up — and hall/shadow will be too, with no test
-// edit, the moment M4 adds their blocks), resolves each theme's `var()` aliases
-// within the block, and asserts WCAG 2.2 AA (4.5:1) for every text token on
-// every surface it can land on. It is the guardrail that keeps every theme
-// AA-clean: ember and mission were designed to pass and MUST pass here — if they
-// don't, the parser or the luminance math is wrong, not the CSS.
+// Contrast oracle (PRD #1167 M3, extended M4). This test READS web/src/index.css
+// from disk, auto-discovers every theme name in a `[data-theme="X"]` selector
+// (the ember base block's `:root:not([data-theme]), [data-theme="ember"]` counts,
+// as does the M4 shared light block `[data-theme="dawn"], [data-theme="hall"],
+// [data-theme="shadow"]` — its ONE comma selector registers all three names,
+// which is why themeNamesIn returns every match rather than the first), resolves
+// each theme's `var()` aliases within the block, and asserts WCAG 2.2 AA (4.5:1)
+// for every text token on every surface it can land on. It is the guardrail that
+// keeps every theme AA-clean: ember and mission were designed to pass and MUST
+// pass here — and hall/shadow inherit Dawn's exact token set, so they pass
+// identically. If a theme fails, the parser or the luminance math is wrong, not
+// the CSS.
 //
 // Runs under the vitest `node` project (src/lib/**), so node:fs is available; the
 // minimal signatures live in web/src/node-fs.d.ts (web/ ships no @types/node).
@@ -65,16 +68,21 @@ function topLevelRules(src: string): Rule[] {
   return rules;
 }
 
-// A theme block is any top-level rule with a comma-separated selector part that
-// is EXACTLY `[data-theme="name"]` (anchored, so the console scope's
-// `[data-theme="dawn"] .console` descendant selectors never match). Returns the
-// theme name, or null.
-function themeName(selector: string): string | null {
+// A theme block is any top-level rule with one or more comma-separated selector
+// parts that are EXACTLY `[data-theme="name"]` (anchored, so descendant selectors
+// like the console scope's `[data-theme="dawn"] .console` and Shadow's
+// `[data-theme="shadow"] [data-live]` never match). Returns EVERY matched name —
+// so the shared `[data-theme="dawn"], [data-theme="hall"], [data-theme="shadow"]`
+// light-theme block (PRD #1167 M4) registers all three off its one comma selector,
+// and the per-theme AA loop then covers hall/shadow with no new test data (they
+// share Dawn's exact token set, so they pass identically).
+function themeNamesIn(selector: string): string[] {
+  const names: string[] = [];
   for (const part of selector.split(",")) {
     const m = part.trim().match(/^\[data-theme="([a-z]+)"\]$/);
-    if (m) return m[1];
+    if (m) names.push(m[1]);
   }
-  return null;
+  return names;
 }
 
 // Parse a block body into { token: rawValue }. Splitting on ";" is safe: no
@@ -94,8 +102,9 @@ function parseTokens(body: string): Record<string, string> {
 
 const themes: Record<string, Record<string, string>> = {};
 for (const rule of topLevelRules(stripComments(css))) {
-  const name = themeName(rule.selector);
-  if (name) themes[name] = parseTokens(rule.body);
+  for (const name of themeNamesIn(rule.selector)) {
+    themes[name] = parseTokens(rule.body);
+  }
 }
 
 const themeNames = Object.keys(themes).sort();
@@ -168,8 +177,10 @@ function aliasTokens(theme: string): string[] {
     .map(([name]) => name);
 }
 
-it("discovers at least ember, mission and dawn", () => {
-  expect(themeNames).toEqual(expect.arrayContaining(["dawn", "ember", "mission"]));
+it("discovers ember, mission, dawn, hall and shadow", () => {
+  expect(themeNames).toEqual(
+    expect.arrayContaining(["dawn", "ember", "hall", "mission", "shadow"]),
+  );
 });
 
 describe.each(themeNames)("theme %s", (theme) => {
