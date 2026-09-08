@@ -917,7 +917,7 @@ and classifying code/flaky/infra inline, watching several SHAs at once, or a
 `*.sh`, including this one) and keep its exit-code contract stable, since callers branch on
 it. Both files are the source of truth (a project skill, tracked in this repo), so an edit
 here IS the published change — no separate install step. Re-run
-`agnix .claude/skills/uzi-watcher/SKILL.md` after editing.
+`agnix .agents/skills/uzi-watcher/SKILL.md` after editing.
 
 ## Safety
 

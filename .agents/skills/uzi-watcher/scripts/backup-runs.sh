@@ -71,6 +71,9 @@ umask 077
 mkdir -p "$DEST"
 LOG="$DEST/backup.log"
 log(){ printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG"; }
+# UZI_CTX unset means the kubeconfig current-context, which is shared across sessions and
+# can be switched under a running loop; say so once so a later "no pod" WARN is legible.
+[ -n "${UZI_CTX:-}" ] || log "WARN UZI_CTX unset; using kubeconfig current-context '$CTX' (pass UZI_CTX explicitly)"
 
 # --- on-pod capture: emits a tar.gz of the artifacts on stdout, noise on stderr.
 # This string runs REMOTELY (`sh -c` in the worker pod); only $REPO_SLUG is
@@ -196,7 +199,7 @@ for RID in "${RUNS[@]}"; do
     continue
   fi
   if ! read -r ns pod < <(resolve_pod "$wid"); then
-    log "WARN $RID ($LBL): status saved, but no pod for worker $wid in [$NAMESPACES]"
+    log "WARN $RID ($LBL): status saved, but no pod for worker $wid in ctx=$CTX ns=[$NAMESPACES]"
     continue
   fi
   # The clone's origin/main is a private worker checkpoint, so read the TRUE public
