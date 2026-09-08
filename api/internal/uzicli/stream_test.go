@@ -874,12 +874,17 @@ func TestStreamRunCloseWhileConsumerIsNotReading(t *testing.T) {
 // CLAUDE.md documents for the repo-root fixtures/ directory.
 //
 // 🔴 THE RESIDUAL — one case, and it is narrower than "a rename breaks this". The scan
-// selects the last migration whose UP half names `runs_status_check`. Measured against
-// the three ways that name can move:
+// selects the last migration whose UP half BOTH names `runs_status_check` AND defines it
+// with a `CHECK (status IN (...))`. Requiring the CHECK, not just the name, is what lets a
+// migration that only REFERENCES the constraint be skipped rather than mis-selected — e.g.
+// 00205's `VALIDATE CONSTRAINT runs_status_check`, or a bare `DROP CONSTRAINT`, names it
+// but carries no CHECK, so it is passed over and the real defining migration is chosen.
+// Measured against the ways that name can move:
 //
 //	renamed in place (no migration names it)     -> FATAL, loudly: "reading the wrong thing"
-//	new migration DROPs it and ADDs a new name   -> caught: the DROP still names it, so
+//	new migration DROPs it and ADDs a new name   -> caught: the ADD carries the new CHECK, so
 //	                                                that file is chosen and its new CHECK parsed
+//	new migration only VALIDATEs / DROPs it      -> skipped: no CHECK, so it is not selected
 //	new migration widens WITHOUT ever naming it  -> SILENT PASS. This is the hole.
 //
 // Only the third is uncovered, and no amount of parsing here can see it: the scan has
@@ -904,7 +909,11 @@ func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
 	sort.Strings(paths)
 
 	// Take the LAST declaration, not the first: the domain is widened by successive
-	// migrations and only the most recent one describes the live constraint.
+	// migrations and only the most recent one describes the live constraint. Selection
+	// requires the UP half to both NAME runs_status_check and carry a `CHECK (status IN
+	// (...))`; a migration that only references the constraint without a CHECK (00205's
+	// `VALIDATE CONSTRAINT`, a bare `DROP CONSTRAINT`) is skipped, per the residual note.
+	statusCheckRe := regexp.MustCompile(`(?is)CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)`)
 	var chosen, upHalf string
 	for _, p := range paths {
 		raw, err := os.ReadFile(p) //nolint:gosec // G304: p comes from a fixed repo-relative migrations dir glob, never external input
@@ -918,7 +927,8 @@ func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if strings.Contains(stripSQLComments(up), "runs_status_check") {
+		stripped := stripSQLComments(up)
+		if strings.Contains(stripped, "runs_status_check") && statusCheckRe.MatchString(stripped) {
 			chosen, upHalf = p, up
 		}
 	}
@@ -929,7 +939,7 @@ func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
 	// The prose in these files names statuses freely, so a regex over raw text would
 	// happily collect them and agree with itself.
 	stmt := stripSQLComments(upHalf)
-	checks := regexp.MustCompile(`(?is)CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)`).FindAllStringSubmatch(stmt, -1)
+	checks := statusCheckRe.FindAllStringSubmatch(stmt, -1)
 	if len(checks) != 1 {
 		t.Fatalf("found %d `CHECK (status IN (...))` statements in %s's UP half, want exactly 1; the file's shape changed and this parse can no longer be trusted", len(checks), chosen)
 	}
