@@ -109,11 +109,26 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     installStorage({
       [KEY]: JSON.stringify({
         v: 1,
-        userSettings: { default_model: "opus", theme: "mission" },
+        userSettings: {
+          default_model: "opus",
+          theme: "mission",
+          // A v4 blob carries the four appearance overrides (PRD #1167 "Lights on" m2);
+          // null = inherit the instance defaults. Present so the blob validates under the
+          // v4 key while still exercising the #1170 health migration below.
+          appearance_mode: null,
+          light_theme: null,
+          dark_theme: null,
+          typeface: null,
+        },
         appSettings: {
           autopilot_label: "autopilot",
           uzi_label: "runnable",
           default_theme: "mission",
+          // A v4 blob carries the four instance appearance defaults (PRD #1167 "Lights on" m2).
+          default_appearance_mode: "dark",
+          default_light_theme: "hall",
+          default_dark_theme: "ember",
+          default_typeface: "system",
           slack_enabled: "false",
           public_base_url: "http://127.0.0.1:8080",
           judge_enabled: "false",
