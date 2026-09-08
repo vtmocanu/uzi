@@ -351,6 +351,23 @@ export interface RunContext {
    */
   checkpoint?(opts: { reap: boolean; progress?: MilestoneProgress }): Promise<void>;
   /**
+   * PRD #1190 M2: park the run for an owner-requested pause. Called by the implement loop at
+   * the server-decided pause boundary (`served.pauseRequested` at the loop top) and when a
+   * `now` pause aborted the in-flight turn (PauseNowSignal caught in the loop). The runner's
+   * implementation publishes a checkpoint FIRST and reports `paused` ONLY if it lands
+   * (Decision 8): a pause whose committed work cannot be made durable does NOT park.
+   *
+   * Returns true once the run is durably parked (checkpoint on origin AND the server ACKed
+   * `paused`), after which the executor breaks and returns `pausedAt` so the runner skips
+   * finalization. Returns false when the park did not take (publish failed → the runner
+   * reported `pause_failed`; or the server did not ACK `paused`): the loop then CONTINUES the
+   * run — a `now` pause restarts the aborted turn on the next iteration, a milestone pause
+   * proceeds to the next milestone (the server has cleared the request, so the next ACK carries
+   * pauseRequested=false). Absent on the stub/test executors, in which case a pause request is
+   * inert (the loop treats it as "not parked" and continues).
+   */
+  parkForPause?(pausedAt: { completedCount: number; total?: number }): Promise<boolean>;
+  /**
    * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
    * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies
    * the ack (the park must actually take, mirroring askUser's ack check), then (b) blocks on
@@ -441,6 +458,14 @@ export interface ExecutorResult {
    *  is not populated). Drives the partial-MR annotation and the `scope_capped` completion.
    *  Issue runs only. Absent on every normal completion. StubExecutor never sets it. */
   scopeCapped?: { completedCount: number; total?: number };
+  /** PRD #1190 M2: set when the run PARKED on an owner-requested pause (ctx.parkForPause
+   *  returned true). `completedCount` is the milestone count the park landed at; `total` is the
+   *  frozen count (absent on a run with no frozen milestones, e.g. a prompt run). The runner
+   *  reads it in phasePublish to SKIP finalization — the run already reported `paused`, is
+   *  non-terminal, and its HOME is preserved for resume. NOT gated on run kind (unlike
+   *  scopeCapped): pause is meaningful for issue, non-interactive task, prompt and self_improve.
+   *  Absent on every normal completion. StubExecutor never sets it. */
+  pausedAt?: { completedCount: number; total?: number };
 }
 
 /**

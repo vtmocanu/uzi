@@ -207,6 +207,10 @@ export class WorkerClient {
             ack.scopeCeiling = fields.scopeCeiling;
           if (fields.completedCount !== undefined)
             ack.completedCount = fields.completedCount;
+          // PRD #1190 M2: pass the server-decided pause boundary through so the reportIteration
+          // closure can fold it into the IterationBudget the loop-top pause branch reads.
+          if (fields.pauseRequested !== undefined)
+            ack.pauseRequested = fields.pauseRequested;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -596,6 +600,7 @@ export async function readRunAck(res: Response): Promise<{
   budgetWallSeconds?: number;
   scopeCeiling?: number;
   completedCount?: number;
+  pauseRequested?: boolean;
 }> {
   try {
     const text = await res.text();
@@ -607,6 +612,7 @@ export async function readRunAck(res: Response): Promise<{
         budget_wall_seconds?: unknown;
         scope_ceiling?: unknown;
         milestones_completed?: unknown;
+        pause_requested?: unknown;
       };
     };
     const run = parsed?.run;
@@ -616,6 +622,7 @@ export async function readRunAck(res: Response): Promise<{
       budgetWallSeconds?: number;
       scopeCeiling?: number;
       completedCount?: number;
+      pauseRequested?: boolean;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     if (typeof run?.budget_max_iterations === "number")
@@ -633,6 +640,11 @@ export async function readRunAck(res: Response): Promise<{
     out.completedCount = Array.isArray(run?.milestones_completed)
       ? run.milestones_completed.length
       : 0;
+    // PRD #1190 M2: the server-decided pause boundary rides the same {run: RunDTO} body. A
+    // boolean only — a non-boolean (older server that omits it, unparseable value) leaves it
+    // absent, which the loop-top pause branch reads as "no pause requested".
+    if (typeof run?.pause_requested === "boolean")
+      out.pauseRequested = run.pause_requested;
     return out;
   } catch {
     return {};

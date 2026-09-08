@@ -108,6 +108,26 @@ function parseAnswerBody(
   return { answers, questionId };
 }
 
+/**
+ * PRD #1190 M2: the abort reason a `now` pause uses to drop the in-flight turn. DISTINCT
+ * from the steering cancel (which aborts with the default AbortError and makes the executor
+ * throw Error(REASON_CANCELLED) → a `failed`/`cancelled` terminal): a pause-now must PARK the
+ * run, not fail it. `route("pause","now")` aborts the shared controller WITH this as the abort
+ * reason; the executor's cancel listener reads `signal.reason instanceof PauseNowSignal` and
+ * trips the turn so driveTurn throws a fresh PauseNowSignal, which the implement loop's turn
+ * catch takes to the pause-park path instead of the terminal cancel/failure path.
+ *
+ * Modeled on LimitReachedError (exported; constructed here, `instanceof`-tested and thrown in
+ * sdk-executor.ts, and `instanceof`-tested in runner.ts) so it crosses files and knip sees a
+ * live consumer of the export.
+ */
+export class PauseNowSignal extends Error {
+  constructor() {
+    super("run paused (now)");
+    this.name = "PauseNowSignal";
+  }
+}
+
 export class SteeringChannel {
   private stopped = false;
   private loop: Promise<void> | undefined;
@@ -135,6 +155,14 @@ export class SteeringChannel {
    *  stop wins over a queued turn). DISTINCT from `this.stopped` (~:112), which means "the
    *  poll loop should stop" — reusing that would kill the poll loop before the park resolves. */
   private stopRequested = false;
+  /** PRD #1190 M2: the sticky owner-requested pause mode, or null when none is pending. Set by
+   *  a `pause` input (route), cleared by `pause_cancel`, and seeded from the claim on a resume
+   *  (seedPauseRequested). Sticky like stopRequested (~:137): it survives across turns until the
+   *  worker parks or the owner withdraws it. The actual park BOUNDARY is decided server-side
+   *  (the running-report ACK's pause_requested); this flag exists so a live "now" pause can
+   *  abort the in-flight turn at once (the server cannot), and so the worker/runner can see a
+   *  pause is pending. DISTINCT slot from stopRequested — a stop and a pause are independent. */
+  private pauseMode: "milestone" | "now" | null = null;
   /** FIFO queue of revision feedback (PRD #41), each stamped with its arrival epoch. */
   private readonly reviseQueue: { feedback: string; epoch: number }[] = [];
   /** The gate waiter parked on awaitGateEvent, with the epoch it is waiting for. */
@@ -193,6 +221,25 @@ export class SteeringChannel {
    *  waiting out the idle timeout. Idempotent with a later live `stop` input. */
   seedStopRequested(): void {
     this.stopRequested = true;
+  }
+
+  /** Seed the sticky pause state at construction time (PRD #1190 M2), before the poll loop
+   *  starts — the direct analog of seedStopRequested. A pause request lives durably in the
+   *  runs.pause_* columns and survives every requeue, but the steering input that carried it is
+   *  consume-on-read, so a resumed worker's fresh channel starts pauseMode=null. The claim
+   *  re-delivers the durable fact (pause_pending + pause_mode); seeding it here reconstructs the
+   *  same state a live `pause` input would have set, so a resumed "now" pause aborts its first
+   *  turn with NO fresh input. The server's ACK re-fires pause_requested regardless, so a
+   *  resumed run parks at its first boundary either way. Only seeds a recognised mode; ignores
+   *  a garbage value (leaves pauseMode null). Idempotent with a later live `pause` input. */
+  seedPauseRequested(mode: string | undefined): void {
+    if (mode === "milestone" || mode === "now") this.pauseMode = mode;
+  }
+
+  /** The sticky owner-requested pause mode, or null when none is pending (PRD #1190 M2).
+   *  Exposed for the runner/executor and the M2 tests to read the seeded/routed state. */
+  getPauseMode(): "milestone" | "now" | null {
+    return this.pauseMode;
   }
 
   /** Start the poll loop (idempotent). Runs until stop(). */
@@ -514,6 +561,29 @@ export class SteeringChannel {
         // MR iff open_mr → completed). serviceFollowUp/awaitFollowUp check this AHEAD of the
         // follow-up drain so an explicit stop beats a queued follow-up (Decision 5).
         this.stopRequested = true;
+        break;
+      case "pause": {
+        // PRD #1190 M2: an owner-requested pause. The body is the mode; default to "milestone"
+        // for an absent/garbage body (the safe, non-destructive mode). Set the sticky flag, and
+        // for "now" ALSO abort the in-flight turn — the server decides the milestone boundary
+        // (the running-report ACK) but cannot drop a turn, so only the worker can. Abort with
+        // PauseNowSignal as the reason (DISTINCT from cancel, which uses the default AbortError),
+        // so the executor's cancel listener trips the turn as a pause, not a cancel. Guarded on
+        // !aborted so a `now` after a `cancel` does not double-abort (cancel already won, and it
+        // is terminal). A pause escalation (a `now` replacing a pending `milestone`) re-aborts
+        // if a turn is in flight, matching "now escalates a pending milestone".
+        const mode = body?.trim() === "now" ? "now" : "milestone";
+        this.pauseMode = mode;
+        if (mode === "now" && !this.cancel.signal.aborted)
+          this.cancel.abort(new PauseNowSignal());
+        break;
+      }
+      case "pause_cancel":
+        // PRD #1190 M2: withdraw a pending pause. Clears the sticky flag; the server clears its
+        // own columns via CancelPauseInput. Does NOT un-abort a turn already dropped by a prior
+        // `now` (an AbortController cannot be reset) — a pause_cancel after a `now` is a rare
+        // race the server's boundary ACK settles.
+        this.pauseMode = null;
         break;
       case "follow_up":
         // issue #559 M2: carry the input id alongside the body so a delivery (takeFollowUp)

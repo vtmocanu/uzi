@@ -82,6 +82,7 @@ import {
   SIGNAL_SERVER_NAME,
 } from "./signals.js";
 import { classifyLimitEvidence } from "./limit.js";
+import { PauseNowSignal } from "./steering.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -127,6 +128,11 @@ const PRD_DONE_PATH_MAX_LEN = 512;
 const REASON_WALL = "run exceeded its wall-clock timeout";
 const REASON_IDLE = "run stalled: no agent activity within the idle timeout";
 const REASON_CANCELLED = "run cancelled";
+// PRD #1190 M2: the internal trip reason for a `now` pause abort. Never a failure_reason — it
+// is converted to a thrown PauseNowSignal at every driveTurn throw site (tripError), which the
+// implement loop's turn catch takes to the pause-park path, so it never reaches a `failed`
+// report as text. DISTINCT from REASON_CANCELLED so the two aborts do not collide.
+const REASON_PAUSE_NOW = "run paused (now)";
 // Exported so the runner's failed-report site can map it to a fail_origin
 // (PRD #69 M7a): a missing Anthropic token is a credential_unavailable failure.
 export const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
@@ -1008,7 +1014,17 @@ export class SdkExecutor implements Executor {
     // reclaims the dependency install (PRD #121 M2) — a cancelled run must not sit at
     // the join waiting out an install whose results nobody will read.
     const onSignal = (): void => {
-      this.trip(state, REASON_CANCELLED);
+      // PRD #1190 M2: a `now` pause aborts the SAME controller as a cancel, but with a
+      // PauseNowSignal as the abort reason. Trip with REASON_PAUSE_NOW so driveTurn throws a
+      // PauseNowSignal (via tripError) instead of Error(REASON_CANCELLED) — the loop then PARKS
+      // the run rather than failing it. Every other abort (a steering cancel, a shutdown) has
+      // the default reason and takes the cancel path unchanged.
+      this.trip(
+        state,
+        ctx.signal?.reason instanceof PauseNowSignal
+          ? REASON_PAUSE_NOW
+          : REASON_CANCELLED,
+      );
       depsAbort.abort();
     };
     if (ctx.signal) {
@@ -1686,6 +1702,10 @@ export class SdkExecutor implements Executor {
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
       let scopeCapped: { completedCount: number; total?: number } | undefined;
+      // PRD #1190 M2: latched when an owner-requested pause parked the run (the loop-top pause
+      // branch, or the `now` pause caught around driveTurn below). Hoisted like scopeCapped so it
+      // survives the `break` into the ExecutorResult assembly. ANY kind (NOT gated on isIssueRun).
+      let pausedAt: { completedCount: number; total?: number } | undefined;
       for (;;) {
         iteration++;
         // PRD #122 M2: report the iteration (carrying the latest milestone progress) and
@@ -1746,6 +1766,25 @@ export class SdkExecutor implements Executor {
           });
           break;
         }
+        // PRD #1190 M2: owner-requested pause boundary. SEPARATE from the scope block above and
+        // deliberately NOT gated on isIssueRun — three of the four pausable kinds (task, prompt,
+        // self_improve) are not issue runs, so a prompt run with no frozen milestones must park on
+        // the first true ACK too. The SERVER owns the boundary decision (Decision 4): it answers
+        // `pauseRequested` on the running-report ACK (true for a `now` pause, or a `milestone`
+        // pause once the in-flight milestone completed / on a run with no frozen list). The worker
+        // just HONOURS the boolean here. parkForPause publishes the checkpoint FIRST and reports
+        // `paused` only if it lands; on a park it breaks, else the run CONTINUES (the server has
+        // cleared the request, so the next ACK carries false).
+        if (served?.pauseRequested) {
+          const at = {
+            completedCount: served.completedCount ?? 0,
+            total: frozenMilestones?.length,
+          };
+          if (await this.requestPause(ctx, at)) {
+            pausedAt = at;
+            break;
+          }
+        }
         ctx.emit({
           kind: "status",
           agent: "worker",
@@ -1762,7 +1801,7 @@ export class SdkExecutor implements Executor {
           latestProgress,
           frozenMilestones,
         );
-        const turn = await this.driveTurn(
+        const turnPromise = this.driveTurn(
           ctx,
           implementConfig,
           "implement",
@@ -1831,6 +1870,42 @@ export class SdkExecutor implements Executor {
           idleMs,
           onProgress,
         );
+        // PRD #1190 M2: await the turn through a catch for a `now` pause abort. driveTurn is an
+        // async function, so even a synchronous trip check surfaces as a REJECTED promise here
+        // (never a throw at the call above) — either way a PauseNowSignal lands in this catch. It
+        // is DISTINCT from a cancel (Error(REASON_CANCELLED)), so the run PARKS rather than fails.
+        // On a park take, break; else (the checkpoint could not be published, so the server
+        // cleared the request) CONTINUE — the aborted turn restarts on the next iteration, exactly
+        // as a cancelled-then-revised turn does. A non-pause error rethrows to the normal path.
+        let turn: TurnResult;
+        try {
+          turn = await turnPromise;
+        } catch (err) {
+          if (err instanceof PauseNowSignal) {
+            const at = {
+              // The server's fresh completed count off THIS iteration's ACK, matching the
+              // loop-top branch; fall back to the worker's own live progress if the ACK carried
+              // none (e.g. a run with no reportIteration budget).
+              completedCount:
+                served?.completedCount ?? latestProgress?.completed.length ?? 0,
+              total: frozenMilestones?.length,
+            };
+            if (await this.requestPause(ctx, at)) {
+              pausedAt = at;
+              break;
+            }
+            // The checkpoint could not be published (Decision 8): the server cleared the request
+            // and the run CONTINUES. Clear the sticky REASON_PAUSE_NOW trip so the restarted turn
+            // is not immediately re-thrown by driveTurn's top guard — the shared cancel controller
+            // stays aborted, but its onSignal is once:true and already fired, and each turn gets a
+            // fresh currentAbort, so the next turn runs cleanly. (A cancel arriving AFTER this
+            // point does not re-abort the consumed controller; the server-side cancel reconciles
+            // the run — a narrow, accepted edge of the single per-run controller.)
+            state.tripReason = undefined;
+            continue;
+          }
+          throw err;
+        }
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
         // PRD #265 M1: latch the finished-milestone declaration the same way, so it
@@ -2165,6 +2240,12 @@ export class SdkExecutor implements Executor {
       // and every existing deepStrictEqual on it holds. runner.ts decides MR-vs-no-MR from the
       // actual diff, so no zero-slice special-casing here.
       if (isIssueRun && scopeCapped) result.scopeCapped = scopeCapped;
+      // PRD #1190 M2: forward the pause-park disposition. NOT gated on isIssueRun (unlike
+      // scopeCapped) — pause is meaningful for task/prompt/self_improve too. Set only when the
+      // run actually PARKED (ctx.parkForPause returned true); phasePublish reads it to SKIP
+      // finalization (the run already reported `paused`). OMITTED (not undefined) on every normal
+      // completion so the result shape is unchanged and existing deepStrictEqual assertions hold.
+      if (pausedAt) result.pausedAt = pausedAt;
       return result;
   }
 
@@ -2466,7 +2547,7 @@ export class SdkExecutor implements Executor {
     onProgress?: (progress: MilestoneProgress) => void,
   ): Promise<TurnResult> {
     // A trip may already be pending (e.g. a cancel that landed during the gate).
-    if (state.tripReason) throw new Error(state.tripReason);
+    if (state.tripReason) throw this.tripError(state);
 
     // The owner still owns the neutral abort signal (trip/cancel drives it); the
     // adapter links the SDK's own controller to it. state.currentChild is the sink
@@ -2499,7 +2580,7 @@ export class SdkExecutor implements Executor {
 
     this.armWall(state);
     // Budget already spent by earlier turns → fail now rather than run unbounded.
-    if (state.tripReason) throw new Error(state.tripReason);
+    if (state.tripReason) throw this.tripError(state);
     try {
       armIdle();
       // The owner hands the adapter the per-turn ClaudeTurnConfig ingredients (plan
@@ -2564,7 +2645,7 @@ export class SdkExecutor implements Executor {
       // wins over every other failure; then a query/iteration/close throw (handled
       // by the catch below); then a failed terminal is classified and materialized
       // into today's typed exception; a clean EOF returns the accumulated result.
-      if (state.tripReason) throw new Error(state.tripReason);
+      if (state.tripReason) throw this.tripError(state);
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         // PRD #35: classify at the completion point with Date.now() (not earlier in
         // the stream). A usage-limit death materializes as the TYPED LimitReachedError
@@ -2588,13 +2669,51 @@ export class SdkExecutor implements Executor {
     } catch (err) {
       // A watchdog/cancel trip surfaces as its static reason, not the raw
       // AbortError the aborted iterator throws.
-      if (state.tripReason) throw new Error(state.tripReason);
+      if (state.tripReason) throw this.tripError(state);
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
       this.disarmWall(state);
       state.currentAbort = undefined;
     }
+  }
+
+  /**
+   * PRD #1190 M2: honour an owner-requested pause at a loop boundary. Emits the `steer_ack`
+   * that acknowledges the pause directive (mirroring the scope cap's steer_ack) and delegates
+   * the actual park to the runner's ctx.parkForPause — which publishes a checkpoint FIRST and
+   * reports `paused` only if it lands (Decision 8). Returns whether the run PARKED: true ⇒ the
+   * caller latches pausedAt and breaks; false ⇒ the caller CONTINUES the run (a failed publish,
+   * or an executor with no parkForPause wired — the stub/tests, where a pause is inert).
+   */
+  private async requestPause(
+    ctx: RunContext,
+    at: { completedCount: number; total?: number },
+  ): Promise<boolean> {
+    ctx.emit({
+      kind: "steer_ack",
+      agent: "worker",
+      payload: {
+        text:
+          at.total !== undefined
+            ? `honoring your pause request after ${at.completedCount}/${at.total} milestone(s)`
+            : "honoring your pause request",
+        directive: "pause",
+        completed: at.completedCount,
+        ...(at.total !== undefined ? { total: at.total } : {}),
+      },
+    });
+    return (await ctx.parkForPause?.(at)) ?? false;
+  }
+
+  /** The error a tripped turn throws (PRD #1190 M2). A `now` pause trip (REASON_PAUSE_NOW)
+   *  throws a PauseNowSignal, which the implement loop's turn catch takes to the pause-park
+   *  path; every other trip reason throws its static Error(reason) exactly as before. Keeps the
+   *  REASON_PAUSE_NOW sentinel from ever surfacing as a `failed` report's text. */
+  private tripError(state: RunDrive): Error {
+    return state.tripReason === REASON_PAUSE_NOW
+      ? new PauseNowSignal()
+      : new Error(state.tripReason ?? REASON_CANCELLED);
   }
 
   /** Record a first-wins watchdog/cancel trip and stop the current turn. */

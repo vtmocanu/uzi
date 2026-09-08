@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { SteeringChannel, ChatSteering, type PlanVerdict } from "../src/steering.js";
+import { SteeringChannel, ChatSteering, PauseNowSignal, type PlanVerdict } from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -82,6 +82,93 @@ describe("SteeringChannel", () => {
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
     ch.start();
     assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
+    await ch.stop();
+  });
+});
+
+// PRD #1190 M2 — the owner-requested pause. `pause` sets the sticky pauseMode and, for the
+// `now` mode ONLY, aborts the in-flight turn via PauseNowSignal (DISTINCT from cancel, which
+// uses the default AbortError and fails the run). `pause_cancel` clears the flag; the claim
+// seeds it on resume. The actual park BOUNDARY is decided server-side (the running-report ACK),
+// so the channel only carries the request/mode and the `now` abort.
+describe("SteeringChannel — pause (PRD #1190 M2)", () => {
+  it("route('pause','milestone') sets pauseMode and does NOT abort the turn", async () => {
+    const { ch, cancel } = makeChannel([[inp("pause", "milestone")]]);
+    ch.start();
+    await tick();
+    assert.strictEqual(ch.getPauseMode(), "milestone", "the milestone mode is recorded");
+    assert.strictEqual(cancel.signal.aborted, false, "a milestone pause must NOT abort the in-flight turn");
+    await ch.stop();
+  });
+
+  it("route('pause','now') aborts the turn with a PauseNowSignal, NOT the cancel error", async () => {
+    const { ch, cancel } = makeChannel([[inp("pause", "now")]]);
+    ch.start();
+    await tick();
+    assert.strictEqual(ch.getPauseMode(), "now", "the now mode is recorded");
+    assert.strictEqual(cancel.signal.aborted, true, "a now pause drops the in-flight turn");
+    // The abort REASON is a PauseNowSignal — this is what lets the executor park rather than
+    // fail: a cancel aborts the same controller with the default AbortError (a DOMException),
+    // which must remain distinguishable from a pause.
+    assert.ok(
+      cancel.signal.reason instanceof PauseNowSignal,
+      `the abort reason must be a PauseNowSignal, got ${String(cancel.signal.reason)}`,
+    );
+    assert.ok(
+      !(cancel.signal.reason instanceof DOMException),
+      "a now pause must NOT abort with the default AbortError the cancel path uses",
+    );
+    await ch.stop();
+  });
+
+  it("a bare 'pause' body defaults to the milestone (non-destructive) mode", async () => {
+    const { ch, cancel } = makeChannel([[inp("pause")]]);
+    ch.start();
+    await tick();
+    assert.strictEqual(ch.getPauseMode(), "milestone", "an absent body defaults to milestone");
+    assert.strictEqual(cancel.signal.aborted, false, "the default mode does not abort");
+    await ch.stop();
+  });
+
+  it("route('pause_cancel') clears a pending pauseMode", async () => {
+    // Both in ONE batch (routed in order: pause sets the flag, pause_cancel clears it), so the
+    // assertion does not race the poll cadence.
+    const { ch } = makeChannel([[inp("pause", "milestone"), inp("pause_cancel")]]);
+    ch.start();
+    await tick();
+    assert.strictEqual(ch.getPauseMode(), null, "pause_cancel (routed after the pause) withdraws it");
+    await ch.stop();
+  });
+
+  it("seedPauseRequested reconstructs the flag from the claim on resume (no fresh input)", () => {
+    const { ch } = makeChannel([[]]);
+    assert.strictEqual(ch.getPauseMode(), null, "no pause pending on a fresh channel");
+    ch.seedPauseRequested("now");
+    assert.strictEqual(ch.getPauseMode(), "now", "the claim's pause_mode seeds the sticky flag");
+  });
+
+  it("seedPauseRequested ignores an unrecognised mode (leaves the flag null)", () => {
+    const { ch } = makeChannel([[]]);
+    ch.seedPauseRequested("garbage");
+    assert.strictEqual(ch.getPauseMode(), null, "a garbage mode never sets a pause");
+    ch.seedPauseRequested(undefined);
+    assert.strictEqual(ch.getPauseMode(), null, "an absent mode never sets a pause");
+  });
+
+  it("a now pause after a cancel does not double-abort (cancel already won, it is terminal)", async () => {
+    const { ch, cancel } = makeChannel([[inp("cancel")], [inp("pause", "now")]]);
+    ch.start();
+    await tick();
+    assert.strictEqual(cancel.signal.aborted, true, "cancel aborted the controller");
+    const reasonAfterCancel = cancel.signal.reason;
+    await tick();
+    // The pause routes and records its mode, but must NOT re-abort an already-aborted controller
+    // (an AbortController cannot be reset) — the cancel reason stands.
+    assert.strictEqual(cancel.signal.reason, reasonAfterCancel, "the cancel abort reason is not clobbered");
+    assert.ok(
+      !(cancel.signal.reason instanceof PauseNowSignal),
+      "cancel remains the terminal outcome; the later now pause does not overwrite it",
+    );
     await ch.stop();
   });
 });
