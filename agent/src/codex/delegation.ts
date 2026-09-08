@@ -369,7 +369,7 @@ export class CodexDelegationRunner {
       // FULL SETTLEMENT BARRIER: every child callback admitted above is awaited here
       // before the parent callback resolves. They are awaited inline in the loop too,
       // so this is belt-and-braces against any concurrently-admitted callback.
-      await Promise.allSettled([...pending]);
+      await Promise.allSettled(pending);
       // Interrupt (a cancel/deadline) then idempotently close the child thread — the
       // child is fully torn down before we return to the parent broker.
       if (aborted) await controller.interrupt().catch(() => {});
