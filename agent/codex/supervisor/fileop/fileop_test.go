@@ -835,11 +835,14 @@ func TestApplyConcurrentMutatorNeverEscapes(t *testing.T) {
 	<-done
 }
 
-// TestApplyAtomicOnHeldFD proves the read-modify-write rides ONE descriptor: a
-// mutator that swaps the pathname to a DIFFERENT in-jail regular file after the
-// open cannot redirect the write — the pinned inode is rewritten, and a fresh
-// resolution afterwards sees the swapped file unmodified. This is the property the
-// held fd buys over a read-op-then-write-op composition.
+// TestApplyAtomicOnHeldFD exercises the read-modify-write mechanism itself: apply
+// reads and rewrites through the SAME descriptor openat2 pinned (Ftruncate+WriteAt on
+// the held fd), producing a correct in-place edit with no read-op-then-write-op
+// composition. It does NOT stage a pathname swap — the anti-redirect property under a
+// concurrent mutator is proven deterministically by TestApplySymlinkSwapRefused (a
+// swapped-in symlink is refused at open with E_SYMLINK) and by
+// TestApplyConcurrentMutatorNeverEscapes (the outside secret is never touched across
+// thousands of iterations).
 func TestApplyAtomicOnHeldFD(t *testing.T) {
 	// Not a timing race: this asserts the mechanism (WriteAt to the fd that openat2
 	// pinned), which cannot be redirected by any later rename of the name.

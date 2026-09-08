@@ -117,6 +117,7 @@ function makeRunner(opts: {
   signal?: AbortSignal;
   childTurnDeadlineMs?: number;
   startImpl?: (spec: StartChildTurnSpec) => Promise<ChildThreadController>;
+  spawnImpl?: (argv: readonly string[], o: SpawnCommandOptions) => Promise<SpawnCommandResult>;
 } = {}): Built {
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const spawn = new SpawnSpy();
@@ -131,7 +132,7 @@ function makeRunner(opts: {
       if (opts.startImpl) return opts.startImpl(spec);
       return opts.controller ?? new FakeController({ notes: [] });
     },
-    spawnCommand: spawn.seam,
+    spawnCommand: opts.spawnImpl ?? spawn.seam,
     fileop,
     worktreePath: WORKTREE,
     signal: opts.signal,
@@ -338,6 +339,37 @@ describe("CodexDelegationRunner: terminal + cancellation", () => {
     const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [], hangAfter: true });
     const b = makeRunner({ controller, childTurnDeadlineMs: 30 });
     const res = await b.runner.run(delegReq());
+    assert.equal(res.ok, false);
+    assert.equal(res.code, "child_timeout");
+    assert.equal(controller.interrupted, true);
+    assert.equal(controller.closed, true);
+  });
+
+  it("returns child_timeout (does NOT hang) when a child CALLBACK is wedged and the deadline fires", async () => {
+    // Regression for the settlement-barrier hang: a child effect that never settles (e.g.
+    // `sleep infinity`, which passes the bash screener) must not make runChild block
+    // forever at the `finally` barrier. Before the fix the barrier did an UNCONDITIONAL
+    // `await Promise.allSettled(pending)`, re-awaiting the very callback the abort race had
+    // abandoned, so runChild never reached interrupt()/close(). The existing child_timeout
+    // test above only wedges the NOTIFICATION stream (pending is empty at the barrier); this
+    // one wedges an admitted CALLBACK, which is the case that broke.
+    const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [], hangAfter: true });
+    (controller as unknown as { notes: CodexNotification[] }).notes = [
+      toolCallNote(controller, "cc-hang", "Bash", { command: "sleep infinity" }),
+    ];
+    const b = makeRunner({
+      controller,
+      childTurnDeadlineMs: 30,
+      spawnImpl: () => new Promise<SpawnCommandResult>(() => {}), // never settles
+    });
+    const hung = new Promise<never>((_, reject) => {
+      const t = setTimeout(
+        () => reject(new Error("runChild hung: the settlement barrier re-awaited a wedged child callback on the abort path")),
+        5000,
+      );
+      t.unref?.();
+    });
+    const res = await Promise.race([b.runner.run(delegReq()), hung]);
     assert.equal(res.ok, false);
     assert.equal(res.code, "child_timeout");
     assert.equal(controller.interrupted, true);

@@ -198,7 +198,7 @@ describe("FileopHelperClient: malformed response desync", () => {
 
 describe("spawnFileopHelper: production process wiring", () => {
   it("spawns the fileop binary with the trusted --root argv and wires a working client", async () => {
-    let captured: { command: string; args: readonly string[] } | undefined;
+    let captured: { command: string; args: readonly string[]; env: NodeJS.ProcessEnv | undefined } | undefined;
     const toHelper = new PassThrough();
     const toClient = new PassThrough();
     let stdinEnded = false;
@@ -206,11 +206,12 @@ describe("spawnFileopHelper: production process wiring", () => {
       stdin: Object.assign(toHelper, { end: () => { stdinEnded = true; } }) as unknown as FileopProcess["stdin"],
       stdout: toClient,
     };
+    const scrubbedEnv: NodeJS.ProcessEnv = { PATH: "/codex-cmd/bin", TMPDIR: "/codex-cmd/tmp" };
     const handle = spawnFileopHelper(
-      { fileopBin: "/opt/uzi-codex/bin/uzi-codex-fileop", worktreePath: "/work/tree" },
+      { fileopBin: "/opt/uzi-codex/bin/uzi-codex-fileop", worktreePath: "/work/tree", env: scrubbedEnv },
       {
-        spawnProcess: (command, args) => {
-          captured = { command, args };
+        spawnProcess: (command, args, env) => {
+          captured = { command, args, env };
           return fakeProc;
         },
       },
@@ -220,6 +221,10 @@ describe("spawnFileopHelper: production process wiring", () => {
     assert.ok(captured);
     assert.equal(captured.command, "/opt/uzi-codex/bin/uzi-codex-fileop");
     assert.deepEqual(captured.args, ["--root", "/work/tree"]);
+    // The command-root env is EXACTLY the caller's scrubbed env — never the worker's
+    // ambient process.env (a cross-root credential-read gap). Proves spawnFileopHelper
+    // forwards spec.env verbatim and does not fall back to the inherited environment.
+    assert.deepEqual(captured.env, scrubbedEnv);
 
     // The wired client speaks over the fake stdio.
     const reqSink = new RequestSink(toHelper);
@@ -239,7 +244,7 @@ describe("spawnFileopHelper: production process wiring", () => {
     assert.throws(
       () =>
         spawnFileopHelper(
-          { fileopBin: "/bin/x", worktreePath: "/w" },
+          { fileopBin: "/bin/x", worktreePath: "/w", env: {} },
           { spawnProcess: () => ({ stdin: null, stdout: null }) },
         ),
       /missing a stdin\/stdout channel/,

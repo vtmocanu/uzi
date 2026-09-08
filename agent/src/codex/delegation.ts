@@ -366,10 +366,16 @@ export class CodexDelegationRunner {
       }
     } finally {
       if (onAbort) signal.removeEventListener("abort", onAbort);
-      // FULL SETTLEMENT BARRIER: every child callback admitted above is awaited here
-      // before the parent callback resolves. They are awaited inline in the loop too,
-      // so this is belt-and-braces against any concurrently-admitted callback.
-      await Promise.allSettled(pending);
+      // FULL SETTLEMENT BARRIER — normal completion ONLY. Each child callback is already
+      // awaited inline in the loop above, so on a clean finish `pending` is empty and this
+      // is a cheap belt-and-braces await. On the ABORT/deadline path we must NOT await
+      // `pending`: it still holds the very child effect the abort race just abandoned (e.g.
+      // a child wedged in a never-settling shell callback), and re-awaiting it here would
+      // hang runChild forever, never reaching interrupt()/close(). The child callbacks are
+      // reserved in the SHARED ExecutionRegistry, so the safety boundary's quiesce/reap
+      // accounts for and poisons any in-flight child effect (mirrors the root harness's
+      // rule-9 in codex-harness.ts) — the barrier is both redundant and harmful on abort.
+      if (!aborted) await Promise.allSettled(pending);
       // Interrupt (a cancel/deadline) then idempotently close the child thread — the
       // child is fully torn down before we return to the parent broker.
       if (aborted) await controller.interrupt().catch(() => {});

@@ -229,8 +229,11 @@ export interface FileopHelperSpec {
   readonly fileopBin: string;
   readonly worktreePath: string;
   /** The command-root env (the credential-free command identity's PATH/TMPDIR); the
-   *  helper needs no credentials. Never merged with the worker's own environment. */
-  readonly env?: NodeJS.ProcessEnv;
+   *  helper needs no credentials. REQUIRED and REPLACED, never merged with — and never
+   *  defaulted to — the worker's own `process.env`: the caller (m3) must construct a
+   *  scrubbed env so the credential-free command identity cannot inherit provider
+   *  credentials. Omitting it is a bug, not "use the ambient environment". */
+  readonly env: NodeJS.ProcessEnv;
 }
 
 /** A live helper process plus its client. `dispose` best-effort ends the request
@@ -254,7 +257,11 @@ export type SpawnFileopProcess = (
 ) => FileopProcess;
 
 const defaultSpawnFileopProcess: SpawnFileopProcess = (command, args, env) =>
-  spawn(command, [...args], { stdio: ["pipe", "pipe", "pipe"], env }) as unknown as FileopProcess;
+  // `env ?? {}`, NEVER a bare `env` that Node would fall back to `process.env` for: the
+  // credential-free command identity must not silently inherit the worker's environment
+  // (a cross-root credential-read gap). A missing env yields an empty environment (a
+  // detectable broken helper), never the ambient one.
+  spawn(command, [...args], { stdio: ["pipe", "pipe", "pipe"], env: env ?? {} }) as unknown as FileopProcess;
 
 export interface SpawnFileopHelperDeps {
   readonly spawnProcess?: SpawnFileopProcess;
