@@ -29,15 +29,78 @@ func newTestServer(t *testing.T) (*server, string) {
 	t.Cleanup(func() { unix.Close(fd) })
 	s := newServer(fd)
 	// Probe openat2 directly so a missing kernel feature is an explicit failure.
-	probeFD, perr := s.openBeneath(".", unix.O_PATH, 0)
+	perr := probeOpenat2(s)
 	if perr != nil {
 		if errors.Is(perr, unix.ENOSYS) {
 			t.Fatalf("openat2 unavailable (ENOSYS): this helper REQUIRES openat2; not falling back to a realpath check")
 		}
 		t.Fatalf("openat2 probe on root failed: %v", perr)
 	}
-	unix.Close(probeFD)
 	return s, root
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
+}
+
+func TestRunStartupAndTransportContract(t *testing.T) {
+	t.Run("invalid arguments", func(t *testing.T) {
+		var errOut bytes.Buffer
+		if got := run(nil, strings.NewReader(""), io.Discard, &errOut); got != 2 {
+			t.Fatalf("run invalid args = %d, want 2", got)
+		}
+		if got := errOut.String(); got != "fileop: invalid arguments\n" {
+			t.Fatalf("stderr = %q", got)
+		}
+	})
+
+	t.Run("root open failure", func(t *testing.T) {
+		var errOut bytes.Buffer
+		missing := filepath.Join(t.TempDir(), "missing")
+		if got := run([]string{"--root", missing}, strings.NewReader(""), io.Discard, &errOut); got != 2 {
+			t.Fatalf("run missing root = %d, want 2", got)
+		}
+		if got := errOut.String(); got != "fileop: cannot open worktree root\n" {
+			t.Fatalf("stderr = %q", got)
+		}
+	})
+
+	t.Run("openat2 unavailable", func(t *testing.T) {
+		var errOut bytes.Buffer
+		probe := func(*server) error { return unix.ENOSYS }
+		if got := runWithProbe(
+			[]string{"--root", t.TempDir()},
+			strings.NewReader(""),
+			io.Discard,
+			&errOut,
+			probe,
+		); got != 2 {
+			t.Fatalf("run unavailable probe = %d, want 2", got)
+		}
+		if got := errOut.String(); got != "fileop: openat2 unavailable\n" {
+			t.Fatalf("stderr = %q", got)
+		}
+	})
+
+	t.Run("transport failure", func(t *testing.T) {
+		var errOut bytes.Buffer
+		input := strings.NewReader("{\"id\":1,\"op\":\"stat\",\"path\":\".\"}\n")
+		if got := run([]string{"--root", t.TempDir()}, input, failingWriter{}, &errOut); got != 1 {
+			t.Fatalf("run transport failure = %d, want 1", got)
+		}
+		if got := errOut.String(); got != "fileop: transport error\n" {
+			t.Fatalf("stderr = %q", got)
+		}
+	})
+
+	t.Run("clean EOF", func(t *testing.T) {
+		var errOut bytes.Buffer
+		if got := run([]string{"--root", t.TempDir()}, strings.NewReader(""), io.Discard, &errOut); got != 0 {
+			t.Fatalf("run clean EOF = %d, want 0 (stderr %q)", got, errOut.String())
+		}
+	})
 }
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }

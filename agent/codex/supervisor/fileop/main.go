@@ -51,10 +51,30 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
+type containmentProbe func(*server) error
+
+func probeOpenat2(server *server) error {
+	probeFD, err := server.openBeneath(".", unix.O_PATH, 0)
+	if err != nil {
+		return err
+	}
+	return unix.Close(probeFD)
+}
+
 // run parses the trusted argv, opens the worktree root ONCE as an O_DIRECTORY|O_PATH
 // dirfd, and services the request/response loop. Every failure is a static,
 // path-free stderr line and a non-zero exit.
 func run(args []string, in io.Reader, out io.Writer, errw io.Writer) int {
+	return runWithProbe(args, in, out, errw, probeOpenat2)
+}
+
+func runWithProbe(
+	args []string,
+	in io.Reader,
+	out io.Writer,
+	errw io.Writer,
+	probe containmentProbe,
+) int {
 	root, err := parseRootArg(args)
 	if err != nil {
 		io.WriteString(errw, "fileop: invalid arguments\n")
@@ -70,7 +90,7 @@ func run(args []string, in io.Reader, out io.Writer, errw io.Writer) int {
 	// Fail before accepting requests if the load-bearing containment syscall is
 	// unavailable or blocked. Serving first and discovering this per operation would
 	// make the helper look healthy while every model effect fails.
-	probeFD, perr := server.openBeneath(".", unix.O_PATH, 0)
+	perr := probe(server)
 	if perr != nil {
 		if errors.Is(perr, unix.ENOSYS) {
 			io.WriteString(errw, "fileop: openat2 unavailable\n")
@@ -79,7 +99,6 @@ func run(args []string, in io.Reader, out io.Writer, errw io.Writer) int {
 		}
 		return 2
 	}
-	unix.Close(probeFD)
 	if serr := serve(server, in, out); serr != nil {
 		io.WriteString(errw, "fileop: transport error\n")
 		return 1

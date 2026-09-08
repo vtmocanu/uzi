@@ -24,7 +24,7 @@ import type {
   ProcessReap,
   ToolDisposal,
 } from "../harness.js";
-import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
+import type { ExecutionRegistry, ReapOutcome, RegisteredRoot } from "./registry.js";
 
 /** Which OS identity a boundary action runs as. `worker_pat` is a PAT-bearing
  *  (credentialed) action (e.g. `git push`); `command` is the credential-free
@@ -191,7 +191,15 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     while (this.pendingActions.length > 0) {
       const batch = this.pendingActions;
       this.pendingActions = [];
-      await Promise.allSettled(batch);
+      const settlements = await Promise.allSettled(batch);
+      for (const settlement of settlements) {
+        if (settlement.status === "rejected") {
+          this.registry.poison({
+            category: "tool",
+            message: "spawnBoundaryAction: child action failed before reap completed",
+          });
+        }
+      }
     }
 
     this.heldPermit = undefined;
@@ -296,7 +304,17 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       return { kind: "poisoned", error: registered.error };
     }
     // Hold the permit until this root reaps its whole descendant set.
-    const reap = await root.reap(this.currentDeadlineMs);
+    let reap: ReapOutcome;
+    try {
+      reap = await root.reap(this.currentDeadlineMs);
+    } catch {
+      const error: HarnessError = {
+        category: "tool",
+        message: "spawnBoundaryAction: root reap rejected before completion",
+      };
+      this.registry.poison(error);
+      return { kind: "poisoned", error };
+    }
     if (!reap.ok) {
       this.registry.poison(reap.error);
       return { kind: "poisoned", error: reap.error };

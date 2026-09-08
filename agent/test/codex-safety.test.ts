@@ -275,6 +275,30 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
     assert.equal(reg.state(), "poisoned"); // ...but the boundary is poisoned, not clean
   });
 
+  it("poisons when a fire-and-forget boundary root rejects during reap", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const seam: SpawnRootSeam = async () => new FakeRoot(
+      "boundary_action",
+      async () => {
+        throw new Error("reap seam rejected");
+      },
+    );
+    const safety = createCodexExecutionSafety(reg, seam);
+
+    await assert.rejects(
+      safety.withBoundary(req("finalize"), async (permit) => {
+        void safety.spawnBoundaryAction(permit, ["background"], "command");
+        return "body-finished";
+      }),
+      (error: unknown) => error instanceof CodexBoundaryError && error.stage === "action",
+    );
+    assert.equal(reg.state(), "poisoned");
+    assert.ok(
+      reg.poisonErrors().some((error) => /root reap rejected/.test(error.message)),
+      "the rejected reap leaves bounded poison evidence",
+    );
+  });
+
   it("disposes the spawned root and returns poisoned when registration fails (finding 6)", async () => {
     // The injected spawn seam returns a root whose kind is NOT "boundary_action", so
     // the registry's registerRoot rejects it (kind mismatch) and poisons. The facade
