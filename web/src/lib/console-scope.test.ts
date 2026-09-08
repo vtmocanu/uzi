@@ -179,8 +179,11 @@ describe("Shadow attention rule", () => {
     const body = attentionRule?.body ?? "";
     // The rail is an inset box-shadow in the theme brand (rust), no layout reflow.
     expect(body, "attention rail box-shadow missing").toMatch(/box-shadow:\s*inset[^;]*var\(--brand\)/);
-    // The tint overrides the card's bg utility with an opaque rust-over-white color.
+    // The tint overrides the card's bg utility with an opaque LIGHT rust-over-white
+    // color. Pin the exact value so a regression to a DARK attention surface (which
+    // would make the human's decision surface read like a [data-live] card) is caught.
     expect(body, "attention background tint missing").toMatch(/background-color:\s*rgb\(/);
+    expect(body, "attention tint is not the light rust rgb(251 244 240)").toContain("251 244 240");
   });
 });
 

@@ -153,11 +153,15 @@ export function effectiveRunStatus(
 }
 
 // shadowSignal derives the Shadow theme's per-run surface signal (PRD #1167 M4):
-// "live" when a machine is working, "attention" when a human owes the run a decision
-// or it is in review, else null. Shadow is the ONLY consumer — the app renders
-// `data-live`/`data-attention` on the card/row/header of every theme, but only
-// Shadow styles them (live → the ember-dark remap, attention → a rust left rail);
-// on every other theme the attributes are inert, and returning null keeps them off.
+// "live" when a machine is working, else "attention" for exactly the states PRD #1167
+// enumerates, else null. attention = awaiting_approval, or a re-plan (revising), or a
+// non-live run in review with an open PR — matching PRD #1167's concrete list. It is
+// NOT "any human decision": awaiting_input and awaiting_followup are deliberately NOT
+// flagged here (they fall through to null), and neither is pool_wait. Shadow is the
+// ONLY consumer — the app renders `data-live`/`data-attention` on the card/row/header
+// of every theme, but only Shadow styles them (live → the ember-dark remap, attention
+// → a rust left rail); on every other theme the attributes are inert, and returning
+// null keeps them off.
 //
 // It flows through effectiveRunStatus so the derived planning/revising phases are
 // handled the same as everywhere else: "planning" is a running run (machine working)

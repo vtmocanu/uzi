@@ -1645,7 +1645,11 @@ export function RunCompletedLine({
 export function RunHeading({ run }: { run: Run }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2">
-      <h1 className="truncate text-xl font-semibold tracking-tight">{stripUnsafeChars(run.issue_title)}</h1>
+      {/* `text-fg` so the title consumes --fg: on Shadow's dark live header band the
+          [data-live] remap sets --fg to ember-light (this h1 would otherwise inherit
+          the light-theme dark page color and vanish, ~1.07:1). No visual change off
+          the live band — text-fg is the normal foreground everywhere else. */}
+      <h1 className="truncate text-xl font-semibold tracking-tight text-fg">{stripUnsafeChars(run.issue_title)}</h1>
       <RunIssueRef
         issueIid={run.issue_iid}
         issueWebUrl={run.issue_web_url}

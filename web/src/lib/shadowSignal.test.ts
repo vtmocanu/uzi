@@ -84,5 +84,17 @@ describe("shadowSignal", () => {
     it("limit_wait is null", () => {
       expect(shadowSignal(run({ status: "limit_wait" }))).toBeNull();
     });
+    // Pin the deliberate non-attention states from PRD #1167's enumeration: these are
+    // human-adjacent waits that shadowSignal intentionally does NOT flag as attention.
+    // They currently fall through to null; lock it so a future change is caught.
+    it("awaiting_input is null — NOT attention per PRD #1167", () => {
+      expect(shadowSignal(run({ status: "awaiting_input" }))).toBeNull();
+    });
+    it("awaiting_followup is null — NOT attention per PRD #1167", () => {
+      expect(shadowSignal(run({ status: "awaiting_followup" }))).toBeNull();
+    });
+    it("pool_wait is null — NOT attention per PRD #1167", () => {
+      expect(shadowSignal(run({ status: "pool_wait" }))).toBeNull();
+    });
   });
 });

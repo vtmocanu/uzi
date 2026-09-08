@@ -341,6 +341,31 @@ describe("AppShell sidebar collapse", () => {
   });
 });
 
+// PRD #1167 M4 (Hall): `frame` must sit on the chrome elements that CARRY `bg-surface`,
+// not on the shared SidebarContent child. CSS custom properties inherit to DESCENDANTS,
+// not ancestors, so Hall's dark-remap only reaches a panel's own background when `frame`
+// is on the same element as `bg-surface`. When `frame` lived on the SidebarContent child
+// the ancestor <aside>/drawer kept its light bg-surface → white sidebar under Hall. Pin
+// both surfaces so `frame` cannot drift back onto a chrome-less element.
+describe("Hall frame markers on the chrome surfaces (PRD #1167 M4)", () => {
+  it("puts BOTH frame and bg-surface on the desktop <aside> and the mobile drawer", async () => {
+    const { container } = renderShell("/dashboard");
+    await screen.findByText("Workers");
+
+    const aside = container.querySelector("aside");
+    expect(aside, "desktop sidebar <aside> not found").toBeTruthy();
+    expect(aside!.className).toContain("frame");
+    expect(aside!.className).toContain("bg-surface");
+
+    // Open the mobile drawer; its container is the direct parent of the Close button.
+    fireEvent.click(screen.getByLabelText("Open navigation"));
+    const drawer = screen.getByLabelText("Close navigation").parentElement;
+    expect(drawer, "mobile drawer container not found").toBeTruthy();
+    expect(drawer!.className).toContain("frame");
+    expect(drawer!.className).toContain("bg-surface");
+  });
+});
+
 describe("forgeIcon (Decision 2 mapping)", () => {
   it("maps gitlab to the tanuki and any other/unknown type to the generic git mark", () => {
     expect((forgeIcon("gitlab") as ReactElement).type).toBe(GitLabIcon);
