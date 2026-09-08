@@ -79,14 +79,26 @@ log(){ printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 CAPTURE='
 set -u
 STEM="$1"
+REALMAIN="${2:-}"
 CLONE="/data/runner/'"$REPO_SLUG"'/$STEM"
 [ -d "$CLONE/.git" ] || { echo "NO_CLONE $CLONE" >&2; exit 3; }
 cd "$CLONE" || exit 3
 OUT="$(mktemp -d)"
 BR="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 HEAD="$(git rev-parse HEAD 2>/dev/null)"
-if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
-  git bundle create "$OUT/$STEM.bundle" "$BR" --not origin/main >/dev/null 2>&1 \
+# Exclude the TRUE public remote main (REALMAIN, read from the shared BARE repo by
+# the host) so the bundle prerequisite is a commit that exists on the forge and is
+# recoverable off-PVC. The working clone advances its OWN origin/main to a private
+# worker checkpoint commit, so --not origin/main would silently drop every committed
+# milestone up to that checkpoint and leave a bundle nothing off the PVC can apply.
+BASE=""
+if [ -n "$REALMAIN" ] && git cat-file -e "$REALMAIN" 2>/dev/null; then
+  BASE="$REALMAIN"
+elif git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+  BASE="origin/main"
+fi
+if [ -n "$BASE" ]; then
+  git bundle create "$OUT/$STEM.bundle" "$BR" --not "$BASE" >/dev/null 2>&1 \
     || git bundle create "$OUT/$STEM.bundle" "$BR" >/dev/null 2>&1 || :
 else
   git bundle create "$OUT/$STEM.bundle" "$BR" >/dev/null 2>&1 || :
@@ -100,9 +112,18 @@ rm -f "$OUT/.untracked"
 {
   echo "stem=$STEM head=$HEAD branch=$BR captured=$(date -u +%FT%TZ)"
   echo "clone_origin_main=$(git rev-parse origin/main 2>/dev/null)"
-  echo "merge_base=$(git merge-base HEAD origin/main 2>/dev/null)"
-  echo "--- new commits (origin/main..HEAD):"
-  git log --oneline origin/main..HEAD 2>/dev/null
+  echo "real_remote_main=${REALMAIN:-unknown}"
+  echo "bundle_base=${BASE:-<none: full-history bundle>}"
+  if [ -n "$BASE" ]; then
+    echo "merge_base=$(git merge-base HEAD "$BASE" 2>/dev/null)"
+    echo "--- new commits ($BASE..HEAD  = what the bundle carries):"
+    git log --oneline "$BASE..HEAD" 2>/dev/null
+  else
+    echo "merge_base=(none; full-history bundle)"
+    echo "--- commits (full history = what the bundle carries; count + newest 10):"
+    echo "count=$(git rev-list --count HEAD 2>/dev/null)"
+    git log --oneline -10 HEAD 2>/dev/null
+  fi
   echo "--- git status --porcelain:"
   git status --porcelain 2>/dev/null
   echo "--- git diff --stat HEAD:"
@@ -178,6 +199,12 @@ for RID in "${RUNS[@]}"; do
     log "WARN $RID ($LBL): status saved, but no pod for worker $wid in [$NAMESPACES]"
     continue
   fi
+  # The clone's origin/main is a private worker checkpoint, so read the TRUE public
+  # remote main from the shared bare repo and pass it to the capture: the bundle then
+  # excludes a forge-recoverable base instead of silently dropping checkpointed work.
+  REALMAIN="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    git --git-dir="/data/repos/$REPO_SLUG.git" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null \
+    | tr -d '[:space:]')"
   f="$DEST/$STEM.tgz"
   # The capture streams a ~10-20 MB gzip out of the pod over `kubectl exec`, and
   # that stream can be TRUNCATED mid-transfer (observed once the bundle grows past
@@ -194,7 +221,7 @@ for RID in "${RUNS[@]}"; do
     # earlier attempt already produced — a truncated archive is still the best
     # forensic artifact we have. Promote to $f only when the attempt produced bytes.
     rm -f "$tmp"
-    "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" > "$tmp" 2>>"$LOG"
+    "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" "$REALMAIN" > "$tmp" 2>>"$LOG"
     kc_rc=$?
     if [ "$kc_rc" -ne 0 ]; then
       log "WARN $RID ($LBL): exec/capture attempt $cap_try exit=$kc_rc; see $LOG"
