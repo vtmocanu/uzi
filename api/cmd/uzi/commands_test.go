@@ -58,7 +58,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "rework"},
+		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "pause", "resume", "rework"},
 		// backlog is the PRD #98 M7 read; `file` (PRD #365 M2) files a recommendation
 		// as a forge issue from the CLI, mirroring `findings file`.
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats", "file"},
@@ -1591,7 +1591,9 @@ func TestRunLogsFollowRidesOutALimitWaitPark(t *testing.T) {
 	}
 
 	stderr := errBuf.String()
-	if n := strings.Count(stderr, "paused"); n != 1 {
+	// PRD #1190 D13: the park notice now reads "waiting: Anthropic usage limit …" (reworded
+	// from "paused:"), so the one-shot edge notice is counted by that distinctive prefix.
+	if n := strings.Count(stderr, "waiting: Anthropic usage limit"); n != 1 {
 		t.Errorf("park notice appeared %d times, want exactly 1 — it must fire on the EDGE into the park, not on every poll of a park that lasts hours:\n%s", n, stderr)
 	}
 	if !strings.Contains(stderr, "five_hour") || !strings.Contains(stderr, "resumes in") {

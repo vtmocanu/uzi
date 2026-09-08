@@ -7,5 +7,9 @@
   "mr_rework_enabled": true,
   "sidebar_token_ids": [
     "x"
-  ]
+  ],
+  "appearance_mode": "x",
+  "light_theme": "x",
+  "dark_theme": "x",
+  "typeface": "x"
 }

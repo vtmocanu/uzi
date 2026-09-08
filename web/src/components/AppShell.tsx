@@ -671,6 +671,11 @@ function SidebarContent({
     !(branding.brand_mode === "logo" && branding.brand_placement === "topright");
 
   return (
+    // No `frame` here: this shared root mounts inside the desktop <aside> and the
+    // mobile drawer, both of which now carry `frame` themselves (PRD #1167 M4). Hall's
+    // dark-remap must land on the element that carries `bg-surface` — a var set here
+    // (a child) would not remap the ancestor panel's own background. SidebarContent
+    // inherits the ember vars from the framed ancestor.
     <div className="flex h-full flex-col">
       {/* Header cluster: the app wordmark/logo Link and the below-wordmark "powered
           by" row share ONE bottom divider, so the border bounds the whole cluster
@@ -1246,7 +1251,11 @@ export function AppShell({ children }: { children: ReactNode }) {
       {/* Desktop sidebar */}
       <aside
         className={cx(
-          "fixed inset-y-0 left-0 z-30 hidden border-r border-edge bg-surface lg:block",
+          // `frame` (PRD #1167 M4) must sit on the element that CARRIES `bg-surface`:
+          // Hall's dark-remap sets the --surface var on the framed element, and CSS
+          // custom properties inherit to descendants, not ancestors. On SidebarContent
+          // (a child) the remap never reaches this panel's own background. Inert off Hall.
+          "frame fixed inset-y-0 left-0 z-30 hidden border-r border-edge bg-surface lg:block",
           collapsed ? "w-14" : "w-60",
         )}
       >
@@ -1264,7 +1273,9 @@ export function AppShell({ children }: { children: ReactNode }) {
       </aside>
 
       {/* Mobile top bar + sheet */}
-      <div className="sticky top-0 z-20 flex items-center gap-3 border-b border-edge bg-surface px-4 py-3 lg:hidden">
+      {/* `frame` (PRD #1167 M4): the mobile top bar is separate from SidebarContent, so
+          it carries its own frame marker to go ember-dark under Hall. Inert elsewhere. */}
+      <div className="frame sticky top-0 z-20 flex items-center gap-3 border-b border-edge bg-surface px-4 py-3 lg:hidden">
         <button
           onClick={() => setMobileOpen(true)}
           aria-label="Open navigation"
@@ -1292,7 +1303,9 @@ export function AppShell({ children }: { children: ReactNode }) {
             onClick={() => setMobileOpen(false)}
             aria-hidden="true"
           />
-          <div className="absolute inset-y-0 left-0 w-64 border-r border-edge bg-surface shadow-2xl">
+          {/* `frame` (PRD #1167 M4) sits here (the drawer carries `bg-surface`), not on
+              the SidebarContent child, so Hall's dark-remap reaches this panel's bg. */}
+          <div className="frame absolute inset-y-0 left-0 w-64 border-r border-edge bg-surface shadow-2xl">
             <button
               onClick={() => setMobileOpen(false)}
               aria-label="Close navigation"

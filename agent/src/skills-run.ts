@@ -6,7 +6,7 @@
 // (repo evicts first); the plugin dir is rebuilt from the survivors.
 
 import type { ClaimConfig, ClaimSkill } from "./protocol.js";
-import { DROP_REPO_COLLISION, enumerateRepoSkills, repoSkillsDir } from "./repo-skills.js";
+import { collectRepoSkills, DROP_REPO_COLLISION } from "./repo-skills.js";
 import { enforceSkillCaps, materializeSkillsPlugin, skillsPluginDir, type SkillDrop } from "./skills-plugin.js";
 
 // Fallbacks only when the claim omits config; the server normally supplies both
@@ -59,9 +59,11 @@ export async function prepareSkillPlugin(ctx: SkillRunInput, caps: SkillCaps): P
 
   // M6: repo-borne skills, opt-in, lowest precedence. A repo skill whose name
   // collides with a delivered (or earlier repo) skill is dropped and logged.
+  // Issue #1205: skills are read from BOTH real roots (`.claude/skills` and
+  // `.agents/skills`) with `.claude/skills` winning a real-vs-real collision.
   const repoKept: ClaimSkill[] = [];
   if (ctx.repoSkillsEnabled) {
-    const repo = await enumerateRepoSkills(repoSkillsDir(ctx.worktreePath), caps.maxBytes);
+    const repo = await collectRepoSkills(ctx.worktreePath, caps.maxBytes);
     drops.push(...repo.dropped);
     const seen = new Set(deliveredSkills.map((s) => s.name));
     for (const rs of repo.skills) {

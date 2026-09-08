@@ -73,6 +73,52 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 	return resumeNow
 }
 
+// newRunResumeCmd builds `uzi run resume` (PRD #1190 M4).
+//
+// It posts to the SAME widened /runs/{id}/resume-now endpoint `run resume-now` uses (D14:
+// one resume mechanism), which now moves a `paused` run back to `queued` as well as a
+// `pool_wait` hold. A plain `resume` verb is added beside `resume-now` because "resume-now"
+// reads wrong for a run nobody else was going to resume; `resume-now` keeps its name and its
+// pool-hold wording.
+//
+// It prints a one-line confirmation rather than the full detail table. The resume response is
+// a plain RunDTO that carries neither the worker's NAME nor its liveness (draining/gone),
+// which the richer "pinned to worker <name> …" wording would need — and the PRD is explicit
+// that a round-trip must not be added just for that wording — so the plain form is what a CLI
+// resume prints today. --json emits the run object for the agent contract.
+func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
+	resume := &cobra.Command{
+		Use:   "resume <run-id>",
+		Short: "Resume a paused run, moving it back to the queue with its remaining budget preserved",
+		Long: "Resume ONE run the owner paused (`paused`, PRD #1190): it flips the hold back to `queued`, " +
+			"keeps the worker pin, and banks the parked time so the remaining budget is what it was — the " +
+			"clock stopped while paused. The claim then continues the SDK session on the same worker if it " +
+			"is still alive, or recovers the branch from the checkpoint on another worker if it is gone.\n\n" +
+			"A run that is NOT paused is a 409 (exit 5); a foreign or unknown run is a 404 (exit 4). It " +
+			"posts to the same endpoint as `uzi run resume-now`, which also resumes a pool-held run.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			run, err := c.ResumeRunNow(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(run)
+			}
+			if !gf.quiet {
+				p.Printf("Resumed %s: queued.\n", args[0])
+			}
+			return nil
+		},
+	}
+	return resume
+}
+
 // newRunMrReworkCmd builds `uzi run mr-rework`.
 func newRunMrReworkCmd(env Env, gf *globalFlags) *cobra.Command {
 	mrRework := &cobra.Command{

@@ -74,14 +74,15 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
     // migration 00091 widened 00020's seven with `limit_wait` (PRD #35), so the
     // non-terminal list below carries all five non-terminal ones.
     assert.deepStrictEqual([...TERMINAL_RUN_STATUSES].sort(), ["cancelled", "completed", "failed"]);
-    // 🔴 `limit_wait` is the load-bearing entry here, not a completeness nicety.
-    // A parked run's HOME is past minAgeMs (3h) for essentially its whole park (up
-    // to RUN_LIMIT_MAX_PARK, default 8d), so it is a candidate on EVERY sweep and
-    // survives ONLY because the API answers `limit_wait` and this status is not
-    // terminal. Without this case that protection was accidental and untested: the
-    // set-membership assert above would still pass with the sweep deleting a parked
-    // HOME, because it pins the SET and not the end-to-end skip.
-    const nonTerminal = ["queued", "claimed", "running", "awaiting_approval", "limit_wait"];
+    // 🔴 `limit_wait` (and, PRD #1190, `paused`) is the load-bearing entry here, not a
+    // completeness nicety. A parked run's HOME is past minAgeMs (3h) for essentially its
+    // whole park (a limit park up to RUN_LIMIT_MAX_PARK, default 8d; an owner-requested
+    // `paused` run has NO maximum), so it is a candidate on EVERY sweep and survives ONLY
+    // because the API answers a non-terminal status and that status is not terminal. Without
+    // these cases that protection was accidental and untested: the set-membership assert above
+    // would still pass with the sweep deleting a parked HOME, because it pins the SET and not
+    // the end-to-end skip. `paused` MUST NOT be in TERMINAL_RUN_STATUSES (asserted above).
+    const nonTerminal = ["queued", "claimed", "running", "awaiting_approval", "limit_wait", "paused"];
     for (const status of [...TERMINAL_RUN_STATUSES, ...nonTerminal]) {
       fs.rmSync(root, { recursive: true, force: true });
       fs.mkdirSync(root, { recursive: true });

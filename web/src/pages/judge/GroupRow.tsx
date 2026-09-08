@@ -1,21 +1,70 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { type JudgeOccurrence, type JudgeRecommendationGroup, type Repo } from "../../lib/api";
+import {
+  api,
+  type JudgeBacklogBucket,
+  type JudgeOccurrence,
+  type JudgeRecommendationGroup,
+  type PendingJudge,
+  type Repo,
+  type RunReview,
+} from "../../lib/api";
 import { recommendationLabel } from "../../lib/judge";
-import { rollupLabel, rollupTone, seenInRunsLabel } from "../../lib/judgeBacklog";
+import { openOfRunsLabel } from "../../lib/judgeBacklog";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { judgeBadge } from "../../lib/judgeBadge";
-import { OccurrenceFileIssue } from "../../components/OccurrenceFileIssue";
-import { Badge, Button } from "../../components/ui";
-import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon } from "../../components/icons";
+import { Markdown } from "../../components/Markdown";
+import { TriageActions } from "../../components/triage/TriageActions";
+import { TriageStateChip } from "../../components/triage/TriageStateChip";
+import { IssueDraftCard } from "../../components/triage/IssueDraftCard";
+import { judgeState, type TriageState } from "../../components/triage/triageCopy";
+import { Badge } from "../../components/ui";
+import { ChevronDownIcon, ChevronRightIcon } from "../../components/icons";
 
 // GroupRow is one deduped (category, target) row: the category + target header, the "seen
-// in N runs" frequency chip, the rollup badge, the group actions, and the occurrence
-// expander. rationale_preview and target are UNTRUSTED judge text — rendered as escaped React
-// text with whitespace-pre-wrap, NEVER through a markdown renderer or dangerouslySetInnerHTML,
-// and passed through stripUnsafeChars first (issue #124): escaping does not touch a bidi
-// override, and the api's review-ingest scrub dropped Cc but not Cf until it learned both —
-// which leaves every row stored before that fix still carrying them.
+// in N runs" frequency chip, the group's rollup state chip, the shared triage action row,
+// and the occurrence expander. rationale_preview and target are UNTRUSTED judge text —
+// rendered as escaped React text with whitespace-pre-wrap, NEVER through a markdown renderer
+// or dangerouslySetInnerHTML, and passed through stripUnsafeChars first (issue #124):
+// escaping does not touch a bidi override, and the api's review-ingest scrub dropped Cc but
+// not Cf until it learned both — which leaves every row stored before that fix still carrying
+// them.
+//
+// The action row is TriageActions in DELEGATED mode (PRD #1183): File issue · Mark done ·
+// Dismiss ▾, all secondary weight. Mark done / Dismiss forward to the page's bulk dispose
+// fan-out; File issue opens the shared IssueDraftCard inside the row for the group's newest
+// OPEN occurrence (see newestOpenOccurrence below). The per-occurrence File issue button is
+// gone: the expander is now for reading (full rationale · run link · verdict · state chip),
+// not acting.
+//
+// fetchReview is the OMITTABLE capability that upgrades the expander's clamped preview to the
+// newest occurrence's full rationale on first expand (PRD #1183 M2). Judge.tsx passes
+// api.getRunReview; PRD #1184's admin scope has no run_id to fetch with and omits it, and the
+// expander then shows only the clamped preview.
+type FetchReview = (
+  runId: string,
+) => Promise<{ review: RunReview | null; pending_judge: PendingJudge | null }>;
+
+// newestOpenOccurrence picks the group's newest OPEN member — the coordinate the File-issue
+// draft targets. Among the bucket "todo" occurrences it takes the largest judged_at compared
+// as a PARSED timestamp, not as a string: RFC3339 does NOT sort lexicographically once the
+// fractional-second precision differs (e.g. "…00.1Z" sorts AFTER "…00.12Z" because 'Z' > '2',
+// yet .1s is earlier than .12s), which would target the wrong occurrence. A member missing (or
+// unparseable) judged_at never wins over one carrying a valid later value, and with none present
+// it falls back to wire order (the backlog query delivers rv.updated_at DESC, so the first todo
+// is already the newest).
+function newestOpenOccurrence(group: JudgeRecommendationGroup): JudgeOccurrence | undefined {
+  return group.occurrences
+    .filter((o) => o.bucket === "todo")
+    .reduce<JudgeOccurrence | undefined>((best, o) => {
+      if (!best) return o;
+      const ot = o.judged_at ? Date.parse(o.judged_at) : NaN;
+      const bt = best.judged_at ? Date.parse(best.judged_at) : NaN;
+      if (!Number.isNaN(ot) && (Number.isNaN(bt) || ot > bt)) return o;
+      return best;
+    }, undefined);
+}
+
 export function GroupRow({
   group,
   selected,
@@ -23,6 +72,7 @@ export function GroupRow({
   onDispose,
   repos,
   onFiled,
+  fetchReview,
 }: {
   group: JudgeRecommendationGroup;
   selected: boolean;
@@ -30,9 +80,61 @@ export function GroupRow({
   onDispose: (status: "done" | "dismissed", reason?: "wont_do" | "not_an_issue") => void;
   repos: Repo[];
   onFiled: () => void;
+  fetchReview?: FetchReview;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [filing, setFiling] = useState(false);
+  // Local just-filed override: the issue a Create click produced plus fileIssue's `warning`.
+  // fileIssue's `warning` is a created-with-warning SUCCESS — the forge issue WAS created, only
+  // its local link/cache could not settle — set EXACTLY when the link did not settle, so the
+  // backlog refetch below then OMITS the coordinate, the row stays in the `todo` bucket, and
+  // File issue would re-arm against a forge issue that already exists (a silent duplicate).
+  // This override keeps the "Filed #N" chip and the warning on the row regardless, while the
+  // settled refetch still reconciles a link that DID settle. Survives onFiled's in-place reload
+  // (the row keeps its coordKey key).
+  const [justFiled, setJustFiled] = useState<{ iid: number; web_url: string; warning: string } | null>(null);
   const openCount = group.open_count;
+  const newestOpen = newestOpenOccurrence(group);
+  const newestOpenRunId = newestOpen?.run_id;
+  const canAct = openCount > 0;
+
+  // The newest open occurrence's FULL rationale, fetched ONCE per newest-open run on first
+  // expand via fetchReview and cached here (this component's key is the coordinate, so the
+  // cache survives an onFiled reload). The cache is keyed to the newest-open RUN: when a
+  // backlog reload changes which run is newest-open, the stale rationale is dropped and the new
+  // run is fetched. Until it lands — and on error, or when fetchReview is omitted — the expander
+  // shows the clamped preview instead. null means "not loaded".
+  const [rationaleMd, setRationaleMd] = useState<string | null>(null);
+  const rationaleFetchedFor = useRef<string | null>(null);
+
+  useEffect(() => {
+    // Only after the user expands, and only when the capability and an open occurrence to fetch
+    // it from are both present.
+    if (!expanded || !fetchReview || !newestOpenRunId) return;
+    // Fetch once per newest-open run. When the run changes across a backlog reload, drop the
+    // previous run's rationale (so the clamped preview shows until the refetch lands) and fetch
+    // the new one; when it is unchanged, keep the cached rationale and skip.
+    if (rationaleFetchedFor.current === newestOpenRunId) return;
+    rationaleFetchedFor.current = newestOpenRunId;
+    setRationaleMd(null);
+    let alive = true;
+    void (async () => {
+      try {
+        const { review } = await fetchReview(newestOpenRunId);
+        // Pull the recommendation at this group's coordinate; its rationale_md is the full
+        // text the clamped preview was cut from.
+        const rec = review?.recommendations.find(
+          (r) => r.category === group.category && r.target === group.target,
+        );
+        if (alive && rec) setRationaleMd(rec.rationale_md);
+      } catch {
+        // Leave rationaleMd null so the clamped preview stays.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [expanded, fetchReview, newestOpenRunId, group.category, group.target]);
 
   return (
     <li className="rounded-lg border border-edge bg-raised/40">
@@ -52,18 +154,38 @@ export function GroupRow({
                 {stripUnsafeChars(group.target)}
               </code>
             )}
-            <span className="text-xs text-faint">{seenInRunsLabel(group.run_count)}</span>
-            {group.bucket !== "todo" && <Badge tone={rollupTone(group.bucket)}>{rollupLabel(group.bucket)}</Badge>}
-            {openCount > 0 && <span className="text-xs text-faint">{openCount} open</span>}
+            {/* One frequency chip folding "seen in M runs" and the open count into one phrase
+                (PRD #1183 M2): "N open of M runs", or "M runs, all settled" once none remain. */}
+            <span className="text-xs text-faint">{openOfRunsLabel(group.open_count, group.run_count)}</span>
+            {/* The local just-filed override wins and shows the "Filed #N" link chip; otherwise
+                the group rollup chip (never rendered for a still-`todo` group). */}
+            {justFiled ? (
+              <TriageStateChip state="filed" filed={{ issue_iid: justFiled.iid, issue_url: justFiled.web_url }} />
+            ) : (
+              group.bucket !== "todo" && <TriageStateChip state={rollupState(group.bucket)} />
+            )}
           </div>
           {group.rationale_preview.trim() !== "" && (
             <p className="mt-1.5 line-clamp-3 whitespace-pre-wrap text-sm text-muted">
               {stripUnsafeChars(group.rationale_preview)}
             </p>
           )}
+          {/* The created-with-warning line, under the chip (same style as FindingCard): the
+              issue exists on the forge, only its local link/cache did not settle. */}
+          {justFiled?.warning && <p className="mt-1 text-xs text-muted">{justFiled.warning}</p>}
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
-          <GroupDisposeControls disabled={openCount === 0} onDispose={onDispose} />
+          {/* Delegated mode: an absent handler hides its button, so a group with no open
+              member (scope=open would settle nothing) shows no action, matching the old
+              GroupDisposeControls that returned null when disabled. */}
+          <TriageActions
+            // Once this coordinate is filed — locally (justFiled, incl. the created-with-warning
+            // case) — File issue is withdrawn so it never re-arms over a live forge issue; Mark
+            // done and Dismiss stay available.
+            onFile={!justFiled && canAct && newestOpen ? () => setFiling(true) : undefined}
+            onMarkDone={canAct ? () => onDispose("done") : undefined}
+            onDismiss={canAct ? (reason) => onDispose("dismissed", reason) : undefined}
+          />
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
@@ -76,111 +198,102 @@ export function GroupRow({
         </div>
       </div>
 
+      {/* Filing lives on the ROW now (#68 Decision 3 / PRD #1183): the shared draft card,
+          prefilled from the newest open occurrence, using the same getIssueDraft / fileIssue
+          endpoints the run page uses. A successful create re-reads the backlog (the coordinate
+          moves to the `filed` rung, so the group rollup may change) and closes the card. */}
+      {filing && newestOpen && (
+        <div className="border-t border-edge px-3 py-2.5">
+          {/* When more than one run is open, the draft targets the newest and the rest stay
+              open until the group is marked done — say so above the card (PRD #1183 M2). */}
+          {openCount > 1 && (
+            <p className="mb-2 text-xs text-muted">
+              Prefilled from the newest of {openCount} open runs. The other {openCount - 1} stay
+              open until you mark the group done.
+            </p>
+          )}
+          <IssueDraftCard
+            repos={repos}
+            loadDraft={async () => {
+              const { draft } = await api.getIssueDraft(newestOpen.run_id, newestOpen.rec_id);
+              return {
+                title: draft.title,
+                description: draft.description,
+                labels: draft.labels,
+                provenance: draft.provenance,
+                defaultRepoId: draft.default_repo_id,
+                defaultNote: draft.default_note,
+              };
+            }}
+            onCreate={async (values) => {
+              const res = await api.fileIssue(newestOpen.run_id, newestOpen.rec_id, {
+                repo_id: values.repoId,
+                title: values.title,
+                description: values.description,
+              });
+              // Record the created issue + any warning locally so the row reflects the filing
+              // even when the refetch below does not settle the link (created-with-warning).
+              setJustFiled({ iid: res.issue.iid, web_url: res.issue.web_url, warning: res.warning ?? "" });
+              setFiling(false);
+              onFiled();
+            }}
+            onCancel={() => setFiling(false)}
+          />
+        </div>
+      )}
+
       {expanded && (
-        <ul className="space-y-2 border-t border-edge px-3 py-2.5">
-          {group.occurrences.map((occ) => (
-            <OccurrenceRow
-              key={`${occ.run_id} ${occ.rec_id}`}
-              occ={occ}
-              repos={repos}
-              onFiled={onFiled}
-            />
-          ))}
-        </ul>
+        <div className="space-y-2 border-t border-edge px-3 py-2.5">
+          {/* The newest open occurrence's FULL rationale, above the occurrence list (PRD #1183
+              M2). It replaces the clamped preview once fetchReview lands; until then, on a
+              fetch error, or when fetchReview is omitted (PRD #1184 admin scope), the clamped
+              preview shows. Both render UNTRUSTED judge text through the hardened Markdown /
+              stripUnsafeChars path the run page uses. */}
+          {rationaleMd !== null ? (
+            <div className="judge-prose">
+              <Markdown content={stripUnsafeChars(rationaleMd)} />
+            </div>
+          ) : (
+            group.rationale_preview.trim() !== "" && (
+              <p className="line-clamp-3 whitespace-pre-wrap text-sm text-muted">
+                {stripUnsafeChars(group.rationale_preview)}
+              </p>
+            )
+          )}
+          <ul className="space-y-2">
+            {group.occurrences.map((occ) => (
+              <OccurrenceRow key={`${occ.run_id} ${occ.rec_id}`} occ={occ} />
+            ))}
+          </ul>
+        </div>
       )}
     </li>
   );
 }
 
-// GroupDisposeControls: the per-group Mark done + Dismiss ▾ (Won't do / Not an issue),
-// mirroring RunView's per-rec controls but fanning out across the group. Disabled when
-// the group has no open member — scope=open would settle nothing.
-function GroupDisposeControls({
-  disabled,
-  onDispose,
-}: {
-  disabled: boolean;
-  onDispose: (status: "done" | "dismissed", reason?: "wont_do" | "not_an_issue") => void;
-}) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const wrapRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setMenuOpen(false);
-        wrapRef.current?.querySelector<HTMLElement>("button")?.focus();
-      }
-    };
-    const onPointerDown = (e: Event) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setMenuOpen(false);
-    };
-    document.addEventListener("keydown", onKey);
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("pointerdown", onPointerDown);
-    };
-  }, [menuOpen]);
-
-  if (disabled) return null;
-
-  return (
-    <div className="flex items-center gap-1.5">
-      <Button size="sm" variant="secondary" onClick={() => onDispose("done")}>
-        Mark done
-      </Button>
-      <div className="relative" ref={wrapRef}>
-        <Button
-          size="sm"
-          variant="secondary"
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
-          onClick={() => setMenuOpen((o) => !o)}
-        >
-          Dismiss ▾
-        </Button>
-        {menuOpen && (
-          <div
-            role="menu"
-            className="absolute right-0 z-10 mt-1 w-56 rounded-lg border border-edge-strong bg-surface p-1 shadow-lg"
-          >
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                setMenuOpen(false);
-                onDispose("dismissed", "wont_do");
-              }}
-              className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised"
-            >
-              Won't do
-              <span className="text-xs text-faint">Valid, but not worth acting on</span>
-            </button>
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                setMenuOpen(false);
-                onDispose("dismissed", "not_an_issue");
-              }}
-              className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised"
-            >
-              Not an issue
-              <span className="text-xs text-faint">False positive — the judge got it wrong</span>
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
+// rollupState maps a group's rollup BUCKET onto the normalised TriageState the shared
+// TriageStateChip takes. A group rollup is never "all" (that is a filter, not a member
+// state) and the "todo" rollup is not rendered as a chip (the caller guards on it), but the
+// switch is total so the type stays exhaustive. Occurrence chips use triageCopy's judgeState
+// adapter instead, which also carries set_via / filed_issue.
+function rollupState(bucket: JudgeBacklogBucket): TriageState {
+  switch (bucket) {
+    case "filed":
+      return "filed";
+    case "done":
+      return "done";
+    case "dismissed":
+      return "dismissed";
+    default:
+      return "to_triage";
+  }
 }
 
-// OccurrenceRow is one run's instance inside the expander: the run link, its verdict, the
-// per-run triage state, and the per-recommendation File-issue draft. run_title is UNTRUSTED
-// (the run's issue_title) — rendered as escaped React text.
-function OccurrenceRow({ occ, repos, onFiled }: { occ: JudgeOccurrence; repos: Repo[]; onFiled: () => void }) {
+// OccurrenceRow is one run's instance inside the expander: the run link, its verdict, and the
+// per-run triage state chip. It is read-only now — filing moved to the group's action row, so
+// the per-occurrence File issue button is gone (PRD #1183). run_title is UNTRUSTED (the run's
+// issue_title) — rendered as escaped React text.
+function OccurrenceRow({ occ }: { occ: JudgeOccurrence }) {
   return (
     <li className="rounded-md border border-edge bg-surface/60 px-2.5 py-2">
       <div className="flex flex-wrap items-center gap-2">
@@ -191,16 +304,8 @@ function OccurrenceRow({ occ, repos, onFiled }: { occ: JudgeOccurrence; repos: R
           {stripUnsafeChars(occ.run_title) || "Untitled run"}
         </Link>
         <OccurrenceVerdictBadge occ={occ} />
-        <OccurrenceBucketChip occ={occ} />
+        <TriageStateChip {...judgeState(occ)} />
       </div>
-      {/* Filing stays per-recommendation via the existing #68 browser draft (Decision 3):
-          a filed occurrence renders its link, an open one offers the draft, a settled-but-
-          unfiled one (done/dismissed) offers nothing to file. */}
-      {occ.filed_issue ? (
-        <OccurrenceFileIssue runId={occ.run_id} recId={occ.rec_id} filed={occ.filed_issue} repos={repos} />
-      ) : occ.bucket === "todo" ? (
-        <OccurrenceFileIssue runId={occ.run_id} recId={occ.rec_id} repos={repos} onFiled={onFiled} />
-      ) : null}
     </li>
   );
 }
@@ -243,72 +348,4 @@ function OccurrenceVerdictBadge({ occ }: { occ: JudgeOccurrence }) {
       {badge.label}
     </Badge>
   );
-}
-
-// OccurrenceBucketChip renders one occurrence's triage state from its bucket. The
-// occurrence DTO carries no dismiss reason, so a HAND-dismissed occurrence reads a plain
-// "Dismissed" — the group-level controls carry the won't-do / not-an-issue distinction.
-//
-// Both DONE and DISMISSED split by provenance (PRD #98 Decision 6; issue #167). A person's
-// "✓ Done" and the M6 issue-close sync's "Done via #IID" are different claims, as are a
-// person's "Dismissed" and the system's auto-dismissal of a recommendation naming a
-// policy-barred credential-bearing CLI (set_via "denied_cli") — rendering either pair
-// identically attributes a system inference to the user. The split is on set_via, which is
-// the only thing that carries the difference within a single bucket.
-function OccurrenceBucketChip({ occ }: { occ: JudgeOccurrence }) {
-  switch (occ.bucket) {
-    case "done":
-      // An auto-done always has a filed link — the sync fires FROM one closing — but the
-      // link is rendered defensively anyway: a filed row deleted after the sync would
-      // otherwise print "Done via #undefined". Without an iid the provenance is still
-      // stated, just unnamed.
-      if (occ.set_via === "issue_close") {
-        return (
-          <Badge tone="ok" title="Marked done automatically when the filed issue was closed">
-            <span aria-hidden="true">✓</span>{" "}
-            {occ.filed_issue ? `Done via #${occ.filed_issue.issue_iid}` : "Done via issue close"}
-          </Badge>
-        );
-      }
-      return (
-        <Badge tone="ok">
-          <span aria-hidden="true">✓</span> Done
-        </Badge>
-      );
-    case "dismissed":
-      if (occ.set_via === "denied_cli") {
-        return (
-          <Badge
-            tone="neutral"
-            title="Automatically dismissed: this recommended a credential-bearing CLI that policy permanently bars (e.g. glab, gh, aws)"
-          >
-            Dismissed · barred CLI
-          </Badge>
-        );
-      }
-      return <Badge tone="neutral">Dismissed</Badge>;
-    case "filed":
-      return occ.filed_issue && isHttpsUrl(occ.filed_issue.issue_url) ? (
-        <a
-          href={occ.filed_issue.issue_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-xs font-medium text-info underline underline-offset-2 hover:text-info"
-        >
-          Filed #{occ.filed_issue.issue_iid} <ExternalLinkIcon />
-        </a>
-      ) : (
-        <Badge tone="info">Filed</Badge>
-      );
-    default:
-      return <Badge tone="neutral">To do</Badge>;
-  }
-}
-
-function isHttpsUrl(u: string): boolean {
-  try {
-    return new URL(u).protocol === "https:";
-  } catch {
-    return false;
-  }
 }

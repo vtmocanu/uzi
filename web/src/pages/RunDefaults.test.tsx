@@ -80,9 +80,14 @@ function mockAuth(user: User, over: Partial<ReturnType<typeof useAuth>> = {}) {
     loading: false,
     uziLabel: "uzi",
     autopilotLabel: "autopilot",
-    theme: "ember",
-    themeOverride: null,
-    defaultTheme: "ember",
+    appearance: {
+      mode: "dark",
+      light_theme: "hall",
+      dark_theme: "ember",
+      typeface: "system",
+      overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+      defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+    },
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
@@ -98,8 +103,8 @@ function mockAuth(user: User, over: Partial<ReturnType<typeof useAuth>> = {}) {
 
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null } });
-  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: "mission" } });
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
   mockApi.getMySlack.mockResolvedValue({
     slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked", workspace: "connected" },
   });
@@ -259,10 +264,10 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
 
   it("saves the per-user judge model through PUT /me/settings", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null },
+      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: "haiku", summary_model: null, theme: null },
+      settings: { default_model: null, default_effort: null, judge_model: "haiku", summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -291,10 +296,10 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
 
   it("saves the per-user summary model through PUT /me/settings", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null },
+      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: "haiku", theme: null },
+      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: "haiku", appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -313,7 +318,7 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
 describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
   it("loads and shows the saved effort", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: "low", judge_model: null, summary_model: null, theme: null },
+      settings: { default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -327,10 +332,10 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
 
   it("changing the dropdown enables Save and sends the chosen level", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null },
+      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: "low", judge_model: null, summary_model: null, theme: null },
+      settings: { default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -350,10 +355,10 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
 
   it("selecting Inherit sends default_effort: null", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: "max", judge_model: null, summary_model: null, theme: null },
+      settings: { default_model: null, default_effort: "max", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null },
+      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>

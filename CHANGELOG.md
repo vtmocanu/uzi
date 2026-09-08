@@ -21,12 +21,53 @@ through `[0.52.0]`.)
 ### Added
 
 - **On-demand MR rework past the automatic cap, with optional guidance ([#1202](https://github.com/vtmocanu/uzi/issues/1202)).**
-  An owner can start one rework cycle on a completed run whose MR is open even after the automatic cap — from the run page's Rework now control, `uzi run rework <run-id> [-m <guidance>]`, or `POST /api/runs/{id}/rework` — bypassing the cap, debounce, staleness and green-pipeline gates while keeping the branch/one-active/kill-switch/token/open-MR guards; the cycle never counts against the automatic cap, advances the consumed high-water so the watcher never re-fires on the same comments, and the cap halt comment/notification now point at it.
+  An owner can start one rework cycle on a completed run whose MR is open even after the automatic cap, from the run page's Rework now control, `uzi run rework <run-id> [-m <guidance>]`, or `POST /api/runs/{id}/rework`. It bypasses the cap, debounce, staleness and green-pipeline gates while keeping the branch, one-active-rework, kill-switch, token and open-MR guards. The cycle never counts against the automatic cap and atomically advances the consumed high-water so the watcher does not repeat those comments. The cap halt comment and notification now point at this action.
+
+- **The Judge page's group expander now shows the newest occurrence's full rationale, and gains a select-all checkbox ([#1183](https://github.com/vtmocanu/uzi/issues/1183)).**
+  Expanding a group fetches and renders the newest open occurrence's complete rationale above its occurrence list, in place of the clamped preview shown before you expand; a "Select all N shown" checkbox above the group list ticks every group currently on screen, for a bulk Mark done or Dismiss in one pass.
+
+### Changed
+
+- **Judge and the run page's judge panel now share one triage row and one vocabulary ([#1183](https://github.com/vtmocanu/uzi/issues/1183)).**
+  Every open recommendation, on `/judge` and on the run page, now shows File issue · Mark done · Dismiss ▾ at equal weight in one row, replacing the run page's lone File issue button on its own line and `/judge`'s per-run File issue buried inside the occurrence expander; the open state reads "To triage" everywhere it appears, the tab, the chip, the strip, and the status line, and a filed recommendation reads "Filed #N" in the same slot. On `/judge`, File issue no longer needs the expander open, it drafts straight from the group's newest open occurrence, the most recently judged run still open, tracked by a new `judged_at` field on the judge backlog occurrence API, while the group's other open runs stay open until you mark the whole group done.
+- **Appearance and Demo mode moved to their own Settings › Appearance tab ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
+  The theme / mode / typeface controls and the per-device Demo mode toggle now live on a dedicated **Appearance** tab, second after Account & tokens, instead of as cards buried inside the Account & tokens tab. The controls behave exactly as before — only their home changed — and Account & tokens no longer lists appearance in its description.
+- **The board search and toolbar are left-anchored on their own row ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
+  On a wide viewport the board's search and controls no longer fling to the far-right edge with a dead gap after the title: they render as their own full-width row beneath the board title, left-aligned at every width, so search stays top-left and a wide window matches the normal-width layout. Sticky positioning, the `/`-to-focus shortcut, and `Esc`-to-clear are unchanged.
+- **Boards open with empty columns hidden by default ([#1208](https://github.com/vtmocanu/uzi/issues/1208)).**
+  The **Hide empty** toggle now defaults on, so a board you have never configured opens without its empty label lanes. The choice is still remembered per board, so a board you explicitly set to show empty columns keeps showing them.
+
+## [0.80.0] - 2026-09-08
+
+### Added
+
+- **Pause a running run and resume it later, right where it left off ([#1190](https://github.com/vtmocanu/uzi/issues/1190)).**
+  A run's owner can now park a running issue, task, prompt or self-improve run on demand, after the milestone in flight (the default) or immediately with `--now`, which drops the turn in flight and discards work since the last checkpoint, and resume it later with the remaining budget untouched, since the clock stops rather than resetting while it waits. The worker publishes a checkpoint before parking, so if that publish fails the run stays running and the owner is told in its activity feed instead of losing the park silently; resuming continues the same session on the original worker or recovers the branch and re-plans only the unfinished milestones on another. Reachable from the run page (a `‖ Pause ▾` menu, a pending-pause chip, a Resume button), the CLI (`uzi run pause <id> [--now|--cancel]`, `uzi run resume <id>`), and the TUI (a `‖ paused` word and detail line, read-only).
+- **Three light themes: Dawn, Hall, and Shadow ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
+  Each keeps the dark factory somewhere on screen: Dawn stays dark only on machine surfaces (the run activity feed, code/log/CLI blocks); Hall adds a dark sidebar and mobile top bar; Shadow additionally keeps a board card, run row, or run header dark while that run is actively working, staying light with a rust accent while it waits on a human. All three share one WCAG 2.2 AA-verified light palette and reuse ember's own dark values for every dark surface, so a machine pane looks identical across every theme.
+- **A System / Lights on / Lights off appearance mode, with one theme held per polarity and matching admin instance defaults ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
+  Settings → Appearance now holds a mode alongside a "Lights on theme" and a "Lights off theme"; System follows the OS's `prefers-color-scheme` live, with no reload. An admin can set the same four fields (mode, light theme, dark theme, typeface) as instance-wide defaults from Admin → Instance settings; the legacy single "Default theme" keeps feeding the dark slot, so nobody's screen changes on upgrade.
+- **A bundled IBM Plex typeface option ([#1167](https://github.com/vtmocanu/uzi/issues/1167)).**
+  Settings → Appearance gains a Typeface choice: System (the platform default) or IBM Plex, shipped with the app so switching to it makes no external font request and the System choice downloads nothing.
+- **Further foundational work toward a Codex-based worker lane ([#1171](https://github.com/vtmocanu/uzi/issues/1171), [#1106](https://github.com/vtmocanu/uzi/issues/1106)).**
+  Behind the scenes and not user-visible yet: ships the credential-free Codex adapter core and execution-safety foundations, building on the credential and packaging groundwork shipped in 0.79.0. Production integration remains pending.
 
 ### Changed
 
 - **The `slow` run-health flag is now a budget-relative "near timeout" warning instead of a bare wall-clock timer ([#1170](https://github.com/vtmocanu/uzi/issues/1170)).**
   It fires once a run's active running time (wall clock since start, gate waits excluded) has used a configurable share of its wall-clock budget (default 85%, `health_near_timeout_pct` replacing `health_slow_seconds`); the flag reads "near timeout" everywhere, and the badge, TUI, and CLI human views now count down the time left to the deadline (e.g. `1h 5m left`) instead of the time since it was raised, while Slack relabels the flag and glyph without a countdown and the machine-readable `health` field keeps reporting `slow`.
+- **Workers enumerate a repo's skills from both `.agents/skills` and `.claude/skills` ([#1205](https://github.com/vtmocanu/uzi/issues/1205), [#1206](https://github.com/vtmocanu/uzi/issues/1206)).**
+  A cloned repo that keeps one real `.agents/skills` tree with `.claude/skills` as a directory symlink (the cross-agent layout) is now read correctly: the worker reads both real roots, `.claude/skills` winning on a name collision, and rejects a symlinked skills-root parent so the containment boundary still holds.
+- **The Codex credential import flow and status badges now explain themselves ([#1177](https://github.com/vtmocanu/uzi/issues/1177)).**
+  The Codex credential import screen and the per-worker Codex credential status badges carry clearer labels and help text, so importing a Codex credential and reading its state no longer needs outside context.
+
+### Fixed
+
+- **TUI in-progress milestone markers render correctly with several milestones running ([#1176](https://github.com/vtmocanu/uzi/issues/1176)).**
+  The in-progress milestone glyph no longer falls back to a mismatched font, and the per-milestone micro-bars now blink for each in-progress milestone instead of only one cell when several are in progress at once.
+- **The admin per-user usage breakdown's SHARE% column sums to 100% ([#1185](https://github.com/vtmocanu/uzi/issues/1185)).**
+  Independent per-row rounding could make the column total 101%; the shares are now apportioned so they add up to exactly 100%.
+
 
 ## [0.79.0] - 2026-09-07
 
@@ -3883,7 +3924,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.79.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.80.0...HEAD
+[0.80.0]: https://github.com/vtmocanu/uzi/compare/v0.79.0...v0.80.0
 [0.79.0]: https://github.com/vtmocanu/uzi/compare/v0.78.0...v0.79.0
 [0.78.0]: https://github.com/vtmocanu/uzi/compare/v0.77.0...v0.78.0
 [0.77.0]: https://github.com/vtmocanu/uzi/compare/v0.76.0...v0.77.0

@@ -64,15 +64,16 @@ import { RUN_ID_RE } from "./util.js";
  * `limit_wait`, PRD #88 added `awaiting_input`, and PRD #517 added `awaiting_followup`
  * (an interactive task parked between turns for the next follow-up).
  *
- * 🔴 NONE OF `limit_wait`, `awaiting_input` NOR `awaiting_followup` IS TERMINAL, AND
- * NONE MAY EVER BE ADDED TO THIS SET. Read the DEFAULT_RECLAIM_MIN_AGE_MS comment below
+ * 🔴 NONE OF `limit_wait`, `awaiting_input`, `awaiting_followup` NOR `paused` IS TERMINAL,
+ * AND NONE MAY EVER BE ADDED TO THIS SET. Read the DEFAULT_RECLAIM_MIN_AGE_MS comment below
  * before touching it: a parked run's HOME is past `minAgeMs` for essentially its whole
  * park (the age filter is 3h, a limit park runs to RUN_LIMIT_MAX_PARK, default 8d, a
- * clarification park waits on a human for up to QUESTION_TIMEOUT, default 24h, and an
- * interactive follow-up park can wait indefinitely between turns), so it becomes a
- * candidate on EVERY sweep and survives only because the API answers a non-terminal
- * status and that status is absent here. Adding any deletes the ~170 MB SDK transcript
- * the entire resume depends on.
+ * clarification park waits on a human for up to QUESTION_TIMEOUT, default 24h, an
+ * interactive follow-up park can wait indefinitely between turns, and an owner-requested
+ * `paused` run (PRD #1190) has NO maximum duration at all — it resumes only on demand), so
+ * it becomes a candidate on EVERY sweep and survives only because the API answers a
+ * non-terminal status and that status is absent here. Adding any deletes the ~170 MB SDK
+ * transcript the entire resume depends on.
  *
  * This is the SECOND of two independent protections for a parked HOME. The first is
  * the runner's cleanup carve-out, which skips the teardown deletion; this one skips

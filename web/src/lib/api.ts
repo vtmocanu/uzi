@@ -1095,6 +1095,48 @@ const realApi = {
     request<{ run: Run }>("POST", `/runs/${id}/resume-now`),
 
   /**
+   * PRD #1190: request a pause of THIS running run. `mode` is "milestone" (park once the
+   * milestone in flight completes, or at the next turn boundary on a run without frozen
+   * milestones) or "now" (drop the turn in flight and park on the last checkpoint). Posted
+   * as a `pause` steering input to /runs/{id}/inputs, owner-scoped.
+   *
+   * 🔴 A PAUSE REQUEST IS NOT A STATUS CHANGE (D3): the run stays `running` and only
+   * `pause_requested_at`/`pause_mode`/`pause_after_count` are set. The actual park to
+   * status "paused" lands on the worker's next report (or, for "now", after it aborts the
+   * turn and publishes the checkpoint). The server 409s a run that is not `running`
+   * (naming the current status) or an unpausable kind (chat/judge/mr_rework/ci_fix and
+   * interactive tasks); a 400 rejects an unknown mode. Callers gate the affordance on
+   * `status === "running"` + a pausable kind; the 4xx are the backstop.
+   */
+  pauseRun: (id: string, mode: "milestone" | "now") =>
+    request<{ server_side: boolean }>("POST", `/runs/${id}/inputs`, { kind: "pause", body: mode }),
+
+  /**
+   * PRD #1190: withdraw a pending pause on THIS run (`pause_cancel`), clearing the three
+   * pause columns and leaving the run running with no trace but the audit rows.
+   *
+   * 🔴 THE SERVER ACCEPTS THIS ONLY WHILE `status === 'running'` (409 "no pause is
+   * pending" otherwise). A pending pause that was overtaken by an involuntary park
+   * (limit_wait / awaiting_input) keeps its columns but can no longer be cancelled from a
+   * parked run, so callers gate the Cancel/Pause-now actions on `status === "running"`.
+   */
+  cancelPause: (id: string) =>
+    request<{ server_side: boolean }>("POST", `/runs/${id}/inputs`, { kind: "pause_cancel", body: "" }),
+
+  /**
+   * PRD #1190 (D14): resume THIS paused run, moving `paused → queued` with the worker pin
+   * kept and the parked time banked into budget_paused_seconds (the clock stops while
+   * paused, the remaining budget is preserved). It hits the SAME widened endpoint as
+   * resumeRunNow (POST /runs/{id}/resume-now); the server reads the status and dispatches
+   * (pool_wait → promote, paused → resume, anything else → 409 naming the status). This is
+   * the paused-verb alias — resumeRunNow keeps its name and pool-hold wording — so the
+   * call site reads honestly. Owner-scoped (404 for a foreign/unknown run). Returns the
+   * updated run, which moves to `queued` on success.
+   */
+  resumeRun: (id: string) =>
+    request<{ run: Run }>("POST", `/runs/${id}/resume-now`),
+
+  /**
    * PRD #320 M6: bump THIS run to the front of the queue (`expedite: true`) or clear
    * that override (`expedite: false`), returning the updated run with its recomputed
    * `priority` class. Owner-scoped (the server 404s a non-owner) and QUEUED-ONLY (409 on

@@ -157,8 +157,8 @@ export interface RunContext {
    *  over-limit). The worker owns the gapless seq, so it logs these. */
   skillsDropped?: ClaimSkillDrop[];
   /** M6 (PRD #16): the repo owner opted in to loading skills from the clone's own
-   *  .claude/skills. Only then does the worker enumerate them (skills only, lowest
-   *  precedence); default off. */
+   *  skill roots (`.claude/skills` and `.agents/skills`, issue #1205). Only then
+   *  does the worker enumerate them (skills only, lowest precedence); default off. */
   repoSkillsEnabled?: boolean;
   /** PRD #246: the repo owner opted in to the lead reading the clone's ROOT CLAUDE.md
    *  as nonce-fenced UNTRUSTED/ADVISORY context (lead-only, `settingSources` untouched);
@@ -351,6 +351,49 @@ export interface RunContext {
    */
   checkpoint?(opts: { reap: boolean; progress?: MilestoneProgress }): Promise<void>;
   /**
+   * PRD #1190 M2: park the run for an owner-requested pause. Called by the implement loop at
+   * the server-decided pause boundary (`served.pauseRequested` at the loop top) and when a
+   * `now` pause aborted the in-flight turn (PauseNowSignal caught in the loop). The runner's
+   * implementation publishes a checkpoint FIRST and reports `paused` ONLY if it lands
+   * (Decision 8): a pause whose committed work cannot be made durable does NOT park.
+   *
+   * Returns true once the run is durably parked (checkpoint on origin AND the server ACKed
+   * `paused`), after which the executor breaks and returns `pausedAt` so the runner skips
+   * finalization. Returns false when the park did not take (publish failed → the runner
+   * reported `pause_failed`; or the server did not ACK `paused`): the loop then CONTINUES the
+   * run — a `now` pause restarts the aborted turn on the next iteration, a milestone pause
+   * proceeds to the next milestone (the server has cleared the request, so the next ACK carries
+   * pauseRequested=false). Absent on the stub/test executors, in which case a pause request is
+   * inert (the loop treats it as "not parked" and continues).
+   */
+  parkForPause?(pausedAt: { completedCount: number; total?: number }): Promise<boolean>;
+  /**
+   * PRD #1190 rework (N2): true when a `cancel` input has been seen (steering.isCancelled). The
+   * implement loop re-checks this at each loop boundary so a cancel that arrives AFTER the shared
+   * abort controller was already spent by a declined `now`-park — the controller fires 'abort' once
+   * and its once-listener is gone — is still honored (the loop throws to the terminal cancel path).
+   * The NORMAL in-flight cancel is unaffected: it aborts the live turn, which throws the cancel
+   * error before control returns to the loop top. Absent on the stub/test executors ⇒ the re-check
+   * is inert (a bare `ctx.cancelRequested?.()` is undefined).
+   */
+  cancelRequested?(): boolean;
+  /**
+   * PRD #1190 M2 (N1): the steering channel's sticky pause mode (steering.getPauseMode) — the mode
+   * of a pending owner pause, or null. The implement loop reads it at its FIRST boundary so a
+   * seeded (resume, from claim.pause_pending) or steered pause parks even if the running-report
+   * ACK's pauseRequested regressed — an ACK-independent fallback. Absent on the stub/test executors
+   * ⇒ no fallback (the ACK's pauseRequested is then the sole park trigger, as before).
+   */
+  pauseModeRequested?(): "milestone" | "now" | null;
+  /**
+   * PRD #1190 rework (N2): register a RE-ARMABLE interrupt (steering.onPauseNow) the steering
+   * channel invokes on EVERY `now` pause, so a second `now` after a declined park still drops the
+   * in-flight turn — the shared abort controller only fires once. The executor passes a callback
+   * that trips the current turn as a pause (REASON_PAUSE_NOW). Absent on the stub/test executors ⇒
+   * no re-arm (the first `now` still drops the turn via ctx.signal).
+   */
+  onPauseNow?(cb: () => void): void;
+  /**
    * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
    * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies
    * the ack (the park must actually take, mirroring askUser's ack check), then (b) blocks on
@@ -441,6 +484,14 @@ export interface ExecutorResult {
    *  is not populated). Drives the partial-MR annotation and the `scope_capped` completion.
    *  Issue runs only. Absent on every normal completion. StubExecutor never sets it. */
   scopeCapped?: { completedCount: number; total?: number };
+  /** PRD #1190 M2: set when the run PARKED on an owner-requested pause (ctx.parkForPause
+   *  returned true). `completedCount` is the milestone count the park landed at; `total` is the
+   *  frozen count (absent on a run with no frozen milestones, e.g. a prompt run). The runner
+   *  reads it in phasePublish to SKIP finalization — the run already reported `paused`, is
+   *  non-terminal, and its HOME is preserved for resume. NOT gated on run kind (unlike
+   *  scopeCapped): pause is meaningful for issue, non-interactive task, prompt and self_improve.
+   *  Absent on every normal completion. StubExecutor never sets it. */
+  pausedAt?: { completedCount: number; total?: number };
 }
 
 /**

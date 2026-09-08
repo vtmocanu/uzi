@@ -5,6 +5,9 @@
 // mirroring the real worker protocol's semantics.
 
 import type { IssueProposal, RunInputKind } from "../lib/api";
+// isTerminalRun comes from the leaf module (not the ../lib/api barrel) to stay clear of the
+// mock↔barrel runtime cycle the api-acyclic test guards.
+import { isTerminalRun } from "../lib/runStatus";
 import { HEARTBEAT_MILESTONES, SAMPLE_PLAN } from "./data";
 import { appendMessage, getRun, listMessages, nextProposalId, patchRun, putProposal } from "./store";
 
@@ -90,6 +93,23 @@ function schedule(runId: string, steps: Timed[]) {
 function clearTimers(runId: string) {
   for (const id of timers.get(runId) ?? []) window.clearTimeout(id);
   timers.delete(runId);
+}
+
+// PRD #1190 (finding [4]): the pending-pause (park) timer is kept SEPARATE from the
+// run-execution timers above. A pause request is a FLAG, not a stop (D3) — the run keeps
+// executing until the park lands — so it must be cancellable on its OWN handle without
+// touching the interrupted script. One handle per run (a run has at most one pending pause).
+const parkTimers = new Map<string, number>();
+
+function schedulePark(runId: string, delayMs: number) {
+  clearParkTimer(runId);
+  parkTimers.set(runId, window.setTimeout(() => parkPaused(runId), delayMs));
+}
+
+function clearParkTimer(runId: string) {
+  const id = parkTimers.get(runId);
+  if (id != null) window.clearTimeout(id);
+  parkTimers.delete(runId);
 }
 
 // ── Scripts ──────────────────────────────────────────────────────────────────
@@ -298,6 +318,11 @@ function implementScript(runId: string): Timed[] {
           mr_iid: 57,
           branch,
           iteration_count: 2,
+          // Every terminal transition clears a pending pause (ADR-1190 I5): a completed
+          // run never renders a stale "pause requested".
+          pause_requested_at: null,
+          pause_mode: null,
+          pause_after_count: null,
           // PRD #122: the run finished — every milestone reported complete, none left in
           // progress, so the checklist reads a full count on the completed hero.
           milestones: HEARTBEAT_MILESTONES,
@@ -601,6 +626,7 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
     }
     case "cancel":
       clearTimers(runId);
+      clearParkTimer(runId);
       openQuestions.delete(runId);
       appendMessage(runId, "status", null, { text: "cancel requested" });
       patchRun(runId, {
@@ -611,6 +637,13 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
         stop_kind: "cancelled",
         stop_reason: "wrong branch, restarting",
         finished_at: new Date().toISOString(),
+        // Every terminal transition clears a pending pause on the wire (ADR-1190 I5,
+        // commit ff6d3518), so a dead run never renders a stale "pause requested". Mirror
+        // that here — it also makes parkPaused's cleared-request short-circuit the natural
+        // terminator for a re-armed pause on cancel.
+        pause_requested_at: null,
+        pause_mode: null,
+        pause_after_count: null,
       });
       return null;
     case "follow_up":
@@ -640,6 +673,45 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       schedule(runId, open === MOCK_QUESTION_ID ? askAgainScript(runId) : implementScript(runId));
       return null;
     }
+    // PRD #1190: an owner's pause request. Mirrors CreatePauseInput — only a RUNNING run
+    // of a pausable kind (D6/D7); a 409 names WHY otherwise. A request is a FLAG, not a
+    // status (D3): the run stays running and only the three pause columns are set. The park
+    // to `paused` then lands on a timer (the mock's stand-in for the worker's next report /
+    // turn abort): quickly for "now", after a beat for "milestone" (the boundary rule).
+    case "pause": {
+      if (run.status !== "running")
+        return { status: 409, message: `run is ${run.status}; the clock is already stopped` };
+      if (!isPausableMock(run)) return { status: 409, message: pauseNotSupportedReason(run) };
+      const mode: "milestone" | "now" = body === "now" ? "now" : "milestone";
+      patchRun(runId, {
+        pause_requested_at: new Date().toISOString(),
+        pause_mode: mode,
+        pause_after_count: (run.milestones_completed ?? []).length,
+      });
+      appendMessage(runId, "status", null, {
+        text: mode === "now" ? "pause requested (now)" : "pause requested",
+      });
+      // A pending pause is a FLAG (D3): the run KEEPS running until the park lands, so do
+      // NOT clear the execution timers here. Schedule the park on its OWN handle (separate
+      // from the run's script) so a later pause_cancel can withdraw it without killing the
+      // interrupted script. parkPaused stops the execution timers when it actually parks.
+      schedulePark(runId, mode === "now" ? 600 : 2500);
+      return null;
+    }
+    // PRD #1190: withdraw a pending pause. Server accepts it ONLY while running (M1 review),
+    // so a 409 "no pause is pending" on any other status or with no request set. Clears the
+    // scheduled park and the three columns; the run keeps running.
+    case "pause_cancel": {
+      if (run.status !== "running" || !run.pause_requested_at)
+        return { status: 409, message: "no pause is pending" };
+      // Clear ONLY the park timer — leave the execution timers running so the interrupted
+      // script continues (finding [4]: clearing them left the run permanently `running` with
+      // no activity, a cancelled pause that silently killed the run).
+      clearParkTimer(runId);
+      patchRun(runId, { pause_requested_at: null, pause_mode: null, pause_after_count: null });
+      appendMessage(runId, "status", null, { text: "pause request withdrawn — the run continues" });
+      return null;
+    }
     default: {
       // Exhaustiveness guard — see the header. If this line stops compiling, a new
       // RunInputKind was added and this switch must learn it; do NOT widen the type
@@ -649,6 +721,72 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       return null;
     }
   }
+}
+
+// PRD #1190 (D7): the kinds a pause is meaningful for. Mirrors the server allowlist —
+// chat/judge/mr_rework/ci_fix and interactive tasks already park or self-end.
+const MOCK_PAUSABLE_KINDS = new Set(["issue", "task", "prompt", "self_improve"]);
+
+function isPausableMock(run: { kind: string; interactive?: boolean }): boolean {
+  if (run.interactive) return false;
+  return MOCK_PAUSABLE_KINDS.has(run.kind);
+}
+
+// pauseNotSupportedReason is the per-kind 409 sentence CreatePauseInput maps to (D7).
+function pauseNotSupportedReason(run: { kind: string; interactive?: boolean }): string {
+  if (run.kind === "chat") return "chat runs already park between turns";
+  if (run.interactive) return "interactive tasks park after each turn";
+  return "judge, mr_rework and ci_fix runs are short and finish on their own";
+}
+
+// parkPaused moves a running run to `paused` — the mock's stand-in for the worker
+// publishing a checkpoint and reporting the park (D8). On the park it stamps
+// checkpoint_tip_at and clears the request columns, exactly as SetRunPaused does on the wire.
+//
+// PRD #1190 (D6 / ADR I4): a pending pause is a FLAG that SURVIVES an involuntary park and
+// RE-ARMS, not a fire-once timer. If the boundary timer fires while the run has been overtaken
+// by an involuntary park (e.g. a clarification question flipped it to awaiting_input before the
+// milestone boundary), the pause request stays pending and the park re-schedules itself, landing
+// at the next boundary once the run is `running` again. Without this a milestone pause requested
+// just after approve_plan is silently DROPPED when the demo's clarification question beats it to
+// the punch — a mock that misleads a developer into thinking the pause was lost.
+//
+// The re-arm is a low-frequency idle poll while the run holds at a non-terminal, non-running
+// state (only awaiting_input is reachable here, and it is HUMAN-gated — an `answer` drives it
+// back to `running`, at which point the park lands). It is bounded by the run's lifecycle, not a
+// fixed count, and it always terminates: a pause_cancel clears the request (short-circuited
+// below), a successful park clears the columns, and every terminal transition both clears the
+// columns (ADR-1190 I5) and is caught by isTerminalRun. It never accumulates timers
+// (schedulePark replaces the handle) and emits no messages while polling.
+function parkPaused(runId: string): void {
+  const run = getRun(runId);
+  // The park-timer handle is spent whether or not the guard below lets the park proceed.
+  clearParkTimer(runId);
+  // Run gone, or the request was withdrawn (pause_cancel) / already parked → the pending pause
+  // is over; do not re-arm.
+  if (!run || !run.pause_requested_at) return;
+  if (run.status !== "running") {
+    // Overtaken by an involuntary park with the pause still pending: re-arm so it lands at the
+    // next `running` boundary (D6 / ADR I4). A terminal run never returns to running, so guard
+    // against it — belt-and-braces beside the cleared-request short-circuit above, now that the
+    // terminal transitions clear the pause columns (mirroring the wire's ADR-I5 behavior).
+    if (!isTerminalRun(run.status)) schedulePark(runId, 500);
+    return;
+  }
+  // The park is landing NOW: stop the run's execution — nothing runs while paused (D3). The
+  // execution timers were deliberately left running until this moment so the script kept
+  // advancing while the pause was merely pending (finding [4]).
+  clearTimers(runId);
+  const nowIso = new Date().toISOString();
+  patchRun(runId, {
+    status: "paused",
+    pause_requested_at: null,
+    pause_mode: null,
+    pause_after_count: null,
+    checkpoint_tip_at: nowIso,
+    updated_at: nowIso,
+  });
+  appendMessage(runId, "status", null, { text: "‖ paused — checkpoint pushed, clock stopped" });
 }
 
 // countPlanFeedback counts the revision rounds already recorded, so the `plan_revising`

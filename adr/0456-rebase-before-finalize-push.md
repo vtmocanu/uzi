@@ -3,8 +3,8 @@
 **Status**: Accepted (PRD #456 M1/M2/M4 landed); amended 2026-08-23 (issue #627) — see amendment below
 **Date**: 2026-08-20
 **Deciders**: Vlad (maintainer), agent team (architect, coders, reviewers)
-**PRD**: [prds/456-rebase-before-finalize-push.md](../prds/456-rebase-before-finalize-push.md) (GitHub issue [vtmocanu/uzi#456](https://github.com/vtmocanu/uzi/issues/456)) — the PRD carries the milestones, the full evidence base (including the #422 PVC recovery), and the Decision Log (D1–D5); this ADR carries the mechanism and the two decisions (D2, D5) most likely to look wrong to a future reader who has not re-derived them.
-**Prerequisite**: [PRD #377](../prds/377-early-fail-unpushable-workflow.md) (merged as PR #454), which added `runs.preserved_patch`, the `workflow_scope_missing` `fail_origin`, and the finalize workflow-**modify** guard this fix sits immediately after. This PRD reuses that machinery for a different trigger — see Context.
+**PRD**: [prds/done/456-rebase-before-finalize-push.md](../prds/done/456-rebase-before-finalize-push.md) (GitHub issue [vtmocanu/uzi#456](https://github.com/vtmocanu/uzi/issues/456)) — the PRD carries the milestones, the full evidence base (including the #422 PVC recovery), and the Decision Log (D1–D5); this ADR carries the mechanism and the two decisions (D2, D5) most likely to look wrong to a future reader who has not re-derived them.
+**Prerequisite**: [PRD #377](../prds/done/377-early-fail-unpushable-workflow.md) (merged as PR #454), which added `runs.preserved_patch`, the `workflow_scope_missing` `fail_origin`, and the finalize workflow-**modify** guard this fix sits immediately after. This PRD reuses that machinery for a different trigger — see Context.
 
 ## Decision (summary)
 

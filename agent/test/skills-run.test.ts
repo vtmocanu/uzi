@@ -23,6 +23,12 @@ function writeRepoSkill(dir: string, name: string, desc: string, body: string): 
   fs.writeFileSync(path.join(d, "SKILL.md"), `---\nname: ${name}\ndescription: ${desc}\n---\n\n${body}\n`);
 }
 
+function writeAgentsRepoSkill(dir: string, name: string, desc: string, body: string): void {
+  const d = path.join(worktree, ".agents", "skills", dir);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, "SKILL.md"), `---\nname: ${name}\ndescription: ${desc}\n---\n\n${body}\n`);
+}
+
 function loadedNames(): string[] {
   const skillsRoot = path.join(skillsPluginDir(worktree), "skills");
   if (!fs.existsSync(skillsRoot)) return [];
@@ -59,6 +65,19 @@ describe("prepareSkillPlugin (shared SDK + stub path)", () => {
     assert.equal(out.runSkills[0]!.body, "# Delivered\n", "the delivered body wins");
     assert.deepEqual(out.repoSurvivorNames, []);
     assert.ok(out.drops.some((d) => d.name === "team-kb" && d.reason === "repo_collision"));
+  });
+
+  it("loads a repo skill from the .agents/skills root through the full wiring (#1205)", async () => {
+    // Guards the production wiring, not just collectRepoSkills: a canonical
+    // cross-agent skill under .agents/skills must reach runSkills, the repo
+    // survivors, and the materialized plugin on disk. Reverting prepareSkillPlugin
+    // to `.claude/skills` only reddens this.
+    const delivered: ClaimSkill[] = [{ name: "team-kb", description: "kb.", body: "# KB\n" }];
+    writeAgentsRepoSkill("codex-notes", "codex-notes", "from agents.", "# Codex");
+    const out = await prepareSkillPlugin({ skills: delivered, repoSkillsEnabled: true, worktreePath: worktree }, caps);
+    assert.deepEqual(out.runSkills.map((s) => s.name), ["team-kb", "codex-notes"], "delivered first, .agents repo skill last");
+    assert.deepEqual(out.repoSurvivorNames, ["codex-notes"]);
+    assert.deepEqual(loadedNames(), ["codex-notes", "team-kb"], "the .agents/skills skill is materialized on disk");
   });
 
   it("evicts repo skills first when over the per-run cap", async () => {

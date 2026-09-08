@@ -63,8 +63,8 @@ already materializes.
   carries the same delivered skills as one started with your own templates.
 - **Per-template scoping does not apply.** Allocating a skill to `coder` alone
   is your scoping surface on a template run; on a repo-agent run every subagent
-  sees it. Repo skills (`.claude/skills/`, opt-in per repo) already worked this
-  way, for the same reason.
+  sees it. Repo skills (`.claude/skills/` or `.agents/skills/`, opt-in per repo)
+  already worked this way, for the same reason.
 
 ## The trust trade-off — read before you pick repo agents
 

@@ -83,7 +83,7 @@ a read-only UX reviewer, you decide and you ship.
   Tailwind + TypeScript), Go API in `api/`. Read `ARCHITECTURE.md` for the five product
   surfaces (board/web, forge, worker/run lane, Slack, chat) and `CLAUDE.md` +
   `.claude/rules/web.md` before UI work.
-- The `frontend-design` skill lives at `.claude/skills/frontend-design/` — invoke it via
+- The `frontend-design` skill lives at `.agents/skills/frontend-design/` (reachable as `.claude/skills/frontend-design/`) — invoke it via
   the Skill tool.
 - Run the UI in mock mode (no backend) to design and drive-test: `cd web && VITE_UZI_MOCK=1
   npm run dev -- --port <port>`; mock scenarios and fixtures live under `web/src/mocks/`.

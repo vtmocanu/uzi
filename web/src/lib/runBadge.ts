@@ -153,6 +153,49 @@ export function effectiveRunStatus(
   return run.status;
 }
 
+// shadowSignal derives the Shadow theme's per-run surface signal (PRD #1167 M4):
+// "live" when a machine is working, else "attention" for exactly the states PRD #1167
+// enumerates, else null. attention = awaiting_approval, or a re-plan (revising), or a
+// COMPLETED run in review with an open PR — matching PRD #1167's concrete list. It is
+// NOT "any human decision": awaiting_input and awaiting_followup are deliberately NOT
+// flagged here (they fall through to null), and neither is pool_wait. Shadow is the
+// ONLY consumer — the app renders `data-live`/`data-attention` on the card/row/header
+// of every theme, but only Shadow styles them (live → the ember-dark remap, attention
+// → a rust left rail); on every other theme the attributes are inert, and returning
+// null keeps them off.
+//
+// It flows through effectiveRunStatus so the derived planning/revising phases are
+// handled the same as everywhere else: "planning" is a running run (machine working)
+// → live, and "revising" is a run re-planning after a revise → attention, matching
+// the calm-but-live badge those phases already get. A completed run is quiet EXCEPT
+// while it is in review — mr_iid set AND the MR still open (mrChipState "open"); a
+// merged/closed MR, and every queued/failed/cancelled/limit_wait/null run, are null.
+export function shadowSignal(
+  run:
+    | {
+        status: string;
+        is_planning?: boolean;
+        is_revising?: boolean;
+        mr_iid?: number | null;
+        mr_state?: string | null;
+      }
+    | null
+    | undefined,
+): "live" | "attention" | null {
+  if (run == null) return null;
+  const eff = effectiveRunStatus(run);
+  if (eff === "claimed" || eff === "running" || eff === "planning") return "live";
+  if (eff === "awaiting_approval" || eff === "revising") return "attention";
+  // "in review" is a COMPLETED run whose MR is still open. Gate on eff === "completed"
+  // so a failed / cancelled / queued / limit_wait run that happens to carry an open MR
+  // (e.g. a run that failed after opening its MR) stays quiet rather than lighting the
+  // Shadow attention rail.
+  if (eff === "completed" && run.mr_iid != null && mrChipState(run.mr_state) === "open") {
+    return "attention";
+  }
+  return null;
+}
+
 // priorityBadge is the pure class→pill map for a run's queue priority (PRD #320 D8),
 // the single source both the Runs list and the run view render from — the same split
 // runStatusTone/healthBadge use, so the wording and tone live in one place. Tones come
@@ -225,6 +268,10 @@ export function runStatusTone(
   // other "blocked on something outside the run" holds — never danger: it has not
   // failed and it resumes on its own when a token is pooled (or on demand).
   if (status === "pool_wait") return "warning";
+  // PRD #1190: a run its owner paused. INFO, not the warn the involuntary holds carry
+  // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
+  // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
+  if (status === "paused") return "info";
   if (isStoppedRun(status, stopKind)) return "neutral";
   if (status === "failed") return "danger";
   if (status === "completed") return "ok";
@@ -502,6 +549,19 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         pulse: false,
         title:
           "Waiting for a pooled Anthropic token. It resumes automatically once one is added to the pool.",
+      };
+    // PRD #1190: a run its owner paused. Info-toned and STATIC (no elapsed on the badge —
+    // the per-card duration token carries `paused <elapsed>` via runDurationLabel). The
+    // "‖" glyph matches StatusPill's "‖ paused" label so one status prints one word on
+    // both surfaces (ui.test.tsx label-agreement loop). Unlike the two self-resuming
+    // holds this resumes ONLY on demand, so the title says how, not "resumes on its own".
+    case "paused":
+      return {
+        kind: "badge",
+        label: "‖ paused",
+        tone: "info",
+        pulse: false,
+        title: "Paused by its owner. Resume it from the run page or with `uzi run resume`.",
       };
     case "failed":
       return {

@@ -1,16 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Settings } from "./Settings";
-import { api, ApiError, type User } from "../lib/api";
+import { api, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importActual) => {
@@ -73,15 +66,28 @@ const baseUser: User = {
   last_login: null,
 };
 
-function mockAuth(user: User) {
+// A resolved AppearanceState fixture. Default: dark mode, hall/ember pair, system
+// typeface, no per-field overrides (so it tracks the instance defaults). Tests pass
+// `over` to exercise a different painted polarity or a synthesised-legacy shape.
+const baseAppearance = (
+  over: Partial<import("../lib/api").AppearanceState> = {},
+): import("../lib/api").AppearanceState => ({
+  mode: "dark",
+  light_theme: "hall",
+  dark_theme: "ember",
+  typeface: "system",
+  overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+  defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+  ...over,
+});
+
+function mockAuth(user: User, appearance = baseAppearance()) {
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
     uziLabel: "uzi",
     autopilotLabel: "autopilot",
-    theme: "ember",
-    themeOverride: null,
-    defaultTheme: "ember",
+    appearance,
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
@@ -96,8 +102,8 @@ function mockAuth(user: User) {
 
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null } });
-  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: "mission" } });
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
   mockApi.getMySlack.mockResolvedValue({
     slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked", workspace: "connected" },
   });
@@ -108,6 +114,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   document.documentElement.removeAttribute("data-theme");
+  document.documentElement.removeAttribute("data-font");
 });
 
 describe("Settings — vault (PRD #32)", () => {
@@ -134,53 +141,6 @@ describe("Settings — vault (PRD #32)", () => {
     // The success notice is unique to the lock confirmation (the card description
     // also mentions "waiting for vault unlock", so match the notice's own text).
     await waitFor(() => expect(screen.getByText(/Runs already in flight finish/i)).toBeTruthy());
-  });
-});
-
-describe("Settings — Appearance theme picker (PRD #21)", () => {
-  const themeSelect = () => screen.getByLabelText("Theme") as HTMLSelectElement;
-
-  it("offers 'Use default (<name>)' plus each theme and selects a null override as default", async () => {
-    render(
-      <MemoryRouter>
-        <Settings />
-      </MemoryRouter>,
-    );
-    await waitFor(() => expect(themeSelect()).toBeTruthy());
-    // The default option is labelled with the instance default's name.
-    expect(screen.getByRole("option", { name: /Use default \(Ember\)/i })).toBeTruthy();
-    expect(screen.getByRole("option", { name: "Mission control" })).toBeTruthy();
-    // A null override selects "use default" (value "").
-    expect(themeSelect().value).toBe("");
-  });
-
-  it("applies live (optimistic) and persists the override on change", async () => {
-    render(
-      <MemoryRouter>
-        <Settings />
-      </MemoryRouter>,
-    );
-    await waitFor(() => expect(themeSelect()).toBeTruthy());
-    fireEvent.change(themeSelect(), { target: { value: "mission" } });
-    // Optimistic: <html data-theme> flips immediately, before the request resolves.
-    expect(document.documentElement.dataset.theme).toBe("mission");
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ theme: "mission" }));
-    // Reconciled by a session refresh (syncs the override + re-applies authoritative).
-    await waitFor(() => expect(refresh).toHaveBeenCalled());
-  });
-
-  it("surfaces an error and refreshes (reverts) on a failed save", async () => {
-    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "unknown theme"));
-    render(
-      <MemoryRouter>
-        <Settings />
-      </MemoryRouter>,
-    );
-    await waitFor(() => expect(themeSelect()).toBeTruthy());
-    fireEvent.change(themeSelect(), { target: { value: "mission" } });
-    expect(await screen.findByText("unknown theme")).toBeTruthy();
-    // refresh is the revert mechanism: re-fetch me() and re-apply the server truth.
-    await waitFor(() => expect(refresh).toHaveBeenCalled());
   });
 });
 
@@ -227,7 +187,7 @@ describe("Settings — per-token 'Show in sidebar' toggle", () => {
   it("checking an extra saves the whole set over PUT /me/settings", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: twoSecrets });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null, sidebar_token_ids: ["sec-2"] },
+      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: ["sec-2"] },
     });
     render(
       <MemoryRouter>

@@ -103,6 +103,11 @@ var runDTOKeys = []string{
 	// like budget_* it is load-bearing on the state-ack, not just display — the worker honors
 	// it at the loop top.
 	"scope_ceiling",
+	// PRD #1190 M1: the server-decided pause boundary (worker-facing, on the state-ack, like
+	// scope_ceiling), the three pending-pause intent fields (null ⇒ no pause pending; they ride
+	// only the owner/admin RunDTO, never the board card), and the checkpoint-tip timestamp
+	// (null before the first publish). All always on the wire.
+	"pause_requested", "pause_requested_at", "pause_mode", "pause_after_count", "checkpoint_tip_at",
 	"worker_id", "branch",
 	// PRD #400 (uzi handoff): the task/handoff columns, meaningful only on a
 	// kind='task' run. base_branch is null on every non-task run; open_mr is false by
@@ -312,16 +317,17 @@ func TestJudgeOccurrenceDTOTags(t *testing.T) {
 	// filed_issue and set_via are both omitempty: an unfiled (or claimed-but-unsettled)
 	// occurrence omits filed_issue rather than shipping a null the consumer special-cases,
 	// and a hand-set (or absent) disposition omits set_via, which carries meaning only when
-	// present.
+	// present. judged_at is NOT omitempty (PRD #1183 M2) — it is always present, so it joins
+	// all three variants below.
 	assertTags(t, "JudgeOccurrenceDTO", JudgeOccurrenceDTO{},
-		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket")
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "judged_at")
 	assertTags(t, "JudgeOccurrenceDTO(filed)", JudgeOccurrenceDTO{FiledIssue: &JudgeFiledIssueRefDTO{}},
-		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "filed_issue")
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "judged_at", "filed_issue")
 	// The auto-done shape: PRD #98 Decision 6's "done via #IID" needs BOTH, since the label
 	// names the issue whose closure produced the done.
 	assertTags(t, "JudgeOccurrenceDTO(auto-done)",
 		JudgeOccurrenceDTO{SetVia: "issue_close", FiledIssue: &JudgeFiledIssueRefDTO{}},
-		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket",
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "judged_at",
 		"filed_issue", "set_via")
 }
 
@@ -678,7 +684,9 @@ func TestUserSettingsDTOTags(t *testing.T) {
 	assertTags(t, "UserSettingsDTO", UserSettingsDTO{},
 		"default_model", "default_effort", "judge_model", "summary_model", "theme", "sidebar_token_ids",
 		// PRD #700 M5: the per-user MR-review-watcher opt-in (default ON; null clears to default).
-		"mr_rework_enabled")
+		"mr_rework_enabled",
+		// PRD #1167: the four raw per-field appearance overrides (each null ⇒ inherit).
+		"appearance_mode", "light_theme", "dark_theme", "typeface")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the

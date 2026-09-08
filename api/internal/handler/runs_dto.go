@@ -57,6 +57,26 @@ func (h *Handler) runPriorityClass(ctx context.Context, r store.Run) string {
 	return class
 }
 
+// pauseRequestedRule is the SINGLE, server-side pause-boundary decision (PRD #1190 M1,
+// Decision 4): given the run's pause mode and its frozen/completed milestone counts, whether
+// the worker holding it should park at its next boundary. The worker honors this boolean off
+// the running-report ACK, so the comparison lives in exactly one place and one test table.
+//   - "now"       → park immediately (drop the in-flight turn).
+//   - "milestone" → park once there is no frozen list to wait on (park at the next turn
+//     boundary) OR the in-flight milestone has completed (completed count now exceeds the
+//     count captured at request time).
+//   - any other value (empty / no pause pending) → false.
+func pauseRequestedRule(pauseMode string, frozenLen, completedLen, afterCount int) bool {
+	switch pauseMode {
+	case "now":
+		return true
+	case "milestone":
+		return frozenLen == 0 || completedLen > afterCount
+	default:
+		return false
+	}
+}
+
 // runToDTO maps a bare run row to its wire DTO. priorityClass is the D8 display class
 // (from fn_run_priority_class via a list column or h.runPriorityClass), passed in
 // explicitly so this mapper stays a PURE function of its inputs — no now()/config
@@ -262,6 +282,27 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) ap
 		v := int(r.ScopeCeiling.Int32)
 		dto.ScopeCeiling = &v
 	}
+	// PRD #1190 M1: the pending-pause flag columns (owner intent) and the server-decided
+	// pause boundary the worker honors on the running-report ACK. checkpoint_tip_at is not
+	// owner-gated (just a timestamp). PauseRequested is computed by the ONE boundary rule
+	// (pauseRequestedRule), reusing the frozen/completed lists decoded above so the count
+	// comparison and the DTO cannot disagree.
+	dto.PauseRequestedAt = timePtr(r.PauseRequestedAt.Valid, r.PauseRequestedAt.Time)
+	dto.PauseMode = textPtrValue(r.PauseMode.Valid, r.PauseMode.String)
+	if r.PauseAfterCount.Valid {
+		v := int(r.PauseAfterCount.Int32)
+		dto.PauseAfterCount = &v
+	}
+	dto.CheckpointTipAt = timePtr(r.CheckpointTipAt.Valid, r.CheckpointTipAt.Time)
+	afterCount := 0
+	if r.PauseAfterCount.Valid {
+		afterCount = int(r.PauseAfterCount.Int32)
+	}
+	mode := ""
+	if r.PauseMode.Valid {
+		mode = r.PauseMode.String
+	}
+	dto.PauseRequested = pauseRequestedRule(mode, len(dto.Milestones), len(dto.MilestonesCompleted), afterCount)
 	// PRD #362 M1, Decision 6 (tolerate-on-read): decode the summary_deltas jsonb into
 	// the typed slice; a malformed or unexpected value renders as NO deltas (nil), logged
 	// and never a panic — the deltas are advisory and a prior write's data, not an

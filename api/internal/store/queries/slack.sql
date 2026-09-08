@@ -153,11 +153,19 @@ RETURNING *;
 -- resume line: on a limit_wait park the notifier copies it onto slack_run_messages
 -- .limit_paused_at, and the waited duration is now − that instant. It is NOT NULL on runs
 -- (migration 00163), stamped now() on every status transition including the park.
+--
+-- checkpoint_tip (PRD #1190) is selected FROM THE RUNS ROW, for the same "explicit column
+-- list" reason as stop_kind/rate_limit_type above: the `‖ Paused by you · checkpoint <short>`
+-- line in the paused thread arm needs the last checkpoint-published branch tip, and there is
+-- no other way to reach it through this query. It is a nullable TEXT column (00185), NULL/empty
+-- for a run that never published a checkpoint, which the Go side omits (the arm's "omit when
+-- absent" convention).
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.stop_kind, r.kind,
        r.health, r.plan_md,
        r.rate_limit_type, r.retry_not_before, r.limit_wait_count, r.status_since,
        r.milestones_frozen, r.milestones_completed, r.milestones_in_progress,
+       r.checkpoint_tip,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
@@ -246,15 +254,17 @@ WHERE run_id = @run_id AND gate_ts = @expected_gate_ts AND gate_state = @expecte
 RETURNING *;
 
 -- name: SetSlackRunLimitPause :one
--- Stamp the pending usage-limit park's start on the run's anchor (PRD #1116): @at is the
--- run's own status_since captured at the park. It is its OWN column, not a reuse of the
--- gate/question anchors, for the same reason gate_generation and milestones_notified_completed
--- are their own columns — a distinct dedupe fact (a park awaiting its resume line), so a park
--- can never clear a gate and a gate can never clear a park. Overwrite is correct: a re-park
--- always follows a consumed resume (the park SQL guards on status='running', and the resumed
--- worker reports running first), so a set never clobbers a live pending park.
+-- Stamp the pending park's start on the run's anchor (PRD #1116, generalised by PRD #1190):
+-- @at is the run's own status_since captured at the park, and @park_kind records WHICH park it
+-- was ('limit_wait' or 'paused') so the eventual resume reply can be worded honestly — a
+-- usage-limit park clears "· usage limit cleared", an owner pause does not. It is its OWN
+-- column, not a reuse of the gate/question anchors, for the same reason gate_generation and
+-- milestones_notified_completed are their own columns — a distinct dedupe fact (a park awaiting
+-- its resume line), so a park can never clear a gate and a gate can never clear a park. Overwrite
+-- is correct: a re-park always follows a consumed resume (the park SQL guards on status='running',
+-- and the resumed worker reports running first), so a set never clobbers a live pending park.
 UPDATE slack_run_messages
-SET limit_paused_at = @at, updated_at = now()
+SET limit_paused_at = @at, park_kind = sqlc.narg('park_kind'), updated_at = now()
 WHERE run_id = @run_id
 RETURNING *;
 

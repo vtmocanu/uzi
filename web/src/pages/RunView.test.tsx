@@ -24,6 +24,7 @@ import {
   HealthFlag,
   LimitWaitPanel,
   MrReworkPanel,
+  PausedPanel,
   RunView,
   RunSummary,
   derivePlanRevision,
@@ -78,6 +79,12 @@ vi.mock("../lib/api", async (importOriginal) => {
       // PRD #1202: the on-demand "Rework now" action. Defaulted to resolve with a new
       // mr_rework run so a click settles; the cases that assert its args/link override it.
       startRunRework: vi.fn().mockResolvedValue({ run: null }),
+
+      // PRD #1190: pause/resume mutations. Defaulted to resolve so a click + refreshRun
+      // settles; the paused cases assert the call args.
+      resumeRun: vi.fn().mockResolvedValue({ run: null }),
+      pauseRun: vi.fn().mockResolvedValue({ server_side: false }),
+      cancelPause: vi.fn().mockResolvedValue({ server_side: false }),
     },
   };
 });
@@ -1203,6 +1210,320 @@ describe("RunView — queue priority pill + Expedite action (PRD #320 M6)", () =
   });
 });
 
+// PRD #1190: the paused header — the conditional Resume action (D14, modelled on Expedite)
+// and the pending-pause chip. Rendered whole-page (useRunStream mocked) so the controls are
+// exercised where they live.
+describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", () => {
+  function renderPage(over: Partial<Run>, canSteer: boolean) {
+    const refreshRun = vi.fn();
+    const submit = vi.fn();
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit,
+      refreshRun,
+      inputs: [],
+      canSteer,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const utils = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    return { ...utils, refreshRun, submit };
+  }
+
+  const PAUSED: Partial<Run> = {
+    status: "paused",
+    started_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T03:42:00Z",
+    branch: "agent/issue-33",
+    checkpoint_tip_at: "2026-01-01T01:00:00Z",
+  };
+
+  it("shows a Resume button for the owner of a paused run, and the '· clock stopped' elapsed", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByRole("button", { name: /resume/i }).length).toBeGreaterThan(0);
+    expect(screen.getByText(/clock stopped/i)).toBeTruthy();
+  });
+
+  it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
+    const { refreshRun } = renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /resume/i })[0]);
+    });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("a NON-OWNER sees inert 'only the owner can resume' text, never a Resume button", async () => {
+    renderPage(PAUSED, false);
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+    // Both the header and the panel state who can — assert at least one such sentence.
+    expect(screen.getAllByText(/only the run's owner can resume/i).length).toBeGreaterThan(0);
+  });
+
+  it("renders the pending-pause chip from pause_requested_at, with Cancel pause + Pause now (running owner)", async () => {
+    renderPage(
+      {
+        status: "running",
+        pause_requested_at: "2026-01-01T02:00:00Z",
+        pause_mode: "milestone",
+        pause_after_count: 3,
+        milestones: [
+          { id: "m1", title: "a" },
+          { id: "m2", title: "b" },
+          { id: "m3", title: "c" },
+          { id: "m4", title: "d" },
+        ],
+        milestones_completed: ["m1", "m2", "m3"],
+      },
+      true,
+    );
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText("Pause requested · after M4")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /cancel pause/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /pause now/i })).toBeTruthy();
+  });
+
+  it("the chip's Cancel posts pause_cancel via api.cancelPause(id)", async () => {
+    const { refreshRun } = renderPage(
+      { status: "running", pause_requested_at: "2026-01-01T02:00:00Z", pause_mode: "now" },
+      true,
+    );
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /cancel pause/i }));
+    });
+    await waitFor(() => expect(mockApi.cancelPause).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("hides 'Pause now' on the chip once the pending mode is already 'now'", async () => {
+    renderPage({ status: "running", pause_requested_at: "2026-01-01T02:00:00Z", pause_mode: "now" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText("Pause requested · now")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /cancel pause/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /pause now/i })).toBeNull();
+  });
+
+  it("shows the chip but NO actions when the request rode an involuntary park (not running)", async () => {
+    // M1 review: the server accepts pause_cancel ONLY while running, so a parked run with a
+    // surviving request shows the chip read-only — never a Cancel/Pause-now that would 409.
+    renderPage(
+      { status: "limit_wait", pause_requested_at: "2026-01-01T02:00:00Z", pause_mode: "milestone", wait_on_limit: true },
+      true,
+    );
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText(/Pause requested/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /cancel pause/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /pause now/i })).toBeNull();
+  });
+
+  it("only the status pill pulses — the pending chip never carries animate-pulse", async () => {
+    renderPage({ status: "running", pause_requested_at: "2026-01-01T02:00:00Z", pause_mode: "now" }, true);
+    await screen.findByText("Add rate limiting");
+    // The running pill pulses (its dot).
+    const pill = screen.getByText("running");
+    expect(pill.querySelector(".animate-pulse")).not.toBeNull();
+    // The chip does not — neither on itself nor anywhere in its subtree.
+    const chip = screen.getByText("Pause requested · now");
+    expect(chip.className).not.toContain("animate-pulse");
+    expect(chip.querySelector(".animate-pulse")).toBeNull();
+  });
+
+  // PRD #1190 Fix 1 (web-ux F2, extending #35/#754): the green "● live" chip is a running
+  // go-signal, so it must NOT render on a paused run — beside "‖ paused · clock stopped" it
+  // is a false all-clear, the very reason limit_wait and pool_wait already exclude it. The
+  // "Live" title is unique to that chip (the stage/health chips carry none), so its absence
+  // is a meaningful miss, paired with the running-run positive control below so the
+  // assertion cannot pass vacuously.
+  it("does NOT render the 'live' chip on a paused run (a false go-signal beside '‖ paused')", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByTitle("Live")).toBeNull();
+    // The clock-stopped elapsed is still there — the run is legitimately not live.
+    expect(screen.getByText(/clock stopped/i)).toBeTruthy();
+  });
+
+  it("DOES render the 'live' chip on a running run (the positive control for the exclusion)", async () => {
+    renderPage({ status: "running", started_at: "2026-01-01T00:00:00Z" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByTitle("Live")).toBeTruthy();
+  });
+
+  // PRD #1190 Fix 2/3: a paused run keeps SteerQueueCard with parked=true, MATCHING the
+  // limit_wait pattern (RunView renders SteerQueueCard unconditionally; on limit_wait both
+  // LimitWaitPanel and the card carry a "Stop run"). So the paused page is DELIBERATELY a
+  // panel/card split, not a single action surface, and this documents the PRD-intended
+  // pairs rather than de-duplicating them:
+  //   - TWO Resume paths — the header "▶ Resume" (D14, the Expedite pattern) + PausedPanel's
+  //     Resume. Both are PRD-spec'd.
+  //   - TWO Stop paths — PausedPanel's Stop + the card's Stop, exactly as limit_wait pairs
+  //     LimitWaitPanel's Stop with the card's Stop.
+  it("keeps the header+panel Resume pair and the panel/card Stop split, matching limit_wait", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: /stop run/i })).toHaveLength(2);
+  });
+
+  it("still offers the follow-up composer on a paused run, with the QUEUED (not 'resumes') copy", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    const box = screen.getByPlaceholderText(/send a follow-up message/i) as HTMLTextAreaElement;
+    expect(box.placeholder).toContain("queued until the run resumes");
+    expect(box.placeholder).not.toContain("resumes the agent as its next turn");
+  });
+});
+
+// PRD #1190 (finding, outside-diff): `paused` is non-terminal, but nothing runs while
+// paused — so the milestone checklist's live "now" strip (green/pulsing, derived
+// client-side from the newest tool_use frame) must NOT render. It is excluded in the
+// `activity` memo alongside terminal runs; limit_wait/pool_wait keep their own strip.
+describe("RunView — a paused run shows no live 'now' activity strip (PRD #1190)", () => {
+  const ACTIVITY_MSG: RunMessage[] = [
+    {
+      seq: 1,
+      kind: "tool_use",
+      agent: "coder",
+      agent_instance: null,
+      agent_label: "Wire the collector",
+      payload: { name: "Write", input: { file_path: "api/collector.go" } },
+      created_at: "2026-01-01T00:00:00Z",
+    } as unknown as RunMessage,
+  ];
+  const MILESTONES: Partial<Run> = {
+    milestones: [
+      { id: "m1", title: "First" },
+      { id: "m2", title: "Second" },
+    ],
+    milestones_completed: ["m1"],
+    milestones_in_progress: ["m2"],
+  };
+
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run({ ...MILESTONES, ...over }),
+      messages: ACTIVITY_MSG,
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  // The MilestoneNowStrip's root is the only `.border-l-2.py-1` on a running/paused page
+  // (the ActivityFeed's own left-bordered rows use py-3). The agent label alone is NOT a
+  // valid probe — it ALSO appears in the transcript feed as the lane label, so a text query
+  // would find it even with no strip.
+  const nowStrip = (c: HTMLElement) => c.querySelector(".border-l-2.py-1");
+
+  it("DOES render the live 'now' strip on a RUNNING milestone run (positive control)", async () => {
+    const { container } = renderPage({ status: "running", started_at: "2026-01-01T00:00:00Z" });
+    await screen.findByText("Add rate limiting");
+    expect(nowStrip(container)).not.toBeNull();
+  });
+
+  it("does NOT render the live 'now' strip on a PAUSED run", async () => {
+    const { container } = renderPage({
+      status: "paused",
+      started_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T03:42:00Z",
+    });
+    await screen.findByText("Add rate limiting");
+    // The checklist still renders (milestones are present) …
+    expect(screen.getByText(/reported complete/i)).toBeTruthy();
+    // … but the live "now" strip is gone (nothing runs while paused).
+    expect(nowStrip(container)).toBeNull();
+  });
+});
+
+// PRD #1190: the PausedPanel, mounted directly (it is exported, like LimitWaitPanel) so its
+// copy and owner-gating are asserted without the full page.
+describe("PausedPanel (PRD #1190)", () => {
+  const paused = (over: Partial<Run> = {}): Run =>
+    run({
+      status: "paused",
+      branch: "agent/issue-33",
+      started_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T03:42:00Z",
+      checkpoint_tip_at: "2026-01-01T01:00:00Z",
+      milestones: [
+        { id: "m1", title: "a" },
+        { id: "m2", title: "b" },
+        { id: "m3", title: "c" },
+        { id: "m4", title: "d" },
+        { id: "m5", title: "e" },
+        { id: "m6", title: "f" },
+      ],
+      milestones_completed: ["m1", "m2", "m3"],
+      ...over,
+    });
+
+  it("self-hides on a non-paused run", () => {
+    const { container } = render(<PausedPanel run={run({ status: "running" })} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("says the checkpoint is safe and that nothing runs or is spent while it waits", () => {
+    render(<PausedPanel run={paused()} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.getByText(/Milestone 3 is finished and its checkpoint is pushed \(agent\/issue-33\)\./)).toBeTruthy();
+    expect(screen.getByText("Nothing runs and nothing is spent while it waits.")).toBeTruthy();
+    expect(screen.getByText("What happens on resume")).toBeTruthy();
+  });
+
+  it("OMITS the budget-remaining sentence (PRD #1189's budget_total_seconds has not landed)", () => {
+    render(<PausedPanel run={paused()} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.queryByText(/left when you resume/i)).toBeNull();
+    expect(screen.queryByText(/budget remains/i)).toBeNull();
+    expect(screen.queryByText(/left when resumed/i)).toBeNull();
+    // And the action-row who-can line names two actions, not three (no "extend").
+    expect(screen.queryByText(/only the run's owner can resume, extend or stop/i)).toBeNull();
+  });
+
+  it("offers Resume + Stop for the owner", () => {
+    const onResume = vi.fn();
+    render(<PausedPanel run={paused()} busy={false} canSteer onResume={onResume} onStop={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /resume/i }));
+    expect(onResume).toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /stop run/i })).toBeTruthy();
+  });
+
+  it("a NON-OWNER sees inert text, never a Resume/Stop button", () => {
+    render(<PausedPanel run={paused()} busy={false} canSteer={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /stop run/i })).toBeNull();
+    expect(screen.getByText("Only the run's owner can resume or stop it.")).toBeTruthy();
+  });
+
+  // PRD #1190 (finding [5]): the heading MUST NOT carry role="status". A live region that
+  // mounts holding its first message is typically silent to assistive tech (Board.tsx S5),
+  // so the paused arrival is announced by RunView's persistent parkAnnounce region instead —
+  // role="status" here too would either be silent-on-mount or a duplicate announcement.
+  it("the heading carries NO role=\"status\" (parkAnnounce owns the announcement)", () => {
+    render(<PausedPanel run={paused()} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    const heading = screen.getByText(/Paused by you/);
+    expect(heading.getAttribute("role")).toBeNull();
+    // The standalone panel declares no live region of its own at all.
+    expect(document.querySelectorAll('[role="status"]').length).toBe(0);
+  });
+});
+
 // PRD #841: the per-run "Auto-rework this MR's review comments" checkbox. Its gate is
 // DELIBERATELY unlike wait-on-limit's (D2): visible for an issue run whose MR is null or
 // `opened` — including a COMPLETED run, because the watcher acts after completion — and
@@ -1500,6 +1821,27 @@ describe("MrReworkPanel — on-demand rework + past-cap surface (PRD #1202)", ()
     expect(link.getAttribute("href")).toBe("/runs/run-new-9");
   });
 
+  it("shows a later rework refusal instead of the previous successful run", async () => {
+    mockApi.startRunRework
+      .mockResolvedValueOnce({ run: run({ id: "run-first", kind: "mr_rework", status: "queued" }) })
+      .mockRejectedValueOnce(new ApiError(409, "a rework is already running for this MR"));
+    renderPanel({});
+    fireEvent.click(screen.getByRole("button", { name: REWORK_NOW }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /start rework/i }));
+    });
+    expect(screen.getByRole("link", { name: /open the rework run/i }).getAttribute("href"))
+      .toBe("/runs/run-first");
+
+    fireEvent.click(screen.getByRole("button", { name: REWORK_NOW }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /start rework/i }));
+    });
+    expect(mockApi.startRunRework).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("a rework is already running for this MR")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /open the rework run/i })).toBeNull();
+  });
+
   it("a 409 renders the server's message INLINE (role=status), not the page banner", async () => {
     mockApi.startRunRework.mockRejectedValue(
       new ApiError(409, "a rework is already running for this MR"),
@@ -1747,8 +2089,8 @@ describe("JudgePanel (PRD #46 M4)", () => {
         },
       ],
       filed_issues: [],
-      // PRD #94: default to an untriaged review (every rec reads "To do"). The triage
-      // bar reads these server counts directly — the panel never re-derives them.
+      // PRD #94/#1183: default to an untriaged review (every rec reads "To triage"). The
+      // triage bar reads these server counts directly — the panel never re-derives them.
       dispositions: [],
       triage: {
         total: 1,
@@ -2699,8 +3041,26 @@ describe("JudgePanel (PRD #46 M4)", () => {
     ).toBe("INPUT");
   });
 
-  it("files the issue and shows the created link (state C)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+  it("files the issue, then the refetch flips the row to the Filed #N chip (state C)", async () => {
+    // The card no longer keeps a local just-filed state: onCreate posts the file-issue call
+    // then REFETCHES, so the filed link arrives on the next getRunReview and the shared
+    // "Filed #N ↗" chip replaces the "Issue created." box the old flow rendered.
+    mockApi.getRunReview
+      .mockResolvedValueOnce({ review: review(), pending_judge: null })
+      .mockResolvedValue({
+        pending_judge: null,
+        review: review({
+          filed_issues: [
+            {
+              category: "install_worker_tool",
+              target: "shellcheck",
+              issue_iid: 71,
+              issue_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+              filed_at: "2026-01-02T00:00:00Z", // newer than updated_at → not stale
+            },
+          ],
+        }),
+      });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -2721,10 +3081,57 @@ describe("JudgePanel (PRD #46 M4)", () => {
       title: "Improve the reviewer: reviewer",
       description: draftFixture().description,
     });
-    const link = await screen.findByRole("link", { name: /#71/ });
+    const link = await screen.findByRole("link", { name: /Filed #71/ });
     expect(link.getAttribute("href")).toBe(
       "https://gitlab.example/vtmocanu/uzi/-/issues/71",
     );
+    // "Issue created." is gone — the filed state is the chip now.
+    expect(screen.queryByText("Issue created.")).toBeNull();
+    // And File issue hides once filed.
+    expect(screen.queryByText("File issue")).toBeNull();
+  });
+
+  it("keeps the created issue + its warning up when the refetch does not settle the link (created-with-warning)", async () => {
+    // fileIssue's `warning` is a created-with-warning SUCCESS: the forge issue WAS created, only
+    // its local link/cache could not settle, so it is set EXACTLY when the review refetch will
+    // NOT carry the filed link. Every getRunReview here returns the UNFILED review (the link
+    // never settles). Without the local just-filed override the row would fall back to "To
+    // triage" and re-arm File issue over a live forge issue (a silent duplicate); the override
+    // keeps "Filed #N" + the warning on screen and withholds File issue.
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+    mockApi.listRepos.mockResolvedValue({
+      repos: [repoOpt("repo1", "vtmocanu/uzi")],
+    });
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    mockApi.fileIssue.mockResolvedValue({
+      issue: {
+        iid: 71,
+        web_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+        title: "t",
+      },
+      warning: "Issue created, but its local link could not be saved.",
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("File issue"));
+    fireEvent.click(await screen.findByText("Create issue"));
+    expect(mockApi.fileIssue).toHaveBeenCalledWith("r1", "rc1", {
+      repo_id: "repo1",
+      title: "Improve the reviewer: reviewer",
+      description: draftFixture().description,
+    });
+
+    // (a) the "Filed #N ↗" chip/link renders from the local override, not the refetch.
+    const link = await screen.findByRole("link", { name: /Filed #71/ });
+    expect(link.getAttribute("href")).toBe(
+      "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+    );
+    // (b) the created-with-warning line renders under the chip.
+    expect(
+      screen.getByText("Issue created, but its local link could not be saved."),
+    ).toBeTruthy();
+    // (c) File issue does NOT reappear — no duplicate invitation over a live issue.
+    expect(screen.queryByText("File issue")).toBeNull();
   });
 
   it("disables Create until a repo is picked when no default resolves (state D)", async () => {
@@ -2829,7 +3236,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     };
   }
 
-  it("renders a status chip per row by the disposition→filed→to-do ladder", async () => {
+  it("renders a status chip per row by the disposition→filed→to-triage ladder", async () => {
     mockApi.getRunReview.mockResolvedValue({
       pending_judge: null,
       review: review({
@@ -2891,8 +3298,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(await screen.findByText("Done")).toBeTruthy(); // done > filed
     expect(screen.getByText("Dismissed · Won't do")).toBeTruthy();
     expect(screen.getByText("Dismissed · Not an issue")).toBeTruthy();
-    expect(screen.getByText("To do")).toBeTruthy(); // no disposition, not filed
-    expect(screen.getByText("Filed")).toBeTruthy(); // settled link, no disposition
+    expect(screen.getByText("To triage")).toBeTruthy(); // no disposition, not filed
+    // A settled link with no disposition is the shared "Filed #N ↗" chip (a link when https).
+    expect(screen.getByRole("link", { name: /Filed #72/ })).toBeTruthy();
   });
 
   it("Mark done sets a done disposition (no reason) and refetches the review", async () => {
@@ -3155,6 +3563,51 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
     fireEvent.click(await screen.findByText("Mark done"));
     expect(await screen.findByText("Marked done")).toBeTruthy();
+  });
+
+  // PRD #1183 live-region fix (carried-forward review finding): in owned mode the row swaps
+  // TriageActions→TriageDisposedRow on a mutation. If the announce region lived INSIDE
+  // TriageActions it would unmount with the row exactly as the message is set, dropping the
+  // screen-reader announcement. The panel hosts a PERSISTENT region a level up; this guards
+  // that the "Marked done" message is still in a polite sr-only region AFTER the swap.
+  it("keeps the owned-mode disposition announcement in a live region that SURVIVES the row swap (#1183)", async () => {
+    mockApi.getRunReview
+      .mockResolvedValueOnce({ review: review(), pending_judge: null })
+      .mockResolvedValue({
+        pending_judge: null,
+        review: review({
+          dispositions: [
+            {
+              category: "install_worker_tool",
+              target: "shellcheck",
+              status: "done",
+              reason: "",
+              set_at: "2026-01-01T00:00:00Z",
+              stale: false,
+            },
+          ],
+          triage: {
+            total: 1,
+            todo: 0,
+            filed: 0,
+            done: 1,
+            dismissed: 0,
+            false_positives: 0,
+          },
+        }),
+      });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Mark done"));
+    // The row has swapped to the disposed state — the action row (and its would-be region) is
+    // gone, exactly where the m1 bug dropped the message.
+    await screen.findByText("Undo");
+    expect(screen.queryByText("Mark done")).toBeNull();
+    // …yet the announcement persists, in a polite sr-only status region.
+    const region = await screen.findByText("Marked done");
+    expect(region.getAttribute("role")).toBe("status");
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.className).toContain("sr-only");
   });
 });
 
@@ -4068,6 +4521,59 @@ describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () 
     await screen.findByText("Add rate limiting");
     const region = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
     expect(region.textContent).toBe("");
+  });
+});
+
+// PRD #1190 (finding [5]): a run parking into `paused` is a deliberate owner hold a
+// screen-reader user must be told about — it must announce through the SAME persistent
+// region as the other parks, on the CONTENT CHANGE (a region born holding text is silent).
+describe("RunView park announcement — paused (PRD #1190, a11y)", () => {
+  function setStream(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+  }
+
+  it("announces the paused park on a running→paused transition through the always-mounted region", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    setStream({ status: "running", started_at: "2026-01-01T00:00:00Z" });
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Add rate limiting");
+    // Running: the region exists but is empty (nothing to announce yet).
+    const before = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+    expect(before.textContent).toBe("");
+
+    // Transition to paused: the SAME region gains the paused message.
+    setStream({ status: "paused", started_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T03:42:00Z" });
+    rerender(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe(
+      "The run is paused. Resume it from this page or with the uzi run resume command.",
+    );
+    // Mutation guards: it is the paused copy, not another park's.
+    expect(region.textContent).not.toContain("asking you a question");
+    expect(region.textContent).not.toContain("pooled Anthropic token");
+    expect(region.textContent).not.toContain("next follow-up");
   });
 });
 

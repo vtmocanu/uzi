@@ -344,6 +344,37 @@ export const runsApi = {
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
+  // PRD #1190: request a pause / withdraw one. Route through the engine's handleInput so
+  // the mock enforces the SAME contract the web is built against (the 409s for a non-
+  // running run and an unpausable kind, the boundary rule, the running → paused park).
+  pauseRun: async (id: string, mode: "milestone" | "now") => {
+    if (!getRun(id)) throw new ApiError(404, "run not found");
+    const rejection = handleInput(id, "pause", mode);
+    if (rejection) throw new ApiError(rejection.status, rejection.message);
+    return delay({ server_side: false }, 120);
+  },
+  cancelPause: async (id: string) => {
+    if (!getRun(id)) throw new ApiError(404, "run not found");
+    const rejection = handleInput(id, "pause_cancel", "");
+    if (rejection) throw new ApiError(rejection.status, rejection.message);
+    return delay({ server_side: false }, 120);
+  },
+
+  // PRD #1190 (D14): resume a `paused` run via the widened /resume-now endpoint. Mirrors
+  // ResumePausedRun — paused → queued (the mock has no budget clock to bank, but the
+  // transition is what un-parks it). Owner-scoped; a 409 naming the status on any run that
+  // is neither paused nor pool_wait, so the panel's inline "no longer paused" note is
+  // reachable when a second click races the refetch. Also accepts a pool_wait run, since
+  // the real endpoint dispatches on status.
+  resumeRun: async (id: string) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (run.status !== "paused" && run.status !== "pool_wait")
+      throw new ApiError(409, `run is ${run.status}`);
+    patchRun(id, { status: "queued", updated_at: new Date().toISOString() });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
   // PRD #320 M6: bump this run to the front of the queue, or clear that override.
   // Mirrors the server: owner-scoped (the demo caller owns every non-other-user run)
   // and QUEUED-ONLY (409 on a non-queued run, exactly like the real endpoint). Clearing

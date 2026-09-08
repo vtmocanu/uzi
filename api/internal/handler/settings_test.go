@@ -130,6 +130,86 @@ func TestGetSettingsSurfacesCapabilityAwareScheduling(t *testing.T) {
 	}
 }
 
+// The admin GET surface auto-surfaces the four PRD #1167 appearance default keys:
+// each unset reads as its compiled-in default (default_dark_theme's default is ""
+// because its legacy fallback chain lives in the accessor, not the stored default),
+// so all four are present in the settings map. This is the read half; the write
+// half (a valid value ⇒ 200) needs a live pool and lives in the LiveDB suite.
+func TestGetSettingsSurfacesAppearanceDefaults(t *testing.T) {
+	h := newSettingsHandler()
+	rec := httptest.NewRecorder()
+	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Settings map[string]string `json:"settings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, key := range []string{
+		settings.KeyDefaultAppearanceMode, settings.KeyDefaultLightTheme,
+		settings.KeyDefaultDarkTheme, settings.KeyDefaultTypeface,
+	} {
+		got, ok := resp.Settings[key]
+		if !ok {
+			t.Errorf("admin settings map missing key %q", key)
+			continue
+		}
+		if want := settings.Defaults[key]; got != want {
+			t.Errorf("%s = %q, want compiled default %q", key, got, want)
+		}
+	}
+}
+
+// A valid light-slot and dark-slot default id are accepted by the same
+// settings.Validate the admin PUT delegates to (the write's 200 path needs a live
+// pool; this pins the acceptance half the polarity-mismatch tests below reject).
+func TestAppearanceDefaultKeysValidate(t *testing.T) {
+	if err := settings.Validate(settings.KeyDefaultLightTheme, "dawn"); err != nil {
+		t.Errorf("default_light_theme=dawn (a light id) should be accepted, got %v", err)
+	}
+	if err := settings.Validate(settings.KeyDefaultDarkTheme, "ember"); err != nil {
+		t.Errorf("default_dark_theme=ember (a dark id) should be accepted, got %v", err)
+	}
+	if err := settings.Validate(settings.KeyDefaultAppearanceMode, "system"); err != nil {
+		t.Errorf("default_appearance_mode=system should be accepted, got %v", err)
+	}
+	if err := settings.Validate(settings.KeyDefaultTypeface, "plex"); err != nil {
+		t.Errorf("default_typeface=plex should be accepted, got %v", err)
+	}
+}
+
+// The admin PUT rejects a polarity-mismatched appearance default with a 400 before
+// any write: a dark id in the light slot and a light id in the dark slot both fail
+// the per-key gate (settings.Validate ⇒ theme.ValidateFor), naming the key.
+func TestUpdateSettingsRejectsAppearancePolarityMismatch(t *testing.T) {
+	admin := adminUser()
+	cases := map[string]struct {
+		body string
+		key  string
+	}{
+		"dark id in the light slot": {`{"settings":{"default_light_theme":"ember"}}`, "default_light_theme"},
+		"light id in the dark slot": {`{"settings":{"default_dark_theme":"dawn"}}`, "default_dark_theme"},
+		"unknown mode":              {`{"settings":{"default_appearance_mode":"bright"}}`, "default_appearance_mode"},
+		"unknown typeface":          {`{"settings":{"default_typeface":"comic"}}`, "default_typeface"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newSettingsHandler()
+			rec := httptest.NewRecorder()
+			h.UpdateSettings(rec, putSettings(&admin, tc.body))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.key) {
+				t.Fatalf("400 body %q should name the key %q", rec.Body.String(), tc.key)
+			}
+		})
+	}
+}
+
 func TestUpdateSettingsRejectsUnauthenticated(t *testing.T) {
 	h := newSettingsHandler()
 	rec := httptest.NewRecorder()

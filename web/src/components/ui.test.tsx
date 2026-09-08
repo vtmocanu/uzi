@@ -127,6 +127,11 @@ describe("StatusPill", () => {
     // RUN_STATUS_LABELS entry would leave StatusPill printing "pool wait" against
     // runBadge's "waiting for pool", which this loop then catches.
     expect(checked).toContain("pool_wait");
+    // PRD #1190: paused must print one word — "‖ paused" — on BOTH the pill and the board
+    // badge. The pill carries the "‖" glyph via RUN_STATUS_LABELS so it agrees with
+    // runBadge's "‖ paused" label; a missing entry would leave StatusPill printing "paused"
+    // against runBadge's "‖ paused", which this loop then catches.
+    expect(checked).toContain("paused");
     expect(checked.length).toBeGreaterThanOrEqual(5);
   });
 });
