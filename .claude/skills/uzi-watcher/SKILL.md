@@ -330,7 +330,9 @@ caught too, not just the checkpointed tracking ref):
   DONE vs LEFT, `log-tail.ndjson`). It resolves worker→pod FRESH each call, so it follows a
   worker roll or a cross-worker migration. Deployment coordinates come from env
   (`UZI_CTX`, `UZI_WORKER_NS`, `UZI_REPO_SLUG` — the last derived from `origin` if unset),
-  never hard-coded.
+  never hard-coded. **Always pass `UZI_CTX` explicitly**: unset, it falls back to the
+  kubeconfig's current context, which is shared across sessions and can be switched under
+  a running loop; the symptom is `WARN … no pod for worker` on a worker whose pod exists.
 - **`scripts/backup-loop.sh <RUN_ID>...`** — runs `backup-runs.sh` every
   `UZI_BACKUP_INTERVAL` (default 900s), **detached** so it outlives the session (`setsid`
   on Linux, a `( nohup … & )` subshell on macOS). It self-terminates when every run is
