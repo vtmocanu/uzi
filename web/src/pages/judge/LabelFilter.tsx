@@ -86,7 +86,7 @@ export function LabelFilter({
                 aria-hidden="true"
                 className={cx(
                   "rounded-full px-1.5 py-px text-[0.68rem] tabular-nums",
-                  on ? "bg-brand/[0.12] text-brand-hover" : "bg-ink/60 text-faint",
+                  on ? "bg-brand/[0.12] text-brand-hover" : "bg-ink/60 inset-well text-faint",
                 )}
               >
                 {count}

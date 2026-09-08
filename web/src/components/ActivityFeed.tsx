@@ -927,7 +927,7 @@ export function ActivityFeed({
 
       {actorKeys.length === 0 ? (
         !terminal && (
-          <p className="rounded-lg border border-edge bg-ink/40 px-3 py-2 text-xs text-muted">
+          <p className="rounded-lg border border-edge bg-ink/40 inset-panel px-3 py-2 text-xs text-muted">
             Waiting for the first agent…
           </p>
         )

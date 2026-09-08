@@ -1112,7 +1112,7 @@ export function ScheduleModal({
           </div>
 
           {/* Next fires preview */}
-          <div className="rounded-lg border border-edge bg-ink/50 px-3 py-2.5">
+          <div className="rounded-lg border border-edge bg-ink/50 inset-panel px-3 py-2.5">
             <p className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-muted">
               Next fires
             </p>
@@ -1137,7 +1137,7 @@ export function ScheduleModal({
         </div>
 
         {/* Footer */}
-        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-edge bg-ink/40 px-5 py-3.5">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-edge bg-ink/40 inset-panel px-5 py-3.5">
           <span className="hidden min-w-0 flex-1 truncate text-[11px] text-faint sm:block">{footerSummary}</span>
           <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2">
             {isEdit && (
@@ -1255,7 +1255,7 @@ function BakedBlock({ label, text }: { label: string; text: string }) {
         </span>
         {label} <span className="text-[11px] font-normal text-faint">(read-only)</span>
       </span>
-      <div className="max-h-52 overflow-y-auto whitespace-pre-wrap rounded-lg border border-edge border-l-2 border-l-brand/60 bg-ink/50 px-3 py-2.5 font-mono text-[12px] leading-relaxed text-muted">
+      <div className="max-h-52 overflow-y-auto whitespace-pre-wrap rounded-lg border border-edge border-l-2 border-l-brand/60 bg-ink/50 inset-panel px-3 py-2.5 font-mono text-[12px] leading-relaxed text-muted">
         {text || "—"}
       </div>
       <p className="text-[11px] text-faint">

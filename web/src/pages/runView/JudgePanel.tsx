@@ -1040,7 +1040,7 @@ export function TriageSummary({
   className?: string;
 }) {
   return (
-    <div className={cx("rounded-lg border border-edge bg-ink/40 p-3", className)}>
+    <div className={cx("rounded-lg border border-edge bg-ink/40 inset-panel p-3", className)}>
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">{title}</h3>
         {aside != null && <span className="ml-auto text-xs text-faint">{aside}</span>}

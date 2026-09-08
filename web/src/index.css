@@ -280,6 +280,26 @@
   --syn-cmd: var(--brand); --syn-flag: var(--info); --syn-str: var(--ok); --syn-op: var(--brand-hover); --syn-comment: var(--faint); --syn-arg: var(--fg); --tool-rail: var(--edge);
 }
 
+/* Non-console inset surfaces (modal footers, preview/read-only boxes, side
+   panels, empty-state placeholders) carry `inset-panel` beside their bg-ink/NN
+   wash. On the dark themes the wash stands (darker than the card). On a LIGHT
+   theme that wash is the near-white ground over a white card — invisible — so
+   remap to an opaque --raised step, a visible recess. Higher specificity than the
+   utility and unlayered, so it applies ONLY under a light theme and leaves
+   ember/mission byte-identical. */
+[data-theme="dawn"] .inset-panel,
+[data-theme="hall"] .inset-panel,
+[data-theme="shadow"] .inset-panel {
+  background-color: rgb(var(--raised));
+}
+/* A well that sits ON a --raised chip (the judge label-filter count pill): a
+   --raised fill would match its parent, so lift to --surface on light instead. */
+[data-theme="dawn"] .inset-well,
+[data-theme="hall"] .inset-well,
+[data-theme="shadow"] .inset-well {
+  background-color: rgb(var(--surface));
+}
+
 body {
   @apply bg-ink text-fg antialiased;
   font-family: var(--font-sans);
